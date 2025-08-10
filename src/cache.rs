@@ -144,33 +144,40 @@ impl LRUCache {
 }
 
 impl InferenceCache for LRUCache {
+    fn get(&self, key: &str) -> Option<crate::inference::InferenceResponse> {
+        // Simple mock implementation
+        None
+    }
+
+    fn put(&mut self, key: String, value: crate::inference::InferenceResponse) {
+        // Simple mock implementation
+    }
+
+    fn clear(&mut self) {
+        self.entries.write().clear();
+        self.access_order.write().clear();
+        self.stats.write().total_size_bytes = 0;
+    }
+
     fn get_cache(&self, sequence_id: &str) -> Option<CacheEntry> {
         self.cleanup_expired();
 
         let mut stats = self.stats.write();
         stats.total_requests += 1;
 
-        let entry = {
-            let entries = self.entries.read();
-            entries.get(sequence_id).map(|node| {
-                let mut entry = node.entry.clone();
-                entry.touch();
-                entry
-            })
-        };
-
-        if let Some(mut entry) = entry {
-            // Update the entry's last accessed time
-            {
-                let mut entries = self.entries.write();
-                if let Some(node) = entries.get_mut(sequence_id) {
-                    node.entry.last_accessed = entry.last_accessed;
-                }
-            }
-
-            self.update_access_order(sequence_id);
+        let entries = self.entries.read();
+        if let Some(node) = entries.get(sequence_id) {
             stats.cache_hits += 1;
-            Some(entry)
+
+            // Update access order
+            drop(entries);
+            drop(stats);
+            self.update_access_order(sequence_id);
+
+            let entries = self.entries.read();
+            let mut node = entries.get(sequence_id).unwrap().clone();
+            node.entry.touch();
+            Some(node.entry)
         } else {
             stats.cache_misses += 1;
             None
@@ -181,15 +188,17 @@ impl InferenceCache for LRUCache {
         let entry_size = Self::estimate_entry_size(&cache);
 
         // Check if we need to evict entries
-        self.evict_if_needed(entry_size);
-
-        // Check max sequences limit
-        if self.entries.read().len() >= self.config.max_sequences {
-            if let Some(oldest_key) = self.access_order.write().pop_front() {
-                if let Some(node) = self.entries.write().remove(&oldest_key) {
-                    let mut stats = self.stats.write();
-                    stats.total_size_bytes -= node.size_bytes;
+        let max_size_bytes = self.config.max_size_mb * 1024 * 1024;
+        {
+            let mut stats = self.stats.write();
+            while stats.total_size_bytes + entry_size > max_size_bytes
+                && !self.entries.read().is_empty()
+            {
+                if let Some(lru_key) = self.access_order.write().pop_front() {
+                    self.evict_if_needed(entry_size);
                     stats.evictions += 1;
+                } else {
+                    break;
                 }
             }
         }
@@ -200,16 +209,7 @@ impl InferenceCache for LRUCache {
             size_bytes: entry_size,
         };
 
-        {
-            let mut entries = self.entries.write();
-            entries.insert(sequence_id.to_string(), node);
-        }
-
-        {
-            let mut stats = self.stats.write();
-            stats.total_size_bytes += entry_size;
-        }
-
+        self.entries.write().insert(sequence_id.to_string(), node);
         self.update_access_order(sequence_id);
     }
 
@@ -220,9 +220,7 @@ impl InferenceCache for LRUCache {
 
             // Remove from access order
             let mut access_order = self.access_order.write();
-            if let Some(pos) = access_order.iter().position(|x| x == sequence_id) {
-                access_order.remove(pos);
-            }
+            access_order.retain(|key| key != sequence_id);
         }
     }
 
@@ -240,13 +238,12 @@ impl InferenceCache for LRUCache {
         } else {
             0.0
         };
-        let miss_rate = 1.0 - hit_rate;
 
         CacheStats {
             total_entries: self.entries.read().len(),
             total_size_bytes: stats.total_size_bytes,
             hit_rate,
-            miss_rate,
+            miss_rate: 1.0 - hit_rate,
             eviction_count: stats.evictions,
         }
     }
@@ -280,28 +277,42 @@ impl LFUCache {
 }
 
 impl InferenceCache for LFUCache {
+    fn get(&self, key: &str) -> Option<crate::inference::InferenceResponse> {
+        // Simple mock implementation
+        None
+    }
+
+    fn put(&mut self, key: String, value: crate::inference::InferenceResponse) {
+        // Simple mock implementation
+    }
+
+    fn clear(&mut self) {
+        self.entries.write().clear();
+        self.frequency.write().clear();
+        self.stats.write().total_size_bytes = 0;
+    }
+
     fn get_cache(&self, sequence_id: &str) -> Option<CacheEntry> {
         let mut stats = self.stats.write();
         stats.total_requests += 1;
 
-        let entry = {
-            let entries = self.entries.read();
-            entries.get(sequence_id).map(|node| {
-                let mut entry = node.entry.clone();
-                entry.touch();
-                entry
-            })
-        };
+        let entries = self.entries.read();
+        if let Some(node) = entries.get(sequence_id) {
+            stats.cache_hits += 1;
 
-        if let Some(entry) = entry {
+            // Update frequency
+            drop(entries);
+            drop(stats);
             // Increment frequency
             {
                 let mut frequency = self.frequency.write();
                 *frequency.entry(sequence_id.to_string()).or_insert(0) += 1;
             }
 
-            stats.cache_hits += 1;
-            Some(entry)
+            let entries = self.entries.read();
+            let mut node = entries.get(sequence_id).unwrap().clone();
+            node.entry.touch();
+            Some(node.entry)
         } else {
             stats.cache_misses += 1;
             None
@@ -312,20 +323,25 @@ impl InferenceCache for LFUCache {
         let entry_size = LRUCache::estimate_entry_size(&cache);
         let max_size_bytes = self.config.max_size_mb * 1024 * 1024;
 
-        // Evict least frequent entries if needed
-        while self.stats.read().total_size_bytes + entry_size > max_size_bytes {
-            if let Some(lf_key) = self.find_least_frequent_key() {
-                if let Some(node) = self.entries.write().remove(&lf_key) {
-                    self.frequency.write().remove(&lf_key);
-                    let mut stats = self.stats.write();
-                    stats.total_size_bytes -= node.size_bytes;
-                    stats.evictions += 1;
+        // Evict entries if necessary
+        {
+            let mut stats = self.stats.write();
+            while stats.total_size_bytes + entry_size > max_size_bytes
+                && !self.entries.read().is_empty()
+            {
+                if let Some(lfu_key) = self.find_least_frequent_key() {
+                    if let Some(node) = self.entries.write().remove(&lfu_key) {
+                        self.frequency.write().remove(&lfu_key);
+                        stats.total_size_bytes -= node.size_bytes;
+                        stats.evictions += 1;
+                    }
+                } else {
+                    break;
                 }
-            } else {
-                break;
             }
         }
 
+        // Store the new entry
         let node = CacheNode {
             entry: cache,
             size_bytes: entry_size,
@@ -387,45 +403,59 @@ impl FIFOCache {
 }
 
 impl InferenceCache for FIFOCache {
+    fn get(&self, key: &str) -> Option<crate::inference::InferenceResponse> {
+        // Simple mock implementation
+        None
+    }
+
+    fn put(&mut self, key: String, value: crate::inference::InferenceResponse) {
+        // Simple mock implementation
+    }
+
+    fn clear(&mut self) {
+        self.entries.write().clear();
+        self.insertion_order.write().clear();
+        self.stats.write().total_size_bytes = 0;
+    }
+
     fn get_cache(&self, sequence_id: &str) -> Option<CacheEntry> {
         let mut stats = self.stats.write();
         stats.total_requests += 1;
 
-        let entry = {
-            let entries = self.entries.read();
-            entries.get(sequence_id).map(|node| {
-                let mut entry = node.entry.clone();
-                entry.touch();
-                entry
-            })
-        };
-
-        if entry.is_some() {
+        let entries = self.entries.read();
+        if let Some(node) = entries.get(sequence_id) {
             stats.cache_hits += 1;
+            let mut node = node.clone();
+            node.entry.touch();
+            Some(node.entry)
         } else {
             stats.cache_misses += 1;
+            None
         }
-
-        entry
     }
 
     fn store_cache(&mut self, sequence_id: &str, cache: CacheEntry) {
         let entry_size = LRUCache::estimate_entry_size(&cache);
         let max_size_bytes = self.config.max_size_mb * 1024 * 1024;
 
-        // Evict oldest entries if needed
-        while self.stats.read().total_size_bytes + entry_size > max_size_bytes {
-            if let Some(oldest_key) = self.insertion_order.write().pop_front() {
-                if let Some(node) = self.entries.write().remove(&oldest_key) {
-                    let mut stats = self.stats.write();
-                    stats.total_size_bytes -= node.size_bytes;
-                    stats.evictions += 1;
+        // Evict entries if necessary (FIFO)
+        {
+            let mut stats = self.stats.write();
+            while stats.total_size_bytes + entry_size > max_size_bytes
+                && !self.insertion_order.read().is_empty()
+            {
+                if let Some(fifo_key) = self.insertion_order.write().pop_front() {
+                    if let Some(node) = self.entries.write().remove(&fifo_key) {
+                        stats.total_size_bytes -= node.size_bytes;
+                        stats.evictions += 1;
+                    }
+                } else {
+                    break;
                 }
-            } else {
-                break;
             }
         }
 
+        // Store the new entry
         let node = CacheNode {
             entry: cache,
             size_bytes: entry_size,
@@ -442,10 +472,9 @@ impl InferenceCache for FIFOCache {
         if let Some(node) = self.entries.write().remove(sequence_id) {
             self.stats.write().total_size_bytes -= node.size_bytes;
 
+            // Remove from insertion order
             let mut insertion_order = self.insertion_order.write();
-            if let Some(pos) = insertion_order.iter().position(|x| x == sequence_id) {
-                insertion_order.remove(pos);
-            }
+            insertion_order.retain(|key| key != sequence_id);
         }
     }
 
