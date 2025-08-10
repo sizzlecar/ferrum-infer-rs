@@ -159,7 +159,7 @@ impl ResponseError for EngineError {
             EngineError::InvalidRequest { .. } => actix_web::http::StatusCode::BAD_REQUEST,
             EngineError::Model { .. } => actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
             EngineError::Resource { .. } => actix_web::http::StatusCode::INSUFFICIENT_STORAGE,
-            EngineError::Config { .. } 
+            EngineError::Config { .. }
             | EngineError::Inference { .. }
             | EngineError::Cache { .. }
             | EngineError::Internal { .. }
@@ -192,7 +192,7 @@ mod tests {
     fn test_error_response() {
         let error = EngineError::invalid_request("Test error");
         let response = error.to_error_response();
-        
+
         assert_eq!(response.error.error_type, "invalid_request_error");
         assert_eq!(response.error.code, "INVALID_REQUEST");
         assert!(response.error.message.contains("Test error"));
@@ -202,7 +202,7 @@ mod tests {
     fn test_http_response() {
         let error = EngineError::invalid_request("Test error");
         let http_response = error.error_response();
-        
+
         assert_eq!(http_response.status(), 400);
     }
 }
