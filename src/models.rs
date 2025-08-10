@@ -5,12 +5,15 @@
 
 use crate::config::{Config, ModelConfig};
 use crate::error::{EngineError, Result};
+#[cfg(feature = "ml")]
 use candle_core::{Device, Tensor};
+#[cfg(feature = "ml")]
 use candle_transformers::models::llama::{Cache, LlamaConfig};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "ml")]
 use tokenizers::Tokenizer;
 
 /// Trait for model loading and management
@@ -18,10 +21,10 @@ use tokenizers::Tokenizer;
 pub trait ModelLoader: Send + Sync {
     /// Load a model from the specified configuration
     async fn load_model(&self, config: &ModelConfig) -> Result<Box<dyn Model>>;
-    
+
     /// Validate if the model can be loaded
     async fn validate_model(&self, config: &ModelConfig) -> Result<()>;
-    
+
     /// Get supported model types
     fn supported_model_types(&self) -> Vec<String>;
 }
@@ -31,13 +34,13 @@ pub trait ModelLoader: Send + Sync {
 pub trait Model: Send + Sync {
     /// Get model information
     fn model_info(&self) -> ModelInfo;
-    
+
     /// Tokenize input text
     fn tokenize(&self, text: &str) -> Result<Vec<u32>>;
-    
+
     /// Detokenize token IDs to text
     fn detokenize(&self, tokens: &[u32]) -> Result<String>;
-    
+
     /// Generate tokens from input
     async fn generate(
         &self,
@@ -45,31 +48,40 @@ pub trait Model: Send + Sync {
         generation_config: &GenerationConfig,
         cache: Option<&mut dyn InferenceCache>,
     ) -> Result<GenerationResult>;
-    
+
     /// Get the model's vocabulary size
     fn vocab_size(&self) -> usize;
-    
+
     /// Get the model's context length
     fn context_length(&self) -> usize;
-    
+
     /// Check if the model supports a specific feature
     fn supports_feature(&self, feature: ModelFeature) -> bool;
 }
 
 /// Trait for inference caching
 pub trait InferenceCache: Send + Sync {
+    /// Get cached response for a key
+    fn get(&self, key: &str) -> Option<crate::inference::InferenceResponse>;
+
+    /// Store response for a key
+    fn put(&mut self, key: String, value: crate::inference::InferenceResponse);
+
+    /// Clear all cache entries
+    fn clear(&mut self);
+
     /// Get cached KV pairs for a sequence
     fn get_cache(&self, sequence_id: &str) -> Option<CacheEntry>;
-    
+
     /// Store KV pairs for a sequence
     fn store_cache(&mut self, sequence_id: &str, cache: CacheEntry);
-    
+
     /// Remove cache entry
     fn remove_cache(&mut self, sequence_id: &str);
-    
+
     /// Clear all cache entries
     fn clear_cache(&mut self);
-    
+
     /// Get cache statistics
     fn cache_stats(&self) -> CacheStats;
 }
@@ -114,8 +126,14 @@ pub struct GenerationResult {
 /// Cache entry for KV caching
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
+    #[cfg(feature = "ml")]
     pub key_cache: Vec<Tensor>,
+    #[cfg(feature = "ml")]
     pub value_cache: Vec<Tensor>,
+    #[cfg(not(feature = "ml"))]
+    pub key_cache: Vec<String>, // Mock data for CI
+    #[cfg(not(feature = "ml"))]
+    pub value_cache: Vec<String>, // Mock data for CI
     pub sequence_length: usize,
     pub created_at: std::time::Instant,
     pub last_accessed: std::time::Instant,
@@ -164,26 +182,36 @@ pub enum ModelFeature {
 /// Model manager for handling multiple models
 pub struct ModelManager {
     config: Config,
+    #[cfg(feature = "ml")]
     models: RwLock<HashMap<String, Arc<dyn Model>>>,
+    #[cfg(feature = "ml")]
     loaders: Vec<Box<dyn ModelLoader>>,
 }
 
 impl ModelManager {
     /// Create a new model manager
-    pub fn new(config: Config) -> Self {
-        Self {
+    #[cfg(feature = "ml")]
+    pub async fn new(config: Config) -> Result<Self> {
+        Ok(Self {
             config,
             models: RwLock::new(HashMap::new()),
             loaders: Vec::new(),
-        }
+        })
+    }
+
+    #[cfg(not(feature = "ml"))]
+    pub async fn new(config: Config) -> Result<Self> {
+        Ok(Self { config })
     }
 
     /// Add a model loader
+    #[cfg(feature = "ml")]
     pub fn add_loader(&mut self, loader: Box<dyn ModelLoader>) {
         self.loaders.push(loader);
     }
 
     /// Load a model with the given name
+    #[cfg(feature = "ml")]
     pub async fn load_model(&self, name: &str) -> Result<Arc<dyn Model>> {
         // Check if model is already loaded
         {
@@ -195,45 +223,87 @@ impl ModelManager {
 
         // Find appropriate loader and load model
         for loader in &self.loaders {
-            if loader.supported_model_types().contains(&self.config.model.name) {
+            if loader
+                .supported_model_types()
+                .contains(&self.config.model.name)
+            {
                 let model = loader.load_model(&self.config.model).await?;
                 let model_arc = Arc::from(model);
-                
+
                 // Store in cache
                 {
                     let mut models = self.models.write();
                     models.insert(name.to_string(), Arc::clone(&model_arc));
                 }
-                
+
                 return Ok(model_arc);
             }
         }
 
-        Err(EngineError::model(format!("No loader found for model: {}", name)))
+        Err(EngineError::model(format!(
+            "No loader found for model: {}",
+            name
+        )))
     }
 
     /// Get a loaded model
+    #[cfg(feature = "ml")]
     pub fn get_model(&self, name: &str) -> Option<Arc<dyn Model>> {
         let models = self.models.read();
         models.get(name).map(Arc::clone)
     }
 
     /// List all loaded models
+    #[cfg(feature = "ml")]
     pub fn list_models(&self) -> Vec<String> {
         let models = self.models.read();
         models.keys().cloned().collect()
     }
 
+    #[cfg(not(feature = "ml"))]
+    pub fn list_models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            name: "mock-model".to_string(),
+            model_type: "mock".to_string(),
+            parameter_count: Some(1000000),
+            context_length: 2048,
+            vocab_size: 50000,
+            device: "cpu".to_string(),
+            dtype: "f32".to_string(),
+            supports_streaming: true,
+            supports_batching: false,
+        }]
+    }
+
     /// Unload a model
+    #[cfg(feature = "ml")]
     pub fn unload_model(&self, name: &str) -> bool {
         let mut models = self.models.write();
         models.remove(name).is_some()
     }
 
     /// Get model information for all loaded models
+    #[cfg(feature = "ml")]
     pub fn get_all_model_info(&self) -> Vec<ModelInfo> {
         let models = self.models.read();
         models.values().map(|model| model.model_info()).collect()
+    }
+
+    #[cfg(not(feature = "ml"))]
+    pub fn get_all_model_info(&self) -> Vec<ModelInfo> {
+        self.list_models()
+    }
+
+    #[cfg(feature = "ml")]
+    pub async fn is_healthy(&self) -> bool {
+        // Check if any models are loaded and responsive
+        let models = self.models.read();
+        !models.is_empty()
+    }
+
+    #[cfg(not(feature = "ml"))]
+    pub async fn is_healthy(&self) -> bool {
+        true // Mock is always healthy
     }
 }
 
@@ -254,7 +324,20 @@ impl Default for GenerationConfig {
 }
 
 impl CacheEntry {
+    #[cfg(feature = "ml")]
     pub fn new(key_cache: Vec<Tensor>, value_cache: Vec<Tensor>, sequence_length: usize) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            key_cache,
+            value_cache,
+            sequence_length,
+            created_at: now,
+            last_accessed: now,
+        }
+    }
+
+    #[cfg(not(feature = "ml"))]
+    pub fn new(key_cache: Vec<String>, value_cache: Vec<String>, sequence_length: usize) -> Self {
         let now = std::time::Instant::now();
         Self {
             key_cache,
@@ -286,6 +369,85 @@ impl Default for CacheStats {
     }
 }
 
+/// Mock model implementation for non-ML builds
+#[cfg(not(feature = "ml"))]
+pub struct MockModel {
+    pub info: ModelInfo,
+}
+
+#[cfg(not(feature = "ml"))]
+impl MockModel {
+    pub fn new() -> Self {
+        Self {
+            info: ModelInfo {
+                name: "mock-model".to_string(),
+                model_type: "mock".to_string(),
+                parameter_count: Some(1000000),
+                context_length: 2048,
+                vocab_size: 50000,
+                device: "cpu".to_string(),
+                dtype: "f32".to_string(),
+                supports_streaming: true,
+                supports_batching: false,
+            },
+        }
+    }
+}
+
+#[cfg(not(feature = "ml"))]
+#[async_trait::async_trait]
+impl Model for MockModel {
+    fn model_info(&self) -> ModelInfo {
+        self.info.clone()
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        // Simple mock tokenization
+        Ok(text.chars().map(|c| c as u32).collect())
+    }
+
+    fn detokenize(&self, tokens: &[u32]) -> Result<String> {
+        // Simple mock detokenization
+        Ok(tokens
+            .iter()
+            .map(|&t| char::from_u32(t).unwrap_or('?'))
+            .collect())
+    }
+
+    async fn generate(
+        &self,
+        _input_tokens: &[u32],
+        _config: &GenerationConfig,
+        _cache: Option<&mut dyn InferenceCache>,
+    ) -> Result<GenerationResult> {
+        Ok(GenerationResult {
+            tokens: vec![72, 101, 108, 108, 111], // "Hello" in ASCII
+            text: "Hello".to_string(),
+            finish_reason: FinishReason::Length,
+            generation_stats: GenerationStats {
+                prompt_tokens: 5,
+                completion_tokens: 5,
+                total_tokens: 10,
+                inference_time_ms: 100,
+                tokens_per_second: 50.0,
+                time_to_first_token_ms: Some(20),
+            },
+        })
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.info.vocab_size
+    }
+
+    fn context_length(&self) -> usize {
+        self.info.context_length
+    }
+
+    fn supports_feature(&self, _feature: ModelFeature) -> bool {
+        true // Mock supports everything
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,7 +462,11 @@ mod tests {
 
     #[test]
     fn test_cache_entry_creation() {
+        #[cfg(feature = "ml")]
         let cache_entry = CacheEntry::new(vec![], vec![], 10);
+        #[cfg(not(feature = "ml"))]
+        let cache_entry = CacheEntry::new(vec![], vec![], 10);
+
         assert_eq!(cache_entry.sequence_length, 10);
         assert!(cache_entry.age().as_millis() < 100);
     }

@@ -1,10 +1,10 @@
 //! # Ferrum Infer
-//! 
+//!
 //! A high-performance Rust-based LLM inference engine MVP designed for
 //! single-node deployment with OpenAI-compatible API.
 //!
 //! ## Architecture Overview
-//! 
+//!
 //! The engine consists of several core modules:
 //! - `api`: RESTful API layer with OpenAI compatibility
 //! - `inference`: Core inference engine and model management
@@ -23,8 +23,8 @@ pub mod models;
 pub mod utils;
 
 // Re-export commonly used types
-pub use crate::error::{EngineError, Result};
 pub use crate::config::Config;
+pub use crate::error::{EngineError, Result};
 pub use crate::inference::{InferenceEngine, InferenceRequest, InferenceResponse};
 pub use crate::models::{ModelLoader, ModelManager};
 

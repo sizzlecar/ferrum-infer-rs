@@ -44,7 +44,9 @@ pub async fn start_server(config: Config, engine: Arc<InferenceEngine>) -> Resul
             .app_data(web::Data::new(app_state.clone()))
             .wrap(cors)
             .wrap(middleware::logging::RequestLogging)
-            .wrap(middleware::auth::ApiKeyAuth::new(config.server.api_key.clone()))
+            .wrap(middleware::auth::ApiKeyAuth::new(
+                config.server.api_key.clone(),
+            ))
             .configure(routes::configure_routes)
     })
     .bind(&bind_address)?
