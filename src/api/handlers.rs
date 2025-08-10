@@ -160,29 +160,29 @@ pub async fn metrics(data: web::Data<AppState>) -> ActixResult<HttpResponse> {
     
     // Generate Prometheus-style metrics
     let metrics_text = format!(
-        "# HELP llm_engine_requests_total Total number of requests\n\
-         # TYPE llm_engine_requests_total counter\n\
-         llm_engine_requests_total {}\n\
+        "# HELP ferrum_infer_requests_total Total number of requests\n\
+         # TYPE ferrum_infer_requests_total counter\n\
+         ferrum_infer_requests_total {}\n\
          \n\
-         # HELP llm_engine_successful_requests_total Total number of successful requests\n\
-         # TYPE llm_engine_successful_requests_total counter\n\
-         llm_engine_successful_requests_total {}\n\
+         # HELP ferrum_infer_successful_requests_total Total number of successful requests\n\
+         # TYPE ferrum_infer_successful_requests_total counter\n\
+         ferrum_infer_successful_requests_total {}\n\
          \n\
-         # HELP llm_engine_failed_requests_total Total number of failed requests\n\
-         # TYPE llm_engine_failed_requests_total counter\n\
-         llm_engine_failed_requests_total {}\n\
+         # HELP ferrum_infer_failed_requests_total Total number of failed requests\n\
+         # TYPE ferrum_infer_failed_requests_total counter\n\
+         ferrum_infer_failed_requests_total {}\n\
          \n\
-         # HELP llm_engine_avg_inference_time_ms Average inference time in milliseconds\n\
-         # TYPE llm_engine_avg_inference_time_ms gauge\n\
-         llm_engine_avg_inference_time_ms {}\n\
+         # HELP ferrum_infer_avg_inference_time_ms Average inference time in milliseconds\n\
+         # TYPE ferrum_infer_avg_inference_time_ms gauge\n\
+         ferrum_infer_avg_inference_time_ms {}\n\
          \n\
-         # HELP llm_engine_tokens_generated_total Total number of tokens generated\n\
-         # TYPE llm_engine_tokens_generated_total counter\n\
-         llm_engine_tokens_generated_total {}\n\
+         # HELP ferrum_infer_tokens_generated_total Total number of tokens generated\n\
+         # TYPE ferrum_infer_tokens_generated_total counter\n\
+         ferrum_infer_tokens_generated_total {}\n\
          \n\
-         # HELP llm_engine_memory_usage_bytes Memory usage in bytes\n\
-         # TYPE llm_engine_memory_usage_bytes gauge\n\
-         llm_engine_memory_usage_bytes {}\n",
+         # HELP ferrum_infer_memory_usage_bytes Memory usage in bytes\n\
+         # TYPE ferrum_infer_memory_usage_bytes gauge\n\
+         ferrum_infer_memory_usage_bytes {}\n",
         stats.total_requests,
         stats.successful_requests,
         stats.failed_requests,

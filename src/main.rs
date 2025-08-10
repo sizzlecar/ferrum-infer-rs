@@ -1,9 +1,9 @@
-//! Main entry point for the LLM Inference Engine
+//! Main entry point for Ferrum Infer
 //!
 //! This is the main binary that starts the inference engine server with
 //! OpenAI-compatible API endpoints.
 
-use llm_inference_engine::{
+use ferrum_infer::{
     api::start_server,
     config::Config,
     error::Result,
@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     print_banner();
 
     // Log configuration (sanitized)
-    info!("Starting LLM Inference Engine with configuration:");
+    info!("Starting Ferrum Infer with configuration:");
     info!("  Server: {}:{}", config.server.host, config.server.port);
     info!("  Model: {}", config.model.name);
     info!("  Device: {}", config.model.device);
@@ -97,7 +97,7 @@ fn print_banner() {
     println!(r#"
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║    🚀 LLM Inference Engine v{}                               ║
+║    🚀 Ferrum Infer v{}                                       ║
 ║                                                              ║
 ║    A high-performance Rust-based LLM inference server       ║
 ║    with OpenAI-compatible API endpoints                      ║

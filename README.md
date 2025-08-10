@@ -1,4 +1,4 @@
-# LLM Inference Engine
+# Ferrum Infer
 
 A high-performance Rust-based LLM inference engine MVP with OpenAI-compatible API endpoints.
 
@@ -30,24 +30,24 @@ This project implements a single-node LLM inference server designed to validate 
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/llm-inference-engine
-cd llm-inference-engine
+git clone https://github.com/sizzlecar/ferrum-infer-rs.git
+cd ferrum-infer-rs
 
 # Build the project
 cargo build --release
 
 # Run the server
-./target/release/llm-engine
+./target/release/ferrum-infer
 ```
 
 ### Docker
 
 ```bash
 # Build Docker image
-docker build -t llm-inference-engine .
+docker build -t ferrum-infer .
 
 # Run container
-docker run -p 8080:8080 llm-inference-engine
+docker run -p 8080:8080 ferrum-infer
 ```
 
 ## Configuration
@@ -56,21 +56,21 @@ docker run -p 8080:8080 llm-inference-engine
 
 ```bash
 # Server settings
-export LLM_ENGINE_HOST=0.0.0.0
-export LLM_ENGINE_PORT=8080
-export LLM_ENGINE_API_KEY=your-secret-key
+export FERRUM_INFER_HOST=0.0.0.0
+export FERRUM_INFER_PORT=8080
+export FERRUM_INFER_API_KEY=your-secret-key
 
 # Model configuration
-export LLM_ENGINE_MODEL_PATH=microsoft/DialoGPT-medium
-export LLM_ENGINE_DEVICE=cpu
-export LLM_ENGINE_MAX_SEQUENCE_LENGTH=2048
+export FERRUM_INFER_MODEL_PATH=microsoft/DialoGPT-medium
+export FERRUM_INFER_DEVICE=cpu
+export FERRUM_INFER_MAX_SEQUENCE_LENGTH=2048
 
 # Cache settings
-export LLM_ENGINE_CACHE_ENABLED=true
-export LLM_ENGINE_CACHE_SIZE_MB=1024
+export FERRUM_INFER_CACHE_ENABLED=true
+export FERRUM_INFER_CACHE_SIZE_MB=1024
 
 # Logging
-export LLM_ENGINE_LOG_LEVEL=info
+export FERRUM_INFER_LOG_LEVEL=info
 ```
 
 ### Configuration File
@@ -210,8 +210,8 @@ The engine is optimized for high performance with:
 
 ```bash
 # Clone and enter directory
-git clone https://github.com/your-org/llm-inference-engine
-cd llm-inference-engine
+git clone https://github.com/sizzlecar/ferrum-infer-rs.git
+cd ferrum-infer-rs
 
 # Install dependencies
 cargo build
@@ -255,10 +255,10 @@ cargo audit
 
 The engine exposes Prometheus metrics at `/metrics`:
 
-- `llm_engine_requests_total` - Total request count
-- `llm_engine_request_duration_ms` - Request latency
-- `llm_engine_cache_hit_rate` - Cache hit rate
-- `llm_engine_memory_usage_bytes` - Memory usage
+- `ferrum_infer_requests_total` - Total request count
+- `ferrum_infer_request_duration_ms` - Request latency
+- `ferrum_infer_cache_hit_rate` - Cache hit rate
+- `ferrum_infer_memory_usage_bytes` - Memory usage
 
 ### Logging
 
@@ -295,13 +295,13 @@ Health endpoint returns system status:
 
 ```bash
 # Build image
-docker build -t llm-inference-engine .
+docker build -t ferrum-infer .
 
 # Run with custom config
 docker run -p 8080:8080 \
-  -e LLM_ENGINE_MODEL_PATH=your-model \
-  -e LLM_ENGINE_API_KEY=your-key \
-  llm-inference-engine
+  -e FERRUM_INFER_MODEL_PATH=your-model \
+  -e FERRUM_INFER_API_KEY=your-key \
+  ferrum-infer
 ```
 
 ### Kubernetes Deployment
@@ -310,24 +310,24 @@ docker run -p 8080:8080 \
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: llm-inference-engine
+  name: ferrum-infer
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: llm-inference-engine
+      app: ferrum-infer
   template:
     metadata:
       labels:
-        app: llm-inference-engine
+        app: ferrum-infer
     spec:
       containers:
-      - name: llm-inference-engine
-        image: llm-inference-engine:latest
+      - name: ferrum-infer
+        image: ferrum-infer:latest
         ports:
         - containerPort: 8080
         env:
-        - name: LLM_ENGINE_MODEL_PATH
+        - name: FERRUM_INFER_MODEL_PATH
           value: "microsoft/DialoGPT-medium"
         resources:
           requests:
@@ -344,7 +344,7 @@ spec:
 
 ```bash
 # Set API key
-export LLM_ENGINE_API_KEY=your-secret-key
+export FERRUM_INFER_API_KEY=your-secret-key
 
 # Use in requests
 curl -H "Authorization: Bearer your-secret-key" \
@@ -385,7 +385,7 @@ Solution: Change port or stop conflicting service.
 
 ```bash
 # Enable debug logging
-export LLM_ENGINE_LOG_LEVEL=debug
+export FERRUM_INFER_LOG_LEVEL=debug
 cargo run
 ```
 
@@ -455,10 +455,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- 📖 [Documentation](https://docs.your-domain.com)
-- 💬 [Discord Community](https://discord.gg/your-server)
-- 🐛 [Issue Tracker](https://github.com/your-org/llm-inference-engine/issues)
-- 📧 Email: support@your-domain.com
+- 📖 [Documentation](https://docs.sizzlecar.com)
+- 💬 [Discord Community](https://discord.gg/sizzlecar)
+- 🐛 [Issue Tracker](https://github.com/sizzlecar/ferrum-infer-rs/issues)
+- 📧 Email: sizzlecar@example.com
 
 ---
 

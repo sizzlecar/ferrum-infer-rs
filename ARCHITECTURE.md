@@ -1,4 +1,4 @@
-# LLM Inference Engine Architecture
+# Ferrum Infer Architecture
 
 This document describes the architecture of the Rust-based LLM inference engine MVP, focusing on performance, extensibility, and OpenAI API compatibility.
 
@@ -17,7 +17,7 @@ This document describes the architecture of the Rust-based LLM inference engine 
 
 ## Overview
 
-The LLM Inference Engine is a high-performance, single-node inference server designed as an MVP to validate Rust's performance advantages for LLM serving. It provides OpenAI-compatible REST API endpoints while implementing efficient caching and memory management.
+Ferrum Infer is a high-performance, single-node inference server designed as an MVP to validate Rust's performance advantages for LLM serving. It provides OpenAI-compatible REST API endpoints while implementing efficient caching and memory management.
 
 ### Key Design Goals
 
@@ -426,21 +426,21 @@ The engine maintains full compatibility with OpenAI's request and response forma
 
 ```bash
 # Server Configuration
-LLM_ENGINE_HOST=0.0.0.0
-LLM_ENGINE_PORT=8080
-LLM_ENGINE_API_KEY=your-secret-key
+FERRUM_INFER_HOST=0.0.0.0
+FERRUM_INFER_PORT=8080
+FERRUM_INFER_API_KEY=your-secret-key
 
 # Model Configuration
-LLM_ENGINE_MODEL_PATH=microsoft/DialoGPT-medium
-LLM_ENGINE_DEVICE=cpu
-LLM_ENGINE_MAX_SEQUENCE_LENGTH=2048
+FERRUM_INFER_MODEL_PATH=microsoft/DialoGPT-medium
+FERRUM_INFER_DEVICE=cpu
+FERRUM_INFER_MAX_SEQUENCE_LENGTH=2048
 
 # Cache Configuration
-LLM_ENGINE_CACHE_ENABLED=true
-LLM_ENGINE_CACHE_SIZE_MB=1024
+FERRUM_INFER_CACHE_ENABLED=true
+FERRUM_INFER_CACHE_SIZE_MB=1024
 
 # Logging Configuration
-LLM_ENGINE_LOG_LEVEL=info
+FERRUM_INFER_LOG_LEVEL=info
 ```
 
 ### Configuration File (TOML)
@@ -526,7 +526,7 @@ pub enum EngineError {
 ### Metrics
 
 - **Request metrics**: Total requests, success/failure rates, latency percentiles
-- **Model metrics**: Inference time, tokens per second, model load time
+- **Model metrics**: Inference time, tokens per second, model load time  
 - **Cache metrics**: Hit rate, miss rate, eviction count, memory usage
 - **System metrics**: CPU usage, memory usage, disk I/O, network I/O
 
