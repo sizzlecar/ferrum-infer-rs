@@ -20,14 +20,13 @@ pub fn init_logging(level: &str, format: &str) -> Result<()> {
         _ => tracing::Level::INFO,
     };
 
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(level.into());
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(level.into());
 
     match format.to_lowercase().as_str() {
         "json" => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().json())
+                .with(tracing_subscriber::fmt::layer().with_target(false).json())
                 .init();
         }
         "pretty" | _ => {
@@ -38,7 +37,10 @@ pub fn init_logging(level: &str, format: &str) -> Result<()> {
         }
     }
 
-    info!("Logging initialized with level: {} and format: {}", level, format);
+    info!(
+        "Logging initialized with level: {} and format: {}",
+        level, format
+    );
     Ok(())
 }
 
@@ -236,7 +238,7 @@ where
     Fut: std::future::Future<Output = std::result::Result<T, E>>,
 {
     let mut delay = initial_delay;
-    
+
     for attempt in 0..=max_retries {
         match operation().await {
             Ok(result) => return Ok(result),
@@ -244,14 +246,19 @@ where
                 if attempt == max_retries {
                     return Err(e);
                 }
-                
-                warn!("Operation failed, retrying in {:?} (attempt {}/{})", delay, attempt + 1, max_retries);
+
+                warn!(
+                    "Operation failed, retrying in {:?} (attempt {}/{})",
+                    delay,
+                    attempt + 1,
+                    max_retries
+                );
                 tokio::time::sleep(delay).await;
                 delay *= 2; // Exponential backoff
             }
         }
     }
-    
+
     unreachable!()
 }
 
@@ -291,7 +298,7 @@ mod tests {
     fn test_generate_request_id() {
         let id1 = generate_request_id();
         let id2 = generate_request_id();
-        
+
         assert!(id1.starts_with("req_"));
         assert!(id2.starts_with("req_"));
         assert_ne!(id1, id2);
@@ -301,7 +308,7 @@ mod tests {
     fn test_sanitize_for_logging() {
         let text = "This is a password: secret123 and a token: abc123";
         let sanitized = sanitize_for_logging(text, 100);
-        
+
         assert!(sanitized.contains("***"));
         assert!(!sanitized.contains("secret123"));
         assert!(!sanitized.contains("abc123"));
@@ -314,7 +321,7 @@ mod tests {
             available_bytes: 300,
             used_bytes: 700,
         };
-        
+
         assert_eq!(memory.usage_percentage(), 70.0);
     }
 }

@@ -56,7 +56,7 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let service = Rc::clone(&self.service);
         let start_time = Instant::now();
-        
+
         // Extract request information
         let method = req.method().to_string();
         let path = req.path().to_string();
@@ -134,5 +134,182 @@ where
 
             response
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{test, web, App, HttpResponse};
+
+    async fn success_handler() -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::Ok().json(serde_json::json!({"status": "success"})))
+    }
+
+    async fn client_error_handler() -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::BadRequest().json(serde_json::json!({"error": "bad request"})))
+    }
+
+    async fn server_error_handler() -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::InternalServerError().json(serde_json::json!({"error": "server error"})))
+    }
+
+    async fn error_handler() -> Result<HttpResponse, Error> {
+        Err(actix_web::error::ErrorInternalServerError("Service error"))
+    }
+
+    #[actix_web::test]
+    async fn test_logging_middleware_with_success_response() {
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestLogging)
+                .route("/success", web::get().to(success_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/success")
+            .insert_header(("User-Agent", "test-agent/1.0"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_logging_middleware_with_client_error() {
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestLogging)
+                .route("/client-error", web::get().to(client_error_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/client-error")
+            .insert_header(("User-Agent", "test-agent/1.0"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[actix_web::test]
+    async fn test_logging_middleware_with_server_error() {
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestLogging)
+                .route("/server-error", web::get().to(server_error_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/server-error")
+            .insert_header(("User-Agent", "test-agent/1.0"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 500);
+    }
+
+    #[actix_web::test]
+    async fn test_logging_middleware_with_handler_error() {
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestLogging)
+                .route("/error", web::get().to(error_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/error")
+            .insert_header(("User-Agent", "test-agent/1.0"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_server_error());
+    }
+
+    #[actix_web::test]
+    async fn test_logging_middleware_with_query_parameters() {
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestLogging)
+                .route("/test", web::get().to(success_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/test?param1=value1&param2=value2")
+            .insert_header(("User-Agent", "test-agent/1.0"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_logging_middleware_without_user_agent() {
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestLogging)
+                .route("/test", web::get().to(success_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/test").to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_logging_middleware_with_different_methods() {
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestLogging)
+                .route("/test", web::post().to(success_handler))
+                .route("/test", web::put().to(success_handler))
+                .route("/test", web::delete().to(success_handler)),
+        )
+        .await;
+
+        // Test POST
+        let req = test::TestRequest::post().uri("/test").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+
+        // Test PUT
+        let req = test::TestRequest::put().uri("/test").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+
+        // Test DELETE
+        let req = test::TestRequest::delete().uri("/test").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_logging_middleware_timing() {
+        use std::time::Duration;
+        use tokio::time::sleep;
+
+        async fn slow_handler() -> Result<HttpResponse, Error> {
+            sleep(Duration::from_millis(100)).await;
+            Ok(HttpResponse::Ok().json(serde_json::json!({"status": "success"})))
+        }
+
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestLogging)
+                .route("/slow", web::get().to(slow_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/slow").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+        // The middleware should log the duration, which should be >= 100ms
     }
 }
