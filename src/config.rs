@@ -214,46 +214,46 @@ impl Config {
         let mut config = Self::default();
 
         // Server configuration
-        if let Ok(host) = std::env::var("LLM_ENGINE_HOST") {
+        if let Ok(host) = std::env::var("FERRUM_INFER_HOST") {
             config.server.host = host;
         }
-        if let Ok(port) = std::env::var("LLM_ENGINE_PORT") {
+        if let Ok(port) = std::env::var("FERRUM_INFER_PORT") {
             config.server.port = port.parse()
                 .map_err(|_| EngineError::config("Invalid port number"))?;
         }
-        if let Ok(max_requests) = std::env::var("LLM_ENGINE_MAX_CONCURRENT_REQUESTS") {
+        if let Ok(max_requests) = std::env::var("FERRUM_INFER_MAX_CONCURRENT_REQUESTS") {
             config.server.max_concurrent_requests = max_requests.parse()
                 .map_err(|_| EngineError::config("Invalid max concurrent requests"))?;
         }
-        if let Ok(api_key) = std::env::var("LLM_ENGINE_API_KEY") {
+        if let Ok(api_key) = std::env::var("FERRUM_INFER_API_KEY") {
             config.server.api_key = Some(api_key);
         }
 
         // Model configuration
-        if let Ok(model_path) = std::env::var("LLM_ENGINE_MODEL_PATH") {
+        if let Ok(model_path) = std::env::var("FERRUM_INFER_MODEL_PATH") {
             config.model.model_path = model_path.clone();
             config.model.name = model_path;
         }
-        if let Ok(device) = std::env::var("LLM_ENGINE_DEVICE") {
+        if let Ok(device) = std::env::var("FERRUM_INFER_DEVICE") {
             config.model.device = device;
         }
-        if let Ok(max_seq_len) = std::env::var("LLM_ENGINE_MAX_SEQUENCE_LENGTH") {
+        if let Ok(max_seq_len) = std::env::var("FERRUM_INFER_MAX_SEQUENCE_LENGTH") {
             config.model.max_sequence_length = max_seq_len.parse()
                 .map_err(|_| EngineError::config("Invalid max sequence length"))?;
         }
 
         // Cache configuration
-        if let Ok(cache_enabled) = std::env::var("LLM_ENGINE_CACHE_ENABLED") {
+        if let Ok(cache_enabled) = std::env::var("FERRUM_INFER_CACHE_ENABLED") {
             config.cache.enabled = cache_enabled.parse()
                 .map_err(|_| EngineError::config("Invalid cache enabled flag"))?;
         }
-        if let Ok(cache_size) = std::env::var("LLM_ENGINE_CACHE_SIZE_MB") {
+        if let Ok(cache_size) = std::env::var("FERRUM_INFER_CACHE_SIZE_MB") {
             config.cache.max_size_mb = cache_size.parse()
                 .map_err(|_| EngineError::config("Invalid cache size"))?;
         }
 
         // Logging configuration
-        if let Ok(log_level) = std::env::var("LLM_ENGINE_LOG_LEVEL") {
+        if let Ok(log_level) = std::env::var("FERRUM_INFER_LOG_LEVEL") {
             config.logging.level = log_level;
         }
 

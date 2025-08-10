@@ -1,4 +1,4 @@
-//! # LLM Inference Engine
+//! # Ferrum Infer
 //! 
 //! A high-performance Rust-based LLM inference engine MVP designed for
 //! single-node deployment with OpenAI-compatible API.

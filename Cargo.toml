@@ -1,11 +1,11 @@
 [package]
-name = "llm-inference-engine"
+name = "ferrum-infer"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["sizzlecar <sizzlecar@example.com>"]
 description = "A high-performance Rust-based LLM inference engine MVP"
 license = "MIT"
-repository = "https://github.com/your-org/llm-inference-engine"
+repository = "https://github.com/sizzlecar/ferrum-infer-rs"
 
 [dependencies]
 # Web framework
@@ -62,7 +62,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 mockall = "0.12"
 
 [[bin]]
-name = "llm-engine"
+name = "ferrum-infer"
 path = "src/main.rs"
 
 [[bench]]

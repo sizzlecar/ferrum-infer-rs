@@ -283,7 +283,7 @@ impl From<crate::inference::StreamChunk> for ChatCompletionChunk {
             id: chunk.id,
             object: "chat.completion.chunk".to_string(),
             created: chrono::Utc::now().timestamp() as u64,
-            model: "llm-engine".to_string(), // This should come from the actual model
+            model: "ferrum-infer".to_string(), // This should come from the actual model
             choices: vec![ChatDelta {
                 index: 0,
                 delta: ChatMessage {
@@ -303,7 +303,7 @@ impl From<crate::models::ModelInfo> for ModelInfo {
             id: info.name,
             object: "model".to_string(),
             created: chrono::Utc::now().timestamp() as u64,
-            owned_by: "llm-engine".to_string(),
+            owned_by: "ferrum-infer".to_string(),
         }
     }
 }
