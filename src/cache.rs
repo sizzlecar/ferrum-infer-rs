@@ -506,6 +506,7 @@ impl InferenceCache for FIFOCache {
 mod tests {
     use super::*;
     use crate::config::CacheConfig;
+    #[cfg(feature = "ml")]
     use candle_core::{Device, Tensor};
 
     fn create_test_config() -> CacheConfig {
@@ -518,6 +519,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ml")]
     fn create_test_cache_entry() -> CacheEntry {
         let device = Device::Cpu;
         let tensor = Tensor::zeros((2, 4), candle_core::DType::F32, &device).unwrap();
@@ -525,6 +527,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml")]
     fn test_lru_cache_basic_operations() {
         let config = create_test_config();
         let mut cache = LRUCache::new(config);
@@ -540,6 +543,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ml")]
     fn test_cache_stats() {
         let config = create_test_config();
         let mut cache = LRUCache::new(config);
