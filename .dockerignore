@@ -1,0 +1,51 @@
+# Target and build artifacts
+target/
+**/*.rs.bk
+**/*.pdb
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Cache
+.cache/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Test artifacts
+coverage/
+test-results/
+
+# Benchmark results
+target/criterion/
+
+# Lock files (but keep Cargo.lock)
+!Cargo.lock
