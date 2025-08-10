@@ -20,8 +20,7 @@ pub fn init_logging(level: &str, format: &str) -> Result<()> {
         _ => tracing::Level::INFO,
     };
 
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(level.into());
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(level.into());
 
     match format.to_lowercase().as_str() {
         "json" => {
@@ -38,7 +37,10 @@ pub fn init_logging(level: &str, format: &str) -> Result<()> {
         }
     }
 
-    info!("Logging initialized with level: {} and format: {}", level, format);
+    info!(
+        "Logging initialized with level: {} and format: {}",
+        level, format
+    );
     Ok(())
 }
 

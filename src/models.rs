@@ -21,10 +21,10 @@ use tokenizers::Tokenizer;
 pub trait ModelLoader: Send + Sync {
     /// Load a model from the specified configuration
     async fn load_model(&self, config: &ModelConfig) -> Result<Box<dyn Model>>;
-    
+
     /// Validate if the model can be loaded
     async fn validate_model(&self, config: &ModelConfig) -> Result<()>;
-    
+
     /// Get supported model types
     fn supported_model_types(&self) -> Vec<String>;
 }
@@ -34,13 +34,13 @@ pub trait ModelLoader: Send + Sync {
 pub trait Model: Send + Sync {
     /// Get model information
     fn model_info(&self) -> ModelInfo;
-    
+
     /// Tokenize input text
     fn tokenize(&self, text: &str) -> Result<Vec<u32>>;
-    
+
     /// Detokenize token IDs to text
     fn detokenize(&self, tokens: &[u32]) -> Result<String>;
-    
+
     /// Generate tokens from input
     async fn generate(
         &self,
@@ -48,13 +48,13 @@ pub trait Model: Send + Sync {
         generation_config: &GenerationConfig,
         cache: Option<&mut dyn InferenceCache>,
     ) -> Result<GenerationResult>;
-    
+
     /// Get the model's vocabulary size
     fn vocab_size(&self) -> usize;
-    
+
     /// Get the model's context length
     fn context_length(&self) -> usize;
-    
+
     /// Check if the model supports a specific feature
     fn supports_feature(&self, feature: ModelFeature) -> bool;
 }
@@ -63,25 +63,25 @@ pub trait Model: Send + Sync {
 pub trait InferenceCache: Send + Sync {
     /// Get cached response for a key
     fn get(&self, key: &str) -> Option<crate::inference::InferenceResponse>;
-    
+
     /// Store response for a key
     fn put(&mut self, key: String, value: crate::inference::InferenceResponse);
-    
+
     /// Clear all cache entries
     fn clear(&mut self);
-    
+
     /// Get cached KV pairs for a sequence
     fn get_cache(&self, sequence_id: &str) -> Option<CacheEntry>;
-    
+
     /// Store KV pairs for a sequence
     fn store_cache(&mut self, sequence_id: &str, cache: CacheEntry);
-    
+
     /// Remove cache entry
     fn remove_cache(&mut self, sequence_id: &str);
-    
+
     /// Clear all cache entries
     fn clear_cache(&mut self);
-    
+
     /// Get cache statistics
     fn cache_stats(&self) -> CacheStats;
 }
@@ -223,21 +223,27 @@ impl ModelManager {
 
         // Find appropriate loader and load model
         for loader in &self.loaders {
-            if loader.supported_model_types().contains(&self.config.model.name) {
+            if loader
+                .supported_model_types()
+                .contains(&self.config.model.name)
+            {
                 let model = loader.load_model(&self.config.model).await?;
                 let model_arc = Arc::from(model);
-                
+
                 // Store in cache
                 {
                     let mut models = self.models.write();
                     models.insert(name.to_string(), Arc::clone(&model_arc));
                 }
-                
+
                 return Ok(model_arc);
             }
         }
 
-        Err(EngineError::model(format!("No loader found for model: {}", name)))
+        Err(EngineError::model(format!(
+            "No loader found for model: {}",
+            name
+        )))
     }
 
     /// Get a loaded model
@@ -394,17 +400,20 @@ impl Model for MockModel {
     fn model_info(&self) -> ModelInfo {
         self.info.clone()
     }
-    
+
     fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         // Simple mock tokenization
         Ok(text.chars().map(|c| c as u32).collect())
     }
-    
+
     fn detokenize(&self, tokens: &[u32]) -> Result<String> {
         // Simple mock detokenization
-        Ok(tokens.iter().map(|&t| char::from_u32(t).unwrap_or('?')).collect())
+        Ok(tokens
+            .iter()
+            .map(|&t| char::from_u32(t).unwrap_or('?'))
+            .collect())
     }
-    
+
     async fn generate(
         &self,
         _input_tokens: &[u32],
@@ -425,15 +434,15 @@ impl Model for MockModel {
             },
         })
     }
-    
+
     fn vocab_size(&self) -> usize {
         self.info.vocab_size
     }
-    
+
     fn context_length(&self) -> usize {
         self.info.context_length
     }
-    
+
     fn supports_feature(&self, _feature: ModelFeature) -> bool {
         true // Mock supports everything
     }
@@ -457,7 +466,7 @@ mod tests {
         let cache_entry = CacheEntry::new(vec![], vec![], 10);
         #[cfg(not(feature = "ml"))]
         let cache_entry = CacheEntry::new(vec![], vec![], 10);
-        
+
         assert_eq!(cache_entry.sequence_length, 10);
         assert!(cache_entry.age().as_millis() < 100);
     }

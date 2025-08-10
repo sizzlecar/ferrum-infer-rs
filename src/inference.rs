@@ -6,9 +6,11 @@
 use crate::config::Config;
 use crate::error::{EngineError, Result};
 #[cfg(feature = "ml")]
-use crate::models::{GenerationConfig, GenerationResult, InferenceCache, Model, ModelManager, ModelInfo};
+use crate::models::{
+    GenerationConfig, GenerationResult, InferenceCache, Model, ModelInfo, ModelManager,
+};
 #[cfg(not(feature = "ml"))]
-use crate::models::{GenerationConfig, InferenceCache, Model, ModelManager, ModelInfo, MockModel};
+use crate::models::{GenerationConfig, InferenceCache, MockModel, Model, ModelInfo, ModelManager};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -136,7 +138,10 @@ impl InferenceEngine {
     /// Process an inference request
     pub async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
         let start_time = Instant::now();
-        let request_id = request.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        let request_id = request
+            .id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         info!("Processing inference request {}", request_id);
 
@@ -155,18 +160,23 @@ impl InferenceEngine {
             match &result {
                 Ok(response) => {
                     stats.successful_requests += 1;
-                    stats.total_tokens_generated += response.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0) as u64;
+                    stats.total_tokens_generated += response
+                        .usage
+                        .as_ref()
+                        .map(|u| u.completion_tokens)
+                        .unwrap_or(0) as u64;
                 }
                 Err(_) => {
                     stats.failed_requests += 1;
                 }
             }
-            
+
             // Update average inference time
             let total_completed = stats.successful_requests + stats.failed_requests;
             if total_completed > 0 {
-                stats.avg_inference_time_ms = 
-                    (stats.avg_inference_time_ms * (total_completed - 1) as f64 + inference_time.as_millis() as f64) 
+                stats.avg_inference_time_ms = (stats.avg_inference_time_ms
+                    * (total_completed - 1) as f64
+                    + inference_time.as_millis() as f64)
                     / total_completed as f64;
             }
         }
@@ -175,45 +185,59 @@ impl InferenceEngine {
     }
 
     /// Process inference request with streaming support
-    pub async fn infer_stream(&self, request: InferenceRequest) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+    pub async fn infer_stream(
+        &self,
+        request: InferenceRequest,
+    ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
         let (tx, rx) = mpsc::channel(100);
-        let request_id = request.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-        
+        let request_id = request
+            .id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
         // For now, just send a single chunk as a mock implementation
         let chunk = StreamChunk {
             id: request_id.clone(),
             text: "Hello, this is a streaming response!".to_string(),
             finish_reason: Some("stop".to_string()),
             created: chrono::Utc::now().timestamp(),
-            model: request.model.unwrap_or_else(|| self.config.model.name.clone()),
+            model: request
+                .model
+                .unwrap_or_else(|| self.config.model.name.clone()),
         };
-        
+
         tokio::spawn(async move {
             if let Err(_) = tx.send(Ok(chunk)).await {
                 error!("Failed to send stream chunk");
             }
         });
-        
+
         Ok(rx)
     }
 
-    async fn process_request_internal(&self, request: InferenceRequest, request_id: &str) -> Result<InferenceResponse> {
+    async fn process_request_internal(
+        &self,
+        request: InferenceRequest,
+        request_id: &str,
+    ) -> Result<InferenceResponse> {
         // Validate request
         self.validate_request(&request)?;
 
         let model_name = request.model.as_ref().unwrap_or(&self.config.model.name);
-        
+
         #[cfg(feature = "ml")]
         {
             // Get model
             let model = self.model_manager.load_model(model_name).await?;
-            
+
             // Process with real model
             let prompt_tokens = model.tokenize(&request.prompt)?;
             let generation_config = request.generation_config.unwrap_or_default();
-            
-            let generation_result = model.generate(&prompt_tokens, &generation_config, None).await?;
-            
+
+            let generation_result = model
+                .generate(&prompt_tokens, &generation_config, None)
+                .await?;
+
             Ok(InferenceResponse {
                 id: request_id.to_string(),
                 text: generation_result.text,
@@ -232,14 +256,14 @@ impl InferenceEngine {
                 },
             })
         }
-        
+
         #[cfg(not(feature = "ml"))]
         {
             // Mock implementation for CI
             let response_text = format!("Mock response for: {}", request.prompt);
             let prompt_tokens = request.prompt.split_whitespace().count();
             let completion_tokens = response_text.split_whitespace().count();
-            
+
             Ok(InferenceResponse {
                 id: request_id.to_string(),
                 text: response_text,
@@ -267,25 +291,31 @@ impl InferenceEngine {
 
         if let Some(max_tokens) = request.max_tokens {
             if max_tokens == 0 {
-                return Err(EngineError::invalid_request("max_tokens must be greater than 0"));
+                return Err(EngineError::invalid_request(
+                    "max_tokens must be greater than 0",
+                ));
             }
             if max_tokens > self.config.model.max_sequence_length {
-                return Err(EngineError::invalid_request(
-                    format!("max_tokens ({}) exceeds model limit ({})", 
-                           max_tokens, self.config.model.max_sequence_length)
-                ));
+                return Err(EngineError::invalid_request(format!(
+                    "max_tokens ({}) exceeds model limit ({})",
+                    max_tokens, self.config.model.max_sequence_length
+                )));
             }
         }
 
         if let Some(temperature) = request.temperature {
             if temperature < 0.0 || temperature > 2.0 {
-                return Err(EngineError::invalid_request("temperature must be between 0.0 and 2.0"));
+                return Err(EngineError::invalid_request(
+                    "temperature must be between 0.0 and 2.0",
+                ));
             }
         }
 
         if let Some(top_p) = request.top_p {
             if top_p < 0.0 || top_p > 1.0 {
-                return Err(EngineError::invalid_request("top_p must be between 0.0 and 1.0"));
+                return Err(EngineError::invalid_request(
+                    "top_p must be between 0.0 and 1.0",
+                ));
             }
         }
 
@@ -371,19 +401,25 @@ impl InferenceRequest {
 
         if let Some(max_tokens) = self.max_tokens {
             if max_tokens == 0 {
-                return Err(EngineError::invalid_request("max_tokens must be greater than 0"));
+                return Err(EngineError::invalid_request(
+                    "max_tokens must be greater than 0",
+                ));
             }
         }
 
         if let Some(temperature) = self.temperature {
             if temperature < 0.0 || temperature > 2.0 {
-                return Err(EngineError::invalid_request("temperature must be between 0.0 and 2.0"));
+                return Err(EngineError::invalid_request(
+                    "temperature must be between 0.0 and 2.0",
+                ));
             }
         }
 
         if let Some(top_p) = self.top_p {
             if top_p < 0.0 || top_p > 1.0 {
-                return Err(EngineError::invalid_request("top_p must be between 0.0 and 1.0"));
+                return Err(EngineError::invalid_request(
+                    "top_p must be between 0.0 and 1.0",
+                ));
             }
         }
 
@@ -430,6 +466,9 @@ mod tests {
             total_tokens: 30,
         };
 
-        assert_eq!(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
     }
 }
