@@ -19,16 +19,6 @@ tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# ML/DL framework
-candle-core = "0.3"
-candle-nn = "0.3" 
-candle-transformers = "0.3"
-candle-datasets = "0.3"
-
-# HuggingFace integration
-hf-hub = "0.3"
-tokenizers = "0.15"
-
 # Logging and monitoring
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -56,6 +46,19 @@ metrics-exporter-prometheus = "0.13"
 
 # Memory management
 parking_lot = "0.12"
+
+# ML/DL framework (conditional compilation for CI)
+[target.'cfg(not(target_env = "ci"))'.dependencies]
+candle-core = { version = "0.3", optional = true }
+candle-nn = { version = "0.3", optional = true }
+candle-transformers = { version = "0.3", optional = true }
+candle-datasets = { version = "0.3", optional = true }
+hf-hub = { version = "0.3", optional = true }
+tokenizers = { version = "0.15", optional = true }
+
+[features]
+default = []
+ml = ["candle-core", "candle-nn", "candle-transformers", "candle-datasets", "hf-hub", "tokenizers"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
