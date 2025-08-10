@@ -150,8 +150,22 @@ impl MetricsCollector {
             return 0.0;
         }
 
-        let index = (percentile * (sorted_values.len() - 1) as f64).round() as usize;
-        sorted_values[index.min(sorted_values.len() - 1)]
+        if sorted_values.len() == 1 {
+            return sorted_values[0];
+        }
+
+        let index = percentile * (sorted_values.len() - 1) as f64;
+        let lower_index = index.floor() as usize;
+        let upper_index = index.ceil() as usize;
+
+        if lower_index == upper_index {
+            sorted_values[lower_index]
+        } else {
+            let lower_value = sorted_values[lower_index];
+            let upper_value = sorted_values[upper_index];
+            let weight = index - lower_index as f64;
+            lower_value + weight * (upper_value - lower_value)
+        }
     }
 }
 
@@ -240,8 +254,8 @@ mod tests {
         assert_eq!(stats.min, 1.0);
         assert_eq!(stats.max, 10.0);
         assert_eq!(stats.mean, 5.5);
-        assert_eq!(stats.p50, 5.0);
-        assert_eq!(stats.p95, 10.0);
-        assert_eq!(stats.p99, 10.0);
+        assert_eq!(stats.p50, 5.5); // Median of 10 values should be average of 5th and 6th elements
+        assert_eq!(stats.p95, 9.5); // 95th percentile
+        assert_eq!(stats.p99, 9.9); // 99th percentile
     }
 }
