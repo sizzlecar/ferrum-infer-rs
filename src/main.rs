@@ -39,8 +39,11 @@ async fn main() -> Result<()> {
     info!("  Model: {}", config.model.name);
     info!("  Device: {}", config.model.device);
     info!("  Cache enabled: {}", config.cache.enabled);
-    info!("  Max sequence length: {}", config.model.max_sequence_length);
-    
+    info!(
+        "  Max sequence length: {}",
+        config.model.max_sequence_length
+    );
+
     if config.server.api_key.is_some() {
         info!("  API key authentication: enabled");
     } else {
@@ -55,11 +58,14 @@ async fn main() -> Result<()> {
     // Initialize the inference engine
     info!("Initializing inference engine...");
     let start_time = Instant::now();
-    
+
     let engine = match init_engine().await {
         Ok(engine) => {
             let init_duration = start_time.elapsed();
-            info!("Inference engine initialized successfully in {}", format_duration(init_duration));
+            info!(
+                "Inference engine initialized successfully in {}",
+                format_duration(init_duration)
+            );
             Arc::new(engine)
         }
         Err(e) => {
@@ -71,13 +77,15 @@ async fn main() -> Result<()> {
     // Set up graceful shutdown
     let engine_clone = Arc::clone(&engine);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
         info!("Received shutdown signal, cleaning up...");
-        
+
         if let Err(e) = engine_clone.shutdown().await {
             error!("Error during shutdown: {}", e);
         }
-        
+
         info!("Shutdown complete");
         std::process::exit(0);
     });
@@ -94,7 +102,8 @@ async fn main() -> Result<()> {
 
 /// Print the startup banner
 fn print_banner() {
-    println!(r#"
+    println!(
+        r#"
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
 ║    🚀 Ferrum Infer v{}                                       ║
@@ -103,14 +112,16 @@ fn print_banner() {
 ║    with OpenAI-compatible API endpoints                      ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
-"#, VERSION);
+"#,
+        VERSION
+    );
     println!();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_banner_contains_version() {
         // Just ensure the banner function doesn't panic

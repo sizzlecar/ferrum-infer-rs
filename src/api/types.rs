@@ -192,7 +192,7 @@ impl ChatCompletionRequest {
     pub fn to_inference_request(&self) -> InferenceRequest {
         // Convert messages to a single prompt
         let prompt = self.messages_to_prompt();
-        
+
         InferenceRequest {
             id: None,
             prompt,
@@ -316,13 +316,11 @@ mod tests {
     fn test_chat_completion_request_to_inference() {
         let request = ChatCompletionRequest {
             model: "gpt-3.5-turbo".to_string(),
-            messages: vec![
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "Hello!".to_string(),
-                    name: None,
-                },
-            ],
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Hello!".to_string(),
+                name: None,
+            }],
             max_tokens: Some(100),
             temperature: Some(0.7),
             top_p: Some(0.9),

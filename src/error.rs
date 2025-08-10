@@ -1,24 +1,21 @@
 //! Error handling for the LLM inference engine
 //!
-//! This module provides centralized error handling with structured error types
-//! that can be easily converted to HTTP responses and logged appropriately.
+//! This module provides a unified error handling system with proper error mapping
+//! to HTTP status codes and structured error responses.
 
-use std::fmt;
 use actix_web::{HttpResponse, ResponseError};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
-
-/// Main result type used throughout the engine
-pub type Result<T> = std::result::Result<T, EngineError>;
 
 /// Main error type for the inference engine
 #[derive(Error, Debug)]
 pub enum EngineError {
-    /// Configuration related errors
+    /// Configuration errors
     #[error("Configuration error: {message}")]
     Config { message: String },
 
-    /// Model loading and management errors
+    /// Model loading/inference errors
     #[error("Model error: {message}")]
     Model { message: String },
 
@@ -26,15 +23,15 @@ pub enum EngineError {
     #[error("Inference error: {message}")]
     Inference { message: String },
 
-    /// Cache related errors
+    /// Cache operation errors
     #[error("Cache error: {message}")]
     Cache { message: String },
 
-    /// API request validation errors
+    /// Invalid request errors
     #[error("Invalid request: {message}")]
     InvalidRequest { message: String },
 
-    /// Resource management errors (memory, GPU, etc.)
+    /// Resource management errors
     #[error("Resource error: {message}")]
     Resource { message: String },
 
@@ -42,33 +39,39 @@ pub enum EngineError {
     #[error("Internal error: {message}")]
     Internal { message: String },
 
-    /// IO errors
-    #[error("IO error: {0}")]
+    /// I/O errors
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
     /// Serialization errors
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    /// Candle framework errors
+    /// ML framework errors (only when ml feature is enabled)
+    #[cfg(feature = "ml")]
     #[error("Candle error: {0}")]
     Candle(#[from] candle_core::Error),
 
-    /// Tokenizer errors
+    /// Tokenizer errors (only when ml feature is enabled)
+    #[cfg(feature = "ml")]
     #[error("Tokenizer error: {0}")]
     Tokenizer(#[from] tokenizers::Error),
 }
 
-/// Error response structure for API endpoints
+/// Result type alias for convenience
+pub type Result<T> = std::result::Result<T, EngineError>;
+
+/// Error response structure for API responses
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
-    pub error: ErrorDetail,
+    pub error: ErrorDetails,
 }
 
+/// Detailed error information
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ErrorDetail {
+pub struct ErrorDetails {
     pub message: String,
-    pub r#type: String,
+    pub error_type: String,
     pub code: String,
 }
 
@@ -122,47 +125,29 @@ impl EngineError {
         }
     }
 
-    /// Get the error type as a string
-    pub fn error_type(&self) -> &'static str {
-        match self {
-            Self::Config { .. } => "configuration_error",
-            Self::Model { .. } => "model_error",
-            Self::Inference { .. } => "inference_error",
-            Self::Cache { .. } => "cache_error",
-            Self::InvalidRequest { .. } => "invalid_request_error",
-            Self::Resource { .. } => "resource_error",
-            Self::Internal { .. } => "internal_error",
-            Self::Io(_) => "io_error",
-            Self::Serde(_) => "serialization_error",
-            Self::Candle(_) => "candle_error",
-            Self::Tokenizer(_) => "tokenizer_error",
-        }
-    }
-
-    /// Get the error code for API responses
-    pub fn error_code(&self) -> &'static str {
-        match self {
-            Self::Config { .. } => "CONFIG_ERROR",
-            Self::Model { .. } => "MODEL_ERROR",
-            Self::Inference { .. } => "INFERENCE_ERROR",
-            Self::Cache { .. } => "CACHE_ERROR",
-            Self::InvalidRequest { .. } => "INVALID_REQUEST",
-            Self::Resource { .. } => "RESOURCE_ERROR",
-            Self::Internal { .. } => "INTERNAL_ERROR",
-            Self::Io(_) => "IO_ERROR",
-            Self::Serde(_) => "SERIALIZATION_ERROR",
-            Self::Candle(_) => "CANDLE_ERROR",
-            Self::Tokenizer(_) => "TOKENIZER_ERROR",
-        }
-    }
-
-    /// Convert to ErrorResponse for API responses
+    /// Convert to an error response for API
     pub fn to_error_response(&self) -> ErrorResponse {
+        let (error_type, code) = match self {
+            EngineError::Config { .. } => ("config_error", "CONFIG_ERROR"),
+            EngineError::Model { .. } => ("model_error", "MODEL_ERROR"),
+            EngineError::Inference { .. } => ("inference_error", "INFERENCE_ERROR"),
+            EngineError::Cache { .. } => ("cache_error", "CACHE_ERROR"),
+            EngineError::InvalidRequest { .. } => ("invalid_request_error", "INVALID_REQUEST"),
+            EngineError::Resource { .. } => ("resource_error", "RESOURCE_ERROR"),
+            EngineError::Internal { .. } => ("internal_error", "INTERNAL_ERROR"),
+            EngineError::Io(_) => ("io_error", "IO_ERROR"),
+            EngineError::Serde(_) => ("serialization_error", "SERIALIZATION_ERROR"),
+            #[cfg(feature = "ml")]
+            EngineError::Candle(_) => ("ml_error", "ML_ERROR"),
+            #[cfg(feature = "ml")]
+            EngineError::Tokenizer(_) => ("tokenizer_error", "TOKENIZER_ERROR"),
+        };
+
         ErrorResponse {
-            error: ErrorDetail {
+            error: ErrorDetails {
                 message: self.to_string(),
-                r#type: self.error_type().to_string(),
-                code: self.error_code().to_string(),
+                error_type: error_type.to_string(),
+                code: code.to_string(),
             },
         }
     }
@@ -171,19 +156,22 @@ impl EngineError {
 impl ResponseError for EngineError {
     fn error_response(&self) -> HttpResponse {
         let status = match self {
-            Self::InvalidRequest { .. } => actix_web::http::StatusCode::BAD_REQUEST,
-            Self::Model { .. } => actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
-            Self::Resource { .. } => actix_web::http::StatusCode::INSUFFICIENT_STORAGE,
-            _ => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            EngineError::InvalidRequest { .. } => actix_web::http::StatusCode::BAD_REQUEST,
+            EngineError::Model { .. } => actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+            EngineError::Resource { .. } => actix_web::http::StatusCode::INSUFFICIENT_STORAGE,
+            EngineError::Config { .. } 
+            | EngineError::Inference { .. }
+            | EngineError::Cache { .. }
+            | EngineError::Internal { .. }
+            | EngineError::Io(_)
+            | EngineError::Serde(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            #[cfg(feature = "ml")]
+            EngineError::Candle(_) | EngineError::Tokenizer(_) => {
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
 
         HttpResponse::build(status).json(self.to_error_response())
-    }
-}
-
-impl fmt::Display for ErrorResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.error.code, self.error.message)
     }
 }
 
@@ -193,16 +181,28 @@ mod tests {
 
     #[test]
     fn test_error_creation() {
-        let err = EngineError::config("Invalid config file");
-        assert_eq!(err.error_type(), "configuration_error");
-        assert_eq!(err.error_code(), "CONFIG_ERROR");
+        let error = EngineError::config("Test config error");
+        assert!(error.to_string().contains("Test config error"));
+
+        let error = EngineError::invalid_request("Invalid parameter");
+        assert!(error.to_string().contains("Invalid parameter"));
     }
 
     #[test]
     fn test_error_response() {
-        let err = EngineError::invalid_request("Missing required parameter");
-        let response = err.to_error_response();
-        assert_eq!(response.error.r#type, "invalid_request_error");
+        let error = EngineError::invalid_request("Test error");
+        let response = error.to_error_response();
+        
+        assert_eq!(response.error.error_type, "invalid_request_error");
         assert_eq!(response.error.code, "INVALID_REQUEST");
+        assert!(response.error.message.contains("Test error"));
+    }
+
+    #[test]
+    fn test_http_response() {
+        let error = EngineError::invalid_request("Test error");
+        let http_response = error.error_response();
+        
+        assert_eq!(http_response.status(), 400);
     }
 }
