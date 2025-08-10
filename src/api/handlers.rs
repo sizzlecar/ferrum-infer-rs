@@ -203,7 +203,7 @@ pub async fn metrics(data: web::Data<AppState>) -> ActixResult<HttpResponse> {
         stats.failed_requests,
         stats.avg_inference_time_ms,
         stats.total_tokens_generated,
-        stats.memory_stats.total_allocated_bytes
+        0 // TODO: Implement actual memory usage tracking
     );
 
     Ok(HttpResponse::Ok()

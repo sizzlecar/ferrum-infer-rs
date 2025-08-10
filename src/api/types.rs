@@ -204,7 +204,7 @@ impl ChatCompletionRequest {
             top_p: self.top_p,
             top_k: None,
             repetition_penalty: self.presence_penalty,
-            stop: self.stop.clone(),
+            stop_sequences: self.stop.clone(),
             user: self.user.clone(),
         }
     }
@@ -233,7 +233,7 @@ impl CompletionRequest {
             top_p: self.top_p,
             top_k: None,
             repetition_penalty: self.presence_penalty,
-            stop: self.stop.clone(),
+            stop_sequences: self.stop.clone(),
             user: self.user.clone(),
         }
     }
@@ -244,7 +244,7 @@ impl From<crate::inference::InferenceResponse> for ChatCompletionResponse {
         Self {
             id: response.id,
             object: "chat.completion".to_string(),
-            created: response.created,
+            created: response.created as u64,
             model: response.model,
             choices: vec![ChatChoice {
                 index: 0,
@@ -253,9 +253,13 @@ impl From<crate::inference::InferenceResponse> for ChatCompletionResponse {
                     content: response.text,
                     name: None,
                 },
-                finish_reason: response.finish_reason,
+                finish_reason: response.finish_reason.unwrap_or_else(|| "stop".to_string()),
             }],
-            usage: response.usage,
+            usage: response.usage.unwrap_or_else(|| Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            }),
         }
     }
 }
@@ -265,14 +269,18 @@ impl From<crate::inference::InferenceResponse> for CompletionResponse {
         Self {
             id: response.id,
             object: "text_completion".to_string(),
-            created: response.created,
+            created: response.created as u64,
             model: response.model,
             choices: vec![CompletionChoice {
                 index: 0,
                 text: response.text,
-                finish_reason: response.finish_reason,
+                finish_reason: response.finish_reason.unwrap_or_else(|| "stop".to_string()),
             }],
-            usage: response.usage,
+            usage: response.usage.unwrap_or_else(|| Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            }),
         }
     }
 }
@@ -288,7 +296,7 @@ impl From<crate::inference::StreamChunk> for ChatCompletionChunk {
                 index: 0,
                 delta: ChatMessage {
                     role: "assistant".to_string(),
-                    content: chunk.delta,
+                    content: chunk.text,
                     name: None,
                 },
                 finish_reason: chunk.finish_reason,
