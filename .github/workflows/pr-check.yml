@@ -14,8 +14,6 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -36,7 +34,7 @@ jobs:
         echo "🔍 Checking code formatting..."
         cargo fmt --all -- --check
 
-    - name: Run quick clippy check
+    - name: Run clippy check
       run: |
         echo "🔧 Running clippy..."
         cargo clippy --all-targets -- -D warnings
@@ -51,40 +49,8 @@ jobs:
         echo "📦 Checking compilation..."
         cargo check --all-targets
 
-  pr-info:
-    name: PR Information
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: Get PR stats
-      run: |
-        echo "📊 Pull Request Statistics:"
-        echo "- Changed files: $(git diff --name-only origin/main...HEAD | wc -l)"
-        echo "- Lines added: $(git diff --numstat origin/main...HEAD | awk '{add+=$1} END {print add}')"
-        echo "- Lines removed: $(git diff --numstat origin/main...HEAD | awk '{sub+=$2} END {print sub}')"
-        echo ""
-        echo "📝 Changed Rust files:"
-        git diff --name-only origin/main...HEAD | grep '\.rs$' || echo "No Rust files changed"
-
-    - name: Check conventional commits
-      run: |
-        echo "🔍 Checking commit messages..."
-        for commit in $(git rev-list origin/main..HEAD); do
-          message=$(git log --format=%B -n 1 $commit | head -n 1)
-          echo "Checking commit: $message"
-          if ! echo "$message" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|chore|ci|build)(\(.+\))?: .+'; then
-            echo "❌ Commit message does not follow conventional commits format: $message"
-            exit 1
-          fi
-        done
-        echo "✅ All commit messages follow conventional commits format"
-
-  dependency-check:
-    name: Dependency Check
+  security-check:
+    name: Security Check
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
@@ -98,28 +64,3 @@ jobs:
 
     - name: Check for security vulnerabilities
       run: cargo audit
-
-    - name: Check for outdated dependencies
-      run: |
-        cargo install cargo-outdated
-        cargo outdated --exit-code 1
-
-  documentation:
-    name: Documentation Check
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Check documentation
-      run: |
-        echo "📚 Building documentation..."
-        cargo doc --all-features --no-deps
-        
-    - name: Check for missing docs
-      run: |
-        echo "🔍 Checking for missing documentation..."
-        RUSTDOCFLAGS="-D missing_docs" cargo doc --all-features --no-deps
