@@ -1,0 +1,39 @@
+[package]
+name = "rust-project"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A Rust project with comprehensive development workflow"
+repository = "https://github.com/username/rust-project"
+license = "MIT"
+keywords = ["rust", "example"]
+categories = ["development-tools"]
+
+[dependencies]
+# 添加运行时依赖
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.0", features = ["derive"] }
+
+[dev-dependencies]
+# 开发和测试依赖
+criterion = "0.5"
+pretty_assertions = "1.4"
+
+[profile.release]
+# 优化发布构建
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+# 开发构建优化
+debug = true
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
+
+[[bench]]
+name = "benchmarks"
+harness = false
