@@ -220,11 +220,37 @@ pub fn sanitize_for_logging(text: &str, max_length: usize) -> String {
         text.to_string()
     };
 
-    // Remove potential sensitive patterns
-    truncated
-        .replace("password", "***")
-        .replace("token", "***")
-        .replace("key", "***")
+    // Replace sensitive patterns and values
+    let mut sanitized = truncated;
+    
+    // List of sensitive keywords to look for (including the space after colon)
+    let sensitive_patterns = [
+        "password: ",
+        "token: ",
+        "key: ",
+    ];
+    
+    // Replace patterns and mask the values that follow
+    for pattern in &sensitive_patterns {
+        while let Some(start) = sanitized.find(pattern) {
+            let after_pattern = start + pattern.len();
+            if let Some(after_text) = sanitized.get(after_pattern..) {
+                // Find where the sensitive value ends (next space or end of string)
+                let value_end = after_text.find(' ').unwrap_or(after_text.len());
+                let before = &sanitized[..start];
+                let after = if after_pattern + value_end < sanitized.len() {
+                    &sanitized[after_pattern + value_end..]
+                } else {
+                    ""
+                };
+                sanitized = format!("{}{} ***{}", before, &pattern[..pattern.len()-1], after);
+            } else {
+                break;
+            }
+        }
+    }
+    
+    sanitized
 }
 
 /// Retry a function with exponential backoff
@@ -308,6 +334,9 @@ mod tests {
     fn test_sanitize_for_logging() {
         let text = "This is a password: secret123 and a token: abc123";
         let sanitized = sanitize_for_logging(text, 100);
+
+        println!("Original: {}", text);
+        println!("Sanitized: {}", sanitized);
 
         assert!(sanitized.contains("***"));
         assert!(!sanitized.contains("secret123"));
