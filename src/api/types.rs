@@ -370,6 +370,6 @@ mod tests {
         assert_eq!(inference_req.model, Some("text-davinci-003".to_string()));
         assert_eq!(inference_req.max_tokens, Some(50));
         assert_eq!(inference_req.stream, Some(true));
-        assert_eq!(inference_req.stop, Some(vec!["END".to_string()]));
+        assert_eq!(inference_req.stop_sequences, Some(vec!["END".to_string()]));
     }
 }
