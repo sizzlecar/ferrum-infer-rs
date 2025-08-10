@@ -1,37 +1,32 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rust_project::calculator::*;
+use ferrum_infer::config::Config;
+use ferrum_infer::utils::*;
 
-fn benchmark_add(c: &mut Criterion) {
-    c.bench_function("add", |b| b.iter(|| add(black_box(100), black_box(200))));
-}
-
-fn benchmark_multiply(c: &mut Criterion) {
-    c.bench_function("multiply", |b| {
-        b.iter(|| multiply(black_box(100), black_box(200)))
+fn benchmark_validate_model_name(c: &mut Criterion) {
+    c.bench_function("validate_model_name", |b| {
+        b.iter(|| validate_model_name(black_box("gpt-3.5-turbo")))
     });
 }
 
-fn benchmark_divide(c: &mut Criterion) {
-    c.bench_function("divide", |b| {
-        b.iter(|| divide(black_box(1000), black_box(10)))
+fn benchmark_sanitize_text(c: &mut Criterion) {
+    let text = "This is a test string with\ninvalid\0characters\tand more.";
+    c.bench_function("sanitize_text", |b| {
+        b.iter(|| sanitize_text(black_box(text)))
     });
 }
 
-fn benchmark_operations_group(c: &mut Criterion) {
-    let mut group = c.benchmark_group("calculator_operations");
-
-    group.bench_function("add_small", |b| b.iter(|| add(black_box(1), black_box(2))));
-
-    group.bench_function("add_large", |b| {
-        b.iter(|| add(black_box(1_000_000), black_box(2_000_000)))
+fn benchmark_truncate_text(c: &mut Criterion) {
+    let text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(100);
+    c.bench_function("truncate_text", |b| {
+        b.iter(|| truncate_text(black_box(&text), black_box(100)))
     });
+}
 
-    group.bench_function("multiply_small", |b| {
-        b.iter(|| multiply(black_box(10), black_box(20)))
-    });
+fn benchmark_config_operations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("config_operations");
 
-    group.bench_function("multiply_large", |b| {
-        b.iter(|| multiply(black_box(10_000), black_box(20_000)))
+    group.bench_function("config_default", |b| {
+        b.iter(|| Config::default())
     });
 
     group.finish();
@@ -39,9 +34,9 @@ fn benchmark_operations_group(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    benchmark_add,
-    benchmark_multiply,
-    benchmark_divide,
-    benchmark_operations_group
+    benchmark_validate_model_name,
+    benchmark_sanitize_text,
+    benchmark_truncate_text,
+    benchmark_config_operations
 );
 criterion_main!(benches);

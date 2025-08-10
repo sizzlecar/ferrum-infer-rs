@@ -123,3 +123,165 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{test, web, App, HttpResponse};
+
+    async fn dummy_handler() -> Result<HttpResponse, Error> {
+        Ok(HttpResponse::Ok().json(serde_json::json!({"status": "success"})))
+    }
+
+    #[actix_web::test]
+    async fn test_no_api_key_configured_allows_all_requests() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(None))
+                .route("/test", web::get().to(dummy_handler))
+        ).await;
+
+        let req = test::TestRequest::get().uri("/test").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_health_endpoints_bypass_auth() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
+                .route("/health", web::get().to(dummy_handler))
+                .route("/ping", web::get().to(dummy_handler))
+                .route("/metrics", web::get().to(dummy_handler))
+        ).await;
+
+        // Test /health endpoint
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+
+        // Test /ping endpoint
+        let req = test::TestRequest::get().uri("/ping").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+
+        // Test /metrics endpoint
+        let req = test::TestRequest::get().uri("/metrics").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_valid_api_key_in_authorization_header() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
+                .route("/test", web::get().to(dummy_handler))
+        ).await;
+
+        let req = test::TestRequest::get()
+            .uri("/test")
+            .insert_header(("Authorization", "Bearer secret-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_valid_api_key_in_query_parameter() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
+                .route("/test", web::get().to(dummy_handler))
+        ).await;
+
+        let req = test::TestRequest::get()
+            .uri("/test?api_key=secret-key")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_invalid_api_key_returns_unauthorized() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
+                .route("/test", web::get().to(dummy_handler))
+        ).await;
+
+        let req = test::TestRequest::get()
+            .uri("/test")
+            .insert_header(("Authorization", "Bearer wrong-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn test_missing_api_key_returns_unauthorized() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
+                .route("/test", web::get().to(dummy_handler))
+        ).await;
+
+        let req = test::TestRequest::get().uri("/test").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn test_malformed_authorization_header() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
+                .route("/test", web::get().to(dummy_handler))
+        ).await;
+
+        let req = test::TestRequest::get()
+            .uri("/test")
+            .insert_header(("Authorization", "secret-key"))  // Missing "Bearer " prefix
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn test_api_key_priority_header_over_query() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
+                .route("/test", web::get().to(dummy_handler))
+        ).await;
+
+        // Header has correct key, query has wrong key
+        let req = test::TestRequest::get()
+            .uri("/test?api_key=wrong-key")
+            .insert_header(("Authorization", "Bearer secret-key"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_error_response_format() {
+        let app = test::init_service(
+            App::new()
+                .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
+                .route("/test", web::get().to(dummy_handler))
+        ).await;
+
+        let req = test::TestRequest::get().uri("/test").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401);
+        
+        let body = test::read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(json["error"]["message"], "Invalid or missing API key");
+        assert_eq!(json["error"]["type"], "authentication_error");
+        assert_eq!(json["error"]["code"], "INVALID_API_KEY");
+    }
+}

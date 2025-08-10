@@ -60,11 +60,12 @@ parking_lot = "0.12"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 mockall = "0.12"
+tokio-test = "0.4"
 
 [[bin]]
 name = "ferrum-infer"
 path = "src/main.rs"
 
 [[bench]]
-name = "inference_benchmark"
+name = "benchmarks"
 harness = false
