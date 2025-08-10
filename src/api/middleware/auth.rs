@@ -86,17 +86,14 @@ where
                 .and_then(|h| h.strip_prefix("Bearer "));
 
             // Check for API key in query parameter
-            let query_key = req
-                .query_string()
-                .split('&')
-                .find_map(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    if parts.next() == Some("api_key") {
-                        parts.next()
-                    } else {
-                        None
-                    }
-                });
+            let query_key = req.query_string().split('&').find_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                if parts.next() == Some("api_key") {
+                    parts.next()
+                } else {
+                    None
+                }
+            });
 
             let provided_key = auth_header.or(query_key);
 
@@ -138,8 +135,9 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(None))
-                .route("/test", web::get().to(dummy_handler))
-        ).await;
+                .route("/test", web::get().to(dummy_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get().uri("/test").to_request();
         let resp = test::call_service(&app, req).await;
@@ -153,8 +151,9 @@ mod tests {
                 .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
                 .route("/health", web::get().to(dummy_handler))
                 .route("/ping", web::get().to(dummy_handler))
-                .route("/metrics", web::get().to(dummy_handler))
-        ).await;
+                .route("/metrics", web::get().to(dummy_handler)),
+        )
+        .await;
 
         // Test /health endpoint
         let req = test::TestRequest::get().uri("/health").to_request();
@@ -177,8 +176,9 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
-                .route("/test", web::get().to(dummy_handler))
-        ).await;
+                .route("/test", web::get().to(dummy_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/test")
@@ -193,8 +193,9 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
-                .route("/test", web::get().to(dummy_handler))
-        ).await;
+                .route("/test", web::get().to(dummy_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/test?api_key=secret-key")
@@ -208,8 +209,9 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
-                .route("/test", web::get().to(dummy_handler))
-        ).await;
+                .route("/test", web::get().to(dummy_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/test")
@@ -224,8 +226,9 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
-                .route("/test", web::get().to(dummy_handler))
-        ).await;
+                .route("/test", web::get().to(dummy_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get().uri("/test").to_request();
         let resp = test::call_service(&app, req).await;
@@ -237,12 +240,13 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
-                .route("/test", web::get().to(dummy_handler))
-        ).await;
+                .route("/test", web::get().to(dummy_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/test")
-            .insert_header(("Authorization", "secret-key"))  // Missing "Bearer " prefix
+            .insert_header(("Authorization", "secret-key")) // Missing "Bearer " prefix
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 401);
@@ -253,8 +257,9 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
-                .route("/test", web::get().to(dummy_handler))
-        ).await;
+                .route("/test", web::get().to(dummy_handler)),
+        )
+        .await;
 
         // Header has correct key, query has wrong key
         let req = test::TestRequest::get()
@@ -270,16 +275,17 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(Some("secret-key".to_string())))
-                .route("/test", web::get().to(dummy_handler))
-        ).await;
+                .route("/test", web::get().to(dummy_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get().uri("/test").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 401);
-        
+
         let body = test::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        
+
         assert_eq!(json["error"]["message"], "Invalid or missing API key");
         assert_eq!(json["error"]["type"], "authentication_error");
         assert_eq!(json["error"]["code"], "INVALID_API_KEY");

@@ -56,7 +56,7 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let service = Rc::clone(&self.service);
         let start_time = Instant::now();
-        
+
         // Extract request information
         let method = req.method().to_string();
         let path = req.path().to_string();
@@ -163,14 +163,15 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RequestLogging)
-                .route("/success", web::get().to(success_handler))
-        ).await;
+                .route("/success", web::get().to(success_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/success")
             .insert_header(("User-Agent", "test-agent/1.0"))
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
     }
@@ -180,14 +181,15 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RequestLogging)
-                .route("/client-error", web::get().to(client_error_handler))
-        ).await;
+                .route("/client-error", web::get().to(client_error_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/client-error")
             .insert_header(("User-Agent", "test-agent/1.0"))
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 400);
     }
@@ -197,14 +199,15 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RequestLogging)
-                .route("/server-error", web::get().to(server_error_handler))
-        ).await;
+                .route("/server-error", web::get().to(server_error_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/server-error")
             .insert_header(("User-Agent", "test-agent/1.0"))
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 500);
     }
@@ -214,14 +217,15 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RequestLogging)
-                .route("/error", web::get().to(error_handler))
-        ).await;
+                .route("/error", web::get().to(error_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/error")
             .insert_header(("User-Agent", "test-agent/1.0"))
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_server_error());
     }
@@ -231,14 +235,15 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RequestLogging)
-                .route("/test", web::get().to(success_handler))
-        ).await;
+                .route("/test", web::get().to(success_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/test?param1=value1&param2=value2")
             .insert_header(("User-Agent", "test-agent/1.0"))
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
     }
@@ -248,13 +253,12 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RequestLogging)
-                .route("/test", web::get().to(success_handler))
-        ).await;
+                .route("/test", web::get().to(success_handler)),
+        )
+        .await;
 
-        let req = test::TestRequest::get()
-            .uri("/test")
-            .to_request();
-        
+        let req = test::TestRequest::get().uri("/test").to_request();
+
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
     }
@@ -266,8 +270,9 @@ mod tests {
                 .wrap(RequestLogging)
                 .route("/test", web::post().to(success_handler))
                 .route("/test", web::put().to(success_handler))
-                .route("/test", web::delete().to(success_handler))
-        ).await;
+                .route("/test", web::delete().to(success_handler)),
+        )
+        .await;
 
         // Test POST
         let req = test::TestRequest::post().uri("/test").to_request();
@@ -298,8 +303,9 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RequestLogging)
-                .route("/slow", web::get().to(slow_handler))
-        ).await;
+                .route("/slow", web::get().to(slow_handler)),
+        )
+        .await;
 
         let req = test::TestRequest::get().uri("/slow").to_request();
         let resp = test::call_service(&app, req).await;

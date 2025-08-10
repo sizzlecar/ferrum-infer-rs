@@ -69,7 +69,7 @@ impl LRUCache {
     fn evict_if_needed(&self, new_entry_size: usize) {
         let max_size_bytes = self.config.max_size_mb * 1024 * 1024;
         let mut stats = self.stats.write();
-        
+
         while stats.total_size_bytes + new_entry_size > max_size_bytes {
             if let Some(oldest_key) = self.access_order.write().pop_front() {
                 if let Some(node) = self.entries.write().remove(&oldest_key) {
@@ -118,7 +118,7 @@ impl LRUCache {
                     if let Some(node) = entries.remove(&key) {
                         stats.total_size_bytes -= node.size_bytes;
                         stats.evictions += 1;
-                        
+
                         // Remove from access order
                         if let Some(pos) = access_order.iter().position(|x| x == &key) {
                             access_order.remove(pos);
@@ -132,12 +132,12 @@ impl LRUCache {
     /// Update access order for LRU tracking
     fn update_access_order(&self, key: &str) {
         let mut access_order = self.access_order.write();
-        
+
         // Remove from current position if exists
         if let Some(pos) = access_order.iter().position(|x| x == key) {
             access_order.remove(pos);
         }
-        
+
         // Add to back (most recently used)
         access_order.push_back(key.to_string());
     }
@@ -146,7 +146,7 @@ impl LRUCache {
 impl InferenceCache for LRUCache {
     fn get_cache(&self, sequence_id: &str) -> Option<CacheEntry> {
         self.cleanup_expired();
-        
+
         let mut stats = self.stats.write();
         stats.total_requests += 1;
 
@@ -167,7 +167,7 @@ impl InferenceCache for LRUCache {
                     node.entry.last_accessed = entry.last_accessed;
                 }
             }
-            
+
             self.update_access_order(sequence_id);
             stats.cache_hits += 1;
             Some(entry)
@@ -179,10 +179,10 @@ impl InferenceCache for LRUCache {
 
     fn store_cache(&mut self, sequence_id: &str, cache: CacheEntry) {
         let entry_size = Self::estimate_entry_size(&cache);
-        
+
         // Check if we need to evict entries
         self.evict_if_needed(entry_size);
-        
+
         // Check max sequences limit
         if self.entries.read().len() >= self.config.max_sequences {
             if let Some(oldest_key) = self.access_order.write().pop_front() {
@@ -217,7 +217,7 @@ impl InferenceCache for LRUCache {
         if let Some(node) = self.entries.write().remove(sequence_id) {
             let mut stats = self.stats.write();
             stats.total_size_bytes -= node.size_bytes;
-            
+
             // Remove from access order
             let mut access_order = self.access_order.write();
             if let Some(pos) = access_order.iter().position(|x| x == sequence_id) {
@@ -299,7 +299,7 @@ impl InferenceCache for LFUCache {
                 let mut frequency = self.frequency.write();
                 *frequency.entry(sequence_id.to_string()).or_insert(0) += 1;
             }
-            
+
             stats.cache_hits += 1;
             Some(entry)
         } else {
@@ -432,14 +432,16 @@ impl InferenceCache for FIFOCache {
         };
 
         self.entries.write().insert(sequence_id.to_string(), node);
-        self.insertion_order.write().push_back(sequence_id.to_string());
+        self.insertion_order
+            .write()
+            .push_back(sequence_id.to_string());
         self.stats.write().total_size_bytes += entry_size;
     }
 
     fn remove_cache(&mut self, sequence_id: &str) {
         if let Some(node) = self.entries.write().remove(sequence_id) {
             self.stats.write().total_size_bytes -= node.size_bytes;
-            
+
             let mut insertion_order = self.insertion_order.write();
             if let Some(pos) = insertion_order.iter().position(|x| x == sequence_id) {
                 insertion_order.remove(pos);

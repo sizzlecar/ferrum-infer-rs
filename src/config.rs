@@ -218,11 +218,13 @@ impl Config {
             config.server.host = host;
         }
         if let Ok(port) = std::env::var("FERRUM_INFER_PORT") {
-            config.server.port = port.parse()
+            config.server.port = port
+                .parse()
                 .map_err(|_| EngineError::config("Invalid port number"))?;
         }
         if let Ok(max_requests) = std::env::var("FERRUM_INFER_MAX_CONCURRENT_REQUESTS") {
-            config.server.max_concurrent_requests = max_requests.parse()
+            config.server.max_concurrent_requests = max_requests
+                .parse()
                 .map_err(|_| EngineError::config("Invalid max concurrent requests"))?;
         }
         if let Ok(api_key) = std::env::var("FERRUM_INFER_API_KEY") {
@@ -238,17 +240,20 @@ impl Config {
             config.model.device = device;
         }
         if let Ok(max_seq_len) = std::env::var("FERRUM_INFER_MAX_SEQUENCE_LENGTH") {
-            config.model.max_sequence_length = max_seq_len.parse()
+            config.model.max_sequence_length = max_seq_len
+                .parse()
                 .map_err(|_| EngineError::config("Invalid max sequence length"))?;
         }
 
         // Cache configuration
         if let Ok(cache_enabled) = std::env::var("FERRUM_INFER_CACHE_ENABLED") {
-            config.cache.enabled = cache_enabled.parse()
+            config.cache.enabled = cache_enabled
+                .parse()
                 .map_err(|_| EngineError::config("Invalid cache enabled flag"))?;
         }
         if let Ok(cache_size) = std::env::var("FERRUM_INFER_CACHE_SIZE_MB") {
-            config.cache.max_size_mb = cache_size.parse()
+            config.cache.max_size_mb = cache_size
+                .parse()
                 .map_err(|_| EngineError::config("Invalid cache size"))?;
         }
 
@@ -265,10 +270,10 @@ impl Config {
     pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| EngineError::config(format!("Failed to read config file: {}", e)))?;
-        
+
         let config: Self = toml::from_str(&content)
             .map_err(|e| EngineError::config(format!("Failed to parse config file: {}", e)))?;
-        
+
         config.validate()?;
         Ok(config)
     }
@@ -280,7 +285,9 @@ impl Config {
             return Err(EngineError::config("Server port cannot be 0"));
         }
         if self.server.max_concurrent_requests == 0 {
-            return Err(EngineError::config("Max concurrent requests must be greater than 0"));
+            return Err(EngineError::config(
+                "Max concurrent requests must be greater than 0",
+            ));
         }
 
         // Validate model configuration
@@ -288,7 +295,9 @@ impl Config {
             return Err(EngineError::config("Model path cannot be empty"));
         }
         if self.model.max_sequence_length == 0 {
-            return Err(EngineError::config("Max sequence length must be greater than 0"));
+            return Err(EngineError::config(
+                "Max sequence length must be greater than 0",
+            ));
         }
         if !["cpu", "cuda", "mps"].contains(&self.model.device.as_str()) {
             return Err(EngineError::config("Device must be one of: cpu, cuda, mps"));
@@ -299,7 +308,9 @@ impl Config {
 
         // Validate cache configuration
         if !["lru", "lfu", "fifo"].contains(&self.cache.eviction_policy.as_str()) {
-            return Err(EngineError::config("Cache eviction policy must be one of: lru, lfu, fifo"));
+            return Err(EngineError::config(
+                "Cache eviction policy must be one of: lru, lfu, fifo",
+            ));
         }
 
         // Validate performance configuration
@@ -309,7 +320,9 @@ impl Config {
 
         // Validate logging configuration
         if !["trace", "debug", "info", "warn", "error"].contains(&self.logging.level.as_str()) {
-            return Err(EngineError::config("Log level must be one of: trace, debug, info, warn, error"));
+            return Err(EngineError::config(
+                "Log level must be one of: trace, debug, info, warn, error",
+            ));
         }
 
         Ok(())

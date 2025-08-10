@@ -65,7 +65,10 @@ impl MetricsCollector {
     /// Record a value in a histogram
     pub fn record_histogram(&self, name: &str, value: f64) {
         let mut histograms = self.histograms.write();
-        histograms.entry(name.to_string()).or_insert_with(Vec::new).push(value);
+        histograms
+            .entry(name.to_string())
+            .or_insert_with(Vec::new)
+            .push(value);
     }
 
     /// Record the duration of an operation
@@ -77,7 +80,7 @@ impl MetricsCollector {
     pub fn snapshot(&self) -> MetricsSnapshot {
         let counters = self.counters.read().clone();
         let gauges = self.gauges.read().clone();
-        
+
         let histograms = {
             let histograms = self.histograms.read();
             histograms

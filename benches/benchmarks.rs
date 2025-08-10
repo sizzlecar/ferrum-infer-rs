@@ -25,9 +25,7 @@ fn benchmark_truncate_text(c: &mut Criterion) {
 fn benchmark_config_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("config_operations");
 
-    group.bench_function("config_default", |b| {
-        b.iter(|| Config::default())
-    });
+    group.bench_function("config_default", |b| b.iter(|| Config::default()));
 
     group.finish();
 }

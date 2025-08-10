@@ -16,7 +16,10 @@ pub async fn chat_completions(
     data: web::Data<AppState>,
     request: web::Json<ChatCompletionRequest>,
 ) -> ActixResult<HttpResponse> {
-    info!("Processing chat completion request for model: {}", request.model);
+    info!(
+        "Processing chat completion request for model: {}",
+        request.model
+    );
 
     // Validate request
     let inference_request = request.to_inference_request();
@@ -129,10 +132,22 @@ pub async fn health_check(data: web::Data<AppState>) -> ActixResult<HttpResponse
     match data.engine.health_check().await {
         Ok(health_status) => {
             let mut details = std::collections::HashMap::new();
-            details.insert("uptime_seconds".to_string(), json!(health_status.uptime_seconds));
-            details.insert("total_requests".to_string(), json!(health_status.total_requests));
-            details.insert("cache_hit_rate".to_string(), json!(health_status.cache_hit_rate));
-            details.insert("memory_usage_mb".to_string(), json!(health_status.memory_usage_mb));
+            details.insert(
+                "uptime_seconds".to_string(),
+                json!(health_status.uptime_seconds),
+            );
+            details.insert(
+                "total_requests".to_string(),
+                json!(health_status.total_requests),
+            );
+            details.insert(
+                "cache_hit_rate".to_string(),
+                json!(health_status.cache_hit_rate),
+            );
+            details.insert(
+                "memory_usage_mb".to_string(),
+                json!(health_status.memory_usage_mb),
+            );
 
             let response = HealthResponse {
                 status: health_status.status,
@@ -157,7 +172,7 @@ pub async fn metrics(data: web::Data<AppState>) -> ActixResult<HttpResponse> {
     }
 
     let stats = data.engine.get_stats();
-    
+
     // Generate Prometheus-style metrics
     let metrics_text = format!(
         "# HELP ferrum_infer_requests_total Total number of requests\n\
@@ -251,7 +266,7 @@ mod tests {
                 .route("/metrics", web::get().to(metrics))
                 .route("/v1/engines", web::get().to(list_engines))
                 .route("/not-implemented", web::get().to(not_implemented))
-                .default_service(web::to(not_found))
+                .default_service(web::to(not_found)),
         )
         .await
     }
@@ -304,7 +319,7 @@ mod tests {
         let req = test::TestRequest::get().uri("/health").to_request();
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
-        
+
         let body = test::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "healthy");
@@ -316,7 +331,7 @@ mod tests {
         let req = test::TestRequest::get().uri("/v1/models").to_request();
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
-        
+
         let body = test::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["object"], "list");
@@ -327,12 +342,12 @@ mod tests {
     async fn test_chat_completions_non_streaming() {
         let app = create_test_app().await;
         let chat_request = create_test_chat_request();
-        
+
         let req = test::TestRequest::post()
             .uri("/v1/chat/completions")
             .set_json(&chat_request)
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         // This might fail if the inference engine isn't properly mocked
         // For now, we just test that the endpoint responds
@@ -344,12 +359,12 @@ mod tests {
         let app = create_test_app().await;
         let mut chat_request = create_test_chat_request();
         chat_request.stream = Some(true);
-        
+
         let req = test::TestRequest::post()
             .uri("/v1/chat/completions")
             .set_json(&chat_request)
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         // This might fail if the inference engine isn't properly mocked
         // For now, we just test that the endpoint responds
@@ -363,12 +378,12 @@ mod tests {
             "model": "",  // Empty model should be invalid
             "messages": []
         });
-        
+
         let req = test::TestRequest::post()
             .uri("/v1/chat/completions")
             .set_json(&invalid_request)
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 400);
     }
@@ -377,12 +392,12 @@ mod tests {
     async fn test_completions() {
         let app = create_test_app().await;
         let completion_request = create_test_completion_request();
-        
+
         let req = test::TestRequest::post()
             .uri("/v1/completions")
             .set_json(&completion_request)
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         // This might fail if the inference engine isn't properly mocked
         // For now, we just test that the endpoint responds
@@ -396,12 +411,12 @@ mod tests {
             "model": "",  // Empty model should be invalid
             "prompt": ""
         });
-        
+
         let req = test::TestRequest::post()
             .uri("/v1/completions")
             .set_json(&invalid_request)
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 400);
     }
@@ -420,7 +435,7 @@ mod tests {
         let req = test::TestRequest::get().uri("/v1/engines").to_request();
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
-        
+
         let body = test::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["object"], "list");
@@ -430,10 +445,12 @@ mod tests {
     #[actix_web::test]
     async fn test_not_implemented() {
         let app = create_test_app().await;
-        let req = test::TestRequest::get().uri("/not-implemented").to_request();
+        let req = test::TestRequest::get()
+            .uri("/not-implemented")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 501);
-        
+
         let body = test::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["type"], "not_implemented_error");
@@ -442,10 +459,12 @@ mod tests {
     #[actix_web::test]
     async fn test_not_found() {
         let app = create_test_app().await;
-        let req = test::TestRequest::get().uri("/non-existent-endpoint").to_request();
+        let req = test::TestRequest::get()
+            .uri("/non-existent-endpoint")
+            .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 404);
-        
+
         let body = test::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["type"], "not_found_error");
@@ -458,12 +477,12 @@ mod tests {
         chat_request.temperature = Some(0.0);
         chat_request.top_p = Some(0.5);
         chat_request.max_tokens = Some(50);
-        
+
         let req = test::TestRequest::post()
             .uri("/v1/chat/completions")
             .set_json(&chat_request)
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().as_u16() < 500 || resp.status().as_u16() >= 200);
     }
@@ -494,12 +513,12 @@ mod tests {
                 name: None,
             },
         ];
-        
+
         let req = test::TestRequest::post()
             .uri("/v1/chat/completions")
             .set_json(&chat_request)
             .to_request();
-        
+
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().as_u16() < 500 || resp.status().as_u16() >= 200);
     }
