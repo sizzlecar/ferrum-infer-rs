@@ -10,7 +10,7 @@ use crate::models::{
     GenerationConfig, GenerationResult, InferenceCache, Model, ModelInfo, ModelManager,
 };
 #[cfg(not(feature = "ml"))]
-use crate::models::{GenerationConfig, InferenceCache, MockModel, Model, ModelInfo, ModelManager};
+use crate::models::{GenerationConfig, MockModel, Model, ModelInfo};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -133,6 +133,19 @@ impl InferenceEngine {
             mock_model,
             stats,
         })
+    }
+
+    /// Create a new inference engine for testing (synchronous, no logging)
+    #[cfg(test)]
+    pub fn new_for_test(config: Config) -> Self {
+        let mock_model = Arc::new(MockModel::new());
+        let stats = Arc::new(RwLock::new(EngineStats::default()));
+
+        Self {
+            config,
+            mock_model,
+            stats,
+        }
     }
 
     /// Process an inference request

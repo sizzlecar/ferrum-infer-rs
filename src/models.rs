@@ -4,15 +4,12 @@
 //! supporting different model types and backends through a trait-based design.
 
 use crate::config::{Config, ModelConfig};
-use crate::error::{EngineError, Result};
+use crate::error::Result;
 #[cfg(feature = "ml")]
 use candle_core::{Device, Tensor};
 #[cfg(feature = "ml")]
 use candle_transformers::models::llama::{Cache, LlamaConfig};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
 #[cfg(feature = "ml")]
 use tokenizers::Tokenizer;
 
@@ -181,6 +178,7 @@ pub enum ModelFeature {
 
 /// Model manager for handling multiple models
 pub struct ModelManager {
+    #[allow(dead_code)]
     config: Config,
     #[cfg(feature = "ml")]
     models: RwLock<HashMap<String, Arc<dyn Model>>>,

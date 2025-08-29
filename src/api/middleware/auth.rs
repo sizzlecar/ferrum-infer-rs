@@ -5,7 +5,7 @@
 
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    Error, HttpResponse,
+    Error,
 };
 use futures_util::future::LocalBoxFuture;
 use std::{
@@ -46,6 +46,7 @@ where
 
 pub struct ApiKeyAuthMiddleware<S> {
     service: Rc<S>,
+    #[allow(dead_code)]
     api_key: Option<String>,
 }
 
@@ -101,6 +102,7 @@ fn _extract_api_key(req: &ServiceRequest) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::init_test_env;
     use actix_web::{test, web, App, HttpResponse};
 
     async fn dummy_handler() -> Result<HttpResponse, Error> {
@@ -109,6 +111,7 @@ mod tests {
 
     #[actix_web::test]
     async fn test_no_api_key_configured_allows_all_requests() {
+        init_test_env();
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(None))
@@ -123,6 +126,7 @@ mod tests {
 
     #[actix_web::test]
     async fn test_health_endpoints_bypass_auth() {
+        init_test_env();
         let app = test::init_service(
             App::new()
                 .wrap(ApiKeyAuth::new(Some("test-key".to_string())))

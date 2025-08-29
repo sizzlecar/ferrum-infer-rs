@@ -22,6 +22,9 @@ pub mod metrics;
 pub mod models;
 pub mod utils;
 
+#[cfg(test)]
+pub mod test_utils;
+
 // Re-export commonly used types
 pub use crate::config::Config;
 pub use crate::error::{EngineError, Result};
