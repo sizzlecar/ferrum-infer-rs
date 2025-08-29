@@ -8,7 +8,6 @@ use crate::error::{EngineError, Result};
 use crate::models::{CacheEntry, CacheStats, InferenceCache};
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// LRU (Least Recently Used) cache implementation
@@ -144,12 +143,12 @@ impl LRUCache {
 }
 
 impl InferenceCache for LRUCache {
-    fn get(&self, key: &str) -> Option<crate::inference::InferenceResponse> {
+    fn get(&self, _key: &str) -> Option<crate::inference::InferenceResponse> {
         // Simple mock implementation
         None
     }
 
-    fn put(&mut self, key: String, value: crate::inference::InferenceResponse) {
+    fn put(&mut self, _key: String, _value: crate::inference::InferenceResponse) {
         // Simple mock implementation
     }
 
@@ -166,7 +165,7 @@ impl InferenceCache for LRUCache {
         stats.total_requests += 1;
 
         let entries = self.entries.read();
-        if let Some(node) = entries.get(sequence_id) {
+        if let Some(_node) = entries.get(sequence_id) {
             stats.cache_hits += 1;
 
             // Update access order
@@ -194,7 +193,7 @@ impl InferenceCache for LRUCache {
             while stats.total_size_bytes + entry_size > max_size_bytes
                 && !self.entries.read().is_empty()
             {
-                if let Some(lru_key) = self.access_order.write().pop_front() {
+                if let Some(_lru_key) = self.access_order.write().pop_front() {
                     self.evict_if_needed(entry_size);
                     stats.evictions += 1;
                 } else {
@@ -277,12 +276,12 @@ impl LFUCache {
 }
 
 impl InferenceCache for LFUCache {
-    fn get(&self, key: &str) -> Option<crate::inference::InferenceResponse> {
+    fn get(&self, _key: &str) -> Option<crate::inference::InferenceResponse> {
         // Simple mock implementation
         None
     }
 
-    fn put(&mut self, key: String, value: crate::inference::InferenceResponse) {
+    fn put(&mut self, _key: String, _value: crate::inference::InferenceResponse) {
         // Simple mock implementation
     }
 
@@ -297,7 +296,7 @@ impl InferenceCache for LFUCache {
         stats.total_requests += 1;
 
         let entries = self.entries.read();
-        if let Some(node) = entries.get(sequence_id) {
+        if let Some(_node) = entries.get(sequence_id) {
             stats.cache_hits += 1;
 
             // Update frequency
@@ -403,12 +402,12 @@ impl FIFOCache {
 }
 
 impl InferenceCache for FIFOCache {
-    fn get(&self, key: &str) -> Option<crate::inference::InferenceResponse> {
+    fn get(&self, _key: &str) -> Option<crate::inference::InferenceResponse> {
         // Simple mock implementation
         None
     }
 
-    fn put(&mut self, key: String, value: crate::inference::InferenceResponse) {
+    fn put(&mut self, _key: String, _value: crate::inference::InferenceResponse) {
         // Simple mock implementation
     }
 
@@ -423,9 +422,9 @@ impl InferenceCache for FIFOCache {
         stats.total_requests += 1;
 
         let entries = self.entries.read();
-        if let Some(node) = entries.get(sequence_id) {
+        if let Some(_node) = entries.get(sequence_id) {
             stats.cache_hits += 1;
-            let mut node = node.clone();
+            let mut node = _node.clone();
             node.entry.touch();
             Some(node.entry)
         } else {
