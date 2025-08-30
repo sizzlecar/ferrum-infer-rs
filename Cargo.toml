@@ -4,15 +4,13 @@ members = [
     "crates/ferrum-engine",
     "crates/ferrum-models",
     "crates/ferrum-cache",
+    "crates/ferrum-runtime",
+    "crates/ferrum-scheduler",
+    "crates/ferrum-server",
+    "crates/ferrum-cli",
 ]
 resolver = "2"
 
-# Note: Additional crates will be added as they are implemented:
-# - ferrum-cache: Cache management with PagedAttention
-# - ferrum-scheduler: Request scheduling and batching
-# - ferrum-server: HTTP API server (using Axum)
-# - ferrum-models: Model implementations with Candle
-# - ferrum-runtime: Execution runtime and GPU operations
 
 [workspace.package]
 version = "0.2.0"
@@ -59,6 +57,32 @@ axum-extra = { version = "0.9", features = ["typed-header"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace", "compression"] }
 hyper = "1.0"
+http = "1.0"
+http-body = "1.0"
+mime = "0.3"
+
+# Authentication
+jsonwebtoken = "9.2"
+base64 = "0.22"
+
+# CLI utilities
+clap = "4.4"
+console = "0.15"
+indicatif = "0.17"
+dialoguer = "0.11"
+colored = "2.1"
+walkdir = "2.4"
+serde_yaml = "0.9"
+
+# HTTP client
+reqwest = "0.12"
+
+# Benchmarking
+criterion = "0.5"
+
+# System utilities
+num_cpus = "1.16"
+dirs = "5.0"
 
 # Stream processing
 futures = "0.3"
@@ -77,10 +101,15 @@ safetensors = "0.4"
 ndarray = "0.15"
 half = "2.4"
 
-# Internal crates (to be added as they are implemented)
+# Internal crates
 ferrum-core = { path = "crates/ferrum-core" }
 ferrum-engine = { path = "crates/ferrum-engine" }
 ferrum-models = { path = "crates/ferrum-models" }
+ferrum-cache = { path = "crates/ferrum-cache" }
+ferrum-runtime = { path = "crates/ferrum-runtime" }
+ferrum-scheduler = { path = "crates/ferrum-scheduler" }
+ferrum-server = { path = "crates/ferrum-server" }
+ferrum-cli = { path = "crates/ferrum-cli" }
 
 [profile.release]
 opt-level = 3

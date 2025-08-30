@@ -99,7 +99,7 @@ impl Default for SamplingParams {
 }
 
 /// Request priority levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Priority {
     Low = 0,
     Normal = 1,
@@ -177,7 +177,7 @@ pub enum DataType {
 }
 
 /// Device type for computation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Device {
     CPU,
     CUDA(usize),
