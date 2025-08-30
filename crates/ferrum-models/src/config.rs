@@ -3,11 +3,11 @@
 //! This module provides utilities for loading and managing model configurations
 //! from various sources without depending on specific ML frameworks.
 
-use crate::traits::{AbstractModelConfig, Architecture, NormType, Activation, AttentionConfig};
-use ferrum_core::{Result, Error};
+use crate::traits::{AbstractModelConfig, Activation, Architecture, AttentionConfig, NormType};
+use ferrum_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Configuration manager for models
 pub struct ConfigManager {
@@ -22,33 +22,34 @@ impl ConfigManager {
             configs: HashMap::new(),
         }
     }
-    
+
     /// Load configuration from file
     pub async fn load_from_file(&mut self, path: &Path) -> Result<AbstractModelConfig> {
-        let content = tokio::fs::read_to_string(path)
-            .await?;
-            
+        let content = tokio::fs::read_to_string(path).await?;
+
         let config: RawConfig = serde_json::from_str(&content)
             .map_err(|e| Error::configuration(format!("Failed to parse config: {}", e)))?;
-            
+
         self.convert_to_abstract(config)
     }
-    
+
     /// Load configuration from HuggingFace model ID
     pub async fn load_from_huggingface(&mut self, _model_id: &str) -> Result<AbstractModelConfig> {
         // This would use the HuggingFace API to fetch config.json
         // For now, return a placeholder
-        Err(Error::unsupported("HuggingFace loading not yet implemented"))
+        Err(Error::unsupported(
+            "HuggingFace loading not yet implemented",
+        ))
     }
-    
+
     /// Convert raw config to abstract config
     fn convert_to_abstract(&self, raw: RawConfig) -> Result<AbstractModelConfig> {
         let architecture = self.detect_architecture(&raw)?;
         let norm_type = self.detect_norm_type(&raw);
         let activation = self.detect_activation(&raw);
-        let extra_params = serde_json::to_value(&raw)
-            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-        
+        let extra_params =
+            serde_json::to_value(&raw).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
         Ok(AbstractModelConfig {
             architecture,
             hidden_size: raw.hidden_size.unwrap_or(4096),
@@ -75,7 +76,7 @@ impl ConfigManager {
             extra_params,
         })
     }
-    
+
     /// Detect architecture from raw config
     fn detect_architecture(&self, raw: &RawConfig) -> Result<Architecture> {
         if let Some(arch) = &raw.architectures {
@@ -83,18 +84,18 @@ impl ConfigManager {
                 return self.parse_architecture(&arch[0]);
             }
         }
-        
+
         if let Some(model_type) = &raw.model_type {
             return self.parse_architecture(model_type);
         }
-        
+
         Err(Error::configuration("Cannot detect model architecture"))
     }
-    
+
     /// Parse architecture string
     fn parse_architecture(&self, arch_str: &str) -> Result<Architecture> {
         let arch_lower = arch_str.to_lowercase();
-        
+
         if arch_lower.contains("llama") {
             if arch_lower.contains("3") {
                 Ok(Architecture::Llama3)
@@ -119,7 +120,7 @@ impl ConfigManager {
             Ok(Architecture::Custom(arch_str.to_string()))
         }
     }
-    
+
     /// Detect normalization type
     fn detect_norm_type(&self, raw: &RawConfig) -> NormType {
         if raw.rms_norm_eps.is_some() {
@@ -128,7 +129,7 @@ impl ConfigManager {
             NormType::LayerNorm
         }
     }
-    
+
     /// Detect activation function
     fn detect_activation(&self, raw: &RawConfig) -> Activation {
         if let Some(act) = &raw.hidden_act {
@@ -164,7 +165,7 @@ struct RawConfig {
     hidden_act: Option<String>,
     attention_bias: Option<bool>,
     sliding_window: Option<usize>,
-    
+
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
 }
@@ -185,16 +186,16 @@ impl Default for ConfigManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_architecture_detection() {
         let manager = ConfigManager::new();
-        
+
         assert!(matches!(
             manager.parse_architecture("LlamaForCausalLM").unwrap(),
             Architecture::Llama
         ));
-        
+
         assert!(matches!(
             manager.parse_architecture("MistralForCausalLM").unwrap(),
             Architecture::Mistral

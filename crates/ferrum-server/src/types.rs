@@ -2,37 +2,37 @@
 //!
 //! This module defines the core types used throughout the server system.
 
-use ferrum_core::{RequestId, ModelId};
-use crate::middleware::{AuthConfig, CorsConfig, CompressionConfig};
+use crate::middleware::{AuthConfig, CompressionConfig, CorsConfig};
+use chrono::{DateTime, Utc};
+use ferrum_core::{ModelId, RequestId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use chrono::{DateTime, Utc};
 
 /// HTTP request representation
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
     /// HTTP method
     pub method: HttpMethod,
-    
+
     /// Request path
     pub path: String,
-    
+
     /// Query parameters
     pub query: HashMap<String, String>,
-    
+
     /// Request headers
     pub headers: Headers,
-    
+
     /// Request body
     pub body: Vec<u8>,
-    
+
     /// Client IP address
     pub client_ip: Option<std::net::IpAddr>,
-    
+
     /// Request timestamp
     pub timestamp: DateTime<Utc>,
-    
+
     /// Request ID for tracking
     pub request_id: RequestId,
 }
@@ -42,13 +42,13 @@ pub struct HttpRequest {
 pub struct HttpResponse {
     /// Status code
     pub status: StatusCode,
-    
+
     /// Response headers
     pub headers: Headers,
-    
+
     /// Response body
     pub body: Vec<u8>,
-    
+
     /// Content type
     pub content_type: String,
 }
@@ -91,16 +91,16 @@ pub type Headers = HashMap<String, String>;
 pub struct RequestContext {
     /// Client information
     pub client_info: Option<ClientInfo>,
-    
+
     /// Authentication result
     pub auth_result: Option<AuthResult>,
-    
+
     /// Request start time
     pub start_time: Instant,
-    
+
     /// Custom context data
     pub data: HashMap<String, serde_json::Value>,
-    
+
     /// Request tracing ID
     pub trace_id: String,
 }
@@ -122,37 +122,37 @@ impl Default for RequestContext {
 pub struct ServerConfig {
     /// Server host
     pub host: String,
-    
+
     /// Server port
     pub port: u16,
-    
+
     /// Maximum concurrent connections
     pub max_connections: usize,
-    
+
     /// Request timeout
     pub request_timeout: Duration,
-    
+
     /// Keep-alive timeout
     pub keep_alive_timeout: Duration,
-    
+
     /// Enable TLS
     pub enable_tls: bool,
-    
+
     /// TLS certificate path
     pub tls_cert_path: Option<String>,
-    
+
     /// TLS private key path
     pub tls_key_path: Option<String>,
-    
+
     /// CORS configuration
     pub cors: Option<CorsConfig>,
-    
+
     /// Compression configuration
     pub compression: Option<CompressionConfig>,
-    
+
     /// Authentication configuration
     pub auth: Option<AuthConfig>,
-    
+
     /// API versioning
     pub api_version: ApiVersion,
 }
@@ -169,34 +169,34 @@ pub enum ApiVersion {
 pub struct ServerMetrics {
     /// Total requests handled
     pub total_requests: u64,
-    
+
     /// Requests by endpoint
     pub requests_by_endpoint: HashMap<String, u64>,
-    
+
     /// Requests by status code
     pub requests_by_status: HashMap<u16, u64>,
-    
+
     /// Average response time in milliseconds
     pub avg_response_time_ms: f64,
-    
+
     /// 95th percentile response time
     pub p95_response_time_ms: f64,
-    
+
     /// 99th percentile response time
     pub p99_response_time_ms: f64,
-    
+
     /// Current active connections
     pub active_connections: usize,
-    
+
     /// Total bytes sent
     pub bytes_sent: u64,
-    
+
     /// Total bytes received
     pub bytes_received: u64,
-    
+
     /// Error rate (0.0 - 1.0)
     pub error_rate: f32,
-    
+
     /// Uptime in seconds
     pub uptime_seconds: u64,
 }
@@ -309,16 +309,16 @@ pub struct RateLimitResetTimes {
 pub struct ValidationRules {
     /// Maximum prompt length
     pub max_prompt_length: usize,
-    
+
     /// Maximum completion tokens
     pub max_completion_tokens: usize,
-    
+
     /// Allowed models
     pub allowed_models: Option<Vec<String>>,
-    
+
     /// Required parameters
     pub required_params: Vec<String>,
-    
+
     /// Parameter constraints
     pub param_constraints: HashMap<String, ParameterConstraint>,
 }
@@ -337,13 +337,13 @@ pub enum ParameterConstraint {
 pub struct HealthCheckConfig {
     /// Health check interval
     pub interval: Duration,
-    
+
     /// Components to check
     pub components: Vec<String>,
-    
+
     /// Timeout for health checks
     pub timeout: Duration,
-    
+
     /// Number of retries
     pub retries: u32,
 }
@@ -353,16 +353,16 @@ pub struct HealthCheckConfig {
 pub struct StreamConfig {
     /// Chunk size for streaming
     pub chunk_size: usize,
-    
+
     /// Buffer size
     pub buffer_size: usize,
-    
+
     /// Flush interval
     pub flush_interval: Duration,
-    
+
     /// Enable compression
     pub enable_compression: bool,
-    
+
     /// Stream timeout
     pub timeout: Duration,
 }

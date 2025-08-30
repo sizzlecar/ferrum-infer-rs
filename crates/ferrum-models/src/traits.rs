@@ -4,7 +4,7 @@
 //! without depending on any specific ML framework implementation.
 
 use async_trait::async_trait;
-use ferrum_core::{Result, ModelConfig};
+use ferrum_core::{ModelConfig, Result};
 use serde::{Deserialize, Serialize};
 
 /// Model architecture types
@@ -27,7 +27,7 @@ pub enum Architecture {
 pub struct AbstractModelConfig {
     /// Model architecture
     pub architecture: Architecture,
-    
+
     /// Model size parameters
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -35,22 +35,22 @@ pub struct AbstractModelConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: Option<usize>,
-    
+
     /// Positional encoding
     pub max_position_embeddings: usize,
     pub rope_theta: Option<f32>,
     pub rope_scaling: Option<RopeScaling>,
-    
+
     /// Normalization
     pub norm_type: NormType,
     pub norm_eps: f64,
-    
+
     /// Attention configuration
     pub attention_config: AttentionConfig,
-    
+
     /// Activation function
     pub activation: Activation,
-    
+
     /// Additional architecture-specific parameters
     pub extra_params: serde_json::Value,
 }
@@ -96,14 +96,14 @@ pub trait ModelBuilder: Send + Sync {
         config: &AbstractModelConfig,
         model_config: &ModelConfig,
     ) -> Result<Box<dyn ferrum_core::Model>>;
-    
+
     /// Load model weights
     async fn load_weights(
         &self,
         model: &mut dyn ferrum_core::Model,
         weights_path: &str,
     ) -> Result<()>;
-    
+
     /// Get supported architectures
     fn supported_architectures(&self) -> Vec<Architecture>;
 }
@@ -112,10 +112,10 @@ pub trait ModelBuilder: Send + Sync {
 pub trait ModelRegistry: Send + Sync {
     /// Register a model builder
     fn register_builder(&mut self, builder: Box<dyn ModelBuilder>);
-    
+
     /// Get builder for architecture
     fn get_builder(&self, architecture: &Architecture) -> Option<&dyn ModelBuilder>;
-    
+
     /// List all supported architectures
     fn supported_architectures(&self) -> Vec<Architecture>;
 }
@@ -125,13 +125,13 @@ pub trait ModelRegistry: Send + Sync {
 pub trait Tokenizer: Send + Sync {
     /// Encode text to token IDs
     fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>>;
-    
+
     /// Decode token IDs to text
     fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String>;
-    
+
     /// Get vocabulary size
     fn vocab_size(&self) -> usize;
-    
+
     /// Get special tokens
     fn special_tokens(&self) -> &SpecialTokens;
 }
@@ -154,10 +154,10 @@ pub trait ModelConverter: Send + Sync {
         model_id: &str,
         revision: Option<&str>,
     ) -> Result<AbstractModelConfig>;
-    
+
     /// Convert from GGUF format
     async fn from_gguf(&self, path: &str) -> Result<AbstractModelConfig>;
-    
+
     /// Convert from SafeTensors format
     async fn from_safetensors(&self, path: &str) -> Result<AbstractModelConfig>;
 }

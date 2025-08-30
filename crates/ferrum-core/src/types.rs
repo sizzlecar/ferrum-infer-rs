@@ -1,9 +1,9 @@
 //! Core type definitions for the Ferrum inference framework
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 // ==================== Basic ID Types ====================
 

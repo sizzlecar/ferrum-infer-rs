@@ -1,14 +1,14 @@
 //! # Ferrum Scheduler
-//! 
+//!
 //! Request scheduling and batching abstractions for LLM inference.
-//! 
+//!
 //! ## Overview
-//! 
+//!
 //! This module defines the core traits for implementing various scheduling strategies
 //! and batching algorithms to optimize throughput and latency in LLM inference.
-//! 
+//!
 //! ## Design Principles
-//! 
+//!
 //! - **Strategy Pattern**: Multiple scheduling algorithms (FIFO, Priority, Fair, etc.)
 //! - **Continuous Batching**: Dynamic request batching for optimal GPU utilization
 //! - **Preemption Support**: Ability to preempt long-running requests
@@ -20,11 +20,11 @@ pub mod types;
 
 // Re-exports
 pub use traits::{
-    Scheduler, BatchScheduler, RequestQueue, LoadBalancer,
-    PreemptionManager, SlaManager, ResourceAwareScheduler
+    BatchScheduler, LoadBalancer, PreemptionManager, RequestQueue, ResourceAwareScheduler,
+    Scheduler, SlaManager,
 };
 
 pub use types::{
-    SchedulingPolicy, BatchingStrategy, PreemptionPolicy,
-    SlaConfig, QueueConfig, SchedulerMetrics, BatchRequest
+    BatchRequest, BatchingStrategy, PreemptionPolicy, QueueConfig, SchedulerMetrics,
+    SchedulingPolicy, SlaConfig,
 };

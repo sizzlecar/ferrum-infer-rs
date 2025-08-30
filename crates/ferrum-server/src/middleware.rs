@@ -11,22 +11,22 @@ use std::time::Duration;
 pub struct MiddlewareConfig {
     /// Authentication middleware
     pub auth: Option<AuthConfig>,
-    
+
     /// CORS middleware
     pub cors: Option<CorsConfig>,
-    
+
     /// Logging middleware
     pub logging: Option<LoggingConfig>,
-    
+
     /// Compression middleware
     pub compression: Option<CompressionConfig>,
-    
+
     /// Rate limiting middleware
     pub rate_limit: Option<RateLimitConfig>,
-    
+
     /// Timeout middleware
     pub timeout: Option<TimeoutConfig>,
-    
+
     /// Custom middleware configurations
     pub custom: HashMap<String, serde_json::Value>,
 }
@@ -36,25 +36,25 @@ pub struct MiddlewareConfig {
 pub struct AuthConfig {
     /// Enable authentication
     pub enabled: bool,
-    
+
     /// JWT secret key
     pub jwt_secret: Option<String>,
-    
+
     /// JWT issuer
     pub jwt_issuer: Option<String>,
-    
+
     /// JWT audience
     pub jwt_audience: Option<String>,
-    
+
     /// Token expiration time
     pub token_expiration: Duration,
-    
+
     /// API key validation endpoint
     pub api_key_endpoint: Option<String>,
-    
+
     /// Default permissions
     pub default_permissions: Vec<String>,
-    
+
     /// Admin API keys
     pub admin_keys: Vec<String>,
 }
@@ -64,22 +64,22 @@ pub struct AuthConfig {
 pub struct CorsConfig {
     /// Enable CORS
     pub enabled: bool,
-    
+
     /// Allowed origins
     pub allowed_origins: Vec<String>,
-    
+
     /// Allowed methods
     pub allowed_methods: Vec<String>,
-    
+
     /// Allowed headers
     pub allowed_headers: Vec<String>,
-    
+
     /// Exposed headers
     pub exposed_headers: Vec<String>,
-    
+
     /// Allow credentials
     pub allow_credentials: bool,
-    
+
     /// Max age for preflight requests
     pub max_age: Duration,
 }
@@ -89,22 +89,22 @@ pub struct CorsConfig {
 pub struct LoggingConfig {
     /// Enable request logging
     pub enabled: bool,
-    
+
     /// Log level
     pub level: LogLevel,
-    
+
     /// Include request body
     pub include_body: bool,
-    
+
     /// Include response body
     pub include_response: bool,
-    
+
     /// Include headers
     pub include_headers: bool,
-    
+
     /// Exclude paths from logging
     pub exclude_paths: Vec<String>,
-    
+
     /// Log format
     pub format: LogFormat,
 }
@@ -133,16 +133,16 @@ pub enum LogFormat {
 pub struct CompressionConfig {
     /// Enable compression
     pub enabled: bool,
-    
+
     /// Compression algorithms
     pub algorithms: Vec<CompressionAlgorithm>,
-    
+
     /// Minimum response size to compress
     pub min_size: usize,
-    
+
     /// Compression level (0-9)
     pub level: u32,
-    
+
     /// Content types to compress
     pub content_types: Vec<String>,
 }
@@ -161,16 +161,16 @@ pub enum CompressionAlgorithm {
 pub struct RateLimitConfig {
     /// Enable rate limiting
     pub enabled: bool,
-    
+
     /// Default rate limits
     pub default_limits: RateLimits,
-    
+
     /// Per-client rate limits
     pub client_limits: HashMap<String, RateLimits>,
-    
+
     /// Rate limit storage backend
     pub storage: RateLimitStorage,
-    
+
     /// Rate limit headers
     pub include_headers: bool,
 }
@@ -180,16 +180,16 @@ pub struct RateLimitConfig {
 pub struct RateLimits {
     /// Requests per minute
     pub requests_per_minute: u32,
-    
+
     /// Requests per hour
     pub requests_per_hour: u32,
-    
+
     /// Tokens per minute
     pub tokens_per_minute: u32,
-    
+
     /// Tokens per hour
     pub tokens_per_hour: u32,
-    
+
     /// Concurrent requests
     pub concurrent_requests: u32,
 }
@@ -207,16 +207,16 @@ pub enum RateLimitStorage {
 pub struct TimeoutConfig {
     /// Enable timeout middleware
     pub enabled: bool,
-    
+
     /// Request timeout
     pub request_timeout: Duration,
-    
+
     /// Keep-alive timeout
     pub keep_alive_timeout: Duration,
-    
+
     /// Read timeout
     pub read_timeout: Duration,
-    
+
     /// Write timeout
     pub write_timeout: Duration,
 }
@@ -241,11 +241,7 @@ impl Default for CorsConfig {
         Self {
             enabled: true,
             allowed_origins: vec!["*".to_string()],
-            allowed_methods: vec![
-                "GET".to_string(),
-                "POST".to_string(),
-                "OPTIONS".to_string(),
-            ],
+            allowed_methods: vec!["GET".to_string(), "POST".to_string(), "OPTIONS".to_string()],
             allowed_headers: vec![
                 "Content-Type".to_string(),
                 "Authorization".to_string(),
@@ -276,10 +272,7 @@ impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            algorithms: vec![
-                CompressionAlgorithm::Gzip,
-                CompressionAlgorithm::Deflate,
-            ],
+            algorithms: vec![CompressionAlgorithm::Gzip, CompressionAlgorithm::Deflate],
             min_size: 1024,
             level: 6,
             content_types: vec![

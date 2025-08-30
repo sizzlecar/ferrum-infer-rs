@@ -32,9 +32,23 @@ chrono = { workspace = true }
 # Metrics
 metrics = { workspace = true }
 
+# ML Framework - Candle
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+hf-hub = { workspace = true }
+tokenizers = { workspace = true }
+safetensors = { workspace = true }
+
+# Random support
+rand = { workspace = true }
+rand_distr = { workspace = true }
+half = { workspace = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"
 
 [features]
 default = []
+cuda = ["candle-core/cuda"]

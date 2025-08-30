@@ -89,17 +89,24 @@ futures = "0.3"
 futures-util = "0.3"
 async-stream = "0.3"
 
-# ML Framework - Candle
-candle-core = "0.7"
-candle-nn = "0.7"
-candle-transformers = "0.7"
+# ML Framework - Mock for MVP (Candle to be added later)
+## candle-core = { version = "0.6", default-features = false }
 hf-hub = { version = "0.3", features = ["tokio"] }
 tokenizers = { version = "0.19", features = ["onig"] }
 safetensors = "0.4"
 
+# Random - 使用与candle-vllm相同的版本
+rand = "0.9.0"
+rand_distr = "0.4.3"
+
 # Tensor operations
 ndarray = "0.15"
-half = "2.4"
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+
+# ML Framework - 使用与candle-vllm相同的git版本
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
+candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
 
 # Internal crates
 ferrum-core = { path = "crates/ferrum-core" }
@@ -119,4 +126,6 @@ strip = true
 
 [profile.bench]
 inherits = "release"
+
+
 

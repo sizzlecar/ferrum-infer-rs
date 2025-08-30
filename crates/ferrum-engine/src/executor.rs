@@ -5,25 +5,25 @@
 
 use async_trait::async_trait;
 use ferrum_core::{
-    Executor, ExecutionTask, ExecutionResult, ExecutorCapabilities,
-    ExecutorStatus, ExecutorState, Result, TaskType, Backend,
+    Backend, ExecutionResult, ExecutionTask, Executor, ExecutorCapabilities, ExecutorState,
+    ExecutorStatus, Result, TaskType,
 };
-use std::sync::Arc;
 use parking_lot::RwLock;
-use tracing::{info, debug};
+use std::sync::Arc;
+use tracing::{debug, info};
 
 /// Executor configuration
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     /// Maximum batch size
     pub max_batch_size: usize,
-    
+
     /// Enable Flash Attention
     pub enable_flash_attention: bool,
-    
+
     /// Enable Paged Attention
     pub enable_paged_attention: bool,
-    
+
     /// Device configuration
     pub device_config: DeviceConfig,
 }
@@ -33,7 +33,7 @@ pub struct ExecutorConfig {
 pub struct DeviceConfig {
     /// Device type (CPU, CUDA, etc.)
     pub device_type: String,
-    
+
     /// Device ID (for multi-GPU)
     pub device_id: usize,
 }
@@ -62,8 +62,11 @@ pub struct GenericExecutor {
 impl GenericExecutor {
     /// Create a new executor with the given backend
     pub fn new(config: ExecutorConfig, backend: Arc<dyn Backend>) -> Self {
-        info!("Initializing GenericExecutor with backend: {}", backend.name());
-        
+        info!(
+            "Initializing GenericExecutor with backend: {}",
+            backend.name()
+        );
+
         let state = ExecutorState {
             status: ExecutorStatus::Idle,
             is_ready: true,
@@ -72,14 +75,14 @@ impl GenericExecutor {
             completed_tasks: 0,
             failed_tasks: 0,
         };
-        
+
         Self {
             config,
             backend,
             state: Arc::new(RwLock::new(state)),
         }
     }
-    
+
     /// Get the backend
     pub fn backend(&self) -> &Arc<dyn Backend> {
         &self.backend
@@ -90,14 +93,14 @@ impl GenericExecutor {
 impl Executor for GenericExecutor {
     async fn execute(&self, task: ExecutionTask) -> Result<ExecutionResult> {
         debug!("Executing task: {:?}", task.task_id);
-        
+
         // Update state
         {
             let mut state = self.state.write();
             state.current_batch_size = task.batch_size;
             state.status = ExecutorStatus::Running;
         }
-        
+
         // Delegate to backend for actual execution
         match task.task_type {
             TaskType::Prefill | TaskType::Decode | TaskType::ModelForward => {
@@ -107,13 +110,13 @@ impl Executor for GenericExecutor {
                     output: task.input.clone(), // Placeholder - backend would transform
                     execution_time_ms: 0,
                 };
-                
+
                 // Update state
                 {
                     let mut state = self.state.write();
                     state.completed_tasks += 1;
                 }
-                
+
                 Ok(result)
             }
             TaskType::Sampling => {
@@ -123,7 +126,7 @@ impl Executor for GenericExecutor {
                     output: task.input.clone(), // Placeholder
                     execution_time_ms: 0,
                 };
-                
+
                 Ok(result)
             }
             TaskType::Preprocessing => {
@@ -133,7 +136,7 @@ impl Executor for GenericExecutor {
                     output: task.input.clone(), // Placeholder
                     execution_time_ms: 0,
                 };
-                
+
                 Ok(result)
             }
             TaskType::Postprocessing => {
@@ -143,20 +146,22 @@ impl Executor for GenericExecutor {
                     output: task.input.clone(), // Placeholder
                     execution_time_ms: 0,
                 };
-                
+
                 Ok(result)
             }
         }
     }
-    
+
     fn capabilities(&self) -> ExecutorCapabilities {
         let backend_caps = self.backend.capabilities();
-        
+
         ExecutorCapabilities {
             max_batch_size: backend_caps.max_batch_size.min(self.config.max_batch_size),
             max_sequence_length: backend_caps.max_sequence_length,
-            supports_flash_attention: backend_caps.supports_flash_attention && self.config.enable_flash_attention,
-            supports_paged_attention: backend_caps.supports_paged_attention && self.config.enable_paged_attention,
+            supports_flash_attention: backend_caps.supports_flash_attention
+                && self.config.enable_flash_attention,
+            supports_paged_attention: backend_caps.supports_paged_attention
+                && self.config.enable_paged_attention,
             supports_continuous_batching: true, // Always supported
             supports_tensor_parallelism: backend_caps.supports_tensor_parallelism,
             supports_pipeline_parallelism: false, // Not yet implemented
@@ -167,7 +172,7 @@ impl Executor for GenericExecutor {
             ],
         }
     }
-    
+
     fn status(&self) -> ExecutorStatus {
         self.state.read().status
     }
@@ -176,6 +181,6 @@ impl Executor for GenericExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // Tests would use a mock backend
 }
