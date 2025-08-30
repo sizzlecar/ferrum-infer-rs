@@ -134,4 +134,24 @@ impl Error {
     pub fn internal<S: Into<String>>(msg: S) -> Self {
         Error::Internal(msg.into())
     }
+    
+    /// Create an IO error from string
+    pub fn io_str<S: Into<String>>(msg: S) -> Self {
+        Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg.into()))
+    }
+    
+    /// Create a serialization error
+    pub fn serialization<S: Into<String>>(msg: S) -> Self {
+        Error::Internal(format!("Serialization error: {}", msg.into()))
+    }
+    
+    /// Create a deserialization error
+    pub fn deserialization<S: Into<String>>(msg: S) -> Self {
+        Error::Internal(format!("Deserialization error: {}", msg.into()))
+    }
+    
+    /// Create a network error
+    pub fn network<S: Into<String>>(msg: S) -> Self {
+        Error::Internal(format!("Network error: {}", msg.into()))
+    }
 }

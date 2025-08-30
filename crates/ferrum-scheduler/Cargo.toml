@@ -1,0 +1,49 @@
+[package]
+name = "ferrum-scheduler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Core dependencies
+ferrum-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+
+# Data structures
+dashmap = "6.1"
+indexmap = "2.2"
+priority-queue = "2.1"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging and metrics
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+# Time and scheduling
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Async utilities
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+pin-project = "1.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = "0.5"
+
+[features]
+default = []
+metrics = []    # Enable detailed metrics collection
+fairness = []   # Enable fairness algorithms
