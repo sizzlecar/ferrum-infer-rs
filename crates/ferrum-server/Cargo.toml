@@ -1,0 +1,56 @@
+[package]
+name = "ferrum-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Core dependencies
+ferrum-core = { workspace = true }
+ferrum-engine = { workspace = true }
+ferrum-scheduler = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+pin-project = "1.1"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# HTTP abstractions
+http = "1.0"
+http-body = "1.0"
+mime = "0.3"
+
+# Logging and metrics
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+# Authentication and security
+jsonwebtoken = "9.2"
+base64 = "0.22"
+
+# Time handling
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+hyper = "1.0"
+
+[features]
+default = []
+openai-compat = []  # Enable OpenAI API compatibility
+auth = []           # Enable authentication middleware
+cors = []           # Enable CORS support
+compression = []    # Enable response compression
+rate-limiting = []  # Enable rate limiting middleware
