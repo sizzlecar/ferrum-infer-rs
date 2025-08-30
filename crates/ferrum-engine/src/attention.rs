@@ -6,7 +6,7 @@
 use ferrum_core::{Result, Tensor};
 
 /// PagedAttention implementation
-/// 
+///
 /// This implements the PagedAttention algorithm for efficient KV cache management
 /// as described in the vLLM paper.
 pub struct PagedAttention {
@@ -24,9 +24,9 @@ impl PagedAttention {
             head_dim,
         }
     }
-    
+
     /// Compute paged attention
-    /// 
+    ///
     /// # Arguments
     /// * `query` - Query tensor of shape [batch, seq_len, hidden_dim]
     /// * `key_cache` - Key cache blocks
@@ -42,21 +42,21 @@ impl PagedAttention {
         // This is an abstract implementation
         // The actual computation will be delegated to the backend
         // through the Backend trait when needed
-        
+
         // For now, return a placeholder
         Ok(query.clone())
     }
-    
+
     /// Get block size
     pub fn block_size(&self) -> usize {
         self.block_size
     }
-    
+
     /// Get number of heads
     pub fn num_heads(&self) -> usize {
         self.num_heads
     }
-    
+
     /// Get head dimension
     pub fn head_dim(&self) -> usize {
         self.head_dim
@@ -64,7 +64,7 @@ impl PagedAttention {
 }
 
 /// FlashAttention implementation (if supported by backend)
-/// 
+///
 /// This provides an interface for FlashAttention, which uses
 /// optimized CUDA kernels for efficient attention computation.
 pub struct FlashAttention {
@@ -80,9 +80,9 @@ impl FlashAttention {
             head_dim,
         }
     }
-    
+
     /// Compute flash attention
-    /// 
+    ///
     /// # Arguments
     /// * `query` - Query tensor
     /// * `key` - Key tensor
@@ -97,11 +97,11 @@ impl FlashAttention {
     ) -> Result<Tensor> {
         // This is an abstract implementation
         // The actual computation will be delegated to the backend
-        
+
         // For now, return a placeholder
         Ok(query.clone())
     }
-    
+
     /// Check if FlashAttention is available
     /// This would query the backend for support
     pub fn is_available() -> bool {
@@ -115,16 +115,16 @@ impl FlashAttention {
 pub struct AttentionConfig {
     /// Use PagedAttention
     pub use_paged_attention: bool,
-    
+
     /// Use FlashAttention if available
     pub use_flash_attention: bool,
-    
+
     /// Block size for PagedAttention
     pub block_size: usize,
-    
+
     /// Number of attention heads
     pub num_heads: usize,
-    
+
     /// Dimension of each attention head
     pub head_dim: usize,
 }

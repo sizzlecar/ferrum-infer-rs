@@ -2,28 +2,27 @@
 
 use async_trait::async_trait;
 use ferrum_core::{
-    Scheduler, InferenceRequest, RequestId, InferenceResponse,
-    ScheduledBatch, SchedulerStats, Result, Error,
-    RequestState, ScheduledRequest,
+    Error, InferenceRequest, InferenceResponse, RequestId, RequestState, Result, ScheduledBatch,
+    ScheduledRequest, Scheduler, SchedulerStats,
 };
-use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::cmp::Ordering;
-use std::sync::Arc;
 use parking_lot::RwLock;
-use tracing::{info, debug, warn};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 /// Scheduler configuration
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     /// Maximum number of waiting requests
     pub max_waiting_requests: usize,
-    
+
     /// Maximum number of running requests
     pub max_running_requests: usize,
-    
+
     /// Enable preemption
     pub enable_preemption: bool,
-    
+
     /// Scheduling policy
     pub policy: SchedulingPolicy,
 }
@@ -78,7 +77,10 @@ impl PartialEq for PrioritizedRequest {
 impl Ord for PrioritizedRequest {
     fn cmp(&self, other: &Self) -> Ordering {
         // Higher priority first, then earlier arrival time
-        other.request.priority.cmp(&self.request.priority)
+        other
+            .request
+            .priority
+            .cmp(&self.request.priority)
             .then_with(|| self.arrival_time.cmp(&other.arrival_time))
     }
 }
@@ -102,8 +104,11 @@ struct SchedulerStatsInternal {
 impl FairScheduler {
     /// Create a new fair scheduler
     pub fn new(config: SchedulerConfig) -> Self {
-        info!("Initializing FairScheduler with policy: {:?}", config.policy);
-        
+        info!(
+            "Initializing FairScheduler with policy: {:?}",
+            config.policy
+        );
+
         Self {
             config,
             waiting_queue: Arc::new(RwLock::new(BinaryHeap::new())),
@@ -120,13 +125,13 @@ impl FairScheduler {
             })),
         }
     }
-    
+
     /// Check if we can schedule more requests
     fn can_schedule_more(&self) -> bool {
         let running = self.running_requests.read().len();
         running < self.config.max_running_requests
     }
-    
+
     /// Select next request to schedule based on policy
     fn select_next_request(&self) -> Option<InferenceRequest> {
         // First check preempted requests (they have priority)
@@ -134,36 +139,39 @@ impl FairScheduler {
             debug!("Resuming preempted request {:?}", preempted.request.id);
             return Some(preempted.request);
         }
-        
+
         // Then check waiting queue
         let mut queue = self.waiting_queue.write();
         if let Some(prioritized) = queue.pop() {
             return Some(prioritized.request);
         }
-        
+
         None
     }
-    
+
     /// Preempt lower priority requests if needed
     fn preempt_if_needed(&self, new_request: &InferenceRequest) -> Result<()> {
         if !self.config.enable_preemption {
             return Ok(());
         }
-        
+
         let running = self.running_requests.read();
-        
+
         // Find lowest priority running request
-        let lowest_priority = running.values()
+        let lowest_priority = running
+            .values()
             .filter(|r| r.request.priority < new_request.priority)
             .min_by_key(|r| r.request.priority);
-        
+
         if let Some(to_preempt) = lowest_priority {
             let request_id = to_preempt.request.id.clone();
             drop(running);
-            
-            warn!("Preempting request {:?} for higher priority request {:?}", 
-                  request_id, new_request.id);
-            
+
+            warn!(
+                "Preempting request {:?} for higher priority request {:?}",
+                request_id, new_request.id
+            );
+
             // Move to preempted queue
             let mut running = self.running_requests.write();
             if let Some(preempted) = running.remove(&request_id) {
@@ -171,7 +179,7 @@ impl FairScheduler {
                 self.stats.write().total_preempted += 1;
             }
         }
-        
+
         Ok(())
     }
 }
@@ -180,7 +188,7 @@ impl FairScheduler {
 impl Scheduler for FairScheduler {
     async fn schedule_request(&self, request: InferenceRequest) -> Result<RequestId> {
         let request_id = request.id.clone();
-        
+
         // Check queue limits
         {
             let queue_size = self.waiting_queue.read().len();
@@ -188,31 +196,34 @@ impl Scheduler for FairScheduler {
                 return Err(Error::invalid_request("Request queue is full"));
             }
         }
-        
-        debug!("Scheduling request {:?} with priority {:?}", request_id, request.priority);
-        
+
+        debug!(
+            "Scheduling request {:?} with priority {:?}",
+            request_id, request.priority
+        );
+
         // Update stats
         self.stats.write().total_scheduled += 1;
-        
+
         // Add to waiting queue
         let prioritized = PrioritizedRequest {
             request,
             arrival_time: std::time::Instant::now(),
         };
-        
+
         self.waiting_queue.write().push(prioritized);
-        
+
         Ok(request_id)
     }
-    
+
     async fn get_next_batch(&self) -> Option<ScheduledBatch> {
         if !self.can_schedule_more() {
             return None;
         }
-        
+
         let mut batch_requests = Vec::new();
         let batch_id = ferrum_core::BatchId(uuid::Uuid::new_v4());
-        
+
         // Try to fill a batch up to max running requests
         while self.can_schedule_more() && batch_requests.len() < 32 {
             if let Some(request) = self.select_next_request() {
@@ -228,25 +239,31 @@ impl Scheduler for FairScheduler {
                         break;
                     }
                 }
-                
+
                 let scheduled = ScheduledRequest {
                     request: request.clone(),
                     state: RequestState::Running,
                     allocated_blocks: Vec::new(), // Will be allocated by cache manager
                 };
-                
+
                 // Add to running requests
-                self.running_requests.write().insert(request.id.clone(), scheduled.clone());
+                self.running_requests
+                    .write()
+                    .insert(request.id.clone(), scheduled.clone());
                 batch_requests.push(scheduled);
             } else {
                 break;
             }
         }
-        
+
         if batch_requests.is_empty() {
             None
         } else {
-            debug!("Created batch {:?} with {} requests", batch_id, batch_requests.len());
+            debug!(
+                "Created batch {:?} with {} requests",
+                batch_id,
+                batch_requests.len()
+            );
             Some(ScheduledBatch {
                 batch_id,
                 requests: batch_requests,
@@ -254,55 +271,67 @@ impl Scheduler for FairScheduler {
             })
         }
     }
-    
+
     async fn preempt_request(&self, request_id: RequestId) -> Result<()> {
         let mut running = self.running_requests.write();
-        
+
         if let Some(mut request) = running.remove(&request_id) {
             request.state = RequestState::Preempted;
             self.preempted_requests.write().push_back(request);
             self.stats.write().total_preempted += 1;
-            
+
             info!("Preempted request {:?}", request_id);
             Ok(())
         } else {
-            Err(Error::not_found(format!("Request {:?} not found in running requests", request_id)))
+            Err(Error::not_found(format!(
+                "Request {:?} not found in running requests",
+                request_id
+            )))
         }
     }
-    
-    async fn complete_request(&self, request_id: RequestId, response: InferenceResponse) -> Result<()> {
+
+    async fn complete_request(
+        &self,
+        request_id: RequestId,
+        response: InferenceResponse,
+    ) -> Result<()> {
         let mut running = self.running_requests.write();
-        
+
         if let Some(mut request) = running.remove(&request_id) {
             request.state = RequestState::Completed;
-            self.completed_requests.write().insert(request_id.clone(), response);
+            self.completed_requests
+                .write()
+                .insert(request_id.clone(), response);
             self.stats.write().total_completed += 1;
-            
+
             debug!("Completed request {:?}", request_id);
             Ok(())
         } else {
-            Err(Error::not_found(format!("Request {:?} not found in running requests", request_id)))
+            Err(Error::not_found(format!(
+                "Request {:?} not found in running requests",
+                request_id
+            )))
         }
     }
-    
+
     async fn get_stats(&self) -> SchedulerStats {
         let stats = self.stats.read();
         let waiting = self.waiting_queue.read().len();
         let running = self.running_requests.read().len();
         let preempted = self.preempted_requests.read().len();
-        
+
         let avg_wait_time = if stats.total_scheduled > 0 {
             stats.total_wait_time_ms as f64 / stats.total_scheduled as f64
         } else {
             0.0
         };
-        
+
         let avg_execution_time = if stats.total_completed > 0 {
             stats.total_execution_time_ms as f64 / stats.total_completed as f64
         } else {
             0.0
         };
-        
+
         SchedulerStats {
             waiting_requests: waiting,
             running_requests: running,

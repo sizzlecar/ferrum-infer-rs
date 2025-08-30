@@ -1,8 +1,8 @@
 //! Output formatting utilities
 
+use colored::*;
 use ferrum_core::Result;
 use serde::Serialize;
-use colored::*;
 
 /// Output format options
 #[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -24,18 +24,17 @@ pub struct DefaultFormatter;
 impl OutputFormatter for DefaultFormatter {
     fn format<T: Serialize>(&self, data: &T, format: &OutputFormat) -> Result<String> {
         match format {
-            OutputFormat::Json => {
-                serde_json::to_string_pretty(data)
-                    .map_err(|e| ferrum_core::Error::serialization(format!("JSON serialization failed: {}", e)))
-            }
-            OutputFormat::Yaml => {
-                serde_yaml::to_string(data)
-                    .map_err(|e| ferrum_core::Error::serialization(format!("YAML serialization failed: {}", e)))
-            }
+            OutputFormat::Json => serde_json::to_string_pretty(data).map_err(|e| {
+                ferrum_core::Error::serialization(format!("JSON serialization failed: {}", e))
+            }),
+            OutputFormat::Yaml => serde_yaml::to_string(data).map_err(|e| {
+                ferrum_core::Error::serialization(format!("YAML serialization failed: {}", e))
+            }),
             OutputFormat::Pretty | OutputFormat::Table => {
                 // For pretty/table format, just use JSON as fallback
-                serde_json::to_string_pretty(data)
-                    .map_err(|e| ferrum_core::Error::serialization(format!("Pretty formatting failed: {}", e)))
+                serde_json::to_string_pretty(data).map_err(|e| {
+                    ferrum_core::Error::serialization(format!("Pretty formatting failed: {}", e))
+                })
             }
         }
     }

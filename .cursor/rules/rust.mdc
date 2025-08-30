@@ -1,85 +1,95 @@
 ---
-description: Rust best practices for Solana smart contract development using Anchor framework and Solana SDK
-globs: programs/**/*.rs, src/**/*.rs, tests/**/*.ts
+description: Rust best practices for Ferrum LLM inference (Candle/ORT backends, engine, cache, scheduler)
+globs: crates/**/*.rs, src/**/*.rs, benches/**/*.rs, examples/**/*.rs
 ---
 
-# Rust + Solana (Anchor) Best Practices
+# Rust + LLM Inference (Candle) Best Practices
 
-## Program Structure
-- Structure Solana programs using `Anchor` framework standards
-- Place program entrypoint logic in `lib.rs`, not `main.rs`
-- Organize handlers into modules (e.g., `initialize`, `update`, `close`)
-- Separate state definitions, errors, instructions, and utils
-- Group reusable logic under a `utils` module (e.g., account validation)
-- Use `declare_id!()` to define program ID
+## Project Structure
+- Keep `ferrum-core` free of heavy deps; only types, errors, traits.
+- Implementations live in leaf crates (engine/runtime/server); depend one-way on `ferrum-core`.
+- Respect crate boundaries: no cross-layer leaks; avoid cyclic features.
+- Use feature flags for optional backends: `cuda`, `ort`, `server`, `cli`.
 
-## Anchor Framework
-- Use `#[derive(Accounts)]` for all instruction contexts
-- Validate accounts strictly using constraint macros (e.g., `#[account(mut)]`, `seeds`, `bump]`)
-- Define all state structs with `#[account]` and `#[derive(AnchorSerialize, AnchorDeserialize)]`
-- Prefer `Init`, `Close`, `Realloc`, `Mut`, and constraint macros to avoid manual deserialization
-- Use `ctx.accounts` to access validated context accounts
-- Handle CPI (Cross-Program Invocation) calls via Anchor’s CPI helpers
+## Code Style
+- Edition 2021; format with `cargo fmt`; lint with `cargo clippy`.
+- Avoid abbreviations; prefer descriptive names (Clean Code). Functions are verbs, values are nouns.
+- Prefer early returns and guard clauses. Avoid deep nesting.
+- Do not use `unwrap`/`expect` in library code; return `Result<T, crate::error::Error>`.
 
-## Serialization
-- Use **Borsh** or Anchor's custom serializer (not Serde) for on-chain data
-- Always include `#[account(zero_copy)]` or `#[repr(C)]` for packed structures
-- Avoid floating point types — use `u64`, `u128`, or fixed-point math
-- Zero out or close unused accounts to reduce rent costs
+## Error Handling
+- Public APIs: use `thiserror`-based domain error; avoid exposing `anyhow::Error`.
+- Internal glue code may use `anyhow` but convert at boundaries.
+- Include context (`with_context`) on fallible IO/model loads.
 
-## Testing
-- Write tests in TypeScript using Anchor’s Mocha + Chai setup (`tests/*.ts`)
-- Use `anchor.workspace.MyProgram` to load deployed contracts
-- Use `provider.simulate()` to inspect failed txs
-- Spin up a local validator (`anchor test`) and reset between tests
-- Airdrop SOL to wallets with `provider.connection.requestAirdrop(...)`
-- Validate program logs using `tx.confirmation.logMessages`
+## Concurrency & Async
+- Use `tokio` everywhere; never block the async runtime.
+- Do not hold locks across `.await`. Split critical sections and clone data first.
+- Prefer `parking_lot::{Mutex,RwLock}` for in-process state; annotate lock scopes.
+- Use `tokio::sync::mpsc` for streams; expose `ReceiverStream` for SSE/stream APIs.
 
-## Solana SDK (Manual)
-- Use `solana_program` crate when not using Anchor (bare-metal programs)
-- Carefully deserialize accounts using `AccountInfo`, `try_from_slice_unchecked`
-- Use `solana_program::msg!` for lightweight debugging logs
-- Verify accounts via `is_signer`, `is_writable`, `key == expected`
-- Never panic! Use `ProgramError::Custom(u32)` or `ErrorCode` enums
+## Logging & Metrics
+- Use `tracing` (`trace/debug/info/warn/error`) with structured fields: `request_id`, `batch_id`, `model_id`.
+- Use `tracing::instrument(skip(allocation_heavy_args))` on hot functions.
+- Emit `metrics` for requests, tokens, latency, cache hits, swaps, evictions.
 
-## Security Patterns
-- Always validate `msg.sender`/signer with `account_info.is_signer`
-- Prevent replay attacks via `seeds`, `bump`, and unique PDAs
-- Use strict size checks before reallocating or deserializing
-- Avoid unsafe unchecked casting; prefer Anchor deserialization
-- For CPIs, validate `target_program` against expected program ID
-- When using randomness, never rely on timestamps — use oracles or off-chain VRFs
+## Candle Tensors & Memory
+- Minimize data movement: avoid unnecessary `.to_device()`, `.to_dtype()`.
+- Treat `Tensor::clone()` as shallow but still prefer borrowing/slicing (`narrow`, `chunk`) over materializing copies.
+- Pre-allocate KV buffers; reuse allocations across decode steps.
+- Keep dtypes consistent (FP16/BF16 on GPU, FP32 on CPU unless justified).
+- Avoid host<->device ping-pong; batch transfers; prefer pinned host memory for FFI.
 
-## Performance
-- Prefer zero-copy deserialization when accounts are large
-- Minimize compute usage; avoid loops and recursion
-- Avoid memory reallocations mid-instruction
-- Use `#[account(zero_copy)]` and `#[repr(packed)]` for tight layout
-- Profile compute units with `solana logs` and `anchor run`
+## KV Cache (MVP Guidance)
+- Start with per-request contiguous KV (no paging). Define clear layout `[layers, heads, seq, head_dim]`.
+- Validate bounds and shapes aggressively in debug builds.
+- Introduce paged/block tables behind a feature flag later.
 
-## Dev Workflow
-- Use `anchor init` to scaffold projects
-- Add Anchor IDL support for front-end usage (JSON ABI)
-- Use `anchor build`, `anchor deploy`, `anchor test` consistently
-- Use separate `Anchor.toml` environments for devnet/mainnet/localnet
-- Format all Rust code with `cargo fmt`, lint with `cargo clippy`
-- Keep `Cargo.lock` checked into `programs/` but not root
+## Batching & Scheduling
+- MVP: dynamic batching with `{max_batch_size, max_wait_ms}`; pad within batch.
+- Separate prefill vs decode in design, even if implemented later.
+- Never add requests into a running decode batch for MVP (simplifies invariants).
 
-## Documentation
-- Use `///` Rust doc comments for all instructions and accounts
-- Include doc examples for each instruction
-- Document PDA derivation logic and bump seed expectations
-- Maintain up-to-date `README.md` with test commands and deployment steps
+## Sampling
+- Implement numerically stable softmax/logits processing.
+- Support greedy, temperature, top-k, top-p, stop sequences; deterministic path for tests.
+- Keep RNG seeds plumbed for reproducibility.
 
-## Wallet & Network Handling
-- Use `anchorProvider.wallet.publicKey` for signer verification in tests
-- Do not hardcode keypairs — use env-based loading (`process.env.ANCHOR_WALLET`)
-- Deploy with clear `cluster` targets (`localnet`, `devnet`, `mainnet`)
-- Use `anchor keys sync` to propagate program ID changes
-- Commit `target/idl/` and `target/types/` to share with front end
+## Backend Abstraction
+- `Backend` trait owns device/tensor creation and model load/execution.
+- Candle backend must not leak Candle types through public `ferrum-core` APIs.
+- Gate CUDA-specific paths behind `cfg(feature = "cuda")`.
 
-## CI/CD & Deploy
-- Use GitHub Actions with `solana-cli`, `anchor-cli`, and `node` installed
-- Run `anchor test` in CI for every PR
-- Use `solana program deploy` with explicit `--program-id` on production deploys
-- Upload IDLs to a central registry (e.g., GitHub, IPFS, or `anchor.cloud`)
+## Unsafe & FFI
+- Prefer safe Rust. If `unsafe` is required (e.g., custom CUDA kernels), isolate in small modules.
+- Document safety invariants above every `unsafe` block.
+- Add tests/fuzz where memory safety relies on protocol/shape invariants.
+
+## Testing Strategy
+- Unit tests: tensor shapes, KV indexing, sampling edge cases.
+- Integration: CLI generate path, server SSE stream with tiny model.
+- Avoid large models in CI. Use tiny variants and fixtures via `hf-hub` caching.
+- Use `#[cfg(feature = "ci-small-model")]` to gate heavy tests.
+
+## API & Server
+- OpenAI-compatible types live in `ferrum-server`; keep handlers thin and defer to engine.
+- SSE: send small JSON deltas per token; terminate with `[DONE]` sentinel.
+- Validate inputs; enforce limits (max tokens, rate limiting optionally) before scheduling.
+
+## Performance Hints
+- Avoid per-token heap allocations in hot loops; reuse buffers.
+- Precompute shapes/strides outside loops.
+- Consider `#[inline]` for tiny hot-path helpers; measure before committing.
+- Instrument and benchmark: latency percentiles, tokens/sec, batch utilization.
+
+## Configuration
+- Use strongly-typed configs with sane defaults; validate at startup.
+- Make dangerous knobs (e.g., huge batch size) explicit and documented.
+
+## Security & Privacy
+- Do not log prompts or raw tokens at `info`. Use `debug` with redaction.
+- Keep API keys and secrets out of logs; support header-based auth behind a flag.
+
+## CI
+- Run `cargo fmt --check`, `cargo check --workspace --all-targets`, advisory `clippy`.
+- Skip heavy benchmarks in CI; keep a tiny end-to-end smoke test.

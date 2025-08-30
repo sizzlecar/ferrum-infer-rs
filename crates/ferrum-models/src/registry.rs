@@ -4,9 +4,9 @@
 //! allowing different backends to register their implementations.
 
 use crate::traits::{Architecture, ModelBuilder, ModelRegistry};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// Default implementation of model registry
 pub struct DefaultModelRegistry {
@@ -21,7 +21,7 @@ impl DefaultModelRegistry {
             builders: Arc::new(RwLock::new(HashMap::new())),
         }
     }
-    
+
     /// Create with default builders (none in this abstract crate)
     pub fn with_defaults() -> Self {
         Self::new()
@@ -36,7 +36,7 @@ impl ModelRegistry for DefaultModelRegistry {
             builders.insert(arch, arc_builder.clone());
         }
     }
-    
+
     fn get_builder(&self, _architecture: &Architecture) -> Option<&dyn ModelBuilder> {
         let _builders = self.builders.read();
         // This is a bit tricky due to lifetime issues
@@ -44,7 +44,7 @@ impl ModelRegistry for DefaultModelRegistry {
         // For now, we return None as this is just the interface
         None
     }
-    
+
     fn supported_architectures(&self) -> Vec<Architecture> {
         let builders = self.builders.read();
         builders.keys().cloned().collect()
@@ -58,7 +58,7 @@ impl Default for DefaultModelRegistry {
 }
 
 /// Global model registry instance
-static GLOBAL_REGISTRY: once_cell::sync::Lazy<Arc<RwLock<DefaultModelRegistry>>> = 
+static GLOBAL_REGISTRY: once_cell::sync::Lazy<Arc<RwLock<DefaultModelRegistry>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(DefaultModelRegistry::new())));
 
 /// Get the global model registry
@@ -77,7 +77,7 @@ pub fn register_global_builder(builder: Box<dyn ModelBuilder>) {
 pub struct RegistryConfig {
     /// Whether to use global registry
     pub use_global: bool,
-    
+
     /// Custom builders to register
     pub custom_builders: Vec<String>,
 }
@@ -94,7 +94,7 @@ impl Default for RegistryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_registry_creation() {
         let registry = DefaultModelRegistry::new();

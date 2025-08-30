@@ -28,6 +28,13 @@ http = "1.0"
 http-body = "1.0"
 mime = "0.3"
 
+# Web framework for MVP server implementation
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1.0"
+tokio-stream = "0.1"
+
 # Logging and metrics
 tracing = { workspace = true }
 metrics = { workspace = true }
