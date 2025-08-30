@@ -8,7 +8,7 @@ use ferrum_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use tracing::{info, debug, warn};
+use tracing::{info, debug};
 
 /// Configuration for batch manager
 #[derive(Debug, Clone)]
@@ -127,7 +127,7 @@ impl ContinuousBatchManager {
         
         for (batch_id, batch) in batches.iter() {
             if self.can_add_to_batch(batch, request) {
-                return Some(*batch_id);
+                return Some(batch_id.clone());
             }
         }
         

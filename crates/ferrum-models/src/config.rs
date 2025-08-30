@@ -1,42 +1,21 @@
 //! Model configuration management
+//!
+//! This module provides utilities for loading and managing model configurations
+//! from various sources without depending on specific ML frameworks.
 
-use ferrum_core::{ModelConfig, ModelType, DataType, Device, ModelId, Result, Error};
+use crate::traits::{AbstractModelConfig, Architecture, NormType, Activation, AttentionConfig};
+use ferrum_core::{Result, Error};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::collections::HashMap;
-use tracing::info;
 
-/// Model configuration manager
-pub struct ModelConfigManager {
-    configs: HashMap<String, ModelConfig>,
+/// Configuration manager for models
+pub struct ConfigManager {
+    /// Cached configurations
+    configs: HashMap<String, AbstractModelConfig>,
 }
 
-/// Model configuration file format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfigFile {
-    pub model_id: String,
-    pub model_type: String,
-    pub model_path: String,
-    pub dtype: String,
-    pub device: String,
-    pub max_batch_size: usize,
-    pub max_sequence_length: usize,
-    pub tensor_parallel_size: Option<usize>,
-    pub pipeline_parallel_size: Option<usize>,
-    pub quantization: Option<QuantizationConfigFile>,
-}
-
-/// Quantization configuration file format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuantizationConfigFile {
-    pub method: String,
-    pub bits: Option<u8>,
-    pub group_size: Option<usize>,
-    pub zero_point: Option<bool>,
-    pub symmetric: Option<bool>,
-}
-
-impl ModelConfigManager {
+impl ConfigManager {
     /// Create a new configuration manager
     pub fn new() -> Self {
         Self {
@@ -45,153 +24,180 @@ impl ModelConfigManager {
     }
     
     /// Load configuration from file
-    pub fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        info!("Loading model config from {:?}", path.as_ref());
-        
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| Error::configuration(format!("Failed to read config file: {}", e)))?;
-        
-        let config_file: ModelConfigFile = toml::from_str(&content)
-            .map_err(|e| Error::configuration(format!("Failed to parse config file: {}", e)))?;
-        
-        let config = self.convert_config_file(config_file)?;
-        self.configs.insert(config.model_id.0.clone(), config);
-        
-        Ok(())
+    pub async fn load_from_file(&mut self, path: &Path) -> Result<AbstractModelConfig> {
+        let content = tokio::fs::read_to_string(path)
+            .await?;
+            
+        let config: RawConfig = serde_json::from_str(&content)
+            .map_err(|e| Error::configuration(format!("Failed to parse config: {}", e)))?;
+            
+        self.convert_to_abstract(config)
     }
     
-    /// Convert config file to ModelConfig
-    fn convert_config_file(&self, file: ModelConfigFile) -> Result<ModelConfig> {
-        let model_type = match file.model_type.as_str() {
-            "llama" | "Llama" => ModelType::Llama,
-            "mistral" | "Mistral" => ModelType::Mistral,
-            "qwen" | "Qwen" => ModelType::Qwen,
-            custom => ModelType::Custom(custom.to_string()),
-        };
+    /// Load configuration from HuggingFace model ID
+    pub async fn load_from_huggingface(&mut self, _model_id: &str) -> Result<AbstractModelConfig> {
+        // This would use the HuggingFace API to fetch config.json
+        // For now, return a placeholder
+        Err(Error::unsupported("HuggingFace loading not yet implemented"))
+    }
+    
+    /// Convert raw config to abstract config
+    fn convert_to_abstract(&self, raw: RawConfig) -> Result<AbstractModelConfig> {
+        let architecture = self.detect_architecture(&raw)?;
+        let norm_type = self.detect_norm_type(&raw);
+        let activation = self.detect_activation(&raw);
+        let extra_params = serde_json::to_value(&raw)
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
         
-        let dtype = match file.dtype.as_str() {
-            "fp32" | "f32" => DataType::FP32,
-            "fp16" | "f16" => DataType::FP16,
-            "bf16" => DataType::BF16,
-            "int8" | "i8" => DataType::INT8,
-            "fp8" => DataType::FP8,
-            _ => return Err(Error::configuration(format!("Unknown dtype: {}", file.dtype))),
-        };
-        
-        let device = self.parse_device(&file.device)?;
-        
-        let quantization = file.quantization
-            .map(|q| self.convert_quantization_config(q))
-            .transpose()?;
-        
-        Ok(ModelConfig {
-            model_id: ModelId(file.model_id),
-            model_path: file.model_path,
-            model_type,
-            dtype,
-            device,
-            max_batch_size: file.max_batch_size,
-            max_sequence_length: file.max_sequence_length,
-            tensor_parallel_size: file.tensor_parallel_size,
-            pipeline_parallel_size: file.pipeline_parallel_size,
-            quantization,
+        Ok(AbstractModelConfig {
+            architecture,
+            hidden_size: raw.hidden_size.unwrap_or(4096),
+            intermediate_size: raw.intermediate_size.unwrap_or(11008),
+            vocab_size: raw.vocab_size.unwrap_or(32000),
+            num_hidden_layers: raw.num_hidden_layers.unwrap_or(32),
+            num_attention_heads: raw.num_attention_heads.unwrap_or(32),
+            num_key_value_heads: raw.num_key_value_heads,
+            max_position_embeddings: raw.max_position_embeddings.unwrap_or(4096),
+            rope_theta: raw.rope_theta,
+            rope_scaling: raw.rope_scaling.map(|s| crate::RopeScaling {
+                scaling_type: s.scaling_type,
+                factor: s.factor,
+            }),
+            norm_type,
+            norm_eps: raw.rms_norm_eps.or(raw.layer_norm_eps).unwrap_or(1e-5),
+            attention_config: AttentionConfig {
+                attention_bias: raw.attention_bias.unwrap_or(false),
+                sliding_window: raw.sliding_window,
+                use_flash_attention: false,
+                use_paged_attention: true,
+            },
+            activation,
+            extra_params,
         })
     }
     
-    /// Parse device string
-    fn parse_device(&self, device_str: &str) -> Result<Device> {
-        match device_str {
-            "cpu" | "CPU" => Ok(Device::CPU),
-            s if s.starts_with("cuda:") => {
-                let id = s.trim_start_matches("cuda:")
-                    .parse::<usize>()
-                    .map_err(|_| Error::configuration(format!("Invalid CUDA device: {}", s)))?;
-                Ok(Device::CUDA(id))
+    /// Detect architecture from raw config
+    fn detect_architecture(&self, raw: &RawConfig) -> Result<Architecture> {
+        if let Some(arch) = &raw.architectures {
+            if !arch.is_empty() {
+                return self.parse_architecture(&arch[0]);
             }
-            s if s.starts_with("rocm:") => {
-                let id = s.trim_start_matches("rocm:")
-                    .parse::<usize>()
-                    .map_err(|_| Error::configuration(format!("Invalid ROCm device: {}", s)))?;
-                Ok(Device::ROCm(id))
-            }
-            _ => Err(Error::configuration(format!("Unknown device: {}", device_str))),
         }
-    }
-    
-    /// Convert quantization config
-    fn convert_quantization_config(&self, config: QuantizationConfigFile) -> Result<ferrum_core::QuantizationConfig> {
-        match config.method.as_str() {
-            "gptq" | "GPTQ" => Ok(ferrum_core::QuantizationConfig::GPTQ {
-                bits: config.bits.unwrap_or(4),
-                group_size: config.group_size.unwrap_or(128),
-            }),
-            "awq" | "AWQ" => Ok(ferrum_core::QuantizationConfig::AWQ {
-                bits: config.bits.unwrap_or(4),
-                zero_point: config.zero_point.unwrap_or(true),
-            }),
-            "fp8" | "FP8" => Ok(ferrum_core::QuantizationConfig::FP8 {
-                e4m3: true,
-            }),
-            "int8" | "INT8" => Ok(ferrum_core::QuantizationConfig::INT8 {
-                symmetric: config.symmetric.unwrap_or(true),
-            }),
-            _ => Err(Error::configuration(format!("Unknown quantization method: {}", config.method))),
-        }
-    }
-    
-    /// Get configuration for a model
-    pub fn get(&self, model_id: &str) -> Option<&ModelConfig> {
-        self.configs.get(model_id)
-    }
-    
-    /// Add configuration
-    pub fn add(&mut self, config: ModelConfig) {
-        self.configs.insert(config.model_id.0.clone(), config);
-    }
-    
-    /// List all configurations
-    pub fn list(&self) -> Vec<&ModelConfig> {
-        self.configs.values().collect()
-    }
-    
-    /// Create default configuration for common models
-    pub fn create_default(model_id: &str) -> Result<ModelConfig> {
-        let (model_type, default_size) = match model_id {
-            s if s.contains("llama") => (ModelType::Llama, 4096),
-            s if s.contains("mistral") => (ModelType::Mistral, 8192),
-            s if s.contains("qwen") => (ModelType::Qwen, 8192),
-            _ => (ModelType::Custom(model_id.to_string()), 4096),
-        };
         
-        Ok(ModelConfig {
-            model_id: ModelId(model_id.to_string()),
-            model_path: format!("models/{}", model_id),
-            model_type,
-            dtype: DataType::FP16,
-            device: Device::cuda_if_available().unwrap_or(Device::CPU),
-            max_batch_size: 256,
-            max_sequence_length: default_size,
-            tensor_parallel_size: None,
-            pipeline_parallel_size: None,
-            quantization: None,
-        })
+        if let Some(model_type) = &raw.model_type {
+            return self.parse_architecture(model_type);
+        }
+        
+        Err(Error::configuration("Cannot detect model architecture"))
     }
-}
-
-impl Device {
-    /// Get CUDA device if available, otherwise CPU
-    pub fn cuda_if_available() -> Option<Device> {
-        // Check if CUDA is available (simplified)
-        if std::env::var("CUDA_VISIBLE_DEVICES").is_ok() {
-            Some(Device::CUDA(0))
+    
+    /// Parse architecture string
+    fn parse_architecture(&self, arch_str: &str) -> Result<Architecture> {
+        let arch_lower = arch_str.to_lowercase();
+        
+        if arch_lower.contains("llama") {
+            if arch_lower.contains("3") {
+                Ok(Architecture::Llama3)
+            } else if arch_lower.contains("2") {
+                Ok(Architecture::Llama2)
+            } else {
+                Ok(Architecture::Llama)
+            }
+        } else if arch_lower.contains("mistral") {
+            Ok(Architecture::Mistral)
+        } else if arch_lower.contains("mixtral") {
+            Ok(Architecture::Mixtral)
+        } else if arch_lower.contains("qwen2") {
+            Ok(Architecture::Qwen2)
+        } else if arch_lower.contains("qwen") {
+            Ok(Architecture::Qwen)
+        } else if arch_lower.contains("phi") {
+            Ok(Architecture::Phi)
+        } else if arch_lower.contains("gemma") {
+            Ok(Architecture::Gemma)
         } else {
-            None
+            Ok(Architecture::Custom(arch_str.to_string()))
+        }
+    }
+    
+    /// Detect normalization type
+    fn detect_norm_type(&self, raw: &RawConfig) -> NormType {
+        if raw.rms_norm_eps.is_some() {
+            NormType::RMSNorm
+        } else {
+            NormType::LayerNorm
+        }
+    }
+    
+    /// Detect activation function
+    fn detect_activation(&self, raw: &RawConfig) -> Activation {
+        if let Some(act) = &raw.hidden_act {
+            match act.to_lowercase().as_str() {
+                "silu" => Activation::SiLU,
+                "gelu" => Activation::GELU,
+                "relu" => Activation::ReLU,
+                "swish" => Activation::Swish,
+                _ => Activation::SiLU, // Default
+            }
+        } else {
+            Activation::SiLU // Default for most modern models
         }
     }
 }
 
-impl Default for ModelConfigManager {
+/// Raw configuration format (HuggingFace compatible)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawConfig {
+    architectures: Option<Vec<String>>,
+    model_type: Option<String>,
+    hidden_size: Option<usize>,
+    intermediate_size: Option<usize>,
+    vocab_size: Option<usize>,
+    num_hidden_layers: Option<usize>,
+    num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    rope_theta: Option<f32>,
+    rope_scaling: Option<RawRopeScaling>,
+    rms_norm_eps: Option<f64>,
+    layer_norm_eps: Option<f64>,
+    hidden_act: Option<String>,
+    attention_bias: Option<bool>,
+    sliding_window: Option<usize>,
+    
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawRopeScaling {
+    #[serde(rename = "type")]
+    scaling_type: String,
+    factor: f32,
+}
+
+impl Default for ConfigManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_architecture_detection() {
+        let manager = ConfigManager::new();
+        
+        assert!(matches!(
+            manager.parse_architecture("LlamaForCausalLM").unwrap(),
+            Architecture::Llama
+        ));
+        
+        assert!(matches!(
+            manager.parse_architecture("MistralForCausalLM").unwrap(),
+            Architecture::Mistral
+        ));
     }
 }

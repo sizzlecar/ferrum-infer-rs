@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use serde::{Serialize, Deserialize};
 use crate::{Result, types::*};
 
 /// Core trait for inference engine
@@ -168,4 +169,41 @@ pub trait Quantization: Send + Sync {
     
     /// Get quantization configuration
     fn config(&self) -> &QuantizationConfig;
+}
+
+/// Backend trait for ML framework abstraction
+/// This trait allows different ML frameworks (Candle, ONNX Runtime, PyTorch, etc.)
+/// to be plugged in without changing the core engine logic
+#[async_trait]
+pub trait Backend: Send + Sync {
+    /// Initialize the backend
+    async fn initialize(&mut self) -> Result<()>;
+    
+    /// Create a tensor from raw data
+    fn create_tensor(&self, data: Vec<f32>, shape: Vec<usize>, device: &Device) -> Result<Tensor>;
+    
+    /// Load model weights from file
+    async fn load_weights(&self, path: &str, dtype: DataType, device: &Device) -> Result<Box<dyn Model>>;
+    
+    /// Get backend name
+    fn name(&self) -> &str;
+    
+    /// Check if backend supports a specific device
+    fn supports_device(&self, device: &Device) -> bool;
+    
+    /// Get backend capabilities
+    fn capabilities(&self) -> BackendCapabilities;
+}
+
+/// Backend capabilities
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendCapabilities {
+    pub supports_fp16: bool,
+    pub supports_bf16: bool,
+    pub supports_int8: bool,
+    pub supports_flash_attention: bool,
+    pub supports_paged_attention: bool,
+    pub supports_tensor_parallelism: bool,
+    pub max_batch_size: usize,
+    pub max_sequence_length: usize,
 }

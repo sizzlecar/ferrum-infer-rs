@@ -17,10 +17,10 @@ pub mod attention;
 
 // Re-exports
 pub use engine::{Engine, EngineConfig};
-pub use executor::{CandleExecutor, ExecutorConfig};
+pub use executor::{GenericExecutor, ExecutorConfig};
 pub use batch_manager::{ContinuousBatchManager, BatchConfig};
 pub use cache_manager::{PagedKVCacheManager, CacheConfig};
 pub use memory_manager::{GpuMemoryManager, MemoryConfig};
 pub use scheduler::{FairScheduler, SchedulerConfig};
 
-use ferrum_core::{Error, Result};
+

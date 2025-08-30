@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use ferrum_core::{
     InferenceEngine, InferenceRequest, InferenceResponse, StreamChunk,
-    EngineStatus, ModelId, RequestId, Result, Error,
+    EngineStatus, ModelId, Result, Error,
     Scheduler, BatchManager, CacheManager, MemoryManager, ModelLoader,
 };
 use std::sync::Arc;

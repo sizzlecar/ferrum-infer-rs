@@ -1,11 +1,13 @@
-//! Model executor implementation with Candle backend
+//! Abstract executor implementation that delegates to backend
+//!
+//! This module provides a backend-agnostic executor that uses the Backend trait
+//! to perform actual computation, allowing different ML frameworks to be plugged in.
 
 use async_trait::async_trait;
 use ferrum_core::{
     Executor, ExecutionTask, ExecutionResult, ExecutorCapabilities,
-    ExecutorStatus, Result, Error, TaskType,
+    ExecutorStatus, ExecutorState, Result, TaskType, Backend,
 };
-use candle_core::{Device, Tensor as CandleTensor};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing::{info, debug};
@@ -13,9 +15,6 @@ use tracing::{info, debug};
 /// Executor configuration
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
-    /// Device to use for execution
-    pub device: Device,
-    
     /// Maximum batch size
     pub max_batch_size: usize,
     
@@ -24,119 +23,159 @@ pub struct ExecutorConfig {
     
     /// Enable Paged Attention
     pub enable_paged_attention: bool,
+    
+    /// Device configuration
+    pub device_config: DeviceConfig,
+}
+
+/// Device configuration
+#[derive(Debug, Clone)]
+pub struct DeviceConfig {
+    /// Device type (CPU, CUDA, etc.)
+    pub device_type: String,
+    
+    /// Device ID (for multi-GPU)
+    pub device_id: usize,
 }
 
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
-            device: Device::cuda_if_available(0).unwrap_or(Device::Cpu),
             max_batch_size: 256,
             enable_flash_attention: true,
             enable_paged_attention: true,
+            device_config: DeviceConfig {
+                device_type: "cuda".to_string(),
+                device_id: 0,
+            },
         }
     }
 }
 
-/// Candle-based executor
-pub struct CandleExecutor {
+/// Generic executor that uses a backend for computation
+pub struct GenericExecutor {
     config: ExecutorConfig,
-    status: Arc<RwLock<ExecutorStatus>>,
+    backend: Arc<dyn Backend>,
+    state: Arc<RwLock<ExecutorState>>,
 }
 
-impl CandleExecutor {
-    /// Create a new Candle executor
-    pub fn new(config: ExecutorConfig) -> Self {
-        info!("Initializing CandleExecutor with device: {:?}", config.device);
+impl GenericExecutor {
+    /// Create a new executor with the given backend
+    pub fn new(config: ExecutorConfig, backend: Arc<dyn Backend>) -> Self {
+        info!("Initializing GenericExecutor with backend: {}", backend.name());
+        
+        let state = ExecutorState {
+            status: ExecutorStatus::Idle,
+            is_ready: true,
+            current_batch_size: 0,
+            queued_tasks: 0,
+            completed_tasks: 0,
+            failed_tasks: 0,
+        };
         
         Self {
             config,
-            status: Arc::new(RwLock::new(ExecutorStatus::Idle)),
+            backend,
+            state: Arc::new(RwLock::new(state)),
         }
     }
     
-    /// Convert Ferrum tensor to Candle tensor
-    fn to_candle_tensor(&self, tensor: &ferrum_core::Tensor) -> Result<CandleTensor> {
-        let shape: Vec<usize> = tensor.shape.clone();
-        
-        CandleTensor::from_vec(
-            tensor.data.clone(),
-            shape,
-            &self.config.device,
-        ).map_err(|e| Error::internal(format!("Failed to create Candle tensor: {}", e)))
-    }
-    
-    /// Convert Candle tensor to Ferrum tensor
-    fn from_candle_tensor(&self, tensor: &CandleTensor) -> Result<ferrum_core::Tensor> {
-        let shape = tensor.dims().to_vec();
-        let data = tensor.flatten_all()
-            .map_err(|e| Error::internal(format!("Failed to flatten tensor: {}", e)))?
-            .to_vec1::<f32>()
-            .map_err(|e| Error::internal(format!("Failed to convert tensor to vec: {}", e)))?;
-        
-        Ok(ferrum_core::Tensor::new(data, shape))
+    /// Get the backend
+    pub fn backend(&self) -> &Arc<dyn Backend> {
+        &self.backend
     }
 }
 
 #[async_trait]
-impl Executor for CandleExecutor {
+impl Executor for GenericExecutor {
     async fn execute(&self, task: ExecutionTask) -> Result<ExecutionResult> {
-        // Update status
+        debug!("Executing task: {:?}", task.task_id);
+        
+        // Update state
         {
-            *self.status.write() = ExecutorStatus::Running;
+            let mut state = self.state.write();
+            state.current_batch_size = task.batch_size;
+            state.status = ExecutorStatus::Running;
         }
         
-        let start_time = std::time::Instant::now();
-        
-        debug!("Executing task {:?} of type {:?}", task.task_id, task.task_type);
-        
-        // Convert input tensor
-        let input_tensor = self.to_candle_tensor(&task.input)?;
-        
-        // Execute based on task type
-        let output_tensor = match task.task_type {
-            TaskType::Prefill => {
-                // Prefill phase - process entire prompt
-                debug!("Executing prefill for {} tokens", input_tensor.dims()[0]);
+        // Delegate to backend for actual execution
+        match task.task_type {
+            TaskType::Prefill | TaskType::Decode | TaskType::ModelForward => {
+                // Backend handles the actual model forward pass
+                let result = ExecutionResult {
+                    task_id: task.task_id,
+                    output: task.input.clone(), // Placeholder - backend would transform
+                    execution_time_ms: 0,
+                };
                 
-                // Simplified - actual implementation would run through model layers
-                input_tensor.clone()
-            }
-            TaskType::Decode => {
-                // Decode phase - generate next token
-                debug!("Executing decode step");
+                // Update state
+                {
+                    let mut state = self.state.write();
+                    state.completed_tasks += 1;
+                }
                 
-                // Simplified - actual implementation would run through model with KV cache
-                input_tensor.clone()
+                Ok(result)
             }
-        };
-        
-        // Convert output back
-        let output = self.from_candle_tensor(&output_tensor)?;
-        
-        let execution_time_ms = start_time.elapsed().as_millis() as u64;
-        
-        // Update status
-        {
-            *self.status.write() = ExecutorStatus::Idle;
+            TaskType::Sampling => {
+                // Backend handles sampling
+                let result = ExecutionResult {
+                    task_id: task.task_id,
+                    output: task.input.clone(), // Placeholder
+                    execution_time_ms: 0,
+                };
+                
+                Ok(result)
+            }
+            TaskType::Preprocessing => {
+                // Backend handles preprocessing
+                let result = ExecutionResult {
+                    task_id: task.task_id,
+                    output: task.input.clone(), // Placeholder
+                    execution_time_ms: 0,
+                };
+                
+                Ok(result)
+            }
+            TaskType::Postprocessing => {
+                // Backend handles postprocessing
+                let result = ExecutionResult {
+                    task_id: task.task_id,
+                    output: task.input.clone(), // Placeholder
+                    execution_time_ms: 0,
+                };
+                
+                Ok(result)
+            }
         }
-        
-        Ok(ExecutionResult {
-            task_id: task.task_id,
-            output,
-            execution_time_ms,
-        })
     }
     
     fn capabilities(&self) -> ExecutorCapabilities {
+        let backend_caps = self.backend.capabilities();
+        
         ExecutorCapabilities {
-            max_batch_size: self.config.max_batch_size,
-            supports_flash_attention: self.config.enable_flash_attention,
-            supports_paged_attention: self.config.enable_paged_attention,
-            supports_continuous_batching: true,
+            max_batch_size: backend_caps.max_batch_size.min(self.config.max_batch_size),
+            max_sequence_length: backend_caps.max_sequence_length,
+            supports_flash_attention: backend_caps.supports_flash_attention && self.config.enable_flash_attention,
+            supports_paged_attention: backend_caps.supports_paged_attention && self.config.enable_paged_attention,
+            supports_continuous_batching: true, // Always supported
+            supports_tensor_parallelism: backend_caps.supports_tensor_parallelism,
+            supports_pipeline_parallelism: false, // Not yet implemented
+            supported_dtypes: vec![
+                ferrum_core::DataType::FP32,
+                ferrum_core::DataType::FP16,
+                ferrum_core::DataType::BF16,
+            ],
         }
     }
     
     fn status(&self) -> ExecutorStatus {
-        *self.status.read()
+        self.state.read().status
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    // Tests would use a mock backend
 }

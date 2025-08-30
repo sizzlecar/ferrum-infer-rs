@@ -17,17 +17,8 @@ parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# ML Framework - Candle
-candle-core = { workspace = true }
-candle-nn = { workspace = true }
-candle-transformers = { workspace = true }
-hf-hub = { workspace = true }
+# Tokenization (framework-agnostic)
 tokenizers = { workspace = true }
-safetensors = { workspace = true }
-
-# Tensor operations
-ndarray = { workspace = true }
-half = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
@@ -41,11 +32,10 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 rand = "0.8"
 toml = { workspace = true }
+once_cell = "1.19"
 
 [dev-dependencies]
 tokio-test = "0.4"
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
-metal = ["candle-core/metal"]
