@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use ferrum_core::{
     Scheduler, InferenceRequest, RequestId, InferenceResponse,
-    ScheduledBatch, SchedulerStats, Result, Error, Priority,
+    ScheduledBatch, SchedulerStats, Result, Error,
     RequestState, ScheduledRequest,
 };
 use std::collections::{BinaryHeap, HashMap, VecDeque};

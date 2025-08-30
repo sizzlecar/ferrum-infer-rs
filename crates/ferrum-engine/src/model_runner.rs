@@ -1,16 +1,33 @@
-//! Model runner with Candle integration
+//! Model runner abstraction
+//!
+//! This module provides an abstract model runner that delegates to the backend
+//! for actual model execution.
 
-use ferrum_core::{Model, ModelLoader, ModelConfig, ModelInfo, Result};
-use candle_core::Device;
+use ferrum_core::{Model, ModelConfig, Result, Backend};
 use std::sync::Arc;
 
-/// Placeholder for model runner implementation
-pub struct CandleModelRunner {
-    device: Device,
+/// Generic model runner that uses a backend
+pub struct ModelRunner {
+    backend: Arc<dyn Backend>,
 }
 
-impl CandleModelRunner {
-    pub fn new(device: Device) -> Self {
-        Self { device }
+impl ModelRunner {
+    /// Create a new model runner with the given backend
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
+        Self { backend }
+    }
+    
+    /// Get the backend
+    pub fn backend(&self) -> &Arc<dyn Backend> {
+        &self.backend
+    }
+    
+    /// Load a model using the backend
+    pub async fn load_model(&self, config: &ModelConfig) -> Result<Box<dyn Model>> {
+        self.backend.load_weights(
+            &config.model_path,
+            config.dtype,
+            &config.device
+        ).await
     }
 }

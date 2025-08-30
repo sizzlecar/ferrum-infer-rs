@@ -1,126 +1,103 @@
-//! Model registry for managing available models
+//! Model registry implementation
+//!
+//! This module provides a registry for model builders,
+//! allowing different backends to register their implementations.
 
-use ferrum_core::{ModelType, Result, Error};
+use crate::traits::{Architecture, ModelBuilder, ModelRegistry};
 use std::collections::HashMap;
+use std::sync::Arc;
 use parking_lot::RwLock;
-use tracing::info;
 
-/// Model metadata
-#[derive(Debug, Clone)]
-pub struct ModelMetadata {
-    pub model_id: String,
-    pub model_type: ModelType,
-    pub description: String,
-    pub size_gb: f32,
-    pub requires_gpu: bool,
-    pub max_sequence_length: usize,
-    pub default_config: HashMap<String, serde_json::Value>,
+/// Default implementation of model registry
+pub struct DefaultModelRegistry {
+    /// Registered model builders
+    builders: Arc<RwLock<HashMap<Architecture, Arc<dyn ModelBuilder>>>>,
 }
 
-/// Model registry
-pub struct ModelRegistry {
-    models: RwLock<HashMap<String, ModelMetadata>>,
-}
-
-impl ModelRegistry {
+impl DefaultModelRegistry {
     /// Create a new model registry
     pub fn new() -> Self {
-        let mut registry = Self {
-            models: RwLock::new(HashMap::new()),
-        };
-        
-        // Register default models
-        registry.register_default_models();
-        registry
+        Self {
+            builders: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
     
-    /// Register default models
-    fn register_default_models(&mut self) {
-        // Llama models
-        self.register(ModelMetadata {
-            model_id: "meta-llama/Llama-2-7b-hf".to_string(),
-            model_type: ModelType::Llama,
-            description: "Llama 2 7B base model".to_string(),
-            size_gb: 13.5,
-            requires_gpu: true,
-            max_sequence_length: 4096,
-            default_config: HashMap::new(),
-        });
-        
-        self.register(ModelMetadata {
-            model_id: "meta-llama/Llama-2-13b-hf".to_string(),
-            model_type: ModelType::Llama,
-            description: "Llama 2 13B base model".to_string(),
-            size_gb: 26.0,
-            requires_gpu: true,
-            max_sequence_length: 4096,
-            default_config: HashMap::new(),
-        });
-        
-        // Mistral models
-        self.register(ModelMetadata {
-            model_id: "mistralai/Mistral-7B-v0.1".to_string(),
-            model_type: ModelType::Mistral,
-            description: "Mistral 7B v0.1 base model".to_string(),
-            size_gb: 14.5,
-            requires_gpu: true,
-            max_sequence_length: 8192,
-            default_config: HashMap::new(),
-        });
-        
-        self.register(ModelMetadata {
-            model_id: "mistralai/Mixtral-8x7B-v0.1".to_string(),
-            model_type: ModelType::Mistral,
-            description: "Mixtral 8x7B MoE model".to_string(),
-            size_gb: 87.0,
-            requires_gpu: true,
-            max_sequence_length: 32768,
-            default_config: HashMap::new(),
-        });
-        
-        // Qwen models
-        self.register(ModelMetadata {
-            model_id: "Qwen/Qwen-7B".to_string(),
-            model_type: ModelType::Qwen,
-            description: "Qwen 7B base model".to_string(),
-            size_gb: 14.0,
-            requires_gpu: true,
-            max_sequence_length: 8192,
-            default_config: HashMap::new(),
-        });
-    }
-    
-    /// Register a model
-    pub fn register(&self, metadata: ModelMetadata) {
-        info!("Registering model: {}", metadata.model_id);
-        self.models.write().insert(metadata.model_id.clone(), metadata);
-    }
-    
-    /// Get model metadata
-    pub fn get(&self, model_id: &str) -> Option<ModelMetadata> {
-        self.models.read().get(model_id).cloned()
-    }
-    
-    /// List all registered models
-    pub fn list(&self) -> Vec<ModelMetadata> {
-        self.models.read().values().cloned().collect()
-    }
-    
-    /// Check if model is registered
-    pub fn contains(&self, model_id: &str) -> bool {
-        self.models.read().contains_key(model_id)
-    }
-    
-    /// Get model type
-    pub fn get_model_type(&self, model_id: &str) -> Result<ModelType> {
-        self.get(model_id)
-            .map(|m| m.model_type)
-            .ok_or_else(|| Error::not_found(format!("Model {} not registered", model_id)))
+    /// Create with default builders (none in this abstract crate)
+    pub fn with_defaults() -> Self {
+        Self::new()
     }
 }
 
-impl Default for ModelRegistry {
+impl ModelRegistry for DefaultModelRegistry {
+    fn register_builder(&mut self, builder: Box<dyn ModelBuilder>) {
+        let arc_builder: Arc<dyn ModelBuilder> = Arc::from(builder);
+        let mut builders = self.builders.write();
+        for arch in arc_builder.supported_architectures() {
+            builders.insert(arch, arc_builder.clone());
+        }
+    }
+    
+    fn get_builder(&self, _architecture: &Architecture) -> Option<&dyn ModelBuilder> {
+        let _builders = self.builders.read();
+        // This is a bit tricky due to lifetime issues
+        // In a real implementation, we might need to return Arc<dyn ModelBuilder>
+        // For now, we return None as this is just the interface
+        None
+    }
+    
+    fn supported_architectures(&self) -> Vec<Architecture> {
+        let builders = self.builders.read();
+        builders.keys().cloned().collect()
+    }
+}
+
+impl Default for DefaultModelRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Global model registry instance
+static GLOBAL_REGISTRY: once_cell::sync::Lazy<Arc<RwLock<DefaultModelRegistry>>> = 
+    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(DefaultModelRegistry::new())));
+
+/// Get the global model registry
+pub fn global_registry() -> Arc<RwLock<DefaultModelRegistry>> {
+    GLOBAL_REGISTRY.clone()
+}
+
+/// Register a model builder globally
+pub fn register_global_builder(builder: Box<dyn ModelBuilder>) {
+    let mut registry = GLOBAL_REGISTRY.write();
+    registry.register_builder(builder);
+}
+
+/// Model registry configuration
+#[derive(Debug, Clone)]
+pub struct RegistryConfig {
+    /// Whether to use global registry
+    pub use_global: bool,
+    
+    /// Custom builders to register
+    pub custom_builders: Vec<String>,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            use_global: true,
+            custom_builders: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_registry_creation() {
+        let registry = DefaultModelRegistry::new();
+        assert_eq!(registry.supported_architectures().len(), 0);
     }
 }

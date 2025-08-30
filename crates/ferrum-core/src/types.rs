@@ -297,7 +297,7 @@ pub struct MemoryUsage {
 }
 
 /// Memory pressure levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MemoryPressure {
     Low,
     Medium,
@@ -314,13 +314,24 @@ pub struct ExecutionTask {
     pub task_type: TaskType,
     pub input: Tensor,
     pub model_id: ModelId,
+    pub batch_size: usize,
 }
 
 /// Task type for execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskType {
+    /// Initial prompt processing
     Prefill,
+    /// Token-by-token generation
     Decode,
+    /// Forward pass through model
+    ModelForward,
+    /// Token sampling
+    Sampling,
+    /// Input preprocessing
+    Preprocessing,
+    /// Output postprocessing
+    Postprocessing,
 }
 
 /// Execution result
@@ -335,9 +346,13 @@ pub struct ExecutionResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorCapabilities {
     pub max_batch_size: usize,
+    pub max_sequence_length: usize,
     pub supports_flash_attention: bool,
     pub supports_paged_attention: bool,
     pub supports_continuous_batching: bool,
+    pub supports_tensor_parallelism: bool,
+    pub supports_pipeline_parallelism: bool,
+    pub supported_dtypes: Vec<DataType>,
 }
 
 /// Executor status
@@ -347,6 +362,17 @@ pub enum ExecutorStatus {
     Running,
     Busy,
     Error,
+}
+
+/// Detailed executor state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutorState {
+    pub status: ExecutorStatus,
+    pub is_ready: bool,
+    pub current_batch_size: usize,
+    pub queued_tasks: usize,
+    pub completed_tasks: u64,
+    pub failed_tasks: u64,
 }
 
 // ==================== Engine Status ====================

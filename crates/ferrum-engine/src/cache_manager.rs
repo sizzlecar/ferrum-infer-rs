@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use ferrum_core::{
     CacheManager, BlockId, KVBlock, CacheStats, Result, Error,
-    Tensor, TokenId,
+    Tensor,
 };
 use std::collections::{HashMap, VecDeque, HashSet};
 use std::sync::Arc;
