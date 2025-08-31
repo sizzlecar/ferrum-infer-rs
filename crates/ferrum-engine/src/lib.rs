@@ -20,7 +20,7 @@ pub mod scheduler;
 pub use batch_manager::{BatchConfig, ContinuousBatchManager};
 pub use cache_manager::{CacheConfig, PagedKVCacheManager};
 pub use candle_backend::{CandleBackend, CandleModel};
-pub use engine::{Engine, EngineConfig};
+pub use engine::{Engine, EngineConfig, create_mvp_engine};
 pub use executor::{ExecutorConfig, GenericExecutor};
 pub use memory_manager::{GpuMemoryManager, MemoryConfig};
 pub use scheduler::{FairScheduler, SchedulerConfig};

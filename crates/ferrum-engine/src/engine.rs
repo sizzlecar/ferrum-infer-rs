@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use ferrum_core::{
     Backend, BatchManager, CacheManager, EngineStatus, Error, FinishReason, InferenceEngine, InferenceRequest,
     InferenceResponse, MemoryManager, Model, ModelConfig, ModelId, ModelLoader, Result, Scheduler, StreamChunk,
-    ScheduledBatch, BatchId, BatchOutput, BatchInfo, BlockId, KVBlock, MemoryHandle, MemoryPressure,
-    SchedulerStats, CacheStats, MemoryUsage, TokenUsage,
+    ScheduledBatch, ScheduledRequest, RequestState, BatchId, BatchOutput, BatchInfo, BlockId, KVBlock, MemoryHandle, MemoryPressure,
+    SchedulerStats, CacheStats, MemoryUsage, TokenUsage, GenerateOutput,
 };
 use crate::CandleBackend;
 use parking_lot::RwLock;
@@ -258,10 +258,10 @@ impl Engine {
             current_ids.push(token_id);
             kv_cache = output.kv_cache;
 
-            // Check for stop tokens
-            if let Some(stop_tokens) = &request.sampling_params.stop_tokens {
+            // Check for stop sequences
+            if !request.sampling_params.stop_sequences.is_empty() {
                 let decoded_text = model.decode(&generated_tokens)?;
-                if stop_tokens.iter().any(|stop| decoded_text.contains(stop)) {
+                if request.sampling_params.stop_sequences.iter().any(|stop| decoded_text.contains(stop)) {
                     break;
                 }
             }
@@ -277,15 +277,15 @@ impl Engine {
         Ok(InferenceResponse {
             request_id: request.id.clone(),
             text: generated_text,
-            tokens: generated_tokens,
-            finish_reason: ferrum_core::FinishReason::Length, // Simplified for MVP
-            usage: ferrum_core::Usage {
-                prompt_tokens: input_ids.len() as u32,
-                completion_tokens: generated_tokens.len() as u32,
-                total_tokens: (input_ids.len() + generated_tokens.len()) as u32,
+            tokens: generated_tokens.clone(),
+            finish_reason: FinishReason::Length, // Simplified for MVP
+            usage: TokenUsage {
+                prompt_tokens: input_ids.len(),
+                completion_tokens: generated_tokens.len(),
+                total_tokens: input_ids.len() + generated_tokens.len(),
             },
+            latency_ms: 0, // TODO: measure actual latency
             created_at: chrono::Utc::now(),
-            model_id: request.model_id.clone(),
         })
     }
 
@@ -384,10 +384,10 @@ impl InferenceEngine for Engine {
                         break; // Stream closed
                     }
 
-                    // Check for stop tokens
-                    if let Some(stop_tokens) = &sampling_params.stop_tokens {
+                    // Check for stop sequences
+                    if !sampling_params.stop_sequences.is_empty() {
                         let decoded_text = model.decode(&generated_tokens)?;
-                        if stop_tokens.iter().any(|stop| decoded_text.contains(stop)) {
+                        if sampling_params.stop_sequences.iter().any(|stop| decoded_text.contains(stop)) {
                             break;
                         }
                     }
@@ -411,12 +411,6 @@ impl InferenceEngine for Engine {
             }.await;
 
             if let Err(e) = result {
-                let error_chunk = StreamChunk {
-                    request_id,
-                    text: "".to_string(),
-                    token: None,
-                    finish_reason: Some(FinishReason::Error),
-                };
                 tx.send(Err(e)).await.ok();
             }
         });
@@ -495,7 +489,7 @@ impl ModelLoader for CandleModelLoader {
     async fn load_model(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
         info!("Loading model: {}", config.model_id.0);
         
-        let model = self.backend.load_weights("", config.dtype, &config.device).await?;
+        let model = Backend::load_weights(&*self.backend, "", config.dtype, &config.device).await?;
         let model_arc = Arc::from(model);
         
         // Cache the loaded model
@@ -543,7 +537,7 @@ pub async fn create_mvp_engine(config: EngineConfig) -> Result<Engine> {
 
     // Create and initialize backend
     let mut backend = CandleBackend::new(device)?;
-    backend.initialize().await?;
+    Backend::initialize(&mut backend).await?;
     let backend = Arc::new(backend);
 
     // Create simplified components
@@ -585,13 +579,16 @@ impl Scheduler for SimpleScheduler {
         Ok(request_id)
     }
 
-    async fn get_next_batch(&self) -> Option<ferrum_core::Batch> {
+    async fn get_next_batch(&self) -> Option<ScheduledBatch> {
         let mut queue = self.requests.write();
         if let Some(request) = queue.pop_front() {
-            Some(ferrum_core::Batch {
-                batch_id: ferrum_core::BatchId(uuid::Uuid::new_v4()),
-                requests: vec![request],
-                max_sequence_length: 2048,
+            Some(ScheduledBatch {
+                batch_id: BatchId(uuid::Uuid::new_v4()),
+                requests: vec![ScheduledRequest {
+                    request,
+                    state: RequestState::Running,
+                    allocated_blocks: vec![],
+                }],
                 created_at: chrono::Utc::now(),
             })
         } else {
@@ -599,19 +596,27 @@ impl Scheduler for SimpleScheduler {
         }
     }
 
-    async fn cancel_request(&self, _request_id: &ferrum_core::RequestId) -> Result<bool> {
-        // For MVP, don't support cancellation
-        Ok(false)
+    async fn preempt_request(&self, _request_id: ferrum_core::RequestId) -> Result<()> {
+        // For MVP, don't support preemption
+        Ok(())
     }
 
-    async fn get_stats(&self) -> ferrum_core::SchedulerStats {
-        ferrum_core::SchedulerStats {
-            total_scheduled: 0,
-            total_completed: 0,
-            total_failed: 0,
-            total_preempted: 0,
+    async fn complete_request(&self, _request_id: ferrum_core::RequestId, _response: InferenceResponse) -> Result<()> {
+        // For MVP, just acknowledge completion
+        Ok(())
+    }
+
+
+
+    async fn get_stats(&self) -> SchedulerStats {
+        SchedulerStats {
+            waiting_requests: self.requests.read().len(),
+            running_requests: 0,
+            preempted_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
             avg_wait_time_ms: 0.0,
-            queue_size: self.requests.read().len(),
+            avg_execution_time_ms: 0.0,
         }
     }
 }
@@ -627,23 +632,28 @@ impl SimpleBatchManager {
 
 #[async_trait]
 impl BatchManager for SimpleBatchManager {
-    async fn execute_batch(&self, _batch_id: ferrum_core::BatchId) -> Result<ferrum_core::BatchOutput> {
+    async fn create_batch(&self, _requests: Vec<InferenceRequest>) -> Result<BatchId> {
+        Ok(BatchId(uuid::Uuid::new_v4()))
+    }
+
+    async fn add_to_batch(&self, _batch_id: BatchId, _request: InferenceRequest) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_from_batch(&self, _batch_id: BatchId, _request_id: ferrum_core::RequestId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn execute_batch(&self, _batch_id: BatchId) -> Result<BatchOutput> {
         // For MVP, batch execution is handled directly in Engine
-        Ok(ferrum_core::BatchOutput {
-            batch_id: ferrum_core::BatchId(uuid::Uuid::new_v4()),
-            responses: vec![],
-            execution_time_ms: 0,
-            created_at: chrono::Utc::now(),
+        Ok(BatchOutput {
+            batch_id: BatchId(uuid::Uuid::new_v4()),
+            outputs: std::collections::HashMap::new(),
         })
     }
 
-    async fn get_stats(&self) -> ferrum_core::BatchStats {
-        ferrum_core::BatchStats {
-            total_batches: 0,
-            avg_batch_size: 0.0,
-            avg_execution_time_ms: 0.0,
-            throughput_tokens_per_sec: 0.0,
-        }
+    async fn get_batch_info(&self, _batch_id: BatchId) -> Option<BatchInfo> {
+        None
     }
 }
 
@@ -658,26 +668,34 @@ impl SimpleCacheManager {
 
 #[async_trait]
 impl CacheManager for SimpleCacheManager {
-    async fn allocate_cache(&self, _request_id: &ferrum_core::RequestId, _sequence_length: usize) -> Result<ferrum_core::KVCache> {
-        // For MVP, return empty cache
-        Ok(ferrum_core::KVCache {
-            keys: vec![],
-            values: vec![],
-            sequence_length: 0,
-        })
+    async fn allocate_blocks(&self, _num_blocks: usize) -> Result<Vec<BlockId>> {
+        Ok(vec![])
     }
 
-    async fn deallocate_cache(&self, _request_id: &ferrum_core::RequestId) -> Result<()> {
+    async fn free_blocks(&self, _block_ids: &[BlockId]) -> Result<()> {
         Ok(())
     }
 
-    async fn get_stats(&self) -> ferrum_core::CacheStats {
-        ferrum_core::CacheStats {
+    async fn get_block(&self, _block_id: BlockId) -> Option<KVBlock> {
+        None
+    }
+
+    async fn update_block(&self, _block_id: BlockId, _block: KVBlock) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_stats(&self) -> CacheStats {
+        CacheStats {
             total_blocks: 0,
+            used_blocks: 0,
             free_blocks: 0,
             cache_hit_rate: 0.0,
             eviction_count: 0,
         }
+    }
+
+    async fn defragment(&self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -692,28 +710,33 @@ impl SimpleMemoryManager {
 
 #[async_trait]
 impl MemoryManager for SimpleMemoryManager {
-    fn get_memory_usage(&self) -> ferrum_core::MemoryUsage {
-        ferrum_core::MemoryUsage {
-            used_bytes: 0,
-            total_bytes: 0,
-            cache_usage: 0,
-        }
+    async fn allocate(&self, _size: usize) -> Result<MemoryHandle> {
+        Ok(MemoryHandle(0))
     }
 
-    async fn allocate(&self, _size: usize) -> Result<ferrum_core::MemoryHandle> {
-        Ok(ferrum_core::MemoryHandle(0))
-    }
-
-    async fn deallocate(&self, _handle: ferrum_core::MemoryHandle) -> Result<()> {
+    async fn deallocate(&self, _handle: MemoryHandle) -> Result<()> {
         Ok(())
     }
 
-    async fn get_stats(&self) -> ferrum_core::MemoryStats {
-        ferrum_core::MemoryStats {
-            total_allocated: 0,
-            peak_allocated: 0,
-            allocation_count: 0,
-            deallocation_count: 0,
+    fn get_memory_usage(&self) -> MemoryUsage {
+        MemoryUsage {
+            used_bytes: 0,
+            free_bytes: 0,
+            total_bytes: 0,
+            gpu_memory_bytes: Some(0),
+            cpu_memory_bytes: Some(0),
         }
+    }
+
+    async fn swap_out(&self, _handle: MemoryHandle) -> Result<()> {
+        Ok(())
+    }
+
+    async fn swap_in(&self, _handle: MemoryHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_pressure_callback(&self, _callback: Box<dyn Fn(MemoryPressure) + Send + Sync>) {
+        // For MVP, ignore pressure callbacks
     }
 }
