@@ -45,6 +45,9 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 half = { workspace = true }
 
+# HTTP client for manual downloads
+reqwest = { workspace = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"

@@ -1130,6 +1130,7 @@ dependencies = [
  "parking_lot",
  "rand 0.9.2",
  "rand_distr 0.4.3",
+ "reqwest 0.12.23",
  "safetensors",
  "serde",
  "serde_json",
