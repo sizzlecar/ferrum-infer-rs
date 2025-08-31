@@ -104,6 +104,47 @@ impl CandleBackend {
             model_info,
         }))
     }
+
+    /// Download file with proper redirect handling
+    async fn download_file_with_redirects(&self, url: &str, local_path: &str) -> Result<std::path::PathBuf> {
+        info!("Downloading {} to {}", url, local_path);
+        
+        // Create directory if needed
+        if let Some(parent) = std::path::Path::new(local_path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        
+        // Create reqwest client with proper redirect handling
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10)) // Allow up to 10 redirects
+            .build()
+            .map_err(|e| Error::internal(format!("Failed to create HTTP client: {}", e)))?;
+        
+        let mut request = client.get(url);
+        
+        // Add authorization if token is available
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        } else if let Ok(token) = std::env::var("HUGGINGFACE_HUB_TOKEN") {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+        
+        let response = request.send().await
+            .map_err(|e| Error::internal(format!("HTTP request failed: {}", e)))?;
+        
+        if !response.status().is_success() {
+            return Err(Error::internal(format!("HTTP error: {}", response.status())));
+        }
+        
+        let bytes = response.bytes().await
+            .map_err(|e| Error::internal(format!("Failed to read response: {}", e)))?;
+        
+        std::fs::write(local_path, bytes)
+            .map_err(|e| Error::internal(format!("Failed to write file: {}", e)))?;
+        
+        info!("Successfully downloaded to {}", local_path);
+        Ok(std::path::PathBuf::from(local_path))
+    }
 }
 
 #[async_trait]
@@ -206,18 +247,31 @@ impl Backend for CandleBackend {
             }
         };
         
+        // Use TinyLlama but try to fix the redirect issue with a different approach
         let repo = api.model("TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
 
         // Try to download with better error handling
         let tokenizer_filename = match repo.get("tokenizer.json").await {
             Ok(path) => path,
             Err(e) => {
-                warn!("Failed to download tokenizer ({}), trying local files", e);
-                let local_path = "/tmp/models/tokenizer.json";
-                if std::path::Path::new(local_path).exists() {
-                    std::path::PathBuf::from(local_path)
-                } else {
-                    return Err(Error::internal(format!("Download tokenizer failed: {}", e)));
+                warn!("HF download failed ({}), trying manual download with proper redirect handling", e);
+                
+                // Try manual download with proper redirect handling
+                match self.download_file_with_redirects(
+                    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json",
+                    "/tmp/models/tokenizer.json"
+                ).await {
+                    Ok(path) => path,
+                    Err(download_err) => {
+                        // Final fallback to existing local file
+                        let local_path = "/tmp/models/tokenizer.json";
+                        if std::path::Path::new(local_path).exists() {
+                            info!("Using existing local tokenizer file");
+                            std::path::PathBuf::from(local_path)
+                        } else {
+                            return Err(Error::internal(format!("All download methods failed. HF error: {}, Manual download error: {}", e, download_err)));
+                        }
+                    }
                 }
             }
         };
@@ -228,12 +282,21 @@ impl Backend for CandleBackend {
         let config_filename = match repo.get("config.json").await {
             Ok(path) => path,
             Err(e) => {
-                warn!("Failed to download config ({}), trying local files", e);
-                let local_path = "/tmp/models/config.json";
-                if std::path::Path::new(local_path).exists() {
-                    std::path::PathBuf::from(local_path)
-                } else {
-                    return Err(Error::internal(format!("Download config failed: {}", e)));
+                warn!("HF download failed ({}), trying manual download", e);
+                match self.download_file_with_redirects(
+                    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/config.json",
+                    "/tmp/models/config.json"
+                ).await {
+                    Ok(path) => path,
+                    Err(download_err) => {
+                        let local_path = "/tmp/models/config.json";
+                        if std::path::Path::new(local_path).exists() {
+                            info!("Using existing local config file");
+                            std::path::PathBuf::from(local_path)
+                        } else {
+                            return Err(Error::internal(format!("All download methods failed. HF error: {}, Manual download error: {}", e, download_err)));
+                        }
+                    }
                 }
             }
         };
@@ -262,12 +325,21 @@ impl Backend for CandleBackend {
         let weights_filename = match repo.get("model.safetensors").await {
             Ok(path) => path,
             Err(e) => {
-                warn!("Failed to download weights ({}), trying local files", e);
-                let local_path = "/tmp/models/model.safetensors";
-                if std::path::Path::new(local_path).exists() {
-                    std::path::PathBuf::from(local_path)
-                } else {
-                    return Err(Error::internal(format!("Download weights failed: {}", e)));
+                warn!("HF download failed ({}), trying manual download", e);
+                match self.download_file_with_redirects(
+                    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/model.safetensors",
+                    "/tmp/models/model.safetensors"
+                ).await {
+                    Ok(path) => path,
+                    Err(download_err) => {
+                        let local_path = "/tmp/models/model.safetensors";
+                        if std::path::Path::new(local_path).exists() {
+                            info!("Using existing local weights file");
+                            std::path::PathBuf::from(local_path)
+                        } else {
+                            return Err(Error::internal(format!("All download methods failed. HF error: {}, Manual download error: {}", e, download_err)));
+                        }
+                    }
                 }
             }
         };
