@@ -2,12 +2,16 @@
 
 use async_trait::async_trait;
 use ferrum_core::{
-    BatchManager, CacheManager, EngineStatus, Error, InferenceEngine, InferenceRequest,
-    InferenceResponse, MemoryManager, ModelId, ModelLoader, Result, Scheduler, StreamChunk,
+    Backend, BatchManager, CacheManager, EngineStatus, Error, FinishReason, InferenceEngine, InferenceRequest,
+    InferenceResponse, MemoryManager, Model, ModelConfig, ModelId, ModelLoader, Result, Scheduler, StreamChunk,
+    ScheduledBatch, ScheduledRequest, RequestState, BatchId, BatchOutput, BatchInfo, BlockId, KVBlock, MemoryHandle, MemoryPressure,
+    SchedulerStats, CacheStats, MemoryUsage, TokenUsage, GenerateOutput,
 };
+use crate::CandleBackend;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
 /// Engine configuration
@@ -127,9 +131,9 @@ impl Engine {
         // Load the model
         let model_config = ferrum_core::ModelConfig {
             model_id: ModelId(self.config.model_id.clone()),
-            model_path: format!("models/{}", self.config.model_id),
+            model_path: "".to_string(), // Not used for Candle backend
             model_type: ferrum_core::ModelType::Llama,
-            dtype: ferrum_core::DataType::FP16,
+            dtype: ferrum_core::DataType::FP32, // Use FP32 for MVP
             device: self.parse_device()?,
             max_batch_size: self.config.max_batch_size,
             max_sequence_length: self.config.max_sequence_length,
@@ -152,7 +156,7 @@ impl Engine {
             self.start_scheduler_loop().await;
         }
 
-        info!("Engine initialization complete");
+        info!("Engine initialized successfully");
         Ok(())
     }
 
@@ -164,10 +168,17 @@ impl Engine {
                 let id = s
                     .trim_start_matches("cuda:")
                     .parse::<usize>()
-                    .map_err(|_| Error::configuration("Invalid CUDA device ID"))?;
+                    .map_err(|_| Error::internal("Invalid CUDA device ID"))?;
                 Ok(ferrum_core::Device::CUDA(id))
             }
-            _ => Err(Error::configuration(format!(
+            s if s.starts_with("rocm:") => {
+                let id = s
+                    .trim_start_matches("rocm:")
+                    .parse::<usize>()
+                    .map_err(|_| Error::internal("Invalid ROCm device ID"))?;
+                Ok(ferrum_core::Device::ROCm(id))
+            }
+            _ => Err(Error::internal(format!(
                 "Unknown device: {}",
                 self.config.device
             ))),
@@ -199,7 +210,7 @@ impl Engine {
 
                     // Execute the batch
                     match batch_manager.execute_batch(batch.batch_id).await {
-                        Ok(output) => {
+                        Ok(_output) => {
                             debug!("Batch execution successful");
                             // Process outputs will be handled by response callbacks
                         }
@@ -211,6 +222,73 @@ impl Engine {
             }
         });
     }
+
+    /// Generate completion directly for MVP
+    async fn generate_completion_direct(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
+        // Get the model
+        let model = self.model_loader.get_model(&request.model_id.0).await
+            .ok_or_else(|| Error::internal("Model not loaded"))?;
+
+        self.generate_completion_with_model(request, &model).await
+    }
+
+    /// Generate completion with a specific model
+    async fn generate_completion_with_model(&self, request: &InferenceRequest, model: &Arc<dyn Model>) -> Result<InferenceResponse> {
+        let prompt = &request.prompt;
+        info!("Generating completion for prompt: {}", prompt);
+
+        // Encode the prompt
+        let input_ids = model.encode(prompt)?;
+        debug!("Encoded prompt to {} tokens", input_ids.len());
+
+        let mut generated_tokens = Vec::new();
+        let mut current_ids = input_ids.clone();
+        let mut kv_cache = None;
+
+        // Generate tokens one by one
+        for _step in 0..request.sampling_params.max_tokens {
+            let output = model.generate_next_token(
+                &current_ids,
+                kv_cache.as_ref(),
+                &request.sampling_params,
+            ).await?;
+
+            let token_id = output.token_id;
+            generated_tokens.push(token_id);
+            current_ids.push(token_id);
+            kv_cache = output.kv_cache;
+
+            // Check for stop sequences
+            if !request.sampling_params.stop_sequences.is_empty() {
+                let decoded_text = model.decode(&generated_tokens)?;
+                if request.sampling_params.stop_sequences.iter().any(|stop| decoded_text.contains(stop)) {
+                    break;
+                }
+            }
+
+            // Check for EOS token (typically 2 for LLaMA models)
+            if token_id == 2 {
+                break;
+            }
+        }
+
+        let generated_text = model.decode(&generated_tokens)?;
+        
+        Ok(InferenceResponse {
+            request_id: request.id.clone(),
+            text: generated_text,
+            tokens: generated_tokens.clone(),
+            finish_reason: FinishReason::Length, // Simplified for MVP
+            usage: TokenUsage {
+                prompt_tokens: input_ids.len(),
+                completion_tokens: generated_tokens.len(),
+                total_tokens: input_ids.len() + generated_tokens.len(),
+            },
+            latency_ms: 0, // TODO: measure actual latency
+            created_at: chrono::Utc::now(),
+        })
+    }
+
 }
 
 #[async_trait]
@@ -231,17 +309,8 @@ impl InferenceEngine for Engine {
             state.total_requests += 1;
         }
 
-        // Schedule the request
-        let request_id = self.scheduler.schedule_request(request.clone()).await?;
-
-        // Create response channel
-        let (tx, mut rx) = mpsc::channel(1);
-
-        // Wait for response (this would be improved with proper callback system)
-        let response = rx
-            .recv()
-            .await
-            .ok_or_else(|| Error::internal("Failed to receive response"))?;
+        // For MVP, directly generate completion without complex scheduling
+        let response = self.generate_completion_direct(&request).await;
 
         // Update stats
         {
@@ -249,7 +318,7 @@ impl InferenceEngine for Engine {
             state.active_requests -= 1;
         }
 
-        Ok(response)
+        response
     }
 
     async fn infer_stream(
@@ -264,16 +333,90 @@ impl InferenceEngine for Engine {
             }
         }
 
-        // Schedule the request with streaming enabled
-        let mut request = request;
-        request.stream = true;
-        let request_id = self.scheduler.schedule_request(request).await?;
-
         // Create stream channel
         let (tx, rx) = mpsc::channel(100);
 
+        // Clone necessary data for the async task
+        let model_loader = Arc::clone(&self.model_loader);
+        let request_id = request.id.clone();
+        let model_id = request.model_id.clone();
+        let prompt = request.prompt.clone();
+        let sampling_params = request.sampling_params.clone();
+
+        // Spawn async task to generate tokens
+        tokio::spawn(async move {
+            let result = async {
+                // Get the model
+                let model = model_loader.get_model(&model_id.0).await
+                    .ok_or_else(|| Error::internal("Model not loaded"))?;
+
+                // Encode the prompt
+                let input_ids = model.encode(&prompt)?;
+                let mut generated_tokens = Vec::new();
+                let mut current_ids = input_ids.clone();
+                let mut kv_cache = None;
+
+                // Generate tokens one by one, streaming each
+                for _step in 0..sampling_params.max_tokens {
+                    let output = model.generate_next_token(
+                        &current_ids,
+                        kv_cache.as_ref(),
+                        &sampling_params,
+                    ).await?;
+
+                    let token_id = output.token_id;
+                    generated_tokens.push(token_id);
+                    current_ids.push(token_id);
+                    kv_cache = output.kv_cache;
+
+                    // Decode the new token
+                    let token_text = model.decode(&[token_id])?;
+
+                    // Send stream chunk
+                    let chunk = StreamChunk {
+                        request_id: request_id.clone(),
+                        text: token_text,
+                        token: Some(token_id),
+                        finish_reason: None,
+                    };
+
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        break; // Stream closed
+                    }
+
+                    // Check for stop sequences
+                    if !sampling_params.stop_sequences.is_empty() {
+                        let decoded_text = model.decode(&generated_tokens)?;
+                        if sampling_params.stop_sequences.iter().any(|stop| decoded_text.contains(stop)) {
+                            break;
+                        }
+                    }
+
+                    // Check for EOS token
+                    if token_id == 2 {
+                        break;
+                    }
+                }
+
+                // Send final chunk
+                let final_chunk = StreamChunk {
+                    request_id: request_id.clone(),
+                    text: "".to_string(),
+                    token: None,
+                    finish_reason: Some(FinishReason::Length),
+                };
+
+                tx.send(Ok(final_chunk)).await.ok();
+                Ok::<(), Error>(())
+            }.await;
+
+            if let Err(e) = result {
+                tx.send(Err(e)).await.ok();
+            }
+        });
+
         // Convert to futures::Stream
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let stream = ReceiverStream::new(rx);
         Ok(Box::new(stream))
     }
 
@@ -323,5 +466,277 @@ impl InferenceEngine for Engine {
 
         info!("Engine shutdown complete");
         Ok(())
+    }
+}
+
+/// Simple ModelLoader implementation for MVP using CandleBackend
+pub struct CandleModelLoader {
+    backend: Arc<CandleBackend>,
+    loaded_models: Arc<RwLock<std::collections::HashMap<String, Arc<dyn Model>>>>,
+}
+
+impl CandleModelLoader {
+    pub fn new(backend: Arc<CandleBackend>) -> Self {
+        Self {
+            backend,
+            loaded_models: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelLoader for CandleModelLoader {
+    async fn load_model(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
+        info!("Loading model: {}", config.model_id.0);
+        
+        let model = Backend::load_weights(&*self.backend, "", config.dtype, &config.device).await?;
+        let model_arc = Arc::from(model);
+        
+        // Cache the loaded model
+        {
+            let mut models = self.loaded_models.write();
+            models.insert(config.model_id.0.clone(), Arc::clone(&model_arc));
+        }
+        
+        Ok(model_arc)
+    }
+
+    async fn unload_model(&self, model_id: &str) -> Result<()> {
+        info!("Unloading model: {}", model_id);
+        let mut models = self.loaded_models.write();
+        models.remove(model_id);
+        Ok(())
+    }
+
+    async fn get_model(&self, model_id: &str) -> Option<Arc<dyn Model>> {
+        let models = self.loaded_models.read();
+        models.get(model_id).cloned()
+    }
+
+    async fn list_models(&self) -> Vec<ferrum_core::ModelInfo> {
+        let models = self.loaded_models.read();
+        models.values().map(|model| model.info().clone()).collect()
+    }
+}
+
+/// Create a simplified Engine for MVP
+pub async fn create_mvp_engine(config: EngineConfig) -> Result<Engine> {
+    info!("Creating MVP Engine with simplified components");
+
+    // Parse device
+    let device = match config.device.as_str() {
+        "cpu" => ferrum_core::Device::CPU,
+        s if s.starts_with("cuda:") => {
+            let id = s.trim_start_matches("cuda:")
+                .parse::<usize>()
+                .map_err(|_| Error::internal("Invalid CUDA device ID"))?;
+            ferrum_core::Device::CUDA(id)
+        }
+        _ => ferrum_core::Device::CPU,
+    };
+
+    // Create and initialize backend
+    let mut backend = CandleBackend::new(device)?;
+    Backend::initialize(&mut backend).await?;
+    let backend = Arc::new(backend);
+
+    // Create simplified components
+    let model_loader = Arc::new(CandleModelLoader::new(Arc::clone(&backend)));
+    let scheduler = Arc::new(SimpleScheduler::new());
+    let batch_manager = Arc::new(SimpleBatchManager::new());
+    let cache_manager = Arc::new(SimpleCacheManager::new());
+    let memory_manager = Arc::new(SimpleMemoryManager::new());
+
+    Engine::new(
+        config,
+        scheduler,
+        batch_manager,
+        cache_manager,
+        memory_manager,
+        model_loader,
+    ).await
+}
+
+/// Simple scheduler implementation for MVP
+pub struct SimpleScheduler {
+    requests: Arc<RwLock<std::collections::VecDeque<InferenceRequest>>>,
+}
+
+impl SimpleScheduler {
+    pub fn new() -> Self {
+        Self {
+            requests: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl Scheduler for SimpleScheduler {
+    async fn schedule_request(&self, request: InferenceRequest) -> Result<ferrum_core::RequestId> {
+        let mut queue = self.requests.write();
+        let request_id = request.id.clone();
+        queue.push_back(request);
+        Ok(request_id)
+    }
+
+    async fn get_next_batch(&self) -> Option<ScheduledBatch> {
+        let mut queue = self.requests.write();
+        if let Some(request) = queue.pop_front() {
+            Some(ScheduledBatch {
+                batch_id: BatchId(uuid::Uuid::new_v4()),
+                requests: vec![ScheduledRequest {
+                    request,
+                    state: RequestState::Running,
+                    allocated_blocks: vec![],
+                }],
+                created_at: chrono::Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+
+    async fn preempt_request(&self, _request_id: ferrum_core::RequestId) -> Result<()> {
+        // For MVP, don't support preemption
+        Ok(())
+    }
+
+    async fn complete_request(&self, _request_id: ferrum_core::RequestId, _response: InferenceResponse) -> Result<()> {
+        // For MVP, just acknowledge completion
+        Ok(())
+    }
+
+
+
+    async fn get_stats(&self) -> SchedulerStats {
+        SchedulerStats {
+            waiting_requests: self.requests.read().len(),
+            running_requests: 0,
+            preempted_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            avg_wait_time_ms: 0.0,
+            avg_execution_time_ms: 0.0,
+        }
+    }
+}
+
+/// Simple batch manager implementation for MVP
+pub struct SimpleBatchManager;
+
+impl SimpleBatchManager {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl BatchManager for SimpleBatchManager {
+    async fn create_batch(&self, _requests: Vec<InferenceRequest>) -> Result<BatchId> {
+        Ok(BatchId(uuid::Uuid::new_v4()))
+    }
+
+    async fn add_to_batch(&self, _batch_id: BatchId, _request: InferenceRequest) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_from_batch(&self, _batch_id: BatchId, _request_id: ferrum_core::RequestId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn execute_batch(&self, _batch_id: BatchId) -> Result<BatchOutput> {
+        // For MVP, batch execution is handled directly in Engine
+        Ok(BatchOutput {
+            batch_id: BatchId(uuid::Uuid::new_v4()),
+            outputs: std::collections::HashMap::new(),
+        })
+    }
+
+    async fn get_batch_info(&self, _batch_id: BatchId) -> Option<BatchInfo> {
+        None
+    }
+}
+
+/// Simple cache manager implementation for MVP
+pub struct SimpleCacheManager;
+
+impl SimpleCacheManager {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl CacheManager for SimpleCacheManager {
+    async fn allocate_blocks(&self, _num_blocks: usize) -> Result<Vec<BlockId>> {
+        Ok(vec![])
+    }
+
+    async fn free_blocks(&self, _block_ids: &[BlockId]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_block(&self, _block_id: BlockId) -> Option<KVBlock> {
+        None
+    }
+
+    async fn update_block(&self, _block_id: BlockId, _block: KVBlock) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_stats(&self) -> CacheStats {
+        CacheStats {
+            total_blocks: 0,
+            used_blocks: 0,
+            free_blocks: 0,
+            cache_hit_rate: 0.0,
+            eviction_count: 0,
+        }
+    }
+
+    async fn defragment(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Simple memory manager implementation for MVP
+pub struct SimpleMemoryManager;
+
+impl SimpleMemoryManager {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl MemoryManager for SimpleMemoryManager {
+    async fn allocate(&self, _size: usize) -> Result<MemoryHandle> {
+        Ok(MemoryHandle(0))
+    }
+
+    async fn deallocate(&self, _handle: MemoryHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_memory_usage(&self) -> MemoryUsage {
+        MemoryUsage {
+            used_bytes: 0,
+            free_bytes: 0,
+            total_bytes: 0,
+            gpu_memory_bytes: Some(0),
+            cpu_memory_bytes: Some(0),
+        }
+    }
+
+    async fn swap_out(&self, _handle: MemoryHandle) -> Result<()> {
+        Ok(())
+    }
+
+    async fn swap_in(&self, _handle: MemoryHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_pressure_callback(&self, _callback: Box<dyn Fn(MemoryPressure) + Send + Sync>) {
+        // For MVP, ignore pressure callbacks
     }
 }
