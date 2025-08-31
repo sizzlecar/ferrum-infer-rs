@@ -402,7 +402,7 @@ fn apply_sampling(logits: &CandleTensor, params: &SamplingParams) -> Result<Toke
     } else {
         // Multinomial sampling
         use rand::Rng;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // Convert logits to probabilities
         let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -417,7 +417,7 @@ fn apply_sampling(logits: &CandleTensor, params: &SamplingParams) -> Result<Toke
 
         // Sample from the distribution
         let mut cumulative = 0.0;
-        let random_value: f32 = rng.gen();
+        let random_value: f32 = rng.random();
 
         for (i, &prob) in probs.iter().enumerate() {
             cumulative += prob;

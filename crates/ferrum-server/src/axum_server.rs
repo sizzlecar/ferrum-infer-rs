@@ -229,8 +229,8 @@ async fn handle_chat_completions_stream(
             Ok(mut stream) => {
                 while let Some(result) = stream.next().await {
                     match result {
-                        Ok(output) => {
-                            current_text.push_str(&output.text);
+                        Ok(chunk) => {
+                            current_text.push_str(&chunk.text);
                             token_count += 1;
 
                             // Create streaming response chunk
@@ -244,7 +244,7 @@ async fn handle_chat_completions_stream(
                                     message: None,
                                     delta: Some(ChatMessage {
                                         role: MessageRole::Assistant,
-                                        content: output.text,
+                                        content: chunk.text.clone(),
                                         name: None,
                                     }),
                                     finish_reason: None,
@@ -260,7 +260,7 @@ async fn handle_chat_completions_stream(
                             }
 
                             // Check stopping conditions
-                            if token_count >= max_tokens || output.finish_reason.is_some() {
+                            if token_count >= max_tokens || chunk.finish_reason.is_some() {
                                 // Send final chunk
                                 let final_chunk = ChatCompletionsResponse {
                                     id: request_id.clone(),
