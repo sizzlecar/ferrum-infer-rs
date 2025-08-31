@@ -74,53 +74,31 @@ impl Backend for CandleBackend {
 
         info!("Loading TinyLlama model...");
         
-        // Try to initialize HF API with proper configuration
-        let api = match std::env::var("HF_HUB_OFFLINE") {
-            Ok(_) => {
-                info!("HF_HUB_OFFLINE is set, skipping model download for MVP");
-                return Err(Error::internal("Model download disabled for MVP testing"));
-            }
-            Err(_) => {
-                // Set proper HF Hub cache directory
-                let cache_dir = "/tmp/hf_cache";
-                std::env::set_var("HF_HOME", cache_dir);
-                std::env::set_var("HUGGINGFACE_HUB_CACHE", cache_dir);
-                
-                // Create cache directory if it doesn't exist
-                std::fs::create_dir_all(cache_dir).ok();
-                
-                // Check for token in environment variables and set it
-                if let Ok(token) = std::env::var("HF_TOKEN") {
-                    info!("Using HF_TOKEN from environment");
-                    // Save token to the exact path hf-hub expects
-                    let token_file = std::path::Path::new(cache_dir).join("token");
-                    std::fs::write(&token_file, &token).ok();
-                } else if let Ok(token) = std::env::var("HUGGINGFACE_HUB_TOKEN") {
-                    info!("Using HUGGINGFACE_HUB_TOKEN from environment");
-                    let token_file = std::path::Path::new(cache_dir).join("token");
-                    std::fs::write(&token_file, &token).ok();
-                } else {
-                    info!("No HF token found, using anonymous access");
-                }
-                
-                Api::new().map_err(|e| Error::internal(format!("HF API failed: {}", e)))?
-            }
-        };
+        // For MVP, use pre-downloaded local files to avoid hf-hub issues
+        let model_dir = "/tmp/models";
+        let tokenizer_path = format!("{}/tokenizer.json", model_dir);
+        let config_path = format!("{}/config.json", model_dir);
+        let weights_path = format!("{}/model.safetensors", model_dir);
         
-        let repo = api.model("TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
-
-        let tokenizer_filename = repo
-            .get("tokenizer.json")
-            .await
-            .map_err(|e| Error::internal(format!("Download tokenizer failed: {}", e)))?;
-        let tokenizer = Tokenizer::from_file(&tokenizer_filename)
+        // Check if local files exist
+        if !std::path::Path::new(&tokenizer_path).exists() ||
+           !std::path::Path::new(&config_path).exists() ||
+           !std::path::Path::new(&weights_path).exists() {
+            return Err(Error::internal(
+                "Local model files not found. Please download TinyLlama model files to /tmp/models/\n\
+                Required files:\n\
+                - /tmp/models/tokenizer.json\n\
+                - /tmp/models/config.json\n\
+                - /tmp/models/model.safetensors"
+            ));
+        }
+        
+        info!("Loading tokenizer from local file: {}", tokenizer_path);
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| Error::internal(format!("Load tokenizer failed: {}", e)))?;
 
-        let config_filename = repo
-            .get("config.json")
-            .await
-            .map_err(|e| Error::internal(format!("Download config failed: {}", e)))?;
-        let _config_bytes = std::fs::read(&config_filename)
+        info!("Reading config from local file: {}", config_path);
+        let _config_bytes = std::fs::read(&config_path)
             .map_err(|e| Error::internal(format!("Read config failed: {}", e)))?;
         
         // Create a TinyLlama config manually for MVP
@@ -141,14 +119,10 @@ impl Backend for CandleBackend {
             tie_word_embeddings: false,
         };
 
-        let weights_filename = repo
-            .get("model.safetensors")
-            .await
-            .map_err(|e| Error::internal(format!("Download weights failed: {}", e)))?;
-
+        info!("Loading weights from local file: {}", weights_path);
         let dtype = DType::F32; // Use FP32 for MVP to avoid half issues
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_filename.clone()], dtype, &self.device)
+            VarBuilder::from_mmaped_safetensors(&[std::path::PathBuf::from(weights_path)], dtype, &self.device)
                 .map_err(|e| Error::internal(format!("Load weights failed: {}", e)))?
         };
 
