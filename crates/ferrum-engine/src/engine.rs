@@ -2,8 +2,10 @@
 
 use async_trait::async_trait;
 use ferrum_core::{
-    Backend, Device, EngineStatus, Error, FinishReason, InferenceEngine, InferenceRequest,
-    InferenceResponse, Model, ModelConfig, ModelId, ModelType, Result, SamplingParams, StreamChunk,
+    Backend, BatchManager, CacheManager, EngineStatus, Error, FinishReason, InferenceEngine, InferenceRequest,
+    InferenceResponse, MemoryManager, Model, ModelConfig, ModelId, ModelLoader, Result, Scheduler, StreamChunk,
+    ScheduledBatch, BatchId, BatchOutput, BatchInfo, BlockId, KVBlock, MemoryHandle, MemoryPressure,
+    SchedulerStats, CacheStats, MemoryUsage, TokenUsage,
 };
 use crate::CandleBackend;
 use parking_lot::RwLock;
@@ -63,11 +65,14 @@ impl Default for EngineConfig {
     }
 }
 
-/// Main inference engine (simplified for MVP)
+/// Main inference engine
 pub struct Engine {
     config: EngineConfig,
-    backend: Arc<CandleBackend>,
-    model: Arc<dyn Model>,
+    scheduler: Arc<dyn Scheduler>,
+    batch_manager: Arc<dyn BatchManager>,
+    cache_manager: Arc<dyn CacheManager>,
+    memory_manager: Arc<dyn MemoryManager>,
+    model_loader: Arc<dyn ModelLoader>,
     engine_state: Arc<RwLock<EngineState>>,
     shutdown_signal: Arc<RwLock<bool>>,
 }
@@ -82,38 +87,21 @@ struct EngineState {
 }
 
 impl Engine {
-    /// Create a new inference engine (simplified for MVP)
-    pub async fn new(config: EngineConfig) -> Result<Self> {
+    /// Create a new inference engine
+    pub async fn new(
+        config: EngineConfig,
+        scheduler: Arc<dyn Scheduler>,
+        batch_manager: Arc<dyn BatchManager>,
+        cache_manager: Arc<dyn CacheManager>,
+        memory_manager: Arc<dyn MemoryManager>,
+        model_loader: Arc<dyn ModelLoader>,
+    ) -> Result<Self> {
         info!("Initializing Ferrum Engine with config: {:?}", config);
-
-        // Parse device from config
-        let device = parse_device_from_string(&config.device)?;
-        
-        // Create and initialize backend
-        let mut backend = CandleBackend::new(device)?;
-        backend.initialize().await?;
-        let backend = Arc::new(backend);
-
-        // Load model
-        let model_config = ModelConfig {
-            model_id: ModelId(config.model_id.clone()),
-            model_path: "".to_string(), // Not used in Candle backend
-            model_type: ModelType::Llama,
-            dtype: ferrum_core::DataType::FP32, // Use FP32 for MVP
-            device: device.clone(),
-            max_batch_size: config.max_batch_size,
-            max_sequence_length: config.max_sequence_length,
-            tensor_parallel_size: None,
-            pipeline_parallel_size: None,
-            quantization: None,
-        };
-
-        let model = backend.load_weights("", model_config.dtype, &device).await?;
 
         // Initialize engine state
         let engine_state = Arc::new(RwLock::new(EngineState {
-            is_ready: true,
-            loaded_models: vec![model_config.model_id],
+            is_ready: false,
+            loaded_models: vec![],
             active_requests: 0,
             total_requests: 0,
             start_time: std::time::Instant::now(),
@@ -121,23 +109,136 @@ impl Engine {
 
         let engine = Self {
             config,
-            backend,
-            model: Arc::from(model),
+            scheduler,
+            batch_manager,
+            cache_manager,
+            memory_manager,
+            model_loader,
             engine_state,
             shutdown_signal: Arc::new(RwLock::new(false)),
         };
 
-        info!("Engine initialized successfully");
+        // Initialize subsystems
+        engine.initialize().await?;
+
         Ok(engine)
     }
 
-    /// Generate text completion using the model
-    async fn generate_completion(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
+    /// Initialize engine subsystems
+    async fn initialize(&self) -> Result<()> {
+        info!("Initializing engine subsystems...");
+
+        // Load the model
+        let model_config = ferrum_core::ModelConfig {
+            model_id: ModelId(self.config.model_id.clone()),
+            model_path: "".to_string(), // Not used for Candle backend
+            model_type: ferrum_core::ModelType::Llama,
+            dtype: ferrum_core::DataType::FP32, // Use FP32 for MVP
+            device: self.parse_device()?,
+            max_batch_size: self.config.max_batch_size,
+            max_sequence_length: self.config.max_sequence_length,
+            tensor_parallel_size: None,
+            pipeline_parallel_size: None,
+            quantization: None,
+        };
+
+        self.model_loader.load_model(&model_config).await?;
+
+        // Update state
+        {
+            let mut state = self.engine_state.write();
+            state.loaded_models.push(model_config.model_id);
+            state.is_ready = true;
+        }
+
+        // Start background scheduler if continuous batching is enabled
+        if self.config.enable_continuous_batching {
+            self.start_scheduler_loop().await;
+        }
+
+        info!("Engine initialized successfully");
+        Ok(())
+    }
+
+    /// Parse device string to Device enum
+    fn parse_device(&self) -> Result<ferrum_core::Device> {
+        match self.config.device.as_str() {
+            "cpu" => Ok(ferrum_core::Device::CPU),
+            s if s.starts_with("cuda:") => {
+                let id = s
+                    .trim_start_matches("cuda:")
+                    .parse::<usize>()
+                    .map_err(|_| Error::internal("Invalid CUDA device ID"))?;
+                Ok(ferrum_core::Device::CUDA(id))
+            }
+            s if s.starts_with("rocm:") => {
+                let id = s
+                    .trim_start_matches("rocm:")
+                    .parse::<usize>()
+                    .map_err(|_| Error::internal("Invalid ROCm device ID"))?;
+                Ok(ferrum_core::Device::ROCm(id))
+            }
+            _ => Err(Error::internal(format!(
+                "Unknown device: {}",
+                self.config.device
+            ))),
+        }
+    }
+
+    /// Start the background scheduler loop
+    async fn start_scheduler_loop(&self) {
+        let scheduler = Arc::clone(&self.scheduler);
+        let batch_manager = Arc::clone(&self.batch_manager);
+        let shutdown_signal = Arc::clone(&self.shutdown_signal);
+        let interval_ms = self.config.scheduling_interval_ms;
+
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
+
+            loop {
+                if *shutdown_signal.read() {
+                    info!("Scheduler loop shutting down");
+                    break;
+                }
+
+                interval.tick().await;
+
+                // Get next batch to execute
+                if let Some(batch) = scheduler.get_next_batch().await {
+                    debug!("Executing batch {:?}", batch.batch_id);
+
+                    // Execute the batch
+                    match batch_manager.execute_batch(batch.batch_id).await {
+                        Ok(_output) => {
+                            debug!("Batch execution successful");
+                            // Process outputs will be handled by response callbacks
+                        }
+                        Err(e) => {
+                            error!("Batch execution failed: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Generate completion directly for MVP
+    async fn generate_completion_direct(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
+        // Get the model
+        let model = self.model_loader.get_model(&request.model_id.0).await
+            .ok_or_else(|| Error::internal("Model not loaded"))?;
+
+        self.generate_completion_with_model(request, &model).await
+    }
+
+    /// Generate completion with a specific model
+    async fn generate_completion_with_model(&self, request: &InferenceRequest, model: &Arc<dyn Model>) -> Result<InferenceResponse> {
         let prompt = &request.prompt;
         info!("Generating completion for prompt: {}", prompt);
 
         // Encode the prompt
-        let input_ids = self.model.encode(prompt)?;
+        let input_ids = model.encode(prompt)?;
         debug!("Encoded prompt to {} tokens", input_ids.len());
 
         let mut generated_tokens = Vec::new();
@@ -146,7 +247,7 @@ impl Engine {
 
         // Generate tokens one by one
         for _step in 0..request.sampling_params.max_tokens {
-            let output = self.model.generate_next_token(
+            let output = model.generate_next_token(
                 &current_ids,
                 kv_cache.as_ref(),
                 &request.sampling_params,
@@ -159,7 +260,7 @@ impl Engine {
 
             // Check for stop tokens
             if let Some(stop_tokens) = &request.sampling_params.stop_tokens {
-                let decoded_text = self.model.decode(&generated_tokens)?;
+                let decoded_text = model.decode(&generated_tokens)?;
                 if stop_tokens.iter().any(|stop| decoded_text.contains(stop)) {
                     break;
                 }
@@ -171,13 +272,13 @@ impl Engine {
             }
         }
 
-        let generated_text = self.model.decode(&generated_tokens)?;
+        let generated_text = model.decode(&generated_tokens)?;
         
         Ok(InferenceResponse {
             request_id: request.id.clone(),
             text: generated_text,
             tokens: generated_tokens,
-            finish_reason: FinishReason::Length, // Simplified for MVP
+            finish_reason: ferrum_core::FinishReason::Length, // Simplified for MVP
             usage: ferrum_core::Usage {
                 prompt_tokens: input_ids.len() as u32,
                 completion_tokens: generated_tokens.len() as u32,
@@ -187,7 +288,6 @@ impl Engine {
             model_id: request.model_id.clone(),
         })
     }
-
 
 }
 
@@ -209,8 +309,8 @@ impl InferenceEngine for Engine {
             state.total_requests += 1;
         }
 
-        // Generate completion directly (simplified for MVP)
-        let response = self.generate_completion(&request).await;
+        // For MVP, directly generate completion without complex scheduling
+        let response = self.generate_completion_direct(&request).await;
 
         // Update stats
         {
@@ -237,14 +337,19 @@ impl InferenceEngine for Engine {
         let (tx, rx) = mpsc::channel(100);
 
         // Clone necessary data for the async task
-        let model = Arc::clone(&self.model);
+        let model_loader = Arc::clone(&self.model_loader);
         let request_id = request.id.clone();
+        let model_id = request.model_id.clone();
         let prompt = request.prompt.clone();
         let sampling_params = request.sampling_params.clone();
 
         // Spawn async task to generate tokens
         tokio::spawn(async move {
             let result = async {
+                // Get the model
+                let model = model_loader.get_model(&model_id.0).await
+                    .ok_or_else(|| Error::internal("Model not loaded"))?;
+
                 // Encode the prompt
                 let input_ids = model.encode(&prompt)?;
                 let mut generated_tokens = Vec::new();
@@ -323,16 +428,13 @@ impl InferenceEngine for Engine {
 
     async fn get_status(&self) -> EngineStatus {
         let state = self.engine_state.read();
+        let memory_usage = self.memory_manager.get_memory_usage();
 
         EngineStatus {
             is_ready: state.is_ready,
             loaded_models: state.loaded_models.clone(),
             active_requests: state.active_requests,
-            memory_usage: ferrum_core::MemoryUsage {
-                used_bytes: 0, // Simplified for MVP
-                total_bytes: 0,
-                cache_usage: 0,
-            },
+            memory_usage,
             uptime_seconds: state.start_time.elapsed().as_secs(),
         }
     }
@@ -373,24 +475,245 @@ impl InferenceEngine for Engine {
     }
 }
 
-/// Parse device string to Device enum
-fn parse_device_from_string(device_str: &str) -> Result<Device> {
-    match device_str {
-        "cpu" => Ok(Device::CPU),
+/// Simple ModelLoader implementation for MVP using CandleBackend
+pub struct CandleModelLoader {
+    backend: Arc<CandleBackend>,
+    loaded_models: Arc<RwLock<std::collections::HashMap<String, Arc<dyn Model>>>>,
+}
+
+impl CandleModelLoader {
+    pub fn new(backend: Arc<CandleBackend>) -> Self {
+        Self {
+            backend,
+            loaded_models: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelLoader for CandleModelLoader {
+    async fn load_model(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
+        info!("Loading model: {}", config.model_id.0);
+        
+        let model = self.backend.load_weights("", config.dtype, &config.device).await?;
+        let model_arc = Arc::from(model);
+        
+        // Cache the loaded model
+        {
+            let mut models = self.loaded_models.write();
+            models.insert(config.model_id.0.clone(), Arc::clone(&model_arc));
+        }
+        
+        Ok(model_arc)
+    }
+
+    async fn unload_model(&self, model_id: &str) -> Result<()> {
+        info!("Unloading model: {}", model_id);
+        let mut models = self.loaded_models.write();
+        models.remove(model_id);
+        Ok(())
+    }
+
+    async fn get_model(&self, model_id: &str) -> Option<Arc<dyn Model>> {
+        let models = self.loaded_models.read();
+        models.get(model_id).cloned()
+    }
+
+    async fn list_models(&self) -> Vec<ferrum_core::ModelInfo> {
+        let models = self.loaded_models.read();
+        models.values().map(|model| model.info().clone()).collect()
+    }
+}
+
+/// Create a simplified Engine for MVP
+pub async fn create_mvp_engine(config: EngineConfig) -> Result<Engine> {
+    info!("Creating MVP Engine with simplified components");
+
+    // Parse device
+    let device = match config.device.as_str() {
+        "cpu" => ferrum_core::Device::CPU,
         s if s.starts_with("cuda:") => {
-            let id = s
-                .trim_start_matches("cuda:")
+            let id = s.trim_start_matches("cuda:")
                 .parse::<usize>()
                 .map_err(|_| Error::internal("Invalid CUDA device ID"))?;
-            Ok(Device::CUDA(id))
+            ferrum_core::Device::CUDA(id)
         }
-        s if s.starts_with("rocm:") => {
-            let id = s
-                .trim_start_matches("rocm:")
-                .parse::<usize>()
-                .map_err(|_| Error::internal("Invalid ROCm device ID"))?;
-            Ok(Device::ROCm(id))
+        _ => ferrum_core::Device::CPU,
+    };
+
+    // Create and initialize backend
+    let mut backend = CandleBackend::new(device)?;
+    backend.initialize().await?;
+    let backend = Arc::new(backend);
+
+    // Create simplified components
+    let model_loader = Arc::new(CandleModelLoader::new(Arc::clone(&backend)));
+    let scheduler = Arc::new(SimpleScheduler::new());
+    let batch_manager = Arc::new(SimpleBatchManager::new());
+    let cache_manager = Arc::new(SimpleCacheManager::new());
+    let memory_manager = Arc::new(SimpleMemoryManager::new());
+
+    Engine::new(
+        config,
+        scheduler,
+        batch_manager,
+        cache_manager,
+        memory_manager,
+        model_loader,
+    ).await
+}
+
+/// Simple scheduler implementation for MVP
+pub struct SimpleScheduler {
+    requests: Arc<RwLock<std::collections::VecDeque<InferenceRequest>>>,
+}
+
+impl SimpleScheduler {
+    pub fn new() -> Self {
+        Self {
+            requests: Arc::new(RwLock::new(std::collections::VecDeque::new())),
         }
-        _ => Err(Error::internal(format!("Unknown device: {}", device_str))),
+    }
+}
+
+#[async_trait]
+impl Scheduler for SimpleScheduler {
+    async fn schedule_request(&self, request: InferenceRequest) -> Result<ferrum_core::RequestId> {
+        let mut queue = self.requests.write();
+        let request_id = request.id.clone();
+        queue.push_back(request);
+        Ok(request_id)
+    }
+
+    async fn get_next_batch(&self) -> Option<ferrum_core::Batch> {
+        let mut queue = self.requests.write();
+        if let Some(request) = queue.pop_front() {
+            Some(ferrum_core::Batch {
+                batch_id: ferrum_core::BatchId(uuid::Uuid::new_v4()),
+                requests: vec![request],
+                max_sequence_length: 2048,
+                created_at: chrono::Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+
+    async fn cancel_request(&self, _request_id: &ferrum_core::RequestId) -> Result<bool> {
+        // For MVP, don't support cancellation
+        Ok(false)
+    }
+
+    async fn get_stats(&self) -> ferrum_core::SchedulerStats {
+        ferrum_core::SchedulerStats {
+            total_scheduled: 0,
+            total_completed: 0,
+            total_failed: 0,
+            total_preempted: 0,
+            avg_wait_time_ms: 0.0,
+            queue_size: self.requests.read().len(),
+        }
+    }
+}
+
+/// Simple batch manager implementation for MVP
+pub struct SimpleBatchManager;
+
+impl SimpleBatchManager {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl BatchManager for SimpleBatchManager {
+    async fn execute_batch(&self, _batch_id: ferrum_core::BatchId) -> Result<ferrum_core::BatchOutput> {
+        // For MVP, batch execution is handled directly in Engine
+        Ok(ferrum_core::BatchOutput {
+            batch_id: ferrum_core::BatchId(uuid::Uuid::new_v4()),
+            responses: vec![],
+            execution_time_ms: 0,
+            created_at: chrono::Utc::now(),
+        })
+    }
+
+    async fn get_stats(&self) -> ferrum_core::BatchStats {
+        ferrum_core::BatchStats {
+            total_batches: 0,
+            avg_batch_size: 0.0,
+            avg_execution_time_ms: 0.0,
+            throughput_tokens_per_sec: 0.0,
+        }
+    }
+}
+
+/// Simple cache manager implementation for MVP
+pub struct SimpleCacheManager;
+
+impl SimpleCacheManager {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl CacheManager for SimpleCacheManager {
+    async fn allocate_cache(&self, _request_id: &ferrum_core::RequestId, _sequence_length: usize) -> Result<ferrum_core::KVCache> {
+        // For MVP, return empty cache
+        Ok(ferrum_core::KVCache {
+            keys: vec![],
+            values: vec![],
+            sequence_length: 0,
+        })
+    }
+
+    async fn deallocate_cache(&self, _request_id: &ferrum_core::RequestId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_stats(&self) -> ferrum_core::CacheStats {
+        ferrum_core::CacheStats {
+            total_blocks: 0,
+            free_blocks: 0,
+            cache_hit_rate: 0.0,
+            eviction_count: 0,
+        }
+    }
+}
+
+/// Simple memory manager implementation for MVP
+pub struct SimpleMemoryManager;
+
+impl SimpleMemoryManager {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl MemoryManager for SimpleMemoryManager {
+    fn get_memory_usage(&self) -> ferrum_core::MemoryUsage {
+        ferrum_core::MemoryUsage {
+            used_bytes: 0,
+            total_bytes: 0,
+            cache_usage: 0,
+        }
+    }
+
+    async fn allocate(&self, _size: usize) -> Result<ferrum_core::MemoryHandle> {
+        Ok(ferrum_core::MemoryHandle(0))
+    }
+
+    async fn deallocate(&self, _handle: ferrum_core::MemoryHandle) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_stats(&self) -> ferrum_core::MemoryStats {
+        ferrum_core::MemoryStats {
+            total_allocated: 0,
+            peak_allocated: 0,
+            allocation_count: 0,
+            deallocation_count: 0,
+        }
     }
 }

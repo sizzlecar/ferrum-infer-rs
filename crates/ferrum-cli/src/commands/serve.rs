@@ -68,7 +68,7 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
 
     // Initialize engine
     println!("{} Initializing inference engine...", "⚙️".yellow());
-    let engine = Arc::new(ferrum_engine::Engine::new(engine_config).await?);
+    let engine = Arc::new(ferrum_engine::create_mvp_engine(engine_config).await?);
     println!("{} Engine initialized successfully", "✅".green());
 
     // Create server configuration
