@@ -4,10 +4,9 @@ use crate::{client::FerrumClient, config::CliConfig, output::OutputFormat};
 use chrono::Utc;
 use clap::Args;
 use colored::*;
-use ferrum_core::Backend;
-use ferrum_core::{DataType, Device, InferenceRequest, KVCache, Priority, Result, SamplingParams};
-use ferrum_engine::CandleBackend;
+use ferrum_core::{InferenceEngine, InferenceRequest, Priority, Result, SamplingParams};
 use ferrum_server::openai::{ChatCompletionsRequest, ChatMessage, MessageRole};
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -164,101 +163,76 @@ async fn run_local_inference(request: &InferenceRequest) -> Result<ferrum_core::
     info!("Starting local inference with Candle backend");
     println!("{} Starting local inference...", "🔥".bright_yellow());
 
-    // Initialize Candle backend
-    let mut backend = CandleBackend::new(Device::CPU)?;
-    backend.initialize().await?;
+    // Create engine configuration
+    let engine_config = ferrum_engine::EngineConfig {
+        max_batch_size: 32,
+        max_sequence_length: 2048,
+        num_gpu_blocks: 512,
+        block_size: 16,
+        enable_continuous_batching: false,
+        enable_prefix_caching: false,
+        gpu_memory_fraction: 0.9,
+        scheduling_interval_ms: 10,
+        model_id: request.model_id.0.clone(),
+        device: "cpu".to_string(),
+    };
 
-    println!("{} Loading model: {}", "📦".cyan(), request.model_id.0);
-
-    // Load the model (TinyLlama for MVP)
-    let model = backend
-        .load_weights(
-            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            DataType::FP16,
-            &Device::CPU,
-        )
-        .await?;
-
-    println!("{} Model loaded successfully", "✅".green());
-
-    // Encode the prompt
-    let input_tokens = model.encode(&request.prompt)?;
-    println!("{} Encoded {} tokens", "🔤".blue(), input_tokens.len());
-
-    // Generate text
-    let mut generated_tokens = Vec::new();
-    let mut generated_text = String::new();
-    let mut kv_cache: Option<KVCache> = None;
-    let start_time = std::time::Instant::now();
-    debug!("Starting generation loop");
+    println!("{} Initializing inference engine...", "⚙️".yellow());
+    let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
+    println!("{} Engine initialized successfully", "✅".green());
 
     println!("{} Generating...", "⚡".bright_magenta());
+
+    let start_time = std::time::Instant::now();
 
     if request.stream {
         print!("Output: ");
         io::stdout().flush().unwrap();
-    }
 
-    // Generation loop
-    for step in 0..request.sampling_params.max_tokens {
-        let current_input = if step == 0 {
-            // Prefill phase: use full prompt
-            input_tokens.clone()
-        } else {
-            // Decode phase: use last generated token
-            vec![generated_tokens.last().copied().unwrap_or(0)]
-        };
+        // Use streaming inference
+        let mut stream = engine.infer_stream(request.clone()).await?;
+        let mut full_text = String::new();
 
-        let generate_output = model
-            .generate_next_token(&current_input, kv_cache.as_ref(), &request.sampling_params)
-            .await?;
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(chunk) => {
+                    print!("{}", chunk.text);
+                    io::stdout().flush().unwrap();
+                    full_text.push_str(&chunk.text);
 
-        generated_tokens.push(generate_output.token_id);
-        kv_cache = generate_output.kv_cache;
-
-        // Decode the new token to text
-        let new_text = model.decode(&[generate_output.token_id])?;
-        generated_text.push_str(&new_text);
-
-        if request.stream {
-            print!("{}", new_text);
-            io::stdout().flush().unwrap();
+                    if chunk.finish_reason.is_some() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("\n{} Stream error: {}", "❌".red(), e);
+                    break;
+                }
+            }
         }
 
-        // Check for finish conditions (for MVP, check if we hit max tokens)
-        if step + 1 >= request.sampling_params.max_tokens {
-            println!(
-                "\n{} Generation completed: reached max tokens",
-                "🏁".green()
-            );
-            break;
-        }
-    }
+        println!("\n{} Generation completed", "🏁".green());
 
-    if !request.stream {
+        let duration = start_time.elapsed();
+        Ok(ferrum_core::InferenceResponse {
+            request_id: request.id.clone(),
+            text: full_text,
+            tokens: vec![], // TODO: collect tokens from stream
+            finish_reason: ferrum_core::FinishReason::Length,
+            usage: ferrum_core::TokenUsage {
+                prompt_tokens: 0, // TODO: get from engine
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
+            latency_ms: duration.as_millis() as u64,
+            created_at: Utc::now(),
+        })
+    } else {
+        // Use non-streaming inference
+        let response = engine.infer(request.clone()).await?;
         println!("{} Generation completed", "🏁".green());
+        Ok(response)
     }
-
-    let duration = start_time.elapsed();
-    info!(
-        tokens_generated = generated_tokens.len(),
-        latency_ms = duration.as_millis(),
-        "Local inference completed"
-    );
-
-    Ok(ferrum_core::InferenceResponse {
-        request_id: request.id.clone(),
-        text: generated_text,
-        tokens: generated_tokens.clone(),
-        finish_reason: ferrum_core::FinishReason::Length,
-        usage: ferrum_core::TokenUsage {
-            prompt_tokens: input_tokens.len(),
-            completion_tokens: generated_tokens.len(),
-            total_tokens: input_tokens.len() + generated_tokens.len(),
-        },
-        latency_ms: duration.as_millis() as u64,
-        created_at: Utc::now(),
-    })
 }
 
 /// Run inference using HTTP client (remote mode)
