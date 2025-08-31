@@ -229,12 +229,12 @@ async fn handle_chat_completions_stream(
             Ok(mut stream) => {
                 while let Some(result) = stream.next().await {
                     match result {
-                        Ok(output) => {
-                            current_text.push_str(&output.text);
+                        Ok(chunk) => {
+                            current_text.push_str(&chunk.text);
                             token_count += 1;
 
                             // Create streaming response chunk
-                            let chunk = ChatCompletionsResponse {
+                            let response_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
                                 created: chrono::Utc::now().timestamp() as u64,
@@ -244,7 +244,7 @@ async fn handle_chat_completions_stream(
                                     message: None,
                                     delta: Some(ChatMessage {
                                         role: MessageRole::Assistant,
-                                        content: output.text,
+                                        content: chunk.text.clone(),
                                         name: None,
                                     }),
                                     finish_reason: None,
@@ -253,14 +253,14 @@ async fn handle_chat_completions_stream(
                             };
 
                             let sse_event = Event::default()
-                                .json_data(&chunk)
+                                .json_data(&response_chunk)
                                 .unwrap_or_else(|_| Event::default().data("error"));
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
 
                             // Check stopping conditions
-                            if token_count >= max_tokens || output.finish_reason.is_some() {
+                            if token_count >= max_tokens || chunk.finish_reason.is_some() {
                                 // Send final chunk
                                 let final_chunk = ChatCompletionsResponse {
                                     id: request_id.clone(),
@@ -271,7 +271,7 @@ async fn handle_chat_completions_stream(
                                         index: 0,
                                         message: None,
                                         delta: None,
-                                        finish_reason: output
+                                        finish_reason: chunk
                                             .finish_reason
                                             .as_ref()
                                             .map(finish_reason_to_string),
