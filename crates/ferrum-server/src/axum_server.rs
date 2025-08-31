@@ -271,7 +271,7 @@ async fn handle_chat_completions_stream(
                                         index: 0,
                                         message: None,
                                         delta: None,
-                                        finish_reason: output
+                                        finish_reason: chunk
                                             .finish_reason
                                             .as_ref()
                                             .map(finish_reason_to_string),
