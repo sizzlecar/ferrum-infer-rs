@@ -81,13 +81,27 @@ impl Backend for CandleBackend {
                 return Err(Error::internal("Model download disabled for MVP testing"));
             }
             Err(_) => {
-                // Set proper HF Hub endpoint and cache directory
-                if std::env::var("HF_HUB_CACHE").is_err() {
-                    std::env::set_var("HF_HUB_CACHE", "/tmp/hf_cache");
-                }
+                // Set proper HF Hub cache directory
+                let cache_dir = "/tmp/hf_cache";
+                std::env::set_var("HF_HOME", cache_dir);
+                std::env::set_var("HUGGINGFACE_HUB_CACHE", cache_dir);
                 
                 // Create cache directory if it doesn't exist
-                std::fs::create_dir_all("/tmp/hf_cache").ok();
+                std::fs::create_dir_all(cache_dir).ok();
+                
+                // Check for token in environment variables and set it
+                if let Ok(token) = std::env::var("HF_TOKEN") {
+                    info!("Using HF_TOKEN from environment");
+                    // Save token to the exact path hf-hub expects
+                    let token_file = std::path::Path::new(cache_dir).join("token");
+                    std::fs::write(&token_file, &token).ok();
+                } else if let Ok(token) = std::env::var("HUGGINGFACE_HUB_TOKEN") {
+                    info!("Using HUGGINGFACE_HUB_TOKEN from environment");
+                    let token_file = std::path::Path::new(cache_dir).join("token");
+                    std::fs::write(&token_file, &token).ok();
+                } else {
+                    info!("No HF token found, using anonymous access");
+                }
                 
                 Api::new().map_err(|e| Error::internal(format!("HF API failed: {}", e)))?
             }
