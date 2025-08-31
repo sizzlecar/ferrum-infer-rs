@@ -234,7 +234,7 @@ async fn handle_chat_completions_stream(
                             token_count += 1;
 
                             // Create streaming response chunk
-                            let chunk = ChatCompletionsResponse {
+                            let response_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
                                 created: chrono::Utc::now().timestamp() as u64,
@@ -253,7 +253,7 @@ async fn handle_chat_completions_stream(
                             };
 
                             let sse_event = Event::default()
-                                .json_data(&chunk)
+                                .json_data(&response_chunk)
                                 .unwrap_or_else(|_| Event::default().data("error"));
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;

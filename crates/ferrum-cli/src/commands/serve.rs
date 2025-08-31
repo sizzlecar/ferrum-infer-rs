@@ -3,11 +3,10 @@
 use crate::{config::CliConfig, output::OutputFormat};
 use clap::Args;
 use colored::*;
-use ferrum_core::{Device, Result};
-use ferrum_engine::CandleBackend;
-use ferrum_server::{AxumServer, ServerConfig};
+use ferrum_core::Result;
+use ferrum_server::{traits::HttpServer, AxumServer, types::ServerConfig};
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::info;
 
 #[derive(Args)]
 pub struct ServeCommand {
@@ -76,23 +75,15 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
         host: cmd.host.clone(),
         port: cmd.port,
         max_connections: 1000,
-        request_timeout_ms: 300000, // 5 minutes
-        enable_cors: true,
-        cors_origins: vec!["*".to_string()],
-        enable_compression: true,
-        compression_level: 6,
-        enable_auth: false,
-        auth_secret: None,
-        enable_rate_limiting: false,
-        rate_limit_requests_per_minute: 60,
-        enable_metrics: true,
-        metrics_path: "/metrics".to_string(),
-        enable_health_check: true,
-        health_check_path: "/health".to_string(),
-        max_request_size_bytes: 10 * 1024 * 1024, // 10MB
-        read_timeout_ms: 30000,
-        write_timeout_ms: 30000,
-        graceful_shutdown_timeout_ms: 30000,
+        request_timeout: std::time::Duration::from_secs(300), // 5 minutes
+        keep_alive_timeout: std::time::Duration::from_secs(60),
+        enable_tls: false,
+        tls_cert_path: None,
+        tls_key_path: None,
+        cors: None, // Simplified for MVP
+        compression: None, // Simplified for MVP
+        auth: None, // No auth for MVP
+        api_version: ferrum_server::types::ApiVersion::V1,
     };
 
     // Create and start server
