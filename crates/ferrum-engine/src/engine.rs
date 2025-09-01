@@ -99,7 +99,7 @@ impl Engine {
         memory_manager: Arc<dyn MemoryManager>,
         model_loader: Arc<dyn ModelLoader>,
     ) -> Result<Self> {
-        info!("Initializing Ferrum Engine with config: {:?}", config);
+        debug!("Initializing Ferrum Engine with config: {:?}", config);
 
         // Initialize engine state
         let engine_state = Arc::new(RwLock::new(EngineState {
@@ -128,8 +128,8 @@ impl Engine {
     }
 
     /// Initialize engine subsystems
-    async fn initialize(&self) -> Result<()> {
-        info!("Initializing engine subsystems...");
+    pub async fn initialize(&self) -> Result<()> {
+        debug!("Initializing engine subsystems...");
 
         // Load the model
         let model_config = ferrum_core::ModelConfig {
@@ -159,7 +159,7 @@ impl Engine {
             self.start_scheduler_loop().await;
         }
 
-        info!("Engine initialized successfully");
+        debug!("Engine initialized successfully");
         Ok(())
     }
 
@@ -181,6 +181,8 @@ impl Engine {
                     .map_err(|_| Error::internal("Invalid ROCm device ID"))?;
                 Ok(ferrum_core::Device::ROCm(id))
             }
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            "metal" => Ok(ferrum_core::Device::Metal),
             _ => Err(Error::internal(format!(
                 "Unknown device: {}",
                 self.config.device
@@ -238,7 +240,7 @@ impl Engine {
     /// Generate completion with a specific model
     async fn generate_completion_with_model(&self, request: &InferenceRequest, model: &Arc<dyn Model>) -> Result<InferenceResponse> {
         let prompt = &request.prompt;
-        info!("Generating completion for prompt: {}", prompt);
+        debug!("Generating completion for prompt: {}", prompt);
 
         // Encode the prompt
         let input_ids = model.encode(prompt)?;
@@ -372,19 +374,43 @@ impl InferenceEngine for Engine {
                     current_ids.push(token_id);
                     kv_cache = output.kv_cache;
 
-                    // Decode the new token
-                    let token_text = model.decode(&[token_id])?;
-
-                    // Send stream chunk
-                    let chunk = StreamChunk {
-                        request_id: request_id.clone(),
-                        text: token_text,
-                        token: Some(token_id),
-                        finish_reason: None,
+                    // Decode incrementally to preserve proper spacing
+                    let token_text = if generated_tokens.len() == 1 {
+                        // First token, decode directly
+                        model.decode(&[token_id]).unwrap_or_default()
+                    } else {
+                        // For subsequent tokens, decode full sequence and extract incremental text
+                        match (model.decode(&generated_tokens), model.decode(&generated_tokens[..generated_tokens.len()-1])) {
+                            (Ok(full_text), Ok(prev_text)) => {
+                                if let Some(incremental) = full_text.strip_prefix(&prev_text) {
+                                    incremental.to_string()
+                                } else {
+                                    // Fallback: try single token decode
+                                    model.decode(&[token_id]).unwrap_or_default()
+                                }
+                            }
+                            _ => {
+                                // Fallback: try single token decode
+                                model.decode(&[token_id]).unwrap_or_default()
+                            }
+                        }
                     };
 
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        break; // Stream closed
+                    // Send stream chunk (只发送非空文本)
+                    if !token_text.is_empty() {
+                        let chunk = StreamChunk {
+                            request_id: request_id.clone(),
+                            text: token_text,
+                            token: Some(token_id),
+                            finish_reason: None,
+                        };
+
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            break; // Stream closed
+                        }
+                        
+                        // 添加小延迟来演示流式效果
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     }
 
                     // Check for stop sequences
@@ -524,7 +550,7 @@ impl ModelLoader for GenericModelLoader {
 
 /// Create a simplified Engine for MVP
 pub async fn create_mvp_engine(config: EngineConfig) -> Result<Engine> {
-    info!("Creating MVP Engine with simplified components");
+            debug!("Creating MVP Engine with simplified components");
 
     // Parse device
     let device = match config.device.as_str() {
@@ -544,13 +570,13 @@ pub async fn create_mvp_engine(config: EngineConfig) -> Result<Engine> {
     let backend: Arc<dyn Backend> = match device {
         #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
         ferrum_core::Device::Metal => {
-            info!("Using Metal backend for Apple GPU acceleration");
+            debug!("Using Metal backend for Apple GPU acceleration");
             let mut backend = crate::metal::MetalBackend::new(device)?;
             Backend::initialize(&mut backend).await?;
             Arc::new(backend)
         }
         _ => {
-            info!("Using Candle backend");
+            debug!("Using Candle backend");
             let mut backend = CandleBackend::new(device)?;
             Backend::initialize(&mut backend).await?;
             Arc::new(backend)

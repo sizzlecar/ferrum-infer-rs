@@ -85,8 +85,13 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
 
     // Initialize engine
     println!("{} Initializing inference engine...", "⚙️".yellow());
-    let engine = Arc::new(ferrum_engine::create_mvp_engine(engine_config).await?);
+    let mut engine = ferrum_engine::create_mvp_engine(engine_config).await?;
+    
+    // 关键：初始化engine以加载模型
+    engine.initialize().await?;
     println!("{} Engine initialized successfully", "✅".green());
+    
+    let engine = Arc::new(engine);
 
     // Create server configuration
     let server_config = ServerConfig {

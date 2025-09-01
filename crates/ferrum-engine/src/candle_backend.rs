@@ -109,7 +109,7 @@ impl CandleBackend {
 
     /// Download file with proper redirect handling
     async fn download_file_with_redirects(&self, url: &str, local_path: &str) -> Result<std::path::PathBuf> {
-        info!("Downloading {} to {}", url, local_path);
+                                debug!("Downloading {} to {}", url, local_path);
         
         // Create directory if needed
         if let Some(parent) = std::path::Path::new(local_path).parent() {
@@ -144,7 +144,7 @@ impl CandleBackend {
         std::fs::write(local_path, bytes)
             .map_err(|e| Error::internal(format!("Failed to write file: {}", e)))?;
         
-        info!("Successfully downloaded to {}", local_path);
+                            debug!("Successfully downloaded to {}", local_path);
         Ok(std::path::PathBuf::from(local_path))
     }
 }
@@ -152,11 +152,11 @@ impl CandleBackend {
 #[async_trait]
 impl Backend for CandleBackend {
     async fn initialize(&mut self) -> Result<()> {
-        info!("Initializing Candle backend on device: {:?}", self.device);
+        debug!("Initializing Candle backend on device: {:?}", self.device);
         let _test_tensor = CandleTensor::zeros((2, 2), DType::F32, &self.device)
             .map_err(|e| Error::internal(format!("Device test failed: {}", e)))?;
         self.initialized = true;
-        info!("Candle backend initialized");
+        debug!("Candle backend initialized");
         Ok(())
     }
 
@@ -181,12 +181,12 @@ impl Backend for CandleBackend {
             return Err(Error::internal("Backend not initialized"));
         }
 
-        info!("Loading TinyLlama model...");
+        debug!("Loading TinyLlama model...");
         
         // Try to initialize HF API with proper configuration to fix redirect issues
         let api = match std::env::var("HF_HUB_OFFLINE") {
             Ok(_) => {
-                info!("HF_HUB_OFFLINE is set, using local files");
+                debug!("HF_HUB_OFFLINE is set, using local files");
                 // Use local files fallback
                 let model_dir = "/tmp/models";
                 let tokenizer_path = format!("{}/tokenizer.json", model_dir);
@@ -373,7 +373,7 @@ impl Backend for CandleBackend {
             },
         };
 
-        info!("TinyLlama loaded successfully");
+        debug!("TinyLlama loaded successfully");
 
         Ok(Box::new(CandleModel {
             model,
@@ -469,11 +469,24 @@ impl Model for CandleModel {
 
     fn decode(&self, tokens: &[TokenId]) -> Result<String> {
         debug!("Decoding {} tokens", tokens.len());
+        
+        if tokens.is_empty() {
+            return Ok(String::new());
+        }
+
         let text = self
             .tokenizer
             .decode(tokens, true)
             .map_err(|e| Error::internal(format!("Detokenization failed: {}", e)))?;
-        Ok(text)
+        
+        // 清理可能的编码问题和特殊字符，保持空格
+        let cleaned_text = text
+            .replace('\u{FFFD}', "") // 移除替换字符
+            .chars()
+            .filter(|c| !c.is_control() || c.is_whitespace()) // 保留正常字符和空白字符
+            .collect::<String>();
+
+        Ok(cleaned_text)
     }
 
     async fn generate_next_token(
