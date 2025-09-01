@@ -8,6 +8,9 @@ use ferrum_core::{
     SchedulerStats, CacheStats, MemoryUsage, TokenUsage, GenerateOutput,
 };
 use crate::CandleBackend;
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+use crate::metal::MetalBackend;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -469,14 +472,14 @@ impl InferenceEngine for Engine {
     }
 }
 
-/// Simple ModelLoader implementation for MVP using CandleBackend
-pub struct CandleModelLoader {
-    backend: Arc<CandleBackend>,
+/// Generic ModelLoader implementation for MVP supporting multiple backends
+pub struct GenericModelLoader {
+    backend: Arc<dyn Backend>,
     loaded_models: Arc<RwLock<std::collections::HashMap<String, Arc<dyn Model>>>>,
 }
 
-impl CandleModelLoader {
-    pub fn new(backend: Arc<CandleBackend>) -> Self {
+impl GenericModelLoader {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
             backend,
             loaded_models: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -485,7 +488,7 @@ impl CandleModelLoader {
 }
 
 #[async_trait]
-impl ModelLoader for CandleModelLoader {
+impl ModelLoader for GenericModelLoader {
     async fn load_model(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
         info!("Loading model: {}", config.model_id.0);
         
@@ -532,16 +535,30 @@ pub async fn create_mvp_engine(config: EngineConfig) -> Result<Engine> {
                 .map_err(|_| Error::internal("Invalid CUDA device ID"))?;
             ferrum_core::Device::CUDA(id)
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        "metal" => ferrum_core::Device::Metal,
         _ => ferrum_core::Device::CPU,
     };
 
-    // Create and initialize backend
-    let mut backend = CandleBackend::new(device)?;
-    Backend::initialize(&mut backend).await?;
-    let backend = Arc::new(backend);
+    // Create and initialize backend based on device
+    let backend: Arc<dyn Backend> = match device {
+        #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+        ferrum_core::Device::Metal => {
+            info!("Using Metal backend for Apple GPU acceleration");
+            let mut backend = crate::metal::MetalBackend::new(device)?;
+            Backend::initialize(&mut backend).await?;
+            Arc::new(backend)
+        }
+        _ => {
+            info!("Using Candle backend");
+            let mut backend = CandleBackend::new(device)?;
+            Backend::initialize(&mut backend).await?;
+            Arc::new(backend)
+        }
+    };
 
-    // Create simplified components
-    let model_loader = Arc::new(CandleModelLoader::new(Arc::clone(&backend)));
+    // Create simplified components  
+    let model_loader = Arc::new(GenericModelLoader::new(backend.clone()));
     let scheduler = Arc::new(SimpleScheduler::new());
     let batch_manager = Arc::new(SimpleBatchManager::new());
     let cache_manager = Arc::new(SimpleCacheManager::new());

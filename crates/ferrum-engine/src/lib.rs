@@ -16,6 +16,10 @@ pub mod memory_manager;
 pub mod model_runner;
 pub mod scheduler;
 
+// Metal backend for Apple GPU acceleration
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal;
+
 // Re-exports
 pub use batch_manager::{BatchConfig, ContinuousBatchManager};
 pub use cache_manager::{CacheConfig, PagedKVCacheManager};
@@ -24,3 +28,6 @@ pub use engine::{Engine, EngineConfig, create_mvp_engine};
 pub use executor::{ExecutorConfig, GenericExecutor};
 pub use memory_manager::{GpuMemoryManager, MemoryConfig};
 pub use scheduler::{FairScheduler, SchedulerConfig};
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use metal::MetalBackend;

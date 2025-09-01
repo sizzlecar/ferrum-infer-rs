@@ -182,6 +182,9 @@ pub enum Device {
     CPU,
     CUDA(usize),
     ROCm(usize),
+    /// Apple GPU using Metal Performance Shaders
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    Metal,
 }
 
 // ==================== Scheduling Types ====================
