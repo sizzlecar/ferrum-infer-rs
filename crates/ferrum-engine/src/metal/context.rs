@@ -22,7 +22,7 @@ impl MetalContext {
         let device = MTLDevice::system_default()
             .ok_or(MetalError::DeviceNotAvailable)?;
         
-        info!("Creating Metal context with device: {}", device.name());
+        debug!("Creating Metal context with device: {}", device.name());
         
         let command_queue = device.new_command_queue();
         
@@ -52,7 +52,7 @@ impl MetalContext {
             .map_err(|e| MetalError::CompilationFailed(format!("Failed to load shader library: {}", e)))?;
         
         self.library = Some(library);
-        info!("Metal shader library loaded successfully ({} bytes)", METAL_LIBRARY_DATA.len());
+        debug!("Metal shader library loaded successfully ({} bytes)", METAL_LIBRARY_DATA.len());
         Ok(())
     }
     

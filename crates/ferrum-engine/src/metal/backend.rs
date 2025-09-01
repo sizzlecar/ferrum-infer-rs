@@ -25,7 +25,7 @@ pub struct MetalBackend {
 impl MetalBackend {
     /// Create a new Metal backend
     pub fn new(device: Device) -> Result<Self> {
-        info!("Creating Metal backend for device: {:?}", device);
+        debug!("Creating Metal backend for device: {:?}", device);
         
         // Create the underlying Candle backend
         let candle_backend = CandleBackend::new(device.clone())?;
@@ -48,7 +48,7 @@ impl MetalBackend {
                         if let Err(e) = context.load_shader_library() {
                             warn!("Failed to load Metal shaders: {}. Falling back to CPU.", e);
                         } else {
-                            info!("Metal context initialized successfully");
+                            debug!("Metal context initialized successfully");
                             self.metal_context = Some(Arc::new(context));
                         }
                     }
@@ -70,7 +70,7 @@ impl MetalBackend {
 #[async_trait]
 impl Backend for MetalBackend {
     async fn initialize(&mut self) -> Result<()> {
-        info!("Initializing Metal backend");
+        debug!("Initializing Metal backend");
         
         // Initialize the underlying Candle backend
         self.candle_backend.initialize().await?;
@@ -79,9 +79,9 @@ impl Backend for MetalBackend {
         self.initialize_metal_context().await?;
         
         if self.has_metal_acceleration() {
-            info!("Metal backend initialized with GPU acceleration");
+            debug!("Metal backend initialized with GPU acceleration");
         } else {
-            info!("Metal backend initialized with CPU fallback");
+            debug!("Metal backend initialized with CPU fallback");
         }
         
         Ok(())
@@ -98,14 +98,14 @@ impl Backend for MetalBackend {
         dtype: DataType,
         device: &Device,
     ) -> Result<Box<dyn Model>> {
-        info!("Loading model with Metal backend: {}", path);
+        debug!("Loading model with Metal backend: {}", path);
         
         // For MVP, delegate to Candle backend
         // TODO: Wrap the returned model with Metal acceleration
         let model = self.candle_backend.load_weights(path, dtype, device).await?;
         
         if self.has_metal_acceleration() {
-            info!("Model loaded with Metal acceleration support");
+            debug!("Model loaded with Metal acceleration support");
         } else {
             info!("Model loaded with CPU fallback");
         }
