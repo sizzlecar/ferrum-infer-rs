@@ -31,6 +31,8 @@ impl CandleBackend {
                 }
             }
             Device::ROCm(_) => return Err(Error::internal("ROCm not supported")),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Device::Metal => CandleDevice::Cpu, // Use CPU tensors, Metal acceleration happens separately
         };
 
         Ok(Self {
@@ -391,6 +393,8 @@ impl Backend for CandleBackend {
             Device::CPU => true,
             Device::CUDA(_) => cfg!(feature = "cuda"),
             Device::ROCm(_) => false,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Device::Metal => true,
         }
     }
 
@@ -719,5 +723,7 @@ pub fn to_candle_device(device: &Device) -> Result<CandleDevice> {
             }
         }
         Device::ROCm(_) => Err(Error::internal("ROCm not supported")),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        Device::Metal => Ok(CandleDevice::Cpu), // Use CPU tensors for Metal backend
     }
 }

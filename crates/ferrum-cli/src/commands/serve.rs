@@ -33,6 +33,10 @@ pub struct ServeCommand {
     /// Enable development mode
     #[arg(long)]
     pub dev: bool,
+
+    /// Backend to use (cpu, metal, cuda:0)
+    #[arg(long, default_value = "auto")]
+    pub backend: String,
 }
 
 pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputFormat) -> Result<()> {
@@ -62,7 +66,21 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
         gpu_memory_fraction: 0.9,
         scheduling_interval_ms: 10,
         model_id: model_id.clone(),
-        device: "cpu".to_string(), // Use CPU for MVP
+        device: match cmd.backend.as_str() {
+            "auto" => {
+                if cfg!(all(feature = "metal", any(target_os = "macos", target_os = "ios"))) {
+                    println!("{} Auto-detected Metal backend for Apple GPU", "🔥".yellow());
+                    "metal".to_string()
+                } else {
+                    println!("{} Auto-detected CPU backend", "💻".blue());
+                    "cpu".to_string()
+                }
+            }
+            backend => {
+                println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
+                backend.to_string()
+            }
+        },
     };
 
     // Initialize engine

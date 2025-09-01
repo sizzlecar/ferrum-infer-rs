@@ -73,3 +73,4 @@ default = []
 benchmark = []  # Enable benchmarking utilities
 dev-tools = []  # Enable development tools
 interactive = [] # Enable interactive mode
+metal = ["ferrum-engine/metal"]  # Enable Apple GPU acceleration
