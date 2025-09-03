@@ -11,7 +11,14 @@ mod backend;
 mod context;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 mod error;
-// mod kernels; // TODO: Re-enable when Metal kernels are ready
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod quantization;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod compute_pipeline;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod benchmark;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_model;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use backend::MetalBackend;
@@ -19,6 +26,14 @@ pub use backend::MetalBackend;
 pub use context::MetalContext;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use error::MetalError;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use quantization::*;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use compute_pipeline::*;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use benchmark::*;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use metal_model::*;
 
 // Stub implementations for non-Apple platforms
 #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]

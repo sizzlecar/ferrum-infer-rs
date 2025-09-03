@@ -13,12 +13,13 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::candle_backend::CandleBackend;
-use crate::metal::{MetalContext, MetalError};
+use crate::metal::{MetalContext, Q4_0MatrixOps};
 
 /// Metal-accelerated backend that wraps CandleBackend
 pub struct MetalBackend {
     candle_backend: CandleBackend,
     metal_context: Option<Arc<MetalContext>>,
+    q4_0_ops: Option<Q4_0MatrixOps>,
     device: Device,
 }
 
@@ -33,6 +34,7 @@ impl MetalBackend {
         Ok(Self {
             candle_backend,
             metal_context: None,
+            q4_0_ops: None,
             device,
         })
     }
@@ -49,7 +51,20 @@ impl MetalBackend {
                             warn!("Failed to load Metal shaders: {}. Falling back to CPU.", e);
                         } else {
                             debug!("Metal context initialized successfully");
-                            self.metal_context = Some(Arc::new(context));
+                            let context_arc = Arc::new(context);
+                            
+                            // Initialize Q4_0 operations
+                            match Q4_0MatrixOps::new(context_arc.clone()) {
+                                Ok(ops) => {
+                                    info!("Q4_0 matrix operations initialized");
+                                    self.q4_0_ops = Some(ops);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to initialize Q4_0 operations: {}. Using fallback.", e);
+                                }
+                            }
+                            
+                            self.metal_context = Some(context_arc);
                         }
                     }
                     Err(e) => {
@@ -64,6 +79,50 @@ impl MetalBackend {
     /// Check if Metal acceleration is available
     pub fn has_metal_acceleration(&self) -> bool {
         self.metal_context.is_some()
+    }
+    
+    /// Check if Q4_0 quantized operations are available
+    pub fn has_q4_0_acceleration(&self) -> bool {
+        self.q4_0_ops.is_some()
+    }
+    
+    /// Execute optimized Q4_0 matrix-vector multiplication
+    /// 
+    /// This method provides a high-performance path for Linear layers
+    /// using Q4_0 quantization on Apple GPU
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    pub fn q4_0_matvec(
+        &self,
+        weights: &[f32],
+        input: &[f32], 
+        nrows: usize,
+        ncols: usize,
+    ) -> Result<Vec<f32>> {
+        if let Some(ref ops) = self.q4_0_ops {
+            ops.quantized_matvec(weights, input, nrows, ncols)
+                .map_err(|e| Error::internal(format!("Q4_0 matvec failed: {}", e)))
+        } else {
+            Err(Error::internal("Q4_0 operations not available"))
+        }
+    }
+    
+    /// Execute pre-quantized Q4_0 matrix-vector multiplication
+    /// 
+    /// Use this for cached/pre-processed weights to avoid repeated quantization
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    pub fn q4_0_matvec_quantized(
+        &self,
+        quantized_weights: &[u32],
+        input: &[f32],
+        nrows: usize, 
+        ncols: usize,
+    ) -> Result<Vec<f32>> {
+        if let Some(ref ops) = self.q4_0_ops {
+            ops.execute_quantized_matvec(quantized_weights, input, nrows, ncols)
+                .map_err(|e| Error::internal(format!("Q4_0 quantized matvec failed: {}", e)))
+        } else {
+            Err(Error::internal("Q4_0 operations not available"))
+        }
     }
 }
 
@@ -100,17 +159,21 @@ impl Backend for MetalBackend {
     ) -> Result<Box<dyn Model>> {
         debug!("Loading model with Metal backend: {}", path);
         
-        // For MVP, delegate to Candle backend
-        // TODO: Wrap the returned model with Metal acceleration
-        let model = self.candle_backend.load_weights(path, dtype, device).await?;
+        // Load base model with Candle backend
+        let base_model = self.candle_backend.load_weights(path, dtype, device).await?;
         
-        if self.has_metal_acceleration() {
-            debug!("Model loaded with Metal acceleration support");
+        // Wrap with Metal acceleration if available
+        if self.has_metal_acceleration() && self.has_q4_0_acceleration() {
+            debug!("Wrapping model with Metal acceleration");
+            let metal_model = crate::metal::MetalOptimizedModel::new(
+                base_model,
+                Arc::new(MetalBackend::new(device.clone())?) // Create a reference for the model
+            );
+            Ok(Box::new(metal_model))
         } else {
-            info!("Model loaded with CPU fallback");
+            debug!("Metal acceleration not available, using standard model");
+            Ok(base_model)
         }
-        
-        Ok(model)
     }
 
     fn name(&self) -> &str {
