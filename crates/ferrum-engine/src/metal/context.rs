@@ -3,7 +3,7 @@
 use crate::metal::error::MetalError;
 use metal::{CommandQueue, Device as MTLDevice, Library};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
 // Include the compiled Metal library
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]

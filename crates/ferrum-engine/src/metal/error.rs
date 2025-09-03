@@ -25,6 +25,9 @@ pub enum MetalError {
     #[error("Invalid tensor shape: {0:?}")]
     InvalidTensorShape(Vec<usize>),
     
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+    
     #[error("Generic Metal error: {0}")]
     Generic(String),
 }
