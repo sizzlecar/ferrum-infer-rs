@@ -10,9 +10,6 @@ pub mod health;
 pub mod infer;
 pub mod models;
 pub mod serve;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub mod apple_gpu_benchmark;
-
 
 // Re-exports
 pub use benchmark::BenchmarkCommand;

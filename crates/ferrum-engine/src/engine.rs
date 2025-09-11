@@ -5,8 +5,9 @@ use ferrum_core::{
     Backend, BatchManager, CacheManager, EngineStatus, Error, FinishReason, InferenceEngine, InferenceRequest,
     InferenceResponse, MemoryManager, Model, ModelConfig, ModelId, ModelLoader, Result, Scheduler, StreamChunk,
     ScheduledBatch, ScheduledRequest, RequestState, BatchId, BatchOutput, BatchInfo, BlockId, KVBlock, MemoryHandle, MemoryPressure,
-    SchedulerStats, CacheStats, MemoryUsage, TokenUsage, GenerateOutput,
+    SchedulerStats, CacheStats, MemoryUsage, TokenUsage,
 };
+use ferrum_models::{DefaultModelRegistry, DefaultModelSourceResolver, ModelSourceConfig, ModelSourceResolver};
 use crate::CandleBackend;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -131,11 +132,25 @@ impl Engine {
     pub async fn initialize(&self) -> Result<()> {
         debug!("Initializing engine subsystems...");
 
-        // Load the model
+        // Use new model maintenance system to resolve model path
+        debug!("Resolving model using new maintenance system: {}", self.config.model_id);
+        
+        let registry = DefaultModelRegistry::with_defaults();
+        let resolved_id = registry.resolve_model_id(&self.config.model_id);
+        
+        let source_config = ModelSourceConfig::default();
+        let resolver = DefaultModelSourceResolver::new(source_config);
+        
+        let resolved_source = resolver.resolve(&resolved_id, None).await
+            .map_err(|e| Error::internal(format!("Failed to resolve model '{}': {}", resolved_id, e)))?;
+            
+        debug!("Model resolved to path: {:?}", resolved_source.local_path);
+        
+        // Load the model with resolved path
         let model_config = ferrum_core::ModelConfig {
-            model_id: ModelId(self.config.model_id.clone()),
-            model_path: "".to_string(), // Not used for Candle backend
-            model_type: ferrum_core::ModelType::Llama,
+            model_id: ModelId(resolved_id.clone()),
+            model_path: resolved_source.local_path.to_string_lossy().to_string(),
+            model_type: ferrum_core::ModelType::Llama, // TODO: Get from config
             dtype: ferrum_core::DataType::FP32, // Use FP32 for MVP
             device: self.parse_device()?,
             max_batch_size: self.config.max_batch_size,
@@ -518,7 +533,16 @@ impl ModelLoader for GenericModelLoader {
     async fn load_model(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
         info!("Loading model: {}", config.model_id.0);
         
-        let model = Backend::load_weights(&*self.backend, "", config.dtype, &config.device).await?;
+        // Use the model_path from config (should be resolved by new model maintenance system)
+        let model_path = if config.model_path.is_empty() {
+            warn!("Empty model path, using model ID as fallback: {}", config.model_id.0);
+            config.model_id.0.as_str()
+        } else {
+            debug!("Using resolved model path: {}", config.model_path);
+            config.model_path.as_str()
+        };
+        
+        let model = Backend::load_weights(&*self.backend, model_path, config.dtype, &config.device).await?;
         let model_arc = Arc::from(model);
         
         // Cache the loaded model

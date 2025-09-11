@@ -5,13 +5,14 @@ use chrono::Utc;
 use clap::Args;
 use colored::*;
 use ferrum_core::{InferenceEngine, InferenceRequest, Priority, Result, SamplingParams};
+use ferrum_models::ModelSourceResolver;
 use ferrum_server::openai::{ChatCompletionsRequest, ChatMessage, MessageRole};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use uuid::Uuid;
 
-use tracing::{debug, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 #[derive(Args, Debug)]
 pub struct InferCommand {
@@ -153,23 +154,69 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
 
 
 
-/// Run inference using local backend
+/// Run inference using local backend with enhanced model loading
 #[instrument(skip(request, cmd), fields(request_id = %request.id.0, model_id = %request.model_id.0))]
 async fn run_local_inference(request: &InferenceRequest, cmd: &InferCommand) -> Result<ferrum_core::InferenceResponse> {
     info!("Starting local inference with Candle backend");
     println!("{} Starting local inference...", "🔥".bright_yellow());
+    
+    // Resolve model using enhanced model maintenance system
+    let model_id = &request.model_id.0;
+    println!("{} Resolving model: {}", "🔍".bright_blue(), model_id.cyan());
+    
+    let registry = ferrum_models::DefaultModelRegistry::with_defaults();
+    let resolved_id = registry.resolve_model_id(model_id);
+    
+    if resolved_id != *model_id {
+        println!("{} Resolved alias '{}' to: {}", "🔗".bright_blue(), model_id.cyan(), resolved_id.yellow());
+    }
+    
+    // Create model source resolver
+    let source_config = ferrum_models::ModelSourceConfig::default();
+    let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
+    
+    // Resolve model source
+    let source = match resolver.resolve(&resolved_id, None).await {
+        Ok(source) => {
+            println!("{} Model resolved: {}", "✅".bright_green(), source.local_path.display());
+            source
+        }
+        Err(e) => {
+            println!("{} Failed to resolve model '{}': {}", "❌".bright_red(), resolved_id, e);
+            println!("\nTips:");
+            println!("  - Use 'ferrum models --download {}' to download the model", resolved_id);
+            println!("  - Check if the model exists locally with 'ferrum models --list'");
+            return Err(e);
+        }
+    };
+    
+    // Load model configuration
+    println!("{} Loading model configuration...", "⚙️".bright_blue());
+    let mut config_manager = ferrum_models::ConfigManager::new();
+    let model_config = match config_manager.load_from_source(&source).await {
+        Ok(config) => {
+            println!("{} Configuration loaded: {} ({})", "✅".bright_green(), 
+                format!("{:?}", config.architecture).yellow(), 
+                format!("{} params", config.vocab_size).cyan());
+            config
+        }
+        Err(e) => {
+            println!("{} Failed to load configuration: {}", "❌".bright_red(), e);
+            return Err(e);
+        }
+    };
 
-    // Create engine configuration
+    // Create engine configuration with resolved model information
     let engine_config = ferrum_engine::EngineConfig {
         max_batch_size: 32,
-        max_sequence_length: 2048,
+        max_sequence_length: model_config.max_position_embeddings.min(2048),
         num_gpu_blocks: 512,
         block_size: 16,
         enable_continuous_batching: false,
         enable_prefix_caching: false,
         gpu_memory_fraction: 0.9,
         scheduling_interval_ms: 10,
-        model_id: request.model_id.0.clone(),
+        model_id: resolved_id,
         device: match cmd.backend.as_str() {
             "auto" => {
                 if cfg!(all(feature = "metal", any(target_os = "macos", target_os = "ios"))) {
@@ -342,17 +389,73 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
     println!("{}", "🚀 Starting interactive conversation mode".bright_green().bold());
     println!("{}", "Type your message and press Enter. Use 'exit' or Ctrl+C to quit.".dimmed());
     
-    // 初始化引擎一次并复用
+    // Initialize engine once with enhanced model resolution
+    let model_name = cmd.model.clone().or(config.models.default_model.clone()).unwrap_or("TinyLlama-1.1B-Chat-v1.0".to_string());
+    
+    println!("{} Resolving model for interactive mode: {}", "🔍".bright_blue(), model_name.cyan());
+    
+    let registry = ferrum_models::DefaultModelRegistry::with_defaults();
+    let resolved_id = registry.resolve_model_id(&model_name);
+    
+    if resolved_id != model_name {
+        println!("{} Resolved alias '{}' to: {}", "🔗".bright_blue(), model_name.cyan(), resolved_id.yellow());
+    }
+    
+    // Create model source resolver
+    let source_config = ferrum_models::ModelSourceConfig::default();
+    let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
+    
+    // Resolve model source
+    let source = match resolver.resolve(&resolved_id, None).await {
+        Ok(source) => {
+            println!("{} Model resolved: {}", "✅".bright_green(), source.local_path.display());
+            source
+        }
+        Err(e) => {
+            println!("{} Failed to resolve model '{}': {}", "❌".bright_red(), resolved_id, e);
+            println!("\nTip: Use 'ferrum models --download {}' to download the model", resolved_id);
+            return Err(e);
+        }
+    };
+    
+    // Load model configuration for better engine setup
+    let mut config_manager = ferrum_models::ConfigManager::new();
+    let model_config = config_manager.load_from_source(&source).await.unwrap_or_else(|e| {
+        warn!("Failed to load model config, using defaults: {}", e);
+        ferrum_models::AbstractModelConfig {
+            architecture: ferrum_models::Architecture::Llama,
+            hidden_size: 4096,
+            intermediate_size: 11008,
+            vocab_size: 32000,
+            num_hidden_layers: 32,
+            num_attention_heads: 32,
+            num_key_value_heads: None,
+            max_position_embeddings: 2048,
+            rope_theta: Some(10000.0),
+            rope_scaling: None,
+            norm_type: ferrum_models::NormType::RMSNorm,
+            norm_eps: 1e-6,
+            attention_config: ferrum_models::AttentionConfig {
+                attention_bias: false,
+                sliding_window: None,
+                use_flash_attention: false,
+                use_paged_attention: true,
+            },
+            activation: ferrum_models::Activation::SiLU,
+            extra_params: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    });
+    
     let engine_config = ferrum_engine::EngineConfig {
         max_batch_size: 32,
-        max_sequence_length: 2048,
+        max_sequence_length: model_config.max_position_embeddings.min(2048),
         num_gpu_blocks: 512,
         block_size: 16,
         enable_continuous_batching: false,
         enable_prefix_caching: false,
         gpu_memory_fraction: 0.9,
         scheduling_interval_ms: 10,
-        model_id: cmd.model.clone().or(config.models.default_model.clone()).unwrap_or("dummy".to_string()),
+        model_id: resolved_id,
         device: match cmd.backend.as_str() {
             "auto" => {
                 if cfg!(all(feature = "metal", any(target_os = "macos", target_os = "ios"))) {

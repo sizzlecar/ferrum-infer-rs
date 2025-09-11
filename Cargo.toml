@@ -91,7 +91,7 @@ async-stream = "0.3"
 
 # ML Framework - Mock for MVP (Candle to be added later)
 ## candle-core = { version = "0.6", default-features = false }
-hf-hub = { version = "0.3", features = ["tokio"] }
+hf-hub = "0.4.1"
 tokenizers = { version = "0.19", features = ["onig"] }
 safetensors = "0.4"
 

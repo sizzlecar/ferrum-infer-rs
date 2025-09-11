@@ -145,6 +145,43 @@ pub struct SpecialTokens {
     pub unk_token_id: Option<u32>,
 }
 
+/// 模型源解析器 trait（基于vLLM的ModelSourceResolver设计）
+#[async_trait]
+pub trait ModelSourceResolver: Send + Sync {
+    /// 解析模型源（HF模型ID或本地路径）到本地路径
+    async fn resolve(
+        &self,
+        id_or_path: &str,
+        revision: Option<&str>,
+    ) -> Result<crate::source::ResolvedModelSource>;
+
+    /// 是否支持离线模式
+    fn supports_offline(&self) -> bool;
+
+    /// 获取缓存信息
+    fn get_cache_info(&self, model_id: &str, revision: Option<&str>) -> Option<std::path::PathBuf>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_special_tokens_struct_is_send_sync_clone() {
+        fn assert_traits<T: Send + Sync + Clone>() {}
+        assert_traits::<SpecialTokens>();
+    }
+
+    #[test]
+    fn test_architecture_enum_variants() {
+        let a = Architecture::Custom("foo".into());
+        match a {
+            Architecture::Custom(s) => assert_eq!(s, "foo"),
+            _ => panic!("unexpected variant"),
+        }
+    }
+}
+
 /// Model conversion trait for different formats
 #[async_trait]
 pub trait ModelConverter: Send + Sync {
