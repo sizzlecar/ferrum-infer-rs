@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 # Core dependencies
 ferrum-core = { workspace = true }
+ferrum-models = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

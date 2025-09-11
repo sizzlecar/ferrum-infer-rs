@@ -65,10 +65,6 @@ enum Commands {
     /// Development and debugging tools
     Dev(DevCommand),
     
-    /// Apple GPU optimization benchmarks (macOS/iOS only)
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    AppleBench(apple_gpu_benchmark::AppleGpuBenchmarkArgs),
-    
 
 }
 
@@ -106,12 +102,6 @@ async fn main() {
         Commands::Health(cmd) => health::execute(cmd, config, cli.format).await,
         Commands::Cache(cmd) => cache::execute(cmd, config, cli.format).await,
         Commands::Dev(cmd) => dev::execute(cmd, config, cli.format).await,
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        Commands::AppleBench(cmd) => {
-            // Apple GPU benchmarks don't use standard config format
-            let _ = config; // Acknowledge we received config but don't use it
-            cmd.run().await
-        },
 
     };
 

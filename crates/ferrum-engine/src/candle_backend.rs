@@ -41,6 +41,58 @@ impl CandleBackend {
         })
     }
 
+    /// Load model from resolved path (new model maintenance system)
+    async fn load_from_resolved_path(&self, model_dir: &std::path::Path, _dtype: DataType) -> Result<Box<dyn Model>> {
+        debug!("Loading model from resolved path: {:?}", model_dir);
+        
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let config_path = model_dir.join("config.json");
+        
+        // Find weights file (could be model.safetensors or sharded files)
+        let weights_path = if model_dir.join("model.safetensors").exists() {
+            model_dir.join("model.safetensors")
+        } else {
+            // Look for sharded safetensors files
+            let entries = std::fs::read_dir(model_dir)
+                .map_err(|e| Error::internal(format!("Failed to read model directory: {}", e)))?;
+            
+            let mut safetensors_files = Vec::new();
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
+                if name.ends_with(".safetensors") {
+                    safetensors_files.push(entry.path());
+                }
+            }
+            
+            if safetensors_files.is_empty() {
+                return Err(Error::internal("No safetensors files found in model directory"));
+            }
+            
+            // For simplicity, use the first safetensors file
+            // In production, we'd need to handle sharded files properly
+            safetensors_files[0].clone()
+        };
+        
+        if !tokenizer_path.exists() {
+            return Err(Error::internal(format!("Tokenizer file not found: {:?}", tokenizer_path)));
+        }
+        
+        if !config_path.exists() {
+            return Err(Error::internal(format!("Config file not found: {:?}", config_path)));
+        }
+        
+        if !weights_path.exists() {
+            return Err(Error::internal(format!("Weights file not found: {:?}", weights_path)));
+        }
+        
+        self.load_from_local_files(
+            &tokenizer_path.to_string_lossy(),
+            &config_path.to_string_lossy(), 
+            &weights_path.to_string_lossy()
+        )
+    }
+
     /// Load model from local files (fallback when HF download fails)
     fn load_from_local_files(&self, tokenizer_path: &str, config_path: &str, weights_path: &str) -> Result<Box<dyn Model>> {
         info!("Loading model from local files");
@@ -48,25 +100,31 @@ impl CandleBackend {
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| Error::internal(format!("Load tokenizer failed: {}", e)))?;
 
-        let _config_bytes = std::fs::read(config_path)
+        let config_content = std::fs::read_to_string(config_path)
             .map_err(|e| Error::internal(format!("Read config failed: {}", e)))?;
+            
+        // Try to parse the actual config from file
+        let parsed_config: serde_json::Value = serde_json::from_str(&config_content)
+            .map_err(|e| Error::internal(format!("Parse config failed: {}", e)))?;
         
-        // Create a TinyLlama config manually for MVP
+        // Extract config parameters or use defaults for TinyLlama fallback
         let config = LlamaConfig {
-            hidden_size: 2048,
-            intermediate_size: 5632,
-            vocab_size: 32000,
-            num_hidden_layers: 22,
-            num_attention_heads: 32,
-            num_key_value_heads: 4,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
+            hidden_size: parsed_config.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(2048) as usize,
+            intermediate_size: parsed_config.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(5632) as usize,
+            vocab_size: parsed_config.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(32000) as usize,
+            num_hidden_layers: parsed_config.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(22) as usize,
+            num_attention_heads: parsed_config.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(32) as usize,
+            num_key_value_heads: parsed_config.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(4) as usize,
+            rms_norm_eps: parsed_config.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5),
+            rope_theta: parsed_config.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(10000.0) as f32,
             rope_scaling: None,
-            max_position_embeddings: 2048,
+            max_position_embeddings: parsed_config.get("max_position_embeddings").and_then(|v| v.as_u64()).unwrap_or(2048) as usize,
             use_flash_attn: false,
-            bos_token_id: Some(1),
-            eos_token_id: Some(LlamaEosToks::Single(2)),
-            tie_word_embeddings: false,
+            bos_token_id: parsed_config.get("bos_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).or(Some(1)),
+            eos_token_id: Some(LlamaEosToks::Single(
+                parsed_config.get("eos_token_id").and_then(|v| v.as_u64()).unwrap_or(2) as u32
+            )),
+            tie_word_embeddings: parsed_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false),
         };
 
         info!("Loading weights from local file: {}", weights_path);
@@ -96,7 +154,29 @@ impl CandleBackend {
             },
         };
 
-        info!("TinyLlama loaded successfully from local files");
+        // Extract model name from config for proper identification
+        let model_name = parsed_config.get("_name_or_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("local-model");
+
+        let model_info = ModelInfo {
+            model_id: ferrum_core::ModelId(model_name.to_string()),
+            model_type: ModelType::Llama,
+            num_parameters: (config.num_hidden_layers * config.hidden_size * config.intermediate_size) as u64,
+            hidden_size: config.hidden_size,
+            num_layers: config.num_hidden_layers,
+            num_heads: config.num_attention_heads,
+            vocab_size: config.vocab_size,
+            max_sequence_length: config.max_position_embeddings,
+            dtype: DataType::FP32,
+            device: match &self.device {
+                CandleDevice::Cpu => Device::CPU,
+                CandleDevice::Cuda(_cuda_device) => Device::CUDA(0),
+                _ => Device::CPU,
+            },
+        };
+
+        info!("Model loaded successfully from local files: {}", model_name);
 
         Ok(Box::new(CandleModel {
             model,
@@ -181,7 +261,16 @@ impl Backend for CandleBackend {
             return Err(Error::internal("Backend not initialized"));
         }
 
-        debug!("Loading TinyLlama model...");
+        debug!("Loading model from path: {}", path);
+        
+        // Try to load from the provided path first (new model maintenance system)
+        let model_path = std::path::Path::new(path);
+        if model_path.exists() && (model_path.is_dir() || model_path.extension().and_then(|s| s.to_str()) == Some("gguf")) {
+            debug!("Model path exists, attempting direct load");
+            return self.load_from_resolved_path(model_path, dtype).await;
+        }
+        
+        debug!("Model path '{}' doesn't exist or is not a directory, falling back to download logic", path);
         
         // Try to initialize HF API with proper configuration to fix redirect issues
         let api = match std::env::var("HF_HUB_OFFLINE") {
@@ -259,8 +348,9 @@ impl Backend for CandleBackend {
                 warn!("HF download failed ({}), trying manual download with proper redirect handling", e);
                 
                 // Try manual download with proper redirect handling
+                let full_url = format!("https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json");
                 match self.download_file_with_redirects(
-                    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json",
+                    &full_url,
                     "/tmp/models/tokenizer.json"
                 ).await {
                     Ok(path) => path,
@@ -285,8 +375,9 @@ impl Backend for CandleBackend {
             Ok(path) => path,
             Err(e) => {
                 warn!("HF download failed ({}), trying manual download", e);
+                let full_url = format!("https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/config.json");
                 match self.download_file_with_redirects(
-                    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/config.json",
+                    &full_url,
                     "/tmp/models/config.json"
                 ).await {
                     Ok(path) => path,
@@ -328,8 +419,9 @@ impl Backend for CandleBackend {
             Ok(path) => path,
             Err(e) => {
                 warn!("HF download failed ({}), trying manual download", e);
+                let full_url = format!("https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/model.safetensors");
                 match self.download_file_with_redirects(
-                    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/model.safetensors",
+                    &full_url,
                     "/tmp/models/model.safetensors"
                 ).await {
                     Ok(path) => path,

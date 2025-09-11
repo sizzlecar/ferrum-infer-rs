@@ -19,14 +19,16 @@
 
 pub mod config;
 pub mod registry;
+pub mod source;
 pub mod tokenizer;
 pub mod traits;
 
 // Re-exports
 pub use config::ConfigManager;
-pub use registry::DefaultModelRegistry;
-pub use tokenizer::TokenizerWrapper;
+pub use registry::{DefaultModelRegistry, DiscoveredModel, ModelAlias};
+pub use source::{DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ResolvedModelSource};
+pub use tokenizer::{TokenizerWrapper, TokenizerFactory, TokenizerMode, CachedTokenizer};
 pub use traits::{
     AbstractModelConfig, Activation, Architecture, AttentionConfig, ModelBuilder, ModelConverter,
-    ModelRegistry, NormType, RopeScaling, SpecialTokens, Tokenizer,
+    ModelRegistry, ModelSourceResolver, NormType, RopeScaling, SpecialTokens, Tokenizer,
 };
