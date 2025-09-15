@@ -29,6 +29,6 @@ pub use registry::{DefaultModelRegistry, DiscoveredModel, ModelAlias};
 pub use source::{DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ResolvedModelSource};
 pub use tokenizer::{TokenizerWrapper, TokenizerFactory, TokenizerMode, CachedTokenizer};
 pub use traits::{
-    AbstractModelConfig, Activation, Architecture, AttentionConfig, ModelBuilder, ModelConverter,
+    ModelDefinition, Activation, Architecture, AttentionConfig, ModelBuilder, ModelConverter,
     ModelRegistry, ModelSourceResolver, NormType, RopeScaling, SpecialTokens, Tokenizer,
 };

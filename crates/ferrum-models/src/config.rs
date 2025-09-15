@@ -4,7 +4,7 @@
 //! from various sources without depending on specific ML frameworks.
 //! Extended to support HF/Mistral/GGUF formats with compatibility patches.
 
-use crate::traits::{AbstractModelConfig, Activation, Architecture, AttentionConfig, NormType};
+use crate::traits::{ModelDefinition, Activation, Architecture, AttentionConfig, NormType};
 use crate::source::{ModelFormat, ResolvedModelSource};
 use ferrum_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 /// Extended to support HF/Mistral/GGUF formats and compatibility patches
 pub struct ConfigManager {
     /// Cached configurations
-    configs: HashMap<String, AbstractModelConfig>,
+    configs: HashMap<String, ModelDefinition>,
     /// Whether to enable compatibility patches
     enable_compatibility_patches: bool,
     /// Supported formats
@@ -56,7 +56,7 @@ impl ConfigManager {
     }
 
     /// Load configuration from file
-    pub async fn load_from_file(&mut self, path: &Path) -> Result<AbstractModelConfig> {
+    pub async fn load_from_file(&mut self, path: &Path) -> Result<ModelDefinition> {
         let content = tokio::fs::read_to_string(path).await?;
 
         let config: RawConfig = serde_json::from_str(&content)
@@ -66,7 +66,7 @@ impl ConfigManager {
     }
 
     /// Load configuration from resolved model source (New vLLM-inspired method)
-    pub async fn load_from_source(&mut self, source: &ResolvedModelSource) -> Result<AbstractModelConfig> {
+    pub async fn load_from_source(&mut self, source: &ResolvedModelSource) -> Result<ModelDefinition> {
         let cache_key = format!("{}:{}", source.model_id, source.revision.as_deref().unwrap_or("main"));
         
         // Check cache first
@@ -96,7 +96,7 @@ impl ConfigManager {
     }
 
     /// Load configuration from HuggingFace model ID
-    pub async fn load_from_huggingface(&mut self, _model_id: &str) -> Result<AbstractModelConfig> {
+    pub async fn load_from_huggingface(&mut self, _model_id: &str) -> Result<ModelDefinition> {
         // This would use the ModelSourceResolver to first resolve the model
         // For now, return a placeholder
         Err(Error::unsupported(
@@ -104,21 +104,17 @@ impl ConfigManager {
         ))
     }
 
-    /// Detect model format from directory
+    /// Detect model format from directory (使用统一的工具函数)
     fn detect_format(&self, path: &Path) -> Result<ModelFormat> {
-        if path.join("config.json").exists() {
-            Ok(ModelFormat::HuggingFace)
-        } else if path.join("params.json").exists() {
-            Ok(ModelFormat::Mistral)
-        } else if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
-            Ok(ModelFormat::GGUF)
-        } else {
-            Err(Error::configuration("Cannot detect model format"))
+        let format = crate::source::detect_format(path);
+        match format {
+            ModelFormat::Auto => Err(Error::configuration("Cannot detect model format")),
+            other => Ok(other),
         }
     }
     
     /// Load HuggingFace configuration with compatibility patches
-    async fn load_hf_config(&self, path: &Path) -> Result<AbstractModelConfig> {
+    async fn load_hf_config(&self, path: &Path) -> Result<ModelDefinition> {
         let config_path = path.join("config.json");
         debug!("Loading HF config from: {:?}", config_path);
         
@@ -137,14 +133,232 @@ impl ConfigManager {
     }
     
     /// Apply HuggingFace compatibility patches
-    async fn apply_hf_compatibility_patches(&self, _raw: &mut RawConfig) -> Result<()> {
+    async fn apply_hf_compatibility_patches(&self, raw: &mut RawConfig) -> Result<()> {
         debug!("Applying HF compatibility patches");
-        // TODO: Implement specific patches (RoPE normalization, architecture mapping, etc.)
+        
+        // 1. RoPE 参数归一化
+        self.normalize_rope_parameters(raw);
+        
+        // 2. KV heads 缺省推断
+        self.infer_missing_kv_heads(raw);
+        
+        // 3. 激活函数别名映射
+        self.normalize_activation_function(raw);
+        
+        // 4. Norm 类型别名映射
+        self.normalize_norm_config(raw);
+        
+        // 5. 架构别名映射
+        self.normalize_architecture_config(raw);
+        
+        debug!("HF compatibility patches applied successfully");
         Ok(())
     }
     
+    /// 归一化 RoPE 参数
+    fn normalize_rope_parameters(&self, raw: &mut RawConfig) {
+        // 标准化 RoPE theta 参数
+        if raw.rope_theta.is_none() {
+            // 检查别名字段
+            if let Some(theta_value) = raw.extra.get("rope_theta").and_then(|v| v.as_f64()) {
+                raw.rope_theta = Some(theta_value as f32);
+            } else if let Some(theta_value) = raw.extra.get("rotary_emb_base").and_then(|v| v.as_f64()) {
+                raw.rope_theta = Some(theta_value as f32);
+            } else {
+                // 根据架构设置默认值
+                if let Some(arch) = &raw.architectures {
+                    if !arch.is_empty() {
+                        let arch_str = arch[0].to_lowercase();
+                        if arch_str.contains("llama") {
+                            raw.rope_theta = Some(10000.0);
+                        } else if arch_str.contains("mistral") {
+                            raw.rope_theta = Some(10000.0);
+                        } else if arch_str.contains("qwen") {
+                            raw.rope_theta = Some(1000000.0);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 标准化 RoPE scaling 配置
+        if raw.rope_scaling.is_none() {
+            if let Some(scaling_obj) = raw.extra.get("rope_scaling").and_then(|v| v.as_object()) {
+                if let (Some(scaling_type), Some(factor)) = (
+                    scaling_obj.get("type").and_then(|v| v.as_str()),
+                    scaling_obj.get("factor").and_then(|v| v.as_f64())
+                ) {
+                    raw.rope_scaling = Some(RawRopeScaling {
+                        scaling_type: scaling_type.to_string(),
+                        factor: factor as f32,
+                    });
+                }
+            }
+        }
+        
+        debug!("RoPE parameters normalized: theta={:?}, scaling={:?}", raw.rope_theta, raw.rope_scaling);
+    }
+    
+    /// 推断缺失的 KV heads 配置
+    fn infer_missing_kv_heads(&self, raw: &mut RawConfig) {
+        if raw.num_key_value_heads.is_none() && raw.num_attention_heads.is_some() {
+            let num_heads = raw.num_attention_heads.unwrap();
+            
+            // 检查是否有 GQA 或 MQA 的配置提示
+            if let Some(gqa_groups) = raw.extra.get("num_key_value_heads").and_then(|v| v.as_u64()) {
+                raw.num_key_value_heads = Some(gqa_groups as usize);
+            } else if let Some(multi_query) = raw.extra.get("multi_query").and_then(|v| v.as_bool()) {
+                // MQA: 所有 heads 共享一个 key-value pair
+                raw.num_key_value_heads = Some(if multi_query { 1 } else { num_heads });
+            } else {
+                // 根据架构推断默认行为
+                if let Some(arch) = &raw.architectures {
+                    if !arch.is_empty() {
+                        let arch_str = arch[0].to_lowercase();
+                        if arch_str.contains("llama") {
+                            // Llama 通常不使用 GQA (除非明确指定)
+                            raw.num_key_value_heads = Some(num_heads);
+                        } else if arch_str.contains("mistral") {
+                            // Mistral 7B 使用 GQA
+                            raw.num_key_value_heads = Some(8);
+                        } else if arch_str.contains("mixtral") {
+                            // Mixtral 使用 GQA
+                            raw.num_key_value_heads = Some(8);
+                        } else {
+                            // 默认情况：与 attention heads 相同
+                            raw.num_key_value_heads = Some(num_heads);
+                        }
+                    }
+                } else {
+                    // 无架构信息时默认与 attention heads 相同
+                    raw.num_key_value_heads = Some(num_heads);
+                }
+            }
+        }
+        
+        debug!("KV heads inferred: num_attention_heads={:?}, num_key_value_heads={:?}", 
+               raw.num_attention_heads, raw.num_key_value_heads);
+    }
+    
+    /// 归一化激活函数配置
+    fn normalize_activation_function(&self, raw: &mut RawConfig) {
+        if raw.hidden_act.is_none() {
+            // 检查别名字段
+            if let Some(act_fn) = raw.extra.get("activation_function").and_then(|v| v.as_str()) {
+                raw.hidden_act = Some(act_fn.to_string());
+            } else if let Some(act_fn) = raw.extra.get("activation").and_then(|v| v.as_str()) {
+                raw.hidden_act = Some(act_fn.to_string());
+            } else {
+                // 根据架构设置默认激活函数
+                if let Some(arch) = &raw.architectures {
+                    if !arch.is_empty() {
+                        let arch_str = arch[0].to_lowercase();
+                        if arch_str.contains("llama") || arch_str.contains("mistral") {
+                            raw.hidden_act = Some("silu".to_string());
+                        } else if arch_str.contains("qwen") {
+                            raw.hidden_act = Some("silu".to_string());
+                        } else if arch_str.contains("phi") {
+                            raw.hidden_act = Some("gelu_new".to_string());
+                        } else if arch_str.contains("gemma") {
+                            raw.hidden_act = Some("gelu".to_string());
+                        } else {
+                            raw.hidden_act = Some("silu".to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 标准化激活函数名称
+        if let Some(ref mut act) = raw.hidden_act {
+            let act_lower = act.to_lowercase();
+            let normalized_act = match act_lower.as_str() {
+                "swish" => "silu",
+                "gelu_new" | "gelu_pytorch_tanh" => "gelu",
+                other => other,
+            };
+            *act = normalized_act.to_string();
+        }
+        
+        debug!("Activation function normalized: {:?}", raw.hidden_act);
+    }
+    
+    /// 归一化 Norm 配置
+    fn normalize_norm_config(&self, raw: &mut RawConfig) {
+        // 标准化 eps 参数
+        if raw.rms_norm_eps.is_none() && raw.layer_norm_eps.is_none() {
+            if let Some(eps_value) = raw.extra.get("norm_eps").and_then(|v| v.as_f64()) {
+                // 判断使用哪种 norm 类型
+                if let Some(arch) = &raw.architectures {
+                    if !arch.is_empty() {
+                        let arch_str = arch[0].to_lowercase();
+                        if arch_str.contains("llama") || arch_str.contains("mistral") {
+                            raw.rms_norm_eps = Some(eps_value);
+                        } else {
+                            raw.layer_norm_eps = Some(eps_value);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 设置默认 eps 值
+        if raw.rms_norm_eps.is_none() && raw.layer_norm_eps.is_none() {
+            if let Some(arch) = &raw.architectures {
+                if !arch.is_empty() {
+                    let arch_str = arch[0].to_lowercase();
+                    if arch_str.contains("llama") || arch_str.contains("mistral") {
+                        raw.rms_norm_eps = Some(1e-6);
+                    } else {
+                        raw.layer_norm_eps = Some(1e-5);
+                    }
+                }
+            }
+        }
+        
+        debug!("Norm config normalized: rms_eps={:?}, layer_eps={:?}", raw.rms_norm_eps, raw.layer_norm_eps);
+    }
+    
+    /// 归一化架构配置
+    fn normalize_architecture_config(&self, raw: &mut RawConfig) {
+        // 如果没有 architectures 字段但有 model_type，尝试转换
+        if raw.architectures.is_none() || raw.architectures.as_ref().map_or(true, |v| v.is_empty()) {
+            if let Some(model_type) = &raw.model_type {
+                raw.architectures = Some(vec![format!("{}ForCausalLM", model_type)]);
+            }
+        }
+        
+        // 标准化架构名称
+        if let Some(ref mut archs) = raw.architectures {
+            for arch in archs.iter_mut() {
+                // 将常见的变体标准化为主要架构名称
+                let normalized = match arch.to_lowercase().as_str() {
+                    s if s.contains("llama") => {
+                        if s.contains("3") {
+                            "LlamaForCausalLM"
+                        } else if s.contains("2") {
+                            "LlamaForCausalLM"
+                        } else {
+                            "LlamaForCausalLM"
+                        }
+                    },
+                    s if s.contains("mistral") && !s.contains("mixtral") => "MistralForCausalLM",
+                    s if s.contains("mixtral") => "MixtralForCausalLM",
+                    s if s.contains("qwen2") => "Qwen2ForCausalLM",
+                    s if s.contains("qwen") => "QwenForCausalLM",
+                    s if s.contains("phi") => "PhiForCausalLM",
+                    s if s.contains("gemma") => "GemmaForCausalLM",
+                    _ => arch.as_str(),
+                };
+                *arch = normalized.to_string();
+            }
+        }
+        
+        debug!("Architecture config normalized: {:?}", raw.architectures);
+    }
+    
     /// Load Mistral configuration from params.json
-    async fn load_mistral_config(&self, path: &Path) -> Result<AbstractModelConfig> {
+    async fn load_mistral_config(&self, path: &Path) -> Result<ModelDefinition> {
         let params_path = path.join("params.json");
         debug!("Loading Mistral config from: {:?}", params_path);
         
@@ -155,7 +369,7 @@ impl ConfigManager {
     }
     
     /// Load GGUF configuration
-    async fn load_gguf_config(&self, path: &Path) -> Result<AbstractModelConfig> {
+    async fn load_gguf_config(&self, path: &Path) -> Result<ModelDefinition> {
         debug!("Loading GGUF config from: {:?}", path);
         
         // Create basic config based on filename
@@ -173,7 +387,7 @@ impl ConfigManager {
             Architecture::Custom("gguf".to_string())
         };
         
-        Ok(AbstractModelConfig {
+        Ok(ModelDefinition {
             architecture,
             hidden_size: 4096,
             intermediate_size: 11008,
@@ -189,8 +403,7 @@ impl ConfigManager {
             attention_config: AttentionConfig {
                 attention_bias: false,
                 sliding_window: None,
-                use_flash_attention: false,
-                use_paged_attention: true,
+                // use_flash_attention and use_paged_attention moved to ferrum_core::ModelConfig
             },
             activation: Activation::SiLU,
             extra_params: serde_json::Value::Object(serde_json::Map::new()),
@@ -198,14 +411,14 @@ impl ConfigManager {
     }
     
     /// Convert raw config to abstract config
-    fn convert_to_abstract(&self, raw: RawConfig) -> Result<AbstractModelConfig> {
+    fn convert_to_abstract(&self, raw: RawConfig) -> Result<ModelDefinition> {
         let architecture = self.detect_architecture(&raw)?;
         let norm_type = self.detect_norm_type(&raw);
         let activation = self.detect_activation(&raw);
         let extra_params =
             serde_json::to_value(&raw).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-        Ok(AbstractModelConfig {
+        Ok(ModelDefinition {
             architecture,
             hidden_size: raw.hidden_size.unwrap_or(4096),
             intermediate_size: raw.intermediate_size.unwrap_or(11008),
@@ -224,8 +437,7 @@ impl ConfigManager {
             attention_config: AttentionConfig {
                 attention_bias: raw.attention_bias.unwrap_or(false),
                 sliding_window: raw.sliding_window,
-                use_flash_attention: false,
-                use_paged_attention: true,
+                // use_flash_attention and use_paged_attention moved to ferrum_core::ModelConfig
             },
             activation,
             extra_params,

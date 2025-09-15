@@ -96,7 +96,7 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
         Err(e) => {
             println!("{} Warning: Failed to load configuration, using defaults: {}", "⚠️".yellow(), e);
             // Use default configuration
-            ferrum_models::AbstractModelConfig {
+            ferrum_models::ModelDefinition {
                 architecture: ferrum_models::Architecture::Llama,
                 hidden_size: 4096,
                 intermediate_size: 11008,
@@ -112,8 +112,6 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
                 attention_config: ferrum_models::AttentionConfig {
                     attention_bias: false,
                     sliding_window: None,
-                    use_flash_attention: false,
-                    use_paged_attention: true,
                 },
                 activation: ferrum_models::Activation::SiLU,
                 extra_params: serde_json::Value::Object(serde_json::Map::new()),

@@ -43,3 +43,4 @@ tempfile = "3.8"
 
 [features]
 default = []
+integration-tests = []

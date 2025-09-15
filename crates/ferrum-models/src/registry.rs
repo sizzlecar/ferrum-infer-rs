@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Model alias configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +49,7 @@ pub struct DefaultModelRegistry {
     /// Discovered models cache
     discovered_models: Arc<RwLock<HashMap<String, DiscoveredModel>>>,
     /// Source configuration
+    #[allow(dead_code)]
     source_config: ModelSourceConfig,
 }
 
@@ -116,12 +117,8 @@ impl ModelRegistry for DefaultModelRegistry {
         }
     }
 
-    fn get_builder(&self, _architecture: &Architecture) -> Option<&dyn ModelBuilder> {
-        let _builders = self.builders.read();
-        // This is a bit tricky due to lifetime issues
-        // In a real implementation, we might need to return Arc<dyn ModelBuilder>
-        // For now, we return None as this is just the interface
-        None
+    fn get_builder_arc(&self, architecture: &Architecture) -> Option<Arc<dyn ModelBuilder>> {
+        self.builders.read().get(architecture).cloned()
     }
 
     fn supported_architectures(&self) -> Vec<Architecture> {
@@ -215,17 +212,9 @@ impl DefaultModelRegistry {
         })
     }
     
-    /// Detect model format from directory
+    /// Detect model format from directory (使用统一的工具函数)
     fn detect_model_format(&self, path: &PathBuf) -> ModelFormat {
-        if path.join("config.json").exists() {
-            ModelFormat::HuggingFace
-        } else if path.join("params.json").exists() {
-            ModelFormat::Mistral
-        } else if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
-            ModelFormat::GGUF
-        } else {
-            ModelFormat::Auto
-        }
+        crate::source::detect_format(path)
     }
     
     /// Detect architecture from path
@@ -311,10 +300,7 @@ impl DefaultModelRegistry {
         self.discovered_models.write().clear();
     }
     
-    /// Get builder as Arc (better lifetime handling)
-    pub fn get_builder_arc(&self, architecture: &Architecture) -> Option<Arc<dyn ModelBuilder>> {
-        self.builders.read().get(architecture).cloned()
-    }
+    // Note: get_builder_arc is now implemented via the ModelRegistry trait
 }
 
 impl Default for DefaultModelRegistry {

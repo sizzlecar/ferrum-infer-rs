@@ -422,7 +422,7 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
     let mut config_manager = ferrum_models::ConfigManager::new();
     let model_config = config_manager.load_from_source(&source).await.unwrap_or_else(|e| {
         warn!("Failed to load model config, using defaults: {}", e);
-        ferrum_models::AbstractModelConfig {
+        ferrum_models::ModelDefinition {
             architecture: ferrum_models::Architecture::Llama,
             hidden_size: 4096,
             intermediate_size: 11008,
@@ -438,8 +438,6 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
             attention_config: ferrum_models::AttentionConfig {
                 attention_bias: false,
                 sliding_window: None,
-                use_flash_attention: false,
-                use_paged_attention: true,
             },
             activation: ferrum_models::Activation::SiLU,
             extra_params: serde_json::Value::Object(serde_json::Map::new()),
