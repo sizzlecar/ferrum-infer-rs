@@ -127,9 +127,9 @@ pub struct TokenUsage {
 
 // ==================== Model Types ====================
 
-/// Model configuration
+/// Model configuration (Runtime/Execution layer)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
+pub struct RuntimeConfig {
     pub model_id: ModelId,
     pub model_path: String,
     pub model_type: ModelType,
@@ -140,6 +140,10 @@ pub struct ModelConfig {
     pub tensor_parallel_size: Option<usize>,
     pub pipeline_parallel_size: Option<usize>,
     pub quantization: Option<QuantizationConfig>,
+    
+    // Runtime attention configuration
+    pub use_flash_attention: bool,
+    pub use_paged_attention: bool,
 }
 
 /// Model type enumeration

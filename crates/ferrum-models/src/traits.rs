@@ -4,8 +4,9 @@
 //! without depending on any specific ML framework implementation.
 
 use async_trait::async_trait;
-use ferrum_core::{ModelConfig, Result};
+use ferrum_core::{RuntimeConfig, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Model architecture types
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,7 +25,7 @@ pub enum Architecture {
 
 /// Abstract model configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AbstractModelConfig {
+pub struct ModelDefinition {
     /// Model architecture
     pub architecture: Architecture,
 
@@ -78,13 +79,13 @@ pub enum Activation {
     Swish,
 }
 
-/// Attention configuration
+/// Attention configuration (Definition layer - architecture-specific)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttentionConfig {
     pub attention_bias: bool,
     pub sliding_window: Option<usize>,
-    pub use_flash_attention: bool,
-    pub use_paged_attention: bool,
+    // Note: use_flash_attention and use_paged_attention moved to ferrum_core::ModelConfig
+    // as they are runtime implementation choices, not architectural properties
 }
 
 /// Abstract model builder trait
@@ -93,15 +94,15 @@ pub trait ModelBuilder: Send + Sync {
     /// Build a model from configuration
     async fn build(
         &self,
-        config: &AbstractModelConfig,
-        model_config: &ModelConfig,
+        config: &ModelDefinition,
+        model_config: &RuntimeConfig,
     ) -> Result<Box<dyn ferrum_core::Model>>;
 
-    /// Load model weights
+    /// Load model weights from resolved source (replaces weights_path for better integration)
     async fn load_weights(
         &self,
         model: &mut dyn ferrum_core::Model,
-        weights_path: &str,
+        source: &crate::source::ResolvedModelSource,
     ) -> Result<()>;
 
     /// Get supported architectures
@@ -113,8 +114,8 @@ pub trait ModelRegistry: Send + Sync {
     /// Register a model builder
     fn register_builder(&mut self, builder: Box<dyn ModelBuilder>);
 
-    /// Get builder for architecture
-    fn get_builder(&self, architecture: &Architecture) -> Option<&dyn ModelBuilder>;
+    /// Get builder for architecture as Arc (recommended)
+    fn get_builder_arc(&self, architecture: &Architecture) -> Option<Arc<dyn ModelBuilder>>;
 
     /// List all supported architectures
     fn supported_architectures(&self) -> Vec<Architecture>;
@@ -182,19 +183,33 @@ mod tests {
     }
 }
 
-/// Model conversion trait for different formats
+/// 模型格式枚举
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModelFormat {
+    HuggingFace { model_id: String, revision: Option<String> },
+    Gguf { path: String },
+    SafeTensors { path: String },
+    Custom { format_name: String, source: String },
+}
+
+/// 模型转换器 trait - 使用统一接口支持可扩展的格式
 #[async_trait]
 pub trait ModelConverter: Send + Sync {
-    /// Convert from HuggingFace format
-    async fn from_huggingface(
-        &self,
-        model_id: &str,
-        revision: Option<&str>,
-    ) -> Result<AbstractModelConfig>;
+    /// 从指定格式转换为 ModelDefinition
+    async fn convert(&self, format: &ModelFormat) -> Result<ModelDefinition>;
 
-    /// Convert from GGUF format
-    async fn from_gguf(&self, path: &str) -> Result<AbstractModelConfig>;
+    /// 获取此转换器支持的格式列表
+    fn supported_formats(&self) -> Vec<String>;
+}
 
-    /// Convert from SafeTensors format
-    async fn from_safetensors(&self, path: &str) -> Result<AbstractModelConfig>;
+/// 格式特定的转换器注册表
+pub trait ModelConverterRegistry: Send + Sync {
+    /// 注册特定格式的转换器
+    fn register_converter(&mut self, format_name: &str, converter: Box<dyn ModelConverter>);
+    
+    /// 获取指定格式的转换器
+    fn get_converter(&self, format_name: &str) -> Option<Arc<dyn ModelConverter>>;
+    
+    /// 列出所有支持的格式
+    fn supported_formats(&self) -> Vec<String>;
 }

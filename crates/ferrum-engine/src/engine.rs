@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use ferrum_core::{
     Backend, BatchManager, CacheManager, EngineStatus, Error, FinishReason, InferenceEngine, InferenceRequest,
-    InferenceResponse, MemoryManager, Model, ModelConfig, ModelId, ModelLoader, Result, Scheduler, StreamChunk,
+    InferenceResponse, MemoryManager, Model, RuntimeConfig, ModelId, ModelLoader, Result, Scheduler, StreamChunk,
     ScheduledBatch, ScheduledRequest, RequestState, BatchId, BatchOutput, BatchInfo, BlockId, KVBlock, MemoryHandle, MemoryPressure,
     SchedulerStats, CacheStats, MemoryUsage, TokenUsage,
 };
@@ -147,7 +147,7 @@ impl Engine {
         debug!("Model resolved to path: {:?}", resolved_source.local_path);
         
         // Load the model with resolved path
-        let model_config = ferrum_core::ModelConfig {
+        let model_config = ferrum_core::RuntimeConfig {
             model_id: ModelId(resolved_id.clone()),
             model_path: resolved_source.local_path.to_string_lossy().to_string(),
             model_type: ferrum_core::ModelType::Llama, // TODO: Get from config
@@ -158,6 +158,9 @@ impl Engine {
             tensor_parallel_size: None,
             pipeline_parallel_size: None,
             quantization: None,
+            // Runtime attention features per DEVELOPMENT.md
+            use_flash_attention: false,
+            use_paged_attention: true,
         };
 
         self.model_loader.load_model(&model_config).await?;
@@ -530,7 +533,7 @@ impl GenericModelLoader {
 
 #[async_trait]
 impl ModelLoader for GenericModelLoader {
-    async fn load_model(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
+    async fn load_model(&self, config: &RuntimeConfig) -> Result<Arc<dyn Model>> {
         info!("Loading model: {}", config.model_id.0);
         
         // Use the model_path from config (should be resolved by new model maintenance system)

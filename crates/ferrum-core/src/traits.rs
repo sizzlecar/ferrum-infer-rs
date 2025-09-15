@@ -28,7 +28,7 @@ pub trait InferenceEngine: Send + Sync {
 #[async_trait]
 pub trait ModelLoader: Send + Sync {
     /// Load a model with given configuration
-    async fn load_model(&self, config: &ModelConfig) -> Result<Arc<dyn Model>>;
+    async fn load_model(&self, config: &RuntimeConfig) -> Result<Arc<dyn Model>>;
 
     /// Unload a model by ID
     async fn unload_model(&self, model_id: &str) -> Result<()>;

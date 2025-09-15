@@ -36,15 +36,43 @@
    - 在后端 crate 注册 `ModelBuilder`（如 Candle 版 Llama）。
    - 通过 `get_builder_arc(&config.architecture)` 获取 builder，执行 `build` 与 `load_weights`。
 
-## 架构抽象（优先项）
-- 统一以 `AbstractModelConfig` 为后端输入契约，后端不得依赖具体格式细节。
-- 规范化字段：
-  - `architecture`：通过 HF `architectures`/`model_type` 映射到 `Architecture` 枚举（已覆盖 Llama/Mistral/Mixtral/Qwen/Qwen2/Phi/Gemma/Custom）。
-  - Norm/Activation：从 HF 字段推断（`rms_norm_eps` → RMSNorm；`hidden_act` → SiLU/GELU/...）。
-  - RoPE：`rope_theta`/`rope_scaling` 透传；后续在兼容补丁中做数值/命名归一化。
-- 后端接口：
-  - `ModelBuilder` 以 `&AbstractModelConfig` + `&ferrum_core::ModelConfig` 为输入；
-  - `load_weights` 由后端负责，`weights_path` 优先来自 `ResolvedModelSource.local_path`。
+## 配置分层与 Builder 参数（重要）
+为避免“配置”概念混淆，明确两层含义：
+
+- Definition 层（架构/超参）
+  - 对应：`AbstractModelConfig`（建议可改名：`ModelDefinition`/`ArchitectureConfig`）。
+  - 含义：HF 模型固有属性（隐藏维度、层数、vocab、RoPE、Norm、激活、注意力结构等）。
+  - 特性：随权重/架构而变，和设备/并行/量化无关。
+
+- Runtime 层（运行/部署）
+  - 对应：`ferrum_core::ModelConfig`（建议可改名：`RuntimeConfig`/`ExecutionConfig`）。
+  - 含义：device、dtype、并行度、batch 上限、运行时 `max_sequence_length`、量化、模型加载路径等。
+  - 特性：同一模型在不同硬件/策略下可不同，但不改变网络结构。
+
+建议与约束：
+- 移除 Runtime 中与 Definition 重叠的语义：
+  - `ModelConfig.model_type` 建议移除，统一使用 `AbstractModelConfig.architecture`。
+- `max_position_embeddings`（Definition）与 `max_sequence_length`（Runtime）并存：
+  - 运行期实际长度 = min(请求、Runtime 限制、Definition 上限)。
+- 注意力“实现特性”归到 Runtime：
+  - 如 `use_flash_attention`/`use_paged_attention` 归类到运行能力（可与 `ExecutorCapabilities` 协同）。
+- Builder 接口建议：
+  - 选项 A：保留现状，但将 `load_weights` 的 `weights_path` 换成 `ResolvedModelSource`，减少胶水代码。
+  - 选项 B：引入 `BuildContext` 统一传参：
+    ```rust
+    pub struct BuildContext<'a> {
+        pub definition: &'a AbstractModelConfig,     // Definition 层
+        pub runtime: &'a ferrum_core::ModelConfig,   // Runtime 层
+        pub source: &'a crate::source::ResolvedModelSource,
+        pub tokenizer: Option<std::sync::Arc<dyn crate::Tokenizer>>, // 可选
+    }
+
+    #[async_trait::async_trait]
+    pub trait ModelBuilder {
+        async fn build(&self, ctx: &BuildContext<'_>) -> ferrum_core::Result<Box<dyn ferrum_core::Model>>;
+    }
+    ```
+
 
 ## 近期改造计划（Roadmap）
 - 必做（HF-first）：
