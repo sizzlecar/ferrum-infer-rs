@@ -1,0 +1,53 @@
+[package]
+name = "ferrum-tokenizer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Core dependencies
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Tokenizers
+tokenizers = { workspace = true }
+hf-hub = { workspace = true }
+
+# Caching
+parking_lot = { workspace = true }
+dashmap = "6.1"
+
+# Utils
+uuid = { workspace = true }
+once_cell = { workspace = true }
+
+# Regex for chat templates
+regex = "1.10"
+
+# File system
+dirs = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = []
+cache = []  # Enable tokenizer caching
+templates = ["dep:regex"]  # Enable chat template support

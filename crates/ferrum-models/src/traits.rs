@@ -96,12 +96,12 @@ pub trait ModelBuilder: Send + Sync {
         &self,
         config: &ModelDefinition,
         model_config: &RuntimeConfig,
-    ) -> Result<Box<dyn ferrum_core::Model>>;
+    ) -> Result<Box<dyn ferrum_core::ModelExecutor>>;
 
     /// Load model weights from resolved source (replaces weights_path for better integration)
     async fn load_weights(
         &self,
-        model: &mut dyn ferrum_core::Model,
+        model: &mut dyn ferrum_core::ModelExecutor,
         source: &crate::source::ResolvedModelSource,
     ) -> Result<()>;
 
