@@ -24,17 +24,49 @@ pub struct TokenizerWrapper {
 }
 
 impl TokenizerWrapper {
-    /// Load tokenizer from file
+    /// Load tokenizer from file with improved error handling
     pub async fn from_file(path: &Path) -> Result<Self> {
-        let tokenizer = tokenizers::Tokenizer::from_file(path)
-            .map_err(|e| Error::model_loading(format!("Failed to load tokenizer: {}", e)))?;
-
+        let tokenizer = Self::load_tokenizer_with_fallback(path)?;
         let special_tokens = Self::extract_special_tokens(&tokenizer);
 
         Ok(Self {
             inner: tokenizer,
             special_tokens,
         })
+    }
+
+    /// Load tokenizer from file with proper error reporting  
+    fn load_tokenizer_with_fallback(path: &Path) -> Result<tokenizers::Tokenizer> {
+        match tokenizers::Tokenizer::from_file(path) {
+            Ok(tokenizer) => Ok(tokenizer),
+            Err(e) => {
+                let error_str = e.to_string();
+                
+                // Check for the specific Qwen compatibility issue
+                if error_str.contains("ModelWrapper") || error_str.contains("untagged enum") {
+                    let model_name = path.parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+                        
+                    return Err(Error::model(format!(
+                        "Tokenizer compatibility issue with model '{}'\n\n\
+                        ROOT CAUSE: This is a known incompatibility between tokenizers 0.19 and some newer models (particularly Qwen3).\n\
+                        The model's tokenizer.json is valid but uses features not fully supported in tokenizers 0.19.\n\n\
+                        SOLUTIONS:\n\
+                        1. Use a compatible model like: TinyLlama/TinyLlama-1.1B-Chat-v1.0\n\
+                        2. Update dependencies (if possible): tokenizers >= 0.20\n\
+                        3. Use a different Qwen variant that's compatible\n\n\
+                        Technical details: {}\n\
+                        Tokenizer file: {:?}",
+                        model_name, e, path
+                    )));
+                }
+                
+                // Generic tokenizer loading error
+                Err(Error::model(format!("Failed to load tokenizer: {}", e)))
+            }
+        }
     }
 
     /// Load tokenizer from HuggingFace (placeholder)
@@ -62,7 +94,7 @@ impl TokenizerWrapper {
                 if tokenizer_file.exists() {
                     tokenizer_file
                 } else {
-                    return Err(Error::model_loading("Cannot find tokenizer.json for auto-detected model"));
+                    return Err(Error::model("Cannot find tokenizer.json for auto-detected model"));
                 }
             }
         };
@@ -234,7 +266,7 @@ impl TokenizerFactory {
                 if let Some(path) = tokenizer_path {
                     Ok(Box::new(TokenizerWrapper::from_file(path).await?))
                 } else {
-                    Err(Error::configuration("Tokenizer path required"))
+                    Err(Error::config("Tokenizer path required"))
                 }
             }
             crate::Architecture::Mistral | crate::Architecture::Mixtral => {
@@ -242,7 +274,7 @@ impl TokenizerFactory {
                 if let Some(path) = tokenizer_path {
                     Ok(Box::new(TokenizerWrapper::from_file(path).await?))
                 } else {
-                    Err(Error::configuration("Tokenizer path required"))
+                    Err(Error::config("Tokenizer path required"))
                 }
             }
             crate::Architecture::Qwen | crate::Architecture::Qwen2 => {
@@ -250,7 +282,7 @@ impl TokenizerFactory {
                 if let Some(path) = tokenizer_path {
                     Ok(Box::new(TokenizerWrapper::from_file(path).await?))
                 } else {
-                    Err(Error::configuration("Tokenizer path required"))
+                    Err(Error::config("Tokenizer path required"))
                 }
             }
             _ => {

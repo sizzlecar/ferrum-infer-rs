@@ -1,11 +1,16 @@
 //! # Ferrum Scheduler
 //!
-//! Request scheduling and batching abstractions for LLM inference.
+//! Request scheduling and batching implementations for LLM inference.
 //!
 //! ## Overview
 //!
-//! This module defines the core traits for implementing various scheduling strategies
-//! and batching algorithms to optimize throughput and latency in LLM inference.
+//! This crate provides concrete implementations of the scheduler interfaces defined
+//! in ferrum-interfaces, including:
+//!
+//! - FIFO scheduler for simple first-come-first-served scheduling
+//! - Priority scheduler for priority-based request handling
+//! - Resource-aware scheduler for optimal resource utilization
+//! - SLA-aware scheduler for meeting service level agreements
 //!
 //! ## Design Principles
 //!
@@ -15,16 +20,27 @@
 //! - **SLA Awareness**: Consider latency SLAs and priorities
 //! - **Resource Awareness**: Schedule based on available resources
 
-pub mod traits;
-pub mod types;
+pub mod implementations;
+pub mod queue;
+pub mod metrics;
 
-// Re-exports
-pub use traits::{
-    BatchScheduler, LoadBalancer, PreemptionManager, RequestQueue, ResourceAwareScheduler,
-    Scheduler, SlaManager,
+// Re-exports of interfaces from ferrum-interfaces
+pub use ferrum_interfaces::{
+    SchedulerInterface as Scheduler, 
+    BatchPlan, 
+    BatchHint,
+    SchedulerConfig,
+    SchedulerMetrics,
+    ScheduledRequest,
+    ResourceConstraints,
+    BatchResourceRequirements,
+    PreemptionResult,
+    SchedulingPolicy,
 };
 
-pub use types::{
-    BatchRequest, BatchingStrategy, PreemptionPolicy, QueueConfig, SchedulerMetrics,
-    SchedulingPolicy, SlaConfig,
+pub use ferrum_types::{
+    BatchId, RequestId, InferenceRequest, InferenceResponse, Priority, Result,
 };
+
+// Re-exports of implementations
+pub use implementations::*;

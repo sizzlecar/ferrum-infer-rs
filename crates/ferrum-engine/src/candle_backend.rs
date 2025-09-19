@@ -98,7 +98,24 @@ impl CandleBackend {
         info!("Loading model from local files");
         
         let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| Error::internal(format!("Load tokenizer failed: {}", e)))?;
+            .map_err(|e| {
+                let error_str = e.to_string();
+                if error_str.contains("ModelWrapper") || error_str.contains("untagged enum") {
+                    Error::internal(format!(
+                        "Load tokenizer failed: {}\n\n\
+                        This is a known compatibility issue with some Qwen models and the current tokenizers library.\n\
+                        The tokenizer format may be incompatible with tokenizers v0.19.\n\
+                        \nSuggested solutions:\n\
+                        1. Try a different model that's confirmed to work (e.g., TinyLlama/TinyLlama-1.1B-Chat-v1.0)\n\
+                        2. Check if there's an updated version of ferrum that supports this model\n\
+                        3. Re-download the model: huggingface-cli download Qwen/Qwen3-1.7B\n\
+                        \nTokenizer file: {}", 
+                        e, tokenizer_path
+                    ))
+                } else {
+                    Error::internal(format!("Load tokenizer failed: {}", e))
+                }
+            })?;
 
         let config_content = std::fs::read_to_string(config_path)
             .map_err(|e| Error::internal(format!("Read config failed: {}", e)))?;
@@ -369,7 +386,24 @@ impl Backend for CandleBackend {
         };
         
         let tokenizer = Tokenizer::from_file(&tokenizer_filename)
-            .map_err(|e| Error::internal(format!("Load tokenizer failed: {}", e)))?;
+            .map_err(|e| {
+                let error_str = e.to_string();
+                if error_str.contains("ModelWrapper") || error_str.contains("untagged enum") {
+                    Error::internal(format!(
+                        "Load tokenizer failed: {}\n\n\
+                        This is a known compatibility issue with some Qwen models and the current tokenizers library.\n\
+                        The tokenizer format may be incompatible with tokenizers v0.19.\n\
+                        \nSuggested solutions:\n\
+                        1. Try a different model that's confirmed to work (e.g., TinyLlama/TinyLlama-1.1B-Chat-v1.0)\n\
+                        2. Check if there's an updated version of ferrum that supports this model\n\
+                        3. Re-download the model: huggingface-cli download <model_id>\n\
+                        \nTokenizer file: {:?}", 
+                        e, tokenizer_filename
+                    ))
+                } else {
+                    Error::internal(format!("Load tokenizer failed: {}", e))
+                }
+            })?;
 
         let config_filename = match repo.get("config.json").await {
             Ok(path) => path,
@@ -513,6 +547,13 @@ pub struct CandleModel {
     model_info: ModelInfo,
 }
 
+impl CandleModel {
+    /// Get the underlying tokenizer for external use
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+}
+
 #[async_trait]
 impl Model for CandleModel {
     fn info(&self) -> &ModelInfo {
@@ -646,6 +687,64 @@ impl Model for CandleModel {
             },
             kv_cache,
         })
+    }
+
+    /// Forward pass without sampling - returns raw logits for external sampling
+    async fn forward_logits(
+        &self,
+        input_ids: &[TokenId],
+        past_kv: Option<&KVCache>,
+    ) -> Result<(Tensor, Option<KVCache>)> {
+        debug!("Forward pass for {} input tokens", input_ids.len());
+
+        let input_tensor = CandleTensor::from_iter(input_ids.iter().cloned(), &self.device)
+            .map_err(|e| Error::internal(format!("Failed to create input tensor: {}", e)))?
+            .unsqueeze(0)
+            .map_err(|e| Error::internal(format!("Failed to unsqueeze tensor: {}", e)))?;
+
+        let mut cache = match past_kv {
+            None => {
+                // Prefill phase: create new cache
+                debug!("Creating new KV cache for prefill");
+                Cache::new(true, DType::F32, &self.config, &self.device)
+                    .map_err(|e| Error::internal(format!("Cache creation failed: {}", e)))?
+            }
+            Some(kv_cache) => {
+                // Decode phase: try to reuse existing cache
+                debug!(
+                    "Reusing KV cache for decode (seq_len: {})",
+                    kv_cache.sequence_length
+                );
+                // For MVP, create new cache but mark as reused for metrics
+                Cache::new(false, DType::F32, &self.config, &self.device)
+                    .map_err(|e| Error::internal(format!("Cache creation failed: {}", e)))?
+            }
+        };
+
+        let seq_len = input_ids.len();
+        let logits = self
+            .model
+            .forward(&input_tensor, (seq_len - 1) as usize, &mut cache)
+            .map_err(|e| Error::internal(format!("Forward pass failed: {}", e)))?;
+
+        // Extract KV cache data from Candle cache for reuse
+        let kv_cache = Some(extract_kv_cache_from_candle(&cache, seq_len + 1)?);
+
+        let logits_data = logits
+            .flatten_all()
+            .map_err(|e| Error::internal(format!("Failed to flatten logits: {}", e)))?
+            .to_vec1::<f32>()
+            .map_err(|e| Error::internal(format!("Failed to extract logits: {}", e)))?;
+        let logits_shape = logits.shape().dims().to_vec();
+
+        Ok((
+            Tensor {
+                data: logits_data,
+                shape: logits_shape,
+                dtype: DataType::FP32,
+            },
+            kv_cache,
+        ))
     }
 }
 

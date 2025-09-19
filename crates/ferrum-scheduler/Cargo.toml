@@ -6,8 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Core dependencies
-ferrum-core = { workspace = true }
+# Core dependencies - New architecture
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

@@ -1,34 +1,69 @@
 //! # Ferrum Models
 //!
-//! Abstract model definitions and interfaces for the Ferrum inference framework.
-//! This module provides framework-agnostic abstractions for various LLM architectures.
+//! Model building and weight loading implementations for LLM inference.
+//!
+//! ## Overview
+//!
+//! This crate provides concrete implementations of the model interfaces defined
+//! in `ferrum-interfaces`, including:
+//!
+//! - ModelBuilder for constructing model executors from configs
+//! - WeightLoader for loading safetensors/GGUF weights
+//! - Model registry for architecture mapping
+//! - Model source resolution (HF Hub, local files, URLs)
 //!
 //! ## Design Principles
 //!
-//! - No direct dependencies on ML frameworks (Candle, ONNX Runtime, etc.)
-//! - Pure trait definitions and abstract configurations
-//! - Concrete implementations belong in backend-specific crates
+//! - **Builder Pattern**: Clear separation of model definition vs construction
+//! - **Weight Loading**: Abstract over different weight formats and sources
+//! - **Registry Pattern**: Map architecture names to builders
+//! - **Source Resolution**: Unified loading from various sources
 //!
 //! ## Architecture Support
 //!
-//! The module defines abstractions for:
-//! - Llama family (Llama, Llama2, Llama3)
-//! - Mistral family (Mistral, Mixtral)
-//! - Qwen family (Qwen, Qwen2)
-//! - Other architectures (Phi, Gemma, etc.)
+//! - Llama family (Llama, Llama2, Code Llama, Vicuna)
+//! - Mistral family (Mistral 7B, Mixtral, Codestral)
+//! - Qwen family (Qwen, Qwen2, CodeQwen)
+//! - Other architectures (Phi, Gemma, ChatGLM)
 
+pub mod builder;
 pub mod config;
+pub mod loader;
 pub mod registry;
 pub mod source;
-pub mod tokenizer;
-pub mod traits;
 
-// Re-exports
-pub use config::ConfigManager;
-pub use registry::{DefaultModelRegistry, DiscoveredModel, ModelAlias};
-pub use source::{DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ResolvedModelSource};
-pub use tokenizer::{TokenizerWrapper, TokenizerFactory, TokenizerMode, CachedTokenizer};
-pub use traits::{
-    ModelDefinition, Activation, Architecture, AttentionConfig, ModelBuilder, ModelConverter,
-    ModelRegistry, ModelSourceResolver, NormType, RopeScaling, SpecialTokens, Tokenizer,
+// Re-exports of interfaces from ferrum-interfaces
+pub use ferrum_interfaces::{
+    ModelBuilder as ModelBuilderInterface,
+    ModelExecutor as ModelExecutorInterface,
+    WeightLoader as WeightLoaderInterface,
+    ModelInfo,
+    ModelConfig,
+    WeightSpec,
+    ModelCapabilities,
 };
+
+pub use ferrum_types::{
+    Result, ModelId, Architecture, DataType, Device, FerrumError,
+};
+
+// Re-exports of implementations
+pub use builder::*;
+pub use config::*;
+pub use loader::*;
+pub use registry::*;
+pub use source::*;
+
+/// Default model builder factory
+pub fn default_builder_factory() -> DefaultModelBuilderFactory {
+    DefaultModelBuilderFactory::new()
+}
+
+/// Default weight loader factory
+pub fn default_weight_loader(format: WeightFormat) -> Result<Box<dyn WeightLoaderInterface + Send + Sync>> {
+    match format {
+        WeightFormat::SafeTensors => Ok(Box::new(SafeTensorsLoader::new())),
+        WeightFormat::GGUF => Ok(Box::new(GGUFLoader::new())),
+        WeightFormat::Pickle => Err(FerrumError::unsupported("Pickle format not supported")),
+    }
+}

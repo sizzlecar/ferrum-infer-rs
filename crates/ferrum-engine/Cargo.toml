@@ -6,11 +6,21 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Core dependencies
-ferrum-core = { workspace = true }
+# Core dependencies - New architecture
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
+
+# Implementation crates
+ferrum-runtime = { workspace = true }
+ferrum-scheduler = { workspace = true }
+ferrum-tokenizer = { workspace = true }
+ferrum-sampler = { workspace = true }
+ferrum-kv = { workspace = true }
 ferrum-models = { workspace = true }
+
+# Async
 async-trait = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
@@ -46,6 +56,7 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 half = { workspace = true }
 ndarray = { version = "0.16.1", optional = true }
+smallvec = "1.11"
 
 # HTTP client for manual downloads
 reqwest = { workspace = true }

@@ -6,6 +6,11 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+# Core types and interfaces
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
+
+# Keep existing dependencies that are used by types.rs and error.rs
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

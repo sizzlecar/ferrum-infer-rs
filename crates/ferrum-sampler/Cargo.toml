@@ -1,0 +1,39 @@
+[package]
+name = "ferrum-sampler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Core dependencies - New architecture
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
+
+# Async
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+
+# Concurrency
+parking_lot = { workspace = true }
+
+# Math and random
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utils
+once_cell = { workspace = true }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
