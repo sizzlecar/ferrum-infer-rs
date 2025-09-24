@@ -1,44 +1,50 @@
 //! Configuration types for Ferrum components
 
-use crate::{Device, DataType, ModelId};
+use crate::{DataType, Device, ModelId, ModelInfo, SamplingParams};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
-    /// Maximum number of concurrent requests
-    pub max_concurrent_requests: usize,
-    /// Request timeout duration
-    pub request_timeout: Duration,
-    /// Enable streaming responses
-    pub enable_streaming: bool,
-    /// Maximum batch size for processing
-    pub max_batch_size: usize,
-    /// Batch timeout for collecting requests
-    pub batch_timeout: Duration,
-    /// Enable request preprocessing
-    pub enable_preprocessing: bool,
-    /// Enable response postprocessing
-    pub enable_postprocessing: bool,
-    /// Enable metrics collection
-    pub enable_metrics: bool,
-    /// Enable distributed tracing
-    pub enable_tracing: bool,
+    pub model: EngineModelConfig,
+    pub scheduler: SchedulerConfig,
+    pub sampling: SamplingConfig,
+    pub backend: BackendConfig,
+    pub kv_cache: KvCacheConfig,
+    pub memory: MemoryConfig,
+    pub batching: BatchConfig,
+    pub monitoring: MonitoringConfig,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_requests: 256,
-            request_timeout: Duration::from_secs(300), // 5 minutes
-            enable_streaming: true,
-            max_batch_size: 32,
-            batch_timeout: Duration::from_millis(10),
-            enable_preprocessing: true,
-            enable_postprocessing: true,
-            enable_metrics: true,
-            enable_tracing: true,
+            model: EngineModelConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            sampling: SamplingConfig::default(),
+            backend: BackendConfig::default(),
+            kv_cache: KvCacheConfig::default(),
+            memory: MemoryConfig::default(),
+            batching: BatchConfig::default(),
+            monitoring: MonitoringConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineModelConfig {
+    pub model_id: ModelId,
+    pub model_info: Option<ModelInfo>,
+    pub tokenizer: TokenizerConfig,
+}
+
+impl Default for EngineModelConfig {
+    fn default() -> Self {
+        Self {
+            model_id: ModelId::new("default"),
+            model_info: None,
+            tokenizer: TokenizerConfig::default(),
         }
     }
 }
@@ -117,9 +123,9 @@ pub struct KvCacheConfig {
 impl Default for KvCacheConfig {
     fn default() -> Self {
         Self {
-            cache_type: KvCacheType::Paged,
+            cache_type: KvCacheType::Contiguous,
             block_size: 16,
-            max_blocks: 1000,
+            max_blocks: 1024,
             enable_compression: false,
             compression_ratio: 0.5,
             enable_multi_level: true,
@@ -165,10 +171,10 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            pool_size: None, // Auto-detect
+            pool_size: None,
             enable_pooling: true,
             alignment: 256,
-            enable_defragmentation: true,
+            enable_defragmentation: false,
             defragmentation_threshold: 0.7,
             enable_memory_stats: true,
             pressure_warning_threshold: 0.8,
@@ -202,11 +208,11 @@ impl Default for BackendConfig {
     fn default() -> Self {
         Self {
             backend_type: BackendType::Candle,
-            device: Device::CPU,
-            dtype: DataType::FP32,
+            device: Device::Cpu,
+            dtype: DataType::F16,
             enable_optimizations: true,
             optimization_level: 2,
-            enable_cuda_graphs: true,
+            enable_cuda_graphs: false,
             enable_kernel_fusion: true,
             backend_options: HashMap::new(),
         }
@@ -232,7 +238,7 @@ pub struct TokenizerConfig {
     /// Tokenizer type
     pub tokenizer_type: TokenizerType,
     /// Path to tokenizer files
-    pub tokenizer_path: String,
+    pub tokenizer_path: Option<String>,
     /// Enable fast tokenization
     pub enable_fast: bool,
     /// Add special tokens
@@ -243,17 +249,17 @@ pub struct TokenizerConfig {
     pub padding: Option<PaddingConfig>,
 }
 
-/// Tokenizer types
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TokenizerType {
-    /// Byte-Pair Encoding
-    BPE,
-    /// WordPiece
-    WordPiece,
-    /// SentencePiece
-    SentencePiece,
-    /// Tiktoken (GPT family)
-    Tiktoken,
+impl Default for TokenizerConfig {
+    fn default() -> Self {
+        Self {
+            tokenizer_type: TokenizerType::BPE,
+            tokenizer_path: None,
+            enable_fast: true,
+            add_special_tokens: true,
+            truncation: None,
+            padding: None,
+        }
+    }
 }
 
 /// Truncation configuration
@@ -302,34 +308,33 @@ pub enum PaddingStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingPresets {
     /// Available presets
-    pub presets: HashMap<String, crate::SamplingParams>,
+    pub presets: HashMap<String, SamplingParams>,
 }
 
 impl Default for SamplingPresets {
     fn default() -> Self {
         let mut presets = HashMap::new();
-        
-        // Greedy decoding
-        presets.insert("greedy".to_string(), crate::SamplingParams::greedy());
-        
-        // Creative writing
-        presets.insert("creative".to_string(), crate::SamplingParams {
-            temperature: 1.2,
-            top_p: 0.9,
-            top_k: Some(50),
-            repetition_penalty: 1.1,
-            ..Default::default()
-        });
-        
-        // Precise/factual
-        presets.insert("precise".to_string(), crate::SamplingParams {
-            temperature: 0.3,
-            top_p: 0.95,
-            top_k: Some(20),
-            repetition_penalty: 1.05,
-            ..Default::default()
-        });
-
+        presets.insert("greedy".to_string(), SamplingParams::greedy());
+        presets.insert(
+            "creative".to_string(),
+            SamplingParams {
+                temperature: 1.2,
+                top_p: 0.9,
+                top_k: Some(50),
+                repetition_penalty: 1.1,
+                ..Default::default()
+            },
+        );
+        presets.insert(
+            "precise".to_string(),
+            SamplingParams {
+                temperature: 0.3,
+                top_p: 0.95,
+                top_k: Some(20),
+                repetition_penalty: 1.05,
+                ..Default::default()
+            },
+        );
         Self { presets }
     }
 }
@@ -366,6 +371,59 @@ impl Default for SecurityConfig {
             max_prompt_length: 32768,
             enable_prompt_validation: true,
             allowed_extensions: vec!["txt".to_string(), "json".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingConfig {
+    pub default_params: SamplingParams,
+    pub presets: SamplingPresets,
+    pub enable_custom_processors: bool,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            default_params: SamplingParams::default(),
+            presets: SamplingPresets::default(),
+            enable_custom_processors: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    pub enable_metrics: bool,
+    pub enable_tracing: bool,
+    pub export_interval: Duration,
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            enable_metrics: true,
+            enable_tracing: true,
+            export_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchConfig {
+    pub max_batch_size: usize,
+    pub max_wait_ms: u64,
+    pub enable_dynamic: bool,
+    pub enable_continuous: bool,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 16,
+            max_wait_ms: 8,
+            enable_dynamic: true,
+            enable_continuous: false,
         }
     }
 }

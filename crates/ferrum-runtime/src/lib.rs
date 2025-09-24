@@ -35,6 +35,54 @@ pub mod memory;
 pub use backends::*;
 pub use memory::*;
 
+/// Lightweight handle around a tensor factory implementation.
+#[derive(Clone)]
+pub struct TensorFactoryHandle(pub Arc<dyn TensorFactory + Send + Sync>);
+
+impl TensorFactoryHandle {
+    /// Create a new handle from a concrete factory.
+    pub fn new(factory: Arc<dyn TensorFactory + Send + Sync>) -> Self {
+        Self(factory)
+    }
+
+    /// Convenience: create a handle for the default factory bound to CPU.
+    pub fn default_cpu() -> Self {
+        Self(default_tensor_factory())
+    }
+
+    /// Clone the underlying factory handle.
+    pub fn clone_handle(&self) -> Self {
+        Self(self.0.clone())
+    }
+
+    /// Borrow the inner factory reference.
+    pub fn as_ref(&self) -> &(dyn TensorFactory + Send + Sync) {
+        self.0.as_ref()
+    }
+
+    /// Merge additional factories into the global registry and return the base handle.
+    pub fn merge_with(self, factories: Vec<(Device, Arc<dyn TensorFactory + Send + Sync>)>) -> Self {
+        for (device, factory) in factories {
+            backends::candle::register_tensor_factory(device, factory);
+        }
+        self
+    }
+}
+
+impl Default for TensorFactoryHandle {
+    fn default() -> Self {
+        Self::default_cpu()
+    }
+}
+
+impl std::ops::Deref for TensorFactoryHandle {
+    type Target = dyn TensorFactory + Send + Sync;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
 // Default backend factory
 use once_cell::sync::Lazy;
 use std::sync::Arc;
@@ -115,4 +163,12 @@ impl Default for DefaultBackendRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+static DEFAULT_TENSOR_FACTORY: Lazy<Arc<dyn TensorFactory + Send + Sync>> = Lazy::new(|| {
+    backends::candle::get_tensor_factory(&Device::CPU)
+});
+
+pub fn default_tensor_factory() -> Arc<dyn TensorFactory + Send + Sync> {
+    DEFAULT_TENSOR_FACTORY.clone()
 }

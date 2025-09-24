@@ -2,42 +2,43 @@ use ferrum_types::*;
 
 #[test]
 fn engine_config_default_sane() {
-    let c = EngineConfig::default();
-    assert!(c.max_concurrent_requests >= 1);
-    assert!(c.enable_streaming);
+    let cfg = EngineConfig::default();
+    assert_eq!(cfg.model.model_id.as_str(), "default");
+    assert!(cfg.batching.max_batch_size >= 1);
+    assert!(cfg.monitoring.enable_metrics);
 }
 
 #[test]
 fn scheduler_config_default_sane() {
-    let c = SchedulerConfig::default();
-    assert!(matches!(c.policy, SchedulingPolicy::Priority));
-    assert!(c.max_waiting_requests >= 1);
+    let cfg = SchedulerConfig::default();
+    assert!(matches!(cfg.policy, SchedulingPolicy::Priority));
+    assert!(cfg.max_waiting_requests >= 1);
 }
 
 #[test]
 fn kv_cache_config_default_sane() {
-    let c = KvCacheConfig::default();
-    assert!(matches!(c.cache_type, KvCacheType::Paged));
-    assert!(c.block_size > 0);
+    let cfg = KvCacheConfig::default();
+    assert!(matches!(cfg.cache_type, KvCacheType::Contiguous));
+    assert!(cfg.block_size > 0);
 }
 
 #[test]
 fn memory_config_default_sane() {
-    let c = MemoryConfig::default();
-    assert!(c.alignment >= 1);
+    let cfg = MemoryConfig::default();
+    assert!(cfg.alignment >= 1);
 }
 
 #[test]
 fn backend_config_default_sane() {
-    let c = BackendConfig::default();
-    assert!(matches!(c.backend_type, BackendType::Candle));
-    assert!(c.enable_optimizations);
+    let cfg = BackendConfig::default();
+    assert!(matches!(cfg.backend_type, BackendType::Candle));
+    assert!(cfg.enable_optimizations);
 }
 
 #[test]
 fn sampling_presets_contains_expected() {
-    let p = SamplingPresets::default();
-    assert!(p.presets.contains_key("greedy"));
-    assert!(p.presets.get("creative").is_some());
-    assert!(p.presets.get("precise").is_some());
+    let presets = SamplingPresets::default();
+    assert!(presets.presets.contains_key("greedy"));
+    assert!(presets.presets.get("creative").is_some());
+    assert!(presets.presets.get("precise").is_some());
 }

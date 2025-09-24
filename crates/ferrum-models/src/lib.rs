@@ -26,6 +26,13 @@
 //! - Qwen family (Qwen, Qwen2, CodeQwen)
 //! - Other architectures (Phi, Gemma, ChatGLM)
 
+use ferrum_interfaces::{
+    ModelBuilder,
+    ModelExecutor,
+    ComputeBackend,
+    WeightLoader,
+};
+
 pub mod builder;
 pub mod config;
 pub mod loader;
@@ -48,7 +55,10 @@ pub use ferrum_types::{
 };
 
 // Re-exports of implementations
-pub use builder::*;
+pub use builder::{
+    DefaultModelBuilderFactory,
+    BuilderRegistry,
+};
 pub use config::*;
 pub use loader::*;
 pub use registry::*;

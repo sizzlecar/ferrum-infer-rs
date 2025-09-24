@@ -4,7 +4,19 @@
 //! orchestrates all other components: tokenizer, model executor, scheduler,
 //! and sampler.
 
-use ferrum_types::{InferenceRequest, InferenceResponse, Result, StreamChunk};
+use ferrum_types::{
+    InferenceRequest,
+    InferenceResponse,
+    Result,
+    StreamChunk,
+    EngineConfig,
+    EngineStatus as TypesEngineStatus,
+    EngineConfig as TypesEngineConfig,
+    EngineModelConfig,
+    BatchConfig,
+    SamplingConfig,
+    MonitoringConfig,
+};
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -61,6 +73,22 @@ pub struct EngineStatus {
     pub component_status: ComponentStatus,
 }
 
+impl From<TypesEngineStatus> for EngineStatus {
+    fn from(status: TypesEngineStatus) -> Self {
+        Self {
+            is_ready: status.is_ready,
+            loaded_models: status.loaded_models,
+            active_requests: status.active_requests,
+            queued_requests: status.queued_requests,
+            memory_usage: status.memory_usage,
+            uptime_seconds: status.uptime_seconds,
+            last_heartbeat: status.last_heartbeat,
+            version: status.version,
+            component_status: status.component_status.into(),
+        }
+    }
+}
+
 /// Status of engine components
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentStatus {
@@ -78,6 +106,19 @@ pub struct ComponentStatus {
     pub backend: ComponentHealth,
 }
 
+impl From<ferrum_types::ComponentStatus> for ComponentStatus {
+    fn from(status: ferrum_types::ComponentStatus) -> Self {
+        Self {
+            scheduler: status.scheduler.into(),
+            model_executor: status.model_executor.into(),
+            tokenizer: status.tokenizer.into(),
+            kv_cache: status.kv_cache.into(),
+            memory_manager: status.memory_manager.into(),
+            backend: status.backend.into(),
+        }
+    }
+}
+
 /// Individual component health
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentHealth {
@@ -89,6 +130,28 @@ pub struct ComponentHealth {
     pub last_check: chrono::DateTime<chrono::Utc>,
     /// Component-specific metrics
     pub metrics: HashMap<String, f64>,
+}
+
+impl ComponentHealth {
+    pub fn healthy(component: &str) -> Self {
+        Self {
+            status: ComponentHealthStatus::Healthy,
+            message: format!("{} healthy", component),
+            last_check: chrono::Utc::now(),
+            metrics: HashMap::new(),
+        }
+    }
+}
+
+impl From<ferrum_types::ComponentHealth> for ComponentHealth {
+    fn from(health: ferrum_types::ComponentHealth) -> Self {
+        Self {
+            status: health.status.into(),
+            message: health.message,
+            last_check: health.last_check,
+            metrics: health.metrics,
+        }
+    }
 }
 
 /// Component health status
@@ -104,59 +167,15 @@ pub enum ComponentHealthStatus {
     Unhealthy,
 }
 
-/// Engine configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineConfig {
-    /// Maximum concurrent requests
-    pub max_concurrent_requests: usize,
-    /// Request timeout
-    pub request_timeout: Duration,
-    /// Enable streaming responses
-    pub enable_streaming: bool,
-    /// Enable batch processing
-    pub enable_batching: bool,
-    /// Batch configuration
-    pub batch_config: BatchConfig,
-    /// Model configuration
-    pub model_config: ModelConfig,
-    /// Scheduler configuration
-    pub scheduler_config: crate::scheduler::SchedulerConfig,
-    /// Memory configuration
-    pub memory_config: MemoryConfig,
-    /// Performance configuration
-    pub performance_config: PerformanceConfig,
-    /// Monitoring configuration
-    pub monitoring_config: MonitoringConfig,
-}
-
-/// Batch processing configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchConfig {
-    /// Maximum batch size
-    pub max_batch_size: usize,
-    /// Batch timeout in milliseconds
-    pub batch_timeout_ms: u64,
-    /// Enable dynamic batching
-    pub enable_dynamic_batching: bool,
-    /// Target batch utilization
-    pub target_utilization: f32,
-    /// Enable continuous batching
-    pub enable_continuous_batching: bool,
-}
-
-/// Model configuration for engine
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    /// Model information
-    pub model_info: ferrum_types::ModelInfo,
-    /// Tokenizer configuration
-    pub tokenizer_config: crate::tokenizer::TokenizerConfig,
-    /// Sampling configuration
-    pub sampling_config: SamplingConfig,
-    /// KV cache configuration
-    pub kv_cache_config: crate::kv_cache::CacheConfig,
-    /// Model executor configuration
-    pub executor_config: crate::model_executor::ExecutorConfig,
+impl From<ferrum_types::ComponentHealthStatus> for ComponentHealthStatus {
+    fn from(status: ferrum_types::ComponentHealthStatus) -> Self {
+        match status {
+            ferrum_types::ComponentHealthStatus::Healthy => Self::Healthy,
+            ferrum_types::ComponentHealthStatus::Warning => Self::Warning,
+            ferrum_types::ComponentHealthStatus::Degraded => Self::Degraded,
+            ferrum_types::ComponentHealthStatus::Unhealthy => Self::Unhealthy,
+        }
+    }
 }
 
 /// Sampling configuration
@@ -181,36 +200,6 @@ pub struct MemoryConfig {
     pub enable_monitoring: bool,
     /// Memory pressure thresholds
     pub pressure_thresholds: crate::kv_cache::MemoryPressureThresholds,
-}
-
-/// Performance configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PerformanceConfig {
-    /// Enable performance monitoring
-    pub enable_monitoring: bool,
-    /// Target latency in milliseconds
-    pub target_latency_ms: Option<u64>,
-    /// Target throughput in requests per second
-    pub target_throughput_rps: Option<f32>,
-    /// Enable auto-scaling
-    pub enable_auto_scaling: bool,
-    /// Performance optimization level (0-3)
-    pub optimization_level: u8,
-}
-
-/// Monitoring configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonitoringConfig {
-    /// Enable metrics collection
-    pub enable_metrics: bool,
-    /// Enable distributed tracing
-    pub enable_tracing: bool,
-    /// Enable detailed logging
-    pub enable_detailed_logging: bool,
-    /// Metrics export interval
-    pub metrics_export_interval_ms: u64,
-    /// Health check interval
-    pub health_check_interval_ms: u64,
 }
 
 /// Engine performance metrics
@@ -328,6 +317,25 @@ pub struct HealthStatus {
     pub health_score: f32,
     /// Health issues detected
     pub issues: Vec<HealthIssue>,
+}
+
+impl HealthStatus {
+    pub fn healthy() -> Self {
+        Self {
+            overall_status: OverallHealthStatus::Healthy,
+            component_status: ComponentStatus {
+                scheduler: ComponentHealth::healthy("scheduler"),
+                model_executor: ComponentHealth::healthy("model"),
+                tokenizer: ComponentHealth::healthy("tokenizer"),
+                kv_cache: ComponentHealth::healthy("kv_cache"),
+                memory_manager: ComponentHealth::healthy("memory"),
+                backend: ComponentHealth::healthy("backend"),
+            },
+            timestamp: chrono::Utc::now(),
+            health_score: 1.0,
+            issues: Vec::new(),
+        }
+    }
 }
 
 /// Overall health status

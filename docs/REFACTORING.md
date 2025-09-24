@@ -43,6 +43,94 @@
 
 ---
 
+### 阶段划分与优先级
+
+- **Phase 0（文档/接口对齐）**：更新本文档标注阶段优先级；统一配置结构（`EngineConfig` 等）集中到 `ferrum-types`；补充 `TensorFactory` MVP API 说明，确保实现指引一致。
+- **Phase 1（MVP 主路径）**：打通单节点 Candle 推理链路（Scheduler → KV → Prefill/Decode → 采样 → 流式输出）；`KvCache` 以连续内存句柄实现；采样链实现温度/top-k/top-p/惩罚；CLI/Server 迁移到新接口。
+- **Phase 2（性能与扩展）**：引入块表/前缀缓存/换入换出等 KV 策略（可选 feature）；调度器支持优先级+资源提示；引擎加入批处理调优与多采样策略；补齐 Metal 后端、观测性与指标。
+- **Phase 3（多后端/高级能力）**：扩展 WeightLoader/ModelBuilder 覆盖 GGUF/量化；实现能力自适应调度、并行采样、Speculative Decoding；完善插件化与分布式能力。
+
+> 对文档中各模块/接口，后续标注 `[MVP]`、`[Phase 2+]` 等标签，明确交付节奏；若无标签默认为 Phase 1 MVP 范畴。
+
+---
+
+### Phase 1 当前进度总览
+
+| 领域 | 状态 | 说明 |
+| --- | --- | --- |
+| Engine Pipeline | ⛔ 未完成 | `InferencePipeline::process_batches`/`decode_loop` 仍为占位实现，`DefaultInferenceEngine` 暂未跑通全流程 |
+| Model Executor | ⛔ 未完成 | Candle `ModelExecutor` 仍返回 `not_implemented`（prefill/decode） |
+| KV Cache Manager | ⛔ 未完成 | 仍使用分页占位实现，尚未提供连续内存 MVP 版本 |
+| Sampler Chain | ⛔ 未完成 | 处理器与默认链尚未接入引擎热点路径 |
+| Tokenizer | ⛔ 未完成 | HuggingFace factory 需补全文件/HF Hub 加载及增量 decode 集成 |
+| CLI & Server | ⛔ 未完成 | `ferrum-cli`/`ferrum-server` 仍依赖旧 core 接口，未使用新引擎 |
+| Runtime Candle 支撑 | ⛔ 未完成 | `TensorFactory/TensorOps` MVP 方法（empty/from_slice/narrow/reshape/to_device）仍缺失 |
+| 测试与验证 | ⛔ 未完成 | 尚无集成测试/单元测试覆盖 Phase 1 关键路径 |
+
+> ✅ = 已完成，⛔ = 未完成，⚠️ = 进行中。
+
+---
+
+### Phase 1 任务拆解
+
+1. **引擎管线（Engine）**
+  - [`MVP`] 衔接 Scheduler → Tokenizer → KV → ModelExecutor → Sampler，构建 `InferencePipeline` 的 `prefill_batch`/`decode_step` 流程。
+    - [进行中] `PipelineComponents` 已接入 `TensorFactoryHandle`；`sample_from_logits` 支持通过运行时注入的 `LogitsProcessor` 链与 `Sampler` 完成温度/top-k/top-p 等处理，下一步聚焦批处理与 KV 生命周期。
+   - [`MVP`] `DefaultInferenceEngine::infer`/`infer_stream` 使用新 pipeline 跑通流式推理，统一调度循环。
+   - [`MVP`] 提供批次提示（`BatchHint`）与基础指标埋点（request_id/batch_id）。
+2. **调度器集成（Scheduler）**
+   - [`MVP`] 使用 `ferrum-scheduler` 的 FIFO/优先级实现，根据 `EngineConfig.scheduler.policy` 切换。
+   - [`MVP`] 与 pipeline 对齐批次参数（`max_batch_size`、`max_tokens`）。
+3. **KV 缓存（ferrum-kv）**
+   - [`MVP`] 实现连续内存版 `DefaultKvCacheManager`，满足 `[layers, heads, seq, head_dim]` 布局和 `allocate/extend/deallocate`。
+   - [`Phase 2+]` 块表、前缀缓存、压缩与换入换出策略通过 feature 控制。
+4. **模型执行器（ferrum-models + ferrum-runtime）**
+   - [`MVP`] Candle ModelExecutor 支持 Prefill（返回 `[B,T,V]` logits + KV handle）与 Decode（返回 `[B,V]` + 更新 KV），可用 Tiny 模型或占位 logits。
+     - [进行中] Prefill/Decode 通过 `TensorFactory` 构建 `TensorRef`，需补齐真实执行与 KV 句柄返回。
+   - [`MVP`] Runtime Candle `TensorFactory/TensorOps` 提供必要 API（empty/from_slice/zeros_like/to_device/narrow/reshape）。
+     - [进行中] `CandleTensor` 已实现 `TensorDataAccess`，默认工厂句柄在引擎中复用；后续完善 zeros_like/narrow 等接口。
+5. **分词与增量解码（ferrum-tokenizer）**
+   - [`MVP`] HuggingFace factory 支持本地文件与 HF Hub 下载，提供 `Tokenizer` + `IncrementalTokenizer`，并在引擎/CLI 中使用。
+6. **采样链（ferrum-sampler）**
+   - [`MVP`] 整合温度/top-k/top-p/惩罚处理器与 greedy/multinomial sampler，提供默认链构建 API。
+   - [`Phase 2+]` 并发/推测采样、beam search 等能力扩展。
+7. **CLI 与 Server**
+   - [`MVP`] `ferrum-cli infer --backend cpu --model <id>` 调用新引擎并打印流式 token。
+   - [`MVP`] `ferrum-server` SSE 端点代理 `InferenceEngine::infer_stream`，发送 `[DONE]` 结尾。
+8. **测试与验证**
+   - [`MVP`] 单元测试覆盖：KV 连续分配、采样处理器、增量解码。
+   - [`MVP`] 集成测试：使用 Mock Executor 的 deterministic output；CI 走 CPU 路径。
+
+---
+
+### Phase 1 检查清单
+
+- [ ] `InferencePipeline` 实现 prefill/decode，返回 `PrefillOutput`/`DecodeOutput`。
+  - [进行中] Pipeline 已打通 `sample_from_logits`，可利用 `LogitsProcessor` 链和 `Sampler` 进行采样；仍需补齐 KV 生命周期管理与请求批次协同。
+- [ ] `DefaultInferenceEngine::infer_stream` 使用 pipeline 驱动完整解码循环。
+- [ ] `DefaultEngineFactory` 能实例化 scheduler/tokenizer/sampler/kv/model executor（去除 `not_implemented!`）。
+- [ ] `DefaultKvCacheManager` MVP（连续内存）编译通过并具备基本单测。
+- [ ] Candle Runtime 提供必须的 `TensorFactory/TensorOps` 方法，无 `unimplemented!`。
+  - [进行中] `CandleTensor` 提供 `TensorDataAccess`，默认工厂句柄已暴露；待补 `zeros_like`、`narrow` 等方法实现。
+- [ ] Candle ModelExecutor Prefill/Decode 落地并对接 builder factory。
+  - [进行中] Prefill/Decode/Forward 依赖 `TensorFactory` 生成张量，仍需对接真实执行与 KV 句柄实现。
+- [ ] HuggingFace tokenizer 工厂接入 `EngineConfig.model.tokenizer` 配置（文件/HF Hub）。
+- [ ] 默认采样链（processor + sampler）在引擎中可用。
+- [ ] CLI `infer` 与 Server SSE 使用新引擎完成流式输出。
+- [ ] 添加最小指标/日志（request_id、batch_id、token 序号）。
+
+---
+
+### Phase 1 验收标准
+
+- `cargo build` 在默认 CPU + Candle 路径通过。
+- `cargo test` 覆盖单元/集成测试（CI 使用 Mock Executor 不依赖大模型）。
+- `ferrum-cli infer --model tiny-llama --prompt "Hello"` 能输出流式 token（可用数据集或 deterministic stub）。
+- `cargo run -p ferrum-server --features server` 提供 `/v1/chat/completions`，SSE 返回 `[DONE]`。
+- 基础指标：记录请求数量、奇数 tokens/s、简要日志以供排障。
+
+---
+
 ### 目标架构与 crate 边界（按依赖关系重排）
 
 已完成（稳定基座）：
@@ -70,33 +158,34 @@
 - `ferrum-engine`（编排层，强流式）
   - 责任：请求接入→调度→（KV 分配）→ prefill→采样→decode 循环→流式输出；指标/trace。
   - 关键组件：
-    - Pipeline：`prefill_batch()`、`decode_step()`；TTFT 优化；并行采样可选。
-    - SamplerChain：接入 `ferrum-sampler`；支持温度/top-k/top-p/惩罚与自定义处理。
-    - TokenizerManager：`encode() / decode_incremental()`，前缀共享，缓存。
-    - KvCoordinator：与 `ferrum-kv` 对接，管理 `KvCacheHandle` 生命周期与 block_table 更新。
-    - SchedulerAdapter：对接 `ferrum-scheduler`，拉取/回填请求与状态。
+    - Pipeline (`[MVP]`)：`prefill_batch()`、`decode_step()`；TTFT 优化；并行采样列为 `[Phase 2+]`。
+    - SamplerChain (`[MVP]`)：接入 `ferrum-sampler`；实现温度/top-k/top-p/惩罚。自定义处理器通过扩展点保留。
+    - TokenizerManager (`[MVP]`)：`encode() / decode_incremental()`；前缀共享缓存列为 `[Phase 2+]`。
+    - KvCoordinator (`[MVP]`)：管理 `KvCacheHandle` 生命周期。Block table 同步与多级缓存列为 `[Phase 2+]`。
+    - SchedulerAdapter (`[MVP]`)：对接 `ferrum-scheduler`，拉取/回填请求与状态。
   - 公共 API：实现 `InferenceEngine`；导出构造器（`Engine::new(config, deps...)`）与 `EngineFactory`。
   - 指标：TTFT、inter-token、tokens/s、batch 利用率、KV 命中、采样/调度/内存阶段耗时。
 
 - `ferrum-runtime`（设备运行时/后端）
   - 责任：`TensorFactory/TensorOps`、`KernelExecutor`、`DeviceMemoryManager`、`StreamManager` 的具体实现；后端能力发现。
   - 后端：
-    - Candle：首个实现；提供张量创建/搬运，矩阵算子与 softmax 等基本算子；合理的内存池与对齐。
-    - Metal：提供 `ComputeBackend` 骨架与 Command Buffer 流；优先实现 attention 路径所需基础算子。
+    - Candle (`[MVP]`)：提供张量创建/搬运，矩阵算子与 softmax 等基本算子；合理的内存池与对齐。
+    - Metal (`[Phase 2+]`)：提供 `ComputeBackend` 骨架与 Command Buffer 流；优先实现 attention 路径所需基础算子。
   - 公共 API：`ComputeBackend`、`WeightLoader`（权重 mmap/加载到设备缓冲）。
 
 - `ferrum-kv`（KV-Cache 子系统）
-  - 责任：PagedAttention 块池（GPU/CPU 两级）、BlockTable 映射（逻辑→物理）、SwapManager、PrefixCache、EvictionPolicy。
+  - 责任：
+    - `[MVP]`：提供连续内存的 `KvCacheHandle`，以 `[layers, heads, seq, head_dim]` 布局管理请求生命周期。
+    - `[Phase 2+]`：PagedAttention 块池（GPU/CPU 两级）、BlockTable 映射、SwapManager、PrefixCache、EvictionPolicy、Compression。
   - 结构：
-    - `BlockPool`（GPU/CPU）：固定大小、对齐、引用计数、统计。
-    - `KvCacheHandle`：持有 block_table 与设备位置；不可变视图与可变更新接口。
-    - `KvCacheManager`：`allocate/resize/deallocate/get_stats`；`can_allocate/suggest_eviction`。
-    - 可选：`Compression`（int4/fp8）在线压缩策略，限 MVP 可跳过实现细节。
-  - 指标：块利用率、前缀命中、swap 次数/时延、压缩开销。
+    - `BlockPool`、`BlockTable`、`Compression` 等模块在 `[Phase 2+]` 中逐步启用（可通过 feature flag）。
+    - `KvCacheManager` 在 `[MVP]` 即提供 `allocate/resize/deallocate/get_stats` 基础接口，`suggest_eviction` 等高级功能 `[Phase 2+]` 实现。
+  - 指标：`[MVP]` 聚焦块利用率/峰值显存；`[Phase 2+]` 扩展前缀命中、swap 次数/时延、压缩开销。
 
 - `ferrum-scheduler`（调度）
   - 责任：Admission/排队/批构建；支持优先级；可扩展抢占/SLA/公平性策略。
-  - MVP：提供 FIFO/优先级两个实现；`next_batch(hint)` 返回兼容 batch 计划；暴露队列指标。
+  - `[MVP]`：提供 FIFO/优先级两个实现；`next_batch(hint)` 返回兼容 batch 计划；暴露队列指标。
+  - `[Phase 2+]`：引入资源约束、预留/抢占、SLA 与公平性策略。
   - 对外：实现 `Scheduler` 与 `RequestQueue`；提供策略枚举与配置结构。
 
 - `ferrum-models`（模型构建）
@@ -138,6 +227,8 @@ pub trait TensorLike: Send + Sync {
 
 pub type TensorRef = std::sync::Arc<dyn TensorLike>;
 ```
+
+> `[MVP]`：`TensorFactory` 至少提供 `from_slice<T>`、`zeros_like`、`empty(shape, dtype, device)`、`narrow`、`reshape`、`to_device` 等基础方法，以支撑模型执行和 KV 管理；批量/异步操作列为 `[Phase 2+]`。
 
 #### Tokenizer（从 `Model` 中剥离，支持增量解码）
 ```rust
@@ -226,6 +317,8 @@ pub trait ModelExecutor: Send + Sync {
 }
 ```
 
+> `async_trait` 在 `[MVP]` 可接受，但需记录在案：`[Phase 2+]` 评估改为手写 `Future` 或基于 `impl Trait` 的异步接口以降低热路径分配成本。
+
 #### Backend 拆分（计算后端 vs 权重加载）
 ```rust
 pub trait ComputeBackend: Send + Sync {
@@ -283,13 +376,13 @@ pub trait InferenceEngine: Send + Sync {
 
 ### 数据流与执行路径（对齐 vLLM、发挥 Rust 优势）
 1. Admission/Validation：请求验证、优先级与速率控制。
-2. Tokenize：使用 `Tokenizer`（支持增量解码）；Prompt 模板化处理。
-3. Schedule：`Scheduler` 生成连续批处理 `BatchPlan`。
-4. KV 分配：`KvCacheManager.allocate`；前缀复用（可选）。
+2. Tokenize：使用 `Tokenizer`（支持增量解码）；Prompt 模板化处理（`[Phase 2+]`）。
+3. Schedule：`Scheduler` 生成连续批处理 `BatchPlan`（`[MVP]`）；持续批处理与插队在 `[Phase 2+]` 升级。
+4. KV 分配：`KvCacheManager.allocate`（`[MVP]` 连续内存）；前缀复用/多级缓存列为 `[Phase 2+]`。
 5. Prefill：`ModelExecutor.prefill` 生成 logits 与初始 KV 句柄。
-6. 采样：通用 `LogitsProcessor` 链 + `Sampler`（支持并行采样策略）。
+6. 采样：通用 `LogitsProcessor` 链 + `Sampler`（`[MVP]` 温度/top-k/top-p/惩罚；并行/推测采样 `[Phase 2+]`）。
 7. Decode 循环：以批为单位步进；重用 KV 句柄；流式增量文本通过 `decode_incremental` 生成输出片段。
-8. 完成与回收：`Scheduler.complete`，KV 回收或缓存策略更新。
+8. 完成与回收：`Scheduler.complete`，KV 回收或缓存策略更新；高级策略（前缀缓存、压缩、换入换出）在 `[Phase 2+]` 逐步加入。
 
 ---
 
@@ -370,21 +463,33 @@ pub trait InferenceEngine: Send + Sync {
 - 流式：chunk 间隔 P99 抖动 < 20ms（目标）。
 - API：稳定 trait 集 + 插件样例（采样/调度/KV/后端/模型构建）。
 
-### 实施计划（MVP 阶段立刻执行）
-- 强制重构接口与分层（Breaking）：
-  - 删除 `core::Model.encode/decode/generate_next_token`，以 `Tokenizer`+`ModelExecutor`+`Sampler` 取代。
-  - 删除 `core::Backend::load_weights -> Model`，以 `ModelBuilder`+`WeightLoader`+`ComputeBackend` 构建执行体。
-  - 统一 `Scheduler` 接口到 `ferrum-scheduler`，移除 `ferrum-core` 中重叠定义。
-  - 将 `core::KVCache(Vec<Tensor>)` 改为 `KvCacheHandle` 句柄，不再在 core 揭示张量细节。
-  - 将 `core::MemoryManager`（KV向）重命名/迁移为 `kv::KvCacheManager`；`runtime::MemoryManager` 更名为 `DeviceMemoryManager`。
-- 立即引入通用采样链：
-  - 标准化 `LogitsProcessor` 与 `Sampler`，把温度/top-k/top-p/惩罚等从后端模型移到引擎层。
-- 立即抽象 `TensorLike/TensorRef`：
-  - 核心路径以句柄传递，Candle/Metal 后端提供具体实现，避免 `Vec<f32>` 来回拷贝。
-- 引擎重写解码循环：
-  - 按批执行 prefill→decode，复用 KV 句柄，流式输出基于 `decode_incremental`。
-- 能力驱动：
-  - 扩展 `BackendCapabilities`，让调度与注意力实现根据能力自适应选择路径。
+### 实施计划（分阶段）
+- **Phase 0：接口与文档校准**
+  - 整理 `docs/REFACTORING.md` 标注阶段标签；补充 `TensorFactory` MVP 方法描述。
+  - 将 `EngineConfig`、`SchedulerConfig`、`KvCacheConfig` 等公共配置统一迁移至 `ferrum-types`，其余 crate 直接引用。
+- **Phase 1：MVP 主路径打通**
+  - 删除 `core::Model.encode/decode/generate_next_token`，以 `Tokenizer` + `ModelExecutor` + `Sampler` 组合取代。
+  - 将 `core::Backend::load_weights -> Model` 替换为 `ModelBuilder` + `WeightLoader` + `ComputeBackend` 构建流程。
+  - 统一 `Scheduler` 接口到 `ferrum-scheduler`；`ferrum-core` 仅保留 re-export 门面。
+  - 将 `core::KVCache(Vec<Tensor>)` 改为连续内存版 `KvCacheHandle`，实现请求级生命周期管理。
+  - 完成采样链迁移，`ferrum-engine` 解码循环按批执行并实现 SSE 流式输出。
+  - Phase 1 执行清单：
+    1. `ferrum-engine`：实现 `InferencePipeline`（prefill_batch/decode_step）、整合调度器、kv 管理与采样链，打通 `infer()`/`infer_stream()`。
+    2. `ferrum-kv`：提供连续内存 `DefaultKvCacheManager`（MVP），支持 allocate/extend/deallocate 和基本统计。
+    3. `ferrum-runtime`：实现 Candle `TensorFactory/TensorOps` 必需方法（empty/from_slice/zeros_like/to_device/narrow/reshape）。
+    4. `ferrum-models`：用 Candle backend 搭建 `ModelExecutor` MVP（prefill/decoder 可先返回占位张量，后续替换为真实 forward）。
+    5. `ferrum-tokenizer`：HuggingFace tokenizer 工厂补齐文件/Hub 加载，并暴露增量 decode；engine、CLI 使用新接口。
+    6. `ferrum-sampler`：整理温度/top-k/top-p/惩罚 processor + greedy/multinomial sampler，提供默认链构建辅助。
+    7. `ferrum-cli`/`ferrum-server`：切换到新 `InferenceEngine`，CLI `infer` 与 server SSE 请求打通。
+    8. 验证：提供最小集成测试（Tiny 模型 mock）、单元测试覆盖 kv 分配、采样链、tokenize/incremental decode。
+- **Phase 2：性能与能力扩展**
+  - 为 `KvCache` 启用块表、前缀缓存、压缩、换入换出策略（feature 控制）。
+  - 扩展调度器支持资源感知、抢占与 SLA；采样链加入并行/推测能力。
+  - 增强运行时：Metal backend、内存池监控、能力发现驱动优化。
+- **Phase 3：多后端与高级特性**
+  - WeightLoader 支持 GGUF/量化；模型构建适配更多架构与混合精度。
+  - 引擎引入 Speculative Decoding、结构化输出约束；开放插件化扩展点。
+  - 完善分布式与多节点推理、冷/热升级流程。
 
 ---
 
@@ -406,14 +511,4 @@ pub trait InferenceEngine: Send + Sync {
 ### 附录：旧→新接口映射（草案）
 - `core::Model.encode/decode` → `tokenizer::Tokenizer`（Engine 组合调用）
 - `core::Model.generate_next_token` → `engine::decode_loop` + `sampler::Sampler` + `model_executor::decode`
-- `core::KVCache(Vec<Tensor>)` → `kv::KvCacheHandle`（后端自定义内部结构）
-- `core::Scheduler`（旧） → `scheduler::Scheduler`（新），保留 `submit/next_batch/complete` 统一语义
-- `core::MemoryManager`（KV 向） → `kv::KvCacheManager`
-- `runtime::MemoryManager`（设备向） → `runtime::DeviceMemoryManager`
-- `core::Backend.load_weights -> Model` → `models::ModelBuilder + runtime::ComputeBackend + models::WeightLoader`
-
----
-
-本提案采用强制重构策略：立即抽离 Tokenizer 与 Sampler、句柄化 KV、统一调度与后端职责拆分，并以能力驱动优化热路径。目标是在 MVP 阶段尽快形成高性能、可组合、类型安全的核心，奠定超越 vLLM 的事实标准基础。
-
----
+- `core::KVCache(Vec<Tensor>)`

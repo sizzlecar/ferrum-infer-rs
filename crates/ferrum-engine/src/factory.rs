@@ -2,7 +2,7 @@
 
 use crate::{EngineConfig, DefaultInferenceEngine};
 use ferrum_interfaces::InferenceEngine;
-use ferrum_types::{Result, Device, FerrumError};
+use ferrum_types::{Result, Device, FerrumError, EngineConfig};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -21,7 +21,7 @@ impl DefaultEngineFactory {
         &self,
         config: EngineConfig,
     ) -> Result<Box<dyn InferenceEngine + Send + Sync>> {
-        info!("Creating inference engine for model: {:?}", config.model_config.model_id);
+        info!("Creating inference engine", model_id = ?config.model.model_id);
 
         // Create scheduler
         let scheduler = self.create_scheduler(&config).await?;
@@ -55,8 +55,9 @@ impl DefaultEngineFactory {
     /// Create scheduler component
     async fn create_scheduler(
         &self,
-        _config: &EngineConfig,
+        config: &EngineConfig,
     ) -> Result<Arc<dyn ferrum_scheduler::Scheduler + Send + Sync>> {
+        debug!("Initializing scheduler", policy = ?config.scheduler.policy);
         // Create default FIFO scheduler
         let scheduler = ferrum_scheduler::implementations::FifoScheduler::new();
         Ok(Arc::new(scheduler))
@@ -65,8 +66,9 @@ impl DefaultEngineFactory {
     /// Create tokenizer component
     async fn create_tokenizer(
         &self,
-        _config: &EngineConfig,
+        config: &EngineConfig,
     ) -> Result<Arc<dyn ferrum_tokenizer::Tokenizer + Send + Sync>> {
+        debug!("Creating tokenizer", tokenizer = ?config.model.tokenizer.tokenizer_type);
         // Create HuggingFace tokenizer
         let factory = ferrum_tokenizer::implementations::HuggingFaceTokenizerFactory;
         // For now, create a placeholder - in real implementation would load from model
@@ -76,8 +78,9 @@ impl DefaultEngineFactory {
     /// Create sampler component
     async fn create_sampler(
         &self,
-        _config: &EngineConfig,
+        config: &EngineConfig,
     ) -> Result<Arc<dyn ferrum_sampler::Sampler + Send + Sync>> {
+        debug!("Creating sampler", enable_custom = config.sampling.enable_custom_processors);
         // Create default greedy sampler
         let sampler = ferrum_sampler::implementations::GreedySampler::new();
         Ok(Arc::new(sampler))
@@ -88,10 +91,15 @@ impl DefaultEngineFactory {
         &self,
         config: &EngineConfig,
     ) -> Result<Arc<dyn ferrum_kv::KvCacheManager + Send + Sync>> {
+        debug!(
+            "Creating KV cache manager",
+            cache_type = ?config.kv_cache.cache_type,
+            max_blocks = config.kv_cache.max_blocks
+        );
         // Create KV cache manager
         let manager = ferrum_kv::managers::DefaultKvCacheManager::new(
-            config.device.clone(),
-            config.kv_cache_config.clone(),
+            config.backend.device,
+            config.kv_cache.clone(),
         )?;
         Ok(Arc::new(manager))
     }
@@ -102,19 +110,26 @@ impl DefaultEngineFactory {
         config: &EngineConfig,
     ) -> Result<Arc<dyn ferrum_interfaces::ModelExecutor + Send + Sync>> {
         // Create compute backend
-        let backend = self.create_compute_backend(&config.device).await?;
+        let backend = self.create_compute_backend(&config.backend.device).await?;
         
         // Create weight loader (placeholder)
         let weight_loader = Arc::new(ferrum_models::loader::SafeTensorsLoader::new());
         
         // Create model builder
         let builder_factory = ferrum_models::builder::DefaultModelBuilderFactory::new();
-        let builder = builder_factory.get_builder(config.model_config.architecture)?;
+        let builder = builder_factory.get_builder(config.model.model_info.as_ref()
+            .map(|info| info.architecture)
+            .unwrap_or(ferrum_types::Architecture::Llama))?;
         
         // Build model executor
-        let model_executor = builder.build(&config.model_config, backend, weight_loader).await?;
+        let model_config = config
+            .model
+            .model_info
+            .clone()
+            .ok_or_else(|| FerrumError::configuration("Missing model_info in EngineConfig"))?;
+        let executor = builder.build(&model_config, backend, weight_loader).await?;
         
-        Ok(model_executor)
+        Ok(executor)
     }
 
     /// Create compute backend
@@ -137,11 +152,10 @@ impl Default for DefaultEngineFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_types::ModelId;
 
     fn create_test_config() -> EngineConfig {
         let mut config = EngineConfig::default();
-        config.model_config.model_id = ModelId::new("test-model");
+        config.model.model_id = ferrum_types::ModelId::new("test-model");
         config
     }
 

@@ -133,6 +133,56 @@ impl KvCacheHandle for DefaultKvCacheHandle {
     fn num_tokens(&self) -> usize {
         self.num_tokens
     }
+
+    fn block_table_mut(&mut self) -> &mut BlockTable {
+        &mut self.block_table
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    fn num_heads(&self) -> usize {
+        self.num_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    fn key_cache(&self, _layer: usize) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
+        Ok(None)
+    }
+
+    fn value_cache(&self, _layer: usize) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
+        Ok(None)
+    }
+
+    fn clone_handle(&self) -> ferrum_types::Result<Arc<dyn KvCacheHandle>> {
+        Ok(Arc::new(self.clone()))
+    }
+
+    fn stats(&self) -> ferrum_interfaces::CacheHandleStats {
+        ferrum_interfaces::CacheHandleStats {
+            memory_bytes: self.memory_usage(),
+            blocks_allocated: self.block_table.num_blocks(),
+            tokens_stored: self.num_tokens,
+            utilization: 1.0,
+            last_access: std::time::Instant::now(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.is_valid()
+    }
+
+    fn cache_id(&self) -> String {
+        self.request_id.to_string()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl Clone for DefaultKvCacheHandle {

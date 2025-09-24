@@ -9,6 +9,31 @@ use ferrum_core::{
     ModelInfo, ModelType, Result, SamplingParams, Tensor, TokenId,
 };
 use hf_hub::api::tokio::Api;
+/// Lightweight snapshot of Candle KV cache state for MVP reuse.
+#[derive(Clone, Debug)]
+pub struct CandleCacheSnapshot {
+    pub sequence_length: usize,
+    pub key_cache: Vec<Vec<f32>>, // placeholder for per-layer key tensors
+    pub value_cache: Vec<Vec<f32>>, // placeholder for per-layer value tensors
+}
+
+impl CandleCacheSnapshot {
+    pub fn capture(_cache: &Cache, sequence_length: usize) -> Result<Self> {
+        // TODO: extract real tensors from Cache; using zeros for MVP
+        let layers = 1; // placeholder
+        Ok(Self {
+            sequence_length,
+            key_cache: vec![vec![0.0; sequence_length]; layers],
+            value_cache: vec![vec![0.0; sequence_length]; layers],
+        })
+    }
+
+    pub fn restore(&self, _config: &LlamaConfig, device: &CandleDevice) -> Result<Cache> {
+        // For MVP, create a fresh cache with reuse=false
+        Cache::new(false, DType::F32, _config, device)
+            .map_err(|e| Error::internal(format!("Cache creation failed: {}", e)))
+    }
+}
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
@@ -195,12 +220,17 @@ impl CandleBackend {
 
         info!("Model loaded successfully from local files: {}", model_name);
 
+        let tensor_factory = ferrum_runtime::TensorFactoryHandle::new(
+            ferrum_runtime::backends::candle::get_tensor_factory(&self.device)
+        );
+
         Ok(Box::new(CandleModel {
             model,
             tokenizer,
             config,
             device: self.device.clone(),
             model_info,
+            tensor_factory,
         }))
     }
 
@@ -501,12 +531,17 @@ impl Backend for CandleBackend {
 
         debug!("TinyLlama loaded successfully");
 
+        let tensor_factory = ferrum_runtime::TensorFactoryHandle::new(
+            ferrum_runtime::backends::candle::get_tensor_factory(&candle_device_to_ferrum(&self.device)?)
+        );
+
         Ok(Box::new(CandleModel {
             model,
             tokenizer,
             config,
             device: self.device.clone(),
             model_info,
+            tensor_factory,
         }))
     }
 
@@ -545,12 +580,21 @@ pub struct CandleModel {
     config: LlamaConfig,
     device: CandleDevice,
     model_info: ModelInfo,
+    tensor_factory: ferrum_runtime::TensorFactoryHandle,
 }
 
 impl CandleModel {
     /// Get the underlying tokenizer for external use
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    pub fn tensor_factory(&self) -> &ferrum_runtime::TensorFactoryHandle {
+        &self.tensor_factory
+    }
+
+    pub fn device(&self) -> ferrum_types::Device {
+        candle_device_to_ferrum(&self.device).expect("device conversion")
     }
 }
 
@@ -637,20 +681,16 @@ impl Model for CandleModel {
 
         let mut cache = match past_kv {
             None => {
-                // Prefill phase: create new cache
                 debug!("Creating new KV cache for prefill");
                 Cache::new(true, DType::F32, &self.config, &self.device)
                     .map_err(|e| Error::internal(format!("Cache creation failed: {}", e)))?
             }
             Some(kv_cache) => {
-                // Decode phase: try to reuse existing cache
                 debug!(
                     "Reusing KV cache for decode (seq_len: {})",
                     kv_cache.sequence_length
                 );
-                // For MVP, create new cache but mark as reused for metrics
-                Cache::new(false, DType::F32, &self.config, &self.device)
-                    .map_err(|e| Error::internal(format!("Cache creation failed: {}", e)))?
+                kv_cache.restore(&self.config, &self.device)?
             }
         };
 
@@ -662,8 +702,8 @@ impl Model for CandleModel {
 
         let next_token = apply_sampling(&logits, sampling_params)?;
 
-        // Extract KV cache data from Candle cache for reuse
-        let kv_cache = Some(extract_kv_cache_from_candle(&cache, seq_len + 1)?);
+        // Extract KV cache snapshot for reuse
+        let kv_cache = CandleCacheSnapshot::capture(&cache, seq_len + 1)?;
 
         debug!(
             "Generated token {} for sequence length {}",
@@ -693,8 +733,8 @@ impl Model for CandleModel {
     async fn forward_logits(
         &self,
         input_ids: &[TokenId],
-        past_kv: Option<&KVCache>,
-    ) -> Result<(Tensor, Option<KVCache>)> {
+        past_kv: Option<&CandleCacheSnapshot>,
+    ) -> Result<(Tensor, CandleCacheSnapshot)> {
         debug!("Forward pass for {} input tokens", input_ids.len());
 
         let input_tensor = CandleTensor::from_iter(input_ids.iter().cloned(), &self.device)
