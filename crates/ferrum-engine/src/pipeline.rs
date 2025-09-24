@@ -96,9 +96,9 @@ impl InferencePipeline {
 
             trace!(batch_id = %batch_plan.batch_id, size = batch_plan.size(), "processing batch");
 
-            let prefill_inputs = self.build_prefill_inputs(&batch_plan)?;
+            let prefill_work = self.prepare_prefill_work(&batch_plan)?;
 
-            for (scheduled, prefill_input) in batch_plan.requests.iter().zip(prefill_inputs.into_iter()) {
+            for (request, prefill_input) in prefill_work {
                 let PrefillOutput { logits, kv_cache, .. } = self
                     .components
                     .model_executor
@@ -106,9 +106,9 @@ impl InferencePipeline {
                     .await?;
 
                 let last_logits = self.extract_last_logits(&logits)?;
-                let token_id = self.sample_from_logits(&last_logits, scheduled.request.sampling_params.clone())?;
+                let token_id = self.sample_from_logits(&last_logits, request.sampling_params.clone())?;
 
-                if &scheduled.request.id == target_request_id {
+                if &request.id == target_request_id {
                     let delta = self
                         .components
                         .incremental_tokenizer
@@ -118,9 +118,9 @@ impl InferencePipeline {
                         token_id,
                         text_delta: delta.clone(),
                     };
-                    self.send_stream_chunk(&tx, &scheduled.request, event, None, None)?;
+                    self.send_stream_chunk(&tx, &request, event, None, None)?;
 
-                    self.decode_loop(scheduled.request.clone(), token_id, kv_cache, tx.clone()).await?;
+                    self.decode_loop(request.clone(), token_id, kv_cache, tx.clone()).await?;
                     return Ok(());
                 }
 
@@ -318,18 +318,21 @@ impl InferencePipeline {
         }
     }
 
-    fn build_prefill_inputs(&self, batch_plan: &BatchPlan) -> Result<Vec<PrefillInput>> {
+    fn prepare_prefill_work(&self, batch_plan: &BatchPlan) -> Result<Vec<(InferenceRequest, PrefillInput)>> {
         batch_plan
             .requests
             .iter()
             .map(|scheduled| {
                 let token_ids = self.components.tokenizer.encode(&scheduled.request.prompt, true)?;
                 let input_tensor = self.create_tensor_from_tokens(&token_ids)?;
-                Ok(PrefillInput {
-                    input_ids: input_tensor,
-                    attention_mask: None,
-                    position_ids: None,
-                })
+                Ok((
+                    scheduled.request.clone(),
+                    PrefillInput {
+                        input_ids: input_tensor,
+                        attention_mask: None,
+                        position_ids: None,
+                    },
+                ))
             })
             .collect()
     }

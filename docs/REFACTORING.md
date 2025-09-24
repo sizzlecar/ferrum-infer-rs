@@ -69,6 +69,11 @@
 
 > ✅ = 已完成，⛔ = 未完成，⚠️ = 进行中。
 
+#### 2025-09-24 更新
+- 配置与指标类型已集中到 `ferrum-types`，`ferrum-interfaces` 正在清理重复结构（当前 `cargo check` 因接口重复仍被阻塞）。
+- `TensorFactory::from_slice` 需要改为非泛型签名以支持 dyn trait；Candle 实现同步调整中。
+- `HealthStatus`/`ComponentHealth` 已规划统一到基础层，默认健康构造函数待在 `ferrum-types` 中补齐。
+
 ---
 
 ### Phase 1 任务拆解

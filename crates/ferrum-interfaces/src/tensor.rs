@@ -67,7 +67,7 @@ pub trait TensorFactory: Send + Sync {
     /// 基于已有张量创建零填充张量（`[MVP]`）
     fn zeros_like(&self, tensor: &TensorRef) -> Result<TensorRef>;
     /// 通过 slice 数据创建张量（`[MVP]`）
-    fn from_slice<T: TensorElement>(&self, data: &[T], shape: &[usize], device: Device) -> Result<TensorRef>;
+    fn from_slice(&self, data: &[f32], shape: &[usize], dtype: DataType, device: Device) -> Result<TensorRef>;
     /// 迁移张量到目标设备（`[MVP]`）
     fn to_device(&self, tensor: &TensorRef, device: Device) -> Result<TensorRef>;
     /// 执行窄视图操作（`[MVP]`）

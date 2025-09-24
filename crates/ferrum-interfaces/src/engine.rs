@@ -11,16 +11,12 @@ use ferrum_types::{
     StreamChunk,
     EngineConfig,
     EngineStatus as TypesEngineStatus,
-    EngineConfig as TypesEngineConfig,
-    EngineModelConfig,
-    BatchConfig,
-    SamplingConfig,
-    MonitoringConfig,
+    ModelConfig,
 };
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, pin::Pin, time::Duration};
+use std::{collections::HashMap, pin::Pin};
 
 /// Core inference engine trait
 #[async_trait]
@@ -70,7 +66,7 @@ pub struct EngineStatus {
     /// Engine version
     pub version: String,
     /// Component status
-    pub component_status: ComponentStatus,
+    pub component_status: ferrum_types::HealthStatus,
 }
 
 impl From<TypesEngineStatus> for EngineStatus {
@@ -84,99 +80,13 @@ impl From<TypesEngineStatus> for EngineStatus {
             uptime_seconds: status.uptime_seconds,
             last_heartbeat: status.last_heartbeat,
             version: status.version,
-            component_status: status.component_status.into(),
+            component_status: status.component_status,
         }
     }
 }
 
 /// Status of engine components
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComponentStatus {
-    /// Scheduler status
-    pub scheduler: ComponentHealth,
-    /// Model executor status
-    pub model_executor: ComponentHealth,
-    /// Tokenizer status
-    pub tokenizer: ComponentHealth,
-    /// KV cache manager status
-    pub kv_cache: ComponentHealth,
-    /// Memory manager status
-    pub memory_manager: ComponentHealth,
-    /// Backend status
-    pub backend: ComponentHealth,
-}
 
-impl From<ferrum_types::ComponentStatus> for ComponentStatus {
-    fn from(status: ferrum_types::ComponentStatus) -> Self {
-        Self {
-            scheduler: status.scheduler.into(),
-            model_executor: status.model_executor.into(),
-            tokenizer: status.tokenizer.into(),
-            kv_cache: status.kv_cache.into(),
-            memory_manager: status.memory_manager.into(),
-            backend: status.backend.into(),
-        }
-    }
-}
-
-/// Individual component health
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComponentHealth {
-    /// Component status
-    pub status: ComponentHealthStatus,
-    /// Health message
-    pub message: String,
-    /// Last check time
-    pub last_check: chrono::DateTime<chrono::Utc>,
-    /// Component-specific metrics
-    pub metrics: HashMap<String, f64>,
-}
-
-impl ComponentHealth {
-    pub fn healthy(component: &str) -> Self {
-        Self {
-            status: ComponentHealthStatus::Healthy,
-            message: format!("{} healthy", component),
-            last_check: chrono::Utc::now(),
-            metrics: HashMap::new(),
-        }
-    }
-}
-
-impl From<ferrum_types::ComponentHealth> for ComponentHealth {
-    fn from(health: ferrum_types::ComponentHealth) -> Self {
-        Self {
-            status: health.status.into(),
-            message: health.message,
-            last_check: health.last_check,
-            metrics: health.metrics,
-        }
-    }
-}
-
-/// Component health status
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum ComponentHealthStatus {
-    /// Component is healthy
-    Healthy,
-    /// Component has warnings but is functional
-    Warning,
-    /// Component is degraded
-    Degraded,
-    /// Component is unhealthy
-    Unhealthy,
-}
-
-impl From<ferrum_types::ComponentHealthStatus> for ComponentHealthStatus {
-    fn from(status: ferrum_types::ComponentHealthStatus) -> Self {
-        match status {
-            ferrum_types::ComponentHealthStatus::Healthy => Self::Healthy,
-            ferrum_types::ComponentHealthStatus::Warning => Self::Warning,
-            ferrum_types::ComponentHealthStatus::Degraded => Self::Degraded,
-            ferrum_types::ComponentHealthStatus::Unhealthy => Self::Unhealthy,
-        }
-    }
-}
 
 /// Sampling configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,7 +220,7 @@ pub struct HealthStatus {
     /// Overall health status
     pub overall_status: OverallHealthStatus,
     /// Individual component status
-    pub component_status: ComponentStatus,
+    pub component_status: ferrum_types::HealthStatus,
     /// Health check timestamp
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Health score (0.0 - 1.0)
@@ -323,14 +233,7 @@ impl HealthStatus {
     pub fn healthy() -> Self {
         Self {
             overall_status: OverallHealthStatus::Healthy,
-            component_status: ComponentStatus {
-                scheduler: ComponentHealth::healthy("scheduler"),
-                model_executor: ComponentHealth::healthy("model"),
-                tokenizer: ComponentHealth::healthy("tokenizer"),
-                kv_cache: ComponentHealth::healthy("kv_cache"),
-                memory_manager: ComponentHealth::healthy("memory"),
-                backend: ComponentHealth::healthy("backend"),
-            },
+            component_status: ferrum_types::HealthStatus::healthy(),
             timestamp: chrono::Utc::now(),
             health_score: 1.0,
             issues: Vec::new(),
