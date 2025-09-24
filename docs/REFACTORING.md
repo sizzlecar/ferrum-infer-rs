@@ -75,7 +75,7 @@
 
 1. **引擎管线（Engine）**
   - [`MVP`] 衔接 Scheduler → Tokenizer → KV → ModelExecutor → Sampler，构建 `InferencePipeline` 的 `prefill_batch`/`decode_step` 流程。
-    - [进行中] `PipelineComponents` 已接入 `TensorFactoryHandle`；`sample_from_logits` 支持通过运行时注入的 `LogitsProcessor` 链与 `Sampler` 完成温度/top-k/top-p 等处理，下一步聚焦批处理与 KV 生命周期。
+    - [进行中] `process_batches` 改造为按调度批次组装 `PrefillInput` 并顺序执行 prefill，`decode_loop` 维护 token 频次及 stop sequence 检测；仍需补齐多请求协同与 KV 生命周期管理。
    - [`MVP`] `DefaultInferenceEngine::infer`/`infer_stream` 使用新 pipeline 跑通流式推理，统一调度循环。
    - [`MVP`] 提供批次提示（`BatchHint`）与基础指标埋点（request_id/batch_id）。
 2. **调度器集成（Scheduler）**
@@ -106,7 +106,7 @@
 ### Phase 1 检查清单
 
 - [ ] `InferencePipeline` 实现 prefill/decode，返回 `PrefillOutput`/`DecodeOutput`。
-  - [进行中] Pipeline 已打通 `sample_from_logits`，可利用 `LogitsProcessor` 链和 `Sampler` 进行采样；仍需补齐 KV 生命周期管理与请求批次协同。
+  - [进行中] `process_batches` 支持批次 prompt 编码、顺序 prefill 与 decode loop；下一步聚焦 KV 生命周期、批间状态与并发请求协同。
 - [ ] `DefaultInferenceEngine::infer_stream` 使用 pipeline 驱动完整解码循环。
 - [ ] `DefaultEngineFactory` 能实例化 scheduler/tokenizer/sampler/kv/model executor（去除 `not_implemented!`）。
 - [ ] `DefaultKvCacheManager` MVP（连续内存）编译通过并具备基本单测。
