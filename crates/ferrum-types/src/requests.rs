@@ -1,8 +1,6 @@
 //! Request and response types for inference
 
-use crate::{
-    ids::*, sampling::*, models::TokenUsage, FinishReason, Priority, SamplingParams, TokenId,
-};
+use crate::{ids::*, models::TokenUsage, FinishReason, Priority, SamplingParams, TokenId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

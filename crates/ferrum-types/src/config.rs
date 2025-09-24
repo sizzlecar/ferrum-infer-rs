@@ -208,8 +208,8 @@ impl Default for BackendConfig {
     fn default() -> Self {
         Self {
             backend_type: BackendType::Candle,
-            device: Device::Cpu,
-            dtype: DataType::F16,
+            device: Device::CPU,
+            dtype: DataType::FP16,
             enable_optimizations: true,
             optimization_level: 2,
             enable_cuda_graphs: false,
@@ -260,6 +260,21 @@ impl Default for TokenizerConfig {
             padding: None,
         }
     }
+}
+
+/// Tokenizer algorithms
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenizerType {
+    /// Byte Pair Encoding
+    BPE,
+    /// WordPiece tokenizer (BERT-style)
+    WordPiece,
+    /// SentencePiece tokenizer
+    SentencePiece,
+    /// Tiktoken tokenizer family
+    Tiktoken,
+    /// Any custom tokenizer implementation
+    Custom,
 }
 
 /// Truncation configuration

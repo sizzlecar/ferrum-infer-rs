@@ -1,6 +1,4 @@
-use ferrum_interfaces::engine::{
-    EngineStatus, ComponentStatus, ComponentHealth, ComponentHealthStatus,
-};
+use ferrum_interfaces::engine::EngineStatus;
 use ferrum_types::{ModelId, MemoryUsage};
 use serde_json as json;
 
@@ -15,14 +13,7 @@ fn engine_status_serde_roundtrip() {
         uptime_seconds: 5,
         last_heartbeat: chrono::Utc::now(),
         version: "0.1".into(),
-        component_status: ComponentStatus {
-            scheduler: ComponentHealth { status: ComponentHealthStatus::Healthy, message: "ok".into(), last_check: chrono::Utc::now(), metrics: Default::default() },
-            model_executor: ComponentHealth { status: ComponentHealthStatus::Healthy, message: "ok".into(), last_check: chrono::Utc::now(), metrics: Default::default() },
-            tokenizer: ComponentHealth { status: ComponentHealthStatus::Healthy, message: "ok".into(), last_check: chrono::Utc::now(), metrics: Default::default() },
-            kv_cache: ComponentHealth { status: ComponentHealthStatus::Healthy, message: "ok".into(), last_check: chrono::Utc::now(), metrics: Default::default() },
-            memory_manager: ComponentHealth { status: ComponentHealthStatus::Healthy, message: "ok".into(), last_check: chrono::Utc::now(), metrics: Default::default() },
-            backend: ComponentHealth { status: ComponentHealthStatus::Healthy, message: "ok".into(), last_check: chrono::Utc::now(), metrics: Default::default() },
-        },
+        component_status: ferrum_types::HealthStatus::healthy(),
     };
     let s = json::to_string(&st).unwrap();
     let back: EngineStatus = json::from_str(&s).unwrap();

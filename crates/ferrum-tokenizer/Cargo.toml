@@ -39,7 +39,7 @@ uuid = { workspace = true }
 once_cell = { workspace = true }
 
 # Regex for chat templates
-regex = "1.10"
+regex = { version = "1.10", optional = true }
 
 # File system
 dirs = { workspace = true }

@@ -1,9 +1,9 @@
 //! Metrics and observability types
 
-use crate::{ids::*, BatchId, RequestId};
+use crate::{ids::*, RequestId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 /// Engine status information
 #[derive(Debug, Clone, Serialize, Deserialize)]

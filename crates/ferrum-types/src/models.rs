@@ -1,6 +1,6 @@
 //! Model-related types and configurations
 
-use crate::{ids::ModelId, devices::*, FerrumError, Result, SpecialTokens};
+use crate::{ids::ModelId, devices::*, FerrumError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
