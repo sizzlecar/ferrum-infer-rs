@@ -91,6 +91,9 @@ pub trait KvCacheHandle: Send + Sync + std::fmt::Debug {
     
     /// Get mutable block table (for extending)
     fn block_table_mut(&mut self) -> &mut BlockTable;
+
+    /// Downcast support for backend-specific handles
+    fn as_any(&self) -> &dyn std::any::Any;
     
     /// Get device where cache resides
     fn device(&self) -> Device;

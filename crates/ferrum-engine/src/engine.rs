@@ -1,13 +1,13 @@
 //! Main inference engine implementation
 
-use crate::EngineConfig;
+use ferrum_types::{Result, InferenceRequest, InferenceResponse, FerrumError, EngineConfig};
 use ferrum_interfaces::{InferenceEngine, EngineStatus, StreamChunk};
-use ferrum_types::{Result, InferenceRequest, InferenceResponse, FerrumError};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::info;
 use tokio_stream::wrappers::ReceiverStream;
 use futures::StreamExt;
+use crate::pipeline::{InferencePipeline, PipelineComponents};
 
 /// Default inference engine implementation
 #[derive(Debug)]
@@ -24,6 +24,8 @@ pub struct DefaultInferenceEngine {
     kv_cache: Arc<dyn ferrum_kv::KvCacheManager + Send + Sync>,
     /// Model executor
     model_executor: Arc<dyn ferrum_interfaces::ModelExecutor + Send + Sync>,
+    /// Pipeline (built lazily)
+    pipeline: Arc<InferencePipeline>,
 }
 
 impl DefaultInferenceEngine {
@@ -36,8 +38,21 @@ impl DefaultInferenceEngine {
         kv_cache: Arc<dyn ferrum_kv::KvCacheManager + Send + Sync>,
         model_executor: Arc<dyn ferrum_interfaces::ModelExecutor + Send + Sync>,
     ) -> Self {
-        info!("Created inference engine with config: {:?}", config.model_config.model_id);
-        
+        info!("Created inference engine with model: {:?}", config.model.model_id);
+
+        let components = PipelineComponents {
+            scheduler: scheduler.clone(),
+            tokenizer: tokenizer.clone(),
+            incremental_tokenizer: tokenizer.clone(),
+            tensor_factory: ferrum_runtime::TensorFactoryHandle::default(),
+            sampler: sampler.clone(),
+            logits_processors: Vec::new(),
+            kv_cache: kv_cache.clone(),
+            model_executor: model_executor.clone(),
+        };
+        let batch_hint = ferrum_interfaces::BatchHint::simple(config.batching.max_batch_size);
+        let pipeline = Arc::new(InferencePipeline::new(components, batch_hint));
+
         Self {
             config,
             scheduler,
@@ -45,6 +60,7 @@ impl DefaultInferenceEngine {
             sampler,
             kv_cache,
             model_executor,
+            pipeline,
         }
     }
 }
@@ -52,28 +68,19 @@ impl DefaultInferenceEngine {
 #[async_trait]
 impl InferenceEngine for DefaultInferenceEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
-        // For non-streaming requests, collect the entire stream
         let mut stream = self.infer_stream(request).await?;
-        
         let mut final_response = None;
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
-                Ok(chunk) => match chunk {
-                    StreamChunk::Delta { .. } => {
-                        // Accumulate deltas
-                    }
-                    StreamChunk::Complete { response } => {
-                        final_response = Some(response);
-                        break;
-                    }
-                    StreamChunk::Error { error } => {
-                        return Err(error);
-                    }
-                },
+                Ok(StreamChunk::Complete { response }) => {
+                    final_response = Some(response);
+                    break;
+                }
+                Ok(StreamChunk::Delta { .. }) => continue,
+                Ok(StreamChunk::Error { error }) => return Err(error),
                 Err(e) => return Err(e),
             }
         }
-        
         final_response.ok_or_else(|| FerrumError::engine_error("No response generated"))
     }
 
@@ -81,102 +88,63 @@ impl InferenceEngine for DefaultInferenceEngine {
         &self,
         request: InferenceRequest,
     ) -> Result<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send + Unpin>> {
-        info!("Starting streaming inference for request: {:?}", request.id);
-        
+        info!(?request.id, "Starting streaming inference");
+
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        
-        // Spawn inference task
-        let scheduler = self.scheduler.clone();
-        let tokenizer = self.tokenizer.clone();
-        let sampler = self.sampler.clone();
-        let kv_cache = self.kv_cache.clone();
-        let model_executor = self.model_executor.clone();
-        let config = self.config.clone();
-        
+        let pipeline = self.pipeline.clone();
+        let target_request_id = request.id;
+
+        pipeline.submit_request(request.clone()).await?;
+
         tokio::spawn(async move {
-            let result = Self::process_streaming_request(
-                request,
-                scheduler,
-                tokenizer,
-                sampler,
-                kv_cache,
-                model_executor,
-                config,
-                tx.clone(),
-            ).await;
-            
-            if let Err(e) = result {
+            if let Err(e) = pipeline.process_batches(&target_request_id, tx.clone()).await {
                 let _ = tx.send(Ok(StreamChunk::Error { error: e }));
             }
         });
-        
+
         Ok(Box::new(ReceiverStream::new(rx)))
     }
 
     async fn status(&self) -> EngineStatus {
+        // TODO: gather real metrics from scheduler/KV/pipeline
         EngineStatus {
-            is_healthy: true,
-            active_requests: 0, // TODO: Get from scheduler
-            queue_size: 0,      // TODO: Get from scheduler
-            gpu_memory_used: 0, // TODO: Get from KV cache
-            gpu_memory_total: 0,
+            is_ready: true,
+            loaded_models: vec![self.model_executor.info().model_id.clone()],
+            active_requests: 0,
+            queued_requests: 0,
+            memory_usage: ferrum_types::MemoryUsage::default(),
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: "mvp".to_string(),
+            component_status: ferrum_interfaces::ComponentStatus {
+                scheduler: ferrum_interfaces::ComponentHealth::healthy("scheduler"),
+                model_executor: ferrum_interfaces::ComponentHealth::healthy("model"),
+                tokenizer: ferrum_interfaces::ComponentHealth::healthy("tokenizer"),
+                kv_cache: ferrum_interfaces::ComponentHealth::healthy("kv"),
+                memory_manager: ferrum_interfaces::ComponentHealth::healthy("memory"),
+                backend: ferrum_interfaces::ComponentHealth::healthy("backend"),
+            },
         }
     }
 
     async fn shutdown(&self) -> Result<()> {
         info!("Shutting down inference engine");
-        // TODO: Implement graceful shutdown
         Ok(())
     }
 
-    fn config(&self) -> &ferrum_interfaces::EngineConfig {
-        // TODO: Return actual config
-        todo!("Engine config method not implemented")
+    fn config(&self) -> &ferrum_types::EngineConfig {
+        &self.config
     }
 
     fn metrics(&self) -> ferrum_interfaces::EngineMetrics {
-        // TODO: Return actual metrics
         ferrum_interfaces::EngineMetrics::default()
     }
 
-    fn health_check(&self) -> ferrum_interfaces::HealthStatus {
-        ferrum_interfaces::HealthStatus::Healthy
+    async fn health_check(&self) -> ferrum_interfaces::HealthStatus {
+        ferrum_interfaces::HealthStatus::healthy()
     }
 }
 
 impl DefaultInferenceEngine {
-    /// Process streaming inference request
-    async fn process_streaming_request(
-        request: InferenceRequest,
-        _scheduler: Arc<dyn ferrum_scheduler::Scheduler + Send + Sync>,
-        _tokenizer: Arc<dyn ferrum_tokenizer::Tokenizer + Send + Sync>,
-        _sampler: Arc<dyn ferrum_sampler::Sampler + Send + Sync>,
-        _kv_cache: Arc<dyn ferrum_kv::KvCacheManager + Send + Sync>,
-        _model_executor: Arc<dyn ferrum_interfaces::ModelExecutor + Send + Sync>,
-        _config: EngineConfig,
-        tx: tokio::sync::mpsc::UnboundedSender<Result<StreamChunk>>,
-    ) -> Result<()> {
-        // Placeholder implementation
-        // TODO: Implement the full inference pipeline:
-        // 1. Submit to scheduler
-        // 2. Tokenize input
-        // 3. Allocate KV cache
-        // 4. Run prefill phase
-        // 5. Decode loop with streaming output
-        
-        let response = InferenceResponse {
-            request_id: request.id,
-            text: String::new(),
-            tokens: vec![],
-            finish_reason: ferrum_types::FinishReason::Length,
-            usage: None,
-            latency_ms: 0,
-            created_at: chrono::Utc::now(),
-            metadata: std::collections::HashMap::new(),
-        };
-        
-        let _ = tx.send(Ok(StreamChunk::Complete { response }));
-        
-        Ok(())
-    }
+    // Process streaming request is now handled via pipeline.process_batches
 }

@@ -62,22 +62,26 @@ pub type TensorRef = Arc<dyn TensorLike>;
 
 /// Tensor factory for creating tensors on specific backends
 pub trait TensorFactory: Send + Sync {
-    /// Create tensor from raw data
-    fn create_tensor(
-        &self,
-        data: &[f32], 
-        shape: &[usize], 
-        dtype: DataType,
-        device: &Device
-    ) -> Result<TensorRef>;
+    /// 创建指定形状/数据类型的空张量（`[MVP]`）
+    fn empty(&self, shape: &[usize], dtype: DataType, device: Device) -> Result<TensorRef>;
+    /// 基于已有张量创建零填充张量（`[MVP]`）
+    fn zeros_like(&self, tensor: &TensorRef) -> Result<TensorRef>;
+    /// 通过 slice 数据创建张量（`[MVP]`）
+    fn from_slice<T: TensorElement>(&self, data: &[T], shape: &[usize], device: Device) -> Result<TensorRef>;
+    /// 迁移张量到目标设备（`[MVP]`）
+    fn to_device(&self, tensor: &TensorRef, device: Device) -> Result<TensorRef>;
+    /// 执行窄视图操作（`[MVP]`）
+    fn narrow(&self, tensor: &TensorRef, dim: usize, start: usize, length: usize) -> Result<TensorRef>;
+    /// reshape 张量（`[MVP]`）
+    fn reshape(&self, tensor: &TensorRef, shape: &[usize]) -> Result<TensorRef>;
     
-    /// Create tensor filled with zeros
+    /// Create tensor filled with zeros（`[Phase 2+]` 可选实现）
     fn zeros(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef>;
     
-    /// Create tensor filled with ones
+    /// Create tensor filled with ones（`[Phase 2+]`）
     fn ones(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef>;
     
-    /// Create tensor from uniform random distribution
+    /// Create tensor from uniform random distribution（`[Phase 2+]`）
     fn uniform(
         &self,
         shape: &[usize],
@@ -87,7 +91,7 @@ pub trait TensorFactory: Send + Sync {
         device: &Device
     ) -> Result<TensorRef>;
     
-    /// Create tensor from normal distribution
+    /// Create tensor from normal distribution（`[Phase 2+]`）
     fn normal(
         &self,
         shape: &[usize],

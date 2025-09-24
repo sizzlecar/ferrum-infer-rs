@@ -35,7 +35,7 @@ pub use ferrum_interfaces::{
 
 pub use ferrum_types::{
     Result, InferenceRequest, InferenceResponse, RequestId, BatchId,
-    StreamingConfig, FerrumError,
+    StreamingConfig, FerrumError, EngineConfig,
 };
 
 // Re-exports from implementation crates
@@ -58,54 +58,4 @@ pub async fn create_default_engine(
 ) -> Result<Box<dyn InferenceEngineInterface + Send + Sync>> {
     let factory = DefaultEngineFactory::new();
     factory.create_engine(config).await
-}
-
-/// Engine configuration
-#[derive(Debug, Clone)]
-pub struct EngineConfig {
-    /// Model configuration
-    pub model_config: ferrum_interfaces::ModelConfig,
-    /// Device to use
-    pub device: ferrum_types::Device,
-    /// Maximum batch size
-    pub max_batch_size: usize,
-    /// Maximum sequence length
-    pub max_sequence_length: usize,
-    /// Enable streaming
-    pub enable_streaming: bool,
-    /// Streaming configuration
-    pub streaming_config: StreamingConfig,
-    /// KV cache configuration
-    pub kv_cache_config: ferrum_kv::KvCacheConfig,
-    /// Enable metrics collection
-    pub enable_metrics: bool,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            model_config: ferrum_interfaces::ModelConfig {
-                model_id: ferrum_types::ModelId::new("default"),
-                architecture: ferrum_types::Architecture::Llama,
-                vocab_size: 32000,
-                hidden_size: 4096,
-                num_layers: 32,
-                num_attention_heads: 32,
-                num_key_value_heads: None,
-                intermediate_size: None,
-                max_position_embeddings: Some(2048),
-                rope_theta: Some(10000.0),
-                rope_scaling: None,
-                rms_norm_eps: Some(1e-6),
-                data_type: Some(ferrum_types::DataType::F16),
-            },
-            device: ferrum_types::Device::Cpu,
-            max_batch_size: 8,
-            max_sequence_length: 2048,
-            enable_streaming: true,
-            streaming_config: StreamingConfig::default(),
-            kv_cache_config: ferrum_kv::KvCacheConfig::default(),
-            enable_metrics: true,
-        }
-    }
 }

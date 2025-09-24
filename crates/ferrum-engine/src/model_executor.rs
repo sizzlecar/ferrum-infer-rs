@@ -4,11 +4,11 @@
 //! prefill and decode phases, following the ferrum-interfaces design.
 
 use ferrum_interfaces::{
-    ModelExecutor, PrefillInput, PrefillOutput, DecodeInput, DecodeOutput, 
-    TensorRef, KvCacheHandle, AllocationRequest,
+    ModelExecutor, PrefillInput, PrefillOutput, DecodeInput, DecodeOutput,
+    TensorRef, KvCacheHandle, AllocationRequest, BlockTable,
 };
-use ferrum_types::{Result, FerrumError, ModelInfo, TokenId};
-use crate::candle_backend::CandleModel;
+use ferrum_types::{Result, FerrumError, ModelInfo, TokenId, Device, DataType};
+use crate::candle_backend::{CandleModel, CandleCacheSnapshot};
 use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, instrument};
@@ -17,101 +17,70 @@ use tracing::{debug, instrument};
 /// This is a simplified implementation that will be replaced with proper handles
 #[derive(Debug, Clone)]
 pub struct CandleKvCacheHandle {
-    pub sequence_length: usize,
-    pub cache_data: Option<Vec<f32>>, // Simplified representation
-    pub num_tokens: usize,
+    block_table: BlockTable,
+    device: Device,
+    num_layers: usize,
+    num_heads: usize,
+    head_dim: usize,
+    dtype: DataType,
+    key_cache: Vec<Option<TensorRef>>,
+    value_cache: Vec<Option<TensorRef>>,
+    cache_id: String,
 }
 
 impl KvCacheHandle for CandleKvCacheHandle {
-    fn block_table(&self) -> &ferrum_interfaces::BlockTable {
-        // For MVP, return a simple block table
-        // This would be implemented properly with paging later
-        static EMPTY_BLOCK_TABLE: ferrum_interfaces::BlockTable = ferrum_interfaces::BlockTable {
-            physical: smallvec::SmallVec::new(),
-            logical_to_physical: smallvec::SmallVec::new(),
-            seq_len: 0,
-        };
-        &EMPTY_BLOCK_TABLE
+    fn block_table(&self) -> &BlockTable {
+        &self.block_table
     }
 
-    fn device(&self) -> ferrum_types::Device {
-        ferrum_types::Device::Cuda(0) // Default device for MVP
+    fn block_table_mut(&mut self) -> &mut BlockTable {
+        &mut self.block_table
     }
 
-    fn num_tokens(&self) -> usize {
-        self.num_tokens
+    fn device(&self) -> Device {
+        self.device
     }
-}
 
-/// Candle tensor implementation for TensorRef
-#[derive(Debug)]
-pub struct CandleTensor {
-    pub data: Vec<f32>,
-    pub shape: Vec<usize>,
-}
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
 
-impl ferrum_interfaces::TensorLike for CandleTensor {
-    fn shape(&self) -> &[usize] {
-        &self.shape
+    fn num_heads(&self) -> usize {
+        self.num_heads
     }
-    
-    fn dtype(&self) -> ferrum_types::DataType {
-        ferrum_types::DataType::FP32
+
+    fn head_dim(&self) -> usize {
+        self.head_dim
     }
-    
-    fn device(&self) -> ferrum_types::Device {
-        ferrum_types::Device::Cuda(0)
+
+    fn key_cache(&self, layer: usize) -> Result<Option<TensorRef>> {
+        Ok(self.key_cache.get(layer).cloned().unwrap_or(None))
     }
-    
-    fn is_contiguous(&self) -> bool {
-        true // Assume contiguous for MVP
+
+    fn value_cache(&self, layer: usize) -> Result<Option<TensorRef>> {
+        Ok(self.value_cache.get(layer).cloned().unwrap_or(None))
     }
-    
-    fn view(&self, _start: &[usize], _end: &[usize]) -> Result<TensorRef> {
-        // For MVP, return a clone - would implement proper views later
-        Ok(Arc::new(CandleTensor {
-            data: self.data.clone(),
-            shape: self.shape.clone(),
-        }))
+
+    fn clone_handle(&self) -> Result<Arc<dyn KvCacheHandle>> {
+        Ok(Arc::new(self.clone()) as Arc<dyn KvCacheHandle>)
     }
-    
-    fn reshape(&self, shape: &[usize]) -> Result<TensorRef> {
-        let total_elements = shape.iter().product::<usize>();
-        if total_elements != self.data.len() {
-            return Err(FerrumError::InvalidTensorShape {
-                requested: shape.to_vec(),
-                current: self.shape.clone(),
-            });
+
+    fn stats(&self) -> ferrum_interfaces::CacheHandleStats {
+        ferrum_interfaces::CacheHandleStats {
+            memory_bytes: 0,
+            blocks_allocated: self.block_table.num_blocks(),
+            tokens_stored: self.block_table.sequence_length,
+            utilization: 1.0,
+            last_access: std::time::Instant::now(),
         }
-        
-        Ok(Arc::new(CandleTensor {
-            data: self.data.clone(),
-            shape: shape.to_vec(),
-        }))
     }
-    
-    fn to_cpu(&self) -> Result<TensorRef> {
-        // For MVP, just return self - would implement device transfer later
-        Ok(Arc::new(CandleTensor {
-            data: self.data.clone(),
-            shape: self.shape.clone(),
-        }))
+
+    fn is_valid(&self) -> bool {
+        true
     }
-    
-    fn to_device(&self, _device: &ferrum_types::Device) -> Result<TensorRef> {
-        // For MVP, just return self - would implement device transfer later
-        Ok(Arc::new(CandleTensor {
-            data: self.data.clone(),
-            shape: self.shape.clone(),
-        }))
-    }
-    
-    fn to_dtype(&self, _dtype: ferrum_types::DataType) -> Result<TensorRef> {
-        // For MVP, just return self - would implement dtype conversion later
-        Ok(Arc::new(CandleTensor {
-            data: self.data.clone(),
-            shape: self.shape.clone(),
-        }))
+
+    fn cache_id(&self) -> String {
+        self.cache_id.clone()
     }
 }
 
@@ -123,6 +92,53 @@ pub struct CandleModelExecutor {
 impl CandleModelExecutor {
     pub fn new(model: Arc<CandleModel>) -> Self {
         Self { model }
+    }
+
+    fn build_kv_handle(
+        snapshot: CandleCacheSnapshot,
+        num_layers: usize,
+        num_heads: usize,
+        head_dim: usize,
+        device: Device,
+    ) -> Result<CandleKvCacheHandle> {
+        let mut block_table = BlockTable::new(head_dim);
+        block_table.sequence_length = snapshot.sequence_length;
+
+        let key_cache = snapshot
+            .key_cache
+            .into_iter()
+            .map(|layer| {
+                // Pack placeholder data into tensor
+                let tensor = ferrum_runtime::TensorFactoryHandle::default()
+                    .from_slice(&layer, &[snapshot.sequence_length, head_dim], device)
+                    .map_err(|e| FerrumError::backend(format!("Failed to build key cache tensor: {}", e)))?;
+                Ok(Some(tensor))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let value_cache = snapshot
+            .value_cache
+            .into_iter()
+            .map(|layer| {
+                let tensor = ferrum_runtime::TensorFactoryHandle::default()
+                    .from_slice(&layer, &[snapshot.sequence_length, head_dim], device)
+                    .map_err(|e| FerrumError::backend(format!("Failed to build value cache tensor: {}", e)))?;
+                Ok(Some(tensor))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(CandleKvCacheHandle {
+            block_table,
+            device,
+            num_layers,
+            num_heads,
+            head_dim,
+            dtype: DataType::F32,
+            key_cache,
+            value_cache,
+            cache_id: uuid::Uuid::new_v4().to_string(),
+            snapshot: Some(snapshot),
+        })
     }
 }
 
@@ -137,15 +153,10 @@ impl ModelExecutor for CandleModelExecutor {
         debug!("Running prefill with input shape: {:?}", input.input_ids.shape());
         
         // Convert TensorRef to token IDs for Candle model
-        let tensor_data = if let Some(candle_tensor) = input.input_ids.as_any().downcast_ref::<CandleTensor>() {
-            &candle_tensor.data
-        } else {
-            return Err(FerrumError::TensorConversionError {
-                message: "Expected CandleTensor for Candle backend".to_string(),
-                from_type: "unknown".to_string(),
-                to_type: "CandleTensor".to_string(),
-            });
-        };
+        let tensor_data = input
+            .input_ids
+            .data_f32()
+            .ok_or_else(|| FerrumError::backend("Tensor data must be accessible as f32 slice"))?;
 
         // Convert f32 tensor data to TokenId (u32)
         let token_ids: Vec<TokenId> = tensor_data.iter()
@@ -157,18 +168,21 @@ impl ModelExecutor for CandleModelExecutor {
         // Use the model's forward_logits method for prefill
         let (logits_tensor, kv_cache) = self.model.forward_logits(&token_ids, None).await?;
 
-        // Convert to TensorRef
-        let logits_ref = Arc::new(CandleTensor {
-            data: logits_tensor.data,
-            shape: logits_tensor.shape,
-        }) as TensorRef;
+        let logits_ref = self
+            .model
+            .tensor_factory()
+            .as_ref()
+            .from_slice(&logits_tensor.data, &logits_tensor.shape, self.model.device())
+            .map_err(|e| FerrumError::backend(format!("Failed to build logits tensor: {}", e)))?;
 
-        // Convert KV cache to handle
-        let kv_handle = Arc::new(CandleKvCacheHandle {
-            sequence_length: token_ids.len(),
-            cache_data: None, // Simplified for MVP
-            num_tokens: token_ids.len(),
-        }) as Arc<dyn KvCacheHandle>;
+        // Convert KV cache snapshot to handle
+        let kv_handle = Arc::new(Self::build_kv_handle(
+            kv_cache,
+            self.model.info().num_layers,
+            self.model.info().num_heads,
+            self.model.info().hidden_size / self.model.info().num_heads,
+            self.model.device(),
+        )?) as Arc<dyn KvCacheHandle>;
 
         Ok(PrefillOutput {
             logits: logits_ref,
@@ -181,15 +195,10 @@ impl ModelExecutor for CandleModelExecutor {
         debug!("Running decode with input shape: {:?}", input.input_ids.shape());
 
         // Convert TensorRef to token IDs
-        let tensor_data = if let Some(candle_tensor) = input.input_ids.as_any().downcast_ref::<CandleTensor>() {
-            &candle_tensor.data
-        } else {
-            return Err(FerrumError::TensorConversionError {
-                message: "Expected CandleTensor for Candle backend".to_string(),
-                from_type: "unknown".to_string(),
-                to_type: "CandleTensor".to_string(),
-            });
-        };
+        let tensor_data = input
+            .input_ids
+            .data_f32()
+            .ok_or_else(|| FerrumError::backend("Tensor data must be accessible as f32 slice"))?;
 
         let token_ids: Vec<TokenId> = tensor_data.iter()
             .map(|&f| f as TokenId)
@@ -198,30 +207,30 @@ impl ModelExecutor for CandleModelExecutor {
         debug!("Decode with {} tokens", token_ids.len());
 
         // Convert KV cache handle to legacy format for now
-        let kv_cache = if let Some(candle_kv) = input.kv.as_any().downcast_ref::<CandleKvCacheHandle>() {
-            Some(ferrum_core::KVCache {
-                sequence_length: candle_kv.sequence_length,
-                data: candle_kv.cache_data.clone().unwrap_or_default(),
-            })
-        } else {
-            None
-        };
+        let kv_cache_snapshot = input
+            .kv
+            .as_any()
+            .downcast_ref::<CandleKvCacheHandle>()
+            .and_then(|handle| handle.snapshot.clone());
 
         // Use the model's forward_logits method for decode
-        let (logits_tensor, new_kv_cache) = self.model.forward_logits(&token_ids, kv_cache.as_ref()).await?;
+        let (logits_tensor, new_kv_cache) = self.model.forward_logits(&token_ids, kv_cache_snapshot.as_ref()).await?;
 
-        // Convert to TensorRef
-        let logits_ref = Arc::new(CandleTensor {
-            data: logits_tensor.data,
-            shape: logits_tensor.shape,
-        }) as TensorRef;
+        let logits_ref = self
+            .model
+            .tensor_factory()
+            .as_ref()
+            .from_slice(&logits_tensor.data, &logits_tensor.shape, self.model.device())
+            .map_err(|e| FerrumError::backend(format!("Failed to build logits tensor: {}", e)))?;
 
         // Update KV cache handle
-        let kv_handle = Arc::new(CandleKvCacheHandle {
-            sequence_length: input.kv.num_tokens() + token_ids.len(),
-            cache_data: new_kv_cache.map(|kv| kv.data),
-            num_tokens: input.kv.num_tokens() + token_ids.len(),
-        }) as Arc<dyn KvCacheHandle>;
+        let kv_handle = Arc::new(Self::build_kv_handle(
+            new_kv_cache,
+            self.model.info().num_layers,
+            self.model.info().num_heads,
+            self.model.info().hidden_size / self.model.info().num_heads,
+            self.model.device(),
+        )?) as Arc<dyn KvCacheHandle>;
 
         Ok(DecodeOutput {
             logits: logits_ref,
@@ -232,32 +241,25 @@ impl ModelExecutor for CandleModelExecutor {
     #[instrument(skip(self, input))]
     async fn forward(&self, input: &TensorRef) -> Result<TensorRef> {
         debug!("Running forward pass with input shape: {:?}", input.shape());
-        
-        // Convert TensorRef to legacy Tensor format
-        let tensor_data = if let Some(candle_tensor) = input.as_any().downcast_ref::<CandleTensor>() {
-            &candle_tensor.data
-        } else {
-            return Err(FerrumError::TensorConversionError {
-                message: "Expected CandleTensor for Candle backend".to_string(),
-                from_type: "unknown".to_string(),
-                to_type: "CandleTensor".to_string(),
-            });
-        };
+        let tensor_data = input
+            .data_f32()
+            .ok_or_else(|| FerrumError::backend("Tensor data must be accessible as f32 slice for forward"))?;
 
+        let shape = input.shape().to_vec();
         let legacy_tensor = ferrum_core::Tensor {
-            data: tensor_data.clone(),
-            shape: input.shape().to_vec(),
+            data: tensor_data.to_vec(),
+            shape,
             dtype: ferrum_core::DataType::FP32,
         };
 
-        // Use the model's forward method
-        let result_tensor = self.model.forward(&legacy_tensor).await?;
+        let result = self.model.forward(&legacy_tensor).await?;
 
-        // Convert back to TensorRef
-        let result_ref = Arc::new(CandleTensor {
-            data: result_tensor.data,
-            shape: result_tensor.shape,
-        }) as TensorRef;
+        let result_ref = self
+            .model
+            .tensor_factory()
+            .as_ref()
+            .from_slice(&result.data, &result.shape, self.model.device())
+            .map_err(|e| FerrumError::backend(format!("Failed to convert output tensor: {}", e)))?;
 
         Ok(result_ref)
     }
