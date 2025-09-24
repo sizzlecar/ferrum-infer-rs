@@ -1,5 +1,6 @@
 //! Inference pipeline implementation
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, instrument, trace, warn};
@@ -81,74 +82,49 @@ impl InferencePipeline {
         target_request_id: &ferrum_types::RequestId,
         tx: UnboundedSender<Result<StreamChunk>>,
     ) -> Result<()> {
-        // TODO: Phase 1 implementation pending: tokenize prompts, manage KV allocation, run model executor and sampling loop.
         loop {
-            // Pull next batch from scheduler
-            let batch_plan = self.components.scheduler.next_batch(self.batch_hint.clone()).await;
-            let Some(batch) = batch_plan else {
+            let Some(batch_plan) = self.components.scheduler.next_batch(self.batch_hint.clone()).await else {
                 trace!("no batch available yet");
                 tokio::task::yield_now().await;
                 continue;
             };
 
-            trace!(batch_id = %batch.batch_id, size = batch.requests.len(), "processing batch");
-            // Tokenize prompts for new requests and allocate KV
-            let mut batch_prefill_inputs = Vec::new();
-            let mut batch_targets = Vec::new();
-
-            for scheduled in &batch.requests {
-                if scheduled.request.id == *target_request_id {
-                    batch_targets.push(scheduled.request.clone());
-                }
-                // Tokenize prompt
-                let encode_result = self.components.tokenizer.encode(
-                    &scheduled.request.prompt,
-                    true,
-                )?;
-
-                let input_ids_tensor = self.create_tensor_from_tokens(&encode_result)?;
-
-                // Build PrefillInput
-                let prefill_input = PrefillInput {
-                    input_ids: input_ids_tensor,
-                    attention_mask: None,
-                    position_ids: None,
-                };
-
-                batch_prefill_inputs.push((scheduled.request.clone(), prefill_input));
-            }
-
-            if batch_prefill_inputs.is_empty() {
+            if batch_plan.is_empty() {
+                trace!(batch_id = %batch_plan.batch_id, "received empty batch");
                 continue;
             }
 
-            // Prefill stage - one request at a time for MVP
-            for (request, prefill_input) in batch_prefill_inputs.into_iter() {
-                let PrefillOutput { logits, kv } = self.components.model_executor.prefill(&prefill_input).await?;
+            trace!(batch_id = %batch_plan.batch_id, size = batch_plan.size(), "processing batch");
 
-                // Sample next token
-                let token_id = self.sample_from_logits(&logits, request.sampling_params.clone())?;
+            let prefill_inputs = self.build_prefill_inputs(&batch_plan)?;
 
-                // Stream delta text if request matches target
-                if &request.id == target_request_id {
-                    let delta = self.components.incremental_tokenizer.decode_incremental(
-                        &[],
-                        token_id,
-                    )?;
+            for (scheduled, prefill_input) in batch_plan.requests.iter().zip(prefill_inputs.into_iter()) {
+                let PrefillOutput { logits, kv_cache, .. } = self
+                    .components
+                    .model_executor
+                    .prefill(&prefill_input)
+                    .await?;
+
+                let last_logits = self.extract_last_logits(&logits)?;
+                let token_id = self.sample_from_logits(&last_logits, scheduled.request.sampling_params.clone())?;
+
+                if &scheduled.request.id == target_request_id {
+                    let delta = self
+                        .components
+                        .incremental_tokenizer
+                        .decode_incremental(&[], token_id)?;
 
                     let event = TokenEvent {
                         token_id,
                         text_delta: delta.clone(),
                     };
+                    self.send_stream_chunk(&tx, &scheduled.request, event, None, None)?;
 
-                    self.send_stream_chunk(&tx, &request, event, None, None)?;
-                }
-
-                // Decode loop for target request
-                if &request.id == target_request_id {
-                    self.decode_loop(request.clone(), token_id, kv, tx.clone()).await?;
+                    self.decode_loop(scheduled.request.clone(), token_id, kv_cache, tx.clone()).await?;
                     return Ok(());
                 }
+
+                // TODO: 对于非目标请求，将初始 token 推入队列或存入状态，等待批次协同。
             }
         }
     }
@@ -163,10 +139,14 @@ impl InferencePipeline {
     ) -> Result<()> {
         let mut tokens = vec![last_token];
         let mut text_acc = String::new();
+        let mut token_frequencies: HashMap<TokenId, usize> = HashMap::new();
+        *token_frequencies.entry(last_token).or_insert(0) += 1;
+
+        let mut stop_reason = None;
 
         for step in 0..request.sampling_params.max_tokens {
             // Prepare input tensor for decode step (batch size 1)
-            let decode_tensor = self.create_tensor_from_tokens(&tokens)?;
+            let decode_tensor = self.create_tensor_from_tokens(&tokens[tokens.len() - 1..])?;
 
             let decode_input = DecodeInput {
                 input_ids: decode_tensor,
@@ -177,13 +157,38 @@ impl InferencePipeline {
             let DecodeOutput { logits, kv: new_kv } = self.components.model_executor.decode(&decode_input).await?;
             kv = new_kv;
 
-            let token_id = self.sample_from_logits(&logits, request.sampling_params.clone())?;
-            tokens.push(token_id);
+            let mut logits_buf = logits
+                .data_f32()
+                .ok_or_else(|| FerrumError::backend("Logits tensor must expose f32 data"))?
+                .to_vec();
 
-            let delta = self.components.incremental_tokenizer.decode_incremental(
-                tokens.iter().take(tokens.len() - 1).collect::<Vec<_>>().as_slice(),
-                token_id,
-            )?;
+            let mut ctx = SamplingContext::new(
+                step + 1,
+                &request.sampling_params,
+                &mut logits_buf,
+                &tokens,
+                &token_frequencies,
+                logits_buf.len(),
+            );
+
+            for processor in &self.components.logits_processors {
+                processor.process(&mut ctx)?;
+            }
+
+            let mut rng = if let Some(seed) = request.sampling_params.seed {
+                StdRng::seed_from_u64(seed + step as u64 + 1)
+            } else {
+                StdRng::from_entropy()
+            };
+
+            let token_id = self.components.sampler.sample_with_context(&ctx, &mut rng)?;
+            tokens.push(token_id);
+            *token_frequencies.entry(token_id).or_insert(0) += 1;
+
+            let delta = self
+                .components
+                .incremental_tokenizer
+                .decode_incremental(tokens.iter().take(tokens.len() - 1).collect::<Vec<_>>().as_slice(), token_id)?;
             text_acc.push_str(&delta);
 
             let event = TokenEvent {
@@ -194,18 +199,24 @@ impl InferencePipeline {
             self.send_stream_chunk(&tx, &request, event, None, None)?;
 
             if self.is_stop_token(token_id, &request.sampling_params) {
-                let response = self.build_final_response(request.clone(), text_acc.clone(), tokens.clone(), FinishReason::Stop);
-                self.send_completion(&tx, response)?;
-                return Ok(());
+                stop_reason = Some(FinishReason::Stop);
+                break;
+            }
+
+            if self.contains_stop_sequence(&text_acc, &request.sampling_params.stop_sequences) {
+                stop_reason = Some(FinishReason::Stop);
+                break;
             }
 
             if step + 1 >= request.sampling_params.max_tokens {
-                let response = self.build_final_response(request.clone(), text_acc.clone(), tokens.clone(), FinishReason::Length);
-                self.send_completion(&tx, response)?;
-                return Ok(());
+                stop_reason = Some(FinishReason::Length);
+                break;
             }
         }
 
+        let reason = stop_reason.unwrap_or(FinishReason::Stop);
+        let response = self.build_final_response(request.clone(), text_acc.clone(), tokens.clone(), reason);
+        self.send_completion(&tx, response)?;
         Ok(())
     }
 
@@ -241,7 +252,7 @@ impl InferencePipeline {
             &sampling_params,
             &mut logits_buf,
             &[],
-            &std::collections::HashMap::new(),
+            &HashMap::new(),
             logits_buf.len(),
         );
 
@@ -305,6 +316,40 @@ impl InferencePipeline {
             created_at: chrono::Utc::now(),
             metadata: request.metadata,
         }
+    }
+
+    fn build_prefill_inputs(&self, batch_plan: &BatchPlan) -> Result<Vec<PrefillInput>> {
+        batch_plan
+            .requests
+            .iter()
+            .map(|scheduled| {
+                let token_ids = self.components.tokenizer.encode(&scheduled.request.prompt, true)?;
+                let input_tensor = self.create_tensor_from_tokens(&token_ids)?;
+                Ok(PrefillInput {
+                    input_ids: input_tensor,
+                    attention_mask: None,
+                    position_ids: None,
+                })
+            })
+            .collect()
+    }
+
+    fn extract_last_logits(&self, logits: &ferrum_interfaces::TensorRef) -> Result<ferrum_interfaces::TensorRef> {
+        let shape = logits.shape();
+        if shape.len() <= 2 {
+            return Ok(logits.clone());
+        }
+
+        let seq_len = shape[1];
+        if seq_len == 0 {
+            return Err(FerrumError::backend("Empty logits sequence"));
+        }
+
+        logits.view(&[0, seq_len - 1, 0], &[shape[0], seq_len, shape[2]])
+    }
+
+    fn contains_stop_sequence(&self, text: &str, stop_sequences: &[String]) -> bool {
+        stop_sequences.iter().any(|seq| !seq.is_empty() && text.ends_with(seq))
     }
 }
 
