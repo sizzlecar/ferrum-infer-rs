@@ -73,6 +73,7 @@
 - 配置与指标类型已集中到 `ferrum-types`，`ferrum-interfaces` 正在清理重复结构（当前 `cargo check` 因接口重复仍被阻塞）。
 - `TensorFactory::from_slice` 需要改为非泛型签名以支持 dyn trait；Candle 实现同步调整中。
 - `HealthStatus`/`ComponentHealth` 已规划统一到基础层，默认健康构造函数待在 `ferrum-types` 中补齐。
+- 已完成：移动 `EngineMetrics`、`DiagnosticsReport`、`SpeculationConfig` 等结构到 `ferrum-types`，接口侧仅保留 type alias 并使用共享实现（`cargo check` 仍因 SpeculationConfig 类型缺失等问题阻塞，后续补齐）。
 
 ---
 
