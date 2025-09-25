@@ -31,7 +31,7 @@ pub use kv_cache::{KvCacheHandle, KvCacheManager, BlockTable, AllocationRequest}
 pub use model_executor::{ModelExecutor, PrefillInput, PrefillOutput, DecodeInput, DecodeOutput};
 pub use backend::{ComputeBackend, WeightLoader, BackendCapabilities};
 pub use scheduler::{Scheduler as SchedulerInterface, BatchPlan, BatchHint};
-pub use engine::{InferenceEngine, EngineStatus as EngineStatusInterface};
+pub use engine::InferenceEngine;
 pub use memory::{DeviceMemoryManager, MemoryHandle, StreamHandle};
 pub use model_builder::{ModelBuilder, BuildOptions};
 
@@ -50,10 +50,11 @@ pub use ferrum_types::{
     // Model types
     ModelInfo, ModelType, ModelSource,
     // Config types - use fully qualified names to avoid conflicts
-    config::EngineConfig as TypesEngineConfig,
-    config::SchedulerConfig as TypesSchedulerConfig,
-    config::BackendConfig as TypesBackendConfig,
-    config::TokenizerConfig as TypesTokenizerConfig,
+    config::EngineConfig,
+    config::SchedulerConfig,
+    config::BackendConfig,
+    config::TokenizerConfig,
     // Metrics
-    MemoryUsage, SchedulerStats,
+    MemoryUsage, SchedulerStats, EngineStatus, EngineMetrics, HealthStatus,
+    ComponentStatus, ComponentHealth,
 };

@@ -1,8 +1,9 @@
 //! Metrics and observability types
 
-use crate::{ids::*, RequestId};
+use crate::{ids::*, RequestId, EngineConfig, Device};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Engine status information
@@ -290,7 +291,7 @@ pub struct DiskMetrics {
 }
 
 /// Error statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ErrorStats {
     /// Total number of errors
     pub total_errors: u64,
@@ -317,19 +318,74 @@ pub struct ErrorEvent {
     pub context: HashMap<String, serde_json::Value>,
 }
 
+/// Aggregated engine metrics
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EngineMetrics {
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub avg_request_latency_ms: f64,
+    pub p95_request_latency_ms: f64,
+    pub p99_request_latency_ms: f64,
+    pub throughput_rps: f32,
+    pub tokens_per_second: f32,
+    pub queue_metrics: QueueMetrics,
+    pub resource_utilization: ResourceMetrics,
+    pub error_stats: ErrorStats,
+    pub performance_breakdown: PerformanceBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueueMetrics {
+    pub current_queue_length: usize,
+    pub avg_queue_wait_time_ms: f64,
+    pub queue_throughput_rps: f32,
+    pub queue_rejection_rate: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceMetrics {
+    pub cpu_utilization: f32,
+    pub memory_utilization: f32,
+    pub gpu_utilization: Option<f32>,
+    pub network_utilization: f32,
+    pub disk_utilization: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PerformanceBreakdown {
+    pub tokenization_time_ms: f64,
+    pub model_execution_time_ms: f64,
+    pub sampling_time_ms: f64,
+    pub scheduling_time_ms: f64,
+    pub memory_operations_time_ms: f64,
+    pub other_overhead_time_ms: f64,
+}
+
 /// Health check status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatus {
     /// Overall health status
     pub status: HealthStatusType,
     /// Individual component health
-    pub components: HashMap<String, ComponentHealth>,
+    pub component_status: ComponentStatus,
     /// Last health check time
     pub last_check: DateTime<Utc>,
 }
 
+impl HealthStatus {
+    /// Construct a healthy status with default component health
+    pub fn healthy() -> Self {
+        Self {
+            status: HealthStatusType::Healthy,
+            component_status: ComponentStatus::healthy(),
+            last_check: Utc::now(),
+        }
+    }
+}
+
 /// Health status types
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HealthStatusType {
     /// System is healthy
     Healthy,
@@ -339,7 +395,7 @@ pub enum HealthStatusType {
     Unhealthy,
 }
 
-/// Individual component health
+/// Individual component health snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentHealth {
     /// Component health status
@@ -350,4 +406,225 @@ pub struct ComponentHealth {
     pub metrics: HashMap<String, f64>,
     /// Last check time
     pub last_check: DateTime<Utc>,
+}
+
+impl ComponentHealth {
+    /// Construct a healthy component entry with default state
+    pub fn healthy(component: &str) -> Self {
+        Self {
+            status: HealthStatusType::Healthy,
+            message: format!("{} healthy", component),
+            metrics: HashMap::new(),
+            last_check: Utc::now(),
+        }
+    }
+}
+
+/// Aggregated component health map
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentStatus {
+    pub scheduler: ComponentHealth,
+    pub model_executor: ComponentHealth,
+    pub tokenizer: ComponentHealth,
+    pub kv_cache: ComponentHealth,
+    pub memory_manager: ComponentHealth,
+    pub backend: ComponentHealth,
+}
+
+impl ComponentStatus {
+    /// Construct a fully healthy component status snapshot
+    pub fn healthy() -> Self {
+        Self {
+            scheduler: ComponentHealth::healthy("scheduler"),
+            model_executor: ComponentHealth::healthy("model"),
+            tokenizer: ComponentHealth::healthy("tokenizer"),
+            kv_cache: ComponentHealth::healthy("kv_cache"),
+            memory_manager: ComponentHealth::healthy("memory"),
+            backend: ComponentHealth::healthy("backend"),
+        }
+    }
+
+    /// Iterate over component entries for aggregation helpers
+    pub fn entries(&self) -> [&ComponentHealth; 6] {
+        [
+            &self.scheduler,
+            &self.model_executor,
+            &self.tokenizer,
+            &self.kv_cache,
+            &self.memory_manager,
+            &self.backend,
+        ]
+    }
+}
+
+/// Component health status alias for backwards compatibility
+pub type ComponentHealthStatus = HealthStatusType;
+
+/// Diagnostics report aggregating engine state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticsReport {
+    /// Engine configuration snapshot
+    pub config_snapshot: EngineConfig,
+    /// Current metrics
+    pub current_metrics: EngineMetrics,
+    /// Resource usage details
+    pub resource_usage: DetailedResourceUsage,
+    /// Performance analysis
+    pub performance_analysis: PerformanceAnalysis,
+    /// Component diagnostics
+    pub component_diagnostics: HashMap<String, Value>,
+    /// System information
+    pub system_info: SystemInfo,
+}
+
+/// Detailed resource usage information
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DetailedResourceUsage {
+    pub memory_by_component: HashMap<String, u64>,
+    pub cpu_by_thread: HashMap<String, f32>,
+    pub gpu_memory_details: Option<GpuMemoryDetails>,
+    pub network_io_details: NetworkIODetails,
+}
+
+/// GPU memory usage details
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GpuMemoryDetails {
+    pub total_memory: u64,
+    pub used_memory: u64,
+    pub memory_by_type: HashMap<String, u64>,
+    pub large_allocations: Vec<AllocationInfo>,
+}
+
+/// Allocation detail record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllocationInfo {
+    pub size: u64,
+    pub allocation_type: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Network I/O details
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkIODetails {
+    pub bytes_received_per_sec: u64,
+    pub bytes_sent_per_sec: u64,
+    pub connection_count: usize,
+    pub request_rate_per_sec: f32,
+}
+
+/// Performance analysis report
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PerformanceAnalysis {
+    pub bottlenecks: Vec<PerformanceBottleneck>,
+    pub recommendations: Vec<PerformanceRecommendation>,
+    pub trends: PerformanceTrends,
+}
+
+/// Performance bottleneck metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceBottleneck {
+    pub bottleneck_type: String,
+    pub severity: f32,
+    pub description: String,
+    pub performance_impact: f32,
+}
+
+/// Optimization recommendation record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceRecommendation {
+    pub category: String,
+    pub description: String,
+    pub expected_impact: f32,
+    pub complexity: f32,
+}
+
+/// Performance trend indicators
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PerformanceTrends {
+    pub latency_trend: TrendDirection,
+    pub throughput_trend: TrendDirection,
+    pub error_rate_trend: TrendDirection,
+    pub resource_utilization_trend: TrendDirection,
+}
+
+/// Trend direction enum
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TrendDirection {
+    Improving,
+    Stable,
+    Degrading,
+    Volatile,
+}
+
+impl Default for TrendDirection {
+    fn default() -> Self {
+        TrendDirection::Stable
+    }
+}
+
+/// System information snapshot
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SystemInfo {
+    pub os: String,
+    pub cpu_info: String,
+    pub total_memory: u64,
+    pub devices: Vec<Device>,
+    pub runtime_info: RuntimeInfo,
+}
+
+/// Runtime information block
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeInfo {
+    pub rust_version: String,
+    pub engine_version: String,
+    pub build_info: BuildInfo,
+    pub feature_flags: Vec<String>,
+}
+
+/// Build information metadata
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BuildInfo {
+    pub build_timestamp: String,
+    pub git_commit: Option<String>,
+    pub build_config: String,
+    pub compiler_flags: Vec<String>,
+}
+
+/// Engine state export for diagnostics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineState {
+    pub config: EngineConfig,
+    pub metrics: EngineMetrics,
+    pub component_states: HashMap<String, Value>,
+    pub active_requests: Vec<EngineRequestState>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Request state for debugging
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineRequestState {
+    pub request_id: RequestId,
+    pub current_phase: String,
+    pub progress: EngineRequestProgress,
+    pub allocated_resources: HashMap<String, Value>,
+}
+
+/// Request progress summary
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EngineRequestProgress {
+    pub tokens_processed: usize,
+    pub tokens_remaining: usize,
+    pub elapsed_time_ms: u64,
+    pub estimated_remaining_ms: Option<u64>,
+}
+
+/// Warmup result structure
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WarmupResult {
+    pub requests_processed: usize,
+    pub total_time_ms: u64,
+    pub avg_latency_ms: f64,
+    pub memory_allocated_bytes: u64,
+    pub success: bool,
+    pub issues: Vec<String>,
 }

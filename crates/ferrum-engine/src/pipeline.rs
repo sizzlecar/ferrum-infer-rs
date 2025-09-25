@@ -227,7 +227,7 @@ impl InferencePipeline {
             .components
             .tensor_factory
             .as_ref()
-            .from_slice(&data, &shape, ferrum_types::Device::Cuda(0))
+            .from_slice(&data, &shape, ferrum_types::DataType::FP32, ferrum_types::Device::CUDA(0))
             .map_err(|e| FerrumError::backend(format!("Failed to build input tensor: {}", e)))
     }
 

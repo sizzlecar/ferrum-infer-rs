@@ -1,6 +1,6 @@
 //! Configuration types for Ferrum components
 
-use crate::{DataType, Device, ModelId, ModelInfo, SamplingParams};
+use crate::{DataType, Device, ModelId, ModelInfo, SamplingParams, SamplingPresets};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
@@ -320,39 +320,6 @@ pub enum PaddingStrategy {
 }
 
 /// Sampling configuration presets
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SamplingPresets {
-    /// Available presets
-    pub presets: HashMap<String, SamplingParams>,
-}
-
-impl Default for SamplingPresets {
-    fn default() -> Self {
-        let mut presets = HashMap::new();
-        presets.insert("greedy".to_string(), SamplingParams::greedy());
-        presets.insert(
-            "creative".to_string(),
-            SamplingParams {
-                temperature: 1.2,
-                top_p: 0.9,
-                top_k: Some(50),
-                repetition_penalty: 1.1,
-                ..Default::default()
-            },
-        );
-        presets.insert(
-            "precise".to_string(),
-            SamplingParams {
-                temperature: 0.3,
-                top_p: 0.95,
-                top_k: Some(20),
-                repetition_penalty: 1.05,
-                ..Default::default()
-            },
-        );
-        Self { presets }
-    }
-}
 
 /// Security configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
