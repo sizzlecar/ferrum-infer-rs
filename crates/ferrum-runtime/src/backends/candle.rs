@@ -186,6 +186,10 @@ impl Default for CandleTensorFactory {
 }
 
 impl TensorFactory for CandleTensorFactory {
+    fn from_slice(&self, data: &[f32], shape: &[usize], dtype: DataType, device: Device) -> Result<TensorRef> {
+        self.create_tensor(data, shape, dtype, &device)
+    }
+
     fn create_tensor(
         &self,
         data: &[f32],
@@ -195,10 +199,10 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
+
         let tensor = candle_core::Tensor::from_slice(data, shape, &candle_device)?
             .to_dtype(candle_dtype)?;
-        
+
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 

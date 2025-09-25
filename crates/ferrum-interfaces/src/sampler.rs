@@ -236,7 +236,7 @@ impl LogitsProcessor for TopKProcessor {
             let threshold = ctx.logits[indices[self.k - 1]];
             
             // Mask tokens below threshold
-            for (i, logit) in ctx.logits.iter_mut().enumerate() {
+            for logit in ctx.logits.iter_mut() {
                 if *logit < threshold {
                     *logit = f32::NEG_INFINITY;
                 }

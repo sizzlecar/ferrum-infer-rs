@@ -1,6 +1,7 @@
 //! Sampling and generation parameters
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Sampling parameters for generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +117,40 @@ pub struct MirostatParams {
     pub tau: f32,
     /// Learning rate
     pub eta: f32,
+}
+
+/// Sampling presets
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingPresets {
+    pub presets: HashMap<String, SamplingParams>,
+}
+
+impl Default for SamplingPresets {
+    fn default() -> Self {
+        let mut presets = HashMap::new();
+        presets.insert("greedy".to_string(), SamplingParams::greedy());
+        presets.insert(
+            "creative".to_string(),
+            SamplingParams {
+                temperature: 1.2,
+                top_p: 0.9,
+                top_k: Some(50),
+                repetition_penalty: 1.1,
+                ..Default::default()
+            },
+        );
+        presets.insert(
+            "precise".to_string(),
+            SamplingParams {
+                temperature: 0.3,
+                top_p: 0.95,
+                top_k: Some(20),
+                repetition_penalty: 1.05,
+                ..Default::default()
+            },
+        );
+        Self { presets }
+    }
 }
 
 /// Request priority levels

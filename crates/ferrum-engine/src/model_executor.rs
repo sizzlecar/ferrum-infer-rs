@@ -110,7 +110,12 @@ impl CandleModelExecutor {
             .map(|layer| {
                 // Pack placeholder data into tensor
                 let tensor = ferrum_runtime::TensorFactoryHandle::default()
-                    .from_slice(&layer, &[snapshot.sequence_length, head_dim], device)
+                    .from_slice(
+                        &layer,
+                        &[snapshot.sequence_length, head_dim],
+                        ferrum_types::DataType::FP32,
+                        device,
+                    )
                     .map_err(|e| FerrumError::backend(format!("Failed to build key cache tensor: {}", e)))?;
                 Ok(Some(tensor))
             })
@@ -121,7 +126,12 @@ impl CandleModelExecutor {
             .into_iter()
             .map(|layer| {
                 let tensor = ferrum_runtime::TensorFactoryHandle::default()
-                    .from_slice(&layer, &[snapshot.sequence_length, head_dim], device)
+                    .from_slice(
+                        &layer,
+                        &[snapshot.sequence_length, head_dim],
+                        ferrum_types::DataType::FP32,
+                        device,
+                    )
                     .map_err(|e| FerrumError::backend(format!("Failed to build value cache tensor: {}", e)))?;
                 Ok(Some(tensor))
             })
@@ -172,7 +182,12 @@ impl ModelExecutor for CandleModelExecutor {
             .model
             .tensor_factory()
             .as_ref()
-            .from_slice(&logits_tensor.data, &logits_tensor.shape, self.model.device())
+            .from_slice(
+                &logits_tensor.data,
+                &logits_tensor.shape,
+                self.model.info().dtype,
+                self.model.device(),
+            )
             .map_err(|e| FerrumError::backend(format!("Failed to build logits tensor: {}", e)))?;
 
         // Convert KV cache snapshot to handle
@@ -220,7 +235,12 @@ impl ModelExecutor for CandleModelExecutor {
             .model
             .tensor_factory()
             .as_ref()
-            .from_slice(&logits_tensor.data, &logits_tensor.shape, self.model.device())
+            .from_slice(
+                &logits_tensor.data,
+                &logits_tensor.shape,
+                self.model.info().dtype,
+                self.model.device(),
+            )
             .map_err(|e| FerrumError::backend(format!("Failed to build logits tensor: {}", e)))?;
 
         // Update KV cache handle
@@ -258,7 +278,12 @@ impl ModelExecutor for CandleModelExecutor {
             .model
             .tensor_factory()
             .as_ref()
-            .from_slice(&result.data, &result.shape, self.model.device())
+            .from_slice(
+                &result.data,
+                &result.shape,
+                self.model.info().dtype,
+                self.model.device(),
+            )
             .map_err(|e| FerrumError::backend(format!("Failed to convert output tensor: {}", e)))?;
 
         Ok(result_ref)
