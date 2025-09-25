@@ -618,6 +618,14 @@ pub struct EngineRequestProgress {
     pub estimated_remaining_ms: Option<u64>,
 }
 
+/// Speculation configuration for speculative decoding
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculationConfig {
+    pub speculation_depth: usize,
+    pub acceptance_threshold: f32,
+    pub draft_model_config: Option<crate::ModelConfig>,
+}
+
 /// Warmup result structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WarmupResult {
@@ -627,4 +635,30 @@ pub struct WarmupResult {
     pub memory_allocated_bytes: u64,
     pub success: bool,
     pub issues: Vec<String>,
+}
+
+/// Hardware constraints for recommendations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardwareConstraints {
+    pub available_devices: Vec<Device>,
+    pub total_memory: u64,
+    pub expected_request_rate: f32,
+    pub request_characteristics: RequestCharacteristics,
+}
+
+/// Request characteristics summary
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestCharacteristics {
+    pub avg_input_tokens: usize,
+    pub avg_output_tokens: usize,
+    pub typical_batch_size: usize,
+    pub latency_requirements: LatencyRequirements,
+}
+
+/// Latency requirements for configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyRequirements {
+    pub target_p95_latency_ms: u64,
+    pub target_p99_latency_ms: u64,
+    pub max_latency_ms: u64,
 }
