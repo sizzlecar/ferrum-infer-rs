@@ -5,7 +5,7 @@
 
 use crate::types::*;
 use async_trait::async_trait;
-use ferrum_core::{BlockId, RequestId, Result};
+use ferrum_types::{BlockId, RequestId, Result};
 
 /// Main cache manager trait for KV cache management
 #[async_trait]

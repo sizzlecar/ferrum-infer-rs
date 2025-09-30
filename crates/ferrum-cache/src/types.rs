@@ -2,7 +2,7 @@
 //!
 //! This module defines the core types used throughout the cache system.
 
-use ferrum_core::{BlockId, ModelId, RequestId};
+use ferrum_types::{BlockId, ModelId, RequestId};
 use serde::{Deserialize, Serialize};
 
 /// Cache block containing KV cache data
