@@ -50,22 +50,22 @@ impl Default for LRUEviction {
 impl EvictionPolicy for LRUEviction {
     fn record_access(&mut self, request_id: RequestId) {
         // Remove from current position if exists
-        if let Some(pos) = self.access_order.iter().position(|&id| id == request_id) {
+        if let Some(pos) = self.access_order.iter().position(|id| *id == request_id) {
             self.access_order.remove(pos);
         }
 
         // Add to back (most recent)
-        self.access_order.push_back(request_id);
+        self.access_order.push_back(request_id.clone());
         self.access_times.insert(request_id, Instant::now());
     }
 
     fn select_eviction_candidates(&mut self, count: usize) -> Vec<RequestId> {
         // Return oldest requests (from front of queue)
-        self.access_order.iter().take(count).copied().collect()
+        self.access_order.iter().take(count).cloned().collect()
     }
 
     fn remove_request(&mut self, request_id: RequestId) {
-        if let Some(pos) = self.access_order.iter().position(|&id| id == request_id) {
+        if let Some(pos) = self.access_order.iter().position(|id| *id == request_id) {
             self.access_order.remove(pos);
         }
         self.access_times.remove(&request_id);
@@ -110,18 +110,18 @@ impl EvictionPolicy for FIFOEviction {
     fn record_access(&mut self, request_id: RequestId) {
         // Only record if not already present (first access only)
         if !self.arrival_times.contains_key(&request_id) {
-            self.arrival_order.push_back(request_id);
+            self.arrival_order.push_back(request_id.clone());
             self.arrival_times.insert(request_id, Instant::now());
         }
     }
 
     fn select_eviction_candidates(&mut self, count: usize) -> Vec<RequestId> {
         // Return oldest arrivals (from front of queue)
-        self.arrival_order.iter().take(count).copied().collect()
+        self.arrival_order.iter().take(count).cloned().collect()
     }
 
     fn remove_request(&mut self, request_id: RequestId) {
-        if let Some(pos) = self.arrival_order.iter().position(|&id| id == request_id) {
+        if let Some(pos) = self.arrival_order.iter().position(|id| *id == request_id) {
             self.arrival_order.remove(pos);
         }
         self.arrival_times.remove(&request_id);
@@ -168,7 +168,7 @@ impl Default for ClockEviction {
 impl EvictionPolicy for ClockEviction {
     fn record_access(&mut self, request_id: RequestId) {
         // Set reference bit
-        self.reference_bits.insert(request_id, true);
+        self.reference_bits.insert(request_id.clone(), true);
 
         // Add to list if not present
         if !self.requests.contains(&request_id) {
@@ -186,7 +186,7 @@ impl EvictionPolicy for ClockEviction {
                 break;
             }
 
-            let request_id = self.requests[self.clock_hand];
+            let request_id = self.requests[self.clock_hand].clone();
             let referenced = self
                 .reference_bits
                 .get(&request_id)
@@ -198,7 +198,7 @@ impl EvictionPolicy for ClockEviction {
                 self.reference_bits.insert(request_id, false);
             } else {
                 // Select for eviction
-                candidates.push(request_id);
+                candidates.push(request_id.clone());
             }
 
             // Advance clock hand
@@ -210,7 +210,7 @@ impl EvictionPolicy for ClockEviction {
     }
 
     fn remove_request(&mut self, request_id: RequestId) {
-        if let Some(pos) = self.requests.iter().position(|&id| id == request_id) {
+        if let Some(pos) = self.requests.iter().position(|id| *id == request_id) {
             self.requests.remove(pos);
 
             // Adjust clock hand if needed

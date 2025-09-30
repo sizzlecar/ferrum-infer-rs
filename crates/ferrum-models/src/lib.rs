@@ -6,6 +6,7 @@
 
 pub mod builder;
 pub mod definition;
+pub mod executor;
 pub mod registry;
 pub mod source;
 pub mod tokenizer;
@@ -13,10 +14,11 @@ pub mod weights;
 
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
-pub use registry::{ModelAlias, ModelDiscoveryEntry, ModelRegistry};
+pub use executor::StubModelExecutor;
+pub use registry::{ModelDiscoveryEntry, ModelRegistry};
 pub use source::{ModelFormat, ModelSourceConfig, ModelSourceResolver, ResolvedModelSource};
 pub use tokenizer::{TokenizerFactory, TokenizerHandle};
-pub use weights::{default_weight_loader, WeightFormat, WeightLoaderHandle};
+pub use weights::{default_weight_loader, StubWeightLoader, WeightLoaderHandle};
 
 pub use ferrum_interfaces::{ModelBuilder, ModelExecutor, WeightLoader};
 pub use ferrum_types::{ModelConfig, ModelInfo, ModelType, Result};

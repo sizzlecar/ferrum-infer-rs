@@ -87,7 +87,7 @@ impl DefaultEngineFactory {
             enable_custom = config.sampling.enable_custom_processors
         );
         // Create default greedy sampler
-        let sampler = ferrum_sampler::implementations::GreedySampler::new();
+        let sampler = ferrum_sampler::sampler_from_params(params);
         Ok(Arc::new(sampler))
     }
 

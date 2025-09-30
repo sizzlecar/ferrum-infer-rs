@@ -146,9 +146,10 @@ impl DefaultBlockTable {
 impl From<DefaultBlockTable> for BlockTable {
     fn from(table: DefaultBlockTable) -> Self {
         BlockTable {
-            physical: table.physical,
+            physical_blocks: table.physical,
             logical_to_physical: table.logical_to_physical,
-            seq_len: table.seq_len,
+            sequence_length: table.seq_len,
+            block_size: 16, // Default block size
         }
     }
 }
@@ -156,9 +157,9 @@ impl From<DefaultBlockTable> for BlockTable {
 impl From<BlockTable> for DefaultBlockTable {
     fn from(table: BlockTable) -> Self {
         Self {
-            physical: table.physical,
-            logical_to_physical: table.logical_to_physical,
-            seq_len: table.seq_len,
+            physical: table.physical_blocks.iter().copied().collect(),
+            logical_to_physical: table.logical_to_physical.iter().copied().collect(),
+            seq_len: table.sequence_length,
         }
     }
 }

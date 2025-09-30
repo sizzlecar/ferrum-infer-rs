@@ -54,7 +54,7 @@ impl FifoQueue {
         if let Some(pos) = self
             .requests
             .iter()
-            .position(|req| &req.request_id == request_id)
+            .position(|req| &req.id == request_id)
         {
             self.requests.remove(pos)
         } else {
@@ -66,14 +66,14 @@ impl FifoQueue {
     pub fn get(&self, request_id: &RequestId) -> Option<&InferenceRequest> {
         self.requests
             .iter()
-            .find(|req| &req.request_id == request_id)
+            .find(|req| &req.id == request_id)
     }
 
     /// Get mutable reference to request by ID
     pub fn get_mut(&mut self, request_id: &RequestId) -> Option<&mut InferenceRequest> {
         self.requests
             .iter_mut()
-            .find(|req| &req.request_id == request_id)
+            .find(|req| &req.id == request_id)
     }
 
     /// Clear all requests
@@ -105,7 +105,7 @@ pub struct QueueStats {
 pub struct PriorityDistribution {
     pub critical: usize,
     pub high: usize,
-    pub medium: usize,
+    pub normal: usize,
     pub low: usize,
 }
 
@@ -121,7 +121,7 @@ impl PriorityDistribution {
             match request.priority {
                 Priority::Critical => dist.critical += 1,
                 Priority::High => dist.high += 1,
-                Priority::Medium => dist.medium += 1,
+                Priority::Normal => dist.normal += 1,
                 Priority::Low => dist.low += 1,
             }
         }
@@ -131,7 +131,7 @@ impl PriorityDistribution {
 
     /// Get total count
     pub fn total(&self) -> usize {
-        self.critical + self.high + self.medium + self.low
+        self.critical + self.high + self.normal + self.low
     }
 
     /// Get percentage for each priority
@@ -144,7 +144,7 @@ impl PriorityDistribution {
         (
             self.critical as f32 / total,
             self.high as f32 / total,
-            self.medium as f32 / total,
+            self.normal as f32 / total,
             self.low as f32 / total,
         )
     }

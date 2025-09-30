@@ -95,7 +95,7 @@ impl Block {
     /// Decrement reference count
     pub fn remove_ref(&mut self) -> Result<()> {
         if self.ref_count == 0 {
-            return Err(FerrumError::invalid_state(
+            return Err(FerrumError::backend(
                 "Cannot remove reference from block with zero ref count",
             ));
         }

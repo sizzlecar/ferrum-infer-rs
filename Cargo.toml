@@ -14,7 +14,6 @@ members = [
     # Existing crates (to be refactored)
     "crates/ferrum-engine",
     "crates/ferrum-models",
-    "crates/ferrum-cache",
     "crates/ferrum-server",
     "crates/ferrum-cli",
 ]
@@ -131,7 +130,6 @@ ferrum-kv = { path = "crates/ferrum-kv" }
 # Internal crates - Existing crates (to be refactored)
 ferrum-engine = { path = "crates/ferrum-engine" }
 ferrum-models = { path = "crates/ferrum-models" }
-ferrum-cache = { path = "crates/ferrum-cache" }
 ferrum-server = { path = "crates/ferrum-server" }
 ferrum-cli = { path = "crates/ferrum-cli" }
 

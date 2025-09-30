@@ -14,7 +14,6 @@ path = "src/main.rs"
 ferrum-types = { workspace = true }
 ferrum-engine = { workspace = true }
 ferrum-models = { workspace = true }
-ferrum-cache = { workspace = true }
 ferrum-runtime = { workspace = true }
 ferrum-scheduler = { workspace = true }
 ferrum-server = { workspace = true }

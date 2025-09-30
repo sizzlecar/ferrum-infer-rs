@@ -323,7 +323,7 @@ impl DeviceMemoryManager for MemoryPool {
                 MemoryHandleInfo {
                     handle: block.handle,
                     size: block.size,
-                    device: self.device,
+                    device: self.device.clone(),
                     alignment: 256, // Default alignment
                     allocated_at: block.allocated_at,
                     is_mapped: false,

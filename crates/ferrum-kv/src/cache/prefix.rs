@@ -84,7 +84,7 @@ impl CachedPrefix {
     /// Remove reference
     pub fn remove_ref(&mut self) -> Result<()> {
         if self.ref_count == 0 {
-            return Err(FerrumError::invalid_state(
+            return Err(FerrumError::invalid_parameter(
                 "Cannot remove ref from zero-ref prefix",
             ));
         }
