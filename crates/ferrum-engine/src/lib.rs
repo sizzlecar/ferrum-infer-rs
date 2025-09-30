@@ -21,36 +21,34 @@
 //! - **Batch Processing**: Dynamic continuous batching for throughput
 //! - **Pipeline Optimization**: Prefill→decode loops with minimal overhead
 
-pub mod engine;
-pub mod pipeline;
 pub mod coordinator;
+pub mod engine;
 pub mod factory;
+pub mod pipeline;
 
 // Re-exports of interfaces from ferrum-interfaces
 pub use ferrum_interfaces::{
-    InferenceEngine as InferenceEngineInterface,
-    EngineStatus,
-    StreamChunk,
+    EngineStatus, InferenceEngine as InferenceEngineInterface, StreamChunk,
 };
 
 pub use ferrum_types::{
-    Result, InferenceRequest, InferenceResponse, RequestId, BatchId,
-    StreamingConfig, FerrumError, EngineConfig,
+    BatchId, EngineConfig, FerrumError, InferenceRequest, InferenceResponse, RequestId, Result,
+    StreamingConfig,
 };
 
 // Re-exports from implementation crates
-pub use ferrum_scheduler::{Scheduler, BatchPlan};
-pub use ferrum_tokenizer::{Tokenizer, IncrementalTokenizer};
-pub use ferrum_sampler::{Sampler, LogitsProcessor};
 pub use ferrum_kv::KvCacheManager;
 pub use ferrum_models::{ModelBuilder, WeightLoader};
 pub use ferrum_runtime::{ComputeBackend, TensorFactory};
+pub use ferrum_sampler::{LogitsProcessor, Sampler};
+pub use ferrum_scheduler::{BatchPlan, Scheduler};
+pub use ferrum_tokenizer::{IncrementalTokenizer, Tokenizer};
 
 // Re-exports of implementations
-pub use engine::*;
-pub use pipeline::*;
 pub use coordinator::*;
+pub use engine::*;
 pub use factory::*;
+pub use pipeline::*;
 
 /// Create default inference engine with MVP configuration
 pub async fn create_default_engine(

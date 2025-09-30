@@ -1,13 +1,13 @@
 //! Main inference engine implementation
 
-use ferrum_types::{Result, InferenceRequest, InferenceResponse, FerrumError, EngineConfig};
-use ferrum_interfaces::{InferenceEngine, EngineStatus, StreamChunk};
-use async_trait::async_trait;
-use std::sync::Arc;
-use tracing::info;
-use tokio_stream::wrappers::ReceiverStream;
-use futures::StreamExt;
 use crate::pipeline::{InferencePipeline, PipelineComponents};
+use async_trait::async_trait;
+use ferrum_interfaces::{EngineStatus, InferenceEngine, StreamChunk};
+use ferrum_types::{EngineConfig, FerrumError, InferenceRequest, InferenceResponse, Result};
+use futures::StreamExt;
+use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::info;
 
 /// Default inference engine implementation
 #[derive(Debug)]
@@ -38,7 +38,10 @@ impl DefaultInferenceEngine {
         kv_cache: Arc<dyn ferrum_kv::KvCacheManager + Send + Sync>,
         model_executor: Arc<dyn ferrum_interfaces::ModelExecutor + Send + Sync>,
     ) -> Self {
-        info!("Created inference engine with model: {:?}", config.model.model_id);
+        info!(
+            "Created inference engine with model: {:?}",
+            config.model.model_id
+        );
 
         let components = PipelineComponents {
             scheduler: scheduler.clone(),
@@ -97,7 +100,10 @@ impl InferenceEngine for DefaultInferenceEngine {
         pipeline.submit_request(request.clone()).await?;
 
         tokio::spawn(async move {
-            if let Err(e) = pipeline.process_batches(&target_request_id, tx.clone()).await {
+            if let Err(e) = pipeline
+                .process_batches(&target_request_id, tx.clone())
+                .await
+            {
                 let _ = tx.send(Ok(StreamChunk::Error { error: e }));
             }
         });

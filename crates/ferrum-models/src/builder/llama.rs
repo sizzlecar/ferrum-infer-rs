@@ -1,11 +1,11 @@
 //! Llama family model builder
 
-use ferrum_interfaces::{ModelBuilder, ModelInfo, ModelConfig, ModelCapabilities, ModelExecutor};
+use async_trait::async_trait;
 use ferrum_interfaces::{ComputeBackend, WeightLoader};
-use ferrum_types::{Result, Architecture, DataType, FerrumError};
+use ferrum_interfaces::{ModelBuilder, ModelCapabilities, ModelConfig, ModelExecutor, ModelInfo};
+use ferrum_types::{Architecture, DataType, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
-use async_trait::async_trait;
 
 /// Llama model builder
 #[derive(Debug, Clone)]
@@ -37,30 +37,43 @@ impl LlamaModelBuilder {
     /// Validate model configuration
     fn validate_config(&self, config: &ModelConfig) -> Result<()> {
         // Check architecture compatibility
-        if !self.capabilities.supported_architectures.contains(&config.architecture) {
-            return Err(FerrumError::invalid_parameter(
-                format!("Architecture {:?} not supported by LlamaModelBuilder", config.architecture)
-            ));
+        if !self
+            .capabilities
+            .supported_architectures
+            .contains(&config.architecture)
+        {
+            return Err(FerrumError::invalid_parameter(format!(
+                "Architecture {:?} not supported by LlamaModelBuilder",
+                config.architecture
+            )));
         }
 
         // Validate required parameters
         if config.hidden_size == 0 {
-            return Err(FerrumError::invalid_parameter("hidden_size must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "hidden_size must be positive",
+            ));
         }
         if config.num_layers == 0 {
-            return Err(FerrumError::invalid_parameter("num_layers must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "num_layers must be positive",
+            ));
         }
         if config.num_attention_heads == 0 {
-            return Err(FerrumError::invalid_parameter("num_attention_heads must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "num_attention_heads must be positive",
+            ));
         }
         if config.vocab_size == 0 {
-            return Err(FerrumError::invalid_parameter("vocab_size must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "vocab_size must be positive",
+            ));
         }
 
         // Validate attention head configuration
         if config.hidden_size % config.num_attention_heads != 0 {
             return Err(FerrumError::invalid_parameter(
-                "hidden_size must be divisible by num_attention_heads"
+                "hidden_size must be divisible by num_attention_heads",
             ));
         }
 
@@ -80,7 +93,9 @@ impl LlamaModelBuilder {
             hidden_size: config.hidden_size,
             num_layers: config.num_layers,
             num_attention_heads: config.num_attention_heads,
-            num_key_value_heads: config.num_key_value_heads.unwrap_or(config.num_attention_heads),
+            num_key_value_heads: config
+                .num_key_value_heads
+                .unwrap_or(config.num_attention_heads),
             head_dim,
             intermediate_size: config.intermediate_size.unwrap_or(config.hidden_size * 4),
             max_sequence_length: config.max_position_embeddings.unwrap_or(2048),
@@ -134,17 +149,20 @@ impl ModelBuilder for LlamaModelBuilder {
         weight_loader: Arc<dyn WeightLoader + Send + Sync>,
     ) -> Result<Box<dyn ModelExecutor + Send + Sync>> {
         info!("Building Llama model: {:?}", config.model_id);
-        
+
         // Validate configuration
         self.validate_config(config)?;
 
         // Create model info
         let model_info = self.create_model_info(config);
-        debug!("Created model info: {} parameters", model_info.total_parameters.unwrap_or(0));
+        debug!(
+            "Created model info: {} parameters",
+            model_info.total_parameters.unwrap_or(0)
+        );
 
         // Create model executor (placeholder implementation)
         let executor = PlaceholderModelExecutor::new(model_info, backend, weight_loader);
-        
+
         info!("Successfully built Llama model");
         Ok(Box::new(executor))
     }
@@ -197,15 +215,20 @@ impl ModelExecutor for PlaceholderModelExecutor {
         input: &ferrum_interfaces::PrefillInput,
     ) -> Result<ferrum_interfaces::PrefillOutput> {
         // Placeholder implementation
-        debug!("Llama prefill: processing {} tokens", input.input_ids.shape()[1]);
-        
+        debug!(
+            "Llama prefill: processing {} tokens",
+            input.input_ids.shape()[1]
+        );
+
         // In real implementation, this would:
         // 1. Run embedding layer
         // 2. Run transformer layers
         // 3. Generate logits
         // 4. Create/update KV cache
-        
-        Err(FerrumError::not_implemented("Llama prefill not yet implemented"))
+
+        Err(FerrumError::not_implemented(
+            "Llama prefill not yet implemented",
+        ))
     }
 
     async fn decode(
@@ -214,14 +237,16 @@ impl ModelExecutor for PlaceholderModelExecutor {
     ) -> Result<ferrum_interfaces::DecodeOutput> {
         // Placeholder implementation
         debug!("Llama decode: processing single token");
-        
+
         // In real implementation, this would:
         // 1. Run embedding for new token
         // 2. Run transformer layers with KV cache
         // 3. Generate logits
         // 4. Update KV cache
-        
-        Err(FerrumError::not_implemented("Llama decode not yet implemented"))
+
+        Err(FerrumError::not_implemented(
+            "Llama decode not yet implemented",
+        ))
     }
 }
 
@@ -252,7 +277,7 @@ mod tests {
     fn test_builder_creation() {
         let builder = LlamaModelBuilder::new();
         let archs = builder.supported_architectures();
-        
+
         assert!(archs.contains(&Architecture::Llama));
         assert!(archs.contains(&Architecture::Llama2));
         assert!(archs.contains(&Architecture::CodeLlama));
@@ -262,19 +287,19 @@ mod tests {
     fn test_config_validation() {
         let builder = LlamaModelBuilder::new();
         let config = create_test_config();
-        
+
         assert!(builder.validate_config(&config).is_ok());
     }
 
     #[test]
     fn test_invalid_config() {
         let builder = LlamaModelBuilder::new();
-        
+
         // Test zero hidden_size
         let mut config = create_test_config();
         config.hidden_size = 0;
         assert!(builder.validate_config(&config).is_err());
-        
+
         // Test misaligned attention heads
         let mut config = create_test_config();
         config.hidden_size = 4095; // Not divisible by 32
@@ -285,9 +310,9 @@ mod tests {
     fn test_model_info_creation() {
         let builder = LlamaModelBuilder::new();
         let config = create_test_config();
-        
+
         let info = builder.model_info(&config).unwrap();
-        
+
         assert_eq!(info.architecture, Architecture::Llama);
         assert_eq!(info.vocab_size, 32000);
         assert_eq!(info.hidden_size, 4096);
@@ -300,9 +325,9 @@ mod tests {
     fn test_parameter_estimation() {
         let builder = LlamaModelBuilder::new();
         let config = create_test_config();
-        
+
         let params = builder.estimate_parameters(&config);
-        
+
         // Should be a reasonable number of parameters for this config
         assert!(params > 1_000_000); // At least 1M parameters
         assert!(params < 100_000_000_000); // Less than 100B parameters

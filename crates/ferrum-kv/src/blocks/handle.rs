@@ -1,11 +1,11 @@
 //! KV Cache handle implementation
 
-use crate::blocks::pool::{PhysicalBlockId, Block};
-use ferrum_interfaces::{KvCacheHandle, BlockTable};
+use crate::blocks::pool::{Block, PhysicalBlockId};
+use ferrum_interfaces::{BlockTable, KvCacheHandle};
 use ferrum_types::{Device, RequestId};
 use parking_lot::RwLock;
-use std::sync::Arc;
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 /// Default implementation of KV cache handle
 #[derive(Debug)]
@@ -52,18 +52,22 @@ impl DefaultKvCacheHandle {
     /// Add physical block to this handle
     pub fn add_block(&mut self, physical_id: PhysicalBlockId, block: Arc<RwLock<Block>>) {
         let logical_id = self.physical_blocks.len() as u32;
-        
+
         // Update block table
         if logical_id as usize >= self.block_table.logical_to_physical.len() {
-            self.block_table.logical_to_physical.resize(logical_id as usize + 1, 0);
+            self.block_table
+                .logical_to_physical
+                .resize(logical_id as usize + 1, 0);
         }
         if physical_id.value() as usize >= self.block_table.physical.len() {
-            self.block_table.physical.resize(physical_id.value() as usize + 1, 0);
+            self.block_table
+                .physical
+                .resize(physical_id.value() as usize + 1, 0);
         }
-        
+
         self.block_table.logical_to_physical[logical_id as usize] = physical_id.value();
         self.block_table.physical[physical_id.value() as usize] = 1; // Mark as used
-        
+
         self.physical_blocks.push(block);
     }
 
@@ -72,7 +76,7 @@ impl DefaultKvCacheHandle {
         if let Some(block) = self.physical_blocks.pop() {
             // Update block table
             if let Some(&physical_id) = self.block_table.logical_to_physical.last() {
-                if physical_id as usize < self.block_table.physical.len() {
+                if (physical_id as usize) < self.block_table.physical.len() {
                     self.block_table.physical[physical_id as usize] = 0;
                 }
             }
@@ -96,7 +100,7 @@ impl DefaultKvCacheHandle {
 
     /// Get request ID
     pub fn request_id(&self) -> RequestId {
-        self.request_id
+        self.request_id.clone()
     }
 
     /// Get model dimensions
@@ -115,7 +119,7 @@ impl DefaultKvCacheHandle {
 
     /// Check if handle is valid
     pub fn is_valid(&self) -> bool {
-        !self.physical_blocks.is_empty() 
+        !self.physical_blocks.is_empty()
             && self.num_tokens > 0
             && self.block_table.logical_to_physical.len() == self.physical_blocks.len()
     }
@@ -150,11 +154,17 @@ impl KvCacheHandle for DefaultKvCacheHandle {
         self.head_dim
     }
 
-    fn key_cache(&self, _layer: usize) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
+    fn key_cache(
+        &self,
+        _layer: usize,
+    ) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
         Ok(None)
     }
 
-    fn value_cache(&self, _layer: usize) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
+    fn value_cache(
+        &self,
+        _layer: usize,
+    ) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
         Ok(None)
     }
 
@@ -188,7 +198,7 @@ impl KvCacheHandle for DefaultKvCacheHandle {
 impl Clone for DefaultKvCacheHandle {
     fn clone(&self) -> Self {
         Self {
-            request_id: self.request_id,
+            request_id: self.request_id.clone(),
             block_table: self.block_table.clone(),
             physical_blocks: self.physical_blocks.clone(),
             device: self.device.clone(),
@@ -212,8 +222,8 @@ mod tests {
         let handle = DefaultKvCacheHandle::new(
             request_id,
             Device::Cpu,
-            32, // layers
-            32, // heads  
+            32,  // layers
+            32,  // heads
             128, // head_dim
         );
 
@@ -226,19 +236,15 @@ mod tests {
     #[test]
     fn test_block_management() {
         let request_id = RequestId::new();
-        let mut handle = DefaultKvCacheHandle::new(
-            request_id,
-            Device::Cpu,
-            32, 32, 128,
-        );
+        let mut handle = DefaultKvCacheHandle::new(request_id, Device::Cpu, 32, 32, 128);
 
         // Add a block
         let physical_id = PhysicalBlockId::new(0);
         let block = Block::new(physical_id, Device::Cpu, 16, DataType::F16);
         let block_arc = Arc::new(RwLock::new(block));
-        
+
         handle.add_block(physical_id, block_arc.clone());
-        
+
         assert_eq!(handle.physical_blocks().len(), 1);
         assert_eq!(handle.block_table().logical_to_physical.len(), 1);
         assert_eq!(handle.block_table().logical_to_physical[0], 0);
@@ -252,11 +258,7 @@ mod tests {
     #[test]
     fn test_token_management() {
         let request_id = RequestId::new();
-        let mut handle = DefaultKvCacheHandle::new(
-            request_id,
-            Device::Cpu,
-            32, 32, 128,
-        );
+        let mut handle = DefaultKvCacheHandle::new(request_id, Device::Cpu, 32, 32, 128);
 
         handle.set_num_tokens(100);
         assert_eq!(handle.num_tokens(), 100);
@@ -269,13 +271,13 @@ mod tests {
         let mut handle = DefaultKvCacheHandle::new(
             request_id,
             Device::Cpu,
-            32, // layers
-            32, // heads
-            128, // head_dim  
+            32,  // layers
+            32,  // heads
+            128, // head_dim
         );
 
         handle.set_num_tokens(100);
-        
+
         // Expected: 32 layers * 32 heads * 128 head_dim * 2 (K+V) * 2 (FP16) * 100 tokens
         let expected = 32 * 32 * 128 * 2 * 2 * 100;
         assert_eq!(handle.memory_usage(), expected);
@@ -284,11 +286,7 @@ mod tests {
     #[test]
     fn test_handle_validity() {
         let request_id = RequestId::new();
-        let mut handle = DefaultKvCacheHandle::new(
-            request_id,
-            Device::Cpu,
-            32, 32, 128,
-        );
+        let mut handle = DefaultKvCacheHandle::new(request_id, Device::Cpu, 32, 32, 128);
 
         // Initially invalid (no blocks, no tokens)
         assert!(!handle.is_valid());

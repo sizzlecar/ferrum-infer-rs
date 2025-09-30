@@ -76,12 +76,14 @@ impl SchedulerMetricsCollector {
     ) {
         let wait_time_ms = wait_time.as_millis() as u64;
         let execution_time_ms = execution_time.as_millis() as u64;
-        
+
         // Update global counters
         self.completions.fetch_add(1, Ordering::Relaxed);
-        self.total_wait_time_ms.fetch_add(wait_time_ms, Ordering::Relaxed);
-        self.total_execution_time_ms.fetch_add(execution_time_ms, Ordering::Relaxed);
-        
+        self.total_wait_time_ms
+            .fetch_add(wait_time_ms, Ordering::Relaxed);
+        self.total_execution_time_ms
+            .fetch_add(execution_time_ms, Ordering::Relaxed);
+
         // Update priority-specific metrics
         {
             let mut priority_metrics = self.priority_metrics.write();
@@ -90,7 +92,7 @@ impl SchedulerMetricsCollector {
             metrics.total_wait_time_ms += wait_time_ms;
             metrics.total_execution_time_ms += execution_time_ms;
         }
-        
+
         // Store recent times for percentile calculation (keep last 1000)
         {
             let mut recent_wait = self.recent_wait_times.write();
@@ -99,7 +101,7 @@ impl SchedulerMetricsCollector {
                 recent_wait.remove(0);
             }
         }
-        
+
         {
             let mut recent_exec = self.recent_execution_times.write();
             recent_exec.push(execution_time_ms);
@@ -112,7 +114,7 @@ impl SchedulerMetricsCollector {
     /// Record request failure
     pub fn record_failure(&self, priority: Priority) {
         self.failures.fetch_add(1, Ordering::Relaxed);
-        
+
         // Update priority-specific metrics
         let mut priority_metrics = self.priority_metrics.write();
         let metrics = priority_metrics.entry(priority).or_default();
@@ -122,8 +124,8 @@ impl SchedulerMetricsCollector {
     /// Record request cancellation
     pub fn record_cancellation(&self, priority: Priority) {
         self.cancellations.fetch_add(1, Ordering::Relaxed);
-        
-        // Update priority-specific metrics  
+
+        // Update priority-specific metrics
         let mut priority_metrics = self.priority_metrics.write();
         let metrics = priority_metrics.entry(priority).or_default();
         metrics.count += 1;
@@ -148,7 +150,7 @@ impl SchedulerMetricsCollector {
     pub fn throughput_rps(&self) -> f64 {
         let elapsed = self.start_time.elapsed();
         let completions = self.completions.load(Ordering::Relaxed);
-        
+
         if elapsed.as_secs_f64() > 0.0 {
             completions as f64 / elapsed.as_secs_f64()
         } else {
@@ -160,7 +162,7 @@ impl SchedulerMetricsCollector {
     pub fn avg_wait_time_ms(&self) -> f64 {
         let total_wait = self.total_wait_time_ms.load(Ordering::Relaxed);
         let completions = self.completions.load(Ordering::Relaxed);
-        
+
         if completions > 0 {
             total_wait as f64 / completions as f64
         } else {
@@ -172,7 +174,7 @@ impl SchedulerMetricsCollector {
     pub fn avg_execution_time_ms(&self) -> f64 {
         let total_exec = self.total_execution_time_ms.load(Ordering::Relaxed);
         let completions = self.completions.load(Ordering::Relaxed);
-        
+
         if completions > 0 {
             total_exec as f64 / completions as f64
         } else {
@@ -206,7 +208,8 @@ impl SchedulerMetricsCollector {
     pub fn batch_efficiency(&self) -> f32 {
         let batch_metrics = self.batch_metrics.read();
         if batch_metrics.total_batches_created > 0 {
-            batch_metrics.total_batches_completed as f32 / batch_metrics.total_batches_created as f32
+            batch_metrics.total_batches_completed as f32
+                / batch_metrics.total_batches_created as f32
         } else {
             0.0
         }
@@ -216,7 +219,8 @@ impl SchedulerMetricsCollector {
     pub fn avg_batch_formation_time_ms(&self) -> f64 {
         let batch_metrics = self.batch_metrics.read();
         if batch_metrics.total_batches_created > 0 {
-            batch_metrics.total_batch_formation_time_ms as f64 / batch_metrics.total_batches_created as f64
+            batch_metrics.total_batch_formation_time_ms as f64
+                / batch_metrics.total_batches_created as f64
         } else {
             0.0
         }
@@ -252,7 +256,10 @@ impl SchedulerMetricsCollector {
     /// Get batch counts
     pub fn batch_counts(&self) -> (u64, u64) {
         let batch_metrics = self.batch_metrics.read();
-        (batch_metrics.total_batches_created, batch_metrics.total_batches_completed)
+        (
+            batch_metrics.total_batches_created,
+            batch_metrics.total_batches_completed,
+        )
     }
 
     /// Reset all metrics
@@ -262,7 +269,7 @@ impl SchedulerMetricsCollector {
         self.cancellations.store(0, Ordering::Relaxed);
         self.total_wait_time_ms.store(0, Ordering::Relaxed);
         self.total_execution_time_ms.store(0, Ordering::Relaxed);
-        
+
         self.priority_metrics.write().clear();
         *self.batch_metrics.write() = BatchMetrics::default();
         self.recent_wait_times.write().clear();
@@ -281,13 +288,13 @@ fn calculate_percentile(values: &[u64], percentile: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    
+
     let mut sorted_values = values.to_vec();
     sorted_values.sort_unstable();
-    
+
     let index = (percentile / 100.0 * (sorted_values.len() - 1) as f64).round() as usize;
     let index = index.min(sorted_values.len() - 1);
-    
+
     sorted_values[index] as f64
 }
 
@@ -315,11 +322,14 @@ impl RequestTracker {
     /// Track new request submission
     pub fn track_submission(&self, request_id: RequestId, priority: Priority) {
         let mut active = self.active_requests.write();
-        active.insert(request_id, RequestLifecycle {
-            submitted_at: Instant::now(),
-            started_at: None,
-            priority,
-        });
+        active.insert(
+            request_id,
+            RequestLifecycle {
+                submitted_at: Instant::now(),
+                started_at: None,
+                priority,
+            },
+        );
     }
 
     /// Track request start (moved from waiting to running)
@@ -331,7 +341,10 @@ impl RequestTracker {
     }
 
     /// Track request completion and return timing info
-    pub fn track_completion(&self, request_id: &RequestId) -> Option<(Duration, Option<Duration>, Priority)> {
+    pub fn track_completion(
+        &self,
+        request_id: &RequestId,
+    ) -> Option<(Duration, Option<Duration>, Priority)> {
         let mut active = self.active_requests.write();
         active.remove(request_id).map(|lifecycle| {
             let total_time = lifecycle.submitted_at.elapsed();
@@ -362,29 +375,29 @@ impl Default for RequestTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_percentile_calculation() {
         let values = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
-        
+
         assert_eq!(calculate_percentile(&values, 50.0), 50.0);
         assert_eq!(calculate_percentile(&values, 95.0), 100.0);
         assert_eq!(calculate_percentile(&values, 0.0), 10.0);
     }
-    
+
     #[test]
     fn test_metrics_collector_basic() {
         let collector = SchedulerMetricsCollector::new();
-        
+
         collector.record_completion(
             Duration::from_millis(100),
             Duration::from_millis(50),
             Priority::High,
         );
-        
+
         assert_eq!(collector.avg_wait_time_ms(), 100.0);
         assert_eq!(collector.avg_execution_time_ms(), 50.0);
-        
+
         let (completed, failed, cancelled) = collector.request_counts();
         assert_eq!(completed, 1);
         assert_eq!(failed, 0);

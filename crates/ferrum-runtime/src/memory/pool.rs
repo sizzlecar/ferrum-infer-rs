@@ -1,15 +1,15 @@
 //! Memory pool implementation for efficient allocation
 
+use async_trait::async_trait;
 use ferrum_interfaces::memory::{
-    DeviceMemoryManager, MemoryHandle, StreamHandle, MemoryTransfer, MemoryInfo, 
-    MemoryHandleInfo, MemoryPoolConfig as InterfaceMemoryPoolConfig, DefragmentationStats,
-    MemoryPressure, MemoryType
+    DefragmentationStats, DeviceMemoryManager, MemoryHandle, MemoryHandleInfo, MemoryInfo,
+    MemoryPoolConfig as InterfaceMemoryPoolConfig, MemoryPressure, MemoryTransfer, MemoryType,
+    StreamHandle,
 };
 use ferrum_types::{Device, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use tracing::{debug, warn};
-use async_trait::async_trait;
 
 /// Memory block in the pool
 #[derive(Debug, Clone)]
@@ -53,12 +53,12 @@ pub struct MemoryPoolConfig {
 impl Default for MemoryPoolConfig {
     fn default() -> Self {
         Self {
-            initial_size: 256 * 1024 * 1024,      // 256MB
-            max_size: 8 * 1024 * 1024 * 1024,     // 8GB
+            initial_size: 256 * 1024 * 1024,  // 256MB
+            max_size: 8 * 1024 * 1024 * 1024, // 8GB
             growth_factor: 1.5,
             enable_defragmentation: true,
-            min_pooled_size: 256,                  // 256B
-            max_pooled_size: 128 * 1024 * 1024,   // 128MB
+            min_pooled_size: 256,               // 256B
+            max_pooled_size: 128 * 1024 * 1024, // 128MB
             size_buckets: 64,
         }
     }
@@ -81,12 +81,12 @@ impl MemoryPool {
     /// Allocate memory from pool
     pub fn allocate(&self, size: usize) -> Result<MemoryHandle> {
         let aligned_size = align_size(size, 256); // 256-byte alignment
-        
+
         // Try to find a free block of appropriate size
         if let Some(handle) = self.try_allocate_from_pool(aligned_size) {
             return Ok(handle);
         }
-        
+
         // Allocate new block
         self.allocate_new_block(aligned_size)
     }
@@ -94,25 +94,28 @@ impl MemoryPool {
     /// Deallocate memory back to pool
     pub fn deallocate(&self, handle: MemoryHandle) -> Result<()> {
         let mut blocks = self.blocks.lock();
-        
+
         // Find the block and mark it as free
         for (index, block) in blocks.iter_mut().enumerate() {
             if block.handle.id() == handle.id() {
                 block.is_free = true;
-                
+
                 // Add to free blocks index
                 let size = block.size;
                 drop(blocks);
-                
+
                 let mut free_blocks = self.free_blocks.lock();
                 free_blocks.entry(size).or_default().push_back(index);
-                
+
                 debug!("Deallocated block of size {} bytes", size);
                 return Ok(());
             }
         }
-        
-        warn!("Attempted to deallocate unknown memory handle: {:?}", handle);
+
+        warn!(
+            "Attempted to deallocate unknown memory handle: {:?}",
+            handle
+        );
         Ok(())
     }
 
@@ -120,26 +123,26 @@ impl MemoryPool {
     pub fn stats(&self) -> MemoryInfo {
         let blocks = self.blocks.lock();
         let total_allocated = *self.total_allocated.lock();
-        
+
         let used_memory = blocks
             .iter()
             .filter(|b| !b.is_free)
             .map(|b| b.size)
             .sum::<usize>();
-        
+
         let free_memory = blocks
             .iter()
             .filter(|b| b.is_free)
             .map(|b| b.size)
             .sum::<usize>();
-        
+
         let fragmentation_ratio = if total_allocated > 0 {
             let free_blocks_count = blocks.iter().filter(|b| b.is_free).count();
             free_blocks_count as f32 / blocks.len() as f32
         } else {
             0.0
         };
-        
+
         MemoryInfo {
             total_bytes: total_allocated as u64,
             used_bytes: used_memory as u64,
@@ -156,31 +159,34 @@ impl MemoryPool {
         if !self.config.enable_defragmentation {
             return Ok(());
         }
-        
-        debug!("Starting memory pool defragmentation for device {:?}", self.device);
-        
+
+        debug!(
+            "Starting memory pool defragmentation for device {:?}",
+            self.device
+        );
+
         // Simple defragmentation: compact free blocks
         let mut blocks = self.blocks.lock();
         let mut free_blocks = self.free_blocks.lock();
-        
+
         // Remove freed blocks and rebuild free index
         blocks.retain(|b| !b.is_free);
         free_blocks.clear();
-        
+
         // Rebuild free blocks index
         for (index, block) in blocks.iter().enumerate() {
             if block.is_free {
                 free_blocks.entry(block.size).or_default().push_back(index);
             }
         }
-        
+
         debug!("Memory pool defragmentation completed");
         Ok(())
     }
 
     fn try_allocate_from_pool(&self, size: usize) -> Option<MemoryHandle> {
         let mut free_blocks = self.free_blocks.lock();
-        
+
         // Look for exact size match first
         if let Some(indices) = free_blocks.get_mut(&size) {
             if let Some(index) = indices.pop_front() {
@@ -191,10 +197,10 @@ impl MemoryPool {
                 }
             }
         }
-        
+
         // Look for larger blocks that can be split
         let mut best_fit: Option<(usize, usize)> = None; // (size, index)
-        
+
         for (&block_size, indices) in free_blocks.iter() {
             if block_size >= size && (best_fit.is_none() || block_size < best_fit.unwrap().0) {
                 if let Some(&index) = indices.front() {
@@ -202,18 +208,18 @@ impl MemoryPool {
                 }
             }
         }
-        
+
         if let Some((block_size, index)) = best_fit {
             // Remove from free list
             free_blocks.get_mut(&block_size)?.pop_front();
-            
+
             let mut blocks = self.blocks.lock();
             if let Some(block) = blocks.get_mut(index) {
                 block.is_free = false;
                 return Some(block.handle);
             }
         }
-        
+
         None
     }
 
@@ -221,21 +227,21 @@ impl MemoryPool {
         // Check if we would exceed max pool size
         let current_total = *self.total_allocated.lock();
         if current_total + size > self.config.max_size {
-            return Err(ferrum_types::FerrumError::backend(
-                format!("Memory pool size limit exceeded: {} + {} > {}", 
-                        current_total, size, self.config.max_size)
-            ));
+            return Err(ferrum_types::FerrumError::backend(format!(
+                "Memory pool size limit exceeded: {} + {} > {}",
+                current_total, size, self.config.max_size
+            )));
         }
-        
+
         // Create new memory handle (simplified - real implementation would allocate actual memory)
         let handle_id = {
             let mut count = self.allocation_count.lock();
             *count += 1;
             *count
         };
-        
+
         let handle = MemoryHandle::new(handle_id);
-        
+
         // Add to blocks
         let block = MemoryBlock {
             handle,
@@ -243,21 +249,21 @@ impl MemoryPool {
             is_free: false,
             allocated_at: std::time::Instant::now(),
         };
-        
+
         let mut blocks = self.blocks.lock();
         blocks.push_back(block);
-        
+
         // Update statistics
         {
             let mut total = self.total_allocated.lock();
             *total += size;
-            
+
             let mut peak = self.peak_allocated.lock();
             if *total > *peak {
                 *peak = *total;
             }
         }
-        
+
         debug!("Allocated new memory block of size {} bytes", size);
         Ok(handle)
     }
@@ -310,20 +316,27 @@ impl DeviceMemoryManager for MemoryPool {
 
     fn handle_info(&self, handle: MemoryHandle) -> Option<MemoryHandleInfo> {
         let blocks = self.blocks.lock();
-        blocks.iter().find(|b| b.handle.id() == handle.id()).map(|block| {
-            MemoryHandleInfo {
-                handle: block.handle,
-                size: block.size,
-                device: self.device,
-                alignment: 256, // Default alignment
-                allocated_at: block.allocated_at,
-                is_mapped: false,
-                memory_type: MemoryType::General,
-            }
-        })
+        blocks
+            .iter()
+            .find(|b| b.handle.id() == handle.id())
+            .map(|block| {
+                MemoryHandleInfo {
+                    handle: block.handle,
+                    size: block.size,
+                    device: self.device,
+                    alignment: 256, // Default alignment
+                    allocated_at: block.allocated_at,
+                    is_mapped: false,
+                    memory_type: MemoryType::General,
+                }
+            })
     }
 
-    async fn configure_pool(&self, _device: &Device, _config: InterfaceMemoryPoolConfig) -> Result<()> {
+    async fn configure_pool(
+        &self,
+        _device: &Device,
+        _config: InterfaceMemoryPoolConfig,
+    ) -> Result<()> {
         // For now, pool config is set at construction
         Ok(())
     }
@@ -332,20 +345,17 @@ impl DeviceMemoryManager for MemoryPool {
         let before_fragmentation = self.stats().fragmentation_ratio;
         self.defragment()?;
         let after_fragmentation = self.stats().fragmentation_ratio;
-        
+
         Ok(DefragmentationStats {
             memory_freed: 0, // Simplified
-            blocks_moved: 0, 
+            blocks_moved: 0,
             time_taken_ms: 0,
             fragmentation_before: before_fragmentation,
             fragmentation_after: after_fragmentation,
         })
     }
 
-    fn set_pressure_callback(
-        &self,
-        _callback: Box<dyn Fn(MemoryPressure) + Send + Sync>,
-    ) {
+    fn set_pressure_callback(&self, _callback: Box<dyn Fn(MemoryPressure) + Send + Sync>) {
         // Simplified - real implementation would store and use callback
     }
 }

@@ -4,8 +4,8 @@
 //! interface, focusing purely on tensor operations without tokenization or sampling.
 
 use crate::{KvCacheHandle, TensorRef};
-use ferrum_types::{ModelInfo, Result};
 use async_trait::async_trait;
+use ferrum_types::{ModelInfo, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
@@ -29,24 +29,24 @@ impl PrefillInput {
             position_ids: None,
         }
     }
-    
+
     /// Add attention mask
     pub fn with_attention_mask(mut self, mask: TensorRef) -> Self {
         self.attention_mask = Some(mask);
         self
     }
-    
+
     /// Add position IDs
     pub fn with_position_ids(mut self, positions: TensorRef) -> Self {
         self.position_ids = Some(positions);
         self
     }
-    
+
     /// Get batch size
     pub fn batch_size(&self) -> usize {
         self.input_ids.shape()[0]
     }
-    
+
     /// Get sequence length
     pub fn sequence_length(&self) -> usize {
         if self.input_ids.shape().len() >= 2 {
@@ -80,23 +80,24 @@ impl PrefillOutput {
             attention_weights: None,
         }
     }
-    
+
     /// Get logits for last position (for next token generation)
     pub fn last_token_logits(&self) -> Result<TensorRef> {
         let shape = self.logits.shape();
         if shape.len() != 3 {
             return Err(ferrum_types::FerrumError::backend(
-                "Expected 3D logits tensor [batch, seq, vocab]"
+                "Expected 3D logits tensor [batch, seq, vocab]",
             ));
         }
-        
+
         let seq_len = shape[1];
         if seq_len == 0 {
             return Err(ferrum_types::FerrumError::backend("Empty sequence"));
         }
-        
+
         // Extract last position: [batch, seq-1:seq, vocab] -> [batch, vocab]
-        self.logits.view(&[0, seq_len - 1, 0], &[shape[0], seq_len, shape[2]])
+        self.logits
+            .view(&[0, seq_len - 1, 0], &[shape[0], seq_len, shape[2]])
     }
 }
 
@@ -120,13 +121,13 @@ impl DecodeInput {
             position_ids: None,
         }
     }
-    
+
     /// Add position IDs
     pub fn with_position_ids(mut self, positions: TensorRef) -> Self {
         self.position_ids = Some(positions);
         self
     }
-    
+
     /// Get batch size
     pub fn batch_size(&self) -> usize {
         self.input_ids.shape()[0]
@@ -163,33 +164,33 @@ impl DecodeOutput {
 pub trait ModelExecutor: Send + Sync {
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
-    
+
     /// Execute prefill phase (process initial prompt)
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput>;
-    
+
     /// Execute decode phase (generate next token)
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput>;
-    
+
     /// Optional: full forward pass (for non-autoregressive use cases)
     async fn forward(&self, input: &TensorRef) -> Result<TensorRef> {
         // Default implementation not supported
         Err(ferrum_types::FerrumError::unsupported(
-            "Full forward pass not supported by this executor"
+            "Full forward pass not supported by this executor",
         ))
     }
-    
+
     /// Get executor capabilities
     fn capabilities(&self) -> ExecutorCapabilities;
-    
+
     /// Get current executor status
     fn status(&self) -> ExecutorStatus;
-    
+
     /// Warm up executor (load model, allocate memory, etc.)
     async fn warmup(&mut self) -> Result<()> {
         // Default no-op implementation
         Ok(())
     }
-    
+
     /// Shutdown executor gracefully
     async fn shutdown(&mut self) -> Result<()> {
         // Default no-op implementation
@@ -262,9 +263,11 @@ impl MemoryRequirements {
         sequence_length: usize,
         num_layers: usize,
     ) -> u64 {
-        let activation_mem = (self.activation_memory_per_token * batch_size * sequence_length) as u64;
-        let kv_cache_mem = (self.kv_cache_memory_per_token * batch_size * sequence_length * num_layers) as u64;
-        
+        let activation_mem =
+            (self.activation_memory_per_token * batch_size * sequence_length) as u64;
+        let kv_cache_mem =
+            (self.kv_cache_memory_per_token * batch_size * sequence_length * num_layers) as u64;
+
         self.parameter_memory + activation_mem + kv_cache_mem + self.overhead_memory
     }
 }
@@ -326,13 +329,13 @@ pub struct ExecutorMemoryUsage {
 pub trait BatchModelExecutor: ModelExecutor {
     /// Execute batch prefill for multiple sequences
     async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>>;
-    
+
     /// Execute batch decode for multiple sequences
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>>;
-    
+
     /// Get optimal batch size for current conditions
     fn optimal_batch_size(&self) -> usize;
-    
+
     /// Check if batch size is supported
     fn supports_batch_size(&self, batch_size: usize) -> bool;
 }
@@ -366,20 +369,17 @@ pub struct SpeculativeDecodeOutput {
 #[async_trait]
 pub trait ModelExecutorFactory: Send + Sync {
     /// Create executor from model configuration
-    async fn create_executor(
-        &self,
-        config: &ExecutorConfig,
-    ) -> Result<Box<dyn ModelExecutor>>;
-    
+    async fn create_executor(&self, config: &ExecutorConfig) -> Result<Box<dyn ModelExecutor>>;
+
     /// Create batch executor
     async fn create_batch_executor(
         &self,
         config: &ExecutorConfig,
     ) -> Result<Box<dyn BatchModelExecutor>>;
-    
+
     /// Get supported executor types
     fn supported_types(&self) -> Vec<ExecutorType>;
-    
+
     /// Validate configuration
     fn validate_config(&self, config: &ExecutorConfig) -> Result<()>;
 }
@@ -495,21 +495,17 @@ pub struct ExecutorMetrics {
 /// Executor registry for managing multiple executors
 pub trait ExecutorRegistry: Send + Sync {
     /// Register executor with name
-    fn register(
-        &mut self,
-        name: &str,
-        executor: Box<dyn ModelExecutor>,
-    ) -> Result<()>;
-    
+    fn register(&mut self, name: &str, executor: Box<dyn ModelExecutor>) -> Result<()>;
+
     /// Get executor by name
     fn get(&self, name: &str) -> Option<&dyn ModelExecutor>;
-    
+
     /// Remove executor by name
     fn remove(&mut self, name: &str) -> Option<Box<dyn ModelExecutor>>;
-    
+
     /// List registered executor names
     fn list_names(&self) -> Vec<String>;
-    
+
     /// Get executor metrics
     fn get_metrics(&self, name: &str) -> Option<ExecutorMetrics>;
 }

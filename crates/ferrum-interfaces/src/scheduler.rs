@@ -3,10 +3,10 @@
 //! This module provides the unified scheduler interface that replaces the
 //! conflicting scheduler definitions in the original codebase.
 
+use async_trait::async_trait;
 use ferrum_types::{
     BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState, Result,
 };
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
@@ -15,35 +15,39 @@ use std::{collections::HashMap, time::Duration};
 pub trait Scheduler: Send + Sync {
     /// Submit new inference request
     async fn submit(&self, request: InferenceRequest) -> Result<RequestId>;
-    
+
     /// Get next batch of requests to execute
     async fn next_batch(&self, hint: BatchHint) -> Option<BatchPlan>;
-    
+
     /// Mark request as completed
     async fn complete(&self, request_id: RequestId, response: &InferenceResponse) -> Result<()>;
-    
+
     /// Cancel pending request
     async fn cancel(&self, request_id: RequestId) -> Result<bool>;
-    
+
     /// Update request priority
     async fn update_priority(&self, request_id: RequestId, priority: Priority) -> Result<()>;
-    
+
     /// Get scheduler metrics
     fn metrics(&self) -> SchedulerMetrics;
-    
+
     /// Get scheduler configuration
     fn config(&self) -> &SchedulerConfig;
-    
+
     /// Preempt running request (if supported)
     async fn preempt(&self, request_id: RequestId) -> Result<PreemptionResult> {
         // Default implementation: preemption not supported
-        Err(ferrum_types::FerrumError::unsupported("Preemption not supported"))
+        Err(ferrum_types::FerrumError::unsupported(
+            "Preemption not supported",
+        ))
     }
-    
+
     /// Resume preempted request
     async fn resume(&self, request_id: RequestId) -> Result<()> {
         // Default implementation: resumption not supported
-        Err(ferrum_types::FerrumError::unsupported("Resumption not supported"))
+        Err(ferrum_types::FerrumError::unsupported(
+            "Resumption not supported",
+        ))
     }
 }
 
@@ -124,17 +128,17 @@ impl BatchPlan {
             .map(|req| req.request.sampling_params.max_tokens)
             .sum()
     }
-    
+
     /// Get batch size
     pub fn size(&self) -> usize {
         self.requests.len()
     }
-    
+
     /// Check if batch is empty
     pub fn is_empty(&self) -> bool {
         self.requests.is_empty()
     }
-    
+
     /// Get highest priority in batch
     pub fn max_priority(&self) -> Priority {
         self.requests
@@ -180,21 +184,18 @@ impl ScheduledRequest {
             started_at: None,
         }
     }
-    
+
     /// Get request age since submission
     pub fn age(&self) -> Duration {
         (chrono::Utc::now() - self.submitted_at)
             .to_std()
             .unwrap_or_default()
     }
-    
+
     /// Get processing time (if started)
     pub fn processing_time(&self) -> Option<Duration> {
-        self.started_at.map(|start| {
-            (chrono::Utc::now() - start)
-                .to_std()
-                .unwrap_or_default()
-        })
+        self.started_at
+            .map(|start| (chrono::Utc::now() - start).to_std().unwrap_or_default())
     }
 }
 
@@ -480,16 +481,16 @@ pub enum SlaViolationType {
 pub trait AdvancedScheduler: Scheduler {
     /// Enable resource-aware scheduling
     async fn enable_resource_awareness(&mut self, config: ResourceAwarenessConfig) -> Result<()>;
-    
+
     /// Set custom admission policy
     async fn set_admission_policy(&mut self, policy: Box<dyn AdmissionPolicy>) -> Result<()>;
-    
+
     /// Configure dynamic batching
     async fn configure_dynamic_batching(&mut self, config: DynamicBatchingConfig) -> Result<()>;
-    
+
     /// Get detailed queue analysis
     fn queue_analysis(&self) -> QueueAnalysis;
-    
+
     /// Simulate scheduling for capacity planning
     async fn simulate_load(
         &self,
@@ -518,7 +519,7 @@ pub trait AdmissionPolicy: Send + Sync {
         request: &InferenceRequest,
         current_metrics: &SchedulerMetrics,
     ) -> AdmissionDecision;
-    
+
     /// Get policy name
     fn name(&self) -> &str;
 }
@@ -655,9 +656,16 @@ pub enum ArrivalPattern {
     /// Poisson process
     Poisson { lambda: f32 },
     /// Bursty pattern
-    Bursty { burst_rate: f32, quiet_rate: f32, burst_duration_s: f32 },
+    Bursty {
+        burst_rate: f32,
+        quiet_rate: f32,
+        burst_duration_s: f32,
+    },
     /// Seasonal pattern
-    Seasonal { base_rate: f32, peaks: Vec<(f32, f32)> }, // (time, multiplier)
+    Seasonal {
+        base_rate: f32,
+        peaks: Vec<(f32, f32)>,
+    }, // (time, multiplier)
 }
 
 /// Request size distribution
@@ -666,7 +674,10 @@ pub enum SizeDistribution {
     /// Fixed size
     Fixed { tokens: usize },
     /// Uniform distribution
-    Uniform { min_tokens: usize, max_tokens: usize },
+    Uniform {
+        min_tokens: usize,
+        max_tokens: usize,
+    },
     /// Normal distribution
     Normal { mean: f32, std_dev: f32 },
     /// Log-normal distribution

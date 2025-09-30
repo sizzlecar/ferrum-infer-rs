@@ -26,12 +26,7 @@
 //! - Qwen family (Qwen, Qwen2, CodeQwen)
 //! - Other architectures (Phi, Gemma, ChatGLM)
 
-use ferrum_interfaces::{
-    ModelBuilder,
-    ModelExecutor,
-    ComputeBackend,
-    WeightLoader,
-};
+use ferrum_interfaces::{ComputeBackend, ModelBuilder, ModelExecutor, WeightLoader};
 
 pub mod builder;
 pub mod config;
@@ -41,24 +36,15 @@ pub mod source;
 
 // Re-exports of interfaces from ferrum-interfaces
 pub use ferrum_interfaces::{
-    ModelBuilder as ModelBuilderInterface,
-    ModelExecutor as ModelExecutorInterface,
-    WeightLoader as WeightLoaderInterface,
-    ModelInfo,
-    ModelConfig,
+    ModelBuilder as ModelBuilderInterface, ModelCapabilities, ModelConfig,
+    ModelExecutor as ModelExecutorInterface, ModelInfo, WeightLoader as WeightLoaderInterface,
     WeightSpec,
-    ModelCapabilities,
 };
 
-pub use ferrum_types::{
-    Result, ModelId, Architecture, DataType, Device, FerrumError,
-};
+pub use ferrum_types::{Architecture, DataType, Device, FerrumError, ModelId, Result};
 
 // Re-exports of implementations
-pub use builder::{
-    DefaultModelBuilderFactory,
-    BuilderRegistry,
-};
+pub use builder::{BuilderRegistry, DefaultModelBuilderFactory};
 pub use config::*;
 pub use loader::*;
 pub use registry::*;
@@ -70,7 +56,9 @@ pub fn default_builder_factory() -> DefaultModelBuilderFactory {
 }
 
 /// Default weight loader factory
-pub fn default_weight_loader(format: WeightFormat) -> Result<Box<dyn WeightLoaderInterface + Send + Sync>> {
+pub fn default_weight_loader(
+    format: WeightFormat,
+) -> Result<Box<dyn WeightLoaderInterface + Send + Sync>> {
     match format {
         WeightFormat::SafeTensors => Ok(Box::new(SafeTensorsLoader::new())),
         WeightFormat::GGUF => Ok(Box::new(GGUFLoader::new())),

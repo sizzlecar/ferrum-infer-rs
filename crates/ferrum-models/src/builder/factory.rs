@@ -1,8 +1,8 @@
 //! Model builder factory implementation
 
 use crate::builder::{LlamaModelBuilder, MistralModelBuilder};
-use ferrum_interfaces::{ModelBuilder, ModelInfo, ModelConfig, ModelCapabilities};
-use ferrum_types::{Result, Architecture, FerrumError};
+use ferrum_interfaces::{ModelBuilder, ModelCapabilities, ModelConfig, ModelInfo};
+use ferrum_types::{Architecture, FerrumError, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -17,22 +17,26 @@ pub struct DefaultModelBuilderFactory {
 impl DefaultModelBuilderFactory {
     /// Create new model builder factory
     pub fn new() -> Self {
-        let mut builders: HashMap<Architecture, Arc<dyn ModelBuilder + Send + Sync>> = HashMap::new();
-        
+        let mut builders: HashMap<Architecture, Arc<dyn ModelBuilder + Send + Sync>> =
+            HashMap::new();
+
         // Register built-in builders
         builders.insert(Architecture::Llama, Arc::new(LlamaModelBuilder::new()));
         builders.insert(Architecture::Llama2, Arc::new(LlamaModelBuilder::new()));
         builders.insert(Architecture::CodeLlama, Arc::new(LlamaModelBuilder::new()));
         builders.insert(Architecture::Mistral, Arc::new(MistralModelBuilder::new()));
         builders.insert(Architecture::Mixtral, Arc::new(MistralModelBuilder::new()));
-        
-        debug!("Created model builder factory with {} builders", builders.len());
-        
+
+        debug!(
+            "Created model builder factory with {} builders",
+            builders.len()
+        );
+
         Self { builders }
     }
 
     /// Register a custom builder for an architecture
-    pub fn register_builder<B>(&mut self, architecture: Architecture, builder: B) 
+    pub fn register_builder<B>(&mut self, architecture: Architecture, builder: B)
     where
         B: ModelBuilder + Send + Sync + 'static,
     {
@@ -41,10 +45,13 @@ impl DefaultModelBuilderFactory {
     }
 
     /// Get builder for architecture
-    pub fn get_builder(&self, architecture: Architecture) -> Result<Arc<dyn ModelBuilder + Send + Sync>> {
-        self.builders.get(&architecture)
-            .cloned()
-            .ok_or_else(|| FerrumError::not_found(format!("No builder for architecture: {:?}", architecture)))
+    pub fn get_builder(
+        &self,
+        architecture: Architecture,
+    ) -> Result<Arc<dyn ModelBuilder + Send + Sync>> {
+        self.builders.get(&architecture).cloned().ok_or_else(|| {
+            FerrumError::not_found(format!("No builder for architecture: {:?}", architecture))
+        })
     }
 
     /// List supported architectures
@@ -117,8 +124,7 @@ impl WeightFormat {
 
     /// Detect format from filename
     pub fn from_filename(filename: &str) -> Option<Self> {
-        filename.rsplit('.').next()
-            .and_then(Self::from_extension)
+        filename.rsplit('.').next().and_then(Self::from_extension)
     }
 }
 
@@ -130,7 +136,7 @@ mod tests {
     fn test_factory_creation() {
         let factory = DefaultModelBuilderFactory::new();
         let supported = factory.supported_architectures();
-        
+
         assert!(supported.contains(&Architecture::Llama));
         assert!(supported.contains(&Architecture::Mistral));
         assert!(!supported.is_empty());
@@ -139,7 +145,7 @@ mod tests {
     #[test]
     fn test_architecture_support() {
         let factory = DefaultModelBuilderFactory::new();
-        
+
         assert!(factory.supports_architecture(Architecture::Llama));
         assert!(factory.supports_architecture(Architecture::Mistral));
         assert!(!factory.supports_architecture(Architecture::Mamba)); // Not registered by default
@@ -148,19 +154,28 @@ mod tests {
     #[test]
     fn test_get_builder() {
         let factory = DefaultModelBuilderFactory::new();
-        
+
         let builder = factory.get_builder(Architecture::Llama);
         assert!(builder.is_ok());
-        
+
         let builder = factory.get_builder(Architecture::Mamba);
         assert!(builder.is_err());
     }
 
     #[test]
     fn test_weight_format_detection() {
-        assert_eq!(WeightFormat::from_filename("model.safetensors"), Some(WeightFormat::SafeTensors));
-        assert_eq!(WeightFormat::from_filename("model.gguf"), Some(WeightFormat::GGUF));
-        assert_eq!(WeightFormat::from_filename("model.pt"), Some(WeightFormat::Pickle));
+        assert_eq!(
+            WeightFormat::from_filename("model.safetensors"),
+            Some(WeightFormat::SafeTensors)
+        );
+        assert_eq!(
+            WeightFormat::from_filename("model.gguf"),
+            Some(WeightFormat::GGUF)
+        );
+        assert_eq!(
+            WeightFormat::from_filename("model.pt"),
+            Some(WeightFormat::Pickle)
+        );
         assert_eq!(WeightFormat::from_filename("model.unknown"), None);
     }
 

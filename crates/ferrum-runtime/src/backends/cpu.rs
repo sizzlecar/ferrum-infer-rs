@@ -1,9 +1,9 @@
 //! CPU backend implementation using ndarray
 
 use crate::{ComputeBackend, DeviceMemoryManager, TensorFactory, TensorLike, TensorOps, TensorRef};
+use async_trait::async_trait;
 use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus};
 use ferrum_types::{DataType, Device, Result};
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -50,13 +50,18 @@ impl TensorLike for CpuTensor {
         for (&s, &e) in start.iter().zip(end.iter()) {
             slice_info.push(ndarray::Slice::from(s..e));
         }
-        
-        let view = self.data.slice(ndarray::SliceInfo::new(slice_info).unwrap());
+
+        let view = self
+            .data
+            .slice(ndarray::SliceInfo::new(slice_info).unwrap());
         Ok(Arc::new(CpuTensor::new(view.to_owned(), self.dtype)))
     }
 
     fn reshape(&self, shape: &[usize]) -> Result<TensorRef> {
-        let reshaped = self.data.clone().into_shape(shape)
+        let reshaped = self
+            .data
+            .clone()
+            .into_shape(shape)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Reshape error: {}", e)))?;
         Ok(Arc::new(CpuTensor::new(reshaped, self.dtype)))
     }
@@ -70,7 +75,7 @@ impl TensorLike for CpuTensor {
             Ok(Arc::new(self.clone()))
         } else {
             Err(ferrum_types::FerrumError::backend(
-                "CPU backend cannot move tensors to non-CPU devices"
+                "CPU backend cannot move tensors to non-CPU devices",
             ))
         }
     }
@@ -80,9 +85,10 @@ impl TensorLike for CpuTensor {
         if matches!(dtype, DataType::F32) {
             Ok(Arc::new(CpuTensor::new(self.data.clone(), dtype)))
         } else {
-            Err(ferrum_types::FerrumError::backend(
-                format!("CPU backend dtype conversion not implemented for {:?}", dtype)
-            ))
+            Err(ferrum_types::FerrumError::backend(format!(
+                "CPU backend dtype conversion not implemented for {:?}",
+                dtype
+            )))
         }
     }
 }
@@ -100,23 +106,24 @@ impl TensorFactory for CpuTensorFactory {
     ) -> Result<TensorRef> {
         if !matches!(device, Device::CPU) {
             return Err(ferrum_types::FerrumError::backend(
-                "CPU factory can only create CPU tensors"
+                "CPU factory can only create CPU tensors",
             ));
         }
-        
-        let array = ndarray::ArrayD::from_shape_vec(shape, data.to_vec())
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Array creation error: {}", e)))?;
-        
+
+        let array = ndarray::ArrayD::from_shape_vec(shape, data.to_vec()).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Array creation error: {}", e))
+        })?;
+
         Ok(Arc::new(CpuTensor::new(array, dtype)))
     }
 
     fn zeros(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
         if !matches!(device, Device::CPU) {
             return Err(ferrum_types::FerrumError::backend(
-                "CPU factory can only create CPU tensors"
+                "CPU factory can only create CPU tensors",
             ));
         }
-        
+
         let array = ndarray::ArrayD::zeros(shape);
         Ok(Arc::new(CpuTensor::new(array, dtype)))
     }
@@ -124,10 +131,10 @@ impl TensorFactory for CpuTensorFactory {
     fn ones(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
         if !matches!(device, Device::CPU) {
             return Err(ferrum_types::FerrumError::backend(
-                "CPU factory can only create CPU tensors"
+                "CPU factory can only create CPU tensors",
             ));
         }
-        
+
         let array = ndarray::ArrayD::ones(shape);
         Ok(Arc::new(CpuTensor::new(array, dtype)))
     }
@@ -142,18 +149,19 @@ impl TensorFactory for CpuTensorFactory {
     ) -> Result<TensorRef> {
         if !matches!(device, Device::CPU) {
             return Err(ferrum_types::FerrumError::backend(
-                "CPU factory can only create CPU tensors"
+                "CPU factory can only create CPU tensors",
             ));
         }
-        
+
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let size: usize = shape.iter().product();
         let data: Vec<f32> = (0..size).map(|_| rng.gen_range(low..high)).collect();
-        
-        let array = ndarray::ArrayD::from_shape_vec(shape, data)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Array creation error: {}", e)))?;
-        
+
+        let array = ndarray::ArrayD::from_shape_vec(shape, data).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Array creation error: {}", e))
+        })?;
+
         Ok(Arc::new(CpuTensor::new(array, dtype)))
     }
 
@@ -167,20 +175,21 @@ impl TensorFactory for CpuTensorFactory {
     ) -> Result<TensorRef> {
         if !matches!(device, Device::CPU) {
             return Err(ferrum_types::FerrumError::backend(
-                "CPU factory can only create CPU tensors"
+                "CPU factory can only create CPU tensors",
             ));
         }
-        
+
         use rand_distr::{Distribution, Normal};
         let normal = Normal::new(mean, std).unwrap();
         let mut rng = rand::thread_rng();
-        
+
         let size: usize = shape.iter().product();
         let data: Vec<f32> = (0..size).map(|_| normal.sample(&mut rng)).collect();
-        
-        let array = ndarray::ArrayD::from_shape_vec(shape, data)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Array creation error: {}", e)))?;
-        
+
+        let array = ndarray::ArrayD::from_shape_vec(shape, data).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Array creation error: {}", e))
+        })?;
+
         Ok(Arc::new(CpuTensor::new(array, dtype)))
     }
 
@@ -196,17 +205,17 @@ impl TensorOps for CpuTensorOps {
     fn matmul(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_cpu = get_cpu_tensor(a)?;
         let b_cpu = get_cpu_tensor(b)?;
-        
+
         // Simple 2D matrix multiplication for now
         let a_data = &a_cpu.data;
         let b_data = &b_cpu.data;
-        
+
         if a_data.ndim() != 2 || b_data.ndim() != 2 {
             return Err(ferrum_types::FerrumError::backend(
-                "CPU matmul only supports 2D matrices currently"
+                "CPU matmul only supports 2D matrices currently",
             ));
         }
-        
+
         let result = a_data.dot(b_data);
         Ok(Arc::new(CpuTensor::new(result.into_dyn(), DataType::F32)))
     }
@@ -214,7 +223,7 @@ impl TensorOps for CpuTensorOps {
     fn add(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_cpu = get_cpu_tensor(a)?;
         let b_cpu = get_cpu_tensor(b)?;
-        
+
         let result = &a_cpu.data + &b_cpu.data;
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
@@ -222,7 +231,7 @@ impl TensorOps for CpuTensorOps {
     fn sub(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_cpu = get_cpu_tensor(a)?;
         let b_cpu = get_cpu_tensor(b)?;
-        
+
         let result = &a_cpu.data - &b_cpu.data;
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
@@ -230,7 +239,7 @@ impl TensorOps for CpuTensorOps {
     fn mul(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_cpu = get_cpu_tensor(a)?;
         let b_cpu = get_cpu_tensor(b)?;
-        
+
         let result = &a_cpu.data * &b_cpu.data;
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
@@ -238,7 +247,7 @@ impl TensorOps for CpuTensorOps {
     fn div(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_cpu = get_cpu_tensor(a)?;
         let b_cpu = get_cpu_tensor(b)?;
-        
+
         let result = &a_cpu.data / &b_cpu.data;
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
@@ -246,24 +255,24 @@ impl TensorOps for CpuTensorOps {
     fn softmax(&self, tensor: &TensorRef, dim: i32) -> Result<TensorRef> {
         let cpu_tensor = get_cpu_tensor(tensor)?;
         let data = &cpu_tensor.data;
-        
+
         // Simple softmax implementation along last dimension
         let mut result = data.clone();
-        
+
         // Apply softmax along the specified dimension
         let dim = if dim < 0 {
             (data.ndim() as i32 + dim) as usize
         } else {
             dim as usize
         };
-        
+
         for mut lane in result.lanes_mut(ndarray::Axis(dim)) {
             let max_val = lane.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             lane.mapv_inplace(|x| (x - max_val).exp());
             let sum = lane.sum();
             lane.mapv_inplace(|x| x / sum);
         }
-        
+
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
 
@@ -277,46 +286,46 @@ impl TensorOps for CpuTensorOps {
         let input_cpu = get_cpu_tensor(input)?;
         let weight_cpu = get_cpu_tensor(weight)?;
         let bias_cpu = bias.map(|b| get_cpu_tensor(b)).transpose()?;
-        
+
         let input_data = &input_cpu.data;
         let mut result = input_data.clone();
-        
+
         // Simple layer norm implementation - normalize last dimension
         let last_axis = ndarray::Axis(input_data.ndim() - 1);
-        
+
         for mut lane in result.lanes_mut(last_axis) {
             let mean = lane.mean().unwrap();
             let var = lane.mapv(|x| (x - mean).powi(2)).mean().unwrap();
             let std = (var + eps).sqrt();
-            
+
             lane.mapv_inplace(|x| (x - mean) / std);
-            
+
             // Apply weight and bias
             lane *= &weight_cpu.data.view();
             if let Some(bias_cpu) = &bias_cpu {
                 lane += &bias_cpu.data.view();
             }
         }
-        
+
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
 
     fn rms_norm(&self, input: &TensorRef, weight: &TensorRef, eps: f32) -> Result<TensorRef> {
         let input_cpu = get_cpu_tensor(input)?;
         let weight_cpu = get_cpu_tensor(weight)?;
-        
+
         let input_data = &input_cpu.data;
         let mut result = input_data.clone();
-        
+
         // Simple RMS norm implementation
         let last_axis = ndarray::Axis(input_data.ndim() - 1);
-        
+
         for mut lane in result.lanes_mut(last_axis) {
             let rms = (lane.mapv(|x| x * x).mean().unwrap() + eps).sqrt();
             lane.mapv_inplace(|x| x / rms);
             lane *= &weight_cpu.data.view();
         }
-        
+
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
 
@@ -329,7 +338,8 @@ impl TensorOps for CpuTensorOps {
     fn gelu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let cpu_tensor = get_cpu_tensor(tensor)?;
         let result = cpu_tensor.data.mapv(|x| {
-            0.5 * x * (1.0 + ((2.0 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x.powi(3))).tanh())
+            0.5 * x
+                * (1.0 + ((2.0 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x.powi(3))).tanh())
         });
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
@@ -342,35 +352,35 @@ impl TensorOps for CpuTensorOps {
 
     fn concat(&self, tensors: &[&TensorRef], dim: usize) -> Result<TensorRef> {
         if tensors.is_empty() {
-            return Err(ferrum_types::FerrumError::backend("Cannot concat empty tensor list"));
+            return Err(ferrum_types::FerrumError::backend(
+                "Cannot concat empty tensor list",
+            ));
         }
-        
-        let cpu_tensors: Result<Vec<_>> = tensors.iter()
-            .map(|t| get_cpu_tensor(t))
-            .collect();
+
+        let cpu_tensors: Result<Vec<_>> = tensors.iter().map(|t| get_cpu_tensor(t)).collect();
         let cpu_tensors = cpu_tensors?;
-        
+
         let arrays: Vec<_> = cpu_tensors.iter().map(|t| t.data.view()).collect();
         let result = ndarray::concatenate(ndarray::Axis(dim), &arrays)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Concat error: {}", e)))?;
-        
+
         Ok(Arc::new(CpuTensor::new(result, DataType::F32)))
     }
 
     fn split(&self, tensor: &TensorRef, sizes: &[usize], dim: usize) -> Result<Vec<TensorRef>> {
         let cpu_tensor = get_cpu_tensor(tensor)?;
         let data = &cpu_tensor.data;
-        
+
         let mut results = Vec::new();
         let mut offset = 0;
-        
+
         for &size in sizes {
             let end = offset + size;
             let slice = data.slice_axis(ndarray::Axis(dim), ndarray::Slice::from(offset..end));
             results.push(Arc::new(CpuTensor::new(slice.to_owned(), DataType::F32)) as TensorRef);
             offset = end;
         }
-        
+
         Ok(results)
     }
 
@@ -400,7 +410,7 @@ impl CpuBackend {
             Device::CPU,
             crate::memory::MemoryPoolConfig::default(),
         ));
-        
+
         Self {
             tensor_factory: Arc::new(CpuTensorFactory),
             tensor_ops: Arc::new(CpuTensorOps),
@@ -417,7 +427,7 @@ impl ComputeBackend for CpuBackend {
 
     fn capabilities(&self) -> BackendCapabilities {
         use ferrum_types::DataType::*;
-        
+
         BackendCapabilities {
             supported_dtypes: vec![F32],
             supported_devices: vec![Device::CPU],

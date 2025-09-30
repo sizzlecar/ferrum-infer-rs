@@ -20,5 +20,3 @@ pub use health::HealthCommand;
 pub use infer::InferCommand;
 pub use models::ModelsCommand;
 pub use serve::ServeCommand;
-
-

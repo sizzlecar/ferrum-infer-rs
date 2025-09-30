@@ -20,19 +20,15 @@
 //! - **Chat Templates**: Support for conversation formatting
 //! - **Special Tokens**: Proper handling of BOS, EOS, PAD, and other special tokens
 
-pub mod implementations;
 pub mod cache;
+pub mod implementations;
 pub mod templates;
 
 // Re-export interfaces
-pub use ferrum_interfaces::{
-    Tokenizer, TokenizerFactory, TokenizerInfo, IncrementalTokenizer,
-};
+pub use ferrum_interfaces::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo};
 
-pub use ferrum_types::{
-    TokenId, SpecialTokens, Result,
-};
+pub use ferrum_types::{Result, SpecialTokens, TokenId};
 
 // Re-export implementations
-pub use implementations::*;
 pub use cache::*;
+pub use implementations::*;

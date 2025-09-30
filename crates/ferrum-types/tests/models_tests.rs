@@ -35,16 +35,24 @@ fn model_info_estimates() {
 
     let mem = info.memory_requirements(2, 128);
     assert!(mem.parameter_memory > 0);
-    assert!(mem.total_estimated >= mem.parameter_memory + mem.kv_cache_memory + mem.activation_memory);
+    assert!(
+        mem.total_estimated >= mem.parameter_memory + mem.kv_cache_memory + mem.activation_memory
+    );
 }
 
 #[test]
 fn quant_config_helpers() {
-    let q = QuantizationConfig::INT4 { symmetric: true, group_size: 128 };
+    let q = QuantizationConfig::INT4 {
+        symmetric: true,
+        group_size: 128,
+    };
     assert_eq!(q.bits(), 4);
     assert!(!q.is_high_accuracy());
 
-    let q = QuantizationConfig::FP8 { e4m3: true, kv_cache: true };
+    let q = QuantizationConfig::FP8 {
+        e4m3: true,
+        kv_cache: true,
+    };
     assert!(q.is_high_accuracy());
 }
 

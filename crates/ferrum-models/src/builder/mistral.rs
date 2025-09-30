@@ -1,11 +1,11 @@
 //! Mistral family model builder
 
-use ferrum_interfaces::{ModelBuilder, ModelInfo, ModelConfig, ModelCapabilities, ModelExecutor};
+use async_trait::async_trait;
 use ferrum_interfaces::{ComputeBackend, WeightLoader};
-use ferrum_types::{Result, Architecture, DataType, FerrumError};
+use ferrum_interfaces::{ModelBuilder, ModelCapabilities, ModelConfig, ModelExecutor, ModelInfo};
+use ferrum_types::{Architecture, DataType, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
-use async_trait::async_trait;
 
 /// Mistral model builder
 #[derive(Debug, Clone)]
@@ -24,10 +24,7 @@ impl MistralModelBuilder {
             supports_vision: false,
             max_sequence_length: 8192, // Mistral typically supports longer contexts
             supported_dtypes: vec![DataType::F16, DataType::F32, DataType::BF16],
-            supported_architectures: vec![
-                Architecture::Mistral,
-                Architecture::Mixtral,
-            ],
+            supported_architectures: vec![Architecture::Mistral, Architecture::Mixtral],
         };
 
         Self { capabilities }
@@ -36,30 +33,43 @@ impl MistralModelBuilder {
     /// Validate model configuration
     fn validate_config(&self, config: &ModelConfig) -> Result<()> {
         // Check architecture compatibility
-        if !self.capabilities.supported_architectures.contains(&config.architecture) {
-            return Err(FerrumError::invalid_parameter(
-                format!("Architecture {:?} not supported by MistralModelBuilder", config.architecture)
-            ));
+        if !self
+            .capabilities
+            .supported_architectures
+            .contains(&config.architecture)
+        {
+            return Err(FerrumError::invalid_parameter(format!(
+                "Architecture {:?} not supported by MistralModelBuilder",
+                config.architecture
+            )));
         }
 
         // Validate required parameters
         if config.hidden_size == 0 {
-            return Err(FerrumError::invalid_parameter("hidden_size must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "hidden_size must be positive",
+            ));
         }
         if config.num_layers == 0 {
-            return Err(FerrumError::invalid_parameter("num_layers must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "num_layers must be positive",
+            ));
         }
         if config.num_attention_heads == 0 {
-            return Err(FerrumError::invalid_parameter("num_attention_heads must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "num_attention_heads must be positive",
+            ));
         }
         if config.vocab_size == 0 {
-            return Err(FerrumError::invalid_parameter("vocab_size must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "vocab_size must be positive",
+            ));
         }
 
         // Validate attention head configuration
         if config.hidden_size % config.num_attention_heads != 0 {
             return Err(FerrumError::invalid_parameter(
-                "hidden_size must be divisible by num_attention_heads"
+                "hidden_size must be divisible by num_attention_heads",
             ));
         }
 
@@ -81,14 +91,13 @@ impl MistralModelBuilder {
         let total_params = self.estimate_parameters(config);
 
         // Mistral uses grouped-query attention by default
-        let num_key_value_heads = config.num_key_value_heads
-            .unwrap_or_else(|| {
-                match config.architecture {
-                    Architecture::Mistral => 8, // Typical for Mistral 7B
-                    Architecture::Mixtral => 8, // Typical for Mixtral
-                    _ => config.num_attention_heads, // Fallback
-                }
-            });
+        let num_key_value_heads = config.num_key_value_heads.unwrap_or_else(|| {
+            match config.architecture {
+                Architecture::Mistral => 8,      // Typical for Mistral 7B
+                Architecture::Mixtral => 8,      // Typical for Mixtral
+                _ => config.num_attention_heads, // Fallback
+            }
+        });
 
         ModelInfo {
             model_id: config.model_id.clone(),
@@ -122,7 +131,7 @@ impl MistralModelBuilder {
                 // Mixture of Experts parameters
                 let num_experts = 8; // Typical for Mixtral
                 let experts_per_token = 2; // Typical routing
-                
+
                 // Embedding layer
                 let embed_params = vocab_size * hidden_size;
 
@@ -131,7 +140,8 @@ impl MistralModelBuilder {
                 let expert_mlp_params = num_experts * (3 * hidden_size * intermediate_size);
                 let routing_params = hidden_size * num_experts; // Router layer
                 let norm_params = 2 * hidden_size;
-                let layer_params = attention_params + expert_mlp_params + routing_params + norm_params;
+                let layer_params =
+                    attention_params + expert_mlp_params + routing_params + norm_params;
 
                 // Output layer
                 let output_params = hidden_size * vocab_size;
@@ -170,17 +180,20 @@ impl ModelBuilder for MistralModelBuilder {
         weight_loader: Arc<dyn WeightLoader + Send + Sync>,
     ) -> Result<Box<dyn ModelExecutor + Send + Sync>> {
         info!("Building Mistral model: {:?}", config.model_id);
-        
+
         // Validate configuration
         self.validate_config(config)?;
 
         // Create model info
         let model_info = self.create_model_info(config);
-        debug!("Created model info: {} parameters", model_info.total_parameters.unwrap_or(0));
+        debug!(
+            "Created model info: {} parameters",
+            model_info.total_parameters.unwrap_or(0)
+        );
 
         // Create model executor (placeholder implementation)
         let executor = PlaceholderMistralExecutor::new(model_info, backend, weight_loader);
-        
+
         info!("Successfully built Mistral model");
         Ok(Box::new(executor))
     }
@@ -231,16 +244,21 @@ impl ModelExecutor for PlaceholderMistralExecutor {
         &self,
         input: &ferrum_interfaces::PrefillInput,
     ) -> Result<ferrum_interfaces::PrefillOutput> {
-        debug!("Mistral prefill: processing {} tokens", input.input_ids.shape()[1]);
-        
+        debug!(
+            "Mistral prefill: processing {} tokens",
+            input.input_ids.shape()[1]
+        );
+
         // In real implementation, this would:
         // 1. Handle sliding window attention for Mistral
         // 2. Handle MoE routing for Mixtral
         // 3. Run embedding layer
         // 4. Run transformer layers with proper attention mechanisms
         // 5. Generate logits
-        
-        Err(FerrumError::not_implemented("Mistral prefill not yet implemented"))
+
+        Err(FerrumError::not_implemented(
+            "Mistral prefill not yet implemented",
+        ))
     }
 
     async fn decode(
@@ -248,14 +266,16 @@ impl ModelExecutor for PlaceholderMistralExecutor {
         input: &ferrum_interfaces::DecodeInput,
     ) -> Result<ferrum_interfaces::DecodeOutput> {
         debug!("Mistral decode: processing single token");
-        
+
         // In real implementation, this would:
         // 1. Handle sliding window attention caching
         // 2. Handle MoE routing if Mixtral
         // 3. Run transformer layers with optimized attention
         // 4. Generate logits
-        
-        Err(FerrumError::not_implemented("Mistral decode not yet implemented"))
+
+        Err(FerrumError::not_implemented(
+            "Mistral decode not yet implemented",
+        ))
     }
 }
 
@@ -304,7 +324,7 @@ mod tests {
     fn test_builder_creation() {
         let builder = MistralModelBuilder::new();
         let archs = builder.supported_architectures();
-        
+
         assert!(archs.contains(&Architecture::Mistral));
         assert!(archs.contains(&Architecture::Mixtral));
     }
@@ -313,7 +333,7 @@ mod tests {
     fn test_mistral_config_validation() {
         let builder = MistralModelBuilder::new();
         let config = create_mistral_config();
-        
+
         assert!(builder.validate_config(&config).is_ok());
     }
 
@@ -321,7 +341,7 @@ mod tests {
     fn test_mixtral_config_validation() {
         let builder = MistralModelBuilder::new();
         let config = create_mixtral_config();
-        
+
         assert!(builder.validate_config(&config).is_ok());
     }
 
@@ -329,9 +349,9 @@ mod tests {
     fn test_mistral_model_info() {
         let builder = MistralModelBuilder::new();
         let config = create_mistral_config();
-        
+
         let info = builder.model_info(&config).unwrap();
-        
+
         assert_eq!(info.architecture, Architecture::Mistral);
         assert_eq!(info.num_key_value_heads, 8); // GQA
         assert_eq!(info.norm_eps, 1e-5); // Mistral default
@@ -342,9 +362,9 @@ mod tests {
     fn test_mixtral_parameter_estimation() {
         let builder = MistralModelBuilder::new();
         let config = create_mixtral_config();
-        
+
         let params = builder.estimate_parameters(&config);
-        
+
         // Mixtral should have significantly more parameters due to MoE
         assert!(params > 10_000_000_000); // At least 10B parameters
     }
@@ -352,10 +372,10 @@ mod tests {
     #[test]
     fn test_unsupported_architecture() {
         let builder = MistralModelBuilder::new();
-        
+
         let mut config = create_mistral_config();
         config.architecture = Architecture::Llama; // Not supported by MistralModelBuilder
-        
+
         assert!(builder.validate_config(&config).is_err());
     }
 }

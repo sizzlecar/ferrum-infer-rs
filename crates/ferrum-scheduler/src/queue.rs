@@ -51,7 +51,11 @@ impl FifoQueue {
 
     /// Remove specific request from queue
     pub fn remove(&mut self, request_id: &RequestId) -> Option<InferenceRequest> {
-        if let Some(pos) = self.requests.iter().position(|req| &req.request_id == request_id) {
+        if let Some(pos) = self
+            .requests
+            .iter()
+            .position(|req| &req.request_id == request_id)
+        {
             self.requests.remove(pos)
         } else {
             None
@@ -60,12 +64,16 @@ impl FifoQueue {
 
     /// Get reference to request by ID
     pub fn get(&self, request_id: &RequestId) -> Option<&InferenceRequest> {
-        self.requests.iter().find(|req| &req.request_id == request_id)
+        self.requests
+            .iter()
+            .find(|req| &req.request_id == request_id)
     }
 
     /// Get mutable reference to request by ID
     pub fn get_mut(&mut self, request_id: &RequestId) -> Option<&mut InferenceRequest> {
-        self.requests.iter_mut().find(|req| &req.request_id == request_id)
+        self.requests
+            .iter_mut()
+            .find(|req| &req.request_id == request_id)
     }
 
     /// Clear all requests
@@ -108,7 +116,7 @@ impl PriorityDistribution {
         I: Iterator<Item = &'a InferenceRequest>,
     {
         let mut dist = PriorityDistribution::default();
-        
+
         for request in requests {
             match request.priority {
                 Priority::Critical => dist.critical += 1,
@@ -117,7 +125,7 @@ impl PriorityDistribution {
                 Priority::Low => dist.low += 1,
             }
         }
-        
+
         dist
     }
 
@@ -132,7 +140,7 @@ impl PriorityDistribution {
         if total == 0.0 {
             return (0.0, 0.0, 0.0, 0.0);
         }
-        
+
         (
             self.critical as f32 / total,
             self.high as f32 / total,
@@ -150,7 +158,7 @@ impl FifoQueue {
         } else {
             0.0
         };
-        
+
         QueueStats {
             length: self.requests.len(),
             capacity: self.max_size,

@@ -12,7 +12,11 @@ fn inference_request_builder_defaults() {
 
 #[test]
 fn inference_request_builder_setters() {
-    let params = SamplingParams { max_tokens: 16, temperature: 0.7, ..Default::default() };
+    let params = SamplingParams {
+        max_tokens: 16,
+        temperature: 0.7,
+        ..Default::default()
+    };
     let req = InferenceRequest::new("hi", "mistral")
         .with_sampling_params(params.clone())
         .with_stream(true)
@@ -32,7 +36,10 @@ fn inference_request_builder_setters() {
 #[test]
 fn batch_request_construction() {
     let r1 = InferenceRequest::new("a", "m");
-    let r2 = InferenceRequest::new("b", "m").with_sampling_params(SamplingParams { max_tokens: 1024, ..Default::default() });
+    let r2 = InferenceRequest::new("b", "m").with_sampling_params(SamplingParams {
+        max_tokens: 1024,
+        ..Default::default()
+    });
     let batch = BatchRequest::new(vec![r1, r2]);
     assert_eq!(batch.size(), 2);
     assert!(batch.max_sequence_length >= 512);

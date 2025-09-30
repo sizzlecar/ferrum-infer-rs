@@ -1,19 +1,19 @@
 //! Compression support for KV cache
 
-use ferrum_types::{Result, DataType, FerrumError};
+use ferrum_types::{DataType, FerrumError, Result};
 use std::sync::Arc;
 
 /// Compression strategy trait
 pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
     /// Compress data
     fn compress(&self, data: &[u8], original_dtype: DataType) -> Result<CompressedData>;
-    
+
     /// Decompress data
     fn decompress(&self, compressed: &CompressedData) -> Result<Vec<u8>>;
-    
+
     /// Get compression ratio estimate
     fn compression_ratio(&self) -> f32;
-    
+
     /// Get strategy name
     fn name(&self) -> &str;
 }
@@ -94,7 +94,7 @@ impl Int4Compression {
     pub fn new() -> Self {
         let mut params = CompressionParams::default();
         params.quantization_bits = Some(4);
-        
+
         Self { params }
     }
 }
@@ -113,7 +113,7 @@ impl CompressionStrategy for Int4Compression {
                 // In practice, this would involve proper float->int4 quantization
                 let compressed_size = (data.len() + 1) / 2; // 4 bits per element
                 let mut compressed = vec![0u8; compressed_size];
-                
+
                 // Placeholder compression (just truncate for demo)
                 for (i, chunk) in data.chunks(2).enumerate() {
                     if i < compressed.len() {
@@ -124,7 +124,7 @@ impl CompressionStrategy for Int4Compression {
                         }
                     }
                 }
-                
+
                 Ok(CompressedData {
                     data: compressed,
                     original_dtype,
@@ -133,30 +133,33 @@ impl CompressionStrategy for Int4Compression {
                     params: self.params.clone(),
                 })
             }
-            _ => Err(FerrumError::invalid_parameter(
-                format!("INT4 compression not supported for {:?}", original_dtype)
-            )),
+            _ => Err(FerrumError::invalid_parameter(format!(
+                "INT4 compression not supported for {:?}",
+                original_dtype
+            ))),
         }
     }
 
     fn decompress(&self, compressed: &CompressedData) -> Result<Vec<u8>> {
         if compressed.algorithm != "int4" {
-            return Err(FerrumError::invalid_parameter("Expected INT4 compressed data"));
+            return Err(FerrumError::invalid_parameter(
+                "Expected INT4 compressed data",
+            ));
         }
-        
+
         // Simplified decompression (reverse of compression)
         let mut decompressed = Vec::with_capacity(compressed.original_size);
-        
+
         for &byte in &compressed.data {
             decompressed.push(byte & 0xF0);
             if decompressed.len() < compressed.original_size {
                 decompressed.push((byte & 0x0F) << 4);
             }
         }
-        
+
         // Trim to original size
         decompressed.truncate(compressed.original_size);
-        
+
         Ok(decompressed)
     }
 
@@ -170,7 +173,7 @@ impl CompressionStrategy for Int4Compression {
 }
 
 /// FP8 compression
-#[derive(Debug, Clone)]  
+#[derive(Debug, Clone)]
 pub struct Fp8Compression {
     params: CompressionParams,
 }
@@ -180,7 +183,7 @@ impl Fp8Compression {
     pub fn new() -> Self {
         let mut params = CompressionParams::default();
         params.quantization_bits = Some(8);
-        
+
         Self { params }
     }
 }
@@ -198,7 +201,7 @@ impl CompressionStrategy for Fp8Compression {
                 // Convert F32 to FP8 (simplified - would need proper FP8 format)
                 // For now, just take every 4th byte as a placeholder
                 let compressed: Vec<u8> = data.iter().step_by(4).cloned().collect();
-                
+
                 Ok(CompressedData {
                     data: compressed,
                     original_dtype,
@@ -210,7 +213,7 @@ impl CompressionStrategy for Fp8Compression {
             DataType::F16 => {
                 // Convert F16 to FP8 (simplified)
                 let compressed: Vec<u8> = data.iter().step_by(2).cloned().collect();
-                
+
                 Ok(CompressedData {
                     data: compressed,
                     original_dtype,
@@ -219,17 +222,20 @@ impl CompressionStrategy for Fp8Compression {
                     params: self.params.clone(),
                 })
             }
-            _ => Err(FerrumError::invalid_parameter(
-                format!("FP8 compression not supported for {:?}", original_dtype)
-            )),
+            _ => Err(FerrumError::invalid_parameter(format!(
+                "FP8 compression not supported for {:?}",
+                original_dtype
+            ))),
         }
     }
 
     fn decompress(&self, compressed: &CompressedData) -> Result<Vec<u8>> {
         if compressed.algorithm != "fp8" {
-            return Err(FerrumError::invalid_parameter("Expected FP8 compressed data"));
+            return Err(FerrumError::invalid_parameter(
+                "Expected FP8 compressed data",
+            ));
         }
-        
+
         match compressed.original_dtype {
             DataType::F32 => {
                 // Expand back to F32 (placeholder)
@@ -253,15 +259,16 @@ impl CompressionStrategy for Fp8Compression {
                 decompressed.truncate(compressed.original_size);
                 Ok(decompressed)
             }
-            _ => Err(FerrumError::invalid_parameter(
-                format!("Cannot decompress FP8 to {:?}", compressed.original_dtype)
-            )),
+            _ => Err(FerrumError::invalid_parameter(format!(
+                "Cannot decompress FP8 to {:?}",
+                compressed.original_dtype
+            ))),
         }
     }
 
     fn compression_ratio(&self) -> f32 {
         match self.params.quantization_bits.unwrap_or(8) {
-            8 => 2.0, // F16 -> FP8: 2:1, F32 -> FP8: 4:1, average ~2:1 
+            8 => 2.0, // F16 -> FP8: 2:1, F32 -> FP8: 4:1, average ~2:1
             _ => 1.5,
         }
     }
@@ -283,13 +290,14 @@ pub struct CompressionManager {
 impl CompressionManager {
     /// Create new compression manager
     pub fn new() -> Self {
-        let mut strategies: std::collections::HashMap<String, Arc<dyn CompressionStrategy>> = std::collections::HashMap::new();
-        
+        let mut strategies: std::collections::HashMap<String, Arc<dyn CompressionStrategy>> =
+            std::collections::HashMap::new();
+
         // Register built-in strategies
         strategies.insert("none".to_string(), Arc::new(NoCompression));
         strategies.insert("int4".to_string(), Arc::new(Int4Compression::new()));
         strategies.insert("fp8".to_string(), Arc::new(Fp8Compression::new()));
-        
+
         Self {
             strategies,
             default_strategy: "none".to_string(),
@@ -297,7 +305,7 @@ impl CompressionManager {
     }
 
     /// Register compression strategy
-    pub fn register_strategy<S>(&mut self, name: String, strategy: S) 
+    pub fn register_strategy<S>(&mut self, name: String, strategy: S)
     where
         S: CompressionStrategy + 'static,
     {
@@ -310,15 +318,18 @@ impl CompressionManager {
             self.default_strategy = name.to_string();
             Ok(())
         } else {
-            Err(FerrumError::not_found(format!("Compression strategy not found: {}", name)))
+            Err(FerrumError::not_found(format!(
+                "Compression strategy not found: {}",
+                name
+            )))
         }
     }
 
     /// Get strategy by name
     pub fn get_strategy(&self, name: &str) -> Result<Arc<dyn CompressionStrategy>> {
-        self.strategies.get(name)
-            .cloned()
-            .ok_or_else(|| FerrumError::not_found(format!("Compression strategy not found: {}", name)))
+        self.strategies.get(name).cloned().ok_or_else(|| {
+            FerrumError::not_found(format!("Compression strategy not found: {}", name))
+        })
     }
 
     /// Get default strategy
@@ -332,7 +343,12 @@ impl CompressionManager {
     }
 
     /// Compress data using specified strategy
-    pub fn compress(&self, data: &[u8], original_dtype: DataType, strategy_name: Option<&str>) -> Result<CompressedData> {
+    pub fn compress(
+        &self,
+        data: &[u8],
+        original_dtype: DataType,
+        strategy_name: Option<&str>,
+    ) -> Result<CompressedData> {
         let strategy_name = strategy_name.unwrap_or(&self.default_strategy);
         let strategy = self.get_strategy(strategy_name)?;
         strategy.compress(data, original_dtype)
@@ -359,11 +375,11 @@ mod tests {
     fn test_no_compression() {
         let compression = NoCompression;
         let data = vec![1, 2, 3, 4];
-        
+
         let compressed = compression.compress(&data, DataType::F32).unwrap();
         assert_eq!(compressed.data, data);
         assert_eq!(compressed.algorithm, "none");
-        
+
         let decompressed = compression.decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
@@ -372,11 +388,11 @@ mod tests {
     fn test_int4_compression() {
         let compression = Int4Compression::new();
         let data = vec![0xAB, 0xCD, 0xEF, 0x12];
-        
+
         let compressed = compression.compress(&data, DataType::F16).unwrap();
         assert_eq!(compressed.algorithm, "int4");
         assert!(compressed.data.len() <= data.len()); // Should be smaller or equal
-        
+
         let decompressed = compression.decompress(&compressed).unwrap();
         assert_eq!(decompressed.len(), data.len());
     }
@@ -384,12 +400,12 @@ mod tests {
     #[test]
     fn test_compression_manager() {
         let manager = CompressionManager::new();
-        
+
         let strategies = manager.available_strategies();
         assert!(strategies.contains(&"none".to_string()));
         assert!(strategies.contains(&"int4".to_string()));
         assert!(strategies.contains(&"fp8".to_string()));
-        
+
         let strategy = manager.default_strategy().unwrap();
         assert_eq!(strategy.name(), "none");
     }
@@ -398,10 +414,12 @@ mod tests {
     fn test_manager_compress_decompress() {
         let manager = CompressionManager::new();
         let data = vec![1, 2, 3, 4];
-        
-        let compressed = manager.compress(&data, DataType::F32, Some("none")).unwrap();
+
+        let compressed = manager
+            .compress(&data, DataType::F32, Some("none"))
+            .unwrap();
         let decompressed = manager.decompress(&compressed).unwrap();
-        
+
         assert_eq!(decompressed, data);
     }
 
@@ -409,7 +427,7 @@ mod tests {
     fn test_unsupported_compression() {
         let compression = Int4Compression::new();
         let data = vec![1, 2, 3, 4];
-        
+
         // INT4 doesn't support integer types in our implementation
         let result = compression.compress(&data, DataType::I32);
         assert!(result.is_err());

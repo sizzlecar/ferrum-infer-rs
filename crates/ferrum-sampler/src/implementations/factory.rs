@@ -1,9 +1,11 @@
 //! Default sampler factory implementation
 
-use crate::{SamplerFactoryInterface, SamplerInterface, SamplingConfig, SamplingMode};
 use crate::implementations::{GreedySampler, MultinomialSampler};
+use crate::processors::{
+    FrequencyPenaltyProcessor, PresencePenaltyProcessor, RepetitionPenaltyProcessor,
+};
 use crate::processors::{ProcessorChain, TemperatureProcessor, TopKProcessor, TopPProcessor};
-use crate::processors::{RepetitionPenaltyProcessor, PresencePenaltyProcessor, FrequencyPenaltyProcessor};
+use crate::{SamplerFactoryInterface, SamplerInterface, SamplingConfig, SamplingMode};
 use ferrum_types::Result;
 use std::sync::Arc;
 
@@ -35,7 +37,7 @@ impl DefaultSamplerFactory {
             }
         }
 
-        // Add frequency penalty if specified  
+        // Add frequency penalty if specified
         if let Some(frequency_penalty) = config.frequency_penalty {
             if frequency_penalty.value().abs() > f32::EPSILON {
                 chain.add(FrequencyPenaltyProcessor::new(frequency_penalty));
@@ -68,7 +70,10 @@ impl DefaultSamplerFactory {
 }
 
 impl SamplerFactoryInterface for DefaultSamplerFactory {
-    fn create_sampler(&self, config: &SamplingConfig) -> Result<Box<dyn SamplerInterface + Send + Sync>> {
+    fn create_sampler(
+        &self,
+        config: &SamplingConfig,
+    ) -> Result<Box<dyn SamplerInterface + Send + Sync>> {
         let sampler: Box<dyn SamplerInterface + Send + Sync> = match config.mode {
             SamplingMode::Greedy => Box::new(GreedySampler::new()),
             SamplingMode::Multinomial => Box::new(MultinomialSampler::new()),
@@ -78,7 +83,10 @@ impl SamplerFactoryInterface for DefaultSamplerFactory {
         Ok(sampler)
     }
 
-    fn create_processor_chain(&self, config: &SamplingConfig) -> Result<Box<dyn crate::LogitsProcessorInterface + Send + Sync>> {
+    fn create_processor_chain(
+        &self,
+        config: &SamplingConfig,
+    ) -> Result<Box<dyn crate::LogitsProcessorInterface + Send + Sync>> {
         let chain = self.create_processor_chain(config)?;
         Ok(Box::new(chain))
     }
@@ -110,8 +118,13 @@ impl CombinedSampler {
         processor_chain: ProcessorChain,
         sampler: Box<dyn SamplerInterface + Send + Sync>,
     ) -> Self {
-        let name = format!("combined[{}+{}]", 
-            if processor_chain.is_empty() { "none" } else { "processors" },
+        let name = format!(
+            "combined[{}+{}]",
+            if processor_chain.is_empty() {
+                "none"
+            } else {
+                "processors"
+            },
             sampler.name()
         );
 
@@ -127,29 +140,33 @@ impl CombinedSampler {
         let factory = DefaultSamplerFactory::new();
         let processor_chain = factory.create_processor_chain(config)?;
         let sampler = factory.create_sampler(config)?;
-        
+
         Ok(Self::new(processor_chain, sampler))
     }
 
     /// Process logits and sample token
-    pub fn process_and_sample(&self, logits: &mut [f32], rng: &mut dyn rand::RngCore) -> Result<ferrum_types::TokenId> {
+    pub fn process_and_sample(
+        &self,
+        logits: &mut [f32],
+        rng: &mut dyn rand::RngCore,
+    ) -> Result<ferrum_types::TokenId> {
         // Apply processor chain
         self.processor_chain.process(logits)?;
-        
+
         // Sample token
         self.sampler.sample(logits, rng)
     }
 
     /// Process logits and sample multiple tokens
     pub fn process_and_sample_multiple(
-        &self, 
-        logits: &mut [f32], 
-        n: usize, 
-        rng: &mut dyn rand::RngCore
+        &self,
+        logits: &mut [f32],
+        n: usize,
+        rng: &mut dyn rand::RngCore,
     ) -> Result<Vec<ferrum_types::TokenId>> {
         // Apply processor chain
         self.processor_chain.process(logits)?;
-        
+
         // Sample tokens
         self.sampler.sample_multiple(logits, n, rng)
     }
@@ -176,7 +193,12 @@ impl SamplerInterface for CombinedSampler {
         self.process_and_sample(&mut logits_copy, rng)
     }
 
-    fn sample_multiple(&self, logits: &[f32], n: usize, rng: &mut dyn rand::RngCore) -> Result<Vec<ferrum_types::TokenId>> {
+    fn sample_multiple(
+        &self,
+        logits: &[f32],
+        n: usize,
+        rng: &mut dyn rand::RngCore,
+    ) -> Result<Vec<ferrum_types::TokenId>> {
         let mut logits_copy = logits.to_vec();
         self.process_and_sample_multiple(&mut logits_copy, n, rng)
     }
@@ -251,7 +273,7 @@ mod tests {
         };
 
         let chain = factory.create_processor_chain(&config).unwrap();
-        
+
         // Should have temperature, top-k, and top-p processors
         assert_eq!(chain.len(), 3);
         let names = chain.processor_names();
@@ -274,10 +296,10 @@ mod tests {
 
         let combined = CombinedSampler::from_config(&config).unwrap();
         let mut rng = StdRng::seed_from_u64(42);
-        
+
         let logits = vec![2.0, 4.0, 6.0];
         let token = combined.sample(&logits, &mut rng).unwrap();
-        
+
         // Should select highest logit (index 2) after temperature processing
         assert_eq!(token.value(), 2);
     }

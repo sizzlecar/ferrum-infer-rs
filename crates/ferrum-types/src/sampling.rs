@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::TokenId;
+
 /// Sampling parameters for generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingParams {
@@ -189,19 +191,19 @@ pub enum FinishReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialTokens {
     /// Beginning of sequence token
-    pub bos_token: Option<u32>,
+    pub bos_token: Option<TokenId>,
     /// End of sequence token
-    pub eos_token: Option<u32>,
+    pub eos_token: Option<TokenId>,
     /// Unknown token
-    pub unk_token: Option<u32>,
+    pub unk_token: Option<TokenId>,
     /// Padding token
-    pub pad_token: Option<u32>,
+    pub pad_token: Option<TokenId>,
     /// Separator token
-    pub sep_token: Option<u32>,
+    pub sep_token: Option<TokenId>,
     /// Classification token
-    pub cls_token: Option<u32>,
+    pub cls_token: Option<TokenId>,
     /// Mask token
-    pub mask_token: Option<u32>,
+    pub mask_token: Option<TokenId>,
 }
 
 impl Default for SpecialTokens {

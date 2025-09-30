@@ -1,6 +1,6 @@
 //! Prefix caching for shared prompt optimization
 
-use ferrum_types::{Result, TokenId, RequestId, FerrumError};
+use ferrum_types::{FerrumError, RequestId, Result, TokenId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,7 +84,9 @@ impl CachedPrefix {
     /// Remove reference
     pub fn remove_ref(&mut self) -> Result<()> {
         if self.ref_count == 0 {
-            return Err(FerrumError::invalid_state("Cannot remove ref from zero-ref prefix"));
+            return Err(FerrumError::invalid_state(
+                "Cannot remove ref from zero-ref prefix",
+            ));
         }
         self.ref_count -= 1;
         Ok(())
@@ -130,13 +132,19 @@ impl PrefixCache {
     }
 
     /// Find matching prefix for given tokens
-    pub fn find_prefix(&self, tokens: &[TokenId]) -> Option<(PrefixId, Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>)> {
+    pub fn find_prefix(
+        &self,
+        tokens: &[TokenId],
+    ) -> Option<(
+        PrefixId,
+        Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+    )> {
         if tokens.len() < self.min_prefix_length {
             return None;
         }
 
         let prefixes = self.prefixes.read();
-        
+
         // Find longest matching prefix
         let mut best_match = None;
         let mut best_len = 0;
@@ -151,7 +159,7 @@ impl PrefixCache {
         if let Some(ref match_info) = best_match {
             *self.hits.lock() += 1;
             trace!("Prefix cache hit: {} tokens", best_len);
-            
+
             // Update access time
             drop(prefixes); // Release read lock
             let mut prefixes = self.prefixes.write();
@@ -180,7 +188,7 @@ impl PrefixCache {
         let cached_prefix = CachedPrefix::new(prefix_id.clone(), kv_handle);
 
         let mut prefixes = self.prefixes.write();
-        
+
         // Check if we need to evict
         if prefixes.len() >= self.max_prefixes && !prefixes.contains_key(&prefix_id) {
             self.evict_lru(&mut prefixes);
@@ -201,14 +209,17 @@ impl PrefixCache {
     pub fn remove_ref(&self, prefix_tokens: &[TokenId]) -> Result<()> {
         let prefix_id = PrefixId::from(prefix_tokens);
         let mut prefixes = self.prefixes.write();
-        
+
         if let Some(cached_prefix) = prefixes.get_mut(&prefix_id) {
             cached_prefix.remove_ref()?;
-            
+
             // Remove if no more references
             if cached_prefix.ref_count == 0 {
                 prefixes.remove(&prefix_id);
-                debug!("Removed unreferenced prefix: {} tokens", prefix_tokens.len());
+                debug!(
+                    "Removed unreferenced prefix: {} tokens",
+                    prefix_tokens.len()
+                );
             }
         }
 
@@ -240,7 +251,7 @@ impl PrefixCache {
         let prefixes = self.prefixes.read();
         let total_size: usize = prefixes.values().map(|p| p.size).sum();
         let active_prefixes = prefixes.len();
-        
+
         PrefixCacheStats {
             hits: *self.hits.lock(),
             misses: *self.misses.lock(),
@@ -340,19 +351,24 @@ mod tests {
     #[test]
     fn test_prefix_storage_and_retrieval() {
         let cache = PrefixCache::new(10, 2);
-        
+
         let tokens = vec![TokenId::new(1), TokenId::new(2), TokenId::new(3)];
         let handle = Arc::new(MockKvHandle::new(3));
-        
+
         // Store prefix
         cache.store_prefix(&tokens, handle.clone()).unwrap();
-        
+
         // Should find exact match
         let result = cache.find_prefix(&tokens);
         assert!(result.is_some());
-        
+
         // Should find prefix for longer sequence
-        let longer_tokens = vec![TokenId::new(1), TokenId::new(2), TokenId::new(3), TokenId::new(4)];
+        let longer_tokens = vec![
+            TokenId::new(1),
+            TokenId::new(2),
+            TokenId::new(3),
+            TokenId::new(4),
+        ];
         let result = cache.find_prefix(&longer_tokens);
         assert!(result.is_some());
         let (found_prefix, _) = result.unwrap();
@@ -362,13 +378,13 @@ mod tests {
     #[test]
     fn test_prefix_length_filtering() {
         let cache = PrefixCache::new(10, 5); // Minimum 5 tokens
-        
+
         let short_tokens = vec![TokenId::new(1), TokenId::new(2)]; // Too short
         let handle = Arc::new(MockKvHandle::new(2));
-        
+
         // Should not store short prefix
         cache.store_prefix(&short_tokens, handle).unwrap();
-        
+
         let result = cache.find_prefix(&short_tokens);
         assert!(result.is_none());
     }
@@ -376,23 +392,23 @@ mod tests {
     #[test]
     fn test_lru_eviction() {
         let cache = PrefixCache::new(2, 1); // Max 2 prefixes
-        
+
         let tokens1 = vec![TokenId::new(1)];
-        let tokens2 = vec![TokenId::new(2)];  
+        let tokens2 = vec![TokenId::new(2)];
         let tokens3 = vec![TokenId::new(3)];
-        
+
         let handle = Arc::new(MockKvHandle::new(1));
-        
+
         // Store 2 prefixes
         cache.store_prefix(&tokens1, handle.clone()).unwrap();
         cache.store_prefix(&tokens2, handle.clone()).unwrap();
-        
+
         // Access first one to make it more recent
         cache.find_prefix(&tokens1);
-        
+
         // Store third - should evict tokens2 (LRU)
         cache.store_prefix(&tokens3, handle.clone()).unwrap();
-        
+
         // tokens1 and tokens3 should exist, tokens2 should be evicted
         assert!(cache.find_prefix(&tokens1).is_some());
         assert!(cache.find_prefix(&tokens2).is_none());
@@ -404,16 +420,16 @@ mod tests {
         let cache = PrefixCache::new(10, 2);
         let tokens = vec![TokenId::new(1), TokenId::new(2)];
         let handle = Arc::new(MockKvHandle::new(2));
-        
+
         cache.store_prefix(&tokens, handle).unwrap();
-        
+
         // Hit
         cache.find_prefix(&tokens);
-        
+
         // Miss
         let other_tokens = vec![TokenId::new(3), TokenId::new(4)];
         cache.find_prefix(&other_tokens);
-        
+
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);

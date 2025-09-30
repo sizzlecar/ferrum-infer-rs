@@ -85,6 +85,14 @@ pub enum FerrumError {
     /// Unsupported operation errors
     #[error("Unsupported operation: {message}")]
     Unsupported { message: String },
+
+    /// Invalid format errors (parsing, schema mismatches)
+    #[error("Invalid format: {message}")]
+    InvalidFormat { message: String },
+
+    /// Invalid parameters or configuration values
+    #[error("Invalid parameter: {message}")]
+    InvalidParameter { message: String },
 }
 
 impl FerrumError {
@@ -224,6 +232,20 @@ impl FerrumError {
     /// Create an unsupported operation error
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::Unsupported {
+            message: message.into(),
+        }
+    }
+
+    /// Create an invalid format error (parsing/schema mismatch)
+    pub fn invalid_format(message: impl Into<String>) -> Self {
+        Self::InvalidFormat {
+            message: message.into(),
+        }
+    }
+
+    /// Create an invalid parameter error
+    pub fn invalid_parameter(message: impl Into<String>) -> Self {
+        Self::InvalidParameter {
             message: message.into(),
         }
     }

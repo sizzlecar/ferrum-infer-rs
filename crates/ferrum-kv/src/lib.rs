@@ -21,33 +21,29 @@
 //! - **Prefix Sharing**: Automatic detection and reuse of common prefixes.
 //! - **Handle-Based API**: Zero-copy operations through opaque handles.
 
-pub mod managers;
 pub mod blocks;
 pub mod cache;
+pub mod managers;
 
 // Re-exports of interfaces from ferrum-interfaces
 pub use ferrum_interfaces::{
-    KvCacheManager as KvCacheManagerInterface,
-    KvCacheHandle as KvCacheHandleInterface,
-    BlockTable,
-    AllocationRequest,
-    CacheStats,
-    EvictionPolicy,
-    CompressionConfig,
+    AllocationRequest, BlockTable, CacheStats, CompressionConfig, EvictionPolicy,
+    KvCacheHandle as KvCacheHandleInterface, KvCacheManager as KvCacheManagerInterface,
     PrefixCacheConfig,
 };
 
-pub use ferrum_types::{
-    Result, RequestId, Device, DataType, FerrumError,
-};
+pub use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
 
 // Re-exports of implementations
-pub use managers::*;
 pub use blocks::*;
 pub use cache::*;
+pub use managers::*;
 
 /// Default KV cache manager factory
-pub fn default_manager(device: Device, config: KvCacheConfig) -> Result<Box<dyn KvCacheManagerInterface + Send + Sync>> {
+pub fn default_manager(
+    device: Device,
+    config: KvCacheConfig,
+) -> Result<Box<dyn KvCacheManagerInterface + Send + Sync>> {
     let manager = DefaultKvCacheManager::new(device, config)?;
     Ok(Box::new(manager))
 }

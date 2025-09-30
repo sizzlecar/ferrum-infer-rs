@@ -4,8 +4,8 @@
 //! KV cache management. It handles raw memory allocation, transfers, and
 //! memory pool management across different devices.
 
-use ferrum_types::{Device, Result};
 use async_trait::async_trait;
+use ferrum_types::{Device, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 pub trait DeviceMemoryManager: Send + Sync {
     /// Allocate memory on device
     async fn allocate(&self, size: usize, device: &Device) -> Result<MemoryHandle>;
-    
+
     /// Allocate aligned memory
     async fn allocate_aligned(
         &self,
@@ -22,10 +22,10 @@ pub trait DeviceMemoryManager: Send + Sync {
         alignment: usize,
         device: &Device,
     ) -> Result<MemoryHandle>;
-    
+
     /// Deallocate memory
     async fn deallocate(&self, handle: MemoryHandle) -> Result<()>;
-    
+
     /// Copy memory between handles
     async fn copy(
         &self,
@@ -35,31 +35,28 @@ pub trait DeviceMemoryManager: Send + Sync {
         src_offset: usize,
         dst_offset: usize,
     ) -> Result<()>;
-    
+
     /// Copy memory between devices asynchronously
     async fn copy_async(
         &self,
         transfer: MemoryTransfer,
         stream: Option<StreamHandle>,
     ) -> Result<()>;
-    
+
     /// Get memory information for device
     async fn memory_info(&self, device: &Device) -> Result<MemoryInfo>;
-    
+
     /// Get handle information
     fn handle_info(&self, handle: MemoryHandle) -> Option<MemoryHandleInfo>;
-    
+
     /// Set memory pool configuration
     async fn configure_pool(&self, device: &Device, config: MemoryPoolConfig) -> Result<()>;
-    
+
     /// Defragment memory (if supported)
     async fn defragment(&self, device: &Device) -> Result<DefragmentationStats>;
-    
+
     /// Set memory pressure callback
-    fn set_pressure_callback(
-        &self,
-        callback: Box<dyn Fn(MemoryPressure) + Send + Sync>,
-    );
+    fn set_pressure_callback(&self, callback: Box<dyn Fn(MemoryPressure) + Send + Sync>);
 }
 
 /// Memory handle representing allocated memory
@@ -71,12 +68,12 @@ impl MemoryHandle {
     pub fn new(id: u64) -> Self {
         Self(id)
     }
-    
+
     /// Get handle ID
     pub fn id(&self) -> u64 {
         self.0
     }
-    
+
     /// Check if handle is valid (non-zero)
     pub fn is_valid(&self) -> bool {
         self.0 != 0
@@ -92,7 +89,7 @@ impl StreamHandle {
     pub fn new(id: u64) -> Self {
         Self(id)
     }
-    
+
     /// Get default stream (usually synchronous)
     pub fn default() -> Self {
         Self(0)
@@ -125,13 +122,13 @@ impl MemoryTransfer {
             dst_offset: 0,
         }
     }
-    
+
     /// Set source offset
     pub fn with_src_offset(mut self, offset: usize) -> Self {
         self.src_offset = offset;
         self
     }
-    
+
     /// Set destination offset
     pub fn with_dst_offset(mut self, offset: usize) -> Self {
         self.dst_offset = offset;
@@ -167,11 +164,11 @@ impl MemoryInfo {
             0.0
         }
     }
-    
+
     /// Check if memory is under pressure
     pub fn pressure_level(&self) -> MemoryPressure {
         let utilization = self.utilization_percent();
-        
+
         if utilization >= 95.0 {
             MemoryPressure::Critical
         } else if utilization >= 85.0 {
@@ -285,15 +282,11 @@ pub struct DefragmentationStats {
 #[async_trait]
 pub trait AdvancedMemoryManager: DeviceMemoryManager {
     /// Map memory for direct CPU access
-    async fn map_memory(
-        &self,
-        handle: MemoryHandle,
-        access: MemoryAccess,
-    ) -> Result<*mut u8>;
-    
+    async fn map_memory(&self, handle: MemoryHandle, access: MemoryAccess) -> Result<*mut u8>;
+
     /// Unmap previously mapped memory
     async fn unmap_memory(&self, handle: MemoryHandle) -> Result<()>;
-    
+
     /// Create memory mapping between devices
     async fn create_mapping(
         &self,
@@ -301,23 +294,15 @@ pub trait AdvancedMemoryManager: DeviceMemoryManager {
         dst_device: &Device,
         size: usize,
     ) -> Result<(MemoryHandle, MemoryHandle)>;
-    
+
     /// Enable memory prefetching
-    async fn prefetch(
-        &self,
-        handle: MemoryHandle,
-        target_device: &Device,
-    ) -> Result<()>;
-    
+    async fn prefetch(&self, handle: MemoryHandle, target_device: &Device) -> Result<()>;
+
     /// Get memory access pattern statistics
     fn access_stats(&self, handle: MemoryHandle) -> Option<MemoryAccessStats>;
-    
+
     /// Set memory usage hints
-    async fn set_usage_hint(
-        &self,
-        handle: MemoryHandle,
-        hint: MemoryUsageHint,
-    ) -> Result<()>;
+    async fn set_usage_hint(&self, handle: MemoryHandle, hint: MemoryUsageHint) -> Result<()>;
 }
 
 /// Memory access modes
@@ -385,22 +370,22 @@ pub enum AccessPatternType {
 pub trait StreamManager: Send + Sync {
     /// Create new compute stream
     async fn create_stream(&self, device: &Device) -> Result<StreamHandle>;
-    
+
     /// Destroy stream
     async fn destroy_stream(&self, stream: StreamHandle) -> Result<()>;
-    
+
     /// Synchronize stream (wait for all operations to complete)
     async fn synchronize_stream(&self, stream: StreamHandle) -> Result<()>;
-    
+
     /// Check if stream operations are complete
     async fn is_stream_ready(&self, stream: StreamHandle) -> Result<bool>;
-    
+
     /// Get default stream for device
     fn default_stream(&self, device: &Device) -> StreamHandle;
-    
+
     /// Record synchronization point
     async fn record_event(&self, stream: StreamHandle) -> Result<EventHandle>;
-    
+
     /// Wait for event on stream
     async fn wait_event(&self, stream: StreamHandle, event: EventHandle) -> Result<()>;
 }
@@ -418,19 +403,16 @@ pub trait MemoryManagerFactory: Send + Sync {
         device: &Device,
         config: &MemoryManagerConfig,
     ) -> Result<Box<dyn DeviceMemoryManager>>;
-    
+
     /// Create advanced memory manager
     async fn create_advanced_memory_manager(
         &self,
         device: &Device,
         config: &MemoryManagerConfig,
     ) -> Result<Box<dyn AdvancedMemoryManager>>;
-    
+
     /// Create stream manager
-    async fn create_stream_manager(
-        &self,
-        device: &Device,
-    ) -> Result<Box<dyn StreamManager>>;
+    async fn create_stream_manager(&self, device: &Device) -> Result<Box<dyn StreamManager>>;
 }
 
 /// Memory manager configuration
@@ -454,7 +436,7 @@ impl Default for MemoryManagerConfig {
     fn default() -> Self {
         let mut pool_configs = HashMap::new();
         pool_configs.insert(MemoryType::General, MemoryPoolConfig::default());
-        
+
         Self {
             pool_configs,
             enable_tracking: true,
@@ -470,22 +452,22 @@ impl Default for MemoryManagerConfig {
 pub trait GlobalMemoryMonitor: Send + Sync {
     /// Get memory information across all devices
     fn global_memory_info(&self) -> HashMap<Device, MemoryInfo>;
-    
+
     /// Get total system memory pressure
     fn global_memory_pressure(&self) -> MemoryPressure;
-    
+
     /// Register memory manager for monitoring
     fn register_manager(&mut self, device: Device, manager: &dyn DeviceMemoryManager);
-    
+
     /// Unregister memory manager
     fn unregister_manager(&mut self, device: &Device);
-    
+
     /// Set global memory pressure callback
     fn set_global_pressure_callback(
         &mut self,
         callback: Box<dyn Fn(HashMap<Device, MemoryPressure>) + Send + Sync>,
     );
-    
+
     /// Force global garbage collection
     async fn global_gc(&self) -> Result<HashMap<Device, DefragmentationStats>>;
 }
@@ -500,7 +482,7 @@ pub trait AllocationStrategy: Send + Sync {
         available_devices: &[Device],
         memory_info: &HashMap<Device, MemoryInfo>,
     ) -> Option<Device>;
-    
+
     /// Get strategy name
     fn name(&self) -> &str;
 }
@@ -533,40 +515,42 @@ impl AllocationStrategy for BestFitStrategy {
     ) -> Option<Device> {
         let mut best_device = None;
         let mut best_score = f32::NEG_INFINITY;
-        
+
         for device in available_devices {
             if let Some(info) = memory_info.get(device) {
                 // Check if device has enough memory
                 if info.free_bytes < size as u64 {
                     continue;
                 }
-                
+
                 // Prefer devices with just enough memory (best fit)
                 let waste_ratio = (info.free_bytes - size as u64) as f32 / info.total_bytes as f32;
                 let utilization = info.utilization_percent() / 100.0;
-                
+
                 // Score based on minimal waste and moderate utilization
                 let score = 1.0 - waste_ratio - (utilization - 0.5).abs() * 0.5;
-                
+
                 // Bonus for preferred devices
-                let preference_bonus = requirements.preferred_devices
+                let preference_bonus = requirements
+                    .preferred_devices
                     .iter()
                     .position(|d| d == device)
                     .map(|pos| 1.0 / (pos as f32 + 1.0))
-                    .unwrap_or(0.0) * 0.2;
-                
+                    .unwrap_or(0.0)
+                    * 0.2;
+
                 let final_score = score + preference_bonus;
-                
+
                 if final_score > best_score {
                     best_score = final_score;
                     best_device = Some(device.clone());
                 }
             }
         }
-        
+
         best_device
     }
-    
+
     fn name(&self) -> &str {
         "best_fit"
     }

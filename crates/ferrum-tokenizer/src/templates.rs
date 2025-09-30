@@ -63,10 +63,15 @@ pub struct ChatTemplate {
 
 impl ChatTemplate {
     /// Create new chat template
-    pub fn new(template: String, bos_token: Option<String>, eos_token: Option<String>) -> Result<Self> {
-        let var_regex = Regex::new(r"\{\{\s*([^}]+)\s*\}\}")
-            .map_err(|e| ferrum_types::FerrumError::tokenizer(format!("Invalid template regex: {}", e)))?;
-        
+    pub fn new(
+        template: String,
+        bos_token: Option<String>,
+        eos_token: Option<String>,
+    ) -> Result<Self> {
+        let var_regex = Regex::new(r"\{\{\s*([^}]+)\s*\}\}").map_err(|e| {
+            ferrum_types::FerrumError::tokenizer(format!("Invalid template regex: {}", e))
+        })?;
+
         Ok(Self {
             template,
             var_regex,
@@ -78,7 +83,7 @@ impl ChatTemplate {
     /// Apply template to conversation
     pub fn apply(&self, messages: &[ChatMessage]) -> Result<String> {
         let mut context = HashMap::new();
-        
+
         // Add special tokens
         if let Some(bos) = &self.bos_token {
             context.insert("bos_token".to_string(), bos.clone());
@@ -86,10 +91,10 @@ impl ChatTemplate {
         if let Some(eos) = &self.eos_token {
             context.insert("eos_token".to_string(), eos.clone());
         }
-        
+
         // Add messages to context
         context.insert("messages".to_string(), format_messages(messages));
-        
+
         // Apply template
         self.substitute_variables(&self.template, &context)
     }
@@ -97,14 +102,14 @@ impl ChatTemplate {
     /// Apply template to a single message
     pub fn apply_message(&self, message: &ChatMessage) -> Result<String> {
         let mut context = HashMap::new();
-        
+
         // Add message fields
         context.insert("role".to_string(), message.role.clone());
         context.insert("content".to_string(), message.content.clone());
         if let Some(name) = &message.name {
             context.insert("name".to_string(), name.clone());
         }
-        
+
         // Add special tokens
         if let Some(bos) = &self.bos_token {
             context.insert("bos_token".to_string(), bos.clone());
@@ -112,18 +117,22 @@ impl ChatTemplate {
         if let Some(eos) = &self.eos_token {
             context.insert("eos_token".to_string(), eos.clone());
         }
-        
+
         self.substitute_variables(&self.template, &context)
     }
 
-    fn substitute_variables(&self, text: &str, context: &HashMap<String, String>) -> Result<String> {
+    fn substitute_variables(
+        &self,
+        text: &str,
+        context: &HashMap<String, String>,
+    ) -> Result<String> {
         let mut result = text.to_string();
-        
+
         for capture in self.var_regex.captures_iter(text) {
             if let Some(var_match) = capture.get(0) {
                 if let Some(var_name) = capture.get(1) {
                     let var_name = var_name.as_str().trim();
-                    
+
                     if let Some(value) = context.get(var_name) {
                         result = result.replace(var_match.as_str(), value);
                     } else {
@@ -133,14 +142,15 @@ impl ChatTemplate {
                 }
             }
         }
-        
+
         Ok(result)
     }
 }
 
 /// Format messages for template context
 fn format_messages(messages: &[ChatMessage]) -> String {
-    messages.iter()
+    messages
+        .iter()
         .map(|msg| {
             if let Some(name) = &msg.name {
                 format!("{} ({}): {}", msg.role, name, msg.content)
@@ -183,7 +193,8 @@ impl CommonTemplates {
             template.to_string(),
             Some("<s>".to_string()),
             Some("</s>".to_string()),
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     /// ChatML template (used by GPT-3.5/GPT-4)
@@ -195,11 +206,7 @@ impl CommonTemplates {
 <|im_start|>assistant
 "#;
 
-        ChatTemplate::new(
-            template.to_string(),
-            None,
-            Some("<|im_end|>".to_string()),
-        ).unwrap()
+        ChatTemplate::new(template.to_string(), None, Some("<|im_end|>".to_string())).unwrap()
     }
 
     /// Simple template for basic models
@@ -282,9 +289,10 @@ impl ChatTemplateBuilder {
 
     /// Build the chat template
     pub fn build(self) -> Result<ChatTemplate> {
-        let template = self.template
+        let template = self
+            .template
             .ok_or_else(|| ferrum_types::FerrumError::tokenizer("Template string is required"))?;
-        
+
         ChatTemplate::new(template, self.bos_token, self.eos_token)
     }
 }
@@ -348,9 +356,8 @@ mod tests {
 
     #[test]
     fn test_chat_message_creation() {
-        let msg = ChatMessage::user("Hello, world!")
-            .with_name("Alice");
-        
+        let msg = ChatMessage::user("Hello, world!").with_name("Alice");
+
         assert_eq!(msg.role, "user");
         assert_eq!(msg.content, "Hello, world!");
         assert_eq!(msg.name, Some("Alice".to_string()));
@@ -363,7 +370,7 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there!"),
         ];
-        
+
         let result = template.apply(&messages).unwrap();
         assert!(result.contains("user: Hello"));
         assert!(result.contains("assistant: Hi there!"));
@@ -372,11 +379,11 @@ mod tests {
     #[test]
     fn test_template_registry() {
         let registry = TemplateRegistry::new();
-        
+
         assert!(registry.has_template("simple"));
         assert!(registry.has_template("llama2"));
         assert!(!registry.has_template("nonexistent"));
-        
+
         let templates = registry.list_templates();
         assert!(templates.len() > 0);
     }
@@ -389,7 +396,7 @@ mod tests {
             .eos_token("</s>")
             .build()
             .unwrap();
-        
+
         // Basic smoke test - would need proper context substitution in real use
         assert!(template.template.contains("Hello"));
     }

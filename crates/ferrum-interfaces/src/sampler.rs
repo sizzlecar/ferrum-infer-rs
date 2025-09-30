@@ -48,31 +48,31 @@ impl<'a> SamplingContext<'a> {
             metadata: HashMap::new(),
         }
     }
-    
+
     /// Get logit value for specific token
     pub fn get_logit(&self, token_id: TokenId) -> Option<f32> {
-        if (token_id as usize) < self.logits.len() {
-            Some(self.logits[token_id as usize])
+        if usize::from(token_id) < self.logits.len() {
+            Some(self.logits[usize::from(token_id)])
         } else {
             None
         }
     }
-    
+
     /// Set logit value for specific token
     pub fn set_logit(&mut self, token_id: TokenId, value: f32) -> bool {
-        if (token_id as usize) < self.logits.len() {
-            self.logits[token_id as usize] = value;
+        if usize::from(token_id) < self.logits.len() {
+            self.logits[usize::from(token_id)] = value;
             true
         } else {
             false
         }
     }
-    
+
     /// Mask (set to negative infinity) specific tokens
     pub fn mask_tokens(&mut self, token_ids: &[TokenId]) {
         for &token_id in token_ids {
-            if (token_id as usize) < self.logits.len() {
-                self.logits[token_id as usize] = f32::NEG_INFINITY;
+            if usize::from(token_id) < self.logits.len() {
+                self.logits[usize::from(token_id)] = f32::NEG_INFINITY;
             }
         }
     }
@@ -82,10 +82,10 @@ impl<'a> SamplingContext<'a> {
 pub trait LogitsProcessor: Send + Sync {
     /// Process logits in-place
     fn process(&self, ctx: &mut SamplingContext) -> Result<()>;
-    
+
     /// Get processor name for debugging/logging
     fn name(&self) -> &str;
-    
+
     /// Whether this processor should be applied before others
     fn priority(&self) -> ProcessorPriority {
         ProcessorPriority::Normal
@@ -107,19 +107,15 @@ pub enum ProcessorPriority {
 pub trait Sampler: Send + Sync {
     /// Sample next token from logits
     fn sample(&self, logits: &[f32], rng: &mut dyn RngCore) -> Result<TokenId>;
-    
+
     /// Sample with additional context (default implementation ignores context)
-    fn sample_with_context(
-        &self, 
-        ctx: &SamplingContext, 
-        rng: &mut dyn RngCore
-    ) -> Result<TokenId> {
+    fn sample_with_context(&self, ctx: &SamplingContext, rng: &mut dyn RngCore) -> Result<TokenId> {
         self.sample(ctx.logits, rng)
     }
-    
+
     /// Get sampler name
     fn name(&self) -> &str;
-    
+
     /// Whether this sampler is deterministic
     fn is_deterministic(&self) -> bool;
 }
@@ -131,14 +127,14 @@ pub trait MultiSampler: Sampler {
         &self,
         logits: &[f32],
         num_samples: usize,
-        rng: &mut dyn RngCore
+        rng: &mut dyn RngCore,
     ) -> Result<Vec<TokenId>>;
-    
+
     /// Sample with probabilities for each token
     fn sample_with_probabilities(
         &self,
         logits: &[f32],
-        rng: &mut dyn RngCore
+        rng: &mut dyn RngCore,
     ) -> Result<(TokenId, Vec<f32>)>;
 }
 
@@ -154,15 +150,16 @@ impl LogitsProcessorChain {
             processors: Vec::new(),
         }
     }
-    
+
     /// Add processor to chain
     pub fn add_processor(mut self, processor: Box<dyn LogitsProcessor>) -> Self {
         self.processors.push(processor);
         // Sort by priority (high to low)
-        self.processors.sort_by(|a, b| b.priority().cmp(&a.priority()));
+        self.processors
+            .sort_by(|a, b| b.priority().cmp(&a.priority()));
         self
     }
-    
+
     /// Process logits through entire chain
     pub fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         for processor in &self.processors {
@@ -170,7 +167,7 @@ impl LogitsProcessorChain {
         }
         Ok(())
     }
-    
+
     /// Get all processor names in order
     pub fn processor_names(&self) -> Vec<&str> {
         self.processors.iter().map(|p| p.name()).collect()
@@ -205,11 +202,11 @@ impl LogitsProcessor for TemperatureProcessor {
         }
         Ok(())
     }
-    
+
     fn name(&self) -> &str {
         "temperature"
     }
-    
+
     fn priority(&self) -> ProcessorPriority {
         ProcessorPriority::Low // Apply temperature scaling last
     }
@@ -231,10 +228,14 @@ impl LogitsProcessor for TopKProcessor {
         if self.k > 0 && self.k < ctx.logits.len() {
             // Find k-th largest logit
             let mut indices: Vec<usize> = (0..ctx.logits.len()).collect();
-            indices.sort_by(|&a, &b| ctx.logits[b].partial_cmp(&ctx.logits[a]).unwrap_or(std::cmp::Ordering::Equal));
-            
+            indices.sort_by(|&a, &b| {
+                ctx.logits[b]
+                    .partial_cmp(&ctx.logits[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
             let threshold = ctx.logits[indices[self.k - 1]];
-            
+
             // Mask tokens below threshold
             for logit in ctx.logits.iter_mut() {
                 if *logit < threshold {
@@ -244,7 +245,7 @@ impl LogitsProcessor for TopKProcessor {
         }
         Ok(())
     }
-    
+
     fn name(&self) -> &str {
         "top_k"
     }
@@ -266,23 +267,29 @@ impl LogitsProcessor for TopPProcessor {
         if self.p < 1.0 && self.p > 0.0 {
             // Convert logits to probabilities
             let max_logit = ctx.logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let mut probs: Vec<f32> = ctx.logits.iter()
+            let mut probs: Vec<f32> = ctx
+                .logits
+                .iter()
                 .map(|&logit| (logit - max_logit).exp())
                 .collect();
-            
+
             let sum: f32 = probs.iter().sum();
             for prob in probs.iter_mut() {
                 *prob /= sum;
             }
-            
+
             // Sort by probability
             let mut indices: Vec<usize> = (0..probs.len()).collect();
-            indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
-            
+            indices.sort_by(|&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
             // Find cumulative probability threshold
             let mut cum_prob = 0.0;
             let mut cutoff_idx = probs.len();
-            
+
             for (i, &idx) in indices.iter().enumerate() {
                 cum_prob += probs[idx];
                 if cum_prob > self.p {
@@ -290,7 +297,7 @@ impl LogitsProcessor for TopPProcessor {
                     break;
                 }
             }
-            
+
             // Mask tokens beyond cutoff
             for (i, &idx) in indices.iter().enumerate() {
                 if i >= cutoff_idx {
@@ -300,7 +307,7 @@ impl LogitsProcessor for TopPProcessor {
         }
         Ok(())
     }
-    
+
     fn name(&self) -> &str {
         "top_p"
     }
@@ -322,14 +329,15 @@ impl LogitsProcessor for RepetitionPenaltyProcessor {
         if self.penalty != 1.0 {
             for &token_id in ctx.previous_tokens {
                 if let Some(freq) = ctx.token_frequencies.get(&token_id) {
-                    if (token_id as usize) < ctx.logits.len() {
-                        let current_logit = ctx.logits[token_id as usize];
+                    if usize::from(token_id) < ctx.logits.len() {
+                        let idx = usize::from(token_id);
+                        let current_logit = ctx.logits[idx];
                         let penalty_factor = self.penalty.powi(*freq as i32);
-                        
+
                         if current_logit > 0.0 {
-                            ctx.logits[token_id as usize] = current_logit / penalty_factor;
+                            ctx.logits[idx] = current_logit / penalty_factor;
                         } else {
-                            ctx.logits[token_id as usize] = current_logit * penalty_factor;
+                            ctx.logits[idx] = current_logit * penalty_factor;
                         }
                     }
                 }
@@ -337,11 +345,11 @@ impl LogitsProcessor for RepetitionPenaltyProcessor {
         }
         Ok(())
     }
-    
+
     fn name(&self) -> &str {
         "repetition_penalty"
     }
-    
+
     fn priority(&self) -> ProcessorPriority {
         ProcessorPriority::High // Apply penalties early
     }
@@ -360,14 +368,14 @@ impl Sampler for GreedySampler {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(idx, _)| idx)
             .ok_or_else(|| ferrum_types::FerrumError::backend("Empty logits for sampling"))?;
-        
-        Ok(max_idx as TokenId)
+
+        Ok(TokenId::new(max_idx as u32))
     }
-    
+
     fn name(&self) -> &str {
         "greedy"
     }
-    
+
     fn is_deterministic(&self) -> bool {
         true
     }
@@ -380,7 +388,7 @@ impl Sampler for MultinomialSampler {
     fn sample(&self, logits: &[f32], rng: &mut dyn RngCore) -> Result<TokenId> {
         // Convert logits to probabilities
         let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        
+
         let mut probs: Vec<f32> = logits
             .iter()
             .map(|&logit| {
@@ -391,35 +399,37 @@ impl Sampler for MultinomialSampler {
                 }
             })
             .collect();
-        
+
         let sum: f32 = probs.iter().sum();
         if sum <= 0.0 {
-            return Err(ferrum_types::FerrumError::backend("No valid tokens for sampling"));
+            return Err(ferrum_types::FerrumError::backend(
+                "No valid tokens for sampling",
+            ));
         }
-        
+
         for prob in probs.iter_mut() {
             *prob /= sum;
         }
-        
+
         // Sample from categorical distribution
         let threshold = rng.next_u32() as f32 / u32::MAX as f32;
         let mut cumulative = 0.0;
-        
+
         for (idx, prob) in probs.iter().enumerate() {
             cumulative += prob;
             if cumulative >= threshold {
-                return Ok(idx as TokenId);
+                return Ok(TokenId::new(idx as u32));
             }
         }
-        
+
         // Fallback to last token (shouldn't happen with proper normalization)
-        Ok((probs.len() - 1) as TokenId)
+        Ok(TokenId::new((probs.len() - 1) as u32))
     }
-    
+
     fn name(&self) -> &str {
         "multinomial"
     }
-    
+
     fn is_deterministic(&self) -> bool {
         false
     }
@@ -439,15 +449,16 @@ impl SamplingConfigBuilder {
             sampler: None,
         }
     }
-    
+
     /// Add temperature scaling
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         if temperature > 0.0 && temperature != 1.0 {
-            self.processors.push(Box::new(TemperatureProcessor::new(temperature)));
+            self.processors
+                .push(Box::new(TemperatureProcessor::new(temperature)));
         }
         self
     }
-    
+
     /// Add top-k filtering
     pub fn with_top_k(mut self, k: usize) -> Self {
         if k > 0 {
@@ -455,7 +466,7 @@ impl SamplingConfigBuilder {
         }
         self
     }
-    
+
     /// Add top-p filtering
     pub fn with_top_p(mut self, p: f32) -> Self {
         if p > 0.0 && p < 1.0 {
@@ -463,30 +474,31 @@ impl SamplingConfigBuilder {
         }
         self
     }
-    
+
     /// Add repetition penalty
     pub fn with_repetition_penalty(mut self, penalty: f32) -> Self {
         if penalty != 1.0 {
-            self.processors.push(Box::new(RepetitionPenaltyProcessor::new(penalty)));
+            self.processors
+                .push(Box::new(RepetitionPenaltyProcessor::new(penalty)));
         }
         self
     }
-    
+
     /// Set sampler (greedy vs multinomial)
     pub fn with_sampler(mut self, sampler: Box<dyn Sampler>) -> Self {
         self.sampler = Some(sampler);
         self
     }
-    
+
     /// Build sampling configuration
     pub fn build(self) -> SamplingConfig {
         let mut chain = LogitsProcessorChain::new();
         for processor in self.processors {
             chain = chain.add_processor(processor);
         }
-        
+
         let sampler = self.sampler.unwrap_or_else(|| Box::new(MultinomialSampler));
-        
+
         SamplingConfig {
             processor_chain: chain,
             sampler,
@@ -512,34 +524,30 @@ impl SamplingConfig {
         let mut builder = SamplingConfigBuilder::new()
             .with_temperature(params.temperature)
             .with_repetition_penalty(params.repetition_penalty);
-        
+
         if let Some(top_k) = params.top_k {
             builder = builder.with_top_k(top_k);
         }
-        
+
         if params.top_p < 1.0 {
             builder = builder.with_top_p(params.top_p);
         }
-        
+
         // Choose sampler based on temperature
         let sampler: Box<dyn Sampler> = if params.temperature == 0.0 {
             Box::new(GreedySampler)
         } else {
             Box::new(MultinomialSampler)
         };
-        
+
         builder.with_sampler(sampler).build()
     }
-    
+
     /// Process logits and sample token
-    pub fn sample(
-        &self,
-        mut ctx: SamplingContext,
-        rng: &mut dyn RngCore,
-    ) -> Result<TokenId> {
+    pub fn sample(&self, mut ctx: SamplingContext, rng: &mut dyn RngCore) -> Result<TokenId> {
         // Apply all logits processors
         self.processor_chain.process(&mut ctx)?;
-        
+
         // Sample token
         self.sampler.sample_with_context(&ctx, rng)
     }

@@ -1,6 +1,6 @@
 //! Metrics and observability types
 
-use crate::{ids::*, RequestId, EngineConfig, Device};
+use crate::{ids::*, Device, EngineConfig, RequestId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

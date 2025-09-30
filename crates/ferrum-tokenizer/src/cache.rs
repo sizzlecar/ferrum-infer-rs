@@ -1,8 +1,8 @@
 //! Tokenizer caching and sharing
 
 use crate::{IncrementalTokenizer, Tokenizer};
-use ferrum_types::Result;
 use dashmap::DashMap;
+use ferrum_types::Result;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -44,7 +44,7 @@ impl TokenizerCache {
 
         // Slow path: create and cache
         debug!("Cache miss for tokenizer: {}, creating new instance", key);
-        
+
         // Check cache size and evict if necessary
         if self.cache.len() >= self.max_size {
             self.evict_oldest();
@@ -52,10 +52,10 @@ impl TokenizerCache {
 
         let tokenizer = factory().await?;
         let arc_tokenizer = Arc::from(tokenizer);
-        
+
         self.cache.insert(key.to_string(), arc_tokenizer.clone());
         info!("Cached tokenizer: {}", key);
-        
+
         Ok(arc_tokenizer)
     }
 
@@ -67,7 +67,8 @@ impl TokenizerCache {
     ) -> Result<Arc<dyn IncrementalTokenizer + Send + Sync>>
     where
         F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future<Output = Result<Box<dyn IncrementalTokenizer + Send + Sync>>> + Send,
+        Fut: std::future::Future<Output = Result<Box<dyn IncrementalTokenizer + Send + Sync>>>
+            + Send,
     {
         // Fast path: check if already cached
         if let Some(tokenizer) = self.incremental_cache.get(key) {
@@ -76,19 +77,23 @@ impl TokenizerCache {
         }
 
         // Slow path: create and cache
-        debug!("Cache miss for incremental tokenizer: {}, creating new instance", key);
-        
-        // Check cache size and evict if necessary  
+        debug!(
+            "Cache miss for incremental tokenizer: {}, creating new instance",
+            key
+        );
+
+        // Check cache size and evict if necessary
         if self.incremental_cache.len() >= self.max_size {
             self.evict_oldest_incremental();
         }
 
         let tokenizer = factory().await?;
         let arc_tokenizer = Arc::from(tokenizer);
-        
-        self.incremental_cache.insert(key.to_string(), arc_tokenizer.clone());
+
+        self.incremental_cache
+            .insert(key.to_string(), arc_tokenizer.clone());
         info!("Cached incremental tokenizer: {}", key);
-        
+
         Ok(arc_tokenizer)
     }
 
@@ -99,7 +104,10 @@ impl TokenizerCache {
     }
 
     /// Remove incremental tokenizer from cache
-    pub fn remove_incremental(&self, key: &str) -> Option<Arc<dyn IncrementalTokenizer + Send + Sync>> {
+    pub fn remove_incremental(
+        &self,
+        key: &str,
+    ) -> Option<Arc<dyn IncrementalTokenizer + Send + Sync>> {
         debug!("Removing incremental tokenizer from cache: {}", key);
         self.incremental_cache.remove(key).map(|(_, v)| v)
     }
@@ -117,7 +125,8 @@ impl TokenizerCache {
             size: self.cache.len(),
             incremental_size: self.incremental_cache.len(),
             max_size: self.max_size,
-            utilization: (self.cache.len() + self.incremental_cache.len()) as f32 / (self.max_size * 2) as f32,
+            utilization: (self.cache.len() + self.incremental_cache.len()) as f32
+                / (self.max_size * 2) as f32,
         }
     }
 
@@ -160,16 +169,18 @@ pub struct CacheStats {
 }
 
 /// Global tokenizer cache instance
-static GLOBAL_CACHE: once_cell::sync::Lazy<TokenizerCache> =
-    once_cell::sync::Lazy::new(|| {
-        let cache_size = std::env::var("FERRUM_TOKENIZER_CACHE_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
-        
-        info!("Initializing global tokenizer cache with size: {}", cache_size);
-        TokenizerCache::new(cache_size)
-    });
+static GLOBAL_CACHE: once_cell::sync::Lazy<TokenizerCache> = once_cell::sync::Lazy::new(|| {
+    let cache_size = std::env::var("FERRUM_TOKENIZER_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+
+    info!(
+        "Initializing global tokenizer cache with size: {}",
+        cache_size
+    );
+    TokenizerCache::new(cache_size)
+});
 
 /// Get global tokenizer cache
 pub fn global_cache() -> &'static TokenizerCache {
@@ -233,24 +244,32 @@ impl TokenizerManager {
     }
 
     /// Get tokenizer for model
-    pub async fn get_tokenizer(&self, repo_id: &str, revision: Option<&str>) -> Result<Arc<dyn Tokenizer + Send + Sync>> {
+    pub async fn get_tokenizer(
+        &self,
+        repo_id: &str,
+        revision: Option<&str>,
+    ) -> Result<Arc<dyn Tokenizer + Send + Sync>> {
         let cache_key = CacheKeyBuilder::new()
             .component("tokenizer")
             .component(repo_id)
             .optional_component(revision)
             .build();
 
-        self.cache.get_or_create(&cache_key, || async {
-            let config = ferrum_interfaces::tokenizer::TokenizerConfig {
-                revision: revision.map(|s| s.to_string()),
-                auth_token: None,
-                cache_dir: None,
-                local_files_only: false,
-                trust_remote_code: false,
-            };
+        self.cache
+            .get_or_create(&cache_key, || async {
+                let config = ferrum_interfaces::tokenizer::TokenizerConfig {
+                    revision: revision.map(|s| s.to_string()),
+                    auth_token: None,
+                    cache_dir: None,
+                    local_files_only: false,
+                    trust_remote_code: false,
+                };
 
-            self.factory.create_from_pretrained(repo_id, Some(&config)).await
-        }).await
+                self.factory
+                    .create_from_pretrained(repo_id, Some(&config))
+                    .await
+            })
+            .await
     }
 
     /// Get incremental tokenizer for model
@@ -265,17 +284,21 @@ impl TokenizerManager {
             .optional_component(revision)
             .build();
 
-        self.cache.get_or_create_incremental(&cache_key, || async {
-            let config = ferrum_interfaces::tokenizer::TokenizerConfig {
-                revision: revision.map(|s| s.to_string()),
-                auth_token: None,
-                cache_dir: None,
-                local_files_only: false,
-                trust_remote_code: false,
-            };
+        self.cache
+            .get_or_create_incremental(&cache_key, || async {
+                let config = ferrum_interfaces::tokenizer::TokenizerConfig {
+                    revision: revision.map(|s| s.to_string()),
+                    auth_token: None,
+                    cache_dir: None,
+                    local_files_only: false,
+                    trust_remote_code: false,
+                };
 
-            self.factory.create_incremental_from_pretrained(repo_id, Some(&config)).await
-        }).await
+                self.factory
+                    .create_incremental_from_pretrained(repo_id, Some(&config))
+                    .await
+            })
+            .await
     }
 
     /// Get cache statistics
@@ -311,7 +334,7 @@ mod tests {
     fn test_cache_stats() {
         let cache = TokenizerCache::new(10);
         let stats = cache.stats();
-        
+
         assert_eq!(stats.size, 0);
         assert_eq!(stats.max_size, 10);
         assert_eq!(stats.utilization, 0.0);

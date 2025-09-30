@@ -4,8 +4,8 @@
 //! from model implementations, supporting incremental decoding and various
 //! tokenization strategies.
 
-use ferrum_types::{Result, SpecialTokens, TokenId};
 use async_trait::async_trait;
+use ferrum_types::{Result, SpecialTokens, TokenId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -13,35 +13,36 @@ use std::collections::HashMap;
 pub trait Tokenizer: Send + Sync {
     /// Encode text to token IDs
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<TokenId>>;
-    
+
     /// Decode token IDs to text
     fn decode(&self, tokens: &[TokenId], skip_special: bool) -> Result<String>;
-    
+
     /// Incremental decode: given previous tokens and new token, return only the new text
     /// This is crucial for streaming applications to avoid re-decoding all tokens
     fn decode_incremental(&self, prev: &[TokenId], next: TokenId) -> Result<String>;
-    
+
     /// Get vocabulary size
     fn vocab_size(&self) -> usize;
-    
+
     /// Get special tokens configuration  
     fn special_tokens(&self) -> &SpecialTokens;
-    
+
     /// Get token ID for a specific text (if exists in vocabulary)
     fn token_id(&self, text: &str) -> Option<TokenId>;
-    
+
     /// Get text for a specific token ID
     fn token_text(&self, token_id: TokenId) -> Option<&str>;
-    
+
     /// Check if token is a special token
     fn is_special_token(&self, token_id: TokenId) -> bool {
         let special = self.special_tokens();
-        token_id == special.bos_token.unwrap_or(TokenId::MAX)
-            || token_id == special.eos_token.unwrap_or(TokenId::MAX)  
-            || token_id == special.unk_token.unwrap_or(TokenId::MAX)
-            || token_id == special.pad_token.unwrap_or(TokenId::MAX)
+        let fallback = TokenId::MAX;
+        token_id == special.bos_token.unwrap_or(fallback)
+            || token_id == special.eos_token.unwrap_or(fallback)
+            || token_id == special.unk_token.unwrap_or(fallback)
+            || token_id == special.pad_token.unwrap_or(fallback)
     }
-    
+
     /// Apply chat template if supported
     fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
         // Default implementation: just concatenate messages
@@ -51,7 +52,7 @@ pub trait Tokenizer: Send + Sync {
         }
         Ok(result.trim_end().to_string())
     }
-    
+
     /// Get tokenizer information
     fn info(&self) -> TokenizerInfo;
 }
@@ -61,34 +62,38 @@ pub trait Tokenizer: Send + Sync {
 pub trait AsyncTokenizer: Tokenizer {
     /// Asynchronous encoding (useful for very large texts)
     async fn encode_async(&self, text: &str, add_special: bool) -> Result<Vec<TokenId>>;
-    
+
     /// Asynchronous decoding
     async fn decode_async(&self, tokens: &[TokenId], skip_special: bool) -> Result<String>;
-    
+
     /// Batch encoding for multiple texts
     async fn encode_batch(&self, texts: &[&str], add_special: bool) -> Result<Vec<Vec<TokenId>>>;
-    
+
     /// Batch decoding for multiple token sequences
-    async fn decode_batch(&self, token_sequences: &[&[TokenId]], skip_special: bool) -> Result<Vec<String>>;
+    async fn decode_batch(
+        &self,
+        token_sequences: &[&[TokenId]],
+        skip_special: bool,
+    ) -> Result<Vec<String>>;
 }
 
 /// Advanced tokenizer capabilities
 pub trait TokenizerCapabilities: Tokenizer {
     /// Get token probability/likelihood for text
     fn token_probability(&self, text: &str, token_id: TokenId) -> Option<f32>;
-    
+
     /// Get all possible tokens for a prefix
     fn get_prefix_tokens(&self, prefix: &str) -> Result<Vec<TokenId>>;
-    
+
     /// Check if sequence can be extended with token
     fn can_extend(&self, tokens: &[TokenId], next_token: TokenId) -> bool;
-    
+
     /// Get token type (word, subword, punctuation, etc.)
     fn token_type(&self, token_id: TokenId) -> TokenType;
-    
+
     /// Normalize text before tokenization
     fn normalize_text(&self, text: &str) -> String;
-    
+
     /// Pre-tokenize text (split into words/subwords)
     fn pre_tokenize(&self, text: &str) -> Vec<String>;
 }
@@ -98,20 +103,20 @@ pub trait TokenizerCapabilities: Tokenizer {
 pub trait TokenizerFactory: Send + Sync {
     /// Load tokenizer from file path
     async fn load_from_file(&self, path: &str) -> Result<Box<dyn Tokenizer>>;
-    
+
     /// Load tokenizer from bytes
     async fn load_from_bytes(&self, data: &[u8]) -> Result<Box<dyn Tokenizer>>;
-    
+
     /// Load tokenizer from Hugging Face Hub
     async fn load_from_hub(
-        &self, 
-        repo_id: &str, 
-        revision: Option<&str>
+        &self,
+        repo_id: &str,
+        revision: Option<&str>,
     ) -> Result<Box<dyn Tokenizer>>;
-    
+
     /// Create tokenizer from configuration
     async fn create_from_config(&self, config: &TokenizerConfig) -> Result<Box<dyn Tokenizer>>;
-    
+
     /// Get supported tokenizer types
     fn supported_types(&self) -> Vec<TokenizerType>;
 }
@@ -142,7 +147,7 @@ pub enum TokenizerType {
     BPE,
     /// WordPiece (BERT-style)
     WordPiece,
-    /// SentencePiece 
+    /// SentencePiece
     SentencePiece,
     /// Tiktoken (GPT family)
     Tiktoken,
@@ -187,28 +192,28 @@ impl ChatMessage {
             metadata: HashMap::new(),
         }
     }
-    
+
     /// Create assistant message
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: "assistant".to_string(), 
+            role: "assistant".to_string(),
             content: content.into(),
             metadata: HashMap::new(),
         }
     }
-    
+
     /// Create system message
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".to_string(),
-            content: content.into(), 
+            content: content.into(),
             metadata: HashMap::new(),
         }
     }
 }
 
 /// Tokenizer configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]  
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenizerConfig {
     /// Tokenizer type
     pub tokenizer_type: TokenizerType,
@@ -291,20 +296,20 @@ pub enum PaddingDirection {
 pub trait IncrementalTokenizer: Tokenizer {
     /// Tokenizer state for incremental operations
     type State: Send + Sync;
-    
+
     /// Create initial state for incremental decoding
     fn create_state(&self) -> Self::State;
-    
+
     /// Add token to state and get incremental text
     fn decode_incremental_with_state(
-        &self, 
-        state: &mut Self::State, 
-        token: TokenId
+        &self,
+        state: &mut Self::State,
+        token: TokenId,
     ) -> Result<String>;
-    
+
     /// Reset state to initial condition
     fn reset_state(&self, state: &mut Self::State);
-    
+
     /// Get all decoded text from current state
     fn get_decoded_text(&self, state: &Self::State) -> String;
 }
@@ -313,16 +318,16 @@ pub trait IncrementalTokenizer: Tokenizer {
 pub trait TextProcessor: Send + Sync {
     /// Clean and normalize text for tokenization
     fn preprocess(&self, text: &str) -> String;
-    
+
     /// Post-process decoded text
     fn postprocess(&self, text: &str) -> String;
-    
+
     /// Detect language of text (if supported)
     fn detect_language(&self, text: &str) -> Option<String>;
-    
+
     /// Split text into sentences
     fn sentence_split(&self, text: &str) -> Vec<String>;
-    
+
     /// Count approximate tokens without full tokenization
     fn estimate_token_count(&self, text: &str) -> usize;
 }
@@ -338,7 +343,7 @@ pub struct TokenizerStats {
     pub tokens_processed: u64,
     /// Average encoding time per character (microseconds)
     pub avg_encode_time_per_char_us: f64,
-    /// Average decoding time per token (microseconds) 
+    /// Average decoding time per token (microseconds)
     pub avg_decode_time_per_token_us: f64,
     /// Cache hit rate for incremental decoding
     pub incremental_cache_hit_rate: f32,
@@ -348,16 +353,16 @@ pub struct TokenizerStats {
 pub trait TokenizerRegistry: Send + Sync {
     /// Register a tokenizer with a name
     fn register(&mut self, name: &str, tokenizer: Box<dyn Tokenizer>) -> Result<()>;
-    
+
     /// Get tokenizer by name
     fn get(&self, name: &str) -> Option<&dyn Tokenizer>;
-    
+
     /// Remove tokenizer by name
     fn remove(&mut self, name: &str) -> Option<Box<dyn Tokenizer>>;
-    
+
     /// List all registered tokenizer names
     fn list_names(&self) -> Vec<String>;
-    
+
     /// Check if tokenizer exists
     fn contains(&self, name: &str) -> bool;
 }

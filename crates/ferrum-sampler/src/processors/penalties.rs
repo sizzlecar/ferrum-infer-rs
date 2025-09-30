@@ -1,11 +1,11 @@
 //! Penalty processors for repetition control
 
 use crate::LogitsProcessorInterface;
-use ferrum_types::{Result, TokenId, RepetitionPenalty, PresencePenalty, FrequencyPenalty};
+use ferrum_types::{FrequencyPenalty, PresencePenalty, RepetitionPenalty, Result, TokenId};
 use std::collections::HashMap;
 
 /// Repetition penalty processor
-/// 
+///
 /// Applies penalty to tokens that have already appeared in the sequence.
 /// Penalty > 1.0 reduces likelihood of repetition.
 /// Penalty < 1.0 increases likelihood of repetition.
@@ -27,7 +27,7 @@ impl RepetitionPenaltyProcessor {
     /// Create from raw value
     pub fn from_value(penalty: f32) -> Result<Self> {
         if penalty <= 0.0 {
-            return Err(ferrum_types::FerrumError::invalid_parameter(
+            return Err(ferrum_types::FerrumError::config(
                 "Repetition penalty must be positive",
             ));
         }
@@ -55,7 +55,7 @@ impl RepetitionPenaltyProcessor {
     /// Set penalty value
     pub fn set_penalty(&mut self, penalty: f32) -> Result<()> {
         if penalty <= 0.0 {
-            return Err(ferrum_types::FerrumError::invalid_parameter(
+            return Err(ferrum_types::FerrumError::config(
                 "Repetition penalty must be positive",
             ));
         }
@@ -73,7 +73,7 @@ impl LogitsProcessorInterface for RepetitionPenaltyProcessor {
 
         // Apply penalty to tokens that have appeared before
         for &token in &self.previous_tokens {
-            let token_id = token.value() as usize;
+            let token_id = token.get() as usize;
             if token_id < logits.len() {
                 let logit = &mut logits[token_id];
                 if *logit > 0.0 {
@@ -102,7 +102,7 @@ impl LogitsProcessorInterface for RepetitionPenaltyProcessor {
 }
 
 /// Presence penalty processor
-/// 
+///
 /// Applies a fixed penalty to tokens that have appeared in the sequence.
 /// Unlike repetition penalty, this doesn't depend on the logit value.
 #[derive(Debug, Clone)]
@@ -158,7 +158,7 @@ impl LogitsProcessorInterface for PresencePenaltyProcessor {
 
         // Apply fixed penalty to present tokens
         for &token in &self.present_tokens {
-            let token_id = token.value() as usize;
+            let token_id = token.get() as usize;
             if token_id < logits.len() {
                 logits[token_id] -= self.penalty;
             }
@@ -182,7 +182,7 @@ impl LogitsProcessorInterface for PresencePenaltyProcessor {
 }
 
 /// Frequency penalty processor
-/// 
+///
 /// Applies penalty based on how frequently tokens have appeared.
 /// Penalty is proportional to token frequency.
 #[derive(Debug, Clone)]
@@ -238,7 +238,7 @@ impl LogitsProcessorInterface for FrequencyPenaltyProcessor {
 
         // Apply penalty based on frequency
         for (&token, &count) in &self.token_counts {
-            let token_id = token.value() as usize;
+            let token_id = token.get() as usize;
             if token_id < logits.len() {
                 let frequency_penalty = self.penalty * count as f32;
                 logits[token_id] -= frequency_penalty;
@@ -270,10 +270,10 @@ mod tests {
     fn test_repetition_penalty() {
         let mut processor = RepetitionPenaltyProcessor::from_value(1.2).unwrap();
         processor.add_token(TokenId::new(1));
-        
+
         let mut logits = vec![1.0, 2.0, 1.0]; // Token 1 has positive logit
         processor.process(&mut logits).unwrap();
-        
+
         // Token 1 should be penalized (divided by 1.2)
         assert_eq!(logits[1], 2.0 / 1.2);
         assert_eq!(logits[0], 1.0); // Unchanged
@@ -284,10 +284,10 @@ mod tests {
     fn test_presence_penalty() {
         let mut processor = PresencePenaltyProcessor::from_value(0.5);
         processor.add_token(TokenId::new(1));
-        
+
         let mut logits = vec![1.0, 2.0, 1.0];
         processor.process(&mut logits).unwrap();
-        
+
         // Token 1 should have penalty subtracted
         assert_eq!(logits[1], 2.0 - 0.5);
         assert_eq!(logits[0], 1.0); // Unchanged
@@ -299,10 +299,10 @@ mod tests {
         let mut processor = FrequencyPenaltyProcessor::from_value(0.1);
         processor.add_token(TokenId::new(1));
         processor.add_token(TokenId::new(1)); // Token 1 appears twice
-        
+
         let mut logits = vec![1.0, 2.0, 1.0];
         processor.process(&mut logits).unwrap();
-        
+
         // Token 1 should have penalty based on frequency (0.1 * 2 = 0.2)
         assert_eq!(logits[1], 2.0 - 0.2);
         assert_eq!(logits[0], 1.0); // Unchanged

@@ -1,28 +1,40 @@
 //! Candle backend implementation for Ferrum runtime
 
-use crate::{ComputeBackend, DeviceMemoryManager, TensorFactory, TensorDataAccess, TensorLike, TensorOps, TensorRef};
+use crate::{
+    ComputeBackend, DeviceMemoryManager, TensorDataAccess, TensorFactory, TensorLike, TensorOps,
+    TensorRef,
+};
+use async_trait::async_trait;
 use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus};
 use ferrum_interfaces::memory::MemoryHandle;
 use ferrum_types::{DataType, Device, Result};
-use async_trait::async_trait;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-use once_cell::sync::Lazy;
 
-static TENSOR_FACTORY_REGISTRY: Lazy<std::sync::RwLock<std::collections::HashMap<Device, Arc<dyn TensorFactory + Send + Sync>>>> = Lazy::new(|| {
+static TENSOR_FACTORY_REGISTRY: Lazy<
+    std::sync::RwLock<std::collections::HashMap<Device, Arc<dyn TensorFactory + Send + Sync>>>,
+> = Lazy::new(|| {
     let mut map = std::collections::HashMap::new();
-    map.insert(Device::CPU, Arc::new(CandleTensorFactory::new(Device::CPU)) as Arc<_>);
+    map.insert(
+        Device::CPU,
+        Arc::new(CandleTensorFactory::new(Device::CPU)) as Arc<_>,
+    );
     std::sync::RwLock::new(map)
 });
 
 pub fn register_tensor_factory(device: Device, factory: Arc<dyn TensorFactory + Send + Sync>) {
-    let mut registry = TENSOR_FACTORY_REGISTRY.write().expect("tensor factory registry poisoned");
+    let mut registry = TENSOR_FACTORY_REGISTRY
+        .write()
+        .expect("tensor factory registry poisoned");
     registry.insert(device, factory);
 }
 
 pub fn get_tensor_factory(device: &Device) -> Arc<dyn TensorFactory + Send + Sync> {
-    let registry = TENSOR_FACTORY_REGISTRY.read().expect("tensor factory registry poisoned");
+    let registry = TENSOR_FACTORY_REGISTRY
+        .read()
+        .expect("tensor factory registry poisoned");
     registry
         .get(device)
         .cloned()
@@ -44,7 +56,7 @@ impl CandleTensor {
         let shape = tensor.shape().dims().to_vec();
         let dtype = candle_dtype_to_ferrum(tensor.dtype())?;
         let device = candle_device_to_ferrum(tensor.device())?;
-        
+
         Ok(Self {
             inner: tensor,
             shape,
@@ -85,35 +97,43 @@ impl TensorLike for CandleTensor {
         // Convert to Candle's narrow operation
         let mut tensor = self.inner.clone();
         for (dim, (&s, &e)) in start.iter().zip(end.iter()).enumerate() {
-            tensor = tensor.narrow(dim, s, e - s)
-                .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle narrow error: {}", e)))?;
+            tensor = tensor.narrow(dim, s, e - s).map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle narrow error: {}", e))
+            })?;
         }
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
     fn reshape(&self, shape: &[usize]) -> Result<TensorRef> {
-        let tensor = self.inner.reshape(shape)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle reshape error: {}", e)))?;
+        let tensor = self.inner.reshape(shape).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle reshape error: {}", e))
+        })?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
     fn to_cpu(&self) -> Result<TensorRef> {
-        let tensor = self.inner.to_device(&candle_core::Device::Cpu)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle to_cpu error: {}", e)))?;
+        let tensor = self
+            .inner
+            .to_device(&candle_core::Device::Cpu)
+            .map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle to_cpu error: {}", e))
+            })?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
     fn to_device(&self, device: &Device) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
-        let tensor = self.inner.to_device(&candle_device)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle to_device error: {}", e)))?;
+        let tensor = self.inner.to_device(&candle_device).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle to_device error: {}", e))
+        })?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
     fn to_dtype(&self, dtype: DataType) -> Result<TensorRef> {
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        let tensor = self.inner.to_dtype(candle_dtype)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle to_dtype error: {}", e)))?;
+        let tensor = self.inner.to_dtype(candle_dtype).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle to_dtype error: {}", e))
+        })?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 }
@@ -136,16 +156,15 @@ impl TensorDataAccess for CandleTensor {
     }
 
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        self.inner
-            .to_vec1::<f32>()
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Tensor to_vec_f32 failed: {}", e)))
+        self.inner.to_vec1::<f32>().map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Tensor to_vec_f32 failed: {}", e))
+        })
     }
 
     fn to_vec_u8(&self) -> Result<Vec<u8>> {
-        let bytes = self
-            .inner
-            .to_vec1::<u8>()
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Tensor to_vec_u8 failed: {}", e)))?;
+        let bytes = self.inner.to_vec1::<u8>().map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Tensor to_vec_u8 failed: {}", e))
+        })?;
         Ok(bytes)
     }
 }
@@ -160,7 +179,13 @@ impl CandleTensorFactory {
         Self { device }
     }
 
-    fn narrow(&self, tensor: &TensorRef, dim: usize, start: usize, length: usize) -> Result<TensorRef> {
+    fn narrow(
+        &self,
+        tensor: &TensorRef,
+        dim: usize,
+        start: usize,
+        length: usize,
+    ) -> Result<TensorRef> {
         let candle_tensor = get_candle_tensor(tensor)?;
         let narrowed = candle_tensor
             .narrow(dim, start, length)
@@ -173,7 +198,9 @@ impl CandleTensorFactory {
         let candle_tensor = get_candle_tensor(tensor)?;
         let reshaped = candle_tensor
             .reshape(shape)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle reshape error: {}", e)))?
+            .map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle reshape error: {}", e))
+            })?
             .to_device(&ferrum_device_to_candle(self.device.clone())?)?;
         Ok(Arc::new(CandleTensor::new(reshaped)?))
     }
@@ -186,7 +213,13 @@ impl Default for CandleTensorFactory {
 }
 
 impl TensorFactory for CandleTensorFactory {
-    fn from_slice(&self, data: &[f32], shape: &[usize], dtype: DataType, device: Device) -> Result<TensorRef> {
+    fn from_slice(
+        &self,
+        data: &[f32],
+        shape: &[usize],
+        dtype: DataType,
+        device: Device,
+    ) -> Result<TensorRef> {
         self.create_tensor(data, shape, dtype, &device)
     }
 
@@ -200,8 +233,8 @@ impl TensorFactory for CandleTensorFactory {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
 
-        let tensor = candle_core::Tensor::from_slice(data, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
+        let tensor =
+            candle_core::Tensor::from_slice(data, shape, &candle_device)?.to_dtype(candle_dtype)?;
 
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
@@ -209,7 +242,7 @@ impl TensorFactory for CandleTensorFactory {
     fn zeros(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
+
         let tensor = candle_core::Tensor::zeros(shape, candle_dtype, &candle_device)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
@@ -217,7 +250,7 @@ impl TensorFactory for CandleTensorFactory {
     fn ones(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
+
         let tensor = candle_core::Tensor::ones(shape, candle_dtype, &candle_device)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
@@ -232,9 +265,9 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
-        let tensor = candle_core::Tensor::rand(low, high, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
+
+        let tensor =
+            candle_core::Tensor::rand(low, high, shape, &candle_device)?.to_dtype(candle_dtype)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
@@ -248,9 +281,9 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
-        let tensor = candle_core::Tensor::randn(mean, std, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
+
+        let tensor =
+            candle_core::Tensor::randn(mean, std, shape, &candle_device)?.to_dtype(candle_dtype)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
@@ -260,8 +293,12 @@ impl TensorFactory for CandleTensorFactory {
 
     fn zeros_like(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let candle_tensor = get_candle_tensor(tensor)?;
-        let zeros = candle_core::Tensor::zeros(candle_tensor.shape(), candle_tensor.dtype(), candle_tensor.device())?
-            .to_device(&ferrum_device_to_candle(self.device.clone())?)?;
+        let zeros = candle_core::Tensor::zeros(
+            candle_tensor.shape(),
+            candle_tensor.dtype(),
+            candle_tensor.device(),
+        )?
+        .to_device(&ferrum_device_to_candle(self.device.clone())?)?;
         Ok(Arc::new(CandleTensor::new(zeros)?))
     }
 }
@@ -273,59 +310,61 @@ impl TensorOps for CandleTensorOps {
     fn matmul(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
-        let result = a_candle.matmul(b_candle)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle matmul error: {}", e)))?;
-        
+
+        let result = a_candle.matmul(b_candle).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle matmul error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn add(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle + b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle add error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn sub(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle - b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle sub error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn mul(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle * b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle mul error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn div(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle / b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle div error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn softmax(&self, tensor: &TensorRef, dim: i32) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = candle_nn::ops::softmax(tensor_candle, dim as usize)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle softmax error: {}", e)))?;
-        
+
+        let result = candle_nn::ops::softmax(tensor_candle, dim as usize).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle softmax error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
@@ -339,93 +378,102 @@ impl TensorOps for CandleTensorOps {
         let input_candle = get_candle_tensor(input)?;
         let weight_candle = get_candle_tensor(weight)?;
         let bias_candle = bias.map(|b| get_candle_tensor(b)).transpose()?;
-        
-        let result = candle_nn::ops::layer_norm(input_candle, weight_candle, bias_candle, eps as f64)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle layer_norm error: {}", e)))?;
-        
+
+        let result =
+            candle_nn::ops::layer_norm(input_candle, weight_candle, bias_candle, eps as f64)
+                .map_err(|e| {
+                    ferrum_types::FerrumError::backend(format!("Candle layer_norm error: {}", e))
+                })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn rms_norm(&self, input: &TensorRef, weight: &TensorRef, eps: f32) -> Result<TensorRef> {
         let input_candle = get_candle_tensor(input)?;
         let weight_candle = get_candle_tensor(weight)?;
-        
-        let result = candle_nn::ops::rms_norm(input_candle, weight_candle, eps as f64)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle rms_norm error: {}", e)))?;
-        
+
+        let result =
+            candle_nn::ops::rms_norm(input_candle, weight_candle, eps as f64).map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle rms_norm error: {}", e))
+            })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn relu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.relu()
+
+        let result = tensor_candle
+            .relu()
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle relu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn gelu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.gelu()
+
+        let result = tensor_candle
+            .gelu()
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle gelu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn silu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
+
         let result = candle_nn::ops::silu(tensor_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle silu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn concat(&self, tensors: &[&TensorRef], dim: usize) -> Result<TensorRef> {
-        let candle_tensors: Result<Vec<_>> = tensors.iter()
-            .map(|t| get_candle_tensor(t))
-            .collect();
+        let candle_tensors: Result<Vec<_>> = tensors.iter().map(|t| get_candle_tensor(t)).collect();
         let candle_tensors = candle_tensors?;
-        
-        let result = candle_core::Tensor::cat(&candle_tensors, dim)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle concat error: {}", e)))?;
-        
+
+        let result = candle_core::Tensor::cat(&candle_tensors, dim).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle concat error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn split(&self, tensor: &TensorRef, sizes: &[usize], dim: usize) -> Result<Vec<TensorRef>> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
+
         let mut results = Vec::new();
         let mut offset = 0;
-        
+
         for &size in sizes {
-            let chunk = tensor_candle.narrow(dim, offset, size)
-                .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle split error: {}", e)))?;
+            let chunk = tensor_candle.narrow(dim, offset, size).map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle split error: {}", e))
+            })?;
             results.push(Arc::new(CandleTensor::new(chunk)?) as TensorRef);
             offset += size;
         }
-        
+
         Ok(results)
     }
 
     fn transpose(&self, tensor: &TensorRef, dim0: usize, dim1: usize) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.transpose(dim0, dim1)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle transpose error: {}", e)))?;
-        
+
+        let result = tensor_candle.transpose(dim0, dim1).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle transpose error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn permute(&self, tensor: &TensorRef, dims: &[usize]) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.permute(dims)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle permute error: {}", e)))?;
-        
+
+        let result = tensor_candle.permute(dims).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle permute error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 }
@@ -498,17 +546,27 @@ impl DeviceMemoryManager for CandleMemoryManager {
         })
     }
 
-    fn handle_info(&self, _handle: MemoryHandle) -> Option<ferrum_interfaces::memory::MemoryHandleInfo> {
+    fn handle_info(
+        &self,
+        _handle: MemoryHandle,
+    ) -> Option<ferrum_interfaces::memory::MemoryHandleInfo> {
         // Simplified implementation
         None
     }
 
-    async fn configure_pool(&self, _device: &Device, _config: ferrum_interfaces::memory::MemoryPoolConfig) -> Result<()> {
+    async fn configure_pool(
+        &self,
+        _device: &Device,
+        _config: ferrum_interfaces::memory::MemoryPoolConfig,
+    ) -> Result<()> {
         warn!("Memory pool configuration not supported by Candle backend");
         Ok(())
     }
 
-    async fn defragment(&self, _device: &Device) -> Result<ferrum_interfaces::memory::DefragmentationStats> {
+    async fn defragment(
+        &self,
+        _device: &Device,
+    ) -> Result<ferrum_interfaces::memory::DefragmentationStats> {
         // Candle handles this automatically
         Ok(ferrum_interfaces::memory::DefragmentationStats {
             memory_freed: 0,
@@ -539,11 +597,11 @@ impl CandleBackend {
     /// Create new Candle backend for device
     pub async fn new(device: Device) -> Result<Self> {
         info!("Initializing Candle backend for device: {:?}", device);
-        
+
         let tensor_factory = Arc::new(CandleTensorFactory::new(device));
         let tensor_ops = Arc::new(CandleTensorOps);
         let memory_manager = Arc::new(CandleMemoryManager::new(device));
-        
+
         Ok(Self {
             device,
             tensor_factory,
@@ -562,23 +620,31 @@ impl ComputeBackend for CandleBackend {
     fn capabilities(&self) -> BackendCapabilities {
         let supported_dtypes = match self.device {
             Device::CUDA(_) => vec![
-                DataType::F32, DataType::F16, DataType::BF16, 
-                DataType::U32, DataType::I64
+                DataType::F32,
+                DataType::F16,
+                DataType::BF16,
+                DataType::U32,
+                DataType::I64,
             ],
             Device::Metal => vec![DataType::F32, DataType::F16, DataType::U32],
             Device::CPU => vec![
-                DataType::F32, DataType::F16, DataType::BF16, 
-                DataType::U32, DataType::I64, DataType::U8, DataType::I32
+                DataType::F32,
+                DataType::F16,
+                DataType::BF16,
+                DataType::U32,
+                DataType::I64,
+                DataType::U8,
+                DataType::I32,
             ],
         };
-        
+
         BackendCapabilities {
             supported_dtypes,
             supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
             max_tensor_dims: 8,
             supports_fp16: true,
             supports_bf16: matches!(self.device, Device::CUDA(_) | Device::CPU),
-            supports_int8: false, // Not yet implemented in Candle
+            supports_int8: false,            // Not yet implemented in Candle
             supports_flash_attention: false, // Coming soon
             supports_paged_attention: false, // Coming soon
             supports_tensor_parallelism: false,
@@ -672,17 +738,17 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
-        let tensor = candle_core::Tensor::from_slice(data, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
-        
+
+        let tensor =
+            candle_core::Tensor::from_slice(data, shape, &candle_device)?.to_dtype(candle_dtype)?;
+
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
     fn zeros(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
+
         let tensor = candle_core::Tensor::zeros(shape, candle_dtype, &candle_device)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
@@ -690,7 +756,7 @@ impl TensorFactory for CandleTensorFactory {
     fn ones(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
+
         let tensor = candle_core::Tensor::ones(shape, candle_dtype, &candle_device)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
@@ -705,9 +771,9 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
-        let tensor = candle_core::Tensor::rand(low, high, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
+
+        let tensor =
+            candle_core::Tensor::rand(low, high, shape, &candle_device)?.to_dtype(candle_dtype)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
@@ -721,9 +787,9 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
-        let tensor = candle_core::Tensor::randn(mean, std, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
+
+        let tensor =
+            candle_core::Tensor::randn(mean, std, shape, &candle_device)?.to_dtype(candle_dtype)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
@@ -733,12 +799,22 @@ impl TensorFactory for CandleTensorFactory {
 
     fn zeros_like(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let candle_tensor = get_candle_tensor(tensor)?;
-        let zeros = candle_core::Tensor::zeros(candle_tensor.shape(), candle_tensor.dtype(), candle_tensor.device())?
-            .to_device(&ferrum_device_to_candle(self.device)?)?;
+        let zeros = candle_core::Tensor::zeros(
+            candle_tensor.shape(),
+            candle_tensor.dtype(),
+            candle_tensor.device(),
+        )?
+        .to_device(&ferrum_device_to_candle(self.device)?)?;
         Ok(Arc::new(CandleTensor::new(zeros)?))
     }
 
-    fn narrow(&self, tensor: &TensorRef, dim: usize, start: usize, length: usize) -> Result<TensorRef> {
+    fn narrow(
+        &self,
+        tensor: &TensorRef,
+        dim: usize,
+        start: usize,
+        length: usize,
+    ) -> Result<TensorRef> {
         let candle_tensor = get_candle_tensor(tensor)?;
         let narrowed = candle_tensor
             .narrow(dim, start, length)
@@ -751,7 +827,9 @@ impl TensorFactory for CandleTensorFactory {
         let candle_tensor = get_candle_tensor(tensor)?;
         let reshaped = candle_tensor
             .reshape(shape)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle reshape error: {}", e)))?
+            .map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle reshape error: {}", e))
+            })?
             .to_device(&ferrum_device_to_candle(self.device.clone())?)?;
         Ok(Arc::new(CandleTensor::new(reshaped)?))
     }
@@ -764,59 +842,61 @@ impl TensorOps for CandleTensorOps {
     fn matmul(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
-        let result = a_candle.matmul(b_candle)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle matmul error: {}", e)))?;
-        
+
+        let result = a_candle.matmul(b_candle).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle matmul error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn add(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle + b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle add error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn sub(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle - b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle sub error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn mul(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle * b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle mul error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn div(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle / b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle div error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn softmax(&self, tensor: &TensorRef, dim: i32) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = candle_nn::ops::softmax(tensor_candle, dim as usize)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle softmax error: {}", e)))?;
-        
+
+        let result = candle_nn::ops::softmax(tensor_candle, dim as usize).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle softmax error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
@@ -830,93 +910,102 @@ impl TensorOps for CandleTensorOps {
         let input_candle = get_candle_tensor(input)?;
         let weight_candle = get_candle_tensor(weight)?;
         let bias_candle = bias.map(|b| get_candle_tensor(b)).transpose()?;
-        
-        let result = candle_nn::ops::layer_norm(input_candle, weight_candle, bias_candle, eps as f64)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle layer_norm error: {}", e)))?;
-        
+
+        let result =
+            candle_nn::ops::layer_norm(input_candle, weight_candle, bias_candle, eps as f64)
+                .map_err(|e| {
+                    ferrum_types::FerrumError::backend(format!("Candle layer_norm error: {}", e))
+                })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn rms_norm(&self, input: &TensorRef, weight: &TensorRef, eps: f32) -> Result<TensorRef> {
         let input_candle = get_candle_tensor(input)?;
         let weight_candle = get_candle_tensor(weight)?;
-        
-        let result = candle_nn::ops::rms_norm(input_candle, weight_candle, eps as f64)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle rms_norm error: {}", e)))?;
-        
+
+        let result =
+            candle_nn::ops::rms_norm(input_candle, weight_candle, eps as f64).map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle rms_norm error: {}", e))
+            })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn relu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.relu()
+
+        let result = tensor_candle
+            .relu()
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle relu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn gelu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.gelu()
+
+        let result = tensor_candle
+            .gelu()
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle gelu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn silu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
+
         let result = candle_nn::ops::silu(tensor_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle silu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn concat(&self, tensors: &[&TensorRef], dim: usize) -> Result<TensorRef> {
-        let candle_tensors: Result<Vec<_>> = tensors.iter()
-            .map(|t| get_candle_tensor(t))
-            .collect();
+        let candle_tensors: Result<Vec<_>> = tensors.iter().map(|t| get_candle_tensor(t)).collect();
         let candle_tensors = candle_tensors?;
-        
-        let result = candle_core::Tensor::cat(&candle_tensors, dim)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle concat error: {}", e)))?;
-        
+
+        let result = candle_core::Tensor::cat(&candle_tensors, dim).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle concat error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn split(&self, tensor: &TensorRef, sizes: &[usize], dim: usize) -> Result<Vec<TensorRef>> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
+
         let mut results = Vec::new();
         let mut offset = 0;
-        
+
         for &size in sizes {
-            let chunk = tensor_candle.narrow(dim, offset, size)
-                .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle split error: {}", e)))?;
+            let chunk = tensor_candle.narrow(dim, offset, size).map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle split error: {}", e))
+            })?;
             results.push(Arc::new(CandleTensor::new(chunk)?) as TensorRef);
             offset += size;
         }
-        
+
         Ok(results)
     }
 
     fn transpose(&self, tensor: &TensorRef, dim0: usize, dim1: usize) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.transpose(dim0, dim1)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle transpose error: {}", e)))?;
-        
+
+        let result = tensor_candle.transpose(dim0, dim1).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle transpose error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn permute(&self, tensor: &TensorRef, dims: &[usize]) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.permute(dims)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle permute error: {}", e)))?;
-        
+
+        let result = tensor_candle.permute(dims).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle permute error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 }
@@ -989,17 +1078,27 @@ impl DeviceMemoryManager for CandleMemoryManager {
         })
     }
 
-    fn handle_info(&self, _handle: MemoryHandle) -> Option<ferrum_interfaces::memory::MemoryHandleInfo> {
+    fn handle_info(
+        &self,
+        _handle: MemoryHandle,
+    ) -> Option<ferrum_interfaces::memory::MemoryHandleInfo> {
         // Simplified implementation
         None
     }
 
-    async fn configure_pool(&self, _device: &Device, _config: ferrum_interfaces::memory::MemoryPoolConfig) -> Result<()> {
+    async fn configure_pool(
+        &self,
+        _device: &Device,
+        _config: ferrum_interfaces::memory::MemoryPoolConfig,
+    ) -> Result<()> {
         warn!("Memory pool configuration not supported by Candle backend");
         Ok(())
     }
 
-    async fn defragment(&self, _device: &Device) -> Result<ferrum_interfaces::memory::DefragmentationStats> {
+    async fn defragment(
+        &self,
+        _device: &Device,
+    ) -> Result<ferrum_interfaces::memory::DefragmentationStats> {
         // Candle handles this automatically
         Ok(ferrum_interfaces::memory::DefragmentationStats {
             memory_freed: 0,
@@ -1030,11 +1129,11 @@ impl CandleBackend {
     /// Create new Candle backend for device
     pub async fn new(device: Device) -> Result<Self> {
         info!("Initializing Candle backend for device: {:?}", device);
-        
+
         let tensor_factory = Arc::new(CandleTensorFactory::new(device));
         let tensor_ops = Arc::new(CandleTensorOps);
         let memory_manager = Arc::new(CandleMemoryManager::new(device));
-        
+
         Ok(Self {
             device,
             tensor_factory,
@@ -1053,23 +1152,31 @@ impl ComputeBackend for CandleBackend {
     fn capabilities(&self) -> BackendCapabilities {
         let supported_dtypes = match self.device {
             Device::CUDA(_) => vec![
-                DataType::F32, DataType::F16, DataType::BF16, 
-                DataType::U32, DataType::I64
+                DataType::F32,
+                DataType::F16,
+                DataType::BF16,
+                DataType::U32,
+                DataType::I64,
             ],
             Device::Metal => vec![DataType::F32, DataType::F16, DataType::U32],
             Device::CPU => vec![
-                DataType::F32, DataType::F16, DataType::BF16, 
-                DataType::U32, DataType::I64, DataType::U8, DataType::I32
+                DataType::F32,
+                DataType::F16,
+                DataType::BF16,
+                DataType::U32,
+                DataType::I64,
+                DataType::U8,
+                DataType::I32,
             ],
         };
-        
+
         BackendCapabilities {
             supported_dtypes,
             supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
             max_tensor_dims: 8,
             supports_fp16: true,
             supports_bf16: matches!(self.device, Device::CUDA(_) | Device::CPU),
-            supports_int8: false, // Not yet implemented in Candle
+            supports_int8: false,            // Not yet implemented in Candle
             supports_flash_attention: false, // Coming soon
             supports_paged_attention: false, // Coming soon
             supports_tensor_parallelism: false,
@@ -1163,17 +1270,17 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
-        let tensor = candle_core::Tensor::from_slice(data, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
-        
+
+        let tensor =
+            candle_core::Tensor::from_slice(data, shape, &candle_device)?.to_dtype(candle_dtype)?;
+
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
     fn zeros(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
+
         let tensor = candle_core::Tensor::zeros(shape, candle_dtype, &candle_device)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
@@ -1181,7 +1288,7 @@ impl TensorFactory for CandleTensorFactory {
     fn ones(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
+
         let tensor = candle_core::Tensor::ones(shape, candle_dtype, &candle_device)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
@@ -1196,9 +1303,9 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
-        let tensor = candle_core::Tensor::rand(low, high, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
+
+        let tensor =
+            candle_core::Tensor::rand(low, high, shape, &candle_device)?.to_dtype(candle_dtype)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
@@ -1212,9 +1319,9 @@ impl TensorFactory for CandleTensorFactory {
     ) -> Result<TensorRef> {
         let candle_device = ferrum_device_to_candle(*device)?;
         let candle_dtype = ferrum_dtype_to_candle(dtype)?;
-        
-        let tensor = candle_core::Tensor::randn(mean, std, shape, &candle_device)?
-            .to_dtype(candle_dtype)?;
+
+        let tensor =
+            candle_core::Tensor::randn(mean, std, shape, &candle_device)?.to_dtype(candle_dtype)?;
         Ok(Arc::new(CandleTensor::new(tensor)?))
     }
 
@@ -1224,12 +1331,22 @@ impl TensorFactory for CandleTensorFactory {
 
     fn zeros_like(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let candle_tensor = get_candle_tensor(tensor)?;
-        let zeros = candle_core::Tensor::zeros(candle_tensor.shape(), candle_tensor.dtype(), candle_tensor.device())?
-            .to_device(&ferrum_device_to_candle(self.device)?)?;
+        let zeros = candle_core::Tensor::zeros(
+            candle_tensor.shape(),
+            candle_tensor.dtype(),
+            candle_tensor.device(),
+        )?
+        .to_device(&ferrum_device_to_candle(self.device)?)?;
         Ok(Arc::new(CandleTensor::new(zeros)?))
     }
 
-    fn narrow(&self, tensor: &TensorRef, dim: usize, start: usize, length: usize) -> Result<TensorRef> {
+    fn narrow(
+        &self,
+        tensor: &TensorRef,
+        dim: usize,
+        start: usize,
+        length: usize,
+    ) -> Result<TensorRef> {
         let candle_tensor = get_candle_tensor(tensor)?;
         let narrowed = candle_tensor
             .narrow(dim, start, length)
@@ -1242,7 +1359,9 @@ impl TensorFactory for CandleTensorFactory {
         let candle_tensor = get_candle_tensor(tensor)?;
         let reshaped = candle_tensor
             .reshape(shape)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle reshape error: {}", e)))?
+            .map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle reshape error: {}", e))
+            })?
             .to_device(&ferrum_device_to_candle(self.device.clone())?)?;
         Ok(Arc::new(CandleTensor::new(reshaped)?))
     }
@@ -1255,59 +1374,61 @@ impl TensorOps for CandleTensorOps {
     fn matmul(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
-        let result = a_candle.matmul(b_candle)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle matmul error: {}", e)))?;
-        
+
+        let result = a_candle.matmul(b_candle).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle matmul error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn add(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle + b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle add error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn sub(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle - b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle sub error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn mul(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle * b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle mul error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn div(&self, a: &TensorRef, b: &TensorRef) -> Result<TensorRef> {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
-        
+
         let result = (a_candle / b_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle div error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn softmax(&self, tensor: &TensorRef, dim: i32) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = candle_nn::ops::softmax(tensor_candle, dim as usize)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle softmax error: {}", e)))?;
-        
+
+        let result = candle_nn::ops::softmax(tensor_candle, dim as usize).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle softmax error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
@@ -1321,93 +1442,102 @@ impl TensorOps for CandleTensorOps {
         let input_candle = get_candle_tensor(input)?;
         let weight_candle = get_candle_tensor(weight)?;
         let bias_candle = bias.map(|b| get_candle_tensor(b)).transpose()?;
-        
-        let result = candle_nn::ops::layer_norm(input_candle, weight_candle, bias_candle, eps as f64)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle layer_norm error: {}", e)))?;
-        
+
+        let result =
+            candle_nn::ops::layer_norm(input_candle, weight_candle, bias_candle, eps as f64)
+                .map_err(|e| {
+                    ferrum_types::FerrumError::backend(format!("Candle layer_norm error: {}", e))
+                })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn rms_norm(&self, input: &TensorRef, weight: &TensorRef, eps: f32) -> Result<TensorRef> {
         let input_candle = get_candle_tensor(input)?;
         let weight_candle = get_candle_tensor(weight)?;
-        
-        let result = candle_nn::ops::rms_norm(input_candle, weight_candle, eps as f64)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle rms_norm error: {}", e)))?;
-        
+
+        let result =
+            candle_nn::ops::rms_norm(input_candle, weight_candle, eps as f64).map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle rms_norm error: {}", e))
+            })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn relu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.relu()
+
+        let result = tensor_candle
+            .relu()
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle relu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn gelu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.gelu()
+
+        let result = tensor_candle
+            .gelu()
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle gelu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn silu(&self, tensor: &TensorRef) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
+
         let result = candle_nn::ops::silu(tensor_candle)
             .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle silu error: {}", e)))?;
-        
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn concat(&self, tensors: &[&TensorRef], dim: usize) -> Result<TensorRef> {
-        let candle_tensors: Result<Vec<_>> = tensors.iter()
-            .map(|t| get_candle_tensor(t))
-            .collect();
+        let candle_tensors: Result<Vec<_>> = tensors.iter().map(|t| get_candle_tensor(t)).collect();
         let candle_tensors = candle_tensors?;
-        
-        let result = candle_core::Tensor::cat(&candle_tensors, dim)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle concat error: {}", e)))?;
-        
+
+        let result = candle_core::Tensor::cat(&candle_tensors, dim).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle concat error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn split(&self, tensor: &TensorRef, sizes: &[usize], dim: usize) -> Result<Vec<TensorRef>> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
+
         let mut results = Vec::new();
         let mut offset = 0;
-        
+
         for &size in sizes {
-            let chunk = tensor_candle.narrow(dim, offset, size)
-                .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle split error: {}", e)))?;
+            let chunk = tensor_candle.narrow(dim, offset, size).map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Candle split error: {}", e))
+            })?;
             results.push(Arc::new(CandleTensor::new(chunk)?) as TensorRef);
             offset += size;
         }
-        
+
         Ok(results)
     }
 
     fn transpose(&self, tensor: &TensorRef, dim0: usize, dim1: usize) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.transpose(dim0, dim1)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle transpose error: {}", e)))?;
-        
+
+        let result = tensor_candle.transpose(dim0, dim1).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle transpose error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
     fn permute(&self, tensor: &TensorRef, dims: &[usize]) -> Result<TensorRef> {
         let tensor_candle = get_candle_tensor(tensor)?;
-        
-        let result = tensor_candle.permute(dims)
-            .map_err(|e| ferrum_types::FerrumError::backend(format!("Candle permute error: {}", e)))?;
-        
+
+        let result = tensor_candle.permute(dims).map_err(|e| {
+            ferrum_types::FerrumError::backend(format!("Candle permute error: {}", e))
+        })?;
+
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 }
@@ -1480,17 +1610,27 @@ impl DeviceMemoryManager for CandleMemoryManager {
         })
     }
 
-    fn handle_info(&self, _handle: MemoryHandle) -> Option<ferrum_interfaces::memory::MemoryHandleInfo> {
+    fn handle_info(
+        &self,
+        _handle: MemoryHandle,
+    ) -> Option<ferrum_interfaces::memory::MemoryHandleInfo> {
         // Simplified implementation
         None
     }
 
-    async fn configure_pool(&self, _device: &Device, _config: ferrum_interfaces::memory::MemoryPoolConfig) -> Result<()> {
+    async fn configure_pool(
+        &self,
+        _device: &Device,
+        _config: ferrum_interfaces::memory::MemoryPoolConfig,
+    ) -> Result<()> {
         warn!("Memory pool configuration not supported by Candle backend");
         Ok(())
     }
 
-    async fn defragment(&self, _device: &Device) -> Result<ferrum_interfaces::memory::DefragmentationStats> {
+    async fn defragment(
+        &self,
+        _device: &Device,
+    ) -> Result<ferrum_interfaces::memory::DefragmentationStats> {
         // Candle handles this automatically
         Ok(ferrum_interfaces::memory::DefragmentationStats {
             memory_freed: 0,
@@ -1521,11 +1661,11 @@ impl CandleBackend {
     /// Create new Candle backend for device
     pub async fn new(device: Device) -> Result<Self> {
         info!("Initializing Candle backend for device: {:?}", device);
-        
+
         let tensor_factory = Arc::new(CandleTensorFactory::new(device));
         let tensor_ops = Arc::new(CandleTensorOps);
         let memory_manager = Arc::new(CandleMemoryManager::new(device));
-        
+
         Ok(Self {
             device,
             tensor_factory,
@@ -1544,23 +1684,31 @@ impl ComputeBackend for CandleBackend {
     fn capabilities(&self) -> BackendCapabilities {
         let supported_dtypes = match self.device {
             Device::CUDA(_) => vec![
-                DataType::F32, DataType::F16, DataType::BF16, 
-                DataType::U32, DataType::I64
+                DataType::F32,
+                DataType::F16,
+                DataType::BF16,
+                DataType::U32,
+                DataType::I64,
             ],
             Device::Metal => vec![DataType::F32, DataType::F16, DataType::U32],
             Device::CPU => vec![
-                DataType::F32, DataType::F16, DataType::BF16, 
-                DataType::U32, DataType::I64, DataType::U8, DataType::I32
+                DataType::F32,
+                DataType::F16,
+                DataType::BF16,
+                DataType::U32,
+                DataType::I64,
+                DataType::U8,
+                DataType::I32,
             ],
         };
-        
+
         BackendCapabilities {
             supported_dtypes,
             supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
             max_tensor_dims: 8,
             supports_fp16: true,
             supports_bf16: matches!(self.device, Device::CUDA(_) | Device::CPU),
-            supports_int8: false, // Not yet implemented in Candle
+            supports_int8: false,            // Not yet implemented in Candle
             supports_flash_attention: false, // Coming soon
             supports_paged_attention: false, // Coming soon
             supports_tensor_parallelism: false,
@@ -1672,8 +1820,12 @@ fn candle_dtype_to_ferrum(dtype: candle_core::DType) -> Result<DataType> {
 fn ferrum_device_to_candle(device: Device) -> Result<candle_core::Device> {
     match device {
         Device::CPU => Ok(candle_core::Device::Cpu),
-        Device::CUDA(id) => Ok(candle_core::Device::Cuda(candle_core::CudaDevice::new(id as usize)?)),
-        Device::Metal => Ok(candle_core::Device::Metal(candle_core::MetalDevice::new(0)?)),
+        Device::CUDA(id) => Ok(candle_core::Device::Cuda(candle_core::CudaDevice::new(
+            id as usize,
+        )?)),
+        Device::Metal => Ok(candle_core::Device::Metal(candle_core::MetalDevice::new(
+            0,
+        )?)),
     }
 }
 

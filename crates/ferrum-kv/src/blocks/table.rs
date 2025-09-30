@@ -45,7 +45,7 @@ impl DefaultBlockTable {
 
     /// Remove mapping for logical block
     pub fn unmap_block(&mut self, logical_id: u32) -> Option<u32> {
-        if logical_id as usize < self.logical_to_physical.len() {
+        if (logical_id as usize) < self.logical_to_physical.len() {
             let physical_id = self.logical_to_physical[logical_id as usize];
             if physical_id > 0 && (physical_id as usize) < self.physical.len() {
                 self.physical[physical_id as usize] = 0; // Mark as free
@@ -61,7 +61,7 @@ impl DefaultBlockTable {
 
     /// Get physical block ID for logical block
     pub fn get_physical(&self, logical_id: u32) -> Option<u32> {
-        if logical_id as usize < self.logical_to_physical.len() {
+        if (logical_id as usize) < self.logical_to_physical.len() {
             let physical_id = self.logical_to_physical[logical_id as usize];
             if physical_id > 0 {
                 Some(physical_id)
@@ -75,7 +75,7 @@ impl DefaultBlockTable {
 
     /// Check if physical block is used
     pub fn is_physical_used(&self, physical_id: u32) -> bool {
-        if physical_id as usize < self.physical.len() {
+        if (physical_id as usize) < self.physical.len() {
             self.physical[physical_id as usize] != 0
         } else {
             false
@@ -130,13 +130,7 @@ impl DefaultBlockTable {
         self.physical
             .iter()
             .enumerate()
-            .filter_map(|(id, &used)| {
-                if used != 0 {
-                    Some(id as u32)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(id, &used)| if used != 0 { Some(id as u32) } else { None })
             .collect()
     }
 
@@ -184,10 +178,10 @@ mod tests {
     #[test]
     fn test_block_mapping() {
         let mut table = DefaultBlockTable::new();
-        
+
         // Map logical block 0 to physical block 5
         table.map_block(0, 5);
-        
+
         assert_eq!(table.get_physical(0), Some(5));
         assert!(table.is_physical_used(5));
         assert_eq!(table.num_used_blocks(), 1);
@@ -196,10 +190,10 @@ mod tests {
     #[test]
     fn test_block_unmapping() {
         let mut table = DefaultBlockTable::new();
-        
+
         table.map_block(0, 5);
         assert_eq!(table.get_physical(0), Some(5));
-        
+
         let unmapped = table.unmap_block(0);
         assert_eq!(unmapped, Some(5));
         assert_eq!(table.get_physical(0), None);
@@ -210,16 +204,16 @@ mod tests {
     #[test]
     fn test_multiple_mappings() {
         let mut table = DefaultBlockTable::new();
-        
+
         table.map_block(0, 10);
         table.map_block(1, 20);
         table.map_block(2, 30);
-        
+
         assert_eq!(table.get_physical(0), Some(10));
         assert_eq!(table.get_physical(1), Some(20));
         assert_eq!(table.get_physical(2), Some(30));
         assert_eq!(table.num_used_blocks(), 3);
-        
+
         let used_blocks = table.used_physical_blocks();
         assert!(used_blocks.contains(&10));
         assert!(used_blocks.contains(&20));
@@ -229,14 +223,14 @@ mod tests {
     #[test]
     fn test_table_shrink() {
         let mut table = DefaultBlockTable::new();
-        
+
         table.map_block(0, 5);
         table.map_block(1, 6);
         table.unmap_block(1); // This should leave trailing zeros
-        
+
         assert!(table.logical_to_physical.len() >= 2);
         table.shrink();
-        
+
         // After shrinking, trailing zeros should be removed
         assert_eq!(table.logical_to_physical.len(), 1);
         assert_eq!(table.get_physical(0), Some(5));
@@ -245,16 +239,16 @@ mod tests {
     #[test]
     fn test_table_clear() {
         let mut table = DefaultBlockTable::new();
-        
+
         table.map_block(0, 5);
         table.map_block(1, 6);
         table.seq_len = 100;
-        
+
         assert!(table.num_logical_blocks() > 0);
         assert!(table.num_physical_blocks() > 0);
-        
+
         table.clear();
-        
+
         assert_eq!(table.num_logical_blocks(), 0);
         assert_eq!(table.num_physical_blocks(), 0);
         assert_eq!(table.seq_len, 0);
@@ -271,22 +265,22 @@ mod tests {
     fn test_extend() {
         let table = DefaultBlockTable::new();
         let extended = table.extend(5, 10);
-        
+
         assert!(extended.logical_to_physical.capacity() >= 5);
         assert!(extended.physical.capacity() >= 10);
     }
 
-    #[test] 
+    #[test]
     fn test_conversion() {
         let mut default_table = DefaultBlockTable::new();
         default_table.map_block(0, 5);
         default_table.seq_len = 50;
-        
+
         // Convert to BlockTable
         let block_table: BlockTable = default_table.clone().into();
         assert_eq!(block_table.seq_len, 50);
         assert_eq!(block_table.logical_to_physical[0], 5);
-        
+
         // Convert back to DefaultBlockTable
         let back_to_default: DefaultBlockTable = block_table.into();
         assert_eq!(back_to_default.seq_len, 50);

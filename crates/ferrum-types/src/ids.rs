@@ -4,6 +4,56 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+/// Token identifier used across the inference pipeline.
+///
+/// This is a thin newtype wrapper around `u32` so that we retain the ergonomic
+/// `.0` access pattern while being able to provide convenience constructors the
+/// rest of the refactor relies on (e.g. `TokenId::new`, `TokenId::MAX`).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct TokenId(pub u32);
+
+impl TokenId {
+    pub const MAX: TokenId = TokenId(u32::MAX);
+
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for TokenId {
+    fn from(value: u32) -> Self {
+        TokenId(value)
+    }
+}
+
+impl From<TokenId> for u32 {
+    fn from(value: TokenId) -> Self {
+        value.0
+    }
+}
+
+impl From<usize> for TokenId {
+    fn from(value: usize) -> Self {
+        TokenId(value as u32)
+    }
+}
+
+impl From<TokenId> for usize {
+    fn from(value: TokenId) -> Self {
+        value.0 as usize
+    }
+}
+
+impl fmt::Display for TokenId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Request identifier
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId(pub Uuid);
@@ -56,7 +106,7 @@ impl ModelId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
-    
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -120,7 +170,7 @@ impl ClientId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
-    
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
