@@ -1,60 +1,41 @@
-//! Main inference engine implementation
+//! Main inference engine - MVP implementation
 
-use crate::pipeline::{InferencePipeline, PipelineComponents};
 use async_trait::async_trait;
-use ferrum_interfaces::{EngineStatus, InferenceEngine, StreamChunk};
-use ferrum_types::{EngineConfig, FerrumError, InferenceRequest, InferenceResponse, Result};
-use futures::StreamExt;
+use ferrum_interfaces::{
+    engine::InferenceEngine, KvCacheHandle, KvCacheManager, ModelExecutor, Sampler,
+    SchedulerInterface as Scheduler, Tokenizer,
+};
+use ferrum_types::{
+    EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest, InferenceResponse,
+    Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
+};
+use futures::stream::{Stream, StreamExt};
+use rand::{rngs::StdRng, SeedableRng};
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{debug, info};
 
-/// Default inference engine implementation
-#[derive(Debug)]
+/// Default inference engine - MVP implementation
 pub struct DefaultInferenceEngine {
-    /// Configuration
     config: EngineConfig,
-    /// Scheduler component
-    scheduler: Arc<dyn ferrum_scheduler::Scheduler + Send + Sync>,
-    /// Tokenizer component
-    tokenizer: Arc<dyn ferrum_tokenizer::Tokenizer + Send + Sync>,
-    /// Sampler component
-    sampler: Arc<dyn ferrum_sampler::Sampler + Send + Sync>,
-    /// KV cache manager
-    kv_cache: Arc<dyn ferrum_kv::KvCacheManager + Send + Sync>,
-    /// Model executor
-    model_executor: Arc<dyn ferrum_interfaces::ModelExecutor + Send + Sync>,
-    /// Pipeline (built lazily)
-    pipeline: Arc<InferencePipeline>,
+    scheduler: Arc<dyn Scheduler + Send + Sync>,
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+    sampler: Arc<dyn Sampler + Send + Sync>,
+    kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+    model_executor: Arc<dyn ModelExecutor + Send + Sync>,
 }
 
 impl DefaultInferenceEngine {
-    /// Create new inference engine
     pub fn new(
         config: EngineConfig,
-        scheduler: Arc<dyn ferrum_scheduler::Scheduler + Send + Sync>,
-        tokenizer: Arc<dyn ferrum_tokenizer::Tokenizer + Send + Sync>,
-        sampler: Arc<dyn ferrum_sampler::Sampler + Send + Sync>,
-        kv_cache: Arc<dyn ferrum_kv::KvCacheManager + Send + Sync>,
-        model_executor: Arc<dyn ferrum_interfaces::ModelExecutor + Send + Sync>,
+        scheduler: Arc<dyn Scheduler + Send + Sync>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     ) -> Self {
-        info!(
-            "Created inference engine with model: {:?}",
-            config.model.model_id
-        );
-
-        let components = PipelineComponents {
-            scheduler: scheduler.clone(),
-            tokenizer: tokenizer.clone(),
-            incremental_tokenizer: tokenizer.clone(),
-            tensor_factory: ferrum_runtime::TensorFactoryHandle::default(),
-            sampler: sampler.clone(),
-            logits_processors: Vec::new(),
-            kv_cache: kv_cache.clone(),
-            model_executor: model_executor.clone(),
-        };
-        let batch_hint = ferrum_interfaces::BatchHint::simple(config.batching.max_batch_size);
-        let pipeline = Arc::new(InferencePipeline::new(components, batch_hint));
+        info!("Created DefaultInferenceEngine");
 
         Self {
             config,
@@ -63,94 +44,269 @@ impl DefaultInferenceEngine {
             sampler,
             kv_cache,
             model_executor,
-            pipeline,
         }
+    }
+
+    /// Execute single inference request
+    async fn execute_request(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
+        let request_id = request.id.clone();
+        debug!("Executing request: {:?}", request_id);
+
+        // 1. Tokenize prompt
+        let input_tokens = self.tokenizer.encode(&request.prompt, true)?;
+        let prompt_tokens = input_tokens.len();
+
+        debug!("Encoded {} tokens from prompt", prompt_tokens);
+
+        // 2. Prepare prefill input
+        let factory = self.model_executor.info().device;
+        let prefill_input = create_prefill_input(&input_tokens, &factory)?;
+
+        // 3. Execute prefill
+        let prefill_output = self.model_executor.prefill(&prefill_input).await?;
+
+        // 4. Generate tokens (decode loop)
+        let max_tokens = request.sampling_params.max_tokens;
+        let mut generated_tokens = Vec::new();
+        let mut kv_cache = prefill_output.kv_cache.clone();
+        let mut rng = create_rng(&request.sampling_params);
+
+        for step in 0..max_tokens {
+            // Get logits from last position
+            let logits = if step == 0 {
+                extract_last_token_logits(&prefill_output.logits)?
+            } else {
+                // Decode step
+                let decode_input = create_decode_input(&generated_tokens, kv_cache.clone(), &factory)?;
+                let decode_output = self.model_executor.decode(&decode_input).await?;
+                kv_cache = decode_output.kv_cache.clone();
+                decode_output.logits.clone()
+            };
+
+            // Sample next token
+            let next_token = sample_token(&logits, &request.sampling_params, &self.sampler, &mut rng)?;
+
+            // Check stop conditions
+            if is_stop_token(next_token, self.model_executor.info().vocab_size) {
+                debug!("Hit EOS token at step {}", step);
+                break;
+            }
+
+            generated_tokens.push(next_token);
+
+            // Check stop sequences
+            if check_stop_sequences(&generated_tokens, &request.sampling_params, &self.tokenizer)? {
+                debug!("Hit stop sequence at step {}", step);
+                break;
+            }
+        }
+
+        // 5. Decode output tokens
+        let generated_text = self
+            .tokenizer
+            .decode(&generated_tokens, true)?;
+
+        debug!(
+            "Generated {} tokens: {}",
+            generated_tokens.len(),
+            generated_text
+        );
+
+        // 6. Build response
+        Ok(InferenceResponse {
+            request_id,
+            text: generated_text,
+            tokens: generated_tokens.clone(),
+            finish_reason: determine_finish_reason(
+                generated_tokens.len(),
+                max_tokens,
+                &request.sampling_params,
+            ),
+            usage: TokenUsage::new(prompt_tokens, generated_tokens.len()),
+            latency_ms: 0, // TODO: measure actual latency
+            created_at: chrono::Utc::now(),
+            metadata: std::collections::HashMap::new(),
+        })
     }
 }
 
 #[async_trait]
 impl InferenceEngine for DefaultInferenceEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
-        let mut stream = self.infer_stream(request).await?;
-        let mut final_response = None;
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(StreamChunk::Complete { response }) => {
-                    final_response = Some(response);
-                    break;
-                }
-                Ok(StreamChunk::Delta { .. }) => continue,
-                Ok(StreamChunk::Error { error }) => return Err(error),
-                Err(e) => return Err(e),
-            }
-        }
-        final_response.ok_or_else(|| FerrumError::engine_error("No response generated"))
+        self.execute_request(&request).await
     }
 
     async fn infer_stream(
         &self,
         request: InferenceRequest,
-    ) -> Result<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send + Unpin>> {
-        info!(?request.id, "Starting streaming inference");
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let pipeline = self.pipeline.clone();
-        let target_request_id = request.id;
-
-        pipeline.submit_request(request.clone()).await?;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        let (tx, rx) = mpsc::channel(100);
+        let engine = self.clone_engine();
 
         tokio::spawn(async move {
-            if let Err(e) = pipeline
-                .process_batches(&target_request_id, tx.clone())
-                .await
-            {
-                let _ = tx.send(Ok(StreamChunk::Error { error: e }));
+            match engine.execute_request(&request).await {
+                Ok(response) => {
+                    let chunk = StreamChunk {
+                        request_id: response.request_id.clone(),
+                        text: response.text.clone(),
+                        token: None,
+                        finish_reason: Some(response.finish_reason),
+                        usage: Some(response.usage.clone()),
+                        created_at: response.created_at,
+                        metadata: response.metadata.clone(),
+                    };
+                    let _ = tx.send(Ok(chunk)).await;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
             }
         });
 
-        Ok(Box::new(ReceiverStream::new(rx)))
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     async fn status(&self) -> EngineStatus {
-        // TODO: gather real metrics from scheduler/KV/pipeline
         EngineStatus {
             is_ready: true,
-            loaded_models: vec![self.model_executor.info().model_id.clone()],
+            loaded_models: vec![],
             active_requests: 0,
             queued_requests: 0,
-            memory_usage: ferrum_types::MemoryUsage::default(),
+            memory_usage: ferrum_types::MemoryUsage {
+                total_bytes: 0,
+                used_bytes: 0,
+                free_bytes: 0,
+                gpu_memory_bytes: None,
+                cpu_memory_bytes: None,
+                cache_memory_bytes: 0,
+                utilization_percent: 0.0,
+            },
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
-            version: "mvp".to_string(),
-            component_status: ferrum_interfaces::ComponentStatus {
-                scheduler: ferrum_interfaces::ComponentHealth::healthy("scheduler"),
-                model_executor: ferrum_interfaces::ComponentHealth::healthy("model"),
-                tokenizer: ferrum_interfaces::ComponentHealth::healthy("tokenizer"),
-                kv_cache: ferrum_interfaces::ComponentHealth::healthy("kv"),
-                memory_manager: ferrum_interfaces::ComponentHealth::healthy("memory"),
-                backend: ferrum_interfaces::ComponentHealth::healthy("backend"),
-            },
+            version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 
     async fn shutdown(&self) -> Result<()> {
-        info!("Shutting down inference engine");
+        info!("Shutting down engine");
         Ok(())
     }
 
-    fn config(&self) -> &ferrum_types::EngineConfig {
+    fn config(&self) -> &EngineConfig {
         &self.config
     }
 
-    fn metrics(&self) -> ferrum_interfaces::EngineMetrics {
-        ferrum_interfaces::EngineMetrics::default()
+    fn metrics(&self) -> ferrum_types::EngineMetrics {
+        ferrum_types::EngineMetrics {
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            avg_request_latency_ms: 0.0,
+            p95_request_latency_ms: 0.0,
+            p99_request_latency_ms: 0.0,
+            throughput_rps: 0.0,
+            tokens_per_second: 0.0,
+            queue_metrics: Default::default(),
+            resource_utilization: Default::default(),
+            error_stats: Default::default(),
+            performance_breakdown: Default::default(),
+        }
     }
 
-    async fn health_check(&self) -> ferrum_interfaces::HealthStatus {
-        ferrum_interfaces::HealthStatus::healthy()
+    async fn health_check(&self) -> ferrum_types::HealthStatus {
+        ferrum_types::HealthStatus::healthy()
     }
 }
 
 impl DefaultInferenceEngine {
-    // Process streaming request is now handled via pipeline.process_batches
+    fn clone_engine(&self) -> Arc<Self> {
+        Arc::new(Self {
+            config: self.config.clone(),
+            scheduler: self.scheduler.clone(),
+            tokenizer: self.tokenizer.clone(),
+            sampler: self.sampler.clone(),
+            kv_cache: self.kv_cache.clone(),
+            model_executor: self.model_executor.clone(),
+        })
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn create_prefill_input(
+    tokens: &[TokenId],
+    _device: &ferrum_types::Device,
+) -> Result<ferrum_interfaces::model_executor::PrefillInput> {
+    // MVP: create dummy tensor - in real implementation would use tensor factory
+    Err(FerrumError::model(
+        "MVP: Prefill input creation needs tensor factory integration",
+    ))
+}
+
+fn create_decode_input(
+    _tokens: &[TokenId],
+    kv_cache: Arc<dyn KvCacheHandle>,
+    _device: &ferrum_types::Device,
+) -> Result<ferrum_interfaces::model_executor::DecodeInput> {
+    Err(FerrumError::model(
+        "MVP: Decode input creation needs tensor factory integration",
+    ))
+}
+
+fn extract_last_token_logits(logits: &ferrum_interfaces::TensorRef) -> Result<ferrum_interfaces::TensorRef> {
+    // MVP: return as-is for now
+    Ok(logits.clone())
+}
+
+fn sample_token(
+    logits: &ferrum_interfaces::TensorRef,
+    _params: &SamplingParams,
+    sampler: &Arc<dyn Sampler>,
+    rng: &mut StdRng,
+) -> Result<TokenId> {
+    // MVP: simplified sampling - need to extract logits to Vec<f32>
+    // For now, return token 0
+    Ok(TokenId::new(0))
+}
+
+fn create_rng(params: &SamplingParams) -> StdRng {
+    if let Some(seed) = params.seed {
+        StdRng::seed_from_u64(seed)
+    } else {
+        StdRng::from_entropy()
+    }
+}
+
+fn is_stop_token(token: TokenId, vocab_size: usize) -> bool {
+    // Common EOS tokens: typically vocab_size - 1 or 2
+    token.get() >= (vocab_size - 10) as u32
+}
+
+fn check_stop_sequences(
+    tokens: &[TokenId],
+    params: &SamplingParams,
+    tokenizer: &Arc<dyn Tokenizer>,
+) -> Result<bool> {
+    if params.stop_sequences.is_empty() {
+        return Ok(false);
+    }
+
+    let text = tokenizer.decode(tokens, true)?;
+    for stop_seq in &params.stop_sequences {
+        if text.contains(stop_seq) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn determine_finish_reason(generated_len: usize, max_tokens: usize, _params: &SamplingParams) -> FinishReason {
+    if generated_len >= max_tokens {
+        FinishReason::Length
+    } else {
+        FinishReason::EOS
+    }
 }

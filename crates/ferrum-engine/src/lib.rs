@@ -21,10 +21,8 @@
 //! - **Batch Processing**: Dynamic continuous batching for throughput
 //! - **Pipeline Optimization**: Prefill→decode loops with minimal overhead
 
-pub mod coordinator;
 pub mod engine;
 pub mod factory;
-pub mod pipeline;
 
 // Re-exports of interfaces
 pub use ferrum_interfaces::{
@@ -44,10 +42,8 @@ pub use ferrum_runtime::ComputeBackend;
 pub use ferrum_scheduler::BatchPlan;
 
 // Re-exports of implementations
-pub use coordinator::*;
 pub use engine::*;
 pub use factory::*;
-pub use pipeline::*;
 
 /// Create default inference engine with MVP configuration
 pub async fn create_default_engine(
