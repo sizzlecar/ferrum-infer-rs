@@ -1,67 +1,22 @@
-//! # Ferrum Models
+//! Ferrum 模型层
 //!
-//! Model building and weight loading implementations for LLM inference.
-//!
-//! ## Overview
-//!
-//! This crate provides concrete implementations of the model interfaces defined
-//! in `ferrum-interfaces`, including:
-//!
-//! - ModelBuilder for constructing model executors from configs
-//! - WeightLoader for loading safetensors/GGUF weights
-//! - Model registry for architecture mapping
-//! - Model source resolution (HF Hub, local files, URLs)
-//!
-//! ## Design Principles
-//!
-//! - **Builder Pattern**: Clear separation of model definition vs construction
-//! - **Weight Loading**: Abstract over different weight formats and sources
-//! - **Registry Pattern**: Map architecture names to builders
-//! - **Source Resolution**: Unified loading from various sources
-//!
-//! ## Architecture Support
-//!
-//! - Llama family (Llama, Llama2, Code Llama, Vicuna)
-//! - Mistral family (Mistral 7B, Mixtral, Codestral)
-//! - Qwen family (Qwen, Qwen2, CodeQwen)
-//! - Other architectures (Phi, Gemma, ChatGLM)
-
-use ferrum_interfaces::{ComputeBackend, ModelBuilder, ModelExecutor, WeightLoader};
+//! 该 crate 负责围绕 `ferrum-interfaces`/`ferrum-types` 定义的核心抽象
+//! 提供模型定义解析、构建器与权重加载占位实现，确保上层可以在
+//! 重构阶段编译。
 
 pub mod builder;
-pub mod config;
-pub mod loader;
+pub mod definition;
 pub mod registry;
 pub mod source;
+pub mod tokenizer;
+pub mod weights;
 
-// Re-exports of interfaces from ferrum-interfaces
-pub use ferrum_interfaces::{
-    ModelBuilder as ModelBuilderInterface, ModelCapabilities, ModelConfig,
-    ModelExecutor as ModelExecutorInterface, ModelInfo, WeightLoader as WeightLoaderInterface,
-    WeightSpec,
-};
+pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
+pub use definition::{ConfigManager, ModelDefinition};
+pub use registry::{ModelAlias, ModelDiscoveryEntry, ModelRegistry};
+pub use source::{ModelFormat, ModelSourceConfig, ModelSourceResolver, ResolvedModelSource};
+pub use tokenizer::{TokenizerFactory, TokenizerHandle};
+pub use weights::{default_weight_loader, WeightFormat, WeightLoaderHandle};
 
-pub use ferrum_types::{Architecture, DataType, Device, FerrumError, ModelId, Result};
-
-// Re-exports of implementations
-pub use builder::{BuilderRegistry, DefaultModelBuilderFactory};
-pub use config::*;
-pub use loader::*;
-pub use registry::*;
-pub use source::*;
-
-/// Default model builder factory
-pub fn default_builder_factory() -> DefaultModelBuilderFactory {
-    DefaultModelBuilderFactory::new()
-}
-
-/// Default weight loader factory
-pub fn default_weight_loader(
-    format: WeightFormat,
-) -> Result<Box<dyn WeightLoaderInterface + Send + Sync>> {
-    match format {
-        WeightFormat::SafeTensors => Ok(Box::new(SafeTensorsLoader::new())),
-        WeightFormat::GGUF => Ok(Box::new(GGUFLoader::new())),
-        WeightFormat::Pickle => Err(FerrumError::unsupported("Pickle format not supported")),
-    }
-}
+pub use ferrum_interfaces::{ModelBuilder, ModelExecutor, WeightLoader};
+pub use ferrum_types::{ModelConfig, ModelInfo, ModelType, Result};

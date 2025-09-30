@@ -1107,7 +1107,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-utils",
  "dashmap",
- "ferrum-core",
+ "ferrum-types",
  "futures",
  "indexmap",
  "metrics",
@@ -1138,12 +1138,12 @@ dependencies = [
  "dialoguer",
  "dirs 5.0.1",
  "ferrum-cache",
- "ferrum-core",
  "ferrum-engine",
  "ferrum-models",
  "ferrum-runtime",
  "ferrum-scheduler",
  "ferrum-server",
+ "ferrum-types",
  "futures",
  "indicatif",
  "num_cpus",
@@ -1159,25 +1159,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "ferrum-core"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "ferrum-interfaces",
- "ferrum-types",
- "futures",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -1382,9 +1363,9 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "config",
- "ferrum-core",
  "ferrum-engine",
  "ferrum-scheduler",
+ "ferrum-types",
  "futures",
  "http",
  "http-body",

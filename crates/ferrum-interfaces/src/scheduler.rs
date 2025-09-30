@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use ferrum_types::{
     BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState, Result,
+    SchedulerConfig as TypesSchedulerConfig, SchedulerStats,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
@@ -32,7 +33,7 @@ pub trait Scheduler: Send + Sync {
     fn metrics(&self) -> SchedulerMetrics;
 
     /// Get scheduler configuration
-    fn config(&self) -> &SchedulerConfig;
+    fn config(&self) -> &TypesSchedulerConfig;
 
     /// Preempt running request (if supported)
     async fn preempt(&self, request_id: RequestId) -> Result<PreemptionResult> {
@@ -248,46 +249,7 @@ pub struct PreemptionState {
 }
 
 /// Scheduler configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulerConfig {
-    /// Scheduling policy
-    pub policy: SchedulingPolicy,
-    /// Maximum waiting requests
-    pub max_waiting_requests: usize,
-    /// Maximum concurrent requests  
-    pub max_running_requests: usize,
-    /// Maximum batch size
-    pub max_batch_size: usize,
-    /// Batch formation timeout
-    pub batch_timeout_ms: u64,
-    /// Enable preemption
-    pub enable_preemption: bool,
-    /// Enable load balancing
-    pub enable_load_balancing: bool,
-    /// Fair share configuration
-    pub fair_share_config: Option<FairShareConfig>,
-    /// SLA configuration
-    pub sla_config: Option<SlaConfig>,
-    /// Resource limits
-    pub resource_limits: ResourceLimits,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            policy: SchedulingPolicy::Priority,
-            max_waiting_requests: 1000,
-            max_running_requests: 100,
-            max_batch_size: 32,
-            batch_timeout_ms: 10,
-            enable_preemption: false,
-            enable_load_balancing: false,
-            fair_share_config: None,
-            sla_config: None,
-            resource_limits: ResourceLimits::default(),
-        }
-    }
-}
+pub type SchedulerConfig = TypesSchedulerConfig;
 
 /// Scheduling policies
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -376,105 +338,7 @@ pub struct ClientResourceLimits {
     pub max_requests_per_minute: Option<u32>,
 }
 
-/// Scheduler performance metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulerMetrics {
-    /// Currently waiting requests
-    pub waiting_requests: usize,
-    /// Currently running requests
-    pub running_requests: usize,
-    /// Total completed requests
-    pub completed_requests: u64,
-    /// Total failed requests
-    pub failed_requests: u64,
-    /// Total cancelled requests
-    pub cancelled_requests: u64,
-    /// Average wait time in queue (ms)
-    pub avg_wait_time_ms: f64,
-    /// Average execution time (ms)
-    pub avg_execution_time_ms: f64,
-    /// P95 wait time (ms)
-    pub p95_wait_time_ms: f64,
-    /// P95 execution time (ms)
-    pub p95_execution_time_ms: f64,
-    /// Current throughput (requests/second)
-    pub throughput_rps: f64,
-    /// Queue utilization (0.0 - 1.0)
-    pub queue_utilization: f32,
-    /// Resource utilization
-    pub resource_utilization: ResourceUtilization,
-    /// Batch statistics
-    pub batch_stats: BatchStats,
-    /// SLA compliance (if enabled)
-    pub sla_compliance: Option<SlaCompliance>,
-}
-
-/// Resource utilization metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceUtilization {
-    /// GPU memory utilization
-    pub gpu_memory_utilization: f32,
-    /// CPU memory utilization
-    pub cpu_memory_utilization: f32,
-    /// KV cache utilization
-    pub kv_cache_utilization: f32,
-    /// Compute unit utilization
-    pub compute_utilization: f32,
-}
-
-/// Batch processing statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchStats {
-    /// Average batch size
-    pub avg_batch_size: f32,
-    /// Batch utilization efficiency
-    pub batch_efficiency: f32,
-    /// Total batches created
-    pub batches_created: u64,
-    /// Total batches completed
-    pub batches_completed: u64,
-    /// Average batch formation time (ms)
-    pub avg_batch_formation_time_ms: f64,
-}
-
-/// SLA compliance metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SlaCompliance {
-    /// Overall SLA compliance rate
-    pub overall_compliance_rate: f32,
-    /// Per-client compliance rates
-    pub client_compliance_rates: HashMap<String, f32>,
-    /// Recent SLA violations
-    pub recent_violations: Vec<SlaViolation>,
-}
-
-/// SLA violation record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SlaViolation {
-    /// Request that violated SLA
-    pub request_id: RequestId,
-    /// Client identifier
-    pub client_id: Option<String>,
-    /// Violation type
-    pub violation_type: SlaViolationType,
-    /// Actual vs required metric
-    pub actual_value: f64,
-    /// Required value
-    pub required_value: f64,
-    /// Violation timestamp
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-}
-
-/// Types of SLA violations
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum SlaViolationType {
-    /// Latency exceeded threshold
-    LatencyViolation,
-    /// Throughput below threshold
-    ThroughputViolation,
-    /// Availability violation
-    AvailabilityViolation,
-}
+pub type SchedulerMetrics = SchedulerStats;
 
 /// Advanced scheduler capabilities
 #[async_trait]
@@ -701,8 +565,15 @@ pub struct SchedulingSimulationResult {
     pub p99_latency_ms: f64,
     /// Throughput achieved
     pub throughput_rps: f32,
-    /// Resource utilization
-    pub resource_utilization: ResourceUtilization,
+    /// Resource utilization (optional placeholder)
+    pub resource_utilization: Option<ResourceStats>,
     /// Predicted bottlenecks
     pub bottlenecks: Vec<BottleneckAnalysis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceStats {
+    pub gpu_memory_bytes: Option<u64>,
+    pub cpu_memory_bytes: Option<u64>,
+    pub compute_utilization: Option<f32>,
 }

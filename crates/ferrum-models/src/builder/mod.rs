@@ -1,7 +1,6 @@
-pub mod factory;
-pub mod llama;
-pub mod mistral;
+//! Builder 模块：提供默认构建器工厂与占位实现
+
+mod factory;
 
 pub use factory::DefaultModelBuilderFactory;
-pub use llama::LlamaModelBuilder;
-pub use mistral::MistralModelBuilder;
+pub use factory::SimpleModelBuilder;

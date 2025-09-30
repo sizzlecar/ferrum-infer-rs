@@ -4,7 +4,7 @@
 
 use crate::middleware::{AuthConfig, CompressionConfig, CorsConfig};
 use chrono::{DateTime, Utc};
-use ferrum_core::{ModelId, RequestId};
+use ferrum_types::{ModelId, RequestId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
