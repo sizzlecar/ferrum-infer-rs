@@ -26,23 +26,22 @@ pub mod engine;
 pub mod factory;
 pub mod pipeline;
 
-// Re-exports of interfaces from ferrum-interfaces
+// Re-exports of interfaces
 pub use ferrum_interfaces::{
-    EngineStatus, InferenceEngine as InferenceEngineInterface, StreamChunk,
+    InferenceEngine as InferenceEngineInterface,
+    KvCacheManager, ModelBuilder, ModelExecutor, WeightLoader,
+    Sampler, SchedulerInterface as Scheduler,
+    Tokenizer, IncrementalTokenizer,
 };
 
 pub use ferrum_types::{
-    BatchId, EngineConfig, FerrumError, InferenceRequest, InferenceResponse, RequestId, Result,
-    StreamingConfig,
+    BatchId, EngineConfig, EngineStatus, FerrumError, InferenceRequest, InferenceResponse, 
+    RequestId, Result, StreamChunk,
 };
 
 // Re-exports from implementation crates
-pub use ferrum_kv::KvCacheManager;
-pub use ferrum_models::{ModelBuilder, WeightLoader};
-pub use ferrum_runtime::{ComputeBackend, TensorFactory};
-pub use ferrum_sampler::{LogitsProcessor, Sampler};
-pub use ferrum_scheduler::{BatchPlan, Scheduler};
-pub use ferrum_tokenizer::{IncrementalTokenizer, Tokenizer};
+pub use ferrum_runtime::ComputeBackend;
+pub use ferrum_scheduler::BatchPlan;
 
 // Re-exports of implementations
 pub use coordinator::*;

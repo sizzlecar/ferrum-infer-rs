@@ -108,7 +108,7 @@ impl Default for Int4Compression {
 impl CompressionStrategy for Int4Compression {
     fn compress(&self, data: &[u8], original_dtype: DataType) -> Result<CompressedData> {
         match original_dtype {
-            DataType::F16 | DataType::F32 => {
+            DataType::FP16 | DataType::FP32 => {
                 // Simplified INT4 quantization
                 // In practice, this would involve proper float->int4 quantization
                 let compressed_size = (data.len() + 1) / 2; // 4 bits per element
@@ -197,7 +197,7 @@ impl Default for Fp8Compression {
 impl CompressionStrategy for Fp8Compression {
     fn compress(&self, data: &[u8], original_dtype: DataType) -> Result<CompressedData> {
         match original_dtype {
-            DataType::F32 => {
+            DataType::FP32 => {
                 // Convert F32 to FP8 (simplified - would need proper FP8 format)
                 // For now, just take every 4th byte as a placeholder
                 let compressed: Vec<u8> = data.iter().step_by(4).cloned().collect();
@@ -210,7 +210,7 @@ impl CompressionStrategy for Fp8Compression {
                     params: self.params.clone(),
                 })
             }
-            DataType::F16 => {
+            DataType::FP16 => {
                 // Convert F16 to FP8 (simplified)
                 let compressed: Vec<u8> = data.iter().step_by(2).cloned().collect();
 
@@ -237,7 +237,7 @@ impl CompressionStrategy for Fp8Compression {
         }
 
         match compressed.original_dtype {
-            DataType::F32 => {
+            DataType::FP32 => {
                 // Expand back to F32 (placeholder)
                 let mut decompressed = Vec::with_capacity(compressed.original_size);
                 for &byte in &compressed.data {
@@ -249,7 +249,7 @@ impl CompressionStrategy for Fp8Compression {
                 decompressed.truncate(compressed.original_size);
                 Ok(decompressed)
             }
-            DataType::F16 => {
+            DataType::FP16 => {
                 // Expand back to F16 (placeholder)
                 let mut decompressed = Vec::with_capacity(compressed.original_size);
                 for &byte in &compressed.data {
@@ -376,7 +376,7 @@ mod tests {
         let compression = NoCompression;
         let data = vec![1, 2, 3, 4];
 
-        let compressed = compression.compress(&data, DataType::F32).unwrap();
+        let compressed = compression.compress(&data, DataType::FP32).unwrap();
         assert_eq!(compressed.data, data);
         assert_eq!(compressed.algorithm, "none");
 
@@ -389,7 +389,7 @@ mod tests {
         let compression = Int4Compression::new();
         let data = vec![0xAB, 0xCD, 0xEF, 0x12];
 
-        let compressed = compression.compress(&data, DataType::F16).unwrap();
+        let compressed = compression.compress(&data, DataType::FP16).unwrap();
         assert_eq!(compressed.algorithm, "int4");
         assert!(compressed.data.len() <= data.len()); // Should be smaller or equal
 
@@ -416,7 +416,7 @@ mod tests {
         let data = vec![1, 2, 3, 4];
 
         let compressed = manager
-            .compress(&data, DataType::F32, Some("none"))
+            .compress(&data, DataType::FP32, Some("none"))
             .unwrap();
         let decompressed = manager.decompress(&compressed).unwrap();
 

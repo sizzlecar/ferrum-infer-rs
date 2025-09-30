@@ -26,10 +26,15 @@ pub mod queue;
 
 // Re-exports of interfaces from ferrum-interfaces
 pub use ferrum_interfaces::{
-    BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, ResourceConstraints,
-    ScheduledRequest, SchedulerConfig, SchedulerInterface as Scheduler, SchedulerMetrics,
-    SchedulingPolicy,
+    scheduler::{
+        BatchResourceRequirements, PreemptionResult, PreemptionState, ResourceConstraints,
+        ScheduledRequest,
+    },
+    BatchHint, BatchPlan, SchedulerInterface as Scheduler,
 };
+
+// Re-export types from ferrum-types
+pub use ferrum_types::{SchedulerConfig, SchedulerStats};
 
 pub use ferrum_types::{BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, Result};
 

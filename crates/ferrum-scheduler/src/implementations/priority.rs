@@ -2,8 +2,9 @@
 
 use crate::{
     BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, ScheduledRequest, Scheduler,
-    SchedulerConfig, SchedulerMetrics,
 };
+use ferrum_interfaces::scheduler::SchedulerMetrics;
+use ferrum_types::SchedulerConfig;
 use async_trait::async_trait;
 use ferrum_types::{
     BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState, Result,
@@ -56,7 +57,7 @@ impl RequestPriority {
         let priority_value = match priority {
             Priority::Critical => 100,
             Priority::High => 75,
-            Priority::Medium => 50,
+            Priority::Normal => 50,
             Priority::Low => 25,
         };
 
@@ -235,7 +236,7 @@ impl PriorityScheduler {
         let estimated_time_ms = match highest_priority {
             Priority::Critical => 500, // Fast lane for critical requests
             Priority::High => 750,
-            Priority::Medium => 1000,
+            Priority::Normal => 1000,
             Priority::Low => 1500,
         };
 
@@ -318,7 +319,7 @@ impl Scheduler for PriorityScheduler {
             );
 
             match response.finish_reason {
-                ferrum_types::FinishReason::Eos | ferrum_types::FinishReason::Stop => {
+                ferrum_types::FinishReason::EOS | ferrum_types::FinishReason::Stop => {
                     self.completed_counter.fetch_add(1, Ordering::Relaxed);
                     debug!(
                         "Request {} (priority {:?}) completed successfully",
@@ -443,38 +444,23 @@ impl Scheduler for PriorityScheduler {
         let high_wait = self.metrics_tracker.priority_wait_time(Priority::High);
         let avg_wait = self.metrics_tracker.avg_wait_time_ms();
 
-        let p95_wait_estimate = if critical_wait > 0.0 || high_wait > 0.0 {
+        let _p95_wait_estimate = if critical_wait > 0.0 || high_wait > 0.0 {
             (critical_wait + high_wait) / 2.0 * 1.2 // Priority requests should have better P95
         } else {
             avg_wait * 1.5 // Fallback to simple estimate
         };
 
-        SchedulerMetrics {
+        ferrum_types::SchedulerStats {
             waiting_requests: waiting_count,
             running_requests: running_count,
+            preempted_requests: 0, // MVP: no preemption tracking
             completed_requests: completed_count,
             failed_requests: failed_count,
             cancelled_requests: cancelled_count,
             avg_wait_time_ms: avg_wait,
             avg_execution_time_ms: self.metrics_tracker.avg_execution_time_ms(),
-            p95_wait_time_ms: p95_wait_estimate,
-            p95_execution_time_ms: self.metrics_tracker.avg_execution_time_ms() * 1.3, // Priority affects exec time
             throughput_rps: throughput,
             queue_utilization,
-            resource_utilization: ferrum_interfaces::scheduler::ResourceUtilization {
-                gpu_memory_utilization: 0.6, // Higher utilization due to priority scheduling
-                cpu_memory_utilization: 0.4,
-                kv_cache_utilization: 0.5,
-                compute_utilization: running_count as f32 / self.config.max_running_requests as f32,
-            },
-            batch_stats: ferrum_interfaces::scheduler::BatchStats {
-                avg_batch_size: 6.0,   // Slightly larger batches due to better selection
-                batch_efficiency: 0.9, // Higher efficiency due to priority optimization
-                batches_created: completed_count / 6,
-                batches_completed: completed_count / 6,
-                avg_batch_formation_time_ms: 8.0, // Slightly longer due to priority sorting
-            },
-            sla_compliance: None,
         }
     }
 
@@ -490,7 +476,7 @@ impl Scheduler for PriorityScheduler {
             let priority = scheduled_req.request.priority;
 
             // Only allow preempting Low and Medium priority requests
-            if matches!(priority, Priority::Low | Priority::Medium) {
+            if matches!(priority, Priority::Low | Priority::Normal) {
                 let removed_req = running_requests.remove(&request_id).unwrap();
 
                 // Move back to waiting queue with updated priority

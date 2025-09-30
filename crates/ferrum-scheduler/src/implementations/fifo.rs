@@ -2,8 +2,9 @@
 
 use crate::{
     BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, ScheduledRequest, Scheduler,
-    SchedulerConfig, SchedulerMetrics,
 };
+use ferrum_interfaces::scheduler::SchedulerMetrics;
+use ferrum_types::SchedulerConfig;
 use async_trait::async_trait;
 use ferrum_types::{
     BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState, Result,
@@ -223,7 +224,7 @@ impl Scheduler for FifoScheduler {
             );
 
             match response.finish_reason {
-                ferrum_types::FinishReason::Eos | ferrum_types::FinishReason::Stop => {
+                ferrum_types::FinishReason::EOS | ferrum_types::FinishReason::Stop => {
                     self.completed_counter.fetch_add(1, Ordering::Relaxed);
                     debug!("Request {} completed successfully", request_id);
                 }
@@ -277,7 +278,7 @@ impl Scheduler for FifoScheduler {
         Ok(false)
     }
 
-    async fn update_priority(&self, request_id: RequestId, priority: Priority) -> Result<()> {
+    async fn update_priority(&self, request_id: RequestId, _priority: Priority) -> Result<()> {
         // FIFO scheduler ignores priority updates by design
         debug!(
             "Priority update ignored for request {} in FIFO scheduler",
@@ -305,32 +306,17 @@ impl Scheduler for FifoScheduler {
 
         let queue_utilization = waiting_count as f32 / self.config.max_waiting_requests as f32;
 
-        SchedulerMetrics {
+        ferrum_types::SchedulerStats {
             waiting_requests: waiting_count,
             running_requests: running_count,
+            preempted_requests: 0, // FIFO doesn't support preemption
             completed_requests: completed_count,
             failed_requests: failed_count,
             cancelled_requests: cancelled_count,
             avg_wait_time_ms: self.metrics_tracker.avg_wait_time_ms(),
             avg_execution_time_ms: self.metrics_tracker.avg_execution_time_ms(),
-            p95_wait_time_ms: self.metrics_tracker.avg_wait_time_ms() * 1.5, // Simplified
-            p95_execution_time_ms: self.metrics_tracker.avg_execution_time_ms() * 1.5, // Simplified
             throughput_rps: throughput,
             queue_utilization,
-            resource_utilization: ferrum_interfaces::scheduler::ResourceUtilization {
-                gpu_memory_utilization: 0.5, // Placeholder
-                cpu_memory_utilization: 0.3, // Placeholder
-                kv_cache_utilization: 0.4,   // Placeholder
-                compute_utilization: running_count as f32 / self.config.max_running_requests as f32,
-            },
-            batch_stats: ferrum_interfaces::scheduler::BatchStats {
-                avg_batch_size: 4.0,                  // Placeholder
-                batch_efficiency: 0.85,               // Placeholder
-                batches_created: completed_count / 4, // Rough estimate
-                batches_completed: completed_count / 4,
-                avg_batch_formation_time_ms: 5.0,
-            },
-            sla_compliance: None,
         }
     }
 

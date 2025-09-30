@@ -30,7 +30,7 @@ impl ModelRegistry {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModelDiscoveryEntry {
     pub model_id: ModelId,
     pub path: std::path::PathBuf,

@@ -151,7 +151,7 @@ impl MemoryStatsTracker {
         }
 
         DetailedMemoryStats {
-            device: self.device,
+            device: self.device.clone(),
             total_allocated_bytes: total_allocated,
             total_deallocated_bytes: self.total_deallocated.load(Ordering::Relaxed),
             current_usage_bytes: self.current_usage.load(Ordering::Relaxed),
@@ -255,7 +255,7 @@ impl GlobalMemoryStatsRegistry {
         {
             let mut trackers = self.trackers.write();
             trackers
-                .entry(device)
+                .entry(device.clone())
                 .or_insert_with(|| MemoryStatsTracker::new(device));
         }
 
