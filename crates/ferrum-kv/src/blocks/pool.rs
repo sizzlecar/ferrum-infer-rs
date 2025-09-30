@@ -1,10 +1,13 @@
 //! Block pool implementation for KV-Cache memory management
 
-use ferrum_types::{Result, Device, DataType, FerrumError};
-use parking_lot::{RwLock, Mutex};
+use ferrum_types::{DataType, Device, FerrumError, Result};
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-use tracing::{debug, warn, trace};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tracing::{debug, trace, warn};
 
 /// Physical block identifier
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -65,12 +68,7 @@ pub struct Block {
 
 impl Block {
     /// Create new block
-    pub fn new(
-        id: PhysicalBlockId,
-        device: Device,
-        size: usize,
-        data_type: DataType,
-    ) -> Self {
+    pub fn new(id: PhysicalBlockId, device: Device, size: usize, data_type: DataType) -> Self {
         Self {
             id,
             device,
@@ -152,10 +150,14 @@ impl BlockPool {
         max_blocks: usize,
     ) -> Result<Self> {
         if block_size == 0 {
-            return Err(FerrumError::invalid_parameter("Block size must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "Block size must be positive",
+            ));
         }
         if max_blocks == 0 {
-            return Err(FerrumError::invalid_parameter("Max blocks must be positive"));
+            return Err(FerrumError::invalid_parameter(
+                "Max blocks must be positive",
+            ));
         }
 
         debug!(
@@ -186,10 +188,10 @@ impl BlockPool {
                 let mut block_guard = block.write();
                 block_guard.state = BlockState::Allocated;
                 block_guard.add_ref();
-                
+
                 debug!("Reused free block: {:?}", block_id);
                 self.total_allocations.fetch_add(1, Ordering::Relaxed);
-                
+
                 return Ok(BlockAllocation {
                     physical_id: block_id,
                     block: block.clone(),
@@ -200,18 +202,25 @@ impl BlockPool {
         // Need to create a new block
         let current_blocks = self.allocated_blocks.load(Ordering::Relaxed);
         if current_blocks >= self.max_blocks {
-            return Err(FerrumError::resource_exhausted(
-                format!("Block pool exhausted: {}/{} blocks allocated", current_blocks, self.max_blocks)
-            ));
+            return Err(FerrumError::resource_exhausted(format!(
+                "Block pool exhausted: {}/{} blocks allocated",
+                current_blocks, self.max_blocks
+            )));
         }
 
-        let block_id = PhysicalBlockId::new(self.next_block_id.fetch_add(1, Ordering::Relaxed) as u32);
-        let mut block = Block::new(block_id, self.device.clone(), self.block_size, self.data_type);
+        let block_id =
+            PhysicalBlockId::new(self.next_block_id.fetch_add(1, Ordering::Relaxed) as u32);
+        let mut block = Block::new(
+            block_id,
+            self.device.clone(),
+            self.block_size,
+            self.data_type,
+        );
         block.state = BlockState::Allocated;
         block.add_ref();
 
         let block = Arc::new(RwLock::new(block));
-        
+
         {
             let mut blocks = self.blocks.write();
             blocks.insert(block_id, block.clone());
@@ -219,7 +228,7 @@ impl BlockPool {
 
         self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
         self.total_allocations.fetch_add(1, Ordering::Relaxed);
-        
+
         debug!("Allocated new block: {:?}", block_id);
 
         Ok(BlockAllocation {
@@ -233,19 +242,22 @@ impl BlockPool {
         let blocks = self.blocks.read();
         if let Some(block) = blocks.get(&block_id) {
             let mut block_guard = block.write();
-            
+
             block_guard.remove_ref()?;
-            
+
             if block_guard.ref_count == 0 {
                 block_guard.state = BlockState::Free;
                 self.free_blocks.lock().push_back(block_id);
                 self.total_deallocations.fetch_add(1, Ordering::Relaxed);
                 debug!("Deallocated block: {:?}", block_id);
             }
-            
+
             Ok(())
         } else {
-            Err(FerrumError::not_found(format!("Block not found: {:?}", block_id)))
+            Err(FerrumError::not_found(format!(
+                "Block not found: {:?}",
+                block_id
+            )))
         }
     }
 
@@ -260,7 +272,7 @@ impl BlockPool {
         let blocks = self.blocks.read();
         let free_count = self.free_blocks.lock().len();
         let total_blocks = blocks.len();
-        
+
         BlockPoolStats {
             total_blocks,
             free_blocks: free_count,
@@ -274,7 +286,7 @@ impl BlockPool {
     /// Force evict blocks to free memory
     pub fn evict_blocks(&self, count: usize) -> Result<Vec<PhysicalBlockId>> {
         let blocks = self.blocks.read();
-        
+
         // Find evictable blocks (ref_count == 0, not free)
         let mut evictable: Vec<_> = blocks
             .iter()
@@ -290,7 +302,7 @@ impl BlockPool {
 
         // Sort by last access time (oldest first)
         evictable.sort_by_key(|(_, last_access)| *last_access);
-        
+
         let mut evicted = Vec::new();
         for (block_id, _) in evictable.iter().take(count) {
             if let Some(block) = blocks.get(block_id) {
@@ -346,12 +358,7 @@ mod tests {
 
     #[test]
     fn test_block_pool_creation() {
-        let pool = BlockPool::new(
-            Device::Cpu,
-            16,
-            DataType::F16,
-            100,
-        ).unwrap();
+        let pool = BlockPool::new(Device::Cpu, 16, DataType::F16, 100).unwrap();
 
         assert_eq!(pool.block_size(), 16);
         assert_eq!(pool.device(), &Device::Cpu);
@@ -359,12 +366,7 @@ mod tests {
 
     #[test]
     fn test_block_allocation() {
-        let pool = BlockPool::new(
-            Device::Cpu,
-            16,
-            DataType::F16,
-            100,
-        ).unwrap();
+        let pool = BlockPool::new(Device::Cpu, 16, DataType::F16, 100).unwrap();
 
         let allocation = pool.allocate().unwrap();
         assert_eq!(allocation.physical_id, PhysicalBlockId::new(0));
@@ -376,16 +378,11 @@ mod tests {
 
     #[test]
     fn test_block_deallocation() {
-        let pool = BlockPool::new(
-            Device::Cpu,
-            16,
-            DataType::F16,
-            100,
-        ).unwrap();
+        let pool = BlockPool::new(Device::Cpu, 16, DataType::F16, 100).unwrap();
 
         let allocation = pool.allocate().unwrap();
         let block_id = allocation.physical_id;
-        
+
         pool.deallocate(block_id).unwrap();
 
         let stats = pool.stats();
@@ -399,11 +396,12 @@ mod tests {
             16,
             DataType::F16,
             1, // Only 1 block allowed
-        ).unwrap();
+        )
+        .unwrap();
 
         // First allocation should succeed
         let _allocation1 = pool.allocate().unwrap();
-        
+
         // Second allocation should fail
         let result = pool.allocate();
         assert!(result.is_err());
@@ -411,12 +409,7 @@ mod tests {
 
     #[test]
     fn test_block_reuse() {
-        let pool = BlockPool::new(
-            Device::Cpu,
-            16,
-            DataType::F16,
-            100,
-        ).unwrap();
+        let pool = BlockPool::new(Device::Cpu, 16, DataType::F16, 100).unwrap();
 
         // Allocate and deallocate
         let allocation = pool.allocate().unwrap();

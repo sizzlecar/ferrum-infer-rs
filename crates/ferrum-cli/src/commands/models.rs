@@ -86,7 +86,7 @@ async fn list_models(config: &CliConfig) -> Result<()> {
     // Use enhanced model registry for discovery
     let mut registry = ferrum_models::DefaultModelRegistry::with_defaults();
     let models_dir = std::path::PathBuf::from(&config.models.model_dir);
-    
+
     match registry.discover_models(&models_dir).await {
         Ok(models) => {
             if models.is_empty() {
@@ -95,12 +95,22 @@ async fn list_models(config: &CliConfig) -> Result<()> {
                 println!("\n{} Found {} models:", "✅".bright_green(), models.len());
                 for model in models {
                     let status_icon = if model.is_valid { "✅" } else { "⚠️" };
-                    let arch_str = model.architecture
+                    let arch_str = model
+                        .architecture
                         .map(|a| format!("{:?}", a))
                         .unwrap_or_else(|| "Unknown".to_string());
-                    
-                    println!("  {} {} ({})", status_icon, model.id.cyan(), arch_str.yellow());
-                    println!("    Format: {:?}, Path: {}", model.format, model.path.display());
+
+                    println!(
+                        "  {} {} ({})",
+                        status_icon,
+                        model.id.cyan(),
+                        arch_str.yellow()
+                    );
+                    println!(
+                        "    Format: {:?}, Path: {}",
+                        model.format,
+                        model.path.display()
+                    );
                 }
             }
         }
@@ -108,13 +118,18 @@ async fn list_models(config: &CliConfig) -> Result<()> {
             println!("{} Failed to discover models: {}", "❌".bright_red(), e);
         }
     }
-    
+
     // Show aliases
     let aliases = registry.list_aliases();
     if !aliases.is_empty() {
         println!("\n{} Available aliases:", "🔗".bright_blue());
         for alias in aliases {
-            println!("  {} {} -> {}", "🔗", alias.name.cyan(), alias.target.yellow());
+            println!(
+                "  {} {} -> {}",
+                "🔗",
+                alias.name.cyan(),
+                alias.target.yellow()
+            );
             if let Some(desc) = alias.description {
                 println!("    {}", desc.dimmed());
             }
@@ -150,27 +165,32 @@ async fn download_model(model_name: &str, config: &CliConfig) -> Result<()> {
 
     let registry = ferrum_models::DefaultModelRegistry::with_defaults();
     let resolved_id = registry.resolve_model_id(model_name);
-    
+
     println!("Resolving model source for: {}", resolved_id.yellow());
-    
+
     // Create model source resolver
     let source_config = ferrum_models::ModelSourceConfig {
-        cache_dir: Some(std::path::PathBuf::from(&config.models.download.hf_cache_dir)),
+        cache_dir: Some(std::path::PathBuf::from(
+            &config.models.download.hf_cache_dir,
+        )),
         hf_token: ferrum_models::ModelSourceConfig::get_hf_token(),
         offline_mode: false,
         max_retries: 3,
         download_timeout: 300,
         use_file_lock: true,
     };
-    
+
     let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
-    
+
     match resolver.resolve(&resolved_id, None).await {
         Ok(source) => {
             println!("{} Successfully resolved model!", "✅".bright_green());
             println!("  Local path: {}", source.local_path.display());
             println!("  Format: {:?}", source.format);
-            println!("  From cache: {}", if source.from_cache { "Yes" } else { "No" });
+            println!(
+                "  From cache: {}",
+                if source.from_cache { "Yes" } else { "No" }
+            );
         }
         Err(e) => {
             println!("{} Failed to download model: {}", "❌".bright_red(), e);
@@ -212,22 +232,27 @@ async fn validate_model(model_name: &str, _config: &CliConfig) -> Result<()> {
 
 async fn show_aliases(_config: &CliConfig) -> Result<()> {
     println!("{} Model aliases", "🔗".bright_blue());
-    
+
     let registry = ferrum_models::DefaultModelRegistry::with_defaults();
     let aliases = registry.list_aliases();
-    
+
     if aliases.is_empty() {
         println!("No aliases configured");
     } else {
         println!("\nConfigured aliases:");
         for alias in aliases {
-            println!("  {} {} -> {}", "🔗", alias.name.cyan(), alias.target.yellow());
+            println!(
+                "  {} {} -> {}",
+                "🔗",
+                alias.name.cyan(),
+                alias.target.yellow()
+            );
             if let Some(desc) = alias.description {
                 println!("    {}", desc.dimmed());
             }
         }
     }
-    
+
     println!("\nTo add an alias: ferrum models --add-alias <name> --alias-target <model-id>");
     Ok(())
 }
@@ -239,14 +264,14 @@ async fn add_alias(alias_name: &str, target: &str, _config: &CliConfig) -> Resul
         alias_name.cyan(),
         target.yellow()
     );
-    
+
     let mut registry = ferrum_models::DefaultModelRegistry::with_defaults();
     let alias = ferrum_models::ModelAlias {
         name: alias_name.to_string(),
         target: target.to_string(),
         description: None,
     };
-    
+
     match registry.add_alias(alias) {
         Ok(_) => {
             println!("{} Alias added successfully!", "✅".bright_green());
@@ -256,6 +281,6 @@ async fn add_alias(alias_name: &str, target: &str, _config: &CliConfig) -> Resul
             println!("{} Failed to add alias: {}", "❌".bright_red(), e);
         }
     }
-    
+
     Ok(())
 }

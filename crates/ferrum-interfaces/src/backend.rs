@@ -5,8 +5,8 @@
 //! model weight management.
 
 use crate::{TensorFactory, TensorOps, TensorRef};
-use ferrum_types::{Device, DataType, Result};
 use async_trait::async_trait;
+use ferrum_types::{DataType, Device, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -15,37 +15,37 @@ use std::collections::HashMap;
 pub trait ComputeBackend: Send + Sync {
     /// Get backend name/identifier
     fn name(&self) -> &str;
-    
+
     /// Get backend capabilities
     fn capabilities(&self) -> BackendCapabilities;
-    
+
     /// Get tensor operations interface
     fn tensor_ops(&self) -> &dyn TensorOps;
-    
+
     /// Get tensor factory for creating tensors
     fn tensor_factory(&self) -> &dyn TensorFactory;
-    
+
     /// Get memory manager for this backend
     fn memory_manager(&self) -> &dyn crate::DeviceMemoryManager;
-    
+
     /// Get kernel executor (if backend supports custom kernels)
     fn kernel_executor(&self) -> Option<&dyn KernelExecutor>;
-    
+
     /// Initialize backend with device
     async fn initialize(&mut self, device: &Device) -> Result<()>;
-    
+
     /// Check if backend supports specific device
     fn supports_device(&self, device: &Device) -> bool;
-    
+
     /// Get backend version
     fn version(&self) -> String;
-    
+
     /// Synchronize all pending operations
     async fn synchronize(&self, device: &Device) -> Result<()>;
-    
+
     /// Get backend status
     fn status(&self) -> BackendStatus;
-    
+
     /// Shutdown backend gracefully
     async fn shutdown(&mut self) -> Result<()>;
 }
@@ -55,19 +55,19 @@ pub trait ComputeBackend: Send + Sync {
 pub trait WeightLoader: Send + Sync {
     /// Load tensor from weight specification
     async fn load_tensor(&self, spec: &TensorSpec) -> Result<TensorRef>;
-    
+
     /// Load multiple tensors at once (batch loading)
     async fn load_tensors(&self, specs: &[TensorSpec]) -> Result<Vec<TensorRef>>;
-    
+
     /// Check if weight source is available
     async fn is_available(&self, source: &WeightSource) -> bool;
-    
+
     /// Get metadata about weight source
     async fn get_metadata(&self, source: &WeightSource) -> Result<WeightMetadata>;
-    
+
     /// Preload weights into cache/memory
     async fn preload(&self, source: &WeightSource) -> Result<()>;
-    
+
     /// Get loader capabilities
     fn capabilities(&self) -> WeightLoaderCapabilities;
 }
@@ -111,10 +111,7 @@ pub enum WeightSource {
         cache_dir: Option<String>,
     },
     /// Raw bytes in memory
-    Memory {
-        data: Vec<u8>,
-        format: WeightFormat,
-    },
+    Memory { data: Vec<u8>, format: WeightFormat },
     /// S3-compatible storage
     S3 {
         bucket: String,
@@ -170,10 +167,10 @@ pub enum TensorTransformation {
     /// Apply scaling
     Scale { factor: f32 },
     /// Slice tensor
-    Slice { 
-        dim: usize, 
-        start: Option<usize>, 
-        end: Option<usize> 
+    Slice {
+        dim: usize,
+        start: Option<usize>,
+        end: Option<usize>,
     },
 }
 
@@ -193,10 +190,7 @@ pub enum QuantizationConfig {
         desc_act: bool,
     },
     /// AWQ quantization
-    AWQ {
-        bits: u8,
-        zero_point: bool,
-    },
+    AWQ { bits: u8, zero_point: bool },
 }
 
 /// Backend capabilities description
@@ -240,27 +234,33 @@ impl BackendCapabilities {
     /// Check if capabilities meet requirements
     pub fn meets_requirements(&self, requirements: &BackendRequirements) -> bool {
         // Check devices
-        if !requirements.required_devices.iter()
-            .all(|dev| self.supported_devices.contains(dev)) {
+        if !requirements
+            .required_devices
+            .iter()
+            .all(|dev| self.supported_devices.contains(dev))
+        {
             return false;
         }
-        
+
         // Check dtypes
-        if !requirements.required_dtypes.iter()
-            .all(|dtype| self.supported_dtypes.contains(dtype)) {
+        if !requirements
+            .required_dtypes
+            .iter()
+            .all(|dtype| self.supported_dtypes.contains(dtype))
+        {
             return false;
         }
-        
+
         // Check batch size
         if requirements.min_batch_size > self.max_batch_size {
             return false;
         }
-        
+
         // Check sequence length
         if requirements.min_sequence_length > self.max_sequence_length {
             return false;
         }
-        
+
         true
     }
 }
@@ -345,13 +345,8 @@ pub struct BackendStatus {
 #[async_trait]
 pub trait KernelExecutor: Send + Sync {
     /// Load kernel from source code
-    async fn load_kernel(
-        &self,
-        source: &str,
-        name: &str,
-        device: &Device,
-    ) -> Result<KernelHandle>;
-    
+    async fn load_kernel(&self, source: &str, name: &str, device: &Device) -> Result<KernelHandle>;
+
     /// Execute kernel with arguments
     async fn execute_kernel(
         &self,
@@ -360,10 +355,10 @@ pub trait KernelExecutor: Send + Sync {
         block_size: (u32, u32, u32),
         args: &[KernelArg],
     ) -> Result<()>;
-    
+
     /// Get kernel information
     fn get_kernel_info(&self, handle: KernelHandle) -> Option<KernelInfo>;
-    
+
     /// Unload kernel
     async fn unload_kernel(&self, handle: KernelHandle) -> Result<()>;
 }
@@ -420,14 +415,20 @@ pub struct KernelInfo {
 #[async_trait]
 pub trait BackendFactory: Send + Sync {
     /// Create compute backend
-    async fn create_compute_backend(&self, config: &BackendConfig) -> Result<Box<dyn ComputeBackend>>;
-    
+    async fn create_compute_backend(
+        &self,
+        config: &BackendConfig,
+    ) -> Result<Box<dyn ComputeBackend>>;
+
     /// Create weight loader
-    async fn create_weight_loader(&self, config: &WeightLoaderConfig) -> Result<Box<dyn WeightLoader>>;
-    
+    async fn create_weight_loader(
+        &self,
+        config: &WeightLoaderConfig,
+    ) -> Result<Box<dyn WeightLoader>>;
+
     /// Get supported backend types
     fn supported_backend_types(&self) -> Vec<BackendType>;
-    
+
     /// Validate backend configuration
     fn validate_config(&self, config: &BackendConfig) -> Result<()>;
 }
@@ -531,26 +532,22 @@ pub trait BackendRegistry: Send + Sync {
         name: &str,
         backend: Box<dyn ComputeBackend>,
     ) -> Result<()>;
-    
+
     /// Register weight loader
-    fn register_weight_loader(
-        &mut self,
-        name: &str,
-        loader: Box<dyn WeightLoader>,
-    ) -> Result<()>;
-    
+    fn register_weight_loader(&mut self, name: &str, loader: Box<dyn WeightLoader>) -> Result<()>;
+
     /// Get compute backend by name
     fn get_compute_backend(&self, name: &str) -> Option<&dyn ComputeBackend>;
-    
+
     /// Get weight loader by name
     fn get_weight_loader(&self, name: &str) -> Option<&dyn WeightLoader>;
-    
+
     /// Find best compute backend for requirements
     fn find_best_compute_backend(
         &self,
         requirements: &BackendRequirements,
     ) -> Option<&dyn ComputeBackend>;
-    
+
     /// List all registered backend names
     fn list_backend_names(&self) -> (Vec<String>, Vec<String>); // (compute, weight)
 }

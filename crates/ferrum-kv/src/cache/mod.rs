@@ -1,5 +1,5 @@
-pub mod prefix;
 pub mod compression;
+pub mod prefix;
 
-pub use prefix::PrefixCache;
 pub use compression::{CompressionManager, NoCompression};
+pub use prefix::PrefixCache;

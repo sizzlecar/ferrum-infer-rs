@@ -1,6 +1,6 @@
 //! Model-related types and configurations
 
-use crate::{ids::ModelId, devices::*, FerrumError, Result};
+use crate::{devices::*, ids::ModelId, FerrumError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -85,16 +85,22 @@ impl ModelInfo {
     }
 
     /// Get memory requirements for inference
-    pub fn memory_requirements(&self, batch_size: usize, sequence_length: usize) -> ModelMemoryRequirements {
+    pub fn memory_requirements(
+        &self,
+        batch_size: usize,
+        sequence_length: usize,
+    ) -> ModelMemoryRequirements {
         let param_memory = self.estimated_size_bytes();
-        
+
         // Estimate KV cache size: layers * heads * seq_len * head_dim * 2 (key + value) * dtype * batch_size
         let head_dim = self.hidden_size / self.num_heads;
-        let kv_cache_per_token = self.num_layers * self.num_kv_heads * head_dim * 2 * self.dtype.size_bytes();
+        let kv_cache_per_token =
+            self.num_layers * self.num_kv_heads * head_dim * 2 * self.dtype.size_bytes();
         let kv_cache_memory = (kv_cache_per_token * sequence_length * batch_size) as u64;
-        
+
         // Estimate activation memory (rough approximation)
-        let activation_memory = (self.hidden_size * sequence_length * batch_size * self.dtype.size_bytes()) as u64 * 4;
+        let activation_memory =
+            (self.hidden_size * sequence_length * batch_size * self.dtype.size_bytes()) as u64 * 4;
 
         ModelMemoryRequirements {
             parameter_memory: param_memory,
@@ -177,11 +183,11 @@ impl ModelConfig {
         if self.model_path.is_empty() {
             return Err(FerrumError::config("Model path cannot be empty"));
         }
-        
+
         if self.max_batch_size == 0 {
             return Err(FerrumError::config("Max batch size must be positive"));
         }
-        
+
         if self.max_sequence_length == 0 {
             return Err(FerrumError::config("Max sequence length must be positive"));
         }
@@ -194,7 +200,9 @@ impl ModelConfig {
 
         if let Some(pp_size) = self.pipeline_parallel_size {
             if pp_size == 0 {
-                return Err(FerrumError::config("Pipeline parallel size must be positive"));
+                return Err(FerrumError::config(
+                    "Pipeline parallel size must be positive",
+                ));
             }
         }
 
@@ -206,37 +214,25 @@ impl ModelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QuantizationConfig {
     /// GPTQ quantization
-    GPTQ { 
-        bits: u8, 
+    GPTQ {
+        bits: u8,
         group_size: usize,
         desc_act: bool,
     },
     /// AWQ quantization
-    AWQ { 
-        bits: u8, 
+    AWQ {
+        bits: u8,
         zero_point: bool,
         version: String,
     },
     /// FP8 quantization
-    FP8 { 
-        e4m3: bool,
-        kv_cache: bool,
-    },
+    FP8 { e4m3: bool, kv_cache: bool },
     /// INT8 quantization
-    INT8 { 
-        symmetric: bool,
-        per_channel: bool,
-    },
+    INT8 { symmetric: bool, per_channel: bool },
     /// INT4 quantization
-    INT4 {
-        symmetric: bool,
-        group_size: usize,
-    },
+    INT4 { symmetric: bool, group_size: usize },
     /// SmoothQuant
-    SmoothQuant {
-        alpha: f32,
-        calibration_size: usize,
-    },
+    SmoothQuant { alpha: f32, calibration_size: usize },
 }
 
 impl QuantizationConfig {

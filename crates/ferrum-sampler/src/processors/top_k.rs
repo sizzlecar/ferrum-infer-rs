@@ -4,7 +4,7 @@ use crate::LogitsProcessorInterface;
 use ferrum_types::{Result, TopK};
 
 /// Top-K processor
-/// 
+///
 /// Keeps only the top-k highest logits, sets others to negative infinity.
 /// This reduces the vocabulary to the k most likely tokens.
 #[derive(Debug, Clone)]
@@ -15,9 +15,7 @@ pub struct TopKProcessor {
 impl TopKProcessor {
     /// Create new top-k processor
     pub fn new(top_k: TopK) -> Self {
-        Self {
-            k: top_k.value(),
-        }
+        Self { k: top_k.value() }
     }
 
     /// Create from raw value
@@ -45,10 +43,12 @@ impl LogitsProcessorInterface for TopKProcessor {
 
         // Find the k-th largest value using partial sort
         let mut indices: Vec<usize> = (0..logits.len()).collect();
-        
+
         // Partial sort to get top-k indices
         indices.select_nth_unstable_by(self.k, |&a, &b| {
-            logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Find the threshold value (k-th largest)
@@ -86,9 +86,9 @@ mod tests {
     fn test_top_k_filtering() {
         let mut processor = TopKProcessor::from_value(2);
         let mut logits = vec![1.0, 4.0, 2.0, 3.0, 0.5];
-        
+
         processor.process(&mut logits).unwrap();
-        
+
         // Only top 2 values (4.0 and 3.0) should remain
         assert_eq!(logits[1], 4.0); // Highest
         assert_eq!(logits[3], 3.0); // Second highest
@@ -102,9 +102,9 @@ mod tests {
         let mut processor = TopKProcessor::from_value(10);
         let original = vec![1.0, 2.0, 3.0];
         let mut logits = original.clone();
-        
+
         processor.process(&mut logits).unwrap();
-        
+
         // No filtering should occur when k >= vocab size
         assert_eq!(logits, original);
     }
@@ -114,9 +114,9 @@ mod tests {
         let mut processor = TopKProcessor::from_value(0);
         let original = vec![1.0, 2.0, 3.0];
         let mut logits = original.clone();
-        
+
         processor.process(&mut logits).unwrap();
-        
+
         // No filtering should occur when k = 0
         assert_eq!(logits, original);
     }

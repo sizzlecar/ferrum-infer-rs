@@ -1,6 +1,6 @@
 //! Model configuration management
 
-use ferrum_types::{Result, ModelId};
+use ferrum_types::{ModelId, Result};
 use std::collections::HashMap;
 
 /// Configuration manager for models

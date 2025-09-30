@@ -5,8 +5,8 @@
 //! from backend implementation.
 
 use crate::{ComputeBackend, ModelExecutor, WeightLoader};
-use ferrum_types::{ModelConfig, ModelInfo, ModelSource, Result};
 use async_trait::async_trait;
+use ferrum_types::{ModelConfig, ModelInfo, ModelSource, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
@@ -20,7 +20,7 @@ pub trait ModelBuilder: Send + Sync {
         compute_backend: Arc<dyn ComputeBackend>,
         weight_loader: Arc<dyn WeightLoader>,
     ) -> Result<Box<dyn ModelExecutor>>;
-    
+
     /// Build model executor from model source
     async fn build_from_source(
         &self,
@@ -29,16 +29,16 @@ pub trait ModelBuilder: Send + Sync {
         weight_loader: Arc<dyn WeightLoader>,
         build_options: &BuildOptions,
     ) -> Result<Box<dyn ModelExecutor>>;
-    
+
     /// Validate model configuration
     fn validate_config(&self, config: &ModelConfig) -> Result<Vec<ValidationIssue>>;
-    
+
     /// Get supported model types
     fn supported_model_types(&self) -> Vec<ferrum_types::ModelType>;
-    
+
     /// Get estimated build time
     async fn estimate_build_time(&self, config: &ModelConfig) -> Result<BuildTimeEstimate>;
-    
+
     /// Get builder information
     fn builder_info(&self) -> BuilderInfo;
 }
@@ -244,7 +244,7 @@ pub trait AdvancedModelBuilder: ModelBuilder {
         compute_backend: Arc<dyn ComputeBackend>,
         weight_loader: Arc<dyn WeightLoader>,
     ) -> Result<Box<dyn ModelExecutor>>;
-    
+
     /// Build model incrementally (for large models)
     async fn build_incremental(
         &self,
@@ -253,7 +253,7 @@ pub trait AdvancedModelBuilder: ModelBuilder {
         weight_loader: Arc<dyn WeightLoader>,
         progress_callback: Box<dyn Fn(BuildProgress) + Send + Sync>,
     ) -> Result<Box<dyn ModelExecutor>>;
-    
+
     /// Build model with custom optimization pipeline
     async fn build_with_optimization(
         &self,
@@ -262,13 +262,10 @@ pub trait AdvancedModelBuilder: ModelBuilder {
         compute_backend: Arc<dyn ComputeBackend>,
         weight_loader: Arc<dyn WeightLoader>,
     ) -> Result<Box<dyn ModelExecutor>>;
-    
+
     /// Export model definition for debugging
-    async fn export_model_definition(
-        &self,
-        config: &ModelConfig,
-    ) -> Result<ModelDefinition>;
-    
+    async fn export_model_definition(&self, config: &ModelConfig) -> Result<ModelDefinition>;
+
     /// Import model definition for custom builds
     async fn import_model_definition(
         &self,
@@ -282,19 +279,19 @@ pub trait AdvancedModelBuilder: ModelBuilder {
 pub trait CustomLayer: Send + Sync {
     /// Get layer name
     fn name(&self) -> &str;
-    
+
     /// Get layer type
     fn layer_type(&self) -> &str;
-    
+
     /// Get input shape requirements
     fn input_shape(&self) -> Vec<i64>; // -1 for dynamic dimensions
-    
+
     /// Get output shape
     fn output_shape(&self, input_shape: &[i64]) -> Vec<i64>;
-    
+
     /// Initialize layer parameters
     fn initialize_parameters(&self) -> Result<HashMap<String, crate::TensorRef>>;
-    
+
     /// Get layer configuration
     fn config(&self) -> serde_json::Value;
 }
@@ -341,13 +338,13 @@ pub enum BuildPhase {
 pub trait OptimizationPass: Send + Sync {
     /// Get optimization pass name
     fn name(&self) -> &str;
-    
+
     /// Apply optimization to model definition
     fn apply(&self, definition: &mut ModelDefinition) -> Result<OptimizationResult>;
-    
+
     /// Check if optimization is applicable
     fn is_applicable(&self, definition: &ModelDefinition) -> bool;
-    
+
     /// Get optimization dependencies (must run before this)
     fn dependencies(&self) -> Vec<String>;
 }
@@ -548,13 +545,13 @@ pub struct GraphEdge {
 pub trait ModelBuilderFactory: Send + Sync {
     /// Create standard model builder
     async fn create_builder(&self) -> Result<Box<dyn ModelBuilder>>;
-    
+
     /// Create advanced model builder
     async fn create_advanced_builder(&self) -> Result<Box<dyn AdvancedModelBuilder>>;
-    
+
     /// Get supported model types
     fn supported_types(&self) -> Vec<ferrum_types::ModelType>;
-    
+
     /// Create builder for specific model type
     async fn create_builder_for_type(
         &self,
@@ -570,22 +567,19 @@ pub trait ModelRegistry: Send + Sync {
         model_id: &ferrum_types::ModelId,
         executor: Box<dyn ModelExecutor>,
     ) -> Result<()>;
-    
+
     /// Get model executor
     fn get_model(&self, model_id: &ferrum_types::ModelId) -> Option<&dyn ModelExecutor>;
-    
+
     /// Remove model executor
-    fn remove_model(
-        &mut self,
-        model_id: &ferrum_types::ModelId,
-    ) -> Option<Box<dyn ModelExecutor>>;
-    
+    fn remove_model(&mut self, model_id: &ferrum_types::ModelId) -> Option<Box<dyn ModelExecutor>>;
+
     /// List registered models
     fn list_models(&self) -> Vec<ferrum_types::ModelId>;
-    
+
     /// Get model information
     fn get_model_info(&self, model_id: &ferrum_types::ModelId) -> Option<&ModelInfo>;
-    
+
     /// Check if model exists
     fn contains_model(&self, model_id: &ferrum_types::ModelId) -> bool;
 }

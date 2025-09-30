@@ -4,7 +4,7 @@ use crate::LogitsProcessorInterface;
 use ferrum_types::Result;
 
 /// Chain of logits processors
-/// 
+///
 /// Applies multiple processors in sequence. Processors are applied
 /// in the order they were added to the chain.
 #[derive(Debug, Default)]
@@ -21,7 +21,7 @@ impl ProcessorChain {
     }
 
     /// Add a processor to the chain
-    pub fn add<P>(&mut self, processor: P) -> &mut Self 
+    pub fn add<P>(&mut self, processor: P) -> &mut Self
     where
         P: LogitsProcessorInterface + Send + Sync + 'static,
     {
@@ -30,7 +30,10 @@ impl ProcessorChain {
     }
 
     /// Add a boxed processor to the chain
-    pub fn add_boxed(&mut self, processor: Box<dyn LogitsProcessorInterface + Send + Sync>) -> &mut Self {
+    pub fn add_boxed(
+        &mut self,
+        processor: Box<dyn LogitsProcessorInterface + Send + Sync>,
+    ) -> &mut Self {
         self.processors.push(processor);
         self
     }
@@ -51,7 +54,10 @@ impl ProcessorChain {
     }
 
     /// Remove processor at index
-    pub fn remove(&mut self, index: usize) -> Option<Box<dyn LogitsProcessorInterface + Send + Sync>> {
+    pub fn remove(
+        &mut self,
+        index: usize,
+    ) -> Option<Box<dyn LogitsProcessorInterface + Send + Sync>> {
         if index < self.processors.len() {
             Some(self.processors.remove(index))
         } else {
@@ -116,7 +122,7 @@ impl ProcessorChainBuilder {
     }
 
     /// Add processor to chain
-    pub fn with<P>(mut self, processor: P) -> Self 
+    pub fn with<P>(mut self, processor: P) -> Self
     where
         P: LogitsProcessorInterface + Send + Sync + 'static,
     {
@@ -125,7 +131,10 @@ impl ProcessorChainBuilder {
     }
 
     /// Add boxed processor to chain
-    pub fn with_boxed(mut self, processor: Box<dyn LogitsProcessorInterface + Send + Sync>) -> Self {
+    pub fn with_boxed(
+        mut self,
+        processor: Box<dyn LogitsProcessorInterface + Send + Sync>,
+    ) -> Self {
         self.chain.add_boxed(processor);
         self
     }
@@ -151,9 +160,9 @@ mod tests {
     fn test_empty_chain() {
         let mut chain = ProcessorChain::new();
         let mut logits = vec![1.0, 2.0, 3.0];
-        
+
         chain.process(&mut logits).unwrap();
-        
+
         // Empty chain should not modify logits
         assert_eq!(logits, vec![1.0, 2.0, 3.0]);
     }
@@ -162,10 +171,10 @@ mod tests {
     fn test_single_processor_chain() {
         let mut chain = ProcessorChain::new();
         chain.add(TemperatureProcessor::from_value(2.0).unwrap());
-        
+
         let mut logits = vec![2.0, 4.0, 6.0];
         chain.process(&mut logits).unwrap();
-        
+
         // Temperature processor should scale by 1/temperature
         assert_eq!(logits, vec![1.0, 2.0, 3.0]);
     }
@@ -175,10 +184,10 @@ mod tests {
         let mut chain = ProcessorChain::new();
         chain.add(TemperatureProcessor::from_value(2.0).unwrap());
         chain.add(TemperatureProcessor::from_value(0.5).unwrap());
-        
+
         let mut logits = vec![2.0, 4.0, 6.0];
         chain.process(&mut logits).unwrap();
-        
+
         // First processor: scale by 1/2, then by 1/0.5 = 2
         // Net effect: no change
         assert_eq!(logits, vec![2.0, 4.0, 6.0]);
@@ -189,7 +198,7 @@ mod tests {
         let chain = ProcessorChainBuilder::new()
             .with(TemperatureProcessor::from_value(2.0).unwrap())
             .build();
-        
+
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.processor_names(), vec!["temperature"]);
     }
@@ -198,11 +207,11 @@ mod tests {
     fn test_chain_management() {
         let mut chain = ProcessorChain::new();
         assert!(chain.is_empty());
-        
+
         chain.add(TemperatureProcessor::from_value(1.0).unwrap());
         assert_eq!(chain.len(), 1);
         assert!(!chain.is_empty());
-        
+
         let removed = chain.remove(0);
         assert!(removed.is_some());
         assert!(chain.is_empty());

@@ -143,8 +143,14 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
             "  Tokens generated: {}",
             result.usage.completion_tokens.to_string().cyan()
         );
-        println!("  Prompt tokens: {}", result.usage.prompt_tokens.to_string().cyan());
-        println!("  Total tokens: {}", result.usage.total_tokens.to_string().cyan());
+        println!(
+            "  Prompt tokens: {}",
+            result.usage.prompt_tokens.to_string().cyan()
+        );
+        println!(
+            "  Total tokens: {}",
+            result.usage.total_tokens.to_string().cyan()
+        );
         println!("  Finish reason: {:?}", result.finish_reason);
         println!("  Total time: {}ms", result.latency_ms.to_string().yellow());
     }
@@ -152,52 +158,77 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
     Ok(())
 }
 
-
-
 /// Run inference using local backend with enhanced model loading
 #[instrument(skip(request, cmd), fields(request_id = %request.id.0, model_id = %request.model_id.0))]
-async fn run_local_inference(request: &InferenceRequest, cmd: &InferCommand) -> Result<ferrum_core::InferenceResponse> {
+async fn run_local_inference(
+    request: &InferenceRequest,
+    cmd: &InferCommand,
+) -> Result<ferrum_core::InferenceResponse> {
     info!("Starting local inference with Candle backend");
     println!("{} Starting local inference...", "🔥".bright_yellow());
-    
+
     // Resolve model using enhanced model maintenance system
     let model_id = &request.model_id.0;
-    println!("{} Resolving model: {}", "🔍".bright_blue(), model_id.cyan());
-    
+    println!(
+        "{} Resolving model: {}",
+        "🔍".bright_blue(),
+        model_id.cyan()
+    );
+
     let registry = ferrum_models::DefaultModelRegistry::with_defaults();
     let resolved_id = registry.resolve_model_id(model_id);
-    
+
     if resolved_id != *model_id {
-        println!("{} Resolved alias '{}' to: {}", "🔗".bright_blue(), model_id.cyan(), resolved_id.yellow());
+        println!(
+            "{} Resolved alias '{}' to: {}",
+            "🔗".bright_blue(),
+            model_id.cyan(),
+            resolved_id.yellow()
+        );
     }
-    
+
     // Create model source resolver
     let source_config = ferrum_models::ModelSourceConfig::default();
     let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
-    
+
     // Resolve model source
     let source = match resolver.resolve(&resolved_id, None).await {
         Ok(source) => {
-            println!("{} Model resolved: {}", "✅".bright_green(), source.local_path.display());
+            println!(
+                "{} Model resolved: {}",
+                "✅".bright_green(),
+                source.local_path.display()
+            );
             source
         }
         Err(e) => {
-            println!("{} Failed to resolve model '{}': {}", "❌".bright_red(), resolved_id, e);
+            println!(
+                "{} Failed to resolve model '{}': {}",
+                "❌".bright_red(),
+                resolved_id,
+                e
+            );
             println!("\nTips:");
-            println!("  - Use 'ferrum models --download {}' to download the model", resolved_id);
+            println!(
+                "  - Use 'ferrum models --download {}' to download the model",
+                resolved_id
+            );
             println!("  - Check if the model exists locally with 'ferrum models --list'");
             return Err(e);
         }
     };
-    
+
     // Load model configuration
     println!("{} Loading model configuration...", "⚙️".bright_blue());
     let mut config_manager = ferrum_models::ConfigManager::new();
     let model_config = match config_manager.load_from_source(&source).await {
         Ok(config) => {
-            println!("{} Configuration loaded: {} ({})", "✅".bright_green(), 
-                format!("{:?}", config.architecture).yellow(), 
-                format!("{} params", config.vocab_size).cyan());
+            println!(
+                "{} Configuration loaded: {} ({})",
+                "✅".bright_green(),
+                format!("{:?}", config.architecture).yellow(),
+                format!("{} params", config.vocab_size).cyan()
+            );
             config
         }
         Err(e) => {
@@ -219,8 +250,14 @@ async fn run_local_inference(request: &InferenceRequest, cmd: &InferCommand) -> 
         model_id: resolved_id,
         device: match cmd.backend.as_str() {
             "auto" => {
-                if cfg!(all(feature = "metal", any(target_os = "macos", target_os = "ios"))) {
-                    println!("{} Auto-detected Metal backend for Apple GPU", "🔥".yellow());
+                if cfg!(all(
+                    feature = "metal",
+                    any(target_os = "macos", target_os = "ios")
+                )) {
+                    println!(
+                        "{} Auto-detected Metal backend for Apple GPU",
+                        "🔥".yellow()
+                    );
                     "metal".to_string()
                 } else {
                     println!("{} Auto-detected CPU backend", "💻".blue());
@@ -260,7 +297,7 @@ async fn run_local_inference(request: &InferenceRequest, cmd: &InferCommand) -> 
                         io::stdout().flush().unwrap();
                         full_text.push_str(&chunk.text);
                     }
-                    
+
                     if chunk.token.is_some() {
                         token_count += 1;
                     }
@@ -386,64 +423,100 @@ async fn run_remote_inference(
 
 /// Interactive conversation mode (like ollama)
 async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()> {
-    println!("{}", "🚀 Starting interactive conversation mode".bright_green().bold());
-    println!("{}", "Type your message and press Enter. Use 'exit' or Ctrl+C to quit.".dimmed());
-    
+    println!(
+        "{}",
+        "🚀 Starting interactive conversation mode"
+            .bright_green()
+            .bold()
+    );
+    println!(
+        "{}",
+        "Type your message and press Enter. Use 'exit' or Ctrl+C to quit.".dimmed()
+    );
+
     // Initialize engine once with enhanced model resolution
-    let model_name = cmd.model.clone().or(config.models.default_model.clone()).unwrap_or("TinyLlama-1.1B-Chat-v1.0".to_string());
-    
-    println!("{} Resolving model for interactive mode: {}", "🔍".bright_blue(), model_name.cyan());
-    
+    let model_name = cmd
+        .model
+        .clone()
+        .or(config.models.default_model.clone())
+        .unwrap_or("TinyLlama-1.1B-Chat-v1.0".to_string());
+
+    println!(
+        "{} Resolving model for interactive mode: {}",
+        "🔍".bright_blue(),
+        model_name.cyan()
+    );
+
     let registry = ferrum_models::DefaultModelRegistry::with_defaults();
     let resolved_id = registry.resolve_model_id(&model_name);
-    
+
     if resolved_id != model_name {
-        println!("{} Resolved alias '{}' to: {}", "🔗".bright_blue(), model_name.cyan(), resolved_id.yellow());
+        println!(
+            "{} Resolved alias '{}' to: {}",
+            "🔗".bright_blue(),
+            model_name.cyan(),
+            resolved_id.yellow()
+        );
     }
-    
+
     // Create model source resolver
     let source_config = ferrum_models::ModelSourceConfig::default();
     let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
-    
+
     // Resolve model source
     let source = match resolver.resolve(&resolved_id, None).await {
         Ok(source) => {
-            println!("{} Model resolved: {}", "✅".bright_green(), source.local_path.display());
+            println!(
+                "{} Model resolved: {}",
+                "✅".bright_green(),
+                source.local_path.display()
+            );
             source
         }
         Err(e) => {
-            println!("{} Failed to resolve model '{}': {}", "❌".bright_red(), resolved_id, e);
-            println!("\nTip: Use 'ferrum models --download {}' to download the model", resolved_id);
+            println!(
+                "{} Failed to resolve model '{}': {}",
+                "❌".bright_red(),
+                resolved_id,
+                e
+            );
+            println!(
+                "\nTip: Use 'ferrum models --download {}' to download the model",
+                resolved_id
+            );
             return Err(e);
         }
     };
-    
+
     // Load model configuration for better engine setup
     let mut config_manager = ferrum_models::ConfigManager::new();
-    let model_config = config_manager.load_from_source(&source).await.unwrap_or_else(|e| {
-        warn!("Failed to load model config, using defaults: {}", e);
-        ferrum_models::ModelDefinition {
-            architecture: ferrum_models::Architecture::Llama,
-            hidden_size: 4096,
-            intermediate_size: 11008,
-            vocab_size: 32000,
-            num_hidden_layers: 32,
-            num_attention_heads: 32,
-            num_key_value_heads: None,
-            max_position_embeddings: 2048,
-            rope_theta: Some(10000.0),
-            rope_scaling: None,
-            norm_type: ferrum_models::NormType::RMSNorm,
-            norm_eps: 1e-6,
-            attention_config: ferrum_models::AttentionConfig {
-                attention_bias: false,
-                sliding_window: None,
-            },
-            activation: ferrum_models::Activation::SiLU,
-            extra_params: serde_json::Value::Object(serde_json::Map::new()),
-        }
-    });
-    
+    let model_config = config_manager
+        .load_from_source(&source)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Failed to load model config, using defaults: {}", e);
+            ferrum_models::ModelDefinition {
+                architecture: ferrum_models::Architecture::Llama,
+                hidden_size: 4096,
+                intermediate_size: 11008,
+                vocab_size: 32000,
+                num_hidden_layers: 32,
+                num_attention_heads: 32,
+                num_key_value_heads: None,
+                max_position_embeddings: 2048,
+                rope_theta: Some(10000.0),
+                rope_scaling: None,
+                norm_type: ferrum_models::NormType::RMSNorm,
+                norm_eps: 1e-6,
+                attention_config: ferrum_models::AttentionConfig {
+                    attention_bias: false,
+                    sliding_window: None,
+                },
+                activation: ferrum_models::Activation::SiLU,
+                extra_params: serde_json::Value::Object(serde_json::Map::new()),
+            }
+        });
+
     let engine_config = ferrum_engine::EngineConfig {
         max_batch_size: 32,
         max_sequence_length: model_config.max_position_embeddings.min(2048),
@@ -456,8 +529,14 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
         model_id: resolved_id,
         device: match cmd.backend.as_str() {
             "auto" => {
-                if cfg!(all(feature = "metal", any(target_os = "macos", target_os = "ios"))) {
-                    println!("{} Auto-detected Metal backend for Apple GPU", "🔥".yellow());
+                if cfg!(all(
+                    feature = "metal",
+                    any(target_os = "macos", target_os = "ios")
+                )) {
+                    println!(
+                        "{} Auto-detected Metal backend for Apple GPU",
+                        "🔥".yellow()
+                    );
                     "metal".to_string()
                 } else {
                     println!("{} Auto-detected CPU backend", "💻".blue());
@@ -474,21 +553,21 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
     println!("{} Initializing inference engine...", "⚙️".yellow());
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
     println!("{} Engine ready for conversation!", "✅".green());
-    
+
     let mut conversation_history = Vec::new();
     let mut conversation_turn = 1;
-    
+
     loop {
         // 显示提示符
         print!("\n{} ", ">>>".bright_blue().bold());
         io::stdout().flush().unwrap();
-        
+
         // 读取用户输入
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {
             Ok(_) => {
                 let input = input.trim();
-                
+
                 // 退出命令
                 if input.is_empty() {
                     continue;
@@ -497,10 +576,10 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                     println!("{} Goodbye!", "👋".bright_yellow());
                     break;
                 }
-                
+
                 // 先添加当前用户输入到历史
                 conversation_history.push(format!("User: {}", input));
-                
+
                 // 构建包含完整历史的prompt
                 let full_prompt = {
                     let recent_history = if conversation_history.len() > 6 {
@@ -511,14 +590,23 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                     };
                     format!("{}\nAssistant:", recent_history.join("\n"))
                 };
-                
+
                 // Debug: 显示完整prompt以便调试
-                println!("{} Prompt context: {} history entries", "🔍".dimmed(), conversation_history.len().to_string().dimmed());
-                
+                println!(
+                    "{} Prompt context: {} history entries",
+                    "🔍".dimmed(),
+                    conversation_history.len().to_string().dimmed()
+                );
+
                 // 创建推理请求
                 let request = ferrum_core::InferenceRequest {
                     id: ferrum_core::RequestId(Uuid::new_v4()),
-                    model_id: ferrum_core::ModelId(cmd.model.clone().or(config.models.default_model.clone()).unwrap_or("dummy".to_string())),
+                    model_id: ferrum_core::ModelId(
+                        cmd.model
+                            .clone()
+                            .or(config.models.default_model.clone())
+                            .unwrap_or("dummy".to_string()),
+                    ),
                     prompt: full_prompt,
                     created_at: Utc::now(),
                     sampling_params: SamplingParams {
@@ -529,24 +617,33 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                         frequency_penalty: 0.0,
                         presence_penalty: 0.0,
                         repetition_penalty: 1.0,
-                        stop_sequences: vec!["User:".to_string(), "\nUser:".to_string(), ">>> ".to_string(), "\n\n".to_string()],
+                        stop_sequences: vec![
+                            "User:".to_string(),
+                            "\nUser:".to_string(),
+                            ">>> ".to_string(),
+                            "\n\n".to_string(),
+                        ],
                         seed: None,
                     },
                     priority: Priority::Normal,
                     stream: true, // 始终使用流式输出
                     metadata: HashMap::new(),
                 };
-                
-                println!("\n{} Turn {}", "🤖".bright_cyan(), conversation_turn.to_string().yellow());
+
+                println!(
+                    "\n{} Turn {}",
+                    "🤖".bright_cyan(),
+                    conversation_turn.to_string().yellow()
+                );
                 print!("{}", "Assistant:".bright_green());
                 io::stdout().flush().unwrap();
-                
+
                 // 流式生成回复
                 let mut stream = engine.infer_stream(request).await?;
                 let mut response_text = String::new();
                 let mut token_count = 0;
                 let start_time = std::time::Instant::now();
-                
+
                 while let Some(result) = stream.next().await {
                     match result {
                         Ok(chunk) => {
@@ -555,11 +652,11 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                                 io::stdout().flush().unwrap();
                                 response_text.push_str(&chunk.text);
                             }
-                            
+
                             if chunk.token.is_some() {
                                 token_count += 1;
                             }
-                            
+
                             if chunk.finish_reason.is_some() {
                                 break;
                             }
@@ -570,34 +667,47 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                         }
                     }
                 }
-                
+
                 let duration = start_time.elapsed();
-                
+
                 // 添加助手回复到历史
                 if !response_text.is_empty() {
-                    let cleaned_response = response_text.trim()
-                        .strip_suffix("User:").unwrap_or(response_text.trim())
-                        .strip_suffix("\nUser:").unwrap_or(response_text.trim())
-                        .strip_suffix("User").unwrap_or(response_text.trim())
+                    let cleaned_response = response_text
+                        .trim()
+                        .strip_suffix("User:")
+                        .unwrap_or(response_text.trim())
+                        .strip_suffix("\nUser:")
+                        .unwrap_or(response_text.trim())
+                        .strip_suffix("User")
+                        .unwrap_or(response_text.trim())
                         .trim();
                     if !cleaned_response.is_empty() {
                         conversation_history.push(format!("Assistant: {}", cleaned_response));
                     }
                 }
-                
+
                 // 显示统计信息
-                println!("\n{} {} tokens in {}ms", "📊".dimmed(), token_count.to_string().dimmed(), duration.as_millis().to_string().dimmed());
-                
+                println!(
+                    "\n{} {} tokens in {}ms",
+                    "📊".dimmed(),
+                    token_count.to_string().dimmed(),
+                    duration.as_millis().to_string().dimmed()
+                );
+
                 conversation_turn += 1;
-                
+
                 // 限制历史长度避免context过长（保持最近5轮对话）
                 if conversation_history.len() > 10 {
                     conversation_history.drain(0..2);
                 }
-                
+
                 // Debug: 显示当前对话历史（可以帮助调试上下文问题）
                 if conversation_history.len() > 2 {
-                    println!("{} Context: {} turns in history", "🧠".dimmed(), (conversation_history.len() / 2).to_string().dimmed());
+                    println!(
+                        "{} Context: {} turns in history",
+                        "🧠".dimmed(),
+                        (conversation_history.len() / 2).to_string().dimmed()
+                    );
                 }
             }
             Err(e) => {
@@ -606,6 +716,6 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
             }
         }
     }
-    
+
     Ok(())
 }

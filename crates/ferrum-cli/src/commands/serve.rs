@@ -5,7 +5,7 @@ use clap::Args;
 use colored::*;
 use ferrum_core::Result;
 use ferrum_models::ModelSourceResolver;
-use ferrum_server::{traits::HttpServer, AxumServer, types::ServerConfig};
+use ferrum_server::{traits::HttpServer, types::ServerConfig, AxumServer};
 use std::sync::Arc;
 use tracing::info;
 
@@ -45,7 +45,9 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
     println!("Host: {}", cmd.host.cyan());
     println!("Port: {}", cmd.port.to_string().cyan());
 
-    let model_name = cmd.model.unwrap_or_else(|| "TinyLlama-1.1B-Chat-v1.0".to_string());
+    let model_name = cmd
+        .model
+        .unwrap_or_else(|| "TinyLlama-1.1B-Chat-v1.0".to_string());
     println!("Model: {}", model_name.cyan());
 
     if cmd.hot_reload {
@@ -57,44 +59,76 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
     }
 
     // Enhanced model resolution and loading
-    println!("{} Resolving model: {}", "🔍".bright_blue(), model_name.cyan());
-    
+    println!(
+        "{} Resolving model: {}",
+        "🔍".bright_blue(),
+        model_name.cyan()
+    );
+
     let registry = ferrum_models::DefaultModelRegistry::with_defaults();
     let resolved_id = registry.resolve_model_id(&model_name);
-    
+
     if resolved_id != model_name {
-        println!("{} Resolved alias '{}' to: {}", "🔗".bright_blue(), model_name.cyan(), resolved_id.yellow());
+        println!(
+            "{} Resolved alias '{}' to: {}",
+            "🔗".bright_blue(),
+            model_name.cyan(),
+            resolved_id.yellow()
+        );
     }
-    
+
     // Create model source resolver
     let source_config = ferrum_models::ModelSourceConfig::default();
     let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
-    
+
     // Resolve model source
     let source = match resolver.resolve(&resolved_id, None).await {
         Ok(source) => {
-            println!("{} Model resolved: {}", "✅".bright_green(), source.local_path.display());
+            println!(
+                "{} Model resolved: {}",
+                "✅".bright_green(),
+                source.local_path.display()
+            );
             source
         }
         Err(e) => {
-            println!("{} Failed to resolve model '{}': {}", "❌".bright_red(), resolved_id, e);
-            println!("\nTip: Use 'ferrum models --download {}' to download the model", resolved_id);
+            println!(
+                "{} Failed to resolve model '{}': {}",
+                "❌".bright_red(),
+                resolved_id,
+                e
+            );
+            println!(
+                "\nTip: Use 'ferrum models --download {}' to download the model",
+                resolved_id
+            );
             return Err(e);
         }
     };
-    
+
     // Load model configuration
     println!("{} Loading model configuration...", "⚙️".bright_blue());
     let mut config_manager = ferrum_models::ConfigManager::new();
     let model_config = match config_manager.load_from_source(&source).await {
         Ok(config) => {
-            println!("{} Configuration loaded: {} ({})", "✅".bright_green(), 
-                format!("{:?}", config.architecture).yellow(), 
-                format!("{} vocab, {} layers", config.vocab_size, config.num_hidden_layers).cyan());
+            println!(
+                "{} Configuration loaded: {} ({})",
+                "✅".bright_green(),
+                format!("{:?}", config.architecture).yellow(),
+                format!(
+                    "{} vocab, {} layers",
+                    config.vocab_size, config.num_hidden_layers
+                )
+                .cyan()
+            );
             config
         }
         Err(e) => {
-            println!("{} Warning: Failed to load configuration, using defaults: {}", "⚠️".yellow(), e);
+            println!(
+                "{} Warning: Failed to load configuration, using defaults: {}",
+                "⚠️".yellow(),
+                e
+            );
             // Use default configuration
             ferrum_models::ModelDefinition {
                 architecture: ferrum_models::Architecture::Llama,
@@ -132,8 +166,14 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
         model_id: resolved_id,
         device: match cmd.backend.as_str() {
             "auto" => {
-                if cfg!(all(feature = "metal", any(target_os = "macos", target_os = "ios"))) {
-                    println!("{} Auto-detected Metal backend for Apple GPU", "🔥".yellow());
+                if cfg!(all(
+                    feature = "metal",
+                    any(target_os = "macos", target_os = "ios")
+                )) {
+                    println!(
+                        "{} Auto-detected Metal backend for Apple GPU",
+                        "🔥".yellow()
+                    );
                     "metal".to_string()
                 } else {
                     println!("{} Auto-detected CPU backend", "💻".blue());
@@ -150,11 +190,11 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
     // Initialize engine
     println!("{} Initializing inference engine...", "⚙️".yellow());
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
-    
+
     // 关键：初始化engine以加载模型
     engine.initialize().await?;
     println!("{} Engine initialized successfully", "✅".green());
-    
+
     let engine = Arc::new(engine);
 
     // Create server configuration
@@ -167,16 +207,16 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
         enable_tls: false,
         tls_cert_path: None,
         tls_key_path: None,
-        cors: None, // Simplified for MVP
+        cors: None,        // Simplified for MVP
         compression: None, // Simplified for MVP
-        auth: None, // No auth for MVP
+        auth: None,        // No auth for MVP
         api_version: ferrum_server::types::ApiVersion::V1,
     };
 
     // Create and start server
     println!("{} Starting HTTP server...", "🌐".blue());
     let server = AxumServer::new(engine);
-    
+
     // This will block until server shuts down
     server.start(&server_config).await?;
 

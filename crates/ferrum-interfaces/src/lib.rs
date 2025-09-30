@@ -2,7 +2,7 @@
 //!
 //! This crate defines all the stable trait interfaces that different components
 //! of Ferrum implement. It provides a clean abstraction layer that allows for
-//! pluggable implementations of tokenizers, model executors, schedulers, 
+//! pluggable implementations of tokenizers, model executors, schedulers,
 //! cache managers, and other core components.
 //!
 //! The interfaces are designed following the principles outlined in the
@@ -12,49 +12,70 @@
 //! - Capability discovery driven
 //! - Performance-first API design
 
-pub mod tensor;
-pub mod tokenizer;
-pub mod sampler;
-pub mod kv_cache;
-pub mod model_executor;
 pub mod backend;
-pub mod scheduler;
 pub mod engine;
+pub mod kv_cache;
 pub mod memory;
 pub mod model_builder;
+pub mod model_executor;
+pub mod sampler;
+pub mod scheduler;
+pub mod tensor;
+pub mod tokenizer;
 
 // Re-export core traits and important types
-pub use tensor::{TensorLike, TensorRef, TensorFactory, TensorOps};
-pub use tokenizer::{Tokenizer, TokenizerFactory, TokenizerInfo, IncrementalTokenizer};
-pub use sampler::{LogitsProcessor, Sampler, SamplingContext, SamplingConfig};
-pub use kv_cache::{KvCacheHandle, KvCacheManager, BlockTable, AllocationRequest};
-pub use model_executor::{ModelExecutor, PrefillInput, PrefillOutput, DecodeInput, DecodeOutput};
-pub use backend::{ComputeBackend, WeightLoader, BackendCapabilities};
-pub use scheduler::{Scheduler as SchedulerInterface, BatchPlan, BatchHint};
+pub use backend::{BackendCapabilities, ComputeBackend, WeightLoader};
 pub use engine::InferenceEngine;
+pub use kv_cache::{AllocationRequest, BlockTable, KvCacheHandle, KvCacheManager};
 pub use memory::{DeviceMemoryManager, MemoryHandle, StreamHandle};
-pub use model_builder::{ModelBuilder, BuildOptions};
+pub use model_builder::{BuildOptions, ModelBuilder};
+pub use model_executor::{DecodeInput, DecodeOutput, ModelExecutor, PrefillInput, PrefillOutput};
+pub use sampler::{LogitsProcessor, Sampler, SamplingConfig, SamplingContext};
+pub use scheduler::{BatchHint, BatchPlan, Scheduler as SchedulerInterface};
+pub use tensor::{TensorFactory, TensorLike, TensorOps, TensorRef};
+pub use tokenizer::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo};
 
 // Re-export types from ferrum-types, avoiding conflicts
 pub use ferrum_types::{
-    // IDs
-    RequestId, BatchId, ModelId, SessionId, TaskId, ClientId,
-    // Basic types
-    TokenId, BlockId, Result, FerrumError,
-    // Requests and responses
-    InferenceRequest, InferenceResponse, StreamChunk,
-    // Sampling
-    SamplingParams, Priority, FinishReason, SpecialTokens,
-    // Device types
-    Device, DataType,
-    // Model types
-    ModelInfo, ModelType, ModelSource,
+    config::BackendConfig,
     // Config types - use fully qualified names to avoid conflicts
     config::EngineConfig,
     config::SchedulerConfig,
-    config::BackendConfig,
     config::TokenizerConfig,
+    BatchId,
+    BlockId,
+    ClientId,
+    ComponentHealth,
+    ComponentStatus,
+    DataType,
+    // Device types
+    Device,
+    EngineMetrics,
+    EngineStatus,
+    FerrumError,
+    FinishReason,
+    HealthStatus,
+    // Requests and responses
+    InferenceRequest,
+    InferenceResponse,
     // Metrics
-    MemoryUsage, SchedulerStats, EngineStatus, EngineMetrics, HealthStatus,
-    ComponentStatus, ComponentHealth,
+    MemoryUsage,
+    ModelId,
+    // Model types
+    ModelInfo,
+    ModelSource,
+    ModelType,
+    Priority,
+    // IDs
+    RequestId,
+    Result,
+    // Sampling
+    SamplingParams,
+    SchedulerStats,
+    SessionId,
+    SpecialTokens,
+    StreamChunk,
+    TaskId,
+    // Basic types
+    TokenId,
 };

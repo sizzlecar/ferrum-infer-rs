@@ -1,6 +1,6 @@
 //! Model registry
 
-use ferrum_types::{Result, Architecture};
+use ferrum_types::{Architecture, Result};
 use std::collections::HashMap;
 
 /// Model registry

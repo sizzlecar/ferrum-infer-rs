@@ -24,19 +24,14 @@ pub mod processors;
 
 // Re-exports of interfaces from ferrum-interfaces
 pub use ferrum_interfaces::{
-    LogitsProcessor as LogitsProcessorInterface,
-    Sampler as SamplerInterface,
-    SamplerFactory as SamplerFactoryInterface,
-    SamplingConfig,
-    SamplingContext,
-    SamplingMode,
+    LogitsProcessor as LogitsProcessorInterface, ProcessorConfig, Sampler as SamplerInterface,
+    SamplerFactory as SamplerFactoryInterface, SamplingConfig, SamplingContext, SamplingMode,
     SamplingStats,
-    ProcessorConfig,
 };
 
 pub use ferrum_types::{
-    TokenId, Result, FerrumError, Temperature, TopK, TopP, 
-    RepetitionPenalty, PresencePenalty, FrequencyPenalty,
+    FerrumError, FrequencyPenalty, PresencePenalty, RepetitionPenalty, Result, Temperature,
+    TokenId, TopK, TopP,
 };
 
 // Re-exports of implementations

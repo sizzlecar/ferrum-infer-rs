@@ -1,11 +1,14 @@
 use ferrum_interfaces::sampler::*;
 use ferrum_types::{SamplingParams, TokenId};
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, SeedableRng};
 
 #[test]
 fn temperature_processor_scales_logits() {
     let mut logits = vec![1.0, 2.0, 3.0];
-    let params = SamplingParams { temperature: 2.0, ..Default::default() };
+    let params = SamplingParams {
+        temperature: 2.0,
+        ..Default::default()
+    };
     let prev: Vec<TokenId> = vec![];
     let freqs = std::collections::HashMap::new();
     let mut ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, 3);
@@ -22,18 +25,29 @@ fn topk_masks_tail() {
     let freqs = std::collections::HashMap::new();
     let mut ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, 4);
     TopKProcessor::new(2).process(&mut ctx).unwrap();
-    let masked = ctx.logits.iter().filter(|v| **v == f32::NEG_INFINITY).count();
+    let masked = ctx
+        .logits
+        .iter()
+        .filter(|v| **v == f32::NEG_INFINITY)
+        .count();
     assert!(masked >= 2);
 }
 
 #[test]
 fn topp_masks_beyond_p() {
     let mut logits = vec![0.0, 0.0, 10.0, 9.0];
-    let params = SamplingParams { top_p: 0.6, ..Default::default() };
+    let params = SamplingParams {
+        top_p: 0.6,
+        ..Default::default()
+    };
     let binding = std::collections::HashMap::new();
     let mut ctx = SamplingContext::new(0, &params, &mut logits, &[], &binding, 4);
     TopPProcessor::new(0.6).process(&mut ctx).unwrap();
-    let masked = ctx.logits.iter().filter(|v| **v == f32::NEG_INFINITY).count();
+    let masked = ctx
+        .logits
+        .iter()
+        .filter(|v| **v == f32::NEG_INFINITY)
+        .count();
     assert!(masked >= 1);
 }
 
@@ -45,13 +59,20 @@ fn repetition_penalty_applies() {
     let mut freqs = std::collections::HashMap::new();
     freqs.insert(1u32, 2usize);
     let mut ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, 3);
-    RepetitionPenaltyProcessor::new(1.1).process(&mut ctx).unwrap();
+    RepetitionPenaltyProcessor::new(1.1)
+        .process(&mut ctx)
+        .unwrap();
     assert!(ctx.logits[1] != 1.0);
 }
 
 #[test]
 fn sampling_config_from_params_builds_chain_and_samples() {
-    let params = SamplingParams { temperature: 0.7, top_p: 0.9, top_k: Some(10), ..Default::default() };
+    let params = SamplingParams {
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: Some(10),
+        ..Default::default()
+    };
     let cfg = SamplingConfig::from_params(&params);
 
     let mut rng = StdRng::seed_from_u64(42);
@@ -67,6 +88,8 @@ fn sampling_config_from_params_builds_chain_and_samples() {
 #[test]
 fn greedy_sampler_picks_max() {
     let g = GreedySampler;
-    let tok = g.sample(&[0.1, 10.0, 0.2], &mut StdRng::seed_from_u64(1)).unwrap();
+    let tok = g
+        .sample(&[0.1, 10.0, 0.2], &mut StdRng::seed_from_u64(1))
+        .unwrap();
     assert_eq!(tok, 1);
 }

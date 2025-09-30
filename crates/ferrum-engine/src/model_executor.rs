@@ -169,8 +169,9 @@ impl ModelExecutor for CandleModelExecutor {
             .ok_or_else(|| FerrumError::backend("Tensor data must be accessible as f32 slice"))?;
 
         // Convert f32 tensor data to TokenId (u32)
-        let token_ids: Vec<TokenId> = tensor_data.iter()
-            .map(|&f| f as TokenId)
+        let token_ids: Vec<TokenId> = tensor_data
+            .iter()
+            .map(|&f| TokenId::new(f as u32))
             .collect();
 
         debug!("Prefill with {} tokens", token_ids.len());
@@ -215,8 +216,9 @@ impl ModelExecutor for CandleModelExecutor {
             .data_f32()
             .ok_or_else(|| FerrumError::backend("Tensor data must be accessible as f32 slice"))?;
 
-        let token_ids: Vec<TokenId> = tensor_data.iter()
-            .map(|&f| f as TokenId)
+        let token_ids: Vec<TokenId> = tensor_data
+            .iter()
+            .map(|&f| TokenId::new(f as u32))
             .collect();
 
         debug!("Decode with {} tokens", token_ids.len());

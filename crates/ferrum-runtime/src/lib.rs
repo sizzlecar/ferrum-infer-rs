@@ -18,11 +18,10 @@
 //! - **CUDA**: Direct CUDA operations (coming soon)
 
 // Core traits are re-exported from ferrum-interfaces
-pub use ferrum_interfaces::{
-    ComputeBackend, DeviceMemoryManager, TensorFactory, TensorLike, TensorOps,
-    TensorRef,
-};
 pub use ferrum_interfaces::backend::KernelExecutor;
+pub use ferrum_interfaces::{
+    ComputeBackend, DeviceMemoryManager, TensorFactory, TensorLike, TensorOps, TensorRef,
+};
 
 // Core types from ferrum-types
 pub use ferrum_types::{DataType, Device, Result};
@@ -61,7 +60,10 @@ impl TensorFactoryHandle {
     }
 
     /// Merge additional factories into the global registry and return the base handle.
-    pub fn merge_with(self, factories: Vec<(Device, Arc<dyn TensorFactory + Send + Sync>)>) -> Self {
+    pub fn merge_with(
+        self,
+        factories: Vec<(Device, Arc<dyn TensorFactory + Send + Sync>)>,
+    ) -> Self {
         for (device, factory) in factories {
             backends::candle::register_tensor_factory(device, factory);
         }
@@ -99,7 +101,8 @@ pub fn global_backend_registry() -> Arc<DefaultBackendRegistry> {
 /// Default backend registry implementation
 #[derive(Debug)]
 pub struct DefaultBackendRegistry {
-    compute_backends: parking_lot::RwLock<std::collections::HashMap<String, Box<dyn ComputeBackend>>>,
+    compute_backends:
+        parking_lot::RwLock<std::collections::HashMap<String, Box<dyn ComputeBackend>>>,
 }
 
 impl DefaultBackendRegistry {
@@ -133,9 +136,9 @@ impl DefaultBackendRegistry {
     pub async fn create_default_backend(&self, device: &Device) -> Result<Box<dyn ComputeBackend>> {
         match device {
             #[cfg(feature = "candle")]
-            Device::CUDA(_) | Device::Metal => {
-                Ok(Box::new(backends::candle::CandleBackend::new(*device).await?))
-            }
+            Device::CUDA(_) | Device::Metal => Ok(Box::new(
+                backends::candle::CandleBackend::new(*device).await?,
+            )),
             Device::CPU => {
                 #[cfg(feature = "cpu")]
                 {
@@ -145,7 +148,9 @@ impl DefaultBackendRegistry {
                 {
                     #[cfg(feature = "candle")]
                     {
-                        Ok(Box::new(backends::candle::CandleBackend::new(*device).await?))
+                        Ok(Box::new(
+                            backends::candle::CandleBackend::new(*device).await?,
+                        ))
                     }
                     #[cfg(not(feature = "candle"))]
                     {
@@ -165,9 +170,8 @@ impl Default for DefaultBackendRegistry {
     }
 }
 
-static DEFAULT_TENSOR_FACTORY: Lazy<Arc<dyn TensorFactory + Send + Sync>> = Lazy::new(|| {
-    backends::candle::get_tensor_factory(&Device::CPU)
-});
+static DEFAULT_TENSOR_FACTORY: Lazy<Arc<dyn TensorFactory + Send + Sync>> =
+    Lazy::new(|| backends::candle::get_tensor_factory(&Device::CPU));
 
 pub fn default_tensor_factory() -> Arc<dyn TensorFactory + Send + Sync> {
     DEFAULT_TENSOR_FACTORY.clone()

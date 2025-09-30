@@ -182,8 +182,8 @@ impl Sampler for MultinomialSampler {
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as TokenId)
-                .unwrap_or(0);
+                .map(|(i, _)| TokenId::new(i as u32))
+                .unwrap_or(TokenId::new(0));
         }
 
         // Convert logits to probabilities using stable softmax
@@ -204,12 +204,12 @@ impl Sampler for MultinomialSampler {
         for (i, &prob) in probs.iter().enumerate() {
             cumulative += prob;
             if random_value <= cumulative {
-                return i as TokenId;
+                return TokenId::new(i as u32);
             }
         }
 
         // Fallback
-        (logits.len() - 1) as TokenId
+        TokenId::new((logits.len() - 1) as u32)
     }
 }
 
@@ -223,8 +223,8 @@ impl Sampler for GreedySampler {
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as TokenId)
-            .unwrap_or(0)
+            .map(|(i, _)| TokenId::new(i as u32))
+            .unwrap_or(TokenId::new(0))
     }
 }
 

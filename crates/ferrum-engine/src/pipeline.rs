@@ -1,42 +1,22 @@
 //! Inference pipeline implementation
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use async_trait::async_trait;
-use tracing::{debug, instrument, trace, warn};
-use ferrum_types::{
-    Result,
-    InferenceRequest,
-    InferenceResponse,
-    StreamChunk,
-    FinishReason,
-    SamplingParams,
-    TokenId,
-    FerrumError,
-};
 use ferrum_interfaces::{
-    BatchHint,
-    BatchPlan,
-    IncrementalTokenizer,
-    KvCacheHandle,
-    KvCacheManager,
-    LogitsProcessor,
-    ModelExecutor,
-    PrefillInput,
-    PrefillOutput,
-    DecodeInput,
-    DecodeOutput,
-    Sampler,
-    SamplingContext,
-    Scheduler as SchedulerInterface,
-    TensorFactory,
-    TensorLike,
-    Tokenizer,
+    BatchHint, BatchPlan, DecodeInput, DecodeOutput, IncrementalTokenizer, KvCacheHandle,
+    KvCacheManager, LogitsProcessor, ModelExecutor, PrefillInput, PrefillOutput, Sampler,
+    SamplingContext, Scheduler as SchedulerInterface, TensorFactory, TensorLike, Tokenizer,
 };
 use ferrum_runtime::TensorFactoryHandle;
-use rand::{Rng, SeedableRng};
+use ferrum_types::{
+    FerrumError, FinishReason, InferenceRequest, InferenceResponse, Result, SamplingParams,
+    StreamChunk, TokenId,
+};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::{debug, instrument, trace, warn};
 
 /// Streaming token event
 #[derive(Debug, Clone)]
@@ -65,7 +45,10 @@ pub struct InferencePipeline {
 
 impl InferencePipeline {
     pub fn new(components: PipelineComponents, batch_hint: BatchHint) -> Self {
-        Self { components, batch_hint }
+        Self {
+            components,
+            batch_hint,
+        }
     }
 
     /// Submit request to scheduler
@@ -83,7 +66,12 @@ impl InferencePipeline {
         tx: UnboundedSender<Result<StreamChunk>>,
     ) -> Result<()> {
         loop {
-            let Some(batch_plan) = self.components.scheduler.next_batch(self.batch_hint.clone()).await else {
+            let Some(batch_plan) = self
+                .components
+                .scheduler
+                .next_batch(self.batch_hint.clone())
+                .await
+            else {
                 trace!("no batch available yet");
                 tokio::task::yield_now().await;
                 continue;
@@ -99,14 +87,17 @@ impl InferencePipeline {
             let prefill_work = self.prepare_prefill_work(&batch_plan)?;
 
             for (request, prefill_input) in prefill_work {
-                let PrefillOutput { logits, kv_cache, .. } = self
+                let PrefillOutput {
+                    logits, kv_cache, ..
+                } = self
                     .components
                     .model_executor
                     .prefill(&prefill_input)
                     .await?;
 
                 let last_logits = self.extract_last_logits(&logits)?;
-                let token_id = self.sample_from_logits(&last_logits, request.sampling_params.clone())?;
+                let token_id =
+                    self.sample_from_logits(&last_logits, request.sampling_params.clone())?;
 
                 if &request.id == target_request_id {
                     let delta = self
@@ -120,7 +111,8 @@ impl InferencePipeline {
                     };
                     self.send_stream_chunk(&tx, &request, event, None, None)?;
 
-                    self.decode_loop(request.clone(), token_id, kv_cache, tx.clone()).await?;
+                    self.decode_loop(request.clone(), token_id, kv_cache, tx.clone())
+                        .await?;
                     return Ok(());
                 }
 
@@ -154,7 +146,8 @@ impl InferencePipeline {
                 position_ids: None,
             };
 
-            let DecodeOutput { logits, kv: new_kv } = self.components.model_executor.decode(&decode_input).await?;
+            let DecodeOutput { logits, kv: new_kv } =
+                self.components.model_executor.decode(&decode_input).await?;
             kv = new_kv;
 
             let mut logits_buf = logits
@@ -181,14 +174,21 @@ impl InferencePipeline {
                 StdRng::from_entropy()
             };
 
-            let token_id = self.components.sampler.sample_with_context(&ctx, &mut rng)?;
+            let token_id = self
+                .components
+                .sampler
+                .sample_with_context(&ctx, &mut rng)?;
             tokens.push(token_id);
             *token_frequencies.entry(token_id).or_insert(0) += 1;
 
-            let delta = self
-                .components
-                .incremental_tokenizer
-                .decode_incremental(tokens.iter().take(tokens.len() - 1).collect::<Vec<_>>().as_slice(), token_id)?;
+            let delta = self.components.incremental_tokenizer.decode_incremental(
+                tokens
+                    .iter()
+                    .take(tokens.len() - 1)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                token_id,
+            )?;
             text_acc.push_str(&delta);
 
             let event = TokenEvent {
@@ -215,19 +215,27 @@ impl InferencePipeline {
         }
 
         let reason = stop_reason.unwrap_or(FinishReason::Stop);
-        let response = self.build_final_response(request.clone(), text_acc.clone(), tokens.clone(), reason);
+        let response =
+            self.build_final_response(request.clone(), text_acc.clone(), tokens.clone(), reason);
         self.send_completion(&tx, response)?;
         Ok(())
     }
 
-    fn create_tensor_from_tokens(&self, tokens: &[TokenId]) -> Result<ferrum_interfaces::TensorRef> {
+    fn create_tensor_from_tokens(
+        &self,
+        tokens: &[TokenId],
+    ) -> Result<ferrum_interfaces::TensorRef> {
         let shape = [1, tokens.len()];
-        let data: Vec<f32> = tokens.iter().map(|t| *t as f32).collect();
-        self
-            .components
+        let data: Vec<f32> = tokens.iter().map(|t| u32::from(*t) as f32).collect();
+        self.components
             .tensor_factory
             .as_ref()
-            .from_slice(&data, &shape, ferrum_types::DataType::FP32, ferrum_types::Device::CUDA(0))
+            .from_slice(
+                &data,
+                &shape,
+                ferrum_types::DataType::FP32,
+                ferrum_types::Device::CUDA(0),
+            )
             .map_err(|e| FerrumError::backend(format!("Failed to build input tensor: {}", e)))
     }
 
@@ -288,7 +296,8 @@ impl InferencePipeline {
             created_at: chrono::Utc::now(),
             metadata: request.metadata.clone(),
         };
-        tx.send(Ok(chunk)).map_err(|_| FerrumError::channel_closed("failed to send stream chunk"))
+        tx.send(Ok(chunk))
+            .map_err(|_| FerrumError::channel_closed("failed to send stream chunk"))
     }
 
     fn send_completion(
@@ -296,7 +305,8 @@ impl InferencePipeline {
         tx: &UnboundedSender<Result<StreamChunk>>,
         response: InferenceResponse,
     ) -> Result<()> {
-        tx.send(Ok(StreamChunk::Complete { response })).map_err(|_| FerrumError::channel_closed("failed to send completion chunk"))
+        tx.send(Ok(StreamChunk::Complete { response }))
+            .map_err(|_| FerrumError::channel_closed("failed to send completion chunk"))
     }
 
     fn build_final_response(
@@ -318,12 +328,18 @@ impl InferencePipeline {
         }
     }
 
-    fn prepare_prefill_work(&self, batch_plan: &BatchPlan) -> Result<Vec<(InferenceRequest, PrefillInput)>> {
+    fn prepare_prefill_work(
+        &self,
+        batch_plan: &BatchPlan,
+    ) -> Result<Vec<(InferenceRequest, PrefillInput)>> {
         batch_plan
             .requests
             .iter()
             .map(|scheduled| {
-                let token_ids = self.components.tokenizer.encode(&scheduled.request.prompt, true)?;
+                let token_ids = self
+                    .components
+                    .tokenizer
+                    .encode(&scheduled.request.prompt, true)?;
                 let input_tensor = self.create_tensor_from_tokens(&token_ids)?;
                 Ok((
                     scheduled.request.clone(),
@@ -337,7 +353,10 @@ impl InferencePipeline {
             .collect()
     }
 
-    fn extract_last_logits(&self, logits: &ferrum_interfaces::TensorRef) -> Result<ferrum_interfaces::TensorRef> {
+    fn extract_last_logits(
+        &self,
+        logits: &ferrum_interfaces::TensorRef,
+    ) -> Result<ferrum_interfaces::TensorRef> {
         let shape = logits.shape();
         if shape.len() <= 2 {
             return Ok(logits.clone());
@@ -352,7 +371,9 @@ impl InferencePipeline {
     }
 
     fn contains_stop_sequence(&self, text: &str, stop_sequences: &[String]) -> bool {
-        stop_sequences.iter().any(|seq| !seq.is_empty() && text.ends_with(seq))
+        stop_sequences
+            .iter()
+            .any(|seq| !seq.is_empty() && text.ends_with(seq))
     }
 }
 

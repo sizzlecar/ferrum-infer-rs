@@ -19,17 +19,16 @@ pub enum Device {
 impl Device {
     /// Check if device is GPU-based
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Device::CUDA(_) | Device::ROCm(_))
-            || {
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                {
-                    matches!(self, Device::Metal)
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-                {
-                    false
-                }
+        matches!(self, Device::CUDA(_) | Device::ROCm(_)) || {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                matches!(self, Device::Metal)
             }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                false
+            }
+        }
     }
 
     /// Get device index for GPU devices
@@ -97,7 +96,10 @@ impl DataType {
 
     /// Check if this is a floating point type
     pub fn is_float(&self) -> bool {
-        matches!(self, DataType::FP32 | DataType::FP16 | DataType::BF16 | DataType::FP8)
+        matches!(
+            self,
+            DataType::FP32 | DataType::FP16 | DataType::BF16 | DataType::FP8
+        )
     }
 
     /// Check if this is an integer type
@@ -117,7 +119,10 @@ impl DataType {
 
     /// Check if this is a quantized type (reduced precision)
     pub fn is_quantized(&self) -> bool {
-        matches!(self, DataType::FP8 | DataType::INT8 | DataType::INT4 | DataType::UINT4)
+        matches!(
+            self,
+            DataType::FP8 | DataType::INT8 | DataType::INT4 | DataType::UINT4
+        )
     }
 }
 

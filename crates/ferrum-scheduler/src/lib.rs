@@ -21,26 +21,17 @@
 //! - **Resource Awareness**: Schedule based on available resources
 
 pub mod implementations;
-pub mod queue;
 pub mod metrics;
+pub mod queue;
 
 // Re-exports of interfaces from ferrum-interfaces
 pub use ferrum_interfaces::{
-    SchedulerInterface as Scheduler, 
-    BatchPlan, 
-    BatchHint,
-    SchedulerConfig,
-    SchedulerMetrics,
-    ScheduledRequest,
-    ResourceConstraints,
-    BatchResourceRequirements,
-    PreemptionResult,
+    BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, ResourceConstraints,
+    ScheduledRequest, SchedulerConfig, SchedulerInterface as Scheduler, SchedulerMetrics,
     SchedulingPolicy,
 };
 
-pub use ferrum_types::{
-    BatchId, RequestId, InferenceRequest, InferenceResponse, Priority, Result,
-};
+pub use ferrum_types::{BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, Result};
 
 // Re-exports of implementations
 pub use implementations::*;

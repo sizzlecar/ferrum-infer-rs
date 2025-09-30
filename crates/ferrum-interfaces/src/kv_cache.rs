@@ -32,23 +32,23 @@ impl BlockTable {
             block_size,
         }
     }
-    
+
     /// Get number of blocks allocated
     pub fn num_blocks(&self) -> usize {
         self.physical_blocks.len()
     }
-    
+
     /// Get required number of blocks for sequence length
     pub fn blocks_needed_for_length(length: usize, block_size: usize) -> usize {
         (length + block_size - 1) / block_size // Ceiling division
     }
-    
+
     /// Check if can accommodate more tokens without new blocks
     pub fn has_free_space(&self) -> bool {
         let used_blocks = Self::blocks_needed_for_length(self.sequence_length, self.block_size);
         used_blocks < self.num_blocks()
     }
-    
+
     /// Get number of free tokens in allocated blocks
     pub fn free_tokens(&self) -> usize {
         if self.num_blocks() == 0 {
@@ -57,28 +57,30 @@ impl BlockTable {
             self.num_blocks() * self.block_size - self.sequence_length
         }
     }
-    
+
     /// Add blocks to the table
     pub fn add_blocks(&mut self, blocks: &[BlockId]) {
         let start_logical = self.logical_to_physical.len();
-        
+
         for (i, &block) in blocks.iter().enumerate() {
             self.physical_blocks.push(block);
             self.logical_to_physical.push((start_logical + i) as u32);
         }
     }
-    
+
     /// Extend sequence length
     pub fn extend_sequence(&mut self, additional_tokens: usize) -> Result<()> {
         let new_length = self.sequence_length + additional_tokens;
         let required_blocks = Self::blocks_needed_for_length(new_length, self.block_size);
-        
+
         if required_blocks > self.num_blocks() {
-            return Err(ferrum_types::FerrumError::backend(
-                format!("Insufficient blocks: need {}, have {}", required_blocks, self.num_blocks())
-            ));
+            return Err(ferrum_types::FerrumError::backend(format!(
+                "Insufficient blocks: need {}, have {}",
+                required_blocks,
+                self.num_blocks()
+            )));
         }
-        
+
         self.sequence_length = new_length;
         Ok(())
     }
@@ -88,50 +90,50 @@ impl BlockTable {
 pub trait KvCacheHandle: Send + Sync + std::fmt::Debug {
     /// Get block table for this cache
     fn block_table(&self) -> &BlockTable;
-    
+
     /// Get mutable block table (for extending)
     fn block_table_mut(&mut self) -> &mut BlockTable;
 
     /// Downcast support for backend-specific handles
     fn as_any(&self) -> &dyn std::any::Any;
-    
+
     /// Get device where cache resides
     fn device(&self) -> Device;
-    
+
     /// Get number of tokens stored in cache
     fn num_tokens(&self) -> usize {
         self.block_table().sequence_length
     }
-    
+
     /// Get number of layers cached
     fn num_layers(&self) -> usize;
-    
+
     /// Get number of attention heads
     fn num_heads(&self) -> usize;
-    
+
     /// Get head dimension
     fn head_dim(&self) -> usize;
-    
+
     /// Get key cache for specific layer (returns tensor reference)
     fn key_cache(&self, layer: usize) -> Result<Option<TensorRef>>;
-    
+
     /// Get value cache for specific layer
     fn value_cache(&self, layer: usize) -> Result<Option<TensorRef>>;
-    
+
     /// Get both key and value caches for layer
     fn kv_cache(&self, layer: usize) -> Result<(Option<TensorRef>, Option<TensorRef>)> {
         Ok((self.key_cache(layer)?, self.value_cache(layer)?))
     }
-    
+
     /// Clone handle (creates new reference, not deep copy)
     fn clone_handle(&self) -> Result<Arc<dyn KvCacheHandle>>;
-    
+
     /// Get cache statistics
     fn stats(&self) -> CacheHandleStats;
-    
+
     /// Check if cache is valid and accessible
     fn is_valid(&self) -> bool;
-    
+
     /// Get unique identifier for this cache instance
     fn cache_id(&self) -> String;
 }
@@ -178,7 +180,8 @@ impl AllocationRequest {
     /// Calculate estimated memory requirement
     pub fn estimated_memory_bytes(&self) -> usize {
         // Key + Value cache size: layers * heads * max_seq * head_dim * 2 * dtype_size
-        let kv_size = self.num_layers * self.num_heads * self.max_sequence_length * self.head_dim * 2;
+        let kv_size =
+            self.num_layers * self.num_heads * self.max_sequence_length * self.head_dim * 2;
         kv_size * self.dtype.size_bytes()
     }
 }
@@ -188,35 +191,28 @@ impl AllocationRequest {
 pub trait KvCacheManager: Send + Sync {
     /// Allocate cache for new sequence
     async fn allocate(&self, request: &AllocationRequest) -> Result<Arc<dyn KvCacheHandle>>;
-    
+
     /// Extend existing cache to accommodate more tokens
-    async fn extend(
-        &self, 
-        handle: &mut dyn KvCacheHandle, 
-        additional_tokens: usize
-    ) -> Result<()>;
-    
+    async fn extend(&self, handle: &mut dyn KvCacheHandle, additional_tokens: usize) -> Result<()>;
+
     /// Deallocate cache (handle becomes invalid)
     async fn deallocate(&self, request_id: RequestId) -> Result<()>;
-    
+
     /// Check if can allocate requested cache size
     fn can_allocate(&self, request: &AllocationRequest) -> bool;
-    
+
     /// Get cache statistics
     fn stats(&self) -> CacheManagerStats;
-    
+
     /// Force garbage collection of unused caches
     async fn gc(&self) -> Result<CacheGcStats>;
-    
+
     /// Set memory pressure callback
-    fn set_pressure_callback(
-        &self, 
-        callback: Box<dyn Fn(MemoryPressure) + Send + Sync>
-    );
-    
+    fn set_pressure_callback(&self, callback: Box<dyn Fn(MemoryPressure) + Send + Sync>);
+
     /// Get handle for existing request (if exists)
     fn get_handle(&self, request_id: RequestId) -> Option<Arc<dyn KvCacheHandle>>;
-    
+
     /// List all active cache handles
     fn list_handles(&self) -> Vec<(RequestId, Arc<dyn KvCacheHandle>)>;
 }
@@ -272,7 +268,7 @@ pub enum MemoryPressure {
 pub trait AdvancedKvCacheManager: KvCacheManager {
     /// Enable prefix caching for common prompt prefixes
     async fn enable_prefix_caching(&self, config: PrefixCacheConfig) -> Result<()>;
-    
+
     /// Share cache blocks between compatible sequences
     async fn share_prefix(
         &self,
@@ -280,16 +276,16 @@ pub trait AdvancedKvCacheManager: KvCacheManager {
         target: RequestId,
         shared_tokens: usize,
     ) -> Result<()>;
-    
+
     /// Swap cache from GPU to CPU to free GPU memory
     async fn swap_out(&self, request_id: RequestId) -> Result<()>;
-    
+
     /// Swap cache from CPU back to GPU
     async fn swap_in(&self, request_id: RequestId) -> Result<()>;
-    
+
     /// Compress cache to reduce memory usage
     async fn compress_cache(&self, request_id: RequestId, compression_ratio: f32) -> Result<()>;
-    
+
     /// Get cache compression statistics
     fn compression_stats(&self) -> CompressionStats;
 }
@@ -324,19 +320,19 @@ pub struct CompressionStats {
 pub trait BlockAllocator: Send + Sync {
     /// Allocate specified number of blocks
     fn allocate_blocks(&self, num_blocks: usize) -> Result<Vec<BlockId>>;
-    
+
     /// Free blocks back to allocator
     fn free_blocks(&self, blocks: &[BlockId]) -> Result<()>;
-    
+
     /// Get number of free blocks
     fn free_block_count(&self) -> usize;
-    
+
     /// Get total block count
     fn total_block_count(&self) -> usize;
-    
+
     /// Get block size in tokens
     fn block_size(&self) -> usize;
-    
+
     /// Defragment free block list
     fn defragment(&self) -> Result<()>;
 }
@@ -346,23 +342,19 @@ pub trait BlockAllocator: Send + Sync {
 pub trait MultiDeviceCacheManager: KvCacheManager {
     /// Get supported devices
     fn supported_devices(&self) -> Vec<Device>;
-    
+
     /// Set device preference for new allocations
     fn set_device_preference(&self, devices: Vec<Device>);
-    
+
     /// Move cache between devices
-    async fn move_cache(
-        &self,
-        request_id: RequestId,
-        target_device: Device,
-    ) -> Result<()>;
-    
+    async fn move_cache(&self, request_id: RequestId, target_device: Device) -> Result<()>;
+
     /// Get cache location
     fn get_cache_device(&self, request_id: RequestId) -> Option<Device>;
-    
+
     /// Balance cache distribution across devices
     async fn rebalance_devices(&self) -> Result<()>;
-    
+
     /// Get per-device statistics
     fn device_stats(&self) -> HashMap<Device, CacheManagerStats>;
 }
@@ -375,10 +367,10 @@ pub trait CacheEvictionPolicy: Send + Sync {
         required_memory: usize,
         active_caches: &[(RequestId, Arc<dyn KvCacheHandle>)],
     ) -> Vec<RequestId>;
-    
+
     /// Update cache access information
     fn record_access(&mut self, request_id: RequestId, access_time: std::time::Instant);
-    
+
     /// Get policy name
     fn name(&self) -> &str;
 }
@@ -405,19 +397,21 @@ impl CacheEvictionPolicy for LruEvictionPolicy {
         let mut candidates: Vec<_> = active_caches
             .iter()
             .map(|(req_id, handle)| {
-                let access_time = self.access_times.get(req_id)
+                let access_time = self
+                    .access_times
+                    .get(req_id)
                     .copied()
                     .unwrap_or_else(std::time::Instant::now);
                 (req_id.clone(), handle.stats().memory_bytes, access_time)
             })
             .collect();
-        
+
         // Sort by access time (oldest first)
         candidates.sort_by(|a, b| a.2.cmp(&b.2));
-        
+
         let mut freed_memory = 0;
         let mut result = Vec::new();
-        
+
         for (req_id, memory_bytes, _) in candidates {
             result.push(req_id);
             freed_memory += memory_bytes;
@@ -425,14 +419,14 @@ impl CacheEvictionPolicy for LruEvictionPolicy {
                 break;
             }
         }
-        
+
         result
     }
-    
+
     fn record_access(&mut self, request_id: RequestId, access_time: std::time::Instant) {
         self.access_times.insert(request_id, access_time);
     }
-    
+
     fn name(&self) -> &str {
         "lru"
     }
@@ -472,7 +466,7 @@ pub struct CacheConfig {
 pub struct MemoryPressureThresholds {
     /// Medium pressure threshold (0.0-1.0)
     pub medium_threshold: f32,
-    /// High pressure threshold (0.0-1.0) 
+    /// High pressure threshold (0.0-1.0)
     pub high_threshold: f32,
     /// Critical pressure threshold (0.0-1.0)
     pub critical_threshold: f32,

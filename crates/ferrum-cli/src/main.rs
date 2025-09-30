@@ -64,8 +64,6 @@ enum Commands {
 
     /// Development and debugging tools
     Dev(DevCommand),
-    
-
 }
 
 #[tokio::main]
@@ -102,7 +100,6 @@ async fn main() {
         Commands::Health(cmd) => health::execute(cmd, config, cli.format).await,
         Commands::Cache(cmd) => cache::execute(cmd, config, cli.format).await,
         Commands::Dev(cmd) => dev::execute(cmd, config, cli.format).await,
-
     };
 
     // Handle result

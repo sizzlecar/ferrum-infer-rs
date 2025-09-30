@@ -15,8 +15,16 @@ fn error_constructors_and_classes() {
 #[test]
 fn error_conversions() {
     let io_err: FerrumError = std::io::Error::new(std::io::ErrorKind::Other, "io").into();
-    match io_err { FerrumError::IO{..} => {}, _ => panic!("wrong kind") }
+    match io_err {
+        FerrumError::IO { .. } => {}
+        _ => panic!("wrong kind"),
+    }
 
-    let ser_err: FerrumError = serde_json::from_str::<serde_json::Value>("{").unwrap_err().into();
-    match ser_err { FerrumError::Serialization{..} => {}, _ => panic!("wrong kind") }
+    let ser_err: FerrumError = serde_json::from_str::<serde_json::Value>("{")
+        .unwrap_err()
+        .into();
+    match ser_err {
+        FerrumError::Serialization { .. } => {}
+        _ => panic!("wrong kind"),
+    }
 }

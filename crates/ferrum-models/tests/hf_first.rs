@@ -1,12 +1,12 @@
-use tempfile::TempDir;
 use std::fs;
 use std::path::PathBuf;
+use tempfile::TempDir;
 
 use ferrum_models as fm;
-use fm::ModelSourceResolver;
-use fm::{ConfigManager};
-use fm::source::{DefaultModelSourceResolver, ModelSourceConfig, ModelFormat};
 use fm::registry::DefaultModelRegistry;
+use fm::source::{DefaultModelSourceResolver, ModelFormat, ModelSourceConfig};
+use fm::ConfigManager;
+use fm::ModelSourceResolver;
 
 fn write_file(dir: &PathBuf, name: &str, content: &str) {
     fs::write(dir.join(name), content).unwrap();
@@ -164,7 +164,7 @@ async fn registry_alias_and_discovery() {
     let m = &found[0];
     assert_eq!(m.format, ModelFormat::HuggingFace);
     assert!(m.is_valid);
-    assert!(matches!(m.architecture, Some(fm::Architecture::Llama))); 
+    assert!(matches!(m.architecture, Some(fm::Architecture::Llama)));
 }
 
 #[tokio::test]

@@ -877,8 +877,8 @@ fn apply_sampling(logits: &CandleTensor, params: &SamplingParams) -> Result<Toke
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as TokenId)
-            .unwrap_or(0);
+            .map(|(i, _)| TokenId::new(i as u32))
+            .unwrap_or(TokenId::new(0));
         Ok(token_id)
     } else {
         // Multinomial sampling
@@ -903,12 +903,12 @@ fn apply_sampling(logits: &CandleTensor, params: &SamplingParams) -> Result<Toke
         for (i, &prob) in probs.iter().enumerate() {
             cumulative += prob;
             if random_value <= cumulative {
-                return Ok(i as TokenId);
+                return Ok(TokenId::new(i as u32));
             }
         }
 
         // Fallback
-        Ok((logits.len() - 1) as TokenId)
+        Ok(TokenId::new((logits.len() - 1) as u32))
     }
 }
 

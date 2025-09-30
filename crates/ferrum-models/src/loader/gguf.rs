@@ -1,11 +1,11 @@
 //! GGUF weight loader implementation
 
+use async_trait::async_trait;
 use ferrum_interfaces::{WeightLoader, WeightSpec};
-use ferrum_types::{Result, DataType, FerrumError};
+use ferrum_types::{DataType, FerrumError, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info, warn};
-use async_trait::async_trait;
 
 /// GGUF format weight loader
 #[derive(Debug, Clone)]
@@ -98,7 +98,10 @@ impl GGMLType {
             18 => Ok(GGMLType::I32),
             19 => Ok(GGMLType::I64),
             20 => Ok(GGMLType::BF16),
-            _ => Err(FerrumError::invalid_format(format!("Unknown GGML type: {}", type_id))),
+            _ => Err(FerrumError::invalid_format(format!(
+                "Unknown GGML type: {}",
+                type_id
+            ))),
         }
     }
 
@@ -128,14 +131,22 @@ impl GGMLType {
             GGMLType::Q4_0 | GGMLType::Q4_1 => 18, // 32 elements in 18 bytes
             GGMLType::Q5_0 | GGMLType::Q5_1 => 22, // 32 elements in 22 bytes
             GGMLType::Q8_0 | GGMLType::Q8_1 => 34, // 32 elements in 34 bytes
-            _ => 2, // Default for K-quants
+            _ => 2,                                // Default for K-quants
         }
     }
 
     /// Check if type is quantized
     fn is_quantized(&self) -> bool {
-        !matches!(self, GGMLType::F32 | GGMLType::F16 | GGMLType::BF16 | 
-                       GGMLType::I8 | GGMLType::I16 | GGMLType::I32 | GGMLType::I64)
+        !matches!(
+            self,
+            GGMLType::F32
+                | GGMLType::F16
+                | GGMLType::BF16
+                | GGMLType::I8
+                | GGMLType::I16
+                | GGMLType::I32
+                | GGMLType::I64
+        )
     }
 }
 
@@ -156,7 +167,8 @@ impl GGUFLoader {
 
         *self.file_path.write() = Some(file_path.to_path_buf());
 
-        let file_data = tokio::fs::read(file_path).await
+        let file_data = tokio::fs::read(file_path)
+            .await
             .map_err(|e| FerrumError::io(format!("Failed to read GGUF file: {}", e)))?;
 
         self.parse_gguf(&file_data).await
@@ -178,7 +190,12 @@ impl GGUFLoader {
         offset += 4;
 
         // Read version
-        let version = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+        let version = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
         if version != 3 {
             warn!("GGUF version {} may not be fully supported", version);
         }
@@ -186,19 +203,34 @@ impl GGUFLoader {
 
         // Read tensor count
         let tensor_count = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         offset += 8;
 
         // Read metadata count
         let metadata_count = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         offset += 8;
 
-        debug!("GGUF: version={}, tensors={}, metadata={}", version, tensor_count, metadata_count);
+        debug!(
+            "GGUF: version={}, tensors={}, metadata={}",
+            version, tensor_count, metadata_count
+        );
 
         // Parse metadata
         let mut model_metadata = self.model_metadata.write();
@@ -226,7 +258,10 @@ impl GGUFLoader {
             tensor_info.offset += data_offset as u64;
         }
 
-        info!("Parsed GGUF: {} metadata entries, {} tensors", metadata_count, tensor_count);
+        info!(
+            "Parsed GGUF: {} metadata entries, {} tensors",
+            metadata_count, tensor_count
+        );
         Ok(())
     }
 
@@ -240,14 +275,17 @@ impl GGUFLoader {
 
         // Read value type
         if pos + 4 > data.len() {
-            return Err(FerrumError::invalid_format("Unexpected end of GGUF metadata"));
+            return Err(FerrumError::invalid_format(
+                "Unexpected end of GGUF metadata",
+            ));
         }
-        let value_type = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+        let value_type =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
 
         // Read value based on type
         let (value, new_pos) = self.read_metadata_value(data, pos, value_type)?;
-        
+
         Ok((key, value, new_pos))
     }
 
@@ -258,8 +296,14 @@ impl GGUFLoader {
         }
 
         let length = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]) as usize;
 
         let string_start = offset + 8;
@@ -269,41 +313,75 @@ impl GGUFLoader {
 
         let string_data = &data[string_start..string_start + length];
         let string = String::from_utf8_lossy(string_data).to_string();
-        
+
         Ok((string, string_start + length))
     }
 
     /// Read metadata value
-    fn read_metadata_value(&self, data: &[u8], offset: usize, value_type: u32) -> Result<(GGUFValue, usize)> {
+    fn read_metadata_value(
+        &self,
+        data: &[u8],
+        offset: usize,
+        value_type: u32,
+    ) -> Result<(GGUFValue, usize)> {
         match value_type {
-            0 => { // UINT8
-                if offset + 1 > data.len() { return Err(FerrumError::invalid_format("Cannot read U8")); }
+            0 => {
+                // UINT8
+                if offset + 1 > data.len() {
+                    return Err(FerrumError::invalid_format("Cannot read U8"));
+                }
                 Ok((GGUFValue::U8(data[offset]), offset + 1))
             }
-            1 => { // INT8
-                if offset + 1 > data.len() { return Err(FerrumError::invalid_format("Cannot read I8")); }
+            1 => {
+                // INT8
+                if offset + 1 > data.len() {
+                    return Err(FerrumError::invalid_format("Cannot read I8"));
+                }
                 Ok((GGUFValue::I8(data[offset] as i8), offset + 1))
             }
-            4 => { // UINT32
-                if offset + 4 > data.len() { return Err(FerrumError::invalid_format("Cannot read U32")); }
-                let value = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+            4 => {
+                // UINT32
+                if offset + 4 > data.len() {
+                    return Err(FerrumError::invalid_format("Cannot read U32"));
+                }
+                let value = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
                 Ok((GGUFValue::U32(value), offset + 4))
             }
-            6 => { // FLOAT32
-                if offset + 4 > data.len() { return Err(FerrumError::invalid_format("Cannot read F32")); }
-                let bytes = [data[offset], data[offset+1], data[offset+2], data[offset+3]];
+            6 => {
+                // FLOAT32
+                if offset + 4 > data.len() {
+                    return Err(FerrumError::invalid_format("Cannot read F32"));
+                }
+                let bytes = [
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ];
                 let value = f32::from_le_bytes(bytes);
                 Ok((GGUFValue::F32(value), offset + 4))
             }
-            8 => { // STRING
+            8 => {
+                // STRING
                 let (string, new_offset) = self.read_string(data, offset)?;
                 Ok((GGUFValue::String(string), new_offset))
             }
-            9 => { // BOOL
-                if offset + 1 > data.len() { return Err(FerrumError::invalid_format("Cannot read bool")); }
+            9 => {
+                // BOOL
+                if offset + 1 > data.len() {
+                    return Err(FerrumError::invalid_format("Cannot read bool"));
+                }
                 Ok((GGUFValue::Bool(data[offset] != 0), offset + 1))
             }
-            _ => Err(FerrumError::invalid_format(format!("Unsupported metadata type: {}", value_type))),
+            _ => Err(FerrumError::invalid_format(format!(
+                "Unsupported metadata type: {}",
+                value_type
+            ))),
         }
     }
 
@@ -319,7 +397,7 @@ impl GGUFLoader {
         if pos + 4 > data.len() {
             return Err(FerrumError::invalid_format("Cannot read tensor n_dims"));
         }
-        let n_dims = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+        let n_dims = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
 
         // Read dimensions
@@ -329,8 +407,14 @@ impl GGUFLoader {
                 return Err(FerrumError::invalid_format("Cannot read tensor dimension"));
             }
             let dim = u64::from_le_bytes([
-                data[pos], data[pos+1], data[pos+2], data[pos+3],
-                data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             dimensions.push(dim);
             pos += 8;
@@ -340,7 +424,7 @@ impl GGUFLoader {
         if pos + 4 > data.len() {
             return Err(FerrumError::invalid_format("Cannot read tensor type"));
         }
-        let type_id = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+        let type_id = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         let ggml_type = GGMLType::from_type_id(type_id)?;
         pos += 4;
 
@@ -349,8 +433,14 @@ impl GGUFLoader {
             return Err(FerrumError::invalid_format("Cannot read tensor offset"));
         }
         let offset = u64::from_le_bytes([
-            data[pos], data[pos+1], data[pos+2], data[pos+3],
-            data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
         ]);
         pos += 8;
 
@@ -388,17 +478,19 @@ impl WeightLoader for GGUFLoader {
         debug!("Loading GGUF tensor: {}", spec.name);
 
         let metadata = self.metadata.read();
-        let tensor_info = metadata.get(&spec.name)
+        let tensor_info = metadata
+            .get(&spec.name)
             .ok_or_else(|| FerrumError::not_found(format!("Tensor not found: {}", spec.name)))?;
 
         // Validate shape if specified
         if let Some(expected_shape) = &spec.shape {
-            let tensor_shape: Vec<usize> = tensor_info.dimensions.iter().map(|&d| d as usize).collect();
+            let tensor_shape: Vec<usize> =
+                tensor_info.dimensions.iter().map(|&d| d as usize).collect();
             if tensor_shape != *expected_shape {
-                return Err(FerrumError::invalid_format(
-                    format!("Shape mismatch for {}: expected {:?}, got {:?}",
-                        spec.name, expected_shape, tensor_shape)
-                ));
+                return Err(FerrumError::invalid_format(format!(
+                    "Shape mismatch for {}: expected {:?}, got {:?}",
+                    spec.name, expected_shape, tensor_shape
+                )));
             }
         }
 
@@ -406,25 +498,29 @@ impl WeightLoader for GGUFLoader {
         let ferrum_dtype = tensor_info.ggml_type.to_ferrum_dtype();
         if let Some(expected_dtype) = spec.dtype {
             if ferrum_dtype != expected_dtype && !tensor_info.ggml_type.is_quantized() {
-                warn!("Data type mismatch for {}: expected {:?}, got {:?} (GGML: {:?})",
-                      spec.name, expected_dtype, ferrum_dtype, tensor_info.ggml_type);
+                warn!(
+                    "Data type mismatch for {}: expected {:?}, got {:?} (GGML: {:?})",
+                    spec.name, expected_dtype, ferrum_dtype, tensor_info.ggml_type
+                );
             }
         }
 
         // Load tensor data
         let file_path = self.file_path.read().as_ref().unwrap().clone();
-        let file = tokio::fs::File::open(&file_path).await
+        let file = tokio::fs::File::open(&file_path)
+            .await
             .map_err(|e| FerrumError::io(format!("Failed to open GGUF file: {}", e)))?;
 
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut file = file;
-        file.seek(std::io::SeekFrom::Start(tensor_info.offset)).await
+        file.seek(std::io::SeekFrom::Start(tensor_info.offset))
+            .await
             .map_err(|e| FerrumError::io(format!("Failed to seek in GGUF file: {}", e)))?;
 
         // Calculate tensor size
         let element_count: u64 = tensor_info.dimensions.iter().product();
         let bytes_per_elem = tensor_info.ggml_type.bytes_per_element();
-        
+
         let tensor_size = if tensor_info.ggml_type.is_quantized() {
             // For quantized types, calculate based on quantization scheme
             match tensor_info.ggml_type {
@@ -438,11 +534,16 @@ impl WeightLoader for GGUFLoader {
         };
 
         let mut buffer = vec![0u8; tensor_size as usize];
-        file.read_exact(&mut buffer).await
+        file.read_exact(&mut buffer)
+            .await
             .map_err(|e| FerrumError::io(format!("Failed to read GGUF tensor data: {}", e)))?;
 
-        debug!("Successfully loaded GGUF tensor: {} ({} bytes, type: {:?})", 
-               spec.name, buffer.len(), tensor_info.ggml_type);
+        debug!(
+            "Successfully loaded GGUF tensor: {} ({} bytes, type: {:?})",
+            spec.name,
+            buffer.len(),
+            tensor_info.ggml_type
+        );
 
         Ok(())
     }
@@ -465,7 +566,7 @@ mod tests {
         assert_eq!(GGMLType::F32.to_ferrum_dtype(), DataType::F32);
         assert_eq!(GGMLType::F16.to_ferrum_dtype(), DataType::F16);
         assert_eq!(GGMLType::BF16.to_ferrum_dtype(), DataType::BF16);
-        
+
         // Quantized types should map to F16
         assert_eq!(GGMLType::Q4_0.to_ferrum_dtype(), DataType::F16);
         assert!(GGMLType::Q4_0.is_quantized());
@@ -477,7 +578,7 @@ mod tests {
         assert_eq!(GGMLType::from_type_id(0).unwrap(), GGMLType::F32);
         assert_eq!(GGMLType::from_type_id(1).unwrap(), GGMLType::F16);
         assert_eq!(GGMLType::from_type_id(2).unwrap(), GGMLType::Q4_0);
-        
+
         assert!(GGMLType::from_type_id(999).is_err());
     }
 

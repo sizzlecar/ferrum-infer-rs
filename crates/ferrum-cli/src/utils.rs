@@ -11,7 +11,7 @@ pub fn setup_logging(verbose: bool, quiet: bool) -> Result<()> {
     } else if verbose {
         tracing::Level::DEBUG
     } else {
-        tracing::Level::WARN  // 改为WARN减少噪音
+        tracing::Level::WARN // 改为WARN减少噪音
     };
 
     tracing_subscriber::registry()
