@@ -52,3 +52,30 @@ pub async fn create_default_engine(
     let factory = DefaultEngineFactory::new();
     factory.create_engine(config).await
 }
+
+/// Create MVP engine - alias for create_default_engine
+pub async fn create_mvp_engine(
+    config: EngineConfig,
+) -> Result<Box<dyn InferenceEngineInterface + Send + Sync>> {
+    create_default_engine(config).await
+}
+
+/// Create a simple engine config from minimal parameters
+pub fn simple_engine_config(
+    model_id: impl Into<ferrum_types::ModelId>,
+    device: ferrum_types::Device,
+) -> EngineConfig {
+    use ferrum_types::*;
+    
+    let mut config = EngineConfig::default();
+    config.model.model_id = model_id.into();
+    config.backend.device = device;
+    
+    // Set reasonable defaults for MVP
+    config.batching.max_batch_size = 32;
+    config.kv_cache.block_size = 16;
+    config.kv_cache.max_blocks = 512;
+    config.scheduler.max_running_requests = 32;
+    
+    config
+}

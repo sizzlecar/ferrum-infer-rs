@@ -2,7 +2,7 @@
 //!
 //! Handles loading and parsing of configuration files for the CLI tool.
 
-use ferrum_core::Result;
+use ferrum_types::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -163,7 +163,7 @@ impl CliConfig {
             // Create default config file
             let default_config = Self::default();
             let content = toml::to_string_pretty(&default_config).map_err(|e| {
-                ferrum_core::Error::configuration(format!(
+                ferrum_types::FerrumError::configuration(format!(
                     "Failed to serialize default config: {}",
                     e
                 ))
@@ -171,49 +171,49 @@ impl CliConfig {
 
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).await.map_err(|e| {
-                    ferrum_core::Error::io_str(format!("Failed to create config directory: {}", e))
+                    ferrum_types::FerrumError::io_str(format!("Failed to create config directory: {}", e))
                 })?;
             }
 
             fs::write(path, content).await.map_err(|e| {
-                ferrum_core::Error::io_str(format!("Failed to write default config: {}", e))
+                ferrum_types::FerrumError::io_str(format!("Failed to write default config: {}", e))
             })?;
 
             return Ok(default_config);
         }
 
         let content = fs::read_to_string(path).await.map_err(|e| {
-            ferrum_core::Error::io_str(format!("Failed to read config file: {}", e))
+            ferrum_types::FerrumError::io_str(format!("Failed to read config file: {}", e))
         })?;
 
         toml::from_str(&content).map_err(|e| {
-            ferrum_core::Error::configuration(format!("Failed to parse config: {}", e))
+            ferrum_types::FerrumError::configuration(format!("Failed to parse config: {}", e))
         })
     }
 
     /// Save configuration to file
     pub async fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let content = toml::to_string_pretty(self).map_err(|e| {
-            ferrum_core::Error::configuration(format!("Failed to serialize config: {}", e))
+            ferrum_types::FerrumError::configuration(format!("Failed to serialize config: {}", e))
         })?;
 
         fs::write(path, content)
             .await
-            .map_err(|e| ferrum_core::Error::io_str(format!("Failed to write config file: {}", e)))
+            .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to write config file: {}", e)))
     }
 
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
         // Validate server config
         if self.server.port == 0 {
-            return Err(ferrum_core::Error::configuration(
+            return Err(ferrum_types::FerrumError::configuration(
                 "Server port cannot be 0".to_string(),
             ));
         }
 
         // Validate model config
         if !Path::new(&self.models.model_dir).exists() {
-            return Err(ferrum_core::Error::configuration(format!(
+            return Err(ferrum_types::FerrumError::configuration(format!(
                 "Model directory does not exist: {}",
                 self.models.model_dir
             )));
@@ -221,13 +221,13 @@ impl CliConfig {
 
         // Validate benchmark config
         if self.benchmark.num_requests == 0 {
-            return Err(ferrum_core::Error::configuration(
+            return Err(ferrum_types::FerrumError::configuration(
                 "Number of requests cannot be 0".to_string(),
             ));
         }
 
         if self.benchmark.concurrency == 0 {
-            return Err(ferrum_core::Error::configuration(
+            return Err(ferrum_types::FerrumError::configuration(
                 "Concurrency cannot be 0".to_string(),
             ));
         }

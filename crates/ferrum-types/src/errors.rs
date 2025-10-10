@@ -250,6 +250,28 @@ impl FerrumError {
         }
     }
 
+    // Alias methods for compatibility
+    
+    /// Alias for io() - Create an I/O error from string
+    pub fn io_str(message: impl Into<String>) -> Self {
+        Self::io(message)
+    }
+    
+    /// Alias for config() - Create a configuration error
+    pub fn configuration(message: impl Into<String>) -> Self {
+        Self::config(message)
+    }
+    
+    /// Alias for serialization() - Create a deserialization error
+    pub fn deserialization(message: impl Into<String>) -> Self {
+        Self::serialization(message)
+    }
+    
+    /// Alias for request_validation() - Create an invalid request error
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::request_validation(message)
+    }
+
     /// Check if this is a retryable error
     pub fn is_retryable(&self) -> bool {
         matches!(

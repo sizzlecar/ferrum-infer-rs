@@ -4,7 +4,8 @@ use crate::{client::FerrumClient, config::CliConfig, output::OutputFormat};
 use chrono::Utc;
 use clap::Args;
 use colored::*;
-use ferrum_core::{InferenceEngine, InferenceRequest, Priority, Result, SamplingParams};
+use ferrum_types::{InferenceRequest, Priority, Result, SamplingParams};
+use ferrum_interfaces::engine::InferenceEngine;
 use ferrum_models::ModelSourceResolver;
 use ferrum_server::openai::{ChatCompletionsRequest, ChatMessage, MessageRole};
 use futures::StreamExt;
@@ -72,7 +73,7 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
     } else if let Some(file_path) = cmd.input_file.clone() {
         tokio::fs::read_to_string(&file_path)
             .await
-            .map_err(|e| ferrum_core::Error::io_str(format!("Failed to read input file: {}", e)))?
+            .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to read input file: {}", e)))?
     } else {
         return run_interactive_mode(cmd, config).await;
     };
@@ -82,7 +83,7 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
         .model
         .clone()
         .or(config.models.default_model.clone())
-        .ok_or_else(|| ferrum_core::Error::invalid_request("No model specified".to_string()))?;
+        .ok_or_else(|| ferrum_types::FerrumError::invalid_request("No model specified".to_string()))?;
 
     println!("Model: {}", model.cyan());
     println!("Prompt: {}", prompt.trim().bright_white());
@@ -103,12 +104,14 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
     };
 
     let request = InferenceRequest {
-        id: ferrum_core::RequestId(uuid::Uuid::new_v4()),
-        model_id: ferrum_core::ModelId(model),
+        id: ferrum_types::RequestId(uuid::Uuid::new_v4()),
+        model_id: ferrum_types::ModelId(model),
         prompt,
         sampling_params,
         stream: cmd.stream,
         priority: Priority::Normal,
+        client_id: None,
+        session_id: None,
         created_at: Utc::now(),
         metadata: HashMap::new(),
     };
@@ -129,7 +132,7 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
         tokio::fs::write(&output_path, output_content)
             .await
             .map_err(|e| {
-                ferrum_core::Error::io_str(format!("Failed to write output file: {}", e))
+                ferrum_types::FerrumError::io_str(format!("Failed to write output file: {}", e))
             })?;
 
         println!("{} Output saved to: {}", "💾".green(), output_path.cyan());
@@ -163,7 +166,7 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
 async fn run_local_inference(
     request: &InferenceRequest,
     cmd: &InferCommand,
-) -> Result<ferrum_core::InferenceResponse> {
+) -> Result<ferrum_types::InferenceResponse> {
     info!("Starting local inference with Candle backend");
     println!("{} Starting local inference...", "🔥".bright_yellow());
 
@@ -238,38 +241,41 @@ async fn run_local_inference(
     };
 
     // Create engine configuration with resolved model information
-    let engine_config = ferrum_engine::EngineConfig {
-        max_batch_size: 32,
-        max_sequence_length: model_config.max_position_embeddings.min(2048),
-        num_gpu_blocks: 512,
-        block_size: 16,
-        enable_continuous_batching: false,
-        enable_prefix_caching: false,
-        gpu_memory_fraction: 0.9,
-        scheduling_interval_ms: 10,
-        model_id: resolved_id,
-        device: match cmd.backend.as_str() {
-            "auto" => {
-                if cfg!(all(
-                    feature = "metal",
-                    any(target_os = "macos", target_os = "ios")
-                )) {
+    let device = match cmd.backend.as_str() {
+        "auto" => {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                if cfg!(feature = "metal") {
                     println!(
                         "{} Auto-detected Metal backend for Apple GPU",
                         "🔥".yellow()
                     );
-                    "metal".to_string()
+                    ferrum_types::Device::Metal
                 } else {
                     println!("{} Auto-detected CPU backend", "💻".blue());
-                    "cpu".to_string()
+                    ferrum_types::Device::CPU
                 }
             }
-            backend => {
-                println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
-                backend.to_string()
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                println!("{} Auto-detected CPU backend", "💻".blue());
+                ferrum_types::Device::CPU
             }
-        },
+        }
+        "cpu" => ferrum_types::Device::CPU,
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        "metal" => ferrum_types::Device::Metal,
+        backend if backend.starts_with("cuda:") => {
+            let device_id = backend[5..].parse().unwrap_or(0);
+            ferrum_types::Device::CUDA(device_id)
+        }
+        backend => {
+            println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
+            ferrum_types::Device::CPU
+        }
     };
+    
+    let engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
 
     println!("{} Initializing inference engine...", "⚙️".yellow());
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
@@ -316,18 +322,19 @@ async fn run_local_inference(
         println!("\n{} Generation completed", "🏁".green());
 
         let duration = start_time.elapsed();
-        Ok(ferrum_core::InferenceResponse {
+        Ok(ferrum_types::InferenceResponse {
             request_id: request.id.clone(),
             text: full_text,
             tokens: vec![], // Tokens not available in streaming mode
-            finish_reason: ferrum_core::FinishReason::Length,
-            usage: ferrum_core::TokenUsage {
+            finish_reason: ferrum_types::FinishReason::Length,
+            usage: ferrum_types::TokenUsage {
                 prompt_tokens: 0, // TODO: get from engine
                 completion_tokens: token_count,
                 total_tokens: token_count,
             },
             latency_ms: duration.as_millis() as u64,
             created_at: Utc::now(),
+            metadata: HashMap::new(),
         })
     } else {
         // Use non-streaming inference
@@ -342,7 +349,7 @@ async fn run_local_inference(
 async fn run_remote_inference(
     request: &InferenceRequest,
     url: &str,
-) -> Result<ferrum_core::InferenceResponse> {
+) -> Result<ferrum_types::InferenceResponse> {
     info!("Starting remote inference to server");
     println!(
         "{} Starting remote inference to: {}",
@@ -399,23 +406,24 @@ async fn run_remote_inference(
 
     // Extract token usage info for usage statistics
 
-    Ok(ferrum_core::InferenceResponse {
+    Ok(ferrum_types::InferenceResponse {
         request_id: request.id.clone(),
         text: generated_text,
         tokens: Vec::new(), // Remote doesn't return tokens
-        finish_reason: ferrum_core::FinishReason::Length, // TODO: Parse from response
+        finish_reason: ferrum_types::FinishReason::Length, // TODO: Parse from response
         usage: chat_response
             .usage
-            .map(|u| ferrum_core::TokenUsage {
+            .map(|u| ferrum_types::TokenUsage {
                 prompt_tokens: u.prompt_tokens as usize,
                 completion_tokens: u.completion_tokens as usize,
                 total_tokens: u.total_tokens as usize,
             })
-            .unwrap_or(ferrum_core::TokenUsage {
+            .unwrap_or(ferrum_types::TokenUsage {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
             }),
+        metadata: HashMap::new(),
         latency_ms: 0, // TODO: Calculate latency
         created_at: Utc::now(),
     })
@@ -517,38 +525,41 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
             }
         });
 
-    let engine_config = ferrum_engine::EngineConfig {
-        max_batch_size: 32,
-        max_sequence_length: model_config.max_position_embeddings.min(2048),
-        num_gpu_blocks: 512,
-        block_size: 16,
-        enable_continuous_batching: false,
-        enable_prefix_caching: false,
-        gpu_memory_fraction: 0.9,
-        scheduling_interval_ms: 10,
-        model_id: resolved_id,
-        device: match cmd.backend.as_str() {
-            "auto" => {
-                if cfg!(all(
-                    feature = "metal",
-                    any(target_os = "macos", target_os = "ios")
-                )) {
+    let device = match cmd.backend.as_str() {
+        "auto" => {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                if cfg!(feature = "metal") {
                     println!(
                         "{} Auto-detected Metal backend for Apple GPU",
                         "🔥".yellow()
                     );
-                    "metal".to_string()
+                    ferrum_types::Device::Metal
                 } else {
                     println!("{} Auto-detected CPU backend", "💻".blue());
-                    "cpu".to_string()
+                    ferrum_types::Device::CPU
                 }
             }
-            backend => {
-                println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
-                backend.to_string()
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                println!("{} Auto-detected CPU backend", "💻".blue());
+                ferrum_types::Device::CPU
             }
-        },
+        }
+        "cpu" => ferrum_types::Device::CPU,
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        "metal" => ferrum_types::Device::Metal,
+        backend if backend.starts_with("cuda:") => {
+            let device_id = backend[5..].parse().unwrap_or(0);
+            ferrum_types::Device::CUDA(device_id)
+        }
+        backend => {
+            println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
+            ferrum_types::Device::CPU
+        }
     };
+    
+    let engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
 
     println!("{} Initializing inference engine...", "⚙️".yellow());
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
@@ -599,9 +610,9 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                 );
 
                 // 创建推理请求
-                let request = ferrum_core::InferenceRequest {
-                    id: ferrum_core::RequestId(Uuid::new_v4()),
-                    model_id: ferrum_core::ModelId(
+                let request = ferrum_types::InferenceRequest {
+                    id: ferrum_types::RequestId(Uuid::new_v4()),
+                    model_id: ferrum_types::ModelId(
                         cmd.model
                             .clone()
                             .or(config.models.default_model.clone())
@@ -624,10 +635,27 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                             "\n\n".to_string(),
                         ],
                         seed: None,
+                        min_p: None,
+                        tfs: None,
+                        typical_p: None,
+                        mirostat: None,
                     },
                     priority: Priority::Normal,
                     stream: true, // 始终使用流式输出
+                    client_id: None,
+                    session_id: None,
                     metadata: HashMap::new(),
+                };
+                
+                // Add missing fields to sampling_params
+                let mut sampling_params = request.sampling_params.clone();
+                sampling_params.min_p = None;
+                sampling_params.tfs = None;
+                sampling_params.typical_p = None;
+                sampling_params.mirostat = None;
+                let request = ferrum_types::InferenceRequest {
+                    sampling_params,
+                    ..request
                 };
 
                 println!(

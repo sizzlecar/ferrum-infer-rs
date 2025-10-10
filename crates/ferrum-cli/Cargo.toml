@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 # Core dependencies
 ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
 ferrum-engine = { workspace = true }
 ferrum-models = { workspace = true }
 ferrum-runtime = { workspace = true }

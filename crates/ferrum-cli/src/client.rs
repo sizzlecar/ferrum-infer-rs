@@ -1,7 +1,7 @@
 //! HTTP client for communicating with Ferrum servers
 
 use crate::config::{CliConfig, ClientConfig};
-use ferrum_core::{InferenceRequest, InferenceResponse, Result};
+use ferrum_types::{InferenceRequest, InferenceResponse, Result};
 use ferrum_server::openai::{ChatCompletionsRequest, ChatCompletionsResponse};
 use futures::Stream;
 use reqwest::Client;
@@ -27,7 +27,7 @@ impl FerrumClient {
             .timeout(Duration::from_secs(config.client.timeout_seconds))
             .build()
             .map_err(|e| {
-                ferrum_core::Error::network(format!("Failed to create HTTP client: {}", e))
+                ferrum_types::FerrumError::network(format!("Failed to create HTTP client: {}", e))
             })?;
 
         Ok(Self {
@@ -51,19 +51,19 @@ impl FerrumClient {
         let response = req_builder
             .send()
             .await
-            .map_err(|e| ferrum_core::Error::network(format!("Request failed: {}", e)))?;
+            .map_err(|e| ferrum_types::FerrumError::network(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ferrum_core::Error::network(format!(
+            return Err(ferrum_types::FerrumError::network(format!(
                 "Request failed with status {}: {}",
                 status, body
             )));
         }
 
         let inference_response: InferenceResponse = response.json().await.map_err(|e| {
-            ferrum_core::Error::deserialization(format!("Failed to parse response: {}", e))
+            ferrum_types::FerrumError::deserialization(format!("Failed to parse response: {}", e))
         })?;
 
         Ok(inference_response)
@@ -87,19 +87,19 @@ impl FerrumClient {
         let response = req_builder
             .send()
             .await
-            .map_err(|e| ferrum_core::Error::network(format!("Request failed: {}", e)))?;
+            .map_err(|e| ferrum_types::FerrumError::network(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ferrum_core::Error::network(format!(
+            return Err(ferrum_types::FerrumError::network(format!(
                 "Request failed with status {}: {}",
                 status, body
             )));
         }
 
         let chat_response: ChatCompletionsResponse = response.json().await.map_err(|e| {
-            ferrum_core::Error::deserialization(format!("Failed to parse response: {}", e))
+            ferrum_types::FerrumError::deserialization(format!("Failed to parse response: {}", e))
         })?;
 
         info!("Chat completions request completed successfully");
@@ -124,12 +124,12 @@ impl FerrumClient {
         let response = req_builder
             .send()
             .await
-            .map_err(|e| ferrum_core::Error::network(format!("Request failed: {}", e)))?;
+            .map_err(|e| ferrum_types::FerrumError::network(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ferrum_core::Error::network(format!(
+            return Err(ferrum_types::FerrumError::network(format!(
                 "Request failed with status {}: {}",
                 status, body
             )));
@@ -156,7 +156,7 @@ impl FerrumClient {
 
                     Ok(mock_response)
                 }
-                Err(e) => Err(ferrum_core::Error::network(format!("Stream error: {}", e))),
+                Err(e) => Err(ferrum_types::FerrumError::network(format!("Stream error: {}", e))),
             }
         });
 
@@ -172,18 +172,18 @@ impl FerrumClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| ferrum_core::Error::network(format!("Health check failed: {}", e)))?;
+            .map_err(|e| ferrum_types::FerrumError::network(format!("Health check failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
-            return Err(ferrum_core::Error::network(format!(
+            return Err(ferrum_types::FerrumError::network(format!(
                 "Health check failed with status {}",
                 status
             )));
         }
 
         let health: serde_json::Value = response.json().await.map_err(|e| {
-            ferrum_core::Error::deserialization(format!("Failed to parse health response: {}", e))
+            ferrum_types::FerrumError::deserialization(format!("Failed to parse health response: {}", e))
         })?;
 
         Ok(health)
@@ -195,19 +195,19 @@ impl FerrumClient {
 
         let response =
             self.client.get(&url).send().await.map_err(|e| {
-                ferrum_core::Error::network(format!("Metrics request failed: {}", e))
+                ferrum_types::FerrumError::network(format!("Metrics request failed: {}", e))
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            return Err(ferrum_core::Error::network(format!(
+            return Err(ferrum_types::FerrumError::network(format!(
                 "Metrics request failed with status {}",
                 status
             )));
         }
 
         let metrics: serde_json::Value = response.json().await.map_err(|e| {
-            ferrum_core::Error::deserialization(format!("Failed to parse metrics response: {}", e))
+            ferrum_types::FerrumError::deserialization(format!("Failed to parse metrics response: {}", e))
         })?;
 
         Ok(metrics)
@@ -226,11 +226,11 @@ impl FerrumClient {
         let response = req_builder
             .send()
             .await
-            .map_err(|e| ferrum_core::Error::network(format!("Models request failed: {}", e)))?;
+            .map_err(|e| ferrum_types::FerrumError::network(format!("Models request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
-            return Err(ferrum_core::Error::network(format!(
+            return Err(ferrum_types::FerrumError::network(format!(
                 "Models request failed with status {}",
                 status
             )));
@@ -238,7 +238,7 @@ impl FerrumClient {
 
         let models: ferrum_server::openai::ModelListResponse =
             response.json().await.map_err(|e| {
-                ferrum_core::Error::deserialization(format!(
+                ferrum_types::FerrumError::deserialization(format!(
                     "Failed to parse models response: {}",
                     e
                 ))

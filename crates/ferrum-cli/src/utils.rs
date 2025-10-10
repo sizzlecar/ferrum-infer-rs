@@ -1,7 +1,7 @@
 //! CLI utility functions
 
 use colored::*;
-use ferrum_core::Result;
+use ferrum_types::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Setup logging based on verbosity level
@@ -126,7 +126,7 @@ pub fn confirm_action(message: &str) -> Result<bool> {
         .default(false)
         .interact()
         .map_err(|e| {
-            ferrum_core::Error::io_str(format!("Failed to get user confirmation: {}", e))
+            ferrum_types::FerrumError::io_str(format!("Failed to get user confirmation: {}", e))
         })?;
 
     Ok(result)
@@ -138,7 +138,7 @@ pub fn select_option<T: std::fmt::Display>(prompt: &str, options: &[T]) -> Resul
         .with_prompt(prompt)
         .items(options)
         .interact()
-        .map_err(|e| ferrum_core::Error::io_str(format!("Failed to get user selection: {}", e)))?;
+        .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to get user selection: {}", e)))?;
 
     Ok(selection)
 }
@@ -153,7 +153,7 @@ pub fn get_input(prompt: &str, default: Option<&str>) -> Result<String> {
 
     let result = input
         .interact_text()
-        .map_err(|e| ferrum_core::Error::io_str(format!("Failed to get user input: {}", e)))?;
+        .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to get user input: {}", e)))?;
 
     Ok(result)
 }

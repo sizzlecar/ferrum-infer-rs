@@ -16,11 +16,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use ferrum_core::{
-    Error, FinishReason, InferenceEngine, InferenceRequest, ModelId, Priority, RequestId,
+use ferrum_types::{
+    FerrumError as Error, FinishReason, InferenceRequest, ModelId, Priority, RequestId,
     SamplingParams,
 };
-use ferrum_engine::Engine;
+use ferrum_interfaces::engine::InferenceEngine;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
@@ -31,14 +31,14 @@ use uuid::Uuid;
 
 /// Axum-based server implementation
 pub struct AxumServer {
-    engine: Arc<Engine>,
+    engine: Arc<dyn InferenceEngine + Send + Sync>,
     config: ServerConfig,
     app: Option<Router>,
 }
 
 impl AxumServer {
     /// Create a new Axum server
-    pub fn new(engine: Arc<Engine>) -> Self {
+    pub fn new(engine: Arc<dyn InferenceEngine + Send + Sync>) -> Self {
         Self {
             engine,
             config: ServerConfig::default(),
@@ -73,7 +73,7 @@ impl AxumServer {
 /// Application state shared across handlers
 #[derive(Clone)]
 struct AppState {
-    engine: Arc<Engine>,
+    engine: Arc<dyn InferenceEngine + Send + Sync>,
 }
 
 /// SSE stream sender implementation
@@ -83,20 +83,20 @@ struct SseSender {
 
 #[async_trait]
 impl StreamSender for SseSender {
-    async fn send_chunk(&self, chunk: &str) -> ferrum_core::Result<()> {
+    async fn send_chunk(&self, chunk: &str) -> ferrum_types::Result<()> {
         self.sender
             .send(Ok(Event::default().data(chunk)))
             .map_err(|_| Error::internal("Stream closed"))?;
         Ok(())
     }
 
-    async fn send_json(&self, data: &serde_json::Value) -> ferrum_core::Result<()> {
+    async fn send_json(&self, data: &serde_json::Value) -> ferrum_types::Result<()> {
         let chunk = serde_json::to_string(data)
             .map_err(|e| Error::internal(format!("JSON serialization failed: {}", e)))?;
         self.send_chunk(&chunk).await
     }
 
-    async fn close(&self) -> ferrum_core::Result<()> {
+    async fn close(&self) -> ferrum_types::Result<()> {
         // Channel will be closed when sender is dropped
         Ok(())
     }
@@ -108,7 +108,7 @@ impl StreamSender for SseSender {
 
 #[async_trait]
 impl HttpServer for AxumServer {
-    async fn start(&self, config: &ServerConfig) -> ferrum_core::Result<()> {
+    async fn start(&self, config: &ServerConfig) -> ferrum_types::Result<()> {
         let addr = format!("{}:{}", config.host, config.port);
         info!("Starting Axum server on {}", addr);
 
@@ -126,7 +126,7 @@ impl HttpServer for AxumServer {
         Ok(())
     }
 
-    async fn stop(&self, _timeout: std::time::Duration) -> ferrum_core::Result<()> {
+    async fn stop(&self, _timeout: std::time::Duration) -> ferrum_types::Result<()> {
         info!("Stopping Axum server");
         // Axum doesn't have explicit stop - server stops when task is cancelled
         Ok(())
@@ -359,7 +359,7 @@ async fn handle_chat_completions_sync(
 }
 
 /// Convert OpenAI chat request to internal inference request
-fn convert_chat_request(request: &ChatCompletionsRequest) -> ferrum_core::Result<InferenceRequest> {
+fn convert_chat_request(request: &ChatCompletionsRequest) -> ferrum_types::Result<InferenceRequest> {
     // Combine all messages into a single prompt for MVP
     let prompt = request
         .messages
@@ -382,9 +382,15 @@ fn convert_chat_request(request: &ChatCompletionsRequest) -> ferrum_core::Result
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             stop_sequences: request.stop.clone().unwrap_or_default(),
             seed: request.seed,
+            min_p: None,
+            tfs: None,
+            typical_p: None,
+            mirostat: None,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
+        client_id: None,
+        session_id: None,
         created_at: chrono::Utc::now(),
         metadata: std::collections::HashMap::new(),
     })
@@ -491,5 +497,6 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
         FinishReason::EOS => "stop".to_string(),
         FinishReason::Cancelled => "cancelled".to_string(),
         FinishReason::Error => "error".to_string(),
+        FinishReason::ContentFilter => "content_filter".to_string(),
     }
 }
