@@ -3,7 +3,7 @@
 use crate::{config::CliConfig, output::OutputFormat};
 use clap::Args;
 use colored::*;
-use ferrum_core::Result;
+use ferrum_types::Result;
 use ferrum_models::ModelSourceResolver;
 use ferrum_server::{traits::HttpServer, types::ServerConfig, AxumServer};
 use std::sync::Arc;
@@ -154,48 +154,46 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
     };
 
     // Create engine configuration with model-aware settings
-    let engine_config = ferrum_engine::EngineConfig {
-        max_batch_size: 32,
-        max_sequence_length: model_config.max_position_embeddings.min(2048),
-        num_gpu_blocks: 512,
-        block_size: 16,
-        enable_continuous_batching: false, // Simplified for MVP
-        enable_prefix_caching: false,
-        gpu_memory_fraction: 0.9,
-        scheduling_interval_ms: 10,
-        model_id: resolved_id,
-        device: match cmd.backend.as_str() {
-            "auto" => {
-                if cfg!(all(
-                    feature = "metal",
-                    any(target_os = "macos", target_os = "ios")
-                )) {
+    let device = match cmd.backend.as_str() {
+        "auto" => {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                if cfg!(feature = "metal") {
                     println!(
                         "{} Auto-detected Metal backend for Apple GPU",
                         "🔥".yellow()
                     );
-                    "metal".to_string()
+                    ferrum_types::Device::Metal
                 } else {
                     println!("{} Auto-detected CPU backend", "💻".blue());
-                    "cpu".to_string()
+                    ferrum_types::Device::CPU
                 }
             }
-            backend => {
-                println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
-                backend.to_string()
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                println!("{} Auto-detected CPU backend", "💻".blue());
+                ferrum_types::Device::CPU
             }
-        },
+        }
+        "cpu" => ferrum_types::Device::CPU,
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        "metal" => ferrum_types::Device::Metal,
+        backend if backend.starts_with("cuda:") => {
+            let device_id = backend[5..].parse().unwrap_or(0);
+            ferrum_types::Device::CUDA(device_id)
+        }
+        backend => {
+            println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
+            ferrum_types::Device::CPU
+        }
     };
+    
+    let mut engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
 
     // Initialize engine
     println!("{} Initializing inference engine...", "⚙️".yellow());
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
-
-    // 关键：初始化engine以加载模型
-    engine.initialize().await?;
     println!("{} Engine initialized successfully", "✅".green());
-
-    let engine = Arc::new(engine);
 
     // Create server configuration
     let server_config = ServerConfig {
@@ -215,7 +213,7 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
 
     // Create and start server
     println!("{} Starting HTTP server...", "🌐".blue());
-    let server = AxumServer::new(engine);
+    let server = AxumServer::new(Arc::from(engine));
 
     // This will block until server shuts down
     server.start(&server_config).await?;

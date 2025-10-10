@@ -13,10 +13,15 @@ pub mod tokenizer;
 pub mod weights;
 
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
-pub use definition::{ConfigManager, ModelDefinition};
+pub use definition::{
+    Activation, AttentionConfig, ConfigManager, ModelDefinition, NormType, RopeScaling,
+};
 pub use executor::StubModelExecutor;
-pub use registry::{ModelDiscoveryEntry, ModelRegistry};
-pub use source::{ModelFormat, ModelSourceConfig, ModelSourceResolver, ResolvedModelSource};
+pub use registry::{Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType};
+pub use source::{
+    DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ModelSourceResolver,
+    ResolvedModelSource,
+};
 pub use tokenizer::{TokenizerFactory, TokenizerHandle};
 pub use weights::{default_weight_loader, StubWeightLoader, WeightLoaderHandle};
 

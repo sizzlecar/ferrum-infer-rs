@@ -5,7 +5,7 @@
 
 use crate::types::*;
 use async_trait::async_trait;
-use ferrum_core::{InferenceRequest, InferenceResponse, Result};
+use ferrum_types::{InferenceRequest, InferenceResponse, Result};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -124,7 +124,7 @@ pub trait Middleware: Send + Sync {
     /// Handle middleware errors
     async fn on_error(
         &self,
-        error: &ferrum_core::Error,
+        error: &ferrum_types::FerrumError,
         context: &RequestContext,
     ) -> Option<HttpResponse>;
 
@@ -225,7 +225,7 @@ pub trait MetricsCollector: Send + Sync {
     );
 
     /// Record error metrics
-    async fn record_error(&self, error: &ferrum_core::Error, endpoint: &str);
+    async fn record_error(&self, error: &ferrum_types::FerrumError, endpoint: &str);
 
     /// Get current metrics
     fn get_metrics(&self) -> ServerMetrics;

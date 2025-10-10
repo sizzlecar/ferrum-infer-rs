@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 # Core dependencies
 ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
 ferrum-engine = { workspace = true }
 ferrum-scheduler = { workspace = true }
 async-trait = { workspace = true }

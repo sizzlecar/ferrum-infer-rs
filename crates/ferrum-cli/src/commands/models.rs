@@ -3,7 +3,7 @@
 use crate::{config::CliConfig, output::OutputFormat};
 use clap::Args;
 use colored::*;
-use ferrum_core::Result;
+use ferrum_types::Result;
 use ferrum_models::ModelSourceResolver;
 
 #[derive(Args)]
@@ -68,7 +68,7 @@ pub async fn execute(cmd: ModelsCommand, config: CliConfig, _format: OutputForma
 
     if let Some(alias_name) = cmd.add_alias {
         let target = cmd.alias_target.ok_or_else(|| {
-            ferrum_core::Error::invalid_request(
+            ferrum_types::FerrumError::invalid_request(
                 "--alias-target is required with --add-alias".to_string(),
             )
         })?;

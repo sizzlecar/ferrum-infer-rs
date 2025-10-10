@@ -59,8 +59,8 @@ impl DefaultInferenceEngine {
         debug!("Encoded {} tokens from prompt", prompt_tokens);
 
         // 2. Prepare prefill input
-        let factory = self.model_executor.info().device;
-        let prefill_input = create_prefill_input(&input_tokens, &factory)?;
+        let device = &self.model_executor.info().device;
+        let prefill_input = create_prefill_input(&input_tokens, device)?;
 
         // 3. Execute prefill
         let prefill_output = self.model_executor.prefill(&prefill_input).await?;
@@ -77,7 +77,7 @@ impl DefaultInferenceEngine {
                 extract_last_token_logits(&prefill_output.logits)?
             } else {
                 // Decode step
-                let decode_input = create_decode_input(&generated_tokens, kv_cache.clone(), &factory)?;
+                let decode_input = create_decode_input(&generated_tokens, kv_cache.clone(), device)?;
                 let decode_output = self.model_executor.decode(&decode_input).await?;
                 kv_cache = decode_output.kv_cache.clone();
                 decode_output.logits.clone()
@@ -263,7 +263,7 @@ fn extract_last_token_logits(logits: &ferrum_interfaces::TensorRef) -> Result<fe
 fn sample_token(
     logits: &ferrum_interfaces::TensorRef,
     _params: &SamplingParams,
-    sampler: &Arc<dyn Sampler>,
+    sampler: &Arc<dyn Sampler + Send + Sync>,
     rng: &mut StdRng,
 ) -> Result<TokenId> {
     // MVP: simplified sampling - need to extract logits to Vec<f32>
@@ -275,7 +275,8 @@ fn create_rng(params: &SamplingParams) -> StdRng {
     if let Some(seed) = params.seed {
         StdRng::seed_from_u64(seed)
     } else {
-        StdRng::from_entropy()
+        // Use a default seed for deterministic testing if no seed provided
+        StdRng::seed_from_u64(42)
     }
 }
 
@@ -287,7 +288,7 @@ fn is_stop_token(token: TokenId, vocab_size: usize) -> bool {
 fn check_stop_sequences(
     tokens: &[TokenId],
     params: &SamplingParams,
-    tokenizer: &Arc<dyn Tokenizer>,
+    tokenizer: &Arc<dyn Tokenizer + Send + Sync>,
 ) -> Result<bool> {
     if params.stop_sequences.is_empty() {
         return Ok(false);

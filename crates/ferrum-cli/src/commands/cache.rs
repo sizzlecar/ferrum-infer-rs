@@ -3,7 +3,7 @@
 use crate::{config::CliConfig, output::OutputFormat};
 use clap::Args;
 use colored::*;
-use ferrum_core::Result;
+use ferrum_types::Result;
 
 #[derive(Args)]
 pub struct CacheCommand {

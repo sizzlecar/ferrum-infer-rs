@@ -22,8 +22,8 @@ impl DefaultEngineFactory {
         info!("Creating inference engine with config: {:?}", config.model.model_id);
 
         // 1. Create compute backend
-        let device = config.model.device.clone();
-        let compute_backend = self.create_compute_backend(device).await?;
+        let device = config.backend.device.clone();
+        let compute_backend = self.create_compute_backend(device.clone()).await?;
 
         // 2. Create tokenizer
         let tokenizer = self.create_tokenizer(&config).await?;
@@ -109,10 +109,10 @@ impl DefaultEngineFactory {
 
         let vocab_size = config
             .model
-            .extra_config
-            .get("vocab_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(32000) as usize;
+            .model_info
+            .as_ref()
+            .map(|info| info.vocab_size)
+            .unwrap_or(32000);
 
         let executor = ferrum_models::StubModelExecutor::new(
             config.model.model_id.clone(),
