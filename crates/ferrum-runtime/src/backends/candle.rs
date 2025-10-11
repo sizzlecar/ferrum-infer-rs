@@ -77,6 +77,29 @@ impl TensorLike for CandleTensor {
             .map_err(|e| ferrum_types::FerrumError::backend(format!("DType conversion: {}", e)))?;
         Ok(Arc::new(Self::new(converted)?))
     }
+    
+    fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        // Extract tensor data as Vec<f32>
+        match self.inner.dims().len() {
+            1 => self.inner.to_vec1::<f32>()
+                .map_err(|e| ferrum_types::FerrumError::backend(format!("to_vec1 failed: {}", e))),
+            2 => {
+                let batch = self.inner.to_vec2::<f32>()
+                    .map_err(|e| ferrum_types::FerrumError::backend(format!("to_vec2 failed: {}", e)))?;
+                Ok(batch.into_iter().next().unwrap_or_default())
+            }
+            3 => {
+                let all = self.inner.to_vec3::<f32>()
+                    .map_err(|e| ferrum_types::FerrumError::backend(format!("to_vec3 failed: {}", e)))?;
+                Ok(all.into_iter().next()
+                    .and_then(|seq| seq.into_iter().last())
+                    .unwrap_or_default())
+            }
+            _ => Err(ferrum_types::FerrumError::backend(
+                format!("Unsupported tensor dimensions: {:?}", self.inner.dims())
+            )),
+        }
+    }
 
     fn reshape(&self, shape: &[usize]) -> Result<TensorRef> {
         let reshaped = self

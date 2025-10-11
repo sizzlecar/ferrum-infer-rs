@@ -20,7 +20,7 @@ pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{
     Activation, AttentionConfig, ConfigManager, ModelDefinition, NormType, RopeScaling,
 };
-pub use executor::{CandleModelExecutor, StubModelExecutor};
+pub use executor::{CandleModelExecutor, CandleModelExecutorV2, StubModelExecutor, extract_logits_safe};
 pub use loader::SafeTensorsLoader;
 pub use tensor_wrapper::CandleTensorWrapper;
 pub use registry::{Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType};
