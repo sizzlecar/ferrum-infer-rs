@@ -1,6 +1,6 @@
 //! Inference command implementation
 
-use crate::{client::FerrumClient, config::CliConfig, output::OutputFormat};
+use crate::{chat_template, client::FerrumClient, config::CliConfig, output::OutputFormat};
 use chrono::Utc;
 use clap::Args;
 use colored::*;
@@ -49,9 +49,13 @@ pub struct InferCommand {
     #[arg(long)]
     pub output_file: Option<String>,
 
-    /// Interactive mode for continuous conversation (auto-enabled if no prompt provided)
+    /// Interactive mode for continuous conversation (enabled by default)
     #[arg(short, long)]
     pub interactive: bool,
+    
+    /// One-shot mode (single inference, then exit)
+    #[arg(long)]
+    pub once: bool,
 
     /// Server URL
     #[arg(long)]
@@ -67,7 +71,16 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
     info!("Starting CLI inference command");
     println!("{} Running inference...", "🧠".bright_blue());
 
-    // Determine prompt
+    // Determine if we should enter interactive mode
+    // Default to interactive unless --once is specified or using --url (remote server)
+    let should_be_interactive = !cmd.once && cmd.url.is_none();
+    
+    if should_be_interactive && cmd.input_file.is_none() {
+        // Enter interactive conversation mode
+        return run_interactive_mode(cmd, config).await;
+    }
+    
+    // One-shot mode: execute single inference
     let prompt = if let Some(prompt) = cmd.prompt.clone() {
         prompt
     } else if let Some(file_path) = cmd.input_file.clone() {
@@ -75,7 +88,9 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
             .await
             .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to read input file: {}", e)))?
     } else {
-        return run_interactive_mode(cmd, config).await;
+        return Err(ferrum_types::FerrumError::invalid_request(
+            "Please provide --prompt, --input-file, or enter interactive mode".to_string()
+        ));
     };
 
     // Determine model
@@ -139,7 +154,11 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
     } else {
         // Print to stdout
         println!("\n{}", "📝 Generated Text:".bright_green().bold());
-        println!("{}", result.text.bright_white());
+        if result.text.trim().is_empty() {
+            println!("{}", "(空输出或仅包含空格)".dimmed());
+        } else {
+            println!("{}", result.text.bright_white());
+        }
 
         println!("\n{}", "📊 Statistics:".bright_blue());
         println!(
@@ -591,15 +610,21 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                 // 先添加当前用户输入到历史
                 conversation_history.push(format!("User: {}", input));
 
-                // 构建包含完整历史的prompt
+                // 构建包含完整历史的prompt - 使用 chat template
                 let full_prompt = {
-                    let recent_history = if conversation_history.len() > 6 {
-                        // 保留最近3轮对话（6条消息）
-                        &conversation_history[conversation_history.len() - 6..]
-                    } else {
-                        &conversation_history[..]
-                    };
-                    format!("{}\nAssistant:", recent_history.join("\n"))
+                    // 将历史转换为 (role, content) 格式
+                    let mut history_pairs = Vec::new();
+                    for (i, msg) in conversation_history.iter().enumerate() {
+                        let role = if i % 2 == 0 { "user" } else { "assistant" };
+                        let content = msg.trim_start_matches("User: ")
+                            .trim_start_matches("Assistant: ");
+                        if i < conversation_history.len() - 1 { // 排除当前用户输入
+                            history_pairs.push((role.to_string(), content.to_string()));
+                        }
+                    }
+                    
+                    // 使用 chat template 格式化
+                    chat_template::auto_format_prompt(&resolved_id, &history_pairs, &input)
                 };
 
                 // Debug: 显示完整prompt以便调试

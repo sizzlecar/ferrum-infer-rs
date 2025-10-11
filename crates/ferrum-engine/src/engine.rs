@@ -401,53 +401,17 @@ fn extract_last_token_logits(logits: &ferrum_interfaces::TensorRef) -> Result<fe
 
 fn sample_token(
     logits: &ferrum_interfaces::TensorRef,
-    params: &SamplingParams,
+    _params: &SamplingParams,
     sampler: &Arc<dyn Sampler + Send + Sync>,
     rng: &mut StdRng,
 ) -> Result<TokenId> {
-    use ferrum_models::CandleTensorWrapper;
+    // Use the new to_vec_f32 method from TensorLike trait
+    let logits_vec = logits.to_vec_f32()?;
     
-    // Extract Candle tensor using unsafe cast
-    unsafe {
-        let raw = Arc::as_ptr(logits) as *const CandleTensorWrapper;
-        let wrapper = &*raw;
-        let tensor = wrapper.inner();
-        
-        // Extract logits to Vec<f32>
-        // Logits may be [batch_size, vocab_size] or [batch_size, seq_len, vocab_size]
-        let logits_vec = match tensor.dims().len() {
-            1 => {
-                // Already 1D: [vocab_size]
-                tensor.to_vec1::<f32>()
-                    .map_err(|e| FerrumError::model(format!("Failed to extract 1D logits: {}", e)))?
-            }
-            2 => {
-                // 2D: [batch_size, vocab_size] - take first batch
-                let batch_logits = tensor.to_vec2::<f32>()
-                    .map_err(|e| FerrumError::model(format!("Failed to extract 2D logits: {}", e)))?;
-                batch_logits.into_iter().next().unwrap_or_default()
-            }
-            3 => {
-                // 3D: [batch_size, seq_len, vocab_size] - take last token of first batch
-                let all_logits = tensor.to_vec3::<f32>()
-                    .map_err(|e| FerrumError::model(format!("Failed to extract 3D logits: {}", e)))?;
-                all_logits.into_iter().next()
-                    .and_then(|seq| seq.into_iter().last())
-                    .unwrap_or_default()
-            }
-            _ => {
-                return Err(FerrumError::model(format!(
-                    "Unexpected logits shape: {:?}",
-                    tensor.dims()
-                )));
-            }
-        };
-        
-        // Use sampler to get next token
-        let token_id = sampler.sample(&logits_vec, rng)?;
-        
-        Ok(token_id)
-    }
+    // Sample token
+    let token_id = sampler.sample(&logits_vec, rng)?;
+    
+    Ok(token_id)
 }
 
 fn create_rng(params: &SamplingParams) -> StdRng {
