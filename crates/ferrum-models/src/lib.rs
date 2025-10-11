@@ -4,23 +4,25 @@
 //! 提供模型定义解析、构建器与权重加载占位实现，确保上层可以在
 //! 重构阶段编译。
 
-// pub mod architectures;  // TODO: Complete implementation
+pub mod architectures;
 pub mod builder;
 pub mod definition;
 pub mod executor;
-// pub mod loader;  // TODO: Complete implementation
+pub mod loader;
 pub mod registry;
 pub mod source;
+pub mod tensor_wrapper;
 pub mod tokenizer;
 pub mod weights;
 
-// pub use architectures::LlamaModelWrapper;
+pub use architectures::LlamaModelWrapper;
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{
     Activation, AttentionConfig, ConfigManager, ModelDefinition, NormType, RopeScaling,
 };
-pub use executor::StubModelExecutor;
-// pub use loader::SafeTensorsLoader;
+pub use executor::{CandleModelExecutor, StubModelExecutor};
+pub use loader::SafeTensorsLoader;
+pub use tensor_wrapper::CandleTensorWrapper;
 pub use registry::{Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType};
 pub use source::{
     DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ModelSourceResolver,
