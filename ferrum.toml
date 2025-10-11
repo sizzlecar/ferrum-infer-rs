@@ -18,7 +18,9 @@ default_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 [models.aliases]
 
 [models.download]
-hf_cache_dir = "./hf_cache"
+# 使用 HuggingFace 标准缓存目录（与 Python transformers 库共享）
+# 支持环境变量 HF_HOME 覆盖
+hf_cache_dir = "~/.cache/huggingface"
 timeout_seconds = 300
 max_concurrent = 4
 retry_attempts = 3

@@ -145,13 +145,18 @@ impl DefaultModelRegistry {
         
         let mut discovered = Vec::new();
         
-        // Scan directory for model directories
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(model_entry) = self.inspect_model_dir(&path).await {
-                        discovered.push(model_entry);
+        // First check if root itself is a model directory
+        if let Some(model_entry) = self.inspect_model_dir(root).await {
+            discovered.push(model_entry);
+        } else {
+            // Otherwise scan subdirectories
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(model_entry) = self.inspect_model_dir(&path).await {
+                            discovered.push(model_entry);
+                        }
                     }
                 }
             }
@@ -166,24 +171,53 @@ impl DefaultModelRegistry {
         // Check for config.json
         let config_path = path.join("config.json");
         if !config_path.exists() {
+            debug!("No config.json in: {:?}", path);
             return None;
         }
         
         // Detect format
         let format = self.detect_model_format(path);
         if format == ModelFormatType::Unknown {
+            debug!("Unknown format in: {:?}", path);
             return None;
         }
+        
+        debug!("Found valid model at: {:?}, format: {:?}", path, format);
         
         // Try to read architecture from config
         let architecture = self.read_architecture(&config_path);
         
-        // Extract model ID from path
-        let id = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        // Extract model ID from path - try to get friendly name from parent directory
+        let id = if let Some(parent) = path.parent() {
+            if let Some(grandparent) = parent.parent() {
+                // Extract from models--org--name format
+                if let Some(name) = grandparent.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("models--") {
+                        name[8..].replace("--", "/")
+                    } else {
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    }
+                } else {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                }
+            } else {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            }
+        } else {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        };
         
         Some(ModelDiscoveryEntry {
             id,

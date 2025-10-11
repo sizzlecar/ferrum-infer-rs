@@ -275,8 +275,12 @@ impl Default for ModelCliConfig {
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            hf_cache_dir: dirs::cache_dir()
-                .map(|p| p.join("huggingface").to_string_lossy().to_string())
+            hf_cache_dir: std::env::var("HF_HOME")
+                .ok()
+                .or_else(|| {
+                    dirs::home_dir()
+                        .map(|h| h.join(".cache/huggingface").to_string_lossy().to_string())
+                })
                 .unwrap_or_else(|| "./hf_cache".to_string()),
             timeout_seconds: 300,
             max_concurrent: 4,
