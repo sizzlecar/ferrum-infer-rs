@@ -25,3 +25,9 @@ target
 # Added by cargo
 
 /target
+
+/hf_cache
+DOWNLOAD_PROGRESS_IMPROVEMENT.md
+.gitignore
+IMPLEMENTATION_SUMMARY.md
+QUICKSTART.md

@@ -1,36 +1,38 @@
-//! Model source resolution and downloading
-//!
-//! Supports multiple model sources:
-//! - HuggingFace Hub (with authentication)
-//! - Local filesystem paths
-//! - HTTP/HTTPS URLs
+//! Model source resolution and downloading with progress tracking
 
 use ferrum_types::{FerrumError, ModelSource, Result};
 use hf_hub::api::tokio::{Api, ApiBuilder, ApiRepo};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Configuration for model source resolution
 #[derive(Debug, Clone)]
 pub struct ModelSourceConfig {
-    /// Cache directory for downloaded models
     pub cache_dir: Option<PathBuf>,
-    /// HuggingFace API token
     pub hf_token: Option<String>,
-    /// Offline mode - only use cached models
     pub offline_mode: bool,
-    /// Maximum retries for downloads
     pub max_retries: usize,
-    /// Download timeout in seconds
     pub download_timeout: u64,
-    /// Use file locks during downloads
     pub use_file_lock: bool,
 }
 
 impl Default for ModelSourceConfig {
     fn default() -> Self {
+        // Use HuggingFace standard cache directory
+        let default_cache = std::env::var("HF_HOME")
+            .ok()
+            .or_else(|| {
+                dirs::home_dir()
+                    .map(|h| h.join(".cache/huggingface"))
+                    .and_then(|p| p.to_str().map(String::from))
+            })
+            .map(PathBuf::from);
+        
         Self {
-            cache_dir: None,
+            cache_dir: default_cache,
             hf_token: Self::get_hf_token(),
             offline_mode: false,
             max_retries: 3,
@@ -41,7 +43,6 @@ impl Default for ModelSourceConfig {
 }
 
 impl ModelSourceConfig {
-    /// Get HuggingFace token from environment
     pub fn get_hf_token() -> Option<String> {
         std::env::var("HF_TOKEN")
             .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
@@ -49,29 +50,19 @@ impl ModelSourceConfig {
     }
 }
 
-/// Model file format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFormat {
-    /// SafeTensors format (preferred)
     SafeTensors,
-    /// PyTorch .bin files
     PyTorchBin,
-    /// GGUF format (quantized)
     GGUF,
-    /// Unknown/unsupported format
     Unknown,
 }
 
-/// Resolved model source with local path
 #[derive(Debug, Clone)]
 pub struct ResolvedModelSource {
-    /// Original model identifier
     pub original: String,
-    /// Local path to model files
     pub local_path: PathBuf,
-    /// Detected model format
     pub format: ModelFormat,
-    /// Whether loaded from cache
     pub from_cache: bool,
 }
 
@@ -81,18 +72,11 @@ impl From<ResolvedModelSource> for ModelSource {
     }
 }
 
-/// Trait for model source resolution
 #[async_trait::async_trait]
 pub trait ModelSourceResolver: Send + Sync {
-    /// Resolve a model identifier to a local path
-    ///
-    /// # Arguments
-    /// * `id` - Model identifier (HF repo, local path, etc.)
-    /// * `revision` - Optional git revision/branch/tag
     async fn resolve(&self, id: &str, revision: Option<&str>) -> Result<ResolvedModelSource>;
 }
 
-/// Default implementation using HuggingFace Hub
 pub struct DefaultModelSourceResolver {
     config: ModelSourceConfig,
     api: Api,
@@ -102,66 +86,43 @@ impl DefaultModelSourceResolver {
     pub fn new(config: ModelSourceConfig) -> Self {
         let mut builder = ApiBuilder::new();
         
-        // Set cache directory
         if let Some(cache_dir) = &config.cache_dir {
             builder = builder.with_cache_dir(cache_dir.clone());
         }
         
-        // Set API token
         if let Some(token) = &config.hf_token {
             builder = builder.with_token(Some(token.clone()));
         }
         
         let api = builder.build().unwrap_or_else(|e| {
-            warn!("Failed to build HF API with custom config: {}, using default", e);
+            warn!("Failed to build HF API: {}, using default", e);
             Api::new().expect("Failed to create default HF API")
         });
         
         Self { config, api }
     }
     
-    /// Check if path is a local directory
     fn is_local_path(id: &str) -> bool {
         Path::new(id).exists()
     }
     
-    /// Detect model format from directory
     fn detect_format(path: &Path) -> ModelFormat {
         if path.join("model.safetensors").exists() 
-            || path.join("model-00001-of-00001.safetensors").exists()
-            || std::fs::read_dir(path)
-                .ok()
-                .and_then(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .find(|e| e.path().extension().and_then(|s| s.to_str()) == Some("safetensors"))
-                })
-                .is_some()
+            || path.join("model.safetensors.index.json").exists()
         {
             ModelFormat::SafeTensors
         } else if path.join("pytorch_model.bin").exists() {
             ModelFormat::PyTorchBin
-        } else if std::fs::read_dir(path)
-            .ok()
-            .and_then(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .find(|e| e.path().extension().and_then(|s| s.to_str()) == Some("gguf"))
-            })
-            .is_some()
-        {
-            ModelFormat::GGUF
         } else {
             ModelFormat::Unknown
         }
     }
     
-    /// Resolve from local filesystem
     async fn resolve_local(&self, path: &str) -> Result<ResolvedModelSource> {
         let path_buf = PathBuf::from(path);
         
         if !path_buf.exists() {
-            return Err(FerrumError::model(format!("Model path does not exist: {}", path)));
+            return Err(FerrumError::model(format!("Path does not exist: {}", path)));
         }
         
         let format = Self::detect_format(&path_buf);
@@ -174,13 +135,87 @@ impl DefaultModelSourceResolver {
         })
     }
     
-    /// Resolve from HuggingFace Hub
+    /// Download file with progress monitoring
+    async fn download_with_monitor(
+        &self,
+        repo: &ApiRepo,
+        filename: &str,
+        expected_cache_dir: &Path,
+    ) -> Result<PathBuf> {
+        info!("📥 下载中: {}...", filename);
+        
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+        let filename_str = filename.to_string();
+        
+        // Start monitor task
+        let monitor_task = tokio::spawn({
+            let done = done.clone();
+            let filename = filename_str.clone();
+            let cache_dir = expected_cache_dir.to_path_buf();
+            
+            async move {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                
+                let start_time = Instant::now();
+                let mut last_size = 0u64;
+                let mut last_time = Instant::now();
+                let mut last_print = Instant::now();
+                
+                while !done.load(Ordering::SeqCst) {
+                    // Try to find downloading file
+                    if let Some(current_size) = find_downloading_file(&cache_dir, &filename) {
+                        let elapsed_since_last = last_time.elapsed().as_secs_f64();
+                        
+                        if elapsed_since_last > 0.5 && current_size > last_size {
+                            let delta = current_size - last_size;
+                            let speed_mbps = delta as f64 / elapsed_since_last / 1024.0 / 1024.0;
+                            let current_mb = current_size as f64 / 1024.0 / 1024.0;
+                            
+                            // Only print every 2 seconds to avoid spam
+                            if last_print.elapsed().as_secs() >= 2 {
+                                info!("  📊 已下载: {:.2} MB (速度: {:.1} MB/s)", current_mb, speed_mbps);
+                                last_print = Instant::now();
+                            }
+                            
+                            last_size = current_size;
+                            last_time = Instant::now();
+                        }
+                    }
+                    
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                
+                // Final statistics
+                let total_time = start_time.elapsed().as_secs_f64();
+                if last_size > 0 && total_time > 0.0 {
+                    let avg_speed = last_size as f64 / total_time / 1024.0 / 1024.0;
+                    info!("  ✅ 下载完成: {:.2} MB (平均速度: {:.1} MB/s, 耗时: {:.1}s)", 
+                        last_size as f64 / 1024.0 / 1024.0, avg_speed, total_time);
+                }
+            }
+        });
+        
+        // Do the actual download (blocking, but monitored)
+        let path = repo.get(&filename_str)
+            .await
+            .map_err(|e| FerrumError::model(format!("Download failed: {}", e)))?;
+        
+        // Signal completion
+        done_clone.store(true, Ordering::SeqCst);
+        
+        // Wait for monitor to finish
+        let _ = monitor_task.await;
+        
+        Ok(path)
+    }
+    
     async fn resolve_huggingface(
         &self,
         repo_id: &str,
         revision: Option<&str>,
     ) -> Result<ResolvedModelSource> {
-        info!("Resolving HuggingFace model: {}", repo_id);
+        info!("🔍 正在解析模型: {}", repo_id);
         
         let repo = if let Some(rev) = revision {
             self.api.repo(hf_hub::Repo::with_revision(
@@ -195,21 +230,23 @@ impl DefaultModelSourceResolver {
             ))
         };
         
-        // Try to download essential files
-        debug!("Downloading config.json...");
+        // Download config first (small file, no need for progress)
+        info!("📥 下载中: config.json...");
         let config_path = repo
             .get("config.json")
             .await
-            .map_err(|e| FerrumError::model(format!("Failed to download config.json: {}", e)))?;
+            .map_err(|e| FerrumError::model(format!("Failed to download config: {}", e)))?;
+        
+        info!("✅ config.json 下载完成");
         
         let model_dir = config_path
             .parent()
             .ok_or_else(|| FerrumError::model("Invalid cache path"))?
             .to_path_buf();
         
-        debug!("Model cached at: {:?}", model_dir);
+        info!("📁 缓存目录: {:?}", model_dir);
         
-        // Try to detect and download model weights
+        // Download weights
         let format = self.download_weights(&repo, &model_dir).await?;
         
         Ok(ResolvedModelSource {
@@ -220,66 +257,159 @@ impl DefaultModelSourceResolver {
         })
     }
     
-    /// Download model weights
-    async fn download_weights(&self, repo: &ApiRepo, model_dir: &Path) -> Result<ModelFormat> {
-        // Try SafeTensors first (preferred)
-        if let Ok(_) = repo.get("model.safetensors").await {
-            info!("Downloaded model.safetensors");
-            return Ok(ModelFormat::SafeTensors);
+    async fn download_weights(
+        &self,
+        repo: &ApiRepo,
+        model_dir: &Path,
+    ) -> Result<ModelFormat> {
+        // Try SafeTensors single file
+        info!("🔍 检查 model.safetensors...");
+        match self.download_with_monitor(repo, "model.safetensors", model_dir).await {
+            Ok(path) => {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    info!("✅ model.safetensors 完成 ({:.2} GB)", metadata.len() as f64 / 1e9);
+                }
+                return Ok(ModelFormat::SafeTensors);
+            }
+            Err(e) => debug!("model.safetensors not found: {}", e),
         }
         
         // Try sharded SafeTensors
-        if let Ok(_) = repo.get("model.safetensors.index.json").await {
-            info!("Found sharded SafeTensors model");
-            // Download all shards
-            if let Ok(index_path) = repo.get("model.safetensors.index.json").await {
-                if let Ok(index_content) = std::fs::read_to_string(&index_path) {
-                    if let Ok(index) = serde_json::from_str::<serde_json::Value>(&index_content) {
-                        if let Some(weight_map) = index.get("weight_map").and_then(|w| w.as_object()) {
-                            let shard_files: std::collections::HashSet<_> = weight_map
-                                .values()
-                                .filter_map(|v| v.as_str())
-                                .collect();
-                            
-                            for shard in shard_files {
-                                debug!("Downloading shard: {}", shard);
-                                repo.get(shard).await.map_err(|e| {
-                                    FerrumError::model(format!("Failed to download shard {}: {}", shard, e))
-                                })?;
-                            }
+        info!("🔍 检查分片模型...");
+        match repo.get("model.safetensors.index.json").await {
+            Ok(index_path) => {
+                info!("✅ 发现分片 SafeTensors 模型");
+                
+                let content = std::fs::read_to_string(&index_path)
+                    .map_err(|e| FerrumError::io(format!("Failed to read index: {}", e)))?;
+                
+                let index: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|e| FerrumError::model(format!("Failed to parse index: {}", e)))?;
+                
+                if let Some(weight_map) = index.get("weight_map").and_then(|w| w.as_object()) {
+                    let shards: std::collections::HashSet<_> = weight_map
+                        .values()
+                        .filter_map(|v| v.as_str())
+                        .collect();
+                    
+                    let total = shards.len();
+                    info!("📦 需要下载 {} 个分片", total);
+                    
+                    let mut total_bytes = 0u64;
+                    for (i, shard) in shards.iter().enumerate() {
+                        info!("📥 [{}/{}] {}", i + 1, total, shard);
+                        
+                        let shard_path = self.download_with_monitor(repo, shard, model_dir).await?;
+                        
+                        if let Ok(meta) = std::fs::metadata(&shard_path) {
+                            let size = meta.len();
+                            total_bytes += size;
+                            info!("📊 进度: [{}/{}] 分片, 累计 {:.2} GB", 
+                                i + 1, total, total_bytes as f64 / 1e9);
                         }
                     }
+                    
+                    info!("🎉 全部下载完成! 总大小: {:.2} GB", total_bytes as f64 / 1e9);
                 }
+                
+                return Ok(ModelFormat::SafeTensors);
             }
-            return Ok(ModelFormat::SafeTensors);
+            Err(e) => debug!("Sharded model not found: {}", e),
         }
         
-        // Try PyTorch .bin format
-        if let Ok(_) = repo.get("pytorch_model.bin").await {
-            warn!("Using PyTorch .bin format (SafeTensors preferred)");
-            return Ok(ModelFormat::PyTorchBin);
+        // Try PyTorch
+        info!("🔍 检查 pytorch_model.bin...");
+        match self.download_with_monitor(repo, "pytorch_model.bin", model_dir).await {
+            Ok(path) => {
+                warn!("⚠️  使用 PyTorch 格式 (推荐使用 SafeTensors)");
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    info!("✅ pytorch_model.bin 完成 ({:.2} GB)", meta.len() as f64 / 1e9);
+                }
+                return Ok(ModelFormat::PyTorchBin);
+            }
+            Err(e) => debug!("pytorch_model.bin not found: {}", e),
         }
         
-        // Check for GGUF
         if Self::detect_format(model_dir) == ModelFormat::GGUF {
             return Ok(ModelFormat::GGUF);
         }
         
-        Err(FerrumError::model(
-            "No supported model format found (expected SafeTensors or PyTorch .bin)",
-        ))
+        Err(FerrumError::model("未找到支持的模型格式"))
     }
+}
+
+/// Find downloading file in cache directory
+fn find_downloading_file(cache_dir: &Path, _filename: &str) -> Option<u64> {
+    // Just search for ANY .part file in the cache directory tree
+    // This is more reliable than trying to match filenames
+    
+    // Check blobs directory
+    if let Ok(entries) = std::fs::read_dir(cache_dir.join("blobs")) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            
+            if path_str.ends_with(".part") || path_str.contains(".sync.part") {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    return Some(metadata.len());
+                }
+            }
+        }
+    }
+    
+    // Also try to find in parent directories
+    let mut current = cache_dir.to_path_buf();
+    for _ in 0..3 {
+        if let Ok(entries) = std::fs::read_dir(&current) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.path().is_dir() {
+                    if let Some(size) = scan_dir_for_part_files(&entry.path()) {
+                        return Some(size);
+                    }
+                }
+            }
+        }
+        
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    
+    None
+}
+
+/// Recursively scan directory for .part files
+fn scan_dir_for_part_files(dir: &Path) -> Option<u64> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            
+            if path_str.ends_with(".part") || path_str.contains(".sync.part") {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    return Some(metadata.len());
+                }
+            }
+            
+            if path.is_dir() {
+                if let Some(size) = scan_dir_for_part_files(&path) {
+                    return Some(size);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[async_trait::async_trait]
 impl ModelSourceResolver for DefaultModelSourceResolver {
     async fn resolve(&self, id: &str, revision: Option<&str>) -> Result<ResolvedModelSource> {
-        // Check if it's a local path
         if Self::is_local_path(id) {
             return self.resolve_local(id).await;
         }
         
-        // Otherwise treat as HuggingFace repo
         self.resolve_huggingface(id, revision).await
     }
 }
