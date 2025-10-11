@@ -163,3 +163,74 @@ impl std::fmt::Debug for DefaultKvCacheManager {
             .finish()
     }
 }
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_allocation_request() -> AllocationRequest {
+        AllocationRequest {
+            request_id: RequestId::new(),
+            initial_tokens: 10,
+            max_sequence_length: 100,
+            num_layers: 32,
+            num_heads: 32,
+            head_dim: 128,
+            device: Device::CPU,
+            dtype: DataType::FP16,
+            priority: ferrum_types::Priority::Normal,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_manager_creation() {
+        let manager = DefaultKvCacheManager::new(Device::CPU, 16, 100);
+        assert!(manager.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allocate_and_deallocate() {
+        let manager = DefaultKvCacheManager::new(Device::CPU, 16, 100).unwrap();
+        let request = create_test_allocation_request();
+        let request_id = request.request_id.clone();
+
+        let handle = manager.allocate(&request).await.unwrap();
+        assert!(handle.is_valid());
+
+        let result = manager.deallocate(request_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_can_allocate() {
+        let manager = DefaultKvCacheManager::new(Device::CPU, 16, 10).unwrap();
+        let request = create_test_allocation_request();
+
+        assert!(manager.can_allocate(&request));
+    }
+
+    #[tokio::test]
+    async fn test_stats() {
+        let manager = DefaultKvCacheManager::new(Device::CPU, 16, 100).unwrap();
+        let stats = manager.stats();
+        
+        assert_eq!(stats.active_caches, 0);
+        assert_eq!(stats.total_blocks, 100);
+    }
+
+    #[tokio::test]
+    async fn test_get_handle() {
+        let manager = DefaultKvCacheManager::new(Device::CPU, 16, 100).unwrap();
+        let request = create_test_allocation_request();
+        let request_id = request.request_id.clone();
+
+        manager.allocate(&request).await.unwrap();
+
+        let handle = manager.get_handle(request_id);
+        assert!(handle.is_some());
+    }
+}

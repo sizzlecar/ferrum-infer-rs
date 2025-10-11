@@ -358,15 +358,15 @@ mod tests {
 
     #[test]
     fn test_block_pool_creation() {
-        let pool = BlockPool::new(Device::Cpu, 16, DataType::F16, 100).unwrap();
+        let pool = BlockPool::new(Device::CPU, 16, DataType::FP16, 100).unwrap();
 
         assert_eq!(pool.block_size(), 16);
-        assert_eq!(pool.device(), &Device::Cpu);
+        assert_eq!(pool.device(), &Device::CPU);
     }
 
     #[test]
     fn test_block_allocation() {
-        let pool = BlockPool::new(Device::Cpu, 16, DataType::F16, 100).unwrap();
+        let pool = BlockPool::new(Device::CPU, 16, DataType::FP16, 100).unwrap();
 
         let allocation = pool.allocate().unwrap();
         assert_eq!(allocation.physical_id, PhysicalBlockId::new(0));
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_block_deallocation() {
-        let pool = BlockPool::new(Device::Cpu, 16, DataType::F16, 100).unwrap();
+        let pool = BlockPool::new(Device::CPU, 16, DataType::FP16, 100).unwrap();
 
         let allocation = pool.allocate().unwrap();
         let block_id = allocation.physical_id;
@@ -392,9 +392,9 @@ mod tests {
     #[test]
     fn test_pool_exhaustion() {
         let pool = BlockPool::new(
-            Device::Cpu,
+            Device::CPU,
             16,
-            DataType::F16,
+            DataType::FP16,
             1, // Only 1 block allowed
         )
         .unwrap();
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_block_reuse() {
-        let pool = BlockPool::new(Device::Cpu, 16, DataType::F16, 100).unwrap();
+        let pool = BlockPool::new(Device::CPU, 16, DataType::FP16, 100).unwrap();
 
         // Allocate and deallocate
         let allocation = pool.allocate().unwrap();

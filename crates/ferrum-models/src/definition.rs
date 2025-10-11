@@ -1,41 +1,13 @@
 //! Model definition and configuration parsing
 
 use crate::{registry::Architecture, source::ResolvedModelSource};
-use ferrum_types::{FerrumError, ModelInfo, ModelType, Result};
+use ferrum_types::{
+    Activation, AttentionConfig, FerrumError, ModelInfo, ModelType, NormType, Result, RopeScaling,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, warn};
-
-/// Normalization type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NormType {
-    LayerNorm,
-    RMSNorm,
-}
-
-/// Activation function type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Activation {
-    GELU,
-    SiLU,
-    ReLU,
-    Swish,
-}
-
-/// Attention configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttentionConfig {
-    pub attention_bias: bool,
-    pub sliding_window: Option<usize>,
-}
-
-/// RoPE scaling configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RopeScaling {
-    pub scaling_type: String,
-    pub factor: f32,
-}
 
 /// Model definition from config.json
 #[derive(Debug, Clone, Serialize, Deserialize)]

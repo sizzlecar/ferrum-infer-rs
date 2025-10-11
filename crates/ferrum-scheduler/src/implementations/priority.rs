@@ -477,30 +477,30 @@ impl Scheduler for PriorityScheduler {
 
             // Only allow preempting Low and Medium priority requests
             if matches!(priority, Priority::Low | Priority::Normal) {
-                let removed_req = running_requests.remove(&request_id).unwrap();
+                if let Some(removed_req) = running_requests.remove(&request_id) {
+                    // Move back to waiting queue with updated priority
+                    let mut waiting_queue = self.waiting_queue.write();
+                    let mut request_map = self.request_map.write();
 
-                // Move back to waiting queue with updated priority
-                let mut waiting_queue = self.waiting_queue.write();
-                let mut request_map = self.request_map.write();
+                    let mut preempted_req = removed_req;
+                    preempted_req.state = RequestState::Waiting;
+                    preempted_req.started_at = None;
 
-                let mut preempted_req = removed_req;
-                preempted_req.state = RequestState::Waiting;
-                preempted_req.started_at = None;
+                    let request_priority = RequestPriority::new(priority, preempted_req.submitted_at);
+                    waiting_queue.push(request_id.clone(), request_priority);
+                    request_map.insert(request_id.clone(), preempted_req);
 
-                let request_priority = RequestPriority::new(priority, preempted_req.submitted_at);
-                waiting_queue.push(request_id.clone(), request_priority);
-                request_map.insert(request_id.clone(), preempted_req);
+                    warn!(
+                        "Preempted request {} with priority {:?}",
+                        request_id, priority
+                    );
 
-                warn!(
-                    "Preempted request {} with priority {:?}",
-                    request_id, priority
-                );
-
-                return Ok(PreemptionResult {
-                    success: true,
-                    saved_state: None, // Simplified - no state saving in this implementation
-                    freed_resources: Default::default(),
-                });
+                    return Ok(PreemptionResult {
+                        success: true,
+                        saved_state: None, // Simplified - no state saving in this implementation
+                        freed_resources: Default::default(),
+                    });
+                }
             }
         }
 

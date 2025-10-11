@@ -398,7 +398,7 @@ pub struct ExecutorConfig {
     /// Maximum sequence length
     pub max_sequence_length: usize,
     /// Attention configuration
-    pub attention_config: AttentionConfig,
+    pub attention_config: ExecutorAttentionConfig,
     /// Memory configuration
     pub memory_config: ExecutorMemoryConfig,
     /// Optimization settings
@@ -407,9 +407,13 @@ pub struct ExecutorConfig {
     pub executor_options: HashMap<String, serde_json::Value>,
 }
 
-/// Attention mechanism configuration
+/// Runtime attention configuration for model executor
+/// 
+/// Note: This is different from ferrum_types::AttentionConfig which describes
+/// the model architecture's attention configuration from config.json.
+/// This type describes the runtime execution settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttentionConfig {
+pub struct ExecutorAttentionConfig {
     /// Type of attention to use
     pub attention_type: AttentionType,
     /// Enable flash attention if available

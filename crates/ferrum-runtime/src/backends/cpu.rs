@@ -408,7 +408,7 @@ impl CpuBackend {
     pub fn new() -> Self {
         let memory_manager = Arc::new(crate::memory::MemoryPool::new(
             Device::CPU,
-            crate::memory::MemoryPoolConfig::default(),
+            crate::memory::InternalMemoryPoolConfig::default(),
         ));
 
         Self {

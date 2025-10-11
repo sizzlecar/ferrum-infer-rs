@@ -28,12 +28,16 @@ pub struct MemoryPool {
     total_allocated: Mutex<usize>,
     peak_allocated: Mutex<usize>,
     allocation_count: Mutex<u64>,
-    config: MemoryPoolConfig,
+    config: InternalMemoryPoolConfig,
 }
 
-/// Memory pool configuration
+/// Internal memory pool configuration for runtime implementation
+/// 
+/// Note: This is distinct from ferrum_interfaces::memory::MemoryPoolConfig which
+/// defines the interface-level configuration. This type contains implementation-specific
+/// details for the memory pool.
 #[derive(Debug, Clone)]
-pub struct MemoryPoolConfig {
+pub struct InternalMemoryPoolConfig {
     /// Initial pool size in bytes
     pub initial_size: usize,
     /// Maximum pool size in bytes  
@@ -50,7 +54,7 @@ pub struct MemoryPoolConfig {
     pub size_buckets: usize,
 }
 
-impl Default for MemoryPoolConfig {
+impl Default for InternalMemoryPoolConfig {
     fn default() -> Self {
         Self {
             initial_size: 256 * 1024 * 1024,  // 256MB
@@ -66,7 +70,7 @@ impl Default for MemoryPoolConfig {
 
 impl MemoryPool {
     /// Create new memory pool
-    pub fn new(device: Device, config: MemoryPoolConfig) -> Self {
+    pub fn new(device: Device, config: InternalMemoryPoolConfig) -> Self {
         Self {
             device,
             blocks: Mutex::new(VecDeque::new()),

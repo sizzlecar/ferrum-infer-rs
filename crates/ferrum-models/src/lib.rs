@@ -17,9 +17,7 @@ pub mod weights;
 
 pub use architectures::LlamaModelWrapper;
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
-pub use definition::{
-    Activation, AttentionConfig, ConfigManager, ModelDefinition, NormType, RopeScaling,
-};
+pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{CandleModelExecutor, CandleModelExecutorV2, StubModelExecutor, extract_logits_safe};
 pub use loader::SafeTensorsLoader;
 pub use tensor_wrapper::CandleTensorWrapper;
@@ -32,4 +30,4 @@ pub use tokenizer::{TokenizerFactory, TokenizerHandle};
 pub use weights::{default_weight_loader, StubWeightLoader, WeightLoaderHandle};
 
 pub use ferrum_interfaces::{ModelBuilder, ModelExecutor, WeightLoader};
-pub use ferrum_types::{ModelConfig, ModelInfo, ModelType, Result};
+pub use ferrum_types::{Activation, AttentionConfig, ModelConfig, ModelInfo, ModelType, NormType, Result, RopeScaling};

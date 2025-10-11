@@ -20,6 +20,8 @@ pub use ferrum_interfaces::{
 };
 
 pub use ferrum_types::{CacheStats, DataType, Device, FerrumError, RequestId, Result};
+// Note: ferrum-types::KvCacheConfig exists but has different fields for engine-level config
+// This crate uses a simplified internal config
 
 // Re-export implementations
 pub use blocks::*;
@@ -36,9 +38,12 @@ pub fn default_manager(
     Ok(Box::new(manager))
 }
 
-/// Simplified KV Cache configuration
+/// Internal KV Cache manager configuration
+/// 
+/// Note: This is distinct from ferrum_types::KvCacheConfig which is the engine-level
+/// configuration. This type is used internally by the KV cache manager implementation.
 #[derive(Debug, Clone)]
-pub struct KvCacheConfig {
+pub struct KvManagerConfig {
     pub block_size: usize,
     pub max_blocks_gpu: usize,
     pub max_blocks_cpu: usize,
