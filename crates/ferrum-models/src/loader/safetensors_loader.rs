@@ -32,10 +32,14 @@ impl SafeTensorsLoader {
         if single_file.exists() {
             info!("  📄 Loading single SafeTensors file...");
             
-            let vb = VarBuilder::from_pth(&single_file, dtype, device)
-                .map_err(|e| FerrumError::model(format!("Failed to load weights: {}", e)))?;
+            // Load SafeTensors file
+            let tensors = vec![single_file.clone()];
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&tensors, dtype, device)
+                    .map_err(|e| FerrumError::model(format!("Failed to load SafeTensors: {}", e)))?
+            };
             
-            info!("  ✅ Weights loaded successfully");
+            info!("  ✅ SafeTensors weights loaded successfully");
             return Ok(vb);
         }
         

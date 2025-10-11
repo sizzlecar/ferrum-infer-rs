@@ -11,11 +11,15 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::architectures::llama::LlamaModelWrapper;
+use crate::tensor_wrapper::CandleTensorWrapper;
+use candle_transformers::models::llama::Cache as LlamaCache;
+use parking_lot::Mutex;
 
 /// Candle-based model executor
 pub struct CandleModelExecutor {
     model: Arc<LlamaModelWrapper>,
     info: ModelInfo,
+    current_cache: Arc<Mutex<Option<LlamaCache>>>,
 }
 
 impl CandleModelExecutor {
@@ -26,6 +30,7 @@ impl CandleModelExecutor {
         Self {
             model: Arc::new(model),
             info,
+            current_cache: Arc::new(Mutex::new(None)),
         }
     }
     
@@ -46,7 +51,17 @@ impl CandleModelExecutor {
     
     /// Wrap Candle tensor as TensorRef
     fn wrap_tensor(&self, tensor: Tensor) -> TensorRef {
-        Arc::new(tensor)
+        Arc::new(CandleTensorWrapper::new(tensor))
+    }
+    
+    /// Extract Candle tensor from TensorRef  
+    fn unwrap_tensor(&self, tensor_ref: &TensorRef) -> Result<Tensor> {
+        // For MVP: assume all TensorRefs are CandleTensorWrappers
+        // Use unsafe to extract - this is OK because we control tensor creation
+        unsafe {
+            let raw = Arc::as_ptr(tensor_ref) as *const CandleTensorWrapper;
+            Ok((*raw).inner().clone())
+        }
     }
 }
 
@@ -59,14 +74,14 @@ impl ModelExecutor for CandleModelExecutor {
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         debug!("Prefill: batch={}, seq_len={}", input.batch_size(), input.sequence_length());
         
-        // Extract token IDs from TensorRef
-        // For now, assume input_ids is a Candle tensor wrapped in Arc
-        let input_tensor = input.input_ids
-            .downcast_ref::<Tensor>()
-            .ok_or_else(|| FerrumError::model("Input tensor is not a Candle tensor"))?;
+        // Extract Candle tensor from TensorRef
+        let input_tensor = self.unwrap_tensor(&input.input_ids)?;
         
-        // Forward pass
-        let logits = self.model.forward_prefill(input_tensor)?;
+        // Forward pass - creates new cache
+        let (logits, cache) = self.model.forward_prefill(&input_tensor)?;
+        
+        // Store cache for future decode steps
+        *self.current_cache.lock() = Some(cache);
         
         let logits_ref = self.wrap_tensor(logits);
         
@@ -79,16 +94,21 @@ impl ModelExecutor for CandleModelExecutor {
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         debug!("Decode: batch={}", input.batch_size());
         
-        // Extract token ID
-        let input_tensor = input.input_ids
-            .downcast_ref::<Tensor>()
-            .ok_or_else(|| FerrumError::model("Input tensor is not a Candle tensor"))?;
+        // Extract Candle tensor from TensorRef
+        let input_tensor = self.unwrap_tensor(&input.input_ids)?;
         
         // Get current position from KV cache
         let pos = input.kv_cache.num_tokens();
         
-        // Forward pass
-        let logits = self.model.forward_decode(input_tensor, pos)?;
+        // Forward pass with cache
+        let logits = {
+            let mut cache_lock = self.current_cache.lock();
+            let cache = cache_lock.as_mut().ok_or_else(|| {
+                FerrumError::model("No cache available - must call prefill first")
+            })?;
+            
+            self.model.forward_decode_with_cache(&input_tensor, pos, cache)?
+        };
         
         let logits_ref = self.wrap_tensor(logits);
         
@@ -108,9 +128,10 @@ impl ModelExecutor for CandleModelExecutor {
             supports_tensor_parallelism: false,
             supports_pipeline_parallelism: false,
             memory_requirements: MemoryRequirements {
-                min_memory_bytes: 1024 * 1024 * 1024, // 1GB minimum
-                recommended_memory_bytes: 4 * 1024 * 1024 * 1024, // 4GB recommended
-                memory_per_token_bytes: 1024,
+                parameter_memory: (self.info.num_parameters * 2) as u64, // FP16: 2 bytes per param
+                activation_memory_per_token: 4 * self.info.hidden_size, // Rough estimate
+                kv_cache_memory_per_token: 2 * self.info.num_layers * self.info.hidden_size, // K+V per layer
+                overhead_memory: 1024 * 1024 * 1024, // 1GB overhead
             },
             supported_devices: vec![self.info.device.clone()],
             supported_dtypes: vec![DataType::FP32, DataType::FP16, DataType::BF16],
@@ -126,9 +147,13 @@ impl ModelExecutor for CandleModelExecutor {
             decode_operations: 0,
             memory_usage: ferrum_interfaces::model_executor::ExecutorMemoryUsage {
                 allocated_bytes: 0,
+                used_bytes: 0,
                 peak_bytes: 0,
-                cached_bytes: 0,
+                utilization_percent: 0.0,
             },
+            avg_prefill_time_ms: 0.0,
+            avg_decode_time_ms: 0.0,
+            last_operation: Some(std::time::Instant::now()),
         }
     }
 }

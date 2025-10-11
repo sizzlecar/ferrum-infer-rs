@@ -141,26 +141,137 @@ impl InferenceEngine for DefaultInferenceEngine {
         request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let (tx, rx) = mpsc::channel(100);
-        let engine = self.clone_engine();
+        
+        // Clone components for async task
+        let tokenizer = self.tokenizer.clone();
+        let sampler = self.sampler.clone();
+        let model_executor = self.model_executor.clone();
+        let request_id = request.id.clone();
+        let max_tokens = request.sampling_params.max_tokens;
+        let sampling_params = request.sampling_params.clone();
 
         tokio::spawn(async move {
-            match engine.execute_request(&request).await {
-                Ok(response) => {
-                    let chunk = StreamChunk {
-                        request_id: response.request_id.clone(),
-                        text: response.text.clone(),
-                        token: None,
-                        finish_reason: Some(response.finish_reason),
-                        usage: Some(response.usage.clone()),
-                        created_at: response.created_at,
-                        metadata: response.metadata.clone(),
-                    };
-                    let _ = tx.send(Ok(chunk)).await;
-                }
+            // 1. Tokenize
+            let input_tokens = match tokenizer.encode(&request.prompt, true) {
+                Ok(tokens) => tokens,
                 Err(e) => {
                     let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+
+            // 2. Prefill
+            let prefill_input = match create_prefill_input(&input_tokens, &model_executor.info().device) {
+                Ok(input) => input,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+
+            let prefill_output = match model_executor.prefill(&prefill_input).await {
+                Ok(output) => output,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+
+            // 3. Decode loop - stream each token
+            let mut generated_tokens = Vec::new();
+            let mut kv_cache = prefill_output.kv_cache.clone();
+            let mut rng = create_rng(&sampling_params);
+            let mut accumulated_text = String::new();
+
+            for step in 0..max_tokens {
+                let logits = if step == 0 {
+                    match extract_last_token_logits(&prefill_output.logits) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
+                } else {
+                    match create_decode_input(&generated_tokens, kv_cache.clone(), &model_executor.info().device) {
+                        Ok(input) => {
+                            match model_executor.decode(&input).await {
+                                Ok(output) => {
+                                    kv_cache = output.kv_cache.clone();
+                                    output.logits
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
+                };
+
+                let next_token = match sample_token(&logits, &sampling_params, &sampler, &mut rng) {
+                    Ok(token) => token,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+
+                if is_stop_token(next_token, model_executor.info().vocab_size) {
+                    break;
+                }
+
+                generated_tokens.push(next_token);
+
+                // Decode token to text
+                let token_text = match tokenizer.decode(&[next_token], false) {
+                    Ok(text) => text,
+                    Err(_) => format!("token_{}", next_token.get()),
+                };
+
+                accumulated_text.push_str(&token_text);
+
+                // Send streaming chunk
+                let chunk = StreamChunk {
+                    request_id: request_id.clone(),
+                    text: token_text.clone(),
+                    token: Some(next_token),
+                    finish_reason: None,
+                    usage: None,
+                    created_at: chrono::Utc::now(),
+                    metadata: std::collections::HashMap::new(),
+                };
+
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return; // Client disconnected
+                }
+
+                // Check stop sequences
+                match check_stop_sequences(&generated_tokens, &sampling_params, &tokenizer) {
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
                 }
             }
+
+            // Final chunk with finish reason
+            let final_chunk = StreamChunk {
+                request_id: request_id.clone(),
+                text: String::new(),
+                token: None,
+                finish_reason: Some(determine_finish_reason(generated_tokens.len(), max_tokens, &sampling_params)),
+                usage: Some(TokenUsage::new(input_tokens.len(), generated_tokens.len())),
+                created_at: chrono::Utc::now(),
+                metadata: std::collections::HashMap::new(),
+            };
+            let _ = tx.send(Ok(final_chunk)).await;
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
@@ -239,19 +350,47 @@ fn create_prefill_input(
     tokens: &[TokenId],
     _device: &ferrum_types::Device,
 ) -> Result<ferrum_interfaces::model_executor::PrefillInput> {
-    // MVP: create dummy tensor - in real implementation would use tensor factory
-    Err(FerrumError::model(
-        "MVP: Prefill input creation needs tensor factory integration",
-    ))
+    use candle_core::{Device as CandleDevice, Tensor};
+    use ferrum_models::tensor_wrapper::CandleTensorWrapper;
+    
+    // Convert token IDs to u32 vector
+    let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
+    
+    // Create Candle tensor
+    let tensor = Tensor::new(&token_u32s[..], &CandleDevice::Cpu)
+        .map_err(|e| FerrumError::model(format!("Failed to create tensor: {}", e)))?
+        .unsqueeze(0) // Add batch dimension: [seq_len] -> [1, seq_len]
+        .map_err(|e| FerrumError::model(format!("Failed to unsqueeze: {}", e)))?;
+    
+    // Wrap as TensorRef
+    let tensor_ref = Arc::new(CandleTensorWrapper::new(tensor));
+    
+    Ok(ferrum_interfaces::model_executor::PrefillInput::new(tensor_ref))
 }
 
 fn create_decode_input(
-    _tokens: &[TokenId],
+    tokens: &[TokenId],
     kv_cache: Arc<dyn KvCacheHandle>,
     _device: &ferrum_types::Device,
 ) -> Result<ferrum_interfaces::model_executor::DecodeInput> {
-    Err(FerrumError::model(
-        "MVP: Decode input creation needs tensor factory integration",
+    use candle_core::{Device as CandleDevice, Tensor};
+    use ferrum_models::tensor_wrapper::CandleTensorWrapper;
+    
+    // Get last token
+    let last_token = tokens.last().copied().unwrap_or(TokenId::new(0));
+    
+    // Create Candle tensor for single token
+    let tensor = Tensor::new(&[last_token.get()], &CandleDevice::Cpu)
+        .map_err(|e| FerrumError::model(format!("Failed to create tensor: {}", e)))?
+        .unsqueeze(0) // Add batch dimension: [1] -> [1, 1]
+        .map_err(|e| FerrumError::model(format!("Failed to unsqueeze: {}", e)))?;
+    
+    // Wrap as TensorRef
+    let tensor_ref = Arc::new(CandleTensorWrapper::new(tensor));
+    
+    Ok(ferrum_interfaces::model_executor::DecodeInput::new(
+        tensor_ref,
+        kv_cache,
     ))
 }
 
@@ -262,13 +401,53 @@ fn extract_last_token_logits(logits: &ferrum_interfaces::TensorRef) -> Result<fe
 
 fn sample_token(
     logits: &ferrum_interfaces::TensorRef,
-    _params: &SamplingParams,
+    params: &SamplingParams,
     sampler: &Arc<dyn Sampler + Send + Sync>,
     rng: &mut StdRng,
 ) -> Result<TokenId> {
-    // MVP: simplified sampling - need to extract logits to Vec<f32>
-    // For now, return token 0
-    Ok(TokenId::new(0))
+    use ferrum_models::CandleTensorWrapper;
+    
+    // Extract Candle tensor using unsafe cast
+    unsafe {
+        let raw = Arc::as_ptr(logits) as *const CandleTensorWrapper;
+        let wrapper = &*raw;
+        let tensor = wrapper.inner();
+        
+        // Extract logits to Vec<f32>
+        // Logits may be [batch_size, vocab_size] or [batch_size, seq_len, vocab_size]
+        let logits_vec = match tensor.dims().len() {
+            1 => {
+                // Already 1D: [vocab_size]
+                tensor.to_vec1::<f32>()
+                    .map_err(|e| FerrumError::model(format!("Failed to extract 1D logits: {}", e)))?
+            }
+            2 => {
+                // 2D: [batch_size, vocab_size] - take first batch
+                let batch_logits = tensor.to_vec2::<f32>()
+                    .map_err(|e| FerrumError::model(format!("Failed to extract 2D logits: {}", e)))?;
+                batch_logits.into_iter().next().unwrap_or_default()
+            }
+            3 => {
+                // 3D: [batch_size, seq_len, vocab_size] - take last token of first batch
+                let all_logits = tensor.to_vec3::<f32>()
+                    .map_err(|e| FerrumError::model(format!("Failed to extract 3D logits: {}", e)))?;
+                all_logits.into_iter().next()
+                    .and_then(|seq| seq.into_iter().last())
+                    .unwrap_or_default()
+            }
+            _ => {
+                return Err(FerrumError::model(format!(
+                    "Unexpected logits shape: {:?}",
+                    tensor.dims()
+                )));
+            }
+        };
+        
+        // Use sampler to get next token
+        let token_id = sampler.sample(&logits_vec, rng)?;
+        
+        Ok(token_id)
+    }
 }
 
 fn create_rng(params: &SamplingParams) -> StdRng {
