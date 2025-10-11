@@ -287,6 +287,55 @@ impl TokenUsage {
     }
 }
 
+/// RoPE (Rotary Position Embedding) scaling configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RopeScaling {
+    /// Type of scaling: "linear", "dynamic", etc.
+    pub scaling_type: String,
+    /// Scaling factor
+    pub factor: f32,
+}
+
+/// Normalization type used in the model
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NormType {
+    /// Layer Normalization
+    LayerNorm,
+    /// Root Mean Square Normalization
+    RMSNorm,
+}
+
+/// Activation function type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Activation {
+    /// Gaussian Error Linear Unit
+    GELU,
+    /// Sigmoid Linear Unit  
+    SiLU,
+    /// Rectified Linear Unit
+    ReLU,
+    /// Swish activation
+    Swish,
+}
+
+/// Attention configuration for model architecture
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionConfig {
+    /// Whether attention uses bias
+    pub attention_bias: bool,
+    /// Sliding window size (None for full attention)
+    pub sliding_window: Option<usize>,
+}
+
+impl Default for AttentionConfig {
+    fn default() -> Self {
+        Self {
+            attention_bias: false,
+            sliding_window: None,
+        }
+    }
+}
+
 /// Model loading source specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ModelSource {

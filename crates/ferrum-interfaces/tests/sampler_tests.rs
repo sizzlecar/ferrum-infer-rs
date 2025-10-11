@@ -11,7 +11,8 @@ fn temperature_processor_scales_logits() {
     };
     let prev: Vec<TokenId> = vec![];
     let freqs = std::collections::HashMap::new();
-    let mut ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, 3);
+    let vocab_size = 3;
+    let mut ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, vocab_size);
     let p = TemperatureProcessor::new(2.0);
     p.process(&mut ctx).unwrap();
     assert!((ctx.logits[2] - 1.5).abs() < 1e-6);
@@ -55,10 +56,11 @@ fn topp_masks_beyond_p() {
 fn repetition_penalty_applies() {
     let mut logits = vec![1.0, 1.0, 1.0];
     let params = SamplingParams::default();
-    let prev = vec![1u32];
+    let prev = vec![TokenId::new(1)];
     let mut freqs = std::collections::HashMap::new();
-    freqs.insert(1u32, 2usize);
-    let mut ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, 3);
+    freqs.insert(TokenId::new(1), 2usize);
+    let vocab_size = 3;
+    let mut ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, vocab_size);
     RepetitionPenaltyProcessor::new(1.1)
         .process(&mut ctx)
         .unwrap();
@@ -82,7 +84,7 @@ fn sampling_config_from_params_builds_chain_and_samples() {
     let vocab = logits.len();
     let ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, vocab);
     let tok = cfg.sample(ctx, &mut rng).unwrap();
-    assert!((tok as usize) < logits.len());
+    assert!((tok.get() as usize) < logits.len());
 }
 
 #[test]
@@ -91,5 +93,5 @@ fn greedy_sampler_picks_max() {
     let tok = g
         .sample(&[0.1, 10.0, 0.2], &mut StdRng::seed_from_u64(1))
         .unwrap();
-    assert_eq!(tok, 1);
+    assert_eq!(tok, TokenId::new(1));
 }

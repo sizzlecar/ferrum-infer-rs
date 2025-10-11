@@ -1,4 +1,4 @@
-use ferrum_interfaces::engine::EngineStatus;
+use ferrum_types::EngineStatus;
 use ferrum_types::{MemoryUsage, ModelId};
 use serde_json as json;
 
@@ -21,7 +21,6 @@ fn engine_status_serde_roundtrip() {
         uptime_seconds: 5,
         last_heartbeat: chrono::Utc::now(),
         version: "0.1".into(),
-        component_status: ferrum_types::HealthStatus::healthy(),
     };
     let s = json::to_string(&st).unwrap();
     let back: EngineStatus = json::from_str(&s).unwrap();

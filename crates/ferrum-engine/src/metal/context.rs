@@ -1,6 +1,7 @@
 //! Metal execution context for Apple GPU operations
 
 use crate::metal::error::MetalError;
+use ferrum_types::FerrumError;
 use metal::{CommandQueue, Device as MTLDevice, Library};
 use std::sync::Arc;
 use tracing::debug;
@@ -18,9 +19,9 @@ pub struct MetalContext {
 
 impl MetalContext {
     /// Create a new Metal context with the default system device
-    pub fn new() -> Result<Self, MetalError> {
+    pub fn new() -> Result<Self, FerrumError> {
         let device = MTLDevice::system_default()
-            .ok_or(MetalError::DeviceNotAvailable)?;
+            .ok_or_else(|| MetalError::device_not_available())?;
         
         debug!("Creating Metal context with device: {}", device.name());
         
@@ -36,7 +37,7 @@ impl MetalContext {
     /// Load Metal shader library from embedded data  
     /// This will be called when Metal kernels are needed
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-    pub fn load_shader_library(&mut self) -> Result<(), MetalError> {
+    pub fn load_shader_library(&mut self) -> Result<(), FerrumError> {
         if self.library.is_some() {
             debug!("Metal shader library already loaded");
             return Ok(());
@@ -49,7 +50,7 @@ impl MetalContext {
         
         let library = self.device
             .new_library_with_data(METAL_LIBRARY_DATA)
-            .map_err(|e| MetalError::CompilationFailed(format!("Failed to load shader library: {}", e)))?;
+            .map_err(|e| MetalError::compilation_failed(format!("Failed to load shader library: {}", e)))?;
         
         self.library = Some(library);
         debug!("Metal shader library loaded successfully ({} bytes)", METAL_LIBRARY_DATA.len());
@@ -57,8 +58,8 @@ impl MetalContext {
     }
     
     #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
-    pub fn load_shader_library(&mut self) -> Result<(), MetalError> {
-        Err(MetalError::Generic("Metal not available on this platform".to_string()))
+    pub fn load_shader_library(&mut self) -> Result<(), FerrumError> {
+        Err(MetalError::generic("Metal not available on this platform"))
     }
     
     /// Get the shader library (must be loaded first)

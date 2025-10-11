@@ -429,7 +429,7 @@ mod tests {
         let data = vec![1, 2, 3, 4];
 
         // INT4 doesn't support integer types in our implementation
-        let result = compression.compress(&data, DataType::I32);
+        let result = compression.compress(&data, DataType::INT32);
         assert!(result.is_err());
     }
 }

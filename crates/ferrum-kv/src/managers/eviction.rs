@@ -248,8 +248,8 @@ mod tests {
         let req3 = RequestId::new();
 
         // Access in order: req1, req2, req3
-        policy.record_access(req1);
-        policy.record_access(req2);
+        policy.record_access(req1.clone());
+        policy.record_access(req2.clone());
         policy.record_access(req3);
 
         // Should evict req1 (least recently used)
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(candidates[0], req1);
 
         // Access req1 again to make it most recent
-        policy.record_access(req1);
+        policy.record_access(req1.clone());
 
         // Now should evict req2
         let candidates = policy.select_eviction_candidates(1);
@@ -274,8 +274,8 @@ mod tests {
         let req3 = RequestId::new();
 
         // Access in order: req1, req2, req3
-        policy.record_access(req1);
-        policy.record_access(req2);
+        policy.record_access(req1.clone());
+        policy.record_access(req2.clone());
         policy.record_access(req3);
 
         // Should evict req1 (first in)
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(candidates[0], req1);
 
         // Access req1 again - should not change FIFO order
-        policy.record_access(req1);
+        policy.record_access(req1.clone());
 
         // Still should evict req1
         let candidates = policy.select_eviction_candidates(1);
@@ -299,8 +299,8 @@ mod tests {
         let req2 = RequestId::new();
 
         // Add requests
-        policy.record_access(req1);
-        policy.record_access(req2);
+        policy.record_access(req1.clone());
+        policy.record_access(req2.clone());
 
         // First eviction should hit req1, but it has reference bit set
         // So it should get second chance and req2 should be selected
@@ -316,8 +316,8 @@ mod tests {
         let req1 = RequestId::new();
         let req2 = RequestId::new();
 
-        policy.record_access(req1);
-        policy.record_access(req2);
+        policy.record_access(req1.clone());
+        policy.record_access(req2.clone());
 
         // Remove req1
         policy.remove_request(req1);
@@ -333,7 +333,7 @@ mod tests {
         let mut policy = LRUEviction::new();
 
         let req1 = RequestId::new();
-        policy.record_access(req1);
+        policy.record_access(req1.clone());
 
         policy.clear();
 

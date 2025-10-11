@@ -279,7 +279,7 @@ mod tests {
 
         // Convert to BlockTable
         let block_table: BlockTable = default_table.clone().into();
-        assert_eq!(block_table.seq_len, 50);
+        assert_eq!(block_table.sequence_length, 50);
         assert_eq!(block_table.logical_to_physical[0], 5);
 
         // Convert back to DefaultBlockTable

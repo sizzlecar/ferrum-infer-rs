@@ -264,12 +264,12 @@ pub trait AdvancedModelBuilder: ModelBuilder {
     ) -> Result<Box<dyn ModelExecutor>>;
 
     /// Export model definition for debugging
-    async fn export_model_definition(&self, config: &ModelConfig) -> Result<ModelDefinition>;
+    async fn export_model_definition(&self, config: &ModelConfig) -> Result<ModelIR>;
 
     /// Import model definition for custom builds
     async fn import_model_definition(
         &self,
-        definition: &ModelDefinition,
+        definition: &ModelIR,
         compute_backend: Arc<dyn ComputeBackend>,
         weight_loader: Arc<dyn WeightLoader>,
     ) -> Result<Box<dyn ModelExecutor>>;
@@ -340,10 +340,10 @@ pub trait OptimizationPass: Send + Sync {
     fn name(&self) -> &str;
 
     /// Apply optimization to model definition
-    fn apply(&self, definition: &mut ModelDefinition) -> Result<OptimizationResult>;
+    fn apply(&self, definition: &mut ModelIR) -> Result<OptimizationResult>;
 
     /// Check if optimization is applicable
-    fn is_applicable(&self, definition: &ModelDefinition) -> bool;
+    fn is_applicable(&self, definition: &ModelIR) -> bool;
 
     /// Get optimization dependencies (must run before this)
     fn dependencies(&self) -> Vec<String>;
@@ -373,9 +373,13 @@ pub struct OptimizationStats {
     pub estimated_speedup: f32,
 }
 
-/// Model definition for export/import
+/// Model IR (Intermediate Representation) for export/import
+/// 
+/// Note: This is different from ferrum_models::ModelDefinition which is used
+/// for parsing HuggingFace config.json files. This type represents a complete
+/// model definition including computational graph for model building/export.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelDefinition {
+pub struct ModelIR {
     /// Model metadata
     pub metadata: ModelMetadata,
     /// Model architecture definition

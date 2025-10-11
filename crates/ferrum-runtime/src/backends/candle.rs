@@ -452,7 +452,7 @@ impl CandleBackend {
         let tensor_ops = CandleTensorOps;
         let memory_manager = MemoryPool::new(
             device.clone(),
-            crate::memory::MemoryPoolConfig {
+            crate::memory::InternalMemoryPoolConfig {
                 initial_size: 1024 * 1024 * 1024, // 1GB
                 max_size: 4 * 1024 * 1024 * 1024,  // 4GB
                 growth_factor: 1.5,
@@ -627,5 +627,125 @@ fn candle_device_to_ferrum(device: &candle_core::Device) -> Result<Device> {
         candle_core::Device::Cpu => Ok(Device::CPU),
         candle_core::Device::Cuda(_) => Ok(Device::CUDA(0)), // Default to GPU 0
         candle_core::Device::Metal(_) => Ok(Device::Metal),
+    }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dtype_conversions() {
+        // FP32
+        let candle_fp32 = ferrum_dtype_to_candle(DataType::FP32).unwrap();
+        let back_fp32 = candle_dtype_to_ferrum(candle_fp32).unwrap();
+        assert_eq!(back_fp32, DataType::FP32);
+
+        // FP16
+        let candle_fp16 = ferrum_dtype_to_candle(DataType::FP16).unwrap();
+        let back_fp16 = candle_dtype_to_ferrum(candle_fp16).unwrap();
+        assert_eq!(back_fp16, DataType::FP16);
+    }
+
+    #[test]
+    fn test_device_conversions_cpu() {
+        let ferrum_device = Device::CPU;
+        let candle_device = ferrum_device_to_candle(ferrum_device.clone()).unwrap();
+        let back_device = candle_device_to_ferrum(&candle_device).unwrap();
+        assert_eq!(back_device, Device::CPU);
+    }
+
+    #[tokio::test]
+    async fn test_candle_backend_creation() {
+        let backend = CandleBackend::new(Device::CPU).await;
+        assert!(backend.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_candle_backend_name() {
+        let backend = CandleBackend::new(Device::CPU).await.unwrap();
+        assert_eq!(backend.name(), "candle");
+    }
+
+    #[tokio::test]
+    async fn test_candle_backend_capabilities() {
+        let backend = CandleBackend::new(Device::CPU).await.unwrap();
+        let caps = backend.capabilities();
+        
+        assert!(caps.supported_dtypes.contains(&DataType::FP32));
+        assert!(caps.max_tensor_dims > 0);
+    }
+
+    #[tokio::test]
+    async fn test_candle_backend_supports_cpu() {
+        let backend = CandleBackend::new(Device::CPU).await.unwrap();
+        assert!(backend.supports_device(&Device::CPU));
+    }
+
+    #[test]
+    fn test_tensor_factory_zeros() {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let tensor = factory.zeros(&[2, 3], DataType::FP32, &Device::CPU).unwrap();
+        
+        assert_eq!(tensor.shape(), &[2, 3]);
+        assert_eq!(tensor.dtype(), DataType::FP32);
+    }
+
+    #[test]
+    fn test_tensor_factory_ones() {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let tensor = factory.ones(&[2, 2], DataType::FP32, &Device::CPU).unwrap();
+        
+        assert_eq!(tensor.shape(), &[2, 2]);
+    }
+
+    #[test]
+    fn test_tensor_ops_add() {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let ops = CandleTensorOps;
+        
+        let a = factory.from_slice(&[1.0, 2.0], &[2], DataType::FP32, Device::CPU).unwrap();
+        let b = factory.from_slice(&[3.0, 4.0], &[2], DataType::FP32, Device::CPU).unwrap();
+        
+        let result = ops.add(&a, &b).unwrap();
+        let data = result.to_vec_f32().unwrap();
+        
+        assert!((data[0] - 4.0).abs() < 1e-5);
+        assert!((data[1] - 6.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_tensor_ops_matmul() {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let ops = CandleTensorOps;
+        
+        // 2x2 matrices
+        let a = factory.from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DataType::FP32, Device::CPU).unwrap();
+        let b = factory.from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2], DataType::FP32, Device::CPU).unwrap();
+        
+        let result = ops.matmul(&a, &b).unwrap();
+        assert_eq!(result.shape(), &[2, 2]);
+    }
+
+    #[test]
+    fn test_tensor_reshape() {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let tensor = factory.zeros(&[2, 3], DataType::FP32, &Device::CPU).unwrap();
+        
+        let reshaped = tensor.reshape(&[3, 2]).unwrap();
+        assert_eq!(reshaped.shape(), &[3, 2]);
+    }
+
+    #[test]
+    fn test_tensor_to_cpu() {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let tensor = factory.zeros(&[2, 3], DataType::FP32, &Device::CPU).unwrap();
+        
+        let cpu_tensor = tensor.to_cpu().unwrap();
+        assert_eq!(cpu_tensor.device(), Device::CPU);
     }
 }

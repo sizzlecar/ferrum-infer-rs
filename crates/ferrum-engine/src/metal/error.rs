@@ -1,39 +1,46 @@
 //! Metal backend error types
+//!
+//! Metal-specific error handling using the unified FerrumError type.
 
-use thiserror::Error;
+use ferrum_types::{DataType, FerrumError};
 
-#[derive(Debug, Error)]
-pub enum MetalError {
-    #[error("Metal initialization failed: {0}")]
-    InitializationFailed(String),
-    
-    #[error("Metal device not available")]
-    DeviceNotAvailable,
-    
-    #[error("Metal library compilation failed: {0}")]
-    CompilationFailed(String),
-    
-    #[error("Metal kernel execution failed: {0}")]
-    KernelExecutionFailed(String),
-    
-    #[error("Memory allocation failed: {0}")]
-    MemoryAllocationFailed(String),
-    
-    #[error("Unsupported data type: {0:?}")]
-    UnsupportedDataType(ferrum_core::DataType),
-    
-    #[error("Invalid tensor shape: {0:?}")]
-    InvalidTensorShape(Vec<usize>),
-    
-    #[error("Invalid argument: {0}")]
-    InvalidArgument(String),
-    
-    #[error("Generic Metal error: {0}")]
-    Generic(String),
-}
+/// Helper functions to create Metal-specific FerrumError instances
+pub struct MetalError;
 
-impl From<MetalError> for ferrum_core::Error {
-    fn from(err: MetalError) -> Self {
-        ferrum_core::Error::internal(err.to_string())
+impl MetalError {
+    pub fn initialization_failed(msg: impl Into<String>) -> FerrumError {
+        FerrumError::backend(format!("Metal initialization failed: {}", msg.into()))
+    }
+
+    pub fn device_not_available() -> FerrumError {
+        FerrumError::device("Metal device not available")
+    }
+
+    pub fn compilation_failed(msg: impl Into<String>) -> FerrumError {
+        FerrumError::backend(format!("Metal library compilation failed: {}", msg.into()))
+    }
+
+    pub fn kernel_execution_failed(msg: impl Into<String>) -> FerrumError {
+        FerrumError::backend(format!("Metal kernel execution failed: {}", msg.into()))
+    }
+
+    pub fn memory_allocation_failed(msg: impl Into<String>) -> FerrumError {
+        FerrumError::device(format!("Memory allocation failed: {}", msg.into()))
+    }
+
+    pub fn unsupported_data_type(dtype: DataType) -> FerrumError {
+        FerrumError::unsupported(format!("Unsupported data type: {:?}", dtype))
+    }
+
+    pub fn invalid_tensor_shape(shape: Vec<usize>) -> FerrumError {
+        FerrumError::backend(format!("Invalid tensor shape: {:?}", shape))
+    }
+
+    pub fn invalid_argument(msg: impl Into<String>) -> FerrumError {
+        FerrumError::backend(format!("Invalid argument: {}", msg.into()))
+    }
+
+    pub fn generic(msg: impl Into<String>) -> FerrumError {
+        FerrumError::backend(format!("Metal error: {}", msg.into()))
     }
 }

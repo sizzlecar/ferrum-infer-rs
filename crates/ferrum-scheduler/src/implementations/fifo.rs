@@ -336,3 +336,74 @@ impl Scheduler for FifoScheduler {
         ))
     }
 }
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrum_types::{ModelId, SamplingParams};
+
+    fn create_test_request(priority: Priority) -> InferenceRequest {
+        InferenceRequest {
+            id: RequestId::new(),
+            prompt: "test".to_string(),
+            model_id: ModelId::new("test-model"),
+            sampling_params: SamplingParams::default(),
+            stream: false,
+            priority,
+            client_id: None,
+            session_id: None,
+            created_at: chrono::Utc::now(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fifo_scheduler_creation() {
+        let config = SchedulerConfig::default();
+        let scheduler = FifoScheduler::new(config);
+        assert_eq!(scheduler.waiting_queue.read().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fifo_submit_and_batch() {
+        let config = SchedulerConfig::default();
+        let scheduler = FifoScheduler::new(config);
+
+        // Submit requests
+        let _id1 = scheduler.submit(create_test_request(Priority::Normal)).await.unwrap();
+        let _id2 = scheduler.submit(create_test_request(Priority::High)).await.unwrap();
+
+        // Should have 2 waiting
+        assert_eq!(scheduler.waiting_queue.read().len(), 2);
+
+        // Get batch
+        let batch = scheduler.next_batch(BatchHint::simple(5)).await;
+        assert!(batch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_fifo_cancel() {
+        let config = SchedulerConfig::default();
+        let scheduler = FifoScheduler::new(config);
+
+        let request = create_test_request(Priority::Normal);
+        let id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        let result = scheduler.cancel(id).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_metrics_tracker() {
+        let tracker = MetricsTracker::new();
+        tracker.record_completion(100, 500);
+        
+        assert!(tracker.avg_wait_time_ms() > 0.0);
+        assert!(tracker.avg_execution_time_ms() > 0.0);
+    }
+}

@@ -203,8 +203,9 @@ mod tests {
             ..Default::default()
         };
         let config = build_sampling_config(&params);
-        // Config should be created successfully
-        assert_eq!(config.processor_chain.processor_names().len(), 3); // temperature, top_k, top_p, repetition_penalty
+        // Config should be created successfully  
+        // Should have: temperature, top_k, top_p, repetition_penalty processors
+        assert_eq!(config.processor_chain.processor_names().len(), 4);
     }
 
     #[test]

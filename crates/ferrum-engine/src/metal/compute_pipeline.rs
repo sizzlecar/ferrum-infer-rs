@@ -5,6 +5,7 @@
 
 use crate::metal::{MetalContext, MetalError};
 use crate::metal::quantization::{MatvecParams, pack_matrix_q4_0_for_gpu, QK4_0};
+use ferrum_types::FerrumError;
 use metal::{Buffer, ComputePipelineDescriptor, ComputePipelineState, MTLSize};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -17,12 +18,12 @@ pub struct Q4_0MatvecPipeline {
 
 impl Q4_0MatvecPipeline {
     /// Create a new Q4_0 matvec pipeline
-    pub fn new(context: Arc<MetalContext>) -> Result<Self, MetalError> {
+    pub fn new(context: Arc<MetalContext>) -> Result<Self, FerrumError> {
         let library = context.library()
-            .ok_or_else(|| MetalError::Generic("Metal library not loaded".to_string()))?;
+            .ok_or_else(|| MetalError::generic("Metal library not loaded"))?;
         
         let function = library.get_function("q4_0_matvec_main", None)
-            .map_err(|e| MetalError::CompilationFailed(format!("Failed to find q4_0_matvec_main function: {}", e)))?;
+            .map_err(|e| MetalError::compilation_failed(format!("Failed to find q4_0_matvec_main function: {}", e)))?;
         
         let pipeline_descriptor = ComputePipelineDescriptor::new();
         pipeline_descriptor.set_compute_function(Some(&function));
@@ -30,7 +31,7 @@ impl Q4_0MatvecPipeline {
         
         let pipeline_state = context.device
             .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| MetalError::CompilationFailed(format!("Failed to create pipeline state: {}", e)))?;
+            .map_err(|e| MetalError::compilation_failed(format!("Failed to create pipeline state: {}", e)))?;
         
         info!("Q4_0 matvec pipeline created successfully");
         
@@ -56,16 +57,16 @@ impl Q4_0MatvecPipeline {
         input: &[f32],
         nrows: usize,
         ncols: usize,
-    ) -> Result<Vec<f32>, MetalError> {
+    ) -> Result<Vec<f32>, FerrumError> {
         // Validate input dimensions
         if ncols % QK4_0 != 0 {
-            return Err(MetalError::InvalidArgument(
+            return Err(MetalError::invalid_argument(
                 format!("ncols ({}) must be divisible by QK4_0 ({})", ncols, QK4_0)
             ));
         }
         
         if input.len() != ncols {
-            return Err(MetalError::InvalidArgument(
+            return Err(MetalError::invalid_argument(
                 format!("Input vector length ({}) must equal ncols ({})", input.len(), ncols)
             ));
         }
@@ -74,7 +75,7 @@ impl Q4_0MatvecPipeline {
         let expected_weight_size = nrows * blocks_per_row * 5; // 5 u32 per block
         
         if weights.len() != expected_weight_size {
-            return Err(MetalError::InvalidArgument(
+            return Err(MetalError::invalid_argument(
                 format!("Weight data size ({}) doesn't match expected ({})", weights.len(), expected_weight_size)
             ));
         }
@@ -142,7 +143,7 @@ impl Q4_0MatvecPipeline {
     }
     
     /// Create a Metal buffer with data
-    fn create_buffer_with_data(&self, data: &[u8], label: &str) -> Result<Buffer, MetalError> {
+    fn create_buffer_with_data(&self, data: &[u8], label: &str) -> Result<Buffer, FerrumError> {
         let buffer = self.context.device.new_buffer_with_data(
             data.as_ptr() as *const std::ffi::c_void,
             data.len() as u64,
@@ -160,7 +161,7 @@ pub struct Q4_0MatrixOps {
 
 impl Q4_0MatrixOps {
     /// Create Q4_0 matrix operations with Metal acceleration
-    pub fn new(context: Arc<MetalContext>) -> Result<Self, MetalError> {
+    pub fn new(context: Arc<MetalContext>) -> Result<Self, FerrumError> {
         let pipeline = Q4_0MatvecPipeline::new(context)?;
         Ok(Self { pipeline })
     }
@@ -174,7 +175,7 @@ impl Q4_0MatrixOps {
         input: &[f32],   // Input vector [ncols]
         nrows: usize,
         ncols: usize,
-    ) -> Result<Vec<f32>, MetalError> {
+    ) -> Result<Vec<f32>, FerrumError> {
         debug!("Quantizing {}×{} matrix to Q4_0 format", nrows, ncols);
         
         // Quantize weights to Q4_0 format
@@ -193,7 +194,7 @@ impl Q4_0MatrixOps {
         input: &[f32],
         nrows: usize,
         ncols: usize,
-    ) -> Result<Vec<f32>, MetalError> {
+    ) -> Result<Vec<f32>, FerrumError> {
         self.pipeline.execute_matvec(quantized_weights, input, nrows, ncols)
     }
 }

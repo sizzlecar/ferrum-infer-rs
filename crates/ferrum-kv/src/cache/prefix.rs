@@ -320,8 +320,8 @@ mod tests {
         fn new(tokens: usize) -> Self {
             Self {
                 tokens,
-                device: ferrum_types::Device::Cpu,
-                block_table: ferrum_interfaces::BlockTable::default(),
+                device: ferrum_types::Device::CPU,
+                block_table: ferrum_interfaces::BlockTable::new(16),
             }
         }
     }
@@ -331,12 +331,66 @@ mod tests {
             &self.block_table
         }
 
+        fn block_table_mut(&mut self) -> &mut ferrum_interfaces::BlockTable {
+            &mut self.block_table
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn device(&self) -> ferrum_types::Device {
             self.device.clone()
         }
 
         fn num_tokens(&self) -> usize {
             self.tokens
+        }
+
+        fn num_layers(&self) -> usize {
+            32
+        }
+
+        fn num_heads(&self) -> usize {
+            32
+        }
+
+        fn head_dim(&self) -> usize {
+            128
+        }
+
+        fn key_cache(&self, _layer: usize) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
+            Ok(None)
+        }
+
+        fn value_cache(&self, _layer: usize) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
+            Ok(None)
+        }
+
+        fn clone_handle(&self) -> ferrum_types::Result<Arc<dyn ferrum_interfaces::KvCacheHandle>> {
+            Ok(Arc::new(Self {
+                tokens: self.tokens,
+                device: self.device.clone(),
+                block_table: self.block_table.clone(),
+            }))
+        }
+
+        fn stats(&self) -> ferrum_interfaces::kv_cache::CacheHandleStats {
+            ferrum_interfaces::kv_cache::CacheHandleStats {
+                memory_bytes: 0,
+                blocks_allocated: 0,
+                tokens_stored: self.tokens,
+                utilization: 0.0,
+                last_access: std::time::Instant::now(),
+            }
+        }
+
+        fn is_valid(&self) -> bool {
+            true
+        }
+
+        fn cache_id(&self) -> String {
+            "mock".to_string()
         }
     }
 
