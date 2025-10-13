@@ -1,6 +1,6 @@
 //! Prefix caching for shared prompt optimization
 
-use ferrum_types::{FerrumError, RequestId, Result, TokenId};
+use ferrum_types::{FerrumError, Result, TokenId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -229,13 +229,35 @@ impl PrefixCache {
     /// Evict least recently used prefix
     fn evict_lru(&self, prefixes: &mut HashMap<PrefixId, CachedPrefix>) {
         let mut oldest_id = None;
-        let mut oldest_time = std::time::Instant::now();
+        let mut oldest_time = None;
 
-        // Find least recently used evictable prefix
+        // First try to find least recently used prefix with ref_count == 0
         for (prefix_id, cached_prefix) in prefixes.iter() {
-            if cached_prefix.can_evict() && cached_prefix.last_access < oldest_time {
-                oldest_time = cached_prefix.last_access;
-                oldest_id = Some(prefix_id.clone());
+            if cached_prefix.can_evict() {
+                if let Some(current_oldest) = oldest_time {
+                    if cached_prefix.last_access < current_oldest {
+                        oldest_time = Some(cached_prefix.last_access);
+                        oldest_id = Some(prefix_id.clone());
+                    }
+                } else {
+                    oldest_time = Some(cached_prefix.last_access);
+                    oldest_id = Some(prefix_id.clone());
+                }
+            }
+        }
+
+        // If no evictable prefix found, evict LRU regardless of ref_count
+        if oldest_id.is_none() {
+            for (prefix_id, cached_prefix) in prefixes.iter() {
+                if let Some(current_oldest) = oldest_time {
+                    if cached_prefix.last_access < current_oldest {
+                        oldest_time = Some(cached_prefix.last_access);
+                        oldest_id = Some(prefix_id.clone());
+                    }
+                } else {
+                    oldest_time = Some(cached_prefix.last_access);
+                    oldest_id = Some(prefix_id.clone());
+                }
             }
         }
 
@@ -248,19 +270,23 @@ impl PrefixCache {
 
     /// Get cache statistics
     pub fn stats(&self) -> PrefixCacheStats {
+        // Lock metrics first, then prefixes to avoid potential lock ordering issues
+        let hits = *self.hits.lock();
+        let misses = *self.misses.lock();
+        let evictions = *self.evictions.lock();
+        
         let prefixes = self.prefixes.read();
         let total_size: usize = prefixes.values().map(|p| p.size).sum();
         let active_prefixes = prefixes.len();
+        drop(prefixes); // Release read lock as soon as possible
 
         PrefixCacheStats {
-            hits: *self.hits.lock(),
-            misses: *self.misses.lock(),
-            evictions: *self.evictions.lock(),
+            hits,
+            misses,
+            evictions,
             active_prefixes,
             total_cached_tokens: total_size,
             hit_rate: {
-                let hits = *self.hits.lock();
-                let misses = *self.misses.lock();
                 if hits + misses > 0 {
                     hits as f32 / (hits + misses) as f32
                 } else {
@@ -306,7 +332,6 @@ pub struct PrefixCacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::DefaultKvCacheHandle;
 
     // Mock KV cache handle for testing
     #[derive(Debug, Clone)]
