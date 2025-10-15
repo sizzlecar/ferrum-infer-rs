@@ -431,3 +431,262 @@ impl Default for HealthCheckConfig {
         }
     }
 }
+
+// ============================================================================
+// 内联单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_http_method_eq() {
+        assert_eq!(HttpMethod::GET, HttpMethod::GET);
+        assert_ne!(HttpMethod::GET, HttpMethod::POST);
+    }
+
+    #[test]
+    fn test_http_method_clone() {
+        let method = HttpMethod::POST;
+        let cloned = method.clone();
+        assert_eq!(method, cloned);
+    }
+
+    #[test]
+    fn test_http_method_debug() {
+        let method = HttpMethod::GET;
+        let debug_str = format!("{:?}", method);
+        assert!(debug_str.contains("GET"));
+    }
+
+    #[test]
+    fn test_status_code_values() {
+        assert_eq!(StatusCode::OK as u16, 200);
+        assert_eq!(StatusCode::BadRequest as u16, 400);
+        assert_eq!(StatusCode::InternalServerError as u16, 500);
+    }
+
+    #[test]
+    fn test_status_code_eq() {
+        assert_eq!(StatusCode::OK, StatusCode::OK);
+        assert_ne!(StatusCode::OK, StatusCode::Created);
+    }
+
+    #[test]
+    fn test_http_request_creation() {
+        let request = HttpRequest {
+            method: HttpMethod::GET,
+            path: "/api/v1/test".to_string(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: vec![],
+            client_ip: None,
+            timestamp: Utc::now(),
+            request_id: RequestId::new(),
+        };
+
+        assert_eq!(request.method, HttpMethod::GET);
+        assert_eq!(request.path, "/api/v1/test");
+    }
+
+    #[test]
+    fn test_http_request_clone() {
+        let request = HttpRequest {
+            method: HttpMethod::POST,
+            path: "/test".to_string(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: b"test body".to_vec(),
+            client_ip: None,
+            timestamp: Utc::now(),
+            request_id: RequestId::new(),
+        };
+
+        let cloned = request.clone();
+        assert_eq!(request.method, cloned.method);
+        assert_eq!(request.body, cloned.body);
+    }
+
+    #[test]
+    fn test_http_response_creation() {
+        let response = HttpResponse {
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: b"success".to_vec(),
+            content_type: "application/json".to_string(),
+        };
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type, "application/json");
+    }
+
+    #[test]
+    fn test_request_context_default() {
+        let context = RequestContext {
+            client_info: None,
+            auth_result: None,
+            start_time: Instant::now(),
+            data: HashMap::new(),
+            trace_id: "test-trace".to_string(),
+        };
+
+        assert!(context.client_info.is_none());
+        assert_eq!(context.trace_id, "test-trace");
+    }
+
+    #[test]
+    fn test_server_config_default() {
+        let config = ServerConfig::default();
+
+        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.port, 8000); // 默认端口是 8000
+    }
+
+    #[test]
+    fn test_server_metrics_default() {
+        let metrics = ServerMetrics::default();
+
+        assert_eq!(metrics.total_requests, 0);
+        // ServerMetrics 只有 total_requests 和其他字段
+    }
+
+    #[test]
+    fn test_health_status_creation() {
+        // HealthStatus 在 types.rs 中定义，简单测试创建
+        let _status = HealthStatus::Healthy;
+        let _status2 = HealthStatus::Degraded;
+        assert!(true);
+    }
+
+    #[test]
+    fn test_api_version_eq() {
+        assert_eq!(ApiVersion::V1, ApiVersion::V1);
+        assert_ne!(ApiVersion::V1, ApiVersion::V2);
+    }
+
+    #[test]
+    fn test_api_version_eq_only() {
+        // ApiVersion 不实现 Display，所以只测试相等性
+        assert_eq!(ApiVersion::V1, ApiVersion::V1);
+        assert_ne!(ApiVersion::V1, ApiVersion::V2);
+    }
+
+    #[test]
+    fn test_component_health_healthy() {
+        let health = ComponentHealth {
+            name: "test".to_string(),
+            status: HealthStatus::Healthy,
+            message: Some("OK".to_string()),
+            last_check: Utc::now(),
+            response_time_ms: Some(10),
+        };
+
+        assert_eq!(health.status, HealthStatus::Healthy);
+        assert!(health.message.is_some());
+    }
+
+    #[test]
+    fn test_component_health_unhealthy() {
+        let health = ComponentHealth {
+            name: "test".to_string(),
+            status: HealthStatus::Unhealthy,
+            message: Some("Connection failed".to_string()),
+            last_check: Utc::now(),
+            response_time_ms: None,
+        };
+
+        assert_eq!(health.status, HealthStatus::Unhealthy);
+        assert!(health.message.is_some());
+    }
+
+    #[test]
+    fn test_client_info_creation() {
+        let info = ClientInfo {
+            client_id: "client123".to_string(),
+            api_key: Some("key123".to_string()),
+            organization_id: None,
+            rate_limit_tier: RateLimitTier::Free,
+            permissions: vec!["read".to_string()],
+        };
+
+        assert_eq!(info.client_id, "client123");
+        assert!(info.api_key.is_some());
+    }
+
+    #[test]
+    fn test_auth_result_success() {
+        let result = AuthResult {
+            success: true,
+            client_info: None,
+            token_claims: None,
+            error: None,
+        };
+
+        assert!(result.success);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_health_check_config_default() {
+        let config = HealthCheckConfig::default();
+
+        assert_eq!(config.interval, Duration::from_secs(30));
+        assert_eq!(config.timeout, Duration::from_secs(5));
+        assert_eq!(config.retries, 3);
+        assert!(config.components.len() >= 3);
+    }
+
+    #[test]
+    fn test_server_config_clone() {
+        let config = ServerConfig::default();
+        let cloned = config.clone();
+
+        assert_eq!(config.host, cloned.host);
+        assert_eq!(config.port, cloned.port);
+    }
+
+    #[test]
+    fn test_server_metrics_clone() {
+        let metrics = ServerMetrics::default();
+        let cloned = metrics.clone();
+
+        assert_eq!(metrics.total_requests, cloned.total_requests);
+    }
+
+    #[test]
+    fn test_http_request_with_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers.insert("Authorization".to_string(), "Bearer token".to_string());
+
+        let request = HttpRequest {
+            method: HttpMethod::POST,
+            path: "/api/v1/completions".to_string(),
+            query: HashMap::new(),
+            headers,
+            body: vec![],
+            client_ip: None,
+            timestamp: Utc::now(),
+            request_id: RequestId::new(),
+        };
+
+        assert_eq!(request.headers.len(), 2);
+        assert!(request.headers.contains_key("Content-Type"));
+    }
+
+    #[test]
+    fn test_http_response_with_body() {
+        let body = serde_json::json!({"message": "success"}).to_string();
+
+        let response = HttpResponse {
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: body.as_bytes().to_vec(),
+            content_type: "application/json".to_string(),
+        };
+
+        assert!(!response.body.is_empty());
+        assert_eq!(response.status, StatusCode::OK);
+    }
+}

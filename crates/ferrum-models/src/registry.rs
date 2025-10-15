@@ -280,3 +280,188 @@ impl Default for DefaultModelRegistry {
         Self::new()
     }
 }
+
+// ============================================================================
+// 内联单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_architecture_from_str() {
+        assert_eq!(Architecture::from_str("llama"), Architecture::Llama);
+        assert_eq!(Architecture::from_str("LlamaForCausalLM"), Architecture::Llama);
+        assert_eq!(Architecture::from_str("qwen2"), Architecture::Qwen2);
+        assert_eq!(Architecture::from_str("mistral"), Architecture::Mistral);
+        assert_eq!(Architecture::from_str("phi"), Architecture::Phi);
+        assert_eq!(Architecture::from_str("gpt2"), Architecture::GPT2);
+        assert_eq!(Architecture::from_str("unknown_arch"), Architecture::Unknown);
+    }
+
+    #[test]
+    fn test_architecture_copy() {
+        let arch = Architecture::Llama;
+        let arch2 = arch;
+        assert_eq!(arch, arch2);
+    }
+
+    #[test]
+    fn test_model_format_type_eq() {
+        assert_eq!(ModelFormatType::SafeTensors, ModelFormatType::SafeTensors);
+        assert_ne!(ModelFormatType::SafeTensors, ModelFormatType::PyTorch);
+    }
+
+    #[test]
+    fn test_model_alias_creation() {
+        let alias = ModelAlias {
+            name: "test".to_string(),
+            target: "test/model".to_string(),
+            description: Some("Test model".to_string()),
+        };
+
+        assert_eq!(alias.name, "test");
+        assert_eq!(alias.target, "test/model");
+        assert!(alias.description.is_some());
+    }
+
+    #[test]
+    fn test_model_alias_clone() {
+        let alias = ModelAlias {
+            name: "test".to_string(),
+            target: "test/model".to_string(),
+            description: None,
+        };
+
+        let cloned = alias.clone();
+        assert_eq!(alias.name, cloned.name);
+        assert_eq!(alias.target, cloned.target);
+    }
+
+    #[test]
+    fn test_model_discovery_entry() {
+        let entry = ModelDiscoveryEntry {
+            id: "test-model".to_string(),
+            path: PathBuf::from("/path/to/model"),
+            format: ModelFormatType::SafeTensors,
+            architecture: Some(Architecture::Llama),
+            is_valid: true,
+        };
+
+        assert_eq!(entry.id, "test-model");
+        assert_eq!(entry.format, ModelFormatType::SafeTensors);
+        assert!(entry.is_valid);
+    }
+
+    #[test]
+    fn test_registry_creation() {
+        let registry = DefaultModelRegistry::new();
+        assert_eq!(registry.aliases.len(), 0);
+        assert_eq!(registry.discovered_models.len(), 0);
+    }
+
+    #[test]
+    fn test_registry_default() {
+        let registry = DefaultModelRegistry::default();
+        assert_eq!(registry.aliases.len(), 0);
+    }
+
+    #[test]
+    fn test_registry_with_defaults() {
+        let registry = DefaultModelRegistry::with_defaults();
+        
+        // 应该有一些默认别名
+        assert!(registry.aliases.len() > 0);
+        
+        // 测试一些常见别名
+        assert!(registry.aliases.contains_key("tinyllama"));
+        assert!(registry.aliases.contains_key("llama2-7b"));
+    }
+
+    #[test]
+    fn test_registry_register_alias() {
+        let mut registry = DefaultModelRegistry::new();
+        
+        registry.register_alias("test", "test/model");
+        
+        assert_eq!(registry.aliases.get("test"), Some(&"test/model".to_string()));
+    }
+
+    #[test]
+    fn test_registry_resolve_model_id() {
+        let mut registry = DefaultModelRegistry::new();
+        
+        registry.register_alias("mymodel", "org/actual-model");
+        
+        let resolved = registry.resolve_model_id("mymodel");
+        assert_eq!(resolved, "org/actual-model");
+        
+        // 未注册的别名应该返回原始值
+        let unresolved = registry.resolve_model_id("unknown");
+        assert_eq!(unresolved, "unknown");
+    }
+
+    #[test]
+    fn test_registry_list_aliases() {
+        let mut registry = DefaultModelRegistry::new();
+        
+        registry.register_alias("model1", "org/model1");
+        registry.register_alias("model2", "org/model2");
+        
+        let aliases = registry.list_aliases();
+        assert_eq!(aliases.len(), 2);
+    }
+
+
+    #[test]
+    fn test_architecture_debug() {
+        let arch = Architecture::Llama;
+        let debug_str = format!("{:?}", arch);
+        assert!(debug_str.contains("Llama"));
+    }
+
+    #[test]
+    fn test_model_format_debug() {
+        let format = ModelFormatType::SafeTensors;
+        let debug_str = format!("{:?}", format);
+        assert!(debug_str.contains("SafeTensors"));
+    }
+
+    #[test]
+    fn test_model_discovery_entry_clone() {
+        let entry = ModelDiscoveryEntry {
+            id: "test".to_string(),
+            path: PathBuf::from("/path"),
+            format: ModelFormatType::GGUF,
+            architecture: Some(Architecture::Mistral),
+            is_valid: false,
+        };
+        
+        let cloned = entry.clone();
+        assert_eq!(entry.id, cloned.id);
+        assert_eq!(entry.format, cloned.format);
+        assert_eq!(entry.is_valid, cloned.is_valid);
+    }
+
+    #[test]
+    fn test_registry_multiple_aliases_same_target() {
+        let mut registry = DefaultModelRegistry::new();
+        
+        registry.register_alias("alias1", "org/model");
+        registry.register_alias("alias2", "org/model");
+        
+        assert_eq!(registry.resolve_model_id("alias1"), "org/model");
+        assert_eq!(registry.resolve_model_id("alias2"), "org/model");
+    }
+
+    #[test]
+    fn test_architecture_serialization() {
+        let arch = Architecture::Qwen2;
+        let json = serde_json::to_string(&arch).unwrap();
+        assert!(json.contains("Qwen2"));
+        
+        let deserialized: Architecture = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, arch);
+    }
+}

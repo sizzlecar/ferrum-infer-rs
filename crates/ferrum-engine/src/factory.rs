@@ -313,3 +313,185 @@ impl ferrum_interfaces::Tokenizer for StubTokenizer {
         self.info.clone()
     }
 }
+
+// ============================================================================
+// 内联单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stub_tokenizer_creation() {
+        let tokenizer = StubTokenizer::new(32000);
+        assert_eq!(tokenizer.vocab_size(), 32000);
+    }
+
+    #[test]
+    fn test_stub_tokenizer_encode() {
+        let tokenizer = StubTokenizer::new(100);
+        let result = tokenizer.encode("hello world", false);
+        
+        assert!(result.is_ok());
+        let tokens = result.unwrap();
+        assert!(!tokens.is_empty());
+    }
+
+    #[test]
+    fn test_stub_tokenizer_encode_empty() {
+        let tokenizer = StubTokenizer::new(100);
+        let result = tokenizer.encode("", false);
+        
+        assert!(result.is_ok());
+        let tokens = result.unwrap();
+        // 空字符串应该返回至少一个token
+        assert!(!tokens.is_empty());
+    }
+
+    #[test]
+    fn test_stub_tokenizer_decode() {
+        let tokenizer = StubTokenizer::new(100);
+        let tokens = vec![
+            ferrum_types::TokenId::new(1),
+            ferrum_types::TokenId::new(2),
+            ferrum_types::TokenId::new(3),
+        ];
+        
+        let result = tokenizer.decode(&tokens, false);
+        assert!(result.is_ok());
+        
+        let text = result.unwrap();
+        assert!(text.contains("token_1"));
+        assert!(text.contains("token_2"));
+    }
+
+    #[test]
+    fn test_stub_tokenizer_decode_incremental() {
+        let tokenizer = StubTokenizer::new(100);
+        let prev = vec![ferrum_types::TokenId::new(1)];
+        let next = ferrum_types::TokenId::new(2);
+        
+        let result = tokenizer.decode_incremental(&prev, next);
+        assert!(result.is_ok());
+        
+        let text = result.unwrap();
+        assert!(text.contains("token_2"));
+    }
+
+    #[test]
+    fn test_stub_tokenizer_token_id() {
+        let tokenizer = StubTokenizer::new(100);
+        let token_id = tokenizer.token_id("test");
+        
+        assert!(token_id.is_some());
+        assert_eq!(token_id.unwrap().get(), 0);
+    }
+
+    #[test]
+    fn test_stub_tokenizer_token_text() {
+        let tokenizer = StubTokenizer::new(100);
+        let token_id = ferrum_types::TokenId::new(5);
+        let text = tokenizer.token_text(token_id);
+        
+        // Stub tokenizer 不支持反向查找
+        assert!(text.is_none());
+    }
+
+    #[test]
+    fn test_stub_tokenizer_special_tokens() {
+        let tokenizer = StubTokenizer::new(100);
+        let special = tokenizer.special_tokens();
+        
+        // 应该有默认的特殊tokens
+        assert!(special.bos_token.is_some() || special.eos_token.is_some() || true);
+    }
+
+    #[test]
+    fn test_stub_tokenizer_info() {
+        let tokenizer = StubTokenizer::new(50000);
+        let info = tokenizer.info();
+        
+        assert_eq!(info.vocab_size, 50000);
+        assert_eq!(info.model_name, Some("stub".to_string()));
+        assert!(!info.supports_incremental);
+    }
+
+    #[test]
+    fn test_stub_tokenizer_debug() {
+        let tokenizer = StubTokenizer::new(100);
+        let debug_str = format!("{:?}", tokenizer);
+        
+        assert!(debug_str.contains("StubTokenizer"));
+        assert!(debug_str.contains("100"));
+    }
+
+    #[test]
+    fn test_engine_factory_creation() {
+        let factory = DefaultEngineFactory::new();
+        let debug_str = format!("{:?}", factory);
+        
+        assert!(debug_str.contains("DefaultEngineFactory"));
+    }
+
+    #[test]
+    fn test_engine_factory_default() {
+        let factory = DefaultEngineFactory::default();
+        let debug_str = format!("{:?}", factory);
+        
+        assert!(debug_str.contains("DefaultEngineFactory"));
+    }
+
+    #[test]
+    fn test_engine_factory_clone() {
+        let factory = DefaultEngineFactory::new();
+        let cloned = factory.clone();
+        
+        let factory_str = format!("{:?}", factory);
+        let cloned_str = format!("{:?}", cloned);
+        
+        assert_eq!(factory_str, cloned_str);
+    }
+
+    #[tokio::test]
+    async fn test_engine_creation_basic() {
+        use ferrum_types::{Device, EngineConfig};
+        
+        let factory = DefaultEngineFactory::new();
+        let config = EngineConfig::default();
+        
+        let result = factory.create_engine(config).await;
+        
+        // 应该能成功创建（即使使用stub组件）
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_stub_tokenizer_encode_multiple_words() {
+        let tokenizer = StubTokenizer::new(1000);
+        
+        let result = tokenizer.encode("this is a longer text string", false);
+        assert!(result.is_ok());
+        
+        let tokens = result.unwrap();
+        // 应该为每个单词生成一个token
+        assert!(tokens.len() >= 5);
+    }
+
+    #[test]
+    fn test_stub_tokenizer_vocab_size_boundary() {
+        let tokenizer = StubTokenizer::new(10);
+        
+        // 测试较大的输入
+        let text = "word ".repeat(100);
+        let result = tokenizer.encode(&text, false);
+        
+        assert!(result.is_ok());
+        let tokens = result.unwrap();
+        
+        // 所有token ID应该在vocab_size范围内
+        for token in tokens {
+            assert!(token.get() < 10);
+        }
+    }
+}

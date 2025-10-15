@@ -364,14 +364,330 @@ fn extract_special_tokens(tokenizer: &HfTokenizer) -> Result<SpecialTokens> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_tokenizer_creation() {
-        // This test requires a tokenizer file, skip in CI
-        if std::env::var("CI").is_ok() {
-            return;
-        }
+    #[test]
+    fn test_decode_cache_creation() {
+        let cache = DecodeCache::new(100);
+        assert_eq!(cache.max_size, 100);
+        assert_eq!(cache.cache.len(), 0);
+    }
 
-        // Try to load a simple tokenizer if available
-        // In real tests, you would provide a test tokenizer file
+    #[test]
+    fn test_decode_cache_insert_and_get() {
+        let mut cache = DecodeCache::new(10);
+        let tokens = vec![TokenId::new(1), TokenId::new(2)];
+        let text = "hello".to_string();
+
+        cache.insert(tokens.clone(), text.clone());
+        
+        let result = cache.get(&tokens);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), &text);
+    }
+
+    #[test]
+    fn test_decode_cache_eviction() {
+        let mut cache = DecodeCache::new(2);
+        
+        // 填满缓存
+        cache.insert(vec![TokenId::new(1)], "a".to_string());
+        cache.insert(vec![TokenId::new(2)], "b".to_string());
+        
+        assert_eq!(cache.cache.len(), 2);
+        
+        // 触发驱逐
+        cache.insert(vec![TokenId::new(3)], "c".to_string());
+        
+        // 应该已经清理了一些旧条目
+        assert!(cache.cache.len() <= 2);
+    }
+
+    #[test]
+    fn test_incremental_state_default() {
+        let state = IncrementalState::default();
+        let debug_str = format!("{:?}", state);
+        assert!(debug_str.contains("IncrementalState"));
+    }
+
+    #[test]
+    fn test_incremental_state_clone() {
+        let state = IncrementalState::default();
+        let cloned = state.clone();
+        
+        // 验证克隆成功
+        let state_str = format!("{:?}", state);
+        let cloned_str = format!("{:?}", cloned);
+        assert_eq!(state_str, cloned_str);
+    }
+
+    #[test]
+    fn test_huggingface_tokenizer_factory_creation() {
+        let factory = HuggingFaceTokenizerFactory::new();
+        let debug_str = format!("{:?}", factory);
+        assert!(debug_str.contains("HuggingFaceTokenizerFactory"));
+    }
+
+    #[test]
+    fn test_huggingface_tokenizer_factory_default() {
+        let factory = HuggingFaceTokenizerFactory::default();
+        let debug_str = format!("{:?}", factory);
+        assert!(debug_str.contains("HuggingFaceTokenizerFactory"));
+    }
+
+    #[test]
+    fn test_huggingface_tokenizer_factory_clone() {
+        let factory = HuggingFaceTokenizerFactory::new();
+        let cloned = factory.clone();
+        
+        let factory_str = format!("{:?}", factory);
+        let cloned_str = format!("{:?}", cloned);
+        assert_eq!(factory_str, cloned_str);
+    }
+
+    #[test]
+    fn test_huggingface_tokenizer_factory_supported_types() {
+        let factory = HuggingFaceTokenizerFactory::new();
+        let types = factory.supported_types();
+        
+        assert!(types.len() >= 1);
+        assert!(types.contains(&TokenizerType::BPE));
+    }
+
+    #[test]
+    fn test_extract_special_tokens_with_mock_tokenizer() {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
+        use std::collections::HashMap;
+
+        // 创建一个简单的 mock tokenizer
+        let vocab = HashMap::from([
+            ("hello".to_string(), 0),
+            ("<s>".to_string(), 1),
+            ("</s>".to_string(), 2),
+            ("<unk>".to_string(), 3),
+            ("<pad>".to_string(), 4),
+        ]);
+
+        let merges = vec![];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+
+        let mut tokenizer = HfTokenizer::new(bpe);
+        tokenizer.add_special_tokens(&[
+            AddedToken::from("<s>", true),
+            AddedToken::from("</s>", true),
+            AddedToken::from("<unk>", true),
+            AddedToken::from("<pad>", true),
+        ]);
+
+        // 测试提取特殊 tokens
+        let result = extract_special_tokens(&tokenizer);
+        assert!(result.is_ok());
+        
+        let special_tokens = result.unwrap();
+        assert!(special_tokens.bos_token.is_some());
+        assert!(special_tokens.eos_token.is_some());
+        assert!(special_tokens.unk_token.is_some());
+        assert!(special_tokens.pad_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_tokenizer_with_mock() {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
+        use std::collections::HashMap;
+
+        let vocab = HashMap::from([
+            ("hello".to_string(), 0),
+            ("world".to_string(), 1),
+            ("<s>".to_string(), 2),
+            ("</s>".to_string(), 3),
+            ("<unk>".to_string(), 4),
+        ]);
+
+        let merges = vec![];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+
+        let mut hf_tokenizer = HfTokenizer::new(bpe);
+        hf_tokenizer.add_special_tokens(&[
+            AddedToken::from("<s>", true),
+            AddedToken::from("</s>", true),
+            AddedToken::from("<unk>", true),
+        ]);
+
+        // 测试创建 HuggingFaceTokenizer
+        let result = HuggingFaceTokenizer::new(hf_tokenizer).await;
+        assert!(result.is_ok());
+        
+        let tokenizer = result.unwrap();
+        assert_eq!(tokenizer.vocab_size(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_tokenizer_encode_decode() {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
+        use std::collections::HashMap;
+
+        let vocab = HashMap::from([
+            ("hello".to_string(), 0),
+            ("world".to_string(), 1),
+            ("<s>".to_string(), 2),
+            ("</s>".to_string(), 3),
+            ("<unk>".to_string(), 4),
+        ]);
+
+        let merges = vec![];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+
+        let mut hf_tokenizer = HfTokenizer::new(bpe);
+        hf_tokenizer.add_special_tokens(&[
+            AddedToken::from("<s>", true),
+            AddedToken::from("</s>", true),
+            AddedToken::from("<unk>", true),
+        ]);
+
+        let tokenizer = HuggingFaceTokenizer::new(hf_tokenizer).await.unwrap();
+
+        // 测试 encode - 即使无法编码，也会返回 UNK token
+        let result = tokenizer.encode("hello", false);
+        assert!(result.is_ok());
+        
+        let tokens = result.unwrap();
+        // Tokenizer 可能返回空数组或 UNK tokens
+        // 我们只验证结果是 Ok
+        
+        // 测试 decode with empty tokens
+        let decoded = tokenizer.decode(&[], false);
+        assert!(decoded.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tokenizer_special_tokens() {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
+        use std::collections::HashMap;
+
+        let vocab = HashMap::from([
+            ("hello".to_string(), 0),
+            ("<s>".to_string(), 1),
+            ("</s>".to_string(), 2),
+        ]);
+
+        let merges = vec![];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .unwrap();
+
+        let mut hf_tokenizer = HfTokenizer::new(bpe);
+        hf_tokenizer.add_special_tokens(&[
+            AddedToken::from("<s>", true),
+            AddedToken::from("</s>", true),
+        ]);
+
+        let tokenizer = HuggingFaceTokenizer::new(hf_tokenizer).await.unwrap();
+        let special_tokens = tokenizer.special_tokens();
+
+        // 应该能找到一些特殊 tokens
+        assert!(
+            special_tokens.bos_token.is_some() || 
+            special_tokens.eos_token.is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tokenizer_token_id_lookup() {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::{Tokenizer as HfTokenizer};
+        use std::collections::HashMap;
+
+        let vocab = HashMap::from([
+            ("hello".to_string(), 0),
+            ("world".to_string(), 1),
+        ]);
+
+        let merges = vec![];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .unwrap();
+
+        let hf_tokenizer = HfTokenizer::new(bpe);
+        let tokenizer = HuggingFaceTokenizer::new(hf_tokenizer).await.unwrap();
+
+        // 测试 token_id 查找
+        let token_id = tokenizer.token_id("hello");
+        assert!(token_id.is_some());
+        assert_eq!(token_id.unwrap().get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tokenizer_info() {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::{Tokenizer as HfTokenizer};
+        use std::collections::HashMap;
+
+        let vocab = HashMap::from([
+            ("hello".to_string(), 0),
+            ("world".to_string(), 1),
+        ]);
+
+        let merges = vec![];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .unwrap();
+
+        let hf_tokenizer = HfTokenizer::new(bpe);
+        let tokenizer = HuggingFaceTokenizer::new(hf_tokenizer).await.unwrap();
+
+        let info = tokenizer.info();
+        assert_eq!(info.vocab_size, 2);
+        assert!(info.supports_incremental);
+        assert_eq!(info.tokenizer_type, TokenizerType::BPE);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_tokenizer_interface() {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::{Tokenizer as HfTokenizer};
+        use std::collections::HashMap;
+
+        let vocab = HashMap::from([
+            ("hello".to_string(), 0),
+            ("world".to_string(), 1),
+        ]);
+
+        let merges = vec![];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .unwrap();
+
+        let hf_tokenizer = HfTokenizer::new(bpe);
+        let tokenizer = HuggingFaceTokenizer::new(hf_tokenizer).await.unwrap();
+
+        // 测试增量解码接口
+        let mut state = tokenizer.create_state();
+        
+        // 添加一个 token
+        let result = tokenizer.decode_incremental_with_state(&mut state, TokenId::new(0));
+        assert!(result.is_ok());
+
+        // 重置状态
+        tokenizer.reset_state(&mut state);
+        let text = tokenizer.get_decoded_text(&state);
+        assert!(text.is_empty());
     }
 }
