@@ -515,3 +515,334 @@ impl Scheduler for PriorityScheduler {
         Ok(())
     }
 }
+
+// ============================================================================
+// 内联单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrum_types::{ModelId, SamplingParams};
+
+    fn create_test_request_with_priority(priority: Priority) -> InferenceRequest {
+        InferenceRequest {
+            id: RequestId::new(),
+            prompt: "test prompt".to_string(),
+            model_id: ModelId::new("test-model"),
+            sampling_params: SamplingParams::default(),
+            stream: false,
+            priority,
+            client_id: None,
+            session_id: None,
+            created_at: chrono::Utc::now(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_request_priority_ordering() {
+        let now = chrono::Utc::now();
+        let later = now + chrono::Duration::seconds(1);
+
+        let critical = RequestPriority::new(Priority::Critical, now);
+        let high = RequestPriority::new(Priority::High, now);
+        let normal = RequestPriority::new(Priority::Normal, now);
+        let low = RequestPriority::new(Priority::Low, now);
+
+        // 优先级应该是：Critical > High > Normal > Low
+        assert!(critical > high);
+        assert!(high > normal);
+        assert!(normal > low);
+    }
+
+    #[test]
+    fn test_request_priority_fifo_within_same_level() {
+        let now = chrono::Utc::now();
+        let later = now + chrono::Duration::seconds(1);
+
+        let high1 = RequestPriority::new(Priority::High, now);
+        let high2 = RequestPriority::new(Priority::High, later);
+
+        // 相同优先级内，早提交的请求优先级更高（负时间戳）
+        assert!(high1 > high2);
+    }
+
+    #[tokio::test]
+    async fn test_priority_scheduler_creation() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config.clone());
+
+        assert_eq!(scheduler.config().max_waiting_requests, config.max_waiting_requests);
+    }
+
+    #[tokio::test]
+    async fn test_priority_scheduler_submit() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let request = create_test_request_with_priority(Priority::Normal);
+        let request_id = request.id.clone();
+
+        let result = scheduler.submit(request).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), request_id);
+
+        // 验证请求在队列中
+        let waiting_queue = scheduler.waiting_queue.read();
+        assert_eq!(waiting_queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_ordering_in_queue() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        // 提交不同优先级的请求
+        let low_req = create_test_request_with_priority(Priority::Low);
+        let normal_req = create_test_request_with_priority(Priority::Normal);
+        let high_req = create_test_request_with_priority(Priority::High);
+        let critical_req = create_test_request_with_priority(Priority::Critical);
+
+        scheduler.submit(low_req).await.unwrap();
+        scheduler.submit(normal_req).await.unwrap();
+        scheduler.submit(high_req).await.unwrap();
+        scheduler.submit(critical_req.clone()).await.unwrap();
+
+        // 获取批次，应该优先处理高优先级请求
+        let batch = scheduler.next_batch(BatchHint::simple(10)).await;
+        assert!(batch.is_some());
+
+        let batch = batch.unwrap();
+        // 第一个请求应该是 Critical 优先级
+        assert_eq!(batch.requests[0].request.priority, Priority::Critical);
+    }
+
+    #[tokio::test]
+    async fn test_priority_scheduler_cancel() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let request = create_test_request_with_priority(Priority::Normal);
+        let request_id = request.id.clone();
+
+        scheduler.submit(request).await.unwrap();
+
+        // 取消请求
+        let result = scheduler.cancel(request_id).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        // 验证请求不在队列中
+        let waiting_queue = scheduler.waiting_queue.read();
+        assert_eq!(waiting_queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_priority_update() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let request = create_test_request_with_priority(Priority::Low);
+        let request_id = request.id.clone();
+
+        scheduler.submit(request).await.unwrap();
+
+        // 更新优先级
+        let result = scheduler.update_priority(request_id.clone(), Priority::High).await;
+        assert!(result.is_ok());
+
+        // 验证优先级已更新
+        let request_map = scheduler.request_map.read();
+        if let Some(scheduled_req) = request_map.get(&request_id) {
+            assert_eq!(scheduled_req.request.priority, Priority::High);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metrics_tracking() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let request = create_test_request_with_priority(Priority::Normal);
+        scheduler.submit(request).await.unwrap();
+
+        let metrics = scheduler.metrics();
+        assert_eq!(metrics.waiting_requests, 1);
+        assert_eq!(metrics.running_requests, 0);
+        assert_eq!(metrics.completed_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_creation() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        // 提交多个请求
+        for i in 0..5 {
+            let priority = if i % 2 == 0 {
+                Priority::High
+            } else {
+                Priority::Normal
+            };
+            let request = create_test_request_with_priority(priority);
+            scheduler.submit(request).await.unwrap();
+        }
+
+        // 创建批次
+        let batch = scheduler.next_batch(BatchHint::simple(3)).await;
+        assert!(batch.is_some());
+
+        let batch = batch.unwrap();
+        assert!(batch.requests.len() <= 3);
+        assert!(batch.requests.len() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_preemption_low_priority() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let low_request = create_test_request_with_priority(Priority::Low);
+        let request_id = low_request.id.clone();
+
+        scheduler.submit(low_request).await.unwrap();
+
+        // 获取批次，将请求移到运行队列
+        let _batch = scheduler.next_batch(BatchHint::simple(10)).await;
+
+        // 尝试抢占
+        let result = scheduler.preempt(request_id).await;
+        assert!(result.is_ok());
+
+        let preemption_result = result.unwrap();
+        assert!(preemption_result.success);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_preempt_high_priority() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let high_request = create_test_request_with_priority(Priority::High);
+        let request_id = high_request.id.clone();
+
+        scheduler.submit(high_request).await.unwrap();
+
+        // 获取批次
+        let _batch = scheduler.next_batch(BatchHint::simple(10)).await;
+
+        // 尝试抢占高优先级请求应该失败
+        let result = scheduler.preempt(request_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_queue_full() {
+        let mut config = SchedulerConfig::default();
+        config.max_waiting_requests = 2;
+        let scheduler = PriorityScheduler::new(config);
+
+        // 填满队列
+        scheduler.submit(create_test_request_with_priority(Priority::Normal)).await.unwrap();
+        scheduler.submit(create_test_request_with_priority(Priority::Normal)).await.unwrap();
+
+        // 第三个请求应该失败
+        let result = scheduler.submit(create_test_request_with_priority(Priority::Normal)).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_metrics_tracker_priority_stats() {
+        let tracker = MetricsTracker::new();
+
+        tracker.record_completion(100, 500, Priority::High);
+        tracker.record_completion(200, 600, Priority::High);
+        tracker.record_completion(300, 700, Priority::Normal);
+
+        let high_wait = tracker.priority_wait_time(Priority::High);
+        assert_eq!(high_wait, 150.0); // (100 + 200) / 2
+
+        let avg_wait = tracker.avg_wait_time_ms();
+        assert_eq!(avg_wait, 200.0); // (100 + 200 + 300) / 3
+    }
+
+    #[tokio::test]
+    async fn test_complete_request() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let request = create_test_request_with_priority(Priority::Normal);
+        let request_id = request.id.clone();
+
+        scheduler.submit(request).await.unwrap();
+
+        // 获取批次，移到运行队列
+        let _batch = scheduler.next_batch(BatchHint::simple(10)).await;
+
+        // 完成请求
+        let response = InferenceResponse {
+            request_id: request_id.clone(),
+            text: "test".to_string(),
+            tokens: vec![],
+            finish_reason: ferrum_types::FinishReason::EOS,
+            usage: ferrum_types::TokenUsage::new(10, 5),
+            latency_ms: 100,
+            created_at: chrono::Utc::now(),
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let result = scheduler.complete(request_id, &response).await;
+        assert!(result.is_ok());
+
+        // 验证已完成计数增加
+        let metrics = scheduler.metrics();
+        assert_eq!(metrics.completed_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn test_resume_request() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let request_id = RequestId::new();
+
+        // Resume 应该总是成功（在这个实现中）
+        let result = scheduler.resume(request_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_priority_levels() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        // 提交各种优先级的请求
+        let priorities = vec![
+            Priority::Low,
+            Priority::Normal,
+            Priority::High,
+            Priority::Critical,
+            Priority::Normal,
+            Priority::Low,
+        ];
+
+        for priority in priorities {
+            scheduler.submit(create_test_request_with_priority(priority)).await.unwrap();
+        }
+
+        let metrics = scheduler.metrics();
+        assert_eq!(metrics.waiting_requests, 6);
+
+        // 获取批次
+        let batch = scheduler.next_batch(BatchHint::simple(10)).await;
+        assert!(batch.is_some());
+
+        // 批次中的请求应该按优先级排序
+        let batch = batch.unwrap();
+        if batch.requests.len() >= 2 {
+            // 第一个应该是最高优先级
+            assert_eq!(batch.requests[0].request.priority, Priority::Critical);
+        }
+    }
+}

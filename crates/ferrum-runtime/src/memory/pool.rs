@@ -368,3 +368,234 @@ impl DeviceMemoryManager for MemoryPool {
 fn align_size(size: usize, alignment: usize) -> usize {
     (size + alignment - 1) & !(alignment - 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_align_size() {
+        assert_eq!(align_size(100, 256), 256);
+        assert_eq!(align_size(256, 256), 256);
+        assert_eq!(align_size(257, 256), 512);
+        assert_eq!(align_size(500, 256), 512);
+        assert_eq!(align_size(1, 64), 64);
+        assert_eq!(align_size(64, 64), 64);
+        assert_eq!(align_size(65, 64), 128);
+    }
+
+    #[test]
+    fn test_memory_pool_creation() {
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device, config);
+
+        let stats = pool.stats();
+        assert_eq!(stats.used_bytes, 0);
+        assert_eq!(stats.active_allocations, 0);
+    }
+
+    #[test]
+    fn test_memory_pool_allocation() {
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device, config);
+
+        // Allocate some memory
+        let handle1 = pool.allocate(1024).unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.active_allocations, 1);
+        assert!(stats.used_bytes > 0);
+
+        // Allocate more memory
+        let handle2 = pool.allocate(2048).unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.active_allocations, 2);
+
+        // Verify handles are different
+        assert_ne!(handle1.id(), handle2.id());
+    }
+
+    #[test]
+    fn test_memory_pool_deallocation() {
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device, config);
+
+        // Allocate and deallocate
+        let handle = pool.allocate(1024).unwrap();
+        assert_eq!(pool.stats().active_allocations, 1);
+
+        pool.deallocate(handle).unwrap();
+        assert_eq!(pool.stats().active_allocations, 0);
+    }
+
+    #[test]
+    fn test_memory_pool_reuse() {
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device, config);
+
+        // Allocate and deallocate
+        let handle1 = pool.allocate(1024).unwrap();
+        pool.deallocate(handle1).unwrap();
+
+        // Allocate again with same size - should reuse
+        let _handle2 = pool.allocate(1024).unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.active_allocations, 1);
+    }
+
+    #[test]
+    fn test_memory_pool_size_limit() {
+        let device = Device::CPU;
+        let mut config = InternalMemoryPoolConfig::default();
+        config.max_size = 1024; // Very small limit
+        let pool = MemoryPool::new(device, config);
+
+        // Try to allocate more than the limit
+        let result = pool.allocate(2048);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_memory_pool_multiple_allocations() {
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device, config);
+
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let handle = pool.allocate(1024 * (i + 1)).unwrap();
+            handles.push(handle);
+        }
+
+        let stats = pool.stats();
+        assert_eq!(stats.active_allocations, 5);
+
+        // Deallocate all
+        for handle in handles {
+            pool.deallocate(handle).unwrap();
+        }
+
+        let stats = pool.stats();
+        assert_eq!(stats.active_allocations, 0);
+    }
+
+    #[test]
+    fn test_memory_pool_stats() {
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device, config);
+
+        // Initially empty
+        let stats = pool.stats();
+        assert_eq!(stats.used_bytes, 0);
+        assert_eq!(stats.active_allocations, 0);
+        assert_eq!(stats.fragmentation_ratio, 0.0);
+
+        // After allocations
+        let _handle1 = pool.allocate(1024).unwrap();
+        let _handle2 = pool.allocate(2048).unwrap();
+
+        let stats = pool.stats();
+        assert!(stats.total_bytes >= 1024 + 2048);
+        assert_eq!(stats.active_allocations, 2);
+        assert!(stats.used_bytes > 0);
+    }
+
+    #[test]
+    fn test_memory_pool_defragment() {
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device, config);
+
+        // Allocate and deallocate to create fragmentation
+        let handle1 = pool.allocate(1024).unwrap();
+        let handle2 = pool.allocate(2048).unwrap();
+        let handle3 = pool.allocate(512).unwrap();
+
+        pool.deallocate(handle2).unwrap(); // Free middle block
+
+        let stats_before = pool.stats();
+        pool.defragment().unwrap();
+        let stats_after = pool.stats();
+
+        // After defragmentation, we should still have the same allocations
+        assert_eq!(stats_before.active_allocations, stats_after.active_allocations);
+
+        // Clean up
+        pool.deallocate(handle1).ok();
+        pool.deallocate(handle3).ok();
+    }
+
+    #[tokio::test]
+    async fn test_device_memory_manager_trait() {
+        use ferrum_interfaces::memory::DeviceMemoryManager;
+        
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device.clone(), config);
+
+        // Test async allocate via trait
+        let handle = DeviceMemoryManager::allocate(&pool, 1024, &device).await.unwrap();
+        assert_ne!(handle.id(), 0);
+
+        // Test aligned allocation
+        let aligned_handle = DeviceMemoryManager::allocate_aligned(&pool, 1000, 256, &device).await.unwrap();
+        assert_ne!(aligned_handle.id(), 0);
+
+        // Test memory info
+        let info = DeviceMemoryManager::memory_info(&pool, &device).await.unwrap();
+        assert_eq!(info.active_allocations, 2);
+
+        // Test deallocate
+        DeviceMemoryManager::deallocate(&pool, handle).await.unwrap();
+        let info = DeviceMemoryManager::memory_info(&pool, &device).await.unwrap();
+        assert_eq!(info.active_allocations, 1);
+
+        // Clean up
+        DeviceMemoryManager::deallocate(&pool, aligned_handle).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_device_memory_manager_defragment() {
+        use ferrum_interfaces::memory::DeviceMemoryManager;
+        
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device.clone(), config);
+
+        // Allocate some memory
+        let _handle1 = DeviceMemoryManager::allocate(&pool, 1024, &device).await.unwrap();
+        let _handle2 = DeviceMemoryManager::allocate(&pool, 2048, &device).await.unwrap();
+
+        // Test defragmentation
+        let defrag_stats = DeviceMemoryManager::defragment(&pool, &device).await.unwrap();
+        assert!(defrag_stats.fragmentation_before >= 0.0);
+        assert!(defrag_stats.fragmentation_after >= 0.0);
+    }
+
+    #[test]
+    fn test_handle_info() {
+        let device = Device::CPU;
+        let config = InternalMemoryPoolConfig::default();
+        let pool = MemoryPool::new(device, config);
+
+        let handle = pool.allocate(1024).unwrap();
+
+        // Get handle info
+        let info = pool.handle_info(handle);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.handle.id(), handle.id());
+        assert!(info.size >= 1024);
+        assert_eq!(info.alignment, 256);
+        assert!(!info.is_mapped);
+
+        // Test with invalid handle
+        let invalid_handle = MemoryHandle::new(99999);
+        let info = pool.handle_info(invalid_handle);
+        assert!(info.is_none());
+    }
+}
