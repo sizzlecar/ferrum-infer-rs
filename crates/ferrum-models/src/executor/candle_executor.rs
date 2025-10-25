@@ -3,7 +3,10 @@
 use async_trait::async_trait;
 use candle_core::{DType, Device as CandleDevice, Tensor};
 use ferrum_interfaces::{
-    model_executor::{DecodeInput, DecodeOutput, ExecutorCapabilities, PrefillInput, PrefillOutput, ExecutorStatus},
+    model_executor::{
+        DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PrefillInput,
+        PrefillOutput,
+    },
     BlockTable, ComputeBackend, KvCacheHandle, ModelExecutor, TensorRef,
 };
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
@@ -26,14 +29,14 @@ impl CandleModelExecutor {
     /// Create new executor
     pub fn new(model: LlamaModelWrapper, info: ModelInfo) -> Self {
         info!("✅ Created CandleModelExecutor for: {}", info.model_id);
-        
+
         Self {
             model: Arc::new(model),
             info,
             current_cache: Arc::new(Mutex::new(None)),
         }
     }
-    
+
     /// Create Candle tensor from token IDs
     fn tokens_to_tensor(&self, token_ids: &[u32]) -> Result<Tensor> {
         Tensor::new(token_ids, self.model.device())
@@ -41,17 +44,19 @@ impl CandleModelExecutor {
             .unsqueeze(0) // Add batch dimension
             .map_err(|e| FerrumError::model(format!("Failed to unsqueeze: {}", e)))
     }
-    
+
     /// Extract token IDs from TensorRef (safe approach)
     fn extract_token_ids(&self, tensor_ref: &TensorRef) -> Result<Vec<u32>> {
         // Try to get Candle tensor via to_cpu and shape analysis
         // This is a workaround - ideally TensorLike would have a to_vec method
-        
+
         // For now, we'll work around by storing the original token IDs
         // This is indicated by returning an error that the engine will handle
-        Err(FerrumError::model("Direct tensor extraction not supported - use token IDs"))
+        Err(FerrumError::model(
+            "Direct tensor extraction not supported - use token IDs",
+        ))
     }
-    
+
     /// Wrap Candle tensor as TensorRef
     fn wrap_tensor(&self, tensor: Tensor) -> TensorRef {
         Arc::new(CandleTensorWrapper::new(tensor))
@@ -63,59 +68,64 @@ impl ModelExecutor for CandleModelExecutor {
     fn info(&self) -> &ModelInfo {
         &self.info
     }
-    
+
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        debug!("Prefill: batch={}, seq_len={}", input.batch_size(), input.sequence_length());
-        
+        debug!(
+            "Prefill: batch={}, seq_len={}",
+            input.batch_size(),
+            input.sequence_length()
+        );
+
         // WORKAROUND: Since we can't safely extract from TensorRef,
         // we expect the input to contain raw u32 token IDs
         // The engine layer should create Candle tensors directly
-        
+
         // For now, create a dummy forward pass
         // The real implementation needs the engine to pass token IDs, not TensorRef
         let input_tensor = self.tokens_to_tensor(&[1, 2])?; // Dummy tokens
-        
+
         // Forward pass - creates new cache
         let (logits, cache) = self.model.forward_prefill(&input_tensor)?;
-        
+
         // Store cache for future decode steps
         *self.current_cache.lock() = Some(cache);
-        
+
         let logits_ref = self.wrap_tensor(logits);
-        
+
         // Create dummy KV cache handle
         let kv_cache = create_dummy_kv_cache(self.info.num_layers, input.sequence_length());
-        
+
         Ok(PrefillOutput::new(logits_ref, kv_cache))
     }
-    
+
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         debug!("Decode: batch={}", input.batch_size());
-        
+
         // WORKAROUND: Same as prefill
         let input_tensor = self.tokens_to_tensor(&[1])?; // Dummy token
-        
+
         // Get current position from KV cache
         let pos = input.kv_cache.num_tokens();
-        
+
         // Forward pass with cache
         let logits = {
             let mut cache_lock = self.current_cache.lock();
             let cache = cache_lock.as_mut().ok_or_else(|| {
                 FerrumError::model("No cache available - must call prefill first")
             })?;
-            
-            self.model.forward_decode_with_cache(&input_tensor, pos, cache)?
+
+            self.model
+                .forward_decode_with_cache(&input_tensor, pos, cache)?
         };
-        
+
         let logits_ref = self.wrap_tensor(logits);
-        
+
         Ok(DecodeOutput::new(logits_ref, input.kv_cache.clone()))
     }
-    
+
     fn capabilities(&self) -> ExecutorCapabilities {
         use ferrum_interfaces::model_executor::{AttentionType, MemoryRequirements};
-        
+
         ExecutorCapabilities {
             max_batch_size: 1,
             max_sequence_length: self.info.max_sequence_length,
@@ -135,7 +145,7 @@ impl ModelExecutor for CandleModelExecutor {
             supported_dtypes: vec![DataType::FP32, DataType::FP16, DataType::BF16],
         }
     }
-    
+
     fn status(&self) -> ExecutorStatus {
         ExecutorStatus {
             state: ferrum_interfaces::model_executor::ExecutorState::Ready,
@@ -171,14 +181,18 @@ impl CandleModelExecutorV2 {
             current_cache: Arc::new(Mutex::new(None)),
         }
     }
-    
+
     /// Forward pass with token IDs directly
-    pub async fn forward_with_tokens(&self, token_ids: &[u32], is_prefill: bool) -> Result<Vec<f32>> {
+    pub async fn forward_with_tokens(
+        &self,
+        token_ids: &[u32],
+        is_prefill: bool,
+    ) -> Result<Vec<f32>> {
         let tensor = Tensor::new(token_ids, self.model.device())
             .map_err(|e| FerrumError::model(format!("Failed to create tensor: {}", e)))?
             .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("Failed to unsqueeze: {}", e)))?;
-        
+
         let logits = if is_prefill {
             let (logits_tensor, cache) = self.model.forward_prefill(&tensor)?;
             *self.current_cache.lock() = Some(cache);
@@ -186,30 +200,40 @@ impl CandleModelExecutorV2 {
         } else {
             let pos = token_ids.len() - 1;
             let mut cache_lock = self.current_cache.lock();
-            let cache = cache_lock.as_mut()
+            let cache = cache_lock
+                .as_mut()
                 .ok_or_else(|| FerrumError::model("No cache - call prefill first"))?;
             self.model.forward_decode_with_cache(&tensor, pos, cache)?
         };
-        
+
         // Extract logits
         let logits_vec = match logits.dims().len() {
-            1 => logits.to_vec1::<f32>()
+            1 => logits
+                .to_vec1::<f32>()
                 .map_err(|e| FerrumError::model(format!("to_vec1 failed: {}", e)))?,
             2 => {
-                let batch = logits.to_vec2::<f32>()
+                let batch = logits
+                    .to_vec2::<f32>()
                     .map_err(|e| FerrumError::model(format!("to_vec2 failed: {}", e)))?;
                 batch.into_iter().next().unwrap_or_default()
             }
             3 => {
-                let all = logits.to_vec3::<f32>()
+                let all = logits
+                    .to_vec3::<f32>()
                     .map_err(|e| FerrumError::model(format!("to_vec3 failed: {}", e)))?;
-                all.into_iter().next()
+                all.into_iter()
+                    .next()
                     .and_then(|seq| seq.into_iter().last())
                     .unwrap_or_default()
             }
-            _ => return Err(FerrumError::model(format!("Unexpected shape: {:?}", logits.dims()))),
+            _ => {
+                return Err(FerrumError::model(format!(
+                    "Unexpected shape: {:?}",
+                    logits.dims()
+                )))
+            }
         };
-        
+
         Ok(logits_vec)
     }
 }
@@ -218,54 +242,54 @@ impl CandleModelExecutorV2 {
 fn create_dummy_kv_cache(num_layers: usize, seq_len: usize) -> Arc<dyn KvCacheHandle> {
     use ferrum_interfaces::kv_cache::CacheHandleStats;
     use ferrum_types::Device;
-    
+
     #[derive(Debug, Clone)]
     struct DummyKvCache {
         block_table: BlockTable,
         num_layers: usize,
     }
-    
+
     impl KvCacheHandle for DummyKvCache {
         fn block_table(&self) -> &BlockTable {
             &self.block_table
         }
-        
+
         fn block_table_mut(&mut self) -> &mut BlockTable {
             &mut self.block_table
         }
-        
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-        
+
         fn device(&self) -> Device {
             Device::CPU
         }
-        
+
         fn num_layers(&self) -> usize {
             self.num_layers
         }
-        
+
         fn num_heads(&self) -> usize {
             32
         }
-        
+
         fn head_dim(&self) -> usize {
             64
         }
-        
+
         fn key_cache(&self, _layer: usize) -> ferrum_types::Result<Option<TensorRef>> {
             Ok(None)
         }
-        
+
         fn value_cache(&self, _layer: usize) -> ferrum_types::Result<Option<TensorRef>> {
             Ok(None)
         }
-        
+
         fn clone_handle(&self) -> ferrum_types::Result<Arc<dyn KvCacheHandle>> {
             Ok(Arc::new(self.clone()))
         }
-        
+
         fn stats(&self) -> CacheHandleStats {
             CacheHandleStats {
                 memory_bytes: 0,
@@ -275,19 +299,19 @@ fn create_dummy_kv_cache(num_layers: usize, seq_len: usize) -> Arc<dyn KvCacheHa
                 last_access: std::time::Instant::now(),
             }
         }
-        
+
         fn is_valid(&self) -> bool {
             true
         }
-        
+
         fn cache_id(&self) -> String {
             "dummy-cache".to_string()
         }
     }
-    
+
     let mut block_table = BlockTable::new(16);
     block_table.sequence_length = seq_len;
-    
+
     Arc::new(DummyKvCache {
         block_table,
         num_layers,
@@ -297,20 +321,28 @@ fn create_dummy_kv_cache(num_layers: usize, seq_len: usize) -> Arc<dyn KvCacheHa
 /// Helper to extract logits from Candle tensor safely
 pub fn extract_logits_safe(tensor: &Tensor) -> Result<Vec<f32>> {
     match tensor.dims().len() {
-        1 => tensor.to_vec1::<f32>()
+        1 => tensor
+            .to_vec1::<f32>()
             .map_err(|e| FerrumError::model(format!("to_vec1 failed: {}", e))),
         2 => {
-            let batch = tensor.to_vec2::<f32>()
+            let batch = tensor
+                .to_vec2::<f32>()
                 .map_err(|e| FerrumError::model(format!("to_vec2 failed: {}", e)))?;
             Ok(batch.into_iter().next().unwrap_or_default())
         }
         3 => {
-            let all = tensor.to_vec3::<f32>()
+            let all = tensor
+                .to_vec3::<f32>()
                 .map_err(|e| FerrumError::model(format!("to_vec3 failed: {}", e)))?;
-            Ok(all.into_iter().next()
+            Ok(all
+                .into_iter()
+                .next()
                 .and_then(|seq| seq.into_iter().last())
                 .unwrap_or_default())
         }
-        _ => Err(FerrumError::model(format!("Unexpected shape: {:?}", tensor.dims()))),
+        _ => Err(FerrumError::model(format!(
+            "Unexpected shape: {:?}",
+            tensor.dims()
+        ))),
     }
 }

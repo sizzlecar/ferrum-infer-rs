@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::TokenId;
+use crate::{FerrumError, Result, TokenId};
 
 /// Sampling parameters for generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,34 +76,48 @@ impl SamplingParams {
     }
 
     /// Validate sampling parameters
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<()> {
         if self.temperature < 0.0 {
-            return Err("Temperature must be non-negative".to_string());
+            return Err(FerrumError::invalid_request(
+                "Temperature must be non-negative".to_string(),
+            ));
         }
         if self.top_p <= 0.0 || self.top_p > 1.0 {
-            return Err("top_p must be in range (0, 1]".to_string());
+            return Err(FerrumError::invalid_request(
+                "top_p must be in range (0, 1]".to_string(),
+            ));
         }
         if let Some(top_k) = self.top_k {
             if top_k == 0 {
-                return Err("top_k must be positive".to_string());
+                return Err(FerrumError::invalid_request(
+                    "top_k must be positive".to_string(),
+                ));
             }
         }
         if self.repetition_penalty <= 0.0 {
-            return Err("Repetition penalty must be positive".to_string());
+            return Err(FerrumError::invalid_request(
+                "Repetition penalty must be positive".to_string(),
+            ));
         }
         if let Some(min_p) = self.min_p {
             if min_p <= 0.0 || min_p > 1.0 {
-                return Err("min_p must be in range (0, 1]".to_string());
+                return Err(FerrumError::invalid_request(
+                    "min_p must be in range (0, 1]".to_string(),
+                ));
             }
         }
         if let Some(tfs) = self.tfs {
             if tfs <= 0.0 || tfs > 1.0 {
-                return Err("tfs must be in range (0, 1]".to_string());
+                return Err(FerrumError::invalid_request(
+                    "tfs must be in range (0, 1]".to_string(),
+                ));
             }
         }
         if let Some(typical_p) = self.typical_p {
             if typical_p <= 0.0 || typical_p > 1.0 {
-                return Err("typical_p must be in range (0, 1]".to_string());
+                return Err(FerrumError::invalid_request(
+                    "typical_p must be in range (0, 1]".to_string(),
+                ));
             }
         }
         Ok(())

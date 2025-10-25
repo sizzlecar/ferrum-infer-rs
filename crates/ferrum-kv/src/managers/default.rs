@@ -96,7 +96,11 @@ impl KvCacheManager for DefaultKvCacheManager {
         Ok(handle_arc)
     }
 
-    async fn extend(&self, _handle: &mut dyn KvCacheHandle, _additional_tokens: usize) -> Result<()> {
+    async fn extend(
+        &self,
+        _handle: &mut dyn KvCacheHandle,
+        _additional_tokens: usize,
+    ) -> Result<()> {
         // MVP: Not yet implemented
         Err(FerrumError::model("MVP: extend not yet implemented"))
     }
@@ -217,7 +221,7 @@ mod tests {
     async fn test_stats() {
         let manager = DefaultKvCacheManager::new(Device::CPU, 16, 100).unwrap();
         let stats = manager.stats();
-        
+
         assert_eq!(stats.active_caches, 0);
         assert_eq!(stats.total_blocks, 100);
     }

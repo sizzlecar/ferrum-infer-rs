@@ -3,9 +3,9 @@
 use crate::{
     BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, ScheduledRequest, Scheduler,
 };
+use async_trait::async_trait;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
 use ferrum_types::SchedulerConfig;
-use async_trait::async_trait;
 use ferrum_types::{
     BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState, Result,
 };
@@ -486,7 +486,8 @@ impl Scheduler for PriorityScheduler {
                     preempted_req.state = RequestState::Waiting;
                     preempted_req.started_at = None;
 
-                    let request_priority = RequestPriority::new(priority, preempted_req.submitted_at);
+                    let request_priority =
+                        RequestPriority::new(priority, preempted_req.submitted_at);
                     waiting_queue.push(request_id.clone(), request_priority);
                     request_map.insert(request_id.clone(), preempted_req);
 
@@ -573,7 +574,10 @@ mod tests {
         let config = SchedulerConfig::default();
         let scheduler = PriorityScheduler::new(config.clone());
 
-        assert_eq!(scheduler.config().max_waiting_requests, config.max_waiting_requests);
+        assert_eq!(
+            scheduler.config().max_waiting_requests,
+            config.max_waiting_requests
+        );
     }
 
     #[tokio::test]
@@ -649,7 +653,9 @@ mod tests {
         scheduler.submit(request).await.unwrap();
 
         // 更新优先级
-        let result = scheduler.update_priority(request_id.clone(), Priority::High).await;
+        let result = scheduler
+            .update_priority(request_id.clone(), Priority::High)
+            .await;
         assert!(result.is_ok());
 
         // 验证优先级已更新
@@ -744,11 +750,19 @@ mod tests {
         let scheduler = PriorityScheduler::new(config);
 
         // 填满队列
-        scheduler.submit(create_test_request_with_priority(Priority::Normal)).await.unwrap();
-        scheduler.submit(create_test_request_with_priority(Priority::Normal)).await.unwrap();
+        scheduler
+            .submit(create_test_request_with_priority(Priority::Normal))
+            .await
+            .unwrap();
+        scheduler
+            .submit(create_test_request_with_priority(Priority::Normal))
+            .await
+            .unwrap();
 
         // 第三个请求应该失败
-        let result = scheduler.submit(create_test_request_with_priority(Priority::Normal)).await;
+        let result = scheduler
+            .submit(create_test_request_with_priority(Priority::Normal))
+            .await;
         assert!(result.is_err());
     }
 
@@ -828,7 +842,10 @@ mod tests {
         ];
 
         for priority in priorities {
-            scheduler.submit(create_test_request_with_priority(priority)).await.unwrap();
+            scheduler
+                .submit(create_test_request_with_priority(priority))
+                .await
+                .unwrap();
         }
 
         let metrics = scheduler.metrics();

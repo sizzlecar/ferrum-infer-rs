@@ -374,7 +374,7 @@ pub struct OptimizationStats {
 }
 
 /// Model IR (Intermediate Representation) for export/import
-/// 
+///
 /// Note: This is different from ferrum_models::ModelDefinition which is used
 /// for parsing HuggingFace config.json files. This type represents a complete
 /// model definition including computational graph for model building/export.

@@ -65,6 +65,7 @@ axum-extra = { version = "0.9", features = ["typed-header"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace", "compression"] }
 hyper = "1.0"
+hyper-util = { version = "0.1", default-features = false, features = ["client", "http1", "http2", "tokio"] }
 http = "1.0"
 http-body = "1.0"
 mime = "0.3"
@@ -82,8 +83,8 @@ colored = "2.1"
 walkdir = "2.4"
 serde_yaml = "0.9"
 
-# HTTP client
-reqwest = "0.12"
+# HTTP client (using rustls to avoid macOS system-configuration issues)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # Benchmarking
 criterion = "0.5"
@@ -132,6 +133,7 @@ ferrum-engine = { path = "crates/ferrum-engine" }
 ferrum-models = { path = "crates/ferrum-models" }
 ferrum-server = { path = "crates/ferrum-server" }
 ferrum-cli = { path = "crates/ferrum-cli" }
+
 
 [profile.release]
 opt-level = 3

@@ -26,14 +26,12 @@ pub mod factory;
 
 // Re-exports of interfaces
 pub use ferrum_interfaces::{
-    InferenceEngine as InferenceEngineInterface,
-    KvCacheManager, ModelBuilder, ModelExecutor, WeightLoader,
-    Sampler, SchedulerInterface as Scheduler,
-    Tokenizer, IncrementalTokenizer,
+    IncrementalTokenizer, InferenceEngine as InferenceEngineInterface, KvCacheManager,
+    ModelBuilder, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer, WeightLoader,
 };
 
 pub use ferrum_types::{
-    BatchId, EngineConfig, EngineStatus, FerrumError, InferenceRequest, InferenceResponse, 
+    BatchId, EngineConfig, EngineStatus, FerrumError, InferenceRequest, InferenceResponse,
     RequestId, Result, StreamChunk,
 };
 
@@ -66,16 +64,16 @@ pub fn simple_engine_config(
     device: ferrum_types::Device,
 ) -> EngineConfig {
     use ferrum_types::*;
-    
+
     let mut config = EngineConfig::default();
     config.model.model_id = model_id.into();
     config.backend.device = device;
-    
+
     // Set reasonable defaults for MVP
     config.batching.max_batch_size = 32;
     config.kv_cache.block_size = 16;
     config.kv_cache.max_blocks = 512;
     config.scheduler.max_running_requests = 32;
-    
+
     config
 }

@@ -3,9 +3,9 @@
 use crate::{
     BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, ScheduledRequest, Scheduler,
 };
+use async_trait::async_trait;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
 use ferrum_types::SchedulerConfig;
-use async_trait::async_trait;
 use ferrum_types::{
     BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState, Result,
 };
@@ -374,8 +374,14 @@ mod tests {
         let scheduler = FifoScheduler::new(config);
 
         // Submit requests
-        let _id1 = scheduler.submit(create_test_request(Priority::Normal)).await.unwrap();
-        let _id2 = scheduler.submit(create_test_request(Priority::High)).await.unwrap();
+        let _id1 = scheduler
+            .submit(create_test_request(Priority::Normal))
+            .await
+            .unwrap();
+        let _id2 = scheduler
+            .submit(create_test_request(Priority::High))
+            .await
+            .unwrap();
 
         // Should have 2 waiting
         assert_eq!(scheduler.waiting_queue.read().len(), 2);
@@ -402,7 +408,7 @@ mod tests {
     fn test_metrics_tracker() {
         let tracker = MetricsTracker::new();
         tracker.record_completion(100, 500);
-        
+
         assert!(tracker.avg_wait_time_ms() > 0.0);
         assert!(tracker.avg_execution_time_ms() > 0.0);
     }

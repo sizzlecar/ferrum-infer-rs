@@ -316,7 +316,7 @@ mod tests {
     fn test_memory_stats_tracker_creation() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
         let stats = tracker.stats();
-        
+
         assert_eq!(stats.total_allocated_bytes, 0);
         assert_eq!(stats.current_usage_bytes, 0);
         assert_eq!(stats.active_allocations, 0);
@@ -326,10 +326,10 @@ mod tests {
     #[test]
     fn test_record_allocation() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         tracker.record_allocation(1024);
         let stats = tracker.stats();
-        
+
         assert_eq!(stats.total_allocated_bytes, 1024);
         assert_eq!(stats.current_usage_bytes, 1024);
         assert_eq!(stats.active_allocations, 1);
@@ -340,10 +340,10 @@ mod tests {
     #[test]
     fn test_record_deallocation() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         tracker.record_allocation(1024);
         tracker.record_deallocation(1024);
-        
+
         let stats = tracker.stats();
         assert_eq!(stats.total_allocated_bytes, 1024);
         assert_eq!(stats.total_deallocated_bytes, 1024);
@@ -355,12 +355,12 @@ mod tests {
     #[test]
     fn test_peak_usage_tracking() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         tracker.record_allocation(1024);
         tracker.record_allocation(2048);
         tracker.record_deallocation(1024);
         tracker.record_allocation(512);
-        
+
         let stats = tracker.stats();
         assert_eq!(stats.peak_usage_bytes, 3072); // 1024 + 2048
         assert_eq!(stats.current_usage_bytes, 2560); // 2048 + 512
@@ -369,11 +369,11 @@ mod tests {
     #[test]
     fn test_average_allocation_size() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         tracker.record_allocation(1000);
         tracker.record_allocation(2000);
         tracker.record_allocation(3000);
-        
+
         let stats = tracker.stats();
         assert_eq!(stats.avg_allocation_size, 2000.0);
     }
@@ -381,10 +381,10 @@ mod tests {
     #[test]
     fn test_allocation_failure_tracking() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         tracker.record_allocation_failure();
         tracker.record_allocation_failure();
-        
+
         let stats = tracker.stats();
         assert_eq!(stats.allocation_failures, 2);
     }
@@ -392,13 +392,13 @@ mod tests {
     #[test]
     fn test_size_histogram() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
-        tracker.record_allocation(512);      // 0-1KB
-        tracker.record_allocation(2048);     // 1KB-4KB
-        tracker.record_allocation(8192);     // 4KB-16KB
-        tracker.record_allocation(32768);    // 16KB-64KB
-        tracker.record_allocation(1048576);  // 256KB-1MB
-        
+
+        tracker.record_allocation(512); // 0-1KB
+        tracker.record_allocation(2048); // 1KB-4KB
+        tracker.record_allocation(8192); // 4KB-16KB
+        tracker.record_allocation(32768); // 16KB-64KB
+        tracker.record_allocation(1048576); // 256KB-1MB
+
         let stats = tracker.stats();
         assert!(!stats.size_histogram.is_empty());
         assert!(stats.size_histogram.contains_key("0-1KB"));
@@ -408,16 +408,16 @@ mod tests {
     #[test]
     fn test_reset_stats() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         tracker.record_allocation(1024);
         tracker.record_allocation(2048);
         tracker.record_allocation_failure();
-        
+
         let stats_before = tracker.stats();
         assert_eq!(stats_before.allocation_count, 2);
-        
+
         tracker.reset();
-        
+
         let stats_after = tracker.stats();
         assert_eq!(stats_after.total_allocated_bytes, 0);
         assert_eq!(stats_after.allocation_count, 0);
@@ -427,16 +427,16 @@ mod tests {
     #[test]
     fn test_fragmentation_ratio() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         // Initially no fragmentation
         let stats = tracker.stats();
         assert_eq!(stats.fragmentation_ratio, 0.0);
-        
+
         // Allocate and deallocate to create fragmentation
         tracker.record_allocation(1000);
         tracker.record_allocation(2000);
         tracker.record_deallocation(1000);
-        
+
         let stats = tracker.stats();
         assert!(stats.fragmentation_ratio > 0.0);
         assert!(stats.fragmentation_ratio <= 1.0);
@@ -445,11 +445,11 @@ mod tests {
     #[test]
     fn test_global_memory_stats_registry() {
         let registry = GlobalMemoryStatsRegistry::new();
-        
+
         // Initially empty
         let stats = registry.get_stats(Device::CPU);
         assert!(stats.is_none());
-        
+
         // Get all stats (should be empty)
         let all_stats = registry.get_all_stats();
         assert_eq!(all_stats.len(), 0);
@@ -459,7 +459,7 @@ mod tests {
     fn test_global_memory_stats_singleton() {
         let registry1 = global_memory_stats();
         let registry2 = global_memory_stats();
-        
+
         // Should be the same instance
         assert!(std::ptr::eq(registry1, registry2));
     }
@@ -467,10 +467,10 @@ mod tests {
     #[test]
     fn test_uptime_tracking() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         // Sleep briefly to ensure uptime is non-zero
         std::thread::sleep(std::time::Duration::from_millis(10));
-        
+
         let stats = tracker.stats();
         assert!(stats.uptime.as_millis() >= 10);
     }
@@ -478,20 +478,20 @@ mod tests {
     #[test]
     fn test_multiple_allocations_deallocations() {
         let tracker = MemoryStatsTracker::new(Device::CPU);
-        
+
         // Simulate multiple allocation/deallocation cycles
         for i in 1..=10 {
             tracker.record_allocation(i * 100);
         }
-        
+
         let stats_after_alloc = tracker.stats();
         assert_eq!(stats_after_alloc.allocation_count, 10);
         assert_eq!(stats_after_alloc.active_allocations, 10);
-        
+
         for _ in 1..=5 {
             tracker.record_deallocation(100);
         }
-        
+
         let stats_after_dealloc = tracker.stats();
         assert_eq!(stats_after_dealloc.deallocation_count, 5);
         assert_eq!(stats_after_dealloc.active_allocations, 5);

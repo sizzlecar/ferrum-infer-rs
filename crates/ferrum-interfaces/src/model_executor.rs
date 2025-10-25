@@ -408,7 +408,7 @@ pub struct ExecutorConfig {
 }
 
 /// Runtime attention configuration for model executor
-/// 
+///
 /// Note: This is different from ferrum_types::AttentionConfig which describes
 /// the model architecture's attention configuration from config.json.
 /// This type describes the runtime execution settings.

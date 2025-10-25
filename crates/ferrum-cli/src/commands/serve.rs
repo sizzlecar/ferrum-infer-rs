@@ -3,9 +3,9 @@
 use crate::{config::CliConfig, output::OutputFormat};
 use clap::Args;
 use colored::*;
-use ferrum_types::Result;
 use ferrum_models::ModelSourceResolver;
 use ferrum_server::{traits::HttpServer, types::ServerConfig, AxumServer};
+use ferrum_types::Result;
 use std::sync::Arc;
 use tracing::info;
 
@@ -187,7 +187,13 @@ pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputForma
             ferrum_types::Device::CPU
         }
     };
-    
+
+    // 设置模型路径环境变量，以便引擎工厂加载真实的 tokenizer 和模型
+    std::env::set_var(
+        "FERRUM_MODEL_PATH",
+        source.local_path.to_string_lossy().to_string(),
+    );
+
     let mut engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
 
     // Initialize engine

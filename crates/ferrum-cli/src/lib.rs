@@ -12,8 +12,8 @@
 //! - **Cache Operations**: Cache management and debugging
 //! - **Development Tools**: Debugging and development utilities
 
-pub mod client;
 pub mod chat_template;
+pub mod client;
 pub mod commands;
 pub mod config;
 pub mod output;

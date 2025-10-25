@@ -16,11 +16,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use ferrum_interfaces::engine::InferenceEngine;
 use ferrum_types::{
     FerrumError as Error, FinishReason, InferenceRequest, ModelId, Priority, RequestId,
     SamplingParams,
 };
-use ferrum_interfaces::engine::InferenceEngine;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
@@ -359,7 +359,9 @@ async fn handle_chat_completions_sync(
 }
 
 /// Convert OpenAI chat request to internal inference request
-fn convert_chat_request(request: &ChatCompletionsRequest) -> ferrum_types::Result<InferenceRequest> {
+fn convert_chat_request(
+    request: &ChatCompletionsRequest,
+) -> ferrum_types::Result<InferenceRequest> {
     // Combine all messages into a single prompt for MVP
     let prompt = request
         .messages

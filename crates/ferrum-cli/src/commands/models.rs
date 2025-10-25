@@ -3,8 +3,8 @@
 use crate::{config::CliConfig, output::OutputFormat};
 use clap::Args;
 use colored::*;
-use ferrum_types::Result;
 use ferrum_models::ModelSourceResolver;
+use ferrum_types::Result;
 
 #[derive(Args)]
 pub struct ModelsCommand {
@@ -81,12 +81,12 @@ pub async fn execute(cmd: ModelsCommand, config: CliConfig, _format: OutputForma
 
 async fn list_models(config: &CliConfig) -> Result<()> {
     println!("{} Available models", "📋".bright_blue());
-    
+
     // Search in both model_dir and hf_cache_dir
     let mut registry = ferrum_models::DefaultModelRegistry::with_defaults();
-    
+
     let mut all_models = Vec::new();
-    
+
     // Search in configured model directory
     let models_dir = std::path::PathBuf::from(&config.models.model_dir);
     if models_dir.exists() {
@@ -95,12 +95,12 @@ async fn list_models(config: &CliConfig) -> Result<()> {
             all_models.extend(models);
         }
     }
-    
+
     // Also search in HF cache directory
     let hf_cache_dir = expand_home_dir(&config.models.download.hf_cache_dir);
     if hf_cache_dir.exists() && hf_cache_dir != models_dir {
         println!("📁 Searching: {}", hf_cache_dir.display());
-        
+
         // HF cache structure: ~/.cache/huggingface/hub/models--org--name/snapshots/hash/
         let hub_dir = hf_cache_dir.join("hub");
         if hub_dir.exists() {
@@ -109,13 +109,21 @@ async fn list_models(config: &CliConfig) -> Result<()> {
             if let Ok(entries) = std::fs::read_dir(&hub_dir) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
-                    if path.is_dir() && path.file_name().and_then(|n| n.to_str()).map(|s| s.starts_with("models--")).unwrap_or(false) {
+                    if path.is_dir()
+                        && path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.starts_with("models--"))
+                            .unwrap_or(false)
+                    {
                         scanned += 1;
                         // Found a model directory, check snapshots
                         if let Ok(snapshot_entries) = std::fs::read_dir(path.join("snapshots")) {
                             for snapshot in snapshot_entries.filter_map(|e| e.ok()) {
                                 if snapshot.path().is_dir() {
-                                    if let Ok(sub_models) = registry.discover_models(&snapshot.path()).await {
+                                    if let Ok(sub_models) =
+                                        registry.discover_models(&snapshot.path()).await
+                                    {
                                         all_models.extend(sub_models);
                                     }
                                 }
@@ -131,7 +139,11 @@ async fn list_models(config: &CliConfig) -> Result<()> {
     if all_models.is_empty() {
         println!("\nℹ️  No models found");
     } else {
-        println!("\n{} Found {} model(s):", "✅".bright_green(), all_models.len());
+        println!(
+            "\n{} Found {} model(s):",
+            "✅".bright_green(),
+            all_models.len()
+        );
         for model in all_models {
             let status_icon = if model.is_valid { "✅" } else { "⚠️" };
             let arch_str = model

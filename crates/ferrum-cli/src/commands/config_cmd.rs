@@ -63,13 +63,19 @@ async fn show_config(config: &CliConfig, format: &OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(config).map_err(|e| {
-                ferrum_types::FerrumError::serialization(format!("Failed to serialize config: {}", e))
+                ferrum_types::FerrumError::serialization(format!(
+                    "Failed to serialize config: {}",
+                    e
+                ))
             })?;
             println!("{}", json);
         }
         OutputFormat::Yaml => {
             let yaml = serde_yaml::to_string(config).map_err(|e| {
-                ferrum_types::FerrumError::serialization(format!("Failed to serialize config: {}", e))
+                ferrum_types::FerrumError::serialization(format!(
+                    "Failed to serialize config: {}",
+                    e
+                ))
             })?;
             println!("{}", yaml);
         }

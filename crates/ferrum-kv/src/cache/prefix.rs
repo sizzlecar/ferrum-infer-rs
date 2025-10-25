@@ -274,7 +274,7 @@ impl PrefixCache {
         let hits = *self.hits.lock();
         let misses = *self.misses.lock();
         let evictions = *self.evictions.lock();
-        
+
         let prefixes = self.prefixes.read();
         let total_size: usize = prefixes.values().map(|p| p.size).sum();
         let active_prefixes = prefixes.len();
@@ -384,11 +384,17 @@ mod tests {
             128
         }
 
-        fn key_cache(&self, _layer: usize) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
+        fn key_cache(
+            &self,
+            _layer: usize,
+        ) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
             Ok(None)
         }
 
-        fn value_cache(&self, _layer: usize) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
+        fn value_cache(
+            &self,
+            _layer: usize,
+        ) -> ferrum_types::Result<Option<ferrum_interfaces::TensorRef>> {
             Ok(None)
         }
 

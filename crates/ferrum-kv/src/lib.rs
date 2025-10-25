@@ -15,8 +15,7 @@ pub use ferrum_interfaces::{
         AllocationRequest, BlockTable, CacheConfig, CacheEvictionPolicy, CacheHandleStats,
         CacheManagerStats, LruEvictionPolicy, PrefixCacheConfig,
     },
-    KvCacheHandle as KvCacheHandleInterface,
-    KvCacheManager as KvCacheManagerInterface,
+    KvCacheHandle as KvCacheHandleInterface, KvCacheManager as KvCacheManagerInterface,
 };
 
 pub use ferrum_types::{CacheStats, DataType, Device, FerrumError, RequestId, Result};
@@ -39,7 +38,7 @@ pub fn default_manager(
 }
 
 /// Internal KV Cache manager configuration
-/// 
+///
 /// Note: This is distinct from ferrum_types::KvCacheConfig which is the engine-level
 /// configuration. This type is used internally by the KV cache manager implementation.
 #[derive(Debug, Clone)]
