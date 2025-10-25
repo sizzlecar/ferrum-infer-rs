@@ -138,7 +138,9 @@ pub fn select_option<T: std::fmt::Display>(prompt: &str, options: &[T]) -> Resul
         .with_prompt(prompt)
         .items(options)
         .interact()
-        .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to get user selection: {}", e)))?;
+        .map_err(|e| {
+            ferrum_types::FerrumError::io_str(format!("Failed to get user selection: {}", e))
+        })?;
 
     Ok(selection)
 }
@@ -151,9 +153,9 @@ pub fn get_input(prompt: &str, default: Option<&str>) -> Result<String> {
         input = input.default(default_value.to_string());
     }
 
-    let result = input
-        .interact_text()
-        .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to get user input: {}", e)))?;
+    let result = input.interact_text().map_err(|e| {
+        ferrum_types::FerrumError::io_str(format!("Failed to get user input: {}", e))
+    })?;
 
     Ok(result)
 }

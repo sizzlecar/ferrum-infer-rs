@@ -77,27 +77,34 @@ impl TensorLike for CandleTensor {
             .map_err(|e| ferrum_types::FerrumError::backend(format!("DType conversion: {}", e)))?;
         Ok(Arc::new(Self::new(converted)?))
     }
-    
+
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
         // Extract tensor data as Vec<f32>
         match self.inner.dims().len() {
-            1 => self.inner.to_vec1::<f32>()
+            1 => self
+                .inner
+                .to_vec1::<f32>()
                 .map_err(|e| ferrum_types::FerrumError::backend(format!("to_vec1 failed: {}", e))),
             2 => {
-                let batch = self.inner.to_vec2::<f32>()
-                    .map_err(|e| ferrum_types::FerrumError::backend(format!("to_vec2 failed: {}", e)))?;
+                let batch = self.inner.to_vec2::<f32>().map_err(|e| {
+                    ferrum_types::FerrumError::backend(format!("to_vec2 failed: {}", e))
+                })?;
                 Ok(batch.into_iter().next().unwrap_or_default())
             }
             3 => {
-                let all = self.inner.to_vec3::<f32>()
-                    .map_err(|e| ferrum_types::FerrumError::backend(format!("to_vec3 failed: {}", e)))?;
-                Ok(all.into_iter().next()
+                let all = self.inner.to_vec3::<f32>().map_err(|e| {
+                    ferrum_types::FerrumError::backend(format!("to_vec3 failed: {}", e))
+                })?;
+                Ok(all
+                    .into_iter()
+                    .next()
                     .and_then(|seq| seq.into_iter().last())
                     .unwrap_or_default())
             }
-            _ => Err(ferrum_types::FerrumError::backend(
-                format!("Unsupported tensor dimensions: {:?}", self.inner.dims())
-            )),
+            _ => Err(ferrum_types::FerrumError::backend(format!(
+                "Unsupported tensor dimensions: {:?}",
+                self.inner.dims()
+            ))),
         }
     }
 
@@ -282,8 +289,8 @@ impl TensorOps for CandleTensorOps {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
 
-        let result = (a_candle + b_candle)
-            .map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
+        let result =
+            (a_candle + b_candle).map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
@@ -291,8 +298,8 @@ impl TensorOps for CandleTensorOps {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
 
-        let result = (a_candle * b_candle)
-            .map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
+        let result =
+            (a_candle * b_candle).map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
@@ -300,8 +307,8 @@ impl TensorOps for CandleTensorOps {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
 
-        let result = (a_candle - b_candle)
-            .map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
+        let result =
+            (a_candle - b_candle).map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
@@ -309,8 +316,8 @@ impl TensorOps for CandleTensorOps {
         let a_candle = get_candle_tensor(a)?;
         let b_candle = get_candle_tensor(b)?;
 
-        let result = (a_candle / b_candle)
-            .map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
+        let result =
+            (a_candle / b_candle).map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
         Ok(Arc::new(CandleTensor::new(result)?))
     }
 
@@ -339,15 +346,19 @@ impl TensorOps for CandleTensorOps {
         let _bias_candle = bias.map(|b| get_candle_tensor(b)).transpose()?;
 
         // MVP: simplified layer norm
-        let zero_bias = candle_core::Tensor::zeros(weight_candle.shape(), weight_candle.dtype(), weight_candle.device())
-            .map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
-        
+        let zero_bias = candle_core::Tensor::zeros(
+            weight_candle.shape(),
+            weight_candle.dtype(),
+            weight_candle.device(),
+        )
+        .map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
+
         let bias_tensor = if let Some(b) = _bias_candle {
             b
         } else {
             &zero_bias
         };
-        
+
         let normalized = candle_nn::ops::layer_norm(input_candle, weight_candle, bias_tensor, eps)
             .map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))?;
         Ok(Arc::new(CandleTensor::new(normalized)?))
@@ -454,7 +465,7 @@ impl CandleBackend {
             device.clone(),
             crate::memory::InternalMemoryPoolConfig {
                 initial_size: 1024 * 1024 * 1024, // 1GB
-                max_size: 4 * 1024 * 1024 * 1024,  // 4GB
+                max_size: 4 * 1024 * 1024 * 1024, // 4GB
                 growth_factor: 1.5,
                 enable_defragmentation: true,
                 min_pooled_size: 256,
@@ -675,7 +686,7 @@ mod tests {
     async fn test_candle_backend_capabilities() {
         let backend = CandleBackend::new(Device::CPU).await.unwrap();
         let caps = backend.capabilities();
-        
+
         assert!(caps.supported_dtypes.contains(&DataType::FP32));
         assert!(caps.max_tensor_dims > 0);
     }
@@ -689,8 +700,10 @@ mod tests {
     #[test]
     fn test_tensor_factory_zeros() {
         let factory = CandleTensorFactory::new(Device::CPU);
-        let tensor = factory.zeros(&[2, 3], DataType::FP32, &Device::CPU).unwrap();
-        
+        let tensor = factory
+            .zeros(&[2, 3], DataType::FP32, &Device::CPU)
+            .unwrap();
+
         assert_eq!(tensor.shape(), &[2, 3]);
         assert_eq!(tensor.dtype(), DataType::FP32);
     }
@@ -699,7 +712,7 @@ mod tests {
     fn test_tensor_factory_ones() {
         let factory = CandleTensorFactory::new(Device::CPU);
         let tensor = factory.ones(&[2, 2], DataType::FP32, &Device::CPU).unwrap();
-        
+
         assert_eq!(tensor.shape(), &[2, 2]);
     }
 
@@ -707,13 +720,17 @@ mod tests {
     fn test_tensor_ops_add() {
         let factory = CandleTensorFactory::new(Device::CPU);
         let ops = CandleTensorOps;
-        
-        let a = factory.from_slice(&[1.0, 2.0], &[2], DataType::FP32, Device::CPU).unwrap();
-        let b = factory.from_slice(&[3.0, 4.0], &[2], DataType::FP32, Device::CPU).unwrap();
-        
+
+        let a = factory
+            .from_slice(&[1.0, 2.0], &[2], DataType::FP32, Device::CPU)
+            .unwrap();
+        let b = factory
+            .from_slice(&[3.0, 4.0], &[2], DataType::FP32, Device::CPU)
+            .unwrap();
+
         let result = ops.add(&a, &b).unwrap();
         let data = result.to_vec_f32().unwrap();
-        
+
         assert!((data[0] - 4.0).abs() < 1e-5);
         assert!((data[1] - 6.0).abs() < 1e-5);
     }
@@ -722,11 +739,15 @@ mod tests {
     fn test_tensor_ops_matmul() {
         let factory = CandleTensorFactory::new(Device::CPU);
         let ops = CandleTensorOps;
-        
+
         // 2x2 matrices
-        let a = factory.from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DataType::FP32, Device::CPU).unwrap();
-        let b = factory.from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2], DataType::FP32, Device::CPU).unwrap();
-        
+        let a = factory
+            .from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DataType::FP32, Device::CPU)
+            .unwrap();
+        let b = factory
+            .from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2], DataType::FP32, Device::CPU)
+            .unwrap();
+
         let result = ops.matmul(&a, &b).unwrap();
         assert_eq!(result.shape(), &[2, 2]);
     }
@@ -734,8 +755,10 @@ mod tests {
     #[test]
     fn test_tensor_reshape() {
         let factory = CandleTensorFactory::new(Device::CPU);
-        let tensor = factory.zeros(&[2, 3], DataType::FP32, &Device::CPU).unwrap();
-        
+        let tensor = factory
+            .zeros(&[2, 3], DataType::FP32, &Device::CPU)
+            .unwrap();
+
         let reshaped = tensor.reshape(&[3, 2]).unwrap();
         assert_eq!(reshaped.shape(), &[3, 2]);
     }
@@ -743,8 +766,10 @@ mod tests {
     #[test]
     fn test_tensor_to_cpu() {
         let factory = CandleTensorFactory::new(Device::CPU);
-        let tensor = factory.zeros(&[2, 3], DataType::FP32, &Device::CPU).unwrap();
-        
+        let tensor = factory
+            .zeros(&[2, 3], DataType::FP32, &Device::CPU)
+            .unwrap();
+
         let cpu_tensor = tensor.to_cpu().unwrap();
         assert_eq!(cpu_tensor.device(), Device::CPU);
     }

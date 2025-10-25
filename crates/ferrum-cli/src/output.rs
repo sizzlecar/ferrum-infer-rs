@@ -25,15 +25,24 @@ impl OutputFormatter for DefaultFormatter {
     fn format<T: Serialize>(&self, data: &T, format: &OutputFormat) -> Result<String> {
         match format {
             OutputFormat::Json => serde_json::to_string_pretty(data).map_err(|e| {
-                ferrum_types::FerrumError::serialization(format!("JSON serialization failed: {}", e))
+                ferrum_types::FerrumError::serialization(format!(
+                    "JSON serialization failed: {}",
+                    e
+                ))
             }),
             OutputFormat::Yaml => serde_yaml::to_string(data).map_err(|e| {
-                ferrum_types::FerrumError::serialization(format!("YAML serialization failed: {}", e))
+                ferrum_types::FerrumError::serialization(format!(
+                    "YAML serialization failed: {}",
+                    e
+                ))
             }),
             OutputFormat::Pretty | OutputFormat::Table => {
                 // For pretty/table format, just use JSON as fallback
                 serde_json::to_string_pretty(data).map_err(|e| {
-                    ferrum_types::FerrumError::serialization(format!("Pretty formatting failed: {}", e))
+                    ferrum_types::FerrumError::serialization(format!(
+                        "Pretty formatting failed: {}",
+                        e
+                    ))
                 })
             }
         }

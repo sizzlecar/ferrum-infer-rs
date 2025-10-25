@@ -383,7 +383,7 @@ mod tests {
         // P50 should be between elements (implementation may vary)
         let p50 = calculate_percentile(&values, 50.0);
         assert!(p50 >= 50.0 && p50 <= 60.0);
-        
+
         assert_eq!(calculate_percentile(&values, 95.0), 100.0);
         assert_eq!(calculate_percentile(&values, 0.0), 10.0);
     }

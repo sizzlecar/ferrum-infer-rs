@@ -15,19 +15,26 @@ pub mod tensor_wrapper;
 pub mod tokenizer;
 pub mod weights;
 
-pub use architectures::LlamaModelWrapper;
+pub use architectures::{LlamaModelWrapper, Qwen2ModelWrapper};
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
-pub use executor::{CandleModelExecutor, CandleModelExecutorV2, StubModelExecutor, extract_logits_safe};
+pub use executor::{
+    extract_logits_safe, CandleModelExecutor, CandleModelExecutorV2, Qwen2ModelExecutor,
+    StubModelExecutor,
+};
 pub use loader::SafeTensorsLoader;
-pub use tensor_wrapper::CandleTensorWrapper;
-pub use registry::{Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType};
+pub use registry::{
+    Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,
+};
 pub use source::{
     DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ModelSourceResolver,
     ResolvedModelSource,
 };
+pub use tensor_wrapper::CandleTensorWrapper;
 pub use tokenizer::{TokenizerFactory, TokenizerHandle};
 pub use weights::{default_weight_loader, StubWeightLoader, WeightLoaderHandle};
 
 pub use ferrum_interfaces::{ModelBuilder, ModelExecutor, WeightLoader};
-pub use ferrum_types::{Activation, AttentionConfig, ModelConfig, ModelInfo, ModelType, NormType, Result, RopeScaling};
+pub use ferrum_types::{
+    Activation, AttentionConfig, ModelConfig, ModelInfo, ModelType, NormType, Result, RopeScaling,
+};

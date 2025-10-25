@@ -171,7 +171,10 @@ impl CliConfig {
 
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).await.map_err(|e| {
-                    ferrum_types::FerrumError::io_str(format!("Failed to create config directory: {}", e))
+                    ferrum_types::FerrumError::io_str(format!(
+                        "Failed to create config directory: {}",
+                        e
+                    ))
                 })?;
             }
 
@@ -197,9 +200,9 @@ impl CliConfig {
             ferrum_types::FerrumError::configuration(format!("Failed to serialize config: {}", e))
         })?;
 
-        fs::write(path, content)
-            .await
-            .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to write config file: {}", e)))
+        fs::write(path, content).await.map_err(|e| {
+            ferrum_types::FerrumError::io_str(format!("Failed to write config file: {}", e))
+        })
     }
 
     /// Validate configuration

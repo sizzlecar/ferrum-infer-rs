@@ -1,6 +1,6 @@
 //! Model registry and alias management
 
-use ferrum_types::{ModelId, Result, FerrumError};
+use ferrum_types::{FerrumError, ModelId, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -81,11 +81,11 @@ impl DefaultModelRegistry {
             discovered_models: Vec::new(),
         }
     }
-    
+
     /// Create registry with common aliases
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
-        
+
         // Common model aliases
         registry.register_alias("tinyllama", "TinyLlama/TinyLlama-1.1B-Chat-v1.0");
         registry.register_alias("llama2-7b", "meta-llama/Llama-2-7b-hf");
@@ -97,10 +97,10 @@ impl DefaultModelRegistry {
         registry.register_alias("mistral-7b", "mistralai/Mistral-7B-v0.1");
         registry.register_alias("mistral-7b-instruct", "mistralai/Mistral-7B-Instruct-v0.2");
         registry.register_alias("phi3-mini", "microsoft/Phi-3-mini-4k-instruct");
-        
+
         registry
     }
-    
+
     /// Register a model alias
     pub fn register_alias(&mut self, alias: impl Into<String>, target: impl Into<String>) {
         let alias_str = alias.into();
@@ -108,13 +108,13 @@ impl DefaultModelRegistry {
         debug!("Registering alias: {} -> {}", alias_str, target_str);
         self.aliases.insert(alias_str, target_str);
     }
-    
+
     /// Add alias from struct
     pub fn add_alias(&mut self, alias: ModelAlias) -> Result<()> {
         self.register_alias(alias.name, alias.target);
         Ok(())
     }
-    
+
     /// Resolve model ID through aliases
     pub fn resolve_model_id(&self, name: &str) -> String {
         self.aliases
@@ -122,7 +122,7 @@ impl DefaultModelRegistry {
             .cloned()
             .unwrap_or_else(|| name.to_string())
     }
-    
+
     /// List all registered aliases
     pub fn list_aliases(&self) -> Vec<ModelAlias> {
         self.aliases
@@ -134,17 +134,17 @@ impl DefaultModelRegistry {
             })
             .collect()
     }
-    
+
     /// Discover models in a directory
     pub async fn discover_models(&mut self, root: &Path) -> Result<Vec<ModelDiscoveryEntry>> {
         if !root.exists() || !root.is_dir() {
             return Ok(Vec::new());
         }
-        
+
         info!("Discovering models in: {:?}", root);
-        
+
         let mut discovered = Vec::new();
-        
+
         // First check if root itself is a model directory
         if let Some(model_entry) = self.inspect_model_dir(root).await {
             discovered.push(model_entry);
@@ -161,11 +161,11 @@ impl DefaultModelRegistry {
                 }
             }
         }
-        
+
         self.discovered_models = discovered.clone();
         Ok(discovered)
     }
-    
+
     /// Inspect a directory to see if it contains a model
     async fn inspect_model_dir(&self, path: &Path) -> Option<ModelDiscoveryEntry> {
         // Check for config.json
@@ -174,19 +174,19 @@ impl DefaultModelRegistry {
             debug!("No config.json in: {:?}", path);
             return None;
         }
-        
+
         // Detect format
         let format = self.detect_model_format(path);
         if format == ModelFormatType::Unknown {
             debug!("Unknown format in: {:?}", path);
             return None;
         }
-        
+
         debug!("Found valid model at: {:?}, format: {:?}", path, format);
-        
+
         // Try to read architecture from config
         let architecture = self.read_architecture(&config_path);
-        
+
         // Extract model ID from path - try to get friendly name from parent directory
         let id = if let Some(parent) = path.parent() {
             if let Some(grandparent) = parent.parent() {
@@ -218,7 +218,7 @@ impl DefaultModelRegistry {
                 .unwrap_or("unknown")
                 .to_string()
         };
-        
+
         Some(ModelDiscoveryEntry {
             id,
             path: path.to_path_buf(),
@@ -227,7 +227,7 @@ impl DefaultModelRegistry {
             is_valid: true,
         })
     }
-    
+
     /// Detect model format in directory
     fn detect_model_format(&self, path: &Path) -> ModelFormatType {
         if path.join("model.safetensors").exists()
@@ -238,39 +238,38 @@ impl DefaultModelRegistry {
             || path.join("pytorch_model.bin.index.json").exists()
         {
             ModelFormatType::PyTorch
-        } else if std::fs::read_dir(path).ok().and_then(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .find(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        == Some("gguf")
-                })
-        }).is_some() {
+        } else if std::fs::read_dir(path)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .find(|e| e.path().extension().and_then(|s| s.to_str()) == Some("gguf"))
+            })
+            .is_some()
+        {
             ModelFormatType::GGUF
         } else {
             ModelFormatType::Unknown
         }
     }
-    
+
     /// Read architecture type from config.json
     fn read_architecture(&self, config_path: &Path) -> Option<Architecture> {
         let content = std::fs::read_to_string(config_path).ok()?;
         let config: serde_json::Value = serde_json::from_str(&content).ok()?;
-        
+
         // Try "model_type" field
         if let Some(model_type) = config.get("model_type").and_then(|v| v.as_str()) {
             return Some(Architecture::from_str(model_type));
         }
-        
+
         // Try "architectures" array
         if let Some(architectures) = config.get("architectures").and_then(|v| v.as_array()) {
             if let Some(arch) = architectures.first().and_then(|v| v.as_str()) {
                 return Some(Architecture::from_str(arch));
             }
         }
-        
+
         None
     }
 }
@@ -292,12 +291,18 @@ mod tests {
     #[test]
     fn test_architecture_from_str() {
         assert_eq!(Architecture::from_str("llama"), Architecture::Llama);
-        assert_eq!(Architecture::from_str("LlamaForCausalLM"), Architecture::Llama);
+        assert_eq!(
+            Architecture::from_str("LlamaForCausalLM"),
+            Architecture::Llama
+        );
         assert_eq!(Architecture::from_str("qwen2"), Architecture::Qwen2);
         assert_eq!(Architecture::from_str("mistral"), Architecture::Mistral);
         assert_eq!(Architecture::from_str("phi"), Architecture::Phi);
         assert_eq!(Architecture::from_str("gpt2"), Architecture::GPT2);
-        assert_eq!(Architecture::from_str("unknown_arch"), Architecture::Unknown);
+        assert_eq!(
+            Architecture::from_str("unknown_arch"),
+            Architecture::Unknown
+        );
     }
 
     #[test]
@@ -370,10 +375,10 @@ mod tests {
     #[test]
     fn test_registry_with_defaults() {
         let registry = DefaultModelRegistry::with_defaults();
-        
+
         // 应该有一些默认别名
         assert!(registry.aliases.len() > 0);
-        
+
         // 测试一些常见别名
         assert!(registry.aliases.contains_key("tinyllama"));
         assert!(registry.aliases.contains_key("llama2-7b"));
@@ -382,21 +387,24 @@ mod tests {
     #[test]
     fn test_registry_register_alias() {
         let mut registry = DefaultModelRegistry::new();
-        
+
         registry.register_alias("test", "test/model");
-        
-        assert_eq!(registry.aliases.get("test"), Some(&"test/model".to_string()));
+
+        assert_eq!(
+            registry.aliases.get("test"),
+            Some(&"test/model".to_string())
+        );
     }
 
     #[test]
     fn test_registry_resolve_model_id() {
         let mut registry = DefaultModelRegistry::new();
-        
+
         registry.register_alias("mymodel", "org/actual-model");
-        
+
         let resolved = registry.resolve_model_id("mymodel");
         assert_eq!(resolved, "org/actual-model");
-        
+
         // 未注册的别名应该返回原始值
         let unresolved = registry.resolve_model_id("unknown");
         assert_eq!(unresolved, "unknown");
@@ -405,14 +413,13 @@ mod tests {
     #[test]
     fn test_registry_list_aliases() {
         let mut registry = DefaultModelRegistry::new();
-        
+
         registry.register_alias("model1", "org/model1");
         registry.register_alias("model2", "org/model2");
-        
+
         let aliases = registry.list_aliases();
         assert_eq!(aliases.len(), 2);
     }
-
 
     #[test]
     fn test_architecture_debug() {
@@ -437,7 +444,7 @@ mod tests {
             architecture: Some(Architecture::Mistral),
             is_valid: false,
         };
-        
+
         let cloned = entry.clone();
         assert_eq!(entry.id, cloned.id);
         assert_eq!(entry.format, cloned.format);
@@ -447,10 +454,10 @@ mod tests {
     #[test]
     fn test_registry_multiple_aliases_same_target() {
         let mut registry = DefaultModelRegistry::new();
-        
+
         registry.register_alias("alias1", "org/model");
         registry.register_alias("alias2", "org/model");
-        
+
         assert_eq!(registry.resolve_model_id("alias1"), "org/model");
         assert_eq!(registry.resolve_model_id("alias2"), "org/model");
     }
@@ -460,7 +467,7 @@ mod tests {
         let arch = Architecture::Qwen2;
         let json = serde_json::to_string(&arch).unwrap();
         assert!(json.contains("Qwen2"));
-        
+
         let deserialized: Architecture = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, arch);
     }

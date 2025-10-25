@@ -4,10 +4,10 @@ use crate::{chat_template, client::FerrumClient, config::CliConfig, output::Outp
 use chrono::Utc;
 use clap::Args;
 use colored::*;
-use ferrum_types::{InferenceRequest, Priority, Result, SamplingParams};
 use ferrum_interfaces::engine::InferenceEngine;
 use ferrum_models::ModelSourceResolver;
 use ferrum_server::openai::{ChatCompletionsRequest, ChatMessage, MessageRole};
+use ferrum_types::{InferenceRequest, Priority, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -52,7 +52,7 @@ pub struct InferCommand {
     /// Interactive mode for continuous conversation (enabled by default)
     #[arg(short, long)]
     pub interactive: bool,
-    
+
     /// One-shot mode (single inference, then exit)
     #[arg(long)]
     pub once: bool,
@@ -74,22 +74,22 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
     // Determine if we should enter interactive mode
     // Default to interactive unless --once is specified or using --url (remote server)
     let should_be_interactive = !cmd.once && cmd.url.is_none();
-    
+
     if should_be_interactive && cmd.input_file.is_none() {
         // Enter interactive conversation mode
         return run_interactive_mode(cmd, config).await;
     }
-    
+
     // One-shot mode: execute single inference
     let prompt = if let Some(prompt) = cmd.prompt.clone() {
         prompt
     } else if let Some(file_path) = cmd.input_file.clone() {
-        tokio::fs::read_to_string(&file_path)
-            .await
-            .map_err(|e| ferrum_types::FerrumError::io_str(format!("Failed to read input file: {}", e)))?
+        tokio::fs::read_to_string(&file_path).await.map_err(|e| {
+            ferrum_types::FerrumError::io_str(format!("Failed to read input file: {}", e))
+        })?
     } else {
         return Err(ferrum_types::FerrumError::invalid_request(
-            "Please provide --prompt, --input-file, or enter interactive mode".to_string()
+            "Please provide --prompt, --input-file, or enter interactive mode".to_string(),
         ));
     };
 
@@ -98,7 +98,9 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
         .model
         .clone()
         .or(config.models.default_model.clone())
-        .ok_or_else(|| ferrum_types::FerrumError::invalid_request("No model specified".to_string()))?;
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::invalid_request("No model specified".to_string())
+        })?;
 
     println!("Model: {}", model.cyan());
     println!("Prompt: {}", prompt.trim().bright_white());
@@ -293,7 +295,13 @@ async fn run_local_inference(
             ferrum_types::Device::CPU
         }
     };
-    
+
+    // 设置模型路径环境变量，以便引擎工厂加载真实的 tokenizer 和模型
+    std::env::set_var(
+        "FERRUM_MODEL_PATH",
+        source.local_path.to_string_lossy().to_string(),
+    );
+
     let engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
 
     println!("{} Initializing inference engine...", "⚙️".yellow());
@@ -577,7 +585,13 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
             ferrum_types::Device::CPU
         }
     };
-    
+
+    // 设置模型路径环境变量，以便引擎工厂加载真实的 tokenizer 和模型
+    std::env::set_var(
+        "FERRUM_MODEL_PATH",
+        source.local_path.to_string_lossy().to_string(),
+    );
+
     let engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
 
     println!("{} Initializing inference engine...", "⚙️".yellow());
@@ -616,13 +630,15 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                     let mut history_pairs = Vec::new();
                     for (i, msg) in conversation_history.iter().enumerate() {
                         let role = if i % 2 == 0 { "user" } else { "assistant" };
-                        let content = msg.trim_start_matches("User: ")
+                        let content = msg
+                            .trim_start_matches("User: ")
                             .trim_start_matches("Assistant: ");
-                        if i < conversation_history.len() - 1 { // 排除当前用户输入
+                        if i < conversation_history.len() - 1 {
+                            // 排除当前用户输入
                             history_pairs.push((role.to_string(), content.to_string()));
                         }
                     }
-                    
+
                     // 使用 chat template 格式化
                     chat_template::auto_format_prompt(&resolved_id, &history_pairs, &input)
                 };
@@ -671,7 +687,7 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                     session_id: None,
                     metadata: HashMap::new(),
                 };
-                
+
                 // Add missing fields to sampling_params
                 let mut sampling_params = request.sampling_params.clone();
                 sampling_params.min_p = None;

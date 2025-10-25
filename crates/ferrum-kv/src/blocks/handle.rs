@@ -26,9 +26,9 @@ impl DefaultKvCacheHandle {
             request_id,
             block_table,
             device: Device::CPU,
-            num_layers: 32,    // Default placeholder
-            num_heads: 32,     // Default placeholder
-            head_dim: 128,     // Default placeholder
+            num_layers: 32, // Default placeholder
+            num_heads: 32,  // Default placeholder
+            head_dim: 128,  // Default placeholder
         }
     }
 
@@ -272,7 +272,7 @@ mod tests {
         let handle = DefaultKvCacheHandle::new(request_id, 16, 8);
 
         let stats = handle.stats();
-        
+
         // 如果有blocks，utilization应该在合理范围内
         if stats.blocks_allocated > 0 {
             assert!(stats.utilization >= 0.0);

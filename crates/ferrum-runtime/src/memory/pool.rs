@@ -32,7 +32,7 @@ pub struct MemoryPool {
 }
 
 /// Internal memory pool configuration for runtime implementation
-/// 
+///
 /// Note: This is distinct from ferrum_interfaces::memory::MemoryPoolConfig which
 /// defines the interface-level configuration. This type contains implementation-specific
 /// details for the memory pool.
@@ -522,7 +522,10 @@ mod tests {
         let stats_after = pool.stats();
 
         // After defragmentation, we should still have the same allocations
-        assert_eq!(stats_before.active_allocations, stats_after.active_allocations);
+        assert_eq!(
+            stats_before.active_allocations,
+            stats_after.active_allocations
+        );
 
         // Clean up
         pool.deallocate(handle1).ok();
@@ -532,46 +535,64 @@ mod tests {
     #[tokio::test]
     async fn test_device_memory_manager_trait() {
         use ferrum_interfaces::memory::DeviceMemoryManager;
-        
+
         let device = Device::CPU;
         let config = InternalMemoryPoolConfig::default();
         let pool = MemoryPool::new(device.clone(), config);
 
         // Test async allocate via trait
-        let handle = DeviceMemoryManager::allocate(&pool, 1024, &device).await.unwrap();
+        let handle = DeviceMemoryManager::allocate(&pool, 1024, &device)
+            .await
+            .unwrap();
         assert_ne!(handle.id(), 0);
 
         // Test aligned allocation
-        let aligned_handle = DeviceMemoryManager::allocate_aligned(&pool, 1000, 256, &device).await.unwrap();
+        let aligned_handle = DeviceMemoryManager::allocate_aligned(&pool, 1000, 256, &device)
+            .await
+            .unwrap();
         assert_ne!(aligned_handle.id(), 0);
 
         // Test memory info
-        let info = DeviceMemoryManager::memory_info(&pool, &device).await.unwrap();
+        let info = DeviceMemoryManager::memory_info(&pool, &device)
+            .await
+            .unwrap();
         assert_eq!(info.active_allocations, 2);
 
         // Test deallocate
-        DeviceMemoryManager::deallocate(&pool, handle).await.unwrap();
-        let info = DeviceMemoryManager::memory_info(&pool, &device).await.unwrap();
+        DeviceMemoryManager::deallocate(&pool, handle)
+            .await
+            .unwrap();
+        let info = DeviceMemoryManager::memory_info(&pool, &device)
+            .await
+            .unwrap();
         assert_eq!(info.active_allocations, 1);
 
         // Clean up
-        DeviceMemoryManager::deallocate(&pool, aligned_handle).await.ok();
+        DeviceMemoryManager::deallocate(&pool, aligned_handle)
+            .await
+            .ok();
     }
 
     #[tokio::test]
     async fn test_device_memory_manager_defragment() {
         use ferrum_interfaces::memory::DeviceMemoryManager;
-        
+
         let device = Device::CPU;
         let config = InternalMemoryPoolConfig::default();
         let pool = MemoryPool::new(device.clone(), config);
 
         // Allocate some memory
-        let _handle1 = DeviceMemoryManager::allocate(&pool, 1024, &device).await.unwrap();
-        let _handle2 = DeviceMemoryManager::allocate(&pool, 2048, &device).await.unwrap();
+        let _handle1 = DeviceMemoryManager::allocate(&pool, 1024, &device)
+            .await
+            .unwrap();
+        let _handle2 = DeviceMemoryManager::allocate(&pool, 2048, &device)
+            .await
+            .unwrap();
 
         // Test defragmentation
-        let defrag_stats = DeviceMemoryManager::defragment(&pool, &device).await.unwrap();
+        let defrag_stats = DeviceMemoryManager::defragment(&pool, &device)
+            .await
+            .unwrap();
         assert!(defrag_stats.fragmentation_before >= 0.0);
         assert!(defrag_stats.fragmentation_after >= 0.0);
     }

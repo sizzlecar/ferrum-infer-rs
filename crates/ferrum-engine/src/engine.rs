@@ -77,14 +77,16 @@ impl DefaultInferenceEngine {
                 extract_last_token_logits(&prefill_output.logits)?
             } else {
                 // Decode step
-                let decode_input = create_decode_input(&generated_tokens, kv_cache.clone(), device)?;
+                let decode_input =
+                    create_decode_input(&generated_tokens, kv_cache.clone(), device)?;
                 let decode_output = self.model_executor.decode(&decode_input).await?;
                 kv_cache = decode_output.kv_cache.clone();
                 decode_output.logits.clone()
             };
 
             // Sample next token
-            let next_token = sample_token(&logits, &request.sampling_params, &self.sampler, &mut rng)?;
+            let next_token =
+                sample_token(&logits, &request.sampling_params, &self.sampler, &mut rng)?;
 
             // Check stop conditions
             if is_stop_token(next_token, self.model_executor.info().vocab_size) {
@@ -102,9 +104,7 @@ impl DefaultInferenceEngine {
         }
 
         // 5. Decode output tokens
-        let generated_text = self
-            .tokenizer
-            .decode(&generated_tokens, true)?;
+        let generated_text = self.tokenizer.decode(&generated_tokens, true)?;
 
         debug!(
             "Generated {} tokens: {}",
@@ -141,7 +141,7 @@ impl InferenceEngine for DefaultInferenceEngine {
         request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let (tx, rx) = mpsc::channel(100);
-        
+
         // Clone components for async task
         let tokenizer = self.tokenizer.clone();
         let sampler = self.sampler.clone();
@@ -161,13 +161,14 @@ impl InferenceEngine for DefaultInferenceEngine {
             };
 
             // 2. Prefill
-            let prefill_input = match create_prefill_input(&input_tokens, &model_executor.info().device) {
-                Ok(input) => input,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
+            let prefill_input =
+                match create_prefill_input(&input_tokens, &model_executor.info().device) {
+                    Ok(input) => input,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
 
             let prefill_output = match model_executor.prefill(&prefill_input).await {
                 Ok(output) => output,
@@ -193,19 +194,21 @@ impl InferenceEngine for DefaultInferenceEngine {
                         }
                     }
                 } else {
-                    match create_decode_input(&generated_tokens, kv_cache.clone(), &model_executor.info().device) {
-                        Ok(input) => {
-                            match model_executor.decode(&input).await {
-                                Ok(output) => {
-                                    kv_cache = output.kv_cache.clone();
-                                    output.logits
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    return;
-                                }
+                    match create_decode_input(
+                        &generated_tokens,
+                        kv_cache.clone(),
+                        &model_executor.info().device,
+                    ) {
+                        Ok(input) => match model_executor.decode(&input).await {
+                            Ok(output) => {
+                                kv_cache = output.kv_cache.clone();
+                                output.logits
                             }
-                        }
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
+                        },
                         Err(e) => {
                             let _ = tx.send(Err(e)).await;
                             return;
@@ -266,7 +269,11 @@ impl InferenceEngine for DefaultInferenceEngine {
                 request_id: request_id.clone(),
                 text: String::new(),
                 token: None,
-                finish_reason: Some(determine_finish_reason(generated_tokens.len(), max_tokens, &sampling_params)),
+                finish_reason: Some(determine_finish_reason(
+                    generated_tokens.len(),
+                    max_tokens,
+                    &sampling_params,
+                )),
                 usage: Some(TokenUsage::new(input_tokens.len(), generated_tokens.len())),
                 created_at: chrono::Utc::now(),
                 metadata: std::collections::HashMap::new(),
@@ -352,20 +359,22 @@ fn create_prefill_input(
 ) -> Result<ferrum_interfaces::model_executor::PrefillInput> {
     use candle_core::{Device as CandleDevice, Tensor};
     use ferrum_models::tensor_wrapper::CandleTensorWrapper;
-    
+
     // Convert token IDs to u32 vector
     let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
-    
+
     // Create Candle tensor
     let tensor = Tensor::new(&token_u32s[..], &CandleDevice::Cpu)
         .map_err(|e| FerrumError::model(format!("Failed to create tensor: {}", e)))?
         .unsqueeze(0) // Add batch dimension: [seq_len] -> [1, seq_len]
         .map_err(|e| FerrumError::model(format!("Failed to unsqueeze: {}", e)))?;
-    
+
     // Wrap as TensorRef
     let tensor_ref = Arc::new(CandleTensorWrapper::new(tensor));
-    
-    Ok(ferrum_interfaces::model_executor::PrefillInput::new(tensor_ref))
+
+    Ok(ferrum_interfaces::model_executor::PrefillInput::new(
+        tensor_ref,
+    ))
 }
 
 fn create_decode_input(
@@ -375,26 +384,27 @@ fn create_decode_input(
 ) -> Result<ferrum_interfaces::model_executor::DecodeInput> {
     use candle_core::{Device as CandleDevice, Tensor};
     use ferrum_models::tensor_wrapper::CandleTensorWrapper;
-    
+
     // Get last token
     let last_token = tokens.last().copied().unwrap_or(TokenId::new(0));
-    
+
     // Create Candle tensor for single token
     let tensor = Tensor::new(&[last_token.get()], &CandleDevice::Cpu)
         .map_err(|e| FerrumError::model(format!("Failed to create tensor: {}", e)))?
         .unsqueeze(0) // Add batch dimension: [1] -> [1, 1]
         .map_err(|e| FerrumError::model(format!("Failed to unsqueeze: {}", e)))?;
-    
+
     // Wrap as TensorRef
     let tensor_ref = Arc::new(CandleTensorWrapper::new(tensor));
-    
+
     Ok(ferrum_interfaces::model_executor::DecodeInput::new(
-        tensor_ref,
-        kv_cache,
+        tensor_ref, kv_cache,
     ))
 }
 
-fn extract_last_token_logits(logits: &ferrum_interfaces::TensorRef) -> Result<ferrum_interfaces::TensorRef> {
+fn extract_last_token_logits(
+    logits: &ferrum_interfaces::TensorRef,
+) -> Result<ferrum_interfaces::TensorRef> {
     // MVP: return as-is for now
     Ok(logits.clone())
 }
@@ -407,10 +417,10 @@ fn sample_token(
 ) -> Result<TokenId> {
     // Use the new to_vec_f32 method from TensorLike trait
     let logits_vec = logits.to_vec_f32()?;
-    
+
     // Sample token
     let token_id = sampler.sample(&logits_vec, rng)?;
-    
+
     Ok(token_id)
 }
 
@@ -447,7 +457,11 @@ fn check_stop_sequences(
     Ok(false)
 }
 
-fn determine_finish_reason(generated_len: usize, max_tokens: usize, _params: &SamplingParams) -> FinishReason {
+fn determine_finish_reason(
+    generated_len: usize,
+    max_tokens: usize,
+    _params: &SamplingParams,
+) -> FinishReason {
     if generated_len >= max_tokens {
         FinishReason::Length
     } else {

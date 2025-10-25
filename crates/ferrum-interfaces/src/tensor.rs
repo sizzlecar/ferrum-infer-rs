@@ -55,13 +55,22 @@ pub trait TensorLike: Send + Sync + std::fmt::Debug {
 
     /// Convert tensor to specific data type
     fn to_dtype(&self, dtype: DataType) -> Result<TensorRef>;
-    
+
     /// Extract tensor data as Vec<f32> (for logits sampling)
     /// This is a convenience method for backends that need to extract data
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
         // Default implementation returns error - backends should override
         Err(crate::FerrumError::model(
-            "to_vec_f32 not implemented for this tensor backend"
+            "to_vec_f32 not implemented for this tensor backend",
+        ))
+    }
+    
+    /// Extract tensor data as Vec<u32> (for token IDs)
+    /// This is a convenience method for backends that need to extract token data
+    fn to_vec_u32(&self) -> Result<Vec<u32>> {
+        // Default implementation returns error - backends should override
+        Err(crate::FerrumError::model(
+            "to_vec_u32 not implemented for this tensor backend",
         ))
     }
 }

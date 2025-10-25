@@ -3,4 +3,3 @@
 pub mod safetensors_loader;
 
 pub use safetensors_loader::SafeTensorsLoader;
-

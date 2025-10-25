@@ -51,11 +51,7 @@ impl FifoQueue {
 
     /// Remove specific request from queue
     pub fn remove(&mut self, request_id: &RequestId) -> Option<InferenceRequest> {
-        if let Some(pos) = self
-            .requests
-            .iter()
-            .position(|req| &req.id == request_id)
-        {
+        if let Some(pos) = self.requests.iter().position(|req| &req.id == request_id) {
             self.requests.remove(pos)
         } else {
             None
@@ -64,16 +60,12 @@ impl FifoQueue {
 
     /// Get reference to request by ID
     pub fn get(&self, request_id: &RequestId) -> Option<&InferenceRequest> {
-        self.requests
-            .iter()
-            .find(|req| &req.id == request_id)
+        self.requests.iter().find(|req| &req.id == request_id)
     }
 
     /// Get mutable reference to request by ID
     pub fn get_mut(&mut self, request_id: &RequestId) -> Option<&mut InferenceRequest> {
-        self.requests
-            .iter_mut()
-            .find(|req| &req.id == request_id)
+        self.requests.iter_mut().find(|req| &req.id == request_id)
     }
 
     /// Clear all requests
@@ -174,8 +166,7 @@ mod tests {
     use ferrum_types::{ModelId, SamplingParams};
 
     fn create_test_request(_id: u64, priority: Priority) -> InferenceRequest {
-        InferenceRequest::new("test prompt", ModelId::new("test-model"))
-            .with_priority(priority)
+        InferenceRequest::new("test prompt", ModelId::new("test-model")).with_priority(priority)
     }
 
     #[test]
@@ -297,7 +288,7 @@ mod tests {
         let mut queue = FifoQueue::new(5);
         let req1 = create_test_request(1, Priority::Normal);
         let req2 = create_test_request(2, Priority::High);
-        
+
         let id1 = req1.id.clone();
         let id2 = req2.id.clone();
 
@@ -313,7 +304,7 @@ mod tests {
     #[test]
     fn test_fifo_queue_stats() {
         let mut queue = FifoQueue::new(10);
-        
+
         // Empty queue
         let stats = queue.stats();
         assert_eq!(stats.length, 0);
@@ -367,9 +358,9 @@ mod tests {
 
         let (critical_pct, high_pct, normal_pct, low_pct) = dist.percentages();
         assert!((critical_pct - 0.1).abs() < 0.01); // 1/10
-        assert!((high_pct - 0.2).abs() < 0.01);     // 2/10
-        assert!((normal_pct - 0.3).abs() < 0.01);   // 3/10
-        assert!((low_pct - 0.4).abs() < 0.01);      // 4/10
+        assert!((high_pct - 0.2).abs() < 0.01); // 2/10
+        assert!((normal_pct - 0.3).abs() < 0.01); // 3/10
+        assert!((low_pct - 0.4).abs() < 0.01); // 4/10
 
         // Test empty distribution
         let empty_dist = PriorityDistribution::default();

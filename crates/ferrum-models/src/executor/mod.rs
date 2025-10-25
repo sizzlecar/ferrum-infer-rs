@@ -1,8 +1,9 @@
 //! Model executor implementations
 
 pub mod candle_executor;
+pub mod qwen2_executor;
 pub mod stub_executor;
 
-pub use candle_executor::{CandleModelExecutor, CandleModelExecutorV2, extract_logits_safe};
+pub use candle_executor::{extract_logits_safe, CandleModelExecutor, CandleModelExecutorV2};
+pub use qwen2_executor::Qwen2ModelExecutor;
 pub use stub_executor::StubModelExecutor;
-

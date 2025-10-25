@@ -1,8 +1,8 @@
 //! HTTP client for communicating with Ferrum servers
 
 use crate::config::{CliConfig, ClientConfig};
-use ferrum_types::{InferenceRequest, InferenceResponse, Result};
 use ferrum_server::openai::{ChatCompletionsRequest, ChatCompletionsResponse};
+use ferrum_types::{InferenceRequest, InferenceResponse, Result};
 use futures::Stream;
 use reqwest::Client;
 use serde_json::Value;
@@ -156,7 +156,10 @@ impl FerrumClient {
 
                     Ok(mock_response)
                 }
-                Err(e) => Err(ferrum_types::FerrumError::network(format!("Stream error: {}", e))),
+                Err(e) => Err(ferrum_types::FerrumError::network(format!(
+                    "Stream error: {}",
+                    e
+                ))),
             }
         });
 
@@ -167,12 +170,9 @@ impl FerrumClient {
     pub async fn health(&self) -> Result<serde_json::Value> {
         let url = format!("{}/health", self.base_url);
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ferrum_types::FerrumError::network(format!("Health check failed: {}", e)))?;
+        let response = self.client.get(&url).send().await.map_err(|e| {
+            ferrum_types::FerrumError::network(format!("Health check failed: {}", e))
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -183,7 +183,10 @@ impl FerrumClient {
         }
 
         let health: serde_json::Value = response.json().await.map_err(|e| {
-            ferrum_types::FerrumError::deserialization(format!("Failed to parse health response: {}", e))
+            ferrum_types::FerrumError::deserialization(format!(
+                "Failed to parse health response: {}",
+                e
+            ))
         })?;
 
         Ok(health)
@@ -193,10 +196,9 @@ impl FerrumClient {
     pub async fn metrics(&self) -> Result<serde_json::Value> {
         let url = format!("{}/metrics", self.base_url);
 
-        let response =
-            self.client.get(&url).send().await.map_err(|e| {
-                ferrum_types::FerrumError::network(format!("Metrics request failed: {}", e))
-            })?;
+        let response = self.client.get(&url).send().await.map_err(|e| {
+            ferrum_types::FerrumError::network(format!("Metrics request failed: {}", e))
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -207,7 +209,10 @@ impl FerrumClient {
         }
 
         let metrics: serde_json::Value = response.json().await.map_err(|e| {
-            ferrum_types::FerrumError::deserialization(format!("Failed to parse metrics response: {}", e))
+            ferrum_types::FerrumError::deserialization(format!(
+                "Failed to parse metrics response: {}",
+                e
+            ))
         })?;
 
         Ok(metrics)
@@ -223,10 +228,9 @@ impl FerrumClient {
             req_builder = req_builder.bearer_auth(api_key);
         }
 
-        let response = req_builder
-            .send()
-            .await
-            .map_err(|e| ferrum_types::FerrumError::network(format!("Models request failed: {}", e)))?;
+        let response = req_builder.send().await.map_err(|e| {
+            ferrum_types::FerrumError::network(format!("Models request failed: {}", e))
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
