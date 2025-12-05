@@ -1,10 +1,12 @@
 //! Inference command implementation
 
-use crate::{chat_template, client::FerrumClient, config::CliConfig, output::OutputFormat};
+use crate::{
+    chat_template, client::FerrumClient, config::CliConfig, output::OutputFormat,
+    profiler::Profiler,
+};
 use chrono::Utc;
 use clap::Args;
 use colored::*;
-use ferrum_interfaces::engine::InferenceEngine;
 use ferrum_models::ModelSourceResolver;
 use ferrum_server::openai::{ChatCompletionsRequest, ChatMessage, MessageRole};
 use ferrum_types::{InferenceRequest, Priority, Result, SamplingParams};
@@ -66,9 +68,18 @@ pub struct InferCommand {
     pub backend: String,
 }
 
-#[instrument(skip(config), fields(model = %cmd.model.as_ref().unwrap_or(&"unknown".to_string()), stream = cmd.stream))]
-pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat) -> Result<()> {
+#[instrument(skip(config, debug), fields(model = %cmd.model.as_ref().unwrap_or(&"unknown".to_string()), stream = cmd.stream))]
+pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat, debug: bool) -> Result<()> {
+    let mut profiler = Profiler::new(debug);
+    
     info!("Starting CLI inference command");
+    
+    if debug {
+        println!();
+        println!("{}", "═══ Debug Mode Enabled ═══".bright_cyan().bold());
+        println!();
+    }
+    
     println!("{} Running inference...", "🧠".bright_blue());
 
     // Determine if we should enter interactive mode
@@ -77,7 +88,7 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
 
     if should_be_interactive && cmd.input_file.is_none() {
         // Enter interactive conversation mode
-        return run_interactive_mode(cmd, config).await;
+        return run_interactive_mode(cmd, config, debug).await;
     }
 
     // One-shot mode: execute single inference
@@ -139,8 +150,11 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
         run_remote_inference(&request, &url).await?
     } else {
         // Local mode: use direct backend
-        run_local_inference(&request, &cmd).await?
+        run_local_inference(&request, &cmd, &mut profiler).await?
     };
+    
+    // Print profiling summary if debug mode is enabled
+    profiler.print_summary();
 
     // Display or save output
     if let Some(output_path) = cmd.output_file {
@@ -183,16 +197,19 @@ pub async fn execute(cmd: InferCommand, config: CliConfig, _format: OutputFormat
 }
 
 /// Run inference using local backend with enhanced model loading
-#[instrument(skip(request, cmd), fields(request_id = %request.id.0, model_id = %request.model_id.0))]
 async fn run_local_inference(
     request: &InferenceRequest,
     cmd: &InferCommand,
+    profiler: &mut Profiler,
 ) -> Result<ferrum_types::InferenceResponse> {
     info!("Starting local inference with Candle backend");
     println!("{} Starting local inference...", "🔥".bright_yellow());
 
+    profiler.enter_section("Model Resolution");
+
     // Resolve model using enhanced model maintenance system
     let model_id = &request.model_id.0;
+    profiler.start_step("Resolve model ID");
     println!(
         "{} Resolving model: {}",
         "🔍".bright_blue(),
@@ -203,6 +220,7 @@ async fn run_local_inference(
     let resolved_id = registry.resolve_model_id(model_id);
 
     if resolved_id != *model_id {
+        profiler.info(&format!("Resolved alias '{}' to '{}'", model_id, resolved_id));
         println!(
             "{} Resolved alias '{}' to: {}",
             "🔗".bright_blue(),
@@ -210,8 +228,10 @@ async fn run_local_inference(
             resolved_id.yellow()
         );
     }
+    profiler.end_step_with_details(&format!("resolved to {}", resolved_id));
 
     // Create model source resolver
+    profiler.start_step("Resolve model source");
     let source_config = ferrum_models::ModelSourceConfig::default();
     let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
 
@@ -223,9 +243,11 @@ async fn run_local_inference(
                 "✅".bright_green(),
                 source.local_path.display()
             );
+            profiler.end_step_with_details(&format!("{}", source.local_path.display()));
             source
         }
         Err(e) => {
+            profiler.error(&format!("Failed to resolve model: {}", e));
             println!(
                 "{} Failed to resolve model '{}': {}",
                 "❌".bright_red(),
@@ -243,9 +265,10 @@ async fn run_local_inference(
     };
 
     // Load model configuration
+    profiler.start_step("Load model configuration");
     println!("{} Loading model configuration...", "⚙️".bright_blue());
     let mut config_manager = ferrum_models::ConfigManager::new();
-    let model_config = match config_manager.load_from_source(&source).await {
+    let _model_config = match config_manager.load_from_source(&source).await {
         Ok(config) => {
             println!(
                 "{} Configuration loaded: {} ({})",
@@ -253,15 +276,22 @@ async fn run_local_inference(
                 format!("{:?}", config.architecture).yellow(),
                 format!("{} params", config.vocab_size).cyan()
             );
+            profiler.end_step_with_details(&format!("{:?}, vocab_size={}", config.architecture, config.vocab_size));
             config
         }
         Err(e) => {
+            profiler.error(&format!("Failed to load configuration: {}", e));
             println!("{} Failed to load configuration: {}", "❌".bright_red(), e);
             return Err(e);
         }
     };
+    
+    profiler.exit_section();
+
+    profiler.enter_section("Engine Initialization");
 
     // Create engine configuration with resolved model information
+    profiler.start_step("Select compute device");
     let device = match cmd.backend.as_str() {
         "auto" => {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -271,30 +301,42 @@ async fn run_local_inference(
                         "{} Auto-detected Metal backend for Apple GPU",
                         "🔥".yellow()
                     );
+                    profiler.info("Selected Metal backend");
                     ferrum_types::Device::Metal
                 } else {
                     println!("{} Auto-detected CPU backend", "💻".blue());
+                    profiler.info("Selected CPU backend");
                     ferrum_types::Device::CPU
                 }
             }
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
                 println!("{} Auto-detected CPU backend", "💻".blue());
+                profiler.info("Selected CPU backend");
                 ferrum_types::Device::CPU
             }
         }
-        "cpu" => ferrum_types::Device::CPU,
+        "cpu" => {
+            profiler.info("Using CPU backend (explicit)");
+            ferrum_types::Device::CPU
+        }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        "metal" => ferrum_types::Device::Metal,
+        "metal" => {
+            profiler.info("Using Metal backend (explicit)");
+            ferrum_types::Device::Metal
+        }
         backend if backend.starts_with("cuda:") => {
             let device_id = backend[5..].parse().unwrap_or(0);
+            profiler.info(&format!("Using CUDA device {}", device_id));
             ferrum_types::Device::CUDA(device_id)
         }
         backend => {
+            profiler.warn(&format!("Unknown backend '{}', falling back to CPU", backend));
             println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
             ferrum_types::Device::CPU
         }
     };
+    profiler.end_step_with_details(&format!("{:?}", device));
 
     // 设置模型路径环境变量，以便引擎工厂加载真实的 tokenizer 和模型
     std::env::set_var(
@@ -302,17 +344,26 @@ async fn run_local_inference(
         source.local_path.to_string_lossy().to_string(),
     );
 
+    profiler.start_step("Create engine config");
     let engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
+    profiler.end_step();
 
+    profiler.start_step("Initialize inference engine");
     println!("{} Initializing inference engine...", "⚙️".yellow());
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
+    profiler.end_step_with_details("Engine ready");
     println!("{} Engine initialized successfully", "✅".green());
+    
+    profiler.exit_section();
 
+    profiler.enter_section("Inference");
+    
     println!("{} Generating...", "⚡".bright_magenta());
 
     let start_time = std::time::Instant::now();
 
     if request.stream {
+        profiler.start_step("Streaming generation");
         print!("Output: ");
         io::stdout().flush().unwrap();
 
@@ -320,10 +371,16 @@ async fn run_local_inference(
         let mut stream = engine.infer_stream(request.clone()).await?;
         let mut full_text = String::new();
         let mut token_count = 0;
+        let mut first_token_time: Option<std::time::Duration> = None;
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
+                    // Record time to first token
+                    if first_token_time.is_none() && chunk.token.is_some() {
+                        first_token_time = Some(start_time.elapsed());
+                    }
+                    
                     // 安全地处理可能的编码问题
                     if !chunk.text.is_empty() {
                         print!("{}", chunk.text);
@@ -340,15 +397,34 @@ async fn run_local_inference(
                     }
                 }
                 Err(e) => {
+                    profiler.error(&format!("Stream error: {}", e));
                     eprintln!("\n{} Stream error: {}", "❌".red(), e);
                     break;
                 }
             }
         }
 
-        println!("\n{} Generation completed", "🏁".green());
-
         let duration = start_time.elapsed();
+        
+        // Calculate tokens per second
+        let tokens_per_sec = if duration.as_secs_f64() > 0.0 {
+            token_count as f64 / duration.as_secs_f64()
+        } else {
+            0.0
+        };
+        
+        let details = format!(
+            "{} tokens, {:.1} tok/s{}",
+            token_count,
+            tokens_per_sec,
+            first_token_time.map(|t| format!(", TTFT: {}ms", t.as_millis())).unwrap_or_default()
+        );
+        profiler.end_step_with_details(&details);
+        
+        println!("\n{} Generation completed", "🏁".green());
+        
+        profiler.exit_section();
+
         Ok(ferrum_types::InferenceResponse {
             request_id: request.id.clone(),
             text: full_text,
@@ -364,9 +440,13 @@ async fn run_local_inference(
             metadata: HashMap::new(),
         })
     } else {
+        profiler.start_step("Non-streaming generation");
         // Use non-streaming inference
         let response = engine.infer(request.clone()).await?;
+        profiler.end_step_with_details(&format!("{} tokens generated", response.usage.completion_tokens));
         println!("{} Generation completed", "🏁".green());
+        
+        profiler.exit_section();
         Ok(response)
     }
 }
@@ -457,7 +537,14 @@ async fn run_remote_inference(
 }
 
 /// Interactive conversation mode (like ollama)
-async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()> {
+async fn run_interactive_mode(cmd: InferCommand, config: CliConfig, debug: bool) -> Result<()> {
+    let mut profiler = Profiler::new(debug);
+    
+    if debug {
+        println!();
+        println!("{}", "═══ Debug Mode Enabled ═══".bright_cyan().bold());
+        println!();
+    }
     println!(
         "{}",
         "🚀 Starting interactive conversation mode"
@@ -469,7 +556,10 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
         "Type your message and press Enter. Use 'exit' or Ctrl+C to quit.".dimmed()
     );
 
+    profiler.enter_section("Model Resolution");
+
     // Initialize engine once with enhanced model resolution
+    profiler.start_step("Resolve model ID");
     let model_name = cmd
         .model
         .clone()
@@ -486,6 +576,7 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
     let resolved_id = registry.resolve_model_id(&model_name);
 
     if resolved_id != model_name {
+        profiler.info(&format!("Resolved alias '{}' to '{}'", model_name, resolved_id));
         println!(
             "{} Resolved alias '{}' to: {}",
             "🔗".bright_blue(),
@@ -493,8 +584,10 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
             resolved_id.yellow()
         );
     }
+    profiler.end_step_with_details(&format!("resolved to {}", resolved_id));
 
     // Create model source resolver
+    profiler.start_step("Resolve model source");
     let source_config = ferrum_models::ModelSourceConfig::default();
     let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
 
@@ -506,9 +599,11 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                 "✅".bright_green(),
                 source.local_path.display()
             );
+            profiler.end_step_with_details(&format!("{}", source.local_path.display()));
             source
         }
         Err(e) => {
+            profiler.error(&format!("Failed to resolve model: {}", e));
             println!(
                 "{} Failed to resolve model '{}': {}",
                 "❌".bright_red(),
@@ -524,8 +619,9 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
     };
 
     // Load model configuration for better engine setup
+    profiler.start_step("Load model configuration");
     let mut config_manager = ferrum_models::ConfigManager::new();
-    let model_config = config_manager
+    let _model_config = config_manager
         .load_from_source(&source)
         .await
         .unwrap_or_else(|e| {
@@ -551,7 +647,13 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                 extra_params: serde_json::Value::Object(serde_json::Map::new()),
             }
         });
+    profiler.end_step();
+    
+    profiler.exit_section();
 
+    profiler.enter_section("Engine Initialization");
+    
+    profiler.start_step("Select compute device");
     let device = match cmd.backend.as_str() {
         "auto" => {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -561,30 +663,42 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
                         "{} Auto-detected Metal backend for Apple GPU",
                         "🔥".yellow()
                     );
+                    profiler.info("Selected Metal backend");
                     ferrum_types::Device::Metal
                 } else {
                     println!("{} Auto-detected CPU backend", "💻".blue());
+                    profiler.info("Selected CPU backend");
                     ferrum_types::Device::CPU
                 }
             }
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
                 println!("{} Auto-detected CPU backend", "💻".blue());
+                profiler.info("Selected CPU backend");
                 ferrum_types::Device::CPU
             }
         }
-        "cpu" => ferrum_types::Device::CPU,
+        "cpu" => {
+            profiler.info("Using CPU backend (explicit)");
+            ferrum_types::Device::CPU
+        }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        "metal" => ferrum_types::Device::Metal,
+        "metal" => {
+            profiler.info("Using Metal backend (explicit)");
+            ferrum_types::Device::Metal
+        }
         backend if backend.starts_with("cuda:") => {
             let device_id = backend[5..].parse().unwrap_or(0);
+            profiler.info(&format!("Using CUDA device {}", device_id));
             ferrum_types::Device::CUDA(device_id)
         }
         backend => {
+            profiler.warn(&format!("Unknown backend '{}', falling back to CPU", backend));
             println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
             ferrum_types::Device::CPU
         }
     };
+    profiler.end_step_with_details(&format!("{:?}", device));
 
     // 设置模型路径环境变量，以便引擎工厂加载真实的 tokenizer 和模型
     std::env::set_var(
@@ -592,11 +706,20 @@ async fn run_interactive_mode(cmd: InferCommand, config: CliConfig) -> Result<()
         source.local_path.to_string_lossy().to_string(),
     );
 
+    profiler.start_step("Create engine config");
     let engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
+    profiler.end_step();
 
+    profiler.start_step("Initialize inference engine");
     println!("{} Initializing inference engine...", "⚙️".yellow());
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
+    profiler.end_step_with_details("Engine ready");
     println!("{} Engine ready for conversation!", "✅".green());
+    
+    profiler.exit_section();
+    
+    // Print initialization summary
+    profiler.print_summary();
 
     let mut conversation_history = Vec::new();
     let mut conversation_turn = 1;

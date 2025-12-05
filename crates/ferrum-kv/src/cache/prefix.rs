@@ -268,6 +268,22 @@ impl PrefixCache {
         }
     }
 
+    /// Evict up to n prefixes, returning the number actually evicted
+    pub fn evict_n(&self, n: usize) -> usize {
+        let mut prefixes = self.prefixes.write();
+        let mut evicted = 0;
+
+        for _ in 0..n {
+            if prefixes.is_empty() {
+                break;
+            }
+            self.evict_lru(&mut prefixes);
+            evicted += 1;
+        }
+
+        evicted
+    }
+
     /// Get cache statistics
     pub fn stats(&self) -> PrefixCacheStats {
         // Lock metrics first, then prefixes to avoid potential lock ordering issues

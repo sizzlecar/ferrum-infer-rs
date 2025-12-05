@@ -26,9 +26,13 @@ struct Cli {
     #[arg(short, long, default_value = "ferrum.toml")]
     config: String,
 
-    /// Verbose output
+    /// Verbose output (show tracing logs)
     #[arg(short, long)]
     verbose: bool,
+
+    /// Debug mode (show step-by-step timing and details)
+    #[arg(short, long)]
+    debug: bool,
 
     /// Quiet mode (only errors)
     #[arg(short, long)]
@@ -93,7 +97,7 @@ async fn main() {
     // Execute command
     let result = match cli.command {
         Commands::Serve(cmd) => serve::execute(cmd, config, cli.format).await,
-        Commands::Infer(cmd) => infer::execute(cmd, config, cli.format).await,
+        Commands::Infer(cmd) => infer::execute(cmd, config, cli.format, cli.debug).await,
         Commands::Models(cmd) => models::execute(cmd, config, cli.format).await,
         Commands::Benchmark(cmd) => benchmark::execute(cmd, config, cli.format).await,
         Commands::Config(cmd) => config_cmd::execute(cmd, config, cli.format).await,
