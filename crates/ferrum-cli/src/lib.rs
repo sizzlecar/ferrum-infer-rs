@@ -17,9 +17,11 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod output;
+pub mod profiler;
 pub mod utils;
 
 // Re-exports
 pub use client::FerrumClient;
 pub use config::CliConfig;
 pub use output::{OutputFormat, OutputFormatter};
+pub use profiler::{GlobalProfiler, Profiler};

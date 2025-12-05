@@ -19,6 +19,10 @@ pub mod compute_pipeline;
 pub mod benchmark;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_model;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_llama;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_executor;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use backend::MetalBackend;
@@ -34,6 +38,10 @@ pub use compute_pipeline::*;
 pub use benchmark::*;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_model::*;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use metal_llama::*;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use metal_executor::*;
 
 // Stub implementations for non-Apple platforms
 #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
@@ -41,7 +49,7 @@ pub struct MetalBackend;
 
 #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
 impl MetalBackend {
-    pub fn new(_device: ferrum_core::Device) -> ferrum_core::Result<Self> {
-        Err(ferrum_core::Error::internal("Metal backend not available on this platform"))
+    pub fn new(_device: ferrum_types::Device) -> ferrum_types::Result<Self> {
+        Err(ferrum_types::FerrumError::internal("Metal backend not available on this platform"))
     }
 }

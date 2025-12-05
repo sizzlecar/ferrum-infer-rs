@@ -9,7 +9,7 @@ use ferrum_types::{
     EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest, InferenceResponse,
     Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
 };
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use rand::{rngs::StdRng, SeedableRng};
 use std::pin::Pin;
 use std::sync::Arc;

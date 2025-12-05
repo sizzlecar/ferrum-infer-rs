@@ -68,7 +68,7 @@ criterion = "0.5"
 [features]
 default = []
 cuda = ["candle-core/cuda"]
-metal = ["dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray"]
+metal = ["candle-core/metal", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray"]
 
 # Metal dependencies for Apple GPU support (only on macOS/iOS)
 [target.'cfg(target_os = "macos")'.dependencies]
