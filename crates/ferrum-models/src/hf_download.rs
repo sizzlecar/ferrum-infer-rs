@@ -7,12 +7,13 @@
 //! - HuggingFace token authentication
 
 use ferrum_types::{FerrumError, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::AsyncWriteExt;
 
 /// HuggingFace API base URL
 const HF_API_URL: &str = "https://huggingface.co";
@@ -37,6 +38,7 @@ struct HfFileInfo {
 }
 
 /// HuggingFace downloader with resume support
+#[derive(Clone)]
 pub struct HfDownloader {
     client: Client,
     cache_dir: PathBuf,
@@ -119,23 +121,58 @@ impl HfDownloader {
 
         // Calculate total size
         let total_size: u64 = files_to_download.iter().filter_map(|f| f.size).sum();
+        let file_count = files_to_download.len();
         println!(
             "📦 Downloading {} files ({:.2} GB)",
-            files_to_download.len(),
+            file_count,
             total_size as f64 / 1_073_741_824.0
         );
 
-        // Download each file
-        for file_info in &files_to_download {
-            self.download_file_with_resume(
-                model_id,
-                revision,
-                &file_info.path,
-                file_info.size.unwrap_or(0),
-                &blobs_dir,
-                &snapshot_dir,
-            )
-            .await?;
+        // Use concurrent downloads for multiple files (up to 3 concurrent)
+        let concurrency = std::cmp::min(3, file_count);
+        
+        if concurrency > 1 && file_count > 1 {
+            // Concurrent download with MultiProgress
+            let mp = Arc::new(MultiProgress::new());
+            let self_arc = Arc::new(self.clone());
+            
+            let mut handles = Vec::new();
+            for file_info in files_to_download {
+                let downloader = self_arc.clone();
+                let mp = mp.clone();
+                let model_id = model_id.to_string();
+                let revision = revision.to_string();
+                let filename = file_info.path.clone();
+                let size = file_info.size.unwrap_or(0);
+                let blobs = blobs_dir.clone();
+                let snapshot = snapshot_dir.clone();
+                
+                let handle = tokio::spawn(async move {
+                    downloader
+                        .download_file_concurrent(&model_id, &revision, &filename, size, &blobs, &snapshot, Some(&mp))
+                        .await
+                });
+                handles.push(handle);
+            }
+            
+            // Wait for all downloads
+            for handle in handles {
+                handle.await.map_err(|e| FerrumError::model(format!("Task error: {}", e)))??;
+            }
+        } else {
+            // Sequential download for single file
+            for file_info in &files_to_download {
+                self.download_file_concurrent(
+                    model_id,
+                    revision,
+                    &file_info.path,
+                    file_info.size.unwrap_or(0),
+                    &blobs_dir,
+                    &snapshot_dir,
+                    None,
+                )
+                .await?;
+            }
         }
 
         // Write refs/main to point to this snapshot
@@ -216,8 +253,8 @@ impl HfDownloader {
         Ok(info.sha)
     }
 
-    /// Download a single file with resume support
-    async fn download_file_with_resume(
+    /// Download a single file with resume support (concurrent-safe)
+    async fn download_file_concurrent(
         &self,
         model_id: &str,
         revision: &str,
@@ -225,11 +262,19 @@ impl HfDownloader {
         expected_size: u64,
         blobs_dir: &Path,
         snapshot_dir: &Path,
+        mp: Option<&MultiProgress>,
     ) -> Result<()> {
         let url = format!(
             "{}/{}/resolve/{}/{}",
             HF_API_URL, model_id, revision, filename
         );
+
+        // Use a short display name for progress
+        let display_name = if filename.len() > 30 {
+            format!("...{}", &filename[filename.len()-27..])
+        } else {
+            filename.to_string()
+        };
 
         // First, do a HEAD request to get file info
         let mut head_req = self.client.head(&url);
@@ -250,10 +295,9 @@ impl HfDownloader {
             )));
         }
 
-        // Get content length and ETag
-        let total_size = head_resp
-            .content_length()
-            .unwrap_or(expected_size);
+        // Get content length - prefer HEAD response, fallback to API size
+        let head_size = head_resp.content_length().unwrap_or(0);
+        let total_size = if head_size > 0 { head_size } else { expected_size };
         
         let etag = head_resp
             .headers()
@@ -269,9 +313,9 @@ impl HfDownloader {
         // Check if already complete
         if blob_path.exists() {
             if let Ok(meta) = fs::metadata(&blob_path).await {
-                if total_size == 0 || meta.len() == total_size {
+                if total_size == 0 || meta.len() == total_size || (total_size == 0 && meta.len() > 0) {
                     create_symlink(&blob_path, &snapshot_file).await?;
-                    println!("  ✓ {} (cached)", filename);
+                    println!("  ✓ {} (cached)", display_name);
                     return Ok(());
                 }
             }
@@ -287,20 +331,39 @@ impl HfDownloader {
             0
         };
 
-        // Create progress bar
-        let pb = ProgressBar::new(total_size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("  {spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                .unwrap()
-                .progress_chars("█▓▒░"),
-        );
-        pb.set_message(filename.to_string());
+        // Create progress bar - use spinner mode if size unknown
+        let pb = if total_size > 0 {
+            let pb = if let Some(mp) = mp {
+                mp.add(ProgressBar::new(total_size))
+            } else {
+                ProgressBar::new(total_size)
+            };
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("  {spinner:.green} {msg:<30} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} ETA {eta}")
+                    .unwrap()
+                    .progress_chars("━╸─"),
+            );
+            pb
+        } else {
+            let pb = if let Some(mp) = mp {
+                mp.add(ProgressBar::new_spinner())
+            } else {
+                ProgressBar::new_spinner()
+            };
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("  {spinner:.green} {msg:<30} {bytes:>10} {bytes_per_sec:>12}")
+                    .unwrap(),
+            );
+            pb
+        };
+        pb.set_message(display_name.clone());
 
         // If resuming, set initial position
-        if resume_from > 0 && resume_from < total_size {
+        if resume_from > 0 && (total_size == 0 || resume_from < total_size) {
             pb.set_position(resume_from);
-            pb.set_message(format!("{} (resuming)", filename));
+            pb.set_message(format!("{} (续传)", display_name));
         }
 
         // Build download request with optional Range header
@@ -339,6 +402,22 @@ impl HfDownloader {
             )));
         }
 
+        // Update total size from GET response if we didn't have it
+        let content_length = response.content_length().unwrap_or(0);
+        let actual_total = if start_pos > 0 {
+            // For range requests, add start position to content-length
+            start_pos + content_length
+        } else if content_length > 0 {
+            content_length
+        } else {
+            total_size
+        };
+        
+        // Update progress bar with correct total
+        if actual_total > 0 && actual_total != total_size {
+            pb.set_length(actual_total);
+        }
+
         // Stream download
         let mut stream = response.bytes_stream();
         let mut downloaded = start_pos;
@@ -359,7 +438,7 @@ impl HfDownloader {
         // Verify size
         let final_size = fs::metadata(&incomplete_path).await?.len();
         if total_size > 0 && final_size != total_size {
-            pb.finish_with_message(format!("{} ⚠ incomplete ({}/{})", filename, final_size, total_size));
+            pb.finish_with_message(format!("{} ⚠ 不完整", display_name));
             return Err(FerrumError::model(format!(
                 "Incomplete download for {}: got {} bytes, expected {}",
                 filename, final_size, total_size
@@ -369,7 +448,7 @@ impl HfDownloader {
         // Rename to final path
         fs::rename(&incomplete_path, &blob_path).await?;
         
-        pb.finish_with_message(format!("{} ✓", filename));
+        pb.finish_with_message(format!("{} ✓ {}", display_name, format_size(final_size)));
 
         // Create symlink in snapshot directory
         create_symlink(&blob_path, &snapshot_file).await?;
@@ -414,4 +493,21 @@ fn simple_hash(s: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Format file size for display
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
