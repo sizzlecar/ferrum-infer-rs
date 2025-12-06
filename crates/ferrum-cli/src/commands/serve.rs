@@ -1,228 +1,243 @@
-//! Server command implementation
+//! Serve command - Start the HTTP inference server
 
-use crate::{config::CliConfig, output::OutputFormat};
+use crate::config::CliConfig;
 use clap::Args;
 use colored::*;
-use ferrum_models::ModelSourceResolver;
-use ferrum_server::{traits::HttpServer, types::ServerConfig, AxumServer};
+use ferrum_interfaces::InferenceEngine;
+use ferrum_models::source::ModelFormat;
+use ferrum_server::{AxumServer, HttpServer, ServerConfig};
 use ferrum_types::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tokio::signal;
 
 #[derive(Args)]
 pub struct ServeCommand {
-    /// Server host to bind
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
-
-    /// Server port to bind
-    #[arg(short, long, default_value = "8000")]
-    pub port: u16,
-
-    /// Number of worker threads
-    #[arg(short, long)]
-    pub workers: Option<usize>,
-
-    /// Model to load on startup
+    /// Model to serve (default: from config)
     #[arg(short, long)]
     pub model: Option<String>,
 
-    /// Enable hot reload
-    #[arg(long)]
-    pub hot_reload: bool,
+    /// Host to bind to
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
 
-    /// Enable development mode
-    #[arg(long)]
-    pub dev: bool,
-
-    /// Backend to use (cpu, metal, cuda:0)
-    #[arg(long, default_value = "auto")]
-    pub backend: String,
+    /// Port to listen on
+    #[arg(short, long, default_value = "11434")]
+    pub port: u16,
 }
 
-pub async fn execute(cmd: ServeCommand, _config: CliConfig, _format: OutputFormat) -> Result<()> {
-    println!("{} Starting Ferrum inference server...", "🚀".bright_blue());
-    println!("Host: {}", cmd.host.cyan());
-    println!("Port: {}", cmd.port.to_string().cyan());
+pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
+    // Print banner
+    print_banner();
 
+    // Resolve model
     let model_name = cmd
         .model
-        .unwrap_or_else(|| "TinyLlama-1.1B-Chat-v1.0".to_string());
-    println!("Model: {}", model_name.cyan());
+        .or(config.models.default_model.clone())
+        .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
 
-    if cmd.hot_reload {
-        println!("{} Hot reload enabled", "🔥".yellow());
-    }
+    let model_id = resolve_model_alias(&model_name);
+    println!("{} {}", "Model:".dimmed(), model_id.cyan());
 
-    if cmd.dev {
-        println!("{} Development mode enabled", "🛠️".yellow());
-    }
-
-    // Enhanced model resolution and loading
-    println!(
-        "{} Resolving model: {}",
-        "🔍".bright_blue(),
-        model_name.cyan()
-    );
-
-    let registry = ferrum_models::DefaultModelRegistry::with_defaults();
-    let resolved_id = registry.resolve_model_id(&model_name);
-
-    if resolved_id != model_name {
-        println!(
-            "{} Resolved alias '{}' to: {}",
-            "🔗".bright_blue(),
-            model_name.cyan(),
-            resolved_id.yellow()
-        );
-    }
-
-    // Create model source resolver
-    let source_config = ferrum_models::ModelSourceConfig::default();
-    let resolver = ferrum_models::DefaultModelSourceResolver::new(source_config);
-
-    // Resolve model source
-    let source = match resolver.resolve(&resolved_id, None).await {
-        Ok(source) => {
-            println!(
-                "{} Model resolved: {}",
-                "✅".bright_green(),
-                source.local_path.display()
-            );
+    // Find cached model
+    let cache_dir = get_hf_cache_dir(&config);
+    let source = match find_cached_model(&cache_dir, &model_id) {
+        Some(source) => {
+            println!("{} {}", "Path:".dimmed(), source.local_path.display());
             source
         }
-        Err(e) => {
-            println!(
-                "{} Failed to resolve model '{}': {}",
-                "❌".bright_red(),
-                resolved_id,
-                e
+        None => {
+            eprintln!(
+                "{} Model '{}' not found. Run: ferrum pull {}",
+                "Error:".red().bold(),
+                model_id,
+                model_name
             );
-            println!(
-                "\nTip: Use 'ferrum models --download {}' to download the model",
-                resolved_id
-            );
-            return Err(e);
+            return Err(ferrum_types::FerrumError::model("Model not found"));
         }
     };
 
-    // Load model configuration
-    println!("{} Loading model configuration...", "⚙️".bright_blue());
-    let mut config_manager = ferrum_models::ConfigManager::new();
-    let model_config = match config_manager.load_from_source(&source).await {
-        Ok(config) => {
-            println!(
-                "{} Configuration loaded: {} ({})",
-                "✅".bright_green(),
-                format!("{:?}", config.architecture).yellow(),
-                format!(
-                    "{} vocab, {} layers",
-                    config.vocab_size, config.num_hidden_layers
-                )
-                .cyan()
-            );
-            config
-        }
-        Err(e) => {
-            println!(
-                "{} Warning: Failed to load configuration, using defaults: {}",
-                "⚠️".yellow(),
-                e
-            );
-            // Use default configuration
-            ferrum_models::ModelDefinition {
-                architecture: ferrum_models::Architecture::Llama,
-                hidden_size: 4096,
-                intermediate_size: 11008,
-                vocab_size: 32000,
-                num_hidden_layers: 32,
-                num_attention_heads: 32,
-                num_key_value_heads: None,
-                max_position_embeddings: 2048,
-                rope_theta: Some(10000.0),
-                rope_scaling: None,
-                norm_type: ferrum_models::NormType::RMSNorm,
-                norm_eps: 1e-6,
-                attention_config: ferrum_models::AttentionConfig {
-                    attention_bias: false,
-                    sliding_window: None,
-                },
-                activation: ferrum_models::Activation::SiLU,
-                extra_params: serde_json::Value::Object(serde_json::Map::new()),
-            }
-        }
-    };
-
-    // Create engine configuration with model-aware settings
-    let device = match cmd.backend.as_str() {
-        "auto" => {
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                if cfg!(feature = "metal") {
-                    println!(
-                        "{} Auto-detected Metal backend for Apple GPU",
-                        "🔥".yellow()
-                    );
-                    ferrum_types::Device::Metal
-                } else {
-                    println!("{} Auto-detected CPU backend", "💻".blue());
-                    ferrum_types::Device::CPU
-                }
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            {
-                println!("{} Auto-detected CPU backend", "💻".blue());
-                ferrum_types::Device::CPU
-            }
-        }
-        "cpu" => ferrum_types::Device::CPU,
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        "metal" => ferrum_types::Device::Metal,
-        backend if backend.starts_with("cuda:") => {
-            let device_id = backend[5..].parse().unwrap_or(0);
-            ferrum_types::Device::CUDA(device_id)
-        }
-        backend => {
-            println!("{} Using {} backend", "⚙️".blue(), backend.cyan());
-            ferrum_types::Device::CPU
-        }
-    };
-
-    // 设置模型路径环境变量，以便引擎工厂加载真实的 tokenizer 和模型
+    // Set model path for engine
     std::env::set_var(
         "FERRUM_MODEL_PATH",
         source.local_path.to_string_lossy().to_string(),
     );
 
-    let mut engine_config = ferrum_engine::simple_engine_config(resolved_id.clone(), device);
+    // Select device
+    let device = select_device();
+    println!("{} {:?}", "Device:".dimmed(), device);
 
-    // Initialize engine
-    println!("{} Initializing inference engine...", "⚙️".yellow());
+    // Create engine
+    println!();
+    println!("{}", "Initializing engine...".dimmed());
+    let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
-    println!("{} Engine initialized successfully", "✅".green());
+    // Convert Box<dyn InferenceEngine> to Arc<dyn InferenceEngine>
+    let engine: Arc<dyn InferenceEngine + Send + Sync> = Arc::from(engine);
 
-    // Create server configuration
+    // Create server config
     let server_config = ServerConfig {
         host: cmd.host.clone(),
         port: cmd.port,
-        max_connections: 1000,
-        request_timeout: std::time::Duration::from_secs(300), // 5 minutes
-        keep_alive_timeout: std::time::Duration::from_secs(60),
-        enable_tls: false,
-        tls_cert_path: None,
-        tls_key_path: None,
-        cors: None,        // Simplified for MVP
-        compression: None, // Simplified for MVP
-        auth: None,        // No auth for MVP
-        api_version: ferrum_server::types::ApiVersion::V1,
+        ..Default::default()
     };
 
-    // Create and start server
-    println!("{} Starting HTTP server...", "🌐".blue());
-    let server = AxumServer::new(Arc::from(engine));
+    // Create server with engine
+    let server = AxumServer::new(engine);
 
-    // This will block until server shuts down
-    server.start(&server_config).await?;
+    println!();
+    println!(
+        "{} {} {}",
+        "🚀".green(),
+        "Server running at".green().bold(),
+        format!("http://{}:{}", cmd.host, cmd.port).cyan().bold()
+    );
+    println!();
+    println!("Endpoints:");
+    println!("  POST /v1/chat/completions  - OpenAI-compatible chat");
+    println!("  GET  /v1/models            - List models");
+    println!("  GET  /health               - Health check");
+    println!();
+    println!("{}", "Press Ctrl+C to stop.".dimmed());
+    println!();
+
+    // Write PID file for stop command
+    let pid_file = std::env::temp_dir().join("ferrum.pid");
+    std::fs::write(&pid_file, std::process::id().to_string()).ok();
+
+    // Start server with graceful shutdown
+    tokio::select! {
+        result = server.start(&server_config) => {
+            if let Err(e) = result {
+                eprintln!("{} Server error: {}", "Error:".red().bold(), e);
+            }
+        }
+        _ = signal::ctrl_c() => {
+            println!();
+            println!("{}", "Shutting down...".yellow());
+        }
+    }
+
+    // Clean up PID file
+    std::fs::remove_file(&pid_file).ok();
 
     Ok(())
+}
+
+fn print_banner() {
+    println!();
+    println!("{}", "  ______                            ".bright_red());
+    println!("{}", " |  ____|                           ".bright_red());
+    println!("{}", " | |__ ___ _ __ _ __ _   _ _ __ ___  ".bright_red());
+    println!(
+        "{}",
+        " |  __/ _ \\ '__| '__| | | | '_ ` _ \\ ".bright_red()
+    );
+    println!("{}", " | | |  __/ |  | |  | |_| | | | | | ".bright_red());
+    println!(
+        "{}",
+        " |_|  \\___|_|  |_|   \\__,_|_| |_| |_|".bright_red()
+    );
+    println!();
+    println!(
+        "   {}",
+        "🦀 Rust LLM Inference Server".bright_cyan().bold()
+    );
+    println!(
+        "   {}",
+        format!("Version {}", env!("CARGO_PKG_VERSION")).dimmed()
+    );
+    println!();
+}
+
+fn resolve_model_alias(name: &str) -> String {
+    match name.to_lowercase().as_str() {
+        "tinyllama" | "tiny" => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
+        "qwen2.5:0.5b" | "qwen:0.5b" => "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+        "qwen2.5:1.5b" | "qwen:1.5b" => "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
+        "qwen2.5:3b" | "qwen:3b" => "Qwen/Qwen2.5-3B-Instruct".to_string(),
+        "qwen2.5:7b" | "qwen:7b" => "Qwen/Qwen2.5-7B-Instruct".to_string(),
+        "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
+        "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
+    if let Ok(hf_home) = std::env::var("HF_HOME") {
+        return PathBuf::from(hf_home);
+    }
+    let configured = shellexpand::tilde(&config.models.download.hf_cache_dir).to_string();
+    PathBuf::from(configured)
+}
+
+fn find_cached_model(
+    cache_dir: &PathBuf,
+    model_id: &str,
+) -> Option<ferrum_models::source::ResolvedModelSource> {
+    let repo_dir = cache_dir
+        .join("hub")
+        .join(format!("models--{}", model_id.replace('/', "--")));
+    let snapshots_dir = repo_dir.join("snapshots");
+
+    // Try refs/main first
+    let ref_main = repo_dir.join("refs").join("main");
+    if let Ok(rev) = std::fs::read_to_string(&ref_main) {
+        let rev = rev.trim();
+        if !rev.is_empty() {
+            let snapshot = snapshots_dir.join(rev);
+            if snapshot.exists() {
+                let format = detect_format(&snapshot);
+                if format != ModelFormat::Unknown {
+                    return Some(ferrum_models::source::ResolvedModelSource {
+                        original: model_id.to_string(),
+                        local_path: snapshot,
+                        format,
+                        from_cache: true,
+                    });
+                }
+            }
+        }
+    }
+
+    // Fallback: first snapshot directory
+    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let format = detect_format(&path);
+                if format != ModelFormat::Unknown {
+                    return Some(ferrum_models::source::ResolvedModelSource {
+                        original: model_id.to_string(),
+                        local_path: path,
+                        format,
+                        from_cache: true,
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn detect_format(path: &PathBuf) -> ModelFormat {
+    if path.join("model.safetensors").exists() || path.join("model.safetensors.index.json").exists()
+    {
+        ModelFormat::SafeTensors
+    } else if path.join("pytorch_model.bin").exists() {
+        ModelFormat::PyTorchBin
+    } else {
+        ModelFormat::Unknown
+    }
+}
+
+fn select_device() -> ferrum_types::Device {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        return ferrum_types::Device::Metal;
+    }
+
+    #[allow(unreachable_code)]
+    ferrum_types::Device::CPU
 }

@@ -84,7 +84,7 @@ walkdir = "2.4"
 serde_yaml = "0.9"
 
 # HTTP client (using rustls to avoid macOS system-configuration issues)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "stream", "json"] }
 
 # Benchmarking
 criterion = "0.5"

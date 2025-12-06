@@ -8,6 +8,7 @@ pub mod architectures;
 pub mod builder;
 pub mod definition;
 pub mod executor;
+pub mod hf_download;
 pub mod loader;
 pub mod registry;
 pub mod source;
@@ -26,6 +27,7 @@ pub use loader::SafeTensorsLoader;
 pub use registry::{
     Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,
 };
+pub use hf_download::HfDownloader;
 pub use source::{
     DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ModelSourceResolver,
     ResolvedModelSource,
