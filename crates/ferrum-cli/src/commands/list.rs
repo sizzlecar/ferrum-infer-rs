@@ -42,23 +42,43 @@ pub async fn execute(_cmd: ListCommand, config: CliConfig) -> Result<()> {
         return Ok(());
     }
 
-    // Sort by name
-    models.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sort: complete models first, then by name
+    models.sort_by(|a, b| {
+        match (a.is_complete, b.is_complete) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        }
+    });
 
     // Print header
     println!(
-        "{:<40} {:<12} {:<20}",
+        "{:<40} {:<12} {:<10} {:<16}",
         "NAME".bold(),
         "SIZE".bold(),
+        "STATUS".bold(),
         "MODIFIED".bold()
     );
 
     // Print models
     for model in models {
+        let status = if model.is_complete {
+            "ready".green().to_string()
+        } else {
+            "incomplete".yellow().to_string()
+        };
+        
+        let name_display = if model.is_complete {
+            model.name.normal().to_string()
+        } else {
+            model.name.dimmed().to_string()
+        };
+
         println!(
-            "{:<40} {:<12} {:<20}",
-            model.name,
+            "{:<40} {:<12} {:<10} {:<16}",
+            name_display,
             format_size(model.size),
+            status,
             model.modified
         );
     }
@@ -70,14 +90,13 @@ struct ModelInfo {
     name: String,
     size: u64,
     modified: String,
+    is_complete: bool,
 }
 
 fn get_model_info(model_dir: &PathBuf) -> Option<ModelInfo> {
     // Parse name from directory: models--Org--ModelName -> Org/ModelName
     let dir_name = model_dir.file_name()?.to_string_lossy().to_string();
-    let name = dir_name
-        .strip_prefix("models--")?
-        .replace("--", "/");
+    let name = dir_name.strip_prefix("models--")?.replace("--", "/");
 
     // Get size of blobs
     let blobs_dir = model_dir.join("blobs");
@@ -86,6 +105,10 @@ fn get_model_info(model_dir: &PathBuf) -> Option<ModelInfo> {
     } else {
         0
     };
+
+    // Check if model files exist (complete model)
+    let snapshots_dir = model_dir.join("snapshots");
+    let is_complete = check_model_complete(&snapshots_dir);
 
     // Get modification time
     let modified = if let Ok(metadata) = fs::metadata(model_dir) {
@@ -103,7 +126,34 @@ fn get_model_info(model_dir: &PathBuf) -> Option<ModelInfo> {
         name,
         size,
         modified,
+        is_complete,
     })
+}
+
+/// Check if model has actual weight files (not just tokenizer)
+fn check_model_complete(snapshots_dir: &PathBuf) -> bool {
+    if !snapshots_dir.exists() {
+        return false;
+    }
+
+    // Check each snapshot directory
+    if let Ok(entries) = fs::read_dir(snapshots_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Check for model weight files
+                if path.join("model.safetensors").exists()
+                    || path.join("model.safetensors.index.json").exists()
+                    || path.join("pytorch_model.bin").exists()
+                    || path.join("pytorch_model.bin.index.json").exists()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn get_dir_size(path: &PathBuf) -> u64 {
@@ -146,4 +196,3 @@ fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
     let configured = shellexpand::tilde(&config.models.download.hf_cache_dir).to_string();
     PathBuf::from(configured)
 }
-

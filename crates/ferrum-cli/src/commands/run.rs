@@ -5,6 +5,7 @@ use chrono::Utc;
 use clap::Args;
 use colored::*;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
+use ferrum_models::HfDownloader;
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -38,18 +39,41 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = resolve_model_alias(&cmd.model);
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
-    // Find cached model
+    // Find cached model or auto-download
     let cache_dir = get_hf_cache_dir(&config);
     let source = match find_cached_model(&cache_dir, &model_id) {
         Some(source) => source,
         None => {
+            // Model not found, try to download automatically
             eprintln!(
-                "{} Model '{}' not found locally.",
-                "Error:".red().bold(),
+                "{} Model '{}' not found locally, downloading...",
+                "📥".cyan(),
                 model_id
             );
-            eprintln!("Run: {} to download it first.", format!("ferrum pull {}", cmd.model).cyan());
-            return Err(ferrum_types::FerrumError::model("Model not found"));
+            
+            // Get HF token from environment
+            let token = std::env::var("HF_TOKEN")
+                .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+                .ok();
+            
+            // Create downloader and download
+            let downloader = HfDownloader::new(cache_dir.clone(), token)?;
+            let snapshot_path = downloader.download(&model_id, None).await?;
+            
+            // Now find the downloaded model
+            let format = detect_format(&snapshot_path);
+            if format == ModelFormat::Unknown {
+                return Err(ferrum_types::FerrumError::model(
+                    "Downloaded model has unknown format"
+                ));
+            }
+            
+            ResolvedModelSource {
+                original: model_id.clone(),
+                local_path: snapshot_path,
+                format,
+                from_cache: false,
+            }
         }
     };
 
