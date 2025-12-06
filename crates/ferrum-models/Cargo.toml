@@ -49,6 +49,8 @@ dirs = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
 hf-hub = { workspace = true }
 indicatif = "0.17"
+pathdiff = "0.2"
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"

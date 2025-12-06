@@ -1,121 +1,85 @@
-//! Ferrum CLI - Command line interface for LLM inference
+//! Ferrum CLI - Ollama-style command line interface for LLM inference
 //!
-//! This binary provides various commands for testing, benchmarking,
-//! and managing the Ferrum inference framework.
+//! Commands:
+//! - serve: Start the inference server
+//! - run: Run a model and start interactive chat
+//! - stop: Stop the running server
+//! - pull: Download a model
+//! - list: List downloaded models
 
 use clap::{Parser, Subcommand};
 use colored::*;
-use ferrum_cli::{
-    commands::*,
-    config::CliConfig,
-    output::OutputFormat as CliOutputFormat,
-    utils::{print_banner, setup_logging},
-};
+use ferrum_cli::{commands::*, config::CliConfig, utils::setup_logging};
 use std::process;
 
 #[derive(Parser)]
 #[command(name = "ferrum")]
-#[command(about = "Ferrum LLM Inference CLI")]
+#[command(about = "Ferrum - Fast LLM Inference Engine")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(long_about = "A command-line interface for the Ferrum LLM inference framework")]
+#[command(
+    long_about = "A high-performance LLM inference engine with Metal/CUDA acceleration.\n\nExamples:\n  ferrum run tinyllama        # Start chat with TinyLlama\n  ferrum pull qwen2.5:7b      # Download Qwen 2.5 7B model\n  ferrum list                 # Show downloaded models\n  ferrum serve                # Start HTTP server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Configuration file path
-    #[arg(short, long, default_value = "ferrum.toml")]
-    config: String,
-
-    /// Verbose output (show tracing logs)
-    #[arg(short, long)]
+    /// Verbose output
+    #[arg(short, long, global = true)]
     verbose: bool,
-
-    /// Debug mode (show step-by-step timing and details)
-    #[arg(short, long)]
-    debug: bool,
-
-    /// Quiet mode (only errors)
-    #[arg(short, long)]
-    quiet: bool,
-
-    /// Output format
-    #[arg(long, default_value = "pretty")]
-    format: CliOutputFormat,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the inference server
-    Serve(ServeCommand),
+    /// Run a model and start interactive chat
+    #[command(visible_alias = "r")]
+    Run(run::RunCommand),
 
-    /// Test inference with a model
-    Infer(InferCommand),
+    /// Start the inference HTTP server
+    Serve(serve::ServeCommand),
 
-    /// List available models
-    Models(ModelsCommand),
+    /// Stop the running server
+    Stop(stop::StopCommand),
 
-    /// Run benchmarks
-    Benchmark(BenchmarkCommand),
+    /// Download a model from HuggingFace Hub
+    Pull(pull::PullCommand),
 
-    /// Validate configuration
-    Config(ConfigCommand),
-
-    /// Health check operations
-    Health(HealthCommand),
-
-    /// Cache management operations
-    Cache(CacheCommand),
-
-    /// Development and debugging tools
-    Dev(DevCommand),
+    /// List downloaded models
+    #[command(visible_alias = "ls")]
+    List(list::ListCommand),
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    // Setup logging based on verbosity
-    setup_logging(cli.verbose, cli.quiet).unwrap_or_else(|e| {
+    // Setup logging
+    if let Err(e) = setup_logging(cli.verbose, false) {
         eprintln!("{} Failed to setup logging: {}", "Error:".red().bold(), e);
         process::exit(1);
-    });
+    }
 
-    // Load configuration
-    let config = match CliConfig::load(&cli.config).await {
+    // Load configuration (create default if not exists)
+    let config = match CliConfig::load("ferrum.toml").await {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("{} Failed to load config: {}", "Error:".red().bold(), e);
-            process::exit(1);
+            if cli.verbose {
+                eprintln!("{} Config: {}", "⚠️".yellow(), e);
+            }
+            CliConfig::default()
         }
     };
-
-    // Print banner for interactive commands
-    if !cli.quiet && matches!(cli.command, Commands::Serve(_) | Commands::Dev(_)) {
-        print_banner();
-    }
 
     // Execute command
     let result = match cli.command {
-        Commands::Serve(cmd) => serve::execute(cmd, config, cli.format).await,
-        Commands::Infer(cmd) => infer::execute(cmd, config, cli.format, cli.debug).await,
-        Commands::Models(cmd) => models::execute(cmd, config, cli.format).await,
-        Commands::Benchmark(cmd) => benchmark::execute(cmd, config, cli.format).await,
-        Commands::Config(cmd) => config_cmd::execute(cmd, config, cli.format).await,
-        Commands::Health(cmd) => health::execute(cmd, config, cli.format).await,
-        Commands::Cache(cmd) => cache::execute(cmd, config, cli.format).await,
-        Commands::Dev(cmd) => dev::execute(cmd, config, cli.format).await,
+        Commands::Run(cmd) => run::execute(cmd, config).await,
+        Commands::Serve(cmd) => serve::execute(cmd, config).await,
+        Commands::Stop(cmd) => stop::execute(cmd).await,
+        Commands::Pull(cmd) => pull::execute(cmd, config).await,
+        Commands::List(cmd) => list::execute(cmd, config).await,
     };
 
-    // Handle result
-    match result {
-        Ok(_) => {
-            if !cli.quiet {
-                println!("{}", "✅ Command completed successfully".green().bold());
-            }
-        }
-        Err(e) => {
-            eprintln!("{} {}", "Error:".red().bold(), e);
-            process::exit(1);
-        }
+    if let Err(e) = result {
+        eprintln!("{} {}", "Error:".red().bold(), e);
+        process::exit(1);
     }
 }
