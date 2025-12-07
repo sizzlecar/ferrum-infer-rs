@@ -26,7 +26,7 @@ pub mod tokenizer;
 // Re-export core traits and important types
 pub use backend::{BackendCapabilities, ComputeBackend, WeightLoader};
 pub use engine::InferenceEngine;
-pub use kv_cache::{AllocationRequest, BlockTable, KvCacheHandle, KvCacheManager};
+pub use kv_cache::{AllocationRequest, BlockTable, CacheHandleStats, KvCacheHandle, KvCacheManager};
 pub use memory::{DeviceMemoryManager, MemoryHandle, StreamHandle};
 pub use model_builder::{BuildOptions, ModelBuilder};
 pub use model_executor::{DecodeInput, DecodeOutput, ModelExecutor, PrefillInput, PrefillOutput};

@@ -24,6 +24,7 @@ pub enum Architecture {
     Mistral,
     Phi,
     GPT2,
+    Bert,
     Unknown,
 }
 
@@ -35,6 +36,7 @@ impl Architecture {
             "mistral" | "mistralforcausallm" => Architecture::Mistral,
             "phi" | "phiforcausallm" => Architecture::Phi,
             "gpt2" | "gpt2lmheadmodel" => Architecture::GPT2,
+            "bert" | "bertmodel" | "bertformaskedlm" | "bertforsequenceclassification" => Architecture::Bert,
             _ => Architecture::Unknown,
         }
     }

@@ -19,6 +19,10 @@ ferrum-runtime = { workspace = true }
 ferrum-scheduler = { workspace = true }
 ferrum-server = { workspace = true }
 
+# ML dependencies
+candle-core = { workspace = true }
+tokenizers = { version = "0.19", default-features = false }
+
 # CLI framework
 clap = { version = "4.4", features = ["derive", "color", "env"] }
 
