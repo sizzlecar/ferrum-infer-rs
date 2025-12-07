@@ -1094,6 +1094,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "candle-core",
  "chrono",
  "clap",
  "colored",
@@ -1118,6 +1119,7 @@ dependencies = [
  "serde_yaml",
  "shellexpand",
  "thiserror 1.0.69",
+ "tokenizers",
  "tokio",
  "tokio-stream",
  "toml",

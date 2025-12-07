@@ -16,12 +16,12 @@ pub mod tensor_wrapper;
 pub mod tokenizer;
 pub mod weights;
 
-pub use architectures::{LlamaModelWrapper, Qwen2ModelWrapper};
+pub use architectures::{BertModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper};
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    extract_logits_safe, CandleModelExecutor, CandleModelExecutorV2, Qwen2ModelExecutor,
-    StubModelExecutor,
+    extract_logits_safe, BertModelExecutor, CandleModelExecutor, CandleModelExecutorV2,
+    Qwen2ModelExecutor, StubModelExecutor,
 };
 pub use loader::SafeTensorsLoader;
 pub use registry::{

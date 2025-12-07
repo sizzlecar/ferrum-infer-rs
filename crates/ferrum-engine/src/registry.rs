@@ -988,6 +988,17 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
 
                 Ok(Arc::new(executor))
             }
+            ferrum_models::Architecture::Bert => {
+                info!("Using BERT executor for embeddings");
+                let executor = ferrum_models::BertModelExecutor::from_path(
+                    &model_path,
+                    &model_def,
+                    candle_device.clone(),
+                )
+                .await?;
+
+                Ok(Arc::new(executor))
+            }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
