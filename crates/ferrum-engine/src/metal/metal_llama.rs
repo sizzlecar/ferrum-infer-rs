@@ -6,6 +6,7 @@
 use crate::metal::{MetalContext, RmsNormOps};
 use candle_core::{DType, Device as CandleDevice, IndexOp, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, Linear, Module, VarBuilder};
+use candle_nn::ops;
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 use std::sync::Arc;
@@ -35,14 +36,14 @@ impl MetalRmsNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Try Metal acceleration if available and on Metal device
+        // If Metal kernel is available and input is on Metal, use Metal kernel
         if let Some(ref metal_ops) = self.metal_ops {
             if matches!(x.device(), CandleDevice::Metal(_)) {
                 return self.forward_metal(x, metal_ops);
             }
         }
 
-        // Fallback to CPU/Candle implementation
+        // Default: use Candle implementation (works on any device including Metal)
         self.forward_candle(x)
     }
 
@@ -122,27 +123,42 @@ impl MetalRmsNorm {
     }
 
     fn forward_candle(&self, x: &Tensor) -> Result<Tensor> {
-        // Standard RMS Norm: x * rsqrt(mean(x^2) + eps) * weight
-        let x_sq = x
-            .sqr()
-            .map_err(|e| FerrumError::internal(format!("Sqr failed: {}", e)))?;
-        let mean_sq = x_sq
-            .mean_keepdim(D::Minus1)
-            .map_err(|e| FerrumError::internal(format!("Mean failed: {}", e)))?;
-        let eps_tensor = Tensor::new(&[self.eps as f64], x.device())
-            .map_err(|e| FerrumError::internal(format!("Eps tensor failed: {}", e)))?;
-        let rms = mean_sq
-            .broadcast_add(&eps_tensor)
-            .map_err(|e| FerrumError::internal(format!("Add eps failed: {}", e)))?
-            .sqrt()
-            .map_err(|e| FerrumError::internal(format!("Sqrt failed: {}", e)))?;
-        let x_normed = x
-            .broadcast_div(&rms)
-            .map_err(|e| FerrumError::internal(format!("Div failed: {}", e)))?;
-        x_normed
+        // Matching candle_nn::ops::rms_norm_slow exactly:
+        // For FP16/BF16, compute in F32 for numerical stability
+        let x_dtype = x.dtype();
+        let hidden_size = x.dims().last().copied().unwrap_or(1);
+        
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        
+        let x = x.to_dtype(internal_dtype)
+            .map_err(|e| FerrumError::internal(format!("x to internal dtype failed: {}", e)))?;
+        
+        // norm_x = sum(x^2) / hidden_size
+        let norm_x = x.sqr()
+            .map_err(|e| FerrumError::internal(format!("Sqr failed: {}", e)))?
+            .sum_keepdim(D::Minus1)
+            .map_err(|e| FerrumError::internal(format!("Sum failed: {}", e)))?
+            .affine(1.0 / hidden_size as f64, 0.0)
+            .map_err(|e| FerrumError::internal(format!("Affine failed: {}", e)))?;
+        
+        // x_normed = x / sqrt(norm_x + eps)
+        let x_normed = x.broadcast_div(
+            &(norm_x + self.eps as f64)
+                .map_err(|e| FerrumError::internal(format!("Add eps failed: {}", e)))?
+                .sqrt()
+                .map_err(|e| FerrumError::internal(format!("Sqrt failed: {}", e)))?
+        ).map_err(|e| FerrumError::internal(format!("Div failed: {}", e)))?;
+        
+        // Convert back to original dtype and apply weight
+        x_normed.to_dtype(x_dtype)
+            .map_err(|e| FerrumError::internal(format!("x_normed to original dtype failed: {}", e)))?
             .broadcast_mul(&self.weight)
             .map_err(|e| FerrumError::internal(format!("Mul weight failed: {}", e)))
     }
+
 }
 
 /// Metal-accelerated Rotary Position Embedding

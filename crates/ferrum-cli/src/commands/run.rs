@@ -32,6 +32,10 @@ pub struct RunCommand {
     /// Temperature (0.0-2.0)
     #[arg(long, default_value = "0.7")]
     pub temperature: f32,
+
+    /// Backend: auto, cpu, metal (default: auto)
+    #[arg(long, default_value = "auto")]
+    pub backend: String,
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
@@ -81,7 +85,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     std::env::set_var("FERRUM_MODEL_PATH", source.local_path.to_string_lossy().to_string());
 
     // Select device
-    let device = select_device();
+    let device = select_device(&cmd.backend);
     eprintln!("{}", format!("Using {:?} backend", device).dimmed());
 
     // Create engine
@@ -299,14 +303,29 @@ fn detect_format(path: &PathBuf) -> ModelFormat {
     }
 }
 
-fn select_device() -> ferrum_types::Device {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    {
-        return ferrum_types::Device::Metal;
+fn select_device(backend: &str) -> ferrum_types::Device {
+    match backend.to_lowercase().as_str() {
+        "cpu" => ferrum_types::Device::CPU,
+        "metal" => {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                return ferrum_types::Device::Metal;
+            }
+            #[allow(unreachable_code)]
+            {
+                eprintln!("Metal not available, falling back to CPU");
+                ferrum_types::Device::CPU
+            }
+        }
+        "auto" | _ => {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                return ferrum_types::Device::Metal;
+            }
+            #[allow(unreachable_code)]
+            ferrum_types::Device::CPU
+        }
     }
-
-    #[allow(unreachable_code)]
-    ferrum_types::Device::CPU
 }
 
 fn build_chat_prompt(
