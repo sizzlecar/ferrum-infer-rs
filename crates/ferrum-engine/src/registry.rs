@@ -915,9 +915,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             }
         };
 
-        // Use FP32 for CPU, FP16 for GPU
+        // Use FP32 for CPU, FP32 for Metal for stability
         let dtype = match &config.device {
             Device::CPU => DType::F32,
+            Device::Metal => DType::F32,
             _ => DType::F16,
         };
 
@@ -959,6 +960,21 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 Ok(Arc::new(executor))
             }
             ferrum_models::Architecture::Qwen2 => {
+                // Use Metal Qwen2 executor for Metal device
+                #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+                if matches!(&config.device, Device::Metal) {
+                    info!("Using Metal-accelerated Qwen2 executor");
+                    let executor = crate::metal::MetalQwen2Executor::from_path(
+                        &model_path,
+                        &model_def,
+                        candle_device.clone(),
+                        dtype,
+                    )
+                    .await?;
+                    return Ok(Arc::new(executor));
+                }
+
+                // Standard Candle executor for CPU
                 let qwen2_model = ferrum_models::Qwen2ModelWrapper::from_varbuilder(
                     vb,
                     &model_def,

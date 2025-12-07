@@ -77,6 +77,24 @@ impl Qwen2ModelWrapper {
             .forward(input_ids, 0)
             .map_err(|e| FerrumError::model(format!("Prefill forward failed: {}", e)))?;
 
+        // Debug: log top logits to compare with Metal implementation
+        if let Ok(flat) = logits.flatten_all() {
+            if let Ok(vals) = flat.to_vec1::<f32>() {
+                let mut indexed: Vec<(usize, f32)> =
+                    vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top_k = 10.min(indexed.len());
+                info!("CPU Qwen2 Top {} logits: {:?}", top_k, &indexed[..top_k]);
+                // Check specific tokens
+                if vals.len() > 29 {
+                    info!(
+                        "CPU tokens: 17='2': {:.4}, 19='4': {:.4}, 28='=': {:.4}",
+                        vals[17], vals[19], vals[28]
+                    );
+                }
+            }
+        }
+
         Ok(logits)
     }
 

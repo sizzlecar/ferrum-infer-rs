@@ -22,6 +22,8 @@ pub mod metal_model;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_llama;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_qwen2;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_executor;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -40,6 +42,8 @@ pub use benchmark::*;
 pub use metal_model::*;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_llama::*;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use metal_qwen2::*;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_executor::*;
 

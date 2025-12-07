@@ -433,9 +433,19 @@ fn create_rng(params: &SamplingParams) -> StdRng {
     }
 }
 
-fn is_stop_token(token: TokenId, vocab_size: usize) -> bool {
-    // Common EOS tokens: typically vocab_size - 1 or 2
-    token.get() >= (vocab_size - 10) as u32
+fn is_stop_token(token: TokenId, _vocab_size: usize) -> bool {
+    let token_id = token.get();
+    // Common EOS token IDs for various models:
+    // - Qwen2.5: <|endoftext|>=151643, <|im_end|>=151645
+    // - LLaMA: </s>=2
+    // - GPT-2/GPT-J: <|endoftext|>=50256
+    matches!(
+        token_id,
+        2 |          // LLaMA </s>
+        50256 |      // GPT-2/GPT-J <|endoftext|>
+        151643 |     // Qwen <|endoftext|>
+        151645       // Qwen <|im_end|>
+    )
 }
 
 fn check_stop_sequences(

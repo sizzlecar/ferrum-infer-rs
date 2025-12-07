@@ -14,13 +14,13 @@ pub fn setup_logging(verbose: bool, quiet: bool) -> Result<()> {
         tracing::Level::WARN
     };
 
-    // Build filter: suppress noisy metal executor warnings unless verbose
+    // Build filter: suppress noisy warnings unless verbose
     let filter = if verbose {
         EnvFilter::new(log_level.to_string())
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new(format!(
-                "{},ferrum_engine::metal::metal_executor=error",
+                "{},ferrum_engine::metal::metal_executor=error,tokenizers=error",
                 log_level
             ))
         })
