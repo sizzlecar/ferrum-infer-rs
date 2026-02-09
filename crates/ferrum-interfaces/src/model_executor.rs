@@ -172,7 +172,7 @@ pub trait ModelExecutor: Send + Sync {
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput>;
 
     /// Optional: full forward pass (for non-autoregressive use cases)
-    async fn forward(&self, input: &TensorRef) -> Result<TensorRef> {
+    async fn forward(&self, _input: &TensorRef) -> Result<TensorRef> {
         // Default implementation not supported
         Err(ferrum_types::FerrumError::unsupported(
             "Full forward pass not supported by this executor",

@@ -17,8 +17,8 @@ pub struct DefaultKvCacheManager {
     device: Device,
     block_size: usize,
     max_blocks: usize,
-    gpu_pool: Option<BlockPool>,
-    cpu_pool: Option<BlockPool>,
+    _gpu_pool: Option<BlockPool>,
+    _cpu_pool: Option<BlockPool>,
     active_handles: RwLock<HashMap<RequestId, Arc<dyn KvCacheHandle>>>,
     stats: Mutex<CacheManagerStats>,
     #[allow(clippy::type_complexity)]
@@ -53,8 +53,8 @@ impl DefaultKvCacheManager {
             device,
             block_size,
             max_blocks,
-            gpu_pool,
-            cpu_pool,
+            _gpu_pool: gpu_pool,
+            _cpu_pool: cpu_pool,
             active_handles: RwLock::new(HashMap::new()),
             stats: Mutex::new(CacheManagerStats {
                 total_memory_bytes: 0,

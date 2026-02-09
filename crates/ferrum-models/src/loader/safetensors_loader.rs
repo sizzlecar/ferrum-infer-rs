@@ -21,7 +21,7 @@ impl SafeTensorsLoader {
     }
 
     /// Load weights to VarBuilder for model construction
-    pub fn load_varbuilder(&self, device: &CandleDevice, dtype: DType) -> Result<VarBuilder> {
+    pub fn load_varbuilder(&self, device: &CandleDevice, dtype: DType) -> Result<VarBuilder<'_>> {
         info!("📦 Loading model weights from: {:?}", self.model_dir);
 
         // Check for single file first
@@ -49,10 +49,8 @@ impl SafeTensorsLoader {
             info!("  📦 Found {} shards", shard_files.len());
 
             // Build full paths for all shards
-            let shard_paths: Vec<PathBuf> = shard_files
-                .iter()
-                .map(|f| self.model_dir.join(f))
-                .collect();
+            let shard_paths: Vec<PathBuf> =
+                shard_files.iter().map(|f| self.model_dir.join(f)).collect();
 
             // Verify all shards exist
             for path in &shard_paths {
@@ -71,7 +69,10 @@ impl SafeTensorsLoader {
                 })?
             };
 
-            info!("  ✅ Sharded weights loaded successfully ({} shards)", shard_files.len());
+            info!(
+                "  ✅ Sharded weights loaded successfully ({} shards)",
+                shard_files.len()
+            );
             return Ok(vb);
         }
 

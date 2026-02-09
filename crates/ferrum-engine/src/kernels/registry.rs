@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+#[cfg(test)]
+use super::attention::AttentionType;
 use super::attention::{
-    create_attention_info, AttentionConfig, AttentionKernel, AttentionType, FlashAttentionInfo,
-    StandardAttentionInfo,
+    AttentionConfig, AttentionKernel, FlashAttentionInfo, StandardAttentionInfo,
 };
 use super::fused::{CpuFusedOpsInfo, FusedOps, FusedOpsConfig};
 
@@ -114,8 +115,7 @@ type AttentionFactory =
     Box<dyn Fn(&AttentionConfig) -> Result<Box<dyn AttentionKernel>> + Send + Sync>;
 
 /// Fused ops factory type
-type FusedOpsFactory =
-    Box<dyn Fn(&FusedOpsConfig) -> Result<Arc<dyn FusedOps>> + Send + Sync>;
+type FusedOpsFactory = Box<dyn Fn(&FusedOpsConfig) -> Result<Arc<dyn FusedOps>> + Send + Sync>;
 
 /// Kernel Registry
 ///
@@ -208,9 +208,9 @@ impl KernelRegistry {
         config: &AttentionConfig,
     ) -> Result<Box<dyn AttentionKernel>> {
         let factories = self.attention_factories.read();
-        let (_, factory) = factories
-            .get(name)
-            .ok_or_else(|| FerrumError::not_found(format!("Attention kernel not found: {}", name)))?;
+        let (_, factory) = factories.get(name).ok_or_else(|| {
+            FerrumError::not_found(format!("Attention kernel not found: {}", name))
+        })?;
         factory(config)
     }
 
@@ -243,8 +243,7 @@ impl KernelRegistry {
                 && info.features.contains(&"flash_attention".to_string())
             {
                 info.priority + 20 // Boost flash attention for memory-constrained scenarios
-            } else if hint.batch_size > 8
-                && info.features.contains(&"flash_attention".to_string())
+            } else if hint.batch_size > 8 && info.features.contains(&"flash_attention".to_string())
             {
                 info.priority + 10 // Boost for large batches
             } else {
@@ -274,10 +273,7 @@ impl KernelRegistry {
     }
 
     /// Select best fused ops for device
-    pub fn select_fused_ops(
-        &self,
-        config: &FusedOpsConfig,
-    ) -> Result<Arc<dyn FusedOps>> {
+    pub fn select_fused_ops(&self, config: &FusedOpsConfig) -> Result<Arc<dyn FusedOps>> {
         let factories = self.fused_factories.read();
 
         let mut best: Option<(&str, i32)> = None;

@@ -78,7 +78,7 @@ pub trait ModelSourceResolver: Send + Sync {
 }
 
 pub struct DefaultModelSourceResolver {
-    config: ModelSourceConfig,
+    _config: ModelSourceConfig,
     api: Api,
 }
 
@@ -99,7 +99,10 @@ impl DefaultModelSourceResolver {
             Api::new().expect("Failed to create default HF API")
         });
 
-        Self { config, api }
+        Self {
+            _config: config,
+            api,
+        }
     }
 
     fn is_local_path(id: &str) -> bool {
@@ -267,10 +270,10 @@ impl DefaultModelSourceResolver {
             from_cache: false,
         })
     }
-    
+
     async fn download_tokenizer_files(&self, repo: &ApiRepo) -> Result<()> {
         info!("📥 下载 tokenizer 文件...");
-        
+
         // List of common tokenizer files
         let tokenizer_files = vec![
             "tokenizer.json",
@@ -279,7 +282,7 @@ impl DefaultModelSourceResolver {
             "merges.txt",
             "special_tokens_map.json",
         ];
-        
+
         let mut downloaded_count = 0;
         for filename in &tokenizer_files {
             match repo.get(filename).await {
@@ -292,13 +295,13 @@ impl DefaultModelSourceResolver {
                 }
             }
         }
-        
+
         if downloaded_count > 0 {
             info!("✅ Tokenizer 文件下载完成 ({} 个文件)", downloaded_count);
         } else {
             warn!("⚠️  未找到 tokenizer 文件，可能影响推理");
         }
-        
+
         Ok(())
     }
 

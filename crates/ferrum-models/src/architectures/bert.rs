@@ -1,7 +1,7 @@
 //! BERT architecture using Candle's built-in implementation
 //! BERT is an encoder model used for embeddings and classification tasks
 
-use candle_core::{DType, Device as CandleDevice, Tensor, D};
+use candle_core::{DType, Device as CandleDevice, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, HiddenAct};
 use ferrum_types::{FerrumError, Result};
@@ -40,7 +40,8 @@ impl BertModelWrapper {
             initializer_range: 0.02,
             layer_norm_eps: config.norm_eps,
             pad_token_id: 0,
-            position_embedding_type: candle_transformers::models::bert::PositionEmbeddingType::Absolute,
+            position_embedding_type:
+                candle_transformers::models::bert::PositionEmbeddingType::Absolute,
             use_cache: true,
             classifier_dropout: None,
             model_type: Some("bert".to_string()),
@@ -48,9 +49,7 @@ impl BertModelWrapper {
 
         debug!(
             "BERT config: hidden={}, layers={}, heads={}",
-            bert_config.hidden_size,
-            bert_config.num_hidden_layers,
-            bert_config.num_attention_heads,
+            bert_config.hidden_size, bert_config.num_hidden_layers, bert_config.num_attention_heads,
         );
 
         // Load model
@@ -78,15 +77,13 @@ impl BertModelWrapper {
 
         let config_content = std::fs::read_to_string(config_path)
             .map_err(|e| FerrumError::model(format!("Failed to read config: {}", e)))?;
-        
+
         let bert_config: BertConfig = serde_json::from_str(&config_content)
             .map_err(|e| FerrumError::model(format!("Failed to parse BERT config: {}", e)))?;
 
         debug!(
             "BERT config: hidden={}, layers={}, heads={}",
-            bert_config.hidden_size,
-            bert_config.num_hidden_layers,
-            bert_config.num_attention_heads,
+            bert_config.hidden_size, bert_config.num_hidden_layers, bert_config.num_attention_heads,
         );
 
         let model = BertModel::load(vb, &bert_config)
@@ -122,23 +119,27 @@ impl BertModelWrapper {
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let hidden_states = self.forward(input_ids, token_type_ids)?;
-        
+
         // Mean pooling over sequence dimension (dim 1)
         let embedding = if let Some(mask) = attention_mask {
             // Expand mask to hidden size
-            let mask = mask.unsqueeze(2)
+            let mask = mask
+                .unsqueeze(2)
                 .map_err(|e| FerrumError::model(format!("unsqueeze failed: {}", e)))?
                 .broadcast_as(hidden_states.shape())
                 .map_err(|e| FerrumError::model(format!("broadcast_as failed: {}", e)))?
                 .to_dtype(hidden_states.dtype())
                 .map_err(|e| FerrumError::model(format!("to_dtype failed: {}", e)))?;
-            
+
             // Masked mean
-            let masked = hidden_states.broadcast_mul(&mask)
+            let masked = hidden_states
+                .broadcast_mul(&mask)
                 .map_err(|e| FerrumError::model(format!("broadcast_mul failed: {}", e)))?;
-            let sum = masked.sum(1)
+            let sum = masked
+                .sum(1)
                 .map_err(|e| FerrumError::model(format!("sum failed: {}", e)))?;
-            let count = mask.sum(1)
+            let count = mask
+                .sum(1)
                 .map_err(|e| FerrumError::model(format!("mask sum failed: {}", e)))?
                 .clamp(1e-9, f64::MAX)
                 .map_err(|e| FerrumError::model(format!("clamp failed: {}", e)))?;
@@ -146,7 +147,8 @@ impl BertModelWrapper {
                 .map_err(|e| FerrumError::model(format!("broadcast_div failed: {}", e)))?
         } else {
             // Simple mean over sequence dimension
-            hidden_states.mean(1)
+            hidden_states
+                .mean(1)
                 .map_err(|e| FerrumError::model(format!("mean failed: {}", e)))?
         };
 
@@ -154,13 +156,9 @@ impl BertModelWrapper {
     }
 
     /// Get CLS token embedding
-    pub fn get_cls_embedding(
-        &self,
-        input_ids: &Tensor,
-        token_type_ids: &Tensor,
-    ) -> Result<Tensor> {
+    pub fn get_cls_embedding(&self, input_ids: &Tensor, token_type_ids: &Tensor) -> Result<Tensor> {
         let hidden_states = self.forward(input_ids, token_type_ids)?;
-        
+
         // Get first token (CLS) - shape [batch, seq, hidden] -> [batch, hidden]
         hidden_states
             .narrow(1, 0, 1)
@@ -189,4 +187,3 @@ impl BertModelWrapper {
         self.config.hidden_size
     }
 }
-

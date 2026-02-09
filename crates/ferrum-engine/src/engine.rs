@@ -10,19 +10,24 @@ use ferrum_types::{
     Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
 };
 use futures::stream::Stream;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+use rand::RngCore;
 use rand::{rngs::StdRng, SeedableRng};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+use std::sync::OnceLock;
+
 /// Default inference engine - MVP implementation
 pub struct DefaultInferenceEngine {
     config: EngineConfig,
-    scheduler: Arc<dyn Scheduler + Send + Sync>,
+    _scheduler: Arc<dyn Scheduler + Send + Sync>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
     sampler: Arc<dyn Sampler + Send + Sync>,
-    kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+    _kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
 }
 
@@ -39,10 +44,10 @@ impl DefaultInferenceEngine {
 
         Self {
             config,
-            scheduler,
+            _scheduler: scheduler,
             tokenizer,
             sampler,
-            kv_cache,
+            _kv_cache: kv_cache,
             model_executor,
         }
     }
@@ -68,6 +73,7 @@ impl DefaultInferenceEngine {
         // 4. Generate tokens (decode loop)
         let max_tokens = request.sampling_params.max_tokens;
         let mut generated_tokens = Vec::new();
+        let mut all_tokens: Vec<TokenId> = input_tokens.clone();
         let mut kv_cache = prefill_output.kv_cache.clone();
         let mut rng = create_rng(&request.sampling_params);
 
@@ -85,8 +91,13 @@ impl DefaultInferenceEngine {
             };
 
             // Sample next token
-            let next_token =
-                sample_token(&logits, &request.sampling_params, &self.sampler, &mut rng)?;
+            let next_token = sample_token(
+                &logits,
+                &request.sampling_params,
+                &self.sampler,
+                &mut rng,
+                &all_tokens,
+            )?;
 
             // Check stop conditions
             if is_stop_token(next_token, self.model_executor.info().vocab_size) {
@@ -95,6 +106,7 @@ impl DefaultInferenceEngine {
             }
 
             generated_tokens.push(next_token);
+            all_tokens.push(next_token);
 
             // Check stop sequences
             if check_stop_sequences(&generated_tokens, &request.sampling_params, &self.tokenizer)? {
@@ -180,6 +192,7 @@ impl InferenceEngine for DefaultInferenceEngine {
 
             // 3. Decode loop - stream each token
             let mut generated_tokens = Vec::new();
+            let mut all_tokens: Vec<TokenId> = input_tokens.iter().copied().collect();
             let mut kv_cache = prefill_output.kv_cache.clone();
             let mut rng = create_rng(&sampling_params);
             let mut accumulated_text = String::new();
@@ -216,7 +229,13 @@ impl InferenceEngine for DefaultInferenceEngine {
                     }
                 };
 
-                let next_token = match sample_token(&logits, &sampling_params, &sampler, &mut rng) {
+                let next_token = match sample_token(
+                    &logits,
+                    &sampling_params,
+                    &sampler,
+                    &mut rng,
+                    &all_tokens,
+                ) {
                     Ok(token) => token,
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
@@ -229,6 +248,7 @@ impl InferenceEngine for DefaultInferenceEngine {
                 }
 
                 generated_tokens.push(next_token);
+                all_tokens.push(next_token);
 
                 // Decode token to text
                 let token_text = match tokenizer.decode(&[next_token], false) {
@@ -287,7 +307,7 @@ impl InferenceEngine for DefaultInferenceEngine {
     async fn status(&self) -> EngineStatus {
         EngineStatus {
             is_ready: true,
-            loaded_models: vec![],
+            loaded_models: vec![self.config.model.model_id.clone()],
             active_requests: 0,
             queued_requests: 0,
             memory_usage: ferrum_types::MemoryUsage {
@@ -333,19 +353,6 @@ impl InferenceEngine for DefaultInferenceEngine {
 
     async fn health_check(&self) -> ferrum_types::HealthStatus {
         ferrum_types::HealthStatus::healthy()
-    }
-}
-
-impl DefaultInferenceEngine {
-    fn clone_engine(&self) -> Arc<Self> {
-        Arc::new(Self {
-            config: self.config.clone(),
-            scheduler: self.scheduler.clone(),
-            tokenizer: self.tokenizer.clone(),
-            sampler: self.sampler.clone(),
-            kv_cache: self.kv_cache.clone(),
-            model_executor: self.model_executor.clone(),
-        })
     }
 }
 
@@ -411,17 +418,130 @@ fn extract_last_token_logits(
 
 fn sample_token(
     logits: &ferrum_interfaces::TensorRef,
-    _params: &SamplingParams,
+    params: &SamplingParams,
     sampler: &Arc<dyn Sampler + Send + Sync>,
     rng: &mut StdRng,
+    all_tokens: &[TokenId],
 ) -> Result<TokenId> {
-    // Use the new to_vec_f32 method from TensorLike trait
+    #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+    let _ = all_tokens;
+
+    // Fast path (greedy): avoid transferring full vocab logits to CPU.
+    // If the backend provides an on-device argmax, we only read back 1 scalar token id.
+    if params.temperature == 0.0 || (sampler.is_deterministic() && sampler.name() == "greedy") {
+        if let Ok(idx) = logits.argmax_last_dim_u32() {
+            return Ok(TokenId::new(idx));
+        }
+    }
+
+    // Metal GPU-side sampling path (top-k/top-p/temperature/repetition penalty).
+    // This avoids copying full-vocab logits to CPU on every token.
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    {
+        if let Some(tok) = try_sample_token_metal_gpu(logits, params, rng, all_tokens) {
+            return Ok(tok);
+        }
+    }
+
+    // Fallback: transfer full logits to CPU and sample there.
     let logits_vec = logits.to_vec_f32()?;
+    sampler.sample(&logits_vec, rng)
+}
 
-    // Sample token
-    let token_id = sampler.sample(&logits_vec, rng)?;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+fn try_sample_token_metal_gpu(
+    logits: &ferrum_interfaces::TensorRef,
+    params: &SamplingParams,
+    rng: &mut StdRng,
+    all_tokens: &[TokenId],
+) -> Option<TokenId> {
+    use ferrum_models::tensor_wrapper::CandleTensorWrapper;
+    use ferrum_types::Device;
 
-    Ok(token_id)
+    if !matches!(logits.device(), Device::Metal) {
+        return None;
+    }
+
+    // Opt-in switch.
+    //
+    // Default is OFF because the current GPU sampling implementation uses multiple
+    // argmax passes (Top-K via repeated argmax+mask), which can be slower than
+    // CPU-side sampling for small models.
+    //
+    // Enable explicitly when you need to avoid full-vocab GPU→CPU logits transfer:
+    //   FERRUM_METAL_GPU_SAMPLING=1
+    let enabled = std::env::var("FERRUM_METAL_GPU_SAMPLING")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    // Only handle stochastic sampling here (greedy handled above).
+    if params.temperature <= 0.0 {
+        return None;
+    }
+
+    // We approximate nucleus sampling by sampling within Top-K candidates.
+    let default_k: usize = std::env::var("FERRUM_METAL_TOPK_DEFAULT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128);
+    let k = params.top_k.unwrap_or(default_k).clamp(1, 256);
+
+    // Prepare repetition penalty sparse list (token_id, freq) over a limited window.
+    let rep_pen = params.repetition_penalty;
+    let mut rep_ids: Vec<u32> = Vec::new();
+    let mut rep_freqs: Vec<u32> = Vec::new();
+    if rep_pen != 1.0 && !all_tokens.is_empty() {
+        let window: usize = std::env::var("FERRUM_REPETITION_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let start = all_tokens.len().saturating_sub(window);
+        let mut map = std::collections::HashMap::<u32, u32>::new();
+        for t in &all_tokens[start..] {
+            *map.entry(t.get()).or_insert(0) += 1;
+        }
+        rep_ids = map.keys().copied().collect();
+        rep_freqs = rep_ids.iter().map(|id| map[id]).collect();
+    }
+
+    static OPS: OnceLock<crate::metal::MetalSamplingOps> = OnceLock::new();
+    let ops = OPS.get_or_init(|| {
+        let mut ctx =
+            crate::metal::MetalContext::new().expect("MetalContext::new failed for sampling");
+        ctx.load_shader_library()
+            .expect("load_shader_library failed for sampling");
+        crate::metal::MetalSamplingOps::new(std::sync::Arc::new(ctx))
+            .expect("MetalSamplingOps::new failed")
+    });
+
+    let ctw = logits.as_any().downcast_ref::<CandleTensorWrapper>()?;
+    let logits_tensor = ctw.inner();
+
+    let seed = rng.next_u32();
+    let top_p = params.top_p;
+
+    match ops.sample_token(
+        logits_tensor,
+        k,
+        top_p,
+        params.temperature,
+        rep_pen,
+        &rep_ids,
+        &rep_freqs,
+        seed,
+    ) {
+        Ok(tok) => Some(TokenId::new(tok)),
+        Err(e) => {
+            debug!(
+                "Metal GPU sampling failed, falling back to CPU sampler: {}",
+                e
+            );
+            None
+        }
+    }
 }
 
 fn create_rng(params: &SamplingParams) -> StdRng {
@@ -444,7 +564,7 @@ fn is_stop_token(token: TokenId, _vocab_size: usize) -> bool {
         2 |          // LLaMA </s>
         50256 |      // GPT-2/GPT-J <|endoftext|>
         151643 |     // Qwen <|endoftext|>
-        151645       // Qwen <|im_end|>
+        151645 // Qwen <|im_end|>
     )
 }
 

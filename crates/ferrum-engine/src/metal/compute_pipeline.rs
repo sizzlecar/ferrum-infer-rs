@@ -1,10 +1,10 @@
 //! Metal compute pipeline management for quantized operations
-//! 
-//! This module provides high-level interfaces for executing quantized 
+//!
+//! This module provides high-level interfaces for executing quantized
 //! matrix operations on Apple GPU using Metal compute shaders.
 
+use crate::metal::quantization::{pack_matrix_q4_0_for_gpu, MatvecParams, QK4_0};
 use crate::metal::{MetalContext, MetalError};
-use crate::metal::quantization::{MatvecParams, pack_matrix_q4_0_for_gpu, QK4_0};
 use ferrum_types::FerrumError;
 use metal::{Buffer, ComputePipelineDescriptor, ComputePipelineState, MTLSize};
 use std::sync::Arc;
@@ -19,36 +19,46 @@ pub struct Q4_0MatvecPipeline {
 impl Q4_0MatvecPipeline {
     /// Create a new Q4_0 matvec pipeline
     pub fn new(context: Arc<MetalContext>) -> Result<Self, FerrumError> {
-        let library = context.library()
+        let library = context
+            .library()
             .ok_or_else(|| MetalError::generic("Metal library not loaded"))?;
-        
-        let function = library.get_function("q4_0_matvec_main", None)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to find q4_0_matvec_main function: {}", e)))?;
-        
+
+        let function = library
+            .get_function("q4_0_matvec_main", None)
+            .map_err(|e| {
+                MetalError::compilation_failed(format!(
+                    "Failed to find q4_0_matvec_main function: {}",
+                    e
+                ))
+            })?;
+
         let pipeline_descriptor = ComputePipelineDescriptor::new();
         pipeline_descriptor.set_compute_function(Some(&function));
         pipeline_descriptor.set_label("Q4_0 MatVec Pipeline");
-        
-        let pipeline_state = context.device
+
+        let pipeline_state = context
+            .device
             .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to create pipeline state: {}", e)))?;
-        
+            .map_err(|e| {
+                MetalError::compilation_failed(format!("Failed to create pipeline state: {}", e))
+            })?;
+
         info!("Q4_0 matvec pipeline created successfully");
-        
+
         Ok(Self {
             pipeline_state,
             context,
         })
     }
-    
+
     /// Execute Q4_0 quantized matrix-vector multiplication
-    /// 
+    ///
     /// # Arguments
     /// * `weights` - Quantized weight matrix data (packed format)
     /// * `input` - Input vector (f32)
     /// * `nrows` - Number of matrix rows
     /// * `ncols` - Number of matrix columns (must be multiple of 32)
-    /// 
+    ///
     /// # Returns
     /// Result vector of length `nrows`
     pub fn execute_matvec(
@@ -60,28 +70,33 @@ impl Q4_0MatvecPipeline {
     ) -> Result<Vec<f32>, FerrumError> {
         // Validate input dimensions
         if ncols % QK4_0 != 0 {
-            return Err(MetalError::invalid_argument(
-                format!("ncols ({}) must be divisible by QK4_0 ({})", ncols, QK4_0)
-            ));
+            return Err(MetalError::invalid_argument(format!(
+                "ncols ({}) must be divisible by QK4_0 ({})",
+                ncols, QK4_0
+            )));
         }
-        
+
         if input.len() != ncols {
-            return Err(MetalError::invalid_argument(
-                format!("Input vector length ({}) must equal ncols ({})", input.len(), ncols)
-            ));
+            return Err(MetalError::invalid_argument(format!(
+                "Input vector length ({}) must equal ncols ({})",
+                input.len(),
+                ncols
+            )));
         }
-        
+
         let blocks_per_row = ncols / QK4_0;
         let expected_weight_size = nrows * blocks_per_row * 5; // 5 u32 per block
-        
+
         if weights.len() != expected_weight_size {
-            return Err(MetalError::invalid_argument(
-                format!("Weight data size ({}) doesn't match expected ({})", weights.len(), expected_weight_size)
-            ));
+            return Err(MetalError::invalid_argument(format!(
+                "Weight data size ({}) doesn't match expected ({})",
+                weights.len(),
+                expected_weight_size
+            )));
         }
-        
+
         debug!("Executing Q4_0 matvec: {}×{} matrix", nrows, ncols);
-        
+
         // Create parameters
         let params = MatvecParams {
             nrows: nrows as u32,
@@ -89,65 +104,57 @@ impl Q4_0MatvecPipeline {
             blocks_per_row: blocks_per_row as u32,
             _pad: 0,
         };
-        
+
         // Create Metal buffers
-        let params_buffer = self.create_buffer_with_data(
-            bytemuck::bytes_of(&params),
-            "Q4_0 Params"
-        )?;
-        
-        let weights_buffer = self.create_buffer_with_data(
-            bytemuck::cast_slice(weights),
-            "Q4_0 Weights"
-        )?;
-        
-        let input_buffer = self.create_buffer_with_data(
-            bytemuck::cast_slice(input),
-            "Q4_0 Input"
-        )?;
-        
+        let params_buffer =
+            self.create_buffer_with_data(bytemuck::bytes_of(&params), "Q4_0 Params")?;
+
+        let weights_buffer =
+            self.create_buffer_with_data(bytemuck::cast_slice(weights), "Q4_0 Weights")?;
+
+        let input_buffer =
+            self.create_buffer_with_data(bytemuck::cast_slice(input), "Q4_0 Input")?;
+
         let output_size = nrows * std::mem::size_of::<f32>();
         let output_buffer = self.context.device.new_buffer(
             output_size as u64,
-            metal::MTLResourceOptions::StorageModeShared
+            metal::MTLResourceOptions::StorageModeShared,
         );
         output_buffer.set_label("Q4_0 Output");
-        
+
         // Create and execute compute command
         let command_buffer = self.context.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        
+
         encoder.set_compute_pipeline_state(&self.pipeline_state);
         encoder.set_buffer(0, Some(&params_buffer), 0);
         encoder.set_buffer(1, Some(&weights_buffer), 0);
         encoder.set_buffer(2, Some(&input_buffer), 0);
         encoder.set_buffer(3, Some(&output_buffer), 0);
-        
+
         // Dispatch: one workgroup per output row
         let threadgroup_size = MTLSize::new(32, 1, 1); // 32 threads per workgroup
         let grid_size = MTLSize::new(1, nrows as u64, 1); // nrows workgroups
-        
+
         encoder.dispatch_thread_groups(grid_size, threadgroup_size);
         encoder.end_encoding();
-        
+
         command_buffer.commit();
         command_buffer.wait_until_completed();
-        
+
         // Read back results
         let output_ptr = output_buffer.contents() as *const f32;
-        let output_slice = unsafe {
-            std::slice::from_raw_parts(output_ptr, nrows)
-        };
-        
+        let output_slice = unsafe { std::slice::from_raw_parts(output_ptr, nrows) };
+
         Ok(output_slice.to_vec())
     }
-    
+
     /// Create a Metal buffer with data
     fn create_buffer_with_data(&self, data: &[u8], label: &str) -> Result<Buffer, FerrumError> {
         let buffer = self.context.device.new_buffer_with_data(
             data.as_ptr() as *const std::ffi::c_void,
             data.len() as u64,
-            metal::MTLResourceOptions::StorageModeShared
+            metal::MTLResourceOptions::StorageModeShared,
         );
         buffer.set_label(label);
         Ok(buffer)
@@ -165,9 +172,9 @@ impl Q4_0MatrixOps {
         let pipeline = Q4_0MatvecPipeline::new(context)?;
         Ok(Self { pipeline })
     }
-    
+
     /// Quantize and execute matrix-vector multiplication
-    /// 
+    ///
     /// This is the high-level interface that handles quantization internally
     pub fn quantized_matvec(
         &self,
@@ -177,16 +184,17 @@ impl Q4_0MatrixOps {
         ncols: usize,
     ) -> Result<Vec<f32>, FerrumError> {
         debug!("Quantizing {}×{} matrix to Q4_0 format", nrows, ncols);
-        
+
         // Quantize weights to Q4_0 format
         let quantized_weights = pack_matrix_q4_0_for_gpu(weights, nrows, ncols);
-        
+
         // Execute on GPU
-        self.pipeline.execute_matvec(&quantized_weights, input, nrows, ncols)
+        self.pipeline
+            .execute_matvec(&quantized_weights, input, nrows, ncols)
     }
-    
+
     /// Execute pre-quantized matrix-vector multiplication
-    /// 
+    ///
     /// Use this when weights are already quantized to avoid repeated quantization
     pub fn execute_quantized_matvec(
         &self,
@@ -195,7 +203,8 @@ impl Q4_0MatrixOps {
         nrows: usize,
         ncols: usize,
     ) -> Result<Vec<f32>, FerrumError> {
-        self.pipeline.execute_matvec(quantized_weights, input, nrows, ncols)
+        self.pipeline
+            .execute_matvec(quantized_weights, input, nrows, ncols)
     }
 }
 
@@ -218,7 +227,7 @@ pub struct RmsNormPipeline {
     single_pipeline: ComputePipelineState,
     batched_pipeline: ComputePipelineState,
     residual_pipeline: ComputePipelineState,
-    inplace_pipeline: ComputePipelineState,
+    _inplace_pipeline: ComputePipelineState,
     context: Arc<MetalContext>,
 }
 
@@ -230,41 +239,55 @@ impl RmsNormPipeline {
             .ok_or_else(|| MetalError::generic("Metal library not loaded"))?;
 
         // Load all kernel variants
-        let single_fn = library
-            .get_function("rms_norm_single", None)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to find rms_norm_single: {}", e)))?;
+        let single_fn = library.get_function("rms_norm_single", None).map_err(|e| {
+            MetalError::compilation_failed(format!("Failed to find rms_norm_single: {}", e))
+        })?;
 
         let batched_fn = library
             .get_function("rms_norm_batched", None)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to find rms_norm_batched: {}", e)))?;
+            .map_err(|e| {
+                MetalError::compilation_failed(format!("Failed to find rms_norm_batched: {}", e))
+            })?;
 
         let residual_fn = library
             .get_function("rms_norm_residual", None)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to find rms_norm_residual: {}", e)))?;
+            .map_err(|e| {
+                MetalError::compilation_failed(format!("Failed to find rms_norm_residual: {}", e))
+            })?;
 
         let inplace_fn = library
             .get_function("rms_norm_inplace", None)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to find rms_norm_inplace: {}", e)))?;
+            .map_err(|e| {
+                MetalError::compilation_failed(format!("Failed to find rms_norm_inplace: {}", e))
+            })?;
 
         let single_pipeline = context
             .device
             .new_compute_pipeline_state_with_function(&single_fn)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to create single pipeline: {}", e)))?;
+            .map_err(|e| {
+                MetalError::compilation_failed(format!("Failed to create single pipeline: {}", e))
+            })?;
 
         let batched_pipeline = context
             .device
             .new_compute_pipeline_state_with_function(&batched_fn)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to create batched pipeline: {}", e)))?;
+            .map_err(|e| {
+                MetalError::compilation_failed(format!("Failed to create batched pipeline: {}", e))
+            })?;
 
         let residual_pipeline = context
             .device
             .new_compute_pipeline_state_with_function(&residual_fn)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to create residual pipeline: {}", e)))?;
+            .map_err(|e| {
+                MetalError::compilation_failed(format!("Failed to create residual pipeline: {}", e))
+            })?;
 
         let inplace_pipeline = context
             .device
             .new_compute_pipeline_state_with_function(&inplace_fn)
-            .map_err(|e| MetalError::compilation_failed(format!("Failed to create inplace pipeline: {}", e)))?;
+            .map_err(|e| {
+                MetalError::compilation_failed(format!("Failed to create inplace pipeline: {}", e))
+            })?;
 
         info!("RMS Norm pipelines created successfully");
 
@@ -272,7 +295,7 @@ impl RmsNormPipeline {
             single_pipeline,
             batched_pipeline,
             residual_pipeline,
-            inplace_pipeline,
+            _inplace_pipeline: inplace_pipeline,
             context,
         })
     }
@@ -302,8 +325,10 @@ impl RmsNormPipeline {
         debug!("RMS Norm single: hidden_size={}", hidden_size);
 
         // Create buffers
-        let input_buffer = self.create_buffer_with_data(bytemuck::cast_slice(input), "RMSNorm Input")?;
-        let weight_buffer = self.create_buffer_with_data(bytemuck::cast_slice(weight), "RMSNorm Weight")?;
+        let input_buffer =
+            self.create_buffer_with_data(bytemuck::cast_slice(input), "RMSNorm Input")?;
+        let weight_buffer =
+            self.create_buffer_with_data(bytemuck::cast_slice(weight), "RMSNorm Weight")?;
 
         let output_size = hidden_size * std::mem::size_of::<f32>();
         let output_buffer = self.context.device.new_buffer(
@@ -313,11 +338,10 @@ impl RmsNormPipeline {
         output_buffer.set_label("RMSNorm Output");
 
         let hidden_size_u32 = hidden_size as u32;
-        let hidden_size_buffer = self.create_buffer_with_data(
-            bytemuck::bytes_of(&hidden_size_u32),
-            "Hidden Size",
-        )?;
-        let epsilon_buffer = self.create_buffer_with_data(bytemuck::bytes_of(&epsilon), "Epsilon")?;
+        let hidden_size_buffer =
+            self.create_buffer_with_data(bytemuck::bytes_of(&hidden_size_u32), "Hidden Size")?;
+        let epsilon_buffer =
+            self.create_buffer_with_data(bytemuck::bytes_of(&epsilon), "Epsilon")?;
 
         // Execute
         let command_buffer = self.context.command_queue.new_command_buffer();
@@ -384,8 +408,10 @@ impl RmsNormPipeline {
         );
 
         // Create buffers
-        let input_buffer = self.create_buffer_with_data(bytemuck::cast_slice(input), "RMSNorm Input")?;
-        let weight_buffer = self.create_buffer_with_data(bytemuck::cast_slice(weight), "RMSNorm Weight")?;
+        let input_buffer =
+            self.create_buffer_with_data(bytemuck::cast_slice(input), "RMSNorm Input")?;
+        let weight_buffer =
+            self.create_buffer_with_data(bytemuck::cast_slice(weight), "RMSNorm Weight")?;
 
         let output_size = batch_size * hidden_size * std::mem::size_of::<f32>();
         let output_buffer = self.context.device.new_buffer(
@@ -397,15 +423,12 @@ impl RmsNormPipeline {
         let batch_size_u32 = batch_size as u32;
         let hidden_size_u32 = hidden_size as u32;
 
-        let batch_size_buffer = self.create_buffer_with_data(
-            bytemuck::bytes_of(&batch_size_u32),
-            "Batch Size",
-        )?;
-        let hidden_size_buffer = self.create_buffer_with_data(
-            bytemuck::bytes_of(&hidden_size_u32),
-            "Hidden Size",
-        )?;
-        let epsilon_buffer = self.create_buffer_with_data(bytemuck::bytes_of(&epsilon), "Epsilon")?;
+        let batch_size_buffer =
+            self.create_buffer_with_data(bytemuck::bytes_of(&batch_size_u32), "Batch Size")?;
+        let hidden_size_buffer =
+            self.create_buffer_with_data(bytemuck::bytes_of(&hidden_size_u32), "Hidden Size")?;
+        let epsilon_buffer =
+            self.create_buffer_with_data(bytemuck::bytes_of(&epsilon), "Epsilon")?;
 
         // Execute
         let command_buffer = self.context.command_queue.new_command_buffer();
@@ -430,7 +453,8 @@ impl RmsNormPipeline {
 
         // Read results
         let output_ptr = output_buffer.contents() as *const f32;
-        let output_slice = unsafe { std::slice::from_raw_parts(output_ptr, batch_size * hidden_size) };
+        let output_slice =
+            unsafe { std::slice::from_raw_parts(output_ptr, batch_size * hidden_size) };
 
         Ok(output_slice.to_vec())
     }
@@ -460,7 +484,8 @@ impl RmsNormPipeline {
 
         // Create buffers
         let input_buffer = self.create_buffer_with_data(bytemuck::cast_slice(input), "Input")?;
-        let residual_buffer = self.create_buffer_with_data(bytemuck::cast_slice(residual), "Residual")?;
+        let residual_buffer =
+            self.create_buffer_with_data(bytemuck::cast_slice(residual), "Residual")?;
         let weight_buffer = self.create_buffer_with_data(bytemuck::cast_slice(weight), "Weight")?;
 
         let output_size = batch_size * hidden_size * std::mem::size_of::<f32>();
@@ -472,8 +497,10 @@ impl RmsNormPipeline {
         let batch_size_u32 = batch_size as u32;
         let hidden_size_u32 = hidden_size as u32;
 
-        let batch_size_buffer = self.create_buffer_with_data(bytemuck::bytes_of(&batch_size_u32), "Batch")?;
-        let hidden_size_buffer = self.create_buffer_with_data(bytemuck::bytes_of(&hidden_size_u32), "Hidden")?;
+        let batch_size_buffer =
+            self.create_buffer_with_data(bytemuck::bytes_of(&batch_size_u32), "Batch")?;
+        let hidden_size_buffer =
+            self.create_buffer_with_data(bytemuck::bytes_of(&hidden_size_u32), "Hidden")?;
         let epsilon_buffer = self.create_buffer_with_data(bytemuck::bytes_of(&epsilon), "Eps")?;
 
         let command_buffer = self.context.command_queue.new_command_buffer();
@@ -498,7 +525,8 @@ impl RmsNormPipeline {
         command_buffer.wait_until_completed();
 
         let output_ptr = output_buffer.contents() as *const f32;
-        let output_slice = unsafe { std::slice::from_raw_parts(output_ptr, batch_size * hidden_size) };
+        let output_slice =
+            unsafe { std::slice::from_raw_parts(output_ptr, batch_size * hidden_size) };
 
         Ok(output_slice.to_vec())
     }
@@ -538,7 +566,8 @@ impl RmsNormOps {
         if batch_size == 1 {
             self.pipeline.forward_single(input, weight, epsilon)
         } else {
-            self.pipeline.forward_batched(input, weight, batch_size, hidden_size, epsilon)
+            self.pipeline
+                .forward_batched(input, weight, batch_size, hidden_size, epsilon)
         }
     }
 
@@ -552,40 +581,57 @@ impl RmsNormOps {
         hidden_size: usize,
         epsilon: f32,
     ) -> Result<Vec<f32>, FerrumError> {
-        self.pipeline.forward_with_residual(input, residual, weight, batch_size, hidden_size, epsilon)
+        self.pipeline.forward_with_residual(
+            input,
+            residual,
+            weight,
+            batch_size,
+            hidden_size,
+            epsilon,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     async fn test_q4_0_matvec_pipeline() {
         // Create test data
         let nrows = 8;
         let ncols = 64; // 2 blocks per row
-        let weights: Vec<f32> = (0..nrows * ncols).map(|i| (i as f32 - 256.0) * 0.001).collect();
+        let weights: Vec<f32> = (0..nrows * ncols)
+            .map(|i| (i as f32 - 256.0) * 0.001)
+            .collect();
         let input: Vec<f32> = (0..ncols).map(|i| i as f32 * 0.01).collect();
-        
+
         // Create Metal context and pipeline
         let mut context = MetalContext::new().expect("Failed to create Metal context");
-        context.load_shader_library().expect("Failed to load shader library");
+        context
+            .load_shader_library()
+            .expect("Failed to load shader library");
         let context = Arc::new(context);
-        
+
         let ops = Q4_0MatrixOps::new(context).expect("Failed to create Q4_0 ops");
-        
+
         // Execute quantized matvec
-        let result = ops.quantized_matvec(&weights, &input, nrows, ncols)
+        let result = ops
+            .quantized_matvec(&weights, &input, nrows, ncols)
             .expect("Failed to execute quantized matvec");
-        
+
         assert_eq!(result.len(), nrows);
-        
+
         // Verify results by comparing with CPU implementation
         // (This would be a more thorough test in practice)
         for (i, &output_val) in result.iter().enumerate() {
-            assert!(output_val.is_finite(), "Output {} is not finite: {}", i, output_val);
+            assert!(
+                output_val.is_finite(),
+                "Output {} is not finite: {}",
+                i,
+                output_val
+            );
         }
     }
 
@@ -599,7 +645,9 @@ mod tests {
 
         // Create Metal context and pipeline
         let mut context = MetalContext::new().expect("Failed to create Metal context");
-        context.load_shader_library().expect("Failed to load shader library");
+        context
+            .load_shader_library()
+            .expect("Failed to load shader library");
         let context = Arc::new(context);
 
         let ops = RmsNormOps::new(context).expect("Failed to create RMS Norm ops");
@@ -642,7 +690,9 @@ mod tests {
         let epsilon = 1e-6;
 
         let mut context = MetalContext::new().expect("Failed to create Metal context");
-        context.load_shader_library().expect("Failed to load shader library");
+        context
+            .load_shader_library()
+            .expect("Failed to load shader library");
         let context = Arc::new(context);
 
         let ops = RmsNormOps::new(context).expect("Failed to create RMS Norm ops");

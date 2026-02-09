@@ -3,14 +3,12 @@
 //! Provides execution coordination for multi-GPU inference.
 
 use async_trait::async_trait;
-use ferrum_interfaces::ModelExecutor;
-use ferrum_types::{Device, FerrumError, Result};
+use ferrum_types::{Device, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::config::{ParallelConfig, ParallelismType};
-use super::device::{DeviceInfo, DeviceManager};
-use super::tensor_parallel::{TensorParallelConfig, TensorParallelGroup};
+use super::device::DeviceManager;
 
 /// Parallel executor trait
 #[async_trait]
@@ -144,7 +142,11 @@ impl ParallelExecutor for SimulatedParallelExecutor {
     }
 
     fn device(&self) -> Device {
-        self.config.devices.get(self.rank).cloned().unwrap_or(Device::CPU)
+        self.config
+            .devices
+            .get(self.rank)
+            .cloned()
+            .unwrap_or(Device::CPU)
     }
 
     async fn barrier(&self) -> Result<()> {
@@ -235,12 +237,16 @@ impl ParallelExecutorFactory {
                 let device = config.devices.first().cloned().unwrap_or(Device::CPU);
                 Ok(Box::new(SingleGpuExecutor::new(device)))
             }
-            ParallelismType::Tensor | ParallelismType::Pipeline | ParallelismType::Data | ParallelismType::Hybrid => {
+            ParallelismType::Tensor
+            | ParallelismType::Pipeline
+            | ParallelismType::Data
+            | ParallelismType::Hybrid => {
                 // For now, return a simulated executor
                 // In production, this would create actual distributed executors
                 info!("Creating simulated parallel executor (rank {})", rank);
                 let world_size = config.world_size();
-                let shared_buffers = Arc::new(parking_lot::RwLock::new(vec![Vec::new(); world_size]));
+                let shared_buffers =
+                    Arc::new(parking_lot::RwLock::new(vec![Vec::new(); world_size]));
                 let barrier = Arc::new(std::sync::Barrier::new(world_size));
 
                 Ok(Box::new(SimulatedParallelExecutor::new(
@@ -289,7 +295,7 @@ impl ParallelStrategySelector {
     /// Select optimal parallelism strategy
     pub fn select(
         model_size_bytes: usize,
-        num_layers: usize,
+        _num_layers: usize,
         device_manager: &DeviceManager,
     ) -> ParallelConfig {
         let gpu_devices = device_manager.get_gpu_devices();
@@ -382,5 +388,3 @@ mod tests {
         assert_eq!(config.world_size(), 1);
     }
 }
-
-

@@ -6,7 +6,6 @@
 use crate::metal::{MetalContext, MetalLlamaConfig, MetalLlamaModel};
 use async_trait::async_trait;
 use candle_core::{DType, Device as CandleDevice, IndexOp, Tensor};
-use half::f16;
 use ferrum_interfaces::kv_cache::CacheHandleStats;
 use ferrum_interfaces::model_executor::{
     AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
@@ -14,7 +13,7 @@ use ferrum_interfaces::model_executor::{
 };
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, PrefillInput, PrefillOutput, TensorRef};
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
-use std::collections::HashMap;
+use half::f16;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -32,6 +31,10 @@ impl SimpleTensor {
 }
 
 impl ferrum_interfaces::TensorLike for SimpleTensor {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn shape(&self) -> &[usize] {
         &self.shape
     }
@@ -81,22 +84,31 @@ impl ferrum_interfaces::TensorLike for SimpleTensor {
         if new_numel != self.numel() {
             return Err(FerrumError::backend("Reshape numel mismatch"));
         }
-        Ok(Arc::new(SimpleTensor::new(self.data.clone(), shape.to_vec())))
+        Ok(Arc::new(SimpleTensor::new(
+            self.data.clone(),
+            shape.to_vec(),
+        )))
     }
 
     fn to_cpu(&self) -> Result<TensorRef> {
-        Ok(Arc::new(SimpleTensor::new(self.data.clone(), self.shape.clone())))
+        Ok(Arc::new(SimpleTensor::new(
+            self.data.clone(),
+            self.shape.clone(),
+        )))
     }
 
     fn to_device(&self, _device: &Device) -> Result<TensorRef> {
-        Ok(Arc::new(SimpleTensor::new(self.data.clone(), self.shape.clone())))
+        Ok(Arc::new(SimpleTensor::new(
+            self.data.clone(),
+            self.shape.clone(),
+        )))
     }
 
     fn to_dtype(&self, dtype: DataType) -> Result<TensorRef> {
         match dtype {
-            DataType::FP32 | DataType::FP16 | DataType::BF16 | DataType::FP8 => {
-                Ok(Arc::new(SimpleTensor::new(self.data.clone(), self.shape.clone())))
-            }
+            DataType::FP32 | DataType::FP16 | DataType::BF16 | DataType::FP8 => Ok(Arc::new(
+                SimpleTensor::new(self.data.clone(), self.shape.clone()),
+            )),
             _ => Err(FerrumError::backend("Unsupported dtype conversion")),
         }
     }
@@ -107,6 +119,16 @@ impl ferrum_interfaces::TensorLike for SimpleTensor {
 
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
         Ok(self.data.iter().map(|x| *x as u32).collect())
+    }
+
+    fn argmax_last_dim_u32(&self) -> Result<u32> {
+        let (idx, _) = self
+            .data
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| FerrumError::backend("Empty tensor"))?;
+        Ok(idx as u32)
     }
 }
 
@@ -195,7 +217,10 @@ pub struct MetalLlamaExecutor {
 impl MetalLlamaExecutor {
     /// Create a new Metal LLaMA executor
     pub fn new(model: MetalLlamaModel, model_info: ModelInfo, device: CandleDevice) -> Self {
-        info!("Created MetalLlamaExecutor for model: {}", model_info.model_id);
+        info!(
+            "Created MetalLlamaExecutor for model: {}",
+            model_info.model_id
+        );
 
         let status = ExecutorStatus {
             state: ExecutorState::Ready,
@@ -273,7 +298,9 @@ impl MetalLlamaExecutor {
         if let Ok(vf) = tensor.to_vec_f32() {
             return Ok(vf.into_iter().map(|x| x as u32).collect());
         }
-        Err(FerrumError::backend("Unable to extract token ids from tensor"))
+        Err(FerrumError::backend(
+            "Unable to extract token ids from tensor",
+        ))
     }
 }
 
@@ -286,7 +313,7 @@ impl ModelExecutor for MetalLlamaExecutor {
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         let token_ids = self.extract_token_ids(&input.input_ids)?;
         let seq_len = token_ids.len();
-        
+
         debug!("Metal prefill: {} tokens", seq_len);
 
         // Convert token IDs to tensor
@@ -330,7 +357,10 @@ impl ModelExecutor for MetalLlamaExecutor {
             warn!("prefill logits were FP16, converting f16->f32");
             v16.iter().map(|v| f32::from(*v)).collect()
         } else {
-            warn!("prefill logits unexpected dtype {:?}, force to f32 via cast", dtype);
+            warn!(
+                "prefill logits unexpected dtype {:?}, force to f32 via cast",
+                dtype
+            );
             last_logits
                 .to_dtype(DType::F32)
                 .unwrap_or(last_logits)
@@ -339,10 +369,7 @@ impl ModelExecutor for MetalLlamaExecutor {
         };
 
         // Create output tensor
-        let output_tensor: TensorRef = Arc::new(SimpleTensor::new(
-            logits_vec,
-            vec![1, vocab_size],
-        ));
+        let output_tensor: TensorRef = Arc::new(SimpleTensor::new(logits_vec, vec![1, vocab_size]));
 
         // Create dummy KV cache handle
         let kv_cache: Arc<dyn KvCacheHandle> = Arc::new(DummyKvCache::new(16));
@@ -353,7 +380,7 @@ impl ModelExecutor for MetalLlamaExecutor {
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         let token_ids = self.extract_token_ids(&input.input_ids)?;
         let position = input.kv_cache.num_tokens();
-        
+
         debug!("Metal decode: position {}", position);
 
         // Convert token ID to tensor
@@ -392,7 +419,10 @@ impl ModelExecutor for MetalLlamaExecutor {
             warn!("decode logits were FP16, converting f16->f32");
             v16.iter().map(|v| f32::from(*v)).collect()
         } else {
-            warn!("decode logits unexpected dtype {:?}, force to f32 via cast", dtype);
+            warn!(
+                "decode logits unexpected dtype {:?}, force to f32 via cast",
+                dtype
+            );
             last_logits
                 .to_dtype(DType::F32)
                 .unwrap_or(last_logits)
@@ -401,10 +431,7 @@ impl ModelExecutor for MetalLlamaExecutor {
         };
 
         let vocab_size = logits_vec.len();
-        let output_tensor: TensorRef = Arc::new(SimpleTensor::new(
-            logits_vec,
-            vec![1, vocab_size],
-        ));
+        let output_tensor: TensorRef = Arc::new(SimpleTensor::new(logits_vec, vec![1, vocab_size]));
 
         // Clone the input kv_cache for output (in a real implementation, this would be updated)
         let kv_cache = input.kv_cache.clone();

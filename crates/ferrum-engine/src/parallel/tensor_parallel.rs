@@ -15,8 +15,6 @@
 //! - Row-parallel → Column-parallel: All-Gather
 
 use ferrum_types::{Device, FerrumError, Result};
-use std::sync::Arc;
-use tracing::debug;
 
 /// Tensor parallel configuration
 #[derive(Debug, Clone)]
@@ -97,7 +95,9 @@ impl TensorParallelGroup {
     /// Create a new tensor parallel group
     pub fn new(devices: Vec<Device>, rank: usize) -> Result<Self> {
         if devices.is_empty() {
-            return Err(FerrumError::config("No devices provided for tensor parallel group"));
+            return Err(FerrumError::config(
+                "No devices provided for tensor parallel group",
+            ));
         }
         if rank >= devices.len() {
             return Err(FerrumError::config(format!(
@@ -169,7 +169,11 @@ pub struct WeightShard {
 
 impl WeightShard {
     /// Create column-parallel shard specification
-    pub fn column_parallel(name: impl Into<String>, dim_size: usize, config: &TensorParallelConfig) -> Self {
+    pub fn column_parallel(
+        name: impl Into<String>,
+        dim_size: usize,
+        config: &TensorParallelConfig,
+    ) -> Self {
         Self {
             name: name.into(),
             parallel_type: LayerParallelType::ColumnParallel,
@@ -179,7 +183,11 @@ impl WeightShard {
     }
 
     /// Create row-parallel shard specification
-    pub fn row_parallel(name: impl Into<String>, dim_size: usize, config: &TensorParallelConfig) -> Self {
+    pub fn row_parallel(
+        name: impl Into<String>,
+        dim_size: usize,
+        config: &TensorParallelConfig,
+    ) -> Self {
         Self {
             name: name.into(),
             parallel_type: LayerParallelType::RowParallel,
@@ -356,7 +364,12 @@ mod tests {
 
     #[test]
     fn test_tensor_parallel_group() {
-        let devices = vec![Device::CUDA(0), Device::CUDA(1), Device::CUDA(2), Device::CUDA(3)];
+        let devices = vec![
+            Device::CUDA(0),
+            Device::CUDA(1),
+            Device::CUDA(2),
+            Device::CUDA(3),
+        ];
         let group = TensorParallelGroup::new(devices, 1).unwrap();
 
         assert_eq!(group.world_size(), 4);
@@ -369,12 +382,12 @@ mod tests {
     fn test_transformer_parallel_mapping() {
         // Test with invalid intermediate_dim (not divisible by tp_size)
         let mapping = TransformerParallelMapping::new(
-            32,     // num_heads
-            8,      // num_kv_heads
-            128,    // head_dim
-            4096,   // hidden_dim
-            11009,  // intermediate_dim (11009 % 4 = 1, not divisible)
-            4,      // tp_size
+            32,    // num_heads
+            8,     // num_kv_heads
+            128,   // head_dim
+            4096,  // hidden_dim
+            11009, // intermediate_dim (11009 % 4 = 1, not divisible)
+            4,     // tp_size
         );
 
         // 11009 is not divisible by 4, so this should fail
@@ -398,4 +411,3 @@ mod tests {
         assert_eq!(shard.shard_range, (1024, 2048));
     }
 }
-

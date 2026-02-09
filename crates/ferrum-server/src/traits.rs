@@ -5,8 +5,7 @@
 
 use crate::types::*;
 use async_trait::async_trait;
-use ferrum_types::{InferenceRequest, InferenceResponse, Result};
-use std::sync::Arc;
+use ferrum_types::{InferenceRequest, Result};
 use std::time::Duration;
 
 /// Main HTTP server trait

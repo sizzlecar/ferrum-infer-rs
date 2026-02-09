@@ -196,7 +196,6 @@ impl MemoryStatsTracker {
             4294967297..=17179869184 => 12,  // 4GB-16GB
             17179869185..=68719476736 => 13, // 16GB-64GB
             68719476737.. => 14,             // 64GB+
-            _ => 15,                         // Other
         };
 
         let mut buckets = self.size_buckets.lock();

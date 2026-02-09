@@ -8,7 +8,7 @@
 //! - Reduced latency for first token when processing long contexts
 
 use ferrum_interfaces::{
-    model_executor::{DecodeInput, DecodeOutput, PrefillInput, PrefillOutput},
+    model_executor::{PrefillInput, PrefillOutput},
     KvCacheHandle, ModelExecutor, TensorRef,
 };
 use ferrum_models::CandleTensorWrapper;
@@ -212,7 +212,7 @@ impl ChunkedPrefillExecutor {
     async fn process_continuation_chunk(
         &self,
         tokens: &[TokenId],
-        kv_cache: Arc<dyn KvCacheHandle>,
+        _kv_cache: Arc<dyn KvCacheHandle>,
     ) -> Result<PrefillOutput> {
         // For continuation, we use decode-like processing but with multiple tokens
         // This is an optimization - some models support batched decode which is
@@ -246,7 +246,10 @@ impl std::fmt::Debug for ChunkedPrefillExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChunkedPrefillExecutor")
             .field("chunk_size", &self.config.chunk_size)
-            .field("min_sequence_for_chunking", &self.config.min_sequence_for_chunking)
+            .field(
+                "min_sequence_for_chunking",
+                &self.config.min_sequence_for_chunking,
+            )
             .finish()
     }
 }
@@ -343,5 +346,3 @@ mod tests {
         assert!((state.progress() - 1.0).abs() < 0.01);
     }
 }
-
-

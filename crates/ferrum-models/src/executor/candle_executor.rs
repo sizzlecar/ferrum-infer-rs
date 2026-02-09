@@ -1,15 +1,15 @@
 //! Real model executor using Candle - safe implementation
 
 use async_trait::async_trait;
-use candle_core::{DType, Device as CandleDevice, Tensor};
+use candle_core::Tensor;
 use ferrum_interfaces::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PrefillInput,
         PrefillOutput,
     },
-    BlockTable, ComputeBackend, KvCacheHandle, ModelExecutor, TensorRef,
+    BlockTable, KvCacheHandle, ModelExecutor, TensorRef,
 };
-use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
+use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -43,18 +43,6 @@ impl CandleModelExecutor {
             .map_err(|e| FerrumError::model(format!("Failed to create tensor: {}", e)))?
             .unsqueeze(0) // Add batch dimension
             .map_err(|e| FerrumError::model(format!("Failed to unsqueeze: {}", e)))
-    }
-
-    /// Extract token IDs from TensorRef (safe approach)
-    fn extract_token_ids(&self, tensor_ref: &TensorRef) -> Result<Vec<u32>> {
-        // Try to get Candle tensor via to_cpu and shape analysis
-        // This is a workaround - ideally TensorLike would have a to_vec method
-
-        // For now, we'll work around by storing the original token IDs
-        // This is indicated by returning an error that the engine will handle
-        Err(FerrumError::model(
-            "Direct tensor extraction not supported - use token IDs",
-        ))
     }
 
     /// Wrap Candle tensor as TensorRef
@@ -169,7 +157,7 @@ impl ModelExecutor for CandleModelExecutor {
 /// Candle model executor that works with token IDs directly
 pub struct CandleModelExecutorV2 {
     model: Arc<LlamaModelWrapper>,
-    info: ModelInfo,
+    _info: ModelInfo,
     current_cache: Arc<Mutex<Option<LlamaCache>>>,
 }
 
@@ -177,7 +165,7 @@ impl CandleModelExecutorV2 {
     pub fn new(model: LlamaModelWrapper, info: ModelInfo) -> Self {
         Self {
             model: Arc::new(model),
-            info,
+            _info: info,
             current_cache: Arc::new(Mutex::new(None)),
         }
     }

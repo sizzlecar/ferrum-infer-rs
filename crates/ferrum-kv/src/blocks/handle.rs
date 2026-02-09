@@ -7,7 +7,6 @@ use std::sync::Arc;
 /// Default KV cache handle - MVP implementation
 #[derive(Debug)]
 pub struct DefaultKvCacheHandle {
-    request_id: RequestId,
     block_table: BlockTable,
     device: Device,
     num_layers: usize,
@@ -23,7 +22,6 @@ impl DefaultKvCacheHandle {
 
         Self {
             cache_id: format!("cache_{}", request_id.to_string()),
-            request_id,
             block_table,
             device: Device::CPU,
             num_layers: 32, // Default placeholder
@@ -119,7 +117,7 @@ mod tests {
         let request_id = RequestId::new();
         let handle = DefaultKvCacheHandle::new(request_id.clone(), 16, 10);
 
-        assert_eq!(handle.request_id, request_id);
+        assert!(handle.cache_id().contains(&request_id.to_string()));
         assert_eq!(handle.block_table().block_size, 16);
         assert_eq!(handle.block_table().sequence_length, 10);
         assert!(handle.is_valid());
@@ -181,8 +179,8 @@ mod tests {
         let stats = handle.stats();
         assert_eq!(stats.tokens_stored, 10);
         assert_eq!(stats.blocks_allocated, handle.block_table().num_blocks());
-        // memory_bytes 可能为0（如果没有分配blocks）
-        assert!(stats.memory_bytes >= 0);
+        // No blocks are mapped in MVP handle construction, so memory usage is 0.
+        assert_eq!(stats.memory_bytes, 0);
         assert!(stats.utilization >= 0.0 && stats.utilization <= 1.0);
     }
 

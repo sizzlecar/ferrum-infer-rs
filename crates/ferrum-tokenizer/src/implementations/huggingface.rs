@@ -570,7 +570,7 @@ mod tests {
         let result = tokenizer.encode("hello", false);
         assert!(result.is_ok());
 
-        let tokens = result.unwrap();
+        let _tokens = result.unwrap();
         // Tokenizer 可能返回空数组或 UNK tokens
         // 我们只验证结果是 Ok
 

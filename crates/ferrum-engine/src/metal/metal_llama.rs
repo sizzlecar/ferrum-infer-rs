@@ -6,7 +6,6 @@
 use crate::metal::{MetalContext, RmsNormOps};
 use candle_core::{DType, Device as CandleDevice, IndexOp, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, Linear, Module, VarBuilder};
-use candle_nn::ops;
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 use std::sync::Arc;
@@ -28,7 +27,12 @@ impl MetalRmsNorm {
         }
     }
 
-    pub fn load(vb: VarBuilder, hidden_size: usize, eps: f64, metal_ops: Option<Arc<RmsNormOps>>) -> Result<Self> {
+    pub fn load(
+        vb: VarBuilder,
+        hidden_size: usize,
+        eps: f64,
+        metal_ops: Option<Arc<RmsNormOps>>,
+    ) -> Result<Self> {
         let weight = vb
             .get(hidden_size, "weight")
             .map_err(|e| FerrumError::model(format!("Failed to load rms_norm weight: {}", e)))?;
@@ -70,36 +74,43 @@ impl MetalRmsNorm {
                 v16.iter().map(|v| f32::from(*v)).collect()
             }
             dtype => {
-                warn!("forward_metal: unexpected dtype {:?}, casting to F32", dtype);
+                warn!(
+                    "forward_metal: unexpected dtype {:?}, casting to F32",
+                    dtype
+                );
                 let converted = x_flat
                     .to_dtype(DType::F32)
                     .map_err(|e| FerrumError::internal(format!("Dtype cast failed: {}", e)))?;
-                converted
-                    .to_vec1()
-                    .map_err(|e| FerrumError::internal(format!("To vec after cast failed: {}", e)))?
+                converted.to_vec1().map_err(|e| {
+                    FerrumError::internal(format!("To vec after cast failed: {}", e))
+                })?
             }
         };
 
         // Convert weight to f32 - handle FP16 weights
         let weight_data: Vec<f32> = match self.weight.dtype() {
-            DType::F32 => self.weight
+            DType::F32 => self
+                .weight
                 .to_vec1()
                 .map_err(|e| FerrumError::internal(format!("Weight to vec f32 failed: {}", e)))?,
             DType::F16 => {
                 debug!("forward_metal: converting FP16 weight to FP32");
-                let v16: Vec<f16> = self.weight
-                    .to_vec1()
-                    .map_err(|e| FerrumError::internal(format!("Weight to vec f16 failed: {}", e)))?;
+                let v16: Vec<f16> = self.weight.to_vec1().map_err(|e| {
+                    FerrumError::internal(format!("Weight to vec f16 failed: {}", e))
+                })?;
                 v16.iter().map(|v| f32::from(*v)).collect()
             }
             dtype => {
-                warn!("forward_metal: unexpected weight dtype {:?}, casting to F32", dtype);
-                let converted = self.weight
-                    .to_dtype(DType::F32)
-                    .map_err(|e| FerrumError::internal(format!("Weight dtype cast failed: {}", e)))?;
-                converted
-                    .to_vec1()
-                    .map_err(|e| FerrumError::internal(format!("Weight to vec after cast failed: {}", e)))?
+                warn!(
+                    "forward_metal: unexpected weight dtype {:?}, casting to F32",
+                    dtype
+                );
+                let converted = self.weight.to_dtype(DType::F32).map_err(|e| {
+                    FerrumError::internal(format!("Weight dtype cast failed: {}", e))
+                })?;
+                converted.to_vec1().map_err(|e| {
+                    FerrumError::internal(format!("Weight to vec after cast failed: {}", e))
+                })?
             }
         };
 
@@ -109,14 +120,17 @@ impl MetalRmsNorm {
         // Convert back to Tensor with original dtype
         let result_tensor = Tensor::from_vec(result, dims, x.device())
             .map_err(|e| FerrumError::internal(format!("Tensor from vec failed: {}", e)))?;
-        
+
         // Convert back to original dtype if needed
         let original_dtype = x.dtype();
         if original_dtype != DType::F32 {
-            debug!("forward_metal: converting result back to {:?}", original_dtype);
-            result_tensor
-                .to_dtype(original_dtype)
-                .map_err(|e| FerrumError::internal(format!("Result dtype conversion failed: {}", e)))
+            debug!(
+                "forward_metal: converting result back to {:?}",
+                original_dtype
+            );
+            result_tensor.to_dtype(original_dtype).map_err(|e| {
+                FerrumError::internal(format!("Result dtype conversion failed: {}", e))
+            })
         } else {
             Ok(result_tensor)
         }
@@ -127,38 +141,44 @@ impl MetalRmsNorm {
         // For FP16/BF16, compute in F32 for numerical stability
         let x_dtype = x.dtype();
         let hidden_size = x.dims().last().copied().unwrap_or(1);
-        
+
         let internal_dtype = match x_dtype {
             DType::F16 | DType::BF16 => DType::F32,
             d => d,
         };
-        
-        let x = x.to_dtype(internal_dtype)
+
+        let x = x
+            .to_dtype(internal_dtype)
             .map_err(|e| FerrumError::internal(format!("x to internal dtype failed: {}", e)))?;
-        
+
         // norm_x = sum(x^2) / hidden_size
-        let norm_x = x.sqr()
+        let norm_x = x
+            .sqr()
             .map_err(|e| FerrumError::internal(format!("Sqr failed: {}", e)))?
             .sum_keepdim(D::Minus1)
             .map_err(|e| FerrumError::internal(format!("Sum failed: {}", e)))?
             .affine(1.0 / hidden_size as f64, 0.0)
             .map_err(|e| FerrumError::internal(format!("Affine failed: {}", e)))?;
-        
+
         // x_normed = x / sqrt(norm_x + eps)
-        let x_normed = x.broadcast_div(
-            &(norm_x + self.eps as f64)
-                .map_err(|e| FerrumError::internal(format!("Add eps failed: {}", e)))?
-                .sqrt()
-                .map_err(|e| FerrumError::internal(format!("Sqrt failed: {}", e)))?
-        ).map_err(|e| FerrumError::internal(format!("Div failed: {}", e)))?;
-        
+        let x_normed = x
+            .broadcast_div(
+                &(norm_x + self.eps as f64)
+                    .map_err(|e| FerrumError::internal(format!("Add eps failed: {}", e)))?
+                    .sqrt()
+                    .map_err(|e| FerrumError::internal(format!("Sqrt failed: {}", e)))?,
+            )
+            .map_err(|e| FerrumError::internal(format!("Div failed: {}", e)))?;
+
         // Convert back to original dtype and apply weight
-        x_normed.to_dtype(x_dtype)
-            .map_err(|e| FerrumError::internal(format!("x_normed to original dtype failed: {}", e)))?
+        x_normed
+            .to_dtype(x_dtype)
+            .map_err(|e| {
+                FerrumError::internal(format!("x_normed to original dtype failed: {}", e))
+            })?
             .broadcast_mul(&self.weight)
             .map_err(|e| FerrumError::internal(format!("Mul weight failed: {}", e)))
     }
-
 }
 
 /// Metal-accelerated Rotary Position Embedding
@@ -169,7 +189,12 @@ pub struct MetalRotaryEmbedding {
 }
 
 impl MetalRotaryEmbedding {
-    pub fn new(max_seq_len: usize, head_dim: usize, theta: f32, device: &CandleDevice) -> Result<Self> {
+    pub fn new(
+        max_seq_len: usize,
+        head_dim: usize,
+        theta: f32,
+        device: &CandleDevice,
+    ) -> Result<Self> {
         let half_dim = head_dim / 2;
 
         // Compute frequencies: theta^(-2i/d) for i in 0..d/2
@@ -189,7 +214,11 @@ impl MetalRotaryEmbedding {
         let freqs = positions
             .unsqueeze(1)
             .map_err(|e| FerrumError::internal(format!("unsqueeze failed: {}", e)))?
-            .broadcast_mul(&inv_freq.unsqueeze(0).map_err(|e| FerrumError::internal(format!("unsqueeze failed: {}", e)))?)
+            .broadcast_mul(
+                &inv_freq
+                    .unsqueeze(0)
+                    .map_err(|e| FerrumError::internal(format!("unsqueeze failed: {}", e)))?,
+            )
             .map_err(|e| FerrumError::internal(format!("broadcast_mul failed: {}", e)))?;
 
         let cos_cache = freqs
@@ -295,11 +324,7 @@ pub struct MetalLlamaAttention {
 }
 
 impl MetalLlamaAttention {
-    pub fn load(
-        vb: VarBuilder,
-        config: &MetalLlamaConfig,
-        device: &CandleDevice,
-    ) -> Result<Self> {
+    pub fn load(vb: VarBuilder, config: &MetalLlamaConfig, device: &CandleDevice) -> Result<Self> {
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.hidden_size / num_heads;
@@ -338,23 +363,33 @@ impl MetalLlamaAttention {
         position_ids: &[usize],
         kv_cache: Option<(&Tensor, &Tensor)>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (batch_size, seq_len, _) = hidden_states.dims3()
+        let (batch_size, seq_len, _) = hidden_states
+            .dims3()
             .map_err(|e| FerrumError::internal(format!("dims3 failed: {}", e)))?;
 
         // Project Q, K, V
-        let q = self.q_proj.forward(hidden_states)
+        let q = self
+            .q_proj
+            .forward(hidden_states)
             .map_err(|e| FerrumError::internal(format!("q_proj forward failed: {}", e)))?;
-        let k = self.k_proj.forward(hidden_states)
+        let k = self
+            .k_proj
+            .forward(hidden_states)
             .map_err(|e| FerrumError::internal(format!("k_proj forward failed: {}", e)))?;
-        let v = self.v_proj.forward(hidden_states)
+        let v = self
+            .v_proj
+            .forward(hidden_states)
             .map_err(|e| FerrumError::internal(format!("v_proj forward failed: {}", e)))?;
 
         // Reshape for multi-head attention
-        let q = q.reshape((batch_size, seq_len, self.num_heads, self.head_dim))
+        let q = q
+            .reshape((batch_size, seq_len, self.num_heads, self.head_dim))
             .map_err(|e| FerrumError::internal(format!("q reshape failed: {}", e)))?;
-        let k = k.reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))
+        let k = k
+            .reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))
             .map_err(|e| FerrumError::internal(format!("k reshape failed: {}", e)))?;
-        let v = v.reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))
+        let v = v
+            .reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))
             .map_err(|e| FerrumError::internal(format!("v reshape failed: {}", e)))?;
 
         // Apply rotary embeddings
@@ -373,11 +408,14 @@ impl MetalLlamaAttention {
         };
 
         // Transpose for attention: [batch, num_heads, seq_len, head_dim]
-        let q = q.transpose(1, 2)
+        let q = q
+            .transpose(1, 2)
             .map_err(|e| FerrumError::internal(format!("q transpose failed: {}", e)))?;
-        let k = k.transpose(1, 2)
+        let k = k
+            .transpose(1, 2)
             .map_err(|e| FerrumError::internal(format!("k transpose failed: {}", e)))?;
-        let v = v.transpose(1, 2)
+        let v = v
+            .transpose(1, 2)
             .map_err(|e| FerrumError::internal(format!("v transpose failed: {}", e)))?;
 
         // Handle GQA by repeating KV heads
@@ -388,16 +426,20 @@ impl MetalLlamaAttention {
 
         // Compute attention scores - ensure tensors are contiguous for Metal matmul
         let scale = (self.head_dim as f64).sqrt();
-        let q = q.contiguous()
+        let q = q
+            .contiguous()
             .map_err(|e| FerrumError::internal(format!("q contiguous failed: {}", e)))?;
-        let k = k.contiguous()
+        let k = k
+            .contiguous()
             .map_err(|e| FerrumError::internal(format!("k contiguous failed: {}", e)))?;
-        let k_t = k.transpose(D::Minus2, D::Minus1)
+        let k_t = k
+            .transpose(D::Minus2, D::Minus1)
             .map_err(|e| FerrumError::internal(format!("k transpose failed: {}", e)))?
             .contiguous()
             .map_err(|e| FerrumError::internal(format!("k_t contiguous failed: {}", e)))?;
         debug!("Attention matmul: q={:?}, k_t={:?}", q.dims(), k_t.dims());
-        let attn_weights = q.matmul(&k_t)
+        let attn_weights = q
+            .matmul(&k_t)
             .map_err(|e| FerrumError::internal(format!("matmul failed: {}", e)))?
             .affine(1.0 / scale, 0.0)
             .map_err(|e| FerrumError::internal(format!("affine failed: {}", e)))?;
@@ -407,7 +449,8 @@ impl MetalLlamaAttention {
             .map_err(|e| FerrumError::internal(format!("softmax failed: {}", e)))?;
 
         // Apply attention to values
-        let attn_output = attn_weights.matmul(&v)
+        let attn_output = attn_weights
+            .matmul(&v)
             .map_err(|e| FerrumError::internal(format!("attn matmul failed: {}", e)))?;
 
         // Reshape back
@@ -418,13 +461,17 @@ impl MetalLlamaAttention {
             .map_err(|e| FerrumError::internal(format!("reshape failed: {}", e)))?;
 
         // Output projection
-        let output = self.o_proj.forward(&attn_output)
+        let output = self
+            .o_proj
+            .forward(&attn_output)
             .map_err(|e| FerrumError::internal(format!("o_proj forward failed: {}", e)))?;
 
         // Return output and updated KV cache
-        let k_cache = k.transpose(1, 2)
+        let k_cache = k
+            .transpose(1, 2)
             .map_err(|e| FerrumError::internal(format!("k cache transpose failed: {}", e)))?;
-        let v_cache = v.transpose(1, 2)
+        let v_cache = v
+            .transpose(1, 2)
             .map_err(|e| FerrumError::internal(format!("v cache transpose failed: {}", e)))?;
 
         Ok((output, k_cache, v_cache))
@@ -436,12 +483,14 @@ impl MetalLlamaAttention {
             return Ok(x.clone());
         }
 
-        let (batch, num_kv_heads, seq_len, head_dim) = x.dims4()
+        let (batch, num_kv_heads, seq_len, head_dim) = x
+            .dims4()
             .map_err(|e| FerrumError::internal(format!("dims4 failed: {}", e)))?;
 
         // Use repeat instead of expand to ensure contiguous memory
         // Candle's expand may create a view which Metal matmul doesn't handle well
-        let x_unsqueezed = x.unsqueeze(2)
+        let x_unsqueezed = x
+            .unsqueeze(2)
             .map_err(|e| FerrumError::internal(format!("unsqueeze failed: {}", e)))?;
 
         // Repeat along dimension 2 n_rep times
@@ -465,12 +514,24 @@ pub struct MetalLlamaMlp {
 
 impl MetalLlamaMlp {
     pub fn load(vb: VarBuilder, config: &MetalLlamaConfig) -> Result<Self> {
-        let gate_proj = linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("gate_proj"))
-            .map_err(|e| FerrumError::model(format!("gate_proj load failed: {}", e)))?;
-        let up_proj = linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("up_proj"))
-            .map_err(|e| FerrumError::model(format!("up_proj load failed: {}", e)))?;
-        let down_proj = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("down_proj"))
-            .map_err(|e| FerrumError::model(format!("down_proj load failed: {}", e)))?;
+        let gate_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("gate_proj"),
+        )
+        .map_err(|e| FerrumError::model(format!("gate_proj load failed: {}", e)))?;
+        let up_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("up_proj"),
+        )
+        .map_err(|e| FerrumError::model(format!("up_proj load failed: {}", e)))?;
+        let down_proj = linear_no_bias(
+            config.intermediate_size,
+            config.hidden_size,
+            vb.pp("down_proj"),
+        )
+        .map_err(|e| FerrumError::model(format!("down_proj load failed: {}", e)))?;
 
         Ok(Self {
             gate_proj,
@@ -481,18 +542,24 @@ impl MetalLlamaMlp {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // SwiGLU: down(silu(gate(x)) * up(x))
-        let gate = self.gate_proj.forward(x)
+        let gate = self
+            .gate_proj
+            .forward(x)
             .map_err(|e| FerrumError::internal(format!("gate_proj forward failed: {}", e)))?;
         let gate = candle_nn::ops::silu(&gate)
             .map_err(|e| FerrumError::internal(format!("silu failed: {}", e)))?;
 
-        let up = self.up_proj.forward(x)
+        let up = self
+            .up_proj
+            .forward(x)
             .map_err(|e| FerrumError::internal(format!("up_proj forward failed: {}", e)))?;
 
-        let hidden = gate.mul(&up)
+        let hidden = gate
+            .mul(&up)
             .map_err(|e| FerrumError::internal(format!("mul failed: {}", e)))?;
 
-        self.down_proj.forward(&hidden)
+        self.down_proj
+            .forward(&hidden)
             .map_err(|e| FerrumError::internal(format!("down_proj forward failed: {}", e)))
     }
 }
@@ -547,10 +614,12 @@ impl MetalLlamaDecoderLayer {
 
         // Self attention
         let (attn_output, k_cache, v_cache) =
-            self.self_attn.forward(&hidden_states, position_ids, kv_cache)?;
+            self.self_attn
+                .forward(&hidden_states, position_ids, kv_cache)?;
 
         // Residual connection
-        let hidden_states = residual.add(&attn_output)
+        let hidden_states = residual
+            .add(&attn_output)
             .map_err(|e| FerrumError::internal(format!("residual add failed: {}", e)))?;
 
         // Pre-normalization for MLP
@@ -561,7 +630,8 @@ impl MetalLlamaDecoderLayer {
         let mlp_output = self.mlp.forward(&hidden_states)?;
 
         // Residual connection
-        let hidden_states = residual.add(&mlp_output)
+        let hidden_states = residual
+            .add(&mlp_output)
             .map_err(|e| FerrumError::internal(format!("mlp residual add failed: {}", e)))?;
 
         Ok((hidden_states, k_cache, v_cache))
@@ -603,8 +673,12 @@ impl MetalLlamaModel {
         };
 
         // Load embedding layer
-        let embed_tokens = embedding(config.vocab_size, config.hidden_size, vb.pp("model.embed_tokens"))
-            .map_err(|e| FerrumError::model(format!("embed_tokens load failed: {}", e)))?;
+        let embed_tokens = embedding(
+            config.vocab_size,
+            config.hidden_size,
+            vb.pp("model.embed_tokens"),
+        )
+        .map_err(|e| FerrumError::model(format!("embed_tokens load failed: {}", e)))?;
 
         // Load decoder layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -631,7 +705,10 @@ impl MetalLlamaModel {
         let lm_head = linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))
             .map_err(|e| FerrumError::model(format!("lm_head load failed: {}", e)))?;
 
-        info!("✅ Metal LLaMA model loaded with {} layers", config.num_hidden_layers);
+        info!(
+            "✅ Metal LLaMA model loaded with {} layers",
+            config.num_hidden_layers
+        );
 
         Ok(Self {
             embed_tokens,
@@ -643,11 +720,14 @@ impl MetalLlamaModel {
     }
 
     pub fn forward(&self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
-        let (batch_size, seq_len) = input_ids.dims2()
+        let (_batch_size, seq_len) = input_ids
+            .dims2()
             .map_err(|e| FerrumError::internal(format!("dims2 failed: {}", e)))?;
 
         // Get embeddings
-        let mut hidden_states = self.embed_tokens.forward(input_ids)
+        let mut hidden_states = self
+            .embed_tokens
+            .forward(input_ids)
             .map_err(|e| FerrumError::internal(format!("embedding forward failed: {}", e)))?;
 
         // Position IDs
@@ -663,7 +743,9 @@ impl MetalLlamaModel {
         hidden_states = self.norm.forward(&hidden_states)?;
 
         // LM head
-        let logits = self.lm_head.forward(&hidden_states)
+        let logits = self
+            .lm_head
+            .forward(&hidden_states)
             .map_err(|e| FerrumError::internal(format!("lm_head forward failed: {}", e)))?;
 
         Ok(logits)
@@ -673,4 +755,3 @@ impl MetalLlamaModel {
         &self.config
     }
 }
-

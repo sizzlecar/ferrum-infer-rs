@@ -4,8 +4,6 @@ use candle_core::{DType, Device as CandleDevice, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::llama as candle_llama;
 use ferrum_types::{FerrumError, Result};
-use parking_lot::Mutex;
-use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Llama model wrapper
