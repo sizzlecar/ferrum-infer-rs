@@ -32,14 +32,15 @@ impl DefaultKvCacheManager {
             device, block_size, max_blocks
         );
 
-        let gpu_pool = match device {
-            Device::CUDA(_) | Device::Metal | Device::ROCm(_) => Some(BlockPool::new(
+        let gpu_pool = if device.is_gpu() {
+            Some(BlockPool::new(
                 device.clone(),
                 block_size,
                 DataType::FP16,
                 max_blocks,
-            )?),
-            Device::CPU => None,
+            )?)
+        } else {
+            None
         };
 
         let cpu_pool = Some(BlockPool::new(

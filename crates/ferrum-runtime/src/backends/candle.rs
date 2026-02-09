@@ -543,9 +543,20 @@ impl ComputeBackend for CandleBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
+        let supported_devices = {
+            #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+            {
+                vec![Device::CPU, Device::CUDA(0), Device::Metal]
+            }
+            #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+            {
+                vec![Device::CPU, Device::CUDA(0)]
+            }
+        };
+
         BackendCapabilities {
             supported_dtypes: vec![DataType::FP32, DataType::FP16, DataType::BF16],
-            supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
+            supported_devices,
             max_tensor_dims: 8,
             supports_fp16: true,
             supports_bf16: true,
@@ -585,7 +596,12 @@ impl ComputeBackend for CandleBackend {
     }
 
     fn supports_device(&self, device: &Device) -> bool {
-        matches!(device, Device::CPU | Device::CUDA(_) | Device::Metal)
+        match device {
+            Device::CPU | Device::CUDA(_) => true,
+            Device::ROCm(_) => false,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Device::Metal => cfg!(feature = "metal"),
+        }
     }
 
     fn version(&self) -> String {
@@ -672,6 +688,7 @@ fn ferrum_device_to_candle(device: Device) -> Result<candle_core::Device> {
                 Err(ferrum_types::FerrumError::unsupported("CUDA not enabled"))
             }
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         Device::Metal => {
             #[cfg(feature = "metal")]
             {
@@ -691,7 +708,18 @@ fn candle_device_to_ferrum(device: &candle_core::Device) -> Result<Device> {
     match device {
         candle_core::Device::Cpu => Ok(Device::CPU),
         candle_core::Device::Cuda(_) => Ok(Device::CUDA(0)), // Default to GPU 0
-        candle_core::Device::Metal(_) => Ok(Device::Metal),
+        candle_core::Device::Metal(_) => {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                Ok(Device::Metal)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                Err(ferrum_types::FerrumError::unsupported(
+                    "Metal devices are not available on this platform",
+                ))
+            }
+        }
     }
 }
 
