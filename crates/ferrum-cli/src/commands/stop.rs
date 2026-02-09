@@ -20,9 +20,10 @@ pub async fn execute(_cmd: StopCommand) -> Result<()> {
         ferrum_types::FerrumError::io_str(format!("Failed to read PID file: {}", e))
     })?;
 
-    let pid: i32 = pid_str.trim().parse().map_err(|e| {
-        ferrum_types::FerrumError::io_str(format!("Invalid PID: {}", e))
-    })?;
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
+        .map_err(|e| ferrum_types::FerrumError::io_str(format!("Invalid PID: {}", e)))?;
 
     // Send SIGTERM
     #[cfg(unix)]
@@ -38,7 +39,11 @@ pub async fn execute(_cmd: StopCommand) -> Result<()> {
                 std::fs::remove_file(&pid_file).ok();
             }
             Ok(_) => {
-                println!("{} Process {} not found (may have already stopped)", "⚠".yellow(), pid);
+                println!(
+                    "{} Process {} not found (may have already stopped)",
+                    "⚠".yellow(),
+                    pid
+                );
                 std::fs::remove_file(&pid_file).ok();
             }
             Err(e) => {
@@ -68,4 +73,3 @@ pub async fn execute(_cmd: StopCommand) -> Result<()> {
 
     Ok(())
 }
-

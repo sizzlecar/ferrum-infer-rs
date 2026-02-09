@@ -72,14 +72,14 @@ metal = ["candle-core/metal", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:obj
 
 # Metal dependencies for Apple GPU support (only on macOS/iOS)
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = { version = "0.32.0", optional = true }
+metal = { version = "0.27.0", optional = true }
 mpsgraph = { version = "0.2.0", optional = true }
 objc2 = { version = "0.6.1", optional = true }
 objc2-foundation = { version = "0.3.1", optional = true }
 bytemuck = { version = "1.23.0", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-metal = { version = "0.32.0", optional = true }
+metal = { version = "0.27.0", optional = true }
 mpsgraph = { version = "0.2.0", optional = true }
 objc2 = { version = "0.6.1", optional = true }
 objc2-foundation = { version = "0.3.1", optional = true }

@@ -5,10 +5,14 @@
 //! semantics and device information.
 
 use ferrum_types::{DataType, Device, Result};
+use std::any::Any;
 use std::sync::Arc;
 
 /// Core tensor trait for zero-copy, device-aware operations
 pub trait TensorLike: Send + Sync + std::fmt::Debug {
+    /// Downcast support for backend-specific fast paths
+    fn as_any(&self) -> &dyn Any;
+
     /// Get tensor shape
     fn shape(&self) -> &[usize];
 
@@ -64,13 +68,22 @@ pub trait TensorLike: Send + Sync + std::fmt::Debug {
             "to_vec_f32 not implemented for this tensor backend",
         ))
     }
-    
+
     /// Extract tensor data as Vec<u32> (for token IDs)
     /// This is a convenience method for backends that need to extract token data
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
         // Default implementation returns error - backends should override
         Err(crate::FerrumError::model(
             "to_vec_u32 not implemented for this tensor backend",
+        ))
+    }
+
+    /// Fast path: argmax over the last dimension, returning the selected token id.
+    ///
+    /// Backends may override this to avoid transferring full logits to CPU.
+    fn argmax_last_dim_u32(&self) -> Result<u32> {
+        Err(crate::FerrumError::model(
+            "argmax_last_dim_u32 not implemented for this tensor backend",
         ))
     }
 }

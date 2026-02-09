@@ -20,6 +20,4 @@ pub use fused::{
     CpuFusedOpsInfo, FusedOpType, FusedOps, FusedOpsConfig, FusedRopeAttention,
     FusedRopeAttentionConfig, RopeCache,
 };
-pub use registry::{
-    global_kernel_registry, KernelInfo, KernelRegistry, PerformanceHint,
-};
+pub use registry::{global_kernel_registry, KernelInfo, KernelRegistry, PerformanceHint};

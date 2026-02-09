@@ -89,8 +89,7 @@ pub use engine::*;
 
 // Re-exports of pipeline
 pub use pipeline::{
-    ChunkedPrefillConfig, ChunkedPrefillExecutor, ExecutionPhase, PipelineConfig,
-    PipelineExecutor,
+    ChunkedPrefillConfig, ChunkedPrefillExecutor, ExecutionPhase, PipelineConfig, PipelineExecutor,
 };
 
 // Re-exports of factory
@@ -103,17 +102,16 @@ pub use builder::{create_engine, create_engine_with_registry, EngineBuilder};
 pub use registry::{
     global_registry, set_global_registry, CandleBackendFactory, CandleExecutorFactory,
     ComponentConfig, ComponentFactory, ComponentMetadata, ComponentRegistry,
-    ContinuousBatchSchedulerFactory, DefaultKvCacheFactory, FifoSchedulerFactory,
-    GreedySampler, GreedySamplerFactory, HuggingFaceTokenizerFactory, MultinomialSamplerFactory,
+    ContinuousBatchSchedulerFactory, DefaultKvCacheFactory, FifoSchedulerFactory, GreedySampler,
+    GreedySamplerFactory, HuggingFaceTokenizerFactory, MultinomialSamplerFactory,
     PagedKvCacheFactory, PrioritySchedulerFactory, StubExecutorFactory, StubTokenizer,
     StubTokenizerFactory,
 };
 
 // Re-exports of kernels
 pub use kernels::{
-    global_kernel_registry, AttentionConfig, AttentionKernel, AttentionType, FusedOpType,
-    FusedOps, FusedOpsConfig, FusedRopeAttention, KernelInfo, KernelRegistry, PerformanceHint,
-    RopeCache,
+    global_kernel_registry, AttentionConfig, AttentionKernel, AttentionType, FusedOpType, FusedOps,
+    FusedOpsConfig, FusedRopeAttention, KernelInfo, KernelRegistry, PerformanceHint, RopeCache,
 };
 
 // Re-exports of parallel module
@@ -205,7 +203,9 @@ mod integration_tests {
         // Should have default factories
         assert!(registry.list_backends().contains(&"candle".to_string()));
         assert!(registry.list_tokenizers().contains(&"stub".to_string()));
-        assert!(registry.list_samplers().contains(&"multinomial".to_string()));
+        assert!(registry
+            .list_samplers()
+            .contains(&"multinomial".to_string()));
     }
 
     #[test]

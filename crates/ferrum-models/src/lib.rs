@@ -23,11 +23,11 @@ pub use executor::{
     extract_logits_safe, BertModelExecutor, CandleModelExecutor, CandleModelExecutorV2,
     Qwen2ModelExecutor, StubModelExecutor,
 };
+pub use hf_download::HfDownloader;
 pub use loader::SafeTensorsLoader;
 pub use registry::{
     Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,
 };
-pub use hf_download::HfDownloader;
 pub use source::{
     DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ModelSourceResolver,
     ResolvedModelSource,

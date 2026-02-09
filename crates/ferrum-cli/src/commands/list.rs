@@ -43,12 +43,10 @@ pub async fn execute(_cmd: ListCommand, config: CliConfig) -> Result<()> {
     }
 
     // Sort: complete models first, then by name
-    models.sort_by(|a, b| {
-        match (a.is_complete, b.is_complete) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
-        }
+    models.sort_by(|a, b| match (a.is_complete, b.is_complete) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
     });
 
     // Print header
@@ -67,7 +65,7 @@ pub async fn execute(_cmd: ListCommand, config: CliConfig) -> Result<()> {
         } else {
             "incomplete".yellow().to_string()
         };
-        
+
         let name_display = if model.is_complete {
             model.name.normal().to_string()
         } else {

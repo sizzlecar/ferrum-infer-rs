@@ -3,7 +3,6 @@
 //! This module defines types that match the OpenAI API specification
 //! for chat completions, completions, and model management.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

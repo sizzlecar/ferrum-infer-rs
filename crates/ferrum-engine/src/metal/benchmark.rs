@@ -91,7 +91,8 @@ pub async fn run_q4_0_benchmarks(config: BenchmarkConfig) -> Result<Vec<Benchmar
             for _ in 0..config.iterations {
                 metal_output = metal_backend.q4_0_matvec(&weights, &input, nrows, ncols)?;
             }
-            let metal_time = metal_start.elapsed().as_secs_f64() * 1000.0 / config.iterations as f64;
+            let metal_time =
+                metal_start.elapsed().as_secs_f64() * 1000.0 / config.iterations as f64;
 
             // Calculate correctness error
             let error = if config.validate_correctness {
@@ -158,7 +159,12 @@ pub fn print_benchmark_results(results: &[BenchmarkResult]) {
 
         println!(
             "║ {:>5}x{:<6}    │ {:>10.2} │ {:>10} │ {:>9} │ {:>10} ║",
-            result.matrix_size.0, result.matrix_size.1, result.cpu_time_ms, metal_str, speedup_str, error_str
+            result.matrix_size.0,
+            result.matrix_size.1,
+            result.cpu_time_ms,
+            metal_str,
+            speedup_str,
+            error_str
         );
     }
 

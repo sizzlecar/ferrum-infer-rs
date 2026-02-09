@@ -9,7 +9,7 @@ use ferrum_models::HfDownloader;
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,24 +54,24 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 "📥".cyan(),
                 model_id
             );
-            
+
             // Get HF token from environment
             let token = std::env::var("HF_TOKEN")
                 .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
                 .ok();
-            
+
             // Create downloader and download
             let downloader = HfDownloader::new(cache_dir.clone(), token)?;
             let snapshot_path = downloader.download(&model_id, None).await?;
-            
+
             // Now find the downloaded model
             let format = detect_format(&snapshot_path);
             if format == ModelFormat::Unknown {
                 return Err(ferrum_types::FerrumError::model(
-                    "Downloaded model has unknown format"
+                    "Downloaded model has unknown format",
                 ));
             }
-            
+
             ResolvedModelSource {
                 original: model_id.clone(),
                 local_path: snapshot_path,
@@ -82,7 +82,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     };
 
     // Set model path for engine
-    std::env::set_var("FERRUM_MODEL_PATH", source.local_path.to_string_lossy().to_string());
+    // NOTE: std::env::set_var is unsafe on Rust 2024; keep it minimal and explicit.
+    unsafe {
+        std::env::set_var(
+            "FERRUM_MODEL_PATH",
+            source.local_path.to_string_lossy().to_string(),
+        );
+    }
 
     // Select device
     let device = select_device(&cmd.backend);
@@ -102,15 +108,22 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content)
     let generating = Arc::new(AtomicBool::new(false));
 
+    // If stdin is not a TTY (piped input), don't print prompts and just consume lines.
+    // This enables: `printf "hi\n/bye\n" | ferrum run ...` for automation/profiling.
+    let stdin_is_tty = io::stdin().is_terminal();
+    let mut stdin = io::stdin().lock();
+
     loop {
-        // Show prompt
-        print!("{} ", ">>>".bright_green().bold());
-        io::stdout().flush().unwrap();
+        if stdin_is_tty {
+            // Show prompt
+            print!("{} ", ">>>".bright_green().bold());
+            io::stdout().flush().unwrap();
+        }
 
         // Read input
         let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            Ok(0) => break, // EOF (Ctrl+D)
+        match stdin.read_line(&mut input) {
+            Ok(0) => break, // EOF
             Ok(_) => {
                 let input = input.trim();
                 if input.is_empty() {
@@ -197,6 +210,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     .dimmed()
                 );
                 eprintln!();
+
+                // In non-interactive mode, don't wait for terminal formatting/spacing.
+                if !stdin_is_tty {
+                    io::stdout().flush().ok();
+                    io::stderr().flush().ok();
+                }
 
                 // Add to history
                 history.push(("user".to_string(), input.to_string()));
@@ -384,4 +403,3 @@ fn build_chat_prompt(
         prompt
     }
 }
-
