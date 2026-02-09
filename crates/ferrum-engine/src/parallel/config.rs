@@ -204,7 +204,9 @@ impl LayerDistribution {
 
     /// Get stage for a given layer
     pub fn stage_for_layer(&self, layer: usize) -> Option<usize> {
-        self.stage_layers.iter().position(|range| range.contains(layer))
+        self.stage_layers
+            .iter()
+            .position(|range| range.contains(layer))
     }
 }
 
@@ -236,7 +238,12 @@ mod tests {
     #[test]
     fn test_hybrid_config() {
         let config = ParallelConfig::hybrid(
-            vec![Device::CUDA(0), Device::CUDA(1), Device::CUDA(2), Device::CUDA(3)],
+            vec![
+                Device::CUDA(0),
+                Device::CUDA(1),
+                Device::CUDA(2),
+                Device::CUDA(3),
+            ],
             2, // tp_size
             2, // pp_size
         );
@@ -280,4 +287,3 @@ mod tests {
         assert_eq!(dist.stage_for_layer(32), None);
     }
 }
-

@@ -28,8 +28,7 @@ impl CandleTensorWrapper {
     pub fn from_tensorref(tensor_ref: &ferrum_interfaces::TensorRef) -> Option<Tensor> {
         // Try to extract by getting raw data and reconstructing
         // This is safe because we only read immutable data
-        let shape = tensor_ref.shape();
-        let dtype_ferrum = tensor_ref.dtype();
+        let _ = tensor_ref;
 
         // For now, return None if not our wrapper
         // A better approach would be to add a method to TensorLike to extract data
@@ -38,6 +37,10 @@ impl CandleTensorWrapper {
 }
 
 impl TensorLike for CandleTensorWrapper {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn shape(&self) -> &[usize] {
         self.tensor.dims()
     }
@@ -164,10 +167,11 @@ impl TensorLike for CandleTensorWrapper {
             4 => {
                 // Handle [batch, seq, extra, vocab] - squeeze and take last
                 // First squeeze to 3D by selecting first element of extra dim
-                let squeezed = self.tensor
+                let squeezed = self
+                    .tensor
                     .squeeze(2)
                     .map_err(|e| FerrumError::model(format!("Squeeze dim 2 failed: {}", e)))?;
-                
+
                 // Now extract as 3D: [batch, seq, vocab]
                 let all = squeezed
                     .to_vec3::<f32>()
@@ -184,7 +188,7 @@ impl TensorLike for CandleTensorWrapper {
             ))),
         }
     }
-    
+
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
         // Handle different tensor dimensions for token IDs
         match self.tensor.dims().len() {
@@ -205,5 +209,50 @@ impl TensorLike for CandleTensorWrapper {
                 self.tensor.dims()
             ))),
         }
+    }
+
+    fn argmax_last_dim_u32(&self) -> Result<u32> {
+        // Same strategy as runtime CandleTensor: argmax on-device, read back a scalar.
+        use candle_core::{IndexOp, D};
+
+        let dims = self.tensor.dims();
+        let logits_1d = match dims.len() {
+            1 => self.tensor.clone(),
+            2 => self
+                .tensor
+                .i(0)
+                .map_err(|e| FerrumError::model(format!("Index batch failed: {}", e)))?,
+            3 => {
+                let seq_len = dims[1];
+                self.tensor
+                    .i((0, seq_len.saturating_sub(1)))
+                    .map_err(|e| FerrumError::model(format!("Index last token failed: {}", e)))?
+            }
+            4 => {
+                // [batch, seq, extra, vocab] -> take batch 0, last seq, extra 0 -> [vocab]
+                let seq_len = dims[1];
+                self.tensor
+                    .i((0, seq_len.saturating_sub(1), 0))
+                    .map_err(|e| {
+                        FerrumError::model(format!("Index last token (4D) failed: {}", e))
+                    })?
+            }
+            _ => {
+                return Err(FerrumError::model(format!(
+                    "argmax_last_dim_u32 unsupported dims: {:?}",
+                    dims
+                )))
+            }
+        };
+
+        let idx = logits_1d
+            .argmax(D::Minus1)
+            .map_err(|e| FerrumError::model(format!("Argmax failed: {}", e)))?
+            .to_device(&candle_core::Device::Cpu)
+            .map_err(|e| FerrumError::model(format!("Argmax to CPU failed: {}", e)))?
+            .to_vec0::<u32>()
+            .map_err(|e| FerrumError::model(format!("Argmax readback failed: {}", e)))?;
+
+        Ok(idx)
     }
 }

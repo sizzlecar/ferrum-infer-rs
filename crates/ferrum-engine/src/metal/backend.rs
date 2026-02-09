@@ -50,10 +50,7 @@ impl MetalBackend {
                     Ok(mut context) => {
                         // Try to load shader library
                         if let Err(e) = context.load_shader_library() {
-                            warn!(
-                                "Failed to load Metal shaders: {}. Falling back to CPU.",
-                                e
-                            );
+                            warn!("Failed to load Metal shaders: {}. Falling back to CPU.", e);
                         } else {
                             debug!("Metal context initialized successfully");
                             let context_arc = Arc::new(context);
@@ -76,7 +73,10 @@ impl MetalBackend {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to create Metal context: {}. Falling back to CPU.", e);
+                        warn!(
+                            "Failed to create Metal context: {}. Falling back to CPU.",
+                            e
+                        );
                     }
                 }
             }

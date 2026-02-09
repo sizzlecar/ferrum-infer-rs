@@ -4,6 +4,7 @@ use crate::{ComputeBackend, DeviceMemoryManager, TensorFactory, TensorLike, Tens
 use async_trait::async_trait;
 use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus};
 use ferrum_types::{DataType, Device, Result};
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -29,6 +30,10 @@ impl CpuTensor {
 }
 
 impl TensorLike for CpuTensor {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn shape(&self) -> &[usize] {
         self.data.shape()
     }
@@ -90,6 +95,20 @@ impl TensorLike for CpuTensor {
                 dtype
             )))
         }
+    }
+
+    fn argmax_last_dim_u32(&self) -> Result<u32> {
+        // Flatten and argmax on CPU
+        let slice = self
+            .data
+            .as_slice()
+            .ok_or_else(|| ferrum_types::FerrumError::backend("CpuTensor is not contiguous"))?;
+        let (idx, _) = slice
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| ferrum_types::FerrumError::backend("Empty tensor"))?;
+        Ok(idx as u32)
     }
 }
 

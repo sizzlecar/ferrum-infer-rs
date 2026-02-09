@@ -1152,7 +1152,7 @@ dependencies = [
  "futures",
  "half",
  "hf-hub",
- "metal 0.32.0",
+ "metal 0.27.0",
  "metrics",
  "mpsgraph",
  "ndarray 0.16.1",

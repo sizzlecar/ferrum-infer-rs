@@ -105,8 +105,7 @@ impl Default for ComponentMetadata {
 
 /// Global component registry for managing component factories
 pub struct ComponentRegistry {
-    backend_factories:
-        RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn ComputeBackend>>>>>,
+    backend_factories: RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn ComputeBackend>>>>>,
     tokenizer_factories:
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Tokenizer + Send + Sync>>>>>,
     sampler_factories:
@@ -480,11 +479,7 @@ impl ComponentFactory<Arc<dyn ComputeBackend>> for CandleBackendFactory {
             version: "0.1.0".to_string(),
             description: "Candle compute backend for CPU/GPU inference".to_string(),
             supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
-            capabilities: vec![
-                "fp16".to_string(),
-                "fp32".to_string(),
-                "bf16".to_string(),
-            ],
+            capabilities: vec!["fp16".to_string(), "fp32".to_string(), "bf16".to_string()],
         }
     }
 }
@@ -688,8 +683,7 @@ impl ComponentFactory<Arc<dyn Scheduler + Send + Sync>> for PrioritySchedulerFac
     async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn Scheduler + Send + Sync>> {
         info!("Creating priority scheduler");
         let scheduler_config = config.engine_config.scheduler.clone();
-        let scheduler =
-            ferrum_scheduler::implementations::PriorityScheduler::new(scheduler_config);
+        let scheduler = ferrum_scheduler::implementations::PriorityScheduler::new(scheduler_config);
         Ok(Arc::new(scheduler))
     }
 
@@ -721,7 +715,8 @@ impl ComponentFactory<Arc<dyn Scheduler + Send + Sync>> for ContinuousBatchSched
         ComponentMetadata {
             name: "continuous".to_string(),
             version: "0.1.0".to_string(),
-            description: "Continuous batching scheduler with iteration-level scheduling".to_string(),
+            description: "Continuous batching scheduler with iteration-level scheduling"
+                .to_string(),
             supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
             capabilities: vec![
                 "continuous_batching".to_string(),
@@ -754,8 +749,11 @@ impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for DefaultKvCacheF
             config.device, block_size, max_blocks
         );
 
-        let manager =
-            ferrum_kv::managers::DefaultKvCacheManager::new(config.device.clone(), block_size, max_blocks)?;
+        let manager = ferrum_kv::managers::DefaultKvCacheManager::new(
+            config.device.clone(),
+            block_size,
+            max_blocks,
+        )?;
         Ok(Arc::new(manager))
     }
 
@@ -797,7 +795,8 @@ impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for PagedKvCacheFac
             ..Default::default()
         };
 
-        let manager = ferrum_kv::managers::PagedKvCacheManager::new(config.device.clone(), paged_config)?;
+        let manager =
+            ferrum_kv::managers::PagedKvCacheManager::new(config.device.clone(), paged_config)?;
         Ok(Arc::new(manager))
     }
 
@@ -915,17 +914,38 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             }
         };
 
-        // Use FP32 for CPU, FP32 for Metal for stability
+        // Select dtype.
+        //
+        // IMPORTANT (correctness): Metal defaults to FP32 for stability.
+        // This was introduced to address cases where CPU inference is correct but Metal results
+        // can deviate. If you want higher performance and accept potential numerical risk, you
+        // can explicitly opt-in via env:
+        // - FERRUM_METAL_DTYPE=fp16|fp32 (takes precedence on Metal)
+        // - FERRUM_DTYPE=fp16|fp32 (global override for non-CPU)
+        fn parse_dtype(s: &str) -> Option<DType> {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "fp16" | "f16" | "float16" => Some(DType::F16),
+                "fp32" | "f32" | "float32" => Some(DType::F32),
+                _ => None,
+            }
+        }
+
         let dtype = match &config.device {
             Device::CPU => DType::F32,
-            Device::Metal => DType::F32,
-            _ => DType::F16,
+            Device::Metal => std::env::var("FERRUM_METAL_DTYPE")
+                .ok()
+                .and_then(|v| parse_dtype(&v))
+                .or_else(|| {
+                    std::env::var("FERRUM_DTYPE")
+                        .ok()
+                        .and_then(|v| parse_dtype(&v))
+                })
+                .unwrap_or(DType::F32),
+            _ => std::env::var("FERRUM_DTYPE")
+                .ok()
+                .and_then(|v| parse_dtype(&v))
+                .unwrap_or(DType::F16),
         };
-
-        // Load weights
-        info!("Loading model weights...");
-        let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
-        let vb = loader.load_varbuilder(&candle_device, dtype)?;
 
         // Create model based on architecture
         info!("Building model...");
@@ -944,6 +964,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     .await?;
                     return Ok(Arc::new(executor));
                 }
+
+                // Load weights (non-Metal path)
+                info!("Loading model weights...");
+                let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
+                let vb = loader.load_varbuilder(&candle_device, dtype)?;
 
                 // Standard Candle executor for CPU/CUDA
                 let llama_model = ferrum_models::LlamaModelWrapper::from_varbuilder(
@@ -973,6 +998,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     .await?;
                     return Ok(Arc::new(executor));
                 }
+
+                // Load weights (non-Metal path)
+                info!("Loading model weights...");
+                let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
+                let vb = loader.load_varbuilder(&candle_device, dtype)?;
 
                 // Standard Candle executor for CPU
                 let qwen2_model = ferrum_models::Qwen2ModelWrapper::from_varbuilder(
@@ -1155,17 +1185,16 @@ mod tests {
         let registry = ComponentRegistry::with_defaults();
         assert!(registry.list_backends().contains(&"candle".to_string()));
         assert!(registry.list_tokenizers().contains(&"stub".to_string()));
-        assert!(registry.list_samplers().contains(&"multinomial".to_string()));
+        assert!(registry
+            .list_samplers()
+            .contains(&"multinomial".to_string()));
         assert!(registry.list_schedulers().contains(&"fifo".to_string()));
     }
 
     #[test]
     fn test_component_config() {
         let mut options = HashMap::new();
-        options.insert(
-            "test_key".to_string(),
-            serde_json::json!("test_value"),
-        );
+        options.insert("test_key".to_string(), serde_json::json!("test_value"));
 
         let config = ComponentConfig {
             engine_config: EngineConfig::default(),
@@ -1195,7 +1224,7 @@ mod tests {
     #[test]
     fn test_greedy_sampler() {
         use rand::SeedableRng;
-        
+
         let sampler = GreedySampler;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 

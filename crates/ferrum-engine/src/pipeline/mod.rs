@@ -11,6 +11,4 @@ pub mod chunked_prefill;
 pub mod executor;
 
 pub use chunked_prefill::{ChunkedPrefillConfig, ChunkedPrefillExecutor};
-pub use executor::{PipelineExecutor, PipelineConfig, ExecutionPhase};
-
-
+pub use executor::{ExecutionPhase, PipelineConfig, PipelineExecutor};

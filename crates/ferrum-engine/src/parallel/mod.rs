@@ -36,4 +36,3 @@ pub use tensor_parallel::{
     LayerParallelType, TensorParallelConfig, TensorParallelGroup, TransformerParallelMapping,
     WeightShard,
 };
-

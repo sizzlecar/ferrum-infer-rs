@@ -9,6 +9,7 @@ use crate::{
 use async_trait::async_trait;
 use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus, KernelExecutor};
 use ferrum_types::{DataType, Device, Result};
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -48,6 +49,10 @@ impl std::fmt::Debug for CandleTensor {
 }
 
 impl TensorLike for CandleTensor {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn shape(&self) -> &[usize] {
         self.inner.dims()
     }
@@ -131,6 +136,54 @@ impl TensorLike for CandleTensor {
 
     fn is_contiguous(&self) -> bool {
         self.inner.is_contiguous()
+    }
+
+    fn argmax_last_dim_u32(&self) -> Result<u32> {
+        // Fast path for greedy sampling: compute argmax on the tensor's device,
+        // then transfer only a single scalar to CPU.
+        //
+        // This is intentionally conservative: it assumes batch=1 and returns the
+        // first element when batch exists.
+        use candle_core::{IndexOp, D};
+
+        let dims = self.inner.dims();
+        let logits_1d = match dims.len() {
+            1 => self.inner.clone(),
+            2 => {
+                // [batch, vocab] -> take batch 0 -> [vocab]
+                self.inner.i(0).map_err(|e| {
+                    ferrum_types::FerrumError::backend(format!("Index batch failed: {}", e))
+                })?
+            }
+            3 => {
+                // [batch, seq, vocab] -> take batch 0, last seq -> [vocab]
+                let seq_len = dims[1];
+                self.inner.i((0, seq_len.saturating_sub(1))).map_err(|e| {
+                    ferrum_types::FerrumError::backend(format!("Index last token failed: {}", e))
+                })?
+            }
+            _ => {
+                return Err(ferrum_types::FerrumError::backend(format!(
+                    "argmax_last_dim_u32 unsupported dims: {:?}",
+                    dims
+                )))
+            }
+        };
+
+        // Candle argmax returns a tensor; we read back a single u32.
+        let idx = logits_1d
+            .argmax(D::Minus1)
+            .map_err(|e| ferrum_types::FerrumError::backend(format!("Argmax failed: {}", e)))?
+            .to_device(&candle_core::Device::Cpu)
+            .map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Argmax to CPU failed: {}", e))
+            })?
+            .to_vec0::<u32>()
+            .map_err(|e| {
+                ferrum_types::FerrumError::backend(format!("Argmax readback failed: {}", e))
+            })?;
+
+        Ok(idx)
     }
 }
 
@@ -615,6 +668,7 @@ fn ferrum_device_to_candle(device: Device) -> Result<candle_core::Device> {
             }
             #[cfg(not(feature = "cuda"))]
             {
+                let _ = id;
                 Err(ferrum_types::FerrumError::unsupported("CUDA not enabled"))
             }
         }

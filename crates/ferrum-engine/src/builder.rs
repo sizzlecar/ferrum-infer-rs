@@ -131,10 +131,7 @@ impl EngineBuilder {
     }
 
     /// Set a pre-created KV cache manager
-    pub fn with_custom_kv_cache(
-        mut self,
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-    ) -> Self {
+    pub fn with_custom_kv_cache(mut self, kv_cache: Arc<dyn KvCacheManager + Send + Sync>) -> Self {
         self.custom_kv_cache = Some(kv_cache);
         self
     }
@@ -272,9 +269,11 @@ impl EngineBuilder {
             Some(backend)
         } else {
             debug!("Creating backend: {}", backend_name);
-            Some(registry
-                .create_backend(&backend_name, &component_config)
-                .await?)
+            Some(
+                registry
+                    .create_backend(&backend_name, &component_config)
+                    .await?,
+            )
         };
 
         // 2. Create or use provided tokenizer
@@ -296,9 +295,7 @@ impl EngineBuilder {
                         tokenizer_name,
                         e
                     );
-                    registry
-                        .create_tokenizer("stub", &component_config)
-                        .await?
+                    registry.create_tokenizer("stub", &component_config).await?
                 }
             }
         };
@@ -355,23 +352,15 @@ impl EngineBuilder {
                         executor_name,
                         err
                     );
-                    registry
-                        .create_executor("stub", &component_config)
-                        .await?
+                    registry.create_executor("stub", &component_config).await?
                 }
             }
         };
 
         // 7. Create the engine
         info!("All components created, building engine");
-        let engine = DefaultInferenceEngine::new(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            kv_cache,
-            executor,
-        );
+        let engine =
+            DefaultInferenceEngine::new(config, scheduler, tokenizer, sampler, kv_cache, executor);
 
         Ok(Box::new(engine))
     }
@@ -447,4 +436,3 @@ mod tests {
         assert!(result.is_ok());
     }
 }
-
