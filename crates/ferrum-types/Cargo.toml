@@ -1,0 +1,27 @@
+[package]
+name = "ferrum-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+serde_json = "1.0"
+
+# Time handling  
+chrono = { workspace = true }
+
+# ID generation
+uuid = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Small vectors for performance
+smallvec = "1.11"
+
+# Random number generation
+rand = { workspace = true }
