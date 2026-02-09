@@ -36,7 +36,7 @@ pub trait Scheduler: Send + Sync {
     fn config(&self) -> &TypesSchedulerConfig;
 
     /// Preempt running request (if supported)
-    async fn preempt(&self, request_id: RequestId) -> Result<PreemptionResult> {
+    async fn preempt(&self, _request_id: RequestId) -> Result<PreemptionResult> {
         // Default implementation: preemption not supported
         Err(ferrum_types::FerrumError::unsupported(
             "Preemption not supported",
@@ -44,7 +44,7 @@ pub trait Scheduler: Send + Sync {
     }
 
     /// Resume preempted request
-    async fn resume(&self, request_id: RequestId) -> Result<()> {
+    async fn resume(&self, _request_id: RequestId) -> Result<()> {
         // Default implementation: resumption not supported
         Err(ferrum_types::FerrumError::unsupported(
             "Resumption not supported",

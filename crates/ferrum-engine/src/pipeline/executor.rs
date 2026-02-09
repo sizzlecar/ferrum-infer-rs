@@ -5,8 +5,7 @@
 
 use super::chunked_prefill::{ChunkedPrefillConfig, ChunkedPrefillExecutor};
 use ferrum_interfaces::{
-    model_executor::{DecodeInput, DecodeOutput, PrefillInput, PrefillOutput},
-    KvCacheHandle, ModelExecutor, Sampler, TensorRef,
+    model_executor::DecodeInput, KvCacheHandle, ModelExecutor, Sampler, TensorRef,
 };
 use ferrum_models::CandleTensorWrapper;
 use ferrum_types::{FerrumError, Priority, Result, SamplingParams, TokenId};
@@ -330,13 +329,17 @@ impl PipelineExecutor {
         };
 
         // Update stats
-        self.stats.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .total_decode_tokens
+            .fetch_add(1, Ordering::Relaxed);
         self.stats
             .total_decode_time_us
             .fetch_add(decode_time.as_micros() as u64, Ordering::Relaxed);
 
         if should_stop {
-            self.stats.completed_sequences.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .completed_sequences
+                .fetch_add(1, Ordering::Relaxed);
             debug!(
                 "Decode complete for seq {}: generated {} tokens",
                 sequence_id,
@@ -536,4 +539,3 @@ mod tests {
         assert_ne!(ExecutionPhase::Prefill, ExecutionPhase::Decode);
     }
 }
-

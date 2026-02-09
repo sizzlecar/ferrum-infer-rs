@@ -5,7 +5,6 @@
 use crate::metal::{MetalBackend, QK4_0};
 use ferrum_types::{FerrumError, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Cache for quantized weights

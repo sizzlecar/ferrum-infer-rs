@@ -120,13 +120,13 @@ impl ModelDefinition {
 /// Configuration manager for loading and parsing model configs
 #[derive(Debug, Default)]
 pub struct ConfigManager {
-    cache: HashMap<String, ModelDefinition>,
+    _cache: HashMap<String, ModelDefinition>,
 }
 
 impl ConfigManager {
     pub fn new() -> Self {
         Self {
-            cache: HashMap::new(),
+            _cache: HashMap::new(),
         }
     }
 

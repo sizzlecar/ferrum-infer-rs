@@ -3,11 +3,7 @@
 //! This module provides a concrete implementation of the HttpServer trait
 //! using the Axum web framework, with full OpenAI API compatibility.
 
-use crate::{
-    openai::*,
-    traits::{HttpServer, StreamSender, StreamingHandler},
-    types::*,
-};
+use crate::{openai::*, traits::HttpServer, types::*};
 use async_trait::async_trait;
 use axum::{
     extract::State,
@@ -23,7 +19,7 @@ use ferrum_types::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
+use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, error, info, span, Level};
@@ -33,7 +29,6 @@ use uuid::Uuid;
 pub struct AxumServer {
     engine: Arc<dyn InferenceEngine + Send + Sync>,
     config: ServerConfig,
-    app: Option<Router>,
 }
 
 impl AxumServer {
@@ -42,7 +37,6 @@ impl AxumServer {
         Self {
             engine,
             config: ServerConfig::default(),
-            app: None,
         }
     }
 
@@ -74,36 +68,6 @@ impl AxumServer {
 #[derive(Clone)]
 struct AppState {
     engine: Arc<dyn InferenceEngine + Send + Sync>,
-}
-
-/// SSE stream sender implementation
-struct SseSender {
-    sender: mpsc::UnboundedSender<std::result::Result<Event, axum::Error>>,
-}
-
-#[async_trait]
-impl StreamSender for SseSender {
-    async fn send_chunk(&self, chunk: &str) -> ferrum_types::Result<()> {
-        self.sender
-            .send(Ok(Event::default().data(chunk)))
-            .map_err(|_| Error::internal("Stream closed"))?;
-        Ok(())
-    }
-
-    async fn send_json(&self, data: &serde_json::Value) -> ferrum_types::Result<()> {
-        let chunk = serde_json::to_string(data)
-            .map_err(|e| Error::internal(format!("JSON serialization failed: {}", e)))?;
-        self.send_chunk(&chunk).await
-    }
-
-    async fn close(&self) -> ferrum_types::Result<()> {
-        // Channel will be closed when sender is dropped
-        Ok(())
-    }
-
-    fn is_closed(&self) -> bool {
-        self.sender.is_closed()
-    }
 }
 
 #[async_trait]
@@ -410,19 +374,27 @@ async fn completions_handler(
 }
 
 async fn models_handler(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
-    let models = ModelListResponse {
-        object: "list".to_string(),
-        data: vec![crate::openai::ModelInfo {
-            id: "TinyLlama-1.1B-Chat-v1.0".to_string(),
+    let status = state.engine.status().await;
+    let now = chrono::Utc::now().timestamp() as u64;
+    let data = status
+        .loaded_models
+        .into_iter()
+        .map(|model_id| crate::openai::ModelInfo {
+            id: model_id.to_string(),
             object: "model".to_string(),
-            created: chrono::Utc::now().timestamp() as u64,
+            created: now,
             owned_by: "ferrum".to_string(),
             permission: vec![],
             root: None,
             parent: None,
-        }],
+        })
+        .collect();
+
+    let models = ModelListResponse {
+        object: "list".to_string(),
+        data,
     };
 
     Ok(Json(models).into_response())
@@ -453,7 +425,6 @@ async fn root_handler() -> std::result::Result<Response, ServerError> {
 #[derive(Debug)]
 enum ServerError {
     BadRequest(String),
-    NotFound(String),
     InternalError(String),
     NotImplemented(String),
 }
@@ -462,7 +433,6 @@ impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ServerError::BadRequest(msg) => (AxumStatusCode::BAD_REQUEST, msg),
-            ServerError::NotFound(msg) => (AxumStatusCode::NOT_FOUND, msg),
             ServerError::InternalError(msg) => (AxumStatusCode::INTERNAL_SERVER_ERROR, msg),
             ServerError::NotImplemented(msg) => (AxumStatusCode::NOT_IMPLEMENTED, msg),
         };

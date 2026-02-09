@@ -18,12 +18,12 @@ pub struct ServeCommand {
     pub model: Option<String>,
 
     /// Host to bind to
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
+    #[arg(long)]
+    pub host: Option<String>,
 
     /// Port to listen on
-    #[arg(short, long, default_value = "11434")]
-    pub port: u16,
+    #[arg(short, long)]
+    pub port: Option<u16>,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -38,6 +38,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     let model_id = resolve_model_alias(&model_name);
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
+
+    let host = cmd.host.unwrap_or_else(|| config.server.host.clone());
+    let port = cmd.port.unwrap_or(config.server.port);
 
     // Find cached model
     let cache_dir = get_hf_cache_dir(&config);
@@ -77,8 +80,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     // Create server config
     let server_config = ServerConfig {
-        host: cmd.host.clone(),
-        port: cmd.port,
+        host: host.clone(),
+        port,
         ..Default::default()
     };
 
@@ -90,7 +93,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         "{} {} {}",
         "🚀".green(),
         "Server running at".green().bold(),
-        format!("http://{}:{}", cmd.host, cmd.port).cyan().bold()
+        format!("http://{}:{}", host, port).cyan().bold()
     );
     println!();
     println!("Endpoints:");
@@ -129,20 +132,11 @@ fn print_banner() {
     println!("{}", "  ______                            ".bright_red());
     println!("{}", " |  ____|                           ".bright_red());
     println!("{}", " | |__ ___ _ __ _ __ _   _ _ __ ___  ".bright_red());
-    println!(
-        "{}",
-        " |  __/ _ \\ '__| '__| | | | '_ ` _ \\ ".bright_red()
-    );
+    println!("{}", " |  __/ _ \\ '__| '__| | | | '_ ` _ \\ ".bright_red());
     println!("{}", " | | |  __/ |  | |  | |_| | | | | | ".bright_red());
-    println!(
-        "{}",
-        " |_|  \\___|_|  |_|   \\__,_|_| |_| |_|".bright_red()
-    );
+    println!("{}", " |_|  \\___|_|  |_|   \\__,_|_| |_| |_|".bright_red());
     println!();
-    println!(
-        "   {}",
-        "🦀 Rust LLM Inference Server".bright_cyan().bold()
-    );
+    println!("   {}", "🦀 Rust LLM Inference Server".bright_cyan().bold());
     println!(
         "   {}",
         format!("Version {}", env!("CARGO_PKG_VERSION")).dimmed()

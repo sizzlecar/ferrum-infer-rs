@@ -11,7 +11,7 @@
 //!
 //! Actual implementations are provided by backend-specific modules.
 
-use ferrum_types::{Device, Result};
+use ferrum_types::Device;
 use std::fmt;
 
 /// Fused operation types
@@ -206,9 +206,9 @@ pub trait FusedOps: Send + Sync {
     /// Estimated compute speedup (multiplier)
     fn compute_speedup(&self, op: FusedOpType) -> f32 {
         match op {
-            FusedOpType::RopeQK => 1.2,        // 20% faster
-            FusedOpType::QkvProject => 1.5,    // 50% faster
-            FusedOpType::SiluGate => 1.3,      // 30% faster
+            FusedOpType::RopeQK => 1.2,     // 20% faster
+            FusedOpType::QkvProject => 1.5, // 50% faster
+            FusedOpType::SiluGate => 1.3,   // 30% faster
             FusedOpType::LayerNormLinear => 1.4,
             FusedOpType::AddRmsNorm => 1.3,
             FusedOpType::RopeAttention => 2.0, // 2x faster for full fusion

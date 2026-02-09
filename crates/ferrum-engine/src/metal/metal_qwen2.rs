@@ -10,11 +10,10 @@
 use crate::metal::{MetalContext, RmsNormOps};
 use candle_core::{DType, Device as CandleDevice, IndexOp, Tensor, D};
 use candle_nn::{embedding, linear, linear_no_bias, Embedding, Linear, Module, VarBuilder};
-use candle_nn::ops;
-use ferrum_types::{FerrumError, Result};
 use ferrum_models::architectures::qwen2::Qwen2ModelWrapper;
+use ferrum_types::{FerrumError, Result};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // Re-use MetalRmsNorm from metal_llama
 use super::metal_llama::MetalRmsNorm;
@@ -32,7 +31,7 @@ pub struct MetalQwen2Config {
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
     pub use_bias: bool,
-    pub tie_word_embeddings: bool,  // Whether lm_head shares weights with embed_tokens
+    pub tie_word_embeddings: bool, // Whether lm_head shares weights with embed_tokens
 }
 
 impl Default for MetalQwen2Config {
@@ -54,15 +53,13 @@ impl Default for MetalQwen2Config {
 }
 
 /// Rotary Position Embedding for Qwen2
-/// 
+///
 /// CRITICAL: All RoPE computations (inv_freq, cos, sin, rotation) are done in F32
 /// to avoid half-precision numerical instability. Only the final result is cast
 /// back to the target dtype.
 struct Qwen2RotaryEmbedding {
-    cos_cache: Tensor,  // Stored in F32 for precision
-    sin_cache: Tensor,  // Stored in F32 for precision
-    head_dim: usize,
-    target_dtype: DType,  // Original dtype to cast back to
+    cos_cache: Tensor, // Stored in F32 for precision
+    sin_cache: Tensor, // Stored in F32 for precision
 }
 
 impl Qwen2RotaryEmbedding {
@@ -72,7 +69,7 @@ impl Qwen2RotaryEmbedding {
 
         // CRITICAL FIX: All RoPE calculations in F32
         // Half-precision theta/cos/sin calculations cause massive numerical errors
-        
+
         // Compute inverse frequencies in f64, store as f32
         // inv_freq[i] = 1 / (theta ^ (2*i / head_dim))
         let inv_freq: Vec<f32> = (0..head_dim)
@@ -93,7 +90,7 @@ impl Qwen2RotaryEmbedding {
         // Compute position indices in F32
         let t = Tensor::arange(0u32, max_seq_len as u32, device)
             .map_err(|e| FerrumError::model(format!("arange failed: {}", e)))?
-            .to_dtype(DType::F32)  // F32, not target dtype!
+            .to_dtype(DType::F32) // F32, not target dtype!
             .map_err(|e| FerrumError::model(format!("t dtype failed: {}", e)))?
             .reshape((max_seq_len, 1))
             .map_err(|e| FerrumError::model(format!("t reshape failed: {}", e)))?;
@@ -114,27 +111,27 @@ impl Qwen2RotaryEmbedding {
 
         info!("RoPE cache (F32 for precision): cos shape={:?}, sin shape={:?}, head_dim={}, target_dtype={:?}", 
             cos_cache.shape(), sin_cache.shape(), head_dim, dtype);
-        
+
         Ok(Self {
             cos_cache,
             sin_cache,
-            head_dim,
-            target_dtype: dtype,
         })
     }
 
     fn apply(&self, q: &Tensor, k: &Tensor, start_pos: usize) -> Result<(Tensor, Tensor)> {
         // CRITICAL FIX: All RoPE operations in F32 for numerical stability
         // Convert input to F32, do rotation, convert back to target dtype
-        
+
         let original_dtype = q.dtype();
-        
+
         // Ensure contiguous first
-        let q = q.contiguous()
+        let q = q
+            .contiguous()
             .map_err(|e| FerrumError::model(format!("q contiguous failed: {}", e)))?;
-        let k = k.contiguous()
+        let k = k
+            .contiguous()
             .map_err(|e| FerrumError::model(format!("k contiguous failed: {}", e)))?;
-        
+
         // Convert to F32 for rotation computation
         let q_f32 = if original_dtype != DType::F32 {
             q.to_dtype(DType::F32)
@@ -148,31 +145,35 @@ impl Qwen2RotaryEmbedding {
         } else {
             k
         };
-        
+
         // Apply RoPE in F32
         let q_rot_f32 = self.rope_slow(&q_f32, start_pos)?;
         let k_rot_f32 = self.rope_slow(&k_f32, start_pos)?;
-        
+
         // Convert back to original dtype
         let q_rot = if original_dtype != DType::F32 {
-            q_rot_f32.to_dtype(original_dtype)
+            q_rot_f32
+                .to_dtype(original_dtype)
                 .map_err(|e| FerrumError::model(format!("q_rot to target dtype failed: {}", e)))?
                 .contiguous()
                 .map_err(|e| FerrumError::model(format!("q_rot contiguous failed: {}", e)))?
         } else {
-            q_rot_f32.contiguous()
+            q_rot_f32
+                .contiguous()
                 .map_err(|e| FerrumError::model(format!("q_rot contiguous failed: {}", e)))?
         };
         let k_rot = if original_dtype != DType::F32 {
-            k_rot_f32.to_dtype(original_dtype)
+            k_rot_f32
+                .to_dtype(original_dtype)
                 .map_err(|e| FerrumError::model(format!("k_rot to target dtype failed: {}", e)))?
                 .contiguous()
                 .map_err(|e| FerrumError::model(format!("k_rot contiguous failed: {}", e)))?
         } else {
-            k_rot_f32.contiguous()
+            k_rot_f32
+                .contiguous()
                 .map_err(|e| FerrumError::model(format!("k_rot contiguous failed: {}", e)))?
         };
-        
+
         Ok((q_rot, k_rot))
     }
 
@@ -182,52 +183,64 @@ impl Qwen2RotaryEmbedding {
     fn rope_slow(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
         // x shape: [batch, num_heads, seq_len, head_dim]
         // x is already in F32 (ensured by apply())
-        let (_b_sz, _n_head, seq_len, n_embd) = x.dims4()
+        let (_b_sz, _n_head, seq_len, n_embd) = x
+            .dims4()
             .map_err(|e| FerrumError::model(format!("dims4 failed: {}", e)))?;
 
         // cos/sin cache shape: [max_seq_len, head_dim/2]
         // For half rotation, we need to duplicate: [seq_len, head_dim/2] -> [seq_len, head_dim]
-        let cos = self.cos_cache
+        let cos = self
+            .cos_cache
             .narrow(0, start_pos, seq_len)
             .map_err(|e| FerrumError::model(format!("cos narrow failed: {}", e)))?;
-        let sin = self.sin_cache
+        let sin = self
+            .sin_cache
             .narrow(0, start_pos, seq_len)
             .map_err(|e| FerrumError::model(format!("sin narrow failed: {}", e)))?;
-        
+
         // Duplicate cos and sin to match head_dim: [seq, dim/2] -> [seq, dim]
         let cos = Tensor::cat(&[&cos, &cos], D::Minus1)
             .map_err(|e| FerrumError::model(format!("cos cat failed: {}", e)))?;
         let sin = Tensor::cat(&[&sin, &sin], D::Minus1)
             .map_err(|e| FerrumError::model(format!("sin cat failed: {}", e)))?;
-        
+
         // Add batch and head dims: [seq, dim] -> [1, 1, seq, dim]
-        let cos = cos.unsqueeze(0)
+        let cos = cos
+            .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("cos unsqueeze1 failed: {}", e)))?
             .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("cos unsqueeze2 failed: {}", e)))?;
-        let sin = sin.unsqueeze(0)
+        let sin = sin
+            .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("sin unsqueeze1 failed: {}", e)))?
             .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("sin unsqueeze2 failed: {}", e)))?;
-        
+
         // rotate_half: split x into first half and second half, negate second half for rotation
         // x = [x1, x2] -> rotate_half(x) = [-x2, x1]
-        let x1 = x.narrow(D::Minus1, 0, n_embd / 2)
+        let x1 = x
+            .narrow(D::Minus1, 0, n_embd / 2)
             .map_err(|e| FerrumError::model(format!("x1 narrow failed: {}", e)))?;
-        let x2 = x.narrow(D::Minus1, n_embd / 2, n_embd / 2)
+        let x2 = x
+            .narrow(D::Minus1, n_embd / 2, n_embd / 2)
             .map_err(|e| FerrumError::model(format!("x2 narrow failed: {}", e)))?;
-        let x2_neg = x2.neg()
+        let x2_neg = x2
+            .neg()
             .map_err(|e| FerrumError::model(format!("x2 neg failed: {}", e)))?;
         let rotated = Tensor::cat(&[&x2_neg, &x1], D::Minus1)
             .map_err(|e| FerrumError::model(format!("rotated cat failed: {}", e)))?;
-        
+
         // Apply rotation: x * cos + rotate_half(x) * sin
-        let result = x.broadcast_mul(&cos)
+        let result = x
+            .broadcast_mul(&cos)
             .map_err(|e| FerrumError::model(format!("x*cos failed: {}", e)))?
-            .broadcast_add(&rotated.broadcast_mul(&sin)
-                .map_err(|e| FerrumError::model(format!("rotated*sin failed: {}", e)))?)
+            .broadcast_add(
+                &rotated
+                    .broadcast_mul(&sin)
+                    .map_err(|e| FerrumError::model(format!("rotated*sin failed: {}", e)))?,
+            )
             .map_err(|e| FerrumError::model(format!("result add failed: {}", e)))?;
-        
+
         Ok(result)
     }
 }
@@ -259,14 +272,22 @@ impl MetalQwen2Attention {
             .map_err(|e| FerrumError::model(format!("q_proj load failed: {}", e)))?;
 
         // Log weight dtype for debugging
-        debug!("q_proj weight dtype: {:?}, shape: {:?}", q_proj.weight().dtype(), q_proj.weight().shape());
+        debug!(
+            "q_proj weight dtype: {:?}, shape: {:?}",
+            q_proj.weight().dtype(),
+            q_proj.weight().shape()
+        );
 
         let k_proj = linear(config.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))
-            .or_else(|_| linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj")))
+            .or_else(|_| {
+                linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))
+            })
             .map_err(|e| FerrumError::model(format!("k_proj load failed: {}", e)))?;
 
         let v_proj = linear(config.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))
-            .or_else(|_| linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj")))
+            .or_else(|_| {
+                linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))
+            })
             .map_err(|e| FerrumError::model(format!("v_proj load failed: {}", e)))?;
 
         let o_proj = linear_no_bias(config.hidden_size, config.hidden_size, vb.pp("o_proj"))
@@ -292,29 +313,39 @@ impl MetalQwen2Attention {
         start_pos: usize,
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (batch, seq_len, _) = x.dims3()
+        let (batch, seq_len, _) = x
+            .dims3()
             .map_err(|e| FerrumError::model(format!("dims3 failed: {}", e)))?;
 
         // Project Q, K, V
-        let q = self.q_proj.forward(x)
+        let q = self
+            .q_proj
+            .forward(x)
             .map_err(|e| FerrumError::model(format!("q_proj forward failed: {}", e)))?;
-        let k = self.k_proj.forward(x)
+        let k = self
+            .k_proj
+            .forward(x)
             .map_err(|e| FerrumError::model(format!("k_proj forward failed: {}", e)))?;
-        let v = self.v_proj.forward(x)
+        let v = self
+            .v_proj
+            .forward(x)
             .map_err(|e| FerrumError::model(format!("v_proj forward failed: {}", e)))?;
 
         // Reshape to [batch, seq, num_heads, head_dim]
-        let q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))
+        let q = q
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))
             .map_err(|e| FerrumError::model(format!("q reshape failed: {}", e)))?
             .transpose(1, 2)
             .map_err(|e| FerrumError::model(format!("q transpose failed: {}", e)))?;
 
-        let k = k.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))
+        let k = k
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))
             .map_err(|e| FerrumError::model(format!("k reshape failed: {}", e)))?
             .transpose(1, 2)
             .map_err(|e| FerrumError::model(format!("k transpose failed: {}", e)))?;
 
-        let v = v.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))
+        let v = v
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))
             .map_err(|e| FerrumError::model(format!("v reshape failed: {}", e)))?
             .transpose(1, 2)
             .map_err(|e| FerrumError::model(format!("v transpose failed: {}", e)))?;
@@ -340,10 +371,13 @@ impl MetalQwen2Attention {
 
         // Scaled dot-product attention
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_scores = q.matmul(&k.transpose(2, 3)
-            .map_err(|e| FerrumError::model(format!("k transpose failed: {}", e)))?)
+        let attn_scores = q
+            .matmul(
+                &k.transpose(2, 3)
+                    .map_err(|e| FerrumError::model(format!("k transpose failed: {}", e)))?,
+            )
             .map_err(|e| FerrumError::model(format!("attn matmul failed: {}", e)))?;
-        
+
         let attn = (attn_scores * scale)
             .map_err(|e| FerrumError::model(format!("attn scale failed: {}", e)))?;
 
@@ -357,27 +391,33 @@ impl MetalQwen2Attention {
 
         // Softmax (manual implementation for Metal compatibility)
         let attn = {
-            let max_val = attn.max_keepdim(D::Minus1)
+            let max_val = attn
+                .max_keepdim(D::Minus1)
                 .map_err(|e| FerrumError::model(format!("softmax max failed: {}", e)))?;
-            let diff = attn.broadcast_sub(&max_val)
+            let diff = attn
+                .broadcast_sub(&max_val)
                 .map_err(|e| FerrumError::model(format!("softmax sub failed: {}", e)))?;
-            let num = diff.exp()
+            let num = diff
+                .exp()
                 .map_err(|e| FerrumError::model(format!("softmax exp failed: {}", e)))?;
-            let den = num.sum_keepdim(D::Minus1)
+            let den = num
+                .sum_keepdim(D::Minus1)
                 .map_err(|e| FerrumError::model(format!("softmax sum failed: {}", e)))?;
             num.broadcast_div(&den)
                 .map_err(|e| FerrumError::model(format!("softmax div failed: {}", e)))?
         };
 
         // attn @ v
-        let output = attn.matmul(&v)
+        let output = attn
+            .matmul(&v)
             .map_err(|e| FerrumError::model(format!("attn v matmul failed: {}", e)))?
             .transpose(1, 2)
             .map_err(|e| FerrumError::model(format!("output transpose failed: {}", e)))?
             .reshape((batch, seq_len, self.num_heads * self.head_dim))
             .map_err(|e| FerrumError::model(format!("output reshape failed: {}", e)))?;
 
-        self.o_proj.forward(&output)
+        self.o_proj
+            .forward(&output)
             .map_err(|e| FerrumError::model(format!("o_proj forward failed: {}", e)))
     }
 
@@ -386,7 +426,8 @@ impl MetalQwen2Attention {
         if n_rep == 1 {
             return Ok(x.clone());
         }
-        let (batch, num_kv_heads, seq_len, head_dim) = x.dims4()
+        let (batch, num_kv_heads, seq_len, head_dim) = x
+            .dims4()
             .map_err(|e| FerrumError::model(format!("dims4 failed: {}", e)))?;
 
         // Use cat like the official implementation (faster and more compatible)
@@ -412,12 +453,24 @@ struct MetalQwen2MLP {
 impl MetalQwen2MLP {
     fn load(vb: VarBuilder, config: &MetalQwen2Config) -> Result<Self> {
         // Qwen2 MLP typically doesn't use bias
-        let gate_proj = linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("gate_proj"))
-            .map_err(|e| FerrumError::model(format!("gate_proj load failed: {}", e)))?;
-        let up_proj = linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("up_proj"))
-            .map_err(|e| FerrumError::model(format!("up_proj load failed: {}", e)))?;
-        let down_proj = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("down_proj"))
-            .map_err(|e| FerrumError::model(format!("down_proj load failed: {}", e)))?;
+        let gate_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("gate_proj"),
+        )
+        .map_err(|e| FerrumError::model(format!("gate_proj load failed: {}", e)))?;
+        let up_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("up_proj"),
+        )
+        .map_err(|e| FerrumError::model(format!("up_proj load failed: {}", e)))?;
+        let down_proj = linear_no_bias(
+            config.intermediate_size,
+            config.hidden_size,
+            vb.pp("down_proj"),
+        )
+        .map_err(|e| FerrumError::model(format!("down_proj load failed: {}", e)))?;
 
         Ok(Self {
             gate_proj,
@@ -428,17 +481,23 @@ impl MetalQwen2MLP {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Match official implementation exactly: gate.apply(act_fn) * up
-        let gate = self.gate_proj.forward(x)
+        let gate = self
+            .gate_proj
+            .forward(x)
             .map_err(|e| FerrumError::model(format!("gate_proj forward failed: {}", e)))?;
         // Use Candle's silu for better compatibility
-        let gate_silu = gate.silu()
+        let gate_silu = gate
+            .silu()
             .map_err(|e| FerrumError::model(format!("gate silu failed: {}", e)))?;
-        
-        let up = self.up_proj.forward(x)
+
+        let up = self
+            .up_proj
+            .forward(x)
             .map_err(|e| FerrumError::model(format!("up_proj forward failed: {}", e)))?;
-        let hidden = (gate_silu * up)
-            .map_err(|e| FerrumError::model(format!("gate * up failed: {}", e)))?;
-        self.down_proj.forward(&hidden)
+        let hidden =
+            (gate_silu * up).map_err(|e| FerrumError::model(format!("gate * up failed: {}", e)))?;
+        self.down_proj
+            .forward(&hidden)
             .map_err(|e| FerrumError::model(format!("down_proj forward failed: {}", e)))
     }
 }
@@ -554,8 +613,12 @@ impl MetalQwen2Model {
         let rope = Qwen2RotaryEmbedding::new(&config, dtype, device)?;
 
         // Load embedding layer
-        let embed_tokens = embedding(config.vocab_size, config.hidden_size, vb.pp("model.embed_tokens"))
-            .map_err(|e| FerrumError::model(format!("embed_tokens load failed: {}", e)))?;
+        let embed_tokens = embedding(
+            config.vocab_size,
+            config.hidden_size,
+            vb.pp("model.embed_tokens"),
+        )
+        .map_err(|e| FerrumError::model(format!("embed_tokens load failed: {}", e)))?;
 
         // Load decoder layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -578,13 +641,17 @@ impl MetalQwen2Model {
         )?;
 
         // Load LM head: prefer dedicated lm_head weight if present, else fall back to tied embedding.
-        let lm_head = match linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head")) {
+        let lm_head = match linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))
+        {
             Ok(head) => {
                 info!("Using dedicated lm_head weight");
                 head
             }
             Err(e) => {
-                info!("lm_head weight missing ({}), falling back to embed_tokens weight", e);
+                info!(
+                    "lm_head weight missing ({}), falling back to embed_tokens weight",
+                    e
+                );
                 let embed_weight = vb
                     .pp("model.embed_tokens")
                     .get((config.vocab_size, config.hidden_size), "weight")
@@ -594,7 +661,10 @@ impl MetalQwen2Model {
             }
         };
 
-        info!("✅ Metal Qwen2 model loaded with {} layers", config.num_hidden_layers);
+        info!(
+            "✅ Metal Qwen2 model loaded with {} layers",
+            config.num_hidden_layers
+        );
 
         Ok(Self {
             embed_tokens,
@@ -610,11 +680,14 @@ impl MetalQwen2Model {
 
     /// Forward pass for prefill
     pub fn forward_prefill(&mut self, input_ids: &Tensor) -> Result<Tensor> {
-        let seq_len = input_ids.dim(1)
+        let seq_len = input_ids
+            .dim(1)
             .map_err(|e| FerrumError::model(format!("dim failed: {}", e)))?;
 
         // Embed tokens
-        let mut x = self.embed_tokens.forward(input_ids)
+        let mut x = self
+            .embed_tokens
+            .forward(input_ids)
             .map_err(|e| FerrumError::model(format!("embed forward failed: {}", e)))?;
 
         // Create causal mask
@@ -634,17 +707,21 @@ impl MetalQwen2Model {
         x = self.norm.forward(&x)?;
 
         // LM head (only last token for efficiency)
-        let last_hidden = x.i((.., seq_len - 1.., ..))
+        let last_hidden = x
+            .i((.., seq_len - 1.., ..))
             .map_err(|e| FerrumError::model(format!("last hidden slice failed: {}", e)))?;
-        
-        self.lm_head.forward(&last_hidden)
+
+        self.lm_head
+            .forward(&last_hidden)
             .map_err(|e| FerrumError::model(format!("lm_head forward failed: {}", e)))
     }
 
     /// Forward pass for decode (single token)
     pub fn forward_decode(&mut self, token_id: &Tensor, pos: usize) -> Result<Tensor> {
         // Embed token
-        let mut x = self.embed_tokens.forward(token_id)
+        let mut x = self
+            .embed_tokens
+            .forward(token_id)
             .map_err(|e| FerrumError::model(format!("embed forward failed: {}", e)))?;
 
         // No mask needed for single token decode with KV cache
@@ -656,7 +733,8 @@ impl MetalQwen2Model {
         x = self.norm.forward(&x)?;
 
         // LM head
-        self.lm_head.forward(&x)
+        self.lm_head
+            .forward(&x)
             .map_err(|e| FerrumError::model(format!("lm_head forward failed: {}", e)))
     }
 
@@ -669,11 +747,7 @@ impl MetalQwen2Model {
 
     fn create_causal_mask(&self, seq_len: usize) -> Result<Tensor> {
         let mask: Vec<f32> = (0..seq_len)
-            .flat_map(|i| {
-                (0..seq_len).map(move |j| {
-                    if j <= i { 0.0 } else { f32::NEG_INFINITY }
-                })
-            })
+            .flat_map(|i| (0..seq_len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
             .collect();
 
         Tensor::from_vec(mask, (1, 1, seq_len, seq_len), &self.device)
@@ -691,18 +765,21 @@ impl MetalQwen2Config {
     /// Create config from ModelDefinition
     pub fn from_model_def(model_def: &ferrum_models::ModelDefinition) -> Self {
         // Read tie_word_embeddings from extra_params (original config.json)
-        let tie_word_embeddings = model_def.extra_params
+        let tie_word_embeddings = model_def
+            .extra_params
             .get("tie_word_embeddings")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        
+
         Self {
             vocab_size: model_def.vocab_size,
             hidden_size: model_def.hidden_size,
             intermediate_size: model_def.intermediate_size,
             num_hidden_layers: model_def.num_hidden_layers,
             num_attention_heads: model_def.num_attention_heads,
-            num_key_value_heads: model_def.num_key_value_heads.unwrap_or(model_def.num_attention_heads),
+            num_key_value_heads: model_def
+                .num_key_value_heads
+                .unwrap_or(model_def.num_attention_heads),
             max_position_embeddings: model_def.max_position_embeddings,
             rms_norm_eps: model_def.norm_eps,
             rope_theta: model_def.rope_theta.unwrap_or(1000000.0) as f32,
@@ -719,99 +796,14 @@ impl MetalQwen2Config {
 use async_trait::async_trait;
 use ferrum_interfaces::kv_cache::CacheHandleStats;
 use ferrum_interfaces::model_executor::{
-    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
-    ExecutorState, ExecutorStatus, MemoryRequirements, AttentionType,
+    AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
+    ExecutorState, ExecutorStatus, MemoryRequirements,
 };
-use ferrum_interfaces::{KvCacheHandle, ModelExecutor, PrefillInput, PrefillOutput, TensorRef, BlockTable};
+use ferrum_interfaces::{
+    BlockTable, KvCacheHandle, ModelExecutor, PrefillInput, PrefillOutput, TensorRef,
+};
+use ferrum_models::tensor_wrapper::CandleTensorWrapper;
 use ferrum_types::{DataType, Device, ModelInfo};
-use half::f16;
-
-/// Simple tensor implementation for executor outputs
-#[derive(Debug)]
-struct SimpleTensor {
-    data: Vec<f32>,
-    shape: Vec<usize>,
-}
-
-impl SimpleTensor {
-    fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        Self { data, shape }
-    }
-}
-
-impl ferrum_interfaces::TensorLike for SimpleTensor {
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-
-    fn dtype(&self) -> DataType {
-        DataType::FP32
-    }
-
-    fn device(&self) -> Device {
-        Device::Metal
-    }
-
-    fn is_contiguous(&self) -> bool {
-        true
-    }
-
-    fn view(&self, start: &[usize], end: &[usize]) -> Result<TensorRef> {
-        if start.len() != end.len() || start.len() != self.shape.len() {
-            return Err(FerrumError::backend("Invalid view dimensions"));
-        }
-        let mut stride = 1usize;
-        let mut offset = 0usize;
-        for dim in (0..self.shape.len()).rev() {
-            offset += start[dim] * stride;
-            stride *= self.shape[dim];
-        }
-        let count: usize = start.iter().zip(end.iter()).map(|(s, e)| e - s).product();
-        let end_offset = offset + count;
-        let data = self
-            .data
-            .get(offset..end_offset)
-            .ok_or_else(|| FerrumError::backend("View slice out of range"))?
-            .to_vec();
-        Ok(Arc::new(SimpleTensor::new(
-            data,
-            end.iter().zip(start.iter()).map(|(e, s)| e - s).collect(),
-        )))
-    }
-
-    fn reshape(&self, shape: &[usize]) -> Result<TensorRef> {
-        let new_numel: usize = shape.iter().product();
-        if new_numel != self.numel() {
-            return Err(FerrumError::backend("Reshape numel mismatch"));
-        }
-        Ok(Arc::new(SimpleTensor::new(self.data.clone(), shape.to_vec())))
-    }
-
-    fn to_cpu(&self) -> Result<TensorRef> {
-        Ok(Arc::new(SimpleTensor::new(self.data.clone(), self.shape.clone())))
-    }
-
-    fn to_device(&self, _device: &Device) -> Result<TensorRef> {
-        Ok(Arc::new(SimpleTensor::new(self.data.clone(), self.shape.clone())))
-    }
-
-    fn to_dtype(&self, dtype: DataType) -> Result<TensorRef> {
-        match dtype {
-            DataType::FP32 | DataType::FP16 | DataType::BF16 | DataType::FP8 => {
-                Ok(Arc::new(SimpleTensor::new(self.data.clone(), self.shape.clone())))
-            }
-            _ => Err(FerrumError::backend("Unsupported dtype conversion")),
-        }
-    }
-
-    fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        Ok(self.data.clone())
-    }
-
-    fn to_vec_u32(&self) -> Result<Vec<u32>> {
-        Ok(self.data.iter().map(|x| *x as u32).collect())
-    }
-}
 
 /// Dummy KV cache handle for Metal Qwen2 executor
 #[derive(Debug, Clone)]
@@ -820,12 +812,6 @@ struct DummyKvCache {
 }
 
 impl DummyKvCache {
-    fn new(block_size: usize) -> Self {
-        Self {
-            block_table: BlockTable::new(block_size),
-        }
-    }
-    
     fn with_length(block_size: usize, sequence_length: usize) -> Self {
         let mut block_table = BlockTable::new(block_size);
         block_table.sequence_length = sequence_length;
@@ -976,9 +962,13 @@ impl MetalQwen2Executor {
             info!("FERRUM_QWEN2_COMPARE_CPU=1: loading CPU reference model for comparison");
             let loader_cpu = ferrum_models::SafeTensorsLoader::new(model_path);
             let vb_cpu = loader_cpu.load_varbuilder(&CandleDevice::Cpu, DType::F32)?;
-            let cpu_model =
-                ferrum_models::Qwen2ModelWrapper::from_varbuilder(vb_cpu, model_def, CandleDevice::Cpu, DType::F32)
-                    .map_err(|e| FerrumError::model(format!("CPU ref load failed: {}", e)))?;
+            let cpu_model = ferrum_models::Qwen2ModelWrapper::from_varbuilder(
+                vb_cpu,
+                model_def,
+                CandleDevice::Cpu,
+                DType::F32,
+            )
+            .map_err(|e| FerrumError::model(format!("CPU ref load failed: {}", e)))?;
             Some(cpu_model)
         } else {
             None
@@ -998,7 +988,9 @@ impl MetalQwen2Executor {
         if let Ok(vf) = tensor.to_vec_f32() {
             return Ok(vf.into_iter().map(|x| x as u32).collect());
         }
-        Err(FerrumError::backend("Unable to extract token ids from tensor"))
+        Err(FerrumError::backend(
+            "Unable to extract token ids from tensor",
+        ))
     }
 }
 
@@ -1016,7 +1008,7 @@ impl ModelExecutor for MetalQwen2Executor {
 
         // Get mutable reference for model operations
         let model_ptr = &self.model as *const MetalQwen2Model as *mut MetalQwen2Model;
-        
+
         // Clear KV cache before new prefill (important for multi-turn conversations)
         unsafe { (*model_ptr).clear_cache() };
 
@@ -1030,12 +1022,20 @@ impl ModelExecutor for MetalQwen2Executor {
         // Optional CPU reference comparison
         if let Some(ref cpu_model) = self.cpu_ref {
             if seq_len <= 64 {
-                let input_cpu = Tensor::from_vec(token_ids.clone(), (1, seq_len), &CandleDevice::Cpu)
-                    .map_err(|e| FerrumError::internal(format!("cpu input tensor failed: {}", e)))?;
+                let input_cpu =
+                    Tensor::from_vec(token_ids.clone(), (1, seq_len), &CandleDevice::Cpu).map_err(
+                        |e| FerrumError::internal(format!("cpu input tensor failed: {}", e)),
+                    )?;
                 if let Ok(cpu_logits) = cpu_model.forward_prefill(&input_cpu) {
                     if let (Ok(metal_vals), Ok(cpu_vals)) = (
-                        logits.flatten_all().and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.to_vec1::<f32>()),
-                        cpu_logits.flatten_all().and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.to_vec1::<f32>()),
+                        logits
+                            .flatten_all()
+                            .and_then(|t| t.to_dtype(DType::F32))
+                            .and_then(|t| t.to_vec1::<f32>()),
+                        cpu_logits
+                            .flatten_all()
+                            .and_then(|t| t.to_dtype(DType::F32))
+                            .and_then(|t| t.to_vec1::<f32>()),
                     ) {
                         let diff: f32 = metal_vals
                             .iter()
@@ -1043,12 +1043,19 @@ impl ModelExecutor for MetalQwen2Executor {
                             .map(|(a, b)| (a - b) * (a - b))
                             .sum::<f32>()
                             .sqrt();
-                        let mut metal_top: Vec<(usize, f32)> =
-                            metal_vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                        metal_top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        let mut metal_top: Vec<(usize, f32)> = metal_vals
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &v)| (i, v))
+                            .collect();
+                        metal_top.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                         let mut cpu_top: Vec<(usize, f32)> =
                             cpu_vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                        cpu_top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        cpu_top.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                         info!(
                             "CPU vs Metal logits L2 diff: {:.4}; top_metal={:?}; top_cpu={:?}; tokens 17/19/28 metal=({:.4},{:.4},{:.4}) cpu=({:.4},{:.4},{:.4})",
                             diff,
@@ -1068,44 +1075,10 @@ impl ModelExecutor for MetalQwen2Executor {
             logits.dtype()
         );
 
-        // Get logits - shape should be [1, 1, vocab_size] (already sliced to last token)
-        let logits_dims = logits.dims();
-        let vocab_size = *logits_dims.last().unwrap_or(&0);
-
-        // Get logits on CPU
-        let logits_cpu = logits
-            .to_device(&CandleDevice::Cpu)
-            .map_err(|e| FerrumError::internal(format!("To CPU failed: {}", e)))?;
-
-        let last_logits = logits_cpu
-            .flatten_all()
-            .map_err(|e| FerrumError::internal(format!("Flatten error: {}", e)))?;
-
-        let dtype = last_logits.dtype();
-
-        // Convert to f32
-        let logits_vec: Vec<f32> = if dtype == DType::F32 {
-            last_logits
-                .to_vec1::<f32>()
-                .map_err(|e| FerrumError::internal(format!("To vec f32 error: {}", e)))?
-        } else if dtype == DType::F16 {
-            let v16: Vec<f16> = last_logits
-                .to_vec1()
-                .map_err(|e| FerrumError::internal(format!("To vec f16 error: {}", e)))?;
-            v16.iter().map(|v| f32::from(*v)).collect()
-        } else {
-            last_logits
-                .to_dtype(DType::F32)
-                .unwrap_or(last_logits)
-                .to_vec1::<f32>()
-                .map_err(|e| FerrumError::internal(format!("Fallback to vec f32 error: {}", e)))?
-        };
-
-        // Create output tensor
-        let output_tensor: TensorRef = Arc::new(SimpleTensor::new(
-            logits_vec,
-            vec![1, vocab_size],
-        ));
+        // Keep logits on Metal and return as Candle tensor wrapper.
+        // This enables engine-side fast paths (e.g. greedy argmax on GPU) without
+        // transferring the full vocab logits back to CPU every step.
+        let output_tensor: TensorRef = Arc::new(CandleTensorWrapper::new(logits));
 
         // Create KV cache handle with correct sequence length
         let kv_cache: Arc<dyn KvCacheHandle> = Arc::new(DummyKvCache::with_length(16, seq_len));
@@ -1133,39 +1106,8 @@ impl ModelExecutor for MetalQwen2Executor {
             logits.dtype()
         );
 
-        // Get logits on CPU
-        let logits_cpu = logits
-            .to_device(&CandleDevice::Cpu)
-            .map_err(|e| FerrumError::internal(format!("To CPU failed: {}", e)))?;
-
-        let last_logits = logits_cpu
-            .flatten_all()
-            .map_err(|e| FerrumError::internal(format!("Flatten error: {}", e)))?;
-
-        let dtype = last_logits.dtype();
-
-        let logits_vec: Vec<f32> = if dtype == DType::F32 {
-            last_logits
-                .to_vec1::<f32>()
-                .map_err(|e| FerrumError::internal(format!("To vec f32 error: {}", e)))?
-        } else if dtype == DType::F16 {
-            let v16: Vec<f16> = last_logits
-                .to_vec1()
-                .map_err(|e| FerrumError::internal(format!("To vec f16 error: {}", e)))?;
-            v16.iter().map(|v| f32::from(*v)).collect()
-        } else {
-            last_logits
-                .to_dtype(DType::F32)
-                .unwrap_or(last_logits)
-                .to_vec1::<f32>()
-                .map_err(|e| FerrumError::internal(format!("Fallback to vec f32 error: {}", e)))?
-        };
-
-        let vocab_size = logits_vec.len();
-        let output_tensor: TensorRef = Arc::new(SimpleTensor::new(
-            logits_vec,
-            vec![1, vocab_size],
-        ));
+        // Keep logits on Metal and return as Candle tensor wrapper.
+        let output_tensor: TensorRef = Arc::new(CandleTensorWrapper::new(logits));
 
         // Create new kv_cache with incremented sequence length
         let new_length = position + 1;
@@ -1199,4 +1141,3 @@ impl ModelExecutor for MetalQwen2Executor {
         self.status.clone()
     }
 }
-

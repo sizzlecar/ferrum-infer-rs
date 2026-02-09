@@ -1,6 +1,6 @@
 //! Eviction policies for KV cache management
 
-use ferrum_types::{RequestId, Result};
+use ferrum_types::RequestId;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 

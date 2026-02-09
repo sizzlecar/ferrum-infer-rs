@@ -1,6 +1,6 @@
 //! Model registry and alias management
 
-use ferrum_types::{FerrumError, ModelId, Result};
+use ferrum_types::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -36,7 +36,9 @@ impl Architecture {
             "mistral" | "mistralforcausallm" => Architecture::Mistral,
             "phi" | "phiforcausallm" => Architecture::Phi,
             "gpt2" | "gpt2lmheadmodel" => Architecture::GPT2,
-            "bert" | "bertmodel" | "bertformaskedlm" | "bertforsequenceclassification" => Architecture::Bert,
+            "bert" | "bertmodel" | "bertformaskedlm" | "bertforsequenceclassification" => {
+                Architecture::Bert
+            }
             _ => Architecture::Unknown,
         }
     }

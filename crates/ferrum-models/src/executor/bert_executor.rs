@@ -15,7 +15,7 @@ use ferrum_interfaces::{
     },
     BlockTable, CacheHandleStats, KvCacheHandle, ModelExecutor, TensorRef,
 };
-use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, Result};
+use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
 use tracing::{debug, info};
 
 use crate::architectures::bert::BertModelWrapper;
@@ -71,7 +71,7 @@ impl BertModelExecutor {
         info!("Loading BERT model from: {}", model_path);
 
         let path = std::path::Path::new(model_path);
-        
+
         // Find safetensors file
         let safetensors_path = if path.join("model.safetensors").exists() {
             path.join("model.safetensors")
@@ -80,7 +80,11 @@ impl BertModelExecutor {
             std::fs::read_dir(path)
                 .map_err(|e| FerrumError::model(format!("Failed to read model dir: {}", e)))?
                 .filter_map(|e| e.ok())
-                .find(|e| e.path().extension().map_or(false, |ext| ext == "safetensors"))
+                .find(|e| {
+                    e.path()
+                        .extension()
+                        .map_or(false, |ext| ext == "safetensors")
+                })
                 .map(|e| e.path())
                 .ok_or_else(|| FerrumError::model("No safetensors file found"))?
         };
@@ -97,7 +101,7 @@ impl BertModelExecutor {
         };
 
         // Create model from config.json
-        // Note: Some models have "bert." prefix, some don't. 
+        // Note: Some models have "bert." prefix, some don't.
         // sentence-transformers models typically don't have the prefix.
         let config_path = path.join("config.json");
         let model = BertModelWrapper::from_config_json(vb, &config_path, device.clone(), dtype)?;
@@ -111,7 +115,7 @@ impl BertModelExecutor {
     /// Get embeddings for input tokens
     pub fn get_embeddings(&self, input_ids: &[u32]) -> Result<Tensor> {
         let seq_len = input_ids.len();
-        
+
         // Create input tensor
         let input_tensor = Tensor::from_vec(
             input_ids.iter().map(|&x| x as i64).collect::<Vec<_>>(),
@@ -125,7 +129,8 @@ impl BertModelExecutor {
             .map_err(|e| FerrumError::model(format!("Failed to create token type ids: {}", e)))?;
 
         // Get sentence embedding
-        self.model.get_sentence_embedding(&input_tensor, &token_type_ids, None)
+        self.model
+            .get_sentence_embedding(&input_tensor, &token_type_ids, None)
     }
 
     /// Get model reference

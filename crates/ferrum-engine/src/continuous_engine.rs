@@ -14,7 +14,7 @@ use ferrum_interfaces::{
     engine::InferenceEngine, kv_cache::AllocationRequest, KvCacheHandle, KvCacheManager,
     ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
-use ferrum_scheduler::implementations::{ContinuousBatchRequest, ContinuousBatchScheduler, RequestPhase};
+use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_types::{
     DataType, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
     InferenceResponse, Priority, RequestId, Result, SamplingParams, StreamChunk, TokenId,
@@ -247,7 +247,8 @@ impl ContinuousBatchEngine {
         for request_id in prefill_requests {
             if let Err(e) = self.run_prefill(&request_id).await {
                 warn!("Prefill failed for {}: {}", request_id, e);
-                self.complete_request(&request_id, FinishReason::Error).await?;
+                self.complete_request(&request_id, FinishReason::Error)
+                    .await?;
             }
         }
 
@@ -255,7 +256,8 @@ impl ContinuousBatchEngine {
         for request_id in decode_requests {
             if let Err(e) = self.run_decode_step(&request_id).await {
                 warn!("Decode failed for {}: {}", request_id, e);
-                self.complete_request(&request_id, FinishReason::Error).await?;
+                self.complete_request(&request_id, FinishReason::Error)
+                    .await?;
             }
         }
 
@@ -295,7 +297,7 @@ impl ContinuousBatchEngine {
             priority: Priority::Normal,
         };
 
-        let kv_handle = self.kv_cache.allocate(&alloc_request).await?;
+        let _kv_handle = self.kv_cache.allocate(&alloc_request).await?;
 
         // Run prefill
         let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor);
@@ -303,7 +305,7 @@ impl ContinuousBatchEngine {
 
         // Sample first token
         let logits_vec = prefill_output.logits.to_vec_f32()?;
-        
+
         let first_token = {
             let mut sequences = self.sequences.write();
             let seq = sequences
@@ -355,7 +357,7 @@ impl ContinuousBatchEngine {
 
     /// Run a single decode step for a request
     async fn run_decode_step(&self, request_id: &RequestId) -> Result<()> {
-        let (decode_input, kv_cache) = {
+        let decode_input = {
             let sequences = self.sequences.read();
             let seq = sequences
                 .get(request_id)
@@ -385,7 +387,7 @@ impl ContinuousBatchEngine {
             let decode_input =
                 ferrum_interfaces::model_executor::DecodeInput::new(tensor_ref, kv_cache.clone());
 
-            (decode_input, kv_cache)
+            decode_input
         };
 
         // Run decode
@@ -522,7 +524,9 @@ impl ContinuousBatchEngine {
         }
 
         // Notify scheduler
-        self.scheduler.complete(request_id.clone(), &response).await?;
+        self.scheduler
+            .complete(request_id.clone(), &response)
+            .await?;
 
         // Send final stream chunk if streaming
         if let Some(tx) = stream_sender {
@@ -559,12 +563,10 @@ impl InferenceEngine for ContinuousBatchEngine {
 
         // Tokenize and create sequence state
         let input_tokens = self.tokenizer.encode(&request.prompt, true)?;
-        let mut seq_state = SequenceState::new(request, input_tokens.clone());
+        let seq_state = SequenceState::new(request, input_tokens.clone());
 
         // Insert into sequences
-        self.sequences
-            .write()
-            .insert(request_id.clone(), seq_state);
+        self.sequences.write().insert(request_id.clone(), seq_state);
 
         // Wait for completion (poll-based for now)
         loop {
@@ -611,9 +613,7 @@ impl InferenceEngine for ContinuousBatchEngine {
         seq_state.stream_sender = Some(tx);
 
         // Insert into sequences
-        self.sequences
-            .write()
-            .insert(request_id.clone(), seq_state);
+        self.sequences.write().insert(request_id.clone(), seq_state);
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
@@ -656,7 +656,8 @@ impl InferenceEngine for ContinuousBatchEngine {
         let scheduler_metrics = self.scheduler.metrics();
 
         ferrum_types::EngineMetrics {
-            total_requests: scheduler_metrics.completed_requests + scheduler_metrics.failed_requests,
+            total_requests: scheduler_metrics.completed_requests
+                + scheduler_metrics.failed_requests,
             successful_requests: scheduler_metrics.completed_requests,
             failed_requests: scheduler_metrics.failed_requests,
             avg_request_latency_ms: 0.0,
@@ -688,7 +689,10 @@ impl std::fmt::Debug for ContinuousBatchEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContinuousBatchEngine")
             .field("is_running", &self.is_running.load(Ordering::SeqCst))
-            .field("iteration_count", &self.iteration_count.load(Ordering::SeqCst))
+            .field(
+                "iteration_count",
+                &self.iteration_count.load(Ordering::SeqCst),
+            )
             .field("active_sequences", &self.sequences.read().len())
             .finish()
     }
@@ -725,4 +729,3 @@ mod tests {
         assert!(!state.prefill_complete);
     }
 }
-

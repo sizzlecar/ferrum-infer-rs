@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tracing::{debug, info, warn};
 
@@ -544,7 +544,6 @@ mod tests {
     #[test]
     fn test_request_priority_ordering() {
         let now = chrono::Utc::now();
-        let later = now + chrono::Duration::seconds(1);
 
         let critical = RequestPriority::new(Priority::Critical, now);
         let high = RequestPriority::new(Priority::High, now);

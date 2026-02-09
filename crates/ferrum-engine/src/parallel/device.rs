@@ -6,8 +6,7 @@
 use ferrum_types::{Device, FerrumError, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Device capability information
 #[derive(Debug, Clone)]
@@ -56,8 +55,8 @@ impl DeviceCapability {
     pub fn cpu() -> Self {
         Self {
             compute_capability: (0, 0),
-            total_memory: 0,        // To be filled from system info
-            num_compute_units: 0,   // CPU cores
+            total_memory: 0,      // To be filled from system info
+            num_compute_units: 0, // CPU cores
             max_threads_per_block: 1,
             warp_size: 1,
             has_tensor_cores: false,
@@ -75,7 +74,7 @@ impl DeviceCapability {
             total_memory,
             num_compute_units: gpu_cores,
             max_threads_per_block: 1024,
-            warp_size: 32, // SIMD width
+            warp_size: 32,           // SIMD width
             has_tensor_cores: false, // No tensor cores, but has AMX
             unified_memory: true,
             max_shared_memory: 32 * 1024,
@@ -124,7 +123,9 @@ impl DeviceInfo {
 
     /// Get available memory
     pub fn available_memory(&self) -> usize {
-        self.capability.total_memory.saturating_sub(self.used_memory)
+        self.capability
+            .total_memory
+            .saturating_sub(self.used_memory)
     }
 }
 
@@ -206,7 +207,10 @@ impl DeviceManager {
             *self.primary_device.write() = device;
             Ok(())
         } else {
-            Err(FerrumError::not_found(format!("Device {:?} not found", device)))
+            Err(FerrumError::not_found(format!(
+                "Device {:?} not found",
+                device
+            )))
         }
     }
 
@@ -275,17 +279,12 @@ impl DeviceManager {
             .collect();
 
         if fitting_devices.len() >= min_devices {
-            return fitting_devices
-                .into_iter()
-                .take(max_devices)
-                .collect();
+            return fitting_devices.into_iter().take(max_devices).collect();
         }
 
         // Otherwise, select devices for model parallelism based on total memory
         let mut sorted_devices = gpu_devices;
-        sorted_devices.sort_by(|a, b| {
-            b.capability.total_memory.cmp(&a.capability.total_memory)
-        });
+        sorted_devices.sort_by(|a, b| b.capability.total_memory.cmp(&a.capability.total_memory));
 
         let mut selected = Vec::new();
         let mut total_memory = 0usize;
@@ -332,7 +331,9 @@ impl DeviceManager {
     #[cfg(feature = "cuda")]
     fn detect_cuda_devices(&self) -> Result<Vec<DeviceInfo>> {
         // Would use CUDA runtime API to detect devices
-        Err(FerrumError::unsupported("CUDA detection not yet implemented"))
+        Err(FerrumError::unsupported(
+            "CUDA detection not yet implemented",
+        ))
     }
 }
 
@@ -392,4 +393,3 @@ mod tests {
         assert!(!cap.can_fit_model(15 * 1024 * 1024 * 1024)); // 15GB model (exceeds 70%)
     }
 }
-

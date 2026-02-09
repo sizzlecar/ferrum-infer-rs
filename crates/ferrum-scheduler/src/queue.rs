@@ -163,7 +163,7 @@ impl FifoQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_types::{ModelId, SamplingParams};
+    use ferrum_types::ModelId;
 
     fn create_test_request(_id: u64, priority: Priority) -> InferenceRequest {
         InferenceRequest::new("test prompt", ModelId::new("test-model")).with_priority(priority)

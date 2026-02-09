@@ -103,7 +103,9 @@ impl HfDownloader {
                     return false;
                 }
                 REQUIRED_FILES.contains(&f.path.as_str())
-                    || MODEL_FILES.iter().any(|m| f.path.starts_with(m) || f.path == *m)
+                    || MODEL_FILES
+                        .iter()
+                        .any(|m| f.path.starts_with(m) || f.path == *m)
                     || TOKENIZER_FILES.contains(&f.path.as_str())
                     || f.path == "generation_config.json"
                     || f.path == "special_tokens_map.json"
@@ -130,12 +132,12 @@ impl HfDownloader {
 
         // Use concurrent downloads for multiple files (up to 3 concurrent)
         let concurrency = std::cmp::min(3, file_count);
-        
+
         if concurrency > 1 && file_count > 1 {
             // Concurrent download with MultiProgress
             let mp = Arc::new(MultiProgress::new());
             let self_arc = Arc::new(self.clone());
-            
+
             let mut handles = Vec::new();
             for file_info in files_to_download {
                 let downloader = self_arc.clone();
@@ -146,18 +148,28 @@ impl HfDownloader {
                 let size = file_info.size.unwrap_or(0);
                 let blobs = blobs_dir.clone();
                 let snapshot = snapshot_dir.clone();
-                
+
                 let handle = tokio::spawn(async move {
                     downloader
-                        .download_file_concurrent(&model_id, &revision, &filename, size, &blobs, &snapshot, Some(&mp))
+                        .download_file_concurrent(
+                            &model_id,
+                            &revision,
+                            &filename,
+                            size,
+                            &blobs,
+                            &snapshot,
+                            Some(&mp),
+                        )
                         .await
                 });
                 handles.push(handle);
             }
-            
+
             // Wait for all downloads
             for handle in handles {
-                handle.await.map_err(|e| FerrumError::model(format!("Task error: {}", e)))??;
+                handle
+                    .await
+                    .map_err(|e| FerrumError::model(format!("Task error: {}", e)))??;
             }
         } else {
             // Sequential download for single file
@@ -217,7 +229,10 @@ impl HfDownloader {
 
     /// Get the commit SHA for a revision
     async fn get_commit_sha(&self, model_id: &str, revision: &str) -> Result<String> {
-        let url = format!("{}/api/models/{}/revision/{}", HF_API_URL, model_id, revision);
+        let url = format!(
+            "{}/api/models/{}/revision/{}",
+            HF_API_URL, model_id, revision
+        );
 
         let mut request = self.client.get(&url);
         if let Some(token) = &self.token {
@@ -271,7 +286,7 @@ impl HfDownloader {
 
         // Use a short display name for progress
         let display_name = if filename.len() > 30 {
-            format!("...{}", &filename[filename.len()-27..])
+            format!("...{}", &filename[filename.len() - 27..])
         } else {
             filename.to_string()
         };
@@ -282,10 +297,9 @@ impl HfDownloader {
             head_req = head_req.header("Authorization", format!("Bearer {}", token));
         }
 
-        let head_resp = head_req
-            .send()
-            .await
-            .map_err(|e| FerrumError::model(format!("Failed to get file info for {}: {}", filename, e)))?;
+        let head_resp = head_req.send().await.map_err(|e| {
+            FerrumError::model(format!("Failed to get file info for {}: {}", filename, e))
+        })?;
 
         if !head_resp.status().is_success() {
             return Err(FerrumError::model(format!(
@@ -297,8 +311,12 @@ impl HfDownloader {
 
         // Get content length - prefer HEAD response, fallback to API size
         let head_size = head_resp.content_length().unwrap_or(0);
-        let total_size = if head_size > 0 { head_size } else { expected_size };
-        
+        let total_size = if head_size > 0 {
+            head_size
+        } else {
+            expected_size
+        };
+
         let etag = head_resp
             .headers()
             .get("etag")
@@ -313,7 +331,7 @@ impl HfDownloader {
         // Check if already complete
         if blob_path.exists() {
             if let Ok(meta) = fs::metadata(&blob_path).await {
-                if total_size == 0 || meta.len() == total_size || (total_size == 0 && meta.len() > 0) {
+                if total_size == 0 || meta.len() == total_size {
                     create_symlink(&blob_path, &snapshot_file).await?;
                     println!("  ✓ {} (cached)", display_name);
                     return Ok(());
@@ -412,7 +430,7 @@ impl HfDownloader {
         } else {
             total_size
         };
-        
+
         // Update progress bar with correct total
         if actual_total > 0 && actual_total != total_size {
             pb.set_length(actual_total);
@@ -424,9 +442,10 @@ impl HfDownloader {
 
         use futures_util::StreamExt;
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| FerrumError::model(format!("Download error for {}: {}", filename, e)))?;
-            
+            let chunk = chunk_result.map_err(|e| {
+                FerrumError::model(format!("Download error for {}: {}", filename, e))
+            })?;
+
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
             pb.set_position(downloaded);
@@ -447,7 +466,7 @@ impl HfDownloader {
 
         // Rename to final path
         fs::rename(&incomplete_path, &blob_path).await?;
-        
+
         pb.finish_with_message(format!("{} ✓ {}", display_name, format_size(final_size)));
 
         // Create symlink in snapshot directory

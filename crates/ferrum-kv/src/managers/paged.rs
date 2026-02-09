@@ -131,7 +131,9 @@ impl PagedKvCacheHandle {
     pub fn add_block(&self, logical_id: u32, physical_id: u32) {
         let mut table = self.block_table.write();
         if logical_id as usize >= table.logical_to_physical.len() {
-            table.logical_to_physical.resize((logical_id + 1) as usize, 0);
+            table
+                .logical_to_physical
+                .resize((logical_id + 1) as usize, 0);
         }
         table.logical_to_physical[logical_id as usize] = physical_id;
 
@@ -172,7 +174,11 @@ impl PagedKvCacheHandle {
     /// Get number of blocks allocated
     pub fn num_blocks(&self) -> usize {
         let table = self.block_table.read();
-        table.logical_to_physical.iter().filter(|&&id| id > 0).count()
+        table
+            .logical_to_physical
+            .iter()
+            .filter(|&&id| id > 0)
+            .count()
     }
 
     /// Update token count
@@ -353,7 +359,10 @@ impl PagedKvCacheManager {
         };
 
         let prefix_cache = if config.enable_prefix_cache {
-            Some(PrefixCache::new(config.max_prefixes, config.min_prefix_length))
+            Some(PrefixCache::new(
+                config.max_prefixes,
+                config.min_prefix_length,
+            ))
         } else {
             None
         };
@@ -393,7 +402,11 @@ impl PagedKvCacheManager {
     }
 
     /// Allocate blocks for a sequence
-    pub fn allocate_blocks(&self, handle: &PagedKvCacheHandle, num_blocks: usize) -> Result<Vec<PhysicalBlockId>> {
+    pub fn allocate_blocks(
+        &self,
+        handle: &PagedKvCacheHandle,
+        num_blocks: usize,
+    ) -> Result<Vec<PhysicalBlockId>> {
         let mut allocated = Vec::with_capacity(num_blocks);
         let current_blocks = handle.num_blocks();
 
@@ -507,8 +520,7 @@ impl PagedKvCacheManager {
     /// Check memory pressure
     pub fn check_pressure(&self) -> MemoryPressure {
         let gpu_stats = self.gpu_pool.stats();
-        let free_ratio =
-            gpu_stats.free_blocks as f32 / gpu_stats.max_blocks.max(1) as f32;
+        let free_ratio = gpu_stats.free_blocks as f32 / gpu_stats.max_blocks.max(1) as f32;
 
         if free_ratio < self.config.high_watermark {
             MemoryPressure::Critical
@@ -642,7 +654,10 @@ impl PagedKvCacheManager {
 #[async_trait]
 impl KvCacheManager for PagedKvCacheManager {
     async fn allocate(&self, request: &AllocationRequest) -> Result<Arc<dyn KvCacheHandle>> {
-        debug!("Allocating paged KV cache for request: {:?}", request.request_id);
+        debug!(
+            "Allocating paged KV cache for request: {:?}",
+            request.request_id
+        );
 
         // Check pressure before allocation
         let pressure = self.check_pressure();
@@ -764,7 +779,8 @@ impl KvCacheManager for PagedKvCacheManager {
     }
 
     fn can_allocate(&self, request: &AllocationRequest) -> bool {
-        let required_blocks = (request.initial_tokens + self.config.block_size - 1) / self.config.block_size;
+        let required_blocks =
+            (request.initial_tokens + self.config.block_size - 1) / self.config.block_size;
         let gpu_stats = self.gpu_pool.stats();
 
         gpu_stats.free_blocks >= required_blocks
@@ -900,7 +916,10 @@ mod tests {
 
         // Extend to require more blocks
         let paged_handle = manager.get_handle(request_id.clone()).unwrap();
-        let paged_ref = paged_handle.as_any().downcast_ref::<PagedKvCacheHandle>().unwrap();
+        let paged_ref = paged_handle
+            .as_any()
+            .downcast_ref::<PagedKvCacheHandle>()
+            .unwrap();
         manager.allocate_blocks(paged_ref, 4).unwrap();
 
         let new_blocks = handle.stats().blocks_allocated;
@@ -939,19 +958,12 @@ mod tests {
 
         // GC should work
         let gc_stats = manager.gc().await.unwrap();
-        assert!(gc_stats.gc_time_ms >= 0);
+        assert_eq!(gc_stats.caches_freed, 0);
     }
 
     #[test]
     fn test_paged_handle() {
-        let handle = PagedKvCacheHandle::new(
-            RequestId::new(),
-            Device::CPU,
-            16,
-            32,
-            32,
-            128,
-        );
+        let handle = PagedKvCacheHandle::new(RequestId::new(), Device::CPU, 16, 32, 32, 128);
 
         assert_eq!(handle.num_tokens(), 0);
         assert_eq!(handle.num_blocks(), 0);
@@ -983,4 +995,3 @@ mod tests {
         assert_eq!(handle.required_blocks(33), 3);
     }
 }
-

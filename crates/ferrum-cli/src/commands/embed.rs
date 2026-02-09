@@ -1,6 +1,7 @@
 //! Embed command - Generate embeddings using BERT models
 
 use crate::config::CliConfig;
+use candle_core::Device as CandleDevice;
 use clap::Args;
 use colored::Colorize;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
@@ -9,7 +10,6 @@ use ferrum_models::{BertModelExecutor, ConfigManager};
 use ferrum_types::Result;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
-use candle_core::Device as CandleDevice;
 
 /// Generate embeddings using a BERT model
 #[derive(Args, Debug)]
@@ -37,7 +37,7 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
     // Resolve model path using same logic as list/run commands
     let model_id = cmd.model.clone();
     let cache_dir = get_hf_cache_dir(&config);
-    
+
     let source = match find_cached_model(&cache_dir, &model_id) {
         Some(source) => source,
         None => {
@@ -46,21 +46,21 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
                 "📥".cyan(),
                 model_id
             );
-            
+
             let token = std::env::var("HF_TOKEN")
                 .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
                 .ok();
-            
-            let downloader = HfDownloader::new(cache_dir.join("hub"), token)?;
+
+            let downloader = HfDownloader::new(cache_dir, token)?;
             let snapshot_path = downloader.download(&model_id, None).await?;
-            
+
             let format = detect_format(&snapshot_path);
             if format == ModelFormat::Unknown {
                 return Err(ferrum_types::FerrumError::model(
-                    "Downloaded model has unknown format"
+                    "Downloaded model has unknown format",
                 ));
             }
-            
+
             ResolvedModelSource {
                 original: model_id.clone(),
                 local_path: snapshot_path,
@@ -85,13 +85,18 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
 
     // Load tokenizer
     let tokenizer = tokenizers::Tokenizer::from_file(source.local_path.join("tokenizer.json"))
-        .map_err(|e| ferrum_types::FerrumError::model(format!("Failed to load tokenizer: {}", e)))?;
+        .map_err(|e| {
+            ferrum_types::FerrumError::model(format!("Failed to load tokenizer: {}", e))
+        })?;
 
     // Process input text
     let texts: Vec<String> = if let Some(text) = cmd.text {
         vec![text]
     } else {
-        eprintln!("{}", "Reading text from stdin (one text per line, Ctrl+D to finish):".dimmed());
+        eprintln!(
+            "{}",
+            "Reading text from stdin (one text per line, Ctrl+D to finish):".dimmed()
+        );
         let stdin = io::stdin();
         stdin.lock().lines().filter_map(|l| l.ok()).collect()
     };
@@ -106,14 +111,15 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
 
     for text in &texts {
         // Tokenize
-        let encoding = tokenizer.encode(text.as_str(), true)
+        let encoding = tokenizer
+            .encode(text.as_str(), true)
             .map_err(|e| ferrum_types::FerrumError::model(format!("Tokenization failed: {}", e)))?;
 
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
 
         // Get embeddings
         let embedding_tensor = executor.get_embeddings(&token_ids)?;
-        
+
         // Convert to vec
         let mut embedding = embedding_tensor
             .flatten_all()
@@ -151,7 +157,8 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
         }
         "csv" => {
             if let Some((_, first_emb)) = all_embeddings.first() {
-                let header: Vec<String> = (0..first_emb.len()).map(|i| format!("dim_{}", i)).collect();
+                let header: Vec<String> =
+                    (0..first_emb.len()).map(|i| format!("dim_{}", i)).collect();
                 println!("text,{}", header.join(","));
             }
             for (text, emb) in &all_embeddings {
@@ -162,7 +169,8 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
         "raw" => {
             for (text, emb) in &all_embeddings {
                 eprintln!("{}: {} dimensions", text.dimmed(), emb.len());
-                let preview: Vec<String> = emb.iter().take(5).map(|v| format!("{:.4}", v)).collect();
+                let preview: Vec<String> =
+                    emb.iter().take(5).map(|v| format!("{:.4}", v)).collect();
                 println!("[{}, ...]", preview.join(", "));
             }
         }
@@ -179,7 +187,7 @@ fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedMode
     let hub_dir = cache_dir.join("hub");
     let model_dir_name = format!("models--{}", model_id.replace("/", "--"));
     let model_dir = hub_dir.join(&model_dir_name);
-    
+
     if model_dir.exists() {
         // Find the latest snapshot
         let snapshots_dir = model_dir.join("snapshots");
@@ -202,7 +210,7 @@ fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedMode
             }
         }
     }
-    
+
     // Also check direct path (for models downloaded to custom locations)
     let direct = cache_dir.join(model_id);
     if direct.exists() && direct.join("config.json").exists() {
@@ -216,7 +224,7 @@ fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedMode
             });
         }
     }
-    
+
     None
 }
 
@@ -232,9 +240,13 @@ fn detect_format(path: &PathBuf) -> ModelFormat {
     if path.join("model.safetensors").exists() {
         ModelFormat::SafeTensors
     } else if std::fs::read_dir(path)
-        .map(|d| d.filter_map(|e| e.ok()).any(|e| {
-            e.path().extension().map_or(false, |ext| ext == "safetensors")
-        }))
+        .map(|d| {
+            d.filter_map(|e| e.ok()).any(|e| {
+                e.path()
+                    .extension()
+                    .map_or(false, |ext| ext == "safetensors")
+            })
+        })
         .unwrap_or(false)
     {
         ModelFormat::SafeTensors

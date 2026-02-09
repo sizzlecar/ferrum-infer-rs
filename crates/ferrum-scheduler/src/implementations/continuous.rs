@@ -97,7 +97,10 @@ impl ContinuousBatchRequest {
 
     /// Check if request is active (prefilling or decoding)
     pub fn is_active(&self) -> bool {
-        matches!(self.phase, RequestPhase::Prefilling | RequestPhase::Decoding)
+        matches!(
+            self.phase,
+            RequestPhase::Prefilling | RequestPhase::Decoding
+        )
     }
 
     /// Check if request is finished
@@ -223,26 +226,6 @@ impl ContinuousBatchMetrics {
 
     fn record_iteration(&self) {
         self.iteration_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn avg_prefill_tokens(&self) -> f64 {
-        let total = self.total_prefill_tokens.load(Ordering::Relaxed) as f64;
-        let count = self.request_count.load(Ordering::Relaxed) as f64;
-        if count > 0.0 {
-            total / count
-        } else {
-            0.0
-        }
-    }
-
-    fn avg_decode_tokens(&self) -> f64 {
-        let total = self.total_decode_tokens.load(Ordering::Relaxed) as f64;
-        let count = self.request_count.load(Ordering::Relaxed) as f64;
-        if count > 0.0 {
-            total / count
-        } else {
-            0.0
-        }
     }
 }
 
@@ -768,9 +751,7 @@ impl Scheduler for ContinuousBatchScheduler {
         if let Some(mut req) = preempted.remove(&request_id) {
             req.phase = RequestPhase::Decoding;
 
-            self.decode_queue
-                .write()
-                .insert(request_id.clone(), req);
+            self.decode_queue.write().insert(request_id.clone(), req);
             self.request_index
                 .write()
                 .insert(request_id, RequestPhase::Decoding);
@@ -907,4 +888,3 @@ mod tests {
         assert!(!cb_req.is_finished());
     }
 }
-
