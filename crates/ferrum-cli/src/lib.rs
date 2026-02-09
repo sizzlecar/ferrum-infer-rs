@@ -1,24 +1,18 @@
 //! # Ferrum CLI Library
-//! 
-//! Command-line interface library for the Ferrum LLM inference framework.
-//! 
-//! ## Features
-//! 
-//! - **Server Management**: Start and manage inference servers
-//! - **Model Testing**: Interactive model testing and validation
-//! - **Benchmarking**: Performance testing and profiling
-//! - **Configuration**: Config file management and validation
-//! - **Health Monitoring**: Server and component health checks
-//! - **Cache Operations**: Cache management and debugging
-//! - **Development Tools**: Debugging and development utilities
+//!
+//! Ollama-style command-line interface for the Ferrum LLM inference framework.
+//!
+//! ## Commands
+//!
+//! - `run`: Run a model and start interactive chat
+//! - `serve`: Start the HTTP inference server
+//! - `stop`: Stop the running server
+//! - `pull`: Download a model from HuggingFace
+//! - `list`: List downloaded models
 
 pub mod commands;
 pub mod config;
 pub mod utils;
-pub mod client;
-pub mod output;
 
 // Re-exports
 pub use config::CliConfig;
-pub use output::{OutputFormatter, OutputFormat};
-pub use client::FerrumClient;

@@ -6,10 +6,21 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Core dependencies
-ferrum-core = { workspace = true }
+# Core dependencies - New architecture
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
+
+# Implementation crates
+ferrum-runtime = { workspace = true }
+ferrum-scheduler = { workspace = true }
+ferrum-tokenizer = { workspace = true }
+ferrum-sampler = { workspace = true }
+ferrum-kv = { workspace = true }
+ferrum-models = { workspace = true }
+
+# Async
 async-trait = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
@@ -32,9 +43,44 @@ chrono = { workspace = true }
 # Metrics
 metrics = { workspace = true }
 
+# ML Framework - Candle
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+hf-hub = { workspace = true }
+tokenizers = { workspace = true }
+safetensors = { workspace = true }
+
+# Random support
+rand = { workspace = true }
+rand_distr = { workspace = true }
+half = { workspace = true }
+ndarray = { version = "0.16.1", optional = true }
+smallvec = "1.11"
+
+# HTTP client for manual downloads
+reqwest = { workspace = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"
 
 [features]
 default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray"]
+
+# Metal dependencies for Apple GPU support (only on macOS/iOS)
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.27.0", optional = true }
+mpsgraph = { version = "0.2.0", optional = true }
+objc2 = { version = "0.6.1", optional = true }
+objc2-foundation = { version = "0.3.1", optional = true }
+bytemuck = { version = "1.23.0", optional = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+metal = { version = "0.27.0", optional = true }
+mpsgraph = { version = "0.2.0", optional = true }
+objc2 = { version = "0.6.1", optional = true }
+objc2-foundation = { version = "0.3.1", optional = true }
+bytemuck = { version = "1.23.0", optional = true }

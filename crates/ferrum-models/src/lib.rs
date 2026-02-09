@@ -1,34 +1,42 @@
-//! # Ferrum Models
-//! 
-//! Abstract model definitions and interfaces for the Ferrum inference framework.
-//! This module provides framework-agnostic abstractions for various LLM architectures.
+//! Ferrum 模型层
 //!
-//! ## Design Principles
-//! 
-//! - No direct dependencies on ML frameworks (Candle, ONNX Runtime, etc.)
-//! - Pure trait definitions and abstract configurations
-//! - Concrete implementations belong in backend-specific crates
-//!
-//! ## Architecture Support
-//! 
-//! The module defines abstractions for:
-//! - Llama family (Llama, Llama2, Llama3)
-//! - Mistral family (Mistral, Mixtral)
-//! - Qwen family (Qwen, Qwen2)
-//! - Other architectures (Phi, Gemma, etc.)
+//! 该 crate 负责围绕 `ferrum-interfaces`/`ferrum-types` 定义的核心抽象
+//! 提供模型定义解析、构建器与权重加载占位实现，确保上层可以在
+//! 重构阶段编译。
 
-pub mod traits;
-pub mod config;
+pub mod architectures;
+pub mod builder;
+pub mod definition;
+pub mod executor;
+pub mod hf_download;
+pub mod loader;
 pub mod registry;
+pub mod source;
+pub mod tensor_wrapper;
 pub mod tokenizer;
+pub mod weights;
 
-// Re-exports
-pub use traits::{
-    Architecture, AbstractModelConfig, ModelBuilder, ModelRegistry,
-    Tokenizer, SpecialTokens, ModelConverter,
-    NormType, Activation, AttentionConfig, RopeScaling,
+pub use architectures::{BertModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper};
+pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
+pub use definition::{ConfigManager, ModelDefinition};
+pub use executor::{
+    extract_logits_safe, BertModelExecutor, CandleModelExecutor, CandleModelExecutorV2,
+    Qwen2ModelExecutor, StubModelExecutor,
 };
-pub use config::ConfigManager;
-pub use registry::DefaultModelRegistry;
-pub use tokenizer::TokenizerWrapper;
+pub use hf_download::HfDownloader;
+pub use loader::SafeTensorsLoader;
+pub use registry::{
+    Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,
+};
+pub use source::{
+    DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ModelSourceResolver,
+    ResolvedModelSource,
+};
+pub use tensor_wrapper::CandleTensorWrapper;
+pub use tokenizer::{TokenizerFactory, TokenizerHandle};
+pub use weights::{default_weight_loader, StubWeightLoader, WeightLoaderHandle};
 
+pub use ferrum_interfaces::{ModelBuilder, ModelExecutor, WeightLoader};
+pub use ferrum_types::{
+    Activation, AttentionConfig, ModelConfig, ModelInfo, ModelType, NormType, Result, RopeScaling,
+};

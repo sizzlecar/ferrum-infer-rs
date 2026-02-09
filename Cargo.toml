@@ -1,11 +1,19 @@
 [workspace]
 members = [
-    "crates/ferrum-core",
+    # New refactored crates
+    "crates/ferrum-types",
+    "crates/ferrum-interfaces",
+    
+    # Implementation crates
+    "crates/ferrum-runtime",
+    "crates/ferrum-scheduler", 
+    "crates/ferrum-tokenizer",
+    "crates/ferrum-sampler",
+    "crates/ferrum-kv",
+    
+    # Existing crates (to be refactored)
     "crates/ferrum-engine",
     "crates/ferrum-models",
-    "crates/ferrum-cache",
-    "crates/ferrum-runtime",
-    "crates/ferrum-scheduler",
     "crates/ferrum-server",
     "crates/ferrum-cli",
 ]
@@ -57,6 +65,7 @@ axum-extra = { version = "0.9", features = ["typed-header"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace", "compression"] }
 hyper = "1.0"
+hyper-util = { version = "0.1", default-features = false, features = ["client", "http1", "http2", "tokio"] }
 http = "1.0"
 http-body = "1.0"
 mime = "0.3"
@@ -74,8 +83,8 @@ colored = "2.1"
 walkdir = "2.4"
 serde_yaml = "0.9"
 
-# HTTP client
-reqwest = "0.12"
+# HTTP client (using rustls to avoid macOS system-configuration issues)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "stream", "json"] }
 
 # Benchmarking
 criterion = "0.5"
@@ -89,27 +98,42 @@ futures = "0.3"
 futures-util = "0.3"
 async-stream = "0.3"
 
-# ML Framework - Candle
-candle-core = "0.7"
-candle-nn = "0.7"
-candle-transformers = "0.7"
-hf-hub = { version = "0.3", features = ["tokio"] }
+# ML Framework - Mock for MVP (Candle to be added later)
+## candle-core = { version = "0.6", default-features = false }
+hf-hub = "0.4.1"
 tokenizers = { version = "0.19", features = ["onig"] }
 safetensors = "0.4"
 
+# Random - 使用与candle-vllm相同的版本
+rand = "0.9.0"
+rand_distr = "0.4.3"
+
 # Tensor operations
 ndarray = "0.15"
-half = "2.4"
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 
-# Internal crates
-ferrum-core = { path = "crates/ferrum-core" }
-ferrum-engine = { path = "crates/ferrum-engine" }
-ferrum-models = { path = "crates/ferrum-models" }
-ferrum-cache = { path = "crates/ferrum-cache" }
+# ML Framework - 使用与candle-vllm相同的git版本
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
+candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
+
+# Internal crates - New refactored crates
+ferrum-types = { path = "crates/ferrum-types" }
+ferrum-interfaces = { path = "crates/ferrum-interfaces" }
+
+# Internal crates - Implementation crates
 ferrum-runtime = { path = "crates/ferrum-runtime" }
 ferrum-scheduler = { path = "crates/ferrum-scheduler" }
+ferrum-tokenizer = { path = "crates/ferrum-tokenizer" }
+ferrum-sampler = { path = "crates/ferrum-sampler" }
+ferrum-kv = { path = "crates/ferrum-kv" }
+
+# Internal crates - Existing crates (to be refactored)
+ferrum-engine = { path = "crates/ferrum-engine" }
+ferrum-models = { path = "crates/ferrum-models" }
 ferrum-server = { path = "crates/ferrum-server" }
 ferrum-cli = { path = "crates/ferrum-cli" }
+
 
 [profile.release]
 opt-level = 3
@@ -119,4 +143,6 @@ strip = true
 
 [profile.bench]
 inherits = "release"
+
+
 

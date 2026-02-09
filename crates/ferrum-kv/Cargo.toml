@@ -1,0 +1,53 @@
+[package]
+name = "ferrum-kv"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Core dependencies - New architecture
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
+
+# Optional runtime dependency for device memory operations
+ferrum-runtime = { workspace = true, optional = true }
+
+# Async
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+# Concurrency
+parking_lot = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utils
+once_cell = { workspace = true }
+
+# Collections
+smallvec = { version = "1.13", features = ["serde"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Math
+half = { workspace = true }
+
+[features]
+default = []
+# Enable integration with ferrum-runtime for device memory
+runtime = ["dep:ferrum-runtime"]
+# Enable compression support
+compression = []
+# Enable detailed metrics and profiling
+profiling = []
+
+[dev-dependencies]
+tokio-test = "0.4"

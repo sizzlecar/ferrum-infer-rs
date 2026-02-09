@@ -2,7 +2,7 @@
 //!
 //! Handles loading and parsing of configuration files for the CLI tool.
 
-use ferrum_core::Result;
+use ferrum_types::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,16 +13,16 @@ use tokio::fs;
 pub struct CliConfig {
     /// Server configuration
     pub server: ServerCliConfig,
-    
+
     /// Model configuration
     pub models: ModelCliConfig,
-    
+
     /// Benchmark configuration
     pub benchmark: BenchmarkConfig,
-    
+
     /// Client configuration
     pub client: ClientConfig,
-    
+
     /// Development configuration
     pub dev: DevConfig,
 }
@@ -32,16 +32,16 @@ pub struct CliConfig {
 pub struct ServerCliConfig {
     /// Default host
     pub host: String,
-    
+
     /// Default port
     pub port: u16,
-    
+
     /// Configuration file path
     pub config_path: String,
-    
+
     /// Log level
     pub log_level: String,
-    
+
     /// Enable hot reload
     pub hot_reload: bool,
 }
@@ -51,16 +51,16 @@ pub struct ServerCliConfig {
 pub struct ModelCliConfig {
     /// Default model directory
     pub model_dir: String,
-    
+
     /// Model cache directory
     pub cache_dir: String,
-    
+
     /// Default model
     pub default_model: Option<String>,
-    
+
     /// Model aliases
     pub aliases: HashMap<String, String>,
-    
+
     /// Download settings
     pub download: DownloadConfig,
 }
@@ -70,13 +70,13 @@ pub struct ModelCliConfig {
 pub struct DownloadConfig {
     /// HuggingFace cache directory
     pub hf_cache_dir: String,
-    
+
     /// Download timeout in seconds
     pub timeout_seconds: u64,
-    
+
     /// Max concurrent downloads
     pub max_concurrent: usize,
-    
+
     /// Retry attempts
     pub retry_attempts: u32,
 }
@@ -86,19 +86,19 @@ pub struct DownloadConfig {
 pub struct BenchmarkConfig {
     /// Default number of requests
     pub num_requests: usize,
-    
+
     /// Default concurrency level
     pub concurrency: usize,
-    
+
     /// Default prompt length
     pub prompt_length: usize,
-    
+
     /// Default max tokens
     pub max_tokens: usize,
-    
+
     /// Warmup requests
     pub warmup_requests: usize,
-    
+
     /// Output directory for reports
     pub output_dir: String,
 }
@@ -108,13 +108,13 @@ pub struct BenchmarkConfig {
 pub struct ClientConfig {
     /// Default API base URL
     pub base_url: String,
-    
+
     /// Default API key
     pub api_key: Option<String>,
-    
+
     /// Request timeout
     pub timeout_seconds: u64,
-    
+
     /// Retry configuration
     pub retry: RetryConfig,
 }
@@ -124,13 +124,13 @@ pub struct ClientConfig {
 pub struct RetryConfig {
     /// Maximum retry attempts
     pub max_attempts: u32,
-    
+
     /// Initial delay in milliseconds
     pub initial_delay_ms: u64,
-    
+
     /// Maximum delay in milliseconds
     pub max_delay_ms: u64,
-    
+
     /// Backoff multiplier
     pub backoff_multiplier: f64,
 }
@@ -140,16 +140,16 @@ pub struct RetryConfig {
 pub struct DevConfig {
     /// Enable debug mode
     pub debug: bool,
-    
+
     /// Profile memory usage
     pub profile_memory: bool,
-    
+
     /// Enable GPU profiling
     pub profile_gpu: bool,
-    
+
     /// Mock backends for testing
     pub mock_backends: bool,
-    
+
     /// Test data directory
     pub test_data_dir: String,
 }
@@ -158,63 +158,83 @@ impl CliConfig {
     /// Load configuration from file
     pub async fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        
+
         if !path.exists() {
             // Create default config file
             let default_config = Self::default();
-            let content = toml::to_string_pretty(&default_config)
-                .map_err(|e| ferrum_core::Error::configuration(format!("Failed to serialize default config: {}", e)))?;
-            
+            let content = toml::to_string_pretty(&default_config).map_err(|e| {
+                ferrum_types::FerrumError::configuration(format!(
+                    "Failed to serialize default config: {}",
+                    e
+                ))
+            })?;
+
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await
-                    .map_err(|e| ferrum_core::Error::io_str(format!("Failed to create config directory: {}", e)))?;
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    ferrum_types::FerrumError::io_str(format!(
+                        "Failed to create config directory: {}",
+                        e
+                    ))
+                })?;
             }
-            
-            fs::write(path, content).await
-                .map_err(|e| ferrum_core::Error::io_str(format!("Failed to write default config: {}", e)))?;
-            
+
+            fs::write(path, content).await.map_err(|e| {
+                ferrum_types::FerrumError::io_str(format!("Failed to write default config: {}", e))
+            })?;
+
             return Ok(default_config);
         }
-        
-        let content = fs::read_to_string(path).await
-            .map_err(|e| ferrum_core::Error::io_str(format!("Failed to read config file: {}", e)))?;
-        
-        toml::from_str(&content)
-            .map_err(|e| ferrum_core::Error::configuration(format!("Failed to parse config: {}", e)))
+
+        let content = fs::read_to_string(path).await.map_err(|e| {
+            ferrum_types::FerrumError::io_str(format!("Failed to read config file: {}", e))
+        })?;
+
+        toml::from_str(&content).map_err(|e| {
+            ferrum_types::FerrumError::configuration(format!("Failed to parse config: {}", e))
+        })
     }
-    
+
     /// Save configuration to file
     pub async fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| ferrum_core::Error::configuration(format!("Failed to serialize config: {}", e)))?;
-        
-        fs::write(path, content).await
-            .map_err(|e| ferrum_core::Error::io_str(format!("Failed to write config file: {}", e)))
+        let content = toml::to_string_pretty(self).map_err(|e| {
+            ferrum_types::FerrumError::configuration(format!("Failed to serialize config: {}", e))
+        })?;
+
+        fs::write(path, content).await.map_err(|e| {
+            ferrum_types::FerrumError::io_str(format!("Failed to write config file: {}", e))
+        })
     }
-    
+
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
         // Validate server config
         if self.server.port == 0 {
-            return Err(ferrum_core::Error::configuration("Server port cannot be 0".to_string()));
-        }
-        
-        // Validate model config
-        if !Path::new(&self.models.model_dir).exists() {
-            return Err(ferrum_core::Error::configuration(
-                format!("Model directory does not exist: {}", self.models.model_dir)
+            return Err(ferrum_types::FerrumError::configuration(
+                "Server port cannot be 0".to_string(),
             ));
         }
-        
+
+        // Validate model config
+        if !Path::new(&self.models.model_dir).exists() {
+            return Err(ferrum_types::FerrumError::configuration(format!(
+                "Model directory does not exist: {}",
+                self.models.model_dir
+            )));
+        }
+
         // Validate benchmark config
         if self.benchmark.num_requests == 0 {
-            return Err(ferrum_core::Error::configuration("Number of requests cannot be 0".to_string()));
+            return Err(ferrum_types::FerrumError::configuration(
+                "Number of requests cannot be 0".to_string(),
+            ));
         }
-        
+
         if self.benchmark.concurrency == 0 {
-            return Err(ferrum_core::Error::configuration("Concurrency cannot be 0".to_string()));
+            return Err(ferrum_types::FerrumError::configuration(
+                "Concurrency cannot be 0".to_string(),
+            ));
         }
-        
+
         Ok(())
     }
 }
@@ -258,8 +278,12 @@ impl Default for ModelCliConfig {
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            hf_cache_dir: dirs::cache_dir()
-                .map(|p| p.join("huggingface").to_string_lossy().to_string())
+            hf_cache_dir: std::env::var("HF_HOME")
+                .ok()
+                .or_else(|| {
+                    dirs::home_dir()
+                        .map(|h| h.join(".cache/huggingface").to_string_lossy().to_string())
+                })
                 .unwrap_or_else(|| "./hf_cache".to_string()),
             timeout_seconds: 300,
             max_concurrent: 4,
