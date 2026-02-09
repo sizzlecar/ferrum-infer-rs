@@ -29,7 +29,6 @@ target
 /hf_cache
 .cargo_home/
 DOWNLOAD_PROGRESS_IMPROVEMENT.md
-.gitignore
 IMPLEMENTATION_SUMMARY.md
 QUICKSTART.md
 docs/registry_pattern_explanation.md
