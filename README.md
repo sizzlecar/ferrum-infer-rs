@@ -1,84 +1,149 @@
-# Ferrum Infer (Rust) — vLLM‑inspired Inference Core (Pre‑alpha)
+# Ferrum Infer (Rust)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Ferrum Infer is a Rust workspace for local LLM inference with an Ollama-like CLI and an
+OpenAI-compatible HTTP server entrypoint.
 
-Ferrum Infer is a Rust research project exploring vLLM‑style LLM inference. The repository currently focuses on clean abstractions (traits) and crate layout. There is no end‑to‑end runnable server yet.
+Current phase: MVP is runnable, but still evolving quickly.
 
-## ⚠️ Project Status
+## Project Status
 
-- **Pre‑alpha / Work in Progress**
-- **Interfaces only**: most modules expose traits and skeletons; many implementations are placeholders
-- **Not production‑ready**: APIs and code structure will change
+- MVP available: local chat, embedding generation, model pull/list, HTTP serving.
+- Not production-ready yet: APIs and internals may change.
+- Focus is correctness, cross-platform build stability, and iterative performance work.
 
-## ✨ Goals (aligned with vLLM)
+## What Works Today
 
-- **PagedAttention KV cache** with block tables and memory swapping
-- **Continuous batching** (prefill/decode separation, token‑level scheduling)
-- **Prefix cache / prompt deduplication**
-- **Backend abstraction** (Candle/ONNX Runtime; CUDA/ROCm/Metal/CPU)
-- **OpenAI‑compatible API** with streaming
+- CLI commands:
+  - `ferrum run` interactive chat
+  - `ferrum embed` BERT embeddings
+  - `ferrum pull` download from Hugging Face
+  - `ferrum list` inspect local model cache (ready/incomplete)
+  - `ferrum serve` start HTTP server
+  - `ferrum stop` stop server by PID file
+- Inference stack:
+  - Candle-based runtime path
+  - Model loading from Hugging Face cache/snapshots
+  - Streaming text generation in CLI
+- Server endpoints:
+  - `POST /v1/chat/completions`
+  - `GET /v1/models`
+  - `GET /health`
 
-## 📦 Crate Overview
+## Known Limits
 
-- `crates/ferrum-core`: core types and traits (`InferenceEngine`, `Backend`, `Scheduler`, `BatchManager`, `CacheManager`, `MemoryManager`, `Model`)
-- `crates/ferrum-engine`: engine skeleton (executor, batch manager, paged KV cache, attention interfaces)
-- `crates/ferrum-models`: model abstractions and config
-- `crates/ferrum-cache`: cache traits and types
-- `crates/ferrum-runtime`: runtime and device/memory abstractions
-- `crates/ferrum-scheduler`: scheduling/batching configuration types
-- `crates/ferrum-server`: OpenAI‑compatible data types (HTTP server not implemented)
-- `crates/ferrum-cli`: CLI scaffolding (TBD)
+- Still pre-production: limited hardening/observability.
+- Feature/performance differs by model architecture and device backend.
+- CUDA builds require CUDA toolchain on host.
+- Some models may appear as `incomplete` in cache if snapshot is partial.
 
-## ✅ What Exists Today
+## Quick Start
 
-- Well‑scoped traits for engine, backend, scheduler, cache, memory, and models
-- Skeletons for paged KV cache and attention with placeholder logic
-- OpenAI‑compatible request/response types under `ferrum-server`
+Prerequisites:
 
-## 🚫 Not Implemented Yet
+- Rust stable toolchain
+- Network access to Hugging Face for model pull
+- Optional private model token: `HF_TOKEN`
 
-- Real backends (Candle/ORT) and model execution
-- FlashAttention/PagedAttention GPU kernels and efficient memory management
-- Prefill/Decode separation, preemption, prefix cache reuse
-- OpenAI HTTP server, SSE streaming, auth, and metrics wiring
-- Benchmarks and performance guarantees
-
-## 🔧 Build
-
-Prerequisites: Rust 1.70+ (latest stable recommended)
+Build CLI:
 
 ```bash
-git clone https://github.com/sizzlecar/ferrum-infer-rs.git
-cd ferrum-infer-rs
-cargo build
+cargo build --release -p ferrum-cli --bin ferrum
 ```
 
-Note: Building succeeds for trait/skeleton crates; running a server is not supported yet.
+Show help:
 
-## 🗺️ Roadmap (high‑level)
+```bash
+./target/release/ferrum --help
+```
 
-1) MVP
-- Plug in Candle backend, tokenizer, and basic sampling
-- Single‑node dynamic batching, naive per‑sequence KV cache
-- OpenAI `/v1/chat/completions` with streaming (SSE)
+Download a model:
 
-2) vLLM‑style features
-- PagedAttention: block tables, allocation/eviction/compaction, GPU/CPU swap
-- Prefill/Decode separation, token‑level continuous batching, prefix cache reuse
-- Scheduler with fairness/priority and bucketed padding
+```bash
+./target/release/ferrum pull Qwen/Qwen2.5-0.5B-Instruct
+```
 
-3) Performance and scale
-- FlashAttention/fused kernels via FFI; quantization options
-- Multi‑GPU (tensor/pipeline parallel), improved observability and benchmarks
+List local models:
 
-## 🤝 Contributing
+```bash
+./target/release/ferrum list
+```
 
-Contributions are welcome! The project is rapidly evolving; please open an issue to discuss design/implementation before large changes.
+Run interactive chat:
 
-## 📝 License
+```bash
+./target/release/ferrum run Qwen/Qwen2.5-0.5B-Instruct
+```
 
-Licensed under the MIT License. See `LICENSE`.
+Start server:
 
-## 🙏 Acknowledgements
+```bash
+./target/release/ferrum serve --model Qwen/Qwen2.5-0.5B-Instruct --host 127.0.0.1 --port 8000
+```
 
-Inspired by the design principles behind vLLM and Rust community projects (Candle, Axum, Tokio).
+Stop server:
+
+```bash
+./target/release/ferrum stop
+```
+
+## Workspace Layout
+
+Core contracts:
+
+- `crates/ferrum-types`
+- `crates/ferrum-interfaces`
+
+Implementations:
+
+- `crates/ferrum-runtime`
+- `crates/ferrum-scheduler`
+- `crates/ferrum-tokenizer`
+- `crates/ferrum-sampler`
+- `crates/ferrum-kv`
+- `crates/ferrum-models`
+- `crates/ferrum-engine`
+- `crates/ferrum-server`
+- `crates/ferrum-cli`
+
+## Build and Validation
+
+Use the same checks as CI:
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -A warnings
+cargo build -p ferrum-cli --bin ferrum
+cargo test -p ferrum-cli --test cli_e2e
+```
+
+Useful local full pass:
+
+```bash
+cargo test --workspace
+```
+
+## Device Notes
+
+- CPU path works cross-platform.
+- Metal path is for Apple targets (`feature = "metal"`).
+- CUDA path is optional and environment-dependent.
+
+## Cache and Environment
+
+- Default config file: `ferrum.toml`
+- Hugging Face cache defaults to `~/.cache/huggingface` (override via `HF_HOME`)
+- Private model token:
+  - `HF_TOKEN`
+  - `HUGGING_FACE_HUB_TOKEN`
+
+## Roadmap (Near Term)
+
+1. Improve model download resilience (`resume/retry/cleanup` for partial snapshots).
+2. Expand CI gates and regression tests for cross-platform device paths.
+3. Improve runtime performance and backend parity.
+4. Continue OpenAI API compatibility and operational hardening.
+
+## License
+
+MIT. See `LICENSE`.
