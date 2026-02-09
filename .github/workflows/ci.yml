@@ -45,3 +45,8 @@ jobs:
       - name: Clippy (advisory)
         run: cargo clippy --workspace --all-targets -- -A warnings
         continue-on-error: true
+
+      - name: CLI E2E smoke tests
+        run: |
+          cargo build -p ferrum-cli --bin ferrum
+          cargo test -p ferrum-cli --test cli_e2e
