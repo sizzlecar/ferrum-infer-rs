@@ -99,6 +99,17 @@ impl Default for ComponentMetadata {
     }
 }
 
+fn cpu_cuda_and_optional_metal_devices() -> Vec<Device> {
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    {
+        vec![Device::CPU, Device::CUDA(0), Device::Metal]
+    }
+    #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+    {
+        vec![Device::CPU, Device::CUDA(0)]
+    }
+}
+
 // ============================================================================
 // Component Registry
 // ============================================================================
@@ -478,7 +489,7 @@ impl ComponentFactory<Arc<dyn ComputeBackend>> for CandleBackendFactory {
             name: "candle".to_string(),
             version: "0.1.0".to_string(),
             description: "Candle compute backend for CPU/GPU inference".to_string(),
-            supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
+            supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec!["fp16".to_string(), "fp32".to_string(), "bf16".to_string()],
         }
     }
@@ -717,7 +728,7 @@ impl ComponentFactory<Arc<dyn Scheduler + Send + Sync>> for ContinuousBatchSched
             version: "0.1.0".to_string(),
             description: "Continuous batching scheduler with iteration-level scheduling"
                 .to_string(),
-            supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
+            supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec![
                 "continuous_batching".to_string(),
                 "preemption".to_string(),
@@ -762,7 +773,7 @@ impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for DefaultKvCacheF
             name: "default".to_string(),
             version: "0.1.0".to_string(),
             description: "Default contiguous KV cache manager".to_string(),
-            supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
+            supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec!["contiguous".to_string()],
         }
     }
@@ -805,7 +816,7 @@ impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for PagedKvCacheFac
             name: "paged".to_string(),
             version: "0.1.0".to_string(),
             description: "Paged KV cache manager for PagedAttention".to_string(),
-            supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
+            supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec![
                 "paged".to_string(),
                 "copy_on_write".to_string(),
@@ -932,6 +943,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
 
         let dtype = match &config.device {
             Device::CPU => DType::F32,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             Device::Metal => std::env::var("FERRUM_METAL_DTYPE")
                 .ok()
                 .and_then(|v| parse_dtype(&v))
@@ -941,7 +953,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                         .and_then(|v| parse_dtype(&v))
                 })
                 .unwrap_or(DType::F32),
-            _ => std::env::var("FERRUM_DTYPE")
+            Device::CUDA(_) | Device::ROCm(_) => std::env::var("FERRUM_DTYPE")
                 .ok()
                 .and_then(|v| parse_dtype(&v))
                 .unwrap_or(DType::F16),
@@ -1041,7 +1053,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             name: "candle".to_string(),
             version: "0.1.0".to_string(),
             description: "Candle-based model executor".to_string(),
-            supported_devices: vec![Device::CPU, Device::CUDA(0), Device::Metal],
+            supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec![
                 "llama".to_string(),
                 "qwen2".to_string(),
