@@ -421,6 +421,24 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn test_fifo_request_state_transitions() {
+        let config = SchedulerConfig::default();
+        let scheduler = FifoScheduler::new(config);
+
+        let request = create_test_request(Priority::Normal);
+        let id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        assert_eq!(scheduler.request_state(&id), Some(RequestState::Waiting));
+
+        let _batch = scheduler.next_batch(BatchHint::simple(1)).await;
+        assert_eq!(scheduler.request_state(&id), Some(RequestState::Running));
+
+        scheduler.cancel(id.clone()).await.unwrap();
+        assert_eq!(scheduler.request_state(&id), None);
+    }
+
     #[test]
     fn test_metrics_tracker() {
         let tracker = MetricsTracker::new();
