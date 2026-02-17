@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -35,6 +35,7 @@ pub struct DefaultInferenceEngine {
     concurrency_limiter: Arc<Semaphore>,
     active_requests: Arc<AtomicUsize>,
     waiting_requests: Arc<AtomicUsize>,
+    admission_lock: Arc<Mutex<()>>,
     effective_max_running_requests: usize,
     serialized_executor: bool,
 }
@@ -103,12 +104,15 @@ impl DefaultInferenceEngine {
             concurrency_limiter: Arc::new(Semaphore::new(effective_max_running_requests)),
             active_requests: Arc::new(AtomicUsize::new(0)),
             waiting_requests: Arc::new(AtomicUsize::new(0)),
+            admission_lock: Arc::new(Mutex::new(())),
             effective_max_running_requests,
             serialized_executor,
         }
     }
 
     async fn admit_request(&self, request: &InferenceRequest) -> Result<()> {
+        // Serialize submit+batch selection so each request can reliably claim its own admission.
+        let _admission_guard = self.admission_lock.lock().await;
         let request_id = self.scheduler.submit(request.clone()).await?;
         let hint = BatchHint {
             max_batch_size: 1,
@@ -120,14 +124,31 @@ impl DefaultInferenceEngine {
 
         let maybe_batch = self.scheduler.next_batch(hint).await;
         if let Some(batch) = maybe_batch {
-            if !batch.requests.iter().any(|r| r.request.id == request_id) {
+            if batch.requests.iter().any(|r| r.request.id == request_id) {
+                Ok(())
+            } else {
+                if let Err(cancel_err) = self.scheduler.cancel(request_id.clone()).await {
+                    warn!(
+                        "Failed to rollback scheduler state for request {} after mismatched batch: {}",
+                        request_id, cancel_err
+                    );
+                }
                 warn!(
-                    "Scheduler started a different request while admitting {}, continuing",
+                    "Scheduler selected a different request while admitting {}",
                     request_id
                 );
+                Err(FerrumError::scheduler(format!(
+                    "Scheduler selected a different request while admitting {}",
+                    request_id
+                )))
             }
-            Ok(())
         } else {
+            if let Err(cancel_err) = self.scheduler.cancel(request_id.clone()).await {
+                warn!(
+                    "Failed to rollback scheduler state for request {} after empty batch: {}",
+                    request_id, cancel_err
+                );
+            }
             Err(FerrumError::scheduler(format!(
                 "Scheduler returned no batch for admitted request {}",
                 request_id
@@ -325,8 +346,8 @@ impl DefaultInferenceEngine {
 impl InferenceEngine for DefaultInferenceEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
         request.sampling_params.validate()?;
-        self.admit_request(&request).await?;
         let _inflight_guard = self.acquire_inflight_guard().await?;
+        self.admit_request(&request).await?;
         let result = self.execute_request(&request).await;
 
         match &result {
@@ -357,8 +378,8 @@ impl InferenceEngine for DefaultInferenceEngine {
         request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         request.sampling_params.validate()?;
-        self.admit_request(&request).await?;
         let inflight_guard = self.acquire_inflight_guard().await?;
+        self.admit_request(&request).await?;
         let (tx, rx) = mpsc::channel(100);
 
         // Clone components for async task
