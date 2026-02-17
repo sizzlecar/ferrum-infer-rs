@@ -1,6 +1,7 @@
 //! Main inference engine - MVP implementation
 
 use async_trait::async_trait;
+use ferrum_interfaces::sampler::{SamplingConfigBuilder, SamplingContext};
 use ferrum_interfaces::{
     engine::InferenceEngine, KvCacheHandle, KvCacheManager, ModelExecutor, Sampler,
     SchedulerInterface as Scheduler, Tokenizer,
@@ -13,10 +14,12 @@ use futures::stream::Stream;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 use rand::RngCore;
 use rand::{rngs::StdRng, SeedableRng};
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 use std::sync::OnceLock;
@@ -29,6 +32,22 @@ pub struct DefaultInferenceEngine {
     sampler: Arc<dyn Sampler + Send + Sync>,
     _kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+    concurrency_limiter: Arc<Semaphore>,
+    active_requests: Arc<AtomicUsize>,
+    waiting_requests: Arc<AtomicUsize>,
+    effective_max_running_requests: usize,
+    serialized_executor: bool,
+}
+
+struct InflightGuard {
+    _permit: OwnedSemaphorePermit,
+    active_requests: Arc<AtomicUsize>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.active_requests.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl DefaultInferenceEngine {
@@ -40,7 +59,39 @@ impl DefaultInferenceEngine {
         kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     ) -> Self {
-        info!("Created DefaultInferenceEngine");
+        let configured_max_running = config.scheduler.max_running_requests.max(1);
+        let model_type_name = model_executor
+            .info()
+            .model_type
+            .to_string()
+            .to_ascii_lowercase();
+        let model_id_name = model_executor
+            .info()
+            .model_id
+            .to_string()
+            .to_ascii_lowercase();
+        let serialized_executor =
+            model_type_name.contains("qwen") || model_id_name.contains("qwen");
+        let effective_max_running_requests = if serialized_executor {
+            1
+        } else {
+            configured_max_running
+        };
+
+        if serialized_executor && configured_max_running > 1 {
+            warn!(
+                "Executor for model '{}' is serialized for correctness (configured max_running_requests={}, effective={})",
+                model_executor.info().model_id,
+                configured_max_running,
+                effective_max_running_requests
+            );
+        }
+
+        info!(
+            "Created DefaultInferenceEngine (configured_max_running_requests={}, effective_max_running_requests={})",
+            configured_max_running,
+            effective_max_running_requests
+        );
 
         Self {
             config,
@@ -49,7 +100,29 @@ impl DefaultInferenceEngine {
             sampler,
             _kv_cache: kv_cache,
             model_executor,
+            concurrency_limiter: Arc::new(Semaphore::new(effective_max_running_requests)),
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            waiting_requests: Arc::new(AtomicUsize::new(0)),
+            effective_max_running_requests,
+            serialized_executor,
         }
+    }
+
+    async fn acquire_inflight_guard(&self) -> Result<InflightGuard> {
+        self.waiting_requests.fetch_add(1, Ordering::SeqCst);
+        let permit = self
+            .concurrency_limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| FerrumError::scheduler("Inference engine concurrency limiter closed"))?;
+        self.waiting_requests.fetch_sub(1, Ordering::SeqCst);
+
+        self.active_requests.fetch_add(1, Ordering::SeqCst);
+        Ok(InflightGuard {
+            _permit: permit,
+            active_requests: self.active_requests.clone(),
+        })
     }
 
     /// Execute single inference request
@@ -145,6 +218,7 @@ impl DefaultInferenceEngine {
 #[async_trait]
 impl InferenceEngine for DefaultInferenceEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
+        let _inflight_guard = self.acquire_inflight_guard().await?;
         self.execute_request(&request).await
     }
 
@@ -152,6 +226,7 @@ impl InferenceEngine for DefaultInferenceEngine {
         &self,
         request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        let inflight_guard = self.acquire_inflight_guard().await?;
         let (tx, rx) = mpsc::channel(100);
 
         // Clone components for async task
@@ -163,6 +238,8 @@ impl InferenceEngine for DefaultInferenceEngine {
         let sampling_params = request.sampling_params.clone();
 
         tokio::spawn(async move {
+            let _inflight_guard = inflight_guard;
+
             // 1. Tokenize
             let input_tokens = match tokenizer.encode(&request.prompt, true) {
                 Ok(tokens) => tokens,
@@ -308,8 +385,8 @@ impl InferenceEngine for DefaultInferenceEngine {
         EngineStatus {
             is_ready: true,
             loaded_models: vec![self.config.model.model_id.clone()],
-            active_requests: 0,
-            queued_requests: 0,
+            active_requests: self.active_requests.load(Ordering::Relaxed),
+            queued_requests: self.waiting_requests.load(Ordering::Relaxed),
             memory_usage: ferrum_types::MemoryUsage {
                 total_bytes: 0,
                 used_bytes: 0,
@@ -326,7 +403,10 @@ impl InferenceEngine for DefaultInferenceEngine {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        info!("Shutting down engine");
+        info!(
+            "Shutting down engine (effective_max_running_requests={}, serialized_executor={})",
+            self.effective_max_running_requests, self.serialized_executor
+        );
         Ok(())
     }
 
@@ -423,9 +503,6 @@ fn sample_token(
     rng: &mut StdRng,
     all_tokens: &[TokenId],
 ) -> Result<TokenId> {
-    #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
-    let _ = all_tokens;
-
     // Fast path (greedy): avoid transferring full vocab logits to CPU.
     // If the backend provides an on-device argmax, we only read back 1 scalar token id.
     if params.temperature == 0.0 || (sampler.is_deterministic() && sampler.name() == "greedy") {
@@ -443,9 +520,100 @@ fn sample_token(
         }
     }
 
-    // Fallback: transfer full logits to CPU and sample there.
-    let logits_vec = logits.to_vec_f32()?;
-    sampler.sample(&logits_vec, rng)
+    // Fallback: transfer logits to CPU and run the full sampling pipeline so
+    // top-k/top-p/repetition/presence/frequency penalties are respected.
+    let mut logits_vec = logits.to_vec_f32()?;
+    let token_frequencies = build_token_frequencies(all_tokens);
+    apply_presence_frequency_penalties(
+        &mut logits_vec,
+        &token_frequencies,
+        params.presence_penalty,
+        params.frequency_penalty,
+    );
+
+    let mut builder = SamplingConfigBuilder::new()
+        .with_temperature(params.temperature)
+        .with_repetition_penalty(params.repetition_penalty)
+        .with_sampler(Box::new(ArcSampler::new(sampler.clone())));
+    if let Some(top_k) = params.top_k {
+        builder = builder.with_top_k(top_k);
+    }
+    if params.top_p < 1.0 {
+        builder = builder.with_top_p(params.top_p);
+    }
+    let config = builder.build();
+
+    let vocab_size = logits_vec.len();
+    let step = all_tokens.len();
+    let ctx = SamplingContext::new(
+        step,
+        params,
+        &mut logits_vec,
+        all_tokens,
+        &token_frequencies,
+        vocab_size,
+    );
+
+    config.sample(ctx, rng)
+}
+
+struct ArcSampler {
+    inner: Arc<dyn Sampler + Send + Sync>,
+}
+
+impl ArcSampler {
+    fn new(inner: Arc<dyn Sampler + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Sampler for ArcSampler {
+    fn sample(&self, logits: &[f32], rng: &mut dyn rand::RngCore) -> Result<TokenId> {
+        self.inner.sample(logits, rng)
+    }
+
+    fn sample_with_context(
+        &self,
+        ctx: &SamplingContext,
+        rng: &mut dyn rand::RngCore,
+    ) -> Result<TokenId> {
+        self.inner.sample_with_context(ctx, rng)
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn is_deterministic(&self) -> bool {
+        self.inner.is_deterministic()
+    }
+}
+
+fn build_token_frequencies(tokens: &[TokenId]) -> HashMap<TokenId, usize> {
+    let mut frequencies = HashMap::new();
+    for &token in tokens {
+        *frequencies.entry(token).or_insert(0) += 1;
+    }
+    frequencies
+}
+
+fn apply_presence_frequency_penalties(
+    logits: &mut [f32],
+    token_frequencies: &HashMap<TokenId, usize>,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+) {
+    if presence_penalty == 0.0 && frequency_penalty == 0.0 {
+        return;
+    }
+
+    for (&token_id, &freq) in token_frequencies {
+        let idx = token_id.get() as usize;
+        if idx < logits.len() {
+            let penalty = presence_penalty + (frequency_penalty * freq as f32);
+            logits[idx] -= penalty;
+        }
+    }
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
