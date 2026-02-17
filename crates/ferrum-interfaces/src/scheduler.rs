@@ -35,6 +35,12 @@ pub trait Scheduler: Send + Sync {
     /// Get scheduler configuration
     fn config(&self) -> &TypesSchedulerConfig;
 
+    /// Get current request state if the request is tracked by scheduler.
+    fn request_state(&self, request_id: &RequestId) -> Option<RequestState> {
+        let _ = request_id;
+        None
+    }
+
     /// Preempt running request (if supported)
     async fn preempt(&self, _request_id: RequestId) -> Result<PreemptionResult> {
         // Default implementation: preemption not supported
