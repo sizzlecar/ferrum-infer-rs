@@ -9,8 +9,11 @@ use ferrum_interfaces::{
     },
     BlockTable, KvCacheHandle, ModelExecutor, TensorRef,
 };
-use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
-use std::sync::Arc;
+use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tracing::{debug, info};
 
 use crate::architectures::llama::LlamaModelWrapper;
@@ -22,7 +25,149 @@ use parking_lot::Mutex;
 pub struct CandleModelExecutor {
     model: Arc<LlamaModelWrapper>,
     info: ModelInfo,
-    current_cache: Arc<Mutex<Option<LlamaCache>>>,
+}
+
+struct LlamaKvCacheShared {
+    cache: Mutex<LlamaCache>,
+    sequence_length: AtomicUsize,
+}
+
+struct LlamaKvCacheHandle {
+    shared: Arc<LlamaKvCacheShared>,
+    block_table: BlockTable,
+    device: Device,
+    num_layers: usize,
+    num_heads: usize,
+    head_dim: usize,
+}
+
+impl std::fmt::Debug for LlamaKvCacheHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlamaKvCacheHandle")
+            .field("num_tokens", &self.num_tokens())
+            .field("num_layers", &self.num_layers)
+            .field("num_heads", &self.num_heads)
+            .field("head_dim", &self.head_dim)
+            .finish()
+    }
+}
+
+impl Clone for LlamaKvCacheHandle {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            block_table: self.block_table.clone(),
+            device: self.device.clone(),
+            num_layers: self.num_layers,
+            num_heads: self.num_heads,
+            head_dim: self.head_dim,
+        }
+    }
+}
+
+impl LlamaKvCacheHandle {
+    fn new(cache: LlamaCache, info: &ModelInfo, sequence_length: usize) -> Self {
+        let mut block_table = BlockTable::new(16);
+        block_table.sequence_length = sequence_length;
+
+        Self {
+            shared: Arc::new(LlamaKvCacheShared {
+                cache: Mutex::new(cache),
+                sequence_length: AtomicUsize::new(sequence_length),
+            }),
+            block_table,
+            device: info.device.clone(),
+            num_layers: info.num_layers,
+            num_heads: info.num_heads,
+            head_dim: if info.num_heads > 0 {
+                info.hidden_size / info.num_heads
+            } else {
+                0
+            },
+        }
+    }
+
+    fn cache(&self) -> &Mutex<LlamaCache> {
+        &self.shared.cache
+    }
+
+    fn advance_tokens(&self, delta: usize) {
+        self.shared
+            .sequence_length
+            .fetch_add(delta, Ordering::Relaxed);
+    }
+}
+
+impl KvCacheHandle for LlamaKvCacheHandle {
+    fn block_table(&self) -> &BlockTable {
+        &self.block_table
+    }
+
+    fn block_table_mut(&mut self) -> &mut BlockTable {
+        &mut self.block_table
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn device(&self) -> Device {
+        self.device.clone()
+    }
+
+    fn num_tokens(&self) -> usize {
+        self.shared.sequence_length.load(Ordering::Relaxed)
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    fn num_heads(&self) -> usize {
+        self.num_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    fn key_cache(&self, _layer: usize) -> ferrum_types::Result<Option<TensorRef>> {
+        Ok(None)
+    }
+
+    fn value_cache(&self, _layer: usize) -> ferrum_types::Result<Option<TensorRef>> {
+        Ok(None)
+    }
+
+    fn clone_handle(&self) -> ferrum_types::Result<Arc<dyn KvCacheHandle>> {
+        Ok(Arc::new(self.clone()))
+    }
+
+    fn stats(&self) -> ferrum_interfaces::kv_cache::CacheHandleStats {
+        let tokens = self.num_tokens();
+        let memory_bytes = tokens
+            .saturating_mul(self.num_layers)
+            .saturating_mul(self.num_heads.max(1))
+            .saturating_mul(self.head_dim.max(1))
+            .saturating_mul(2)
+            .saturating_mul(2);
+
+        ferrum_interfaces::kv_cache::CacheHandleStats {
+            memory_bytes,
+            blocks_allocated: self.block_table.num_blocks(),
+            tokens_stored: tokens,
+            utilization: 0.0,
+            last_access: std::time::Instant::now(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        true
+    }
+
+    fn cache_id(&self) -> String {
+        format!("llama-cache-{:p}", Arc::as_ptr(&self.shared))
+    }
 }
 
 impl CandleModelExecutor {
@@ -33,7 +178,6 @@ impl CandleModelExecutor {
         Self {
             model: Arc::new(model),
             info,
-            current_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -48,6 +192,27 @@ impl CandleModelExecutor {
     /// Wrap Candle tensor as TensorRef
     fn wrap_tensor(&self, tensor: Tensor) -> TensorRef {
         Arc::new(CandleTensorWrapper::new(tensor))
+    }
+
+    fn tensor_to_token_ids(&self, tensor: &TensorRef) -> Result<Vec<u32>> {
+        if let Ok(tokens) = tensor.to_vec_u32() {
+            if tokens.is_empty() {
+                return Err(FerrumError::model("Input token tensor is empty"));
+            }
+            return Ok(tokens);
+        }
+
+        if let Ok(tokens_f32) = tensor.to_vec_f32() {
+            let tokens: Vec<u32> = tokens_f32.into_iter().map(|x| x as u32).collect();
+            if tokens.is_empty() {
+                return Err(FerrumError::model("Input token tensor is empty"));
+            }
+            return Ok(tokens);
+        }
+
+        Err(FerrumError::model(
+            "Unable to extract token IDs from input tensor",
+        ))
     }
 }
 
@@ -64,24 +229,17 @@ impl ModelExecutor for CandleModelExecutor {
             input.sequence_length()
         );
 
-        // WORKAROUND: Since we can't safely extract from TensorRef,
-        // we expect the input to contain raw u32 token IDs
-        // The engine layer should create Candle tensors directly
-
-        // For now, create a dummy forward pass
-        // The real implementation needs the engine to pass token IDs, not TensorRef
-        let input_tensor = self.tokens_to_tensor(&[1, 2])?; // Dummy tokens
+        let token_ids = self.tensor_to_token_ids(&input.input_ids)?;
+        let input_tensor = self.tokens_to_tensor(&token_ids)?;
 
         // Forward pass - creates new cache
         let (logits, cache) = self.model.forward_prefill(&input_tensor)?;
 
-        // Store cache for future decode steps
-        *self.current_cache.lock() = Some(cache);
-
         let logits_ref = self.wrap_tensor(logits);
 
-        // Create dummy KV cache handle
-        let kv_cache = create_dummy_kv_cache(self.info.num_layers, input.sequence_length());
+        // Create per-request KV cache handle, so parallel requests do not share state.
+        let kv_cache: Arc<dyn KvCacheHandle> =
+            Arc::new(LlamaKvCacheHandle::new(cache, &self.info, token_ids.len()));
 
         Ok(PrefillOutput::new(logits_ref, kv_cache))
     }
@@ -89,22 +247,26 @@ impl ModelExecutor for CandleModelExecutor {
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         debug!("Decode: batch={}", input.batch_size());
 
-        // WORKAROUND: Same as prefill
-        let input_tensor = self.tokens_to_tensor(&[1])?; // Dummy token
+        let token_ids = self.tensor_to_token_ids(&input.input_ids)?;
+        let input_tensor = self.tokens_to_tensor(&token_ids)?;
 
-        // Get current position from KV cache
-        let pos = input.kv_cache.num_tokens();
+        let cache_handle = input
+            .kv_cache
+            .as_any()
+            .downcast_ref::<LlamaKvCacheHandle>()
+            .ok_or_else(|| {
+                FerrumError::model("Invalid KV cache handle type for CandleModelExecutor")
+            })?;
 
         // Forward pass with cache
         let logits = {
-            let mut cache_lock = self.current_cache.lock();
-            let cache = cache_lock.as_mut().ok_or_else(|| {
-                FerrumError::model("No cache available - must call prefill first")
-            })?;
-
+            let pos = cache_handle.num_tokens();
+            let mut cache = cache_handle.cache().lock();
             self.model
-                .forward_decode_with_cache(&input_tensor, pos, cache)?
+                .forward_decode_with_cache(&input_tensor, pos, &mut cache)?
         };
+
+        cache_handle.advance_tokens(token_ids.len());
 
         let logits_ref = self.wrap_tensor(logits);
 
@@ -224,86 +386,6 @@ impl CandleModelExecutorV2 {
 
         Ok(logits_vec)
     }
-}
-
-/// Create dummy KV cache handle
-fn create_dummy_kv_cache(num_layers: usize, seq_len: usize) -> Arc<dyn KvCacheHandle> {
-    use ferrum_interfaces::kv_cache::CacheHandleStats;
-    use ferrum_types::Device;
-
-    #[derive(Debug, Clone)]
-    struct DummyKvCache {
-        block_table: BlockTable,
-        num_layers: usize,
-    }
-
-    impl KvCacheHandle for DummyKvCache {
-        fn block_table(&self) -> &BlockTable {
-            &self.block_table
-        }
-
-        fn block_table_mut(&mut self) -> &mut BlockTable {
-            &mut self.block_table
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn device(&self) -> Device {
-            Device::CPU
-        }
-
-        fn num_layers(&self) -> usize {
-            self.num_layers
-        }
-
-        fn num_heads(&self) -> usize {
-            32
-        }
-
-        fn head_dim(&self) -> usize {
-            64
-        }
-
-        fn key_cache(&self, _layer: usize) -> ferrum_types::Result<Option<TensorRef>> {
-            Ok(None)
-        }
-
-        fn value_cache(&self, _layer: usize) -> ferrum_types::Result<Option<TensorRef>> {
-            Ok(None)
-        }
-
-        fn clone_handle(&self) -> ferrum_types::Result<Arc<dyn KvCacheHandle>> {
-            Ok(Arc::new(self.clone()))
-        }
-
-        fn stats(&self) -> CacheHandleStats {
-            CacheHandleStats {
-                memory_bytes: 0,
-                blocks_allocated: self.block_table.num_blocks(),
-                tokens_stored: self.block_table.sequence_length,
-                utilization: 0.0,
-                last_access: std::time::Instant::now(),
-            }
-        }
-
-        fn is_valid(&self) -> bool {
-            true
-        }
-
-        fn cache_id(&self) -> String {
-            "dummy-cache".to_string()
-        }
-    }
-
-    let mut block_table = BlockTable::new(16);
-    block_table.sequence_length = seq_len;
-
-    Arc::new(DummyKvCache {
-        block_table,
-        num_layers,
-    })
 }
 
 /// Helper to extract logits from Candle tensor safely
