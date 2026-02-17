@@ -525,7 +525,10 @@ impl Default for CpuBackend {
 
 // Helper function
 fn get_cpu_tensor(tensor: &TensorRef) -> Result<&CpuTensor> {
-    // This is a simplified implementation - in practice we'd need proper downcasting
-    // For now, we'll assume all tensors in CPU backend are CpuTensor
-    unimplemented!("Proper tensor downcasting not implemented in this simplified version")
+    tensor.as_any().downcast_ref::<CpuTensor>().ok_or_else(|| {
+        ferrum_types::FerrumError::backend(format!(
+            "Expected CpuTensor for CPU backend ops, got tensor on {:?}",
+            tensor.device()
+        ))
+    })
 }
