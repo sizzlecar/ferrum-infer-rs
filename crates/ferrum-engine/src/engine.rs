@@ -8,13 +8,14 @@ use ferrum_interfaces::{
 };
 use ferrum_types::{
     EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest, InferenceResponse,
-    Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
+    RequestId, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
 };
 use futures::stream::Stream;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 use rand::RngCore;
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -48,6 +49,135 @@ struct InflightGuard {
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.active_requests.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn spawn_cleanup_task<F>(fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(fut);
+        }
+        Err(e) => {
+            warn!(
+                "Skipping async cleanup task because no Tokio runtime is active: {}",
+                e
+            );
+        }
+    }
+}
+
+struct SchedulerFinalizationGuard {
+    request_id: RequestId,
+    scheduler: Arc<dyn Scheduler + Send + Sync>,
+    admitted: bool,
+    finalized: bool,
+}
+
+impl SchedulerFinalizationGuard {
+    fn new(request_id: RequestId, scheduler: Arc<dyn Scheduler + Send + Sync>) -> Self {
+        Self {
+            request_id,
+            scheduler,
+            admitted: false,
+            finalized: false,
+        }
+    }
+
+    fn mark_admitted(&mut self) {
+        self.admitted = true;
+    }
+
+    async fn complete_now(&mut self, response: &InferenceResponse) -> Result<()> {
+        self.scheduler
+            .complete(self.request_id.clone(), response)
+            .await?;
+        self.finalized = true;
+        Ok(())
+    }
+
+    async fn cancel_now(&mut self) -> Result<()> {
+        if self.admitted {
+            self.scheduler.cancel(self.request_id.clone()).await?;
+        }
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for SchedulerFinalizationGuard {
+    fn drop(&mut self) {
+        if !self.admitted || self.finalized {
+            return;
+        }
+
+        let request_id = self.request_id.clone();
+        let scheduler = self.scheduler.clone();
+        spawn_cleanup_task(async move {
+            if let Err(e) = scheduler.cancel(request_id.clone()).await {
+                warn!(
+                    "Best-effort cleanup failed to cancel request {} in scheduler: {}",
+                    request_id, e
+                );
+            }
+        });
+    }
+}
+
+struct KvReservationGuard {
+    request_id: RequestId,
+    kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+    reserved: bool,
+    cleaned: bool,
+}
+
+impl KvReservationGuard {
+    fn new(request_id: RequestId, kv_cache: Arc<dyn KvCacheManager + Send + Sync>) -> Self {
+        Self {
+            request_id,
+            kv_cache,
+            reserved: false,
+            cleaned: false,
+        }
+    }
+
+    fn mark_reserved(&mut self) {
+        self.reserved = true;
+    }
+
+    async fn deallocate_now(&mut self, context: &str) {
+        if !self.reserved || self.cleaned {
+            return;
+        }
+
+        if let Err(e) = self.kv_cache.deallocate(self.request_id.clone()).await {
+            warn!(
+                "Failed to deallocate KV cache for request {} ({}): {}",
+                self.request_id, context, e
+            );
+        }
+        self.cleaned = true;
+    }
+}
+
+impl Drop for KvReservationGuard {
+    fn drop(&mut self) {
+        if !self.reserved || self.cleaned {
+            return;
+        }
+
+        let request_id = self.request_id.clone();
+        let kv_cache = self.kv_cache.clone();
+        spawn_cleanup_task(async move {
+            if let Err(e) = kv_cache.deallocate(request_id.clone()).await {
+                warn!(
+                    "Best-effort cleanup failed to deallocate KV cache for request {}: {}",
+                    request_id, e
+                );
+            }
+        });
     }
 }
 
@@ -233,6 +363,7 @@ impl DefaultInferenceEngine {
     async fn execute_request(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
         let request_id = request.id.clone();
         debug!("Executing request: {:?}", request_id);
+        let mut kv_guard = KvReservationGuard::new(request.id.clone(), self.kv_cache.clone());
 
         // 1. Tokenize prompt
         let input_tokens = self.tokenizer.encode(&request.prompt, true)?;
@@ -243,6 +374,7 @@ impl DefaultInferenceEngine {
         // Reserve KV cache resources for this request lifecycle.
         self.reserve_request_kv_cache(request, prompt_tokens)
             .await?;
+        kv_guard.mark_reserved();
 
         let result = async {
             // 2. Prepare prefill input
@@ -331,12 +463,7 @@ impl DefaultInferenceEngine {
         }
         .await;
 
-        if let Err(e) = self.kv_cache.deallocate(request.id.clone()).await {
-            warn!(
-                "Failed to deallocate KV cache for request {}: {}",
-                request.id, e
-            );
-        }
+        kv_guard.deallocate_now("sync-infer").await;
 
         result
     }
@@ -347,30 +474,46 @@ impl InferenceEngine for DefaultInferenceEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
         request.sampling_params.validate()?;
         let _inflight_guard = self.acquire_inflight_guard().await?;
+        let mut scheduler_guard =
+            SchedulerFinalizationGuard::new(request.id.clone(), self.scheduler.clone());
         self.admit_request(&request).await?;
+        scheduler_guard.mark_admitted();
         let result = self.execute_request(&request).await;
 
-        match &result {
+        match result {
             Ok(response) => {
-                if let Err(e) = self.scheduler.complete(request.id.clone(), response).await {
+                if let Err(complete_err) = scheduler_guard.complete_now(&response).await {
                     warn!(
                         "Failed to mark request {} complete in scheduler: {}",
-                        request.id, e
+                        request.id, complete_err
                     );
+                    if let Err(cancel_err) = scheduler_guard.cancel_now().await {
+                        return Err(FerrumError::scheduler(format!(
+                            "Scheduler completion failed for request {}: {}. Rollback cancel also failed: {}",
+                            request.id, complete_err, cancel_err
+                        )));
+                    }
+
+                    return Err(FerrumError::scheduler(format!(
+                        "Scheduler completion failed for request {}: {}",
+                        request.id, complete_err
+                    )));
                 }
+
+                Ok(response)
             }
             Err(e) => {
                 warn!("Request {} failed: {}", request.id, e);
-                if let Err(cancel_err) = self.scheduler.cancel(request.id.clone()).await {
-                    warn!(
-                        "Failed to cancel request {} in scheduler after error: {}",
-                        request.id, cancel_err
-                    );
+                if let Err(cancel_err) = scheduler_guard.cancel_now().await {
+                    return Err(FerrumError::scheduler(format!(
+                        "Request {} failed with error '{}', and scheduler cancel failed: {}",
+                        request.id, e, cancel_err
+                    )));
                 }
+
+                Err(e)
             }
         }
-
-        result
     }
 
     async fn infer_stream(
@@ -379,14 +522,16 @@ impl InferenceEngine for DefaultInferenceEngine {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         request.sampling_params.validate()?;
         let inflight_guard = self.acquire_inflight_guard().await?;
+        let mut scheduler_guard =
+            SchedulerFinalizationGuard::new(request.id.clone(), self.scheduler.clone());
         self.admit_request(&request).await?;
+        scheduler_guard.mark_admitted();
         let (tx, rx) = mpsc::channel(100);
 
         // Clone components for async task
         let tokenizer = self.tokenizer.clone();
         let sampler = self.sampler.clone();
         let model_executor = self.model_executor.clone();
-        let scheduler = self.scheduler.clone();
         let kv_cache = self.kv_cache.clone();
         let request_id = request.id.clone();
         let max_tokens = request.sampling_params.max_tokens;
@@ -394,7 +539,8 @@ impl InferenceEngine for DefaultInferenceEngine {
 
         tokio::spawn(async move {
             let _inflight_guard = inflight_guard;
-            let mut kv_cache_reserved = false;
+            let mut scheduler_guard = scheduler_guard;
+            let mut kv_guard = KvReservationGuard::new(request_id.clone(), kv_cache.clone());
 
             let generation_result: Result<InferenceResponse> = async {
                 // 1. Tokenize
@@ -409,7 +555,7 @@ impl InferenceEngine for DefaultInferenceEngine {
                     prompt_tokens,
                 )
                 .await?;
-                kv_cache_reserved = true;
+                kv_guard.mark_reserved();
 
                 // 2. Prefill
                 let prefill_input =
@@ -497,17 +643,30 @@ impl InferenceEngine for DefaultInferenceEngine {
             }
             .await;
 
-            if kv_cache_reserved {
-                if let Err(e) = kv_cache.deallocate(request_id.clone()).await {
-                    warn!(
-                        "Failed to deallocate KV cache for streaming request {}: {}",
-                        request_id, e
-                    );
-                }
-            }
+            kv_guard.deallocate_now("stream-infer").await;
 
             match generation_result {
                 Ok(response) => {
+                    if let Err(complete_err) = scheduler_guard.complete_now(&response).await {
+                        warn!(
+                            "Failed to mark streaming request {} complete in scheduler: {}",
+                            request_id, complete_err
+                        );
+                        if let Err(cancel_err) = scheduler_guard.cancel_now().await {
+                            warn!(
+                                "Failed to rollback streaming request {} after completion failure: {}",
+                                request_id, cancel_err
+                            );
+                        }
+                        let _ = tx
+                            .send(Err(FerrumError::scheduler(format!(
+                                "Scheduler completion failed for request {}: {}",
+                                request_id, complete_err
+                            ))))
+                            .await;
+                        return;
+                    }
+
                     let final_chunk = StreamChunk {
                         request_id: request_id.clone(),
                         text: String::new(),
@@ -523,25 +682,12 @@ impl InferenceEngine for DefaultInferenceEngine {
                             "Streaming consumer disconnected before final chunk for request {}",
                             request_id
                         );
-                        if let Err(cancel_err) = scheduler.cancel(request_id.clone()).await {
-                            warn!(
-                                "Failed to cancel request {} after stream disconnect: {}",
-                                request_id, cancel_err
-                            );
-                        }
                         return;
-                    }
-
-                    if let Err(e) = scheduler.complete(request_id.clone(), &response).await {
-                        warn!(
-                            "Failed to mark streaming request {} complete in scheduler: {}",
-                            request_id, e
-                        );
                     }
                 }
                 Err(e) => {
                     let _ = tx.send(Err(e.clone())).await;
-                    if let Err(cancel_err) = scheduler.cancel(request_id.clone()).await {
+                    if let Err(cancel_err) = scheduler_guard.cancel_now().await {
                         warn!(
                             "Failed to cancel request {} after stream error: {}",
                             request_id, cancel_err
