@@ -468,6 +468,22 @@ impl Scheduler for PriorityScheduler {
         &self.config
     }
 
+    fn request_state(&self, request_id: &RequestId) -> Option<RequestState> {
+        if self.running_requests.read().contains_key(request_id) {
+            return Some(RequestState::Running);
+        }
+
+        if let Some(req) = self.request_map.read().get(request_id) {
+            return Some(req.state);
+        }
+
+        if self.waiting_queue.read().get_priority(request_id).is_some() {
+            return Some(RequestState::Waiting);
+        }
+
+        None
+    }
+
     async fn preempt(&self, request_id: RequestId) -> Result<PreemptionResult> {
         // Simple preemption: can preempt lower priority running requests
         let mut running_requests = self.running_requests.write();

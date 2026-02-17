@@ -324,6 +324,23 @@ impl Scheduler for FifoScheduler {
         &self.config
     }
 
+    fn request_state(&self, request_id: &RequestId) -> Option<RequestState> {
+        if self.running_requests.read().contains_key(request_id) {
+            return Some(RequestState::Running);
+        }
+
+        if self
+            .waiting_queue
+            .read()
+            .iter()
+            .any(|req| req.request.id == *request_id)
+        {
+            return Some(RequestState::Waiting);
+        }
+
+        None
+    }
+
     async fn preempt(&self, _request_id: RequestId) -> Result<PreemptionResult> {
         Err(ferrum_types::FerrumError::unsupported(
             "FIFO scheduler does not support preemption",

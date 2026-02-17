@@ -8,7 +8,7 @@ use ferrum_interfaces::{
 };
 use ferrum_types::{
     EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest, InferenceResponse,
-    RequestId, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
+    RequestId, RequestState, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
 };
 use futures::stream::Stream;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -19,7 +19,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use std::time::Duration;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -36,7 +37,6 @@ pub struct DefaultInferenceEngine {
     concurrency_limiter: Arc<Semaphore>,
     active_requests: Arc<AtomicUsize>,
     waiting_requests: Arc<AtomicUsize>,
-    admission_lock: Arc<Mutex<()>>,
     effective_max_running_requests: usize,
     serialized_executor: bool,
 }
@@ -234,56 +234,79 @@ impl DefaultInferenceEngine {
             concurrency_limiter: Arc::new(Semaphore::new(effective_max_running_requests)),
             active_requests: Arc::new(AtomicUsize::new(0)),
             waiting_requests: Arc::new(AtomicUsize::new(0)),
-            admission_lock: Arc::new(Mutex::new(())),
             effective_max_running_requests,
             serialized_executor,
         }
     }
 
     async fn admit_request(&self, request: &InferenceRequest) -> Result<()> {
-        // Serialize submit+batch selection so each request can reliably claim its own admission.
-        let _admission_guard = self.admission_lock.lock().await;
         let request_id = self.scheduler.submit(request.clone()).await?;
+        let max_batch_size = self.effective_max_running_requests.max(1);
+        let per_request_tokens = request.sampling_params.max_tokens.max(1);
         let hint = BatchHint {
-            max_batch_size: 1,
-            max_tokens: request.sampling_params.max_tokens.max(1),
+            max_batch_size,
+            max_tokens: per_request_tokens.saturating_mul(max_batch_size),
             target_latency_ms: Some(0),
             available_memory: None,
             resource_constraints: Default::default(),
         };
 
-        let maybe_batch = self.scheduler.next_batch(hint).await;
-        if let Some(batch) = maybe_batch {
-            if batch.requests.iter().any(|r| r.request.id == request_id) {
-                Ok(())
-            } else {
-                if let Err(cancel_err) = self.scheduler.cancel(request_id.clone()).await {
-                    warn!(
-                        "Failed to rollback scheduler state for request {} after mismatched batch: {}",
-                        request_id, cancel_err
-                    );
+        let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.scheduler.request_state(&request_id) {
+                Some(RequestState::Running) => return Ok(()),
+                Some(RequestState::Cancelled) => {
+                    return Err(FerrumError::scheduler(format!(
+                        "Scheduler cancelled request {} during admission",
+                        request_id
+                    )))
                 }
-                warn!(
-                    "Scheduler selected a different request while admitting {}",
-                    request_id
-                );
-                Err(FerrumError::scheduler(format!(
-                    "Scheduler selected a different request while admitting {}",
-                    request_id
-                )))
+                Some(RequestState::Failed) => {
+                    return Err(FerrumError::scheduler(format!(
+                        "Scheduler failed request {} during admission",
+                        request_id
+                    )))
+                }
+                Some(RequestState::Completed) => {
+                    return Err(FerrumError::scheduler(format!(
+                        "Scheduler completed request {} before execution started",
+                        request_id
+                    )))
+                }
+                Some(RequestState::Waiting | RequestState::Preempted) | None => {}
             }
-        } else {
-            if let Err(cancel_err) = self.scheduler.cancel(request_id.clone()).await {
-                warn!(
-                    "Failed to rollback scheduler state for request {} after empty batch: {}",
-                    request_id, cancel_err
-                );
+
+            if let Some(batch) = self.scheduler.next_batch(hint.clone()).await {
+                if batch.requests.iter().any(|r| r.request.id == request_id) {
+                    return Ok(());
+                }
             }
-            Err(FerrumError::scheduler(format!(
-                "Scheduler returned no batch for admitted request {}",
-                request_id
-            )))
+
+            if let Some(RequestState::Running) = self.scheduler.request_state(&request_id) {
+                return Ok(());
+            }
+
+            if tokio::time::Instant::now() >= admission_deadline {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
+
+        if let Err(cancel_err) = self.scheduler.cancel(request_id.clone()).await {
+            warn!(
+                "Failed to rollback scheduler state for request {} after admission timeout: {}",
+                request_id, cancel_err
+            );
+            return Err(FerrumError::scheduler(format!(
+                "Timed out admitting request {} and rollback cancel also failed: {}",
+                request_id, cancel_err
+            )));
+        }
+
+        Err(FerrumError::timeout(format!(
+            "Timed out admitting request {} after 10s",
+            request_id
+        )))
     }
 
     async fn reserve_request_kv_cache_with(

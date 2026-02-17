@@ -701,6 +701,20 @@ impl Scheduler for ContinuousBatchScheduler {
         &self.config
     }
 
+    fn request_state(&self, request_id: &RequestId) -> Option<RequestState> {
+        self.request_index
+            .read()
+            .get(request_id)
+            .copied()
+            .map(|phase| match phase {
+                RequestPhase::Waiting => RequestState::Waiting,
+                RequestPhase::Prefilling | RequestPhase::Decoding => RequestState::Running,
+                RequestPhase::Completed => RequestState::Completed,
+                RequestPhase::Preempted => RequestState::Preempted,
+                RequestPhase::Cancelled => RequestState::Cancelled,
+            })
+    }
+
     async fn preempt(&self, request_id: RequestId) -> Result<PreemptionResult> {
         if !self.cb_config.enable_swapping {
             return Err(FerrumError::unsupported("Swapping is not enabled"));
