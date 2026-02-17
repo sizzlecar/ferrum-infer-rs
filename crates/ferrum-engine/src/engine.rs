@@ -149,6 +149,7 @@ impl DefaultInferenceEngine {
         let mut all_tokens: Vec<TokenId> = input_tokens.clone();
         let mut kv_cache = prefill_output.kv_cache.clone();
         let mut rng = create_rng(&request.sampling_params);
+        let mut stop_reason: Option<FinishReason> = None;
 
         for step in 0..max_tokens {
             // Get logits from last position
@@ -160,7 +161,7 @@ impl DefaultInferenceEngine {
                     create_decode_input(&generated_tokens, kv_cache.clone(), device)?;
                 let decode_output = self.model_executor.decode(&decode_input).await?;
                 kv_cache = decode_output.kv_cache.clone();
-                decode_output.logits.clone()
+                extract_last_token_logits(&decode_output.logits)?
             };
 
             // Sample next token
@@ -175,6 +176,7 @@ impl DefaultInferenceEngine {
             // Check stop conditions
             if is_stop_token(next_token, self.model_executor.info().vocab_size) {
                 debug!("Hit EOS token at step {}", step);
+                stop_reason = Some(FinishReason::EOS);
                 break;
             }
 
@@ -184,6 +186,7 @@ impl DefaultInferenceEngine {
             // Check stop sequences
             if check_stop_sequences(&generated_tokens, &request.sampling_params, &self.tokenizer)? {
                 debug!("Hit stop sequence at step {}", step);
+                stop_reason = Some(FinishReason::Stop);
                 break;
             }
         }
@@ -202,11 +205,7 @@ impl DefaultInferenceEngine {
             request_id,
             text: generated_text,
             tokens: generated_tokens.clone(),
-            finish_reason: determine_finish_reason(
-                generated_tokens.len(),
-                max_tokens,
-                &request.sampling_params,
-            ),
+            finish_reason: determine_finish_reason(stop_reason, generated_tokens.len(), max_tokens),
             usage: TokenUsage::new(prompt_tokens, generated_tokens.len()),
             latency_ms: 0, // TODO: measure actual latency
             created_at: chrono::Utc::now(),
@@ -218,6 +217,7 @@ impl DefaultInferenceEngine {
 #[async_trait]
 impl InferenceEngine for DefaultInferenceEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
+        request.sampling_params.validate()?;
         let _inflight_guard = self.acquire_inflight_guard().await?;
         self.execute_request(&request).await
     }
@@ -226,6 +226,7 @@ impl InferenceEngine for DefaultInferenceEngine {
         &self,
         request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        request.sampling_params.validate()?;
         let inflight_guard = self.acquire_inflight_guard().await?;
         let (tx, rx) = mpsc::channel(100);
 
@@ -273,6 +274,7 @@ impl InferenceEngine for DefaultInferenceEngine {
             let mut kv_cache = prefill_output.kv_cache.clone();
             let mut rng = create_rng(&sampling_params);
             let mut accumulated_text = String::new();
+            let mut stop_reason: Option<FinishReason> = None;
 
             for step in 0..max_tokens {
                 let logits = if step == 0 {
@@ -292,7 +294,13 @@ impl InferenceEngine for DefaultInferenceEngine {
                         Ok(input) => match model_executor.decode(&input).await {
                             Ok(output) => {
                                 kv_cache = output.kv_cache.clone();
-                                output.logits
+                                match extract_last_token_logits(&output.logits) {
+                                    Ok(logits) => logits,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e)).await;
+                                        return;
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
@@ -321,6 +329,7 @@ impl InferenceEngine for DefaultInferenceEngine {
                 };
 
                 if is_stop_token(next_token, model_executor.info().vocab_size) {
+                    stop_reason = Some(FinishReason::EOS);
                     break;
                 }
 
@@ -352,7 +361,10 @@ impl InferenceEngine for DefaultInferenceEngine {
 
                 // Check stop sequences
                 match check_stop_sequences(&generated_tokens, &sampling_params, &tokenizer) {
-                    Ok(true) => break,
+                    Ok(true) => {
+                        stop_reason = Some(FinishReason::Stop);
+                        break;
+                    }
                     Ok(false) => continue,
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
@@ -367,9 +379,9 @@ impl InferenceEngine for DefaultInferenceEngine {
                 text: String::new(),
                 token: None,
                 finish_reason: Some(determine_finish_reason(
+                    stop_reason,
                     generated_tokens.len(),
                     max_tokens,
-                    &sampling_params,
                 )),
                 usage: Some(TokenUsage::new(input_tokens.len(), generated_tokens.len())),
                 created_at: chrono::Utc::now(),
@@ -492,8 +504,68 @@ fn create_decode_input(
 fn extract_last_token_logits(
     logits: &ferrum_interfaces::TensorRef,
 ) -> Result<ferrum_interfaces::TensorRef> {
-    // MVP: return as-is for now
-    Ok(logits.clone())
+    let shape = logits.shape();
+    if let Some(candle_tensor) = logits
+        .as_any()
+        .downcast_ref::<ferrum_models::tensor_wrapper::CandleTensorWrapper>()
+    {
+        use candle_core::IndexOp;
+        let inner = candle_tensor.inner();
+        let extracted = match shape.len() {
+            1 => inner.clone(),
+            2 => {
+                let batch = shape[0];
+                let vocab = shape[1];
+                if batch == 0 || vocab == 0 {
+                    return Err(FerrumError::model("Invalid 2D logits shape"));
+                }
+                inner
+                    .i(batch - 1)
+                    .map_err(|e| FerrumError::model(format!("Index 2D logits failed: {}", e)))?
+            }
+            3 => {
+                let batch = shape[0];
+                let seq = shape[1];
+                let vocab = shape[2];
+                if batch == 0 || seq == 0 || vocab == 0 {
+                    return Err(FerrumError::model("Invalid 3D logits shape"));
+                }
+                inner
+                    .i((batch - 1, seq - 1))
+                    .map_err(|e| FerrumError::model(format!("Index 3D logits failed: {}", e)))?
+            }
+            4 => {
+                let batch = shape[0];
+                let seq = shape[1];
+                let extra = shape[2];
+                let vocab = shape[3];
+                if batch == 0 || seq == 0 || extra == 0 || vocab == 0 {
+                    return Err(FerrumError::model("Invalid 4D logits shape"));
+                }
+                inner
+                    .i((batch - 1, seq - 1, 0))
+                    .map_err(|e| FerrumError::model(format!("Index 4D logits failed: {}", e)))?
+            }
+            _ => {
+                return Err(FerrumError::model(format!(
+                    "Unsupported logits rank {}, expected 1D/2D/3D/4D",
+                    shape.len()
+                )))
+            }
+        };
+
+        return Ok(Arc::new(
+            ferrum_models::tensor_wrapper::CandleTensorWrapper::new(extracted),
+        ));
+    }
+
+    match shape.len() {
+        1..=4 => Ok(logits.clone()),
+        _ => Err(FerrumError::model(format!(
+            "Unsupported logits rank {}, expected 1D/2D/3D/4D",
+            shape.len()
+        ))),
+    }
 }
 
 fn sample_token(
@@ -716,8 +788,8 @@ fn create_rng(params: &SamplingParams) -> StdRng {
     if let Some(seed) = params.seed {
         StdRng::seed_from_u64(seed)
     } else {
-        // Use a default seed for deterministic testing if no seed provided
-        StdRng::seed_from_u64(42)
+        let mut os_rng = rand::rng();
+        StdRng::from_rng(&mut os_rng)
     }
 }
 
@@ -756,13 +828,51 @@ fn check_stop_sequences(
 }
 
 fn determine_finish_reason(
+    stop_reason: Option<FinishReason>,
     generated_len: usize,
     max_tokens: usize,
-    _params: &SamplingParams,
 ) -> FinishReason {
+    if let Some(reason) = stop_reason {
+        return reason;
+    }
+
     if generated_len >= max_tokens {
         FinishReason::Length
     } else {
         FinishReason::EOS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device as CandleDevice, Tensor};
+    use ferrum_models::tensor_wrapper::CandleTensorWrapper;
+
+    #[test]
+    fn extract_last_token_logits_uses_last_sequence_position() {
+        let values: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        let tensor = Tensor::new(values.as_slice(), &CandleDevice::Cpu)
+            .expect("create tensor")
+            .reshape((1, 3, 4))
+            .expect("reshape tensor");
+        let logits_ref: ferrum_interfaces::TensorRef = Arc::new(CandleTensorWrapper::new(tensor));
+
+        let last = extract_last_token_logits(&logits_ref).expect("extract last logits");
+        let sampled = last.to_vec_f32().expect("to_vec_f32");
+
+        assert_eq!(sampled, vec![8.0, 9.0, 10.0, 11.0]);
+    }
+
+    #[test]
+    fn determine_finish_reason_prefers_explicit_reason() {
+        let reason = determine_finish_reason(Some(FinishReason::Stop), 10, 100);
+        assert_eq!(reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn determine_finish_reason_falls_back_to_length() {
+        let reason = determine_finish_reason(None, 64, 64);
+        assert_eq!(reason, FinishReason::Length);
     }
 }
