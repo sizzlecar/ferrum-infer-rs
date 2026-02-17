@@ -658,6 +658,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_priority_request_state_transitions() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let request = create_test_request_with_priority(Priority::Normal);
+        let request_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        assert_eq!(
+            scheduler.request_state(&request_id),
+            Some(RequestState::Waiting)
+        );
+
+        let _batch = scheduler.next_batch(BatchHint::simple(1)).await;
+        assert_eq!(
+            scheduler.request_state(&request_id),
+            Some(RequestState::Running)
+        );
+
+        scheduler.cancel(request_id.clone()).await.unwrap();
+        assert_eq!(scheduler.request_state(&request_id), None);
+    }
+
+    #[tokio::test]
     async fn test_priority_update() {
         let config = SchedulerConfig::default();
         let scheduler = PriorityScheduler::new(config);
