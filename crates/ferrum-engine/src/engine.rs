@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use ferrum_interfaces::sampler::{SamplingConfigBuilder, SamplingContext};
 use ferrum_interfaces::{
-    engine::InferenceEngine, KvCacheHandle, KvCacheManager, ModelExecutor, Sampler,
-    SchedulerInterface as Scheduler, Tokenizer,
+    engine::InferenceEngine, AllocationRequest, BatchHint, KvCacheHandle, KvCacheManager,
+    ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
 use ferrum_types::{
     EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest, InferenceResponse,
@@ -27,10 +27,10 @@ use std::sync::OnceLock;
 /// Default inference engine - MVP implementation
 pub struct DefaultInferenceEngine {
     config: EngineConfig,
-    _scheduler: Arc<dyn Scheduler + Send + Sync>,
+    scheduler: Arc<dyn Scheduler + Send + Sync>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
     sampler: Arc<dyn Sampler + Send + Sync>,
-    _kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+    kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     concurrency_limiter: Arc<Semaphore>,
     active_requests: Arc<AtomicUsize>,
@@ -95,10 +95,10 @@ impl DefaultInferenceEngine {
 
         Self {
             config,
-            _scheduler: scheduler,
+            scheduler,
             tokenizer,
             sampler,
-            _kv_cache: kv_cache,
+            kv_cache,
             model_executor,
             concurrency_limiter: Arc::new(Semaphore::new(effective_max_running_requests)),
             active_requests: Arc::new(AtomicUsize::new(0)),
@@ -106,6 +106,89 @@ impl DefaultInferenceEngine {
             effective_max_running_requests,
             serialized_executor,
         }
+    }
+
+    async fn admit_request(&self, request: &InferenceRequest) -> Result<()> {
+        let request_id = self.scheduler.submit(request.clone()).await?;
+        let hint = BatchHint {
+            max_batch_size: 1,
+            max_tokens: request.sampling_params.max_tokens.max(1),
+            target_latency_ms: Some(0),
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let maybe_batch = self.scheduler.next_batch(hint).await;
+        if let Some(batch) = maybe_batch {
+            if !batch.requests.iter().any(|r| r.request.id == request_id) {
+                warn!(
+                    "Scheduler started a different request while admitting {}, continuing",
+                    request_id
+                );
+            }
+            Ok(())
+        } else {
+            Err(FerrumError::scheduler(format!(
+                "Scheduler returned no batch for admitted request {}",
+                request_id
+            )))
+        }
+    }
+
+    async fn reserve_request_kv_cache_with(
+        kv_cache: &Arc<dyn KvCacheManager + Send + Sync>,
+        model_executor: &Arc<dyn ModelExecutor + Send + Sync>,
+        request: &InferenceRequest,
+        prompt_tokens: usize,
+    ) -> Result<()> {
+        let info = model_executor.info();
+        let num_heads = info.num_heads.max(1);
+        let head_dim = (info.hidden_size / num_heads).max(1);
+        let allocation = AllocationRequest {
+            request_id: request.id.clone(),
+            initial_tokens: prompt_tokens,
+            max_sequence_length: prompt_tokens
+                .saturating_add(request.sampling_params.max_tokens)
+                .max(1),
+            num_layers: info.num_layers.max(1),
+            num_heads,
+            head_dim,
+            device: info.device.clone(),
+            dtype: info.dtype,
+            priority: request.priority,
+        };
+
+        if !kv_cache.can_allocate(&allocation) {
+            return Err(FerrumError::resource_exhausted(format!(
+                "KV cache cannot allocate for request {}",
+                request.id
+            )));
+        }
+
+        kv_cache
+            .allocate(&allocation)
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                FerrumError::resource_exhausted(format!(
+                    "KV cache allocation failed for request {}: {}",
+                    request.id, e
+                ))
+            })
+    }
+
+    async fn reserve_request_kv_cache(
+        &self,
+        request: &InferenceRequest,
+        prompt_tokens: usize,
+    ) -> Result<()> {
+        Self::reserve_request_kv_cache_with(
+            &self.kv_cache,
+            &self.model_executor,
+            request,
+            prompt_tokens,
+        )
+        .await
     }
 
     async fn acquire_inflight_guard(&self) -> Result<InflightGuard> {
@@ -136,199 +219,51 @@ impl DefaultInferenceEngine {
 
         debug!("Encoded {} tokens from prompt", prompt_tokens);
 
-        // 2. Prepare prefill input
-        let device = &self.model_executor.info().device;
-        let prefill_input = create_prefill_input(&input_tokens, device)?;
+        // Reserve KV cache resources for this request lifecycle.
+        self.reserve_request_kv_cache(request, prompt_tokens)
+            .await?;
 
-        // 3. Execute prefill
-        let prefill_output = self.model_executor.prefill(&prefill_input).await?;
+        let result = async {
+            // 2. Prepare prefill input
+            let device = &self.model_executor.info().device;
+            let prefill_input = create_prefill_input(&input_tokens, device)?;
 
-        // 4. Generate tokens (decode loop)
-        let max_tokens = request.sampling_params.max_tokens;
-        let mut generated_tokens = Vec::new();
-        let mut all_tokens: Vec<TokenId> = input_tokens.clone();
-        let mut kv_cache = prefill_output.kv_cache.clone();
-        let mut rng = create_rng(&request.sampling_params);
-        let mut stop_reason: Option<FinishReason> = None;
+            // 3. Execute prefill
+            let prefill_output = self.model_executor.prefill(&prefill_input).await?;
 
-        for step in 0..max_tokens {
-            // Get logits from last position
-            let logits = if step == 0 {
-                extract_last_token_logits(&prefill_output.logits)?
-            } else {
-                // Decode step
-                let decode_input =
-                    create_decode_input(&generated_tokens, kv_cache.clone(), device)?;
-                let decode_output = self.model_executor.decode(&decode_input).await?;
-                kv_cache = decode_output.kv_cache.clone();
-                extract_last_token_logits(&decode_output.logits)?
-            };
-
-            // Sample next token
-            let next_token = sample_token(
-                &logits,
-                &request.sampling_params,
-                &self.sampler,
-                &mut rng,
-                &all_tokens,
-            )?;
-
-            // Check stop conditions
-            if is_stop_token(next_token, self.model_executor.info().vocab_size) {
-                debug!("Hit EOS token at step {}", step);
-                stop_reason = Some(FinishReason::EOS);
-                break;
-            }
-
-            generated_tokens.push(next_token);
-            all_tokens.push(next_token);
-
-            // Check stop sequences
-            if check_stop_sequences(&generated_tokens, &request.sampling_params, &self.tokenizer)? {
-                debug!("Hit stop sequence at step {}", step);
-                stop_reason = Some(FinishReason::Stop);
-                break;
-            }
-        }
-
-        // 5. Decode output tokens
-        let generated_text = self.tokenizer.decode(&generated_tokens, true)?;
-
-        debug!(
-            "Generated {} tokens: {}",
-            generated_tokens.len(),
-            generated_text
-        );
-
-        // 6. Build response
-        Ok(InferenceResponse {
-            request_id,
-            text: generated_text,
-            tokens: generated_tokens.clone(),
-            finish_reason: determine_finish_reason(stop_reason, generated_tokens.len(), max_tokens),
-            usage: TokenUsage::new(prompt_tokens, generated_tokens.len()),
-            latency_ms: 0, // TODO: measure actual latency
-            created_at: chrono::Utc::now(),
-            metadata: std::collections::HashMap::new(),
-        })
-    }
-}
-
-#[async_trait]
-impl InferenceEngine for DefaultInferenceEngine {
-    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
-        request.sampling_params.validate()?;
-        let _inflight_guard = self.acquire_inflight_guard().await?;
-        self.execute_request(&request).await
-    }
-
-    async fn infer_stream(
-        &self,
-        request: InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        request.sampling_params.validate()?;
-        let inflight_guard = self.acquire_inflight_guard().await?;
-        let (tx, rx) = mpsc::channel(100);
-
-        // Clone components for async task
-        let tokenizer = self.tokenizer.clone();
-        let sampler = self.sampler.clone();
-        let model_executor = self.model_executor.clone();
-        let request_id = request.id.clone();
-        let max_tokens = request.sampling_params.max_tokens;
-        let sampling_params = request.sampling_params.clone();
-
-        tokio::spawn(async move {
-            let _inflight_guard = inflight_guard;
-
-            // 1. Tokenize
-            let input_tokens = match tokenizer.encode(&request.prompt, true) {
-                Ok(tokens) => tokens,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            // 2. Prefill
-            let prefill_input =
-                match create_prefill_input(&input_tokens, &model_executor.info().device) {
-                    Ok(input) => input,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-
-            let prefill_output = match model_executor.prefill(&prefill_input).await {
-                Ok(output) => output,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            // 3. Decode loop - stream each token
+            // 4. Generate tokens (decode loop)
+            let max_tokens = request.sampling_params.max_tokens;
             let mut generated_tokens = Vec::new();
-            let mut all_tokens: Vec<TokenId> = input_tokens.iter().copied().collect();
+            let mut all_tokens: Vec<TokenId> = input_tokens.clone();
             let mut kv_cache = prefill_output.kv_cache.clone();
-            let mut rng = create_rng(&sampling_params);
-            let mut accumulated_text = String::new();
+            let mut rng = create_rng(&request.sampling_params);
             let mut stop_reason: Option<FinishReason> = None;
 
             for step in 0..max_tokens {
+                // Get logits from last position
                 let logits = if step == 0 {
-                    match extract_last_token_logits(&prefill_output.logits) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = tx.send(Err(e)).await;
-                            return;
-                        }
-                    }
+                    extract_last_token_logits(&prefill_output.logits)?
                 } else {
-                    match create_decode_input(
-                        &generated_tokens,
-                        kv_cache.clone(),
-                        &model_executor.info().device,
-                    ) {
-                        Ok(input) => match model_executor.decode(&input).await {
-                            Ok(output) => {
-                                kv_cache = output.kv_cache.clone();
-                                match extract_last_token_logits(&output.logits) {
-                                    Ok(logits) => logits,
-                                    Err(e) => {
-                                        let _ = tx.send(Err(e)).await;
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(e)).await;
-                                return;
-                            }
-                        },
-                        Err(e) => {
-                            let _ = tx.send(Err(e)).await;
-                            return;
-                        }
-                    }
+                    // Decode step
+                    let decode_input =
+                        create_decode_input(&generated_tokens, kv_cache.clone(), device)?;
+                    let decode_output = self.model_executor.decode(&decode_input).await?;
+                    kv_cache = decode_output.kv_cache.clone();
+                    extract_last_token_logits(&decode_output.logits)?
                 };
 
-                let next_token = match sample_token(
+                // Sample next token
+                let next_token = sample_token(
                     &logits,
-                    &sampling_params,
-                    &sampler,
+                    &request.sampling_params,
+                    &self.sampler,
                     &mut rng,
                     &all_tokens,
-                ) {
-                    Ok(token) => token,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
+                )?;
 
-                if is_stop_token(next_token, model_executor.info().vocab_size) {
+                // Check stop conditions
+                if is_stop_token(next_token, self.model_executor.info().vocab_size) {
+                    debug!("Hit EOS token at step {}", step);
                     stop_reason = Some(FinishReason::EOS);
                     break;
                 }
@@ -336,58 +271,263 @@ impl InferenceEngine for DefaultInferenceEngine {
                 generated_tokens.push(next_token);
                 all_tokens.push(next_token);
 
-                // Decode token to text
-                let token_text = match tokenizer.decode(&[next_token], false) {
-                    Ok(text) => text,
-                    Err(_) => format!("token_{}", next_token.get()),
-                };
-
-                accumulated_text.push_str(&token_text);
-
-                // Send streaming chunk
-                let chunk = StreamChunk {
-                    request_id: request_id.clone(),
-                    text: token_text.clone(),
-                    token: Some(next_token),
-                    finish_reason: None,
-                    usage: None,
-                    created_at: chrono::Utc::now(),
-                    metadata: std::collections::HashMap::new(),
-                };
-
-                if tx.send(Ok(chunk)).await.is_err() {
-                    return; // Client disconnected
-                }
-
                 // Check stop sequences
-                match check_stop_sequences(&generated_tokens, &sampling_params, &tokenizer) {
-                    Ok(true) => {
-                        stop_reason = Some(FinishReason::Stop);
-                        break;
-                    }
-                    Ok(false) => continue,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
+                if check_stop_sequences(
+                    &generated_tokens,
+                    &request.sampling_params,
+                    &self.tokenizer,
+                )? {
+                    debug!("Hit stop sequence at step {}", step);
+                    stop_reason = Some(FinishReason::Stop);
+                    break;
                 }
             }
 
-            // Final chunk with finish reason
-            let final_chunk = StreamChunk {
-                request_id: request_id.clone(),
-                text: String::new(),
-                token: None,
-                finish_reason: Some(determine_finish_reason(
+            // 5. Decode output tokens
+            let generated_text = self.tokenizer.decode(&generated_tokens, true)?;
+
+            debug!(
+                "Generated {} tokens: {}",
+                generated_tokens.len(),
+                generated_text
+            );
+
+            // 6. Build response
+            Ok(InferenceResponse {
+                request_id,
+                text: generated_text,
+                tokens: generated_tokens.clone(),
+                finish_reason: determine_finish_reason(
                     stop_reason,
                     generated_tokens.len(),
                     max_tokens,
-                )),
-                usage: Some(TokenUsage::new(input_tokens.len(), generated_tokens.len())),
+                ),
+                usage: TokenUsage::new(prompt_tokens, generated_tokens.len()),
+                latency_ms: 0, // TODO: measure actual latency
                 created_at: chrono::Utc::now(),
                 metadata: std::collections::HashMap::new(),
-            };
-            let _ = tx.send(Ok(final_chunk)).await;
+            })
+        }
+        .await;
+
+        if let Err(e) = self.kv_cache.deallocate(request.id.clone()).await {
+            warn!(
+                "Failed to deallocate KV cache for request {}: {}",
+                request.id, e
+            );
+        }
+
+        result
+    }
+}
+
+#[async_trait]
+impl InferenceEngine for DefaultInferenceEngine {
+    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
+        request.sampling_params.validate()?;
+        self.admit_request(&request).await?;
+        let _inflight_guard = self.acquire_inflight_guard().await?;
+        let result = self.execute_request(&request).await;
+
+        match &result {
+            Ok(response) => {
+                if let Err(e) = self.scheduler.complete(request.id.clone(), response).await {
+                    warn!(
+                        "Failed to mark request {} complete in scheduler: {}",
+                        request.id, e
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("Request {} failed: {}", request.id, e);
+                if let Err(cancel_err) = self.scheduler.cancel(request.id.clone()).await {
+                    warn!(
+                        "Failed to cancel request {} in scheduler after error: {}",
+                        request.id, cancel_err
+                    );
+                }
+            }
+        }
+
+        result
+    }
+
+    async fn infer_stream(
+        &self,
+        request: InferenceRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        request.sampling_params.validate()?;
+        self.admit_request(&request).await?;
+        let inflight_guard = self.acquire_inflight_guard().await?;
+        let (tx, rx) = mpsc::channel(100);
+
+        // Clone components for async task
+        let tokenizer = self.tokenizer.clone();
+        let sampler = self.sampler.clone();
+        let model_executor = self.model_executor.clone();
+        let scheduler = self.scheduler.clone();
+        let kv_cache = self.kv_cache.clone();
+        let request_id = request.id.clone();
+        let max_tokens = request.sampling_params.max_tokens;
+        let sampling_params = request.sampling_params.clone();
+
+        tokio::spawn(async move {
+            let _inflight_guard = inflight_guard;
+            let mut kv_cache_reserved = false;
+
+            let generation_result: Result<InferenceResponse> = async {
+                // 1. Tokenize
+                let input_tokens = tokenizer.encode(&request.prompt, true)?;
+                let prompt_tokens = input_tokens.len();
+
+                // Reserve KV cache resources for the full stream lifecycle.
+                DefaultInferenceEngine::reserve_request_kv_cache_with(
+                    &kv_cache,
+                    &model_executor,
+                    &request,
+                    prompt_tokens,
+                )
+                .await?;
+                kv_cache_reserved = true;
+
+                // 2. Prefill
+                let prefill_input =
+                    create_prefill_input(&input_tokens, &model_executor.info().device)?;
+                let prefill_output = model_executor.prefill(&prefill_input).await?;
+
+                // 3. Decode loop - stream each token
+                let mut generated_tokens = Vec::new();
+                let mut all_tokens: Vec<TokenId> = input_tokens.iter().copied().collect();
+                let mut model_kv_cache = prefill_output.kv_cache.clone();
+                let mut rng = create_rng(&sampling_params);
+                let mut stop_reason: Option<FinishReason> = None;
+
+                for step in 0..max_tokens {
+                    let logits = if step == 0 {
+                        extract_last_token_logits(&prefill_output.logits)?
+                    } else {
+                        let decode_input = create_decode_input(
+                            &generated_tokens,
+                            model_kv_cache.clone(),
+                            &model_executor.info().device,
+                        )?;
+                        let decode_output = model_executor.decode(&decode_input).await?;
+                        model_kv_cache = decode_output.kv_cache.clone();
+                        extract_last_token_logits(&decode_output.logits)?
+                    };
+
+                    let next_token =
+                        sample_token(&logits, &sampling_params, &sampler, &mut rng, &all_tokens)?;
+
+                    if is_stop_token(next_token, model_executor.info().vocab_size) {
+                        stop_reason = Some(FinishReason::EOS);
+                        break;
+                    }
+
+                    generated_tokens.push(next_token);
+                    all_tokens.push(next_token);
+
+                    // Decode token to text
+                    let token_text = match tokenizer.decode(&[next_token], false) {
+                        Ok(text) => text,
+                        Err(_) => format!("token_{}", next_token.get()),
+                    };
+
+                    // Send streaming chunk
+                    let chunk = StreamChunk {
+                        request_id: request_id.clone(),
+                        text: token_text,
+                        token: Some(next_token),
+                        finish_reason: None,
+                        usage: None,
+                        created_at: chrono::Utc::now(),
+                        metadata: HashMap::new(),
+                    };
+
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        return Err(FerrumError::cancelled(format!(
+                            "Streaming consumer dropped for request {}",
+                            request_id
+                        )));
+                    }
+
+                    // Check stop sequences
+                    if check_stop_sequences(&generated_tokens, &sampling_params, &tokenizer)? {
+                        stop_reason = Some(FinishReason::Stop);
+                        break;
+                    }
+                }
+
+                let finish_reason =
+                    determine_finish_reason(stop_reason, generated_tokens.len(), max_tokens);
+                let generated_len = generated_tokens.len();
+                let generated_text = tokenizer.decode(&generated_tokens, true)?;
+
+                Ok(InferenceResponse {
+                    request_id: request_id.clone(),
+                    text: generated_text,
+                    tokens: generated_tokens,
+                    finish_reason,
+                    usage: TokenUsage::new(prompt_tokens, generated_len),
+                    latency_ms: 0, // TODO: measure actual latency
+                    created_at: chrono::Utc::now(),
+                    metadata: HashMap::new(),
+                })
+            }
+            .await;
+
+            if kv_cache_reserved {
+                if let Err(e) = kv_cache.deallocate(request_id.clone()).await {
+                    warn!(
+                        "Failed to deallocate KV cache for streaming request {}: {}",
+                        request_id, e
+                    );
+                }
+            }
+
+            match generation_result {
+                Ok(response) => {
+                    let final_chunk = StreamChunk {
+                        request_id: request_id.clone(),
+                        text: String::new(),
+                        token: None,
+                        finish_reason: Some(response.finish_reason),
+                        usage: Some(response.usage.clone()),
+                        created_at: chrono::Utc::now(),
+                        metadata: HashMap::new(),
+                    };
+
+                    if tx.send(Ok(final_chunk)).await.is_err() {
+                        warn!(
+                            "Streaming consumer disconnected before final chunk for request {}",
+                            request_id
+                        );
+                        if let Err(cancel_err) = scheduler.cancel(request_id.clone()).await {
+                            warn!(
+                                "Failed to cancel request {} after stream disconnect: {}",
+                                request_id, cancel_err
+                            );
+                        }
+                        return;
+                    }
+
+                    if let Err(e) = scheduler.complete(request_id.clone(), &response).await {
+                        warn!(
+                            "Failed to mark streaming request {} complete in scheduler: {}",
+                            request_id, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.clone())).await;
+                    if let Err(cancel_err) = scheduler.cancel(request_id.clone()).await {
+                        warn!(
+                            "Failed to cancel request {} after stream error: {}",
+                            request_id, cancel_err
+                        );
+                    }
+                }
+            }
         });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
