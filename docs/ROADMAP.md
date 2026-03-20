@@ -13,22 +13,49 @@ Core value proposition: **vLLM-level scheduling capabilities, rewritten with Rus
 
 ## Current State
 
-MVP phase on the `mvp` branch. Core components exist but are not yet production-capable:
+MVP phase on the `mvp` branch. Phase 1.1 (PagedAttention) is complete. Phase 1.2 (Continuous Batching) is next.
 
-- Scheduler framework with priority support, but continuous batching is per-request, not iteration-level
-- Block-based KV cache framework, but not true PagedAttention (logical-to-physical block mapping, CoW, dynamic resize)
-- Candle as inference backend - sufficient for prototyping, not for production throughput
-- 3 model architectures (Llama, Qwen2, BERT)
+### What's done
+
+- **PagedAttention (Phase 1.1)** — fully implemented and tested end-to-end
+  - Logical-to-physical block mapping with indirection table (`BlockTable`)
+  - Block-level KV tensor storage (`BlockStorage`) with per-layer K/V read/write
+  - Block memory pool with allocation, deallocation, reuse, and ID 0 sentinel
+  - Paged attention kernel (CPU reference): causal masking, GQA head mapping, softmax with numerical stability
+  - Cross-block KV gather for non-contiguous memory access
+  - `PagedKvCacheManager`: `write_kv()` / `read_kv()` through block table indirection
+  - `PagedAttentionExecutor`: test executor using real paged KV (identity projections Q=K=V=embedding)
+  - `PrefillInput.kv_cache` field: engine passes pre-allocated KV handle to executor, avoiding double allocation
+  - 4 paged lifecycle integration tests + 4 engine integration tests with paged KV
+  - 67 unit tests in `ferrum-kv`, all passing
+
+- **Scheduler correctness foundation**
+  - Per-request KV isolation, cancellation safety, state-based admission control
+  - Request state machine: waiting → running transitions with rollback on mismatch
+  - 7 `continuous_batch_test` integration tests (single/multi/concurrent/streaming/latency)
+
+- **Hardware-independent test infrastructure** (`ferrum-testkit`)
+  - `MockModelExecutor`, `MockKvCacheManager`, `MockTokenizer`, `MockSampler`, `MockTensor`, `MockTensorFactory`
+  - `PagedAttentionExecutor` — real paged KV usage without GPU
+  - `TensorFactory` trait injection to decouple engine from candle_core
+
+- **Engine decoupling**
+  - KV allocation dims derived from `ModelInfo` instead of hardcoded 32/32/128
+  - `TensorFactory` abstraction replaces direct candle tensor construction
+
+- 3 model architectures (Llama, Qwen2, BERT) with Candle backend
 - OpenAI-compatible HTTP API and CLI
 
-Recent refactoring has focused on correctness: per-request KV isolation, cancellation safety, state-based admission control, decode sampling robustness. The scheduling layer's correctness foundation is solid.
+### What's next
+
+**Phase 1.2: Iteration-level continuous batching** — the current engine processes requests serially (one prefill → N decodes → complete → next). The target is same-iteration mixing of multiple requests' prefill and decode phases.
 
 ## Gap Analysis vs vLLM
 
 | Capability | vLLM | Ferrum | Gap |
 |---|---|---|---|
-| PagedAttention | Mature | Block-based KV framework, not paged | Large |
-| Continuous Batching | Iteration-level, prefill/decode mixed | Per-request scheduling | Large |
+| PagedAttention | Mature | **Done** — block table, paged KV R/W, CPU attention kernel | Closed |
+| Continuous Batching | Iteration-level, prefill/decode mixed | Per-request scheduling | **Active** |
 | CUDA Kernel Optimization | FlashAttention / FlashInfer | Candle (no custom kernels) | Critical |
 | Quantization | AWQ / GPTQ / FP8 | None | Large |
 | Tensor Parallelism | Multi-GPU via NCCL | Type stubs only | Large |
@@ -55,12 +82,15 @@ The `ferrum-runtime` crate already has extension points (`ComputeBackend` trait)
 
 The scheduling layer is Ferrum's moat. This is where Rust's advantages are most tangible.
 
-#### 1.1 True PagedAttention
+#### 1.1 True PagedAttention ✅
 
-- Logical block -> physical block mapping with indirection table
-- Copy-on-Write for shared prefix blocks
-- Dynamic block allocation and reclamation
-- Block-level memory pool with defragmentation
+- ~~Logical block -> physical block mapping with indirection table~~
+- Copy-on-Write for shared prefix blocks (framework exists, not yet exercised)
+- ~~Dynamic block allocation and reclamation~~
+- ~~Block-level memory pool with defragmentation~~
+- ~~Block-level KV tensor storage with cross-block gather~~
+- ~~CPU reference paged attention kernel (causal mask, GQA, softmax)~~
+- ~~End-to-end integration tests with ContinuousBatchEngine~~
 
 #### 1.2 Iteration-Level Continuous Batching
 
