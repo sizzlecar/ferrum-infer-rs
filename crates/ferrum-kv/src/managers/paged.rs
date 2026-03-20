@@ -534,6 +534,46 @@ impl PagedKvCacheManager {
         &self.gpu_pool
     }
 
+    /// Get a reference to the prefix cache (if enabled).
+    pub fn prefix_cache(&self) -> Option<&PrefixCache> {
+        self.prefix_cache.as_ref()
+    }
+
+    /// Share the first `num_prefix_blocks` physical blocks from `source` into
+    /// `target`.  The shared blocks get an incremented ref count so they
+    /// survive when the source handle is deallocated.
+    ///
+    /// After this call the target handle's block table maps logical blocks
+    /// `0..num_prefix_blocks` to the same physical blocks as the source.
+    pub fn share_prefix_blocks(
+        &self,
+        source: &PagedKvCacheHandle,
+        target: &PagedKvCacheHandle,
+        num_prefix_blocks: usize,
+    ) -> Result<()> {
+        let source_blocks = source.get_physical_blocks();
+        let n = num_prefix_blocks.min(source_blocks.len());
+
+        for i in 0..n {
+            let phys_id = source_blocks[i];
+            // Map in target
+            target.add_block(i as u32, phys_id);
+            // Increment ref count on the physical block so it isn't freed
+            // when the source handle is deallocated.
+            let pid = PhysicalBlockId::new(phys_id);
+            if let Some(block) = self.gpu_pool.get_block(pid) {
+                block.write().add_ref();
+            }
+        }
+
+        debug!(
+            "Shared {} prefix blocks from {} to {}",
+            n, source.request_id, target.request_id
+        );
+
+        Ok(())
+    }
+
     /// Swap out blocks to CPU
     pub fn swap_out(&self, block_ids: &[PhysicalBlockId]) -> Result<Vec<PhysicalBlockId>> {
         let cpu_pool = self
@@ -664,18 +704,19 @@ impl PagedKvCacheManager {
     // ==========================================================================
 
     /// Find a cached prefix that matches the given tokens
-    /// Returns (prefix_id, kv_handle, matched_length) if found
+    /// Returns (prefix_id, kv_handle, last_logits, matched_length) if found
     pub fn find_prefix(
         &self,
         tokens: &[ferrum_types::TokenId],
     ) -> Option<(
         PrefixId,
         Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+        Vec<f32>,
         usize,
     )> {
         let prefix_cache = self.prefix_cache.as_ref()?;
 
-        if let Some((prefix_id, kv_handle)) = prefix_cache.find_prefix(tokens) {
+        if let Some((prefix_id, kv_handle, last_logits)) = prefix_cache.find_prefix(tokens) {
             let matched_len = prefix_id.len();
             debug!("Prefix cache hit: matched {} tokens", matched_len);
 
@@ -688,7 +729,7 @@ impl PagedKvCacheManager {
                 }
             }
 
-            Some((prefix_id, kv_handle, matched_len))
+            Some((prefix_id, kv_handle, last_logits, matched_len))
         } else {
             None
         }
@@ -699,9 +740,10 @@ impl PagedKvCacheManager {
         &self,
         tokens: &[ferrum_types::TokenId],
         kv_handle: Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+        last_logits: Vec<f32>,
     ) -> Result<()> {
         if let Some(prefix_cache) = &self.prefix_cache {
-            prefix_cache.store_prefix(tokens, kv_handle)?;
+            prefix_cache.store_prefix(tokens, kv_handle, last_logits)?;
             debug!("Stored prefix with {} tokens in cache", tokens.len());
         }
         Ok(())

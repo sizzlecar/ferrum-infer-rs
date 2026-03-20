@@ -51,6 +51,9 @@ pub struct CachedPrefix {
     pub prefix_id: PrefixId,
     /// KV cache handle for this prefix
     pub kv_handle: Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+    /// Last-token logits from the prefill — used to sample the first generated
+    /// token on a cache hit without re-running the executor.
+    pub last_logits: Vec<f32>,
     /// Reference count
     pub ref_count: usize,
     /// Last access time
@@ -64,11 +67,13 @@ impl CachedPrefix {
     pub fn new(
         prefix_id: PrefixId,
         kv_handle: Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+        last_logits: Vec<f32>,
     ) -> Self {
         let size = prefix_id.len();
         Self {
             prefix_id,
             kv_handle,
+            last_logits,
             ref_count: 1,
             last_access: std::time::Instant::now(),
             size,
@@ -131,13 +136,17 @@ impl PrefixCache {
         }
     }
 
-    /// Find matching prefix for given tokens
+    /// Find matching prefix for given tokens.
+    ///
+    /// Returns `(PrefixId, KvCacheHandle, last_logits)` for the longest
+    /// matching prefix, or `None` on miss.
     pub fn find_prefix(
         &self,
         tokens: &[TokenId],
     ) -> Option<(
         PrefixId,
         Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+        Vec<f32>,
     )> {
         if tokens.len() < self.min_prefix_length {
             return None;
@@ -151,7 +160,11 @@ impl PrefixCache {
 
         for (prefix_id, cached_prefix) in prefixes.iter() {
             if tokens.starts_with(prefix_id.tokens()) && prefix_id.len() > best_len {
-                best_match = Some((prefix_id.clone(), cached_prefix.kv_handle.clone()));
+                best_match = Some((
+                    prefix_id.clone(),
+                    cached_prefix.kv_handle.clone(),
+                    cached_prefix.last_logits.clone(),
+                ));
                 best_len = prefix_id.len();
             }
         }
@@ -179,13 +192,14 @@ impl PrefixCache {
         &self,
         prefix_tokens: &[TokenId],
         kv_handle: Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+        last_logits: Vec<f32>,
     ) -> Result<()> {
         if prefix_tokens.len() < self.min_prefix_length {
             return Ok(()); // Don't cache short prefixes
         }
 
         let prefix_id = PrefixId::from(prefix_tokens);
-        let cached_prefix = CachedPrefix::new(prefix_id.clone(), kv_handle);
+        let cached_prefix = CachedPrefix::new(prefix_id.clone(), kv_handle, last_logits);
 
         let mut prefixes = self.prefixes.write();
 
@@ -457,7 +471,7 @@ mod tests {
         let handle = Arc::new(MockKvHandle::new(3));
 
         // Store prefix
-        cache.store_prefix(&tokens, handle.clone()).unwrap();
+        cache.store_prefix(&tokens, handle.clone(), vec![0.1; 10]).unwrap();
 
         // Should find exact match
         let result = cache.find_prefix(&tokens);
@@ -472,7 +486,7 @@ mod tests {
         ];
         let result = cache.find_prefix(&longer_tokens);
         assert!(result.is_some());
-        let (found_prefix, _) = result.unwrap();
+        let (found_prefix, _, _) = result.unwrap();
         assert_eq!(found_prefix.tokens(), &tokens);
     }
 
@@ -484,7 +498,7 @@ mod tests {
         let handle = Arc::new(MockKvHandle::new(2));
 
         // Should not store short prefix
-        cache.store_prefix(&short_tokens, handle).unwrap();
+        cache.store_prefix(&short_tokens, handle, vec![0.1; 10]).unwrap();
 
         let result = cache.find_prefix(&short_tokens);
         assert!(result.is_none());
@@ -501,14 +515,14 @@ mod tests {
         let handle = Arc::new(MockKvHandle::new(1));
 
         // Store 2 prefixes
-        cache.store_prefix(&tokens1, handle.clone()).unwrap();
-        cache.store_prefix(&tokens2, handle.clone()).unwrap();
+        cache.store_prefix(&tokens1, handle.clone(), vec![0.1; 10]).unwrap();
+        cache.store_prefix(&tokens2, handle.clone(), vec![0.1; 10]).unwrap();
 
         // Access first one to make it more recent
         cache.find_prefix(&tokens1);
 
         // Store third - should evict tokens2 (LRU)
-        cache.store_prefix(&tokens3, handle.clone()).unwrap();
+        cache.store_prefix(&tokens3, handle.clone(), vec![0.1; 10]).unwrap();
 
         // tokens1 and tokens3 should exist, tokens2 should be evicted
         assert!(cache.find_prefix(&tokens1).is_some());
@@ -522,7 +536,7 @@ mod tests {
         let tokens = vec![TokenId::new(1), TokenId::new(2)];
         let handle = Arc::new(MockKvHandle::new(2));
 
-        cache.store_prefix(&tokens, handle).unwrap();
+        cache.store_prefix(&tokens, handle, vec![0.1; 10]).unwrap();
 
         // Hit
         cache.find_prefix(&tokens);
