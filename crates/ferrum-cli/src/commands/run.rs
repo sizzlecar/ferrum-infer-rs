@@ -145,6 +145,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                         max_tokens: cmd.max_tokens as usize,
                         temperature: cmd.temperature,
                         top_p: 0.9,
+                        repetition_penalty: 1.1,
                         stop_sequences: vec![
                             "<|im_end|>".to_string(),
                             "</s>".to_string(),

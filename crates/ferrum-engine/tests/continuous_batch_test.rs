@@ -37,6 +37,7 @@ fn make_engine() -> ContinuousBatchEngine {
 fn make_request(prompt: &str) -> InferenceRequest {
     let mut req = InferenceRequest::new(prompt, "mock-model");
     req.sampling_params.max_tokens = 5;
+    req.sampling_params.temperature = 0.0; // Greedy for deterministic tests
     req
 }
 

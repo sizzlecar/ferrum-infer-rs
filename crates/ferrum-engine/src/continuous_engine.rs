@@ -55,6 +55,8 @@ pub struct SequenceState {
     pub preemption_count: usize,
     /// JSON mode logits processor (active when response_format is JsonObject).
     pub json_processor: Option<Arc<JsonModeProcessor>>,
+    /// Token frequency counts for repetition penalty.
+    pub token_frequencies: HashMap<TokenId, usize>,
 }
 
 impl SequenceState {
@@ -81,6 +83,7 @@ impl SequenceState {
             tokens_this_iteration: 0,
             preemption_count: 0,
             json_processor,
+            token_frequencies: HashMap::new(),
         }
     }
 
@@ -99,6 +102,38 @@ impl SequenceState {
         }
         false
     }
+
+    /// Sample next token with full processor chain (temperature, top-k/p, repetition penalty, JSON mode).
+    pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
+        use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
+
+        // Apply JSON mode biases before the standard processor chain
+        if let Some(ref jp) = self.json_processor {
+            let generated: String = self.generated_tokens.iter()
+                .filter_map(|t| { let v = t.get(); if v < 128 { Some(v as u8 as char) } else { None } })
+                .collect();
+            jp.apply_biases(logits, &generated);
+        }
+
+        // Build SamplingConfig from this request's params (includes temperature, top-k/p, repetition penalty)
+        let config = SamplingConfig::from_params(&self.sampling_params);
+        let step = self.generated_tokens.len();
+        let vocab_size = logits.len();
+        let ctx = SamplingContext::new(
+            step,
+            &self.sampling_params,
+            logits,
+            &self.generated_tokens,
+            &self.token_frequencies,
+            vocab_size,
+        );
+        let token = config.sample(ctx, &mut self.rng)?;
+
+        // Update frequency tracking
+        *self.token_frequencies.entry(token).or_insert(0) += 1;
+
+        Ok(token)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -109,6 +144,7 @@ struct EngineInner {
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+    #[allow(dead_code)] // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
     kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
@@ -333,16 +369,11 @@ impl EngineInner {
                 let seq = sequences
                     .get_mut(request_id)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                let mut logits = cached_logits;
                 if let Some(ref jp) = seq.json_processor {
                     jp.reset();
-                    // No generated text yet at prefill — just apply start-state biases
-                    let generated: String = seq.generated_tokens.iter()
-                        .filter_map(|t| { let v = t.get(); if v < 128 { Some(v as u8 as char) } else { None } })
-                        .collect();
-                    jp.apply_biases(&mut logits, &generated);
                 }
-                let token = self.sampler.sample(&logits, &mut seq.rng)?;
+                let mut logits = cached_logits;
+                let token = seq.sample_with_processors(&mut logits)?;
                 seq.generated_tokens.push(token);
                 seq.kv_cache = Some(cloned_kv);
                 seq.prefill_complete = true;
@@ -429,15 +460,11 @@ impl EngineInner {
             let seq = sequences
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-            let mut logits = logits_vec;
             if let Some(ref jp) = seq.json_processor {
                 jp.reset();
-                let generated: String = seq.generated_tokens.iter()
-                    .filter_map(|t| { let v = t.get(); if v < 128 { Some(v as u8 as char) } else { None } })
-                    .collect();
-                jp.apply_biases(&mut logits, &generated);
             }
-            let token = self.sampler.sample(&logits, &mut seq.rng)?;
+            let mut logits = logits_vec;
+            let token = seq.sample_with_processors(&mut logits)?;
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(prefill_output.kv_cache.clone());
             seq.prefill_complete = true;
@@ -504,13 +531,7 @@ impl EngineInner {
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
             let mut logits = logits_vec;
-            if let Some(ref jp) = seq.json_processor {
-                let generated: String = seq.generated_tokens.iter()
-                    .filter_map(|t| { let v = t.get(); if v < 128 { Some(v as u8 as char) } else { None } })
-                    .collect();
-                jp.apply_biases(&mut logits, &generated);
-            }
-            let token = self.sampler.sample(&logits, &mut seq.rng)?;
+            let token = seq.sample_with_processors(&mut logits)?;
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(decode_output.kv_cache.clone());
             seq.tokens_this_iteration += 1;
