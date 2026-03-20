@@ -140,8 +140,14 @@ struct DummyKvCache {
 
 impl DummyKvCache {
     fn new(block_size: usize) -> Self {
+        Self::with_length(block_size, 0)
+    }
+
+    fn with_length(block_size: usize, sequence_length: usize) -> Self {
+        let mut block_table = ferrum_interfaces::BlockTable::new(block_size);
+        block_table.sequence_length = sequence_length;
         Self {
-            block_table: ferrum_interfaces::BlockTable::new(block_size),
+            block_table,
         }
     }
 }
@@ -371,8 +377,8 @@ impl ModelExecutor for MetalLlamaExecutor {
         // Create output tensor
         let output_tensor: TensorRef = Arc::new(SimpleTensor::new(logits_vec, vec![1, vocab_size]));
 
-        // Create dummy KV cache handle
-        let kv_cache: Arc<dyn KvCacheHandle> = Arc::new(DummyKvCache::new(16));
+        // Create dummy KV cache handle with the current sequence length.
+        let kv_cache: Arc<dyn KvCacheHandle> = Arc::new(DummyKvCache::with_length(16, seq_len));
 
         Ok(PrefillOutput::new(output_tensor, kv_cache))
     }
@@ -433,8 +439,8 @@ impl ModelExecutor for MetalLlamaExecutor {
         let vocab_size = logits_vec.len();
         let output_tensor: TensorRef = Arc::new(SimpleTensor::new(logits_vec, vec![1, vocab_size]));
 
-        // Clone the input kv_cache for output (in a real implementation, this would be updated)
-        let kv_cache = input.kv_cache.clone();
+        // Return a cache handle with incremented sequence length so decode position advances.
+        let kv_cache: Arc<dyn KvCacheHandle> = Arc::new(DummyKvCache::with_length(16, position + 1));
 
         Ok(DecodeOutput::new(output_tensor, kv_cache))
     }
