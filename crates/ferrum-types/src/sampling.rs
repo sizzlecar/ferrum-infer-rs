@@ -34,6 +34,32 @@ pub struct SamplingParams {
     pub typical_p: Option<f32>,
     /// Mirostat sampling parameters
     pub mirostat: Option<MirostatParams>,
+    /// Response format constraint (JSON mode, schema-constrained, etc.)
+    #[serde(default)]
+    pub response_format: ResponseFormat,
+}
+
+/// Response format for structured output.
+///
+/// Controls how the model output is constrained:
+/// - `Text`: no constraint (default)
+/// - `JsonObject`: output must be valid JSON
+/// - `JsonSchema`: output must conform to a JSON schema
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "schema")]
+pub enum ResponseFormat {
+    /// No constraint — raw text output.
+    Text,
+    /// Output must be a valid JSON object.
+    JsonObject,
+    /// Output must conform to the given JSON schema (as a JSON string).
+    JsonSchema(String),
+}
+
+impl Default for ResponseFormat {
+    fn default() -> Self {
+        Self::Text
+    }
 }
 
 impl Default for SamplingParams {
@@ -52,6 +78,7 @@ impl Default for SamplingParams {
             tfs: None,
             typical_p: None,
             mirostat: None,
+            response_format: ResponseFormat::default(),
         }
     }
 }
