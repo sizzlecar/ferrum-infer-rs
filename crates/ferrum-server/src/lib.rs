@@ -34,7 +34,7 @@ pub use types::{
 
 pub use openai::{
     ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage, CompletionsRequest,
-    CompletionsResponse, ModelListResponse, OpenAiError, OpenAiErrorType,
+    CompletionsResponse, ModelListResponse, OpenAiError, OpenAiErrorType, OpenAiResponseFormat,
 };
 
 pub use middleware::{
@@ -42,4 +42,4 @@ pub use middleware::{
     RateLimitConfig as MiddlewareRateLimitConfig,
 };
 
-pub use axum_server::AxumServer;
+pub use axum_server::{init_prometheus_recorder, AxumServer};

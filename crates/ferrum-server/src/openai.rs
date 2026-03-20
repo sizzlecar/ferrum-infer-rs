@@ -58,6 +58,18 @@ pub struct ChatCompletionsRequest {
     /// Random seed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+
+    /// Response format constraint (e.g., `{"type": "json_object"}`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<OpenAiResponseFormat>,
+}
+
+/// OpenAI-compatible response format specifier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiResponseFormat {
+    /// Format type: "text" or "json_object"
+    #[serde(rename = "type")]
+    pub format_type: String,
 }
 
 /// Chat message

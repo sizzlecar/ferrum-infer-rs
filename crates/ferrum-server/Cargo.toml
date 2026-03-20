@@ -39,6 +39,7 @@ tokio-stream = "0.1"
 # Logging and metrics
 tracing = { workspace = true }
 metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 # Authentication and security
 jsonwebtoken = "9.2"
