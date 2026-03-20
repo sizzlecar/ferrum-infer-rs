@@ -444,7 +444,39 @@ impl MetalLlamaAttention {
             .affine(1.0 / scale, 0.0)
             .map_err(|e| FerrumError::internal(format!("affine failed: {}", e)))?;
 
-        // Apply causal mask (TODO: proper implementation)
+        // Apply causal mask. For decode with cache, each query row i can only attend up to
+        // (past_len + i), where past_len = kv_len - q_len.
+        let (batch, heads, q_len, kv_len) = attn_weights
+            .dims4()
+            .map_err(|e| FerrumError::internal(format!("attn dims4 failed: {}", e)))?;
+        debug!(
+            "Attention scores shape: batch={}, heads={}, q_len={}, kv_len={}",
+            batch, heads, q_len, kv_len
+        );
+        let past_len = kv_len.saturating_sub(q_len);
+        let causal_mask_data: Vec<f32> = (0..q_len)
+            .flat_map(|i| {
+                let max_k = past_len + i;
+                (0..kv_len).map(move |j| if j <= max_k { 0.0 } else { f32::NEG_INFINITY })
+            })
+            .collect();
+        let causal_mask = Tensor::from_vec(
+            causal_mask_data,
+            (1, 1, q_len, kv_len),
+            attn_weights.device(),
+        )
+        .map_err(|e| FerrumError::internal(format!("causal mask tensor failed: {}", e)))?;
+        let causal_mask = if causal_mask.dtype() != attn_weights.dtype() {
+            causal_mask
+                .to_dtype(attn_weights.dtype())
+                .map_err(|e| FerrumError::internal(format!("causal mask dtype failed: {}", e)))?
+        } else {
+            causal_mask
+        };
+        let attn_weights = attn_weights
+            .broadcast_add(&causal_mask)
+            .map_err(|e| FerrumError::internal(format!("causal mask add failed: {}", e)))?;
+
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)
             .map_err(|e| FerrumError::internal(format!("softmax failed: {}", e)))?;
 
