@@ -12,11 +12,11 @@
 use async_trait::async_trait;
 use ferrum_interfaces::{
     engine::InferenceEngine, kv_cache::AllocationRequest, KvCacheHandle, KvCacheManager,
-    ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
+    ModelExecutor, Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_types::{
-    DataType, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
+    DataType, Device, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
     InferenceResponse, Priority, RequestId, Result, SamplingParams, StreamChunk, TokenId,
     TokenUsage,
 };
@@ -52,6 +52,8 @@ pub struct SequenceState {
     pub prefill_complete: bool,
     /// Stream sender (if streaming)
     pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
+    /// Response sender for sync infer (oneshot)
+    pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
     /// Start time
     pub start_time: Instant,
     /// Number of tokens generated in current iteration
@@ -72,6 +74,7 @@ impl SequenceState {
             rng: StdRng::seed_from_u64(seed),
             prefill_complete: false,
             stream_sender: None,
+            response_sender: None,
             start_time: Instant::now(),
             tokens_this_iteration: 0,
         }
@@ -115,6 +118,8 @@ pub struct ContinuousBatchEngine {
     kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
     /// Model executor
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+    /// Tensor factory for creating input tensors (backend-agnostic)
+    tensor_factory: Arc<dyn TensorFactory>,
     /// Active sequences
     sequences: RwLock<HashMap<RequestId, SequenceState>>,
     /// Engine running flag
@@ -137,6 +142,7 @@ impl ContinuousBatchEngine {
         sampler: Arc<dyn Sampler + Send + Sync>,
         kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
     ) -> Self {
         info!("Creating ContinuousBatchEngine");
 
@@ -147,6 +153,7 @@ impl ContinuousBatchEngine {
             sampler,
             kv_cache,
             model_executor,
+            tensor_factory,
             sequences: RwLock::new(HashMap::new()),
             is_running: AtomicBool::new(false),
             shutdown_notify: Arc::new(Notify::new()),
@@ -154,6 +161,19 @@ impl ContinuousBatchEngine {
             total_prefill_tokens: AtomicU64::new(0),
             total_decode_tokens: AtomicU64::new(0),
         }
+    }
+
+    /// Helper: create a TensorRef from u32 token IDs with shape [1, len].
+    fn tokens_to_tensor(&self, token_ids: &[u32]) -> Result<TensorRef> {
+        let f32_data: Vec<f32> = token_ids.iter().map(|&v| v as f32).collect();
+        let len = f32_data.len();
+        let tensor = self.tensor_factory.from_slice(
+            &f32_data,
+            &[1, len],
+            DataType::FP32,
+            Device::CPU,
+        )?;
+        Ok(tensor)
     }
 
     /// Start the engine loop
@@ -272,15 +292,8 @@ impl ContinuousBatchEngine {
                 .get(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
 
-            // Create input tensor
             let token_u32s: Vec<u32> = seq.input_tokens.iter().map(|t| t.get()).collect();
-            let tensor = candle_core::Tensor::new(&token_u32s[..], &candle_core::Device::Cpu)
-                .map_err(|e| FerrumError::model(format!("Tensor error: {}", e)))?
-                .unsqueeze(0)
-                .map_err(|e| FerrumError::model(format!("Unsqueeze error: {}", e)))?;
-
-            let tensor_ref: ferrum_interfaces::TensorRef =
-                Arc::new(ferrum_models::CandleTensorWrapper::new(tensor));
+            let tensor_ref = self.tokens_to_tensor(&token_u32s)?;
             (tensor_ref, seq.input_tokens.len())
         };
 
@@ -303,8 +316,9 @@ impl ContinuousBatchEngine {
         let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor);
         let prefill_output = self.model_executor.prefill(&prefill_input).await?;
 
-        // Sample first token
-        let logits_vec = prefill_output.logits.to_vec_f32()?;
+        // Sample first token from last position's logits
+        let last_logits = prefill_output.last_token_logits()?;
+        let logits_vec = last_logits.to_vec_f32()?;
 
         let first_token = {
             let mut sequences = self.sequences.write();
@@ -338,7 +352,7 @@ impl ContinuousBatchEngine {
         // Send streaming update if applicable
         self.send_stream_update(request_id, first_token).await;
 
-        // Check if we should stop
+        // Check if we should stop after prefill
         let should_stop = {
             let sequences = self.sequences.read();
             if let Some(seq) = sequences.get(request_id) {
@@ -369,25 +383,15 @@ impl ContinuousBatchEngine {
                 .ok_or_else(|| FerrumError::internal("No KV cache"))?
                 .clone();
 
-            // Get last token
             let last_token = seq
                 .generated_tokens
                 .last()
                 .copied()
                 .unwrap_or(TokenId::new(0));
 
-            let tensor = candle_core::Tensor::new(&[last_token.get()], &candle_core::Device::Cpu)
-                .map_err(|e| FerrumError::model(format!("Tensor error: {}", e)))?
-                .unsqueeze(0)
-                .map_err(|e| FerrumError::model(format!("Unsqueeze error: {}", e)))?;
+            let tensor_ref = self.tokens_to_tensor(&[last_token.get()])?;
 
-            let tensor_ref: ferrum_interfaces::TensorRef =
-                Arc::new(ferrum_models::CandleTensorWrapper::new(tensor));
-
-            let decode_input =
-                ferrum_interfaces::model_executor::DecodeInput::new(tensor_ref, kv_cache.clone());
-
-            decode_input
+            ferrum_interfaces::model_executor::DecodeInput::new(tensor_ref, kv_cache)
         };
 
         // Run decode
@@ -492,7 +496,7 @@ impl ContinuousBatchEngine {
         finish_reason: FinishReason,
     ) -> Result<()> {
         // Extract data without holding lock across await
-        let (response, stream_sender, has_kv_cache) = {
+        let (response, stream_sender, response_sender, has_kv_cache) = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.remove(request_id) {
                 let text = self
@@ -512,7 +516,7 @@ impl ContinuousBatchEngine {
                 };
 
                 let has_kv_cache = seq.kv_cache.is_some();
-                (response, seq.stream_sender, has_kv_cache)
+                (response, seq.stream_sender, seq.response_sender, has_kv_cache)
             } else {
                 return Ok(());
             }
@@ -527,6 +531,11 @@ impl ContinuousBatchEngine {
         self.scheduler
             .complete(request_id.clone(), &response)
             .await?;
+
+        // Send response for sync infer
+        if let Some(tx) = response_sender {
+            let _ = tx.send(response.clone());
+        }
 
         // Send final stream chunk if streaming
         if let Some(tx) = stream_sender {
@@ -561,39 +570,27 @@ impl InferenceEngine for ContinuousBatchEngine {
         // Submit to scheduler
         self.scheduler.submit(request.clone()).await?;
 
-        // Tokenize and create sequence state
+        // Tokenize and create sequence state with response channel
         let input_tokens = self.tokenizer.encode(&request.prompt, true)?;
-        let seq_state = SequenceState::new(request, input_tokens.clone());
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let mut seq_state = SequenceState::new(request, input_tokens);
+        seq_state.response_sender = Some(resp_tx);
 
         // Insert into sequences
         self.sequences.write().insert(request_id.clone(), seq_state);
 
-        // Wait for completion (poll-based for now)
+        // Drive iterations until request completes
         loop {
-            // Run an iteration
             self.run_iteration().await?;
 
-            // Check if request is done
             if !self.sequences.read().contains_key(&request_id) {
                 break;
             }
-
-            // Check timeout
-            tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        // The response was already built and sent to scheduler
-        // For non-streaming, we need to rebuild it
-        let text = "Generated response"; // Placeholder
-        Ok(InferenceResponse {
-            request_id,
-            text: text.to_string(),
-            tokens: vec![],
-            finish_reason: FinishReason::EOS,
-            usage: TokenUsage::new(input_tokens.len(), 0),
-            latency_ms: 0,
-            created_at: chrono::Utc::now(),
-            metadata: HashMap::new(),
+        // Receive the actual response built by complete_request
+        resp_rx.await.map_err(|_| {
+            FerrumError::internal("Response channel closed before response was sent")
         })
     }
 
@@ -614,6 +611,16 @@ impl InferenceEngine for ContinuousBatchEngine {
 
         // Insert into sequences
         self.sequences.write().insert(request_id.clone(), seq_state);
+
+        // Drive iterations until request completes
+        // (chunks are sent via stream_sender during iteration)
+        loop {
+            self.run_iteration().await?;
+
+            if !self.sequences.read().contains_key(&request_id) {
+                break;
+            }
+        }
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
