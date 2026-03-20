@@ -302,3 +302,74 @@ async fn concurrent_streams_all_complete() {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Prefix cache tests
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn prefix_cache_avoids_second_prefill() {
+    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let config = ferrum_types::EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
+    let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
+    let sampler = Arc::new(MockSampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
+    let tensor_factory = Arc::new(MockTensorFactory);
+
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor.clone(),
+        tensor_factory,
+    );
+
+    // First request — cache miss, runs real prefill
+    let req1 = make_request("Identical prompt for prefix cache");
+    let resp1 = engine.infer(req1).await.unwrap();
+    assert_eq!(executor.prefill_count(), 1);
+
+    // Second request with same prompt — should hit prefix cache, no executor prefill
+    let req2 = make_request("Identical prompt for prefix cache");
+    let resp2 = engine.infer(req2).await.unwrap();
+    assert_eq!(
+        executor.prefill_count(),
+        1,
+        "Prefix cache should skip second prefill"
+    );
+
+    // Both should produce the same output (same prompt + deterministic sampling)
+    assert_eq!(resp1.tokens, resp2.tokens);
+    assert!(!resp1.tokens.is_empty());
+}
+
+#[tokio::test]
+async fn json_mode_biases_first_token() {
+    use ferrum_types::ResponseFormat;
+
+    let engine = make_engine();
+
+    // Without JSON mode: MockExecutor biases token 42, so greedy picks 42.
+    let mut plain_req = make_request("Hello");
+    plain_req.sampling_params.max_tokens = 1;
+    let plain_resp = engine.infer(plain_req).await.unwrap();
+    assert_eq!(
+        plain_resp.tokens[0].get(),
+        42,
+        "Without JSON mode, greedy should pick token 42"
+    );
+
+    // With JSON mode: structural_bias (5.0) on token 123 (`{`) beats 1.0 on token 42.
+    let mut json_req = make_request("Hello");
+    json_req.sampling_params.max_tokens = 1;
+    json_req.sampling_params.response_format = ResponseFormat::JsonObject;
+    let json_resp = engine.infer(json_req).await.unwrap();
+    assert_eq!(
+        json_resp.tokens[0].get(),
+        123,
+        "JSON mode should bias first token to `{{` (token 123)"
+    );
+}
