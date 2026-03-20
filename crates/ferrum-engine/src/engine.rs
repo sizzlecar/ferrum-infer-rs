@@ -428,13 +428,14 @@ impl DefaultInferenceEngine {
                     extract_last_token_logits(&decode_output.logits)?
                 };
 
-                // Sample next token
+                // Sample next token (use generated_tokens only for repetition penalty
+                // so prompt tokens like <|im_end|> are not penalised)
                 let next_token = sample_token(
                     &logits,
                     &request.sampling_params,
                     &self.sampler,
                     &mut rng,
-                    &all_tokens,
+                    &generated_tokens,
                 )?;
 
                 // Check stop conditions
@@ -607,7 +608,7 @@ impl InferenceEngine for DefaultInferenceEngine {
                     };
 
                     let next_token =
-                        sample_token(&logits, &sampling_params, &sampler, &mut rng, &all_tokens)?;
+                        sample_token(&logits, &sampling_params, &sampler, &mut rng, &generated_tokens)?;
 
                     if is_stop_token(next_token, model_executor.info().vocab_size) {
                         stop_reason = Some(FinishReason::EOS);
