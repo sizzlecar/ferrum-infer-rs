@@ -311,10 +311,11 @@ impl ContinuousBatchEngine {
             priority: Priority::Normal,
         };
 
-        let _kv_handle = self.kv_cache.allocate(&alloc_request).await?;
+        let kv_handle = self.kv_cache.allocate(&alloc_request).await?;
 
-        // Run prefill
-        let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor);
+        // Run prefill, passing pre-allocated KV handle to executor
+        let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
+            .with_kv_cache(kv_handle);
         let prefill_output = self.model_executor.prefill(&prefill_input).await?;
 
         // Sample first token from last position's logits

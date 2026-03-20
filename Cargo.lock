@@ -1370,6 +1370,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ferrum-interfaces",
+ "ferrum-kv",
  "ferrum-types",
  "parking_lot",
  "rand 0.9.2",

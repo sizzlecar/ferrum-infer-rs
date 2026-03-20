@@ -9,6 +9,7 @@ description = "Mock components for testing ferrum inference engine without GPU"
 [dependencies]
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
+ferrum-kv = { workspace = true }
 
 async-trait = { workspace = true }
 tokio = { workspace = true }

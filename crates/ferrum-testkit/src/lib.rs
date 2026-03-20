@@ -9,9 +9,11 @@ mod executor;
 mod kv_cache;
 mod tokenizer;
 mod sampler;
+pub mod paged_executor;
 
 pub use tensor::{MockTensor, MockTensorFactory};
 pub use executor::MockModelExecutor;
 pub use kv_cache::{MockKvCacheHandle, MockKvCacheManager};
 pub use tokenizer::MockTokenizer;
 pub use sampler::MockSampler;
+pub use paged_executor::{PagedAttentionExecutor, PagedExecutorConfig};
