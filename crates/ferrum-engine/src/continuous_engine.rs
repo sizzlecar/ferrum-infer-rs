@@ -297,16 +297,17 @@ impl ContinuousBatchEngine {
             (tensor_ref, seq.input_tokens.len())
         };
 
-        // Allocate KV cache
+        // Allocate KV cache using model dimensions
+        let model_info = self.model_executor.info();
         let alloc_request = AllocationRequest {
             request_id: request_id.clone(),
             initial_tokens: num_tokens,
-            max_sequence_length: 2048,
-            num_layers: 32,
-            num_heads: 32,
-            head_dim: 128,
+            max_sequence_length: model_info.max_sequence_length,
+            num_layers: model_info.num_layers,
+            num_heads: model_info.num_kv_heads,
+            head_dim: model_info.hidden_size / model_info.num_heads.max(1),
             device: self.config.backend.device.clone(),
-            dtype: DataType::FP16,
+            dtype: model_info.dtype,
             priority: Priority::Normal,
         };
 
