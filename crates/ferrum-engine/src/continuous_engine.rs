@@ -35,6 +35,8 @@ use tracing::{debug, info, warn};
 #[derive(Debug)]
 pub struct SequenceState {
     pub request_id: RequestId,
+    /// Original request — kept for re-submission after preemption.
+    pub original_request: InferenceRequest,
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
     pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
@@ -46,6 +48,8 @@ pub struct SequenceState {
     pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
     pub start_time: Instant,
     pub tokens_this_iteration: usize,
+    /// Number of times this request has been preempted.
+    pub preemption_count: usize,
 }
 
 impl SequenceState {
@@ -53,6 +57,7 @@ impl SequenceState {
         let seed = request.sampling_params.seed.unwrap_or(42);
         Self {
             request_id: request.id.clone(),
+            original_request: request.clone(),
             input_tokens,
             generated_tokens: Vec::new(),
             kv_cache: None,
@@ -64,6 +69,7 @@ impl SequenceState {
             response_sender: None,
             start_time: Instant::now(),
             tokens_this_iteration: 0,
+            preemption_count: 0,
         }
     }
 
@@ -107,6 +113,7 @@ struct EngineInner {
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
     total_decode_tokens: AtomicU64,
+    total_preemptions: AtomicU64,
 }
 
 impl EngineInner {
@@ -210,6 +217,77 @@ impl EngineInner {
         Ok(())
     }
 
+    // ── preemption ──────────────────────────────────────────────────────
+
+    /// Try to preempt a decoding request to free KV cache blocks.
+    ///
+    /// Picks the lowest-priority victim (ties broken by fewest generated
+    /// tokens — least work lost).  Frees the victim's KV cache, resets
+    /// its sequence state, and re-submits it to the scheduler so it will
+    /// be re-prefilled in a later iteration.
+    ///
+    /// Returns `true` if a victim was preempted.
+    async fn preempt_victim(&self, exclude_id: &RequestId) -> bool {
+        // Select victim: any decoding sequence except the requester
+        let victim_id = {
+            let sequences = self.sequences.read();
+            sequences
+                .iter()
+                .filter(|(id, s)| {
+                    *id != exclude_id && s.prefill_complete && s.kv_cache.is_some()
+                })
+                .min_by(|(_, a), (_, b)| {
+                    // Lowest priority first, then fewest generated tokens
+                    a.sampling_params
+                        .max_tokens // proxy for priority (TODO: use real priority)
+                        .cmp(&b.sampling_params.max_tokens)
+                        .then_with(|| a.generated_tokens.len().cmp(&b.generated_tokens.len()))
+                })
+                .map(|(id, _)| id.clone())
+        };
+
+        let victim_id = match victim_id {
+            Some(id) => id,
+            None => return false,
+        };
+
+        info!("Preempting request {} to free KV blocks", victim_id);
+
+        // Free KV cache
+        let _ = self.kv_cache.deallocate(victim_id.clone()).await;
+
+        // Reset sequence state — keep response/stream channels intact
+        {
+            let mut sequences = self.sequences.write();
+            if let Some(seq) = sequences.get_mut(&victim_id) {
+                seq.kv_cache = None;
+                seq.generated_tokens.clear();
+                seq.prefill_complete = false;
+                seq.phase = RequestPhase::Waiting;
+                seq.tokens_this_iteration = 0;
+                seq.preemption_count += 1;
+                // Reset RNG to original seed for deterministic re-generation
+                let seed = seq.sampling_params.seed.unwrap_or(42);
+                seq.rng = StdRng::seed_from_u64(seed);
+            }
+        }
+
+        // Cancel in scheduler and re-submit so it goes back to waiting queue
+        let _ = self.scheduler.cancel(victim_id.clone()).await;
+        let request = {
+            let sequences = self.sequences.read();
+            sequences
+                .get(&victim_id)
+                .map(|s| s.original_request.clone())
+        };
+        if let Some(req) = request {
+            let _ = self.scheduler.submit(req).await;
+        }
+
+        self.total_preemptions.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     // ── prefill ────────────────────────────────────────────────────────
 
     async fn run_prefill(&self, request_id: &RequestId) -> Result<()> {
@@ -235,7 +313,21 @@ impl EngineInner {
             priority: Priority::Normal,
         };
 
-        let kv_handle = self.kv_cache.allocate(&alloc_request).await?;
+        // Try allocation, preempting if necessary
+        let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
+            Ok(h) => h,
+            Err(_) => {
+                // OOM — try to free blocks by preempting a victim
+                if self.preempt_victim(request_id).await {
+                    // Retry after preemption
+                    self.kv_cache.allocate(&alloc_request).await?
+                } else {
+                    return Err(FerrumError::resource_exhausted(
+                        "No blocks available and no request to preempt",
+                    ));
+                }
+            }
+        };
 
         let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
             .with_kv_cache(kv_handle);
@@ -498,6 +590,7 @@ impl ContinuousBatchEngine {
                 iteration_count: AtomicU64::new(0),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
+                total_preemptions: AtomicU64::new(0),
             }),
         }
     }
