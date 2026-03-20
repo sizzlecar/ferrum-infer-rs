@@ -11,6 +11,8 @@ use ferrum_interfaces::{
     ModelExecutor, Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
+use ferrum_kv::cache::prefix::PrefixCache;
+use ferrum_sampler::json_mode::JsonModeProcessor;
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
     InferenceResponse, Priority, RequestId, Result, SamplingParams, StreamChunk, TokenId,
@@ -25,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
+use metrics::{counter, gauge, histogram};
 use tracing::{debug, info, warn};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -50,11 +53,18 @@ pub struct SequenceState {
     pub tokens_this_iteration: usize,
     /// Number of times this request has been preempted.
     pub preemption_count: usize,
+    /// JSON mode logits processor (active when response_format is JsonObject).
+    pub json_processor: Option<Arc<JsonModeProcessor>>,
 }
 
 impl SequenceState {
     pub fn new(request: InferenceRequest, input_tokens: Vec<TokenId>) -> Self {
+        use ferrum_types::ResponseFormat;
         let seed = request.sampling_params.seed.unwrap_or(42);
+        let json_processor = match &request.sampling_params.response_format {
+            ResponseFormat::JsonObject => Some(Arc::new(JsonModeProcessor::new())),
+            _ => None,
+        };
         Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
@@ -70,6 +80,7 @@ impl SequenceState {
             start_time: Instant::now(),
             tokens_this_iteration: 0,
             preemption_count: 0,
+            json_processor,
         }
     }
 
@@ -109,11 +120,14 @@ struct EngineInner {
     iteration_lock: tokio::sync::Mutex<()>,
     /// Wakes callers or a background loop when new work is submitted.
     work_notify: Notify,
+    /// Prefix cache: shares KV blocks across requests with common prompts.
+    prefix_cache: PrefixCache,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
     total_decode_tokens: AtomicU64,
     total_preemptions: AtomicU64,
+    prefix_cache_hits: AtomicU64,
 }
 
 impl EngineInner {
@@ -146,6 +160,7 @@ impl EngineInner {
     /// Run one iteration: ask the scheduler for a batch, then process it.
     async fn run_iteration(&self) -> Result<()> {
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
+        counter!("ferrum.engine.iterations_total").increment(1);
 
         let hint = ferrum_interfaces::BatchHint {
             max_batch_size: self.config.batching.max_batch_size,
@@ -285,19 +300,85 @@ impl EngineInner {
         }
 
         self.total_preemptions.fetch_add(1, Ordering::Relaxed);
+        counter!("ferrum.engine.preemptions_total").increment(1);
         true
     }
 
     // ── prefill ────────────────────────────────────────────────────────
 
     async fn run_prefill(&self, request_id: &RequestId) -> Result<()> {
-        let (input_tensor, num_tokens) = {
+        let (input_tokens_clone, num_tokens) = {
             let sequences = self.sequences.read();
             let seq = sequences
                 .get(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-            let token_u32s: Vec<u32> = seq.input_tokens.iter().map(|t| t.get()).collect();
-            (self.tokens_to_tensor(&token_u32s)?, seq.input_tokens.len())
+            (seq.input_tokens.clone(), seq.input_tokens.len())
+        };
+
+        // ── Check prefix cache ──────────────────────────────────────────
+        // On an exact match we can skip the executor prefill entirely:
+        // clone the cached KV handle and reuse the stored logits.
+        if let Some((_prefix_id, cached_kv, cached_logits)) =
+            self.prefix_cache.find_prefix(&input_tokens_clone)
+        {
+            debug!(
+                "Prefix cache hit for {}: reusing {} cached tokens",
+                request_id, num_tokens,
+            );
+
+            let cloned_kv = cached_kv.clone_handle()?;
+
+            let first_token = {
+                let mut sequences = self.sequences.write();
+                let seq = sequences
+                    .get_mut(request_id)
+                    .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+                let mut logits = cached_logits;
+                if let Some(ref jp) = seq.json_processor {
+                    jp.reset();
+                    // No generated text yet at prefill — just apply start-state biases
+                    let generated: String = seq.generated_tokens.iter()
+                        .filter_map(|t| { let v = t.get(); if v < 128 { Some(v as u8 as char) } else { None } })
+                        .collect();
+                    jp.apply_biases(&mut logits, &generated);
+                }
+                let token = self.sampler.sample(&logits, &mut seq.rng)?;
+                seq.generated_tokens.push(token);
+                seq.kv_cache = Some(cloned_kv);
+                seq.prefill_complete = true;
+                seq.phase = RequestPhase::Decoding;
+                token
+            };
+
+            self.scheduler.mark_prefill_complete(request_id, num_tokens);
+            self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+            counter!("ferrum.engine.prefix_cache_hits").increment(1);
+
+            debug!(
+                "Prefix cache prefill for {}: first generated: {}",
+                request_id,
+                first_token.get()
+            );
+
+            self.send_stream_update(request_id, first_token).await;
+
+            let should_stop = {
+                let sequences = self.sequences.read();
+                sequences
+                    .get(request_id)
+                    .map_or(true, |s| s.should_stop(self.model_executor.info().vocab_size))
+            };
+            if should_stop {
+                self.complete_request(request_id, FinishReason::EOS).await?;
+            }
+
+            return Ok(());
+        }
+
+        // ── Cache miss — full prefill ───────────────────────────────────
+        let input_tensor = {
+            let token_u32s: Vec<u32> = input_tokens_clone.iter().map(|t| t.get()).collect();
+            self.tokens_to_tensor(&token_u32s)?
         };
 
         let model_info = self.model_executor.info();
@@ -336,12 +417,27 @@ impl EngineInner {
         let last_logits = prefill_output.last_token_logits()?;
         let logits_vec = last_logits.to_vec_f32()?;
 
+        // Store in prefix cache for future reuse
+        let _ = self.prefix_cache.store_prefix(
+            &input_tokens_clone,
+            prefill_output.kv_cache.clone(),
+            logits_vec.clone(),
+        );
+
         let first_token = {
             let mut sequences = self.sequences.write();
             let seq = sequences
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-            let token = self.sampler.sample(&logits_vec, &mut seq.rng)?;
+            let mut logits = logits_vec;
+            if let Some(ref jp) = seq.json_processor {
+                jp.reset();
+                let generated: String = seq.generated_tokens.iter()
+                    .filter_map(|t| { let v = t.get(); if v < 128 { Some(v as u8 as char) } else { None } })
+                    .collect();
+                jp.apply_biases(&mut logits, &generated);
+            }
+            let token = self.sampler.sample(&logits, &mut seq.rng)?;
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(prefill_output.kv_cache.clone());
             seq.prefill_complete = true;
@@ -352,6 +448,8 @@ impl EngineInner {
         self.scheduler.mark_prefill_complete(request_id, num_tokens);
         self.total_prefill_tokens
             .fetch_add(num_tokens as u64, Ordering::Relaxed);
+        counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
+        counter!("ferrum.engine.prefills_total").increment(1);
 
         debug!(
             "Prefill complete for {}: {} prompt tokens, first generated: {}",
@@ -405,7 +503,14 @@ impl EngineInner {
             let seq = sequences
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-            let token = self.sampler.sample(&logits_vec, &mut seq.rng)?;
+            let mut logits = logits_vec;
+            if let Some(ref jp) = seq.json_processor {
+                let generated: String = seq.generated_tokens.iter()
+                    .filter_map(|t| { let v = t.get(); if v < 128 { Some(v as u8 as char) } else { None } })
+                    .collect();
+                jp.apply_biases(&mut logits, &generated);
+            }
+            let token = self.sampler.sample(&logits, &mut seq.rng)?;
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(decode_output.kv_cache.clone());
             seq.tokens_this_iteration += 1;
@@ -422,6 +527,7 @@ impl EngineInner {
         self.scheduler
             .update_decode_progress(request_id, generated_count);
         self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+        counter!("ferrum.engine.decode_tokens_total").increment(1);
 
         self.send_stream_update(request_id, next_token).await;
 
@@ -588,9 +694,11 @@ impl ContinuousBatchEngine {
                 iteration_lock: tokio::sync::Mutex::new(()),
                 work_notify: Notify::new(),
                 iteration_count: AtomicU64::new(0),
+                prefix_cache: PrefixCache::new(256, 2),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
+                prefix_cache_hits: AtomicU64::new(0),
             }),
         }
     }
@@ -624,6 +732,9 @@ impl ContinuousBatchEngine {
 impl InferenceEngine for ContinuousBatchEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
         let request_id = request.id.clone();
+        let infer_start = Instant::now();
+        counter!("ferrum.engine.requests_total").increment(1);
+        gauge!("ferrum.engine.active_requests").increment(1.0);
 
         // Submit to scheduler
         self.inner.scheduler.submit(request.clone()).await?;
@@ -644,9 +755,23 @@ impl InferenceEngine for ContinuousBatchEngine {
         // Drive iterations until our request completes
         self.inner.drive_to_completion(&request_id).await?;
 
-        resp_rx.await.map_err(|_| {
+        let result = resp_rx.await.map_err(|_| {
             FerrumError::internal("Response channel closed before response was sent")
-        })
+        });
+
+        gauge!("ferrum.engine.active_requests").decrement(1.0);
+        let elapsed_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
+        histogram!("ferrum.engine.request_duration_ms").record(elapsed_ms);
+
+        if let Ok(ref resp) = result {
+            counter!("ferrum.engine.requests_completed").increment(1);
+            counter!("ferrum.engine.tokens_generated_total").increment(resp.tokens.len() as u64);
+            histogram!("ferrum.engine.ttft_ms").record(elapsed_ms / resp.tokens.len().max(1) as f64);
+        } else {
+            counter!("ferrum.engine.requests_failed").increment(1);
+        }
+
+        result
     }
 
     async fn infer_stream(
