@@ -10,6 +10,7 @@
 
 pub mod attention;
 pub mod fused;
+pub mod ops;
 pub mod registry;
 
 pub use attention::{
@@ -19,5 +20,9 @@ pub use attention::{
 pub use fused::{
     CpuFusedOpsInfo, FusedOpType, FusedOps, FusedOpsConfig, FusedRopeAttention,
     FusedRopeAttentionConfig, RopeCache,
+};
+pub use ops::{
+    create_attention_op, AttentionOp, AttentionOutput, CpuAttentionOp, DecodeAttentionInput,
+    PrefillAttentionInput,
 };
 pub use registry::{global_kernel_registry, KernelInfo, KernelRegistry, PerformanceHint};
