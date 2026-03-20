@@ -1,0 +1,18 @@
+[package]
+name = "ferrum-testkit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Mock components for testing ferrum inference engine without GPU"
+
+[dependencies]
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
+
+async-trait = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }

@@ -16,6 +16,7 @@ members = [
     "crates/ferrum-models",
     "crates/ferrum-server",
     "crates/ferrum-cli",
+    "crates/ferrum-testkit",
 ]
 resolver = "2"
 
@@ -133,6 +134,7 @@ ferrum-engine = { path = "crates/ferrum-engine" }
 ferrum-models = { path = "crates/ferrum-models" }
 ferrum-server = { path = "crates/ferrum-server" }
 ferrum-cli = { path = "crates/ferrum-cli" }
+ferrum-testkit = { path = "crates/ferrum-testkit" }
 
 
 [profile.release]
