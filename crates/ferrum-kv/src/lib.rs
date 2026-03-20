@@ -5,6 +5,7 @@
 //! This crate provides block-based KV cache management, implementing the
 //! interfaces defined in `ferrum-interfaces::kv_cache`.
 
+pub mod attention;
 pub mod blocks;
 pub mod cache;
 pub mod managers;
