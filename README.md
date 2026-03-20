@@ -1,15 +1,20 @@
 # Ferrum Infer (Rust)
 
-Ferrum Infer is a Rust workspace for local LLM inference with an Ollama-like CLI and an
-OpenAI-compatible HTTP server entrypoint.
+Production-grade LLM inference engine in Rust, targeting the same market as vLLM.
 
-Current phase: MVP is runnable, but still evolving quickly.
+**Core thesis**: vLLM-level scheduling capabilities (PagedAttention, continuous batching),
+rewritten with Rust's determinism, memory safety, and zero-GC guarantees for stable P99 latency
+and single-binary deployment.
+
+Current phase: MVP is runnable, evolving toward production readiness.
 
 ## Project Status
 
 - MVP available: local chat, embedding generation, model pull/list, HTTP serving.
+- Scheduling layer correctness hardened: per-request KV isolation, cancellation safety, state-based admission.
 - Not production-ready yet: APIs and internals may change.
-- Focus is correctness, cross-platform build stability, and iterative performance work.
+- See [docs/ROADMAP.md](docs/ROADMAP.md) for the full technical roadmap.
+- See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the development guide (Mac + CUDA CI workflow).
 
 ## What Works Today
 
@@ -137,12 +142,14 @@ cargo test --workspace
   - `HF_TOKEN`
   - `HUGGING_FACE_HUB_TOKEN`
 
-## Roadmap (Near Term)
+## Roadmap
 
-1. Improve model download resilience (`resume/retry/cleanup` for partial snapshots).
-2. Expand CI gates and regression tests for cross-platform device paths.
-3. Improve runtime performance and backend parity.
-4. Continue OpenAI API compatibility and operational hardening.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full roadmap. Key priorities:
+
+1. **True PagedAttention and iteration-level continuous batching** - the core value of the project.
+2. **CUDA kernel FFI layer** - bind FlashAttention/FlashInfer via FFI instead of reimplementing.
+3. **Benchmark framework** - prove Rust scheduling advantage with data.
+4. **Quantization and tensor parallelism** - production deployment requirements.
 
 ## License
 
