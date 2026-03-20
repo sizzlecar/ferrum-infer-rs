@@ -13,7 +13,7 @@ Core value proposition: **vLLM-level scheduling capabilities, rewritten with Rus
 
 ## Current State
 
-MVP phase on the `mvp` branch. Phase 1.1 (PagedAttention) is complete. Phase 1.2 (Continuous Batching) is next.
+MVP phase on the `mvp` branch. Phase 1 (Core Scheduling Engine) is complete.
 
 ### What's done
 
@@ -26,13 +26,36 @@ MVP phase on the `mvp` branch. Phase 1.1 (PagedAttention) is complete. Phase 1.2
   - `PagedKvCacheManager`: `write_kv()` / `read_kv()` through block table indirection
   - `PagedAttentionExecutor`: test executor using real paged KV (identity projections Q=K=V=embedding)
   - `PrefillInput.kv_cache` field: engine passes pre-allocated KV handle to executor, avoiding double allocation
-  - 4 paged lifecycle integration tests + 4 engine integration tests with paged KV
+  - 4 paged lifecycle integration tests + 5 engine integration tests with paged KV
   - 67 unit tests in `ferrum-kv`, all passing
+
+- **Iteration-Level Continuous Batching (Phase 1.2)**
+  - `Arc<EngineInner>` pattern for concurrent spawning from trait methods
+  - `iteration_lock` (tokio::Mutex) serializes engine steps to prevent double-processing
+  - `drive_to_completion()` loop drives iterations until a specific request completes
+  - Mixed prefill+decode batches per iteration via scheduler's `next_batch()`
+  - Background iteration loop (`start_loop()`) with `work_notify` signaling
+  - 11 `continuous_batch_test` integration tests (single/multi/concurrent/streaming/latency/prefix)
+
+- **Preemption (Phase 1.3)**
+  - Recomputation-based preemption on KV cache OOM
+  - Victim selection: lowest-priority decoding request (fewest generated tokens as tiebreaker)
+  - Frees victim's KV cache, resets sequence state, re-submits to scheduler for re-prefill
+  - Response/stream channels preserved across preemption
+  - Deterministic RNG reset for consistent re-generation
+  - 1 preemption integration test with tight block pool (5 concurrent requests, 6-block pool)
+
+- **Prefix Caching (Phase 1.4)**
+  - `PrefixCache`: exact prompt match with LRU eviction and stats (hits/misses/hit_rate)
+  - Cached last-token logits alongside KV handle — cache hit skips executor prefill entirely
+  - `clone_handle()` for KV reuse across requests with identical prompts
+  - Engine-level integration: `run_prefill()` checks cache before executor call, stores result on miss
+  - 1 prefix cache integration test proving second identical prompt skips prefill (executor.prefill_count() == 1)
+  - 5 unit tests for prefix cache (storage, retrieval, filtering, LRU eviction, stats)
 
 - **Scheduler correctness foundation**
   - Per-request KV isolation, cancellation safety, state-based admission control
   - Request state machine: waiting → running transitions with rollback on mismatch
-  - 7 `continuous_batch_test` integration tests (single/multi/concurrent/streaming/latency)
 
 - **Hardware-independent test infrastructure** (`ferrum-testkit`)
   - `MockModelExecutor`, `MockKvCacheManager`, `MockTokenizer`, `MockSampler`, `MockTensor`, `MockTensorFactory`
@@ -48,20 +71,21 @@ MVP phase on the `mvp` branch. Phase 1.1 (PagedAttention) is complete. Phase 1.2
 
 ### What's next
 
-**Phase 1.2: Iteration-level continuous batching** — the current engine processes requests serially (one prefill → N decodes → complete → next). The target is same-iteration mixing of multiple requests' prefill and decode phases.
+**Phase 2: CUDA Kernel Layer** — FFI bindings to FlashAttention/FlashInfer for production attention performance. The scheduling layer (Phase 1) is complete; without CUDA kernels, performance cannot compete with vLLM.
 
 ## Gap Analysis vs vLLM
 
 | Capability | vLLM | Ferrum | Gap |
 |---|---|---|---|
 | PagedAttention | Mature | **Done** — block table, paged KV R/W, CPU attention kernel | Closed |
-| Continuous Batching | Iteration-level, prefill/decode mixed | Per-request scheduling | **Active** |
-| CUDA Kernel Optimization | FlashAttention / FlashInfer | Candle (no custom kernels) | Critical |
+| Continuous Batching | Iteration-level, prefill/decode mixed | **Done** — iteration-level mixed batching, concurrent requests | Closed |
+| Preemption | Swap/recomputation | **Done** — recomputation-based preemption with auto-resubmit | Closed |
+| Prefix Caching | Yes | **Done** — exact-match prefix cache with LRU eviction | Closed |
+| CUDA Kernel Optimization | FlashAttention / FlashInfer | Candle (no custom kernels) | **Critical** |
 | Quantization | AWQ / GPTQ / FP8 | None | Large |
 | Tensor Parallelism | Multi-GPU via NCCL | Type stubs only | Large |
 | Model Support | Dozens | 3 | Medium |
-| Prefix Caching | Yes | No | Medium |
-| Structured Output | JSON mode / grammar-guided | No | Medium |
+| Structured Output | JSON mode / grammar-guided | **Done** — JSON mode via logits biasing, OpenAI API support | Partial (grammar-guided future) |
 | Benchmarking | Comprehensive | None | Medium |
 
 ## Architecture Principle
@@ -92,25 +116,28 @@ The scheduling layer is Ferrum's moat. This is where Rust's advantages are most 
 - ~~CPU reference paged attention kernel (causal mask, GQA, softmax)~~
 - ~~End-to-end integration tests with ContinuousBatchEngine~~
 
-#### 1.2 Iteration-Level Continuous Batching
+#### 1.2 Iteration-Level Continuous Batching ✅
 
-- Prefill and decode requests mixed in the same batch at iteration boundaries
-- Dynamic insertion: new requests join running batches without waiting for batch completion
-- Dynamic eviction: completed/cancelled requests leave immediately
-- Iteration-level scheduling loop replaces current per-request flow
+- ~~Prefill and decode requests mixed in the same batch at iteration boundaries~~
+- ~~Dynamic insertion: new requests join running batches without waiting for batch completion~~
+- ~~Dynamic eviction: completed/cancelled requests leave immediately~~
+- ~~Iteration-level scheduling loop replaces current per-request flow~~
 
-#### 1.3 Preemption and Priority Scheduling
+#### 1.3 Preemption ✅
 
-- Land the existing priority scheduler design
-- Preemption via swap (KV cache offload to CPU) or recomputation
-- SLA-aware scheduling: latency targets per request
-- Backpressure and admission control under overload
+- ~~Recomputation-based preemption on KV cache OOM~~
+- ~~Victim selection with automatic re-submission to scheduler~~
+- ~~Response/stream channels preserved across preemption~~
+- SLA-aware scheduling: latency targets per request (future)
+- Swap-based preemption: KV cache offload to CPU (future)
 
-#### 1.4 Prefix Caching
+#### 1.4 Prefix Caching ✅
 
-- Automatic detection of shared prompt prefixes across requests
-- Shared KV cache blocks with reference counting
-- Hash-based prefix matching (radix tree or similar)
+- ~~Exact-match prefix cache with LRU eviction~~
+- ~~Cached last-token logits — cache hit skips executor prefill entirely~~
+- ~~`clone_handle()` for KV reuse across identical prompts~~
+- Partial prefix matching / radix tree (future)
+- Block-level sharing via `share_prefix_blocks()` for paged KV (future)
 
 ### Phase 2: CUDA Kernel Layer (P0)
 
@@ -137,18 +164,24 @@ Without this, performance cannot compete. The strategy is FFI bindings, not reim
 
 ### Phase 3: Production Features (P1)
 
-#### 3.1 Benchmark Framework
+#### 3.1 Benchmark Framework ✅
 
-- Throughput benchmark: requests/sec, tokens/sec at various concurrency levels
-- Latency benchmark: TTFT (Time To First Token), TPOT (Time Per Output Token), P50/P95/P99
-- Comparison harness against vLLM on same hardware/model
-- Automated regression detection in CI
+- ~~Throughput benchmark: requests/sec, tokens/sec at various concurrency levels~~
+- ~~Latency benchmark: TTFT (Time To First Token), TPOT (Time Per Output Token), P50/P95/P99~~
+- ~~Criterion micro-benchmarks: CPU attention prefill/decode at various seq lengths~~
+- ~~Latency profiling tests: sequential and concurrent with percentile reporting~~
+- Comparison harness against vLLM on same hardware/model (requires CUDA)
+- Automated regression detection in CI (future)
 
-#### 3.2 Observability
+#### 3.2 Observability ✅
 
-- Prometheus metrics: TTFT, TPOT, throughput, queue depth, KV cache utilization, batch size distribution
-- Structured logging with request tracing (request ID propagation)
-- Health check with detailed component status
+- ~~Prometheus metrics: requests, prefills, decodes, preemptions, prefix cache hits, latencies~~
+- ~~`/metrics` endpoint with Prometheus text format export~~
+- ~~`/health` endpoint with engine status, active/queued requests, throughput~~
+- ~~`metrics` crate instrumentation across engine critical path~~
+- ~~`init_prometheus_recorder()` for server startup~~
+- Grafana dashboard templates (future)
+- Distributed tracing with OpenTelemetry (future)
 
 #### 3.3 Tensor Parallelism
 
@@ -156,11 +189,14 @@ Without this, performance cannot compete. The strategy is FFI bindings, not reim
 - Pipeline parallelism as alternative for memory-constrained setups
 - Automatic parallelism strategy selection based on model size and available GPUs
 
-#### 3.4 Structured Output
+#### 3.4 Structured Output ✅
 
-- JSON mode with schema-constrained decoding
-- Grammar-guided generation (context-free grammar)
-- Integration with sampling pipeline
+- ~~JSON mode with logits biasing via `JsonModeProcessor` state machine~~
+- ~~`ResponseFormat` enum (`Text`, `JsonObject`, `JsonSchema`) in `SamplingParams`~~
+- ~~Integration with engine sampling path (prefill + decode)~~
+- ~~OpenAI API `response_format` parameter support~~
+- Grammar-guided generation with full tokenizer integration (future)
+- JSON Schema constraint enforcement (future)
 
 ### Phase 4: Competitive Differentiation (P2)
 
