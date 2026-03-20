@@ -8,7 +8,7 @@ use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
 };
-use ferrum_types::{InferenceRequest, SchedulerConfig};
+use ferrum_types::{InferenceRequest, InferenceResponse, SchedulerConfig};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -191,4 +191,114 @@ async fn engine_with_latency_still_completes() {
     assert_eq!(response.finish_reason, ferrum_types::FinishReason::Length);
     // With 5ms prefill + 4*2ms decode = ~13ms minimum
     assert!(response.latency_ms >= 10);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Continuous batching tests (concurrent requests)
+// ────────────────────────────────────────────────────────────────────────────
+
+fn make_engine_shared() -> Arc<ContinuousBatchEngine> {
+    Arc::new(make_engine())
+}
+
+#[tokio::test]
+async fn concurrent_requests_all_complete() {
+    let engine = make_engine_shared();
+
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let e = engine.clone();
+        handles.push(tokio::spawn(async move {
+            let req = make_request(&format!("Concurrent request {}", i));
+            e.infer(req).await
+        }));
+    }
+
+    let results: Vec<InferenceResponse> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap().unwrap())
+        .collect();
+
+    assert_eq!(results.len(), 5);
+    for resp in &results {
+        assert_eq!(resp.finish_reason, ferrum_types::FinishReason::Length);
+        assert!(!resp.tokens.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_requests_deallocate_kv() {
+    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
+    let config = ferrum_types::EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
+    let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
+    let sampler = Arc::new(MockSampler);
+    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let tensor_factory = Arc::new(MockTensorFactory);
+
+    let engine = Arc::new(ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+    ));
+
+    assert_eq!(kv_cache.active_count(), 0);
+
+    let mut handles = Vec::new();
+    for i in 0..3 {
+        let e = engine.clone();
+        handles.push(tokio::spawn(async move {
+            let req = make_request(&format!("KV test {}", i));
+            e.infer(req).await.unwrap()
+        }));
+    }
+
+    futures::future::join_all(handles).await;
+
+    // All KV caches should be deallocated after all requests complete
+    assert_eq!(kv_cache.active_count(), 0, "All KV caches should be freed");
+}
+
+#[tokio::test]
+async fn concurrent_streams_all_complete() {
+    use futures::StreamExt;
+
+    let engine = make_engine_shared();
+
+    let mut handles = Vec::new();
+    for i in 0..3 {
+        let e = engine.clone();
+        handles.push(tokio::spawn(async move {
+            let req = make_request(&format!("Stream {}", i));
+            let stream = e.infer_stream(req).await.unwrap();
+            let chunks: Vec<_> = stream
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            chunks
+        }));
+    }
+
+    let all_chunks: Vec<Vec<_>> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(all_chunks.len(), 3);
+    for chunks in &all_chunks {
+        assert!(!chunks.is_empty(), "Each stream should produce chunks");
+        let last = chunks.last().unwrap();
+        assert!(
+            last.finish_reason.is_some(),
+            "Final chunk should have finish_reason"
+        );
+    }
 }
