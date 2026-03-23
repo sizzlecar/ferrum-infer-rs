@@ -227,23 +227,54 @@ impl Attention {
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
-        let key_states =
-            candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states = candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?
-            .contiguous()?;
-
         let attn_output = {
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+            #[cfg(feature = "cuda")]
+            {
+                // FlashAttention-2: expects [batch, seq, heads, head_dim]
+                // query_states is [batch, heads, seq, head_dim] after transpose(1,2)
+                // Transpose back to [batch, seq, heads, head_dim] for flash_attn
+                let q = query_states.transpose(1, 2)?.contiguous()?;
+                let k = key_states.transpose(1, 2)?.contiguous()?;
+                let v = value_states.transpose(1, 2)?.contiguous()?;
 
-            let attn_weights = match attention_mask {
-                None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(mask)?,
-            };
-            // Use softmax (basic tensor ops) instead of softmax_last_dim (custom op
-            // without Metal kernel).
-            let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-            attn_weights.matmul(&value_states)?
+                let scale = 1f32 / (self.head_dim as f32).sqrt();
+                let causal = attention_mask.is_some() || q_len > 1;
+
+                // flash_attn requires F16 or BF16
+                let target_dtype = q.dtype();
+                let compute_dtype = match target_dtype {
+                    DType::F16 | DType::BF16 => target_dtype,
+                    _ => DType::F16,
+                };
+                let q = if q.dtype() != compute_dtype { q.to_dtype(compute_dtype)? } else { q };
+                let k = if k.dtype() != compute_dtype { k.to_dtype(compute_dtype)? } else { k };
+                let v = if v.dtype() != compute_dtype { v.to_dtype(compute_dtype)? } else { v };
+
+                let out = candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)?;
+                // Output is [batch, seq, heads, head_dim], need [batch, heads, seq, head_dim]
+                let out = if out.dtype() != target_dtype { out.to_dtype(target_dtype)? } else { out };
+                out.transpose(1, 2)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let key_states =
+                    candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?
+                        .contiguous()?;
+                let value_states =
+                    candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?
+                        .contiguous()?;
+
+                let scale = 1f64 / f64::sqrt(self.head_dim as f64);
+                let attn_weights =
+                    (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+
+                let attn_weights = match attention_mask {
+                    None => attn_weights,
+                    Some(mask) => attn_weights.broadcast_add(mask)?,
+                };
+                let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
+                attn_weights.matmul(&value_states)?
+            }
         };
         // o_proj maps num_heads * head_dim -> hidden_size
         attn_output

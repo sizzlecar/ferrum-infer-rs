@@ -117,6 +117,7 @@ half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_di
 candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
 candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
 candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
+candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "cf5b1ad" }
 
 # Internal crates - New refactored crates
 ferrum-types = { path = "crates/ferrum-types" }

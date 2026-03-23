@@ -30,6 +30,7 @@ tokenizers = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
+candle-flash-attn = { workspace = true, optional = true }
 safetensors = { workspace = true }
 
 # Error handling
@@ -60,6 +61,8 @@ tempfile = "3.8"
 default = []
 # Enable runtime integration for weight loading
 runtime = ["dep:ferrum-runtime"]
+# Enable CUDA FlashAttention-2 in model attention layers
+cuda = ["dep:candle-flash-attn"]
 # Enable integration tests
 integration-tests = []
 # Enable built-in model registry
