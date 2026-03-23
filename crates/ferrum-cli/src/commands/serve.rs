@@ -235,6 +235,11 @@ fn select_device() -> ferrum_types::Device {
         return ferrum_types::Device::Metal;
     }
 
+    #[cfg(feature = "cuda")]
+    {
+        return ferrum_types::Device::CUDA(0);
+    }
+
     #[allow(unreachable_code)]
     ferrum_types::Device::CPU
 }
