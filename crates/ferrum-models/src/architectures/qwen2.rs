@@ -26,7 +26,31 @@ impl Qwen2ModelWrapper {
         info!("🔨 Creating Qwen2 model from weights...");
 
         // Build Candle's Qwen2 config
-        // Use default values from Qwen2 examples
+        // Read optional fields from extra_params (raw config.json)
+        let tie_word_embeddings = config
+            .extra_params
+            .get("tie_word_embeddings")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let sliding_window = config
+            .extra_params
+            .get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(32768) as usize;
+
+        let max_window_layers = config
+            .extra_params
+            .get("max_window_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(config.num_hidden_layers as u64) as usize;
+
+        let use_sliding_window = config
+            .extra_params
+            .get("use_sliding_window")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let candle_config = candle_qwen2::Config {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
@@ -39,11 +63,11 @@ impl Qwen2ModelWrapper {
             max_position_embeddings: config.max_position_embeddings,
             rope_theta: config.rope_theta.unwrap_or(1000000.0),
             rms_norm_eps: config.norm_eps,
-            tie_word_embeddings: false,
-            sliding_window: 32768, // Default sliding window
-            max_window_layers: config.num_hidden_layers,
-            use_sliding_window: false,
-            hidden_act: Activation::Silu, // Default activation
+            tie_word_embeddings,
+            sliding_window,
+            max_window_layers,
+            use_sliding_window,
+            hidden_act: Activation::Silu,
         };
 
         debug!(
