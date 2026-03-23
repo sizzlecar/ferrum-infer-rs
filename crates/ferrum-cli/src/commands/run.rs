@@ -136,6 +136,15 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 // Build prompt with history
                 let prompt = build_chat_prompt(&history, input, cmd.system.as_deref(), &model_id);
 
+                // Model-specific sampling defaults
+                let model_lower = model_id.to_lowercase();
+                let (default_top_p, default_top_k) = if model_lower.contains("qwen3") {
+                    // Qwen3 non-thinking mode: top_p=0.8, top_k=20
+                    (0.8, Some(20))
+                } else {
+                    (0.9, None)
+                };
+
                 // Create request
                 let request = InferenceRequest {
                     id: RequestId(Uuid::new_v4()),
@@ -144,7 +153,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     sampling_params: SamplingParams {
                         max_tokens: cmd.max_tokens as usize,
                         temperature: cmd.temperature,
-                        top_p: 0.9,
+                        top_p: default_top_p,
+                        top_k: default_top_k,
+                        repetition_penalty: 1.1,
                         stop_sequences: vec![
                             "<|im_end|>".to_string(),
                             "</s>".to_string(),
@@ -247,6 +258,9 @@ fn resolve_model_alias(name: &str) -> String {
         "qwen2.5:1.5b" | "qwen:1.5b" => "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
         "qwen2.5:3b" | "qwen:3b" => "Qwen/Qwen2.5-3B-Instruct".to_string(),
         "qwen2.5:7b" | "qwen:7b" => "Qwen/Qwen2.5-7B-Instruct".to_string(),
+        "qwen3:0.6b" => "Qwen/Qwen3-0.6B".to_string(),
+        "qwen3:1.7b" => "Qwen/Qwen3-1.7B".to_string(),
+        "qwen3:4b" => "Qwen/Qwen3-4B".to_string(),
         "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
         "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
         _ => name.to_string(),
@@ -357,7 +371,7 @@ fn build_chat_prompt(
     let model_lower = model_id.to_lowercase();
 
     if model_lower.contains("qwen") {
-        // Qwen ChatML format
+        // Qwen ChatML format (Qwen2, Qwen2.5, Qwen3)
         let mut prompt = String::new();
         if let Some(sys) = system {
             prompt.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys));
@@ -369,6 +383,10 @@ fn build_chat_prompt(
             "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             user_input
         ));
+        // Qwen3: disable thinking mode by inserting empty think block
+        if model_lower.contains("qwen3") {
+            prompt.push_str("<think>\n\n</think>\n\n");
+        }
         prompt
     } else if model_lower.contains("llama") && model_lower.contains("3") {
         // Llama 3 format

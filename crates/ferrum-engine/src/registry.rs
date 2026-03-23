@@ -1016,7 +1016,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let vb = loader.load_varbuilder(&candle_device, dtype)?;
 
-                // Standard Candle executor for CPU
                 let qwen2_model = ferrum_models::Qwen2ModelWrapper::from_varbuilder(
                     vb,
                     &model_def,
@@ -1027,6 +1026,24 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
                 let executor = ferrum_models::Qwen2ModelExecutor::new(qwen2_model, model_info);
+
+                Ok(Arc::new(executor))
+            }
+            ferrum_models::Architecture::Qwen3 => {
+                info!("Loading Qwen3 model weights...");
+                let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
+                let vb = loader.load_varbuilder(&candle_device, dtype)?;
+
+                let qwen3_model = ferrum_models::Qwen3ModelWrapper::from_varbuilder(
+                    vb,
+                    &model_def,
+                    candle_device.clone(),
+                    dtype,
+                )?;
+
+                let model_info =
+                    model_def.to_model_info(config.engine_config.model.model_id.to_string());
+                let executor = ferrum_models::Qwen3ModelExecutor::new(qwen3_model, model_info);
 
                 Ok(Arc::new(executor))
             }
@@ -1057,6 +1074,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             capabilities: vec![
                 "llama".to_string(),
                 "qwen2".to_string(),
+                "qwen3".to_string(),
                 "fp16".to_string(),
                 "fp32".to_string(),
             ],

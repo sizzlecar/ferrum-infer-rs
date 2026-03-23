@@ -25,6 +25,25 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, error, info, span, Level};
 use uuid::Uuid;
 
+/// Shared Prometheus recorder handle for rendering metrics.
+static PROM_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+    std::sync::OnceLock::new();
+
+/// Initialize the Prometheus metrics recorder.
+///
+/// Must be called once before any `metrics::counter!()` / `histogram!()` calls.
+/// Safe to call multiple times — subsequent calls are no-ops.
+pub fn init_prometheus_recorder() {
+    PROM_HANDLE.get_or_init(|| {
+        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+        let handle = builder
+            .install_recorder()
+            .expect("Failed to install Prometheus recorder");
+        info!("Prometheus metrics recorder installed");
+        handle
+    });
+}
+
 /// Axum-based server implementation
 pub struct AxumServer {
     engine: Arc<dyn InferenceEngine + Send + Sync>,
@@ -51,8 +70,9 @@ impl AxumServer {
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/models", get(models_handler))
-            // Health check
+            // Health & observability
             .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler))
             .route("/", get(root_handler))
             // Apply middleware
             .layer(
@@ -352,6 +372,12 @@ fn convert_chat_request(
             tfs: None,
             typical_p: None,
             mirostat: None,
+            response_format: match &request.response_format {
+                Some(rf) if rf.format_type == "json_object" => {
+                    ferrum_types::ResponseFormat::JsonObject
+                }
+                _ => ferrum_types::ResponseFormat::Text,
+            },
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -400,14 +426,46 @@ async fn models_handler(
     Ok(Json(models).into_response())
 }
 
-async fn health_handler() -> std::result::Result<Response, ServerError> {
+async fn health_handler(
+    State(state): State<AppState>,
+) -> std::result::Result<Response, ServerError> {
+    let engine_status = state.engine.status().await;
+    let scheduler_metrics = state.engine.metrics();
+
     let health = serde_json::json!({
         "status": "healthy",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "version": env!("CARGO_PKG_VERSION")
+        "version": env!("CARGO_PKG_VERSION"),
+        "engine": {
+            "active_requests": engine_status.active_requests,
+            "queued_requests": engine_status.queued_requests,
+        },
+        "scheduler": {
+            "total_requests": scheduler_metrics.total_requests,
+            "successful_requests": scheduler_metrics.successful_requests,
+            "failed_requests": scheduler_metrics.failed_requests,
+            "throughput_rps": scheduler_metrics.throughput_rps,
+        }
     });
 
     Ok(Json(health).into_response())
+}
+
+/// Prometheus metrics endpoint — returns metrics in Prometheus text format.
+async fn metrics_handler() -> std::result::Result<Response, ServerError> {
+    let body = match PROM_HANDLE.get() {
+        Some(handle) => handle.render(),
+        None => "# Prometheus recorder not initialized\n".to_string(),
+    };
+
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
 }
 
 async fn root_handler() -> std::result::Result<Response, ServerError> {

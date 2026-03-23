@@ -1,149 +1,127 @@
-# Ferrum Infer (Rust)
+# Ferrum Infer
 
-Ferrum Infer is a Rust workspace for local LLM inference with an Ollama-like CLI and an
-OpenAI-compatible HTTP server entrypoint.
+A Rust-native LLM inference engine. Load models from Hugging Face, chat locally or serve via OpenAI-compatible API. Single binary, no Python, no runtime dependencies.
 
-Current phase: MVP is runnable, but still evolving quickly.
-
-## Project Status
-
-- MVP available: local chat, embedding generation, model pull/list, HTTP serving.
-- Not production-ready yet: APIs and internals may change.
-- Focus is correctness, cross-platform build stability, and iterative performance work.
-
-## What Works Today
-
-- CLI commands:
-  - `ferrum run` interactive chat
-  - `ferrum embed` BERT embeddings
-  - `ferrum pull` download from Hugging Face
-  - `ferrum list` inspect local model cache (ready/incomplete)
-  - `ferrum serve` start HTTP server
-  - `ferrum stop` stop server by PID file
-- Inference stack:
-  - Candle-based runtime path
-  - Model loading from Hugging Face cache/snapshots
-  - Streaming text generation in CLI
-- Server endpoints:
-  - `POST /v1/chat/completions`
-  - `GET /v1/models`
-  - `GET /health`
-
-## Known Limits
-
-- Still pre-production: limited hardening/observability.
-- Feature/performance differs by model architecture and device backend.
-- CUDA builds require CUDA toolchain on host.
-- Some models may appear as `incomplete` in cache if snapshot is partial.
+[中文说明](README_zh.md)
 
 ## Quick Start
 
-Prerequisites:
+Prerequisites: Rust stable toolchain.
 
-- Rust stable toolchain
-- Network access to Hugging Face for model pull
-- Optional private model token: `HF_TOKEN`
-
-Build CLI:
+For gated models (e.g. Llama 3.2), set your Hugging Face token first:
+```bash
+export HF_TOKEN=hf_your_token_here
+```
 
 ```bash
+# Build
 cargo build --release -p ferrum-cli --bin ferrum
+
+# Download a model
+./target/release/ferrum pull qwen3:0.6b
+
+# Chat
+./target/release/ferrum run qwen3:0.6b
+
+# Or start an API server
+./target/release/ferrum serve --model qwen3:0.6b --port 8000
 ```
 
-Show help:
+## Supported Models
+
+| Alias | Model | Architecture |
+|-------|-------|-------------|
+| `qwen3:0.6b` / `1.7b` / `4b` | Qwen3 | Qwen3 |
+| `qwen2.5:0.5b` / `1.5b` / `3b` / `7b` | Qwen2.5-Instruct | Qwen2 |
+| `llama3.2:1b` / `3b` | Llama-3.2-Instruct | LLaMA |
+| `tinyllama` | TinyLlama-1.1B-Chat | LLaMA |
+
+Any Hugging Face model ID with a supported architecture also works directly:
+```bash
+./target/release/ferrum run Qwen/Qwen3-0.6B
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `ferrum run <model>` | Interactive chat |
+| `ferrum serve --model <model>` | OpenAI-compatible HTTP server |
+| `ferrum stop` | Stop running server |
+| `ferrum pull <model>` | Download model from Hugging Face |
+| `ferrum list` | Show cached models |
+| `ferrum embed <model>` | Generate BERT embeddings |
+
+## API Endpoints
 
 ```bash
-./target/release/ferrum --help
+# Chat completions (OpenAI-compatible)
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"Hello"}]}'
+
+# List models
+curl http://localhost:8000/v1/models
+
+# Health check
+curl http://localhost:8000/health
 ```
 
-Download a model:
+## Current Status
+
+**v0.2.0 — Functional MVP, pre-production.**
+
+What works:
+- CLI chat and HTTP serving with streaming
+- Qwen3, Qwen2/2.5, LLaMA 3.x, TinyLlama architectures
+- Metal GPU acceleration (macOS), CPU cross-platform
+- Top-k/top-p/temperature/repetition-penalty sampling
+- Hugging Face model download and cache management
+
+What's in progress:
+- Backend abstraction layer (KernelOps) for pluggable Metal/CUDA/CPU kernels
+- PagedAttention integration for production-grade KV cache management
+- Continuous batching for concurrent request serving
+
+## Roadmap
+
+1. **Kernel backend abstraction** — unify Metal/CUDA/CPU behind a single trait interface
+2. **CUDA kernel FFI** — bind FlashAttention/FlashInfer for NVIDIA GPUs
+3. **Production batching** — iteration-level continuous batching with preemption
+4. **Quantization** — GPTQ/AWQ/GGUF support for larger models on consumer hardware
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
+
+## Build Options
 
 ```bash
-./target/release/ferrum pull Qwen/Qwen2.5-0.5B-Instruct
+# CPU only (default)
+cargo build --release -p ferrum-cli
+
+# With Metal acceleration (macOS)
+cargo build --release -p ferrum-cli --features metal
 ```
 
-List local models:
+Prerequisites: Rust stable toolchain.
 
-```bash
-./target/release/ferrum list
+## Project Structure
+
 ```
-
-Run interactive chat:
-
-```bash
-./target/release/ferrum run Qwen/Qwen2.5-0.5B-Instruct
+crates/
+├── ferrum-types        # Shared type definitions
+├── ferrum-interfaces   # Core trait contracts (ComputeBackend, KernelOps, ModelExecutor)
+├── ferrum-runtime      # Backend implementations (Candle, CPU)
+├── ferrum-engine       # Metal kernels, model orchestration
+├── ferrum-models       # Model architectures (LLaMA, Qwen2, Qwen3, BERT)
+├── ferrum-tokenizer    # Tokenization
+├── ferrum-sampler      # Sampling strategies
+├── ferrum-scheduler    # Request scheduling
+├── ferrum-kv           # KV cache management
+├── ferrum-server       # HTTP API server
+├── ferrum-cli          # CLI binary
+└── ferrum-testkit      # Testing utilities
 ```
-
-Start server:
-
-```bash
-./target/release/ferrum serve --model Qwen/Qwen2.5-0.5B-Instruct --host 127.0.0.1 --port 8000
-```
-
-Stop server:
-
-```bash
-./target/release/ferrum stop
-```
-
-## Workspace Layout
-
-Core contracts:
-
-- `crates/ferrum-types`
-- `crates/ferrum-interfaces`
-
-Implementations:
-
-- `crates/ferrum-runtime`
-- `crates/ferrum-scheduler`
-- `crates/ferrum-tokenizer`
-- `crates/ferrum-sampler`
-- `crates/ferrum-kv`
-- `crates/ferrum-models`
-- `crates/ferrum-engine`
-- `crates/ferrum-server`
-- `crates/ferrum-cli`
-
-## Build and Validation
-
-Use the same checks as CI:
-
-```bash
-cargo fmt --all -- --check
-cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets -- -A warnings
-cargo build -p ferrum-cli --bin ferrum
-cargo test -p ferrum-cli --test cli_e2e
-```
-
-Useful local full pass:
-
-```bash
-cargo test --workspace
-```
-
-## Device Notes
-
-- CPU path works cross-platform.
-- Metal path is for Apple targets (`feature = "metal"`).
-- CUDA path is optional and environment-dependent.
-
-## Cache and Environment
-
-- Default config file: `ferrum.toml`
-- Hugging Face cache defaults to `~/.cache/huggingface` (override via `HF_HOME`)
-- Private model token:
-  - `HF_TOKEN`
-  - `HUGGING_FACE_HUB_TOKEN`
-
-## Roadmap (Near Term)
-
-1. Improve model download resilience (`resume/retry/cleanup` for partial snapshots).
-2. Expand CI gates and regression tests for cross-platform device paths.
-3. Improve runtime performance and backend parity.
-4. Continue OpenAI API compatibility and operational hardening.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT

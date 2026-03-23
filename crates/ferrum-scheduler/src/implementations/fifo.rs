@@ -324,6 +324,23 @@ impl Scheduler for FifoScheduler {
         &self.config
     }
 
+    fn request_state(&self, request_id: &RequestId) -> Option<RequestState> {
+        if self.running_requests.read().contains_key(request_id) {
+            return Some(RequestState::Running);
+        }
+
+        if self
+            .waiting_queue
+            .read()
+            .iter()
+            .any(|req| req.request.id == *request_id)
+        {
+            return Some(RequestState::Waiting);
+        }
+
+        None
+    }
+
     async fn preempt(&self, _request_id: RequestId) -> Result<PreemptionResult> {
         Err(ferrum_types::FerrumError::unsupported(
             "FIFO scheduler does not support preemption",
@@ -402,6 +419,24 @@ mod tests {
 
         let result = scheduler.cancel(id).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_fifo_request_state_transitions() {
+        let config = SchedulerConfig::default();
+        let scheduler = FifoScheduler::new(config);
+
+        let request = create_test_request(Priority::Normal);
+        let id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        assert_eq!(scheduler.request_state(&id), Some(RequestState::Waiting));
+
+        let _batch = scheduler.next_batch(BatchHint::simple(1)).await;
+        assert_eq!(scheduler.request_state(&id), Some(RequestState::Running));
+
+        scheduler.cancel(id.clone()).await.unwrap();
+        assert_eq!(scheduler.request_state(&id), None);
     }
 
     #[test]

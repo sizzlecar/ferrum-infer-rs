@@ -25,6 +25,7 @@ use candle_core::{Layout, Storage};
 use candle_core::MetalStorage;
 
 /// GPU sampling ops backed by Ferrum's embedded metallib.
+// TODO(phase-2.2): migrate to implement `SamplingOps` from `ferrum_interfaces::kernel_ops`
 pub struct MetalSamplingOps {
     context: Arc<MetalContext>,
     mask_one: ComputePipelineState,

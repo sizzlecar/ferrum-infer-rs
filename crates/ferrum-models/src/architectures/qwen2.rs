@@ -26,7 +26,31 @@ impl Qwen2ModelWrapper {
         info!("🔨 Creating Qwen2 model from weights...");
 
         // Build Candle's Qwen2 config
-        // Use default values from Qwen2 examples
+        // Read optional fields from extra_params (raw config.json)
+        let tie_word_embeddings = config
+            .extra_params
+            .get("tie_word_embeddings")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let sliding_window = config
+            .extra_params
+            .get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(32768) as usize;
+
+        let max_window_layers = config
+            .extra_params
+            .get("max_window_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(config.num_hidden_layers as u64) as usize;
+
+        let use_sliding_window = config
+            .extra_params
+            .get("use_sliding_window")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let candle_config = candle_qwen2::Config {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
@@ -39,11 +63,11 @@ impl Qwen2ModelWrapper {
             max_position_embeddings: config.max_position_embeddings,
             rope_theta: config.rope_theta.unwrap_or(1000000.0),
             rms_norm_eps: config.norm_eps,
-            tie_word_embeddings: false,
-            sliding_window: 32768, // Default sliding window
-            max_window_layers: config.num_hidden_layers,
-            use_sliding_window: false,
-            hidden_act: Activation::Silu, // Default activation
+            tie_word_embeddings,
+            sliding_window,
+            max_window_layers,
+            use_sliding_window,
+            hidden_act: Activation::Silu,
         };
 
         debug!(
@@ -73,29 +97,9 @@ impl Qwen2ModelWrapper {
     pub fn forward_prefill(&self, input_ids: &Tensor) -> Result<Tensor> {
         let mut model = self.model.lock();
 
-        let logits = model
+        model
             .forward(input_ids, 0)
-            .map_err(|e| FerrumError::model(format!("Prefill forward failed: {}", e)))?;
-
-        // Debug: log top logits to compare with Metal implementation
-        if let Ok(flat) = logits.flatten_all() {
-            if let Ok(vals) = flat.to_vec1::<f32>() {
-                let mut indexed: Vec<(usize, f32)> =
-                    vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let top_k = 10.min(indexed.len());
-                info!("CPU Qwen2 Top {} logits: {:?}", top_k, &indexed[..top_k]);
-                // Check specific tokens
-                if vals.len() > 29 {
-                    info!(
-                        "CPU tokens: 17='2': {:.4}, 19='4': {:.4}, 28='=': {:.4}",
-                        vals[17], vals[19], vals[28]
-                    );
-                }
-            }
-        }
-
-        Ok(logits)
+            .map_err(|e| FerrumError::model(format!("Prefill forward failed: {}", e)))
     }
 
     /// Forward pass for decode (single token)
