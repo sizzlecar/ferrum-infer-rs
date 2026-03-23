@@ -35,6 +35,9 @@ enum Commands {
     #[command(visible_alias = "r")]
     Run(run::RunCommand),
 
+    /// Benchmark model throughput and latency
+    Bench(bench::BenchCommand),
+
     /// Generate text embeddings using BERT models
     #[command(visible_alias = "e")]
     Embed(embed::EmbedCommand),
@@ -77,6 +80,7 @@ async fn main() {
     // Execute command
     let result = match cli.command {
         Commands::Run(cmd) => run::execute(cmd, config).await,
+        Commands::Bench(cmd) => bench::execute(cmd, config).await,
         Commands::Embed(cmd) => embed::execute(cmd, config).await,
         Commands::Serve(cmd) => serve::execute(cmd, config).await,
         Commands::Stop(cmd) => stop::execute(cmd).await,
