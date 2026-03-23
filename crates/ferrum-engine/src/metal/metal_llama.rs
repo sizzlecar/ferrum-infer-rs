@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Metal-accelerated RMS Normalization layer
+// TODO(phase-2.2): migrate to implement `NormOps` from `ferrum_interfaces::kernel_ops`
 pub struct MetalRmsNorm {
     weight: Tensor,
     eps: f32,
@@ -182,6 +183,7 @@ impl MetalRmsNorm {
 }
 
 /// Metal-accelerated Rotary Position Embedding
+// TODO(phase-2.2): migrate to implement `PositionOps` from `ferrum_interfaces::kernel_ops`
 pub struct MetalRotaryEmbedding {
     cos_cache: Tensor,
     sin_cache: Tensor,
@@ -312,6 +314,7 @@ pub struct MetalLlamaConfig {
 }
 
 /// Metal-accelerated LLaMA Attention layer
+// TODO(phase-2.2): migrate to implement `AttentionOps` from `ferrum_interfaces::kernel_ops`
 pub struct MetalLlamaAttention {
     q_proj: Linear,
     k_proj: Linear,
@@ -538,6 +541,7 @@ impl MetalLlamaAttention {
 }
 
 /// Metal-accelerated LLaMA MLP
+// TODO(phase-2.2): SwiGLU pattern maps to `ActivationOps::silu_mul` + `LinearOps::linear`
 pub struct MetalLlamaMlp {
     gate_proj: Linear,
     up_proj: Linear,
