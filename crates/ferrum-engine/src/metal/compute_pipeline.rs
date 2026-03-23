@@ -161,8 +161,10 @@ impl Q4_0MatvecPipeline {
     }
 }
 
-/// High-level Q4_0 matrix operations interface
-// TODO(phase-2.2): migrate to implement `LinearOps::quantized_linear` from `ferrum_interfaces::kernel_ops`
+/// High-level Q4_0 matrix operations interface.
+///
+/// For the trait-based `LinearOps::quantized_linear` interface, see
+/// [`super::metal_kernel_ops::MetalLinearOps`].
 pub struct Q4_0MatrixOps {
     pipeline: Q4_0MatvecPipeline,
 }

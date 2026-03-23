@@ -27,6 +27,8 @@ pub mod metal_qwen2;
 pub mod quantization;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod sampling_ops;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_kernel_ops;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use backend::MetalBackend;
@@ -50,6 +52,8 @@ pub use metal_qwen2::*;
 pub use quantization::*;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use sampling_ops::*;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use metal_kernel_ops::MetalKernelOps;
 
 // Stub implementations for non-Apple platforms
 #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]

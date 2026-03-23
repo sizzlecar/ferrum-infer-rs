@@ -11,8 +11,40 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-// Re-use candle's with_tracing utilities
-use candle_transformers::models::with_tracing::{linear_no_bias, Linear, RmsNorm};
+// Re-use candle's with_tracing utilities (except RmsNorm — candle's custom op
+// lacks a Metal kernel; we use rms_norm_slow which is built from basic tensor
+// ops that Metal supports).
+use candle_transformers::models::with_tracing::{linear_no_bias, Linear};
+
+/// Metal-compatible RmsNorm using basic tensor ops instead of `candle_nn::ops::rms_norm`
+/// which relies on a custom op without Metal support.
+#[derive(Debug, Clone)]
+struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    fn new(size: usize, eps: f64, vb: VarBuilder) -> CandleResult<Self> {
+        let weight = vb.get(size, "weight")?;
+        Ok(Self { weight, eps })
+    }
+}
+
+impl Module for RmsNorm {
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let x_dtype = x.dtype();
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        let hidden_size = x.dim(D::Minus1)?;
+        let x = x.to_dtype(internal_dtype)?;
+        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+        x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -68,8 +100,9 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        // Use rope_slow (basic tensor ops) instead of rope (custom op without Metal kernel).
+        let q_embed = candle_nn::rotary_emb::rope_slow(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope_slow(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -207,7 +240,9 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            // Use softmax (basic tensor ops) instead of softmax_last_dim (custom op
+            // without Metal kernel).
+            let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
             attn_weights.matmul(&value_states)?
         };
         // o_proj maps num_heads * head_dim -> hidden_size
