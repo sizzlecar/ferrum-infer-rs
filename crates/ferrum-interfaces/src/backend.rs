@@ -5,6 +5,7 @@
 //! model weight management.
 
 use crate::{TensorFactory, TensorOps, TensorRef};
+use crate::kernel_ops::KernelOps;
 use async_trait::async_trait;
 use ferrum_types::{DataType, Device, Result};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,15 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Get kernel executor (if backend supports custom kernels)
     fn kernel_executor(&self) -> Option<&dyn KernelExecutor>;
+
+    /// Get LLM-specific kernel operations (if backend provides optimized impls).
+    ///
+    /// Returns `None` by default — existing backends compile unchanged.
+    /// Backends that implement `KernelOps` sub-traits (NormOps, PositionOps, etc.)
+    /// return `Some` here to enable accelerated paths.
+    fn kernel_ops(&self) -> Option<&dyn KernelOps> {
+        None
+    }
 
     /// Initialize backend with device
     async fn initialize(&mut self, device: &Device) -> Result<()>;
