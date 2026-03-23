@@ -251,7 +251,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     Ok(())
 }
 
-fn resolve_model_alias(name: &str) -> String {
+pub fn resolve_model_alias(name: &str) -> String {
     match name.to_lowercase().as_str() {
         "tinyllama" | "tiny" => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
         "qwen2.5:0.5b" | "qwen:0.5b" => "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
@@ -267,7 +267,7 @@ fn resolve_model_alias(name: &str) -> String {
     }
 }
 
-fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
+pub fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
     // Check environment variable first
     if let Ok(hf_home) = std::env::var("HF_HOME") {
         return PathBuf::from(hf_home);
@@ -278,7 +278,7 @@ fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
     PathBuf::from(configured)
 }
 
-fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedModelSource> {
+pub fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedModelSource> {
     let repo_dir = cache_dir
         .join("hub")
         .join(format!("models--{}", model_id.replace('/', "--")));
@@ -325,7 +325,7 @@ fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedMode
     None
 }
 
-fn detect_format(path: &PathBuf) -> ModelFormat {
+pub fn detect_format(path: &PathBuf) -> ModelFormat {
     if path.join("model.safetensors").exists() || path.join("model.safetensors.index.json").exists()
     {
         ModelFormat::SafeTensors
@@ -336,7 +336,7 @@ fn detect_format(path: &PathBuf) -> ModelFormat {
     }
 }
 
-fn select_device(backend: &str) -> ferrum_types::Device {
+pub fn select_device(backend: &str) -> ferrum_types::Device {
     match backend.to_lowercase().as_str() {
         "cpu" => ferrum_types::Device::CPU,
         "metal" => {
