@@ -16,6 +16,7 @@
 
 pub mod backend;
 pub mod engine;
+pub mod kernel_ops;
 pub mod kv_cache;
 pub mod memory;
 pub mod model_builder;
@@ -38,6 +39,13 @@ pub use sampler::{LogitsProcessor, Sampler, SamplingConfig, SamplingContext};
 pub use scheduler::{BatchHint, BatchPlan, Scheduler as SchedulerInterface};
 pub use tensor::{TensorFactory, TensorLike, TensorOps, TensorRef};
 pub use tokenizer::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo};
+
+// Kernel ops re-exports
+pub use kernel_ops::{
+    ActivationOps, AttentionOps, AttentionParams, KernelOps, KernelOpsDispatch, LinearOps,
+    NormOps, PositionOps, QuantScheme, RoPEConfig, SamplingOps,
+    SamplingParams as KernelSamplingParams,
+};
 
 // Re-export types from ferrum-types, avoiding conflicts
 pub use ferrum_types::{
