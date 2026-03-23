@@ -468,6 +468,22 @@ impl Scheduler for PriorityScheduler {
         &self.config
     }
 
+    fn request_state(&self, request_id: &RequestId) -> Option<RequestState> {
+        if self.running_requests.read().contains_key(request_id) {
+            return Some(RequestState::Running);
+        }
+
+        if let Some(req) = self.request_map.read().get(request_id) {
+            return Some(req.state);
+        }
+
+        if self.waiting_queue.read().get_priority(request_id).is_some() {
+            return Some(RequestState::Waiting);
+        }
+
+        None
+    }
+
     async fn preempt(&self, request_id: RequestId) -> Result<PreemptionResult> {
         // Simple preemption: can preempt lower priority running requests
         let mut running_requests = self.running_requests.write();
@@ -639,6 +655,30 @@ mod tests {
         // 验证请求不在队列中
         let waiting_queue = scheduler.waiting_queue.read();
         assert_eq!(waiting_queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_priority_request_state_transitions() {
+        let config = SchedulerConfig::default();
+        let scheduler = PriorityScheduler::new(config);
+
+        let request = create_test_request_with_priority(Priority::Normal);
+        let request_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        assert_eq!(
+            scheduler.request_state(&request_id),
+            Some(RequestState::Waiting)
+        );
+
+        let _batch = scheduler.next_batch(BatchHint::simple(1)).await;
+        assert_eq!(
+            scheduler.request_state(&request_id),
+            Some(RequestState::Running)
+        );
+
+        scheduler.cancel(request_id.clone()).await.unwrap();
+        assert_eq!(scheduler.request_state(&request_id), None);
     }
 
     #[tokio::test]

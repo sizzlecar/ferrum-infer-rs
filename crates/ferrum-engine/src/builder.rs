@@ -14,7 +14,7 @@ use ferrum_interfaces::{
     ComputeBackend, InferenceEngine, KvCacheManager, ModelExecutor, Sampler,
     SchedulerInterface as Scheduler, Tokenizer,
 };
-use ferrum_types::{EngineConfig, Result};
+use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -252,6 +252,8 @@ impl EngineBuilder {
         let executor_name = self.resolve_executor_name();
 
         let component_config = ComponentConfig::from_engine_config(&self.config);
+        let has_model_path = component_config.get_string_option("model_path").is_some()
+            || std::env::var("FERRUM_MODEL_PATH").is_ok();
         let registry = self.registry.clone();
         let config = self.config;
 
@@ -290,6 +292,13 @@ impl EngineBuilder {
             {
                 Ok(t) => t,
                 Err(e) => {
+                    if has_model_path {
+                        return Err(FerrumError::config(format!(
+                            "Failed to create tokenizer '{}' in model mode: {}",
+                            tokenizer_name, e
+                        )));
+                    }
+
                     tracing::warn!(
                         "Failed to create tokenizer '{}': {}, falling back to stub",
                         tokenizer_name,
@@ -347,6 +356,13 @@ impl EngineBuilder {
             {
                 Ok(e) => e,
                 Err(err) => {
+                    if has_model_path {
+                        return Err(FerrumError::config(format!(
+                            "Failed to create executor '{}' in model mode: {}",
+                            executor_name, err
+                        )));
+                    }
+
                     tracing::warn!(
                         "Failed to create executor '{}': {}, falling back to stub",
                         executor_name,

@@ -12,7 +12,13 @@ use ferrum_interfaces::{
 };
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
 use parking_lot::Mutex;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 use tracing::{debug, info};
 
 use crate::{architectures::qwen2::Qwen2ModelWrapper, tensor_wrapper::CandleTensorWrapper};
@@ -22,8 +28,8 @@ use crate::{architectures::qwen2::Qwen2ModelWrapper, tensor_wrapper::CandleTenso
 struct Qwen2CacheState {
     /// Current sequence length processed by the model
     sequence_length: usize,
-    /// KV cache handle exposed to the engine
-    kv_handle: Arc<Qwen2KvCacheHandle>,
+    /// Request-scoped cache identifier
+    cache_id: String,
 }
 
 /// Candle-based Qwen2 model executor
@@ -31,6 +37,7 @@ pub struct Qwen2ModelExecutor {
     model: Arc<Qwen2ModelWrapper>,
     info: ModelInfo,
     state: Mutex<Option<Qwen2CacheState>>,
+    next_cache_id: AtomicU64,
 }
 
 impl Qwen2ModelExecutor {
@@ -42,6 +49,7 @@ impl Qwen2ModelExecutor {
             model: Arc::new(model),
             info,
             state: Mutex::new(None),
+            next_cache_id: AtomicU64::new(1),
         }
     }
 
@@ -113,17 +121,23 @@ impl ModelExecutor for Qwen2ModelExecutor {
 
         let logits_ref = self.wrap_tensor(logits);
 
+        let cache_id = format!(
+            "qwen2-cache-{}",
+            self.next_cache_id.fetch_add(1, Ordering::Relaxed)
+        );
+
         // Create KV cache handle representing internal state
         let kv_handle = Arc::new(Qwen2KvCacheHandle::new(
             self.model.config(),
             self.model.device().clone(),
             tokens.len(),
+            cache_id.clone(),
         ));
 
         // Store state for subsequent decode steps
         *self.state.lock() = Some(Qwen2CacheState {
             sequence_length: tokens.len(),
-            kv_handle: kv_handle.clone(),
+            cache_id,
         });
 
         Ok(PrefillOutput::new(logits_ref, kv_handle))
@@ -136,6 +150,19 @@ impl ModelExecutor for Qwen2ModelExecutor {
         let state = guard
             .as_mut()
             .ok_or_else(|| FerrumError::model("Decode called before prefill"))?;
+
+        let input_handle = input
+            .kv_cache
+            .as_any()
+            .downcast_ref::<Qwen2KvCacheHandle>()
+            .ok_or_else(|| FerrumError::model("Invalid KV cache handle type for Qwen2 executor"))?;
+        if input_handle.request_cache_id() != state.cache_id {
+            return Err(FerrumError::model(format!(
+                "KV cache handle mismatch: expected {}, got {}",
+                state.cache_id,
+                input_handle.request_cache_id()
+            )));
+        }
 
         // Extract single token for decode
         let tokens = self.tensor_to_tokens(&input.input_ids)?;
@@ -154,8 +181,7 @@ impl ModelExecutor for Qwen2ModelExecutor {
 
         // Update sequence length and KV handle
         state.sequence_length += tokens.len();
-        let new_handle = Arc::new(state.kv_handle.with_sequence_length(state.sequence_length));
-        state.kv_handle = new_handle.clone();
+        let new_handle = Arc::new(input_handle.with_sequence_length(state.sequence_length));
 
         Ok(DecodeOutput::new(logits_ref, new_handle))
     }
@@ -209,6 +235,7 @@ struct Qwen2KvCacheHandle {
     num_heads: usize,
     head_dim: usize,
     device: Device,
+    request_cache_id: String,
 }
 
 impl Qwen2KvCacheHandle {
@@ -216,6 +243,7 @@ impl Qwen2KvCacheHandle {
         config: &candle_transformers::models::qwen2::Config,
         device: CandleDevice,
         seq_len: usize,
+        request_cache_id: String,
     ) -> Self {
         let mut block_table = BlockTable::new(16);
         block_table.sequence_length = seq_len;
@@ -225,6 +253,7 @@ impl Qwen2KvCacheHandle {
             num_layers: config.num_hidden_layers,
             num_heads: config.num_attention_heads,
             head_dim: config.hidden_size / config.num_attention_heads,
+            request_cache_id,
             device: match device {
                 CandleDevice::Cpu => Device::CPU,
                 CandleDevice::Cuda(_dev) => Device::CUDA(0),
@@ -246,7 +275,12 @@ impl Qwen2KvCacheHandle {
             num_heads: self.num_heads,
             head_dim: self.head_dim,
             device: self.device.clone(),
+            request_cache_id: self.request_cache_id.clone(),
         }
+    }
+
+    fn request_cache_id(&self) -> &str {
+        &self.request_cache_id
     }
 }
 
@@ -306,6 +340,9 @@ impl KvCacheHandle for Qwen2KvCacheHandle {
     }
 
     fn cache_id(&self) -> String {
-        format!("qwen2-cache-{}", self.block_table.sequence_length)
+        format!(
+            "{}-{}",
+            self.request_cache_id, self.block_table.sequence_length
+        )
     }
 }

@@ -64,6 +64,12 @@ reqwest = { workspace = true }
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"
+ferrum-testkit = { workspace = true }
+futures = { workspace = true }
+
+[[bench]]
+name = "engine_bench"
+harness = false
 
 [features]
 default = []

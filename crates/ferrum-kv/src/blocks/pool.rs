@@ -1,5 +1,6 @@
 //! Block pool implementation for KV-Cache memory management
 
+use super::storage::{BlockStorage, BlockStorageConfig};
 use ferrum_types::{DataType, Device, FerrumError, Result};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
@@ -129,6 +130,8 @@ pub struct BlockPool {
     data_type: DataType,
     /// Maximum number of blocks
     max_blocks: usize,
+    /// Optional storage config — when set, blocks get KV tensor storage
+    storage_config: Option<BlockStorageConfig>,
     /// Free blocks queue
     free_blocks: Mutex<VecDeque<PhysicalBlockId>>,
     /// All blocks (id -> block)
@@ -142,12 +145,39 @@ pub struct BlockPool {
 }
 
 impl BlockPool {
-    /// Create new block pool
+    /// Create new block pool (blocks have no tensor storage).
     pub fn new(
         device: Device,
         block_size: usize,
         data_type: DataType,
         max_blocks: usize,
+    ) -> Result<Self> {
+        Self::create(device, block_size, data_type, max_blocks, None)
+    }
+
+    /// Create a block pool where each block has KV tensor storage.
+    pub fn new_with_storage(
+        device: Device,
+        block_size: usize,
+        data_type: DataType,
+        max_blocks: usize,
+        storage_config: BlockStorageConfig,
+    ) -> Result<Self> {
+        Self::create(
+            device,
+            block_size,
+            data_type,
+            max_blocks,
+            Some(storage_config),
+        )
+    }
+
+    fn create(
+        device: Device,
+        block_size: usize,
+        data_type: DataType,
+        max_blocks: usize,
+        storage_config: Option<BlockStorageConfig>,
     ) -> Result<Self> {
         if block_size == 0 {
             return Err(FerrumError::invalid_parameter(
@@ -161,8 +191,8 @@ impl BlockPool {
         }
 
         debug!(
-            "Creating block pool: device={:?}, block_size={}, data_type={:?}, max_blocks={}",
-            device, block_size, data_type, max_blocks
+            "Creating block pool: device={:?}, block_size={}, data_type={:?}, max_blocks={}, has_storage={}",
+            device, block_size, data_type, max_blocks, storage_config.is_some()
         );
 
         Ok(Self {
@@ -170,9 +200,10 @@ impl BlockPool {
             block_size,
             data_type,
             max_blocks,
+            storage_config,
             free_blocks: Mutex::new(VecDeque::new()),
             blocks: RwLock::new(HashMap::new()),
-            next_block_id: AtomicUsize::new(0),
+            next_block_id: AtomicUsize::new(1), // Start at 1; 0 is reserved as "unmapped"
             allocated_blocks: AtomicUsize::new(0),
             total_allocations: AtomicUsize::new(0),
             total_deallocations: AtomicUsize::new(0),
@@ -218,6 +249,13 @@ impl BlockPool {
         );
         block.state = BlockState::Allocated;
         block.add_ref();
+
+        // Attach tensor storage if configured
+        if let Some(cfg) = &self.storage_config {
+            let storage: Arc<parking_lot::RwLock<BlockStorage>> =
+                Arc::new(parking_lot::RwLock::new(BlockStorage::new(*cfg)));
+            block.memory_handle = Some(Arc::new(storage));
+        }
 
         let block = Arc::new(RwLock::new(block));
 
@@ -328,6 +366,59 @@ impl BlockPool {
     pub fn block_size(&self) -> usize {
         self.block_size
     }
+
+    /// Whether this pool has tensor storage attached to blocks.
+    pub fn has_storage(&self) -> bool {
+        self.storage_config.is_some()
+    }
+
+    /// Access the storage lock for a given block.
+    fn block_storage(
+        &self,
+        block_id: PhysicalBlockId,
+    ) -> Result<Arc<parking_lot::RwLock<BlockStorage>>> {
+        let block_arc = self
+            .get_block(block_id)
+            .ok_or_else(|| FerrumError::not_found(format!("Block {:?} not found", block_id)))?;
+        let block = block_arc.read();
+        let storage_any = block
+            .memory_handle
+            .as_ref()
+            .ok_or_else(|| FerrumError::internal("Block has no tensor storage"))?;
+        storage_any
+            .downcast_ref::<Arc<parking_lot::RwLock<BlockStorage>>>()
+            .cloned()
+            .ok_or_else(|| FerrumError::internal("Block memory_handle is not BlockStorage"))
+    }
+
+    /// Write one token's K/V vectors into a physical block at a given slot and layer.
+    pub fn write_kv_slot(
+        &self,
+        block_id: PhysicalBlockId,
+        layer: usize,
+        slot: usize,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<()> {
+        let storage = self.block_storage(block_id)?;
+        let result = storage.write().write_slot(layer, slot, key, value);
+        result
+    }
+
+    /// Read one token's K/V vectors from a physical block at a given slot and layer.
+    ///
+    /// Returns `(key, value)` as owned Vec to avoid holding locks.
+    pub fn read_kv_slot(
+        &self,
+        block_id: PhysicalBlockId,
+        layer: usize,
+        slot: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let storage = self.block_storage(block_id)?;
+        let guard = storage.read();
+        let (k, v) = guard.read_slot(layer, slot)?;
+        Ok((k.to_vec(), v.to_vec()))
+    }
 }
 
 /// Block pool statistics
@@ -369,7 +460,7 @@ mod tests {
         let pool = BlockPool::new(Device::CPU, 16, DataType::FP16, 100).unwrap();
 
         let allocation = pool.allocate().unwrap();
-        assert_eq!(allocation.physical_id, PhysicalBlockId::new(0));
+        assert_eq!(allocation.physical_id, PhysicalBlockId::new(1));
 
         let stats = pool.stats();
         assert_eq!(stats.allocated_blocks, 1);
@@ -405,6 +496,34 @@ mod tests {
         // Second allocation should fail
         let result = pool.allocate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_block_storage_write_read() {
+        let cfg = BlockStorageConfig {
+            num_layers: 2,
+            num_kv_heads: 4,
+            head_dim: 8,
+            block_size: 16,
+        };
+        let pool = BlockPool::new_with_storage(Device::CPU, 16, DataType::FP16, 100, cfg).unwrap();
+        assert!(pool.has_storage());
+
+        let alloc = pool.allocate().unwrap();
+        let bid = alloc.physical_id;
+
+        let tok_size = cfg.num_kv_heads * cfg.head_dim; // 32
+        let key: Vec<f32> = (0..tok_size).map(|i| i as f32).collect();
+        let val: Vec<f32> = (0..tok_size).map(|i| (i as f32) + 100.0).collect();
+
+        pool.write_kv_slot(bid, 0, 3, &key, &val).unwrap();
+        let (k, v) = pool.read_kv_slot(bid, 0, 3).unwrap();
+        assert_eq!(k, key);
+        assert_eq!(v, val);
+
+        // Different slot should be zeros
+        let (k0, _) = pool.read_kv_slot(bid, 0, 0).unwrap();
+        assert!(k0.iter().all(|&x| x == 0.0));
     }
 
     #[test]

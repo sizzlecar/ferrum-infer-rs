@@ -12,7 +12,7 @@ use candle_core::{DType, Device as CandleDevice, IndexOp, Tensor, D};
 use candle_nn::{embedding, linear, linear_no_bias, Embedding, Linear, Module, VarBuilder};
 use ferrum_models::architectures::qwen2::Qwen2ModelWrapper;
 use ferrum_types::{FerrumError, Result};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 // Re-use MetalRmsNorm from metal_llama
@@ -881,7 +881,7 @@ impl KvCacheHandle for DummyKvCache {
 
 /// Metal-accelerated Qwen2 Executor
 pub struct MetalQwen2Executor {
-    model: MetalQwen2Model,
+    model: Mutex<MetalQwen2Model>,
     info: ModelInfo,
     device: CandleDevice,
     status: ExecutorStatus,
@@ -920,7 +920,7 @@ impl MetalQwen2Executor {
         };
 
         Self {
-            model,
+            model: Mutex::new(model),
             info: model_info,
             device,
             status,
@@ -1006,18 +1006,18 @@ impl ModelExecutor for MetalQwen2Executor {
 
         debug!("Metal Qwen2 prefill: {} tokens", seq_len);
 
-        // Get mutable reference for model operations
-        let model_ptr = &self.model as *const MetalQwen2Model as *mut MetalQwen2Model;
-
-        // Clear KV cache before new prefill (important for multi-turn conversations)
-        unsafe { (*model_ptr).clear_cache() };
-
         // Convert token IDs to tensor
         let input_tensor = Tensor::from_vec(token_ids.clone(), (1, seq_len), &self.device)
             .map_err(|e| FerrumError::internal(format!("Failed to create input tensor: {}", e)))?;
 
-        // Forward pass
-        let logits = unsafe { (*model_ptr).forward_prefill(&input_tensor)? };
+        // Serialize mutable model access behind a lock instead of unsafe aliasing.
+        let logits = {
+            let mut model = self.model.lock().map_err(|e| {
+                FerrumError::internal(format!("Metal Qwen2 model lock poisoned: {}", e))
+            })?;
+            model.clear_cache();
+            model.forward_prefill(&input_tensor)?
+        };
 
         // Optional CPU reference comparison
         if let Some(ref cpu_model) = self.cpu_ref {
@@ -1096,9 +1096,12 @@ impl ModelExecutor for MetalQwen2Executor {
         let token_tensor = Tensor::from_vec(token_ids, (1, 1), &self.device)
             .map_err(|e| FerrumError::internal(format!("Failed to create token tensor: {}", e)))?;
 
-        // Get mutable reference for forward pass
-        let model_ptr = &self.model as *const MetalQwen2Model as *mut MetalQwen2Model;
-        let logits = unsafe { (*model_ptr).forward_decode(&token_tensor, position)? };
+        let logits = {
+            let mut model = self.model.lock().map_err(|e| {
+                FerrumError::internal(format!("Metal Qwen2 model lock poisoned: {}", e))
+            })?;
+            model.forward_decode(&token_tensor, position)?
+        };
 
         debug!(
             "decode logits shape={:?}, dtype={:?}",
@@ -1119,7 +1122,7 @@ impl ModelExecutor for MetalQwen2Executor {
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities {
             max_batch_size: 1,
-            max_sequence_length: self.model.config().max_position_embeddings,
+            max_sequence_length: self.info.max_sequence_length,
             attention_mechanisms: vec![AttentionType::MultiHead],
             supports_dynamic_batching: false,
             supports_continuous_batching: false,

@@ -9,7 +9,7 @@
 //! - Efficient block reclamation and reuse
 //! - Prefix caching for shared prompt optimization
 
-use crate::blocks::{BlockPool, PhysicalBlockId};
+use crate::blocks::{BlockPool, BlockStorageConfig, PhysicalBlockId};
 use crate::cache::prefix::{PrefixCache, PrefixCacheStats, PrefixId};
 use async_trait::async_trait;
 use ferrum_interfaces::{
@@ -340,19 +340,28 @@ impl PagedKvCacheManager {
             device, config.block_size, config.max_gpu_blocks, config.max_cpu_blocks, config.enable_prefix_cache
         );
 
-        let gpu_pool = BlockPool::new(
+        let storage_config = BlockStorageConfig {
+            num_layers: config.num_layers,
+            num_kv_heads: config.num_heads,
+            head_dim: config.head_dim,
+            block_size: config.block_size,
+        };
+
+        let gpu_pool = BlockPool::new_with_storage(
             device.clone(),
             config.block_size,
             DataType::FP16,
             config.max_gpu_blocks,
+            storage_config,
         )?;
 
         let cpu_pool = if config.enable_swapping {
-            Some(BlockPool::new(
+            Some(BlockPool::new_with_storage(
                 Device::CPU,
                 config.block_size,
                 DataType::FP16,
                 config.max_cpu_blocks,
+                storage_config,
             )?)
         } else {
             None
@@ -448,6 +457,120 @@ impl PagedKvCacheManager {
         }
 
         debug!("Freed {} blocks", block_ids.len());
+        Ok(())
+    }
+
+    /// Write one token's K/V vectors for a given layer and absolute token position.
+    ///
+    /// The position is translated through the handle's block table to find the
+    /// physical block and slot within that block.
+    pub fn write_kv(
+        &self,
+        handle: &PagedKvCacheHandle,
+        layer: usize,
+        token_position: usize,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<()> {
+        let block_size = self.config.block_size;
+        let logical_block = token_position / block_size;
+        let slot = token_position % block_size;
+
+        let physical_id = handle
+            .get_physical_block(logical_block as u32)
+            .ok_or_else(|| {
+                FerrumError::internal(format!(
+                    "No physical block for logical block {} (token {})",
+                    logical_block, token_position
+                ))
+            })?;
+
+        self.gpu_pool
+            .write_kv_slot(PhysicalBlockId::new(physical_id), layer, slot, key, value)
+    }
+
+    /// Read K/V vectors for a range of token positions in one layer.
+    ///
+    /// Gathers data across potentially non-contiguous physical blocks using
+    /// the handle's block table. Returns `(keys, values)` each of length
+    /// `num_tokens * num_kv_heads * head_dim`, with tokens in order.
+    pub fn read_kv(
+        &self,
+        handle: &PagedKvCacheHandle,
+        layer: usize,
+        start_token: usize,
+        num_tokens: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let block_size = self.config.block_size;
+        let kv_size = self.config.num_heads * self.config.head_dim;
+        let mut keys = Vec::with_capacity(num_tokens * kv_size);
+        let mut values = Vec::with_capacity(num_tokens * kv_size);
+
+        for pos in start_token..start_token + num_tokens {
+            let logical_block = pos / block_size;
+            let slot = pos % block_size;
+
+            let physical_id = handle
+                .get_physical_block(logical_block as u32)
+                .ok_or_else(|| {
+                    FerrumError::internal(format!(
+                        "No physical block for logical block {} (token {})",
+                        logical_block, pos
+                    ))
+                })?;
+
+            let (k, v) =
+                self.gpu_pool
+                    .read_kv_slot(PhysicalBlockId::new(physical_id), layer, slot)?;
+            keys.extend_from_slice(&k);
+            values.extend_from_slice(&v);
+        }
+
+        Ok((keys, values))
+    }
+
+    /// Get a reference to the GPU block pool.
+    pub fn gpu_pool(&self) -> &BlockPool {
+        &self.gpu_pool
+    }
+
+    /// Get a reference to the prefix cache (if enabled).
+    pub fn prefix_cache(&self) -> Option<&PrefixCache> {
+        self.prefix_cache.as_ref()
+    }
+
+    /// Share the first `num_prefix_blocks` physical blocks from `source` into
+    /// `target`.  The shared blocks get an incremented ref count so they
+    /// survive when the source handle is deallocated.
+    ///
+    /// After this call the target handle's block table maps logical blocks
+    /// `0..num_prefix_blocks` to the same physical blocks as the source.
+    pub fn share_prefix_blocks(
+        &self,
+        source: &PagedKvCacheHandle,
+        target: &PagedKvCacheHandle,
+        num_prefix_blocks: usize,
+    ) -> Result<()> {
+        let source_blocks = source.get_physical_blocks();
+        let n = num_prefix_blocks.min(source_blocks.len());
+
+        for i in 0..n {
+            let phys_id = source_blocks[i];
+            // Map in target
+            target.add_block(i as u32, phys_id);
+            // Increment ref count on the physical block so it isn't freed
+            // when the source handle is deallocated.
+            let pid = PhysicalBlockId::new(phys_id);
+            if let Some(block) = self.gpu_pool.get_block(pid) {
+                block.write().add_ref();
+            }
+        }
+
+        debug!(
+            "Shared {} prefix blocks from {} to {}",
+            n, source.request_id, target.request_id
+        );
+
         Ok(())
     }
 
@@ -581,18 +704,19 @@ impl PagedKvCacheManager {
     // ==========================================================================
 
     /// Find a cached prefix that matches the given tokens
-    /// Returns (prefix_id, kv_handle, matched_length) if found
+    /// Returns (prefix_id, kv_handle, last_logits, matched_length) if found
     pub fn find_prefix(
         &self,
         tokens: &[ferrum_types::TokenId],
     ) -> Option<(
         PrefixId,
         Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+        Vec<f32>,
         usize,
     )> {
         let prefix_cache = self.prefix_cache.as_ref()?;
 
-        if let Some((prefix_id, kv_handle)) = prefix_cache.find_prefix(tokens) {
+        if let Some((prefix_id, kv_handle, last_logits)) = prefix_cache.find_prefix(tokens) {
             let matched_len = prefix_id.len();
             debug!("Prefix cache hit: matched {} tokens", matched_len);
 
@@ -605,7 +729,7 @@ impl PagedKvCacheManager {
                 }
             }
 
-            Some((prefix_id, kv_handle, matched_len))
+            Some((prefix_id, kv_handle, last_logits, matched_len))
         } else {
             None
         }
@@ -616,9 +740,10 @@ impl PagedKvCacheManager {
         &self,
         tokens: &[ferrum_types::TokenId],
         kv_handle: Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
+        last_logits: Vec<f32>,
     ) -> Result<()> {
         if let Some(prefix_cache) = &self.prefix_cache {
-            prefix_cache.store_prefix(tokens, kv_handle)?;
+            prefix_cache.store_prefix(tokens, kv_handle, last_logits)?;
             debug!("Stored prefix with {} tokens in cache", tokens.len());
         }
         Ok(())
@@ -975,6 +1100,73 @@ mod tests {
         assert_eq!(handle.num_blocks(), 2);
         assert_eq!(handle.get_physical_block(0), Some(5));
         assert_eq!(handle.get_physical_block(1), Some(10));
+    }
+
+    #[tokio::test]
+    async fn test_write_read_kv_across_blocks() {
+        // Small model: 2 layers, 2 heads, dim=4, block_size=4
+        let config = PagedKvCacheConfig {
+            block_size: 4,
+            max_gpu_blocks: 16,
+            max_cpu_blocks: 0,
+            enable_cow: false,
+            enable_swapping: false,
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 4,
+            enable_prefix_cache: false,
+            ..Default::default()
+        };
+        let manager = PagedKvCacheManager::new(Device::CPU, config).unwrap();
+
+        let request = AllocationRequest {
+            request_id: RequestId::new(),
+            initial_tokens: 6, // needs 2 blocks (ceil(6/4))
+            max_sequence_length: 32,
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 4,
+            device: Device::CPU,
+            dtype: DataType::FP16,
+            priority: ferrum_types::Priority::Normal,
+        };
+        let request_id = request.request_id.clone();
+
+        let handle_dyn = manager.allocate(&request).await.unwrap();
+        let handle = handle_dyn
+            .as_any()
+            .downcast_ref::<PagedKvCacheHandle>()
+            .unwrap();
+
+        let kv_size = 2 * 4; // num_heads * head_dim = 8
+
+        // Write KV for 6 tokens across 2 blocks (tokens 0-3 in block 0, 4-5 in block 1)
+        for pos in 0..6 {
+            let key: Vec<f32> = (0..kv_size).map(|i| (pos * 100 + i) as f32).collect();
+            let val: Vec<f32> = (0..kv_size).map(|i| (pos * 100 + i + 50) as f32).collect();
+            manager.write_kv(handle, 0, pos, &key, &val).unwrap();
+        }
+
+        // Read back all 6 tokens — this gathers across 2 non-contiguous blocks
+        let (keys, vals) = manager.read_kv(handle, 0, 0, 6).unwrap();
+        assert_eq!(keys.len(), 6 * kv_size);
+        assert_eq!(vals.len(), 6 * kv_size);
+
+        // Verify token 0 key
+        assert_eq!(keys[0], 0.0);
+        assert_eq!(keys[kv_size - 1], 7.0);
+
+        // Verify token 4 key (first token of second block)
+        assert_eq!(keys[4 * kv_size], 400.0);
+
+        // Verify token 5 value
+        assert_eq!(vals[5 * kv_size], 550.0);
+
+        // Layer 1 should still be zeros
+        let (k1, _) = manager.read_kv(handle, 1, 0, 1).unwrap();
+        assert!(k1.iter().all(|&x| x == 0.0));
+
+        manager.deallocate(request_id).await.unwrap();
     }
 
     #[test]

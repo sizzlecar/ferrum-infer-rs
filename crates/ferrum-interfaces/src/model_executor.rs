@@ -18,6 +18,8 @@ pub struct PrefillInput {
     pub attention_mask: Option<TensorRef>,
     /// Position IDs [batch_size, sequence_length] (optional, for RoPE)
     pub position_ids: Option<TensorRef>,
+    /// Pre-allocated KV cache handle (optional, for paged attention)
+    pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
 }
 
 impl PrefillInput {
@@ -27,7 +29,14 @@ impl PrefillInput {
             input_ids,
             attention_mask: None,
             position_ids: None,
+            kv_cache: None,
         }
+    }
+
+    /// Create prefill input with a pre-allocated KV cache handle.
+    pub fn with_kv_cache(mut self, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
+        self.kv_cache = Some(kv_cache);
+        self
     }
 
     /// Add attention mask

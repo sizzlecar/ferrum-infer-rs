@@ -16,6 +16,7 @@ members = [
     "crates/ferrum-models",
     "crates/ferrum-server",
     "crates/ferrum-cli",
+    "crates/ferrum-testkit",
 ]
 resolver = "2"
 
@@ -101,7 +102,7 @@ async-stream = "0.3"
 # ML Framework - Mock for MVP (Candle to be added later)
 ## candle-core = { version = "0.6", default-features = false }
 hf-hub = "0.4.1"
-tokenizers = { version = "0.19", features = ["onig"] }
+tokenizers = { version = "0.21", features = ["onig"] }
 safetensors = "0.4"
 
 # Random - 使用与candle-vllm相同的版本
@@ -133,6 +134,7 @@ ferrum-engine = { path = "crates/ferrum-engine" }
 ferrum-models = { path = "crates/ferrum-models" }
 ferrum-server = { path = "crates/ferrum-server" }
 ferrum-cli = { path = "crates/ferrum-cli" }
+ferrum-testkit = { path = "crates/ferrum-testkit" }
 
 
 [profile.release]

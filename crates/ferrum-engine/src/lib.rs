@@ -110,8 +110,10 @@ pub use registry::{
 
 // Re-exports of kernels
 pub use kernels::{
-    global_kernel_registry, AttentionConfig, AttentionKernel, AttentionType, FusedOpType, FusedOps,
-    FusedOpsConfig, FusedRopeAttention, KernelInfo, KernelRegistry, PerformanceHint, RopeCache,
+    create_attention_op, global_kernel_registry, AttentionConfig, AttentionKernel, AttentionOp,
+    AttentionOutput, AttentionType, CpuAttentionOp, DecodeAttentionInput, FusedOpType, FusedOps,
+    FusedOpsConfig, FusedRopeAttention, KernelInfo, KernelRegistry, PerformanceHint,
+    PrefillAttentionInput, RopeCache,
 };
 
 // Re-exports of parallel module

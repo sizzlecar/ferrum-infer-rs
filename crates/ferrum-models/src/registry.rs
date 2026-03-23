@@ -21,6 +21,7 @@ pub struct ModelAlias {
 pub enum Architecture {
     Llama,
     Qwen2,
+    Qwen3,
     Mistral,
     Phi,
     GPT2,
@@ -33,6 +34,7 @@ impl Architecture {
         match s.to_lowercase().as_str() {
             "llama" | "llamaforcausallm" => Architecture::Llama,
             "qwen2" | "qwen2forcausallm" => Architecture::Qwen2,
+            "qwen3" | "qwen3forcausallm" => Architecture::Qwen3,
             "mistral" | "mistralforcausallm" => Architecture::Mistral,
             "phi" | "phiforcausallm" => Architecture::Phi,
             "gpt2" | "gpt2lmheadmodel" => Architecture::GPT2,
@@ -98,6 +100,9 @@ impl DefaultModelRegistry {
         registry.register_alias("llama3-8b-instruct", "meta-llama/Meta-Llama-3-8B-Instruct");
         registry.register_alias("qwen2-7b", "Qwen/Qwen2-7B");
         registry.register_alias("qwen2-7b-instruct", "Qwen/Qwen2-7B-Instruct");
+        registry.register_alias("qwen3-0.6b", "Qwen/Qwen3-0.6B");
+        registry.register_alias("qwen3-1.7b", "Qwen/Qwen3-1.7B");
+        registry.register_alias("qwen3-4b", "Qwen/Qwen3-4B");
         registry.register_alias("mistral-7b", "mistralai/Mistral-7B-v0.1");
         registry.register_alias("mistral-7b-instruct", "mistralai/Mistral-7B-Instruct-v0.2");
         registry.register_alias("phi3-mini", "microsoft/Phi-3-mini-4k-instruct");

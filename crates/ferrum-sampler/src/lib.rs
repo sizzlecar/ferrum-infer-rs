@@ -23,6 +23,8 @@
 //! let sampler = sampler_from_params(&params);
 //! ```
 
+pub mod json_mode;
+
 // Re-export all sampler types from ferrum-interfaces
 pub use ferrum_interfaces::sampler::{
     GreedySampler, LogitsProcessor, LogitsProcessorChain, MultiSampler, MultinomialSampler,
