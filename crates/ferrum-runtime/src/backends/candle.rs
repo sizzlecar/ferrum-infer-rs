@@ -8,6 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus, KernelExecutor};
+use ferrum_interfaces::kernel_ops::KernelOps;
 use ferrum_types::{DataType, Device, Result};
 use std::any::Any;
 use std::collections::HashMap;
@@ -497,6 +498,7 @@ pub struct CandleBackend {
     device: Device,
     tensor_factory: CandleTensorFactory,
     tensor_ops: CandleTensorOps,
+    kernel_ops: super::candle_kernel_ops::CandleKernelOps,
     memory_manager: MemoryPool,
 }
 
@@ -514,6 +516,7 @@ impl CandleBackend {
 
         let tensor_factory = CandleTensorFactory::new(device.clone());
         let tensor_ops = CandleTensorOps;
+        let kernel_ops = super::candle_kernel_ops::CandleKernelOps::new();
         let memory_manager = MemoryPool::new(
             device.clone(),
             crate::memory::InternalMemoryPoolConfig {
@@ -531,6 +534,7 @@ impl CandleBackend {
             device,
             tensor_factory,
             tensor_ops,
+            kernel_ops,
             memory_manager,
         })
     }
@@ -588,6 +592,10 @@ impl ComputeBackend for CandleBackend {
 
     fn kernel_executor(&self) -> Option<&dyn KernelExecutor> {
         None // MVP: no custom kernels
+    }
+
+    fn kernel_ops(&self) -> Option<&dyn KernelOps> {
+        Some(&self.kernel_ops)
     }
 
     async fn initialize(&mut self, _device: &Device) -> Result<()> {
