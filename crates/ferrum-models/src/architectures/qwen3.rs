@@ -196,8 +196,8 @@ impl Attention {
 
         let key_states =
             candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states =
-            candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+        let value_states = candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?
+            .contiguous()?;
 
         let attn_output = {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
@@ -260,9 +260,7 @@ impl DecoderLayer {
         let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = xs
-            .apply(&self.post_attention_layernorm)?
-            .apply(&self.mlp)?;
+        let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
         residual + xs
     }
 
@@ -309,15 +307,7 @@ impl Model {
         seqlen_offset: usize,
     ) -> CandleResult<Tensor> {
         let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| {
-                (0..tgt_len).map(move |j| {
-                    if i < j {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.
-                    }
-                })
-            })
+            .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
             .collect();
         let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
         let mask = if seqlen_offset > 0 {

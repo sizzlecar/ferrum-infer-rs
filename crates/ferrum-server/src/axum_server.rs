@@ -26,9 +26,8 @@ use tracing::{debug, error, info, span, Level};
 use uuid::Uuid;
 
 /// Shared Prometheus recorder handle for rendering metrics.
-static PROM_HANDLE: std::sync::OnceLock<
-    metrics_exporter_prometheus::PrometheusHandle,
-> = std::sync::OnceLock::new();
+static PROM_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+    std::sync::OnceLock::new();
 
 /// Initialize the Prometheus metrics recorder.
 ///

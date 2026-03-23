@@ -519,9 +519,9 @@ impl PagedKvCacheManager {
                     ))
                 })?;
 
-            let (k, v) = self
-                .gpu_pool
-                .read_kv_slot(PhysicalBlockId::new(physical_id), layer, slot)?;
+            let (k, v) =
+                self.gpu_pool
+                    .read_kv_slot(PhysicalBlockId::new(physical_id), layer, slot)?;
             keys.extend_from_slice(&k);
             values.extend_from_slice(&v);
         }

@@ -163,7 +163,13 @@ impl BlockPool {
         max_blocks: usize,
         storage_config: BlockStorageConfig,
     ) -> Result<Self> {
-        Self::create(device, block_size, data_type, max_blocks, Some(storage_config))
+        Self::create(
+            device,
+            block_size,
+            data_type,
+            max_blocks,
+            Some(storage_config),
+        )
     }
 
     fn create(
@@ -371,13 +377,14 @@ impl BlockPool {
         &self,
         block_id: PhysicalBlockId,
     ) -> Result<Arc<parking_lot::RwLock<BlockStorage>>> {
-        let block_arc = self.get_block(block_id).ok_or_else(|| {
-            FerrumError::not_found(format!("Block {:?} not found", block_id))
-        })?;
+        let block_arc = self
+            .get_block(block_id)
+            .ok_or_else(|| FerrumError::not_found(format!("Block {:?} not found", block_id)))?;
         let block = block_arc.read();
-        let storage_any = block.memory_handle.as_ref().ok_or_else(|| {
-            FerrumError::internal("Block has no tensor storage")
-        })?;
+        let storage_any = block
+            .memory_handle
+            .as_ref()
+            .ok_or_else(|| FerrumError::internal("Block has no tensor storage"))?;
         storage_any
             .downcast_ref::<Arc<parking_lot::RwLock<BlockStorage>>>()
             .cloned()
@@ -499,8 +506,7 @@ mod tests {
             head_dim: 8,
             block_size: 16,
         };
-        let pool =
-            BlockPool::new_with_storage(Device::CPU, 16, DataType::FP16, 100, cfg).unwrap();
+        let pool = BlockPool::new_with_storage(Device::CPU, 16, DataType::FP16, 100, cfg).unwrap();
         assert!(pool.has_storage());
 
         let alloc = pool.allocate().unwrap();

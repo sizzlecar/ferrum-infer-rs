@@ -1,6 +1,9 @@
 //! Mock tokenizer that maps words to sequential token IDs.
 
-use ferrum_interfaces::{Tokenizer, tokenizer::{TokenizerInfo, TokenizerType}};
+use ferrum_interfaces::{
+    tokenizer::{TokenizerInfo, TokenizerType},
+    Tokenizer,
+};
 use ferrum_types::{Result, SpecialTokens, TokenId};
 
 /// Mock tokenizer: splits on whitespace, assigns sequential token IDs.
@@ -39,7 +42,9 @@ impl Tokenizer for MockTokenizer {
         }
         // Hash each word to a token ID in range [1, vocab_size - 3]
         for word in text.split_whitespace() {
-            let hash = word.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+            let hash = word
+                .bytes()
+                .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
             let id = 1 + (hash % (self.vocab_size as u32 - 3));
             tokens.push(TokenId::new(id));
         }

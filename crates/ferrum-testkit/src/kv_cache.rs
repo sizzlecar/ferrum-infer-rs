@@ -2,14 +2,16 @@
 
 use async_trait::async_trait;
 use ferrum_interfaces::{
-    kv_cache::{AllocationRequest, CacheGcStats, CacheHandleStats, CacheManagerStats, MemoryPressure},
+    kv_cache::{
+        AllocationRequest, CacheGcStats, CacheHandleStats, CacheManagerStats, MemoryPressure,
+    },
     BlockTable, KvCacheHandle, KvCacheManager, TensorRef,
 };
 use ferrum_types::{Device, RequestId, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Mock KV cache handle — tracks block metadata without allocating real memory.
 #[derive(Debug)]
@@ -92,7 +94,12 @@ impl KvCacheHandle for MockKvCacheHandle {
 
     fn stats(&self) -> CacheHandleStats {
         CacheHandleStats {
-            memory_bytes: self.block_table.num_blocks() * 16 * self.num_layers * self.num_heads * self.head_dim * 2,
+            memory_bytes: self.block_table.num_blocks()
+                * 16
+                * self.num_layers
+                * self.num_heads
+                * self.head_dim
+                * 2,
             blocks_allocated: self.block_table.num_blocks(),
             tokens_stored: self.block_table.sequence_length,
             utilization: if self.block_table.num_blocks() > 0 {

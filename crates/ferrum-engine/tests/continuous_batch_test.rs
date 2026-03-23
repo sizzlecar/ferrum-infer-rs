@@ -1,9 +1,7 @@
 //! Integration tests for ContinuousBatchEngine using mock components.
 //! Runs on any platform — no GPU required.
 
-use ferrum_engine::{
-    ContinuousBatchEngine, InferenceEngineInterface, Scheduler,
-};
+use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface, Scheduler};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,

@@ -142,9 +142,7 @@ impl ModelExecutor for Qwen3ModelExecutor {
             .kv_cache
             .as_any()
             .downcast_ref::<Qwen3KvCacheHandle>()
-            .ok_or_else(|| {
-                FerrumError::model("Invalid KV cache handle type for Qwen3 executor")
-            })?;
+            .ok_or_else(|| FerrumError::model("Invalid KV cache handle type for Qwen3 executor"))?;
         if input_handle.request_cache_id() != state.cache_id {
             return Err(FerrumError::model(format!(
                 "KV cache handle mismatch: expected {}, got {}",

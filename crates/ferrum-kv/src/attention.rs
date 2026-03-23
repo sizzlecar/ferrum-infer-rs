@@ -46,9 +46,7 @@ pub fn paged_attention(
         )));
     }
     if kv_len == 0 {
-        return Err(FerrumError::invalid_parameter(
-            "kv_len must be positive",
-        ));
+        return Err(FerrumError::invalid_parameter("kv_len must be positive"));
     }
 
     // GQA: number of query heads per KV head
@@ -167,7 +165,10 @@ mod tests {
         let head_dim = 4;
         let (manager, rid) = setup(1, num_heads, head_dim, 16, 3).await;
         let handle_dyn = manager.get_handle(rid.clone()).unwrap();
-        let handle = handle_dyn.as_any().downcast_ref::<PagedKvCacheHandle>().unwrap();
+        let handle = handle_dyn
+            .as_any()
+            .downcast_ref::<PagedKvCacheHandle>()
+            .unwrap();
 
         // Store K/V for 3 cached tokens in layer 0
         let kv_size = num_heads * head_dim; // 8
@@ -199,7 +200,10 @@ mod tests {
         let head_dim = 2;
         let (manager, rid) = setup(1, num_heads, head_dim, 16, 3).await;
         let handle_dyn = manager.get_handle(rid.clone()).unwrap();
-        let handle = handle_dyn.as_any().downcast_ref::<PagedKvCacheHandle>().unwrap();
+        let handle = handle_dyn
+            .as_any()
+            .downcast_ref::<PagedKvCacheHandle>()
+            .unwrap();
 
         let kv_size = num_heads * head_dim; // 2
 
@@ -237,8 +241,16 @@ mod tests {
         // Q=[0,1], K0=[1,0]→0, K1=[0,1]→1
         // softmax([0/sqrt(2), 1/sqrt(2)]) → token 1 gets higher weight
         // Output should lean toward V1=[0,1]
-        assert!(output[2] < 0.5, "Expected output[2] < 0.5, got {}", output[2]);
-        assert!(output[3] > 0.5, "Expected output[3] > 0.5, got {}", output[3]);
+        assert!(
+            output[2] < 0.5,
+            "Expected output[2] < 0.5, got {}",
+            output[2]
+        );
+        assert!(
+            output[3] > 0.5,
+            "Expected output[3] > 0.5, got {}",
+            output[3]
+        );
     }
 
     #[tokio::test]
@@ -248,7 +260,10 @@ mod tests {
         let head_dim = 2;
         let (manager, rid) = setup(1, num_heads, head_dim, 2, 4).await;
         let handle_dyn = manager.get_handle(rid.clone()).unwrap();
-        let handle = handle_dyn.as_any().downcast_ref::<PagedKvCacheHandle>().unwrap();
+        let handle = handle_dyn
+            .as_any()
+            .downcast_ref::<PagedKvCacheHandle>()
+            .unwrap();
 
         // Write 4 tokens across 2 blocks
         for pos in 0..4 {

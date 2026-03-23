@@ -121,8 +121,7 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
                         for i in 0..concurrency {
                             let e = engine.clone();
                             handles.push(tokio::spawn(async move {
-                                let req =
-                                    make_request(&format!("Concurrent {}", i), 5);
+                                let req = make_request(&format!("Concurrent {}", i), 5);
                                 e.infer(req).await.unwrap()
                             }));
                         }
@@ -177,7 +176,9 @@ fn bench_scheduling_overhead(c: &mut Criterion) {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn bench_cpu_attention(c: &mut Criterion) {
-    use ferrum_engine::kernels::ops::{CpuAttentionOp, PrefillAttentionInput, DecodeAttentionInput, AttentionOp};
+    use ferrum_engine::kernels::ops::{
+        AttentionOp, CpuAttentionOp, DecodeAttentionInput, PrefillAttentionInput,
+    };
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let mut group = c.benchmark_group("cpu_attention");
@@ -207,13 +208,9 @@ fn bench_cpu_attention(c: &mut Criterion) {
         };
 
         group.throughput(Throughput::Elements(seq_len as u64));
-        group.bench_with_input(
-            BenchmarkId::new("prefill", seq_len),
-            &input,
-            |b, input| {
-                b.iter(|| rt.block_on(op.prefill(input)))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("prefill", seq_len), &input, |b, input| {
+            b.iter(|| rt.block_on(op.prefill(input)))
+        });
     }
 
     // Decode at various KV cache lengths
@@ -232,13 +229,9 @@ fn bench_cpu_attention(c: &mut Criterion) {
             kv_len,
         };
 
-        group.bench_with_input(
-            BenchmarkId::new("decode", kv_len),
-            &input,
-            |b, input| {
-                b.iter(|| rt.block_on(op.decode(input)))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("decode", kv_len), &input, |b, input| {
+            b.iter(|| rt.block_on(op.decode(input)))
+        });
     }
 
     group.finish();

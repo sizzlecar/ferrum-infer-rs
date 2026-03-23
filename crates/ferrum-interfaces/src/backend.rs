@@ -4,8 +4,8 @@
 //! interfaces: ComputeBackend for tensor operations and WeightLoader for
 //! model weight management.
 
-use crate::{TensorFactory, TensorOps, TensorRef};
 use crate::kernel_ops::KernelOps;
+use crate::{TensorFactory, TensorOps, TensorRef};
 use async_trait::async_trait;
 use ferrum_types::{DataType, Device, Result};
 use serde::{Deserialize, Serialize};

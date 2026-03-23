@@ -217,8 +217,17 @@ impl ModelExecutor for PagedAttentionExecutor {
             }
         }
 
-        let attn_output =
-            paged_attention(&query, seq_len, num_heads, num_kv_heads, head_dim, &self.kv_manager, paged_handle, last_layer, seq_len)?;
+        let attn_output = paged_attention(
+            &query,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            &self.kv_manager,
+            paged_handle,
+            last_layer,
+            seq_len,
+        )?;
 
         // Build logits [batch, seq_len, vocab_size]
         let q_head_size = num_heads * head_dim;
@@ -330,8 +339,7 @@ impl ModelExecutor for PagedAttentionExecutor {
                     * self.config.head_dim
                     * 2
                     * self.config.num_layers
-                    * 4) as u64
-                    as usize,
+                    * 4) as u64 as usize,
                 overhead_memory: 0,
             },
         }

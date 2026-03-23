@@ -200,7 +200,13 @@ async fn throughput_scaling() {
         let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
         let tensor_factory = Arc::new(MockTensorFactory);
         ContinuousBatchEngine::new(
-            config, scheduler, tokenizer, sampler, kv_cache, executor, tensor_factory,
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            kv_cache,
+            executor,
+            tensor_factory,
         )
     });
 
