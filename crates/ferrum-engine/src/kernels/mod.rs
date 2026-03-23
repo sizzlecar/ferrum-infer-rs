@@ -27,4 +27,6 @@ pub use ops::{
     PrefillAttentionInput,
 };
 pub use cuda_kernel_ops::CudaKernelOps;
+#[cfg(feature = "cuda")]
+pub use cuda_kernel_ops::flash_attn_varlen;
 pub use registry::{global_kernel_registry, KernelInfo, KernelRegistry, PerformanceHint};

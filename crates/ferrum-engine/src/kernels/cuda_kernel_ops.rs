@@ -1,11 +1,8 @@
-//! CUDA `KernelOps` implementation.
+//! CUDA `KernelOps` implementation with FlashAttention-2.
 //!
-//! Delegates all operations to candle tensor ops, which candle dispatches to
-//! CUDA kernels automatically when tensors reside on a CUDA device. This
-//! includes native CUDA implementations for rms-norm, rotary-emb,
-//! softmax-last-dim, and all standard tensor ops.
-//!
-//! Future: wire FlashAttention-2 FFI for `paged_attention`.
+//! Uses `candle-flash-attn` for GPU-accelerated attention (FlashAttention-2).
+//! Other operations delegate to candle tensor ops, which candle dispatches to
+//! CUDA kernels automatically (rms-norm, rotary-emb, softmax, cuBLAS matmul).
 
 use ferrum_interfaces::kernel_ops::{
     ActivationOps, AttentionOps, AttentionParams, KernelOps, LinearOps, NormOps, PositionOps,
@@ -125,7 +122,7 @@ impl PositionOps for CudaPositionOps {
 }
 
 // ---------------------------------------------------------------------------
-// AttentionOps — candle matmul/softmax on CUDA
+// AttentionOps — FlashAttention-2 (cuda) or standard attention (fallback)
 // ---------------------------------------------------------------------------
 
 pub struct CudaAttentionOps;
@@ -138,64 +135,240 @@ impl AttentionOps for CudaAttentionOps {
         v: &TensorRef,
         params: &AttentionParams,
     ) -> Result<TensorRef> {
-        use candle_core::D;
-
-        let q = ct(q)?;
-        let k = ct(k)?;
-        let v = ct(v)?;
-
-        let q = q.transpose(1, 2).map_err(err)?;
-        let k = k.transpose(1, 2).map_err(err)?;
-        let v = v.transpose(1, 2).map_err(err)?;
-
-        let n_rep = params.num_heads / params.num_kv_heads;
-        let (k, v) = if n_rep > 1 {
-            (repeat_kv(&k, n_rep)?, repeat_kv(&v, n_rep)?)
-        } else {
-            (k, v)
-        };
-
-        let q = q.contiguous().map_err(err)?;
-        let k = k.contiguous().map_err(err)?;
-
-        let k_t = k.transpose(D::Minus2, D::Minus1).map_err(err)?;
-        let k_t = k_t.contiguous().map_err(err)?;
-        let scores = q.matmul(&k_t).map_err(err)?;
-        let scores = scores
-            .affine(params.softmax_scale as f64, 0.0)
-            .map_err(err)?;
-
-        let scores = if params.causal {
-            let (_, _, q_len, kv_len) = scores.dims4().map_err(err)?;
-            let past_len = kv_len.saturating_sub(q_len);
-            let mask_data: Vec<f32> = (0..q_len)
-                .flat_map(|i| {
-                    let max_k = past_len + i;
-                    (0..kv_len).map(move |j| if j <= max_k { 0.0 } else { f32::NEG_INFINITY })
-                })
-                .collect();
-            let mask =
-                candle_core::Tensor::from_vec(mask_data, (1, 1, q_len, kv_len), scores.device())
-                    .map_err(err)?;
-            let mask = if mask.dtype() != scores.dtype() {
-                mask.to_dtype(scores.dtype()).map_err(err)?
-            } else {
-                mask
-            };
-            scores.broadcast_add(&mask).map_err(err)?
-        } else {
-            scores
-        };
-
-        let attn_weights = candle_nn::ops::softmax(&scores, D::Minus1).map_err(err)?;
-        let output = attn_weights.matmul(&v).map_err(err)?;
-        let output = output.transpose(1, 2).map_err(err)?;
-        wrap(output)
+        #[cfg(feature = "cuda")]
+        {
+            return flash_attention(q, k, v, params);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            standard_attention(q, k, v, params)
+        }
     }
 
-    // TODO: wire FlashAttention-2 FFI for paged_attention
+    fn paged_attention(
+        &self,
+        q: &TensorRef,
+        k_cache: &TensorRef,
+        v_cache: &TensorRef,
+        block_table: &[u32],
+        params: &AttentionParams,
+    ) -> Result<TensorRef> {
+        #[cfg(feature = "cuda")]
+        {
+            return flash_paged_attention(q, k_cache, v_cache, block_table, params);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (q, k_cache, v_cache, block_table, params);
+            Err(FerrumError::unsupported(
+                "paged_attention requires cuda feature with FlashAttention",
+            ))
+        }
+    }
 }
 
+// ---------------------------------------------------------------------------
+// FlashAttention-2 implementations (cuda feature only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+fn flash_attention(
+    q: &TensorRef,
+    k: &TensorRef,
+    v: &TensorRef,
+    params: &AttentionParams,
+) -> Result<TensorRef> {
+    let q = ct(q)?;
+    let k = ct(k)?;
+    let v = ct(v)?;
+
+    // candle-flash-attn expects [batch, seq, heads, head_dim].
+    let q = q.contiguous().map_err(err)?;
+    let k = k.contiguous().map_err(err)?;
+    let v = v.contiguous().map_err(err)?;
+
+    // flash_attn requires F16 or BF16
+    let target_dtype = q.dtype();
+    let compute_dtype = match target_dtype {
+        candle_core::DType::F16 | candle_core::DType::BF16 => target_dtype,
+        _ => candle_core::DType::F16,
+    };
+
+    let q = to_compute_dtype(&q, compute_dtype)?;
+    let k = to_compute_dtype(&k, compute_dtype)?;
+    let v = to_compute_dtype(&v, compute_dtype)?;
+
+    let output =
+        candle_flash_attn::flash_attn(&q, &k, &v, params.softmax_scale, params.causal)
+            .map_err(err)?;
+
+    let output = if output.dtype() != target_dtype {
+        output.to_dtype(target_dtype).map_err(err)?
+    } else {
+        output
+    };
+    wrap(output)
+}
+
+#[cfg(feature = "cuda")]
+fn flash_paged_attention(
+    q: &TensorRef,
+    k_cache: &TensorRef,
+    v_cache: &TensorRef,
+    block_table: &[u32],
+    params: &AttentionParams,
+) -> Result<TensorRef> {
+    let q = ct(q)?;
+    let k_cache = ct(k_cache)?;
+    let v_cache = ct(v_cache)?;
+
+    let batch_size = q.dims()[0];
+    let max_blocks = if batch_size > 0 {
+        block_table.len() / batch_size
+    } else {
+        0
+    };
+
+    let block_table_i32: Vec<i32> = block_table.iter().map(|&x| x as i32).collect();
+    let block_table_tensor =
+        candle_core::Tensor::from_vec(block_table_i32, (batch_size, max_blocks), q.device())
+            .map_err(err)?;
+
+    // Context lengths derived from k_cache shape
+    let seq_len = k_cache.dims().get(1).copied().unwrap_or(0);
+    let context_lens_data: Vec<i32> = vec![seq_len as i32; batch_size];
+    let context_lens =
+        candle_core::Tensor::from_vec(context_lens_data, (batch_size,), q.device())
+            .map_err(err)?;
+
+    let target_dtype = q.dtype();
+    let compute_dtype = match target_dtype {
+        candle_core::DType::F16 | candle_core::DType::BF16 => target_dtype,
+        _ => candle_core::DType::F16,
+    };
+
+    let q = to_compute_dtype(q, compute_dtype)?;
+    let k_cache = to_compute_dtype(k_cache, compute_dtype)?;
+    let v_cache = to_compute_dtype(v_cache, compute_dtype)?;
+
+    let output = candle_flash_attn::flash_attn_with_kvcache(
+        &q,
+        &k_cache,
+        &v_cache,
+        &context_lens,
+        &block_table_tensor,
+        params.softmax_scale,
+    )
+    .map_err(err)?;
+
+    let output = if output.dtype() != target_dtype {
+        output.to_dtype(target_dtype).map_err(err)?
+    } else {
+        output
+    };
+    wrap(output)
+}
+
+#[cfg(feature = "cuda")]
+fn to_compute_dtype(
+    t: &candle_core::Tensor,
+    dtype: candle_core::DType,
+) -> Result<candle_core::Tensor> {
+    if t.dtype() != dtype {
+        t.to_dtype(dtype).map_err(err)
+    } else {
+        Ok(t.clone())
+    }
+}
+
+/// Variable-length FlashAttention for continuous batching prefill.
+///
+/// Exposed as a standalone function for callers building batch prefill.
+#[cfg(feature = "cuda")]
+pub fn flash_attn_varlen(
+    q: &candle_core::Tensor,
+    k: &candle_core::Tensor,
+    v: &candle_core::Tensor,
+    seqlens_q: &candle_core::Tensor,
+    seqlens_k: &candle_core::Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<candle_core::Tensor> {
+    candle_flash_attn::flash_attn_varlen(
+        q, k, v, seqlens_q, seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal,
+    )
+    .map_err(err)
+}
+
+// ---------------------------------------------------------------------------
+// Standard attention fallback (non-cuda)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "cuda"))]
+fn standard_attention(
+    q: &TensorRef,
+    k: &TensorRef,
+    v: &TensorRef,
+    params: &AttentionParams,
+) -> Result<TensorRef> {
+    use candle_core::D;
+
+    let q = ct(q)?;
+    let k = ct(k)?;
+    let v = ct(v)?;
+
+    let q = q.transpose(1, 2).map_err(err)?;
+    let k = k.transpose(1, 2).map_err(err)?;
+    let v = v.transpose(1, 2).map_err(err)?;
+
+    let n_rep = params.num_heads / params.num_kv_heads;
+    let (k, v) = if n_rep > 1 {
+        (repeat_kv(&k, n_rep)?, repeat_kv(&v, n_rep)?)
+    } else {
+        (k, v)
+    };
+
+    let q = q.contiguous().map_err(err)?;
+    let k = k.contiguous().map_err(err)?;
+
+    let k_t = k.transpose(D::Minus2, D::Minus1).map_err(err)?;
+    let k_t = k_t.contiguous().map_err(err)?;
+    let scores = q.matmul(&k_t).map_err(err)?;
+    let scores = scores
+        .affine(params.softmax_scale as f64, 0.0)
+        .map_err(err)?;
+
+    let scores = if params.causal {
+        let (_, _, q_len, kv_len) = scores.dims4().map_err(err)?;
+        let past_len = kv_len.saturating_sub(q_len);
+        let mask_data: Vec<f32> = (0..q_len)
+            .flat_map(|i| {
+                let max_k = past_len + i;
+                (0..kv_len).map(move |j| if j <= max_k { 0.0 } else { f32::NEG_INFINITY })
+            })
+            .collect();
+        let mask =
+            candle_core::Tensor::from_vec(mask_data, (1, 1, q_len, kv_len), scores.device())
+                .map_err(err)?;
+        let mask = if mask.dtype() != scores.dtype() {
+            mask.to_dtype(scores.dtype()).map_err(err)?
+        } else {
+            mask
+        };
+        scores.broadcast_add(&mask).map_err(err)?
+    } else {
+        scores
+    };
+
+    let attn_weights = candle_nn::ops::softmax(&scores, D::Minus1).map_err(err)?;
+    let output = attn_weights.matmul(&v).map_err(err)?;
+    let output = output.transpose(1, 2).map_err(err)?;
+    wrap(output)
+}
+
+#[cfg(not(feature = "cuda"))]
 fn repeat_kv(x: &candle_core::Tensor, n_rep: usize) -> Result<candle_core::Tensor> {
     let (batch, num_kv_heads, seq_len, head_dim) = x.dims4().map_err(err)?;
     let unsqueezed = x.unsqueeze(2).map_err(err)?;
