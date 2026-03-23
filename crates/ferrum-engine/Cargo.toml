@@ -74,7 +74,12 @@ harness = false
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "dep:candle-flash-attn", "ferrum-models/cuda"]
+cuda = [
+    "candle-core/cuda",
+    "dep:candle-flash-attn",
+    "candle-flash-attn/flash-decoding",
+    "ferrum-models/cuda",
+]
 metal = ["candle-core/metal", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray"]
 
 # Metal dependencies for Apple GPU support (only on macOS/iOS)

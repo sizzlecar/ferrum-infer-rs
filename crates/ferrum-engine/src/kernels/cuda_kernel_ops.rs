@@ -229,14 +229,14 @@ fn flash_paged_attention(
         0
     };
 
-    let block_table_i32: Vec<i32> = block_table.iter().map(|&x| x as i32).collect();
+    let block_table_data: Vec<u32> = block_table.to_vec();
     let block_table_tensor =
-        candle_core::Tensor::from_vec(block_table_i32, (batch_size, max_blocks), q.device())
+        candle_core::Tensor::from_vec(block_table_data, (batch_size, max_blocks), q.device())
             .map_err(err)?;
 
     // Context lengths derived from k_cache shape
     let seq_len = k_cache.dims().get(1).copied().unwrap_or(0);
-    let context_lens_data: Vec<i32> = vec![seq_len as i32; batch_size];
+    let context_lens_data: Vec<u32> = vec![seq_len as u32; batch_size];
     let context_lens =
         candle_core::Tensor::from_vec(context_lens_data, (batch_size,), q.device())
             .map_err(err)?;

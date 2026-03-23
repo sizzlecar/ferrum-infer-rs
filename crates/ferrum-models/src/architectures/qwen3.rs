@@ -150,6 +150,7 @@ struct Attention {
     k_norm: RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
+    #[allow(dead_code)]
     num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
