@@ -16,7 +16,9 @@ pub mod tensor_wrapper;
 pub mod tokenizer;
 pub mod weights;
 
-pub use architectures::{BertModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper};
+pub use architectures::{
+    BertModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper,
+};
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{

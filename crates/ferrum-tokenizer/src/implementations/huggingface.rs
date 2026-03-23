@@ -471,7 +471,9 @@ mod tests {
             ("</s>".to_string(), 2),
             ("<unk>".to_string(), 3),
             ("<pad>".to_string(), 4),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
 
         let merges = vec![];
         let bpe = BPE::builder()
@@ -510,7 +512,9 @@ mod tests {
             ("<s>".to_string(), 2),
             ("</s>".to_string(), 3),
             ("<unk>".to_string(), 4),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
 
         let merges = vec![];
         let bpe = BPE::builder()
@@ -545,7 +549,9 @@ mod tests {
             ("<s>".to_string(), 2),
             ("</s>".to_string(), 3),
             ("<unk>".to_string(), 4),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
 
         let merges = vec![];
         let bpe = BPE::builder()
@@ -585,7 +591,9 @@ mod tests {
             ("hello".to_string(), 0),
             ("<s>".to_string(), 1),
             ("</s>".to_string(), 2),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
 
         let merges = vec![];
         let bpe = BPE::builder()
@@ -611,7 +619,9 @@ mod tests {
         use tokenizers::models::bpe::{Vocab, BPE};
         use tokenizers::Tokenizer as HfTokenizer;
 
-        let vocab: Vocab = [("hello".to_string(), 0), ("world".to_string(), 1)].into_iter().collect();
+        let vocab: Vocab = [("hello".to_string(), 0), ("world".to_string(), 1)]
+            .into_iter()
+            .collect();
 
         let merges = vec![];
         let bpe = BPE::builder()
@@ -633,7 +643,9 @@ mod tests {
         use tokenizers::models::bpe::{Vocab, BPE};
         use tokenizers::Tokenizer as HfTokenizer;
 
-        let vocab: Vocab = [("hello".to_string(), 0), ("world".to_string(), 1)].into_iter().collect();
+        let vocab: Vocab = [("hello".to_string(), 0), ("world".to_string(), 1)]
+            .into_iter()
+            .collect();
 
         let merges = vec![];
         let bpe = BPE::builder()
@@ -655,7 +667,9 @@ mod tests {
         use tokenizers::models::bpe::{Vocab, BPE};
         use tokenizers::Tokenizer as HfTokenizer;
 
-        let vocab: Vocab = [("hello".to_string(), 0), ("world".to_string(), 1)].into_iter().collect();
+        let vocab: Vocab = [("hello".to_string(), 0), ("world".to_string(), 1)]
+            .into_iter()
+            .collect();
 
         let merges = vec![];
         let bpe = BPE::builder()

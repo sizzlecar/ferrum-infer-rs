@@ -1,7 +1,7 @@
 //! Mock model executor with configurable latency for scheduling tests.
 
-use crate::tensor::MockTensor;
 use crate::kv_cache::MockKvCacheHandle;
+use crate::tensor::MockTensor;
 use async_trait::async_trait;
 use ferrum_interfaces::{
     model_executor::{
@@ -12,8 +12,8 @@ use ferrum_interfaces::{
 };
 use ferrum_types::{DataType, Device, ModelInfo, ModelType, RequestId, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Mock model executor that simulates prefill/decode with configurable latency.
@@ -94,7 +94,8 @@ impl ModelExecutor for MockModelExecutor {
                 }
             }
         }
-        let logits = MockTensor::from_f32(logits_data, &[batch_size, seq_len, vocab_size]).into_ref();
+        let logits =
+            MockTensor::from_f32(logits_data, &[batch_size, seq_len, vocab_size]).into_ref();
 
         let kv_cache = Arc::new(MockKvCacheHandle::new(
             RequestId::new(),

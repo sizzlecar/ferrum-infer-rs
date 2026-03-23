@@ -475,7 +475,12 @@ mod tests {
     fn test_argmax() {
         let f = factory();
         let logits = f
-            .from_slice(&[0.1, 0.5, 0.3, 0.9, 0.2], &[5], DataType::FP32, Device::CPU)
+            .from_slice(
+                &[0.1, 0.5, 0.3, 0.9, 0.2],
+                &[5],
+                DataType::FP32,
+                Device::CPU,
+            )
             .unwrap();
 
         let token = CandleSamplingOps.argmax(&logits).unwrap();
@@ -511,8 +516,7 @@ mod tests {
         let tensor_ops = CandleTensorOps;
 
         // With kernel_ops = None, should fall back to TensorOps
-        let dispatch =
-            ferrum_interfaces::kernel_ops::KernelOpsDispatch::new(None, &tensor_ops);
+        let dispatch = ferrum_interfaces::kernel_ops::KernelOpsDispatch::new(None, &tensor_ops);
         let result = dispatch.rms_norm(&input, &weight, 1e-5).unwrap();
         let vals = result.to_vec_f32().unwrap();
         assert_eq!(vals.len(), 4);
@@ -552,8 +556,7 @@ mod tests {
         let tensor_ops = CandleTensorOps;
 
         // No kernel ops → falls back to silu(gate) * up via TensorOps
-        let dispatch =
-            ferrum_interfaces::kernel_ops::KernelOpsDispatch::new(None, &tensor_ops);
+        let dispatch = ferrum_interfaces::kernel_ops::KernelOpsDispatch::new(None, &tensor_ops);
         let result = dispatch.silu_mul(&gate, &up).unwrap();
         let vals = result.to_vec_f32().unwrap();
         assert_eq!(vals.len(), 2);

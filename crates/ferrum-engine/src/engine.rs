@@ -607,8 +607,13 @@ impl InferenceEngine for DefaultInferenceEngine {
                         extract_last_token_logits(&decode_output.logits)?
                     };
 
-                    let next_token =
-                        sample_token(&logits, &sampling_params, &sampler, &mut rng, &generated_tokens)?;
+                    let next_token = sample_token(
+                        &logits,
+                        &sampling_params,
+                        &sampler,
+                        &mut rng,
+                        &generated_tokens,
+                    )?;
 
                     if is_stop_token(next_token, model_executor.info().vocab_size) {
                         stop_reason = Some(FinishReason::EOS);

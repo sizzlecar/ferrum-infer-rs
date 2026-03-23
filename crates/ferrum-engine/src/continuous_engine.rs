@@ -10,15 +10,16 @@ use ferrum_interfaces::{
     engine::InferenceEngine, kv_cache::AllocationRequest, KvCacheHandle, KvCacheManager,
     ModelExecutor, Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
-use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
+use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
     InferenceResponse, Priority, RequestId, Result, SamplingParams, StreamChunk, TokenId,
     TokenUsage,
 };
 use futures::stream::Stream;
+use metrics::{counter, gauge, histogram};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
@@ -27,7 +28,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
-use metrics::{counter, gauge, histogram};
 use tracing::{debug, info, warn};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -109,8 +109,17 @@ impl SequenceState {
 
         // Apply JSON mode biases before the standard processor chain
         if let Some(ref jp) = self.json_processor {
-            let generated: String = self.generated_tokens.iter()
-                .filter_map(|t| { let v = t.get(); if v < 128 { Some(v as u8 as char) } else { None } })
+            let generated: String = self
+                .generated_tokens
+                .iter()
+                .filter_map(|t| {
+                    let v = t.get();
+                    if v < 128 {
+                        Some(v as u8 as char)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             jp.apply_biases(logits, &generated);
         }
@@ -144,7 +153,8 @@ struct EngineInner {
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-    #[allow(dead_code)] // Retained for constructor API; sampling now uses per-request SamplingConfig
+    #[allow(dead_code)]
+    // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
     kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
@@ -284,9 +294,7 @@ impl EngineInner {
             let sequences = self.sequences.read();
             sequences
                 .iter()
-                .filter(|(id, s)| {
-                    *id != exclude_id && s.prefill_complete && s.kv_cache.is_some()
-                })
+                .filter(|(id, s)| *id != exclude_id && s.prefill_complete && s.kv_cache.is_some())
                 .min_by(|(_, a), (_, b)| {
                     // Lowest priority first, then fewest generated tokens
                     a.sampling_params
@@ -395,9 +403,9 @@ impl EngineInner {
 
             let should_stop = {
                 let sequences = self.sequences.read();
-                sequences
-                    .get(request_id)
-                    .map_or(true, |s| s.should_stop(self.model_executor.info().vocab_size))
+                sequences.get(request_id).map_or(true, |s| {
+                    s.should_stop(self.model_executor.info().vocab_size)
+                })
             };
             if should_stop {
                 self.complete_request(request_id, FinishReason::EOS).await?;
@@ -489,9 +497,9 @@ impl EngineInner {
 
         let should_stop = {
             let sequences = self.sequences.read();
-            sequences
-                .get(request_id)
-                .map_or(true, |s| s.should_stop(self.model_executor.info().vocab_size))
+            sequences.get(request_id).map_or(true, |s| {
+                s.should_stop(self.model_executor.info().vocab_size)
+            })
         };
         if should_stop {
             self.complete_request(request_id, FinishReason::EOS).await?;
@@ -554,9 +562,9 @@ impl EngineInner {
 
         let should_stop = {
             let sequences = self.sequences.read();
-            sequences
-                .get(request_id)
-                .map_or(true, |s| s.should_stop(self.model_executor.info().vocab_size))
+            sequences.get(request_id).map_or(true, |s| {
+                s.should_stop(self.model_executor.info().vocab_size)
+            })
         };
 
         if should_stop {
@@ -776,9 +784,9 @@ impl InferenceEngine for ContinuousBatchEngine {
         // Drive iterations until our request completes
         self.inner.drive_to_completion(&request_id).await?;
 
-        let result = resp_rx.await.map_err(|_| {
-            FerrumError::internal("Response channel closed before response was sent")
-        });
+        let result = resp_rx
+            .await
+            .map_err(|_| FerrumError::internal("Response channel closed before response was sent"));
 
         gauge!("ferrum.engine.active_requests").decrement(1.0);
         let elapsed_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
@@ -787,7 +795,8 @@ impl InferenceEngine for ContinuousBatchEngine {
         if let Ok(ref resp) = result {
             counter!("ferrum.engine.requests_completed").increment(1);
             counter!("ferrum.engine.tokens_generated_total").increment(resp.tokens.len() as u64);
-            histogram!("ferrum.engine.ttft_ms").record(elapsed_ms / resp.tokens.len().max(1) as f64);
+            histogram!("ferrum.engine.ttft_ms")
+                .record(elapsed_ms / resp.tokens.len().max(1) as f64);
         } else {
             counter!("ferrum.engine.requests_failed").increment(1);
         }
@@ -895,10 +904,7 @@ impl InferenceEngine for ContinuousBatchEngine {
 impl std::fmt::Debug for ContinuousBatchEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContinuousBatchEngine")
-            .field(
-                "is_running",
-                &self.inner.is_running.load(Ordering::SeqCst),
-            )
+            .field("is_running", &self.inner.is_running.load(Ordering::SeqCst))
             .field(
                 "iteration_count",
                 &self.inner.iteration_count.load(Ordering::SeqCst),

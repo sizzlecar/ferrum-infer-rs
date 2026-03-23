@@ -159,7 +159,10 @@ impl BlockStorage {
         let tok_size = self.config.token_kv_size();
         let start = start_slot * tok_size;
         let end = end_slot * tok_size;
-        Ok((&self.keys[layer][start..end], &self.values[layer][start..end]))
+        Ok((
+            &self.keys[layer][start..end],
+            &self.values[layer][start..end],
+        ))
     }
 
     /// Deep-copy all data from another storage (for COW).
@@ -226,7 +229,9 @@ mod tests {
         // Write slots 0 and 1
         for slot in 0..2 {
             let key: Vec<f32> = (0..tok_size).map(|i| (slot * 100 + i) as f32).collect();
-            let val: Vec<f32> = (0..tok_size).map(|i| (slot * 100 + i + 50) as f32).collect();
+            let val: Vec<f32> = (0..tok_size)
+                .map(|i| (slot * 100 + i + 50) as f32)
+                .collect();
             storage.write_slot(0, slot, &key, &val).unwrap();
         }
 

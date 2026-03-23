@@ -42,9 +42,8 @@ pub use tokenizer::{IncrementalTokenizer, Tokenizer, TokenizerFactory, Tokenizer
 
 // Kernel ops re-exports
 pub use kernel_ops::{
-    ActivationOps, AttentionOps, AttentionParams, KernelOps, KernelOpsDispatch, LinearOps,
-    NormOps, PositionOps, QuantScheme, RoPEConfig, SamplingOps,
-    SamplingParams as KernelSamplingParams,
+    ActivationOps, AttentionOps, AttentionParams, KernelOps, KernelOpsDispatch, LinearOps, NormOps,
+    PositionOps, QuantScheme, RoPEConfig, SamplingOps, SamplingParams as KernelSamplingParams,
 };
 
 // Re-export types from ferrum-types, avoiding conflicts

@@ -471,7 +471,9 @@ mod tests {
         let handle = Arc::new(MockKvHandle::new(3));
 
         // Store prefix
-        cache.store_prefix(&tokens, handle.clone(), vec![0.1; 10]).unwrap();
+        cache
+            .store_prefix(&tokens, handle.clone(), vec![0.1; 10])
+            .unwrap();
 
         // Should find exact match
         let result = cache.find_prefix(&tokens);
@@ -498,7 +500,9 @@ mod tests {
         let handle = Arc::new(MockKvHandle::new(2));
 
         // Should not store short prefix
-        cache.store_prefix(&short_tokens, handle, vec![0.1; 10]).unwrap();
+        cache
+            .store_prefix(&short_tokens, handle, vec![0.1; 10])
+            .unwrap();
 
         let result = cache.find_prefix(&short_tokens);
         assert!(result.is_none());
@@ -515,14 +519,20 @@ mod tests {
         let handle = Arc::new(MockKvHandle::new(1));
 
         // Store 2 prefixes
-        cache.store_prefix(&tokens1, handle.clone(), vec![0.1; 10]).unwrap();
-        cache.store_prefix(&tokens2, handle.clone(), vec![0.1; 10]).unwrap();
+        cache
+            .store_prefix(&tokens1, handle.clone(), vec![0.1; 10])
+            .unwrap();
+        cache
+            .store_prefix(&tokens2, handle.clone(), vec![0.1; 10])
+            .unwrap();
 
         // Access first one to make it more recent
         cache.find_prefix(&tokens1);
 
         // Store third - should evict tokens2 (LRU)
-        cache.store_prefix(&tokens3, handle.clone(), vec![0.1; 10]).unwrap();
+        cache
+            .store_prefix(&tokens3, handle.clone(), vec![0.1; 10])
+            .unwrap();
 
         // tokens1 and tokens3 should exist, tokens2 should be evicted
         assert!(cache.find_prefix(&tokens1).is_some());

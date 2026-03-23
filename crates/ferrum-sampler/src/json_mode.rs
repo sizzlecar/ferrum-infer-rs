@@ -190,7 +190,9 @@ impl JsonModeProcessor {
                     *state = JsonState::ArrayStart;
                     *depth += 1;
                 }
-                (JsonState::AfterColon, _) if ch.is_ascii_digit() || ch == '-' || ch == 't' || ch == 'f' || ch == 'n' => {
+                (JsonState::AfterColon, _)
+                    if ch.is_ascii_digit() || ch == '-' || ch == 't' || ch == 'f' || ch == 'n' =>
+                {
                     // Number, true, false, null — treat as value
                     *state = JsonState::AfterValue;
                 }

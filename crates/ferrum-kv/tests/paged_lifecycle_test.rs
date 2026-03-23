@@ -92,7 +92,10 @@ async fn two_requests_share_block_pool_without_corruption() {
     let q = vec![1.0f32; KV_SIZE];
     let out_a = paged_attention(&q, 1, 2, 2, 4, &manager, handle_a, 0, 6).unwrap();
     let out_b = paged_attention(&q, 1, 2, 2, 4, &manager, handle_b, 0, 5).unwrap();
-    assert!(out_a != out_b, "Outputs from different requests should differ");
+    assert!(
+        out_a != out_b,
+        "Outputs from different requests should differ"
+    );
 
     manager.deallocate(rid_a).await.unwrap();
     manager.deallocate(rid_b).await.unwrap();

@@ -94,7 +94,11 @@ async fn multiple_requests_sequential() {
     for i in 0..3 {
         let request = make_request(&format!("Request {}", i));
         let response = engine.infer(request).await.unwrap();
-        assert!(!response.tokens.is_empty(), "Request {} should produce tokens", i);
+        assert!(
+            !response.tokens.is_empty(),
+            "Request {} should produce tokens",
+            i
+        );
     }
 
     // All caches should be cleaned up

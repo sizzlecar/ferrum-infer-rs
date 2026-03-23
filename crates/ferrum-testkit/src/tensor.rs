@@ -83,11 +83,7 @@ impl ferrum_interfaces::TensorLike for MockTensor {
     }
 
     fn view(&self, start: &[usize], end: &[usize]) -> Result<TensorRef> {
-        let new_shape: Vec<usize> = start
-            .iter()
-            .zip(end.iter())
-            .map(|(s, e)| e - s)
-            .collect();
+        let new_shape: Vec<usize> = start.iter().zip(end.iter()).map(|(s, e)| e - s).collect();
 
         // Compute strides for the original shape (row-major)
         let ndim = self.shape.len();

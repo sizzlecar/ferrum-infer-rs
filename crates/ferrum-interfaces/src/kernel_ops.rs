@@ -240,12 +240,7 @@ impl<'a> KernelOpsDispatch<'a> {
     }
 
     /// RMS norm: prefer `KernelOps::NormOps`, fall back to `TensorOps::rms_norm`.
-    pub fn rms_norm(
-        &self,
-        input: &TensorRef,
-        weight: &TensorRef,
-        eps: f32,
-    ) -> Result<TensorRef> {
+    pub fn rms_norm(&self, input: &TensorRef, weight: &TensorRef, eps: f32) -> Result<TensorRef> {
         if let Some(ko) = self.kernel_ops {
             if let Some(norm) = ko.norm_ops() {
                 return norm.rms_norm(input, weight, eps);
