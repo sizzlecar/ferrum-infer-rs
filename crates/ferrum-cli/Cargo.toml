@@ -21,7 +21,7 @@ ferrum-server = { workspace = true }
 
 # ML dependencies
 candle-core = { workspace = true }
-tokenizers = { version = "0.19", default-features = false }
+tokenizers = { workspace = true }
 
 # CLI framework
 clap = { version = "4.4", features = ["derive", "color", "env"] }
