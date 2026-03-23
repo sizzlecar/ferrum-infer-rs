@@ -339,8 +339,13 @@ impl DeviceManager {
                     devices.push(DeviceInfo {
                         device: Device::CUDA(idx),
                         name,
-                        compute_capability: format!("cuda:{}", idx),
-                        total_memory: 0,   // candle doesn't expose memory info
+                        capability: DeviceCapability {
+                            // candle probing does not expose CUDA properties here yet.
+                            compute_capability: (0, 0),
+                            total_memory: 0,
+                            unified_memory: false,
+                            ..DeviceCapability::default()
+                        },
                         used_memory: 0,
                         is_available: true,
                         utilization: 0.0,
