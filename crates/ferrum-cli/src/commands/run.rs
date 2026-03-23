@@ -350,10 +350,25 @@ fn select_device(backend: &str) -> ferrum_types::Device {
                 ferrum_types::Device::CPU
             }
         }
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                return ferrum_types::Device::CUDA(0);
+            }
+            #[allow(unreachable_code)]
+            {
+                eprintln!("CUDA not available, falling back to CPU");
+                ferrum_types::Device::CPU
+            }
+        }
         "auto" | _ => {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
                 return ferrum_types::Device::Metal;
+            }
+            #[cfg(feature = "cuda")]
+            {
+                return ferrum_types::Device::CUDA(0);
             }
             #[allow(unreachable_code)]
             ferrum_types::Device::CPU
