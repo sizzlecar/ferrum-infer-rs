@@ -143,14 +143,17 @@ mod tests {
         let quantized = quantize_q4_0_block(&original);
         let dequantized = dequantize_q4_0_block(&quantized);
 
-        // Check that quantization error is reasonable
+        // Q4_0 maps 32 values into 4-bit buckets.  The scale factor for this
+        // data is d = max_abs / 8 = 0.2, so worst-case rounding error is d/2 = 0.1.
+        // Use 0.11 as the tolerance to cover rounding at bucket boundaries.
         for (orig, deq) in original.iter().zip(dequantized.iter()) {
             let error = (orig - deq).abs();
             assert!(
-                error < 0.05,
-                "Quantization error too large: {} vs {}",
+                error < 0.11,
+                "Quantization error too large: {} vs {} (diff {})",
                 orig,
-                deq
+                deq,
+                error
             );
         }
     }
