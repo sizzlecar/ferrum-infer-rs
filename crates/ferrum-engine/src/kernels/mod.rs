@@ -9,6 +9,7 @@
 //! - Kernel Registry: Runtime discovery and selection of optimal kernels
 
 pub mod attention;
+pub mod cuda_kernel_ops;
 pub mod fused;
 pub mod ops;
 pub mod registry;
@@ -25,4 +26,5 @@ pub use ops::{
     create_attention_op, AttentionOp, AttentionOutput, CpuAttentionOp, DecodeAttentionInput,
     PrefillAttentionInput,
 };
+pub use cuda_kernel_ops::CudaKernelOps;
 pub use registry::{global_kernel_registry, KernelInfo, KernelRegistry, PerformanceHint};

@@ -330,10 +330,31 @@ impl DeviceManager {
 
     #[cfg(feature = "cuda")]
     fn detect_cuda_devices(&self) -> Result<Vec<DeviceInfo>> {
-        // Would use CUDA runtime API to detect devices
-        Err(FerrumError::unsupported(
-            "CUDA detection not yet implemented",
-        ))
+        // Use candle to probe CUDA device availability
+        let mut devices = Vec::new();
+        for idx in 0..8 {
+            match candle_core::Device::new_cuda(idx) as std::result::Result<candle_core::Device, _> {
+                Ok(dev) => {
+                    let name = format!("CUDA Device {}", idx);
+                    devices.push(DeviceInfo {
+                        device: Device::CUDA(idx),
+                        name,
+                        compute_capability: format!("cuda:{}", idx),
+                        total_memory: 0,   // candle doesn't expose memory info
+                        used_memory: 0,
+                        is_available: true,
+                        utilization: 0.0,
+                    });
+                    let _ = dev; // keep device alive for probe
+                }
+                Err(_) => break, // no more devices
+            }
+        }
+        if devices.is_empty() {
+            Err(FerrumError::unsupported("No CUDA devices found"))
+        } else {
+            Ok(devices)
+        }
     }
 }
 
