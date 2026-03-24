@@ -38,30 +38,6 @@ fn make_engine() -> ContinuousBatchEngine {
     )
 }
 
-fn make_engine_with_latency(prefill_ms: u64, decode_ms: u64) -> ContinuousBatchEngine {
-    let config = ferrum_types::EngineConfig::default();
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
-    let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
-    let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let executor = Arc::new(MockModelExecutor::new(
-        VOCAB_SIZE,
-        Duration::from_millis(prefill_ms),
-        Duration::from_millis(decode_ms),
-    ));
-    let tensor_factory = Arc::new(MockTensorFactory);
-
-    ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-    )
-}
-
 fn make_request(prompt: &str, max_tokens: usize) -> InferenceRequest {
     let mut req = InferenceRequest::new(prompt, "bench-model");
     req.sampling_params.max_tokens = max_tokens;

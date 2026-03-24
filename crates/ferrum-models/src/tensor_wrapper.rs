@@ -138,24 +138,29 @@ impl TensorLike for CandleTensorWrapper {
 
     /// Extract tensor data as Vec<f32> - Candle implementation
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        // Ensure F32 dtype (CUDA/Metal may produce F16/BF16 logits)
+        let tensor = if self.tensor.dtype() != candle_core::DType::F32 {
+            self.tensor
+                .to_dtype(candle_core::DType::F32)
+                .map_err(|e| FerrumError::model(format!("Cast to f32 failed: {}", e)))?
+        } else {
+            self.tensor.clone()
+        };
         // Handle different tensor dimensions
-        match self.tensor.dims().len() {
-            1 => self
-                .tensor
+        match tensor.dims().len() {
+            1 => tensor
                 .to_vec1::<f32>()
                 .map_err(|e| FerrumError::model(format!("to_vec1 failed: {}", e))),
             2 => {
                 // Take first batch: [batch, vocab] -> [vocab]
-                let batch = self
-                    .tensor
+                let batch = tensor
                     .to_vec2::<f32>()
                     .map_err(|e| FerrumError::model(format!("to_vec2 failed: {}", e)))?;
                 Ok(batch.into_iter().next().unwrap_or_default())
             }
             3 => {
                 // Take last token of first batch: [batch, seq, vocab] -> [vocab]
-                let all = self
-                    .tensor
+                let all = tensor
                     .to_vec3::<f32>()
                     .map_err(|e| FerrumError::model(format!("to_vec3 failed: {}", e)))?;
                 Ok(all
@@ -167,8 +172,7 @@ impl TensorLike for CandleTensorWrapper {
             4 => {
                 // Handle [batch, seq, extra, vocab] - squeeze and take last
                 // First squeeze to 3D by selecting first element of extra dim
-                let squeezed = self
-                    .tensor
+                let squeezed = tensor
                     .squeeze(2)
                     .map_err(|e| FerrumError::model(format!("Squeeze dim 2 failed: {}", e)))?;
 

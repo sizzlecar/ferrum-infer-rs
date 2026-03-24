@@ -47,6 +47,8 @@ metrics = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
+candle-flash-attn = { workspace = true, optional = true }
+candle-metal-kernels = { workspace = true, optional = true }
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }
 safetensors = { workspace = true }
@@ -73,8 +75,13 @@ harness = false
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
-metal = ["candle-core/metal", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray"]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "dep:candle-flash-attn",
+    "ferrum-models/cuda",
+]
+metal = ["candle-core/metal", "dep:candle-metal-kernels", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray"]
 
 # Metal dependencies for Apple GPU support (only on macOS/iOS)
 [target.'cfg(target_os = "macos")'.dependencies]

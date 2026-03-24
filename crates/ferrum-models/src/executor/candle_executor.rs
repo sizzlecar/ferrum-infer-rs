@@ -356,7 +356,14 @@ impl CandleModelExecutorV2 {
             self.model.forward_decode_with_cache(&tensor, pos, cache)?
         };
 
-        // Extract logits
+        // Extract logits (cast to F32 if needed for F16/BF16 GPU inference)
+        let logits = if logits.dtype() != candle_core::DType::F32 {
+            logits
+                .to_dtype(candle_core::DType::F32)
+                .map_err(|e| FerrumError::model(format!("Cast logits to f32: {}", e)))?
+        } else {
+            logits
+        };
         let logits_vec = match logits.dims().len() {
             1 => logits
                 .to_vec1::<f32>()
@@ -390,6 +397,13 @@ impl CandleModelExecutorV2 {
 
 /// Helper to extract logits from Candle tensor safely
 pub fn extract_logits_safe(tensor: &Tensor) -> Result<Vec<f32>> {
+    let tensor = if tensor.dtype() != candle_core::DType::F32 {
+        &tensor
+            .to_dtype(candle_core::DType::F32)
+            .map_err(|e| FerrumError::model(format!("Cast logits to f32: {}", e)))?
+    } else {
+        tensor
+    };
     match tensor.dims().len() {
         1 => tensor
             .to_vec1::<f32>()
