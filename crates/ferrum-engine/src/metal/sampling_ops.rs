@@ -15,7 +15,8 @@ use crate::metal::{MetalContext, MetalError};
 use ferrum_types::FerrumError;
 
 use candle_core::{DType, IndexOp, Tensor, D};
-use metal::{Buffer, ComputePipelineState, MTLSize};
+use metal::ComputePipelineState;
+use metal::MTLSize;
 use std::sync::Arc;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -23,6 +24,22 @@ use candle_core::{Layout, Storage};
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 use candle_core::MetalStorage;
+
+// Type alias for the candle Metal buffer (candle 0.9+ uses candle_metal_kernels::metal::Buffer
+// which is distinct from metal::Buffer).
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+type CandleMetalBuffer = candle_metal_kernels::metal::Buffer;
+
+/// Bridge: convert a candle Metal buffer reference to a metal crate BufferRef.
+///
+/// Both types wrap the same Obj-C `MTLBuffer` protocol object — candle uses
+/// `objc2_metal` bindings while the `metal` crate uses `objc` bindings. The
+/// underlying pointer is identical, so this transmute is sound for read-only
+/// use in Metal command encoder calls.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+unsafe fn as_metal_buf(candle_buf: &CandleMetalBuffer) -> &metal::BufferRef {
+    &*(candle_buf.as_ref() as *const _ as *const metal::BufferRef)
+}
 
 /// GPU sampling ops backed by Ferrum's embedded metallib.
 ///
@@ -67,14 +84,6 @@ impl MetalSamplingOps {
     }
 
     /// Attempt to sample a token on GPU from a logits tensor on Metal.
-    ///
-    /// - `logits`: logits tensor (any shape where last dim is vocab)
-    /// - `top_k`: number of candidates to consider
-    /// - `top_p`: nucleus threshold (0..1)
-    /// - `temperature`: temperature (>0)
-    /// - `repetition_penalty`: repetition penalty (>=1 typically)
-    /// - `rep_token_ids` / `rep_token_freqs`: sparse repetition list
-    /// - `rng_seed`: per-step random seed
     pub fn sample_token(
         &self,
         logits: &Tensor,
@@ -124,8 +133,12 @@ impl MetalSamplingOps {
             .ok_or_else(|| FerrumError::internal("Non-contiguous logits layout"))?;
         let vocab_size = (end - start) as u32;
 
-        let logits_buf = metal_storage.buffer();
+        // candle 0.9+ returns candle_metal_kernels::metal::Buffer
+        let candle_buf = metal_storage.buffer();
         let logits_offset_bytes = (start * std::mem::size_of::<f32>()) as u64;
+
+        // Bridge to metal crate's BufferRef for our dispatch functions
+        let logits_buf = unsafe { as_metal_buf(candle_buf) };
 
         // 3) Select Top-K indices using repeated argmax + in-place mask.
         let k = top_k.clamp(1, 256);
@@ -180,7 +193,7 @@ impl MetalSamplingOps {
 
     fn dispatch_mask_one(
         &self,
-        logits_buf: &Buffer,
+        logits_buf: &metal::BufferRef,
         logits_offset: u64,
         vocab_size: u32,
         token_id: u32,
@@ -206,12 +219,12 @@ impl MetalSamplingOps {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_sample_from_topk(
         &self,
-        logits_buf: &Buffer,
+        logits_buf: &metal::BufferRef,
         logits_offset: u64,
-        topk_indices: &Buffer,
-        rep_ids: &Buffer,
-        rep_freqs: &Buffer,
-        output: &Buffer,
+        topk_indices: &metal::Buffer,
+        rep_ids: &metal::Buffer,
+        rep_freqs: &metal::Buffer,
+        output: &metal::Buffer,
         vocab_size: u32,
         k: u32,
         rep_len: u32,
@@ -253,7 +266,7 @@ impl MetalSamplingOps {
         Ok(())
     }
 
-    fn create_u32_buffer(&self, data: &[u32], label: &str) -> Result<Buffer, FerrumError> {
+    fn create_u32_buffer(&self, data: &[u32], label: &str) -> Result<metal::Buffer, FerrumError> {
         let bytes: &[u8] = bytemuck::cast_slice::<u32, u8>(data);
         let buffer = self.context.device.new_buffer_with_data(
             bytes.as_ptr() as *const std::ffi::c_void,
@@ -264,11 +277,11 @@ impl MetalSamplingOps {
         Ok(buffer)
     }
 
-    fn create_scalar_u32(&self, v: u32, label: &str) -> Result<Buffer, FerrumError> {
+    fn create_scalar_u32(&self, v: u32, label: &str) -> Result<metal::Buffer, FerrumError> {
         self.create_u32_buffer(&[v], label)
     }
 
-    fn create_scalar_f32(&self, v: f32, label: &str) -> Result<Buffer, FerrumError> {
+    fn create_scalar_f32(&self, v: f32, label: &str) -> Result<metal::Buffer, FerrumError> {
         let binding = [v];
         let bytes: &[u8] = bytemuck::cast_slice::<f32, u8>(&binding);
         let buffer = self.context.device.new_buffer_with_data(

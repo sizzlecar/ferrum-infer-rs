@@ -66,7 +66,7 @@ pub async fn run_q4_0_benchmarks(config: BenchmarkConfig) -> Result<Vec<Benchmar
 
         // Generate random test data
         let weights: Vec<f32> = (0..nrows * ncols)
-            .map(|i| ((i as f32 * 0.001).sin() * 2.0))
+            .map(|i| (i as f32 * 0.001).sin() * 2.0)
             .collect();
         let input: Vec<f32> = (0..ncols).map(|i| (i as f32 * 0.01).cos()).collect();
 
