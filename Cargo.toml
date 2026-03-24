@@ -11,6 +11,9 @@ members = [
     "crates/ferrum-sampler",
     "crates/ferrum-kv",
     
+    # CUDA kernel crate
+    "crates/ferrum-cuda-kernels",
+
     # Existing crates (to be refactored)
     "crates/ferrum-engine",
     "crates/ferrum-models",
@@ -130,6 +133,9 @@ ferrum-scheduler = { path = "crates/ferrum-scheduler" }
 ferrum-tokenizer = { path = "crates/ferrum-tokenizer" }
 ferrum-sampler = { path = "crates/ferrum-sampler" }
 ferrum-kv = { path = "crates/ferrum-kv" }
+
+# CUDA kernel crate
+ferrum-cuda-kernels = { path = "crates/ferrum-cuda-kernels" }
 
 # Internal crates - Existing crates (to be refactored)
 ferrum-engine = { path = "crates/ferrum-engine" }

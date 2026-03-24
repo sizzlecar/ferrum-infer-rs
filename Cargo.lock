@@ -1207,6 +1207,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-cuda-kernels"
+version = "0.2.0"
+dependencies = [
+ "candle-core",
+ "ferrum-types",
+ "half",
+ "tracing",
+]
+
+[[package]]
 name = "ferrum-engine"
 version = "0.2.0"
 dependencies = [
