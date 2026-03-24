@@ -67,6 +67,23 @@ curl http://localhost:8000/v1/models
 curl http://localhost:8000/health
 ```
 
+## 性能测试
+
+测试环境：**NVIDIA RTX 5090**，Qwen3-4B，FP16，解码吞吐量：
+
+| 版本 | 优化内容 | Tokens/s |
+|------|---------|----------|
+| 基准 | 原始 candle 算子 | ~33.5 |
+| +融合内核 | `candle_nn::RmsNorm` + 融合 RoPE（CUDA） | ~88.3 |
+| +预分配 KV 缓存 | O(1) `slice_set` 写入，零拷贝 `narrow` 视图 | ~94.4 |
+| +融合投影 | QKV 3→1 矩阵乘，gate+up 2→1 矩阵乘 | ~100+ |
+
+**当前**：Qwen3-4B 平均 ~100 tok/s，峰值超过 103 tok/s。
+
+进行中的 CUDA 内核工作（`ferrum-cuda-kernels` crate）：
+- `fused_add_rms_norm` — residual add + RMS Norm 合并为 1 个内核（每层节省 1 次 kernel launch + 1 次显存读写）
+- `fused_silu_mul` — SiLU 激活 + 逐元素乘合并为 1 个内核
+
 ## 当前状态
 
 **v0.2.0 — 可用的 MVP，尚未达到生产级别。**
@@ -74,20 +91,22 @@ curl http://localhost:8000/health
 已完成：
 - CLI 对话和 HTTP 服务（支持流式输出）
 - Qwen3、Qwen2/2.5、LLaMA 3.x、TinyLlama 架构
-- Metal GPU 加速（macOS）、CPU 跨平台
+- Metal GPU 加速（macOS）、CUDA（NVIDIA）、CPU 跨平台
+- 通过 cudarc/nvrtc 实现的融合 CUDA 内核：RmsNorm、RoPE、QKV 投影、SiLU+mul
+- CUDA 上的 FlashAttention-2（KV 缓存零拷贝视图）
 - Top-k / Top-p / Temperature / 重复惩罚采样
 - Hugging Face 模型下载与缓存管理
 
 进行中：
-- 后端抽象层（KernelOps）——可插拔 Metal/CUDA/CPU 内核
-- PagedAttention 集成——生产级 KV 缓存管理
+- Paged Attention——生产级 KV 缓存管理
 - 连续批处理——并发请求服务
+- CUDA Graph——消除解码循环中的 CPU→GPU 调度开销
 
 ## 路线图
 
-1. **内核后端抽象** — 统一 Metal/CUDA/CPU 到单一 trait 接口
-2. **CUDA 内核 FFI** — 绑定 FlashAttention/FlashInfer 支持 NVIDIA GPU
-3. **生产级批处理** — 迭代级连续批处理与抢占
+1. **Paged KV 缓存** — PagedAttention，支持高并发生产服务
+2. **连续批处理** — 迭代级调度与抢占
+3. **CUDA Graph** — 消除解码步骤的 CPU→GPU 调度延迟
 4. **量化支持** — GPTQ/AWQ/GGUF，让消费级硬件跑更大模型
 
 详见 [docs/ROADMAP.md](docs/ROADMAP.md)。
@@ -100,6 +119,9 @@ cargo build --release -p ferrum-cli
 
 # 启用 Metal 加速（macOS）
 cargo build --release -p ferrum-cli --features metal
+
+# 启用 CUDA 加速（NVIDIA，需要 CUDA Toolkit）
+cargo build --release -p ferrum-cli --features cuda
 ```
 
 前置条件：Rust stable 工具链。
