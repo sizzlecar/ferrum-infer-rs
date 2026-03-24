@@ -55,7 +55,24 @@ impl Qwen2ModelExecutor {
 
     /// Extract token IDs from tensor reference (supports [batch, seq] tensors)
     fn tensor_to_tokens(&self, tensor: &TensorRef) -> Result<Vec<u32>> {
-        tensor.to_vec_u32()
+        if let Ok(tokens) = tensor.to_vec_u32() {
+            if tokens.is_empty() {
+                return Err(FerrumError::model("Input token tensor is empty"));
+            }
+            return Ok(tokens);
+        }
+
+        if let Ok(tokens_f32) = tensor.to_vec_f32() {
+            let tokens: Vec<u32> = tokens_f32.into_iter().map(|x| x as u32).collect();
+            if tokens.is_empty() {
+                return Err(FerrumError::model("Input token tensor is empty"));
+            }
+            return Ok(tokens);
+        }
+
+        Err(FerrumError::model(
+            "Unable to extract token IDs from input tensor",
+        ))
     }
 
     /// Create Candle tensor from token IDs on the correct device
@@ -114,10 +131,19 @@ impl ModelExecutor for Qwen2ModelExecutor {
             .forward_prefill(&input_tensor)
             .map_err(|e| FerrumError::model(format!("Qwen2 prefill failed: {}", e)))?;
 
-        // Qwen2 returns [batch, vocab]; expand to [batch, seq(=1), vocab]
-        let logits = logits
-            .unsqueeze(1)
-            .map_err(|e| FerrumError::model(format!("Unsqueeze logits failed: {}", e)))?;
+        let logits = match logits.dims().len() {
+            2 => logits
+                .unsqueeze(1)
+                .map_err(|e| FerrumError::model(format!("Unsqueeze logits failed: {}", e)))?,
+            3 => logits,
+            dims => {
+                return Err(FerrumError::model(format!(
+                    "Unexpected Qwen2 prefill logits rank: {} (shape {:?})",
+                    dims,
+                    logits.dims()
+                )))
+            }
+        };
 
         let logits_ref = self.wrap_tensor(logits);
 

@@ -50,7 +50,24 @@ impl Qwen3ModelExecutor {
     }
 
     fn tensor_to_tokens(&self, tensor: &TensorRef) -> Result<Vec<u32>> {
-        tensor.to_vec_u32()
+        if let Ok(tokens) = tensor.to_vec_u32() {
+            if tokens.is_empty() {
+                return Err(FerrumError::model("Input token tensor is empty"));
+            }
+            return Ok(tokens);
+        }
+
+        if let Ok(tokens_f32) = tensor.to_vec_f32() {
+            let tokens: Vec<u32> = tokens_f32.into_iter().map(|x| x as u32).collect();
+            if tokens.is_empty() {
+                return Err(FerrumError::model("Input token tensor is empty"));
+            }
+            return Ok(tokens);
+        }
+
+        Err(FerrumError::model(
+            "Unable to extract token IDs from input tensor",
+        ))
     }
 
     fn tokens_to_tensor(&self, tokens: &[u32]) -> Result<Tensor> {
@@ -104,9 +121,19 @@ impl ModelExecutor for Qwen3ModelExecutor {
             .forward_prefill(&input_tensor)
             .map_err(|e| FerrumError::model(format!("Qwen3 prefill failed: {}", e)))?;
 
-        let logits = logits
-            .unsqueeze(1)
-            .map_err(|e| FerrumError::model(format!("Unsqueeze logits failed: {}", e)))?;
+        let logits = match logits.dims().len() {
+            2 => logits
+                .unsqueeze(1)
+                .map_err(|e| FerrumError::model(format!("Unsqueeze logits failed: {}", e)))?,
+            3 => logits,
+            dims => {
+                return Err(FerrumError::model(format!(
+                    "Unexpected Qwen3 prefill logits rank: {} (shape {:?})",
+                    dims,
+                    logits.dims()
+                )))
+            }
+        };
 
         let logits_ref = self.wrap_tensor(logits);
 
