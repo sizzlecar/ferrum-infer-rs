@@ -224,7 +224,9 @@ impl Scheduler for FifoScheduler {
             );
 
             match response.finish_reason {
-                ferrum_types::FinishReason::EOS | ferrum_types::FinishReason::Stop => {
+                ferrum_types::FinishReason::EOS
+                | ferrum_types::FinishReason::Stop
+                | ferrum_types::FinishReason::Length => {
                     self.completed_counter.fetch_add(1, Ordering::Relaxed);
                     debug!("Request {} completed successfully", request_id);
                 }
