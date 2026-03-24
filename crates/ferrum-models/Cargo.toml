@@ -33,6 +33,9 @@ candle-transformers = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 safetensors = { workspace = true }
 
+# Custom CUDA kernels
+ferrum-cuda-kernels = { workspace = true, optional = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -61,8 +64,8 @@ tempfile = "3.8"
 default = []
 # Enable runtime integration for weight loading
 runtime = ["dep:ferrum-runtime"]
-# Enable CUDA FlashAttention-2 in model attention layers
-cuda = ["dep:candle-flash-attn", "candle-nn/cuda"]
+# Enable CUDA FlashAttention-2 and fused custom kernels
+cuda = ["dep:candle-flash-attn", "candle-nn/cuda", "dep:ferrum-cuda-kernels", "ferrum-cuda-kernels?/cuda"]
 # Enable integration tests
 integration-tests = []
 # Enable built-in model registry

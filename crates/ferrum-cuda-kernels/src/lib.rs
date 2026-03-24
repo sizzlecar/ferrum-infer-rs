@@ -4,16 +4,18 @@
 //! reducing kernel launch overhead and memory bandwidth usage.
 //!
 //! Kernels are compiled from CUDA source via nvrtc at first use, then cached.
-//! The candle `CudaDevice` is used to access the underlying cudarc stream.
 
 #[cfg(feature = "cuda")]
 mod fused_add_rms_norm;
+#[cfg(feature = "cuda")]
+pub use fused_add_rms_norm::fused_add_rms_norm;
 
 #[cfg(feature = "cuda")]
-pub use fused_add_rms_norm::FusedAddRmsNorm;
+mod fused_silu_mul;
+#[cfg(feature = "cuda")]
+pub use fused_silu_mul::fused_silu_mul;
 
 #[cfg(feature = "cuda")]
 mod kernel_loader;
-
 #[cfg(feature = "cuda")]
 pub use kernel_loader::KernelStore;

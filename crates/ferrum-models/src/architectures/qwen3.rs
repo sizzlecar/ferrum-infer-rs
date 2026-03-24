@@ -21,26 +21,26 @@ use candle_transformers::models::with_tracing::{linear_no_bias, Linear};
 /// On CUDA: uses `candle_nn::RmsNorm` which dispatches to a single fused CUDA kernel.
 /// On other backends (Metal/CPU): uses a manual implementation with basic tensor ops
 /// because the custom op lacks a Metal kernel.
+///
+/// Weight and eps are always accessible for use by fused custom CUDA kernels.
 #[derive(Debug, Clone)]
 struct RmsNorm {
     #[cfg(feature = "cuda")]
     inner: candle_nn::RmsNorm,
-    #[cfg(not(feature = "cuda"))]
     weight: Tensor,
-    #[cfg(not(feature = "cuda"))]
     eps: f64,
 }
 
 impl RmsNorm {
     fn new(size: usize, eps: f64, vb: VarBuilder) -> CandleResult<Self> {
+        let weight = vb.get(size, "weight")?;
         #[cfg(feature = "cuda")]
         {
-            let inner = candle_nn::rms_norm(size, eps, vb)?;
-            Ok(Self { inner })
+            let inner = candle_nn::RmsNorm::new(weight.clone(), eps);
+            Ok(Self { inner, weight, eps })
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let weight = vb.get(size, "weight")?;
             Ok(Self { weight, eps })
         }
     }
@@ -54,18 +54,23 @@ impl Module for RmsNorm {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let x_dtype = x.dtype();
-            let internal_dtype = match x_dtype {
-                DType::F16 | DType::BF16 => DType::F32,
-                d => d,
-            };
-            let hidden_size = x.dim(D::Minus1)?;
-            let x = x.to_dtype(internal_dtype)?;
-            let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
-            let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-            x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
+            rms_norm_slow(x, &self.weight, self.eps)
         }
     }
+}
+
+/// Manual RMS norm using basic tensor ops (Metal/CPU compatible).
+fn rms_norm_slow(x: &Tensor, weight: &Tensor, eps: f64) -> CandleResult<Tensor> {
+    let x_dtype = x.dtype();
+    let internal_dtype = match x_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        d => d,
+    };
+    let hidden_size = x.dim(D::Minus1)?;
+    let x = x.to_dtype(internal_dtype)?;
+    let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+    let x_normed = x.broadcast_div(&(norm_x + eps)?.sqrt()?)?;
+    x_normed.to_dtype(x_dtype)?.broadcast_mul(weight)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,9 +182,14 @@ impl MLP {
 impl Module for MLP {
     fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         let gate_up = xs.apply(&self.gate_up_proj)?;
-        let lhs = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?.apply(&self.act_fn)?;
-        let rhs = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
+        let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+        // Fused SiLU+mul: 2 kernel launches → 1, reads gate+up once instead of twice
+        #[cfg(feature = "cuda")]
+        let hidden = ferrum_cuda_kernels::fused_silu_mul(&gate.contiguous()?, &up.contiguous()?)?;
+        #[cfg(not(feature = "cuda"))]
+        let hidden = (gate.apply(&self.act_fn)? * up)?;
+        hidden.apply(&self.down_proj)
     }
 }
 
@@ -465,10 +475,24 @@ impl DecoderLayer {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
-        residual + xs
+        // Fused residual-add + RMS norm: 2 kernel launches → 1, saves 1 memory round-trip
+        #[cfg(feature = "cuda")]
+        let (xs, residual) = {
+            let (normalized, residual_updated) = ferrum_cuda_kernels::fused_add_rms_norm(
+                &xs,
+                residual,
+                &self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps as f32,
+            )?;
+            (normalized.apply(&self.mlp)?, residual_updated)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (xs, residual) = {
+            let sum = (xs + residual)?;
+            let xs = sum.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
+            (xs, sum)
+        };
+        &residual + xs
     }
 
     fn clear_kv_cache(&mut self) {
