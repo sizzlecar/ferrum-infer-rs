@@ -74,13 +74,15 @@ fn fused_add_rms_norm_compat(
         );
     }
 
-    match input.dims().as_slice() {
-        [num_tokens, hidden_size] => {
-            ferrum_cuda_kernels::fused_add_rms_norm(input, residual, weight, eps)
-        }
-        [batch_size, seq_len, hidden_size] => {
-            let flat_shape = (*batch_size * *seq_len, *hidden_size);
-            let view_shape = (*batch_size, *seq_len, *hidden_size);
+    let dims = input.dims();
+    match dims.len() {
+        2 => ferrum_cuda_kernels::fused_add_rms_norm(input, residual, weight, eps),
+        3 => {
+            let batch_size = dims[0];
+            let seq_len = dims[1];
+            let hidden_size = dims[2];
+            let flat_shape = (batch_size * seq_len, hidden_size);
+            let view_shape = (batch_size, seq_len, hidden_size);
 
             let input_2d = input.reshape(flat_shape)?;
             let residual_2d = residual.reshape(flat_shape)?;
@@ -92,7 +94,7 @@ fn fused_add_rms_norm_compat(
                 residual_updated.reshape(view_shape)?,
             ))
         }
-        dims => candle_core::bail!(
+        _ => candle_core::bail!(
             "fused_add_rms_norm_compat unsupported input shape: {:?}",
             dims
         ),

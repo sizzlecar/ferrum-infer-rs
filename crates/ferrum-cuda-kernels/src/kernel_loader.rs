@@ -8,6 +8,7 @@ use tracing::info;
 /// Holds compiled CUDA modules, one per kernel source file.
 pub struct KernelStore {
     device: CudaDevice,
+    #[allow(dead_code)]
     loaded: RwLock<HashMap<&'static str, String>>, // module_name -> PTX string
 }
 
@@ -22,6 +23,7 @@ impl KernelStore {
 
     /// Ensure a kernel module is loaded. `module_name` is used as the cache key.
     /// `cuda_src` is the CUDA C++ source, `func_names` are the entry points.
+    #[allow(dead_code)]
     pub(crate) fn ensure_loaded(
         &self,
         module_name: &'static str,

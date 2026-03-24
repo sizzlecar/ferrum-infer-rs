@@ -7,7 +7,7 @@
 //! Memory bandwidth saved: reads input+residual once instead of twice
 //! (once for add, once for norm).
 
-use candle_core::cuda_backend::{CudaDType, CudaStorage};
+use candle_core::cuda_backend::CudaStorage;
 use candle_core::{op::BackpropOp, DType, Storage, Tensor};
 use cudarc::driver::PushKernelArg;
 use std::sync::OnceLock;
