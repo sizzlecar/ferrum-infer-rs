@@ -62,7 +62,7 @@ default = []
 # Enable runtime integration for weight loading
 runtime = ["dep:ferrum-runtime"]
 # Enable CUDA FlashAttention-2 in model attention layers
-cuda = ["dep:candle-flash-attn"]
+cuda = ["dep:candle-flash-attn", "candle-nn/cuda"]
 # Enable integration tests
 integration-tests = []
 # Enable built-in model registry
