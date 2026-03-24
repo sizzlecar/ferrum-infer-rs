@@ -8,7 +8,7 @@ use tracing::info;
 /// Holds compiled CUDA modules, one per kernel source file.
 pub struct KernelStore {
     device: CudaDevice,
-    loaded: RwLock<HashMap<&'static str, ()>>,
+    loaded: RwLock<HashMap<&'static str, String>>, // module_name -> PTX string
 }
 
 impl KernelStore {
@@ -45,14 +45,17 @@ impl KernelStore {
         };
         let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(cuda_src, opts)
             .map_err(|e| candle_core::Error::Msg(format!("nvrtc compile '{module_name}': {e}")))?;
+        let ptx_str = ptx.to_src();
 
         // Load all functions from this module
         for &func_name in func_names {
-            let _ = self.device.get_or_load_custom_func(func_name, module_name, &ptx)?;
+            let _ = self
+                .device
+                .get_or_load_custom_func(func_name, module_name, &ptx_str)?;
         }
 
         let mut loaded = self.loaded.write().unwrap();
-        loaded.insert(module_name, ());
+        loaded.insert(module_name, ptx_str);
         info!("CUDA kernel module '{}' ready", module_name);
         Ok(())
     }
