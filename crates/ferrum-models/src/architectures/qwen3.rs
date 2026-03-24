@@ -59,6 +59,46 @@ impl Module for RmsNorm {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn fused_add_rms_norm_compat(
+    input: &Tensor,
+    residual: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> CandleResult<(Tensor, Tensor)> {
+    if input.dims() != residual.dims() {
+        candle_core::bail!(
+            "fused_add_rms_norm_compat shape mismatch: input {:?}, residual {:?}",
+            input.dims(),
+            residual.dims()
+        );
+    }
+
+    match input.dims().as_slice() {
+        [num_tokens, hidden_size] => {
+            ferrum_cuda_kernels::fused_add_rms_norm(input, residual, weight, eps)
+        }
+        [batch_size, seq_len, hidden_size] => {
+            let flat_shape = (*batch_size * *seq_len, *hidden_size);
+            let view_shape = (*batch_size, *seq_len, *hidden_size);
+
+            let input_2d = input.reshape(flat_shape)?;
+            let residual_2d = residual.reshape(flat_shape)?;
+            let (normalized, residual_updated) =
+                ferrum_cuda_kernels::fused_add_rms_norm(&input_2d, &residual_2d, weight, eps)?;
+
+            Ok((
+                normalized.reshape(view_shape)?,
+                residual_updated.reshape(view_shape)?,
+            ))
+        }
+        dims => candle_core::bail!(
+            "fused_add_rms_norm_compat unsupported input shape: {:?}",
+            dims
+        ),
+    }
+}
+
 /// Manual RMS norm using basic tensor ops (Metal/CPU compatible).
 fn rms_norm_slow(x: &Tensor, weight: &Tensor, eps: f64) -> CandleResult<Tensor> {
     let x_dtype = x.dtype();
@@ -483,7 +523,7 @@ impl DecoderLayer {
         // Fused residual-add + RMS norm: 2 kernel launches → 1, saves 1 memory round-trip
         #[cfg(feature = "cuda")]
         let (xs, residual) = {
-            let (normalized, residual_updated) = ferrum_cuda_kernels::fused_add_rms_norm(
+            let (normalized, residual_updated) = fused_add_rms_norm_compat(
                 &xs,
                 residual,
                 &self.post_attention_layernorm.weight,
