@@ -10,7 +10,10 @@ ferrum-types = { workspace = true }
 candle-core = { workspace = true }
 half = { workspace = true }
 tracing = { workspace = true }
-cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc"], optional = true }
+cudarc = { version = "0.19", default-features = false, features = ["driver"], optional = true }
+
+[build-dependencies]
+bindgen_cuda = "0.1.6"
 
 [features]
 default = []

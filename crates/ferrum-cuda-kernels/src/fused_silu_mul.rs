@@ -8,24 +8,10 @@
 use candle_core::cuda_backend::CudaStorage;
 use candle_core::{op::BackpropOp, DType, Storage, Tensor};
 use cudarc::driver::PushKernelArg;
-use std::sync::OnceLock;
 
-const CUDA_SRC: &str = include_str!("../kernels/fused_silu_mul.cu");
+use crate::ptx;
+
 const MODULE_NAME: &str = "fused_silu_mul";
-
-static COMPILED_PTX: OnceLock<String> = OnceLock::new();
-
-fn get_ptx() -> &'static str {
-    COMPILED_PTX.get_or_init(|| {
-        let opts = cudarc::nvrtc::CompileOptions {
-            use_fast_math: Some(true),
-            ..Default::default()
-        };
-        cudarc::nvrtc::safe::compile_ptx_with_opts(CUDA_SRC, opts)
-            .expect("Failed to compile fused_silu_mul CUDA kernel")
-            .to_src()
-    })
-}
 
 /// Fused: output = silu(gate) * up
 ///
@@ -44,7 +30,7 @@ pub fn fused_silu_mul(gate: &Tensor, up: &Tensor) -> candle_core::Result<Tensor>
     };
 
     let cuda_dev = gate.device().as_cuda_device()?;
-    let func = cuda_dev.get_or_load_custom_func(func_name, MODULE_NAME, get_ptx())?;
+    let func = cuda_dev.get_or_load_custom_func(func_name, MODULE_NAME, ptx::FUSED_SILU_MUL)?;
 
     let block_size = 256u32;
     let grid_size = (elem_count as u32 + block_size - 1) / block_size;
