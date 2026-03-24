@@ -5,7 +5,7 @@
 //!
 //! Used in gated MLP: after fused gate+up matmul, split and apply silu+mul.
 
-use candle_core::cuda_backend::{CudaDType, CudaStorage};
+use candle_core::cuda_backend::CudaStorage;
 use candle_core::{op::BackpropOp, DType, Storage, Tensor};
 use cudarc::driver::PushKernelArg;
 use std::sync::OnceLock;
