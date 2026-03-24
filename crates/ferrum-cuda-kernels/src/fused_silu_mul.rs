@@ -5,25 +5,26 @@
 //!
 //! Used in gated MLP: after fused gate+up matmul, split and apply silu+mul.
 
-use candle_core::{BackpropOp, CudaStorage, DType, Storage, Tensor};
+use candle_core::cuda_backend::{CudaDType, CudaStorage};
+use candle_core::{op::BackpropOp, DType, Storage, Tensor};
+use cudarc::driver::PushKernelArg;
 use std::sync::OnceLock;
 
 const CUDA_SRC: &str = include_str!("../kernels/fused_silu_mul.cu");
 const MODULE_NAME: &str = "fused_silu_mul";
 
-static COMPILED_PTX: OnceLock<cudarc::nvrtc::Ptx> = OnceLock::new();
+static COMPILED_PTX: OnceLock<String> = OnceLock::new();
 
-fn get_ptx() -> candle_core::Result<&'static cudarc::nvrtc::Ptx> {
-    COMPILED_PTX
-        .get_or_try_init(|| {
-            let opts = cudarc::nvrtc::CompileOptions {
-                use_fast_math: Some(true),
-                ..Default::default()
-            };
-            cudarc::nvrtc::safe::compile_ptx_with_opts(CUDA_SRC, opts)
-                .map_err(|e| candle_core::Error::Msg(format!("nvrtc compile: {e}")))
-        })
-        .map_err(|e| candle_core::Error::Msg(format!("PTX init: {e}")))
+fn get_ptx() -> &'static str {
+    COMPILED_PTX.get_or_init(|| {
+        let opts = cudarc::nvrtc::CompileOptions {
+            use_fast_math: Some(true),
+            ..Default::default()
+        };
+        cudarc::nvrtc::safe::compile_ptx_with_opts(CUDA_SRC, opts)
+            .expect("Failed to compile fused_silu_mul CUDA kernel")
+            .to_src()
+    })
 }
 
 /// Fused: output = silu(gate) * up
@@ -42,9 +43,8 @@ pub fn fused_silu_mul(gate: &Tensor, up: &Tensor) -> candle_core::Result<Tensor>
         _ => candle_core::bail!("fused_silu_mul: unsupported dtype {dtype:?}"),
     };
 
-    let ptx = get_ptx()?;
     let cuda_dev = gate.device().as_cuda_device()?;
-    let func = cuda_dev.get_or_load_custom_func(func_name, MODULE_NAME, ptx)?;
+    let func = cuda_dev.get_or_load_custom_func(func_name, MODULE_NAME, get_ptx())?;
 
     let block_size = 256u32;
     let grid_size = (elem_count as u32 + block_size - 1) / block_size;
@@ -53,17 +53,25 @@ pub fn fused_silu_mul(gate: &Tensor, up: &Tensor) -> candle_core::Result<Tensor>
     let (gate_s, gate_l) = gate.storage_and_layout();
     let (up_s, up_l) = up.storage_and_layout();
 
+    let gate_cuda = match &*gate_s {
+        Storage::Cuda(cs) => cs,
+        _ => candle_core::bail!("gate must be on CUDA"),
+    };
+    let up_cuda = match &*up_s {
+        Storage::Cuda(cs) => cs,
+        _ => candle_core::bail!("up must be on CUDA"),
+    };
+
     let output_storage = match dtype {
         DType::F16 => {
-            let g = gate_s.as_cuda_slice::<half::f16>()?;
-            let u = up_s.as_cuda_slice::<half::f16>()?;
+            let g = gate_cuda.as_cuda_slice::<half::f16>()?;
+            let u = up_cuda.as_cuda_slice::<half::f16>()?;
             let out = unsafe { cuda_dev.alloc::<half::f16>(elem_count)? };
 
             let g = g.slice(gate_l.start_offset()..);
             let u = u.slice(up_l.start_offset()..);
 
-            let stream = cuda_dev.cuda_stream();
-            let mut builder = stream.launch_builder(&func);
+            let mut builder = func.builder();
             builder.arg(&g);
             builder.arg(&u);
             builder.arg(&out);
@@ -80,15 +88,14 @@ pub fn fused_silu_mul(gate: &Tensor, up: &Tensor) -> candle_core::Result<Tensor>
             CudaStorage::wrap_cuda_slice(out, cuda_dev.clone())
         }
         DType::F32 => {
-            let g = gate_s.as_cuda_slice::<f32>()?;
-            let u = up_s.as_cuda_slice::<f32>()?;
+            let g = gate_cuda.as_cuda_slice::<f32>()?;
+            let u = up_cuda.as_cuda_slice::<f32>()?;
             let out = unsafe { cuda_dev.alloc::<f32>(elem_count)? };
 
             let g = g.slice(gate_l.start_offset()..);
             let u = u.slice(up_l.start_offset()..);
 
-            let stream = cuda_dev.cuda_stream();
-            let mut builder = stream.launch_builder(&func);
+            let mut builder = func.builder();
             builder.arg(&g);
             builder.arg(&u);
             builder.arg(&out);
