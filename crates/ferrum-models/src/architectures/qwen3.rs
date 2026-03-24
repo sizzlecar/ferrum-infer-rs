@@ -16,33 +16,55 @@ use tracing::{debug, info};
 // ops that Metal supports).
 use candle_transformers::models::with_tracing::{linear_no_bias, Linear};
 
-/// Metal-compatible RmsNorm using basic tensor ops instead of `candle_nn::ops::rms_norm`
-/// which relies on a custom op without Metal support.
+/// RmsNorm implementation.
+///
+/// On CUDA: uses `candle_nn::RmsNorm` which dispatches to a single fused CUDA kernel.
+/// On other backends (Metal/CPU): uses a manual implementation with basic tensor ops
+/// because the custom op lacks a Metal kernel.
 #[derive(Debug, Clone)]
 struct RmsNorm {
+    #[cfg(feature = "cuda")]
+    inner: candle_nn::RmsNorm,
+    #[cfg(not(feature = "cuda"))]
     weight: Tensor,
+    #[cfg(not(feature = "cuda"))]
     eps: f64,
 }
 
 impl RmsNorm {
     fn new(size: usize, eps: f64, vb: VarBuilder) -> CandleResult<Self> {
-        let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps })
+        #[cfg(feature = "cuda")]
+        {
+            let inner = candle_nn::rms_norm(size, eps, vb)?;
+            Ok(Self { inner })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let weight = vb.get(size, "weight")?;
+            Ok(Self { weight, eps })
+        }
     }
 }
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let x_dtype = x.dtype();
-        let internal_dtype = match x_dtype {
-            DType::F16 | DType::BF16 => DType::F32,
-            d => d,
-        };
-        let hidden_size = x.dim(D::Minus1)?;
-        let x = x.to_dtype(internal_dtype)?;
-        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
-        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-        x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
+        #[cfg(feature = "cuda")]
+        {
+            self.inner.forward(x)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let x_dtype = x.dtype();
+            let internal_dtype = match x_dtype {
+                DType::F16 | DType::BF16 => DType::F32,
+                d => d,
+            };
+            let hidden_size = x.dim(D::Minus1)?;
+            let x = x.to_dtype(internal_dtype)?;
+            let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+            let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+            x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
+        }
     }
 }
 
@@ -100,9 +122,19 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        // Use rope_slow (basic tensor ops) instead of rope (custom op without Metal kernel).
-        let q_embed = candle_nn::rotary_emb::rope_slow(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope_slow(&k.contiguous()?, &cos, &sin)?;
+        // CUDA: fused rope custom op. Other backends: basic tensor ops (no Metal kernel).
+        #[cfg(feature = "cuda")]
+        let (q_embed, k_embed) = {
+            let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+            let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+            (q_embed, k_embed)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (q_embed, k_embed) = {
+            let q_embed = candle_nn::rotary_emb::rope_slow(&q.contiguous()?, &cos, &sin)?;
+            let k_embed = candle_nn::rotary_emb::rope_slow(&k.contiguous()?, &cos, &sin)?;
+            (q_embed, k_embed)
+        };
         Ok((q_embed, k_embed))
     }
 }
@@ -218,11 +250,11 @@ impl Attention {
             self.rotary_emb
                 .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
 
-        let (key_states, value_states) = match &self.kv_cache {
+        let (key_states, value_states) = match self.kv_cache.take() {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
+                let key_states = Tensor::cat(&[&prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[&prev_v, &value_states], 2)?;
                 (key_states, value_states)
             }
         };
