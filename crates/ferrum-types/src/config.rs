@@ -95,6 +95,8 @@ pub enum SchedulingPolicy {
     SJF,
     /// Round-Robin
     RoundRobin,
+    /// Iteration-level continuous batching with preemption
+    ContinuousBatch,
 }
 
 /// KV Cache configuration

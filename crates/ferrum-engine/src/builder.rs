@@ -12,9 +12,9 @@ use crate::registry::{ComponentConfig, ComponentRegistry};
 use crate::DefaultInferenceEngine;
 use ferrum_interfaces::{
     ComputeBackend, InferenceEngine, KvCacheManager, ModelExecutor, Sampler,
-    SchedulerInterface as Scheduler, Tokenizer,
+    SchedulerInterface as Scheduler, TensorFactory, Tokenizer,
 };
-use ferrum_types::{EngineConfig, FerrumError, Result};
+use ferrum_types::{EngineConfig, FerrumError, Result, SchedulingPolicy};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -201,11 +201,12 @@ impl EngineBuilder {
         }
 
         match self.config.scheduler.policy {
-            ferrum_types::SchedulingPolicy::FCFS => "fifo".to_string(),
-            ferrum_types::SchedulingPolicy::Priority => "priority".to_string(),
-            ferrum_types::SchedulingPolicy::FairShare => "fifo".to_string(), // Fallback
-            ferrum_types::SchedulingPolicy::SJF => "fifo".to_string(),       // Fallback
-            ferrum_types::SchedulingPolicy::RoundRobin => "fifo".to_string(), // Fallback
+            SchedulingPolicy::FCFS => "fifo".to_string(),
+            SchedulingPolicy::Priority => "priority".to_string(),
+            SchedulingPolicy::FairShare => "fifo".to_string(), // Fallback
+            SchedulingPolicy::SJF => "fifo".to_string(),       // Fallback
+            SchedulingPolicy::RoundRobin => "fifo".to_string(), // Fallback
+            SchedulingPolicy::ContinuousBatch => "continuous".to_string(),
         }
     }
 
@@ -375,10 +376,40 @@ impl EngineBuilder {
 
         // 7. Create the engine
         info!("All components created, building engine");
-        let engine =
-            DefaultInferenceEngine::new(config, scheduler, tokenizer, sampler, kv_cache, executor);
 
-        Ok(Box::new(engine))
+        if matches!(config.scheduler.policy, SchedulingPolicy::ContinuousBatch) {
+            info!("Using ContinuousBatchEngine with iteration-level scheduling");
+
+            // Create ContinuousBatchScheduler directly (needs concrete type)
+            let cb_scheduler = Arc::new(
+                ferrum_scheduler::implementations::ContinuousBatchScheduler::new(
+                    config.scheduler.clone(),
+                ),
+            );
+
+            // Create TensorFactory for the configured device
+            let tensor_factory: Arc<dyn TensorFactory> = Arc::new(
+                ferrum_runtime::backends::candle::CandleTensorFactory::new(
+                    config.backend.device.clone(),
+                ),
+            );
+
+            let engine = crate::ContinuousBatchEngine::new(
+                config,
+                cb_scheduler,
+                tokenizer,
+                sampler,
+                kv_cache,
+                executor,
+                tensor_factory,
+            );
+            Ok(Box::new(engine))
+        } else {
+            let engine = DefaultInferenceEngine::new(
+                config, scheduler, tokenizer, sampler, kv_cache, executor,
+            );
+            Ok(Box::new(engine))
+        }
     }
 }
 
