@@ -72,7 +72,10 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     // Create engine with continuous batching for serve mode
     println!();
-    println!("{}", "Initializing engine (continuous batching)...".dimmed());
+    println!(
+        "{}",
+        "Initializing engine (continuous batching)...".dimmed()
+    );
     let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;

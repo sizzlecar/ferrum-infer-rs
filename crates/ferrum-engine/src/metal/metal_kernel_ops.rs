@@ -6,7 +6,7 @@
 //! kernel delegate to candle tensor ops, which candle dispatches to the Metal
 //! GPU automatically when tensors reside on a Metal device.
 
-use crate::metal::compute_pipeline::{RmsNormPipeline, Q4_0MatvecPipeline};
+use crate::metal::compute_pipeline::{Q4_0MatvecPipeline, RmsNormPipeline};
 use crate::metal::sampling_ops::MetalSamplingOps as RawMetalSamplingOps;
 use crate::metal::MetalContext;
 use ferrum_interfaces::kernel_ops::{
@@ -96,9 +96,9 @@ impl NormOps for MetalNormOps {
         let input_f32 = to_f32_vec(input_t)?;
         let weight_f32 = to_f32_vec(weight_t)?;
 
-        let result = self
-            .pipeline
-            .forward_batched(&input_f32, &weight_f32, batch_size, hidden_size, eps)?;
+        let result =
+            self.pipeline
+                .forward_batched(&input_f32, &weight_f32, batch_size, hidden_size, eps)?;
 
         let out = from_f32_vec(result, dims, input_t.device(), input_t.dtype())?;
         wrap(out)
@@ -340,9 +340,10 @@ impl LinearOps for MetalLinearOps {
                 "Metal quantized_linear only supports Q4_0",
             ));
         };
-        let pipeline = self.q4_pipeline.as_ref().ok_or_else(|| {
-            FerrumError::backend("Q4_0 Metal pipeline not available")
-        })?;
+        let pipeline = self
+            .q4_pipeline
+            .as_ref()
+            .ok_or_else(|| FerrumError::backend("Q4_0 Metal pipeline not available"))?;
 
         let input_t = ct(input)?;
         let packed_t = ct(packed_weight)?;

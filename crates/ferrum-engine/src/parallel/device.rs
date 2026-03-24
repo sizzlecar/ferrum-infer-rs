@@ -333,7 +333,8 @@ impl DeviceManager {
         // Use candle to probe CUDA device availability
         let mut devices = Vec::new();
         for idx in 0..8 {
-            match candle_core::Device::new_cuda(idx) as std::result::Result<candle_core::Device, _> {
+            match candle_core::Device::new_cuda(idx) as std::result::Result<candle_core::Device, _>
+            {
                 Ok(dev) => {
                     let name = format!("CUDA Device {}", idx);
                     devices.push(DeviceInfo {

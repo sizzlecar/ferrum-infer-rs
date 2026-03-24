@@ -209,11 +209,7 @@ struct PreAllocKvCache {
 
 impl PreAllocKvCache {
     /// Allocate cache. K/V must be in [batch, seq, kv_heads, head_dim] layout, contiguous.
-    fn new(
-        k_init: &Tensor,
-        v_init: &Tensor,
-        max_len: usize,
-    ) -> CandleResult<Self> {
+    fn new(k_init: &Tensor, v_init: &Tensor, max_len: usize) -> CandleResult<Self> {
         let (b, seq, h, d) = k_init.dims4()?;
         // Allocate [batch, max_len, kv_heads, head_dim]
         let k_buf = Tensor::zeros((b, max_len, h, d), k_init.dtype(), k_init.device())?;
@@ -231,11 +227,7 @@ impl PreAllocKvCache {
 
     /// Append new K/V at current position. Returns (k_view, v_view) for attention.
     /// Both views are [batch, current_len+new_len, kv_heads, head_dim] with last-dim stride=1.
-    fn append(
-        &mut self,
-        k_new: &Tensor,
-        v_new: &Tensor,
-    ) -> CandleResult<(Tensor, Tensor)> {
+    fn append(&mut self, k_new: &Tensor, v_new: &Tensor) -> CandleResult<(Tensor, Tensor)> {
         let new_len = k_new.dims4()?.1;
         let total = self.current_len + new_len;
 
@@ -365,9 +357,7 @@ impl Attention {
             Some(cache) => cache.append(&k_for_cache, &v_for_cache)?,
             None => {
                 // First call: allocate cache sized to seq_len*8 (capped)
-                let alloc_len = (q_len * 8)
-                    .max(2048)
-                    .min(self.max_position_embeddings);
+                let alloc_len = (q_len * 8).max(2048).min(self.max_position_embeddings);
                 let cache = PreAllocKvCache::new(&k_for_cache, &v_for_cache, alloc_len)?;
                 let k_v = cache.k.narrow(1, 0, cache.current_len)?;
                 let v_v = cache.v.narrow(1, 0, cache.current_len)?;
@@ -394,12 +384,28 @@ impl Attention {
                     DType::F16 | DType::BF16 => target_dtype,
                     _ => DType::F16,
                 };
-                let q = if q.dtype() != compute_dtype { q.to_dtype(compute_dtype)? } else { q };
-                let k = if k_view.dtype() != compute_dtype { k_view.to_dtype(compute_dtype)? } else { k_view };
-                let v = if v_view.dtype() != compute_dtype { v_view.to_dtype(compute_dtype)? } else { v_view };
+                let q = if q.dtype() != compute_dtype {
+                    q.to_dtype(compute_dtype)?
+                } else {
+                    q
+                };
+                let k = if k_view.dtype() != compute_dtype {
+                    k_view.to_dtype(compute_dtype)?
+                } else {
+                    k_view
+                };
+                let v = if v_view.dtype() != compute_dtype {
+                    v_view.to_dtype(compute_dtype)?
+                } else {
+                    v_view
+                };
 
                 let out = candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)?;
-                let out = if out.dtype() != target_dtype { out.to_dtype(target_dtype)? } else { out };
+                let out = if out.dtype() != target_dtype {
+                    out.to_dtype(target_dtype)?
+                } else {
+                    out
+                };
                 // Output [batch, q_len, heads, head_dim] -> [batch, heads, q_len, head_dim]
                 out.transpose(1, 2)?
             }
@@ -417,8 +423,7 @@ impl Attention {
                         .contiguous()?;
 
                 let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-                let attn_weights =
-                    (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+                let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
 
                 let attn_weights = match attention_mask {
                     None => attn_weights,
@@ -489,7 +494,9 @@ impl DecoderLayer {
         #[cfg(not(feature = "cuda"))]
         let (xs, residual) = {
             let sum = (xs + residual)?;
-            let xs = sum.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
+            let xs = sum
+                .apply(&self.post_attention_layernorm)?
+                .apply(&self.mlp)?;
             (xs, sum)
         };
         &residual + xs

@@ -388,11 +388,10 @@ impl EngineBuilder {
             );
 
             // Create TensorFactory for the configured device
-            let tensor_factory: Arc<dyn TensorFactory> = Arc::new(
-                ferrum_runtime::backends::candle::CandleTensorFactory::new(
+            let tensor_factory: Arc<dyn TensorFactory> =
+                Arc::new(ferrum_runtime::backends::candle::CandleTensorFactory::new(
                     config.backend.device.clone(),
-                ),
-            );
+                ));
 
             let engine = crate::ContinuousBatchEngine::new(
                 config,

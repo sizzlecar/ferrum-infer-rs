@@ -18,6 +18,9 @@ pub use attention::{
     create_attention_info, AttentionConfig, AttentionKernel, AttentionType, FlashAttentionInfo,
     PagedAttentionInfo, StandardAttentionInfo,
 };
+#[cfg(feature = "cuda")]
+pub use cuda_kernel_ops::flash_attn_varlen;
+pub use cuda_kernel_ops::CudaKernelOps;
 pub use fused::{
     CpuFusedOpsInfo, FusedOpType, FusedOps, FusedOpsConfig, FusedRopeAttention,
     FusedRopeAttentionConfig, RopeCache,
@@ -26,7 +29,4 @@ pub use ops::{
     create_attention_op, AttentionOp, AttentionOutput, CpuAttentionOp, DecodeAttentionInput,
     PrefillAttentionInput,
 };
-pub use cuda_kernel_ops::CudaKernelOps;
-#[cfg(feature = "cuda")]
-pub use cuda_kernel_ops::flash_attn_varlen;
 pub use registry::{global_kernel_registry, KernelInfo, KernelRegistry, PerformanceHint};

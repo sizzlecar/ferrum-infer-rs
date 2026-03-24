@@ -36,10 +36,7 @@ pub struct BenchCommand {
 
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let model_id = super::run::resolve_model_alias(&cmd.model);
-    eprintln!(
-        "{}",
-        format!("Ferrum Benchmark - {}", model_id).bold()
-    );
+    eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
 
     // Find or download model
@@ -98,10 +95,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let mut tps_list: Vec<f64> = Vec::new();
 
     for round in 1..=cmd.rounds {
-        eprintln!(
-            "{}",
-            format!("Round {}/{}...", round, cmd.rounds).dimmed()
-        );
+        eprintln!("{}", format!("Round {}/{}...", round, cmd.rounds).dimmed());
 
         let start = Instant::now();
         let result = run_single(&*engine, &model_id, &cmd.prompt, cmd.max_tokens).await?;
@@ -131,7 +125,10 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     eprintln!("{}", "BENCHMARK RESULTS".bold());
     eprintln!("{}", "=".repeat(60));
     eprintln!("Model:             {}", model_id);
-    eprintln!("Backend:           {:?}", super::run::select_device(&cmd.backend));
+    eprintln!(
+        "Backend:           {:?}",
+        super::run::select_device(&cmd.backend)
+    );
     eprintln!("Rounds:            {}", cmd.rounds);
     eprintln!("Max tokens/round:  {}", cmd.max_tokens);
     eprintln!("{}", "-".repeat(60));
