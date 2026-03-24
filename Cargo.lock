@@ -1211,6 +1211,7 @@ name = "ferrum-cuda-kernels"
 version = "0.2.0"
 dependencies = [
  "candle-core",
+ "cudarc 0.19.4",
  "ferrum-types",
  "half",
  "tracing",
@@ -1315,6 +1316,7 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "dirs 5.0.1",
+ "ferrum-cuda-kernels",
  "ferrum-interfaces",
  "ferrum-runtime",
  "ferrum-types",

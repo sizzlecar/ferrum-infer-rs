@@ -29,21 +29,23 @@ __inline__ __device__ float block_reduce_sum(float val) {
     return val;
 }
 
-// Fused: residual = input + residual; output = rms_norm(residual, weight, eps)
+// Fused: residual_out = input + residual; output = rms_norm(residual_out, weight, eps)
 // All in FP16, internal computation in FP32.
 //
 // Grid:  (num_tokens,)   — one block per token
 // Block: (min(hidden_size, 1024),)
 //
-// input:    [num_tokens, hidden_size] fp16
-// residual: [num_tokens, hidden_size] fp16 (in-place updated)
-// weight:   [hidden_size] fp16
-// output:   [num_tokens, hidden_size] fp16
+// input:        [num_tokens, hidden_size] fp16  (read-only)
+// residual:     [num_tokens, hidden_size] fp16  (read-only)
+// weight:       [hidden_size] fp16              (read-only)
+// output:       [num_tokens, hidden_size] fp16  (normalized result)
+// residual_out: [num_tokens, hidden_size] fp16  (input + residual)
 extern "C" __global__ void fused_add_rms_norm_f16(
     const __half* __restrict__ input,
-    __half* __restrict__ residual,
+    const __half* __restrict__ residual,
     const __half* __restrict__ weight,
     __half* __restrict__ output,
+    __half* __restrict__ residual_out,
     const int hidden_size,
     const float eps
 ) {
@@ -56,8 +58,7 @@ extern "C" __global__ void fused_add_rms_norm_f16(
         float x = __half2float(input[offset + i]);
         float r = __half2float(residual[offset + i]);
         float sum = x + r;
-        // Write updated residual
-        residual[offset + i] = __float2half(sum);
+        residual_out[offset + i] = __float2half(sum);
         variance += sum * sum;
     }
 
@@ -72,18 +73,19 @@ extern "C" __global__ void fused_add_rms_norm_f16(
 
     // Step 2: Normalize and write output
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float val = __half2float(residual[offset + i]);
+        float val = __half2float(residual_out[offset + i]);
         float w = __half2float(weight[i]);
         output[offset + i] = __float2half(val * inv_rms * w);
     }
 }
 
-// FP32 version for CPU/non-F16 paths
+// FP32 version
 extern "C" __global__ void fused_add_rms_norm_f32(
     const float* __restrict__ input,
-    float* __restrict__ residual,
+    const float* __restrict__ residual,
     const float* __restrict__ weight,
     float* __restrict__ output,
+    float* __restrict__ residual_out,
     const int hidden_size,
     const float eps
 ) {
@@ -93,7 +95,7 @@ extern "C" __global__ void fused_add_rms_norm_f32(
     float variance = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         float sum = input[offset + i] + residual[offset + i];
-        residual[offset + i] = sum;
+        residual_out[offset + i] = sum;
         variance += sum * sum;
     }
 
@@ -106,6 +108,6 @@ extern "C" __global__ void fused_add_rms_norm_f32(
     float inv_rms = s_inv_rms;
 
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        output[offset + i] = residual[offset + i] * inv_rms * weight[i];
+        output[offset + i] = residual_out[offset + i] * inv_rms * weight[i];
     }
 }
