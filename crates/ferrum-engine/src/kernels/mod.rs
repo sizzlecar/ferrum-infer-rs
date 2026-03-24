@@ -9,6 +9,7 @@
 //! - Kernel Registry: Runtime discovery and selection of optimal kernels
 
 pub mod attention;
+pub mod cuda_kernel_ops;
 pub mod fused;
 pub mod ops;
 pub mod registry;
@@ -17,6 +18,9 @@ pub use attention::{
     create_attention_info, AttentionConfig, AttentionKernel, AttentionType, FlashAttentionInfo,
     PagedAttentionInfo, StandardAttentionInfo,
 };
+#[cfg(feature = "cuda")]
+pub use cuda_kernel_ops::flash_attn_varlen;
+pub use cuda_kernel_ops::CudaKernelOps;
 pub use fused::{
     CpuFusedOpsInfo, FusedOpType, FusedOps, FusedOpsConfig, FusedRopeAttention,
     FusedRopeAttentionConfig, RopeCache,

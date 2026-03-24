@@ -1,0 +1,17 @@
+[package]
+name = "ferrum-cuda-kernels"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrum-types = { workspace = true }
+candle-core = { workspace = true }
+half = { workspace = true }
+tracing = { workspace = true }
+cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc"], optional = true }
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "dep:cudarc"]

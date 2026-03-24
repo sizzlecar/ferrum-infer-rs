@@ -1,5 +1,6 @@
 //! CLI Commands - Ollama-style interface
 
+pub mod bench;
 pub mod embed;
 pub mod list;
 pub mod pull;

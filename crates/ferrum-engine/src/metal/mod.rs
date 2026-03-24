@@ -18,6 +18,8 @@ mod error;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_executor;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_kernel_ops;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_llama;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_model;
@@ -40,6 +42,8 @@ pub use context::MetalContext;
 pub use error::MetalError;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_executor::*;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub use metal_kernel_ops::MetalKernelOps;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_llama::*;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]

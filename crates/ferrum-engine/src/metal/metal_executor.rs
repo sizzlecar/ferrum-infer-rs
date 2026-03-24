@@ -139,6 +139,7 @@ struct DummyKvCache {
 }
 
 impl DummyKvCache {
+    #[allow(dead_code)]
     fn new(block_size: usize) -> Self {
         Self::with_length(block_size, 0)
     }

@@ -11,8 +11,9 @@ use half::f16;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Metal-accelerated RMS Normalization layer
-// TODO(phase-2.2): migrate to implement `NormOps` from `ferrum_interfaces::kernel_ops`
+/// Metal-accelerated RMS Normalization layer.
+///
+/// For the trait-based `NormOps` interface, see [`super::metal_kernel_ops::MetalNormOps`].
 pub struct MetalRmsNorm {
     weight: Tensor,
     eps: f32,
@@ -182,8 +183,9 @@ impl MetalRmsNorm {
     }
 }
 
-/// Metal-accelerated Rotary Position Embedding
-// TODO(phase-2.2): migrate to implement `PositionOps` from `ferrum_interfaces::kernel_ops`
+/// Metal-accelerated Rotary Position Embedding.
+///
+/// For the trait-based `PositionOps` interface, see [`super::metal_kernel_ops::MetalPositionOps`].
 pub struct MetalRotaryEmbedding {
     cos_cache: Tensor,
     sin_cache: Tensor,
@@ -313,8 +315,9 @@ pub struct MetalLlamaConfig {
     pub rope_theta: f32,
 }
 
-/// Metal-accelerated LLaMA Attention layer
-// TODO(phase-2.2): migrate to implement `AttentionOps` from `ferrum_interfaces::kernel_ops`
+/// Metal-accelerated LLaMA Attention layer.
+///
+/// For the trait-based `AttentionOps` interface, see [`super::metal_kernel_ops::MetalAttentionOps`].
 pub struct MetalLlamaAttention {
     q_proj: Linear,
     k_proj: Linear,
@@ -540,8 +543,10 @@ impl MetalLlamaAttention {
     }
 }
 
-/// Metal-accelerated LLaMA MLP
-// TODO(phase-2.2): SwiGLU pattern maps to `ActivationOps::silu_mul` + `LinearOps::linear`
+/// Metal-accelerated LLaMA MLP.
+///
+/// For the trait-based interface, see [`super::metal_kernel_ops::MetalActivationOps`] and
+/// [`super::metal_kernel_ops::MetalLinearOps`].
 pub struct MetalLlamaMlp {
     gate_proj: Linear,
     up_proj: Linear,
