@@ -153,17 +153,10 @@ impl AttentionOps for CudaAttentionOps {
         block_table: &[u32],
         params: &AttentionParams,
     ) -> Result<TensorRef> {
-        #[cfg(feature = "cuda")]
-        {
-            return flash_paged_attention(q, k_cache, v_cache, block_table, params);
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = (q, k_cache, v_cache, block_table, params);
-            Err(FerrumError::unsupported(
-                "paged_attention requires cuda feature with FlashAttention",
-            ))
-        }
+        let _ = (q, k_cache, v_cache, block_table, params);
+        Err(FerrumError::unsupported(
+            "paged_attention not yet supported — requires custom CUDA kernel (planned)",
+        ))
     }
 }
 
@@ -210,64 +203,6 @@ fn flash_attention(
     wrap(output)
 }
 
-#[cfg(feature = "cuda")]
-fn flash_paged_attention(
-    q: &TensorRef,
-    k_cache: &TensorRef,
-    v_cache: &TensorRef,
-    block_table: &[u32],
-    params: &AttentionParams,
-) -> Result<TensorRef> {
-    let q = ct(q)?;
-    let k_cache = ct(k_cache)?;
-    let v_cache = ct(v_cache)?;
-
-    let batch_size = q.dims()[0];
-    let max_blocks = if batch_size > 0 {
-        block_table.len() / batch_size
-    } else {
-        0
-    };
-
-    let block_table_data: Vec<u32> = block_table.to_vec();
-    let block_table_tensor =
-        candle_core::Tensor::from_vec(block_table_data, (batch_size, max_blocks), q.device())
-            .map_err(err)?;
-
-    // Context lengths derived from k_cache shape
-    let seq_len = k_cache.dims().get(1).copied().unwrap_or(0);
-    let context_lens_data: Vec<u32> = vec![seq_len as u32; batch_size];
-    let context_lens =
-        candle_core::Tensor::from_vec(context_lens_data, (batch_size,), q.device())
-            .map_err(err)?;
-
-    let target_dtype = q.dtype();
-    let compute_dtype = match target_dtype {
-        candle_core::DType::F16 | candle_core::DType::BF16 => target_dtype,
-        _ => candle_core::DType::F16,
-    };
-
-    let q = to_compute_dtype(q, compute_dtype)?;
-    let k_cache = to_compute_dtype(k_cache, compute_dtype)?;
-    let v_cache = to_compute_dtype(v_cache, compute_dtype)?;
-
-    let output = candle_flash_attn::flash_attn_with_kvcache(
-        &q,
-        &k_cache,
-        &v_cache,
-        &context_lens,
-        &block_table_tensor,
-        params.softmax_scale,
-    )
-    .map_err(err)?;
-
-    let output = if output.dtype() != target_dtype {
-        output.to_dtype(target_dtype).map_err(err)?
-    } else {
-        output
-    };
-    wrap(output)
-}
 
 #[cfg(feature = "cuda")]
 fn to_compute_dtype(
