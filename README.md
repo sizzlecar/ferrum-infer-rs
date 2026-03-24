@@ -67,6 +67,23 @@ curl http://localhost:8000/v1/models
 curl http://localhost:8000/health
 ```
 
+## Performance
+
+Benchmarked on **NVIDIA RTX 5090**, Qwen3-4B, FP16, decode throughput:
+
+| Version | Optimization | Tokens/s |
+|---------|-------------|----------|
+| Baseline | Stock candle ops | ~33.5 |
+| +Fused kernels | `candle_nn::RmsNorm` + fused RoPE (CUDA) | ~88.3 |
+| +Pre-alloc KV cache | O(1) `slice_set` writes, zero-copy `narrow` views | ~94.4 |
+| +Fused projections | QKV 3→1 matmul, gate+up 2→1 matmul | ~100+ |
+
+**Current**: ~100 tok/s average, peaks at 103+ tok/s on Qwen3-4B.
+
+Ongoing CUDA kernel work (`ferrum-cuda-kernels` crate):
+- `fused_add_rms_norm` — residual add + RMS norm in 1 kernel (saves 1 launch + 1 memory round-trip per layer)
+- `fused_silu_mul` — SiLU activation + elementwise multiply in 1 kernel
+
 ## Current Status
 
 **v0.2.0 — Functional MVP, pre-production.**
@@ -74,20 +91,22 @@ curl http://localhost:8000/health
 What works:
 - CLI chat and HTTP serving with streaming
 - Qwen3, Qwen2/2.5, LLaMA 3.x, TinyLlama architectures
-- Metal GPU acceleration (macOS), CPU cross-platform
+- Metal GPU acceleration (macOS), CUDA (NVIDIA), CPU cross-platform
+- Fused CUDA kernels via cudarc/nvrtc: RmsNorm, RoPE, QKV projection, SiLU+mul
+- FlashAttention-2 on CUDA (zero-copy KV cache views)
 - Top-k/top-p/temperature/repetition-penalty sampling
 - Hugging Face model download and cache management
 
 What's in progress:
-- Backend abstraction layer (KernelOps) for pluggable Metal/CUDA/CPU kernels
-- PagedAttention integration for production-grade KV cache management
+- Paged attention for production-grade KV cache management
 - Continuous batching for concurrent request serving
+- CUDA Graph capture for decode-step latency reduction
 
 ## Roadmap
 
-1. **Kernel backend abstraction** — unify Metal/CUDA/CPU behind a single trait interface
-2. **CUDA kernel FFI** — bind FlashAttention/FlashInfer for NVIDIA GPUs
-3. **Production batching** — iteration-level continuous batching with preemption
+1. **Paged KV cache** — PagedAttention for high-concurrency production serving
+2. **Continuous batching** — iteration-level scheduling with preemption
+3. **CUDA Graphs** — eliminate CPU→GPU scheduling overhead in decode loop
 4. **Quantization** — GPTQ/AWQ/GGUF support for larger models on consumer hardware
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
@@ -100,6 +119,9 @@ cargo build --release -p ferrum-cli
 
 # With Metal acceleration (macOS)
 cargo build --release -p ferrum-cli --features metal
+
+# With CUDA acceleration (NVIDIA, requires CUDA toolkit)
+cargo build --release -p ferrum-cli --features cuda
 ```
 
 Prerequisites: Rust stable toolchain.
