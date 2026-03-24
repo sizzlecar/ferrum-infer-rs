@@ -14,8 +14,17 @@ use tokio::signal;
 #[derive(Args)]
 pub struct ServeCommand {
     /// Model to serve (default: from config)
-    #[arg(short, long)]
+    #[arg(value_name = "MODEL")]
     pub model: Option<String>,
+
+    /// Model to serve (default: from config)
+    #[arg(
+        short = 'm',
+        long = "model",
+        value_name = "MODEL",
+        conflicts_with = "model"
+    )]
+    pub model_option: Option<String>,
 
     /// Host to bind to
     #[arg(long)]
@@ -27,20 +36,27 @@ pub struct ServeCommand {
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
+    let ServeCommand {
+        model,
+        model_option,
+        host,
+        port,
+    } = cmd;
+
     // Print banner
     print_banner();
 
     // Resolve model
-    let model_name = cmd
-        .model
+    let model_name = model
+        .or(model_option)
         .or(config.models.default_model.clone())
         .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
 
     let model_id = resolve_model_alias(&model_name);
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
 
-    let host = cmd.host.unwrap_or_else(|| config.server.host.clone());
-    let port = cmd.port.unwrap_or(config.server.port);
+    let host = host.unwrap_or_else(|| config.server.host.clone());
+    let port = port.unwrap_or(config.server.port);
 
     // Find cached model
     let cache_dir = get_hf_cache_dir(&config);
