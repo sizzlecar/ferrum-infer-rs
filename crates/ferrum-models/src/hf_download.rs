@@ -109,6 +109,7 @@ impl HfDownloader {
                     || TOKENIZER_FILES.contains(&f.path.as_str())
                     || f.path == "generation_config.json"
                     || f.path == "special_tokens_map.json"
+                    || f.path.ends_with(".safetensors")
             })
             .collect();
 
