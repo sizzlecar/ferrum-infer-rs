@@ -139,12 +139,15 @@ impl RotaryEmbedding {
     }
 }
 
+/// MLP with fused gate+up projection: 2 matmuls → 1.
+///
+/// During decode, input activations are read once instead of twice from GPU memory.
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
 struct MLP {
-    gate_proj: Linear,
-    up_proj: Linear,
+    gate_up_proj: Linear, // fused [intermediate*2, hidden]
     down_proj: Linear,
+    intermediate_size: usize,
     act_fn: Activation,
 }
 
@@ -152,13 +155,20 @@ impl MLP {
     fn new(cfg: &Config, vb: VarBuilder) -> CandleResult<Self> {
         let hidden_sz = cfg.hidden_size;
         let intermediate_sz = cfg.intermediate_size;
-        let gate_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
+        // Load gate and up weights separately, then fuse
+        let gate_w = vb
+            .pp("gate_proj")
+            .get((intermediate_sz, hidden_sz), "weight")?;
+        let up_w = vb
+            .pp("up_proj")
+            .get((intermediate_sz, hidden_sz), "weight")?;
+        let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 0)?; // [intermediate*2, hidden]
+        let gate_up_proj = Linear::from_weights(gate_up_w, None);
         let down_proj = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
+            intermediate_size: intermediate_sz,
             act_fn: cfg.hidden_act,
         })
     }
@@ -166,8 +176,9 @@ impl MLP {
 
 impl Module for MLP {
     fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
+        let gate_up = xs.apply(&self.gate_up_proj)?;
+        let lhs = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?.apply(&self.act_fn)?;
+        let rhs = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
         (lhs * rhs)?.apply(&self.down_proj)
     }
 }
@@ -246,11 +257,12 @@ impl PreAllocKvCache {
     }
 }
 
+/// Attention with fused QKV projection: 3 matmuls → 1.
+///
+/// During decode, input activations are read once instead of three times from GPU memory.
 #[derive(Debug, Clone)]
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    qkv_proj: Linear, // fused [q_dim + kv_dim*2, hidden]
     o_proj: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -258,6 +270,8 @@ struct Attention {
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
+    q_dim: usize,  // num_heads * head_dim
+    kv_dim: usize, // num_kv_heads * head_dim
     max_position_embeddings: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: Option<PreAllocKvCache>,
@@ -270,16 +284,19 @@ impl Attention {
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
         let head_dim = cfg.head_dim;
-        let q_proj = linear_no_bias(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        // Load Q/K/V weights separately, then fuse into one matrix
+        let q_w = vb.pp("q_proj").get((q_dim, hidden_sz), "weight")?;
+        let k_w = vb.pp("k_proj").get((kv_dim, hidden_sz), "weight")?;
+        let v_w = vb.pp("v_proj").get((kv_dim, hidden_sz), "weight")?;
+        let qkv_w = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?; // [q_dim+kv_dim*2, hidden]
+        let qkv_proj = Linear::from_weights(qkv_w, None);
+        let o_proj = linear_no_bias(q_dim, hidden_sz, vb.pp("o_proj"))?;
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -287,6 +304,8 @@ impl Attention {
             num_kv_heads,
             num_kv_groups,
             head_dim,
+            q_dim,
+            kv_dim,
             max_position_embeddings: cfg.max_position_embeddings,
             rotary_emb,
             kv_cache: None,
@@ -301,11 +320,13 @@ impl Attention {
     ) -> CandleResult<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        let query_states = self.q_proj.forward(xs)?;
-        let key_states = self.k_proj.forward(xs)?;
-        let value_states = self.v_proj.forward(xs)?;
+        // Fused QKV projection: single matmul instead of 3 separate ones.
+        // Input activations are read from GPU memory once instead of three times.
+        let qkv = self.qkv_proj.forward(xs)?;
+        let query_states = qkv.narrow(D::Minus1, 0, self.q_dim)?;
+        let key_states = qkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+        let value_states = qkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
 
-        // Reshape to [batch, seq, heads, head_dim] then transpose to [batch, heads, seq, head_dim]
         let query_states = query_states
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
