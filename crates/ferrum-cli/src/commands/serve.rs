@@ -70,10 +70,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let device = select_device();
     println!("{} {:?}", "Device:".dimmed(), device);
 
-    // Create engine
+    // Create engine with continuous batching for serve mode
     println!();
-    println!("{}", "Initializing engine...".dimmed());
-    let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    println!("{}", "Initializing engine (continuous batching)...".dimmed());
+    let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
+    engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
     // Convert Box<dyn InferenceEngine> to Arc<dyn InferenceEngine>
     let engine: Arc<dyn InferenceEngine + Send + Sync> = Arc::from(engine);
