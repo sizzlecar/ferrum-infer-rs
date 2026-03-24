@@ -191,9 +191,8 @@ fn flash_attention(
     let k = to_compute_dtype(&k, compute_dtype)?;
     let v = to_compute_dtype(&v, compute_dtype)?;
 
-    let output =
-        candle_flash_attn::flash_attn(&q, &k, &v, params.softmax_scale, params.causal)
-            .map_err(err)?;
+    let output = candle_flash_attn::flash_attn(&q, &k, &v, params.softmax_scale, params.causal)
+        .map_err(err)?;
 
     let output = if output.dtype() != target_dtype {
         output.to_dtype(target_dtype).map_err(err)?
@@ -202,7 +201,6 @@ fn flash_attention(
     };
     wrap(output)
 }
-
 
 #[cfg(feature = "cuda")]
 fn to_compute_dtype(
@@ -232,7 +230,15 @@ pub fn flash_attn_varlen(
     causal: bool,
 ) -> Result<candle_core::Tensor> {
     candle_flash_attn::flash_attn_varlen(
-        q, k, v, seqlens_q, seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal,
+        q,
+        k,
+        v,
+        seqlens_q,
+        seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
     )
     .map_err(err)
 }
@@ -284,9 +290,8 @@ fn standard_attention(
                 (0..kv_len).map(move |j| if j <= max_k { 0.0 } else { f32::NEG_INFINITY })
             })
             .collect();
-        let mask =
-            candle_core::Tensor::from_vec(mask_data, (1, 1, q_len, kv_len), scores.device())
-                .map_err(err)?;
+        let mask = candle_core::Tensor::from_vec(mask_data, (1, 1, q_len, kv_len), scores.device())
+            .map_err(err)?;
         let mask = if mask.dtype() != scores.dtype() {
             mask.to_dtype(scores.dtype()).map_err(err)?
         } else {
