@@ -1,18 +1,22 @@
-// Single-query decode attention kernel with GQA (Grouped Query Attention).
+// Warp-cooperative single-query decode attention with GQA and online softmax.
 //
-// For decode phase: query has seq_len=1, K/V cache has seq_len=kv_len.
-// Each block handles one query head:
-//   1. Compute Q·K^T scores for all kv positions
-//   2. Apply causal mask + softmax
-//   3. Compute scores·V to produce output
+// Each warp (32 threads) cooperates on one Q·K dot product:
+//   - 32 threads each compute head_dim/32 partial products
+//   - warp_reduce_sum combines them → one complete score
+//   - Online softmax: running max + sum, no need to store all scores
 //
-// GQA: multiple query heads share the same KV head.
-// kv_head_idx = q_head_idx / num_kv_groups
+// Grid:  (num_q_heads,)
+// Block: (NUM_WARPS * 32,)  — multiple warps process KV positions in parallel
 //
-// This is more efficient than FlashAttention for single-query decode because
-// FlashAttention's tile-based approach has overhead for tiny query lengths.
+// K/V cache layout: [seq_len, num_kv_heads, head_dim] (candle's layout)
 
 #include <cuda_fp16.h>
+
+// Number of warps per block. Each warp handles one KV position at a time.
+// More warps = more KV positions processed in parallel.
+#define NUM_WARPS 8
+#define WARP_SIZE 32
+#define BLOCK_SIZE (NUM_WARPS * WARP_SIZE)
 
 __inline__ __device__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -30,15 +34,6 @@ __inline__ __device__ float warp_reduce_max(float val) {
     return val;
 }
 
-// Grid:  (num_q_heads,)
-// Block: (BLOCK_SIZE,)   — threads cooperate over kv_len and head_dim
-//
-// q:      [num_q_heads, head_dim] fp16           — single query token
-// k_cache: [num_kv_heads, max_kv_len, head_dim] fp16 — full KV buffer
-// v_cache: [num_kv_heads, max_kv_len, head_dim] fp16
-// output: [num_q_heads, head_dim] fp16
-// valid_kv_len: number of valid KV positions (for masking)
-// scale:  1/sqrt(head_dim)
 extern "C" __global__ void decode_attention_f16(
     const __half* __restrict__ q,
     const __half* __restrict__ k_cache,
@@ -55,97 +50,122 @@ extern "C" __global__ void decode_attention_f16(
     const int num_kv_groups = num_q_heads / num_kv_heads;
     const int kv_head = q_head / num_kv_groups;
 
-    // Pointers for this head
-    // Q layout: [num_q_heads, head_dim] (flat, contiguous per head)
     const __half* q_ptr = q + q_head * head_dim;
     __half* out_ptr = output + q_head * head_dim;
 
-    // K/V cache layout: [seq_len, num_kv_heads, head_dim] (candle's layout)
-    // To access head h at position p: offset = p * num_kv_heads * head_dim + h * head_dim
-    const int kv_stride = num_kv_heads * head_dim;  // stride per sequence position
+    // K/V cache layout: [seq_len, num_kv_heads, head_dim]
+    const int kv_stride = num_kv_heads * head_dim;
 
-    // Shared memory for attention scores (one per kv position)
-    extern __shared__ float s_scores[];
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id = threadIdx.x % WARP_SIZE;
 
-    // Step 1: Compute Q·K^T scores for all valid kv positions
-    float local_max = -1e20f;
-    for (int kv_pos = threadIdx.x; kv_pos < valid_kv_len; kv_pos += blockDim.x) {
-        float score = 0.0f;
-        // K at [kv_pos, kv_head, :] in [seq, heads, dim] layout
+    // Each thread loads its portion of Q into registers (head_dim / 32 elements)
+    // For head_dim=128: each thread holds 4 Q values
+    const int q_elems_per_thread = (head_dim + WARP_SIZE - 1) / WARP_SIZE;
+    float q_reg[4];  // max head_dim=128 → 128/32=4
+    #pragma unroll
+    for (int i = 0; i < q_elems_per_thread && (lane_id + i * WARP_SIZE) < head_dim; i++) {
+        q_reg[i] = __half2float(q_ptr[lane_id + i * WARP_SIZE]);
+    }
+
+    // ========== Phase 1: Q·K^T scores with online softmax ==========
+    //
+    // Online softmax: maintain running (max, sum) per warp, then reduce.
+    // No need to store all scores to shared memory.
+    //
+    // Per-warp accumulators for V weighted sum (online softmax output)
+    float v_acc[4];
+    #pragma unroll
+    for (int i = 0; i < q_elems_per_thread; i++) v_acc[i] = 0.0f;
+
+    float warp_max = -1e20f;
+    float warp_sum = 0.0f;
+
+    // Each warp processes KV positions strided by NUM_WARPS
+    for (int kv_pos = warp_id; kv_pos < valid_kv_len; kv_pos += NUM_WARPS) {
+        // Warp-cooperative Q·K dot product
         const __half* k_row = k_cache + kv_pos * kv_stride + kv_head * head_dim;
-        for (int d = 0; d < head_dim; d++) {
-            score += __half2float(q_ptr[d]) * __half2float(k_row[d]);
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < q_elems_per_thread && (lane_id + i * WARP_SIZE) < head_dim; i++) {
+            partial += q_reg[i] * __half2float(k_row[lane_id + i * WARP_SIZE]);
         }
-        score *= scale;
-        s_scores[kv_pos] = score;
-        local_max = fmaxf(local_max, score);
-    }
-    // Fill invalid positions with -inf
-    for (int kv_pos = valid_kv_len + threadIdx.x; kv_pos < max_kv_len; kv_pos += blockDim.x) {
-        s_scores[kv_pos] = -1e20f;
-    }
-    __syncthreads();
+        // Reduce across warp → complete dot product (only lane 0 needs it,
+        // but all lanes get the result from __shfl)
+        float score = warp_reduce_sum(partial) * scale;
 
-    // Step 2: Softmax — find global max
-    // Reduce max across all threads in the block
-    float block_max = local_max;
-    // Use shared memory for cross-warp max reduction
-    __shared__ float s_max[32];
-    {
-        int lane = threadIdx.x & 31;
-        int wid = threadIdx.x >> 5;
-        block_max = warp_reduce_max(block_max);
-        if (lane == 0) s_max[wid] = block_max;
-        __syncthreads();
-        block_max = (threadIdx.x < (blockDim.x >> 5)) ? s_max[threadIdx.x & 31] : -1e20f;
-        if (wid == 0) block_max = warp_reduce_max(block_max);
-    }
-    // Broadcast max to all threads
-    __shared__ float s_global_max;
-    if (threadIdx.x == 0) s_global_max = block_max;
-    __syncthreads();
-    float global_max = s_global_max;
+        // Online softmax update
+        float old_max = warp_max;
+        warp_max = fmaxf(warp_max, score);
+        float exp_diff = expf(old_max - warp_max);  // correction factor
 
-    // Compute exp(score - max) and sum
-    float local_sum = 0.0f;
-    for (int kv_pos = threadIdx.x; kv_pos < valid_kv_len; kv_pos += blockDim.x) {
-        float val = expf(s_scores[kv_pos] - global_max);
-        s_scores[kv_pos] = val;
-        local_sum += val;
-    }
-    __syncthreads();
+        // Rescale previous accumulator
+        warp_sum = warp_sum * exp_diff;
+        #pragma unroll
+        for (int i = 0; i < q_elems_per_thread; i++) v_acc[i] *= exp_diff;
 
-    // Reduce sum
-    __shared__ float s_sum[32];
-    {
-        int lane = threadIdx.x & 31;
-        int wid = threadIdx.x >> 5;
-        local_sum = warp_reduce_sum(local_sum);
-        if (lane == 0) s_sum[wid] = local_sum;
-        __syncthreads();
-        local_sum = (threadIdx.x < (blockDim.x >> 5)) ? s_sum[threadIdx.x & 31] : 0.0f;
-        if (wid == 0) local_sum = warp_reduce_sum(local_sum);
-    }
-    __shared__ float s_global_sum;
-    if (threadIdx.x == 0) s_global_sum = local_sum;
-    __syncthreads();
-    float inv_sum = 1.0f / s_global_sum;
+        // Add current position's contribution
+        float exp_score = expf(score - warp_max);
+        warp_sum += exp_score;
 
-    // Normalize scores
-    for (int kv_pos = threadIdx.x; kv_pos < valid_kv_len; kv_pos += blockDim.x) {
-        s_scores[kv_pos] *= inv_sum;
-    }
-    __syncthreads();
-
-    // Step 3: Compute weighted sum of V: output = sum(scores[i] * V[i])
-    // V cache layout: [seq_len, num_kv_heads, head_dim] (same as K)
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int kv_pos = 0; kv_pos < valid_kv_len; kv_pos++) {
-            // V at [kv_pos, kv_head, d] in [seq, heads, dim] layout
-            acc += s_scores[kv_pos] * __half2float(
-                v_cache[kv_pos * kv_stride + kv_head * head_dim + d]);
+        // Accumulate V weighted by attention score
+        const __half* v_row = v_cache + kv_pos * kv_stride + kv_head * head_dim;
+        #pragma unroll
+        for (int i = 0; i < q_elems_per_thread && (lane_id + i * WARP_SIZE) < head_dim; i++) {
+            v_acc[i] += exp_score * __half2float(v_row[lane_id + i * WARP_SIZE]);
         }
-        out_ptr[d] = __float2half(acc);
+    }
+
+    // ========== Phase 2: Cross-warp reduction ==========
+    //
+    // Each warp has its own (max, sum, v_acc). Merge them using the
+    // online softmax correction formula.
+
+    // Store per-warp results to shared memory
+    __shared__ float s_max[NUM_WARPS];
+    __shared__ float s_sum[NUM_WARPS];
+    // v_acc per warp: [NUM_WARPS, head_dim] — each lane stores its elements
+    extern __shared__ float s_vacc[];  // size = NUM_WARPS * head_dim
+
+    if (lane_id == 0) {
+        s_max[warp_id] = warp_max;
+        s_sum[warp_id] = warp_sum;
+    }
+    // Store v_acc to shared memory
+    #pragma unroll
+    for (int i = 0; i < q_elems_per_thread && (lane_id + i * WARP_SIZE) < head_dim; i++) {
+        s_vacc[warp_id * head_dim + lane_id + i * WARP_SIZE] = v_acc[i];
+    }
+    __syncthreads();
+
+    // Warp 0 does the final reduction
+    if (warp_id == 0) {
+        // Find global max across all warps
+        float global_max = -1e20f;
+        for (int w = 0; w < NUM_WARPS; w++) {
+            global_max = fmaxf(global_max, s_max[w]);
+        }
+
+        // Compute corrected sum and merge v_acc
+        float global_sum = 0.0f;
+        // Reset v_acc for final output
+        #pragma unroll
+        for (int i = 0; i < q_elems_per_thread; i++) v_acc[i] = 0.0f;
+
+        for (int w = 0; w < NUM_WARPS; w++) {
+            float correction = expf(s_max[w] - global_max);
+            global_sum += s_sum[w] * correction;
+            #pragma unroll
+            for (int i = 0; i < q_elems_per_thread && (lane_id + i * WARP_SIZE) < head_dim; i++) {
+                v_acc[i] += s_vacc[w * head_dim + lane_id + i * WARP_SIZE] * correction;
+            }
+        }
+
+        // Normalize and write output
+        float inv_sum = 1.0f / global_sum;
+        #pragma unroll
+        for (int i = 0; i < q_elems_per_thread && (lane_id + i * WARP_SIZE) < head_dim; i++) {
+            out_ptr[lane_id + i * WARP_SIZE] = __float2half(v_acc[i] * inv_sum);
+        }
     }
 }
