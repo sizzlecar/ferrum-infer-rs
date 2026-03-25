@@ -1,10 +1,8 @@
-//! CUDA decode runner — full decode forward pass bypassing candle.
+//! CUDA decode runner with piecewise CUDA Graphs (vLLM pattern).
 //!
-//! All intermediate buffers are pre-allocated. The runner uses cuBLAS for GEMM
-//! and custom CUDA kernels for norm/rope/attention/activation directly via cudarc.
-//! No candle Tensor allocation in the hot path.
-//!
-//! This module is the foundation for CUDA Graph capture (Phase 3).
+//! Captures fixed-shape operations (GEMM, norm, activation) as CUDA Graphs.
+//! Attention runs in eager mode because KV cache length varies per step.
+//! Pre-allocated buffers eliminate per-op allocation overhead.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,24 +17,24 @@ use crate::weight_store::Qwen3Weights;
 
 /// Per-sequence KV cache managed by the decode runner.
 struct SequenceKvState {
-    /// Per-layer K cache: [num_kv_heads * max_len * head_dim] each
     k_caches: Vec<CudaSlice<half::f16>>,
-    /// Per-layer V cache: same layout
     v_caches: Vec<CudaSlice<half::f16>>,
-    /// Number of valid KV positions
     current_len: usize,
-    /// Allocated max length
     max_len: usize,
 }
 
-/// CUDA decode runner for Qwen3-style transformer models.
-///
-/// Executes the full decode forward pass using:
-/// - cuBLAS GEMM for all linear projections
-/// - Custom CUDA kernels for norm, RoPE, attention, activation
-/// - Pre-allocated intermediate buffers (DecodeBuffers)
-///
-/// Created from a loaded candle model by extracting weight GPU pointers.
+/// Piecewise CUDA Graphs (vLLM pattern).
+/// Only captures fixed-shape ops; attention runs eager.
+struct PiecewiseGraphs {
+    pre_attn: Vec<cudarc::driver::CudaGraph>,
+    post_attn: Vec<cudarc::driver::CudaGraph>,
+    final_graph: Option<cudarc::driver::CudaGraph>,
+}
+
+unsafe impl Send for PiecewiseGraphs {}
+unsafe impl Sync for PiecewiseGraphs {}
+
+/// CUDA decode runner with piecewise graph acceleration.
 pub struct CudaDecodeRunner {
     weights: Qwen3Weights,
     buffers: DecodeBuffers,
@@ -44,20 +42,13 @@ pub struct CudaDecodeRunner {
     device: CudaDevice,
     stream: Arc<CudaStream>,
     dims: ModelDims,
-    /// Per-sequence KV cache state
     kv_states: HashMap<String, SequenceKvState>,
-    /// Captured CUDA Graph for decode replay (None until first capture).
-    graph: Option<crate::cuda_graph::CudaGraphState>,
-    /// Whether graph capture is enabled (can be disabled if capture fails).
-    graph_enabled: bool,
+    graphs: Option<PiecewiseGraphs>,
+    warmup_count: usize,
+    capture_attempted: bool,
 }
 
 impl CudaDecodeRunner {
-    /// Create a new decode runner.
-    ///
-    /// - `weights`: GPU weight pointers extracted from the candle model
-    /// - `dims`: Model dimensions
-    /// - `device`: candle CudaDevice (used for kernel loading and cuBLAS handle)
     pub fn new(
         weights: Qwen3Weights,
         dims: ModelDims,
@@ -82,23 +73,12 @@ impl CudaDecodeRunner {
             stream,
             dims,
             kv_states: HashMap::new(),
-            graph: None,
-            graph_enabled: true,
+            graphs: None,
+            warmup_count: 0,
+            capture_attempted: false,
         })
     }
 
-    /// Initialize KV cache for a sequence from prefill data.
-    ///
-    /// `kv_data`: per-layer (K, V) CudaSlice pairs from prefill, each
-    /// [num_kv_heads * prefill_len * head_dim].
-    /// Initialize KV cache for a sequence by taking ownership of cloned CudaSlice buffers.
-    ///
-    /// The CudaSlice are already independent copies (cloned from candle's storage),
-    /// so we just take ownership — no additional D2D memcpy needed.
-    ///
-    /// `kv_data`: per-layer (K, V) CudaSlice pairs, each containing all pre-allocated
-    /// space including the prefill data in the first `prefill_len` positions.
-    /// `max_len`: the allocated max length of each K/V buffer.
     pub fn init_kv_cache(
         &mut self,
         cache_key: &str,
@@ -106,678 +86,408 @@ impl CudaDecodeRunner {
         prefill_len: usize,
         max_len: usize,
     ) -> candle_core::Result<()> {
-        let mut k_caches = Vec::with_capacity(kv_data.len());
-        let mut v_caches = Vec::with_capacity(kv_data.len());
-
+        let (mut ks, mut vs) = (Vec::new(), Vec::new());
         for (k, v) in kv_data {
-            k_caches.push(k);
-            v_caches.push(v);
+            ks.push(k);
+            vs.push(v);
         }
-
         self.kv_states.insert(
             cache_key.to_string(),
             SequenceKvState {
-                k_caches,
-                v_caches,
+                k_caches: ks,
+                v_caches: vs,
                 current_len: prefill_len,
                 max_len,
             },
         );
-
         Ok(())
     }
 
-    /// Check if KV cache exists for a sequence.
     pub fn has_kv_cache(&self, cache_key: &str) -> bool {
         self.kv_states.contains_key(cache_key)
     }
 
-    /// Release KV cache for a completed sequence.
     pub fn release_kv_cache(&mut self, cache_key: &str) {
         self.kv_states.remove(cache_key);
     }
 
-    /// Execute one decode step: single token in, logits out.
-    ///
-    /// Returns a CudaSlice containing logits [vocab_size].
+    // ======================== Sub-methods ========================
+
+    fn embed_eager(&mut self, token_id: u32) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let off = (token_id as usize) * h;
+        let src = self
+            .weights
+            .embed_table
+            .slice
+            .try_slice(off..off + h)
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "embed OOB: off={off}, len={}",
+                    self.weights.embed_table.slice.len()
+                ))
+            })?;
+        self.stream
+            .memcpy_dtod(&src, &mut self.buffers.embed_out)
+            .map_err(|e| candle_core::Error::Msg(format!("embed: {e}")))?;
+        let v = self.buffers.embed_out.slice(..);
+        self.stream
+            .memcpy_dtod(&v, &mut self.buffers.residual)
+            .map_err(|e| candle_core::Error::Msg(format!("residual init: {e}")))?;
+        Ok(())
+    }
+
+    fn pre_attention_eager(&mut self, li: usize, position: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let hd = self.dims.head_dim;
+        let half_dim = hd / 2;
+        let eps = 1e-6f32;
+        let lw = &self.weights.layers[li];
+
+        Self::launch_rms_norm(
+            &self.device,
+            &self.buffers.residual,
+            &lw.input_ln_w.slice,
+            &mut self.buffers.norm_out,
+            h,
+            eps,
+        )?;
+        crate::cublas::linear_f16(
+            &self.blas,
+            &self.buffers.norm_out,
+            &lw.qkv_w.slice,
+            &mut self.buffers.qkv_out,
+            1,
+            qkv_dim as i32,
+            h as i32,
+        )?;
+
+        let q = self.buffers.qkv_out.slice(..q_dim);
+        let k = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
+        Self::launch_rms_norm_view(
+            &self.device,
+            &q,
+            &lw.q_norm_w.slice,
+            &mut self.buffers.rope_q_temp,
+            hd,
+            eps,
+        )?;
+        Self::launch_rms_norm_view(
+            &self.device,
+            &k,
+            &lw.k_norm_w.slice,
+            &mut self.buffers.rope_k_temp,
+            hd,
+            eps,
+        )?;
+
+        let co = position * half_dim;
+        let cos = self.weights.rope_cos.slice.slice(co..co + half_dim);
+        let sin = self.weights.rope_sin.slice.slice(co..co + half_dim);
+        Self::launch_rope(
+            &self.device,
+            &self.buffers.rope_q_temp,
+            &self.buffers.rope_k_temp,
+            &cos,
+            &sin,
+            &mut self.buffers.q_rotated,
+            &mut self.buffers.k_rotated,
+            self.dims.num_attention_heads,
+            self.dims.num_kv_heads,
+            hd,
+        )?;
+        Ok(())
+    }
+
+    fn attention_eager(&mut self, li: usize, kv: &mut SequenceKvState) -> candle_core::Result<()> {
+        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
+        let hd = self.dims.head_dim;
+        let nq = self.dims.num_attention_heads;
+        let nkv = self.dims.num_kv_heads;
+        let kv_stride = nkv * hd;
+        let off = kv.current_len * kv_stride;
+
+        let ks = self.buffers.k_rotated.slice(..kv_dim);
+        let mut kd = kv.k_caches[li].slice_mut(off..off + kv_dim);
+        self.stream
+            .memcpy_dtod(&ks, &mut kd)
+            .map_err(|e| candle_core::Error::Msg(format!("KV k: {e}")))?;
+
+        let qkv_dim = nq * hd + 2 * kv_dim;
+        let vs = self.buffers.qkv_out.slice(nq * hd + kv_dim..qkv_dim);
+        let mut vd = kv.v_caches[li].slice_mut(off..off + kv_dim);
+        self.stream
+            .memcpy_dtod(&vs, &mut vd)
+            .map_err(|e| candle_core::Error::Msg(format!("KV v: {e}")))?;
+
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        Self::launch_decode_attention(
+            &self.device,
+            &self.buffers.q_rotated,
+            &kv.k_caches[li],
+            &kv.v_caches[li],
+            &mut self.buffers.attn_out,
+            nq,
+            nkv,
+            hd,
+            kv.max_len,
+            kv.current_len + 1,
+            scale,
+        )
+    }
+
+    fn post_attention_eager(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let inter = self.dims.intermediate_size;
+        let eps = 1e-6f32;
+        let lw = &self.weights.layers[li];
+
+        crate::cublas::linear_f16(
+            &self.blas,
+            &self.buffers.attn_out,
+            &lw.o_w.slice,
+            &mut self.buffers.o_proj_out,
+            1,
+            h as i32,
+            q_dim as i32,
+        )?;
+        Self::launch_fused_add_rms_norm(
+            &self.device,
+            &self.buffers.o_proj_out,
+            &self.buffers.residual,
+            &lw.post_ln_w.slice,
+            &mut self.buffers.post_norm_out,
+            &mut self.buffers.post_norm_residual,
+            h,
+            eps,
+        )?;
+        let pnr = self.buffers.post_norm_residual.slice(..h);
+        self.stream
+            .memcpy_dtod(&pnr, &mut self.buffers.residual)
+            .map_err(|e| candle_core::Error::Msg(format!("res: {e}")))?;
+
+        crate::cublas::linear_f16(
+            &self.blas,
+            &self.buffers.post_norm_out,
+            &lw.gate_up_w.slice,
+            &mut self.buffers.gate_up_out,
+            1,
+            (2 * inter) as i32,
+            h as i32,
+        )?;
+        let g = self.buffers.gate_up_out.slice(..inter);
+        let u = self.buffers.gate_up_out.slice(inter..2 * inter);
+        Self::launch_fused_silu_mul(&self.device, &g, &u, &mut self.buffers.mlp_act, inter)?;
+
+        crate::cublas::linear_f16(
+            &self.blas,
+            &self.buffers.mlp_act,
+            &lw.down_w.slice,
+            &mut self.buffers.down_out,
+            1,
+            h as i32,
+            inter as i32,
+        )?;
+        Self::launch_residual_add(
+            &self.device,
+            &self.buffers.residual,
+            &self.buffers.down_out,
+            &mut self.buffers.norm_out,
+            h,
+        )?;
+        let nv = self.buffers.norm_out.slice(..h);
+        self.stream
+            .memcpy_dtod(&nv, &mut self.buffers.residual)
+            .map_err(|e| candle_core::Error::Msg(format!("res add: {e}")))
+    }
+
+    fn final_eager(&mut self) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        Self::launch_rms_norm(
+            &self.device,
+            &self.buffers.residual,
+            &self.weights.final_norm_w.slice,
+            &mut self.buffers.final_norm_out,
+            h,
+            1e-6f32,
+        )?;
+        crate::cublas::linear_f16(
+            &self.blas,
+            &self.buffers.final_norm_out,
+            &self.weights.lm_head_w.slice,
+            &mut self.buffers.logits,
+            1,
+            self.dims.vocab_size as i32,
+            h as i32,
+        )
+    }
+
+    // ======================== Piecewise Graph Capture ========================
+
+    fn capture_piecewise_graphs(&mut self) -> candle_core::Result<()> {
+        self.stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
+
+        let n = self.dims.num_layers;
+        let mut pre = Vec::with_capacity(n);
+        let mut post = Vec::with_capacity(n);
+        let mode = cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+
+        for li in 0..n {
+            // Pre-attention graph
+            self.stream
+                .begin_capture(mode)
+                .map_err(|e| candle_core::Error::Msg(format!("pre begin L{li}: {e}")))?;
+            self.pre_attention_eager(li, 0)?;
+            match self.stream.end_capture(0) {
+                Ok(Some(g)) => {
+                    g.upload().ok();
+                    pre.push(g);
+                }
+                Ok(None) => return Err(candle_core::Error::Msg(format!("pre empty L{li}"))),
+                Err(e) => return Err(candle_core::Error::Msg(format!("pre end L{li}: {e}"))),
+            }
+
+            // Post-attention graph
+            self.stream
+                .begin_capture(mode)
+                .map_err(|e| candle_core::Error::Msg(format!("post begin L{li}: {e}")))?;
+            self.post_attention_eager(li)?;
+            match self.stream.end_capture(0) {
+                Ok(Some(g)) => {
+                    g.upload().ok();
+                    post.push(g);
+                }
+                Ok(None) => return Err(candle_core::Error::Msg(format!("post empty L{li}"))),
+                Err(e) => return Err(candle_core::Error::Msg(format!("post end L{li}: {e}"))),
+            }
+        }
+
+        // Final graph
+        self.stream
+            .begin_capture(mode)
+            .map_err(|e| candle_core::Error::Msg(format!("final begin: {e}")))?;
+        self.final_eager()?;
+        let fg = self
+            .stream
+            .end_capture(0)
+            .map_err(|e| candle_core::Error::Msg(format!("final end: {e}")))?;
+        if let Some(ref g) = fg {
+            g.upload().ok();
+        }
+
+        tracing::info!(
+            "Piecewise graphs captured: {} pre + {} post + final",
+            pre.len(),
+            post.len()
+        );
+        self.graphs = Some(PiecewiseGraphs {
+            pre_attn: pre,
+            post_attn: post,
+            final_graph: fg,
+        });
+        Ok(())
+    }
+
+    // ======================== Public API ========================
+
     pub fn decode_step(
         &mut self,
         token_id: u32,
         position: usize,
         cache_key: &str,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        let h = self.dims.hidden_size;
-        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
-        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
-        let qkv_dim = q_dim + 2 * kv_dim;
-        let inter = self.dims.intermediate_size;
-        let head_dim = self.dims.head_dim;
-        let num_q = self.dims.num_attention_heads;
-        let num_kv = self.dims.num_kv_heads;
-        let half_dim = head_dim / 2;
-        let eps = 1e-6f32; // Qwen3 default
-
-        // 1. Embedding lookup: copy row token_id from embed table
-        let embed_offset = (token_id as usize) * h;
-        tracing::debug!(
-            "decode_step: token={}, pos={}, embed_table.len={}, embed_offset={}, h={}, \
-             qkv_out.len={}, qkv_dim={}, buffers.residual.len={}",
-            token_id,
-            position,
-            self.weights.embed_table.slice.len(),
-            embed_offset,
-            h,
-            self.buffers.qkv_out.len(),
-            qkv_dim,
-            self.buffers.residual.len(),
-        );
-        let embed_src = self
-            .weights
-            .embed_table
-            .slice
-            .try_slice(embed_offset..embed_offset + h)
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "embed slice OOB: offset={embed_offset}, h={h}, len={}",
-                    self.weights.embed_table.slice.len()
-                ))
-            })?;
-        self.stream
-            .memcpy_dtod(&embed_src, &mut self.buffers.embed_out)
-            .map_err(|e| candle_core::Error::Msg(format!("embed memcpy: {e}")))?;
-
-        // Copy embedding to residual accumulator
-        let embed_view = self.buffers.embed_out.slice(..);
-        self.stream
-            .memcpy_dtod(&embed_view, &mut self.buffers.residual)
-            .map_err(|e| candle_core::Error::Msg(format!("residual init: {e}")))?;
-
-        // Take KV state out of HashMap to avoid borrow conflicts with self.launch_*
-        let mut kv_state = self.kv_states.remove(cache_key).ok_or_else(|| {
-            candle_core::Error::Msg(format!("No KV cache for sequence: {cache_key}"))
-        })?;
-
-        // RoPE cos/sin for this position
-        let cos_offset = position * half_dim;
-        let sin_offset = position * half_dim;
-
-        // 2. Decoder layers
-        for layer_idx in 0..self.dims.num_layers {
-            let lw = &self.weights.layers[layer_idx];
-
-            // 2a. Input LayerNorm
-            Self::launch_rms_norm(
-                &self.device,
-                &self.buffers.residual,
-                &lw.input_ln_w.slice,
-                &mut self.buffers.norm_out,
-                h,
-                eps,
-            )?;
-
-            // 2b. Fused QKV projection: [1, h] @ [qkv_dim, h]^T → [1, qkv_dim]
-            crate::cublas::linear_f16(
-                &self.blas,
-                &self.buffers.norm_out,
-                &lw.qkv_w.slice,
-                &mut self.buffers.qkv_out,
-                1,
-                qkv_dim as i32,
-                h as i32,
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("QKV gemm: {e}")))?;
-
-            // 2c. Split QKV (pointer arithmetic — no compute)
-            let q_slice = self.buffers.qkv_out.slice(..q_dim);
-            let k_slice = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
-            let v_slice = self.buffers.qkv_out.slice(q_dim + kv_dim..qkv_dim);
-
-            // 2d. Q-norm → rope_q_temp, K-norm → rope_k_temp
-            Self::launch_rms_norm_view(
-                &self.device,
-                &q_slice,
-                &lw.q_norm_w.slice,
-                &mut self.buffers.rope_q_temp,
-                head_dim,
-                eps,
-            )?;
-            Self::launch_rms_norm_view(
-                &self.device,
-                &k_slice,
-                &lw.k_norm_w.slice,
-                &mut self.buffers.rope_k_temp,
-                head_dim,
-                eps,
-            )?;
-
-            // 2e. RoPE: rope_q_temp → q_rotated, rope_k_temp → k_rotated
-            let cos_view = self
-                .weights
-                .rope_cos
-                .slice
-                .slice(cos_offset..cos_offset + half_dim);
-            let sin_view = self
-                .weights
-                .rope_sin
-                .slice
-                .slice(sin_offset..sin_offset + half_dim);
-            Self::launch_rope(
-                &self.device,
-                &self.buffers.rope_q_temp,
-                &self.buffers.rope_k_temp,
-                &cos_view,
-                &sin_view,
-                &mut self.buffers.q_rotated,
-                &mut self.buffers.k_rotated,
-                num_q,
-                num_kv,
-                head_dim,
-            )?;
-
-            // 2f. KV cache append
-            let kv_head_dim_total = num_kv * head_dim;
-            let kv_offset = kv_state.current_len * kv_head_dim_total;
-            {
-                let k_src_view = self.buffers.k_rotated.slice(..kv_dim);
-                let mut k_dst =
-                    kv_state.k_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
-                self.stream
-                    .memcpy_dtod(&k_src_view, &mut k_dst)
-                    .map_err(|e| candle_core::Error::Msg(format!("KV append k: {e}")))?;
-
-                let v_src_view = v_slice.slice(..kv_dim);
-                let mut v_dst =
-                    kv_state.v_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
-                self.stream
-                    .memcpy_dtod(&v_src_view, &mut v_dst)
-                    .map_err(|e| candle_core::Error::Msg(format!("KV append v: {e}")))?;
-            }
-            let valid_kv_len = kv_state.current_len + 1;
-
-            // 2g. Decode attention
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
-            Self::launch_decode_attention(
-                &self.device,
-                &self.buffers.q_rotated,
-                &kv_state.k_caches[layer_idx],
-                &kv_state.v_caches[layer_idx],
-                &mut self.buffers.attn_out,
-                num_q,
-                num_kv,
-                head_dim,
-                kv_state.max_len,
-                valid_kv_len,
-                scale,
-            )?;
-
-            // 2h. O projection: [1, q_dim] @ [h, q_dim]^T → [1, h]
-            crate::cublas::linear_f16(
-                &self.blas,
-                &self.buffers.attn_out,
-                &lw.o_w.slice,
-                &mut self.buffers.o_proj_out,
-                1,
-                h as i32,
-                q_dim as i32,
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("O proj gemm: {e}")))?;
-
-            // 2i. Fused add + RMS norm:
-            //   residual_updated = o_proj_out + residual
-            //   post_norm_out = rms_norm(residual_updated, post_ln_w)
-            Self::launch_fused_add_rms_norm(
-                &self.device,
-                &self.buffers.o_proj_out,
-                &self.buffers.residual,
-                &lw.post_ln_w.slice,
-                &mut self.buffers.post_norm_out,
-                &mut self.buffers.post_norm_residual,
-                h,
-                eps,
-            )?;
-            // Update residual to post_norm_residual
-            let pnr_view = self.buffers.post_norm_residual.slice(..h);
-            self.stream
-                .memcpy_dtod(&pnr_view, &mut self.buffers.residual)
-                .map_err(|e| candle_core::Error::Msg(format!("residual update: {e}")))?;
-
-            // 2j. Gate+Up projection: [1, h] @ [2*inter, h]^T → [1, 2*inter]
-            crate::cublas::linear_f16(
-                &self.blas,
-                &self.buffers.post_norm_out,
-                &lw.gate_up_w.slice,
-                &mut self.buffers.gate_up_out,
-                1,
-                (2 * inter) as i32,
-                h as i32,
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("gate_up gemm: {e}")))?;
-
-            // 2k. Fused SiLU * mul
-            let gate_view = self.buffers.gate_up_out.slice(..inter);
-            let up_view = self.buffers.gate_up_out.slice(inter..2 * inter);
-            Self::launch_fused_silu_mul(
-                &self.device,
-                &gate_view,
-                &up_view,
-                &mut self.buffers.mlp_act,
-                inter,
-            )?;
-
-            // 2l. Down projection: [1, inter] @ [h, inter]^T → [1, h]
-            crate::cublas::linear_f16(
-                &self.blas,
-                &self.buffers.mlp_act,
-                &lw.down_w.slice,
-                &mut self.buffers.down_out,
-                1,
-                h as i32,
-                inter as i32,
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("down gemm: {e}")))?;
-
-            // 2m. Residual add: residual = residual + down_out
-            Self::launch_residual_add(
-                &self.device,
-                &self.buffers.residual,
-                &self.buffers.down_out,
-                &mut self.buffers.norm_out, // temp output
-                h,
-            )?;
-            let norm_view = self.buffers.norm_out.slice(..h);
-            self.stream
-                .memcpy_dtod(&norm_view, &mut self.buffers.residual)
-                .map_err(|e| candle_core::Error::Msg(format!("residual add copy: {e}")))?;
+        self.embed_eager(token_id)?;
+        let mut kv = self
+            .kv_states
+            .remove(cache_key)
+            .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
+        for li in 0..self.dims.num_layers {
+            self.pre_attention_eager(li, position)?;
+            self.attention_eager(li, &mut kv)?;
+            self.post_attention_eager(li)?;
         }
-
-        // Update KV length and re-insert into HashMap
-        kv_state.current_len += 1;
-        self.kv_states.insert(cache_key.to_string(), kv_state);
-
-        // 3. Final RMS norm
-        Self::launch_rms_norm(
-            &self.device,
-            &self.buffers.residual,
-            &self.weights.final_norm_w.slice,
-            &mut self.buffers.final_norm_out,
-            h,
-            eps,
-        )?;
-
-        // 4. LM head: [1, h] @ [vocab, h]^T → [1, vocab]
-        crate::cublas::linear_f16(
-            &self.blas,
-            &self.buffers.final_norm_out,
-            &self.weights.lm_head_w.slice,
-            &mut self.buffers.logits,
-            1,
-            self.dims.vocab_size as i32,
-            h as i32,
-        )
-        .map_err(|e| candle_core::Error::Msg(format!("lm_head gemm: {e}")))?;
-
-        // Return a clone of the logits buffer
-        let logits = self
-            .stream
+        kv.current_len += 1;
+        self.kv_states.insert(cache_key.to_string(), kv);
+        self.final_eager()?;
+        self.stream
             .clone_dtod(&self.buffers.logits)
-            .map_err(|e| candle_core::Error::Msg(format!("logits clone: {e}")))?;
-
-        Ok(logits)
+            .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
     }
 
-    /// Execute a decode step with CUDA Graph acceleration.
-    ///
-    /// On the first call for a sequence, runs `decode_step` normally while
-    /// attempting to capture a CUDA Graph. On subsequent calls, replays the
-    /// captured graph (1 GPU launch instead of ~550).
-    ///
-    /// Falls back to `decode_step` if graph capture fails (e.g., unsupported
-    /// GPU or driver version).
     pub fn decode_step_graphed(
         &mut self,
         token_id: u32,
         position: usize,
         cache_key: &str,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        // If graph capture is disabled or we don't have a graph yet, decide what to do
-        if !self.graph_enabled {
+        const WARMUP: usize = 3;
+
+        if self.warmup_count < WARMUP {
+            self.warmup_count += 1;
             return self.decode_step(token_id, position, cache_key);
         }
 
-        if let Some(ref graph_state) = self.graph {
-            // Graph exists — replay it
-            let kv_state = self.kv_states.get_mut(cache_key).ok_or_else(|| {
-                candle_core::Error::Msg(format!("No KV cache for sequence: {cache_key}"))
-            })?;
-            let valid_kv_len = kv_state.current_len + 1;
+        if self.graphs.is_none() && !self.capture_attempted {
+            self.capture_attempted = true;
+            match self.capture_piecewise_graphs() {
+                Ok(()) => {}
+                Err(e) => tracing::warn!("Piecewise capture failed: {e}"),
+            }
+        }
 
-            graph_state.replay(token_id, position as u32, valid_kv_len as u32)?;
+        self.embed_eager(token_id)?;
+        let mut kv = self
+            .kv_states
+            .remove(cache_key)
+            .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
 
-            // Update KV state (CPU-side bookkeeping only)
-            kv_state.current_len = valid_kv_len;
+        let use_graphs = self.graphs.is_some();
+        for li in 0..self.dims.num_layers {
+            if use_graphs {
+                self.graphs.as_ref().unwrap().pre_attn[li]
+                    .launch()
+                    .map_err(|e| candle_core::Error::Msg(format!("pre graph L{li}: {e}")))?;
+            } else {
+                self.pre_attention_eager(li, position)?;
+            }
 
-            // Return logits from the pre-allocated buffer (clone for safety)
-            let logits = self
-                .stream
-                .clone_dtod(&self.buffers.logits)
-                .map_err(|e| candle_core::Error::Msg(format!("logits clone: {e}")))?;
-            Ok(logits)
+            self.attention_eager(li, &mut kv)?;
+
+            if use_graphs {
+                self.graphs.as_ref().unwrap().post_attn[li]
+                    .launch()
+                    .map_err(|e| candle_core::Error::Msg(format!("post graph L{li}: {e}")))?;
+            } else {
+                self.post_attention_eager(li)?;
+            }
+        }
+
+        kv.current_len += 1;
+        self.kv_states.insert(cache_key.to_string(), kv);
+
+        if use_graphs {
+            if let Some(ref g) = self.graphs.as_ref().unwrap().final_graph {
+                g.launch()
+                    .map_err(|e| candle_core::Error::Msg(format!("final graph: {e}")))?;
+            } else {
+                self.final_eager()?;
+            }
         } else {
-            // No graph yet — try to capture one
-            tracing::info!("Attempting CUDA Graph capture for decode...");
-
-            // First, do a normal decode step (warmup — ensures all kernels are loaded)
-            let result = self.decode_step(token_id, position, cache_key)?;
-
-            // Now try to capture the next decode step as a graph
-            match self.try_capture_graph(cache_key) {
-                Ok(()) => {
-                    tracing::info!("CUDA Graph captured successfully — subsequent decodes will use graph replay");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "CUDA Graph capture failed, falling back to direct execution: {e}"
-                    );
-                    self.graph_enabled = false;
-                }
-            }
-
-            Ok(result)
+            self.final_eager()?;
         }
-    }
 
-    /// Attempt to capture the decode forward pass as a CUDA Graph.
-    ///
-    /// This does a dummy decode step while the stream is in capture mode.
-    /// All kernel launches are recorded but not executed. The resulting
-    /// graph can then be replayed with different parameters.
-    fn try_capture_graph(&mut self, cache_key: &str) -> candle_core::Result<()> {
-        use crate::cuda_graph::CudaGraphState;
-
-        // Synchronize stream before capture — ensures all pending async ops complete
         self.stream
-            .synchronize()
-            .map_err(|e| candle_core::Error::Msg(format!("stream sync before capture: {e}")))?;
-
-        // Begin capture (RELAXED mode: other threads/streams can still make CUDA calls)
-        CudaGraphState::begin_capture(&self.stream)?;
-
-        // Run a decode step — all GPU ops are recorded, not executed
-        // Use dummy values; the actual values will be updated via memcpy before replay
-        let dummy_result = self.decode_step_inner_for_capture(cache_key);
-
-        // End capture regardless of whether the inner step succeeded
-        let graph = CudaGraphState::end_capture(&self.stream)?;
-
-        // Check if inner step had an error
-        dummy_result?;
-
-        match graph {
-            Some(cuda_graph) => {
-                let mut state = CudaGraphState::new(cuda_graph, self.stream.clone())?;
-                state.upload()?;
-                self.graph = Some(state);
-                Ok(())
-            }
-            None => Err(candle_core::Error::Msg(
-                "Graph capture produced no graph (no kernels recorded)".to_string(),
-            )),
-        }
-    }
-
-    /// Inner decode step used during graph capture.
-    ///
-    /// Same as `decode_step` but doesn't update CPU-side KV state
-    /// (since captured ops aren't actually executed).
-    fn decode_step_inner_for_capture(&mut self, cache_key: &str) -> candle_core::Result<()> {
-        let h = self.dims.hidden_size;
-        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
-        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
-        let qkv_dim = q_dim + 2 * kv_dim;
-        let inter = self.dims.intermediate_size;
-        let head_dim = self.dims.head_dim;
-        let num_q = self.dims.num_attention_heads;
-        let num_kv = self.dims.num_kv_heads;
-        let half_dim = head_dim / 2;
-        let eps = 1e-6f32;
-
-        // Extract KV state info before the loop to avoid borrow conflicts
-        let (kv_current_len, kv_max_len) = {
-            let kv_state = self.kv_states.get(cache_key).ok_or_else(|| {
-                candle_core::Error::Msg(format!("No KV cache for capture: {cache_key}"))
-            })?;
-            (kv_state.current_len, kv_state.max_len)
-        };
-        let position = kv_current_len;
-        let cos_offset = position * half_dim;
-        let sin_offset = position * half_dim;
-        let valid_kv_len = kv_current_len + 1;
-
-        // Same operation sequence as decode_step, but no CPU-side state updates
-        // Embedding lookup (using first token as dummy — address is what matters)
-        let embed_src = self.weights.embed_table.slice.slice(0..h);
-        self.stream
-            .memcpy_dtod(&embed_src, &mut self.buffers.embed_out)
-            .map_err(|e| candle_core::Error::Msg(format!("capture embed: {e}")))?;
-
-        let embed_view = self.buffers.embed_out.slice(..);
-        self.stream
-            .memcpy_dtod(&embed_view, &mut self.buffers.residual)
-            .map_err(|e| candle_core::Error::Msg(format!("capture residual init: {e}")))?;
-
-        for layer_idx in 0..self.dims.num_layers {
-            let lw = &self.weights.layers[layer_idx];
-
-            Self::launch_rms_norm(
-                &self.device,
-                &self.buffers.residual,
-                &lw.input_ln_w.slice,
-                &mut self.buffers.norm_out,
-                h,
-                eps,
-            )?;
-
-            crate::cublas::linear_f16(
-                &self.blas,
-                &self.buffers.norm_out,
-                &lw.qkv_w.slice,
-                &mut self.buffers.qkv_out,
-                1,
-                qkv_dim as i32,
-                h as i32,
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("capture QKV: {e}")))?;
-
-            let q_slice = self.buffers.qkv_out.slice(..q_dim);
-            let k_slice = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
-            let v_slice = self.buffers.qkv_out.slice(q_dim + kv_dim..qkv_dim);
-
-            Self::launch_rms_norm_view(
-                &self.device,
-                &q_slice,
-                &lw.q_norm_w.slice,
-                &mut self.buffers.rope_q_temp,
-                head_dim,
-                eps,
-            )?;
-            Self::launch_rms_norm_view(
-                &self.device,
-                &k_slice,
-                &lw.k_norm_w.slice,
-                &mut self.buffers.rope_k_temp,
-                head_dim,
-                eps,
-            )?;
-
-            let cos_view = self
-                .weights
-                .rope_cos
-                .slice
-                .slice(cos_offset..cos_offset + half_dim);
-            let sin_view = self
-                .weights
-                .rope_sin
-                .slice
-                .slice(sin_offset..sin_offset + half_dim);
-            Self::launch_rope(
-                &self.device,
-                &self.buffers.rope_q_temp,
-                &self.buffers.rope_k_temp,
-                &cos_view,
-                &sin_view,
-                &mut self.buffers.q_rotated,
-                &mut self.buffers.k_rotated,
-                num_q,
-                num_kv,
-                head_dim,
-            )?;
-
-            // KV cache append
-            let kv_head_dim_total = num_kv * head_dim;
-            let kv_offset = kv_current_len * kv_head_dim_total;
-            {
-                let kv = self.kv_states.get_mut(cache_key).unwrap();
-                let k_src = self.buffers.k_rotated.slice(..kv_dim);
-                let mut k_dst = kv.k_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
-                self.stream
-                    .memcpy_dtod(&k_src, &mut k_dst)
-                    .map_err(|e| candle_core::Error::Msg(format!("capture KV k: {e}")))?;
-                let v_src = v_slice.slice(..kv_dim);
-                let mut v_dst = kv.v_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
-                self.stream
-                    .memcpy_dtod(&v_src, &mut v_dst)
-                    .map_err(|e| candle_core::Error::Msg(format!("capture KV v: {e}")))?;
-            }
-
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
-            {
-                let kv = self.kv_states.get(cache_key).unwrap();
-                Self::launch_decode_attention(
-                    &self.device,
-                    &self.buffers.q_rotated,
-                    &kv.k_caches[layer_idx],
-                    &kv.v_caches[layer_idx],
-                    &mut self.buffers.attn_out,
-                    num_q,
-                    num_kv,
-                    head_dim,
-                    kv_max_len,
-                    valid_kv_len,
-                    scale,
-                )?;
-            }
-
-            crate::cublas::linear_f16(
-                &self.blas,
-                &self.buffers.attn_out,
-                &lw.o_w.slice,
-                &mut self.buffers.o_proj_out,
-                1,
-                h as i32,
-                q_dim as i32,
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("capture O: {e}")))?;
-
-            Self::launch_fused_add_rms_norm(
-                &self.device,
-                &self.buffers.o_proj_out,
-                &self.buffers.residual,
-                &lw.post_ln_w.slice,
-                &mut self.buffers.post_norm_out,
-                &mut self.buffers.post_norm_residual,
-                h,
-                eps,
-            )?;
-            let pnr = self.buffers.post_norm_residual.slice(..h);
-            self.stream
-                .memcpy_dtod(&pnr, &mut self.buffers.residual)
-                .map_err(|e| candle_core::Error::Msg(format!("capture res: {e}")))?;
-
-            crate::cublas::linear_f16(
-                &self.blas,
-                &self.buffers.post_norm_out,
-                &lw.gate_up_w.slice,
-                &mut self.buffers.gate_up_out,
-                1,
-                (2 * inter) as i32,
-                h as i32,
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("capture gate_up: {e}")))?;
-
-            let gate = self.buffers.gate_up_out.slice(..inter);
-            let up = self.buffers.gate_up_out.slice(inter..2 * inter);
-            Self::launch_fused_silu_mul(
-                &self.device,
-                &gate,
-                &up,
-                &mut self.buffers.mlp_act,
-                inter,
-            )?;
-
-            crate::cublas::linear_f16(
-                &self.blas,
-                &self.buffers.mlp_act,
-                &lw.down_w.slice,
-                &mut self.buffers.down_out,
-                1,
-                h as i32,
-                inter as i32,
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("capture down: {e}")))?;
-
-            Self::launch_residual_add(
-                &self.device,
-                &self.buffers.residual,
-                &self.buffers.down_out,
-                &mut self.buffers.norm_out,
-                h,
-            )?;
-            let nv = self.buffers.norm_out.slice(..h);
-            self.stream
-                .memcpy_dtod(&nv, &mut self.buffers.residual)
-                .map_err(|e| candle_core::Error::Msg(format!("capture res add: {e}")))?;
-        }
-
-        Self::launch_rms_norm(
-            &self.device,
-            &self.buffers.residual,
-            &self.weights.final_norm_w.slice,
-            &mut self.buffers.final_norm_out,
-            h,
-            eps,
-        )?;
-
-        crate::cublas::linear_f16(
-            &self.blas,
-            &self.buffers.final_norm_out,
-            &self.weights.lm_head_w.slice,
-            &mut self.buffers.logits,
-            1,
-            self.dims.vocab_size as i32,
-            h as i32,
-        )
-        .map_err(|e| candle_core::Error::Msg(format!("capture lm_head: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Enable or disable CUDA Graph acceleration.
-    pub fn set_graph_enabled(&mut self, enabled: bool) {
-        self.graph_enabled = enabled;
-        if !enabled {
-            self.graph = None;
-        }
-    }
-
-    /// Returns whether a CUDA Graph has been captured and is ready for replay.
-    pub fn has_graph(&self) -> bool {
-        self.graph.is_some()
+            .clone_dtod(&self.buffers.logits)
+            .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
     }
 
     // ======================== Kernel Launch Helpers ========================
-    //
-    // All helpers take CudaSlice/CudaView (concrete types) instead of
-    // impl DeviceSlice, because cudarc's builder.arg() requires DeviceRepr.
 
     fn launch_rms_norm(
         device: &CudaDevice,
@@ -789,27 +499,23 @@ impl CudaDecodeRunner {
     ) -> candle_core::Result<()> {
         let num_rows = input.len() / row_size;
         let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
-        let block_size = row_size.min(1024) as u32;
-        let row_size_i32 = row_size as i32;
-
-        let inp_view = input.slice(..);
-        let w_view = weight.slice(..);
-
-        let mut builder = func.builder();
-        builder.arg(&inp_view);
-        builder.arg(&w_view);
-        builder.arg(output);
-        builder.arg(&row_size_i32);
-        builder.arg(&eps);
-
-        let cfg = LaunchConfig {
-            grid_dim: (num_rows as u32, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { builder.launch(cfg) }
-            .map(|_| ())
-            .map_err(|e| candle_core::Error::Msg(format!("rms_norm launch: {e}")))
+        let inp = input.slice(..);
+        let w = weight.slice(..);
+        let mut b = func.builder();
+        b.arg(&inp);
+        b.arg(&w);
+        b.arg(output);
+        b.arg(&(row_size as i32));
+        b.arg(&eps);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_rows as u32, 1, 1),
+                block_dim: (row_size.min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("rms_norm: {e}")))
     }
 
     fn launch_rms_norm_view(
@@ -822,25 +528,22 @@ impl CudaDecodeRunner {
     ) -> candle_core::Result<()> {
         let num_rows = input.len() / row_size;
         let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
-        let block_size = row_size.min(1024) as u32;
-        let row_size_i32 = row_size as i32;
-        let w_view = weight.slice(..);
-
-        let mut builder = func.builder();
-        builder.arg(input);
-        builder.arg(&w_view);
-        builder.arg(output);
-        builder.arg(&row_size_i32);
-        builder.arg(&eps);
-
-        let cfg = LaunchConfig {
-            grid_dim: (num_rows as u32, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { builder.launch(cfg) }
-            .map(|_| ())
-            .map_err(|e| candle_core::Error::Msg(format!("rms_norm launch: {e}")))
+        let w = weight.slice(..);
+        let mut b = func.builder();
+        b.arg(input);
+        b.arg(&w);
+        b.arg(output);
+        b.arg(&(row_size as i32));
+        b.arg(&eps);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_rows as u32, 1, 1),
+                block_dim: (row_size.min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("rms_norm: {e}")))
     }
 
     fn launch_rope(
@@ -851,52 +554,45 @@ impl CudaDecodeRunner {
         sin: &CudaView<half::f16>,
         q_out: &mut CudaSlice<half::f16>,
         k_out: &mut CudaSlice<half::f16>,
-        num_q_heads: usize,
-        num_k_heads: usize,
-        head_dim: usize,
+        nq: usize,
+        nk: usize,
+        hd: usize,
     ) -> candle_core::Result<()> {
         let func = device.get_or_load_custom_func("rope_f16", "rope", ptx::ROPE)?;
-        let total_heads = (num_q_heads + num_k_heads) as u32;
-        let half_dim = (head_dim / 2).min(1024) as u32;
-        let num_q_i32 = num_q_heads as i32;
-        let num_k_i32 = num_k_heads as i32;
-        let head_dim_i32 = head_dim as i32;
-
-        let q_view = q.slice(..);
-        let k_view = k.slice(..);
-
-        let mut builder = func.builder();
-        builder.arg(&q_view);
-        builder.arg(&k_view);
-        builder.arg(cos);
-        builder.arg(sin);
-        builder.arg(q_out);
-        builder.arg(k_out);
-        builder.arg(&num_q_i32);
-        builder.arg(&num_k_i32);
-        builder.arg(&head_dim_i32);
-
-        let cfg = LaunchConfig {
-            grid_dim: (total_heads, 1, 1),
-            block_dim: (half_dim, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { builder.launch(cfg) }
-            .map(|_| ())
-            .map_err(|e| candle_core::Error::Msg(format!("rope launch: {e}")))
+        let qv = q.slice(..);
+        let kv = k.slice(..);
+        let mut b = func.builder();
+        b.arg(&qv);
+        b.arg(&kv);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(q_out);
+        b.arg(k_out);
+        b.arg(&(nq as i32));
+        b.arg(&(nk as i32));
+        b.arg(&(hd as i32));
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: ((nq + nk) as u32, 1, 1),
+                block_dim: ((hd / 2).min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("rope: {e}")))
     }
 
     fn launch_decode_attention(
         device: &CudaDevice,
         q: &CudaSlice<half::f16>,
-        k_cache: &CudaSlice<half::f16>,
-        v_cache: &CudaSlice<half::f16>,
+        kc: &CudaSlice<half::f16>,
+        vc: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        max_kv_len: usize,
-        valid_kv_len: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        max_kv: usize,
+        valid_kv: usize,
         scale: f32,
     ) -> candle_core::Result<()> {
         let func = device.get_or_load_custom_func(
@@ -904,39 +600,29 @@ impl CudaDecodeRunner {
             "decode_attention",
             ptx::DECODE_ATTENTION,
         )?;
-        let block_size = 256u32;
-        let shared_mem = (max_kv_len as u32) * 4;
-
-        let num_q_i32 = num_q_heads as i32;
-        let num_kv_i32 = num_kv_heads as i32;
-        let head_dim_i32 = head_dim as i32;
-        let max_kv_i32 = max_kv_len as i32;
-        let valid_kv_i32 = valid_kv_len as i32;
-
-        let q_view = q.slice(..);
-        let k_view = k_cache.slice(..);
-        let v_view = v_cache.slice(..);
-
-        let mut builder = func.builder();
-        builder.arg(&q_view);
-        builder.arg(&k_view);
-        builder.arg(&v_view);
-        builder.arg(output);
-        builder.arg(&num_q_i32);
-        builder.arg(&num_kv_i32);
-        builder.arg(&head_dim_i32);
-        builder.arg(&max_kv_i32);
-        builder.arg(&valid_kv_i32);
-        builder.arg(&scale);
-
-        let cfg = LaunchConfig {
-            grid_dim: (num_q_heads as u32, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: shared_mem,
-        };
-        unsafe { builder.launch(cfg) }
-            .map(|_| ())
-            .map_err(|e| candle_core::Error::Msg(format!("decode_attention launch: {e}")))
+        let qv = q.slice(..);
+        let kv = kc.slice(..);
+        let vv = vc.slice(..);
+        let mut b = func.builder();
+        b.arg(&qv);
+        b.arg(&kv);
+        b.arg(&vv);
+        b.arg(output);
+        b.arg(&(nq as i32));
+        b.arg(&(nkv as i32));
+        b.arg(&(hd as i32));
+        b.arg(&(max_kv as i32));
+        b.arg(&(valid_kv as i32));
+        b.arg(&scale);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: (max_kv as u32) * 4,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("attn: {e}")))
     }
 
     fn launch_fused_add_rms_norm(
@@ -946,7 +632,7 @@ impl CudaDecodeRunner {
         weight: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
         residual_out: &mut CudaSlice<half::f16>,
-        hidden_size: usize,
+        h: usize,
         eps: f32,
     ) -> candle_core::Result<()> {
         let func = device.get_or_load_custom_func(
@@ -954,30 +640,26 @@ impl CudaDecodeRunner {
             "fused_add_rms_norm",
             ptx::FUSED_ADD_RMS_NORM,
         )?;
-        let block_size = hidden_size.min(1024) as u32;
-        let hidden_i32 = hidden_size as i32;
-
-        let inp_view = input.slice(..);
-        let res_view = residual.slice(..);
-        let w_view = weight.slice(..);
-
-        let mut builder = func.builder();
-        builder.arg(&inp_view);
-        builder.arg(&res_view);
-        builder.arg(&w_view);
-        builder.arg(output);
-        builder.arg(residual_out);
-        builder.arg(&hidden_i32);
-        builder.arg(&eps);
-
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { builder.launch(cfg) }
-            .map(|_| ())
-            .map_err(|e| candle_core::Error::Msg(format!("fused_add_rms_norm launch: {e}")))
+        let iv = input.slice(..);
+        let rv = residual.slice(..);
+        let wv = weight.slice(..);
+        let mut b = func.builder();
+        b.arg(&iv);
+        b.arg(&rv);
+        b.arg(&wv);
+        b.arg(output);
+        b.arg(residual_out);
+        b.arg(&(h as i32));
+        b.arg(&eps);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (h.min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("fused_add_rms: {e}")))
     }
 
     fn launch_fused_silu_mul(
@@ -992,30 +674,26 @@ impl CudaDecodeRunner {
             "fused_silu_mul",
             ptx::FUSED_SILU_MUL,
         )?;
-        let block_size = 256u32;
-        let grid_size = (n as u32 + block_size - 1) / block_size;
-        let n_i32 = n as i32;
-
-        let mut builder = func.builder();
-        builder.arg(gate);
-        builder.arg(up);
-        builder.arg(output);
-        builder.arg(&n_i32);
-
-        let cfg = LaunchConfig {
-            grid_dim: (grid_size, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { builder.launch(cfg) }
-            .map(|_| ())
-            .map_err(|e| candle_core::Error::Msg(format!("fused_silu_mul launch: {e}")))
+        let mut b = func.builder();
+        b.arg(gate);
+        b.arg(up);
+        b.arg(output);
+        b.arg(&(n as i32));
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("silu_mul: {e}")))
     }
 
     fn launch_residual_add(
         device: &CudaDevice,
         a: &CudaSlice<half::f16>,
-        b: &CudaSlice<half::f16>,
+        b_: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
         n: usize,
     ) -> candle_core::Result<()> {
@@ -1024,26 +702,21 @@ impl CudaDecodeRunner {
             "residual_add",
             ptx::RESIDUAL_ADD,
         )?;
-        let block_size = 256u32;
-        let grid_size = (n as u32 + block_size - 1) / block_size;
-        let n_i32 = n as i32;
-
-        let a_view = a.slice(..);
-        let b_view = b.slice(..);
-
-        let mut builder = func.builder();
-        builder.arg(&a_view);
-        builder.arg(&b_view);
-        builder.arg(output);
-        builder.arg(&n_i32);
-
-        let cfg = LaunchConfig {
-            grid_dim: (grid_size, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { builder.launch(cfg) }
-            .map(|_| ())
-            .map_err(|e| candle_core::Error::Msg(format!("residual_add launch: {e}")))
+        let av = a.slice(..);
+        let bv = b_.slice(..);
+        let mut b = func.builder();
+        b.arg(&av);
+        b.arg(&bv);
+        b.arg(output);
+        b.arg(&(n as i32));
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("res_add: {e}")))
     }
 }
