@@ -31,7 +31,7 @@ unsafe impl Sync for CudaGraphState {}
 impl CudaGraphState {
     pub fn begin_capture(stream: &Arc<CudaStream>) -> candle_core::Result<()> {
         stream
-            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| candle_core::Error::Msg(format!("Graph begin_capture failed: {e}")))
     }
 
