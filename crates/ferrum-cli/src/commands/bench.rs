@@ -93,29 +93,50 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let mut total_time_ms: f64 = 0.0;
     let mut ttft_ms_list: Vec<f64> = Vec::new();
     let mut tps_list: Vec<f64> = Vec::new();
+    let mut tpot_ms_list: Vec<f64> = Vec::new();
+    let mut decode_tps_list: Vec<f64> = Vec::new();
 
     for round in 1..=cmd.rounds {
         eprintln!("{}", format!("Round {}/{}...", round, cmd.rounds).dimmed());
 
-        let start = Instant::now();
         let result = run_single(&*engine, &model_id, &cmd.prompt, cmd.max_tokens).await?;
-        let elapsed = start.elapsed();
-        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
-        let tps = if elapsed.as_secs_f64() > 0.0 {
-            result.token_count as f64 / elapsed.as_secs_f64()
+        let tps = if result.total_ms > 0.0 {
+            result.token_count as f64 / (result.total_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        // TPOT: decode-only time per token (excludes prefill/TTFT)
+        let decode_tokens = if result.token_count > 1 {
+            result.token_count - 1
+        } else {
+            0
+        };
+        let decode_time_ms = result.total_ms - result.ttft_ms;
+        let tpot_ms = if decode_tokens > 0 {
+            decode_time_ms / decode_tokens as f64
+        } else {
+            0.0
+        };
+        let decode_tps = if decode_time_ms > 0.0 {
+            decode_tokens as f64 / (decode_time_ms / 1000.0)
         } else {
             0.0
         };
 
         total_tokens += result.token_count;
-        total_time_ms += elapsed_ms;
+        total_time_ms += result.total_ms;
         ttft_ms_list.push(result.ttft_ms);
         tps_list.push(tps);
+        if decode_tokens > 0 {
+            tpot_ms_list.push(tpot_ms);
+            decode_tps_list.push(decode_tps);
+        }
 
         eprintln!(
-            "  {} tokens in {:.1}ms ({:.1} tok/s, TTFT {:.1}ms)",
-            result.token_count, elapsed_ms, tps, result.ttft_ms
+            "  {} tokens in {:.1}ms ({:.1} tok/s, TTFT {:.1}ms, TPOT {:.2}ms, decode {:.1} tok/s)",
+            result.token_count, result.total_ms, tps, result.ttft_ms, tpot_ms, decode_tps
         );
     }
 
@@ -148,13 +169,30 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     };
     let p99_ttft = percentile(&ttft_ms_list, 99.0);
 
+    let avg_decode_tps = if !decode_tps_list.is_empty() {
+        decode_tps_list.iter().sum::<f64>() / decode_tps_list.len() as f64
+    } else {
+        0.0
+    };
+    let avg_tpot = if !tpot_ms_list.is_empty() {
+        tpot_ms_list.iter().sum::<f64>() / tpot_ms_list.len() as f64
+    } else {
+        0.0
+    };
+    let p99_tpot = percentile(&tpot_ms_list, 99.0);
+
     eprintln!(
-        "Throughput:        {:.1} tok/s avg ({:.1} min, {:.1} max)",
+        "Throughput (e2e):  {:.1} tok/s avg ({:.1} min, {:.1} max)",
         avg_tps, min_tps, max_tps
     );
+    eprintln!("Decode only:       {:.1} tok/s avg", avg_decode_tps);
     eprintln!(
         "TTFT:              {:.1}ms avg, {:.1}ms p99",
         avg_ttft, p99_ttft
+    );
+    eprintln!(
+        "TPOT:              {:.2}ms avg, {:.2}ms p99",
+        avg_tpot, p99_tpot
     );
     eprintln!("Total tokens:      {}", total_tokens);
     eprintln!("Total time:        {:.1}ms", total_time_ms);
@@ -166,6 +204,8 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
 struct BenchResult {
     token_count: usize,
     ttft_ms: f64,
+    /// Total generation time in ms (from request start to last token)
+    total_ms: f64,
 }
 
 async fn run_single(
@@ -223,6 +263,7 @@ async fn run_single(
     Ok(BenchResult {
         token_count,
         ttft_ms: first_token_time.unwrap_or(0.0),
+        total_ms: start.elapsed().as_secs_f64() * 1000.0,
     })
 }
 
