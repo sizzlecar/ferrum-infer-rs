@@ -34,11 +34,21 @@ struct Qwen3CacheState {
 /// Each active sequence gets its own KV cache keyed by a unique cache_id.
 /// This allows concurrent prefill and decode across many sequences without
 /// one sequence's prefill destroying another's KV cache.
+///
+/// On CUDA devices, lazily creates a `CudaDecodeRunner` that bypasses candle
+/// for the decode hot path, using cuBLAS + custom kernels with pre-allocated
+/// buffers and optional CUDA Graph acceleration.
 pub struct Qwen3ModelExecutor {
     model: Arc<Qwen3ModelWrapper>,
     info: ModelInfo,
     states: Mutex<HashMap<String, Qwen3CacheState>>,
     next_cache_id: AtomicU64,
+    /// CUDA decode runner (created lazily on first CUDA decode call).
+    #[cfg(feature = "cuda")]
+    cuda_runner: Mutex<Option<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner>>,
+    /// Whether CUDA runner initialization has been attempted (avoid retrying on failure).
+    #[cfg(feature = "cuda")]
+    cuda_runner_init_attempted: std::sync::atomic::AtomicBool,
 }
 
 impl Qwen3ModelExecutor {
@@ -50,6 +60,42 @@ impl Qwen3ModelExecutor {
             info,
             states: Mutex::new(HashMap::new()),
             next_cache_id: AtomicU64::new(1),
+            #[cfg(feature = "cuda")]
+            cuda_runner: Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            cuda_runner_init_attempted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Try to initialize the CUDA decode runner (lazy, first call only).
+    /// Returns true if runner is available for use.
+    #[cfg(feature = "cuda")]
+    fn ensure_cuda_runner(&self) -> bool {
+        if self.cuda_runner.lock().is_some() {
+            return true;
+        }
+        if self
+            .cuda_runner_init_attempted
+            .swap(true, Ordering::Relaxed)
+        {
+            return false; // Already tried and failed
+        }
+
+        // Only create runner on CUDA devices
+        if !matches!(self.model.candle_device(), CandleDevice::Cuda(_)) {
+            return false;
+        }
+
+        match self.model.create_decode_runner() {
+            Ok(runner) => {
+                info!("CUDA decode runner initialized — decode will bypass candle");
+                *self.cuda_runner.lock() = Some(runner);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("CUDA decode runner init failed, using candle path: {e}");
+                false
+            }
         }
     }
 
@@ -58,6 +104,11 @@ impl Qwen3ModelExecutor {
     pub fn release_sequence(&self, cache_id: &str) {
         self.states.lock().remove(cache_id);
         self.model.release_cache(cache_id);
+        // Also release from CUDA decode runner if active
+        #[cfg(feature = "cuda")]
+        if let Some(ref mut runner) = *self.cuda_runner.lock() {
+            runner.release_kv_cache(cache_id);
+        }
         debug!("Released KV cache for sequence: {}", cache_id);
     }
 
@@ -196,6 +247,52 @@ impl ModelExecutor for Qwen3ModelExecutor {
             return Err(FerrumError::model("Decode input is empty"));
         }
 
+        // Try CUDA decode runner path (bypasses candle for the hot path)
+        #[cfg(feature = "cuda")]
+        if tokens.len() == 1 && self.ensure_cuda_runner() {
+            let token_id = tokens[0];
+            let mut runner = self.cuda_runner.lock();
+            if let Some(ref mut runner) = *runner {
+                // Use graph-accelerated decode if available, else direct CUDA
+                let logits_slice = runner
+                    .decode_step_graphed(token_id, seq_len, &req_cache_id)
+                    .map_err(|e| FerrumError::model(format!("CUDA decode failed: {}", e)))?;
+
+                // Wrap CudaSlice into candle Tensor (zero-copy, stays on GPU)
+                let cuda_dev = self
+                    .model
+                    .candle_device()
+                    .as_cuda_device()
+                    .map_err(|e| FerrumError::model(format!("Not CUDA device: {e}")))?;
+                let storage = candle_core::cuda_backend::CudaStorage::wrap_cuda_slice(
+                    logits_slice,
+                    cuda_dev.clone(),
+                );
+                let logits_tensor = candle_core::Tensor::from_storage(
+                    candle_core::Storage::Cuda(storage),
+                    (1, 1, self.info.vocab_size),
+                    candle_core::op::BackpropOp::none(),
+                    false,
+                );
+
+                let logits_ref = self.wrap_tensor(logits_tensor);
+
+                let new_seq_len = {
+                    let mut states = self.states.lock();
+                    if let Some(state) = states.get_mut(&req_cache_id) {
+                        state.sequence_length += 1;
+                        state.sequence_length
+                    } else {
+                        seq_len + 1
+                    }
+                };
+                let new_handle = Arc::new(input_handle.with_sequence_length(new_seq_len));
+
+                return Ok(DecodeOutput::new(logits_ref, new_handle));
+            }
+        }
+
+        // Fallback: standard candle decode path
         let input_tensor = self.tokens_to_tensor(&tokens)?;
 
         let logits = self
