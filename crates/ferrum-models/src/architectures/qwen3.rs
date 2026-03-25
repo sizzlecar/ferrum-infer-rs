@@ -814,18 +814,23 @@ impl Qwen3ModelWrapper {
 
     /// Export KV cache data for a sequence, for use by CudaDecodeRunner.
     ///
-    /// Returns per-layer (k_tensor, v_tensor, current_len) where K/V are
+    /// Returns per-layer (k_tensor, v_tensor, current_len, max_len) where K/V are
     /// [batch=1, max_len, kv_heads, head_dim] contiguous candle Tensors.
     /// Returns None if the sequence has no KV cache.
     #[cfg(feature = "cuda")]
-    pub fn export_kv_cache(&self, cache_key: &str) -> Option<Vec<(Tensor, Tensor, usize)>> {
+    pub fn export_kv_cache(&self, cache_key: &str) -> Option<Vec<(Tensor, Tensor, usize, usize)>> {
         let model = self.model.lock();
         let mut result = Vec::new();
         for layer in &model.base_model.layers {
             if let Some(cache) = layer.self_attn.kv_caches.get(cache_key) {
-                result.push((cache.k.clone(), cache.v.clone(), cache.current_len));
+                result.push((
+                    cache.k.clone(),
+                    cache.v.clone(),
+                    cache.current_len,
+                    cache.max_len,
+                ));
             } else {
-                return None; // All layers must have cache
+                return None;
             }
         }
         Some(result)

@@ -138,17 +138,12 @@ impl Qwen3ModelExecutor {
             return Err(FerrumError::model("Empty KV cache export"));
         }
         let prefill_len = kv_data_tensors[0].2;
+        let max_len = kv_data_tensors[0].3;
 
-        // Extract CudaSlice from each layer's K/V tensors
+        // Extract CudaSlice from each layer's K/V tensors.
+        // clone() on CudaSlice does a D2D copy — we get independent buffers.
         let mut kv_slices = Vec::new();
-        for (k_tensor, v_tensor, _len) in &kv_data_tensors {
-            let k_tensor = k_tensor
-                .contiguous()
-                .map_err(|e| FerrumError::model(format!("KV cache contiguous failed: {e}")))?;
-            let v_tensor = v_tensor
-                .contiguous()
-                .map_err(|e| FerrumError::model(format!("KV cache contiguous failed: {e}")))?;
-
+        for (k_tensor, v_tensor, _len, _max) in &kv_data_tensors {
             let (k_s, _) = k_tensor.storage_and_layout();
             let (v_s, _) = v_tensor.storage_and_layout();
             let k_cuda = match &*k_s {
@@ -171,7 +166,7 @@ impl Qwen3ModelExecutor {
         }
 
         runner
-            .init_kv_cache(cache_id, kv_slices, prefill_len)
+            .init_kv_cache(cache_id, kv_slices, prefill_len, max_len)
             .map_err(|e| FerrumError::model(format!("CUDA runner KV init failed: {e}")))?;
 
         debug!("Migrated KV cache to CUDA runner for sequence: {cache_id}");
