@@ -47,6 +47,10 @@ pub struct CudaDecodeRunner {
     dims: ModelDims,
     /// Per-sequence KV cache state
     kv_states: HashMap<String, SequenceKvState>,
+    /// Captured CUDA Graph for decode replay (None until first capture).
+    graph: Option<crate::cuda_graph::CudaGraphState>,
+    /// Whether graph capture is enabled (can be disabled if capture fails).
+    graph_enabled: bool,
 }
 
 impl CudaDecodeRunner {
@@ -79,6 +83,8 @@ impl CudaDecodeRunner {
             stream,
             dims,
             kv_states: HashMap::new(),
+            graph: None,
+            graph_enabled: true,
         })
     }
 
@@ -414,6 +420,342 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("logits clone: {e}")))?;
 
         Ok(logits)
+    }
+
+    /// Execute a decode step with CUDA Graph acceleration.
+    ///
+    /// On the first call for a sequence, runs `decode_step` normally while
+    /// attempting to capture a CUDA Graph. On subsequent calls, replays the
+    /// captured graph (1 GPU launch instead of ~550).
+    ///
+    /// Falls back to `decode_step` if graph capture fails (e.g., unsupported
+    /// GPU or driver version).
+    pub fn decode_step_graphed(
+        &mut self,
+        token_id: u32,
+        position: usize,
+        cache_key: &str,
+    ) -> candle_core::Result<CudaSlice<half::f16>> {
+        // If graph capture is disabled or we don't have a graph yet, decide what to do
+        if !self.graph_enabled {
+            return self.decode_step(token_id, position, cache_key);
+        }
+
+        if let Some(ref graph_state) = self.graph {
+            // Graph exists — replay it
+            let kv_state = self.kv_states.get_mut(cache_key).ok_or_else(|| {
+                candle_core::Error::Msg(format!("No KV cache for sequence: {cache_key}"))
+            })?;
+            let valid_kv_len = kv_state.current_len + 1;
+
+            graph_state.replay(token_id, position as u32, valid_kv_len as u32)?;
+
+            // Update KV state (CPU-side bookkeeping only)
+            kv_state.current_len = valid_kv_len;
+
+            // Return logits from the pre-allocated buffer (clone for safety)
+            let logits = self
+                .stream
+                .clone_dtod(&self.buffers.logits)
+                .map_err(|e| candle_core::Error::Msg(format!("logits clone: {e}")))?;
+            Ok(logits)
+        } else {
+            // No graph yet — try to capture one
+            tracing::info!("Attempting CUDA Graph capture for decode...");
+
+            // First, do a normal decode step (warmup — ensures all kernels are loaded)
+            let result = self.decode_step(token_id, position, cache_key)?;
+
+            // Now try to capture the next decode step as a graph
+            match self.try_capture_graph(cache_key) {
+                Ok(()) => {
+                    tracing::info!("CUDA Graph captured successfully — subsequent decodes will use graph replay");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "CUDA Graph capture failed, falling back to direct execution: {e}"
+                    );
+                    self.graph_enabled = false;
+                }
+            }
+
+            Ok(result)
+        }
+    }
+
+    /// Attempt to capture the decode forward pass as a CUDA Graph.
+    ///
+    /// This does a dummy decode step while the stream is in capture mode.
+    /// All kernel launches are recorded but not executed. The resulting
+    /// graph can then be replayed with different parameters.
+    fn try_capture_graph(&mut self, cache_key: &str) -> candle_core::Result<()> {
+        use crate::cuda_graph::CudaGraphState;
+
+        // Begin capture
+        CudaGraphState::begin_capture(&self.stream)?;
+
+        // Run a decode step — all GPU ops are recorded, not executed
+        // Use dummy values; the actual values will be updated via memcpy before replay
+        let dummy_result = self.decode_step_inner_for_capture(cache_key);
+
+        // End capture regardless of whether the inner step succeeded
+        let graph = CudaGraphState::end_capture(&self.stream)?;
+
+        // Check if inner step had an error
+        dummy_result?;
+
+        match graph {
+            Some(cuda_graph) => {
+                let mut state = CudaGraphState::new(cuda_graph, self.stream.clone())?;
+                state.upload()?;
+                self.graph = Some(state);
+                Ok(())
+            }
+            None => Err(candle_core::Error::Msg(
+                "Graph capture produced no graph (no kernels recorded)".to_string(),
+            )),
+        }
+    }
+
+    /// Inner decode step used during graph capture.
+    ///
+    /// Same as `decode_step` but doesn't update CPU-side KV state
+    /// (since captured ops aren't actually executed).
+    fn decode_step_inner_for_capture(&mut self, cache_key: &str) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let inter = self.dims.intermediate_size;
+        let head_dim = self.dims.head_dim;
+        let num_q = self.dims.num_attention_heads;
+        let num_kv = self.dims.num_kv_heads;
+        let half_dim = head_dim / 2;
+        let eps = 1e-6f32;
+
+        let kv_state = self.kv_states.get(cache_key).ok_or_else(|| {
+            candle_core::Error::Msg(format!("No KV cache for capture: {cache_key}"))
+        })?;
+
+        // During capture, use fixed offsets (the actual values don't matter
+        // since the ops are recorded but not executed)
+        let position = kv_state.current_len;
+        let cos_offset = position * half_dim;
+        let sin_offset = position * half_dim;
+        let valid_kv_len = kv_state.current_len + 1;
+
+        // Same operation sequence as decode_step, but no CPU-side state updates
+        // Embedding lookup (using first token as dummy — address is what matters)
+        let embed_src = self.weights.embed_table.slice.slice(0..h);
+        self.stream
+            .memcpy_dtod(&embed_src, &mut self.buffers.embed_out)
+            .map_err(|e| candle_core::Error::Msg(format!("capture embed: {e}")))?;
+
+        let embed_view = self.buffers.embed_out.slice(..);
+        self.stream
+            .memcpy_dtod(&embed_view, &mut self.buffers.residual)
+            .map_err(|e| candle_core::Error::Msg(format!("capture residual init: {e}")))?;
+
+        for layer_idx in 0..self.dims.num_layers {
+            let lw = &self.weights.layers[layer_idx];
+
+            self.launch_rms_norm(
+                &self.buffers.residual,
+                &lw.input_ln_w.slice,
+                &mut self.buffers.norm_out,
+                h,
+                eps,
+            )?;
+
+            crate::cublas::linear_f16(
+                &self.blas,
+                &self.buffers.norm_out,
+                &lw.qkv_w.slice,
+                &mut self.buffers.qkv_out,
+                1,
+                qkv_dim as i32,
+                h as i32,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("capture QKV: {e}")))?;
+
+            let q_slice = self.buffers.qkv_out.slice(..q_dim);
+            let k_slice = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
+            let v_slice = self.buffers.qkv_out.slice(q_dim + kv_dim..qkv_dim);
+
+            self.launch_rms_norm(
+                &q_slice,
+                &lw.q_norm_w.slice,
+                &mut self.buffers.q_rotated,
+                head_dim,
+                eps,
+            )?;
+            self.launch_rms_norm(
+                &k_slice,
+                &lw.k_norm_w.slice,
+                &mut self.buffers.k_rotated,
+                head_dim,
+                eps,
+            )?;
+
+            let cos_view = self
+                .weights
+                .rope_cos
+                .slice
+                .slice(cos_offset..cos_offset + half_dim);
+            let sin_view = self
+                .weights
+                .rope_sin
+                .slice
+                .slice(sin_offset..sin_offset + half_dim);
+            self.launch_rope(
+                &self.buffers.q_rotated,
+                &self.buffers.k_rotated,
+                &cos_view,
+                &sin_view,
+                &mut self.buffers.norm_out,
+                &mut self.buffers.o_proj_out,
+                num_q,
+                num_kv,
+                head_dim,
+            )?;
+
+            let norm_view = self.buffers.norm_out.slice(..q_dim);
+            self.stream
+                .memcpy_dtod(&norm_view, &mut self.buffers.q_rotated)
+                .map_err(|e| candle_core::Error::Msg(format!("capture rope q: {e}")))?;
+            let oproj_view = self.buffers.o_proj_out.slice(..kv_dim);
+            self.stream
+                .memcpy_dtod(&oproj_view, &mut self.buffers.k_rotated)
+                .map_err(|e| candle_core::Error::Msg(format!("capture rope k: {e}")))?;
+
+            // KV cache append
+            let kv_head_dim_total = num_kv * head_dim;
+            let kv_offset = kv_state.current_len * kv_head_dim_total;
+            {
+                let k_src = self.buffers.k_rotated.slice(..kv_dim);
+                let mut k_dst =
+                    kv_state.k_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
+                self.stream
+                    .memcpy_dtod(&k_src, &mut k_dst)
+                    .map_err(|e| candle_core::Error::Msg(format!("capture KV k: {e}")))?;
+                let v_src = v_slice.slice(..kv_dim);
+                let mut v_dst =
+                    kv_state.v_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
+                self.stream
+                    .memcpy_dtod(&v_src, &mut v_dst)
+                    .map_err(|e| candle_core::Error::Msg(format!("capture KV v: {e}")))?;
+            }
+
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            self.launch_decode_attention(
+                &self.buffers.q_rotated,
+                &kv_state.k_caches[layer_idx],
+                &kv_state.v_caches[layer_idx],
+                &mut self.buffers.attn_out,
+                num_q,
+                num_kv,
+                head_dim,
+                kv_state.max_len,
+                valid_kv_len,
+                scale,
+            )?;
+
+            crate::cublas::linear_f16(
+                &self.blas,
+                &self.buffers.attn_out,
+                &lw.o_w.slice,
+                &mut self.buffers.o_proj_out,
+                1,
+                h as i32,
+                q_dim as i32,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("capture O: {e}")))?;
+
+            self.launch_fused_add_rms_norm(
+                &self.buffers.o_proj_out,
+                &self.buffers.residual,
+                &lw.post_ln_w.slice,
+                &mut self.buffers.post_norm_out,
+                &mut self.buffers.post_norm_residual,
+                h,
+                eps,
+            )?;
+            let pnr = self.buffers.post_norm_residual.slice(..h);
+            self.stream
+                .memcpy_dtod(&pnr, &mut self.buffers.residual)
+                .map_err(|e| candle_core::Error::Msg(format!("capture res: {e}")))?;
+
+            crate::cublas::linear_f16(
+                &self.blas,
+                &self.buffers.post_norm_out,
+                &lw.gate_up_w.slice,
+                &mut self.buffers.gate_up_out,
+                1,
+                (2 * inter) as i32,
+                h as i32,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("capture gate_up: {e}")))?;
+
+            let gate = self.buffers.gate_up_out.slice(..inter);
+            let up = self.buffers.gate_up_out.slice(inter..2 * inter);
+            self.launch_fused_silu_mul(&gate, &up, &mut self.buffers.mlp_act, inter)?;
+
+            crate::cublas::linear_f16(
+                &self.blas,
+                &self.buffers.mlp_act,
+                &lw.down_w.slice,
+                &mut self.buffers.down_out,
+                1,
+                h as i32,
+                inter as i32,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("capture down: {e}")))?;
+
+            self.launch_residual_add(
+                &self.buffers.residual,
+                &self.buffers.down_out,
+                &mut self.buffers.norm_out,
+                h,
+            )?;
+            let nv = self.buffers.norm_out.slice(..h);
+            self.stream
+                .memcpy_dtod(&nv, &mut self.buffers.residual)
+                .map_err(|e| candle_core::Error::Msg(format!("capture res add: {e}")))?;
+        }
+
+        self.launch_rms_norm(
+            &self.buffers.residual,
+            &self.weights.final_norm_w.slice,
+            &mut self.buffers.final_norm_out,
+            h,
+            eps,
+        )?;
+
+        crate::cublas::linear_f16(
+            &self.blas,
+            &self.buffers.final_norm_out,
+            &self.weights.lm_head_w.slice,
+            &mut self.buffers.logits,
+            1,
+            self.dims.vocab_size as i32,
+            h as i32,
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("capture lm_head: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Enable or disable CUDA Graph acceleration.
+    pub fn set_graph_enabled(&mut self, enabled: bool) {
+        self.graph_enabled = enabled;
+        if !enabled {
+            self.graph = None;
+        }
+    }
+
+    /// Returns whether a CUDA Graph has been captured and is ready for replay.
+    pub fn has_graph(&self) -> bool {
+        self.graph.is_some()
     }
 
     // ======================== Kernel Launch Helpers ========================

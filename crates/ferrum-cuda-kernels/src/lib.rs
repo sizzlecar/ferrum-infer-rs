@@ -51,4 +51,7 @@ pub mod decode_buffers;
 pub mod weight_store;
 
 #[cfg(feature = "cuda")]
+pub mod cuda_graph;
+
+#[cfg(feature = "cuda")]
 pub mod cuda_decode;
