@@ -597,7 +597,7 @@ impl CudaDecodeRunner {
             let k_slice = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
             let v_slice = self.buffers.qkv_out.slice(q_dim + kv_dim..qkv_dim);
 
-            Self::launch_rms_norm(
+            Self::launch_rms_norm_view(
                 &self.device,
                 &q_slice,
                 &lw.q_norm_w.slice,
@@ -605,7 +605,7 @@ impl CudaDecodeRunner {
                 head_dim,
                 eps,
             )?;
-            Self::launch_rms_norm(
+            Self::launch_rms_norm_view(
                 &self.device,
                 &k_slice,
                 &lw.k_norm_w.slice,
@@ -752,7 +752,8 @@ impl CudaDecodeRunner {
                 .map_err(|e| candle_core::Error::Msg(format!("capture res add: {e}")))?;
         }
 
-        self.launch_rms_norm(
+        Self::launch_rms_norm(
+            &self.device,
             &self.buffers.residual,
             &self.weights.final_norm_w.slice,
             &mut self.buffers.final_norm_out,
