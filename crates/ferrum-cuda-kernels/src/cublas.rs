@@ -26,17 +26,13 @@ pub fn linear_f16(
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
-    // Get raw device pointers, bypassing cudarc's event tracking.
-    // We use DevicePtr but forget the SyncOnDrop guard — all buffers are
-    // on the same stream so no cross-stream sync is needed.
+    // Get raw device pointers. With event tracking disabled during capture,
+    // DevicePtr won't call stream.wait() which would break graph capture.
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     let stream = input.stream();
-    let (a_ptr, a_guard) = weight.device_ptr(stream);
-    std::mem::forget(a_guard);
-    let (b_ptr, b_guard) = input.device_ptr(stream);
-    std::mem::forget(b_guard);
-    let (c_ptr, c_guard) = output.device_ptr_mut(stream);
-    std::mem::forget(c_guard);
+    let (a_ptr, _) = weight.device_ptr(stream);
+    let (b_ptr, _) = input.device_ptr(stream);
+    let (c_ptr, _) = output.device_ptr_mut(stream);
     let a_ptr = a_ptr as *const std::ffi::c_void;
     let b_ptr = b_ptr as *const std::ffi::c_void;
     let c_ptr = c_ptr as *mut std::ffi::c_void;
