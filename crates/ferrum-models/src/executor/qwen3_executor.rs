@@ -69,34 +69,16 @@ impl Qwen3ModelExecutor {
 
     /// Try to initialize the CUDA decode runner (lazy, first call only).
     /// Returns true if runner is available for use.
+    ///
+    /// TODO: Currently disabled — cudarc's CudaSlice::clone() panics when
+    /// cloning slices from candle's CUDA storage due to cross-stream event
+    /// tracking incompatibility. The KV cache migration from candle to the
+    /// runner needs to be redesigned to avoid CudaSlice::clone() (e.g., by
+    /// sharing raw device pointers or using candle Tensors directly).
+    /// The candle path with fused kernels still works and is used instead.
     #[cfg(feature = "cuda")]
     fn ensure_cuda_runner(&self) -> bool {
-        if self.cuda_runner.lock().is_some() {
-            return true;
-        }
-        if self
-            .cuda_runner_init_attempted
-            .swap(true, Ordering::Relaxed)
-        {
-            return false; // Already tried and failed
-        }
-
-        // Only create runner on CUDA devices
-        if !matches!(self.model.candle_device(), CandleDevice::Cuda(_)) {
-            return false;
-        }
-
-        match self.model.create_decode_runner() {
-            Ok(runner) => {
-                info!("CUDA decode runner initialized — decode will bypass candle");
-                *self.cuda_runner.lock() = Some(runner);
-                true
-            }
-            Err(e) => {
-                tracing::warn!("CUDA decode runner init failed, using candle path: {e}");
-                false
-            }
-        }
+        false // Disabled until KV cache migration is fixed
     }
 
     /// Release a sequence's KV cache, freeing GPU memory.
