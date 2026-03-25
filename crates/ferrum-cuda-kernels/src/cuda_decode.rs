@@ -49,20 +49,14 @@ pub struct CudaDecodeRunner {
 }
 
 impl CudaDecodeRunner {
+    /// Create with a pre-created non-blocking stream.
+    /// Weights must already be on this stream (via GpuWeight::from_tensor with stream).
     pub fn new(
         weights: Qwen3Weights,
         dims: ModelDims,
         device: CudaDevice,
+        stream: Arc<CudaStream>,
     ) -> candle_core::Result<Self> {
-        // Create a NON-BLOCKING stream for the decode runner.
-        // candle's default stream (stream 0) is blocking and doesn't support
-        // CUDA Graph capture. We need CU_STREAM_NON_BLOCKING for piecewise graphs.
-        let candle_stream = device.cuda_stream();
-        let stream = candle_stream
-            .context()
-            .new_stream()
-            .map_err(|e| candle_core::Error::Msg(format!("new_stream: {e}")))?;
-        // Create a cuBLAS handle on our non-blocking stream
         let blas = Arc::new(
             cudarc::cublas::CudaBlas::new(stream.clone())
                 .map_err(|e| candle_core::Error::Msg(format!("cublas new: {e}")))?,
