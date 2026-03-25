@@ -866,6 +866,18 @@ impl Qwen3ModelWrapper {
         let model = self.model.lock();
         let cfg = &self.config;
 
+        // Create non-blocking stream — required for CUDA Graph capture.
+        // All weights and buffers will be copied to this stream.
+        let cuda_device = self
+            .device
+            .as_cuda_device()
+            .map_err(|e| FerrumError::model(format!("not CUDA: {e}")))?;
+        let rs = cuda_device
+            .cuda_stream()
+            .context()
+            .new_stream()
+            .map_err(|e| FerrumError::model(format!("new_stream: {e}")))?;
+
         let dims = ModelDims {
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
@@ -877,47 +889,43 @@ impl Qwen3ModelWrapper {
             max_seq_len: cfg.max_position_embeddings,
         };
 
-        // Extract embedding table
-        let embed_table = GpuWeight::from_tensor(model.base_model.embed_tokens.embeddings())
-            .map_err(|e| FerrumError::model(format!("embed weight extract: {e}")))?;
+        // Extract weights — copy to runner's non-blocking stream
+        let embed_table = GpuWeight::from_tensor(model.base_model.embed_tokens.embeddings(), &rs)
+            .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
 
-        // Extract per-layer weights
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer in &model.base_model.layers {
             let lw = LayerWeights {
-                input_ln_w: GpuWeight::from_tensor(&layer.input_layernorm.weight)
-                    .map_err(|e| FerrumError::model(format!("input_ln weight: {e}")))?,
-                qkv_w: GpuWeight::from_tensor(layer.self_attn.qkv_proj.weight())
-                    .map_err(|e| FerrumError::model(format!("qkv weight: {e}")))?,
-                q_norm_w: GpuWeight::from_tensor(&layer.self_attn.q_norm.weight)
-                    .map_err(|e| FerrumError::model(format!("q_norm weight: {e}")))?,
-                k_norm_w: GpuWeight::from_tensor(&layer.self_attn.k_norm.weight)
-                    .map_err(|e| FerrumError::model(format!("k_norm weight: {e}")))?,
-                o_w: GpuWeight::from_tensor(layer.self_attn.o_proj.weight())
-                    .map_err(|e| FerrumError::model(format!("o_proj weight: {e}")))?,
-                post_ln_w: GpuWeight::from_tensor(&layer.post_attention_layernorm.weight)
-                    .map_err(|e| FerrumError::model(format!("post_ln weight: {e}")))?,
-                gate_up_w: GpuWeight::from_tensor(layer.mlp.gate_up_proj.weight())
-                    .map_err(|e| FerrumError::model(format!("gate_up weight: {e}")))?,
-                down_w: GpuWeight::from_tensor(layer.mlp.down_proj.weight())
-                    .map_err(|e| FerrumError::model(format!("down weight: {e}")))?,
+                input_ln_w: GpuWeight::from_tensor(&layer.input_layernorm.weight, &rs)
+                    .map_err(|e| FerrumError::model(format!("input_ln: {e}")))?,
+                qkv_w: GpuWeight::from_tensor(layer.self_attn.qkv_proj.weight(), &rs)
+                    .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
+                q_norm_w: GpuWeight::from_tensor(&layer.self_attn.q_norm.weight, &rs)
+                    .map_err(|e| FerrumError::model(format!("q_norm: {e}")))?,
+                k_norm_w: GpuWeight::from_tensor(&layer.self_attn.k_norm.weight, &rs)
+                    .map_err(|e| FerrumError::model(format!("k_norm: {e}")))?,
+                o_w: GpuWeight::from_tensor(layer.self_attn.o_proj.weight(), &rs)
+                    .map_err(|e| FerrumError::model(format!("o_proj: {e}")))?,
+                post_ln_w: GpuWeight::from_tensor(&layer.post_attention_layernorm.weight, &rs)
+                    .map_err(|e| FerrumError::model(format!("post_ln: {e}")))?,
+                gate_up_w: GpuWeight::from_tensor(layer.mlp.gate_up_proj.weight(), &rs)
+                    .map_err(|e| FerrumError::model(format!("gate_up: {e}")))?,
+                down_w: GpuWeight::from_tensor(layer.mlp.down_proj.weight(), &rs)
+                    .map_err(|e| FerrumError::model(format!("down: {e}")))?,
             };
             layers.push(lw);
         }
 
-        // Final norm
-        let final_norm_w = GpuWeight::from_tensor(&model.base_model.norm.weight)
-            .map_err(|e| FerrumError::model(format!("final_norm weight: {e}")))?;
-
-        // LM head
-        let lm_head_w = GpuWeight::from_tensor(model.lm_head.weight())
-            .map_err(|e| FerrumError::model(format!("lm_head weight: {e}")))?;
-
-        // RoPE cos/sin tables — extract from the first layer's rotary_emb
-        let rope_cos = GpuWeight::from_tensor(&model.base_model.layers[0].self_attn.rotary_emb.cos)
-            .map_err(|e| FerrumError::model(format!("rope_cos: {e}")))?;
-        let rope_sin = GpuWeight::from_tensor(&model.base_model.layers[0].self_attn.rotary_emb.sin)
-            .map_err(|e| FerrumError::model(format!("rope_sin: {e}")))?;
+        let final_norm_w = GpuWeight::from_tensor(&model.base_model.norm.weight, &rs)
+            .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
+        let lm_head_w = GpuWeight::from_tensor(model.lm_head.weight(), &rs)
+            .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
+        let rope_cos =
+            GpuWeight::from_tensor(&model.base_model.layers[0].self_attn.rotary_emb.cos, &rs)
+                .map_err(|e| FerrumError::model(format!("rope_cos: {e}")))?;
+        let rope_sin =
+            GpuWeight::from_tensor(&model.base_model.layers[0].self_attn.rotary_emb.sin, &rs)
+                .map_err(|e| FerrumError::model(format!("rope_sin: {e}")))?;
 
         let weights = Qwen3Weights {
             embed_table,
@@ -928,13 +936,12 @@ impl Qwen3ModelWrapper {
             rope_sin,
         };
 
-        let cuda_device = self
-            .device
-            .as_cuda_device()
-            .map_err(|e| FerrumError::model(format!("not a CUDA device: {e}")))?
-            .clone();
-
-        ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(weights, dims, cuda_device)
-            .map_err(|e| FerrumError::model(format!("CudaDecodeRunner creation failed: {e}")))
+        ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
+            weights,
+            dims,
+            cuda_device.clone(),
+            rs,
+        )
+        .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
     }
 }
