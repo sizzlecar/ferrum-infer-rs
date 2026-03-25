@@ -146,6 +146,11 @@ impl CudaDecodeRunner {
         Ok(())
     }
 
+    /// Check if KV cache exists for a sequence.
+    pub fn has_kv_cache(&self, cache_key: &str) -> bool {
+        self.kv_states.contains_key(cache_key)
+    }
+
     /// Release KV cache for a completed sequence.
     pub fn release_kv_cache(&mut self, cache_key: &str) {
         self.kv_states.remove(cache_key);
