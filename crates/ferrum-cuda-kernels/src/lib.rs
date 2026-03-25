@@ -20,3 +20,35 @@ pub use fused_add_rms_norm::fused_add_rms_norm;
 mod fused_silu_mul;
 #[cfg(feature = "cuda")]
 pub use fused_silu_mul::fused_silu_mul;
+
+#[cfg(feature = "cuda")]
+mod rms_norm;
+#[cfg(feature = "cuda")]
+pub use rms_norm::rms_norm;
+
+#[cfg(feature = "cuda")]
+mod rope;
+#[cfg(feature = "cuda")]
+pub use rope::rope;
+
+#[cfg(feature = "cuda")]
+mod decode_attention;
+#[cfg(feature = "cuda")]
+pub use decode_attention::decode_attention;
+
+#[cfg(feature = "cuda")]
+mod residual_add;
+#[cfg(feature = "cuda")]
+pub use residual_add::residual_add;
+
+#[cfg(feature = "cuda")]
+pub mod cublas;
+
+#[cfg(feature = "cuda")]
+pub mod decode_buffers;
+
+#[cfg(feature = "cuda")]
+pub mod weight_store;
+
+#[cfg(feature = "cuda")]
+pub mod cuda_decode;
