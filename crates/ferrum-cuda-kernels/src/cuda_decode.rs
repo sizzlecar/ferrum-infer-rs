@@ -501,8 +501,8 @@ impl CudaDecodeRunner {
             }
         }
 
-        // Use graphs if captured, otherwise eager
-        if let Some(ref graphs) = self.graphs {
+        // Take graphs out to avoid borrow conflict with &mut self methods
+        if let Some(graphs) = self.graphs.take() {
             self.embed_eager(token_id)?;
             let mut kv = self
                 .kv_states
@@ -528,6 +528,9 @@ impl CudaDecodeRunner {
             } else {
                 self.final_eager()?;
             }
+
+            // Put graphs back
+            self.graphs = Some(graphs);
 
             self.stream
                 .clone_dtod(&self.buffers.logits)
