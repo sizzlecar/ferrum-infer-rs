@@ -9,14 +9,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::cuda_backend::cudarc;
 use candle_core::cuda_backend::CudaDevice;
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::cublas::CudaBlas;
+use cudarc::driver::{CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
 
 use crate::decode_buffers::{DecodeBuffers, ModelDims};
 use crate::ptx;
-use crate::weight_store::{GpuWeight, Qwen3Weights};
+use crate::weight_store::Qwen3Weights;
 
 /// Per-sequence KV cache managed by the decode runner.
 struct SequenceKvState {
@@ -106,19 +105,18 @@ impl CudaDecodeRunner {
 
         for (k_src, v_src) in &kv_data {
             // Allocate full-size KV buffer
-            let k_buf = unsafe {
+            let mut k_buf = unsafe {
                 self.stream
                     .alloc::<half::f16>(kv_head_dim * max_len)
                     .map_err(|e| candle_core::Error::Msg(format!("KV alloc: {e}")))?
             };
-            let v_buf = unsafe {
+            let mut v_buf = unsafe {
                 self.stream
                     .alloc::<half::f16>(kv_head_dim * max_len)
                     .map_err(|e| candle_core::Error::Msg(format!("KV alloc: {e}")))?
             };
 
             // Copy prefill data into the beginning of the buffer
-            let copy_bytes = kv_head_dim * prefill_len * std::mem::size_of::<half::f16>();
             let k_src_view = k_src.slice(..kv_head_dim * prefill_len);
             let mut k_dst_view = k_buf.slice_mut(..kv_head_dim * prefill_len);
             self.stream
@@ -231,18 +229,18 @@ impl CudaDecodeRunner {
 
             // 2d. Q-norm and K-norm
             // Q: treat as [num_q_heads, head_dim], norm each row
-            self.launch_rms_norm(
+            self.launch_rms_norm_view(
                 &q_slice,
                 &lw.q_norm_w.slice,
-                &mut self.buffers.q_rotated, // reuse as temp
+                &mut self.buffers.q_rotated,
                 head_dim,
                 eps,
             )?;
             // K: treat as [num_kv_heads, head_dim]
-            self.launch_rms_norm(
+            self.launch_rms_norm_view(
                 &k_slice,
                 &lw.k_norm_w.slice,
-                &mut self.buffers.k_rotated, // reuse as temp
+                &mut self.buffers.k_rotated,
                 head_dim,
                 eps,
             )?;
@@ -759,11 +757,14 @@ impl CudaDecodeRunner {
     }
 
     // ======================== Kernel Launch Helpers ========================
+    //
+    // All helpers take CudaSlice/CudaView (concrete types) instead of
+    // impl DeviceSlice, because cudarc's builder.arg() requires DeviceRepr.
 
     fn launch_rms_norm(
         &self,
-        input: &impl cudarc::driver::DeviceSlice<half::f16>,
-        weight: &impl cudarc::driver::DeviceSlice<half::f16>,
+        input: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
         row_size: usize,
         eps: f32,
@@ -775,9 +776,12 @@ impl CudaDecodeRunner {
         let block_size = row_size.min(1024) as u32;
         let row_size_i32 = row_size as i32;
 
+        let inp_view = input.slice(..);
+        let w_view = weight.slice(..);
+
         let mut builder = func.builder();
-        builder.arg(input);
-        builder.arg(weight);
+        builder.arg(&inp_view);
+        builder.arg(&w_view);
         builder.arg(output);
         builder.arg(&row_size_i32);
         builder.arg(&eps);
@@ -788,15 +792,49 @@ impl CudaDecodeRunner {
             shared_mem_bytes: 0,
         };
         unsafe { builder.launch(cfg) }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("rms_norm launch: {e}")))
+    }
+
+    fn launch_rms_norm_view(
+        &self,
+        input: &CudaView<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        row_size: usize,
+        eps: f32,
+    ) -> candle_core::Result<()> {
+        let num_rows = input.len() / row_size;
+        let func =
+            self.device
+                .get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
+        let block_size = row_size.min(1024) as u32;
+        let row_size_i32 = row_size as i32;
+        let w_view = weight.slice(..);
+
+        let mut builder = func.builder();
+        builder.arg(input);
+        builder.arg(&w_view);
+        builder.arg(output);
+        builder.arg(&row_size_i32);
+        builder.arg(&eps);
+
+        let cfg = LaunchConfig {
+            grid_dim: (num_rows as u32, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { builder.launch(cfg) }
+            .map(|_| ())
             .map_err(|e| candle_core::Error::Msg(format!("rms_norm launch: {e}")))
     }
 
     fn launch_rope(
         &self,
-        q: &impl cudarc::driver::DeviceSlice<half::f16>,
-        k: &impl cudarc::driver::DeviceSlice<half::f16>,
-        cos: &impl cudarc::driver::DeviceSlice<half::f16>,
-        sin: &impl cudarc::driver::DeviceSlice<half::f16>,
+        q: &CudaSlice<half::f16>,
+        k: &CudaSlice<half::f16>,
+        cos: &CudaView<half::f16>,
+        sin: &CudaView<half::f16>,
         q_out: &mut CudaSlice<half::f16>,
         k_out: &mut CudaSlice<half::f16>,
         num_q_heads: usize,
@@ -812,9 +850,12 @@ impl CudaDecodeRunner {
         let num_k_i32 = num_k_heads as i32;
         let head_dim_i32 = head_dim as i32;
 
+        let q_view = q.slice(..);
+        let k_view = k.slice(..);
+
         let mut builder = func.builder();
-        builder.arg(q);
-        builder.arg(k);
+        builder.arg(&q_view);
+        builder.arg(&k_view);
         builder.arg(cos);
         builder.arg(sin);
         builder.arg(q_out);
@@ -829,12 +870,13 @@ impl CudaDecodeRunner {
             shared_mem_bytes: 0,
         };
         unsafe { builder.launch(cfg) }
+            .map(|_| ())
             .map_err(|e| candle_core::Error::Msg(format!("rope launch: {e}")))
     }
 
     fn launch_decode_attention(
         &self,
-        q: &impl cudarc::driver::DeviceSlice<half::f16>,
+        q: &CudaSlice<half::f16>,
         k_cache: &CudaSlice<half::f16>,
         v_cache: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
@@ -851,7 +893,7 @@ impl CudaDecodeRunner {
             ptx::DECODE_ATTENTION,
         )?;
         let block_size = 256u32;
-        let shared_mem = (max_kv_len as u32) * 4; // f32 per position
+        let shared_mem = (max_kv_len as u32) * 4;
 
         let num_q_i32 = num_q_heads as i32;
         let num_kv_i32 = num_kv_heads as i32;
@@ -859,10 +901,14 @@ impl CudaDecodeRunner {
         let max_kv_i32 = max_kv_len as i32;
         let valid_kv_i32 = valid_kv_len as i32;
 
+        let q_view = q.slice(..);
+        let k_view = k_cache.slice(..);
+        let v_view = v_cache.slice(..);
+
         let mut builder = func.builder();
-        builder.arg(q);
-        builder.arg(k_cache);
-        builder.arg(v_cache);
+        builder.arg(&q_view);
+        builder.arg(&k_view);
+        builder.arg(&v_view);
         builder.arg(output);
         builder.arg(&num_q_i32);
         builder.arg(&num_kv_i32);
@@ -877,14 +923,15 @@ impl CudaDecodeRunner {
             shared_mem_bytes: shared_mem,
         };
         unsafe { builder.launch(cfg) }
+            .map(|_| ())
             .map_err(|e| candle_core::Error::Msg(format!("decode_attention launch: {e}")))
     }
 
     fn launch_fused_add_rms_norm(
         &self,
-        input: &impl cudarc::driver::DeviceSlice<half::f16>,
-        residual: &impl cudarc::driver::DeviceSlice<half::f16>,
-        weight: &impl cudarc::driver::DeviceSlice<half::f16>,
+        input: &CudaSlice<half::f16>,
+        residual: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
         residual_out: &mut CudaSlice<half::f16>,
         hidden_size: usize,
@@ -898,28 +945,33 @@ impl CudaDecodeRunner {
         let block_size = hidden_size.min(1024) as u32;
         let hidden_i32 = hidden_size as i32;
 
+        let inp_view = input.slice(..);
+        let res_view = residual.slice(..);
+        let w_view = weight.slice(..);
+
         let mut builder = func.builder();
-        builder.arg(input);
-        builder.arg(residual);
-        builder.arg(weight);
+        builder.arg(&inp_view);
+        builder.arg(&res_view);
+        builder.arg(&w_view);
         builder.arg(output);
         builder.arg(residual_out);
         builder.arg(&hidden_i32);
         builder.arg(&eps);
 
         let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1), // 1 token in decode
+            grid_dim: (1, 1, 1),
             block_dim: (block_size, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { builder.launch(cfg) }
+            .map(|_| ())
             .map_err(|e| candle_core::Error::Msg(format!("fused_add_rms_norm launch: {e}")))
     }
 
     fn launch_fused_silu_mul(
         &self,
-        gate: &impl cudarc::driver::DeviceSlice<half::f16>,
-        up: &impl cudarc::driver::DeviceSlice<half::f16>,
+        gate: &CudaView<half::f16>,
+        up: &CudaView<half::f16>,
         output: &mut CudaSlice<half::f16>,
         n: usize,
     ) -> candle_core::Result<()> {
@@ -944,13 +996,14 @@ impl CudaDecodeRunner {
             shared_mem_bytes: 0,
         };
         unsafe { builder.launch(cfg) }
+            .map(|_| ())
             .map_err(|e| candle_core::Error::Msg(format!("fused_silu_mul launch: {e}")))
     }
 
     fn launch_residual_add(
         &self,
-        a: &impl cudarc::driver::DeviceSlice<half::f16>,
-        b: &impl cudarc::driver::DeviceSlice<half::f16>,
+        a: &CudaSlice<half::f16>,
+        b: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
         n: usize,
     ) -> candle_core::Result<()> {
@@ -963,9 +1016,12 @@ impl CudaDecodeRunner {
         let grid_size = (n as u32 + block_size - 1) / block_size;
         let n_i32 = n as i32;
 
+        let a_view = a.slice(..);
+        let b_view = b.slice(..);
+
         let mut builder = func.builder();
-        builder.arg(a);
-        builder.arg(b);
+        builder.arg(&a_view);
+        builder.arg(&b_view);
         builder.arg(output);
         builder.arg(&n_i32);
 
@@ -975,6 +1031,7 @@ impl CudaDecodeRunner {
             shared_mem_bytes: 0,
         };
         unsafe { builder.launch(cfg) }
+            .map(|_| ())
             .map_err(|e| candle_core::Error::Msg(format!("residual_add launch: {e}")))
     }
 }
