@@ -35,6 +35,7 @@ safetensors = { workspace = true }
 
 # Custom CUDA kernels
 ferrum-cuda-kernels = { workspace = true, optional = true }
+half = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
