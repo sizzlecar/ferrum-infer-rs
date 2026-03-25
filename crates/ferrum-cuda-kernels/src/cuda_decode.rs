@@ -433,8 +433,6 @@ impl CudaDecodeRunner {
         position: usize,
         cache_key: &str,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        // vLLM uses multiple warmup runs to ensure cuBLAS workspace allocation
-        // and JIT compilation are complete before graph capture.
         const WARMUP: usize = 5;
 
         if self.warmup_count < WARMUP {
@@ -442,58 +440,62 @@ impl CudaDecodeRunner {
             return self.decode_step(token_id, position, cache_key);
         }
 
+        // Try capture once after warmup
         if self.graphs.is_none() && !self.capture_attempted {
             self.capture_attempted = true;
             match self.capture_piecewise_graphs() {
                 Ok(()) => {}
-                Err(e) => tracing::warn!("Piecewise capture failed: {e}"),
+                Err(e) => {
+                    tracing::warn!("Piecewise capture failed: {e}");
+                    // Recreate cuBLAS handle — capture failure corrupts its state
+                    match cudarc::cublas::CudaBlas::new(self.stream.clone()) {
+                        Ok(new_blas) => {
+                            self.blas = Arc::new(new_blas);
+                            tracing::info!("cuBLAS handle recreated after capture failure");
+                        }
+                        Err(e2) => {
+                            tracing::error!("cuBLAS recreate failed: {e2}");
+                        }
+                    }
+                    self.stream.synchronize().ok();
+                }
             }
         }
 
-        self.embed_eager(token_id)?;
-        let mut kv = self
-            .kv_states
-            .remove(cache_key)
-            .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
+        // Use graphs if captured, otherwise eager
+        if let Some(ref graphs) = self.graphs {
+            self.embed_eager(token_id)?;
+            let mut kv = self
+                .kv_states
+                .remove(cache_key)
+                .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
 
-        let use_graphs = self.graphs.is_some();
-        for li in 0..self.dims.num_layers {
-            if use_graphs {
-                self.graphs.as_ref().unwrap().pre_attn[li]
+            for li in 0..self.dims.num_layers {
+                graphs.pre_attn[li]
                     .launch()
-                    .map_err(|e| candle_core::Error::Msg(format!("pre graph L{li}: {e}")))?;
-            } else {
-                self.pre_attention_eager(li, position)?;
+                    .map_err(|e| candle_core::Error::Msg(format!("pre L{li}: {e}")))?;
+                self.attention_eager(li, &mut kv)?;
+                graphs.post_attn[li]
+                    .launch()
+                    .map_err(|e| candle_core::Error::Msg(format!("post L{li}: {e}")))?;
             }
 
-            self.attention_eager(li, &mut kv)?;
+            kv.current_len += 1;
+            self.kv_states.insert(cache_key.to_string(), kv);
 
-            if use_graphs {
-                self.graphs.as_ref().unwrap().post_attn[li]
-                    .launch()
-                    .map_err(|e| candle_core::Error::Msg(format!("post graph L{li}: {e}")))?;
-            } else {
-                self.post_attention_eager(li)?;
-            }
-        }
-
-        kv.current_len += 1;
-        self.kv_states.insert(cache_key.to_string(), kv);
-
-        if use_graphs {
-            if let Some(ref g) = self.graphs.as_ref().unwrap().final_graph {
+            if let Some(ref g) = graphs.final_graph {
                 g.launch()
-                    .map_err(|e| candle_core::Error::Msg(format!("final graph: {e}")))?;
+                    .map_err(|e| candle_core::Error::Msg(format!("final: {e}")))?;
             } else {
                 self.final_eager()?;
             }
-        } else {
-            self.final_eager()?;
-        }
 
-        self.stream
-            .clone_dtod(&self.buffers.logits)
-            .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
+            self.stream
+                .clone_dtod(&self.buffers.logits)
+                .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
+        } else {
+            self.decode_step(token_id, position, cache_key)
+        }
     }
 
     // ======================== Kernel Launch Helpers ========================
