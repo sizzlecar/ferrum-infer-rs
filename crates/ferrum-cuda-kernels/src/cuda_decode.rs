@@ -411,6 +411,15 @@ impl CudaDecodeRunner {
             ws_size / (1024 * 1024)
         );
 
+        // Disable cudarc event tracking during capture.
+        // cudarc's DevicePtr::device_ptr_mut() calls stream.wait(event) when
+        // event tracking is on, which is not capture-safe. Since all our
+        // buffers and weights are on the same stream, we don't need
+        // cross-stream event synchronization.
+        unsafe {
+            self.stream.context().disable_event_tracking();
+        }
+
         let n = self.dims.num_layers;
         let mut pre = Vec::with_capacity(n);
         let mut post = Vec::with_capacity(n);
@@ -486,7 +495,12 @@ impl CudaDecodeRunner {
             post.push(g);
         }
 
-        let fg = self.capture_one("final", |s| s.final_eager()).ok(); // final graph is optional
+        let fg = self.capture_one("final", |s| s.final_eager()).ok();
+
+        // Re-enable event tracking after capture
+        unsafe {
+            self.stream.context().enable_event_tracking();
+        }
 
         tracing::info!(
             "Piecewise graphs captured: {} pre + {} post + final",
