@@ -494,7 +494,11 @@ impl CudaDecodeRunner {
         position: usize,
         cache_key: &str,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        const WARMUP: usize = 5;
+        // Graph capture is architecturally working but currently slower than
+        // eager (~100 vs ~109 tok/s) due to per-graph launch overhead.
+        // Set WARMUP to usize::MAX to disable graph capture by default.
+        // To enable: change to 5.
+        const WARMUP: usize = usize::MAX;
 
         if self.warmup_count < WARMUP {
             self.warmup_count += 1;
