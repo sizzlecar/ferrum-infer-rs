@@ -54,8 +54,19 @@ impl CudaDecodeRunner {
         dims: ModelDims,
         device: CudaDevice,
     ) -> candle_core::Result<Self> {
-        let stream = device.cuda_stream();
-        let blas = device.cublas_handle();
+        // Create a NON-BLOCKING stream for the decode runner.
+        // candle's default stream (stream 0) is blocking and doesn't support
+        // CUDA Graph capture. We need CU_STREAM_NON_BLOCKING for piecewise graphs.
+        let candle_stream = device.cuda_stream();
+        let stream = candle_stream
+            .context()
+            .new_stream()
+            .map_err(|e| candle_core::Error::Msg(format!("new_stream: {e}")))?;
+        // Create a cuBLAS handle on our non-blocking stream
+        let blas = Arc::new(
+            cudarc::cublas::CudaBlas::new(stream.clone())
+                .map_err(|e| candle_core::Error::Msg(format!("cublas new: {e}")))?,
+        );
         let buffers = DecodeBuffers::new(dims.clone(), &stream)
             .map_err(|e| candle_core::Error::Msg(format!("DecodeBuffers alloc: {e}")))?;
 
