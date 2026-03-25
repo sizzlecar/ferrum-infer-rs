@@ -375,7 +375,7 @@ impl CudaDecodeRunner {
         self.final_eager()?;
         let fg = self
             .stream
-            .end_capture(0)
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
             .map_err(|e| candle_core::Error::Msg(format!("final end: {e}")))?;
         if let Some(ref g) = fg {
             g.upload().ok();
