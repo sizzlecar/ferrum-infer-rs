@@ -232,27 +232,25 @@ impl CudaDecodeRunner {
             let k_slice = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
             let v_slice = self.buffers.qkv_out.slice(q_dim + kv_dim..qkv_dim);
 
-            // 2d. Q-norm and K-norm
-            // Q: treat as [num_q_heads, head_dim], norm each row
+            // 2d. Q-norm → rope_q_temp, K-norm → rope_k_temp
             Self::launch_rms_norm_view(
                 &self.device,
                 &q_slice,
                 &lw.q_norm_w.slice,
-                &mut self.buffers.q_rotated,
+                &mut self.buffers.rope_q_temp,
                 head_dim,
                 eps,
             )?;
-            // K: treat as [num_kv_heads, head_dim]
             Self::launch_rms_norm_view(
                 &self.device,
                 &k_slice,
                 &lw.k_norm_w.slice,
-                &mut self.buffers.k_rotated,
+                &mut self.buffers.rope_k_temp,
                 head_dim,
                 eps,
             )?;
 
-            // 2e. RoPE (fused Q+K rotation)
+            // 2e. RoPE: rope_q_temp → q_rotated, rope_k_temp → k_rotated
             let cos_view = self
                 .weights
                 .rope_cos
@@ -263,30 +261,18 @@ impl CudaDecodeRunner {
                 .rope_sin
                 .slice
                 .slice(sin_offset..sin_offset + half_dim);
-            // RoPE writes back to q_rotated and k_rotated (in-place via separate out buffers)
-            // We need temp buffers for in→out. Reuse norm_out and o_proj_out as temps.
             Self::launch_rope(
                 &self.device,
-                &self.buffers.q_rotated,
-                &self.buffers.k_rotated,
+                &self.buffers.rope_q_temp,
+                &self.buffers.rope_k_temp,
                 &cos_view,
                 &sin_view,
-                &mut self.buffers.norm_out,   // temp for q_out
-                &mut self.buffers.o_proj_out, // temp for k_out
+                &mut self.buffers.q_rotated,
+                &mut self.buffers.k_rotated,
                 num_q,
                 num_kv,
                 head_dim,
             )?;
-            // Now q_rotated data is in norm_out, k_rotated data is in o_proj_out.
-            // Swap back by memcpy.
-            let norm_view = self.buffers.norm_out.slice(..q_dim);
-            self.stream
-                .memcpy_dtod(&norm_view, &mut self.buffers.q_rotated)
-                .map_err(|e| candle_core::Error::Msg(format!("rope q copy: {e}")))?;
-            let oproj_view = self.buffers.o_proj_out.slice(..kv_dim);
-            self.stream
-                .memcpy_dtod(&oproj_view, &mut self.buffers.k_rotated)
-                .map_err(|e| candle_core::Error::Msg(format!("rope k copy: {e}")))?;
 
             // 2f. KV cache append
             let kv_head_dim_total = num_kv * head_dim;
@@ -605,7 +591,7 @@ impl CudaDecodeRunner {
                 &self.device,
                 &q_slice,
                 &lw.q_norm_w.slice,
-                &mut self.buffers.q_rotated,
+                &mut self.buffers.rope_q_temp,
                 head_dim,
                 eps,
             )?;
@@ -613,7 +599,7 @@ impl CudaDecodeRunner {
                 &self.device,
                 &k_slice,
                 &lw.k_norm_w.slice,
-                &mut self.buffers.k_rotated,
+                &mut self.buffers.rope_k_temp,
                 head_dim,
                 eps,
             )?;
@@ -630,25 +616,16 @@ impl CudaDecodeRunner {
                 .slice(sin_offset..sin_offset + half_dim);
             Self::launch_rope(
                 &self.device,
-                &self.buffers.q_rotated,
-                &self.buffers.k_rotated,
+                &self.buffers.rope_q_temp,
+                &self.buffers.rope_k_temp,
                 &cos_view,
                 &sin_view,
-                &mut self.buffers.norm_out,
-                &mut self.buffers.o_proj_out,
+                &mut self.buffers.q_rotated,
+                &mut self.buffers.k_rotated,
                 num_q,
                 num_kv,
                 head_dim,
             )?;
-
-            let norm_view = self.buffers.norm_out.slice(..q_dim);
-            self.stream
-                .memcpy_dtod(&norm_view, &mut self.buffers.q_rotated)
-                .map_err(|e| candle_core::Error::Msg(format!("capture rope q: {e}")))?;
-            let oproj_view = self.buffers.o_proj_out.slice(..kv_dim);
-            self.stream
-                .memcpy_dtod(&oproj_view, &mut self.buffers.k_rotated)
-                .map_err(|e| candle_core::Error::Msg(format!("capture rope k: {e}")))?;
 
             // KV cache append
             let kv_head_dim_total = num_kv * head_dim;

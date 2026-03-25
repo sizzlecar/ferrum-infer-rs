@@ -41,6 +41,13 @@ pub struct DecodeBuffers {
     /// K after norm+RoPE: [num_kv_heads * head_dim]
     pub k_rotated: CudaSlice<half::f16>,
 
+    /// RoPE temp buffer for Q output: [num_q_heads * head_dim]
+    /// (can't do in-place RoPE, need separate input/output buffers)
+    pub rope_q_temp: CudaSlice<half::f16>,
+
+    /// RoPE temp buffer for K output: [num_kv_heads * head_dim]
+    pub rope_k_temp: CudaSlice<half::f16>,
+
     /// After attention: [num_q_heads * head_dim]
     pub attn_out: CudaSlice<half::f16>,
 
@@ -91,6 +98,8 @@ impl DecodeBuffers {
             qkv_out: unsafe { stream.alloc::<half::f16>(qkv_dim)? },
             q_rotated: unsafe { stream.alloc::<half::f16>(q_dim)? },
             k_rotated: unsafe { stream.alloc::<half::f16>(kv_dim)? },
+            rope_q_temp: unsafe { stream.alloc::<half::f16>(q_dim)? },
+            rope_k_temp: unsafe { stream.alloc::<half::f16>(kv_dim)? },
             attn_out: unsafe { stream.alloc::<half::f16>(q_dim)? },
             o_proj_out: unsafe { stream.alloc::<half::f16>(dims.hidden_size)? },
             residual: unsafe { stream.alloc::<half::f16>(dims.hidden_size)? },
