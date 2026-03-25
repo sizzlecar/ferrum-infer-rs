@@ -344,7 +344,7 @@ impl CudaDecodeRunner {
                 .begin_capture(mode)
                 .map_err(|e| candle_core::Error::Msg(format!("pre begin L{li}: {e}")))?;
             self.pre_attention_eager(li, 0)?;
-            match self.stream.end_capture(0) {
+            match self.stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH) {
                 Ok(Some(g)) => {
                     g.upload().ok();
                     pre.push(g);
@@ -358,7 +358,7 @@ impl CudaDecodeRunner {
                 .begin_capture(mode)
                 .map_err(|e| candle_core::Error::Msg(format!("post begin L{li}: {e}")))?;
             self.post_attention_eager(li)?;
-            match self.stream.end_capture(0) {
+            match self.stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH) {
                 Ok(Some(g)) => {
                     g.upload().ok();
                     post.push(g);
@@ -501,11 +501,12 @@ impl CudaDecodeRunner {
         let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
         let inp = input.slice(..);
         let w = weight.slice(..);
+        let rs = row_size as i32;
         let mut b = func.builder();
         b.arg(&inp);
         b.arg(&w);
         b.arg(output);
-        b.arg(&(row_size as i32));
+        b.arg(&rs);
         b.arg(&eps);
         unsafe {
             b.launch(LaunchConfig {
@@ -529,11 +530,12 @@ impl CudaDecodeRunner {
         let num_rows = input.len() / row_size;
         let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
         let w = weight.slice(..);
+        let rs = row_size as i32;
         let mut b = func.builder();
         b.arg(input);
         b.arg(&w);
         b.arg(output);
-        b.arg(&(row_size as i32));
+        b.arg(&rs);
         b.arg(&eps);
         unsafe {
             b.launch(LaunchConfig {
@@ -561,6 +563,9 @@ impl CudaDecodeRunner {
         let func = device.get_or_load_custom_func("rope_f16", "rope", ptx::ROPE)?;
         let qv = q.slice(..);
         let kv = k.slice(..);
+        let nqi = nq as i32;
+        let nki = nk as i32;
+        let hdi = hd as i32;
         let mut b = func.builder();
         b.arg(&qv);
         b.arg(&kv);
@@ -568,9 +573,9 @@ impl CudaDecodeRunner {
         b.arg(sin);
         b.arg(q_out);
         b.arg(k_out);
-        b.arg(&(nq as i32));
-        b.arg(&(nk as i32));
-        b.arg(&(hd as i32));
+        b.arg(&nqi);
+        b.arg(&nki);
+        b.arg(&hdi);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: ((nq + nk) as u32, 1, 1),
@@ -603,16 +608,21 @@ impl CudaDecodeRunner {
         let qv = q.slice(..);
         let kv = kc.slice(..);
         let vv = vc.slice(..);
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let mki = max_kv as i32;
+        let vki = valid_kv as i32;
         let mut b = func.builder();
         b.arg(&qv);
         b.arg(&kv);
         b.arg(&vv);
         b.arg(output);
-        b.arg(&(nq as i32));
-        b.arg(&(nkv as i32));
-        b.arg(&(hd as i32));
-        b.arg(&(max_kv as i32));
-        b.arg(&(valid_kv as i32));
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mki);
+        b.arg(&vki);
         b.arg(&scale);
         unsafe {
             b.launch(LaunchConfig {
@@ -643,13 +653,14 @@ impl CudaDecodeRunner {
         let iv = input.slice(..);
         let rv = residual.slice(..);
         let wv = weight.slice(..);
+        let hi = h as i32;
         let mut b = func.builder();
         b.arg(&iv);
         b.arg(&rv);
         b.arg(&wv);
         b.arg(output);
         b.arg(residual_out);
-        b.arg(&(h as i32));
+        b.arg(&hi);
         b.arg(&eps);
         unsafe {
             b.launch(LaunchConfig {
@@ -674,11 +685,12 @@ impl CudaDecodeRunner {
             "fused_silu_mul",
             ptx::FUSED_SILU_MUL,
         )?;
+        let ni = n as i32;
         let mut b = func.builder();
         b.arg(gate);
         b.arg(up);
         b.arg(output);
-        b.arg(&(n as i32));
+        b.arg(&ni);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (((n + 255) / 256) as u32, 1, 1),
@@ -704,11 +716,12 @@ impl CudaDecodeRunner {
         )?;
         let av = a.slice(..);
         let bv = b_.slice(..);
+        let ni = n as i32;
         let mut b = func.builder();
         b.arg(&av);
         b.arg(&bv);
         b.arg(output);
-        b.arg(&(n as i32));
+        b.arg(&ni);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (((n + 255) / 256) as u32, 1, 1),
