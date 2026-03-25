@@ -188,8 +188,8 @@ impl CudaDecodeRunner {
             .memcpy_dtod(&embed_view, &mut self.buffers.residual)
             .map_err(|e| candle_core::Error::Msg(format!("residual init: {e}")))?;
 
-        // Get KV state for this sequence
-        let kv_state = self.kv_states.get_mut(cache_key).ok_or_else(|| {
+        // Take KV state out of HashMap to avoid borrow conflicts with self.launch_*
+        let mut kv_state = self.kv_states.remove(cache_key).ok_or_else(|| {
             candle_core::Error::Msg(format!("No KV cache for sequence: {cache_key}"))
         })?;
 
@@ -202,7 +202,8 @@ impl CudaDecodeRunner {
             let lw = &self.weights.layers[layer_idx];
 
             // 2a. Input LayerNorm
-            self.launch_rms_norm(
+            Self::launch_rms_norm(
+                &self.device,
                 &self.buffers.residual,
                 &lw.input_ln_w.slice,
                 &mut self.buffers.norm_out,
@@ -229,7 +230,8 @@ impl CudaDecodeRunner {
 
             // 2d. Q-norm and K-norm
             // Q: treat as [num_q_heads, head_dim], norm each row
-            self.launch_rms_norm_view(
+            Self::launch_rms_norm_view(
+                &self.device,
                 &q_slice,
                 &lw.q_norm_w.slice,
                 &mut self.buffers.q_rotated,
@@ -237,7 +239,8 @@ impl CudaDecodeRunner {
                 eps,
             )?;
             // K: treat as [num_kv_heads, head_dim]
-            self.launch_rms_norm_view(
+            Self::launch_rms_norm_view(
+                &self.device,
                 &k_slice,
                 &lw.k_norm_w.slice,
                 &mut self.buffers.k_rotated,
@@ -258,7 +261,8 @@ impl CudaDecodeRunner {
                 .slice(sin_offset..sin_offset + half_dim);
             // RoPE writes back to q_rotated and k_rotated (in-place via separate out buffers)
             // We need temp buffers for in→out. Reuse norm_out and o_proj_out as temps.
-            self.launch_rope(
+            Self::launch_rope(
+                &self.device,
                 &self.buffers.q_rotated,
                 &self.buffers.k_rotated,
                 &cos_view,
@@ -302,7 +306,8 @@ impl CudaDecodeRunner {
 
             // 2g. Decode attention
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            self.launch_decode_attention(
+            Self::launch_decode_attention(
+                &self.device,
                 &self.buffers.q_rotated,
                 &kv_state.k_caches[layer_idx],
                 &kv_state.v_caches[layer_idx],
@@ -330,7 +335,8 @@ impl CudaDecodeRunner {
             // 2i. Fused add + RMS norm:
             //   residual_updated = o_proj_out + residual
             //   post_norm_out = rms_norm(residual_updated, post_ln_w)
-            self.launch_fused_add_rms_norm(
+            Self::launch_fused_add_rms_norm(
+                &self.device,
                 &self.buffers.o_proj_out,
                 &self.buffers.residual,
                 &lw.post_ln_w.slice,
@@ -360,7 +366,13 @@ impl CudaDecodeRunner {
             // 2k. Fused SiLU * mul
             let gate_view = self.buffers.gate_up_out.slice(..inter);
             let up_view = self.buffers.gate_up_out.slice(inter..2 * inter);
-            self.launch_fused_silu_mul(&gate_view, &up_view, &mut self.buffers.mlp_act, inter)?;
+            Self::launch_fused_silu_mul(
+                &self.device,
+                &gate_view,
+                &up_view,
+                &mut self.buffers.mlp_act,
+                inter,
+            )?;
 
             // 2l. Down projection: [1, inter] @ [h, inter]^T → [1, h]
             crate::cublas::linear_f16(
@@ -375,7 +387,8 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("down gemm: {e}")))?;
 
             // 2m. Residual add: residual = residual + down_out
-            self.launch_residual_add(
+            Self::launch_residual_add(
+                &self.device,
                 &self.buffers.residual,
                 &self.buffers.down_out,
                 &mut self.buffers.norm_out, // temp output
@@ -387,11 +400,13 @@ impl CudaDecodeRunner {
                 .map_err(|e| candle_core::Error::Msg(format!("residual add copy: {e}")))?;
         }
 
-        // Update KV length after processing all layers
+        // Update KV length and re-insert into HashMap
         kv_state.current_len += 1;
+        self.kv_states.insert(cache_key.to_string(), kv_state);
 
         // 3. Final RMS norm
-        self.launch_rms_norm(
+        Self::launch_rms_norm(
+            &self.device,
             &self.buffers.residual,
             &self.weights.final_norm_w.slice,
             &mut self.buffers.final_norm_out,
@@ -531,16 +546,17 @@ impl CudaDecodeRunner {
         let half_dim = head_dim / 2;
         let eps = 1e-6f32;
 
-        let kv_state = self.kv_states.get(cache_key).ok_or_else(|| {
-            candle_core::Error::Msg(format!("No KV cache for capture: {cache_key}"))
-        })?;
-
-        // During capture, use fixed offsets (the actual values don't matter
-        // since the ops are recorded but not executed)
-        let position = kv_state.current_len;
+        // Extract KV state info before the loop to avoid borrow conflicts
+        let (kv_current_len, kv_max_len) = {
+            let kv_state = self.kv_states.get(cache_key).ok_or_else(|| {
+                candle_core::Error::Msg(format!("No KV cache for capture: {cache_key}"))
+            })?;
+            (kv_state.current_len, kv_state.max_len)
+        };
+        let position = kv_current_len;
         let cos_offset = position * half_dim;
         let sin_offset = position * half_dim;
-        let valid_kv_len = kv_state.current_len + 1;
+        let valid_kv_len = kv_current_len + 1;
 
         // Same operation sequence as decode_step, but no CPU-side state updates
         // Embedding lookup (using first token as dummy — address is what matters)
@@ -557,7 +573,8 @@ impl CudaDecodeRunner {
         for layer_idx in 0..self.dims.num_layers {
             let lw = &self.weights.layers[layer_idx];
 
-            self.launch_rms_norm(
+            Self::launch_rms_norm(
+                &self.device,
                 &self.buffers.residual,
                 &lw.input_ln_w.slice,
                 &mut self.buffers.norm_out,
@@ -580,14 +597,16 @@ impl CudaDecodeRunner {
             let k_slice = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
             let v_slice = self.buffers.qkv_out.slice(q_dim + kv_dim..qkv_dim);
 
-            self.launch_rms_norm(
+            Self::launch_rms_norm(
+                &self.device,
                 &q_slice,
                 &lw.q_norm_w.slice,
                 &mut self.buffers.q_rotated,
                 head_dim,
                 eps,
             )?;
-            self.launch_rms_norm(
+            Self::launch_rms_norm(
+                &self.device,
                 &k_slice,
                 &lw.k_norm_w.slice,
                 &mut self.buffers.k_rotated,
@@ -605,7 +624,8 @@ impl CudaDecodeRunner {
                 .rope_sin
                 .slice
                 .slice(sin_offset..sin_offset + half_dim);
-            self.launch_rope(
+            Self::launch_rope(
+                &self.device,
                 &self.buffers.q_rotated,
                 &self.buffers.k_rotated,
                 &cos_view,
@@ -628,35 +648,38 @@ impl CudaDecodeRunner {
 
             // KV cache append
             let kv_head_dim_total = num_kv * head_dim;
-            let kv_offset = kv_state.current_len * kv_head_dim_total;
+            let kv_offset = kv_current_len * kv_head_dim_total;
             {
+                let kv = self.kv_states.get_mut(cache_key).unwrap();
                 let k_src = self.buffers.k_rotated.slice(..kv_dim);
-                let mut k_dst =
-                    kv_state.k_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
+                let mut k_dst = kv.k_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
                 self.stream
                     .memcpy_dtod(&k_src, &mut k_dst)
                     .map_err(|e| candle_core::Error::Msg(format!("capture KV k: {e}")))?;
                 let v_src = v_slice.slice(..kv_dim);
-                let mut v_dst =
-                    kv_state.v_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
+                let mut v_dst = kv.v_caches[layer_idx].slice_mut(kv_offset..kv_offset + kv_dim);
                 self.stream
                     .memcpy_dtod(&v_src, &mut v_dst)
                     .map_err(|e| candle_core::Error::Msg(format!("capture KV v: {e}")))?;
             }
 
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            self.launch_decode_attention(
-                &self.buffers.q_rotated,
-                &kv_state.k_caches[layer_idx],
-                &kv_state.v_caches[layer_idx],
-                &mut self.buffers.attn_out,
-                num_q,
-                num_kv,
-                head_dim,
-                kv_state.max_len,
-                valid_kv_len,
-                scale,
-            )?;
+            {
+                let kv = self.kv_states.get(cache_key).unwrap();
+                Self::launch_decode_attention(
+                    &self.device,
+                    &self.buffers.q_rotated,
+                    &kv.k_caches[layer_idx],
+                    &kv.v_caches[layer_idx],
+                    &mut self.buffers.attn_out,
+                    num_q,
+                    num_kv,
+                    head_dim,
+                    kv_max_len,
+                    valid_kv_len,
+                    scale,
+                )?;
+            }
 
             crate::cublas::linear_f16(
                 &self.blas,
@@ -669,7 +692,8 @@ impl CudaDecodeRunner {
             )
             .map_err(|e| candle_core::Error::Msg(format!("capture O: {e}")))?;
 
-            self.launch_fused_add_rms_norm(
+            Self::launch_fused_add_rms_norm(
+                &self.device,
                 &self.buffers.o_proj_out,
                 &self.buffers.residual,
                 &lw.post_ln_w.slice,
@@ -696,7 +720,13 @@ impl CudaDecodeRunner {
 
             let gate = self.buffers.gate_up_out.slice(..inter);
             let up = self.buffers.gate_up_out.slice(inter..2 * inter);
-            self.launch_fused_silu_mul(&gate, &up, &mut self.buffers.mlp_act, inter)?;
+            Self::launch_fused_silu_mul(
+                &self.device,
+                &gate,
+                &up,
+                &mut self.buffers.mlp_act,
+                inter,
+            )?;
 
             crate::cublas::linear_f16(
                 &self.blas,
@@ -709,7 +739,8 @@ impl CudaDecodeRunner {
             )
             .map_err(|e| candle_core::Error::Msg(format!("capture down: {e}")))?;
 
-            self.launch_residual_add(
+            Self::launch_residual_add(
+                &self.device,
                 &self.buffers.residual,
                 &self.buffers.down_out,
                 &mut self.buffers.norm_out,
@@ -762,7 +793,7 @@ impl CudaDecodeRunner {
     // impl DeviceSlice, because cudarc's builder.arg() requires DeviceRepr.
 
     fn launch_rms_norm(
-        &self,
+        device: &CudaDevice,
         input: &CudaSlice<half::f16>,
         weight: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
@@ -770,9 +801,7 @@ impl CudaDecodeRunner {
         eps: f32,
     ) -> candle_core::Result<()> {
         let num_rows = input.len() / row_size;
-        let func =
-            self.device
-                .get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
+        let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
         let block_size = row_size.min(1024) as u32;
         let row_size_i32 = row_size as i32;
 
@@ -797,7 +826,7 @@ impl CudaDecodeRunner {
     }
 
     fn launch_rms_norm_view(
-        &self,
+        device: &CudaDevice,
         input: &CudaView<half::f16>,
         weight: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
@@ -805,9 +834,7 @@ impl CudaDecodeRunner {
         eps: f32,
     ) -> candle_core::Result<()> {
         let num_rows = input.len() / row_size;
-        let func =
-            self.device
-                .get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
+        let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
         let block_size = row_size.min(1024) as u32;
         let row_size_i32 = row_size as i32;
         let w_view = weight.slice(..);
@@ -830,7 +857,7 @@ impl CudaDecodeRunner {
     }
 
     fn launch_rope(
-        &self,
+        device: &CudaDevice,
         q: &CudaSlice<half::f16>,
         k: &CudaSlice<half::f16>,
         cos: &CudaView<half::f16>,
@@ -841,9 +868,7 @@ impl CudaDecodeRunner {
         num_k_heads: usize,
         head_dim: usize,
     ) -> candle_core::Result<()> {
-        let func = self
-            .device
-            .get_or_load_custom_func("rope_f16", "rope", ptx::ROPE)?;
+        let func = device.get_or_load_custom_func("rope_f16", "rope", ptx::ROPE)?;
         let total_heads = (num_q_heads + num_k_heads) as u32;
         let half_dim = (head_dim / 2).min(1024) as u32;
         let num_q_i32 = num_q_heads as i32;
@@ -875,7 +900,7 @@ impl CudaDecodeRunner {
     }
 
     fn launch_decode_attention(
-        &self,
+        device: &CudaDevice,
         q: &CudaSlice<half::f16>,
         k_cache: &CudaSlice<half::f16>,
         v_cache: &CudaSlice<half::f16>,
@@ -887,7 +912,7 @@ impl CudaDecodeRunner {
         valid_kv_len: usize,
         scale: f32,
     ) -> candle_core::Result<()> {
-        let func = self.device.get_or_load_custom_func(
+        let func = device.get_or_load_custom_func(
             "decode_attention_f16",
             "decode_attention",
             ptx::DECODE_ATTENTION,
@@ -928,7 +953,7 @@ impl CudaDecodeRunner {
     }
 
     fn launch_fused_add_rms_norm(
-        &self,
+        device: &CudaDevice,
         input: &CudaSlice<half::f16>,
         residual: &CudaSlice<half::f16>,
         weight: &CudaSlice<half::f16>,
@@ -937,7 +962,7 @@ impl CudaDecodeRunner {
         hidden_size: usize,
         eps: f32,
     ) -> candle_core::Result<()> {
-        let func = self.device.get_or_load_custom_func(
+        let func = device.get_or_load_custom_func(
             "fused_add_rms_norm_f16",
             "fused_add_rms_norm",
             ptx::FUSED_ADD_RMS_NORM,
@@ -969,13 +994,13 @@ impl CudaDecodeRunner {
     }
 
     fn launch_fused_silu_mul(
-        &self,
+        device: &CudaDevice,
         gate: &CudaView<half::f16>,
         up: &CudaView<half::f16>,
         output: &mut CudaSlice<half::f16>,
         n: usize,
     ) -> candle_core::Result<()> {
-        let func = self.device.get_or_load_custom_func(
+        let func = device.get_or_load_custom_func(
             "fused_silu_mul_f16",
             "fused_silu_mul",
             ptx::FUSED_SILU_MUL,
@@ -1001,13 +1026,13 @@ impl CudaDecodeRunner {
     }
 
     fn launch_residual_add(
-        &self,
+        device: &CudaDevice,
         a: &CudaSlice<half::f16>,
         b: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
         n: usize,
     ) -> candle_core::Result<()> {
-        let func = self.device.get_or_load_custom_func(
+        let func = device.get_or_load_custom_func(
             "residual_add_f16",
             "residual_add",
             ptx::RESIDUAL_ADD,
