@@ -91,46 +91,27 @@ impl CudaDecodeRunner {
     ///
     /// `kv_data`: per-layer (K, V) CudaSlice pairs from prefill, each
     /// [num_kv_heads * prefill_len * head_dim].
+    /// Initialize KV cache for a sequence by taking ownership of cloned CudaSlice buffers.
+    ///
+    /// The CudaSlice are already independent copies (cloned from candle's storage),
+    /// so we just take ownership — no additional D2D memcpy needed.
+    ///
+    /// `kv_data`: per-layer (K, V) CudaSlice pairs, each containing all pre-allocated
+    /// space including the prefill data in the first `prefill_len` positions.
+    /// `max_len`: the allocated max length of each K/V buffer.
     pub fn init_kv_cache(
         &mut self,
         cache_key: &str,
         kv_data: Vec<(CudaSlice<half::f16>, CudaSlice<half::f16>)>,
         prefill_len: usize,
+        max_len: usize,
     ) -> candle_core::Result<()> {
-        let kv_head_dim = self.dims.num_kv_heads * self.dims.head_dim;
-        let max_len = (prefill_len * 8).max(2048).min(self.dims.max_seq_len);
+        let mut k_caches = Vec::with_capacity(kv_data.len());
+        let mut v_caches = Vec::with_capacity(kv_data.len());
 
-        let mut k_caches = Vec::with_capacity(self.dims.num_layers);
-        let mut v_caches = Vec::with_capacity(self.dims.num_layers);
-
-        for (k_src, v_src) in &kv_data {
-            // Allocate full-size KV buffer
-            let mut k_buf = unsafe {
-                self.stream
-                    .alloc::<half::f16>(kv_head_dim * max_len)
-                    .map_err(|e| candle_core::Error::Msg(format!("KV alloc: {e}")))?
-            };
-            let mut v_buf = unsafe {
-                self.stream
-                    .alloc::<half::f16>(kv_head_dim * max_len)
-                    .map_err(|e| candle_core::Error::Msg(format!("KV alloc: {e}")))?
-            };
-
-            // Copy prefill data into the beginning of the buffer
-            let k_src_view = k_src.slice(..kv_head_dim * prefill_len);
-            let mut k_dst_view = k_buf.slice_mut(..kv_head_dim * prefill_len);
-            self.stream
-                .memcpy_dtod(&k_src_view, &mut k_dst_view)
-                .map_err(|e| candle_core::Error::Msg(format!("KV memcpy: {e}")))?;
-
-            let v_src_view = v_src.slice(..kv_head_dim * prefill_len);
-            let mut v_dst_view = v_buf.slice_mut(..kv_head_dim * prefill_len);
-            self.stream
-                .memcpy_dtod(&v_src_view, &mut v_dst_view)
-                .map_err(|e| candle_core::Error::Msg(format!("KV memcpy: {e}")))?;
-
-            k_caches.push(k_buf);
-            v_caches.push(v_buf);
+        for (k, v) in kv_data {
+            k_caches.push(k);
+            v_caches.push(v);
         }
 
         self.kv_states.insert(
