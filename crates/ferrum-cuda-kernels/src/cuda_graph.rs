@@ -9,6 +9,11 @@ use candle_core::cuda_backend::cudarc;
 use cudarc::driver::{CudaSlice, CudaStream};
 
 /// Manages a captured CUDA Graph for decode replay.
+///
+/// Safety: CudaGraph contains raw CUDA pointers (*mut CUgraph_st, *mut CUgraphExec_st)
+/// which don't auto-implement Send/Sync. These pointers are only accessed through
+/// cudarc's safe API and are protected by the executor's Mutex, so cross-thread
+/// transfer is safe.
 pub struct CudaGraphState {
     graph: cudarc::driver::CudaGraph,
     stream: Arc<CudaStream>,
@@ -17,6 +22,11 @@ pub struct CudaGraphState {
     pub valid_kv_len_buf: CudaSlice<u32>,
     uploaded: bool,
 }
+
+// Safety: CUDA graph handles are thread-safe when accessed through a single
+// stream (which we enforce via Mutex<CudaDecodeRunner> in the executor).
+unsafe impl Send for CudaGraphState {}
+unsafe impl Sync for CudaGraphState {}
 
 impl CudaGraphState {
     pub fn begin_capture(stream: &Arc<CudaStream>) -> candle_core::Result<()> {
