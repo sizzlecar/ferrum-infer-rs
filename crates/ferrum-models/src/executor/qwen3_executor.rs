@@ -319,7 +319,7 @@ impl ModelExecutor for Qwen3ModelExecutor {
             let cuda_result = {
                 let mut runner = self.cuda_runner.lock();
                 if let Some(ref mut runner) = *runner {
-                    Some(runner.decode_step(token_id, seq_len, &req_cache_id))
+                    Some(runner.decode_step_graphed(token_id, seq_len, &req_cache_id))
                 } else {
                     None
                 }
