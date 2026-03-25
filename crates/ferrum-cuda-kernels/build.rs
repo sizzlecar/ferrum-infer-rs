@@ -23,6 +23,10 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=kernels/fused_add_rms_norm.cu");
     println!("cargo:rerun-if-changed=kernels/fused_silu_mul.cu");
+    println!("cargo:rerun-if-changed=kernels/rms_norm.cu");
+    println!("cargo:rerun-if-changed=kernels/rope.cu");
+    println!("cargo:rerun-if-changed=kernels/decode_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/residual_add.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -35,6 +39,10 @@ fn main() {
         .kernel_paths(vec![
             "kernels/fused_add_rms_norm.cu",
             "kernels/fused_silu_mul.cu",
+            "kernels/rms_norm.cu",
+            "kernels/rope.cu",
+            "kernels/decode_attention.cu",
+            "kernels/residual_add.cu",
         ])
         .out_dir(out_dir)
         .arg("--expt-relaxed-constexpr")
