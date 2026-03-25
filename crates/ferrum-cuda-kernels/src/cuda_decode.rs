@@ -44,6 +44,8 @@ pub struct CudaDecodeRunner {
     dims: ModelDims,
     kv_states: HashMap<String, SequenceKvState>,
     graphs: Option<PiecewiseGraphs>,
+    /// cuBLAS workspace buffer (must stay alive while graphs use it)
+    _cublas_workspace: Option<CudaSlice<u8>>,
     warmup_count: usize,
     capture_attempted: bool,
 }
@@ -79,6 +81,7 @@ impl CudaDecodeRunner {
             dims,
             kv_states: HashMap::new(),
             graphs: None,
+            _cublas_workspace: None,
             warmup_count: 0,
             capture_attempted: false,
         })
@@ -371,6 +374,42 @@ impl CudaDecodeRunner {
         self.stream
             .synchronize()
             .map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
+
+        // Pre-allocate cuBLAS workspace BEFORE capture.
+        // cuBLAS internally calls cudaMalloc for workspace during GEMM, which is
+        // NOT capture-safe. By setting a pre-allocated workspace, cuBLAS uses it
+        // instead of allocating dynamically during graph capture.
+        // Pre-allocate cuBLAS workspace BEFORE capture.
+        // cuBLAS internally calls cudaMalloc for workspace during GEMM, which is
+        // NOT capture-safe. By setting a pre-allocated workspace via
+        // cublasSetWorkspace_v2, cuBLAS uses it instead of allocating dynamically.
+        let ws_size: usize = 32 * 1024 * 1024; // 32MB
+        let ws_buf = unsafe {
+            self.stream
+                .alloc::<u8>(ws_size)
+                .map_err(|e| candle_core::Error::Msg(format!("cublas ws alloc: {e}")))?
+        };
+        {
+            use cudarc::driver::DevicePtr;
+            let (ws_ptr, _guard) = ws_buf.device_ptr(&self.stream);
+            unsafe {
+                let status = cudarc::cublas::sys::cublasSetWorkspace_v2(
+                    *self.blas.handle(),
+                    ws_ptr as *mut std::ffi::c_void,
+                    ws_size,
+                );
+                if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    return Err(candle_core::Error::Msg(format!(
+                        "cublasSetWorkspace failed: {status:?}"
+                    )));
+                }
+            }
+        }
+        self._cublas_workspace = Some(ws_buf);
+        tracing::info!(
+            "cuBLAS workspace pre-allocated: {}MB",
+            ws_size / (1024 * 1024)
+        );
 
         let n = self.dims.num_layers;
         let mut pre = Vec::with_capacity(n);
