@@ -159,11 +159,29 @@ impl CudaDecodeRunner {
 
         // 1. Embedding lookup: copy row token_id from embed table
         let embed_offset = (token_id as usize) * h;
+        tracing::debug!(
+            "decode_step: token={}, pos={}, embed_table.len={}, embed_offset={}, h={}, \
+             qkv_out.len={}, qkv_dim={}, buffers.residual.len={}",
+            token_id,
+            position,
+            self.weights.embed_table.slice.len(),
+            embed_offset,
+            h,
+            self.buffers.qkv_out.len(),
+            qkv_dim,
+            self.buffers.residual.len(),
+        );
         let embed_src = self
             .weights
             .embed_table
             .slice
-            .slice(embed_offset..embed_offset + h);
+            .try_slice(embed_offset..embed_offset + h)
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "embed slice OOB: offset={embed_offset}, h={h}, len={}",
+                    self.weights.embed_table.slice.len()
+                ))
+            })?;
         self.stream
             .memcpy_dtod(&embed_src, &mut self.buffers.embed_out)
             .map_err(|e| candle_core::Error::Msg(format!("embed memcpy: {e}")))?;

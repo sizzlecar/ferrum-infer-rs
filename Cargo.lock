@@ -1323,6 +1323,7 @@ dependencies = [
  "ferrum-types",
  "futures",
  "futures-util",
+ "half",
  "hf-hub",
  "indicatif",
  "once_cell",
