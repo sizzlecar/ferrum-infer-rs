@@ -112,6 +112,72 @@ impl Qwen3ModelExecutor {
         debug!("Released KV cache for sequence: {}", cache_id);
     }
 
+    /// Ensure the CUDA decode runner has KV cache for a sequence.
+    /// On first call for a sequence, migrates KV data from candle's PreAllocKvCache.
+    #[cfg(feature = "cuda")]
+    fn ensure_runner_kv_cache(&self, cache_id: &str, _seq_len: usize) -> Result<()> {
+        use candle_core::Storage;
+
+        let mut runner_guard = self.cuda_runner.lock();
+        let runner = match runner_guard.as_mut() {
+            Some(r) => r,
+            None => return Ok(()), // No runner, will fall through to candle
+        };
+
+        // Check if runner already has KV cache for this sequence
+        if runner.has_kv_cache(cache_id) {
+            return Ok(());
+        }
+
+        // Export KV data from candle model
+        let kv_data_tensors = self.model.export_kv_cache(cache_id).ok_or_else(|| {
+            FerrumError::model(format!("No candle KV cache to export for: {cache_id}"))
+        })?;
+
+        if kv_data_tensors.is_empty() {
+            return Err(FerrumError::model("Empty KV cache export"));
+        }
+        let prefill_len = kv_data_tensors[0].2;
+
+        // Extract CudaSlice from each layer's K/V tensors
+        let mut kv_slices = Vec::new();
+        for (k_tensor, v_tensor, _len) in &kv_data_tensors {
+            let k_tensor = k_tensor
+                .contiguous()
+                .map_err(|e| FerrumError::model(format!("KV cache contiguous failed: {e}")))?;
+            let v_tensor = v_tensor
+                .contiguous()
+                .map_err(|e| FerrumError::model(format!("KV cache contiguous failed: {e}")))?;
+
+            let (k_s, _) = k_tensor.storage_and_layout();
+            let (v_s, _) = v_tensor.storage_and_layout();
+            let k_cuda = match &*k_s {
+                Storage::Cuda(cs) => cs
+                    .as_cuda_slice::<half::f16>()
+                    .map_err(|e| FerrumError::model(format!("KV slice extract: {e}")))?
+                    .clone(),
+                _ => return Err(FerrumError::model("KV cache not on CUDA")),
+            };
+            let v_cuda = match &*v_s {
+                Storage::Cuda(cs) => cs
+                    .as_cuda_slice::<half::f16>()
+                    .map_err(|e| FerrumError::model(format!("KV slice extract: {e}")))?
+                    .clone(),
+                _ => return Err(FerrumError::model("KV cache not on CUDA")),
+            };
+            drop(k_s);
+            drop(v_s);
+            kv_slices.push((k_cuda, v_cuda));
+        }
+
+        runner
+            .init_kv_cache(cache_id, kv_slices, prefill_len)
+            .map_err(|e| FerrumError::model(format!("CUDA runner KV init failed: {e}")))?;
+
+        debug!("Migrated KV cache to CUDA runner for sequence: {cache_id}");
+        Ok(())
+    }
+
     fn tensor_to_tokens(&self, tensor: &TensorRef) -> Result<Vec<u32>> {
         if let Ok(tokens) = tensor.to_vec_u32() {
             if tokens.is_empty() {
@@ -247,17 +313,25 @@ impl ModelExecutor for Qwen3ModelExecutor {
             return Err(FerrumError::model("Decode input is empty"));
         }
 
-        // Try CUDA decode runner path (bypasses candle for the hot path)
+        // Try CUDA decode runner path (bypasses candle for the hot path).
+        // Falls back to candle if runner fails (e.g., KV cache not yet initialized).
         #[cfg(feature = "cuda")]
         if tokens.len() == 1 && self.ensure_cuda_runner() {
             let token_id = tokens[0];
-            let mut runner = self.cuda_runner.lock();
-            if let Some(ref mut runner) = *runner {
-                // Use graph-accelerated decode if available, else direct CUDA
-                let logits_slice = runner
-                    .decode_step_graphed(token_id, seq_len, &req_cache_id)
-                    .map_err(|e| FerrumError::model(format!("CUDA decode failed: {}", e)))?;
 
+            // Ensure CUDA runner has KV cache for this sequence
+            // (migrated from candle's PreAllocKvCache on first decode call)
+            self.ensure_runner_kv_cache(&req_cache_id, seq_len)?;
+
+            let cuda_result = {
+                let mut runner = self.cuda_runner.lock();
+                if let Some(ref mut runner) = *runner {
+                    Some(runner.decode_step(token_id, seq_len, &req_cache_id))
+                } else {
+                    None
+                }
+            };
+            if let Some(Ok(logits_slice)) = cuda_result {
                 // Wrap CudaSlice into candle Tensor (zero-copy, stays on GPU)
                 let cuda_dev = self
                     .model
@@ -289,6 +363,9 @@ impl ModelExecutor for Qwen3ModelExecutor {
                 let new_handle = Arc::new(input_handle.with_sequence_length(new_seq_len));
 
                 return Ok(DecodeOutput::new(logits_ref, new_handle));
+            } else if let Some(Err(e)) = cuda_result {
+                // CUDA runner failed — log and fall through to candle path
+                tracing::debug!("CUDA decode runner failed, falling back to candle: {e}");
             }
         }
 
