@@ -415,6 +415,67 @@ impl CudaDecodeRunner {
         let mut pre = Vec::with_capacity(n);
         let mut post = Vec::with_capacity(n);
 
+        // Diagnostic: try capturing individual operations to find what fails
+        tracing::info!("Testing individual capture compatibility...");
+
+        // Test 1: custom kernel only (rms_norm)
+        match self.capture_one("test_rms_norm", |s| {
+            let h = s.dims.hidden_size;
+            Self::launch_rms_norm(
+                &s.device,
+                &s.buffers.residual,
+                &s.weights.layers[0].input_ln_w.slice,
+                &mut s.buffers.norm_out,
+                h,
+                1e-6,
+            )
+        }) {
+            Ok(_g) => tracing::info!("  rms_norm capture: OK"),
+            Err(e) => tracing::error!("  rms_norm capture: FAILED — {e}"),
+        }
+
+        // Test 2: cuBLAS GEMM only
+        match self.capture_one("test_cublas", |s| {
+            let h = s.dims.hidden_size;
+            let qkv_dim = s.dims.num_attention_heads * s.dims.head_dim
+                + 2 * s.dims.num_kv_heads * s.dims.head_dim;
+            crate::cublas::linear_f16(
+                &s.blas,
+                &s.buffers.norm_out,
+                &s.weights.layers[0].qkv_w.slice,
+                &mut s.buffers.qkv_out,
+                1,
+                qkv_dim as i32,
+                h as i32,
+            )
+        }) {
+            Ok(_g) => tracing::info!("  cuBLAS GEMM capture: OK"),
+            Err(e) => tracing::error!("  cuBLAS GEMM capture: FAILED — {e}"),
+        }
+
+        // Test 3: custom kernel (rope)
+        match self.capture_one("test_rope", |s| {
+            let hd = s.dims.head_dim;
+            let half_dim = hd / 2;
+            let cos = s.weights.rope_cos.slice.slice(0..half_dim);
+            let sin = s.weights.rope_sin.slice.slice(0..half_dim);
+            Self::launch_rope(
+                &s.device,
+                &s.buffers.rope_q_temp,
+                &s.buffers.rope_k_temp,
+                &cos,
+                &sin,
+                &mut s.buffers.q_rotated,
+                &mut s.buffers.k_rotated,
+                s.dims.num_attention_heads,
+                s.dims.num_kv_heads,
+                hd,
+            )
+        }) {
+            Ok(_g) => tracing::info!("  rope capture: OK"),
+            Err(e) => tracing::error!("  rope capture: FAILED — {e}"),
+        }
+
         for li in 0..n {
             let g =
                 self.capture_one(&format!("pre_attn L{li}"), |s| s.pre_attention_eager(li, 0))?;
