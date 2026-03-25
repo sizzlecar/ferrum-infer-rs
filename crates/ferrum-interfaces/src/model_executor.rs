@@ -205,6 +205,15 @@ pub trait ModelExecutor: Send + Sync {
         // Default no-op implementation
         Ok(())
     }
+
+    /// Release KV cache and state for a completed sequence.
+    ///
+    /// Called by the engine when a request finishes (success or error) to free
+    /// GPU memory held by the sequence's KV cache. The `cache_id` matches the
+    /// value embedded in the `KvCacheHandle` returned by prefill/decode.
+    fn release_cache(&self, _cache_id: &str) {
+        // Default no-op — executors that manage per-sequence KV caches should override.
+    }
 }
 
 /// Executor capabilities and configuration

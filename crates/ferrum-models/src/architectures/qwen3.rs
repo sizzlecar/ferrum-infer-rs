@@ -8,6 +8,7 @@ use candle_core::{DType, Device as CandleDevice, Module, Result as CandleResult,
 use candle_nn::{Activation, VarBuilder};
 use ferrum_types::{FerrumError, Result};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -318,7 +319,7 @@ struct Attention {
     kv_dim: usize, // num_kv_heads * head_dim
     max_position_embeddings: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<PreAllocKvCache>,
+    kv_caches: HashMap<String, PreAllocKvCache>,
 }
 
 impl Attention {
@@ -352,7 +353,7 @@ impl Attention {
             kv_dim,
             max_position_embeddings: cfg.max_position_embeddings,
             rotary_emb,
-            kv_cache: None,
+            kv_caches: HashMap::new(),
         })
     }
 
@@ -361,6 +362,7 @@ impl Attention {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        cache_key: &str,
     ) -> CandleResult<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -395,17 +397,17 @@ impl Attention {
         let v_for_cache = value_states.transpose(1, 2)?.contiguous()?;
 
         // Update pre-allocated cache (O(1) write) or create it (first call)
-        let (k_view, v_view) = match &mut self.kv_cache {
-            Some(cache) => cache.append(&k_for_cache, &v_for_cache)?,
-            None => {
-                // First call: allocate cache sized to seq_len*8 (capped)
-                let alloc_len = (q_len * 8).max(2048).min(self.max_position_embeddings);
-                let cache = PreAllocKvCache::new(&k_for_cache, &v_for_cache, alloc_len)?;
-                let k_v = cache.k.narrow(1, 0, cache.current_len)?;
-                let v_v = cache.v.narrow(1, 0, cache.current_len)?;
-                self.kv_cache = Some(cache);
-                (k_v, v_v)
-            }
+        // Each sequence gets its own KV cache keyed by cache_key.
+        let (k_view, v_view) = if let Some(cache) = self.kv_caches.get_mut(cache_key) {
+            cache.append(&k_for_cache, &v_for_cache)?
+        } else {
+            // First call for this sequence: allocate cache
+            let alloc_len = (q_len * 8).max(2048).min(self.max_position_embeddings);
+            let cache = PreAllocKvCache::new(&k_for_cache, &v_for_cache, alloc_len)?;
+            let k_v = cache.k.narrow(1, 0, cache.current_len)?;
+            let v_v = cache.v.narrow(1, 0, cache.current_len)?;
+            self.kv_caches.insert(cache_key.to_string(), cache);
+            (k_v, v_v)
         };
         // k_view, v_view: [batch, total_seq, kv_heads, head_dim] — zero-copy narrow views
 
@@ -482,7 +484,11 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
+        self.kv_caches.clear();
+    }
+
+    fn clear_kv_cache_for(&mut self, cache_key: &str) {
+        self.kv_caches.remove(cache_key);
     }
 }
 
@@ -518,10 +524,13 @@ impl DecoderLayer {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        cache_key: &str,
     ) -> CandleResult<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+        let xs = self
+            .self_attn
+            .forward(&xs, attention_mask, seqlen_offset, cache_key)?;
         // Fused residual-add + RMS norm: 2 kernel launches → 1, saves 1 memory round-trip
         #[cfg(feature = "cuda")]
         let (xs, residual) = {
@@ -546,6 +555,10 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache()
+    }
+
+    fn clear_kv_cache_for(&mut self, cache_key: &str) {
+        self.self_attn.clear_kv_cache_for(cache_key)
     }
 }
 
@@ -605,6 +618,7 @@ impl Model {
         input_ids: &Tensor,
         seqlen_offset: usize,
         _attn_mask: Option<&Tensor>,
+        cache_key: &str,
     ) -> CandleResult<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
         let attention_mask = if seq_len <= 1 {
@@ -614,7 +628,7 @@ impl Model {
         };
         let mut xs = self.embed_tokens.forward(input_ids)?;
         for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset, cache_key)?
         }
         xs.apply(&self.norm)
     }
@@ -622,6 +636,12 @@ impl Model {
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
+        }
+    }
+
+    pub fn clear_kv_cache_for(&mut self, cache_key: &str) {
+        for layer in self.layers.iter_mut() {
+            layer.clear_kv_cache_for(cache_key)
         }
     }
 }
@@ -648,16 +668,25 @@ impl ModelForCausalLM {
         })
     }
 
-    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> CandleResult<Tensor> {
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        cache_key: &str,
+    ) -> CandleResult<Tensor> {
         let (_b_size, seq_len) = input_ids.dims2()?;
         self.base_model
-            .forward(input_ids, seqlen_offset, None)?
+            .forward(input_ids, seqlen_offset, None, cache_key)?
             .narrow(1, seq_len - 1, 1)?
             .apply(&self.lm_head)
     }
 
     pub fn clear_kv_cache(&mut self) {
         self.base_model.clear_kv_cache()
+    }
+
+    pub fn clear_kv_cache_for(&mut self, cache_key: &str) {
+        self.base_model.clear_kv_cache_for(cache_key)
     }
 }
 
@@ -754,23 +783,28 @@ impl Qwen3ModelWrapper {
         })
     }
 
-    pub fn forward_prefill(&self, input_ids: &Tensor) -> Result<Tensor> {
+    pub fn forward_prefill(&self, input_ids: &Tensor, cache_key: &str) -> Result<Tensor> {
         let mut model = self.model.lock();
+        model.clear_kv_cache_for(cache_key);
         model
-            .forward(input_ids, 0)
+            .forward(input_ids, 0, cache_key)
             .map_err(|e| FerrumError::model(format!("Prefill forward failed: {}", e)))
     }
 
-    pub fn forward_decode(&self, token_id: &Tensor, pos: usize) -> Result<Tensor> {
+    pub fn forward_decode(&self, token_id: &Tensor, pos: usize, cache_key: &str) -> Result<Tensor> {
         let mut model = self.model.lock();
         model
-            .forward(token_id, pos)
+            .forward(token_id, pos, cache_key)
             .map_err(|e| FerrumError::model(format!("Decode forward failed: {}", e)))
     }
 
-    pub fn reset_cache(&self) -> Result<()> {
+    /// Release KV cache for a completed sequence, freeing GPU memory.
+    pub fn release_cache(&self, cache_key: &str) {
+        self.model.lock().clear_kv_cache_for(cache_key);
+    }
+
+    pub fn reset_all_caches(&self) {
         self.model.lock().clear_kv_cache();
-        Ok(())
     }
 
     pub fn config(&self) -> &Config {

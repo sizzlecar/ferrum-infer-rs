@@ -57,6 +57,8 @@ pub struct SequenceState {
     pub json_processor: Option<Arc<JsonModeProcessor>>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
+    /// Model executor's KV cache key for this sequence (for cleanup on completion).
+    pub model_cache_id: Option<String>,
 }
 
 impl SequenceState {
@@ -84,6 +86,7 @@ impl SequenceState {
             preemption_count: 0,
             json_processor,
             token_frequencies: HashMap::new(),
+            model_cache_id: None,
         }
     }
 
@@ -312,7 +315,17 @@ impl EngineInner {
 
         info!("Preempting request {} to free KV blocks", victim_id);
 
-        // Free KV cache
+        // Free model executor's KV cache for this sequence
+        {
+            let sequences = self.sequences.read();
+            if let Some(seq) = sequences.get(&victim_id) {
+                if let Some(ref cache_id) = seq.model_cache_id {
+                    self.model_executor.release_cache(cache_id);
+                }
+            }
+        }
+
+        // Free KV cache manager blocks
         let _ = self.kv_cache.deallocate(victim_id.clone()).await;
 
         // Reset sequence state — keep response/stream channels intact
@@ -320,6 +333,7 @@ impl EngineInner {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(&victim_id) {
                 seq.kv_cache = None;
+                seq.model_cache_id = None;
                 seq.generated_tokens.clear();
                 seq.prefill_complete = false;
                 seq.phase = RequestPhase::Waiting;
@@ -383,6 +397,7 @@ impl EngineInner {
                 let mut logits = cached_logits;
                 let token = seq.sample_with_processors(&mut logits)?;
                 seq.generated_tokens.push(token);
+                seq.model_cache_id = Some(cloned_kv.cache_id());
                 seq.kv_cache = Some(cloned_kv);
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
@@ -474,6 +489,7 @@ impl EngineInner {
             let mut logits = logits_vec;
             let token = seq.sample_with_processors(&mut logits)?;
             seq.generated_tokens.push(token);
+            seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
             seq.kv_cache = Some(prefill_output.kv_cache.clone());
             seq.prefill_complete = true;
             seq.phase = RequestPhase::Decoding;
@@ -620,7 +636,7 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
     ) -> Result<()> {
-        let (response, stream_sender, response_sender, has_kv_cache) = {
+        let (response, stream_sender, response_sender, has_kv_cache, model_cache_id) = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.remove(request_id) {
                 let text = self
@@ -640,11 +656,23 @@ impl EngineInner {
                 };
 
                 let has_kv = seq.kv_cache.is_some();
-                (response, seq.stream_sender, seq.response_sender, has_kv)
+                let cache_id = seq.model_cache_id.clone();
+                (
+                    response,
+                    seq.stream_sender,
+                    seq.response_sender,
+                    has_kv,
+                    cache_id,
+                )
             } else {
                 return Ok(());
             }
         };
+
+        // Release model executor's KV cache for this sequence (frees GPU memory).
+        if let Some(ref cache_id) = model_cache_id {
+            self.model_executor.release_cache(cache_id);
+        }
 
         if has_kv_cache {
             let _ = self.kv_cache.deallocate(request_id.clone()).await;

@@ -13,6 +13,7 @@ use ferrum_interfaces::{
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
 use parking_lot::Mutex;
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -26,14 +27,17 @@ use crate::{architectures::qwen3::Qwen3ModelWrapper, tensor_wrapper::CandleTenso
 #[derive(Debug, Clone)]
 struct Qwen3CacheState {
     sequence_length: usize,
-    cache_id: String,
 }
 
-/// Candle-based Qwen3 model executor
+/// Candle-based Qwen3 model executor with multi-sequence support.
+///
+/// Each active sequence gets its own KV cache keyed by a unique cache_id.
+/// This allows concurrent prefill and decode across many sequences without
+/// one sequence's prefill destroying another's KV cache.
 pub struct Qwen3ModelExecutor {
     model: Arc<Qwen3ModelWrapper>,
     info: ModelInfo,
-    state: Mutex<Option<Qwen3CacheState>>,
+    states: Mutex<HashMap<String, Qwen3CacheState>>,
     next_cache_id: AtomicU64,
 }
 
@@ -44,9 +48,17 @@ impl Qwen3ModelExecutor {
         Self {
             model: Arc::new(model),
             info,
-            state: Mutex::new(None),
+            states: Mutex::new(HashMap::new()),
             next_cache_id: AtomicU64::new(1),
         }
+    }
+
+    /// Release a sequence's KV cache, freeing GPU memory.
+    /// Should be called when a request completes.
+    pub fn release_sequence(&self, cache_id: &str) {
+        self.states.lock().remove(cache_id);
+        self.model.release_cache(cache_id);
+        debug!("Released KV cache for sequence: {}", cache_id);
     }
 
     fn tensor_to_tokens(&self, tensor: &TensorRef) -> Result<Vec<u32>> {
@@ -112,13 +124,17 @@ impl ModelExecutor for Qwen3ModelExecutor {
             return Err(FerrumError::model("Prefill input is empty"));
         }
 
-        self.model.reset_cache()?;
+        let cache_id = format!(
+            "qwen3-cache-{}",
+            self.next_cache_id.fetch_add(1, Ordering::Relaxed)
+        );
 
         let input_tensor = self.tokens_to_tensor(&tokens)?;
 
+        // Each sequence gets its own KV cache slot; no need to clear other sequences.
         let logits = self
             .model
-            .forward_prefill(&input_tensor)
+            .forward_prefill(&input_tensor, &cache_id)
             .map_err(|e| FerrumError::model(format!("Qwen3 prefill failed: {}", e)))?;
 
         let logits = match logits.dims().len() {
@@ -137,11 +153,6 @@ impl ModelExecutor for Qwen3ModelExecutor {
 
         let logits_ref = self.wrap_tensor(logits);
 
-        let cache_id = format!(
-            "qwen3-cache-{}",
-            self.next_cache_id.fetch_add(1, Ordering::Relaxed)
-        );
-
         let kv_handle = Arc::new(Qwen3KvCacheHandle::new(
             self.model.config(),
             self.model.device().clone(),
@@ -149,10 +160,12 @@ impl ModelExecutor for Qwen3ModelExecutor {
             cache_id.clone(),
         ));
 
-        *self.state.lock() = Some(Qwen3CacheState {
-            sequence_length: tokens.len(),
+        self.states.lock().insert(
             cache_id,
-        });
+            Qwen3CacheState {
+                sequence_length: tokens.len(),
+            },
+        );
 
         Ok(PrefillOutput::new(logits_ref, kv_handle))
     }
@@ -160,23 +173,23 @@ impl ModelExecutor for Qwen3ModelExecutor {
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         debug!("Qwen3 Decode: batch={}", input.batch_size());
 
-        let mut guard = self.state.lock();
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| FerrumError::model("Decode called before prefill"))?;
-
         let input_handle = input
             .kv_cache
             .as_any()
             .downcast_ref::<Qwen3KvCacheHandle>()
             .ok_or_else(|| FerrumError::model("Invalid KV cache handle type for Qwen3 executor"))?;
-        if input_handle.request_cache_id() != state.cache_id {
-            return Err(FerrumError::model(format!(
-                "KV cache handle mismatch: expected {}, got {}",
-                state.cache_id,
-                input_handle.request_cache_id()
-            )));
-        }
+        let req_cache_id = input_handle.request_cache_id().to_string();
+
+        let seq_len = {
+            let states = self.states.lock();
+            let state = states.get(&req_cache_id).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Decode called for unknown sequence: {}",
+                    req_cache_id
+                ))
+            })?;
+            state.sequence_length
+        };
 
         let tokens = self.tensor_to_tokens(&input.input_ids)?;
         if tokens.is_empty() {
@@ -187,24 +200,32 @@ impl ModelExecutor for Qwen3ModelExecutor {
 
         let logits = self
             .model
-            .forward_decode(&input_tensor, state.sequence_length)
+            .forward_decode(&input_tensor, seq_len, &req_cache_id)
             .map_err(|e| FerrumError::model(format!("Qwen3 decode failed: {}", e)))?;
 
         let logits_ref = self.wrap_tensor(logits);
 
-        state.sequence_length += tokens.len();
-        let new_handle = Arc::new(input_handle.with_sequence_length(state.sequence_length));
+        let new_seq_len = {
+            let mut states = self.states.lock();
+            if let Some(state) = states.get_mut(&req_cache_id) {
+                state.sequence_length += tokens.len();
+                state.sequence_length
+            } else {
+                seq_len + tokens.len()
+            }
+        };
+        let new_handle = Arc::new(input_handle.with_sequence_length(new_seq_len));
 
         Ok(DecodeOutput::new(logits_ref, new_handle))
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities {
-            max_batch_size: 1,
+            max_batch_size: 256,
             max_sequence_length: self.info.max_sequence_length,
             attention_mechanisms: vec![AttentionType::MultiHead, AttentionType::GroupedQuery],
-            supports_dynamic_batching: false,
-            supports_continuous_batching: false,
+            supports_dynamic_batching: true,
+            supports_continuous_batching: true,
             supports_speculative_decoding: false,
             supports_tensor_parallelism: false,
             supports_pipeline_parallelism: false,
@@ -217,6 +238,10 @@ impl ModelExecutor for Qwen3ModelExecutor {
                 overhead_memory: 256 * 1024 * 1024,
             },
         }
+    }
+
+    fn release_cache(&self, cache_id: &str) {
+        self.release_sequence(cache_id);
     }
 
     fn status(&self) -> ExecutorStatus {
@@ -351,9 +376,6 @@ impl KvCacheHandle for Qwen3KvCacheHandle {
     }
 
     fn cache_id(&self) -> String {
-        format!(
-            "{}-{}",
-            self.request_cache_id, self.block_table.sequence_length
-        )
+        self.request_cache_id.clone()
     }
 }
