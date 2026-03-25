@@ -339,6 +339,40 @@ impl CudaDecodeRunner {
 
     // ======================== Piecewise Graph Capture ========================
 
+    /// Helper: capture a single graph segment. Always calls end_capture even on error.
+    fn capture_one<F>(
+        &mut self,
+        label: &str,
+        f: F,
+    ) -> candle_core::Result<cudarc::driver::CudaGraph>
+    where
+        F: FnOnce(&mut Self) -> candle_core::Result<()>,
+    {
+        let mode = cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+        let flags = cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+
+        self.stream
+            .begin_capture(mode)
+            .map_err(|e| candle_core::Error::Msg(format!("{label} begin: {e}")))?;
+
+        let result = f(self);
+
+        // ALWAYS end capture, even if f() failed
+        let graph = self.stream.end_capture(flags);
+
+        // Check f() result first
+        result?;
+
+        match graph {
+            Ok(Some(g)) => {
+                g.upload().ok();
+                Ok(g)
+            }
+            Ok(None) => Err(candle_core::Error::Msg(format!("{label} empty"))),
+            Err(e) => Err(candle_core::Error::Msg(format!("{label} end: {e}"))),
+        }
+    }
+
     fn capture_piecewise_graphs(&mut self) -> candle_core::Result<()> {
         self.stream
             .synchronize()
@@ -347,50 +381,18 @@ impl CudaDecodeRunner {
         let n = self.dims.num_layers;
         let mut pre = Vec::with_capacity(n);
         let mut post = Vec::with_capacity(n);
-        let mode = cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 
         for li in 0..n {
-            // Pre-attention graph
-            self.stream
-                .begin_capture(mode)
-                .map_err(|e| candle_core::Error::Msg(format!("pre begin L{li}: {e}")))?;
-            self.pre_attention_eager(li, 0)?;
-            match self.stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH) {
-                Ok(Some(g)) => {
-                    g.upload().ok();
-                    pre.push(g);
-                }
-                Ok(None) => return Err(candle_core::Error::Msg(format!("pre empty L{li}"))),
-                Err(e) => return Err(candle_core::Error::Msg(format!("pre end L{li}: {e}"))),
-            }
+            let g =
+                self.capture_one(&format!("pre_attn L{li}"), |s| s.pre_attention_eager(li, 0))?;
+            pre.push(g);
 
-            // Post-attention graph
-            self.stream
-                .begin_capture(mode)
-                .map_err(|e| candle_core::Error::Msg(format!("post begin L{li}: {e}")))?;
-            self.post_attention_eager(li)?;
-            match self.stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH) {
-                Ok(Some(g)) => {
-                    g.upload().ok();
-                    post.push(g);
-                }
-                Ok(None) => return Err(candle_core::Error::Msg(format!("post empty L{li}"))),
-                Err(e) => return Err(candle_core::Error::Msg(format!("post end L{li}: {e}"))),
-            }
+            let g =
+                self.capture_one(&format!("post_attn L{li}"), |s| s.post_attention_eager(li))?;
+            post.push(g);
         }
 
-        // Final graph
-        self.stream
-            .begin_capture(mode)
-            .map_err(|e| candle_core::Error::Msg(format!("final begin: {e}")))?;
-        self.final_eager()?;
-        let fg = self
-            .stream
-            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-            .map_err(|e| candle_core::Error::Msg(format!("final end: {e}")))?;
-        if let Some(ref g) = fg {
-            g.upload().ok();
-        }
+        let fg = self.capture_one("final", |s| s.final_eager()).ok(); // final graph is optional
 
         tracing::info!(
             "Piecewise graphs captured: {} pre + {} post + final",
@@ -437,7 +439,9 @@ impl CudaDecodeRunner {
         position: usize,
         cache_key: &str,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        const WARMUP: usize = 3;
+        // vLLM uses multiple warmup runs to ensure cuBLAS workspace allocation
+        // and JIT compilation are complete before graph capture.
+        const WARMUP: usize = 5;
 
         if self.warmup_count < WARMUP {
             self.warmup_count += 1;
