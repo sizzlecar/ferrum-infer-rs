@@ -12,6 +12,7 @@ use candle_core::{DType, Device as CandleDevice, IndexOp, Tensor, D};
 use candle_nn::{embedding, linear, linear_no_bias, Embedding, Linear, Module, VarBuilder};
 use ferrum_models::architectures::qwen2::Qwen2ModelWrapper;
 use ferrum_types::{FerrumError, Result};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
@@ -254,7 +255,7 @@ struct MetalQwen2Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_caches: HashMap<String, (Tensor, Tensor)>,
 }
 
 impl MetalQwen2Attention {
@@ -302,7 +303,7 @@ impl MetalQwen2Attention {
             num_heads: config.num_attention_heads,
             num_kv_heads,
             head_dim,
-            kv_cache: None,
+            kv_caches: HashMap::new(),
         })
     }
 
@@ -312,6 +313,7 @@ impl MetalQwen2Attention {
         rope: &Qwen2RotaryEmbedding,
         start_pos: usize,
         mask: Option<&Tensor>,
+        cache_key: &str,
     ) -> Result<Tensor> {
         let (batch, seq_len, _) = x
             .dims3()
@@ -353,8 +355,8 @@ impl MetalQwen2Attention {
         // Apply rotary embeddings (already in F32)
         let (q, k) = rope.apply(&q, &k, start_pos)?;
 
-        // Update KV cache
-        let (k, v) = if let Some((prev_k, prev_v)) = &self.kv_cache {
+        // Update KV cache — each sequence gets its own slot keyed by cache_key
+        let (k, v) = if let Some((prev_k, prev_v)) = self.kv_caches.get(cache_key) {
             let k = Tensor::cat(&[prev_k, &k], 2)
                 .map_err(|e| FerrumError::model(format!("k cat failed: {}", e)))?;
             let v = Tensor::cat(&[prev_v, &v], 2)
@@ -363,7 +365,8 @@ impl MetalQwen2Attention {
         } else {
             (k, v)
         };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        self.kv_caches
+            .insert(cache_key.to_string(), (k.clone(), v.clone()));
 
         // Repeat KV for GQA
         let k = self.repeat_kv(&k)?;
@@ -439,7 +442,11 @@ impl MetalQwen2Attention {
     }
 
     fn clear_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_caches.clear();
+    }
+
+    fn clear_cache_for(&mut self, cache_key: &str) {
+        self.kv_caches.remove(cache_key);
     }
 }
 
@@ -545,11 +552,14 @@ impl MetalQwen2DecoderLayer {
         rope: &Qwen2RotaryEmbedding,
         start_pos: usize,
         mask: Option<&Tensor>,
+        cache_key: &str,
     ) -> Result<Tensor> {
         // Pre-norm + attention + residual
         let residual = x.clone();
         let x = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward(&x, rope, start_pos, mask)?;
+        let attn_out = self
+            .self_attn
+            .forward(&x, rope, start_pos, mask, cache_key)?;
         let x = (residual + attn_out)
             .map_err(|e| FerrumError::model(format!("residual add 1 failed: {}", e)))?;
 
@@ -569,13 +579,18 @@ impl MetalQwen2DecoderLayer {
         start_pos: usize,
         mask: Option<&Tensor>,
         _layer_idx: usize,
+        cache_key: &str,
     ) -> Result<Tensor> {
         // Simplified debug forward - same as regular forward
-        self.forward(x, rope, start_pos, mask)
+        self.forward(x, rope, start_pos, mask, cache_key)
     }
 
     fn clear_cache(&mut self) {
         self.self_attn.clear_cache();
+    }
+
+    fn clear_cache_for(&mut self, cache_key: &str) {
+        self.self_attn.clear_cache_for(cache_key);
     }
 }
 
@@ -679,7 +694,7 @@ impl MetalQwen2Model {
     }
 
     /// Forward pass for prefill
-    pub fn forward_prefill(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+    pub fn forward_prefill(&mut self, input_ids: &Tensor, cache_key: &str) -> Result<Tensor> {
         let seq_len = input_ids
             .dim(1)
             .map_err(|e| FerrumError::model(format!("dim failed: {}", e)))?;
@@ -697,9 +712,9 @@ impl MetalQwen2Model {
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if i == 0 {
                 // Debug first layer
-                x = layer.forward_debug(&x, &self.rope, 0, Some(&mask), i)?;
+                x = layer.forward_debug(&x, &self.rope, 0, Some(&mask), i, cache_key)?;
             } else {
-                x = layer.forward(&x, &self.rope, 0, Some(&mask))?;
+                x = layer.forward(&x, &self.rope, 0, Some(&mask), cache_key)?;
             }
         }
 
@@ -717,7 +732,12 @@ impl MetalQwen2Model {
     }
 
     /// Forward pass for decode (single token)
-    pub fn forward_decode(&mut self, token_id: &Tensor, pos: usize) -> Result<Tensor> {
+    pub fn forward_decode(
+        &mut self,
+        token_id: &Tensor,
+        pos: usize,
+        cache_key: &str,
+    ) -> Result<Tensor> {
         // Embed token
         let mut x = self
             .embed_tokens
@@ -726,7 +746,7 @@ impl MetalQwen2Model {
 
         // No mask needed for single token decode with KV cache
         for layer in &mut self.layers {
-            x = layer.forward(&x, &self.rope, pos, None)?;
+            x = layer.forward(&x, &self.rope, pos, None, cache_key)?;
         }
 
         // Final norm
@@ -738,10 +758,17 @@ impl MetalQwen2Model {
             .map_err(|e| FerrumError::model(format!("lm_head forward failed: {}", e)))
     }
 
-    /// Clear KV cache
+    /// Clear all KV caches
     pub fn clear_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_cache();
+        }
+    }
+
+    /// Clear KV cache for a specific sequence
+    pub fn clear_cache_for(&mut self, cache_key: &str) {
+        for layer in &mut self.layers {
+            layer.clear_cache_for(cache_key);
         }
     }
 
@@ -805,17 +832,31 @@ use ferrum_interfaces::{
 use ferrum_models::tensor_wrapper::CandleTensorWrapper;
 use ferrum_types::{DataType, Device, ModelInfo};
 
-/// Dummy KV cache handle for Metal Qwen2 executor
+/// KV cache handle for Metal Qwen2 executor.
+/// Tracks per-sequence position and the model's internal cache key.
 #[derive(Debug, Clone)]
 struct DummyKvCache {
     block_table: BlockTable,
+    cache_id: String,
 }
 
 impl DummyKvCache {
     fn with_length(block_size: usize, sequence_length: usize) -> Self {
         let mut block_table = BlockTable::new(block_size);
         block_table.sequence_length = sequence_length;
-        Self { block_table }
+        Self {
+            block_table,
+            cache_id: String::new(),
+        }
+    }
+
+    fn with_cache_id(block_size: usize, sequence_length: usize, cache_id: String) -> Self {
+        let mut block_table = BlockTable::new(block_size);
+        block_table.sequence_length = sequence_length;
+        Self {
+            block_table,
+            cache_id,
+        }
     }
 }
 
@@ -875,17 +916,20 @@ impl KvCacheHandle for DummyKvCache {
     }
 
     fn cache_id(&self) -> String {
-        "metal_qwen2_dummy_cache".to_string()
+        self.cache_id.clone()
     }
 }
 
-/// Metal-accelerated Qwen2 Executor
+/// Metal-accelerated Qwen2 Executor with multi-sequence KV cache support.
 pub struct MetalQwen2Executor {
     model: Mutex<MetalQwen2Model>,
     info: ModelInfo,
     device: CandleDevice,
     status: ExecutorStatus,
     cpu_ref: Option<Qwen2ModelWrapper>,
+    /// Per-sequence sequence lengths, keyed by cache_id.
+    seq_lengths: Mutex<HashMap<String, usize>>,
+    next_cache_id: std::sync::atomic::AtomicU64,
 }
 
 impl MetalQwen2Executor {
@@ -925,6 +969,8 @@ impl MetalQwen2Executor {
             device,
             status,
             cpu_ref,
+            seq_lengths: Mutex::new(HashMap::new()),
+            next_cache_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -1006,18 +1052,29 @@ impl ModelExecutor for MetalQwen2Executor {
 
         debug!("Metal Qwen2 prefill: {} tokens", seq_len);
 
+        let cache_id = format!(
+            "metal-qwen2-{}",
+            self.next_cache_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+
         // Convert token IDs to tensor
         let input_tensor = Tensor::from_vec(token_ids.clone(), (1, seq_len), &self.device)
             .map_err(|e| FerrumError::internal(format!("Failed to create input tensor: {}", e)))?;
 
-        // Serialize mutable model access behind a lock instead of unsafe aliasing.
+        // Serialize mutable model access. Each sequence gets its own cache slot.
         let logits = {
             let mut model = self.model.lock().map_err(|e| {
                 FerrumError::internal(format!("Metal Qwen2 model lock poisoned: {}", e))
             })?;
-            model.clear_cache();
-            model.forward_prefill(&input_tensor)?
+            model.clear_cache_for(&cache_id); // clear only this sequence's old cache if any
+            model.forward_prefill(&input_tensor, &cache_id)?
         };
+
+        self.seq_lengths
+            .lock()
+            .unwrap()
+            .insert(cache_id.clone(), seq_len);
 
         // Optional CPU reference comparison
         if let Some(ref cpu_model) = self.cpu_ref {
@@ -1080,17 +1137,29 @@ impl ModelExecutor for MetalQwen2Executor {
         // transferring the full vocab logits back to CPU every step.
         let output_tensor: TensorRef = Arc::new(CandleTensorWrapper::new(logits));
 
-        // Create KV cache handle with correct sequence length
-        let kv_cache: Arc<dyn KvCacheHandle> = Arc::new(DummyKvCache::with_length(16, seq_len));
+        // Create KV cache handle with cache_id so decode can identify this sequence.
+        let kv_cache: Arc<dyn KvCacheHandle> =
+            Arc::new(DummyKvCache::with_cache_id(16, seq_len, cache_id));
 
         Ok(PrefillOutput::new(output_tensor, kv_cache))
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         let token_ids = self.extract_token_ids(&input.input_ids)?;
-        let position = input.kv_cache.num_tokens();
 
-        debug!("Metal Qwen2 decode: position {}", position);
+        // Get cache_id and position from the KV handle.
+        let cache_id = input.kv_cache.cache_id();
+        let position = {
+            let lengths = self.seq_lengths.lock().unwrap();
+            *lengths
+                .get(&cache_id)
+                .unwrap_or(&input.kv_cache.num_tokens())
+        };
+
+        debug!(
+            "Metal Qwen2 decode: cache_id={} position={}",
+            cache_id, position
+        );
 
         // Convert token ID to tensor
         let token_tensor = Tensor::from_vec(token_ids, (1, 1), &self.device)
@@ -1100,7 +1169,7 @@ impl ModelExecutor for MetalQwen2Executor {
             let mut model = self.model.lock().map_err(|e| {
                 FerrumError::internal(format!("Metal Qwen2 model lock poisoned: {}", e))
             })?;
-            model.forward_decode(&token_tensor, position)?
+            model.forward_decode(&token_tensor, position, &cache_id)?
         };
 
         debug!(
@@ -1109,23 +1178,36 @@ impl ModelExecutor for MetalQwen2Executor {
             logits.dtype()
         );
 
+        // Update sequence length.
+        let new_length = position + 1;
+        self.seq_lengths
+            .lock()
+            .unwrap()
+            .insert(cache_id.clone(), new_length);
+
         // Keep logits on Metal and return as Candle tensor wrapper.
         let output_tensor: TensorRef = Arc::new(CandleTensorWrapper::new(logits));
 
-        // Create new kv_cache with incremented sequence length
-        let new_length = position + 1;
-        let kv_cache: Arc<dyn KvCacheHandle> = Arc::new(DummyKvCache::with_length(16, new_length));
+        let kv_cache: Arc<dyn KvCacheHandle> =
+            Arc::new(DummyKvCache::with_cache_id(16, new_length, cache_id));
 
         Ok(DecodeOutput::new(output_tensor, kv_cache))
     }
 
+    fn release_cache(&self, cache_id: &str) {
+        self.seq_lengths.lock().unwrap().remove(cache_id);
+        if let Ok(mut model) = self.model.lock() {
+            model.clear_cache_for(cache_id);
+        }
+    }
+
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities {
-            max_batch_size: 1,
+            max_batch_size: 256,
             max_sequence_length: self.info.max_sequence_length,
             attention_mechanisms: vec![AttentionType::MultiHead],
-            supports_dynamic_batching: false,
-            supports_continuous_batching: false,
+            supports_dynamic_batching: true,
+            supports_continuous_batching: true,
             supports_speculative_decoding: false,
             supports_tensor_parallelism: false,
             supports_pipeline_parallelism: false,
