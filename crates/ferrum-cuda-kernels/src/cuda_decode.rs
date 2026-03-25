@@ -494,7 +494,12 @@ impl CudaDecodeRunner {
     fn try_capture_graph(&mut self, cache_key: &str) -> candle_core::Result<()> {
         use crate::cuda_graph::CudaGraphState;
 
-        // Begin capture
+        // Synchronize stream before capture — ensures all pending async ops complete
+        self.stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("stream sync before capture: {e}")))?;
+
+        // Begin capture (RELAXED mode: other threads/streams can still make CUDA calls)
         CudaGraphState::begin_capture(&self.stream)?;
 
         // Run a decode step — all GPU ops are recorded, not executed
