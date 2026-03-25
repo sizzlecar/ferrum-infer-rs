@@ -56,20 +56,23 @@ extern "C" __global__ void decode_attention_f16(
     const int kv_head = q_head / num_kv_groups;
 
     // Pointers for this head
+    // Q layout: [num_q_heads, head_dim] (flat, contiguous per head)
     const __half* q_ptr = q + q_head * head_dim;
-    const __half* k_ptr = k_cache + kv_head * max_kv_len * head_dim;
-    const __half* v_ptr = v_cache + kv_head * max_kv_len * head_dim;
     __half* out_ptr = output + q_head * head_dim;
+
+    // K/V cache layout: [seq_len, num_kv_heads, head_dim] (candle's layout)
+    // To access head h at position p: offset = p * num_kv_heads * head_dim + h * head_dim
+    const int kv_stride = num_kv_heads * head_dim;  // stride per sequence position
 
     // Shared memory for attention scores (one per kv position)
     extern __shared__ float s_scores[];
 
     // Step 1: Compute Q·K^T scores for all valid kv positions
-    // Each thread handles multiple kv positions
     float local_max = -1e20f;
     for (int kv_pos = threadIdx.x; kv_pos < valid_kv_len; kv_pos += blockDim.x) {
         float score = 0.0f;
-        const __half* k_row = k_ptr + kv_pos * head_dim;
+        // K at [kv_pos, kv_head, :] in [seq, heads, dim] layout
+        const __half* k_row = k_cache + kv_pos * kv_stride + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
             score += __half2float(q_ptr[d]) * __half2float(k_row[d]);
         }
@@ -135,11 +138,13 @@ extern "C" __global__ void decode_attention_f16(
     __syncthreads();
 
     // Step 3: Compute weighted sum of V: output = sum(scores[i] * V[i])
-    // Each thread handles multiple dimensions of the output
+    // V cache layout: [seq_len, num_kv_heads, head_dim] (same as K)
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int kv_pos = 0; kv_pos < valid_kv_len; kv_pos++) {
-            acc += s_scores[kv_pos] * __half2float(v_ptr[kv_pos * head_dim + d]);
+            // V at [kv_pos, kv_head, d] in [seq, heads, dim] layout
+            acc += s_scores[kv_pos] * __half2float(
+                v_cache[kv_pos * kv_stride + kv_head * head_dim + d]);
         }
         out_ptr[d] = __float2half(acc);
     }
