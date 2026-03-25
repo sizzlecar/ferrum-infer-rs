@@ -23,12 +23,18 @@ struct SequenceKvState {
     max_len: usize,
 }
 
-/// Piecewise CUDA Graphs (vLLM pattern).
-/// Only captures fixed-shape ops; attention runs eager.
+/// Merged piecewise CUDA Graphs.
+/// Each graph captures all non-attention ops between two attention calls.
+/// Layout for N layers:
+///   graphs[0]     = pre_attn_0                       (before first attention)
+///   graphs[1..N]  = post_attn_{i-1} + pre_attn_i     (between attention calls)
+///   graphs[N]     = post_attn_{N-1} + final_norm + lm_head  (after last attention)
+/// Total: N+1 graphs instead of 2*N+1, each with ~12-15 kernels.
 struct PiecewiseGraphs {
-    pre_attn: Vec<cudarc::driver::CudaGraph>,
-    post_attn: Vec<cudarc::driver::CudaGraph>,
-    final_graph: Option<cudarc::driver::CudaGraph>,
+    /// graphs[0] = pre_attn_0
+    /// graphs[i] for i in 1..num_layers = post_attn_{i-1} + pre_attn_i
+    /// graphs[num_layers] = post_attn_{num_layers-1} + final
+    segments: Vec<cudarc::driver::CudaGraph>,
 }
 
 unsafe impl Send for PiecewiseGraphs {}
@@ -421,81 +427,27 @@ impl CudaDecodeRunner {
         }
 
         let n = self.dims.num_layers;
-        let mut pre = Vec::with_capacity(n);
-        let mut post = Vec::with_capacity(n);
+        let mut segments = Vec::with_capacity(n + 1);
 
-        // Diagnostic: try capturing individual operations to find what fails
-        tracing::info!("Testing individual capture compatibility...");
+        // Segment 0: pre_attn_0 only
+        let g = self.capture_one("seg0_pre0", |s| s.pre_attention_eager(0, 0))?;
+        segments.push(g);
 
-        // Test 1: custom kernel only (rms_norm)
-        match self.capture_one("test_rms_norm", |s| {
-            let h = s.dims.hidden_size;
-            Self::launch_rms_norm(
-                &s.device,
-                &s.buffers.residual,
-                &s.weights.layers[0].input_ln_w.slice,
-                &mut s.buffers.norm_out,
-                h,
-                1e-6,
-            )
-        }) {
-            Ok(_g) => tracing::info!("  rms_norm capture: OK"),
-            Err(e) => tracing::error!("  rms_norm capture: FAILED — {e}"),
+        // Segments 1..N-1: post_attn_{i-1} + pre_attn_i (merged across layer boundary)
+        for li in 1..n {
+            let g = self.capture_one(&format!("seg{li}"), |s| {
+                s.post_attention_eager(li - 1)?;
+                s.pre_attention_eager(li, 0)
+            })?;
+            segments.push(g);
         }
 
-        // Test 2: cuBLAS GEMM only
-        match self.capture_one("test_cublas", |s| {
-            let h = s.dims.hidden_size;
-            let qkv_dim = s.dims.num_attention_heads * s.dims.head_dim
-                + 2 * s.dims.num_kv_heads * s.dims.head_dim;
-            crate::cublas::linear_f16(
-                &s.blas,
-                &s.buffers.norm_out,
-                &s.weights.layers[0].qkv_w.slice,
-                &mut s.buffers.qkv_out,
-                1,
-                qkv_dim as i32,
-                h as i32,
-            )
-        }) {
-            Ok(_g) => tracing::info!("  cuBLAS GEMM capture: OK"),
-            Err(e) => tracing::error!("  cuBLAS GEMM capture: FAILED — {e}"),
-        }
-
-        // Test 3: custom kernel (rope)
-        match self.capture_one("test_rope", |s| {
-            let hd = s.dims.head_dim;
-            let half_dim = hd / 2;
-            let cos = s.weights.rope_cos.slice.slice(0..half_dim);
-            let sin = s.weights.rope_sin.slice.slice(0..half_dim);
-            Self::launch_rope(
-                &s.device,
-                &s.buffers.rope_q_temp,
-                &s.buffers.rope_k_temp,
-                &cos,
-                &sin,
-                &mut s.buffers.q_rotated,
-                &mut s.buffers.k_rotated,
-                s.dims.num_attention_heads,
-                s.dims.num_kv_heads,
-                hd,
-            )
-        }) {
-            Ok(_g) => tracing::info!("  rope capture: OK"),
-            Err(e) => tracing::error!("  rope capture: FAILED — {e}"),
-        }
-
-        for li in 0..n {
-            let g =
-                self.capture_one(&format!("pre_attn L{li}"), |s| s.pre_attention_eager(li, 0))?;
-            pre.push(g);
-
-            let g =
-                self.capture_one(&format!("post_attn L{li}"), |s| s.post_attention_eager(li))?;
-            post.push(g);
-        }
-
-        let fg = self.capture_one("final", |s| s.final_eager()).ok();
+        // Segment N: post_attn_{N-1} + final_norm + lm_head
+        let g = self.capture_one(&format!("seg{n}_final"), |s| {
+            s.post_attention_eager(n - 1)?;
+            s.final_eager()
+        })?;
+        segments.push(g);
 
         // Re-enable event tracking after capture
         unsafe {
@@ -503,15 +455,10 @@ impl CudaDecodeRunner {
         }
 
         tracing::info!(
-            "Piecewise graphs captured: {} pre + {} post + final",
-            pre.len(),
-            post.len()
+            "Merged piecewise graphs captured: {} segments ({} layers)",
+            segments.len(),
+            n,
         );
-        self.graphs = Some(PiecewiseGraphs {
-            pre_attn: pre,
-            post_attn: post,
-            final_graph: fg,
-        });
         Ok(())
     }
 
@@ -578,33 +525,34 @@ impl CudaDecodeRunner {
 
         // Take graphs out to avoid borrow conflict with &mut self methods
         if let Some(graphs) = self.graphs.take() {
+            let n = self.dims.num_layers;
             self.embed_eager(token_id)?;
             let mut kv = self
                 .kv_states
                 .remove(cache_key)
                 .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
 
-            for li in 0..self.dims.num_layers {
-                graphs.pre_attn[li]
+            // segments[0] = pre_attn_0
+            graphs.segments[0]
+                .launch()
+                .map_err(|e| candle_core::Error::Msg(format!("seg0: {e}")))?;
+            self.attention_eager(0, &mut kv)?;
+
+            // segments[1..N-1] = post_attn_{i-1} + pre_attn_i
+            for li in 1..n {
+                graphs.segments[li]
                     .launch()
-                    .map_err(|e| candle_core::Error::Msg(format!("pre L{li}: {e}")))?;
+                    .map_err(|e| candle_core::Error::Msg(format!("seg{li}: {e}")))?;
                 self.attention_eager(li, &mut kv)?;
-                graphs.post_attn[li]
-                    .launch()
-                    .map_err(|e| candle_core::Error::Msg(format!("post L{li}: {e}")))?;
             }
+
+            // segments[N] = post_attn_{N-1} + final
+            graphs.segments[n]
+                .launch()
+                .map_err(|e| candle_core::Error::Msg(format!("seg{n}: {e}")))?;
 
             kv.current_len += 1;
             self.kv_states.insert(cache_key.to_string(), kv);
-
-            if let Some(ref g) = graphs.final_graph {
-                g.launch()
-                    .map_err(|e| candle_core::Error::Msg(format!("final: {e}")))?;
-            } else {
-                self.final_eager()?;
-            }
-
-            // Put graphs back
             self.graphs = Some(graphs);
 
             self.stream
