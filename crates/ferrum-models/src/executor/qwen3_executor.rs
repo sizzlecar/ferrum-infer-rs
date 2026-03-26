@@ -316,6 +316,27 @@ impl ModelExecutor for Qwen3ModelExecutor {
                     false,
                 );
 
+                // FERRUM_LOG_TOKENS=1 → log argmax token for every decode step
+                if std::env::var("FERRUM_LOG_TOKENS").unwrap_or_default() == "1" {
+                    if let Ok(flat) = logits_tensor.flatten_all() {
+                        if let Ok(vals) = flat.to_vec1::<half::f16>() {
+                            let (idx, val) = vals
+                                .iter()
+                                .enumerate()
+                                .max_by(|(_, a), (_, b)| {
+                                    a.to_f32().partial_cmp(&b.to_f32()).unwrap()
+                                })
+                                .unwrap();
+                            tracing::info!(
+                                "[CUDA] pos={} argmax={} logit={:.2}",
+                                seq_len,
+                                idx,
+                                val.to_f32()
+                            );
+                        }
+                    }
+                }
+
                 let logits_ref = self.wrap_tensor(logits_tensor);
 
                 let new_seq_len = {
@@ -343,6 +364,24 @@ impl ModelExecutor for Qwen3ModelExecutor {
             .model
             .forward_decode(&input_tensor, seq_len, &req_cache_id)
             .map_err(|e| FerrumError::model(format!("Qwen3 decode failed: {}", e)))?;
+
+        if std::env::var("FERRUM_LOG_TOKENS").unwrap_or_default() == "1" {
+            if let Ok(flat) = logits.flatten_all() {
+                if let Ok(vals) = flat.to_vec1::<half::f16>() {
+                    let (idx, val) = vals
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
+                        .unwrap();
+                    tracing::info!(
+                        "[CANDLE] pos={} argmax={} logit={:.2}",
+                        seq_len,
+                        idx,
+                        val.to_f32()
+                    );
+                }
+            }
+        }
 
         let logits_ref = self.wrap_tensor(logits);
 
