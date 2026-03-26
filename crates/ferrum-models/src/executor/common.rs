@@ -179,3 +179,93 @@ pub fn default_executor_status() -> ferrum_interfaces::model_executor::ExecutorS
         last_operation: Some(Instant::now()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrum_interfaces::KvCacheHandle;
+
+    #[test]
+    fn tensor_to_tokens_from_u32() {
+        let tensor = ferrum_testkit::MockTensor::from_u32(&[1, 2, 3], &[3]);
+        let tokens = tensor_to_tokens(&tensor.into_ref()).unwrap();
+        assert_eq!(tokens, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn tensor_to_tokens_from_f32() {
+        let tensor = ferrum_testkit::MockTensor::from_f32(vec![10.0, 20.0, 30.0], &[3]);
+        let tokens = tensor_to_tokens(&tensor.into_ref()).unwrap();
+        assert_eq!(tokens, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn tensor_to_tokens_empty_fails() {
+        let tensor = ferrum_testkit::MockTensor::from_u32(&[], &[0]);
+        let result = tensor_to_tokens(&tensor.into_ref());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tokens_to_tensor_cpu() {
+        let tensor = tokens_to_tensor(&[42, 100], &CandleDevice::Cpu).unwrap();
+        assert_eq!(tensor.dims(), &[1, 2]);
+        assert_eq!(tensor.dtype(), candle_core::DType::I64);
+    }
+
+    #[test]
+    fn wrap_tensor_creates_tensor_ref() {
+        let t = Tensor::zeros((2, 3), candle_core::DType::F32, &CandleDevice::Cpu).unwrap();
+        let tr = wrap_tensor(t);
+        assert_eq!(tr.shape(), &[2, 3]);
+    }
+
+    #[test]
+    fn generic_kv_cache_handle_basic() {
+        let handle = GenericKvCacheHandle::new(
+            36,  // num_layers
+            32,  // num_heads
+            128, // head_dim
+            CandleDevice::Cpu,
+            10, // seq_len
+            "test-cache-1".to_string(),
+        );
+
+        assert_eq!(handle.num_layers(), 36);
+        assert_eq!(handle.num_heads(), 32);
+        assert_eq!(handle.head_dim(), 128);
+        assert_eq!(handle.cache_id(), "test-cache-1");
+        assert_eq!(handle.block_table().sequence_length, 10);
+        assert!(handle.is_valid());
+    }
+
+    #[test]
+    fn generic_kv_cache_handle_with_sequence_length() {
+        let handle =
+            GenericKvCacheHandle::new(4, 8, 64, CandleDevice::Cpu, 5, "cache-1".to_string());
+        let updated = handle.with_sequence_length(15);
+        assert_eq!(updated.block_table().sequence_length, 15);
+        assert_eq!(updated.request_cache_id(), "cache-1");
+        // Original unchanged
+        assert_eq!(handle.block_table().sequence_length, 5);
+    }
+
+    #[test]
+    fn generic_kv_cache_handle_clone_handle() {
+        let handle =
+            GenericKvCacheHandle::new(4, 8, 64, CandleDevice::Cpu, 5, "cache-2".to_string());
+        let cloned = handle.clone_handle().unwrap();
+        assert_eq!(cloned.cache_id(), "cache-2");
+        assert_eq!(cloned.num_layers(), 4);
+    }
+
+    #[test]
+    fn default_executor_status_is_ready() {
+        let status = default_executor_status();
+        assert!(status.is_ready);
+        assert_eq!(
+            status.state,
+            ferrum_interfaces::model_executor::ExecutorState::Ready
+        );
+    }
+}
