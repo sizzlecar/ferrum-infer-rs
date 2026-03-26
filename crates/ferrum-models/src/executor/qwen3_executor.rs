@@ -1,7 +1,7 @@
 //! Qwen3 model executor using Candle
 
 use async_trait::async_trait;
-use candle_core::Tensor;
+use candle_core::{Device as CandleDevice, Tensor};
 use ferrum_interfaces::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
