@@ -497,6 +497,13 @@ impl CudaDecodeRunner {
         kv.current_len += 1;
         self.kv_states.insert(cache_key.to_string(), kv);
         self.final_eager()?;
+        // Synchronize runner stream before returning logits.
+        // The logits CudaSlice will be wrapped as a candle Tensor on candle's
+        // default stream. Without sync, candle reads stale data because the
+        // default stream doesn't wait for the non-blocking stream.
+        self.stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("stream sync: {e}")))?;
         self.stream
             .clone_dtod(&self.buffers.logits)
             .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
