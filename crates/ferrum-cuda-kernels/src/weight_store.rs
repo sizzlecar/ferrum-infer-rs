@@ -1,8 +1,6 @@
-//! GPU weight pointer storage for the decode runner.
+//! GPU weight storage for the decode runner.
 //!
-//! Extracts raw GPU pointers from candle Tensors at runner initialization.
-//! The CudaSlice is cloned from the candle Tensor's storage (cheap — just
-//! increments an Arc-like refcount). The underlying GPU memory is shared.
+//! Stores model weights on a specific CUDA stream for graph-safe access.
 
 use std::sync::Arc;
 
@@ -17,10 +15,6 @@ pub struct GpuWeight {
 
 impl GpuWeight {
     /// Extract GPU weight from a candle Tensor and copy to the given stream.
-    ///
-    /// This creates an independent copy on `target_stream` so that all weight
-    /// accesses are on the same stream as the decode runner. This is required
-    /// for CUDA Graph capture (cross-stream accesses break graph structure).
     pub fn from_tensor(
         tensor: &Tensor,
         target_stream: &Arc<CudaStream>,
@@ -36,9 +30,6 @@ impl GpuWeight {
             _ => candle_core::bail!("GpuWeight: tensor must be on CUDA"),
         };
         let src = cuda_storage.as_cuda_slice::<half::f16>()?;
-        // Copy weight data to the target stream (D2D copy).
-        // This ensures the CudaSlice is owned by target_stream,
-        // avoiding cross-stream event tracking during graph capture.
         let owned = target_stream
             .clone_dtod(src)
             .map_err(|e| candle_core::Error::Msg(format!("weight clone_dtod: {e}")))?;
@@ -51,16 +42,17 @@ impl GpuWeight {
 pub struct LayerWeights {
     pub input_ln_w: GpuWeight,
     pub qkv_w: GpuWeight,
-    pub q_norm_w: GpuWeight,
-    pub k_norm_w: GpuWeight,
+    pub q_norm_w: Option<GpuWeight>,
+    pub k_norm_w: Option<GpuWeight>,
     pub o_w: GpuWeight,
     pub post_ln_w: GpuWeight,
     pub gate_up_w: GpuWeight,
     pub down_w: GpuWeight,
 }
 
-/// All weights for a Qwen3-style model, extracted from candle Tensors.
-pub struct Qwen3Weights {
+/// All weights for a transformer model on GPU.
+/// Architecture-agnostic — uses the same struct for Qwen3, Llama, Qwen2.
+pub struct TransformerGpuWeights {
     pub embed_table: GpuWeight,
     pub layers: Vec<LayerWeights>,
     pub final_norm_w: GpuWeight,
@@ -68,3 +60,6 @@ pub struct Qwen3Weights {
     pub rope_cos: GpuWeight,
     pub rope_sin: GpuWeight,
 }
+
+/// Backward compat alias.
+pub type Qwen3Weights = TransformerGpuWeights;

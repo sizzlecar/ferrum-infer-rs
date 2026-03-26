@@ -13,7 +13,7 @@ use cudarc::driver::{CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelAr
 
 use crate::decode_buffers::{DecodeBuffers, ModelDims};
 use crate::ptx;
-use crate::weight_store::Qwen3Weights;
+use crate::weight_store::TransformerGpuWeights;
 
 /// Per-sequence KV cache managed by the decode runner.
 struct SequenceKvState {
@@ -42,7 +42,7 @@ unsafe impl Sync for PiecewiseGraphs {}
 
 /// CUDA decode runner with piecewise graph acceleration.
 pub struct CudaDecodeRunner {
-    weights: Qwen3Weights,
+    weights: TransformerGpuWeights,
     buffers: DecodeBuffers,
     blas: Arc<CudaBlas>,
     device: CudaDevice,
@@ -60,7 +60,7 @@ impl CudaDecodeRunner {
     /// Create with a pre-created non-blocking stream.
     /// Weights must already be on this stream (via GpuWeight::from_tensor with stream).
     pub fn new(
-        weights: Qwen3Weights,
+        weights: TransformerGpuWeights,
         dims: ModelDims,
         device: CudaDevice,
         stream: Arc<CudaStream>,
@@ -181,22 +181,35 @@ impl CudaDecodeRunner {
 
         let q = self.buffers.qkv_out.slice(..q_dim);
         let k = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
-        Self::launch_rms_norm_view(
-            &self.device,
-            &q,
-            &lw.q_norm_w.slice,
-            &mut self.buffers.rope_q_temp,
-            hd,
-            eps,
-        )?;
-        Self::launch_rms_norm_view(
-            &self.device,
-            &k,
-            &lw.k_norm_w.slice,
-            &mut self.buffers.rope_k_temp,
-            hd,
-            eps,
-        )?;
+        // Q/K normalization (Qwen3 has this, Llama doesn't)
+        if let Some(ref qnw) = lw.q_norm_w {
+            Self::launch_rms_norm_view(
+                &self.device,
+                &q,
+                &qnw.slice,
+                &mut self.buffers.rope_q_temp,
+                hd,
+                eps,
+            )?;
+        } else {
+            self.stream
+                .memcpy_dtod(&q, &mut self.buffers.rope_q_temp)
+                .map_err(|e| candle_core::Error::Msg(format!("q copy: {e}")))?;
+        }
+        if let Some(ref knw) = lw.k_norm_w {
+            Self::launch_rms_norm_view(
+                &self.device,
+                &k,
+                &knw.slice,
+                &mut self.buffers.rope_k_temp,
+                hd,
+                eps,
+            )?;
+        } else {
+            self.stream
+                .memcpy_dtod(&k, &mut self.buffers.rope_k_temp)
+                .map_err(|e| candle_core::Error::Msg(format!("k copy: {e}")))?;
+        }
 
         let co = position * half_dim;
         let cos = self.weights.rope_cos.slice.slice(co..co + half_dim);
