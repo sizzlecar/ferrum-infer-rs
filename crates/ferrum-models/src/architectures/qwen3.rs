@@ -940,6 +940,11 @@ impl Qwen3ModelWrapper {
             rope_sin,
         };
 
+        // Synchronize the runner stream to ensure all weight D2D copies
+        // from candle's default stream are complete before use.
+        rs.synchronize()
+            .map_err(|e| FerrumError::model(format!("stream sync after weight copy: {e}")))?;
+
         ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
             weights,
             dims,
