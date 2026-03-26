@@ -477,26 +477,219 @@ impl CudaDecodeRunner {
 
     // ======================== Public API ========================
 
+    /// Fused decode step with double-buffered residual and cross-layer norm fusion.
+    ///
+    /// Optimization over the naive per-layer loop:
+    /// - Double-buffer residual: `residual` (res_a) and `post_norm_residual` (res_b)
+    ///   alternate, eliminating all residual memcpy operations.
+    /// - Cross-layer fusion: each layer's MLP residual-add is fused with the next
+    ///   layer's input RMS norm via `fused_add_rms_norm`, eliminating separate
+    ///   `residual_add` and `rms_norm` kernel launches.
+    /// - Last layer fuses MLP residual-add with final norm.
+    ///
+    /// Net savings: 108 fewer kernel launches per token (580 → 472 for 36-layer model).
     pub fn decode_step(
         &mut self,
         token_id: u32,
         position: usize,
         cache_key: &str,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
+        let n = self.dims.num_layers;
+        let h = self.dims.hidden_size;
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let hd = self.dims.head_dim;
+        let half_dim = hd / 2;
+        let inter = self.dims.intermediate_size;
+        let eps = 1e-6f32;
+
         self.embed_eager(token_id)?;
 
         let mut kv = self
             .kv_states
             .remove(cache_key)
             .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
-        for li in 0..self.dims.num_layers {
-            self.pre_attention_eager(li, position)?;
+
+        // First layer: standalone rms_norm (subsequent layers get norm from
+        // previous layer's exit fused_add_rms_norm)
+        Self::launch_rms_norm(
+            &self.device,
+            &self.buffers.residual,
+            &self.weights.layers[0].input_ln_w.slice,
+            &mut self.buffers.norm_out,
+            h,
+            eps,
+        )?;
+
+        for li in 0..n {
+            // ---- QKV projection (norm_out already computed) ----
+            {
+                let lw = &self.weights.layers[li];
+                crate::cublas::linear_f16(
+                    &self.blas,
+                    &self.buffers.norm_out,
+                    &lw.qkv_w.slice,
+                    &mut self.buffers.qkv_out,
+                    1,
+                    qkv_dim as i32,
+                    h as i32,
+                )?;
+
+                // Q/K norm
+                let q = self.buffers.qkv_out.slice(..q_dim);
+                let k = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
+                if let Some(ref qnw) = lw.q_norm_w {
+                    Self::launch_rms_norm_view(
+                        &self.device,
+                        &q,
+                        &qnw.slice,
+                        &mut self.buffers.rope_q_temp,
+                        hd,
+                        eps,
+                    )?;
+                } else {
+                    self.stream
+                        .memcpy_dtod(&q, &mut self.buffers.rope_q_temp)
+                        .map_err(|e| candle_core::Error::Msg(format!("q copy: {e}")))?;
+                }
+                if let Some(ref knw) = lw.k_norm_w {
+                    Self::launch_rms_norm_view(
+                        &self.device,
+                        &k,
+                        &knw.slice,
+                        &mut self.buffers.rope_k_temp,
+                        hd,
+                        eps,
+                    )?;
+                } else {
+                    self.stream
+                        .memcpy_dtod(&k, &mut self.buffers.rope_k_temp)
+                        .map_err(|e| candle_core::Error::Msg(format!("k copy: {e}")))?;
+                }
+
+                // RoPE
+                let co = position * half_dim;
+                let cos = self.weights.rope_cos.slice.slice(co..co + half_dim);
+                let sin = self.weights.rope_sin.slice.slice(co..co + half_dim);
+                Self::launch_rope(
+                    &self.device,
+                    &self.buffers.rope_q_temp,
+                    &self.buffers.rope_k_temp,
+                    &cos,
+                    &sin,
+                    &mut self.buffers.q_rotated,
+                    &mut self.buffers.k_rotated,
+                    self.dims.num_attention_heads,
+                    self.dims.num_kv_heads,
+                    hd,
+                )?;
+            }
+
+            // ---- Attention ----
             self.attention_eager(li, &mut kv)?;
-            self.post_attention_eager(li)?;
+
+            // ---- O proj + post-attn residual/norm + MLP + layer exit ----
+            {
+                let lw = &self.weights.layers[li];
+
+                // O projection
+                crate::cublas::linear_f16(
+                    &self.blas,
+                    &self.buffers.attn_out,
+                    &lw.o_w.slice,
+                    &mut self.buffers.o_proj_out,
+                    1,
+                    h as i32,
+                    q_dim as i32,
+                )?;
+
+                // Post-attention: residual + norm
+                // Double-buffer: residual (res_a) → post_norm_residual (res_b)
+                Self::launch_fused_add_rms_norm(
+                    &self.device,
+                    &self.buffers.o_proj_out,
+                    &self.buffers.residual,
+                    &lw.post_ln_w.slice,
+                    &mut self.buffers.post_norm_out,
+                    &mut self.buffers.post_norm_residual,
+                    h,
+                    eps,
+                )?;
+                // Residual now lives in post_norm_residual — no memcpy needed
+
+                // MLP
+                crate::cublas::linear_f16(
+                    &self.blas,
+                    &self.buffers.post_norm_out,
+                    &lw.gate_up_w.slice,
+                    &mut self.buffers.gate_up_out,
+                    1,
+                    (2 * inter) as i32,
+                    h as i32,
+                )?;
+                let g = self.buffers.gate_up_out.slice(..inter);
+                let u = self.buffers.gate_up_out.slice(inter..2 * inter);
+                Self::launch_fused_silu_mul(
+                    &self.device,
+                    &g,
+                    &u,
+                    &mut self.buffers.mlp_act,
+                    inter,
+                )?;
+                crate::cublas::linear_f16(
+                    &self.blas,
+                    &self.buffers.mlp_act,
+                    &lw.down_w.slice,
+                    &mut self.buffers.down_out,
+                    1,
+                    h as i32,
+                    inter as i32,
+                )?;
+
+                // Layer exit: fuse MLP residual-add with next layer's input norm
+                // Double-buffer: post_norm_residual (res_b) → residual (res_a)
+                if li < n - 1 {
+                    Self::launch_fused_add_rms_norm(
+                        &self.device,
+                        &self.buffers.down_out,
+                        &self.buffers.post_norm_residual,
+                        &self.weights.layers[li + 1].input_ln_w.slice,
+                        &mut self.buffers.norm_out,
+                        &mut self.buffers.residual,
+                        h,
+                        eps,
+                    )?;
+                } else {
+                    // Last layer: fuse with final norm
+                    Self::launch_fused_add_rms_norm(
+                        &self.device,
+                        &self.buffers.down_out,
+                        &self.buffers.post_norm_residual,
+                        &self.weights.final_norm_w.slice,
+                        &mut self.buffers.final_norm_out,
+                        &mut self.buffers.residual,
+                        h,
+                        eps,
+                    )?;
+                }
+            }
         }
+
         kv.current_len += 1;
         self.kv_states.insert(cache_key.to_string(), kv);
-        self.final_eager()?;
+
+        // LM head only — final norm already computed in loop
+        crate::cublas::linear_f16(
+            &self.blas,
+            &self.buffers.final_norm_out,
+            &self.weights.lm_head_w.slice,
+            &mut self.buffers.logits,
+            1,
+            self.dims.vocab_size as i32,
+            h as i32,
+        )?;
+
         // Synchronize runner stream before returning logits.
         // The logits CudaSlice will be wrapped as a candle Tensor on candle's
         // default stream. Without sync, candle reads stale data because the
