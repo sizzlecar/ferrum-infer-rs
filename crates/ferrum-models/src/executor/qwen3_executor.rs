@@ -71,6 +71,10 @@ impl Qwen3ModelExecutor {
     ///
     #[cfg(feature = "cuda")]
     fn ensure_cuda_runner(&self) -> bool {
+        // FERRUM_DISABLE_CUDA_RUNNER=1 → always use candle path
+        if std::env::var("FERRUM_DISABLE_CUDA_RUNNER").unwrap_or_default() == "1" {
+            return false;
+        }
         if self.cuda_runner.lock().is_some() {
             return true;
         }
