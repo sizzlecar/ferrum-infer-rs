@@ -1320,6 +1320,7 @@ dependencies = [
  "ferrum-cuda-kernels",
  "ferrum-interfaces",
  "ferrum-runtime",
+ "ferrum-testkit",
  "ferrum-types",
  "futures",
  "futures-util",
