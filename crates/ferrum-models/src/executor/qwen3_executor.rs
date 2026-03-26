@@ -1,16 +1,15 @@
 //! Qwen3 model executor using Candle
 
 use async_trait::async_trait;
-use candle_core::{Device as CandleDevice, Tensor};
+use candle_core::Tensor;
 use ferrum_interfaces::{
-    kv_cache::{BlockTable, CacheHandleStats},
     model_executor::{
-        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
-        ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
+        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
+        MemoryRequirements, PrefillInput, PrefillOutput,
     },
-    KvCacheHandle, ModelExecutor, TensorRef,
+    ModelExecutor, TensorRef,
 };
-use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
+use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
 use parking_lot::Mutex;
 use std::{
     collections::HashMap,
@@ -18,11 +17,11 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Instant,
 };
 use tracing::{debug, info};
 
-use crate::{architectures::qwen3::Qwen3ModelWrapper, tensor_wrapper::CandleTensorWrapper};
+use crate::architectures::qwen3::Qwen3ModelWrapper;
+use crate::executor::common;
 
 #[derive(Debug, Clone)]
 struct Qwen3CacheState {
@@ -172,47 +171,15 @@ impl Qwen3ModelExecutor {
     }
 
     fn tensor_to_tokens(&self, tensor: &TensorRef) -> Result<Vec<u32>> {
-        if let Ok(tokens) = tensor.to_vec_u32() {
-            if tokens.is_empty() {
-                return Err(FerrumError::model("Input token tensor is empty"));
-            }
-            return Ok(tokens);
-        }
-
-        if let Ok(tokens_f32) = tensor.to_vec_f32() {
-            let tokens: Vec<u32> = tokens_f32.into_iter().map(|x| x as u32).collect();
-            if tokens.is_empty() {
-                return Err(FerrumError::model("Input token tensor is empty"));
-            }
-            return Ok(tokens);
-        }
-
-        Err(FerrumError::model(
-            "Unable to extract token IDs from input tensor",
-        ))
+        common::tensor_to_tokens(tensor)
     }
 
     fn tokens_to_tensor(&self, tokens: &[u32]) -> Result<Tensor> {
-        let base = Tensor::new(tokens, &CandleDevice::Cpu)
-            .map_err(|e| FerrumError::model(format!("Failed to create tensor: {}", e)))?
-            .unsqueeze(0)
-            .map_err(|e| FerrumError::model(format!("Failed to unsqueeze tensor: {}", e)))?
-            .to_dtype(candle_core::DType::I64)
-            .map_err(|e| FerrumError::model(format!("Failed to cast tokens to I64: {}", e)))?;
-
-        match self.model.candle_device() {
-            CandleDevice::Cpu => Ok(base),
-            CandleDevice::Cuda(dev) => base
-                .to_device(&CandleDevice::Cuda(dev.clone()))
-                .map_err(|e| FerrumError::model(format!("Failed to move tensor to CUDA: {}", e))),
-            CandleDevice::Metal(dev) => base
-                .to_device(&CandleDevice::Metal(dev.clone()))
-                .map_err(|e| FerrumError::model(format!("Failed to move tensor to Metal: {}", e))),
-        }
+        common::tokens_to_tensor(tokens, self.model.candle_device())
     }
 
     fn wrap_tensor(&self, tensor: Tensor) -> TensorRef {
-        Arc::new(CandleTensorWrapper::new(tensor))
+        common::wrap_tensor(tensor)
     }
 }
 
@@ -263,8 +230,11 @@ impl ModelExecutor for Qwen3ModelExecutor {
 
         let logits_ref = self.wrap_tensor(logits);
 
-        let kv_handle = Arc::new(Qwen3KvCacheHandle::new(
-            self.model.config(),
+        let cfg = self.model.config();
+        let kv_handle = Arc::new(common::GenericKvCacheHandle::new(
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            cfg.head_dim,
             self.model.device().clone(),
             tokens.len(),
             cache_id.clone(),
@@ -286,7 +256,7 @@ impl ModelExecutor for Qwen3ModelExecutor {
         let input_handle = input
             .kv_cache
             .as_any()
-            .downcast_ref::<Qwen3KvCacheHandle>()
+            .downcast_ref::<common::GenericKvCacheHandle>()
             .ok_or_else(|| FerrumError::model("Invalid KV cache handle type for Qwen3 executor"))?;
         let req_cache_id = input_handle.request_cache_id().to_string();
 
@@ -412,137 +382,8 @@ impl ModelExecutor for Qwen3ModelExecutor {
     }
 
     fn status(&self) -> ExecutorStatus {
-        ExecutorStatus {
-            state: ExecutorState::Ready,
-            is_ready: true,
-            current_batch_size: 0,
-            prefill_operations: 0,
-            decode_operations: 0,
-            avg_prefill_time_ms: 0.0,
-            avg_decode_time_ms: 0.0,
-            memory_usage: ExecutorMemoryUsage {
-                allocated_bytes: 0,
-                used_bytes: 0,
-                peak_bytes: 0,
-                utilization_percent: 0.0,
-            },
-            last_operation: Some(Instant::now()),
-        }
+        common::default_executor_status()
     }
 }
 
-#[derive(Debug, Clone)]
-struct Qwen3KvCacheHandle {
-    block_table: BlockTable,
-    num_layers: usize,
-    num_heads: usize,
-    head_dim: usize,
-    device: Device,
-    request_cache_id: String,
-}
-
-impl Qwen3KvCacheHandle {
-    fn new(
-        config: &crate::architectures::qwen3::Config,
-        device: CandleDevice,
-        seq_len: usize,
-        request_cache_id: String,
-    ) -> Self {
-        let mut block_table = BlockTable::new(16);
-        block_table.sequence_length = seq_len;
-
-        Self {
-            block_table,
-            num_layers: config.num_hidden_layers,
-            num_heads: config.num_attention_heads,
-            head_dim: config.head_dim,
-            request_cache_id,
-            device: match device {
-                CandleDevice::Cpu => Device::CPU,
-                CandleDevice::Cuda(_dev) => Device::CUDA(0),
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                CandleDevice::Metal(_) => Device::Metal,
-                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-                CandleDevice::Metal(_) => Device::CPU,
-            },
-        }
-    }
-
-    fn with_sequence_length(&self, seq_len: usize) -> Self {
-        let mut block_table = self.block_table.clone();
-        block_table.sequence_length = seq_len;
-
-        Self {
-            block_table,
-            num_layers: self.num_layers,
-            num_heads: self.num_heads,
-            head_dim: self.head_dim,
-            device: self.device.clone(),
-            request_cache_id: self.request_cache_id.clone(),
-        }
-    }
-
-    fn request_cache_id(&self) -> &str {
-        &self.request_cache_id
-    }
-}
-
-impl KvCacheHandle for Qwen3KvCacheHandle {
-    fn block_table(&self) -> &BlockTable {
-        &self.block_table
-    }
-
-    fn block_table_mut(&mut self) -> &mut BlockTable {
-        &mut self.block_table
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn device(&self) -> Device {
-        self.device.clone()
-    }
-
-    fn num_layers(&self) -> usize {
-        self.num_layers
-    }
-
-    fn num_heads(&self) -> usize {
-        self.num_heads
-    }
-
-    fn head_dim(&self) -> usize {
-        self.head_dim
-    }
-
-    fn key_cache(&self, _layer: usize) -> Result<Option<TensorRef>> {
-        Ok(None)
-    }
-
-    fn value_cache(&self, _layer: usize) -> Result<Option<TensorRef>> {
-        Ok(None)
-    }
-
-    fn clone_handle(&self) -> Result<Arc<dyn KvCacheHandle>> {
-        Ok(Arc::new(self.clone()))
-    }
-
-    fn stats(&self) -> CacheHandleStats {
-        CacheHandleStats {
-            memory_bytes: 0,
-            blocks_allocated: self.block_table.num_blocks(),
-            tokens_stored: self.block_table.sequence_length,
-            utilization: 0.0,
-            last_access: Instant::now(),
-        }
-    }
-
-    fn is_valid(&self) -> bool {
-        true
-    }
-
-    fn cache_id(&self) -> String {
-        self.request_cache_id.clone()
-    }
-}
+// Qwen3KvCacheHandle replaced by common::GenericKvCacheHandle

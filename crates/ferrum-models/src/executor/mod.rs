@@ -2,6 +2,7 @@
 
 pub mod bert_executor;
 pub mod candle_executor;
+pub mod common;
 pub mod qwen2_executor;
 pub mod qwen3_executor;
 pub mod stub_executor;
