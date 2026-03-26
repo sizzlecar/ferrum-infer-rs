@@ -317,7 +317,12 @@ impl ModelExecutor for Qwen3ModelExecutor {
                 );
 
                 // FERRUM_LOG_TOKENS=1 → log argmax token for every decode step
-                if std::env::var("FERRUM_LOG_TOKENS").unwrap_or_default() == "1" {
+                if std::env::var("FERRUM_LOG_TOKENS").unwrap_or_default() == "1" || seq_len == 13 {
+                    tracing::info!(
+                        "[CUDA] logits shape={:?} dtype={:?}",
+                        logits_tensor.shape(),
+                        logits_tensor.dtype()
+                    );
                     if let Ok(flat) = logits_tensor.flatten_all() {
                         if let Ok(vals) = flat.to_vec1::<half::f16>() {
                             let (idx, val) = vals
@@ -365,7 +370,12 @@ impl ModelExecutor for Qwen3ModelExecutor {
             .forward_decode(&input_tensor, seq_len, &req_cache_id)
             .map_err(|e| FerrumError::model(format!("Qwen3 decode failed: {}", e)))?;
 
-        if std::env::var("FERRUM_LOG_TOKENS").unwrap_or_default() == "1" {
+        if std::env::var("FERRUM_LOG_TOKENS").unwrap_or_default() == "1" || seq_len == 13 {
+            tracing::info!(
+                "[CANDLE] logits shape={:?} dtype={:?}",
+                logits.shape(),
+                logits.dtype()
+            );
             if let Ok(flat) = logits.flatten_all() {
                 if let Ok(vals) = flat.to_vec1::<half::f16>() {
                     let (idx, val) = vals
