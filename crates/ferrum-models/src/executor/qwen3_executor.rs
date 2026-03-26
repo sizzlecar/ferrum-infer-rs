@@ -318,26 +318,19 @@ impl ModelExecutor for Qwen3ModelExecutor {
 
                 // FERRUM_LOG_TOKENS=1 → log argmax token for every decode step
                 if std::env::var("FERRUM_LOG_TOKENS").unwrap_or_default() == "1" || seq_len == 13 {
-                    tracing::info!(
-                        "[CUDA] logits shape={:?} dtype={:?}",
-                        logits_tensor.shape(),
-                        logits_tensor.dtype()
-                    );
                     if let Ok(flat) = logits_tensor.flatten_all() {
                         if let Ok(vals) = flat.to_vec1::<half::f16>() {
-                            let (idx, val) = vals
+                            let mut indexed: Vec<(usize, f32)> = vals
                                 .iter()
                                 .enumerate()
-                                .max_by(|(_, a), (_, b)| {
-                                    a.to_f32().partial_cmp(&b.to_f32()).unwrap()
-                                })
-                                .unwrap();
-                            tracing::info!(
-                                "[CUDA] pos={} argmax={} logit={:.2}",
-                                seq_len,
-                                idx,
-                                val.to_f32()
-                            );
+                                .map(|(i, v)| (i, v.to_f32()))
+                                .collect();
+                            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                            let top5: Vec<String> = indexed[..5]
+                                .iter()
+                                .map(|(i, v)| format!("{}:{:.2}", i, v))
+                                .collect();
+                            tracing::info!("[CUDA] pos={} top5=[{}]", seq_len, top5.join(", "));
                         }
                     }
                 }
@@ -371,24 +364,19 @@ impl ModelExecutor for Qwen3ModelExecutor {
             .map_err(|e| FerrumError::model(format!("Qwen3 decode failed: {}", e)))?;
 
         if std::env::var("FERRUM_LOG_TOKENS").unwrap_or_default() == "1" || seq_len == 13 {
-            tracing::info!(
-                "[CANDLE] logits shape={:?} dtype={:?}",
-                logits.shape(),
-                logits.dtype()
-            );
             if let Ok(flat) = logits.flatten_all() {
                 if let Ok(vals) = flat.to_vec1::<half::f16>() {
-                    let (idx, val) = vals
+                    let mut indexed: Vec<(usize, f32)> = vals
                         .iter()
                         .enumerate()
-                        .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
-                        .unwrap();
-                    tracing::info!(
-                        "[CANDLE] pos={} argmax={} logit={:.2}",
-                        seq_len,
-                        idx,
-                        val.to_f32()
-                    );
+                        .map(|(i, v)| (i, v.to_f32()))
+                        .collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    let top5: Vec<String> = indexed[..5]
+                        .iter()
+                        .map(|(i, v)| format!("{}:{:.2}", i, v))
+                        .collect();
+                    tracing::info!("[CANDLE] pos={} top5=[{}]", seq_len, top5.join(", "));
                 }
             }
         }
