@@ -872,8 +872,14 @@ impl Qwen3ModelWrapper {
             .device
             .as_cuda_device()
             .map_err(|e| FerrumError::model(format!("not CUDA: {e}")))?;
-        let rs = cuda_device
-            .cuda_stream()
+        // Sync candle's stream FIRST — ensure all weight tensors are
+        // fully materialized on GPU before we copy them cross-stream.
+        let candle_stream = cuda_device.cuda_stream();
+        candle_stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("candle stream sync: {e}")))?;
+
+        let rs = candle_stream
             .context()
             .new_stream()
             .map_err(|e| FerrumError::model(format!("new_stream: {e}")))?;
