@@ -28,6 +28,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/residual_add.cu");
     println!("cargo:rerun-if-changed=kernels/flash_decode_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/paged_decode_attention.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -45,6 +46,7 @@ fn main() {
             "kernels/decode_attention.cu",
             "kernels/residual_add.cu",
             "kernels/flash_decode_attention.cu",
+            "kernels/paged_decode_attention.cu",
         ])
         .out_dir(out_dir)
         .arg("--expt-relaxed-constexpr")
