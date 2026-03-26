@@ -130,7 +130,7 @@ impl CudaDecodeRunner {
     /// Dump first N values from a GPU buffer (for debugging).
     fn dump_gpu(stream: &Arc<CudaStream>, slice: &CudaSlice<half::f16>, label: &str, n: usize) {
         let n = n.min(slice.len());
-        match stream.clone_dtoh::<half::f16>(&slice.slice(..n)) {
+        match stream.clone_dtoh(&slice.slice(..n)) {
             Ok(vals) => {
                 let floats: Vec<f32> = vals.iter().map(|v| v.to_f32()).collect();
                 tracing::debug!("  {label}: {:?}", &floats[..n.min(8)]);
@@ -537,7 +537,7 @@ impl CudaDecodeRunner {
         if is_first {
             Self::dump_gpu(&self.stream, &self.buffers.logits, "logits[0..8]", 8);
             // Find argmax of logits
-            if let Ok(logit_vals) = self.stream.clone_dtoh::<half::f16>(&self.buffers.logits) {
+            if let Ok(logit_vals) = self.stream.clone_dtoh(&self.buffers.logits) {
                 let (max_idx, max_val) = logit_vals
                     .iter()
                     .enumerate()
