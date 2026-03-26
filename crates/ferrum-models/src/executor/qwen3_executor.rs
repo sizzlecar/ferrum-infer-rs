@@ -295,6 +295,37 @@ impl ModelExecutor for Qwen3ModelExecutor {
                 }
             };
             if let Some(Ok(logits_slice)) = cuda_result {
+                // DIAGNOSTIC: compare CUDA runner logits with candle on first decode
+                if seq_len <= 14 {
+                    let candle_input = self.tokens_to_tensor(&tokens)?;
+                    let candle_logits = self
+                        .model
+                        .forward_decode(&candle_input, seq_len, &req_cache_id)
+                        .ok();
+                    if let Some(cl) = candle_logits {
+                        let cl_flat = cl
+                            .flatten_all()
+                            .ok()
+                            .and_then(|t| t.to_vec1::<half::f16>().ok());
+                        if let Some(cl_vals) = cl_flat {
+                            // Get argmax of candle logits
+                            let (c_idx, c_val) = cl_vals
+                                .iter()
+                                .enumerate()
+                                .max_by(|(_, a), (_, b)| {
+                                    a.to_f32().partial_cmp(&b.to_f32()).unwrap()
+                                })
+                                .unwrap();
+                            tracing::info!(
+                                "COMPARE pos={}: candle argmax=token {} (logit={:.2})",
+                                seq_len,
+                                c_idx,
+                                c_val.to_f32()
+                            );
+                        }
+                    }
+                }
+
                 // Wrap CudaSlice into candle Tensor (zero-copy, stays on GPU)
                 let cuda_dev = self
                     .model
