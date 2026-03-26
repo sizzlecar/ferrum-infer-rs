@@ -125,20 +125,6 @@ impl CudaDecodeRunner {
         self.kv_states.remove(cache_key);
     }
 
-    // ======================== Diagnostics ========================
-
-    /// Dump first N values from a GPU buffer (for debugging).
-    fn dump_gpu(stream: &Arc<CudaStream>, slice: &CudaSlice<half::f16>, label: &str, n: usize) {
-        let n = n.min(slice.len());
-        match stream.clone_dtoh(&slice.slice(..n)) {
-            Ok(vals) => {
-                let floats: Vec<f32> = vals.iter().map(|v| v.to_f32()).collect();
-                tracing::debug!("  {label}: {:?}", &floats[..n.min(8)]);
-            }
-            Err(e) => tracing::debug!("  {label}: dump failed: {e}"),
-        }
-    }
-
     // ======================== Sub-methods ========================
 
     fn embed_eager(&mut self, token_id: u32) -> candle_core::Result<()> {
@@ -497,18 +483,7 @@ impl CudaDecodeRunner {
         position: usize,
         cache_key: &str,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        let is_first = !self.capture_attempted; // only dump on very first decode call
-
         self.embed_eager(token_id)?;
-        if is_first {
-            tracing::debug!(
-                "=== CUDA RUNNER DECODE DIAGNOSTICS (token={}, pos={}) ===",
-                token_id,
-                position
-            );
-            Self::dump_gpu(&self.stream, &self.buffers.embed_out, "embed_out", 8);
-            Self::dump_gpu(&self.stream, &self.buffers.residual, "residual_init", 8);
-        }
 
         let mut kv = self
             .kv_states
@@ -516,40 +491,12 @@ impl CudaDecodeRunner {
             .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
         for li in 0..self.dims.num_layers {
             self.pre_attention_eager(li, position)?;
-            if is_first && li == 0 {
-                Self::dump_gpu(&self.stream, &self.buffers.norm_out, "L0 norm_out", 8);
-                Self::dump_gpu(&self.stream, &self.buffers.qkv_out, "L0 qkv_out", 8);
-                Self::dump_gpu(&self.stream, &self.buffers.q_rotated, "L0 q_rotated", 8);
-                Self::dump_gpu(&self.stream, &self.buffers.k_rotated, "L0 k_rotated", 8);
-            }
             self.attention_eager(li, &mut kv)?;
-            if is_first && li == 0 {
-                Self::dump_gpu(&self.stream, &self.buffers.attn_out, "L0 attn_out", 8);
-            }
             self.post_attention_eager(li)?;
-            if is_first && li == 0 {
-                Self::dump_gpu(&self.stream, &self.buffers.residual, "L0 residual_after", 8);
-            }
         }
         kv.current_len += 1;
         self.kv_states.insert(cache_key.to_string(), kv);
         self.final_eager()?;
-        if is_first {
-            Self::dump_gpu(&self.stream, &self.buffers.logits, "logits[0..8]", 8);
-            // Find argmax of logits
-            if let Ok(logit_vals) = self.stream.clone_dtoh(&self.buffers.logits) {
-                let (max_idx, max_val) = logit_vals
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.to_f32().partial_cmp(&b.to_f32()).unwrap())
-                    .unwrap();
-                tracing::debug!(
-                    "  logits argmax: token_id={}, value={:.4}",
-                    max_idx,
-                    max_val.to_f32()
-                );
-            }
-        }
         self.stream
             .clone_dtod(&self.buffers.logits)
             .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
