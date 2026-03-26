@@ -15,6 +15,7 @@
 #![allow(async_fn_in_trait)]
 
 pub mod backend;
+pub mod decode_backend;
 pub mod engine;
 pub mod kernel_ops;
 pub mod kv_cache;
@@ -25,9 +26,11 @@ pub mod sampler;
 pub mod scheduler;
 pub mod tensor;
 pub mod tokenizer;
+pub mod transformer;
 
 // Re-export core traits and important types
 pub use backend::{BackendCapabilities, ComputeBackend, WeightLoader};
+pub use decode_backend::DecodeBackend;
 pub use engine::InferenceEngine;
 pub use kv_cache::{
     AllocationRequest, BlockTable, CacheHandleStats, KvCacheHandle, KvCacheManager,
@@ -39,6 +42,7 @@ pub use sampler::{LogitsProcessor, Sampler, SamplingConfig, SamplingContext};
 pub use scheduler::{BatchHint, BatchPlan, Scheduler as SchedulerInterface};
 pub use tensor::{TensorFactory, TensorLike, TensorOps, TensorRef};
 pub use tokenizer::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo};
+pub use transformer::{TransformerConfig, TransformerWeights};
 
 // Kernel ops re-exports
 pub use kernel_ops::{

@@ -945,3 +945,119 @@ impl Qwen3ModelWrapper {
         .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
     }
 }
+
+// ======================== TransformerWeights implementation ========================
+
+use ferrum_interfaces::transformer::{TransformerConfig, TransformerWeights};
+use ferrum_interfaces::TensorRef;
+
+/// Cached weight TensorRefs for the TransformerWeights trait.
+/// Pre-wrapped at construction time — each call returns Arc::clone() (cheap).
+struct Qwen3WeightCache {
+    config: TransformerConfig,
+    embed: TensorRef,
+    layers: Vec<Qwen3LayerWeightCache>,
+    final_norm: TensorRef,
+    lm_head: TensorRef,
+    rope_cos: TensorRef,
+    rope_sin: TensorRef,
+}
+
+struct Qwen3LayerWeightCache {
+    input_norm: TensorRef,
+    qkv: TensorRef,
+    q_norm: TensorRef,
+    k_norm: TensorRef,
+    o_proj: TensorRef,
+    post_norm: TensorRef,
+    gate_up: TensorRef,
+    down: TensorRef,
+}
+
+fn wrap(t: &Tensor) -> TensorRef {
+    Arc::new(crate::tensor_wrapper::CandleTensorWrapper::new(t.clone()))
+}
+
+impl Qwen3WeightCache {
+    fn from_model(model: &ModelForCausalLM, cfg: &Config) -> Self {
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for layer in &model.base_model.layers {
+            layers.push(Qwen3LayerWeightCache {
+                input_norm: wrap(&layer.input_layernorm.weight),
+                qkv: wrap(layer.self_attn.qkv_proj.weight()),
+                q_norm: wrap(&layer.self_attn.q_norm.weight),
+                k_norm: wrap(&layer.self_attn.k_norm.weight),
+                o_proj: wrap(layer.self_attn.o_proj.weight()),
+                post_norm: wrap(&layer.post_attention_layernorm.weight),
+                gate_up: wrap(layer.mlp.gate_up_proj.weight()),
+                down: wrap(layer.mlp.down_proj.weight()),
+            });
+        }
+
+        Self {
+            config: TransformerConfig {
+                num_layers: cfg.num_hidden_layers,
+                hidden_size: cfg.hidden_size,
+                num_attention_heads: cfg.num_attention_heads,
+                num_kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                intermediate_size: cfg.intermediate_size,
+                vocab_size: cfg.vocab_size,
+                max_seq_len: cfg.max_position_embeddings,
+                rms_norm_eps: cfg.rms_norm_eps as f32,
+                has_qk_norm: true, // Qwen3 has Q/K head normalization
+            },
+            embed: wrap(model.base_model.embed_tokens.embeddings()),
+            layers,
+            final_norm: wrap(&model.base_model.norm.weight),
+            lm_head: wrap(model.lm_head.weight()),
+            rope_cos: wrap(&model.base_model.layers[0].self_attn.rotary_emb.cos),
+            rope_sin: wrap(&model.base_model.layers[0].self_attn.rotary_emb.sin),
+        }
+    }
+}
+
+impl TransformerWeights for Qwen3WeightCache {
+    fn config(&self) -> &TransformerConfig {
+        &self.config
+    }
+    fn embed_weight(&self) -> TensorRef {
+        self.embed.clone()
+    }
+    fn layer_input_norm_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].input_norm.clone()
+    }
+    fn layer_qkv_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].qkv.clone()
+    }
+    fn layer_q_norm_weight(&self, layer: usize) -> Option<TensorRef> {
+        Some(self.layers[layer].q_norm.clone())
+    }
+    fn layer_k_norm_weight(&self, layer: usize) -> Option<TensorRef> {
+        Some(self.layers[layer].k_norm.clone())
+    }
+    fn layer_o_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].o_proj.clone()
+    }
+    fn layer_post_norm_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].post_norm.clone()
+    }
+    fn layer_gate_up_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].gate_up.clone()
+    }
+    fn layer_down_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].down.clone()
+    }
+    fn final_norm_weight(&self) -> TensorRef {
+        self.final_norm.clone()
+    }
+    fn lm_head_weight(&self) -> TensorRef {
+        self.lm_head.clone()
+    }
+    fn rope_cos(&self) -> TensorRef {
+        self.rope_cos.clone()
+    }
+    fn rope_sin(&self) -> TensorRef {
+        self.rope_sin.clone()
+    }
+}
