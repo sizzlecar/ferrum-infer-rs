@@ -51,12 +51,10 @@ pub fn decode_attention(
         ptx::DECODE_ATTENTION,
     )?;
 
-    // 8 warps × 32 threads per block, one block per query head
-    let num_warps = 8u32;
-    let block_size = num_warps * 32;
+    let block_size = 256u32;
     let grid_size = num_q_heads as u32;
-    // Shared memory: NUM_WARPS * head_dim floats for v_acc cross-warp reduction
-    let shared_mem = num_warps * (head_dim as u32) * 4;
+    // Shared memory: max_kv_len floats for attention scores
+    let shared_mem = (max_kv_len as u32) * 4;
 
     let num_q_heads_i32 = num_q_heads as i32;
     let num_kv_heads_i32 = num_kv_heads as i32;

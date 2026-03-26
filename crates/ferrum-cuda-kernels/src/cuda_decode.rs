@@ -717,14 +717,12 @@ impl CudaDecodeRunner {
         b.arg(&mki);
         b.arg(&vki);
         b.arg(&scale);
-        // Block: 8 warps × 32 threads = 256
-        // Shared: NUM_WARPS * head_dim floats for v_acc cross-warp reduction
-        let num_warps: u32 = 8;
-        let shared_bytes = num_warps * (hd as u32) * 4; // float per element
+        // Shared: max_kv_len floats for attention scores
+        let shared_bytes = (max_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (nq as u32, 1, 1),
-                block_dim: (num_warps * 32, 1, 1),
+                block_dim: (256, 1, 1),
                 shared_mem_bytes: shared_bytes,
             })
         }
