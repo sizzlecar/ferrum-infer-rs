@@ -251,19 +251,43 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("KV v: {e}")))?;
 
         let scale = 1.0f32 / (hd as f32).sqrt();
-        Self::launch_decode_attention(
-            &self.device,
-            &self.buffers.q_rotated,
-            &kv.k_caches[li],
-            &kv.v_caches[li],
-            &mut self.buffers.attn_out,
-            nq,
-            nkv,
-            hd,
-            kv.max_len,
-            kv.current_len + 1,
-            scale,
-        )
+        let valid_kv = kv.current_len + 1;
+        let num_splits = Self::compute_num_splits(valid_kv);
+
+        if num_splits <= 1 {
+            // Short KV: use original single-block kernel (no Phase 2 overhead)
+            Self::launch_decode_attention(
+                &self.device,
+                &self.buffers.q_rotated,
+                &kv.k_caches[li],
+                &kv.v_caches[li],
+                &mut self.buffers.attn_out,
+                nq,
+                nkv,
+                hd,
+                kv.max_len,
+                valid_kv,
+                scale,
+            )
+        } else {
+            // Long KV: flash decode with split-K
+            Self::launch_flash_decode_attention(
+                &self.device,
+                &self.buffers.q_rotated,
+                &kv.k_caches[li],
+                &kv.v_caches[li],
+                &mut self.buffers.flash_partial_out,
+                &mut self.buffers.flash_partial_m,
+                &mut self.buffers.flash_partial_l,
+                &mut self.buffers.attn_out,
+                nq,
+                nkv,
+                hd,
+                valid_kv,
+                scale,
+                num_splits,
+            )
+        }
     }
 
     fn post_attention_eager(&mut self, li: usize) -> candle_core::Result<()> {
@@ -929,6 +953,102 @@ impl CudaDecodeRunner {
         }
         .map(|_| ())
         .map_err(|e| candle_core::Error::Msg(format!("attn: {e}")))
+    }
+
+    /// Determine number of KV splits for flash decoding.
+    /// Returns 1 for short KV (uses original kernel), >1 for long KV.
+    fn compute_num_splits(valid_kv_len: usize) -> usize {
+        use crate::decode_buffers::DecodeBuffers;
+        const MIN_KV_PER_SPLIT: usize = 256;
+        if valid_kv_len <= MIN_KV_PER_SPLIT {
+            return 1;
+        }
+        (valid_kv_len / MIN_KV_PER_SPLIT).min(DecodeBuffers::MAX_SPLITS).max(2)
+    }
+
+    /// Flash Decoding: two-phase split-K attention for long KV sequences.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_flash_decode_attention(
+        device: &CudaDevice,
+        q: &CudaSlice<half::f16>,
+        kc: &CudaSlice<half::f16>,
+        vc: &CudaSlice<half::f16>,
+        partial_out: &mut CudaSlice<f32>,
+        partial_m: &mut CudaSlice<f32>,
+        partial_l: &mut CudaSlice<f32>,
+        output: &mut CudaSlice<half::f16>,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        valid_kv: usize,
+        scale: f32,
+        num_splits: usize,
+    ) -> candle_core::Result<()> {
+        // Phase 1: split-K attention
+        let func1 = device.get_or_load_custom_func(
+            "flash_decode_attn_f16",
+            "flash_decode_attention",
+            ptx::FLASH_DECODE_ATTENTION,
+        )?;
+        let qv = q.slice(..);
+        let kv = kc.slice(..);
+        let vv = vc.slice(..);
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let vki = valid_kv as i32;
+        let nsi = num_splits as i32;
+        let chunk_size = (valid_kv + num_splits - 1) / num_splits;
+        let shared_bytes = (chunk_size as u32) * 4; // floats for local scores
+
+        let mut b1 = func1.builder();
+        b1.arg(&qv);
+        b1.arg(&kv);
+        b1.arg(&vv);
+        b1.arg(partial_out);
+        b1.arg(partial_m);
+        b1.arg(partial_l);
+        b1.arg(&nqi);
+        b1.arg(&nkvi);
+        b1.arg(&hdi);
+        b1.arg(&vki);
+        b1.arg(&scale);
+        b1.arg(&nsi);
+        unsafe {
+            b1.launch(LaunchConfig {
+                grid_dim: (nq as u32, num_splits as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("flash_decode phase1: {e}")))?;
+
+        // Phase 2: reduce across splits
+        let func2 = device.get_or_load_custom_func(
+            "flash_decode_reduce_f16",
+            "flash_decode_attention",
+            ptx::FLASH_DECODE_ATTENTION,
+        )?;
+        let po = partial_out.slice(..);
+        let pm = partial_m.slice(..);
+        let pl = partial_l.slice(..);
+        let mut b2 = func2.builder();
+        b2.arg(&po);
+        b2.arg(&pm);
+        b2.arg(&pl);
+        b2.arg(output);
+        b2.arg(&hdi);
+        b2.arg(&nsi);
+        unsafe {
+            b2.launch(LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (hd.min(256) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("flash_decode phase2: {e}")))
     }
 
     fn launch_fused_add_rms_norm(
