@@ -900,10 +900,14 @@ impl Qwen3ModelWrapper {
                     .map_err(|e| FerrumError::model(format!("input_ln: {e}")))?,
                 qkv_w: GpuWeight::from_tensor(layer.self_attn.qkv_proj.weight(), &rs)
                     .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
-                q_norm_w: GpuWeight::from_tensor(&layer.self_attn.q_norm.weight, &rs)
-                    .map_err(|e| FerrumError::model(format!("q_norm: {e}")))?,
-                k_norm_w: GpuWeight::from_tensor(&layer.self_attn.k_norm.weight, &rs)
-                    .map_err(|e| FerrumError::model(format!("k_norm: {e}")))?,
+                q_norm_w: Some(
+                    GpuWeight::from_tensor(&layer.self_attn.q_norm.weight, &rs)
+                        .map_err(|e| FerrumError::model(format!("q_norm: {e}")))?,
+                ),
+                k_norm_w: Some(
+                    GpuWeight::from_tensor(&layer.self_attn.k_norm.weight, &rs)
+                        .map_err(|e| FerrumError::model(format!("k_norm: {e}")))?,
+                ),
                 o_w: GpuWeight::from_tensor(layer.self_attn.o_proj.weight(), &rs)
                     .map_err(|e| FerrumError::model(format!("o_proj: {e}")))?,
                 post_ln_w: GpuWeight::from_tensor(&layer.post_attention_layernorm.weight, &rs)
