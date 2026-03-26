@@ -32,6 +32,14 @@ impl GpuWeight {
         let src = cuda_storage.as_cuda_slice::<half::f16>()?;
         // Apply layout offset — tensor may be a view into a larger storage
         let offset = layout.start_offset();
+        if offset != 0 {
+            tracing::warn!(
+                "GpuWeight: tensor has non-zero start_offset={}, len={}, storage_len={}",
+                offset,
+                len,
+                src.len()
+            );
+        }
         let src_view = src.slice(offset..offset + len);
         let owned = target_stream
             .clone_dtod(&src_view)
