@@ -1,17 +1,14 @@
 //! cuBLAS GEMM wrapper for LLM linear projections.
 //!
-//! Wraps cudarc's `Gemm<half::f16>` for the common LLM pattern:
-//!   output = input @ weight^T   (no allocation — writes to pre-existing buffer)
+//! output = input @ weight^T  (pre-allocated output buffer)
 
-use std::sync::Arc;
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::driver::CudaSlice;
 
-use cudarc::cublas::CudaBlas;
-use cudarc::driver::{CudaSlice, CudaStream};
-
-/// Compute output = input @ weight^T using raw cublasGemmEx FFI.
+/// Compute output = input @ weight^T using cuBLAS.
 ///
-/// Bypasses cudarc's DevicePtr/SyncOnDrop which does stream.wait()
-/// and event recording that break CUDA Graph capture.
+/// Uses cudarc's safe Gemm wrapper which handles event tracking
+/// correctly for cross-stream synchronization.
 pub fn linear_f16(
     blas: &CudaBlas,
     input: &CudaSlice<half::f16>,
@@ -21,51 +18,19 @@ pub fn linear_f16(
     n: i32,
     k: i32,
 ) -> candle_core::Result<()> {
-    use cudarc::cublas::sys::*;
-
-    let alpha: f32 = 1.0;
-    let beta: f32 = 0.0;
-
-    // Get raw device pointers. With event tracking disabled during capture,
-    // DevicePtr won't call stream.wait() which would break graph capture.
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
-    let stream = input.stream();
-    let (a_ptr, _) = weight.device_ptr(stream);
-    let (b_ptr, _) = input.device_ptr(stream);
-    let (c_ptr, _) = output.device_ptr_mut(stream);
-    let a_ptr = a_ptr as *const std::ffi::c_void;
-    let b_ptr = b_ptr as *const std::ffi::c_void;
-    let c_ptr = c_ptr as *mut std::ffi::c_void;
-
-    let status = unsafe {
-        cublasGemmEx(
-            *blas.handle(),
-            cublasOperation_t::CUBLAS_OP_T, // weight transposed
-            cublasOperation_t::CUBLAS_OP_N, // input not transposed
-            n,                              // rows of output (output features)
-            m,                              // cols of output (batch)
-            k,                              // reduction dim
-            &alpha as *const f32 as *const _,
-            a_ptr,
-            cudaDataType_t::CUDA_R_16F,
-            k, // lda
-            b_ptr,
-            cudaDataType_t::CUDA_R_16F,
-            k, // ldb
-            &beta as *const f32 as *const _,
-            c_ptr,
-            cudaDataType_t::CUDA_R_16F,
-            n, // ldc
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-        )
+    let cfg = GemmConfig {
+        transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+        transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+        m: n,
+        n: m,
+        k,
+        alpha: half::f16::ONE,
+        lda: k,
+        ldb: k,
+        beta: half::f16::ZERO,
+        ldc: n,
     };
 
-    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        Err(candle_core::Error::Msg(format!(
-            "cublasGemmEx failed: {status:?}"
-        )))
-    } else {
-        Ok(())
-    }
+    unsafe { blas.gemm(cfg, weight, input, output) }
+        .map_err(|e| candle_core::Error::Msg(format!("cuBLAS gemm: {e}")))
 }
