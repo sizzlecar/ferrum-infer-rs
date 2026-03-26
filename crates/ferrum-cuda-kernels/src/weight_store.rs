@@ -24,14 +24,17 @@ impl GpuWeight {
         }
         let tensor = tensor.contiguous()?;
         let len = tensor.elem_count();
-        let (storage, _layout) = tensor.storage_and_layout();
+        let (storage, layout) = tensor.storage_and_layout();
         let cuda_storage = match &*storage {
             Storage::Cuda(cs) => cs,
             _ => candle_core::bail!("GpuWeight: tensor must be on CUDA"),
         };
         let src = cuda_storage.as_cuda_slice::<half::f16>()?;
+        // Apply layout offset — tensor may be a view into a larger storage
+        let offset = layout.start_offset();
+        let src_view = src.slice(offset..offset + len);
         let owned = target_stream
-            .clone_dtod(src)
+            .clone_dtod(&src_view)
             .map_err(|e| candle_core::Error::Msg(format!("weight clone_dtod: {e}")))?;
         drop(storage);
         Ok(Self { slice: owned, len })
