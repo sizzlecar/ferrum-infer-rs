@@ -78,11 +78,25 @@ pub struct DecodeBuffers {
     /// LM head output logits: [vocab_size]
     pub logits: CudaSlice<half::f16>,
 
+    // ---- Flash Decode partial buffers (f32 for numerical precision) ----
+
+    /// Partial V accumulation: [num_q_heads * MAX_SPLITS * head_dim]
+    pub flash_partial_out: CudaSlice<f32>,
+
+    /// Per-split max score: [num_q_heads * MAX_SPLITS]
+    pub flash_partial_m: CudaSlice<f32>,
+
+    /// Per-split exp sum: [num_q_heads * MAX_SPLITS]
+    pub flash_partial_l: CudaSlice<f32>,
+
     /// Model dimensions (for reference)
     pub dims: ModelDims,
 }
 
 impl DecodeBuffers {
+    /// Maximum number of KV splits for flash decoding.
+    pub const MAX_SPLITS: usize = 32;
+
     /// Allocate all decode buffers on the given stream.
     pub fn new(
         dims: ModelDims,
@@ -110,6 +124,17 @@ impl DecodeBuffers {
             down_out: unsafe { stream.alloc::<half::f16>(dims.hidden_size)? },
             final_norm_out: unsafe { stream.alloc::<half::f16>(dims.hidden_size)? },
             logits: unsafe { stream.alloc::<half::f16>(dims.vocab_size)? },
+            flash_partial_out: unsafe {
+                stream.alloc::<f32>(
+                    dims.num_attention_heads * Self::MAX_SPLITS * dims.head_dim,
+                )?
+            },
+            flash_partial_m: unsafe {
+                stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS)?
+            },
+            flash_partial_l: unsafe {
+                stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS)?
+            },
             dims,
         })
     }
@@ -120,7 +145,7 @@ impl DecodeBuffers {
         let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
         let qkv_dim = q_dim + 2 * kv_dim;
 
-        let total_elems = self.dims.hidden_size * 7 // embed, norm, o_proj, residual, post_norm, post_norm_res, down, final_norm
+        let fp16_elems = self.dims.hidden_size * 7 // embed, norm, o_proj, residual, post_norm, post_norm_res, down, final_norm
             + qkv_dim
             + q_dim * 2  // q_rotated, attn_out
             + kv_dim     // k_rotated
@@ -129,6 +154,10 @@ impl DecodeBuffers {
             + self.dims.hidden_size            // final_norm_out
             + self.dims.vocab_size; // logits
 
-        total_elems * std::mem::size_of::<half::f16>()
+        let flash_f32_elems = q_dim * Self::MAX_SPLITS  // partial_out (q_dim = num_q_heads * head_dim)
+            + self.dims.num_attention_heads * Self::MAX_SPLITS * 2; // partial_m + partial_l
+
+        fp16_elems * std::mem::size_of::<half::f16>()
+            + flash_f32_elems * std::mem::size_of::<f32>()
     }
 }
