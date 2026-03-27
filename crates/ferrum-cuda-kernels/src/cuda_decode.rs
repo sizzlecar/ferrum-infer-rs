@@ -109,8 +109,9 @@ pub struct CudaDecodeRunner {
     paged_kv_states: HashMap<String, PagedSequenceKvState>,
     /// Shared GPU block pool for paged KV (None when paged KV is off).
     kv_pool: Option<crate::gpu_paged_kv::GpuPagedKvPool>,
-    /// Simple block allocator: next free physical block ID.
+    /// Simple block allocator: next fresh block ID + free list for reuse.
     next_block_id: usize,
+    free_blocks: Vec<usize>,
     /// Whether paged KV is enabled (FERRUM_PAGED_KV=1).
     use_paged_kv: bool,
     graphs: Option<PiecewiseGraphs>,
@@ -192,6 +193,7 @@ impl CudaDecodeRunner {
             paged_kv_states: HashMap::new(),
             kv_pool,
             next_block_id,
+            free_blocks: Vec::new(),
             use_paged_kv,
             graphs: None,
             _cublas_workspace: None,
@@ -242,14 +244,11 @@ impl CudaDecodeRunner {
         let bs = pool.block_size();
         let num_blocks_needed = (prefill_len + bs - 1) / bs;
 
-        // Allocate physical blocks
+        // Allocate physical blocks (reuse free blocks first)
         let mut block_table = Vec::with_capacity(num_blocks_needed);
         for _ in 0..num_blocks_needed {
-            if self.next_block_id >= pool.max_blocks() {
-                return Err(candle_core::Error::Msg("KV block pool exhausted".into()));
-            }
-            block_table.push(self.next_block_id as i32);
-            self.next_block_id += 1;
+            let block_id = self.alloc_block(pool.max_blocks())?;
+            block_table.push(block_id as i32);
         }
 
         // Bulk copy contiguous KV → paged blocks, per layer
@@ -288,8 +287,31 @@ impl CudaDecodeRunner {
 
     pub fn release_kv_cache(&mut self, cache_key: &str) {
         self.kv_states.remove(cache_key);
-        // TODO: return freed blocks to pool for reuse
-        self.paged_kv_states.remove(cache_key);
+        // Return freed paged blocks to the free list for reuse
+        if let Some(paged) = self.paged_kv_states.remove(cache_key) {
+            for &block_id in &paged.block_table_cpu {
+                self.free_blocks.push(block_id as usize);
+            }
+            if self.diag.shapes {
+                tracing::info!(
+                    "[diag:shapes] release_kv_cache key={cache_key} freed {} blocks",
+                    paged.block_table_cpu.len(),
+                );
+            }
+        }
+    }
+
+    /// Allocate a physical block: reuse from free list, else bump allocator.
+    fn alloc_block(&mut self, max_blocks: usize) -> candle_core::Result<usize> {
+        if let Some(id) = self.free_blocks.pop() {
+            Ok(id)
+        } else if self.next_block_id < max_blocks {
+            let id = self.next_block_id;
+            self.next_block_id += 1;
+            Ok(id)
+        } else {
+            Err(candle_core::Error::Msg("KV block pool exhausted".into()))
+        }
     }
 
     // ======================== Sub-methods ========================
@@ -484,12 +506,8 @@ impl CudaDecodeRunner {
         let logical_block = paged.current_len / bs;
         let slot = paged.current_len % bs;
         if slot == 0 {
-            // Need a new block
-            if self.next_block_id >= pool.max_blocks() {
-                return Err(candle_core::Error::Msg("KV block pool exhausted".into()));
-            }
-            paged.block_table_cpu.push(self.next_block_id as i32);
-            self.next_block_id += 1;
+            let block_id = self.alloc_block(pool.max_blocks())?;
+            paged.block_table_cpu.push(block_id as i32);
             paged.dirty = true;
         }
         let physical_block = paged.block_table_cpu[logical_block] as usize;

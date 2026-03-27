@@ -191,32 +191,12 @@ impl DefaultInferenceEngine {
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     ) -> Self {
         let configured_max_running = config.scheduler.max_running_requests.max(1);
-        let model_type_name = model_executor
-            .info()
-            .model_type
-            .to_string()
-            .to_ascii_lowercase();
-        let model_id_name = model_executor
-            .info()
-            .model_id
-            .to_string()
-            .to_ascii_lowercase();
-        let serialized_executor =
-            model_type_name.contains("qwen") || model_id_name.contains("qwen");
-        let effective_max_running_requests = if serialized_executor {
-            1
-        } else {
-            configured_max_running
-        };
-
-        if serialized_executor && configured_max_running > 1 {
-            warn!(
-                "Executor for model '{}' is serialized for correctness (configured max_running_requests={}, effective={})",
-                model_executor.info().model_id,
-                configured_max_running,
-                effective_max_running_requests
-            );
-        }
+        // Use FERRUM_MAX_RUNNING env var to override max concurrent requests.
+        let effective_max_running_requests = std::env::var("FERRUM_MAX_RUNNING")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(configured_max_running)
+            .max(1);
 
         info!(
             "Created DefaultInferenceEngine (configured_max_running_requests={}, effective_max_running_requests={})",
@@ -235,7 +215,7 @@ impl DefaultInferenceEngine {
             active_requests: Arc::new(AtomicUsize::new(0)),
             waiting_requests: Arc::new(AtomicUsize::new(0)),
             effective_max_running_requests,
-            serialized_executor,
+            serialized_executor: effective_max_running_requests <= 1,
         }
     }
 
