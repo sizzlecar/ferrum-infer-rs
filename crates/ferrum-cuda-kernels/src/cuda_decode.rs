@@ -266,12 +266,12 @@ impl CudaDecodeRunner {
         let block_table_gpu = pool.upload_block_table(&block_table)
             .map_err(|e| candle_core::Error::Msg(format!("block table upload: {e}")))?;
 
-        if self.diag.shapes {
-            tracing::info!(
-                "[diag:shapes] init_kv_cache_paged key={cache_key} prefill={prefill_len} \
-                 blocks={num_blocks_needed} physical_ids={block_table:?}",
-            );
-        }
+        tracing::info!(
+            "init_kv_cache_paged key={cache_key} prefill={prefill_len} \
+             blocks={num_blocks_needed} ids={block_table:?} free_list={} next_id={}",
+            self.free_blocks.len(),
+            self.next_block_id,
+        );
 
         self.paged_kv_states.insert(
             cache_key.to_string(),
@@ -294,15 +294,16 @@ impl CudaDecodeRunner {
         self.kv_states.remove(cache_key);
         // Return freed paged blocks to the free list for reuse
         if let Some(paged) = self.paged_kv_states.remove(cache_key) {
+            let freed = paged.block_table_cpu.len();
             for &block_id in &paged.block_table_cpu {
                 self.free_blocks.push(block_id as usize);
             }
-            if self.diag.shapes {
-                tracing::info!(
-                    "[diag:shapes] release_kv_cache key={cache_key} freed {} blocks",
-                    paged.block_table_cpu.len(),
-                );
-            }
+            tracing::info!(
+                "release_kv_cache(paged) key={cache_key} freed={freed} blocks, \
+                 free_list={}, next_id={}",
+                self.free_blocks.len(),
+                self.next_block_id,
+            );
         }
     }
 
