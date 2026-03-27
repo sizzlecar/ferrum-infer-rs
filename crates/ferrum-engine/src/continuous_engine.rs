@@ -773,7 +773,10 @@ impl EngineInner {
 
         // Release model executor's KV cache for this sequence (frees GPU memory).
         if let Some(ref cache_id) = model_cache_id {
+            tracing::warn!("complete_request: releasing cache {cache_id} for {request_id}");
             self.model_executor.release_cache(cache_id);
+        } else {
+            tracing::warn!("complete_request: no model_cache_id for {request_id}");
         }
 
         if has_kv_cache {
