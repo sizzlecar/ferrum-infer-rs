@@ -893,6 +893,10 @@ impl Qwen3ModelWrapper {
             vocab_size: cfg.vocab_size,
             num_layers: cfg.num_hidden_layers,
             max_seq_len: cfg.max_position_embeddings,
+            max_batch_size: std::env::var("FERRUM_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
         };
 
         // Extract weights — copy to runner's non-blocking stream
