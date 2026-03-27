@@ -114,6 +114,52 @@ impl TensorLike for CandleTensor {
         }
     }
 
+    fn to_vec_u32(&self) -> Result<Vec<u32>> {
+        let cpu_tensor = self
+            .inner
+            .to_device(&candle_core::Device::Cpu)
+            .map_err(|e| ferrum_types::FerrumError::backend(format!("to_cpu failed: {}", e)))?;
+
+        match cpu_tensor.dims().len() {
+            1 => match cpu_tensor.to_vec1::<u32>() {
+                Ok(tokens) => Ok(tokens),
+                Err(_) => cpu_tensor
+                    .to_vec1::<f32>()
+                    .map(|tokens| tokens.into_iter().map(|x| x as u32).collect())
+                    .map_err(|e| {
+                        ferrum_types::FerrumError::backend(format!(
+                            "to_vec1<u32/f32> failed: {}",
+                            e
+                        ))
+                    }),
+            },
+            2 => match cpu_tensor.to_vec2::<u32>() {
+                Ok(batch) => Ok(batch.into_iter().next().unwrap_or_default()),
+                Err(_) => cpu_tensor
+                    .to_vec2::<f32>()
+                    .map(|batch| {
+                        batch
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|x| x as u32)
+                            .collect()
+                    })
+                    .map_err(|e| {
+                        ferrum_types::FerrumError::backend(format!(
+                            "to_vec2<u32/f32> failed: {}",
+                            e
+                        ))
+                    }),
+            },
+            _ => Err(ferrum_types::FerrumError::backend(format!(
+                "Unsupported tensor dimensions for token extraction: {:?}",
+                cpu_tensor.dims()
+            ))),
+        }
+    }
+
     fn reshape(&self, shape: &[usize]) -> Result<TensorRef> {
         let reshaped = self
             .inner
@@ -862,5 +908,16 @@ mod tests {
 
         let cpu_tensor = tensor.to_cpu().unwrap();
         assert_eq!(cpu_tensor.device(), Device::CPU);
+    }
+
+    #[test]
+    fn test_tensor_to_vec_u32_from_fp32_ids() {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let tensor = factory
+            .from_slice(&[1.0, 2.0, 3.0], &[1, 3], DataType::FP32, Device::CPU)
+            .unwrap();
+
+        let tokens = tensor.to_vec_u32().unwrap();
+        assert_eq!(tokens, vec![1, 2, 3]);
     }
 }

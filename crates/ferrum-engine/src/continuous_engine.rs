@@ -57,6 +57,8 @@ pub struct SequenceState {
     pub json_processor: Option<Arc<JsonModeProcessor>>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
+    /// Model executor's KV cache key for this sequence (for cleanup on completion).
+    pub model_cache_id: Option<String>,
 }
 
 impl SequenceState {
@@ -84,6 +86,7 @@ impl SequenceState {
             preemption_count: 0,
             json_processor,
             token_frequencies: HashMap::new(),
+            model_cache_id: None,
         }
     }
 
@@ -267,11 +270,28 @@ impl EngineInner {
             }
         }
 
-        // Decode continuing requests
-        for rid in &decode_ids {
-            if let Err(e) = self.run_decode_step(rid).await {
-                warn!("Decode failed for {}: {}", rid, e);
-                self.complete_request(rid, FinishReason::Error).await?;
+        // Decode continuing requests (batch when possible)
+        eprintln!(
+            "[ENGINE] decode: prefill={} decode={}",
+            prefill_ids.len(),
+            decode_ids.len()
+        );
+        if decode_ids.len() > 1 {
+            if let Err(e) = self.run_batch_decode(&decode_ids).await {
+                warn!("Batch decode failed, falling back to per-request: {}", e);
+                for rid in &decode_ids {
+                    if let Err(e) = self.run_decode_step(rid).await {
+                        warn!("Decode failed for {}: {}", rid, e);
+                        self.complete_request(rid, FinishReason::Error).await?;
+                    }
+                }
+            }
+        } else {
+            for rid in &decode_ids {
+                if let Err(e) = self.run_decode_step(rid).await {
+                    warn!("Decode failed for {}: {}", rid, e);
+                    self.complete_request(rid, FinishReason::Error).await?;
+                }
             }
         }
 
@@ -312,7 +332,17 @@ impl EngineInner {
 
         info!("Preempting request {} to free KV blocks", victim_id);
 
-        // Free KV cache
+        // Free model executor's KV cache for this sequence
+        {
+            let sequences = self.sequences.read();
+            if let Some(seq) = sequences.get(&victim_id) {
+                if let Some(ref cache_id) = seq.model_cache_id {
+                    self.model_executor.release_cache(cache_id);
+                }
+            }
+        }
+
+        // Free KV cache manager blocks
         let _ = self.kv_cache.deallocate(victim_id.clone()).await;
 
         // Reset sequence state — keep response/stream channels intact
@@ -320,6 +350,7 @@ impl EngineInner {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(&victim_id) {
                 seq.kv_cache = None;
+                seq.model_cache_id = None;
                 seq.generated_tokens.clear();
                 seq.prefill_complete = false;
                 seq.phase = RequestPhase::Waiting;
@@ -383,6 +414,7 @@ impl EngineInner {
                 let mut logits = cached_logits;
                 let token = seq.sample_with_processors(&mut logits)?;
                 seq.generated_tokens.push(token);
+                seq.model_cache_id = Some(cloned_kv.cache_id());
                 seq.kv_cache = Some(cloned_kv);
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
@@ -474,6 +506,7 @@ impl EngineInner {
             let mut logits = logits_vec;
             let token = seq.sample_with_processors(&mut logits)?;
             seq.generated_tokens.push(token);
+            seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
             seq.kv_cache = Some(prefill_output.kv_cache.clone());
             seq.prefill_complete = true;
             seq.phase = RequestPhase::Decoding;
@@ -503,6 +536,96 @@ impl EngineInner {
         };
         if should_stop {
             self.complete_request(request_id, FinishReason::EOS).await?;
+        }
+
+        Ok(())
+    }
+
+    // ── batch decode ──────────────────────────────────────────────────
+
+    /// Run batch decode for multiple requests in a single forward pass.
+    async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
+        // Build DecodeInput for each request
+        let mut decode_inputs = Vec::with_capacity(request_ids.len());
+        let rids: Vec<RequestId> = request_ids.to_vec();
+        {
+            let sequences = self.sequences.read();
+            for rid in &rids {
+                let seq = sequences
+                    .get(rid)
+                    .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+                let kv_cache = seq
+                    .kv_cache
+                    .as_ref()
+                    .ok_or_else(|| FerrumError::internal("No KV cache"))?
+                    .clone();
+                let last_token = seq
+                    .generated_tokens
+                    .last()
+                    .copied()
+                    .unwrap_or(TokenId::new(0));
+                let tensor = self.tokens_to_tensor(&[last_token.get()])?;
+                decode_inputs.push(ferrum_interfaces::model_executor::DecodeInput::new(
+                    tensor, kv_cache,
+                ));
+            }
+        }
+
+        // Call batch_decode on the executor
+        let decode_outputs = self.model_executor.batch_decode(&decode_inputs).await?;
+
+        // Process each result: sample, update state, stream
+        for (rid, decode_output) in rids.iter().zip(decode_outputs.iter()) {
+            let logits_vec = decode_output.logits.to_vec_f32()?;
+
+            let next_token = {
+                let mut sequences = self.sequences.write();
+                let seq = sequences
+                    .get_mut(rid)
+                    .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+                let mut logits = logits_vec;
+                let token = seq.sample_with_processors(&mut logits)?;
+                seq.generated_tokens.push(token);
+                seq.kv_cache = Some(decode_output.kv_cache.clone());
+                seq.tokens_this_iteration += 1;
+                token
+            };
+
+            let generated_count = {
+                let sequences = self.sequences.read();
+                sequences
+                    .get(rid)
+                    .map(|s| s.generated_tokens.len())
+                    .unwrap_or(0)
+            };
+            self.scheduler.update_decode_progress(rid, generated_count);
+            self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+            counter!("ferrum.engine.decode_tokens_total").increment(1);
+
+            self.send_stream_update(rid, next_token).await;
+
+            let should_stop = {
+                let sequences = self.sequences.read();
+                sequences.get(rid).map_or(true, |s| {
+                    s.should_stop(self.model_executor.info().vocab_size)
+                })
+            };
+            if should_stop {
+                eprintln!("[ENGINE] should_stop=true for {rid} in batch_decode");
+                let finish_reason = {
+                    let sequences = self.sequences.read();
+                    match sequences.get(rid) {
+                        Some(seq)
+                            if seq.generated_tokens.len() >= seq.sampling_params.max_tokens =>
+                        {
+                            FinishReason::Length
+                        }
+                        Some(_) => FinishReason::EOS,
+                        None => FinishReason::Error,
+                    }
+                };
+                self.complete_request(rid, finish_reason).await?;
+            }
         }
 
         Ok(())
@@ -568,6 +691,7 @@ impl EngineInner {
         };
 
         if should_stop {
+            eprintln!("[ENGINE] should_stop=true for {request_id} in decode_step");
             let finish_reason = {
                 let sequences = self.sequences.read();
                 match sequences.get(request_id) {
@@ -620,7 +744,7 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
     ) -> Result<()> {
-        let (response, stream_sender, response_sender, has_kv_cache) = {
+        let (response, stream_sender, response_sender, has_kv_cache, model_cache_id) = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.remove(request_id) {
                 let text = self
@@ -640,11 +764,27 @@ impl EngineInner {
                 };
 
                 let has_kv = seq.kv_cache.is_some();
-                (response, seq.stream_sender, seq.response_sender, has_kv)
+                let cache_id = seq.model_cache_id.clone();
+                (
+                    response,
+                    seq.stream_sender,
+                    seq.response_sender,
+                    has_kv,
+                    cache_id,
+                )
             } else {
+                eprintln!("[RELEASE] complete_request: seq already gone for {request_id}");
                 return Ok(());
             }
         };
+
+        // Release model executor's KV cache for this sequence (frees GPU memory).
+        if let Some(ref cache_id) = model_cache_id {
+            eprintln!("[RELEASE] complete_request: cache={cache_id} req={request_id}");
+            self.model_executor.release_cache(cache_id);
+        } else {
+            eprintln!("[RELEASE] complete_request: NO cache_id for req={request_id}");
+        }
 
         if has_kv_cache {
             let _ = self.kv_cache.deallocate(request_id.clone()).await;
