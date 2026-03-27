@@ -510,10 +510,12 @@ impl CudaDecodeRunner {
             (pool.block_size(), pool.max_blocks())
         };
 
-        // Allocate new block if needed
+        // Allocate new block only if this logical block doesn't exist yet.
+        // attention_paged is called once per layer, but all layers share the
+        // same block table — only the first layer should allocate.
         let logical_block = paged.current_len / bs;
         let slot = paged.current_len % bs;
-        if slot == 0 {
+        if logical_block >= paged.block_table_cpu.len() {
             let block_id = self.alloc_block(max_blk)?;
             paged.block_table_cpu.push(block_id as i32);
             paged.dirty = true;
