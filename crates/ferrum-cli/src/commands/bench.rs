@@ -397,6 +397,7 @@ async fn collect_stream(
     let mut token_count = 0usize;
     let mut first_token_time: Option<f64> = None;
 
+    let mut got_finish = false;
     while let Some(result) = stream.next().await {
         match result {
             Ok(chunk) => {
@@ -407,11 +408,18 @@ async fn collect_stream(
                     }
                 }
                 if chunk.finish_reason.is_some() {
+                    got_finish = true;
                     break;
                 }
             }
             Err(_) => break,
         }
+    }
+    if !got_finish && token_count > 0 {
+        eprintln!(
+            "  [warn] stream ended without finish_reason ({} tokens)",
+            token_count
+        );
     }
 
     Ok(BenchResult {

@@ -291,7 +291,8 @@ impl CudaDecodeRunner {
     }
 
     pub fn release_kv_cache(&mut self, cache_key: &str) {
-        self.kv_states.remove(cache_key);
+        let had_contiguous = self.kv_states.remove(cache_key).is_some();
+        let had_paged = self.paged_kv_states.contains_key(cache_key);
         // Return freed paged blocks to the free list for reuse
         if let Some(paged) = self.paged_kv_states.remove(cache_key) {
             let freed = paged.block_table_cpu.len();
@@ -303,6 +304,11 @@ impl CudaDecodeRunner {
                  free_list={}, next_id={}",
                 self.free_blocks.len(),
                 self.next_block_id,
+            );
+        } else {
+            tracing::warn!(
+                "release_kv_cache key={cache_key} cont={had_contiguous} paged={had_paged} \
+                 (nothing in paged_kv_states)",
             );
         }
     }
