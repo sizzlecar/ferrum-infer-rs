@@ -1647,9 +1647,9 @@ impl CudaDecodeRunner {
         b1.arg(&qv);
         b1.arg(&kv);
         b1.arg(&vv);
-        b1.arg(partial_out);
-        b1.arg(partial_m);
-        b1.arg(partial_l);
+        b1.arg(&mut *partial_out);
+        b1.arg(&mut *partial_m);
+        b1.arg(&mut *partial_l);
         b1.arg(&nqi);
         b1.arg(&nkvi);
         b1.arg(&hdi);

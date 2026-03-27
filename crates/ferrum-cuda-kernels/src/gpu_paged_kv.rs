@@ -147,7 +147,7 @@ impl GpuPagedKvPool {
         &self,
         block_ids: &[i32],
     ) -> Result<CudaSlice<i32>, cudarc::driver::DriverError> {
-        self.stream.memcpy_stod(block_ids)
+        self.stream.clone_htod(block_ids)
     }
 
     /// Get the K block pool buffer for a layer (for passing to kernel).
