@@ -238,20 +238,25 @@ impl CudaDecodeRunner {
         kv_data: Vec<(CudaSlice<half::f16>, CudaSlice<half::f16>)>,
         prefill_len: usize,
     ) -> candle_core::Result<()> {
-        let pool = self.kv_pool.as_mut().ok_or_else(|| {
-            candle_core::Error::Msg("paged KV not enabled".into())
-        })?;
-        let bs = pool.block_size();
+        let (bs, max_blk) = {
+            let pool = self.kv_pool.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("paged KV not enabled".into())
+            })?;
+            (pool.block_size(), pool.max_blocks())
+        };
         let num_blocks_needed = (prefill_len + bs - 1) / bs;
 
         // Allocate physical blocks (reuse free blocks first)
         let mut block_table = Vec::with_capacity(num_blocks_needed);
         for _ in 0..num_blocks_needed {
-            let block_id = self.alloc_block(pool.max_blocks())?;
+            let block_id = self.alloc_block(max_blk)?;
             block_table.push(block_id as i32);
         }
 
         // Bulk copy contiguous KV → paged blocks, per layer
+        let pool = self.kv_pool.as_mut().ok_or_else(|| {
+            candle_core::Error::Msg("paged KV not enabled".into())
+        })?;
         for (li, (k_cont, v_cont)) in kv_data.iter().enumerate() {
             pool.copy_contiguous_to_paged(li, k_cont, v_cont, prefill_len, &block_table)
                 .map_err(|e| candle_core::Error::Msg(format!("paged copy L{li}: {e}")))?;
@@ -497,22 +502,27 @@ impl CudaDecodeRunner {
         let nq = self.dims.num_attention_heads;
         let nkv = self.dims.num_kv_heads;
 
-        let pool = self.kv_pool.as_mut().ok_or_else(|| {
-            candle_core::Error::Msg("paged KV not enabled".into())
-        })?;
-        let bs = pool.block_size();
+        let (bs, max_blk) = {
+            let pool = self.kv_pool.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("paged KV not enabled".into())
+            })?;
+            (pool.block_size(), pool.max_blocks())
+        };
 
         // Allocate new block if needed
         let logical_block = paged.current_len / bs;
         let slot = paged.current_len % bs;
         if slot == 0 {
-            let block_id = self.alloc_block(pool.max_blocks())?;
+            let block_id = self.alloc_block(max_blk)?;
             paged.block_table_cpu.push(block_id as i32);
             paged.dirty = true;
         }
         let physical_block = paged.block_table_cpu[logical_block] as usize;
 
         // Append K to pool
+        let pool = self.kv_pool.as_mut().ok_or_else(|| {
+            candle_core::Error::Msg("paged KV not enabled".into())
+        })?;
         let ks = self.buffers.k_rotated.slice(..kv_dim);
         pool.write_k_token(li, physical_block, slot, &ks)
             .map_err(|e| candle_core::Error::Msg(format!("paged K write: {e}")))?;
