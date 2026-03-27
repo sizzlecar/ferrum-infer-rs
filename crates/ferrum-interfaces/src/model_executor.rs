@@ -180,6 +180,18 @@ pub trait ModelExecutor: Send + Sync {
     /// Execute decode phase (generate next token)
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput>;
 
+    /// Batch decode: process multiple sequences in one forward pass.
+    ///
+    /// Default implementation falls back to per-request `decode()`.
+    /// Executors with batched CUDA runners should override this.
+    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            outputs.push(self.decode(input).await?);
+        }
+        Ok(outputs)
+    }
+
     /// Optional: full forward pass (for non-autoregressive use cases)
     async fn forward(&self, _input: &TensorRef) -> Result<TensorRef> {
         // Default implementation not supported
