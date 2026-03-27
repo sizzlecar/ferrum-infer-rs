@@ -457,7 +457,8 @@ impl ModelExecutor for Qwen3ModelExecutor {
             let runner = runner
                 .as_mut()
                 .ok_or_else(|| FerrumError::model("CUDA runner not initialized"))?;
-            runner.batch_decode_step(&batch_requests)?
+            runner.batch_decode_step(&batch_requests)
+                .map_err(|e| FerrumError::model(format!("batch_decode_step: {e}")))?
         };
 
         // Split [B * vocab] logits into per-request outputs
