@@ -397,6 +397,126 @@ impl ModelExecutor for Qwen3ModelExecutor {
         Ok(DecodeOutput::new(logits_ref, new_handle))
     }
 
+    #[cfg(feature = "cuda")]
+    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        use ferrum_cuda_kernels::cuda_decode::BatchDecodeRequest;
+
+        if inputs.len() <= 1 || !self.ensure_cuda_runner() {
+            // Fallback to per-request decode
+            let mut outputs = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                outputs.push(self.decode(input).await?);
+            }
+            return Ok(outputs);
+        }
+
+        // Extract cache_ids, positions, and tokens for all inputs
+        let mut requests = Vec::with_capacity(inputs.len());
+        let mut cache_ids = Vec::with_capacity(inputs.len());
+        let mut seq_lens = Vec::with_capacity(inputs.len());
+
+        for input in inputs {
+            let handle = input
+                .kv_cache
+                .as_any()
+                .downcast_ref::<common::GenericKvCacheHandle>()
+                .ok_or_else(|| FerrumError::model("Invalid KV cache handle"))?;
+            let cache_id = handle.request_cache_id().to_string();
+            let seq_len = {
+                let states = self.states.lock();
+                states
+                    .get(&cache_id)
+                    .map(|s| s.sequence_length)
+                    .unwrap_or(0)
+            };
+            let tokens = self.tensor_to_tokens(&input.input_ids)?;
+            if tokens.len() != 1 {
+                return Err(FerrumError::model("batch_decode requires single-token inputs"));
+            }
+
+            self.ensure_runner_kv_cache(&cache_id, seq_len)?;
+            cache_ids.push(cache_id);
+            seq_lens.push(seq_len);
+            requests.push((tokens[0], seq_len));
+        }
+
+        // Build BatchDecodeRequests
+        let batch_requests: Vec<BatchDecodeRequest<'_>> = requests
+            .iter()
+            .zip(cache_ids.iter())
+            .map(|((token_id, position), cache_key)| BatchDecodeRequest {
+                token_id: *token_id,
+                position: *position,
+                cache_key: cache_key.as_str(),
+            })
+            .collect();
+
+        // Call runner.batch_decode_step
+        let logits_slice = {
+            let mut runner = self.cuda_runner.lock();
+            let runner = runner
+                .as_mut()
+                .ok_or_else(|| FerrumError::model("CUDA runner not initialized"))?;
+            runner.batch_decode_step(&batch_requests)?
+        };
+
+        // Split [B * vocab] logits into per-request outputs
+        let batch = inputs.len();
+        let vocab = self.info.vocab_size;
+        let cuda_dev = self
+            .model
+            .candle_device()
+            .as_cuda_device()
+            .map_err(|e| FerrumError::model(format!("Not CUDA: {e}")))?;
+
+        let storage = candle_core::cuda_backend::CudaStorage::wrap_cuda_slice(
+            logits_slice,
+            cuda_dev.clone(),
+        );
+        let logits_tensor = candle_core::Tensor::from_storage(
+            candle_core::Storage::Cuda(storage),
+            (batch, 1, vocab),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+
+        let mut outputs = Vec::with_capacity(batch);
+        for (i, input) in inputs.iter().enumerate() {
+            let item_logits = logits_tensor
+                .narrow(0, i, 1)
+                .map_err(|e| FerrumError::model(format!("logits narrow: {e}")))?;
+            let logits_ref = self.wrap_tensor(item_logits);
+
+            let handle = input
+                .kv_cache
+                .as_any()
+                .downcast_ref::<common::GenericKvCacheHandle>()
+                .unwrap();
+            let new_seq_len = {
+                let mut states = self.states.lock();
+                if let Some(state) = states.get_mut(&cache_ids[i]) {
+                    state.sequence_length += 1;
+                    state.sequence_length
+                } else {
+                    seq_lens[i] + 1
+                }
+            };
+            let new_handle = Arc::new(handle.with_sequence_length(new_seq_len));
+            outputs.push(DecodeOutput::new(logits_ref, new_handle));
+        }
+
+        Ok(outputs)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            outputs.push(self.decode(input).await?);
+        }
+        Ok(outputs)
+    }
+
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities {
             max_batch_size: 256,
