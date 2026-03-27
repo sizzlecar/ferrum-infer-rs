@@ -271,7 +271,11 @@ impl EngineInner {
         }
 
         // Decode continuing requests (batch when possible)
-        eprintln!("[ENGINE] decode: prefill={} decode={}", prefill_ids.len(), decode_ids.len());
+        eprintln!(
+            "[ENGINE] decode: prefill={} decode={}",
+            prefill_ids.len(),
+            decode_ids.len()
+        );
         if decode_ids.len() > 1 {
             if let Err(e) = self.run_batch_decode(&decode_ids).await {
                 warn!("Batch decode failed, falling back to per-request: {}", e);
@@ -561,9 +565,9 @@ impl EngineInner {
                     .copied()
                     .unwrap_or(TokenId::new(0));
                 let tensor = self.tokens_to_tensor(&[last_token.get()])?;
-                decode_inputs.push(
-                    ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache),
-                );
+                decode_inputs.push(ferrum_interfaces::model_executor::DecodeInput::new(
+                    tensor, kv_cache,
+                ));
             }
         }
 
@@ -594,8 +598,7 @@ impl EngineInner {
                     .map(|s| s.generated_tokens.len())
                     .unwrap_or(0)
             };
-            self.scheduler
-                .update_decode_progress(rid, generated_count);
+            self.scheduler.update_decode_progress(rid, generated_count);
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
 

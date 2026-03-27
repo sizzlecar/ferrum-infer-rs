@@ -143,10 +143,7 @@ async fn run_sequential_bench(
     let mut decode_tps_list: Vec<f64> = Vec::new();
 
     for round in 1..=cmd.rounds {
-        eprintln!(
-            "{}",
-            format!("Round {}/{}...", round, cmd.rounds).dimmed()
-        );
+        eprintln!("{}", format!("Round {}/{}...", round, cmd.rounds).dimmed());
 
         let result = run_single(engine, model_id, prompt, cmd.max_tokens).await?;
         let (tps, decode_tokens, tpot_ms, decode_tps) = compute_metrics(&result);
@@ -299,10 +296,7 @@ async fn run_concurrent_bench(
     eprintln!(
         "Throughput (total): {:.1} tok/s avg ({:.1} min, {:.1} max)",
         avg_tps,
-        round_tps_list
-            .iter()
-            .cloned()
-            .fold(f64::INFINITY, f64::min),
+        round_tps_list.iter().cloned().fold(f64::INFINITY, f64::min),
         round_tps_list.iter().cloned().fold(0.0_f64, f64::max)
     );
     eprintln!(
@@ -390,7 +384,14 @@ async fn run_single(
 
 async fn collect_stream(
     mut stream: std::pin::Pin<
-        Box<dyn futures::Stream<Item = std::result::Result<ferrum_types::StreamChunk, ferrum_types::FerrumError>> + Send>,
+        Box<
+            dyn futures::Stream<
+                    Item = std::result::Result<
+                        ferrum_types::StreamChunk,
+                        ferrum_types::FerrumError,
+                    >,
+                > + Send,
+        >,
     >,
 ) -> Result<BenchResult> {
     let start = Instant::now();
@@ -465,10 +466,7 @@ fn print_summary(
 
     eprintln!();
     eprintln!("{}", "=".repeat(60));
-    eprintln!(
-        "{}",
-        format!("BENCHMARK RESULTS ({})", mode).bold()
-    );
+    eprintln!("{}", format!("BENCHMARK RESULTS ({})", mode).bold());
     eprintln!("{}", "=".repeat(60));
     eprintln!("Model:             {}", model_id);
     eprintln!(

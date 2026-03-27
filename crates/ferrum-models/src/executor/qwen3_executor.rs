@@ -433,7 +433,9 @@ impl ModelExecutor for Qwen3ModelExecutor {
             };
             let tokens = self.tensor_to_tokens(&input.input_ids)?;
             if tokens.len() != 1 {
-                return Err(FerrumError::model("batch_decode requires single-token inputs"));
+                return Err(FerrumError::model(
+                    "batch_decode requires single-token inputs",
+                ));
             }
 
             self.ensure_runner_kv_cache(&cache_id, seq_len)?;
@@ -459,7 +461,8 @@ impl ModelExecutor for Qwen3ModelExecutor {
             let runner = runner
                 .as_mut()
                 .ok_or_else(|| FerrumError::model("CUDA runner not initialized"))?;
-            runner.batch_decode_step(&batch_requests)
+            runner
+                .batch_decode_step(&batch_requests)
                 .map_err(|e| FerrumError::model(format!("batch_decode_step: {e}")))?
         };
 
@@ -472,10 +475,8 @@ impl ModelExecutor for Qwen3ModelExecutor {
             .as_cuda_device()
             .map_err(|e| FerrumError::model(format!("Not CUDA: {e}")))?;
 
-        let storage = candle_core::cuda_backend::CudaStorage::wrap_cuda_slice(
-            logits_slice,
-            cuda_dev.clone(),
-        );
+        let storage =
+            candle_core::cuda_backend::CudaStorage::wrap_cuda_slice(logits_slice, cuda_dev.clone());
         let logits_tensor = candle_core::Tensor::from_storage(
             candle_core::Storage::Cuda(storage),
             (batch, 1, vocab),

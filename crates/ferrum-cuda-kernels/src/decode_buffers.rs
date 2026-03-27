@@ -32,7 +32,6 @@ pub struct ModelDims {
 /// The decode runner writes to these buffers in-place each step.
 pub struct DecodeBuffers {
     // ---- Batch-scaled buffers: [B * dim] ----
-
     /// After embedding lookup: [B * hidden_size]
     pub embed_out: CudaSlice<half::f16>,
 
@@ -85,14 +84,12 @@ pub struct DecodeBuffers {
     pub logits: CudaSlice<half::f16>,
 
     // ---- Single-token scratch for per-item ops in batch mode ----
-
     /// Per-item attention output scratch: [q_dim]
     /// Used when batch > 1 to avoid overwriting other items' attn results.
     pub scratch_attn: CudaSlice<half::f16>,
 
     // ---- Flash Decode partial buffers (f32, NOT batch-scaled) ----
     // Reused across batch items since attention is sequential per-item.
-
     /// Partial V accumulation: [num_q_heads * MAX_SPLITS * head_dim]
     pub flash_partial_out: CudaSlice<f32>,
 
@@ -135,18 +132,14 @@ impl DecodeBuffers {
             residual: unsafe { stream.alloc::<half::f16>(b * dims.hidden_size)? },
             post_norm_out: unsafe { stream.alloc::<half::f16>(b * dims.hidden_size)? },
             post_norm_residual: unsafe { stream.alloc::<half::f16>(b * dims.hidden_size)? },
-            gate_up_out: unsafe {
-                stream.alloc::<half::f16>(b * 2 * dims.intermediate_size)?
-            },
+            gate_up_out: unsafe { stream.alloc::<half::f16>(b * 2 * dims.intermediate_size)? },
             mlp_act: unsafe { stream.alloc::<half::f16>(b * dims.intermediate_size)? },
             down_out: unsafe { stream.alloc::<half::f16>(b * dims.hidden_size)? },
             final_norm_out: unsafe { stream.alloc::<half::f16>(b * dims.hidden_size)? },
             logits: unsafe { stream.alloc::<half::f16>(b * dims.vocab_size)? },
             scratch_attn: unsafe { stream.alloc::<half::f16>(q_dim)? },
             flash_partial_out: unsafe {
-                stream.alloc::<f32>(
-                    dims.num_attention_heads * Self::MAX_SPLITS * dims.head_dim,
-                )?
+                stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS * dims.head_dim)?
             },
             flash_partial_m: unsafe {
                 stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS)?
@@ -179,8 +172,8 @@ impl DecodeBuffers {
         let scratch_fp16 = q_dim; // scratch_attn
 
         // Flash decode partials (f32, not batched)
-        let flash_f32 = q_dim * Self::MAX_SPLITS
-            + self.dims.num_attention_heads * Self::MAX_SPLITS * 2;
+        let flash_f32 =
+            q_dim * Self::MAX_SPLITS + self.dims.num_attention_heads * Self::MAX_SPLITS * 2;
 
         (batch_fp16 + scratch_fp16) * std::mem::size_of::<half::f16>()
             + flash_f32 * std::mem::size_of::<f32>()
