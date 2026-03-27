@@ -228,6 +228,10 @@ async fn run_concurrent_bench(
             }
         }
 
+        // Let the engine finish cleaning up completed requests
+        // (complete_request runs asynchronously after stream ends)
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         let round_ms = round_start.elapsed().as_secs_f64() * 1000.0;
         let round_tps = if round_ms > 0.0 {
             round_tokens as f64 / (round_ms / 1000.0)
