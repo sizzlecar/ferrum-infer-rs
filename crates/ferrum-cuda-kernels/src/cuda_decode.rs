@@ -40,8 +40,7 @@ impl DiagConfig {
             shapes: all || std::env::var("FERRUM_DIAG_SHAPES").map_or(false, |v| v == "1"),
             attn: all || std::env::var("FERRUM_DIAG_ATTN").map_or(false, |v| v == "1"),
             timing: all || std::env::var("FERRUM_DIAG_TIMING").map_or(false, |v| v == "1"),
-            numerical: all
-                || std::env::var("FERRUM_DIAG_NUMERICAL").map_or(false, |v| v == "1"),
+            numerical: all || std::env::var("FERRUM_DIAG_NUMERICAL").map_or(false, |v| v == "1"),
         }
     }
 
@@ -139,8 +138,7 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("DecodeBuffers alloc: {e}")))?;
 
         let diag = DiagConfig::from_env();
-        let use_paged_kv =
-            std::env::var("FERRUM_PAGED_KV").map_or(false, |v| v == "1");
+        let use_paged_kv = std::env::var("FERRUM_PAGED_KV").map_or(false, |v| v == "1");
 
         let (kv_pool, next_block_id) = if use_paged_kv {
             let max_blocks: usize = std::env::var("FERRUM_KV_BLOCKS")
@@ -239,9 +237,10 @@ impl CudaDecodeRunner {
         prefill_len: usize,
     ) -> candle_core::Result<()> {
         let (bs, max_blk) = {
-            let pool = self.kv_pool.as_ref().ok_or_else(|| {
-                candle_core::Error::Msg("paged KV not enabled".into())
-            })?;
+            let pool = self
+                .kv_pool
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("paged KV not enabled".into()))?;
             (pool.block_size(), pool.max_blocks())
         };
         let num_blocks_needed = (prefill_len + bs - 1) / bs;
@@ -254,16 +253,18 @@ impl CudaDecodeRunner {
         }
 
         // Bulk copy contiguous KV → paged blocks, per layer
-        let pool = self.kv_pool.as_mut().ok_or_else(|| {
-            candle_core::Error::Msg("paged KV not enabled".into())
-        })?;
+        let pool = self
+            .kv_pool
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::Msg("paged KV not enabled".into()))?;
         for (li, (k_cont, v_cont)) in kv_data.iter().enumerate() {
             pool.copy_contiguous_to_paged(li, k_cont, v_cont, prefill_len, &block_table)
                 .map_err(|e| candle_core::Error::Msg(format!("paged copy L{li}: {e}")))?;
         }
 
         // Upload block table to GPU
-        let block_table_gpu = pool.upload_block_table(&block_table)
+        let block_table_gpu = pool
+            .upload_block_table(&block_table)
             .map_err(|e| candle_core::Error::Msg(format!("block table upload: {e}")))?;
 
         tracing::warn!(
@@ -286,8 +287,7 @@ impl CudaDecodeRunner {
     }
 
     pub fn has_kv_cache(&self, cache_key: &str) -> bool {
-        self.kv_states.contains_key(cache_key)
-            || self.paged_kv_states.contains_key(cache_key)
+        self.kv_states.contains_key(cache_key) || self.paged_kv_states.contains_key(cache_key)
     }
 
     pub fn release_kv_cache(&mut self, cache_key: &str) {
@@ -510,9 +510,10 @@ impl CudaDecodeRunner {
         let nkv = self.dims.num_kv_heads;
 
         let (bs, max_blk) = {
-            let pool = self.kv_pool.as_ref().ok_or_else(|| {
-                candle_core::Error::Msg("paged KV not enabled".into())
-            })?;
+            let pool = self
+                .kv_pool
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("paged KV not enabled".into()))?;
             (pool.block_size(), pool.max_blocks())
         };
 
@@ -529,9 +530,10 @@ impl CudaDecodeRunner {
         let physical_block = paged.block_table_cpu[logical_block] as usize;
 
         // Append K to pool
-        let pool = self.kv_pool.as_mut().ok_or_else(|| {
-            candle_core::Error::Msg("paged KV not enabled".into())
-        })?;
+        let pool = self
+            .kv_pool
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::Msg("paged KV not enabled".into()))?;
         let ks = self.buffers.k_rotated.slice(..kv_dim);
         pool.write_k_token(li, physical_block, slot, &ks)
             .map_err(|e| candle_core::Error::Msg(format!("paged K write: {e}")))?;
@@ -826,9 +828,11 @@ impl CudaDecodeRunner {
 
         // Extract KV state (contiguous or paged)
         let mut kv_cont = if !self.use_paged_kv {
-            Some(self.kv_states.remove(cache_key).ok_or_else(|| {
-                candle_core::Error::Msg(format!("No KV cache: {cache_key}"))
-            })?)
+            Some(
+                self.kv_states
+                    .remove(cache_key)
+                    .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?,
+            )
         } else {
             None
         };
@@ -1078,7 +1082,11 @@ impl CudaDecodeRunner {
             return Err(candle_core::Error::Msg("empty batch".into()));
         }
         if batch == 1 {
-            return self.decode_step(requests[0].token_id, requests[0].position, requests[0].cache_key);
+            return self.decode_step(
+                requests[0].token_id,
+                requests[0].position,
+                requests[0].cache_key,
+            );
         }
         if batch > self.dims.max_batch_size {
             return Err(candle_core::Error::Msg(format!(
@@ -1109,9 +1117,7 @@ impl CudaDecodeRunner {
 
         if self.diag.shapes {
             let positions: Vec<_> = requests.iter().map(|r| r.position).collect();
-            tracing::info!(
-                "[diag:shapes] batch_decode batch={batch} positions={positions:?}",
-            );
+            tracing::info!("[diag:shapes] batch_decode batch={batch} positions={positions:?}",);
         }
 
         // ---- Batched embedding: gather B rows into residual[0..B*H] ----
@@ -1173,8 +1179,10 @@ impl CudaDecodeRunner {
 
                 // Q/K norm: input is CudaView → rms_norm computes num_rows from view.len()
                 let q_view = self.buffers.qkv_out.slice(b * qkv_dim..b * qkv_dim + q_dim);
-                let k_view =
-                    self.buffers.qkv_out.slice(b * qkv_dim + q_dim..b * qkv_dim + q_dim + kv_dim);
+                let k_view = self
+                    .buffers
+                    .qkv_out
+                    .slice(b * qkv_dim + q_dim..b * qkv_dim + q_dim + kv_dim);
 
                 if let Some(ref qnw) = lw.q_norm_w {
                     Self::launch_rms_norm_view(
@@ -1234,9 +1242,10 @@ impl CudaDecodeRunner {
                         .map_err(|e| candle_core::Error::Msg(format!("KV k: {e}")))?;
                 }
                 {
-                    let vs = self.buffers.qkv_out.slice(
-                        b * qkv_dim + q_dim + kv_dim..b * qkv_dim + qkv_dim,
-                    );
+                    let vs = self
+                        .buffers
+                        .qkv_out
+                        .slice(b * qkv_dim + q_dim + kv_dim..b * qkv_dim + qkv_dim);
                     let mut vd = kv.v_caches[li].slice_mut(kv_off..kv_off + kv_dim);
                     self.stream
                         .memcpy_dtod(&vs, &mut vd)
@@ -1642,7 +1651,9 @@ impl CudaDecodeRunner {
         if valid_kv_len <= MIN_KV_PER_SPLIT {
             return 1;
         }
-        (valid_kv_len / MIN_KV_PER_SPLIT).min(DecodeBuffers::MAX_SPLITS).max(2)
+        (valid_kv_len / MIN_KV_PER_SPLIT)
+            .min(DecodeBuffers::MAX_SPLITS)
+            .max(2)
     }
 
     /// Flash Decoding: two-phase split-K attention for long KV sequences.

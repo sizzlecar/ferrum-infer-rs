@@ -14,8 +14,8 @@ use cudarc::driver::{CudaSlice, CudaStream};
 /// Configuration for the GPU paged KV block pool.
 #[derive(Debug, Clone)]
 pub struct GpuPagedKvConfig {
-    pub block_size: usize,       // tokens per block (must be power of 2)
-    pub max_blocks: usize,       // total physical blocks in pool
+    pub block_size: usize, // tokens per block (must be power of 2)
+    pub max_blocks: usize, // total physical blocks in pool
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub num_layers: usize,
@@ -171,6 +171,7 @@ impl GpuPagedKvPool {
     /// Total GPU memory used by all pool buffers (bytes).
     pub fn memory_bytes(&self) -> usize {
         let pool_elems = self.config.max_blocks * self.block_stride;
-        pool_elems * std::mem::size_of::<half::f16>() * 2 * self.config.num_layers // K + V
+        pool_elems * std::mem::size_of::<half::f16>() * 2 * self.config.num_layers
+        // K + V
     }
 }
