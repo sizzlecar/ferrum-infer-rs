@@ -767,16 +767,17 @@ impl EngineInner {
                     cache_id,
                 )
             } else {
+                eprintln!("[RELEASE] complete_request: seq already gone for {request_id}");
                 return Ok(());
             }
         };
 
         // Release model executor's KV cache for this sequence (frees GPU memory).
         if let Some(ref cache_id) = model_cache_id {
-            tracing::warn!("complete_request: releasing cache {cache_id} for {request_id}");
+            eprintln!("[RELEASE] complete_request: cache={cache_id} req={request_id}");
             self.model_executor.release_cache(cache_id);
         } else {
-            tracing::warn!("complete_request: no model_cache_id for {request_id}");
+            eprintln!("[RELEASE] complete_request: NO cache_id for req={request_id}");
         }
 
         if has_kv_cache {
