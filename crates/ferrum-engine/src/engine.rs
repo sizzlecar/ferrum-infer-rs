@@ -191,32 +191,12 @@ impl DefaultInferenceEngine {
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     ) -> Self {
         let configured_max_running = config.scheduler.max_running_requests.max(1);
-        let model_type_name = model_executor
-            .info()
-            .model_type
-            .to_string()
-            .to_ascii_lowercase();
-        let model_id_name = model_executor
-            .info()
-            .model_id
-            .to_string()
-            .to_ascii_lowercase();
-        let serialized_executor =
-            model_type_name.contains("qwen") || model_id_name.contains("qwen");
-        let effective_max_running_requests = if serialized_executor {
-            1
-        } else {
-            configured_max_running
-        };
-
-        if serialized_executor && configured_max_running > 1 {
-            warn!(
-                "Executor for model '{}' is serialized for correctness (configured max_running_requests={}, effective={})",
-                model_executor.info().model_id,
-                configured_max_running,
-                effective_max_running_requests
-            );
-        }
+        // Use FERRUM_MAX_RUNNING env var to override max concurrent requests.
+        let effective_max_running_requests = std::env::var("FERRUM_MAX_RUNNING")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(configured_max_running)
+            .max(1);
 
         info!(
             "Created DefaultInferenceEngine (configured_max_running_requests={}, effective_max_running_requests={})",
@@ -235,7 +215,7 @@ impl DefaultInferenceEngine {
             active_requests: Arc::new(AtomicUsize::new(0)),
             waiting_requests: Arc::new(AtomicUsize::new(0)),
             effective_max_running_requests,
-            serialized_executor,
+            serialized_executor: effective_max_running_requests <= 1,
         }
     }
 
@@ -565,6 +545,7 @@ impl InferenceEngine for DefaultInferenceEngine {
             let _inflight_guard = inflight_guard;
             let mut scheduler_guard = scheduler_guard;
             let mut kv_guard = KvReservationGuard::new(request_id.clone(), kv_cache.clone());
+            let mut last_cache_id = String::new();
 
             let generation_result: Result<InferenceResponse> = async {
                 // 1. Tokenize
@@ -590,6 +571,7 @@ impl InferenceEngine for DefaultInferenceEngine {
                 let mut generated_tokens = Vec::new();
                 let mut all_tokens: Vec<TokenId> = input_tokens.iter().copied().collect();
                 let mut model_kv_cache = prefill_output.kv_cache.clone();
+                last_cache_id = model_kv_cache.cache_id();
                 let mut rng = create_rng(&sampling_params);
                 let mut stop_reason: Option<FinishReason> = None;
 
@@ -673,6 +655,14 @@ impl InferenceEngine for DefaultInferenceEngine {
             .await;
 
             kv_guard.deallocate_now("stream-infer").await;
+
+            match &generation_result {
+                Ok(_) => {
+                    // Release model executor's KV cache (frees CUDA runner paged blocks)
+                    model_executor.release_cache(&last_cache_id);
+                }
+                Err(_) => {}
+            }
 
             match generation_result {
                 Ok(response) => {

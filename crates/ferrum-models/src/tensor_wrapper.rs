@@ -71,9 +71,46 @@ impl TensorLike for CandleTensorWrapper {
         self.tensor.is_contiguous()
     }
 
-    fn view(&self, _start: &[usize], _end: &[usize]) -> Result<ferrum_interfaces::TensorRef> {
-        // TODO: Implement tensor slicing
-        Err(FerrumError::model("Tensor view not yet implemented"))
+    fn view(&self, start: &[usize], end: &[usize]) -> Result<ferrum_interfaces::TensorRef> {
+        if start.len() != end.len() || start.len() != self.tensor.dims().len() {
+            return Err(FerrumError::model(format!(
+                "Invalid view dimensions: start={:?}, end={:?}, shape={:?}",
+                start,
+                end,
+                self.tensor.dims()
+            )));
+        }
+
+        let mut view = self.tensor.clone();
+        for (dim, (&start_idx, &end_idx)) in start.iter().zip(end.iter()).enumerate() {
+            if end_idx < start_idx {
+                return Err(FerrumError::model(format!(
+                    "Invalid view range on dim {}: {}..{}",
+                    dim, start_idx, end_idx
+                )));
+            }
+
+            let current_dim = view
+                .dims()
+                .get(dim)
+                .copied()
+                .ok_or_else(|| FerrumError::model("View dimension out of bounds"))?;
+            if end_idx > current_dim {
+                return Err(FerrumError::model(format!(
+                    "View end out of bounds on dim {}: {} > {}",
+                    dim, end_idx, current_dim
+                )));
+            }
+
+            let length = end_idx - start_idx;
+            if start_idx != 0 || length != current_dim {
+                view = view.narrow(dim, start_idx, length).map_err(|e| {
+                    FerrumError::model(format!("View narrow failed on dim {}: {}", dim, e))
+                })?;
+            }
+        }
+
+        Ok(std::sync::Arc::new(CandleTensorWrapper::new(view)))
     }
 
     fn reshape(&self, shape: &[usize]) -> Result<ferrum_interfaces::TensorRef> {
@@ -258,5 +295,25 @@ impl TensorLike for CandleTensorWrapper {
             .map_err(|e| FerrumError::model(format!("Argmax readback failed: {}", e)))?;
 
         Ok(idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_extracts_last_sequence_slice() {
+        let tensor = Tensor::from_vec(
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            (1, 2, 3),
+            &candle_core::Device::Cpu,
+        )
+        .expect("create tensor");
+        let wrapper = CandleTensorWrapper::new(tensor);
+
+        let view = wrapper.view(&[0, 1, 0], &[1, 2, 3]).expect("slice view");
+        assert_eq!(view.shape(), &[1, 1, 3]);
+        assert_eq!(view.to_vec_f32().expect("to_vec_f32"), vec![4.0, 5.0, 6.0]);
     }
 }

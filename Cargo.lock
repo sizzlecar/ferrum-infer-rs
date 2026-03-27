@@ -1210,6 +1210,7 @@ dependencies = [
 name = "ferrum-cuda-kernels"
 version = "0.2.0"
 dependencies = [
+ "bindgen_cuda",
  "candle-core",
  "cudarc 0.19.4",
  "ferrum-types",
@@ -1319,9 +1320,11 @@ dependencies = [
  "ferrum-cuda-kernels",
  "ferrum-interfaces",
  "ferrum-runtime",
+ "ferrum-testkit",
  "ferrum-types",
  "futures",
  "futures-util",
+ "half",
  "hf-hub",
  "indicatif",
  "once_cell",

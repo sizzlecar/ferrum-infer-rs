@@ -8,13 +8,19 @@ use candle_core::{DType, Device as CandleDevice, Module, Result as CandleResult,
 use candle_nn::{Activation, VarBuilder};
 use ferrum_types::{FerrumError, Result};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-// Re-use candle's with_tracing utilities (except RmsNorm — candle's custom op
-// lacks a Metal kernel; we use rms_norm_slow which is built from basic tensor
-// ops that Metal supports).
-use candle_transformers::models::with_tracing::{linear_no_bias, Linear};
+// Use candle_nn::Linear directly (not with_tracing wrapper) so we can
+// access weight() for CUDA decode runner weight extraction.
+use candle_nn::Linear;
+
+/// Load a no-bias linear layer from a VarBuilder.
+fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> CandleResult<Linear> {
+    let weight = vb.get((out_dim, in_dim), "weight")?;
+    Ok(Linear::new(weight, None))
+}
 
 /// RmsNorm implementation.
 ///
@@ -56,6 +62,48 @@ impl Module for RmsNorm {
         {
             rms_norm_slow(x, &self.weight, self.eps)
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn fused_add_rms_norm_compat(
+    input: &Tensor,
+    residual: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> CandleResult<(Tensor, Tensor)> {
+    if input.dims() != residual.dims() {
+        candle_core::bail!(
+            "fused_add_rms_norm_compat shape mismatch: input {:?}, residual {:?}",
+            input.dims(),
+            residual.dims()
+        );
+    }
+
+    let dims = input.dims();
+    match dims.len() {
+        2 => ferrum_cuda_kernels::fused_add_rms_norm(input, residual, weight, eps),
+        3 => {
+            let batch_size = dims[0];
+            let seq_len = dims[1];
+            let hidden_size = dims[2];
+            let flat_shape = (batch_size * seq_len, hidden_size);
+            let view_shape = (batch_size, seq_len, hidden_size);
+
+            let input_2d = input.reshape(flat_shape)?;
+            let residual_2d = residual.reshape(flat_shape)?;
+            let (normalized, residual_updated) =
+                ferrum_cuda_kernels::fused_add_rms_norm(&input_2d, &residual_2d, weight, eps)?;
+
+            Ok((
+                normalized.reshape(view_shape)?,
+                residual_updated.reshape(view_shape)?,
+            ))
+        }
+        _ => candle_core::bail!(
+            "fused_add_rms_norm_compat unsupported input shape: {:?}",
+            dims
+        ),
     }
 }
 
@@ -168,7 +216,7 @@ impl MLP {
             .pp("up_proj")
             .get((intermediate_sz, hidden_sz), "weight")?;
         let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 0)?; // [intermediate*2, hidden]
-        let gate_up_proj = Linear::from_weights(gate_up_w, None);
+        let gate_up_proj = Linear::new(gate_up_w, None);
         let down_proj = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
         Ok(Self {
             gate_up_proj,
@@ -276,7 +324,7 @@ struct Attention {
     kv_dim: usize, // num_kv_heads * head_dim
     max_position_embeddings: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<PreAllocKvCache>,
+    kv_caches: HashMap<String, PreAllocKvCache>,
 }
 
 impl Attention {
@@ -293,7 +341,7 @@ impl Attention {
         let k_w = vb.pp("k_proj").get((kv_dim, hidden_sz), "weight")?;
         let v_w = vb.pp("v_proj").get((kv_dim, hidden_sz), "weight")?;
         let qkv_w = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?; // [q_dim+kv_dim*2, hidden]
-        let qkv_proj = Linear::from_weights(qkv_w, None);
+        let qkv_proj = Linear::new(qkv_w, None);
         let o_proj = linear_no_bias(q_dim, hidden_sz, vb.pp("o_proj"))?;
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
@@ -310,7 +358,7 @@ impl Attention {
             kv_dim,
             max_position_embeddings: cfg.max_position_embeddings,
             rotary_emb,
-            kv_cache: None,
+            kv_caches: HashMap::new(),
         })
     }
 
@@ -319,6 +367,7 @@ impl Attention {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        cache_key: &str,
     ) -> CandleResult<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -353,17 +402,17 @@ impl Attention {
         let v_for_cache = value_states.transpose(1, 2)?.contiguous()?;
 
         // Update pre-allocated cache (O(1) write) or create it (first call)
-        let (k_view, v_view) = match &mut self.kv_cache {
-            Some(cache) => cache.append(&k_for_cache, &v_for_cache)?,
-            None => {
-                // First call: allocate cache sized to seq_len*8 (capped)
-                let alloc_len = (q_len * 8).max(2048).min(self.max_position_embeddings);
-                let cache = PreAllocKvCache::new(&k_for_cache, &v_for_cache, alloc_len)?;
-                let k_v = cache.k.narrow(1, 0, cache.current_len)?;
-                let v_v = cache.v.narrow(1, 0, cache.current_len)?;
-                self.kv_cache = Some(cache);
-                (k_v, v_v)
-            }
+        // Each sequence gets its own KV cache keyed by cache_key.
+        let (k_view, v_view) = if let Some(cache) = self.kv_caches.get_mut(cache_key) {
+            cache.append(&k_for_cache, &v_for_cache)?
+        } else {
+            // First call for this sequence: allocate cache
+            let alloc_len = (q_len * 8).max(2048).min(self.max_position_embeddings);
+            let cache = PreAllocKvCache::new(&k_for_cache, &v_for_cache, alloc_len)?;
+            let k_v = cache.k.narrow(1, 0, cache.current_len)?;
+            let v_v = cache.v.narrow(1, 0, cache.current_len)?;
+            self.kv_caches.insert(cache_key.to_string(), cache);
+            (k_v, v_v)
         };
         // k_view, v_view: [batch, total_seq, kv_heads, head_dim] — zero-copy narrow views
 
@@ -440,7 +489,11 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
+        self.kv_caches.clear();
+    }
+
+    fn clear_kv_cache_for(&mut self, cache_key: &str) {
+        self.kv_caches.remove(cache_key);
     }
 }
 
@@ -476,14 +529,17 @@ impl DecoderLayer {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        cache_key: &str,
     ) -> CandleResult<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+        let xs = self
+            .self_attn
+            .forward(&xs, attention_mask, seqlen_offset, cache_key)?;
         // Fused residual-add + RMS norm: 2 kernel launches → 1, saves 1 memory round-trip
         #[cfg(feature = "cuda")]
         let (xs, residual) = {
-            let (normalized, residual_updated) = ferrum_cuda_kernels::fused_add_rms_norm(
+            let (normalized, residual_updated) = fused_add_rms_norm_compat(
                 &xs,
                 residual,
                 &self.post_attention_layernorm.weight,
@@ -504,6 +560,10 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache()
+    }
+
+    fn clear_kv_cache_for(&mut self, cache_key: &str) {
+        self.self_attn.clear_kv_cache_for(cache_key)
     }
 }
 
@@ -563,6 +623,7 @@ impl Model {
         input_ids: &Tensor,
         seqlen_offset: usize,
         _attn_mask: Option<&Tensor>,
+        cache_key: &str,
     ) -> CandleResult<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
         let attention_mask = if seq_len <= 1 {
@@ -572,7 +633,7 @@ impl Model {
         };
         let mut xs = self.embed_tokens.forward(input_ids)?;
         for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset, cache_key)?
         }
         xs.apply(&self.norm)
     }
@@ -580,6 +641,12 @@ impl Model {
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
+        }
+    }
+
+    pub fn clear_kv_cache_for(&mut self, cache_key: &str) {
+        for layer in self.layers.iter_mut() {
+            layer.clear_kv_cache_for(cache_key)
         }
     }
 }
@@ -594,11 +661,11 @@ impl ModelForCausalLM {
     pub fn new(cfg: &Config, vb: VarBuilder) -> CandleResult<Self> {
         let base_model = Model::new(cfg, vb.clone())?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(base_model.embed_tokens.embeddings().clone(), None)
+            Linear::new(base_model.embed_tokens.embeddings().clone(), None)
         } else if vb.contains_tensor("lm_head.weight") {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         } else {
-            Linear::from_weights(base_model.embed_tokens.embeddings().clone(), None)
+            Linear::new(base_model.embed_tokens.embeddings().clone(), None)
         };
         Ok(Self {
             base_model,
@@ -606,16 +673,25 @@ impl ModelForCausalLM {
         })
     }
 
-    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> CandleResult<Tensor> {
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        cache_key: &str,
+    ) -> CandleResult<Tensor> {
         let (_b_size, seq_len) = input_ids.dims2()?;
         self.base_model
-            .forward(input_ids, seqlen_offset, None)?
+            .forward(input_ids, seqlen_offset, None, cache_key)?
             .narrow(1, seq_len - 1, 1)?
             .apply(&self.lm_head)
     }
 
     pub fn clear_kv_cache(&mut self) {
         self.base_model.clear_kv_cache()
+    }
+
+    pub fn clear_kv_cache_for(&mut self, cache_key: &str) {
+        self.base_model.clear_kv_cache_for(cache_key)
     }
 }
 
@@ -712,23 +788,52 @@ impl Qwen3ModelWrapper {
         })
     }
 
-    pub fn forward_prefill(&self, input_ids: &Tensor) -> Result<Tensor> {
+    pub fn forward_prefill(&self, input_ids: &Tensor, cache_key: &str) -> Result<Tensor> {
         let mut model = self.model.lock();
+        model.clear_kv_cache_for(cache_key);
         model
-            .forward(input_ids, 0)
+            .forward(input_ids, 0, cache_key)
             .map_err(|e| FerrumError::model(format!("Prefill forward failed: {}", e)))
     }
 
-    pub fn forward_decode(&self, token_id: &Tensor, pos: usize) -> Result<Tensor> {
+    pub fn forward_decode(&self, token_id: &Tensor, pos: usize, cache_key: &str) -> Result<Tensor> {
         let mut model = self.model.lock();
         model
-            .forward(token_id, pos)
+            .forward(token_id, pos, cache_key)
             .map_err(|e| FerrumError::model(format!("Decode forward failed: {}", e)))
     }
 
-    pub fn reset_cache(&self) -> Result<()> {
+    /// Release KV cache for a completed sequence, freeing GPU memory.
+    pub fn release_cache(&self, cache_key: &str) {
+        self.model.lock().clear_kv_cache_for(cache_key);
+    }
+
+    pub fn reset_all_caches(&self) {
         self.model.lock().clear_kv_cache();
-        Ok(())
+    }
+
+    /// Export KV cache data for a sequence, for use by CudaDecodeRunner.
+    ///
+    /// Returns per-layer (k_tensor, v_tensor, current_len, max_len) where K/V are
+    /// [batch=1, max_len, kv_heads, head_dim] contiguous candle Tensors.
+    /// Returns None if the sequence has no KV cache.
+    #[cfg(feature = "cuda")]
+    pub fn export_kv_cache(&self, cache_key: &str) -> Option<Vec<(Tensor, Tensor, usize, usize)>> {
+        let model = self.model.lock();
+        let mut result = Vec::new();
+        for layer in &model.base_model.layers {
+            if let Some(cache) = layer.self_attn.kv_caches.get(cache_key) {
+                result.push((
+                    cache.k.clone(),
+                    cache.v.clone(),
+                    cache.current_len,
+                    cache.max_len,
+                ));
+            } else {
+                return None;
+            }
+        }
+        Some(result)
     }
 
     pub fn config(&self) -> &Config {
@@ -745,5 +850,233 @@ impl Qwen3ModelWrapper {
 
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// Create a CUDA decode runner by extracting weight pointers from the model.
+    ///
+    /// The runner bypasses candle for the decode hot path, using cuBLAS + custom
+    /// CUDA kernels with pre-allocated buffers.
+    #[cfg(feature = "cuda")]
+    pub fn create_decode_runner(
+        &self,
+    ) -> Result<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner> {
+        use ferrum_cuda_kernels::decode_buffers::ModelDims;
+        use ferrum_cuda_kernels::weight_store::{GpuWeight, LayerWeights, Qwen3Weights};
+
+        let model = self.model.lock();
+        let cfg = &self.config;
+
+        // Create non-blocking stream — required for CUDA Graph capture.
+        // All weights and buffers will be copied to this stream.
+        let cuda_device = self
+            .device
+            .as_cuda_device()
+            .map_err(|e| FerrumError::model(format!("not CUDA: {e}")))?;
+        // Sync candle's stream FIRST — ensure all weight tensors are
+        // fully materialized on GPU before we copy them cross-stream.
+        let candle_stream = cuda_device.cuda_stream();
+        candle_stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("candle stream sync: {e}")))?;
+
+        let rs = candle_stream
+            .context()
+            .new_stream()
+            .map_err(|e| FerrumError::model(format!("new_stream: {e}")))?;
+
+        let dims = ModelDims {
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+            num_attention_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            vocab_size: cfg.vocab_size,
+            num_layers: cfg.num_hidden_layers,
+            max_seq_len: cfg.max_position_embeddings,
+            max_batch_size: std::env::var("FERRUM_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+        };
+
+        // Extract weights — copy to runner's non-blocking stream
+        let embed_table = GpuWeight::from_tensor(model.base_model.embed_tokens.embeddings(), &rs)
+            .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for layer in &model.base_model.layers {
+            let lw = LayerWeights {
+                input_ln_w: GpuWeight::from_tensor(&layer.input_layernorm.weight, &rs)
+                    .map_err(|e| FerrumError::model(format!("input_ln: {e}")))?,
+                qkv_w: GpuWeight::from_tensor(layer.self_attn.qkv_proj.weight(), &rs)
+                    .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
+                q_norm_w: Some(
+                    GpuWeight::from_tensor(&layer.self_attn.q_norm.weight, &rs)
+                        .map_err(|e| FerrumError::model(format!("q_norm: {e}")))?,
+                ),
+                k_norm_w: Some(
+                    GpuWeight::from_tensor(&layer.self_attn.k_norm.weight, &rs)
+                        .map_err(|e| FerrumError::model(format!("k_norm: {e}")))?,
+                ),
+                o_w: GpuWeight::from_tensor(layer.self_attn.o_proj.weight(), &rs)
+                    .map_err(|e| FerrumError::model(format!("o_proj: {e}")))?,
+                post_ln_w: GpuWeight::from_tensor(&layer.post_attention_layernorm.weight, &rs)
+                    .map_err(|e| FerrumError::model(format!("post_ln: {e}")))?,
+                gate_up_w: GpuWeight::from_tensor(layer.mlp.gate_up_proj.weight(), &rs)
+                    .map_err(|e| FerrumError::model(format!("gate_up: {e}")))?,
+                down_w: GpuWeight::from_tensor(layer.mlp.down_proj.weight(), &rs)
+                    .map_err(|e| FerrumError::model(format!("down: {e}")))?,
+            };
+            layers.push(lw);
+        }
+
+        let final_norm_w = GpuWeight::from_tensor(&model.base_model.norm.weight, &rs)
+            .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
+        let lm_head_w = GpuWeight::from_tensor(model.lm_head.weight(), &rs)
+            .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
+        let rope_cos =
+            GpuWeight::from_tensor(&model.base_model.layers[0].self_attn.rotary_emb.cos, &rs)
+                .map_err(|e| FerrumError::model(format!("rope_cos: {e}")))?;
+        let rope_sin =
+            GpuWeight::from_tensor(&model.base_model.layers[0].self_attn.rotary_emb.sin, &rs)
+                .map_err(|e| FerrumError::model(format!("rope_sin: {e}")))?;
+
+        let weights = Qwen3Weights {
+            embed_table,
+            layers,
+            final_norm_w,
+            lm_head_w,
+            rope_cos,
+            rope_sin,
+        };
+
+        // Synchronize the runner stream to ensure all weight D2D copies
+        // from candle's default stream are complete before use.
+        rs.synchronize()
+            .map_err(|e| FerrumError::model(format!("stream sync after weight copy: {e}")))?;
+
+        ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
+            weights,
+            dims,
+            cuda_device.clone(),
+            rs,
+        )
+        .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
+    }
+}
+
+// ======================== TransformerWeights implementation ========================
+
+use ferrum_interfaces::transformer::{TransformerConfig, TransformerWeights};
+use ferrum_interfaces::TensorRef;
+
+/// Cached weight TensorRefs for the TransformerWeights trait.
+/// Pre-wrapped at construction time — each call returns Arc::clone() (cheap).
+struct Qwen3WeightCache {
+    config: TransformerConfig,
+    embed: TensorRef,
+    layers: Vec<Qwen3LayerWeightCache>,
+    final_norm: TensorRef,
+    lm_head: TensorRef,
+    rope_cos: TensorRef,
+    rope_sin: TensorRef,
+}
+
+struct Qwen3LayerWeightCache {
+    input_norm: TensorRef,
+    qkv: TensorRef,
+    q_norm: TensorRef,
+    k_norm: TensorRef,
+    o_proj: TensorRef,
+    post_norm: TensorRef,
+    gate_up: TensorRef,
+    down: TensorRef,
+}
+
+fn wrap(t: &Tensor) -> TensorRef {
+    Arc::new(crate::tensor_wrapper::CandleTensorWrapper::new(t.clone()))
+}
+
+impl Qwen3WeightCache {
+    fn from_model(model: &ModelForCausalLM, cfg: &Config) -> Self {
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for layer in &model.base_model.layers {
+            layers.push(Qwen3LayerWeightCache {
+                input_norm: wrap(&layer.input_layernorm.weight),
+                qkv: wrap(layer.self_attn.qkv_proj.weight()),
+                q_norm: wrap(&layer.self_attn.q_norm.weight),
+                k_norm: wrap(&layer.self_attn.k_norm.weight),
+                o_proj: wrap(layer.self_attn.o_proj.weight()),
+                post_norm: wrap(&layer.post_attention_layernorm.weight),
+                gate_up: wrap(layer.mlp.gate_up_proj.weight()),
+                down: wrap(layer.mlp.down_proj.weight()),
+            });
+        }
+
+        Self {
+            config: TransformerConfig {
+                num_layers: cfg.num_hidden_layers,
+                hidden_size: cfg.hidden_size,
+                num_attention_heads: cfg.num_attention_heads,
+                num_kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                intermediate_size: cfg.intermediate_size,
+                vocab_size: cfg.vocab_size,
+                max_seq_len: cfg.max_position_embeddings,
+                rms_norm_eps: cfg.rms_norm_eps as f32,
+                has_qk_norm: true, // Qwen3 has Q/K head normalization
+            },
+            embed: wrap(model.base_model.embed_tokens.embeddings()),
+            layers,
+            final_norm: wrap(&model.base_model.norm.weight),
+            lm_head: wrap(model.lm_head.weight()),
+            rope_cos: wrap(&model.base_model.layers[0].self_attn.rotary_emb.cos),
+            rope_sin: wrap(&model.base_model.layers[0].self_attn.rotary_emb.sin),
+        }
+    }
+}
+
+impl TransformerWeights for Qwen3WeightCache {
+    fn config(&self) -> &TransformerConfig {
+        &self.config
+    }
+    fn embed_weight(&self) -> TensorRef {
+        self.embed.clone()
+    }
+    fn layer_input_norm_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].input_norm.clone()
+    }
+    fn layer_qkv_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].qkv.clone()
+    }
+    fn layer_q_norm_weight(&self, layer: usize) -> Option<TensorRef> {
+        Some(self.layers[layer].q_norm.clone())
+    }
+    fn layer_k_norm_weight(&self, layer: usize) -> Option<TensorRef> {
+        Some(self.layers[layer].k_norm.clone())
+    }
+    fn layer_o_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].o_proj.clone()
+    }
+    fn layer_post_norm_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].post_norm.clone()
+    }
+    fn layer_gate_up_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].gate_up.clone()
+    }
+    fn layer_down_weight(&self, layer: usize) -> TensorRef {
+        self.layers[layer].down.clone()
+    }
+    fn final_norm_weight(&self) -> TensorRef {
+        self.final_norm.clone()
+    }
+    fn lm_head_weight(&self) -> TensorRef {
+        self.lm_head.clone()
+    }
+    fn rope_cos(&self) -> TensorRef {
+        self.rope_cos.clone()
+    }
+    fn rope_sin(&self) -> TensorRef {
+        self.rope_sin.clone()
     }
 }
