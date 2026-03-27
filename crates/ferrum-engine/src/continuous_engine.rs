@@ -271,6 +271,7 @@ impl EngineInner {
         }
 
         // Decode continuing requests (batch when possible)
+        eprintln!("[ENGINE] decode: prefill={} decode={}", prefill_ids.len(), decode_ids.len());
         if decode_ids.len() > 1 {
             if let Err(e) = self.run_batch_decode(&decode_ids).await {
                 warn!("Batch decode failed, falling back to per-request: {}", e);
@@ -607,6 +608,7 @@ impl EngineInner {
                 })
             };
             if should_stop {
+                eprintln!("[ENGINE] should_stop=true for {rid} in batch_decode");
                 let finish_reason = {
                     let sequences = self.sequences.read();
                     match sequences.get(rid) {
@@ -686,6 +688,7 @@ impl EngineInner {
         };
 
         if should_stop {
+            eprintln!("[ENGINE] should_stop=true for {request_id} in decode_step");
             let finish_reason = {
                 let sequences = self.sequences.read();
                 match sequences.get(request_id) {
