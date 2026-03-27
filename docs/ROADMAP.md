@@ -71,22 +71,23 @@ MVP phase on the `mvp` branch. Phase 1 (Core Scheduling Engine) is complete.
 
 ### What's next
 
-**Phase 2: CUDA Kernel Layer** — FFI bindings to FlashAttention/FlashInfer for production attention performance. The scheduling layer (Phase 1) is complete; without CUDA kernels, performance cannot compete with vLLM.
+**Phase 2: CUDA Kernel Layer** — Custom CUDA kernels for decode, flash decoding, paged attention, and batch decode. Candle retained for prefill (FlashAttention-2) and weight loading.
 
 ## Gap Analysis vs vLLM
 
 | Capability | vLLM | Ferrum | Gap |
 |---|---|---|---|
-| PagedAttention | Mature | **Done** — block table, paged KV R/W, CPU attention kernel | Closed |
+| PagedAttention | Mature | **Done** — GPU paged KV pool, block-table attention kernel, free-list reclamation | Closed |
 | Continuous Batching | Iteration-level, prefill/decode mixed | **Done** — iteration-level mixed batching, concurrent requests | Closed |
 | Preemption | Swap/recomputation | **Done** — recomputation-based preemption with auto-resubmit | Closed |
 | Prefix Caching | Yes | **Done** — exact-match prefix cache with LRU eviction | Closed |
-| CUDA Kernel Optimization | FlashAttention / FlashInfer | Candle (no custom kernels) | **Critical** |
-| Quantization | AWQ / GPTQ / FP8 | None | Large |
+| CUDA Kernel Optimization | FlashAttention / FlashInfer | **Done** — custom decode kernels, flash decoding (split-K), fused ops | Closed |
+| Batch Decode | Batched GEMM + attention | **Done** — batched cuBLAS GEMM (m=batch), per-item attention | Partial (attention not yet batched) |
+| Quantization | AWQ / GPTQ / FP8 | None | **Critical** |
 | Tensor Parallelism | Multi-GPU via NCCL | Type stubs only | Large |
-| Model Support | Dozens | 3 | Medium |
+| Model Support | Dozens | 4 | Medium |
 | Structured Output | JSON mode / grammar-guided | **Done** — JSON mode via logits biasing, OpenAI API support | Partial (grammar-guided future) |
-| Benchmarking | Comprehensive | None | Medium |
+| Benchmarking | Comprehensive | **Done** — sequential, concurrent, long-context modes | Closed |
 
 ## Architecture Principle
 

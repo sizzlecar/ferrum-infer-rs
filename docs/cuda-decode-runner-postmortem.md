@@ -135,30 +135,36 @@ RTX 5090 上正确的代码在 RTX PRO 6000 上乱码。不同 GPU 的 timing、
 | 组件 | 状态 |
 |------|------|
 | CudaDecodeRunner | ✅ 正确运行（RTX 5090 + RTX PRO 6000） |
-| 自定义 CUDA kernels | ✅ rms_norm, rope, decode_attention, residual_add, fused_add_rms_norm, fused_silu_mul |
-| cuBLAS GEMM | ✅ 用 cudarc safe wrapper |
-| 预分配 DecodeBuffers | ✅ 零动态分配 |
+| 自定义 CUDA kernels | ✅ rms_norm, rope, decode_attention, flash_decode_attention, paged_decode_attention, residual_add, fused_add_rms_norm, fused_silu_mul (+interleaved) |
+| cuBLAS GEMM | ✅ 支持 batch decode（m=batch） |
+| 预分配 DecodeBuffers | ✅ 支持 max_batch_size 缩放 |
+| 双缓冲 residual | ✅ 跨层 norm 融合，减少 108 次 kernel launch |
+| Flash Decoding (split-K) | ✅ 长上下文自动启用（kv_len > 256） |
+| Paged KV Attention | ✅ GPU block pool + block-table 间接寻址 + free-list 回收 |
+| Batch Decode | ✅ batched GEMM + per-item attention，executor/engine 端到端集成 |
 | CUDA Graphs | ⚠️ 架构就绪但默认禁用（比 eager 慢） |
 | TransformerWeights 抽象 | ✅ Qwen3 已实现，Llama/Qwen2 待做 |
-| DecodeBackend 抽象 | ✅ trait 定义完成 |
-| GenericKvCacheHandle | ✅ 替代了 per-model KvCacheHandle |
-| 测试 | ✅ 28 个测试全部通过（不依赖 GPU） |
-| 环境变量控制 | ✅ FERRUM_DISABLE_CUDA_RUNNER, FERRUM_LOG_TOKENS |
+| 运行时诊断 | ✅ FERRUM_DIAG=1 控制 shapes/attn/timing 日志 |
+| Bench CLI | ✅ 顺序/并发/长上下文模式 |
 
 ## 性能数据
+
+### RTX PRO 6000, Qwen3-4B FP16（最新）
+
+| 场景 | Decode tok/s | TPOT | 备注 |
+|------|-------------|------|------|
+| 优化前基线 | 73.5 | 13.60ms | 旧 CUDA runner |
+| 单请求（优化后） | **88.8** | 11.26ms | +21%，双缓冲+跨层融合 |
+| 4 并发 batch decode | **109.4** | 4.75ms | batched GEMM |
+| 4 并发 paged KV | **102.9** | 5.05ms | block-table attention |
+| 长 decode (1024 tok) | 79.7 | 12.54ms | flash decode 自动启用 |
+| 长 prompt (~2k tok) | 78.1 | 12.81ms | flash decode + 长 prefill |
 
 ### RTX 5090, Qwen3-4B FP16
 | 路径 | Decode tok/s | TPOT |
 |------|-------------|------|
 | Candle (fused kernels) | ~100 | ~10ms |
 | CUDA Runner (eager) | ~109 | ~9.15ms |
-| CUDA Runner (graphs) | ~100 | ~10ms |
-
-### RTX PRO 6000, Qwen3-4B FP16
-| 路径 | Decode tok/s | TPOT |
-|------|-------------|------|
-| Candle | 71.5 | 14.00ms |
-| CUDA Runner | 70.7 | 14.15ms |
 
 ### Mac (CPU), Qwen2.5-0.5B
 | 路径 | Decode tok/s | TPOT |
