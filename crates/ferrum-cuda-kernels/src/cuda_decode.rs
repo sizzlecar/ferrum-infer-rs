@@ -15,6 +15,41 @@ use crate::decode_buffers::{DecodeBuffers, ModelDims};
 use crate::ptx;
 use crate::weight_store::TransformerGpuWeights;
 
+// ======================== Runtime Diagnostics ========================
+//
+// Enable via env vars (checked once at runner init, zero cost when off):
+//   FERRUM_DIAG_SHAPES=1   — log tensor shapes at key points per step
+//   FERRUM_DIAG_ATTN=1     — log attention details (kv_len, num_splits, etc.)
+//   FERRUM_DIAG_TIMING=1   — log per-layer timing breakdown
+//   FERRUM_DIAG_NUMERICAL=1 — sync + log first/last few values of key tensors
+//   FERRUM_DIAG=1           — enable ALL of the above
+
+/// Runtime diagnostic flags, read once from env vars.
+#[derive(Debug, Clone, Copy)]
+struct DiagConfig {
+    shapes: bool,
+    attn: bool,
+    timing: bool,
+    numerical: bool,
+}
+
+impl DiagConfig {
+    fn from_env() -> Self {
+        let all = std::env::var("FERRUM_DIAG").map_or(false, |v| v == "1");
+        Self {
+            shapes: all || std::env::var("FERRUM_DIAG_SHAPES").map_or(false, |v| v == "1"),
+            attn: all || std::env::var("FERRUM_DIAG_ATTN").map_or(false, |v| v == "1"),
+            timing: all || std::env::var("FERRUM_DIAG_TIMING").map_or(false, |v| v == "1"),
+            numerical: all
+                || std::env::var("FERRUM_DIAG_NUMERICAL").map_or(false, |v| v == "1"),
+        }
+    }
+
+    fn any_enabled(self) -> bool {
+        self.shapes || self.attn || self.timing || self.numerical
+    }
+}
+
 /// Per-sequence KV cache managed by the decode runner.
 struct SequenceKvState {
     k_caches: Vec<CudaSlice<half::f16>>,
@@ -54,6 +89,7 @@ pub struct CudaDecodeRunner {
     _cublas_workspace: Option<CudaSlice<u8>>,
     warmup_count: usize,
     capture_attempted: bool,
+    diag: DiagConfig,
 }
 
 impl CudaDecodeRunner {
@@ -72,10 +108,16 @@ impl CudaDecodeRunner {
         let buffers = DecodeBuffers::new(dims.clone(), &stream)
             .map_err(|e| candle_core::Error::Msg(format!("DecodeBuffers alloc: {e}")))?;
 
+        let diag = DiagConfig::from_env();
         tracing::info!(
-            "CudaDecodeRunner initialized: {}MB decode buffers, {} layers",
+            "CudaDecodeRunner initialized: {}MB decode buffers, {} layers{}",
             buffers.memory_bytes() / (1024 * 1024),
             dims.num_layers,
+            if diag.any_enabled() {
+                format!(", diag={diag:?}")
+            } else {
+                String::new()
+            },
         );
 
         Ok(Self {
@@ -90,6 +132,7 @@ impl CudaDecodeRunner {
             _cublas_workspace: None,
             warmup_count: 0,
             capture_attempted: false,
+            diag,
         })
     }
 
@@ -253,6 +296,13 @@ impl CudaDecodeRunner {
         let scale = 1.0f32 / (hd as f32).sqrt();
         let valid_kv = kv.current_len + 1;
         let num_splits = Self::compute_num_splits(valid_kv);
+
+        if self.diag.attn && li == 0 {
+            tracing::info!(
+                "[diag:attn] layer=0 valid_kv={valid_kv} num_splits={num_splits} \
+                 nq={nq} nkv={nkv} hd={hd} scale={scale:.4}",
+            );
+        }
 
         if num_splits <= 1 {
             // Short KV: use original single-block kernel (no Phase 2 overhead)
@@ -528,12 +578,27 @@ impl CudaDecodeRunner {
         let inter = self.dims.intermediate_size;
         let eps = 1e-6f32;
 
+        let step_start = if self.diag.timing {
+            self.stream.synchronize().ok();
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         self.embed_eager(token_id)?;
 
         let mut kv = self
             .kv_states
             .remove(cache_key)
             .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
+
+        if self.diag.shapes {
+            tracing::info!(
+                "[diag:shapes] decode_step token={token_id} pos={position} kv_len={} max_kv={}",
+                kv.current_len,
+                kv.max_len,
+            );
+        }
 
         // First layer: standalone rms_norm (subsequent layers get norm from
         // previous layer's exit fused_add_rms_norm)
@@ -721,6 +786,16 @@ impl CudaDecodeRunner {
         self.stream
             .synchronize()
             .map_err(|e| candle_core::Error::Msg(format!("stream sync: {e}")))?;
+
+        if let Some(t0) = step_start {
+            let elapsed = t0.elapsed();
+            tracing::info!(
+                "[diag:timing] decode_step total={:.2}ms (pos={position}, kv_len={})",
+                elapsed.as_secs_f64() * 1000.0,
+                kv.current_len,
+            );
+        }
+
         self.stream
             .clone_dtod(&self.buffers.logits)
             .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
@@ -1078,9 +1153,10 @@ impl CudaDecodeRunner {
         b.arg(residual_out);
         b.arg(&hi);
         b.arg(&eps);
+        let num_tokens = (input.len() / h) as u32;
         unsafe {
             b.launch(LaunchConfig {
-                grid_dim: (1, 1, 1),
+                grid_dim: (num_tokens, 1, 1),
                 block_dim: (h.min(1024) as u32, 1, 1),
                 shared_mem_bytes: 0,
             })
