@@ -159,7 +159,7 @@ impl CudaDecodeRunner {
                 stream.clone(),
             )
             .map_err(|e| candle_core::Error::Msg(format!("GpuPagedKvPool: {e}")))?;
-            tracing::info!(
+            tracing::warn!(
                 "Paged KV enabled: {} blocks × {} tok/block = {}MB pool",
                 max_blocks,
                 block_size,
@@ -170,7 +170,7 @@ impl CudaDecodeRunner {
             (None, 0)
         };
 
-        tracing::info!(
+        tracing::warn!(
             "CudaDecodeRunner initialized: {}MB decode buffers, {} layers, paged_kv={}{}",
             buffers.memory_bytes() / (1024 * 1024),
             dims.num_layers,
@@ -266,7 +266,7 @@ impl CudaDecodeRunner {
         let block_table_gpu = pool.upload_block_table(&block_table)
             .map_err(|e| candle_core::Error::Msg(format!("block table upload: {e}")))?;
 
-        tracing::info!(
+        tracing::warn!(
             "init_kv_cache_paged key={cache_key} prefill={prefill_len} \
              blocks={num_blocks_needed} ids={block_table:?} free_list={} next_id={}",
             self.free_blocks.len(),
@@ -298,7 +298,7 @@ impl CudaDecodeRunner {
             for &block_id in &paged.block_table_cpu {
                 self.free_blocks.push(block_id as usize);
             }
-            tracing::info!(
+            tracing::warn!(
                 "release_kv_cache(paged) key={cache_key} freed={freed} blocks, \
                  free_list={}, next_id={}",
                 self.free_blocks.len(),

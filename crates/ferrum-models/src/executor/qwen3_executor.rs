@@ -110,7 +110,7 @@ impl Qwen3ModelExecutor {
         if let Some(ref mut runner) = *self.cuda_runner.lock() {
             runner.release_kv_cache(cache_id);
         }
-        tracing::info!("Released KV cache for sequence: {}", cache_id);
+        tracing::warn!("Released KV cache for sequence: {}", cache_id);
     }
 
     /// Ensure the CUDA decode runner has KV cache for a sequence.
