@@ -57,12 +57,25 @@ pub struct BatchDecodeRequest<'a> {
     pub cache_key: &'a str,
 }
 
-/// Per-sequence KV cache managed by the decode runner.
+/// Per-sequence contiguous KV cache (legacy).
 struct SequenceKvState {
     k_caches: Vec<CudaSlice<half::f16>>,
     v_caches: Vec<CudaSlice<half::f16>>,
     current_len: usize,
     max_len: usize,
+}
+
+/// Per-sequence paged KV state.
+/// KV data lives in the shared `GpuPagedKvPool`; this holds the block table.
+struct PagedSequenceKvState {
+    /// Block table: logical block → physical block ID.
+    block_table_cpu: Vec<i32>,
+    /// GPU copy of the block table (re-uploaded when new blocks are allocated).
+    block_table_gpu: CudaSlice<i32>,
+    /// Current sequence length (number of valid KV tokens).
+    current_len: usize,
+    /// Whether the GPU block table needs re-upload.
+    dirty: bool,
 }
 
 /// Merged piecewise CUDA Graphs.
@@ -90,7 +103,16 @@ pub struct CudaDecodeRunner {
     device: CudaDevice,
     stream: Arc<CudaStream>,
     dims: ModelDims,
+    /// Contiguous KV states (used when paged KV is off).
     kv_states: HashMap<String, SequenceKvState>,
+    /// Paged KV states (used when paged KV is on).
+    paged_kv_states: HashMap<String, PagedSequenceKvState>,
+    /// Shared GPU block pool for paged KV (None when paged KV is off).
+    kv_pool: Option<crate::gpu_paged_kv::GpuPagedKvPool>,
+    /// Simple block allocator: next free physical block ID.
+    next_block_id: usize,
+    /// Whether paged KV is enabled (FERRUM_PAGED_KV=1).
+    use_paged_kv: bool,
     graphs: Option<PiecewiseGraphs>,
     /// cuBLAS workspace buffer (must stay alive while graphs use it)
     _cublas_workspace: Option<CudaSlice<u8>>,
@@ -116,10 +138,42 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("DecodeBuffers alloc: {e}")))?;
 
         let diag = DiagConfig::from_env();
+        let use_paged_kv =
+            std::env::var("FERRUM_PAGED_KV").map_or(false, |v| v == "1");
+
+        let (kv_pool, next_block_id) = if use_paged_kv {
+            let max_blocks: usize = std::env::var("FERRUM_KV_BLOCKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024);
+            let block_size: usize = 16;
+            let pool = crate::gpu_paged_kv::GpuPagedKvPool::new(
+                crate::gpu_paged_kv::GpuPagedKvConfig {
+                    block_size,
+                    max_blocks,
+                    num_kv_heads: dims.num_kv_heads,
+                    head_dim: dims.head_dim,
+                    num_layers: dims.num_layers,
+                },
+                stream.clone(),
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("GpuPagedKvPool: {e}")))?;
+            tracing::info!(
+                "Paged KV enabled: {} blocks × {} tok/block = {}MB pool",
+                max_blocks,
+                block_size,
+                pool.memory_bytes() / (1024 * 1024),
+            );
+            (Some(pool), 0usize)
+        } else {
+            (None, 0)
+        };
+
         tracing::info!(
-            "CudaDecodeRunner initialized: {}MB decode buffers, {} layers{}",
+            "CudaDecodeRunner initialized: {}MB decode buffers, {} layers, paged_kv={}{}",
             buffers.memory_bytes() / (1024 * 1024),
             dims.num_layers,
+            use_paged_kv,
             if diag.any_enabled() {
                 format!(", diag={diag:?}")
             } else {
@@ -135,6 +189,10 @@ impl CudaDecodeRunner {
             stream,
             dims,
             kv_states: HashMap::new(),
+            paged_kv_states: HashMap::new(),
+            kv_pool,
+            next_block_id,
+            use_paged_kv,
             graphs: None,
             _cublas_workspace: None,
             warmup_count: 0,
@@ -150,6 +208,9 @@ impl CudaDecodeRunner {
         prefill_len: usize,
         max_len: usize,
     ) -> candle_core::Result<()> {
+        if self.use_paged_kv {
+            return self.init_kv_cache_paged(cache_key, kv_data, prefill_len);
+        }
         let (mut ks, mut vs) = (Vec::new(), Vec::new());
         for (k, v) in kv_data {
             ks.push(k);
@@ -167,12 +228,68 @@ impl CudaDecodeRunner {
         Ok(())
     }
 
+    /// Initialize paged KV cache from prefill's contiguous KV tensors.
+    /// Allocates blocks from the pool and bulk-copies the data.
+    pub fn init_kv_cache_paged(
+        &mut self,
+        cache_key: &str,
+        kv_data: Vec<(CudaSlice<half::f16>, CudaSlice<half::f16>)>,
+        prefill_len: usize,
+    ) -> candle_core::Result<()> {
+        let pool = self.kv_pool.as_mut().ok_or_else(|| {
+            candle_core::Error::Msg("paged KV not enabled".into())
+        })?;
+        let bs = pool.block_size();
+        let num_blocks_needed = (prefill_len + bs - 1) / bs;
+
+        // Allocate physical blocks
+        let mut block_table = Vec::with_capacity(num_blocks_needed);
+        for _ in 0..num_blocks_needed {
+            if self.next_block_id >= pool.max_blocks() {
+                return Err(candle_core::Error::Msg("KV block pool exhausted".into()));
+            }
+            block_table.push(self.next_block_id as i32);
+            self.next_block_id += 1;
+        }
+
+        // Bulk copy contiguous KV → paged blocks, per layer
+        for (li, (k_cont, v_cont)) in kv_data.iter().enumerate() {
+            pool.copy_contiguous_to_paged(li, k_cont, v_cont, prefill_len, &block_table)
+                .map_err(|e| candle_core::Error::Msg(format!("paged copy L{li}: {e}")))?;
+        }
+
+        // Upload block table to GPU
+        let block_table_gpu = pool.upload_block_table(&block_table)
+            .map_err(|e| candle_core::Error::Msg(format!("block table upload: {e}")))?;
+
+        if self.diag.shapes {
+            tracing::info!(
+                "[diag:shapes] init_kv_cache_paged key={cache_key} prefill={prefill_len} \
+                 blocks={num_blocks_needed} physical_ids={block_table:?}",
+            );
+        }
+
+        self.paged_kv_states.insert(
+            cache_key.to_string(),
+            PagedSequenceKvState {
+                block_table_cpu: block_table,
+                block_table_gpu,
+                current_len: prefill_len,
+                dirty: false,
+            },
+        );
+        Ok(())
+    }
+
     pub fn has_kv_cache(&self, cache_key: &str) -> bool {
         self.kv_states.contains_key(cache_key)
+            || self.paged_kv_states.contains_key(cache_key)
     }
 
     pub fn release_kv_cache(&mut self, cache_key: &str) {
         self.kv_states.remove(cache_key);
+        // TODO: return freed blocks to pool for reuse
+        self.paged_kv_states.remove(cache_key);
     }
 
     // ======================== Sub-methods ========================
@@ -345,6 +462,82 @@ impl CudaDecodeRunner {
                 num_splits,
             )
         }
+    }
+
+    /// Paged attention: append K/V to block pool, run paged kernel.
+    fn attention_paged(
+        &mut self,
+        li: usize,
+        paged: &mut PagedSequenceKvState,
+    ) -> candle_core::Result<()> {
+        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
+        let hd = self.dims.head_dim;
+        let nq = self.dims.num_attention_heads;
+        let nkv = self.dims.num_kv_heads;
+
+        let pool = self.kv_pool.as_mut().ok_or_else(|| {
+            candle_core::Error::Msg("paged KV not enabled".into())
+        })?;
+        let bs = pool.block_size();
+
+        // Allocate new block if needed
+        let logical_block = paged.current_len / bs;
+        let slot = paged.current_len % bs;
+        if slot == 0 {
+            // Need a new block
+            if self.next_block_id >= pool.max_blocks() {
+                return Err(candle_core::Error::Msg("KV block pool exhausted".into()));
+            }
+            paged.block_table_cpu.push(self.next_block_id as i32);
+            self.next_block_id += 1;
+            paged.dirty = true;
+        }
+        let physical_block = paged.block_table_cpu[logical_block] as usize;
+
+        // Append K to pool
+        let ks = self.buffers.k_rotated.slice(..kv_dim);
+        pool.write_k_token(li, physical_block, slot, &ks)
+            .map_err(|e| candle_core::Error::Msg(format!("paged K write: {e}")))?;
+
+        // Append V to pool
+        let qkv_dim = nq * hd + 2 * kv_dim;
+        let vs = self.buffers.qkv_out.slice(nq * hd + kv_dim..qkv_dim);
+        pool.write_v_token(li, physical_block, slot, &vs)
+            .map_err(|e| candle_core::Error::Msg(format!("paged V write: {e}")))?;
+
+        // Re-upload block table if dirty
+        if paged.dirty {
+            paged.block_table_gpu = pool
+                .upload_block_table(&paged.block_table_cpu)
+                .map_err(|e| candle_core::Error::Msg(format!("block table: {e}")))?;
+            paged.dirty = false;
+        }
+
+        let valid_kv = paged.current_len + 1;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        if self.diag.attn && li == 0 {
+            tracing::info!(
+                "[diag:attn] paged layer=0 valid_kv={valid_kv} blocks={} bs={bs}",
+                paged.block_table_cpu.len(),
+            );
+        }
+
+        // Launch paged attention kernel
+        Self::launch_paged_decode_attention(
+            &self.device,
+            &self.buffers.q_rotated,
+            pool.k_pool(li),
+            pool.v_pool(li),
+            &paged.block_table_gpu,
+            &mut self.buffers.attn_out,
+            nq,
+            nkv,
+            hd,
+            valid_kv,
+            bs,
+            scale,
+        )
     }
 
     fn post_attention_eager(&mut self, li: usize) -> candle_core::Result<()> {
@@ -594,16 +787,30 @@ impl CudaDecodeRunner {
 
         self.embed_eager(token_id)?;
 
-        let mut kv = self
-            .kv_states
-            .remove(cache_key)
-            .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
+        // Extract KV state (contiguous or paged)
+        let mut kv_cont = if !self.use_paged_kv {
+            Some(self.kv_states.remove(cache_key).ok_or_else(|| {
+                candle_core::Error::Msg(format!("No KV cache: {cache_key}"))
+            })?)
+        } else {
+            None
+        };
+        let mut kv_paged = if self.use_paged_kv {
+            Some(self.paged_kv_states.remove(cache_key).ok_or_else(|| {
+                candle_core::Error::Msg(format!("No paged KV cache: {cache_key}"))
+            })?)
+        } else {
+            None
+        };
 
         if self.diag.shapes {
+            let kv_len = kv_cont.as_ref().map_or_else(
+                || kv_paged.as_ref().map_or(0, |p| p.current_len),
+                |c| c.current_len,
+            );
             tracing::info!(
-                "[diag:shapes] decode_step token={token_id} pos={position} kv_len={} max_kv={}",
-                kv.current_len,
-                kv.max_len,
+                "[diag:shapes] decode_step token={token_id} pos={position} kv_len={kv_len} paged={}",
+                self.use_paged_kv,
             );
         }
 
@@ -682,8 +889,12 @@ impl CudaDecodeRunner {
                 )?;
             }
 
-            // ---- Attention ----
-            self.attention_eager(li, &mut kv)?;
+            // ---- Attention (contiguous or paged) ----
+            if let Some(ref mut kv) = kv_cont {
+                self.attention_eager(li, kv)?;
+            } else if let Some(ref mut paged) = kv_paged {
+                self.attention_paged(li, paged)?;
+            }
 
             // ---- O proj + post-attn residual/norm + MLP + layer exit ----
             {
@@ -772,8 +983,28 @@ impl CudaDecodeRunner {
             }
         }
 
-        kv.current_len += 1;
-        self.kv_states.insert(cache_key.to_string(), kv);
+        // Update KV state and put it back
+        if let Some(mut kv) = kv_cont {
+            kv.current_len += 1;
+            let cur_len = kv.current_len;
+            self.kv_states.insert(cache_key.to_string(), kv);
+            if let Some(t0) = step_start {
+                tracing::info!(
+                    "[diag:timing] decode_step total={:.2}ms (pos={position}, kv_len={cur_len})",
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        } else if let Some(mut paged) = kv_paged {
+            paged.current_len += 1;
+            let cur_len = paged.current_len;
+            self.paged_kv_states.insert(cache_key.to_string(), paged);
+            if let Some(t0) = step_start {
+                tracing::info!(
+                    "[diag:timing] decode_step total={:.2}ms (pos={position}, kv_len={cur_len}, paged)",
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
 
         // LM head only — final norm already computed in loop
         crate::cublas::linear_f16(
@@ -787,22 +1018,9 @@ impl CudaDecodeRunner {
         )?;
 
         // Synchronize runner stream before returning logits.
-        // The logits CudaSlice will be wrapped as a candle Tensor on candle's
-        // default stream. Without sync, candle reads stale data because the
-        // default stream doesn't wait for the non-blocking stream.
         self.stream
             .synchronize()
             .map_err(|e| candle_core::Error::Msg(format!("stream sync: {e}")))?;
-
-        if let Some(t0) = step_start {
-            let elapsed = t0.elapsed();
-            tracing::info!(
-                "[diag:timing] decode_step total={:.2}ms (pos={position}, kv_len={})",
-                elapsed.as_secs_f64() * 1000.0,
-                kv.current_len,
-            );
-        }
-
         self.stream
             .clone_dtod(&self.buffers.logits)
             .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
@@ -1473,6 +1691,60 @@ impl CudaDecodeRunner {
         }
         .map(|_| ())
         .map_err(|e| candle_core::Error::Msg(format!("flash_decode phase2: {e}")))
+    }
+
+    /// Paged decode attention kernel launcher.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_paged_decode_attention(
+        device: &CudaDevice,
+        q: &CudaSlice<half::f16>,
+        k_pool: &CudaSlice<half::f16>,
+        v_pool: &CudaSlice<half::f16>,
+        block_table: &CudaSlice<i32>,
+        output: &mut CudaSlice<half::f16>,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        valid_kv: usize,
+        block_size: usize,
+        scale: f32,
+    ) -> candle_core::Result<()> {
+        let func = device.get_or_load_custom_func(
+            "paged_decode_attention_f16",
+            "paged_decode_attention",
+            ptx::PAGED_DECODE_ATTENTION,
+        )?;
+        let qv = q.slice(..);
+        let kp = k_pool.slice(..);
+        let vp = v_pool.slice(..);
+        let bt = block_table.slice(..);
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let vki = valid_kv as i32;
+        let bsi = block_size as i32;
+        let mut b = func.builder();
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(&bt);
+        b.arg(output);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&vki);
+        b.arg(&bsi);
+        b.arg(&scale);
+        let shared_bytes = (valid_kv as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("paged_attn: {e}")))
     }
 
     fn launch_fused_add_rms_norm(
