@@ -332,6 +332,7 @@ impl CudaDecodeRunner {
     fn linear(
         blas: &std::sync::Arc<cudarc::cublas::CudaBlas>,
         device: &CudaDevice,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         input: &CudaSlice<half::f16>,
         weight: &crate::weight_store::LinearWeight,
         output: &mut CudaSlice<half::f16>,
@@ -350,6 +351,9 @@ impl CudaDecodeRunner {
                 })?;
                 crate::quant::dequant_int4(device, qw, t)?;
                 crate::cublas::linear_f16(blas, input, t, output, m, n, k)
+            }
+            crate::weight_store::LinearWeight::Marlin(mw) => {
+                crate::marlin::marlin_gemm(stream, input, mw, output, m)
             }
         }
     }
@@ -901,6 +905,7 @@ impl CudaDecodeRunner {
                 Self::linear(
                     &self.blas,
                     &self.device,
+                    &self.stream,
                     &self.buffers.norm_out,
                     &lw.qkv_w,
                     &mut self.buffers.qkv_out,
@@ -975,6 +980,7 @@ impl CudaDecodeRunner {
                 Self::linear(
                     &self.blas,
                     &self.device,
+                    &self.stream,
                     &self.buffers.attn_out,
                     &lw.o_w,
                     &mut self.buffers.o_proj_out,
@@ -1001,6 +1007,7 @@ impl CudaDecodeRunner {
                 Self::linear(
                     &self.blas,
                     &self.device,
+                    &self.stream,
                     &self.buffers.post_norm_out,
                     &lw.gate_up_w,
                     &mut self.buffers.gate_up_out,
@@ -1021,6 +1028,7 @@ impl CudaDecodeRunner {
                 Self::linear(
                     &self.blas,
                     &self.device,
+                    &self.stream,
                     &self.buffers.mlp_act,
                     &lw.down_w,
                     &mut self.buffers.down_out,
@@ -1086,6 +1094,7 @@ impl CudaDecodeRunner {
         Self::linear(
             &self.blas,
             &self.device,
+            &self.stream,
             &self.buffers.final_norm_out,
             &self.weights.lm_head_w,
             &mut self.buffers.logits,
