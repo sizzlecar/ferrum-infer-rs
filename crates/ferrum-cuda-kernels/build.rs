@@ -135,10 +135,16 @@ fn compile_marlin(out_dir: &PathBuf) {
             eprintln!("Failed to create libmarlin.a, Marlin disabled");
         }
         Ok(s) => {
-            eprintln!("nvcc failed with {s}, Marlin kernel disabled");
+            panic!(
+                "nvcc failed with {s} compiling Marlin kernel. \
+                    Remove --features marlin or fix CUDA setup."
+            );
         }
         Err(e) => {
-            eprintln!("nvcc not available ({e}), Marlin kernel disabled");
+            panic!(
+                "nvcc not available ({e}). \
+                    Remove --features marlin or install CUDA toolkit."
+            );
         }
     }
 }
