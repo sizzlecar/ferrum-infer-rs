@@ -1207,13 +1207,23 @@ impl CudaDecodeRunner {
                 .map_err(|e| candle_core::Error::Msg(format!("batch embed: {e}")))?;
         }
 
-        // Extract all KV states for the batch
+        // Extract all KV states for the batch.
+        // If any is missing, restore already-extracted ones before returning error.
         let mut kv_batch: Vec<SequenceKvState> = Vec::with_capacity(batch);
-        for req in requests {
-            let kv = self.kv_states.remove(req.cache_key).ok_or_else(|| {
-                candle_core::Error::Msg(format!("No KV cache: {}", req.cache_key))
-            })?;
-            kv_batch.push(kv);
+        for (i, req) in requests.iter().enumerate() {
+            match self.kv_states.remove(req.cache_key) {
+                Some(kv) => kv_batch.push(kv),
+                None => {
+                    // Restore already-extracted KV states
+                    for (j, kv) in kv_batch.into_iter().enumerate() {
+                        self.kv_states.insert(requests[j].cache_key.to_string(), kv);
+                    }
+                    return Err(candle_core::Error::Msg(format!(
+                        "No KV cache: {} (item {i}/{batch})",
+                        req.cache_key
+                    )));
+                }
+            }
         }
 
         // First layer: batched rms_norm (num_rows = B*H / H = B)
@@ -1541,10 +1551,9 @@ impl CudaDecodeRunner {
         }
 
         // Update KV state lengths and put them back
-        for (b, req) in requests.iter().enumerate() {
-            kv_batch[b].current_len += 1;
-            self.kv_states
-                .insert(req.cache_key.to_string(), kv_batch.remove(0));
+        for (req, mut kv) in requests.iter().zip(kv_batch.into_iter()) {
+            kv.current_len += 1;
+            self.kv_states.insert(req.cache_key.to_string(), kv);
         }
 
         // Batched LM head: [B*H] → [B*vocab]
