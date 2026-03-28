@@ -951,8 +951,8 @@ impl Qwen3ModelWrapper {
                             repack_gptq_to_marlin, repack_scales_to_marlin, MarlinWeight,
                         };
                         let marlin_qw = repack_gptq_to_marlin(&gw.qweight, gw.k, gw.n);
-                        let marlin_scales =
-                            repack_scales_to_marlin(&gw.scales, gw.k, gw.n, gw.group_size);
+                        // TODO: debug scale permutation. For now try raw scales.
+                        let marlin_scales = gw.scales.clone();
                         let gs_marlin = if gw.group_size == gw.k {
                             -1i32
                         } else {
