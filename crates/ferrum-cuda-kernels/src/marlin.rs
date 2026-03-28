@@ -146,26 +146,37 @@ pub fn repack_gptq_to_marlin(
         }
     }
 
-    // Step 2: Transpose [K, N] → [N, K] (Marlin convention: out_features first)
-    let mut w = vec![0u8; n * k]; // [N, K]
-    for row in 0..k {
-        for col in 0..n {
-            w[col * k + row] = kn[row * n + col];
+    // Step 2: Transpose [K, N] to get w = linear.weight.data.t() = [K, N]
+    // (GPTQ stores [K, N] already, so kn IS [K, N] — no transpose needed!)
+    // Marlin's pack() does: w = linear.weight.data.t() which gives [K, N].
+    // Our kn is already [K, N].
+
+    // Step 3: Tile [K, N] → [K/16, 16, N/16, 16] → permute(0,2,1,3) → [K/16, N*16]
+    let tile = 16;
+    let kt = k / tile;
+    let nt = n / tile;
+    let mut tiled = vec![0u8; k * n]; // [K/16, N*16]
+    for tk in 0..kt {
+        for tn in 0..nt {
+            for ik in 0..tile {
+                for in_ in 0..tile {
+                    let src = (tk * tile + ik) * n + (tn * tile + in_);
+                    let dst = tk * (n * tile) + tn * (tile * tile) + ik * tile + in_;
+                    tiled[dst] = kn[src];
+                }
+            }
         }
     }
 
-    // Step 3: Apply Marlin's _perm directly to [N, K] flat data.
-    // _perm combines tiling + m16n8k16 mma fragment layout in one permutation.
-    // Applied as: W.reshape((-1, 1024))[:, _perm].reshape(W.shape)
-    // NO separate tiling step needed — _perm encodes everything.
+    // Step 4: Apply _perm in blocks of 1024
     let perm = build_marlin_perm();
-    let total = n * k;
+    let total = k * n;
     let mut permuted = vec![0u8; total];
     let num_blocks = total / 1024;
     for blk in 0..num_blocks {
         let base = blk * 1024;
         for (dst, &src) in perm.iter().enumerate() {
-            permuted[base + dst] = w[base + src];
+            permuted[base + dst] = tiled[base + src];
         }
     }
 
@@ -279,5 +290,15 @@ fn build_marlin_perm() -> Vec<usize> {
     }
 
     assert_eq!(perm.len(), 1024);
-    perm
+
+    // KEY: apply interleave [0,2,4,6,1,3,5,7] within each group of 8
+    let interleave = [0usize, 2, 4, 6, 1, 3, 5, 7];
+    let mut perm_interleaved = vec![0usize; 1024];
+    for g in 0..128 {
+        for i in 0..8 {
+            perm_interleaved[g * 8 + i] = perm[g * 8 + interleave[i]];
+        }
+    }
+
+    perm_interleaved
 }
