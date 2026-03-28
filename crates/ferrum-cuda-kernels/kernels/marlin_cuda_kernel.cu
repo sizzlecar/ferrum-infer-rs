@@ -69,12 +69,11 @@ __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool
 __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   const int BYTES = 16;
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  // Use plain cp.async.cg without L2 cache hint (createpolicy.fractional
+  // is not supported on all architectures, e.g. Blackwell sm_120).
   asm volatile(
-    "{\n"
-    "   .reg .b64 p;\n"
-    "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;"
-    "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
-    "}\n" :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
+    "cp.async.cg.shared.global [%0], [%1], %2;\n"
+    :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
   );
 }
 
