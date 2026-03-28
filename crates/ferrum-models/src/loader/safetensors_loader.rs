@@ -1,9 +1,9 @@
 //! SafeTensors weight loader with Candle integration
 
-use candle_core::{DType, Device as CandleDevice};
+use candle_core::{DType, Device as CandleDevice, Tensor};
 use candle_nn::VarBuilder;
 use ferrum_types::{FerrumError, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -88,6 +88,113 @@ impl SafeTensorsLoader {
             "No SafeTensors files found in model directory: {}",
             self.model_dir.display()
         )))
+    }
+
+    /// Load GPTQ quantized model: dequantize INT4→FP16 on CPU, return VarBuilder.
+    ///
+    /// GPTQ safetensors use .qweight/.scales/.qzeros instead of .weight.
+    /// This method dequantizes them to FP16 so candle can load the model normally.
+    pub fn load_varbuilder_gptq(
+        &self,
+        qconfig: &super::QuantizeConfig,
+        device: &CandleDevice,
+        dtype: DType,
+    ) -> Result<VarBuilder<'static>> {
+        info!("Loading GPTQ model from: {:?}", self.model_dir);
+
+        // 1. Load GPTQ packed weights
+        let gptq_weights = super::load_gptq_weights(&self.model_dir, qconfig)?;
+
+        // 2. Load non-quantized tensors from safetensors
+        let st_files = self.find_all_safetensor_files()?;
+        let mut tensor_map: HashMap<String, Tensor> = HashMap::new();
+
+        for path in &st_files {
+            let data = std::fs::read(path)
+                .map_err(|e| FerrumError::model(format!("read {}: {e}", path.display())))?;
+            let st = safetensors::SafeTensors::deserialize(&data)
+                .map_err(|e| FerrumError::model(format!("parse {}: {e}", path.display())))?;
+
+            for (name, _) in st.tensors() {
+                // Skip quantization-specific tensors
+                if name.ends_with(".qweight")
+                    || name.ends_with(".scales")
+                    || name.ends_with(".qzeros")
+                    || name.ends_with(".g_idx")
+                {
+                    continue;
+                }
+
+                let view = st
+                    .tensor(&name)
+                    .map_err(|e| FerrumError::model(format!("tensor {name}: {e}")))?;
+
+                let candle_dtype = match view.dtype() {
+                    safetensors::Dtype::F16 => DType::F16,
+                    safetensors::Dtype::BF16 => DType::BF16,
+                    safetensors::Dtype::F32 => DType::F32,
+                    safetensors::Dtype::F64 => DType::F64,
+                    other => {
+                        debug!("Skipping tensor {name} with dtype {:?}", other);
+                        continue;
+                    }
+                };
+
+                let tensor = Tensor::from_raw_buffer(
+                    view.data(),
+                    candle_dtype,
+                    view.shape(),
+                    &CandleDevice::Cpu,
+                )
+                .map_err(|e| FerrumError::model(format!("tensor {name}: {e}")))?
+                .to_device(device)
+                .map_err(|e| FerrumError::model(format!("tensor {name} to device: {e}")))?
+                .to_dtype(dtype)
+                .map_err(|e| FerrumError::model(format!("tensor {name} to dtype: {e}")))?;
+
+                tensor_map.insert(name.to_string(), tensor);
+            }
+        }
+        info!("Loaded {} non-quantized tensors", tensor_map.len());
+
+        // 3. Dequantize quantized weights → FP16, add as .weight
+        for (prefix, gw) in &gptq_weights {
+            let dequant = gw.dequantize_cpu();
+            let f32_data: Vec<f32> = dequant.iter().map(|x| x.to_f32()).collect();
+            let tensor = Tensor::new(&f32_data[..], &CandleDevice::Cpu)
+                .map_err(|e| FerrumError::model(format!("dequant {prefix}: {e}")))?
+                .reshape(&[gw.k, gw.n])
+                .map_err(|e| FerrumError::model(format!("dequant {prefix} reshape: {e}")))?
+                .to_device(device)
+                .map_err(|e| FerrumError::model(format!("dequant {prefix} to device: {e}")))?
+                .to_dtype(dtype)
+                .map_err(|e| FerrumError::model(format!("dequant {prefix} to dtype: {e}")))?;
+
+            let weight_name = format!("{prefix}.weight");
+            debug!("Dequantized: {weight_name} [{}, {}]", gw.k, gw.n);
+            tensor_map.insert(weight_name, tensor);
+        }
+        info!(
+            "Total tensors: {} ({} dequantized from INT4)",
+            tensor_map.len(),
+            gptq_weights.len()
+        );
+
+        Ok(VarBuilder::from_tensors(tensor_map, dtype, device))
+    }
+
+    /// Find all safetensor files (single or sharded).
+    fn find_all_safetensor_files(&self) -> Result<Vec<PathBuf>> {
+        let single = self.model_dir.join("model.safetensors");
+        if single.exists() {
+            return Ok(vec![single]);
+        }
+        let index_file = self.model_dir.join("model.safetensors.index.json");
+        if index_file.exists() {
+            let shard_files = self.parse_sharded_index(&index_file)?;
+            return Ok(shard_files.iter().map(|f| self.model_dir.join(f)).collect());
+        }
+        Ok(vec![])
     }
 
     /// Parse model.safetensors.index.json to get unique shard filenames
