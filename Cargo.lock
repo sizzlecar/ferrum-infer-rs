@@ -1311,6 +1311,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytemuck",
  "candle-core",
  "candle-flash-attn",
  "candle-nn",
