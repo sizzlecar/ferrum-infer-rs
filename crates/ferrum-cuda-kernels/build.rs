@@ -70,8 +70,10 @@ fn main() {
         .expect("failed to write ferrum CUDA PTX bindings");
 
     // Compile Marlin INT4xFP16 kernel separately (uses runtime API, not PTX).
-    // Requires SM >= 8.0 (Ampere). Compiled to a static library and linked.
-    compile_marlin(&out_dir_clone);
+    // Only when "marlin" feature is enabled. Requires SM >= 8.0 (Ampere).
+    if env::var_os("CARGO_FEATURE_MARLIN").is_some() {
+        compile_marlin(&out_dir_clone);
+    }
 }
 
 fn compile_marlin(out_dir: &PathBuf) {

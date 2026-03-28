@@ -8,7 +8,9 @@
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::Arc;
 
-// FFI declaration for the Marlin CUDA kernel
+// FFI declaration for the Marlin CUDA kernel.
+// Only linked when the "marlin" feature is enabled (requires nvcc + SM >= 8.0).
+#[cfg(feature = "marlin")]
 extern "C" {
     fn marlin_cuda(
         A: *const std::ffi::c_void,
@@ -29,6 +31,11 @@ extern "C" {
     ) -> i32;
 }
 
+/// Check if Marlin kernel is available at compile time.
+pub fn is_available() -> bool {
+    cfg!(feature = "marlin")
+}
+
 /// Marlin-format quantized weight for one linear layer.
 pub struct MarlinWeight {
     /// Repacked INT4 weights in Marlin tile format: varies by K, N
@@ -46,6 +53,9 @@ pub struct MarlinWeight {
 ///
 /// Computes: C[m, n] = A[m, k] @ dequant(B[k, n])
 /// where B is in Marlin packed INT4 format.
+///
+/// Only available when compiled with `--features marlin`.
+#[cfg(feature = "marlin")]
 pub fn marlin_gemm(
     stream: &Arc<CudaStream>,
     input: &CudaSlice<half::f16>,
@@ -92,6 +102,20 @@ pub fn marlin_gemm(
         )));
     }
     Ok(())
+}
+
+/// Stub when Marlin feature is not enabled.
+#[cfg(not(feature = "marlin"))]
+pub fn marlin_gemm(
+    _stream: &Arc<CudaStream>,
+    _input: &CudaSlice<half::f16>,
+    _weight: &MarlinWeight,
+    _output: &mut CudaSlice<half::f16>,
+    _m: i32,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "Marlin kernel not available (compile with --features marlin)".into(),
+    ))
 }
 
 // ===================== Weight Repacking (GPTQ → Marlin) =====================

@@ -940,7 +940,8 @@ impl Qwen3ModelWrapper {
             if let Some(gptq_map) = gptq {
                 if let Some(gw) = gptq_map.get(prefix) {
                     // Try Marlin (fused, 3.9x) if dimensions are compatible
-                    let use_marlin = gw.k % 128 == 0
+                    let use_marlin = ferrum_cuda_kernels::marlin::is_available()
+                        && gw.k % 128 == 0
                         && gw.n % 256 == 0
                         && (gw.group_size == 128 || gw.group_size == gw.k)
                         && std::env::var("FERRUM_NO_MARLIN").is_err();
