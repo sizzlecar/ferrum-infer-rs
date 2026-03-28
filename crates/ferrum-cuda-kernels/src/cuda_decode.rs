@@ -326,6 +326,34 @@ impl CudaDecodeRunner {
         }
     }
 
+    // ======================== Linear dispatch ========================
+
+    /// Dispatch linear projection: FP16 cuBLAS or INT4 dequant+cuBLAS.
+    fn linear(
+        blas: &std::sync::Arc<cudarc::cublas::CudaBlas>,
+        device: &CudaDevice,
+        input: &CudaSlice<half::f16>,
+        weight: &crate::weight_store::LinearWeight,
+        output: &mut CudaSlice<half::f16>,
+        temp: &mut Option<CudaSlice<half::f16>>,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> candle_core::Result<()> {
+        match weight {
+            crate::weight_store::LinearWeight::Fp16(w) => {
+                crate::cublas::linear_f16(blas, input, &w.slice, output, m, n, k)
+            }
+            crate::weight_store::LinearWeight::Int4(qw) => {
+                let t = temp.as_mut().ok_or_else(|| {
+                    candle_core::Error::Msg("INT4 requires temp_dequant buffer".into())
+                })?;
+                crate::quant::dequant_int4(device, qw, t)?;
+                crate::cublas::linear_f16(blas, input, t, output, m, n, k)
+            }
+        }
+    }
+
     // ======================== Sub-methods ========================
 
     fn embed_eager(&mut self, token_id: u32) -> candle_core::Result<()> {
@@ -870,11 +898,13 @@ impl CudaDecodeRunner {
             // ---- QKV projection (norm_out already computed) ----
             {
                 let lw = &self.weights.layers[li];
-                crate::cublas::linear_f16(
+                Self::linear(
                     &self.blas,
+                    &self.device,
                     &self.buffers.norm_out,
-                    &lw.qkv_w.slice,
+                    &lw.qkv_w,
                     &mut self.buffers.qkv_out,
+                    &mut self.buffers.temp_dequant,
                     1,
                     qkv_dim as i32,
                     h as i32,
@@ -942,11 +972,13 @@ impl CudaDecodeRunner {
                 let lw = &self.weights.layers[li];
 
                 // O projection
-                crate::cublas::linear_f16(
+                Self::linear(
                     &self.blas,
+                    &self.device,
                     &self.buffers.attn_out,
-                    &lw.o_w.slice,
+                    &lw.o_w,
                     &mut self.buffers.o_proj_out,
+                    &mut self.buffers.temp_dequant,
                     1,
                     h as i32,
                     q_dim as i32,
@@ -964,14 +996,15 @@ impl CudaDecodeRunner {
                     h,
                     eps,
                 )?;
-                // Residual now lives in post_norm_residual — no memcpy needed
 
                 // MLP
-                crate::cublas::linear_f16(
+                Self::linear(
                     &self.blas,
+                    &self.device,
                     &self.buffers.post_norm_out,
-                    &lw.gate_up_w.slice,
+                    &lw.gate_up_w,
                     &mut self.buffers.gate_up_out,
+                    &mut self.buffers.temp_dequant,
                     1,
                     (2 * inter) as i32,
                     h as i32,
@@ -985,11 +1018,13 @@ impl CudaDecodeRunner {
                     &mut self.buffers.mlp_act,
                     inter,
                 )?;
-                crate::cublas::linear_f16(
+                Self::linear(
                     &self.blas,
+                    &self.device,
                     &self.buffers.mlp_act,
-                    &lw.down_w.slice,
+                    &lw.down_w,
                     &mut self.buffers.down_out,
+                    &mut self.buffers.temp_dequant,
                     1,
                     h as i32,
                     inter as i32,
@@ -1048,11 +1083,13 @@ impl CudaDecodeRunner {
         }
 
         // LM head only — final norm already computed in loop
-        crate::cublas::linear_f16(
+        Self::linear(
             &self.blas,
+            &self.device,
             &self.buffers.final_norm_out,
-            &self.weights.lm_head_w.slice,
+            &self.weights.lm_head_w,
             &mut self.buffers.logits,
+            &mut self.buffers.temp_dequant,
             1,
             self.dims.vocab_size as i32,
             h as i32,
