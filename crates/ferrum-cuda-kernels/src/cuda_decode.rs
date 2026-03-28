@@ -661,7 +661,14 @@ impl CudaDecodeRunner {
         )?;
         let g = self.buffers.gate_up_out.slice(..inter);
         let u = self.buffers.gate_up_out.slice(inter..2 * inter);
-        Self::launch_fused_silu_mul(&self.device, &g, &u, &mut self.buffers.mlp_act, inter)?;
+        Self::launch_fused_silu_mul(
+            &self.device,
+            &self.stream,
+            &g,
+            &u,
+            &mut self.buffers.mlp_act,
+            inter,
+        )?;
 
         crate::cublas::linear_f16(
             &self.blas,
