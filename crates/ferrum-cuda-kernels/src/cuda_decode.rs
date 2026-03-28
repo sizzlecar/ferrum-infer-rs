@@ -1210,6 +1210,14 @@ impl CudaDecodeRunner {
         // Extract all KV states for the batch.
         // If any is missing, restore already-extracted ones before returning error.
         let mut kv_batch: Vec<SequenceKvState> = Vec::with_capacity(batch);
+        {
+            let available: Vec<&str> = self.kv_states.keys().map(|k| k.as_str()).collect();
+            let requested: Vec<&str> = requests.iter().map(|r| r.cache_key).collect();
+            eprintln!(
+                "[batch_decode] kv_states has {:?}, requested {:?}",
+                available, requested
+            );
+        }
         for (i, req) in requests.iter().enumerate() {
             match self.kv_states.remove(req.cache_key) {
                 Some(kv) => kv_batch.push(kv),
