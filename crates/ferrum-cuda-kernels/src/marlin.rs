@@ -66,6 +66,16 @@ pub fn marlin_gemm(
     let n = weight.n as i32;
     let k = weight.k as i32;
 
+    // Zero workspace before each call — Marlin uses it as mutex locks.
+    // Stale non-zero values from previous calls cause incorrect behavior.
+    unsafe {
+        cudarc::driver::sys::cuMemsetD32_v2(
+            *weight.workspace.device_ptr(stream).0,
+            0,
+            weight.workspace.len(),
+        );
+    }
+
     // Get raw device pointers
     let (a_ptr, _a_guard) = input.device_ptr(stream);
     let (b_ptr, _b_guard) = weight.qweight.device_ptr(stream);
