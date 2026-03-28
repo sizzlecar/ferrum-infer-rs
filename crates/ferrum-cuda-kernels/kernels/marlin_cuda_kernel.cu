@@ -728,7 +728,7 @@ const int SHARED_MEM = 96 * 1024; // max shared memory on compute capability 8.6
 const int ERR_PROB_SHAPE = 1;
 const int ERR_KERN_SHAPE = 2;
 
-int marlin_cuda(
+extern "C" int marlin_cuda(
   const void* A,
   const void* B,
         void* C,
