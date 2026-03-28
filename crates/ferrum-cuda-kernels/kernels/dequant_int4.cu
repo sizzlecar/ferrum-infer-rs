@@ -42,7 +42,7 @@ extern "C" __global__ void dequant_int4_to_fp16(
     for (int i = 0; i < 8; i++) {
         const int val = (packed >> (i * 4)) & 0xF;
         const float dequantized = (float)(val - zero) * s;
-        output[(base_k + i) * N + col] = __float2half(dequantized);
+        output[col * K + (base_k + i)] = __float2half(dequantized);
     }
 }
 
@@ -71,6 +71,6 @@ extern "C" __global__ void dequant_int4_sym_to_fp16(
     for (int i = 0; i < 8; i++) {
         const int val = (packed >> (i * 4)) & 0xF;
         const float dequantized = (float)(val - 8) * s;
-        output[(base_k + i) * N + col] = __float2half(dequantized);
+        output[col * K + (base_k + i)] = __float2half(dequantized);
     }
 }
