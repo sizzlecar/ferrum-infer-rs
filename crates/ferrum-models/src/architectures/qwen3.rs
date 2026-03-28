@@ -861,7 +861,9 @@ impl Qwen3ModelWrapper {
         &self,
     ) -> Result<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner> {
         use ferrum_cuda_kernels::decode_buffers::ModelDims;
-        use ferrum_cuda_kernels::weight_store::{GpuWeight, LayerWeights, Qwen3Weights};
+        use ferrum_cuda_kernels::weight_store::{
+            GpuWeight, LayerWeights, LinearWeight, Qwen3Weights,
+        };
 
         let model = self.model.lock();
         let cfg = &self.config;
@@ -893,6 +895,7 @@ impl Qwen3ModelWrapper {
             vocab_size: cfg.vocab_size,
             num_layers: cfg.num_hidden_layers,
             max_seq_len: cfg.max_position_embeddings,
+            quantized: false, // TODO: detect GPTQ models
             max_batch_size: std::env::var("FERRUM_MAX_BATCH")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -908,8 +911,10 @@ impl Qwen3ModelWrapper {
             let lw = LayerWeights {
                 input_ln_w: GpuWeight::from_tensor(&layer.input_layernorm.weight, &rs)
                     .map_err(|e| FerrumError::model(format!("input_ln: {e}")))?,
-                qkv_w: GpuWeight::from_tensor(layer.self_attn.qkv_proj.weight(), &rs)
-                    .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
+                qkv_w: LinearWeight::Fp16(
+                    GpuWeight::from_tensor(layer.self_attn.qkv_proj.weight(), &rs)
+                        .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
+                ),
                 q_norm_w: Some(
                     GpuWeight::from_tensor(&layer.self_attn.q_norm.weight, &rs)
                         .map_err(|e| FerrumError::model(format!("q_norm: {e}")))?,
@@ -918,22 +923,30 @@ impl Qwen3ModelWrapper {
                     GpuWeight::from_tensor(&layer.self_attn.k_norm.weight, &rs)
                         .map_err(|e| FerrumError::model(format!("k_norm: {e}")))?,
                 ),
-                o_w: GpuWeight::from_tensor(layer.self_attn.o_proj.weight(), &rs)
-                    .map_err(|e| FerrumError::model(format!("o_proj: {e}")))?,
+                o_w: LinearWeight::Fp16(
+                    GpuWeight::from_tensor(layer.self_attn.o_proj.weight(), &rs)
+                        .map_err(|e| FerrumError::model(format!("o_proj: {e}")))?,
+                ),
                 post_ln_w: GpuWeight::from_tensor(&layer.post_attention_layernorm.weight, &rs)
                     .map_err(|e| FerrumError::model(format!("post_ln: {e}")))?,
-                gate_up_w: GpuWeight::from_tensor(layer.mlp.gate_up_proj.weight(), &rs)
-                    .map_err(|e| FerrumError::model(format!("gate_up: {e}")))?,
-                down_w: GpuWeight::from_tensor(layer.mlp.down_proj.weight(), &rs)
-                    .map_err(|e| FerrumError::model(format!("down: {e}")))?,
+                gate_up_w: LinearWeight::Fp16(
+                    GpuWeight::from_tensor(layer.mlp.gate_up_proj.weight(), &rs)
+                        .map_err(|e| FerrumError::model(format!("gate_up: {e}")))?,
+                ),
+                down_w: LinearWeight::Fp16(
+                    GpuWeight::from_tensor(layer.mlp.down_proj.weight(), &rs)
+                        .map_err(|e| FerrumError::model(format!("down: {e}")))?,
+                ),
             };
             layers.push(lw);
         }
 
         let final_norm_w = GpuWeight::from_tensor(&model.base_model.norm.weight, &rs)
             .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
-        let lm_head_w = GpuWeight::from_tensor(model.lm_head.weight(), &rs)
-            .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
+        let lm_head_w = LinearWeight::Fp16(
+            GpuWeight::from_tensor(model.lm_head.weight(), &rs)
+                .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?,
+        );
         let rope_cos =
             GpuWeight::from_tensor(&model.base_model.layers[0].self_attn.rotary_emb.cos, &rs)
                 .map_err(|e| FerrumError::model(format!("rope_cos: {e}")))?;

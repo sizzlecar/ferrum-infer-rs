@@ -20,6 +20,8 @@ pub struct ModelDims {
     pub vocab_size: usize,
     pub num_layers: usize,
     pub max_seq_len: usize,
+    /// Whether model uses INT4 quantized weights.
+    pub quantized: bool,
     /// Maximum batch size for decode. Buffers are allocated for this many tokens.
     /// Default: 1 (single-token decode).
     pub max_batch_size: usize,
@@ -83,6 +85,12 @@ pub struct DecodeBuffers {
     /// LM head output logits: [B * vocab_size]
     pub logits: CudaSlice<half::f16>,
 
+    // ---- INT4 dequant scratch buffer ----
+    // Temporary FP16 buffer for dequantized weights (sized for largest layer).
+    // Only allocated when dims.quantized is true.
+    /// Dequant temp: [max_weight_k * max_weight_n] fp16
+    pub temp_dequant: Option<CudaSlice<half::f16>>,
+
     // ---- Single-token scratch for per-item ops in batch mode ----
     /// Per-item attention output scratch: [q_dim]
     /// Used when batch > 1 to avoid overwriting other items' attn results.
@@ -137,6 +145,14 @@ impl DecodeBuffers {
             down_out: unsafe { stream.alloc::<half::f16>(b * dims.hidden_size)? },
             final_norm_out: unsafe { stream.alloc::<half::f16>(b * dims.hidden_size)? },
             logits: unsafe { stream.alloc::<half::f16>(b * dims.vocab_size)? },
+            temp_dequant: if dims.quantized {
+                // Largest weight is gate_up_proj: [hidden_size, 2*intermediate_size]
+                let max_k = dims.hidden_size;
+                let max_n = 2 * dims.intermediate_size;
+                Some(unsafe { stream.alloc::<half::f16>(max_k * max_n)? })
+            } else {
+                None
+            },
             scratch_attn: unsafe { stream.alloc::<half::f16>(q_dim)? },
             flash_partial_out: unsafe {
                 stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS * dims.head_dim)?
