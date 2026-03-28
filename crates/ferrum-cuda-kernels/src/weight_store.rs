@@ -67,10 +67,11 @@ pub struct GpuQuantWeight {
     pub symmetric: bool,
 }
 
-/// A linear layer weight — either FP16 or INT4 quantized.
+/// A linear layer weight — FP16, INT4 (dequant+cuBLAS), or Marlin (fused INT4xFP16).
 pub enum LinearWeight {
     Fp16(GpuWeight),
     Int4(GpuQuantWeight),
+    Marlin(crate::marlin::MarlinWeight),
 }
 
 impl LinearWeight {

@@ -38,6 +38,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by cargo"));
     let ptx_rs = out_dir.join("ptx.rs");
 
+    let out_dir_clone = out_dir.clone();
     let mut builder = bindgen_cuda::Builder::default()
         .kernel_paths(vec![
             "kernels/fused_add_rms_norm.cu",
@@ -67,4 +68,75 @@ fn main() {
     bindings
         .write(&ptx_rs)
         .expect("failed to write ferrum CUDA PTX bindings");
+
+    // Compile Marlin INT4xFP16 kernel separately (uses runtime API, not PTX).
+    // Requires SM >= 8.0 (Ampere). Compiled to a static library and linked.
+    compile_marlin(&out_dir_clone);
+}
+
+fn compile_marlin(out_dir: &PathBuf) {
+    println!("cargo:rerun-if-changed=kernels/marlin_cuda_kernel.cu");
+
+    let cuda_root = cuda_root_from_env();
+    let nvcc = cuda_root
+        .as_ref()
+        .map(|r| r.join("bin").join("nvcc"))
+        .unwrap_or_else(|| PathBuf::from("nvcc"));
+
+    if !nvcc.exists() && cuda_root.is_some() {
+        eprintln!("nvcc not found at {:?}, skipping Marlin kernel", nvcc);
+        return;
+    }
+
+    // Determine compute capability: use CUDA_COMPUTE_CAP env or default to 80
+    let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "80".to_string());
+
+    let obj_file = out_dir.join("marlin_cuda_kernel.o");
+    let status = std::process::Command::new(&nvcc)
+        .args(["-c", "kernels/marlin_cuda_kernel.cu", "-o"])
+        .arg(obj_file.to_str().unwrap())
+        .args([
+            &format!("-arch=sm_{compute_cap}"),
+            "-std=c++17",
+            "-O3",
+            "--use_fast_math",
+            "-Xcompiler",
+            "-fPIC",
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            // Create static library from object file
+            let lib_file = out_dir.join("libmarlin.a");
+            let ar_status = std::process::Command::new("ar")
+                .args(["rcs"])
+                .arg(lib_file.to_str().unwrap())
+                .arg(obj_file.to_str().unwrap())
+                .status();
+            if let Ok(s) = ar_status {
+                if s.success() {
+                    println!("cargo:rustc-link-search=native={}", out_dir.display());
+                    println!("cargo:rustc-link-lib=static=marlin");
+                    // Link CUDA runtime
+                    if let Some(ref cuda_root) = cuda_root {
+                        let lib64 = cuda_root.join("lib64");
+                        if lib64.exists() {
+                            println!("cargo:rustc-link-search=native={}", lib64.display());
+                        }
+                    }
+                    println!("cargo:rustc-link-lib=dylib=cudart");
+                    eprintln!("Marlin kernel compiled successfully (sm_{compute_cap})");
+                    return;
+                }
+            }
+            eprintln!("Failed to create libmarlin.a, Marlin disabled");
+        }
+        Ok(s) => {
+            eprintln!("nvcc failed with {s}, Marlin kernel disabled");
+        }
+        Err(e) => {
+            eprintln!("nvcc not available ({e}), Marlin kernel disabled");
+        }
+    }
 }

@@ -57,6 +57,9 @@ pub mod cuda_graph;
 pub mod quant;
 
 #[cfg(feature = "cuda")]
+pub mod marlin;
+
+#[cfg(feature = "cuda")]
 pub mod gpu_paged_kv;
 
 #[cfg(feature = "cuda")]
