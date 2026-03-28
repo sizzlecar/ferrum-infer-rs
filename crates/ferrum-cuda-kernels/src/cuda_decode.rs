@@ -1243,74 +1243,98 @@ impl CudaDecodeRunner {
                 )?;
             }
 
-            // ---- Per-item: Q/K norm + RoPE + attention ----
-            // Each item has different position and KV cache.
-            // Uses first [q_dim]/[kv_dim] of batched buffers as single-token scratch.
-            for b in 0..batch {
+            // ---- Per-item Q/K norm → batch-offset positions in rope_q/k_temp ----
+            {
                 let lw = &self.weights.layers[li];
+                for b in 0..batch {
+                    let q_view = self.buffers.qkv_out.slice(b * qkv_dim..b * qkv_dim + q_dim);
+                    let k_view = self
+                        .buffers
+                        .qkv_out
+                        .slice(b * qkv_dim + q_dim..b * qkv_dim + q_dim + kv_dim);
 
-                // Q/K norm: input is CudaView → rms_norm computes num_rows from view.len()
-                let q_view = self.buffers.qkv_out.slice(b * qkv_dim..b * qkv_dim + q_dim);
-                let k_view = self
-                    .buffers
-                    .qkv_out
-                    .slice(b * qkv_dim + q_dim..b * qkv_dim + q_dim + kv_dim);
-
-                if let Some(ref qnw) = lw.q_norm_w {
-                    Self::launch_rms_norm_view(
-                        &self.device,
-                        &self.stream,
-                        &q_view,
-                        &qnw.slice,
-                        &mut self.buffers.rope_q_temp,
-                        hd,
-                        eps,
-                    )?;
-                } else {
-                    self.stream
-                        .memcpy_dtod(&q_view, &mut self.buffers.rope_q_temp)
-                        .map_err(|e| candle_core::Error::Msg(format!("q copy: {e}")))?;
+                    // Q norm → rope_q_temp[b*q_dim..(b+1)*q_dim]
+                    if let Some(ref qnw) = lw.q_norm_w {
+                        let mut q_dst = self
+                            .buffers
+                            .rope_q_temp
+                            .slice_mut(b * q_dim..(b + 1) * q_dim);
+                        Self::launch_rms_norm_into(
+                            &self.device,
+                            &self.stream,
+                            &q_view,
+                            &qnw.slice,
+                            &mut q_dst,
+                            hd,
+                            eps,
+                        )?;
+                    } else {
+                        let mut q_dst = self
+                            .buffers
+                            .rope_q_temp
+                            .slice_mut(b * q_dim..(b + 1) * q_dim);
+                        self.stream
+                            .memcpy_dtod(&q_view, &mut q_dst)
+                            .map_err(|e| candle_core::Error::Msg(format!("q copy: {e}")))?;
+                    }
+                    // K norm → rope_k_temp[b*kv_dim..(b+1)*kv_dim]
+                    if let Some(ref knw) = lw.k_norm_w {
+                        let mut k_dst = self
+                            .buffers
+                            .rope_k_temp
+                            .slice_mut(b * kv_dim..(b + 1) * kv_dim);
+                        Self::launch_rms_norm_into(
+                            &self.device,
+                            &self.stream,
+                            &k_view,
+                            &knw.slice,
+                            &mut k_dst,
+                            hd,
+                            eps,
+                        )?;
+                    } else {
+                        let mut k_dst = self
+                            .buffers
+                            .rope_k_temp
+                            .slice_mut(b * kv_dim..(b + 1) * kv_dim);
+                        self.stream
+                            .memcpy_dtod(&k_view, &mut k_dst)
+                            .map_err(|e| candle_core::Error::Msg(format!("k copy: {e}")))?;
+                    }
                 }
-                if let Some(ref knw) = lw.k_norm_w {
-                    Self::launch_rms_norm_view(
-                        &self.device,
-                        &self.stream,
-                        &k_view,
-                        &knw.slice,
-                        &mut self.buffers.rope_k_temp,
-                        hd,
-                        eps,
-                    )?;
-                } else {
-                    self.stream
-                        .memcpy_dtod(&k_view, &mut self.buffers.rope_k_temp)
-                        .map_err(|e| candle_core::Error::Msg(format!("k copy: {e}")))?;
-                }
+            }
 
-                // RoPE with per-item position
-                let co = requests[b].position * half_dim;
-                let cos = self.weights.rope_cos.slice.slice(co..co + half_dim);
-                let sin = self.weights.rope_sin.slice.slice(co..co + half_dim);
-                Self::launch_rope(
-                    &self.device,
-                    &self.stream,
-                    &self.buffers.rope_q_temp,
-                    &self.buffers.rope_k_temp,
-                    &cos,
-                    &sin,
-                    &mut self.buffers.q_rotated,
-                    &mut self.buffers.k_rotated,
-                    nq,
-                    nkv,
-                    hd,
-                )?;
+            // ---- Batched RoPE: single launch for all items ----
+            // Upload positions once on first layer (same across layers).
+            if li == 0 {
+                let pos_vec: Vec<i32> = requests.iter().map(|r| r.position as i32).collect();
+                self.stream
+                    .memcpy_htod(&pos_vec, &mut self.buffers.batched_positions)
+                    .map_err(|e| candle_core::Error::Msg(format!("positions: {e}")))?;
+            }
+            Self::launch_batched_rope(
+                &self.device,
+                &self.stream,
+                &self.buffers.rope_q_temp,
+                &self.buffers.rope_k_temp,
+                &self.weights.rope_cos.slice,
+                &self.weights.rope_sin.slice,
+                &self.buffers.batched_positions,
+                &mut self.buffers.q_rotated,
+                &mut self.buffers.k_rotated,
+                nq,
+                nkv,
+                hd,
+                batch,
+            )?;
 
-                // Append K/V to this item's KV cache
+            // ---- Per-item KV cache append ----
+            let kv_stride = nkv * hd;
+            for b in 0..batch {
                 let kv = &mut kv_batch[b];
-                let kv_stride = nkv * hd;
                 let kv_off = kv.current_len * kv_stride;
                 {
-                    let ks = self.buffers.k_rotated.slice(..kv_dim);
+                    let ks = self.buffers.k_rotated.slice(b * kv_dim..(b + 1) * kv_dim);
                     let mut kd = kv.k_caches[li].slice_mut(kv_off..kv_off + kv_dim);
                     self.stream
                         .memcpy_dtod(&ks, &mut kd)
@@ -1326,53 +1350,114 @@ impl CudaDecodeRunner {
                         .memcpy_dtod(&vs, &mut vd)
                         .map_err(|e| candle_core::Error::Msg(format!("KV v: {e}")))?;
                 }
+            }
 
-                // Attention → scratch_attn
-                let scale = 1.0f32 / (hd as f32).sqrt();
-                let valid_kv = kv.current_len + 1;
-                let num_splits = Self::compute_num_splits(valid_kv);
+            // ---- Attention: batched when all items have short KV, else per-item ----
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            let max_valid_kv = kv_batch
+                .iter()
+                .map(|kv| kv.current_len + 1)
+                .max()
+                .unwrap_or(1);
+            let all_short = max_valid_kv <= 256;
 
-                if num_splits <= 1 {
-                    Self::launch_decode_attention(
-                        &self.device,
-                        &self.stream,
-                        &self.buffers.q_rotated,
-                        &kv.k_caches[li],
-                        &kv.v_caches[li],
-                        &mut self.buffers.scratch_attn,
-                        nq,
-                        nkv,
-                        hd,
-                        kv.max_len,
-                        valid_kv,
-                        scale,
-                    )?;
-                } else {
-                    Self::launch_flash_decode_attention(
-                        &self.device,
-                        &self.stream,
-                        &self.buffers.q_rotated,
-                        &kv.k_caches[li],
-                        &kv.v_caches[li],
-                        &mut self.buffers.flash_partial_out,
-                        &mut self.buffers.flash_partial_m,
-                        &mut self.buffers.flash_partial_l,
-                        &mut self.buffers.scratch_attn,
-                        nq,
-                        nkv,
-                        hd,
-                        valid_kv,
-                        scale,
-                        num_splits,
-                    )?;
+            if all_short {
+                // Build device pointer arrays for K/V caches
+                use cudarc::driver::DevicePtr;
+                let mut k_ptrs_host = Vec::with_capacity(batch);
+                let mut v_ptrs_host = Vec::with_capacity(batch);
+                let mut kv_lens_host = Vec::with_capacity(batch);
+                for b in 0..batch {
+                    let kv = &kv_batch[b];
+                    let (kp, _) = kv.k_caches[li].device_ptr(&self.stream);
+                    let (vp, _) = kv.v_caches[li].device_ptr(&self.stream);
+                    k_ptrs_host.push(kp);
+                    v_ptrs_host.push(vp);
+                    kv_lens_host.push((kv.current_len + 1) as i32);
                 }
-
-                // Copy scratch → attn_out[b*q_dim..(b+1)*q_dim]
-                let src = self.buffers.scratch_attn.slice(..q_dim);
-                let mut dst = self.buffers.attn_out.slice_mut(b * q_dim..(b + 1) * q_dim);
                 self.stream
-                    .memcpy_dtod(&src, &mut dst)
-                    .map_err(|e| candle_core::Error::Msg(format!("attn copy: {e}")))?;
+                    .memcpy_htod(&k_ptrs_host, &mut self.buffers.batched_k_ptrs)
+                    .map_err(|e| candle_core::Error::Msg(format!("k_ptrs: {e}")))?;
+                self.stream
+                    .memcpy_htod(&v_ptrs_host, &mut self.buffers.batched_v_ptrs)
+                    .map_err(|e| candle_core::Error::Msg(format!("v_ptrs: {e}")))?;
+                self.stream
+                    .memcpy_htod(&kv_lens_host, &mut self.buffers.batched_kv_lens)
+                    .map_err(|e| candle_core::Error::Msg(format!("kv_lens: {e}")))?;
+
+                Self::launch_batched_decode_attention(
+                    &self.device,
+                    &self.stream,
+                    &self.buffers.q_rotated,
+                    &self.buffers.batched_k_ptrs,
+                    &self.buffers.batched_v_ptrs,
+                    &self.buffers.batched_kv_lens,
+                    &mut self.buffers.attn_out,
+                    batch,
+                    nq,
+                    nkv,
+                    hd,
+                    max_valid_kv,
+                    scale,
+                )?;
+            } else {
+                // Fallback: per-item attention for long KV (flash decode)
+                for b in 0..batch {
+                    let kv = &kv_batch[b];
+                    let valid_kv = kv.current_len + 1;
+                    let num_splits = Self::compute_num_splits(valid_kv);
+
+                    // Copy this item's Q to scratch_attn (launchers need CudaSlice)
+                    {
+                        let q_src = self.buffers.q_rotated.slice(b * q_dim..(b + 1) * q_dim);
+                        self.stream
+                            .memcpy_dtod(&q_src, &mut self.buffers.scratch_attn)
+                            .map_err(|e| candle_core::Error::Msg(format!("q scratch: {e}")))?;
+                    }
+
+                    if num_splits <= 1 {
+                        Self::launch_decode_attention(
+                            &self.device,
+                            &self.stream,
+                            &self.buffers.scratch_attn,
+                            &kv.k_caches[li],
+                            &kv.v_caches[li],
+                            &mut self.buffers.scratch_attn,
+                            nq,
+                            nkv,
+                            hd,
+                            kv.max_len,
+                            valid_kv,
+                            scale,
+                        )?;
+                    } else {
+                        Self::launch_flash_decode_attention(
+                            &self.device,
+                            &self.stream,
+                            &self.buffers.scratch_attn,
+                            &kv.k_caches[li],
+                            &kv.v_caches[li],
+                            &mut self.buffers.flash_partial_out,
+                            &mut self.buffers.flash_partial_m,
+                            &mut self.buffers.flash_partial_l,
+                            &mut self.buffers.scratch_attn,
+                            nq,
+                            nkv,
+                            hd,
+                            valid_kv,
+                            scale,
+                            num_splits,
+                        )?;
+                    }
+                    // Copy scratch → attn_out[b*q_dim..]
+                    {
+                        let src = self.buffers.scratch_attn.slice(..q_dim);
+                        let mut dst = self.buffers.attn_out.slice_mut(b * q_dim..(b + 1) * q_dim);
+                        self.stream
+                            .memcpy_dtod(&src, &mut dst)
+                            .map_err(|e| candle_core::Error::Msg(format!("attn cp: {e}")))?;
+                    }
+                }
             }
 
             // ---- Batched O proj + post-attn residual/norm + MLP + layer exit ----
@@ -1637,6 +1722,37 @@ impl CudaDecodeRunner {
         .map_err(|e| candle_core::Error::Msg(format!("rms_norm: {e}")))
     }
 
+    /// RMS norm from CudaView input to CudaViewMut output (for batch-offset writes).
+    fn launch_rms_norm_into(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        input: &CudaView<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        output: &mut cudarc::driver::CudaViewMut<half::f16>,
+        row_size: usize,
+        eps: f32,
+    ) -> candle_core::Result<()> {
+        let num_rows = input.len() / row_size;
+        let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
+        let w = weight.slice(..);
+        let rs = row_size as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(input);
+        b.arg(&w);
+        b.arg(output);
+        b.arg(&rs);
+        b.arg(&eps);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_rows as u32, 1, 1),
+                block_dim: (row_size.min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("rms_norm: {e}")))
+    }
+
     fn launch_rope(
         device: &CudaDevice,
         stream: &Arc<CudaStream>,
@@ -1726,6 +1842,108 @@ impl CudaDecodeRunner {
         }
         .map(|_| ())
         .map_err(|e| candle_core::Error::Msg(format!("attn: {e}")))
+    }
+
+    /// Batched decode attention: single launch for all batch items.
+    /// Grid: (num_q_heads, batch, 1). Each block handles one (head, item) pair.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_batched_decode_attention(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        q: &CudaSlice<half::f16>,          // [B * nq * hd]
+        k_ptrs: &CudaSlice<u64>,           // [B] device pointers
+        v_ptrs: &CudaSlice<u64>,           // [B] device pointers
+        kv_lens: &CudaSlice<i32>,          // [B] valid kv lengths
+        output: &mut CudaSlice<half::f16>, // [B * nq * hd]
+        batch: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        max_valid_kv: usize,
+        scale: f32,
+    ) -> candle_core::Result<()> {
+        let func = device.get_or_load_custom_func(
+            "batched_decode_attention_f16",
+            "batched_decode_attention",
+            ptx::BATCHED_DECODE_ATTENTION,
+        )?;
+        let qv = q.slice(..);
+        let kp = k_ptrs.slice(..);
+        let vp = v_ptrs.slice(..);
+        let kl = kv_lens.slice(..);
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(output);
+        b.arg(&kl);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&scale);
+        let shared_bytes = (max_valid_kv as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (nq as u32, batch as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("batched_attn: {e}")))
+    }
+
+    /// Batched RoPE: single launch for all batch items with per-item positions.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_batched_rope(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        q: &CudaSlice<half::f16>,         // [B * nq * hd]
+        k: &CudaSlice<half::f16>,         // [B * nk * hd]
+        cos_table: &CudaSlice<half::f16>, // full cos table
+        sin_table: &CudaSlice<half::f16>, // full sin table
+        positions: &CudaSlice<i32>,       // [B]
+        q_out: &mut CudaSlice<half::f16>, // [B * nq * hd]
+        k_out: &mut CudaSlice<half::f16>, // [B * nk * hd]
+        nq: usize,
+        nk: usize,
+        hd: usize,
+        batch: usize,
+    ) -> candle_core::Result<()> {
+        let func = device.get_or_load_custom_func("batched_rope_f16", "rope", ptx::ROPE)?;
+        let qv = q.slice(..);
+        let kv = k.slice(..);
+        let cv = cos_table.slice(..);
+        let sv = sin_table.slice(..);
+        let pv = positions.slice(..);
+        let nqi = nq as i32;
+        let nki = nk as i32;
+        let hdi = hd as i32;
+        let bi = batch as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kv);
+        b.arg(&cv);
+        b.arg(&sv);
+        b.arg(q_out);
+        b.arg(k_out);
+        b.arg(&pv);
+        b.arg(&nqi);
+        b.arg(&nki);
+        b.arg(&hdi);
+        b.arg(&bi);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (((nq + nk) * batch) as u32, 1, 1),
+                block_dim: ((hd / 2).min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("batched_rope: {e}")))
     }
 
     /// Determine number of KV splits for flash decoding.

@@ -30,6 +30,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/flash_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/paged_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/dequant_int4.cu");
+    println!("cargo:rerun-if-changed=kernels/batched_decode_attention.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -50,6 +51,7 @@ fn main() {
             "kernels/flash_decode_attention.cu",
             "kernels/paged_decode_attention.cu",
             "kernels/dequant_int4.cu",
+            "kernels/batched_decode_attention.cu",
         ])
         .out_dir(out_dir)
         .arg("--expt-relaxed-constexpr")

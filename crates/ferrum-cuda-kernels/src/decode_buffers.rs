@@ -96,6 +96,16 @@ pub struct DecodeBuffers {
     /// Used when batch > 1 to avoid overwriting other items' attn results.
     pub scratch_attn: CudaSlice<half::f16>,
 
+    // ---- Batched attention helper buffers ----
+    /// Device pointer array for K caches: [max_batch_size] u64
+    pub batched_k_ptrs: CudaSlice<u64>,
+    /// Device pointer array for V caches: [max_batch_size] u64
+    pub batched_v_ptrs: CudaSlice<u64>,
+    /// Valid KV lengths per batch item: [max_batch_size] i32
+    pub batched_kv_lens: CudaSlice<i32>,
+    /// Positions per batch item (for batched RoPE): [max_batch_size] i32
+    pub batched_positions: CudaSlice<i32>,
+
     // ---- Flash Decode partial buffers (f32, NOT batch-scaled) ----
     // Reused across batch items since attention is sequential per-item.
     /// Partial V accumulation: [num_q_heads * MAX_SPLITS * head_dim]
@@ -154,6 +164,10 @@ impl DecodeBuffers {
                 None
             },
             scratch_attn: unsafe { stream.alloc::<half::f16>(q_dim)? },
+            batched_k_ptrs: unsafe { stream.alloc::<u64>(b)? },
+            batched_v_ptrs: unsafe { stream.alloc::<u64>(b)? },
+            batched_kv_lens: unsafe { stream.alloc::<i32>(b)? },
+            batched_positions: unsafe { stream.alloc::<i32>(b)? },
             flash_partial_out: unsafe {
                 stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS * dims.head_dim)?
             },
