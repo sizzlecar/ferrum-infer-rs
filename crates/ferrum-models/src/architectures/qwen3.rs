@@ -961,14 +961,17 @@ impl Qwen3ModelWrapper {
                         let qweight = stream
                             .clone_htod(&marlin_qw)
                             .map_err(|e| FerrumError::model(format!("{prefix} marlin qw: {e}")))?;
-                        let scales = stream
-                            .clone_htod(bytemuck::cast_slice::<half::f16, u8>(&marlin_scales))
-                            .map_err(|e| {
-                                FerrumError::model(format!("{prefix} marlin scales: {e}"))
-                            })?;
+                        // Upload scales as f16 directly (no transmute).
+                        // cudarc clone_htod with u16 preserves correct element count.
+                        let scales_u16: &[u16] =
+                            bytemuck::cast_slice::<half::f16, u16>(&marlin_scales);
+                        let scales_gpu_u16 = stream.clone_htod(scales_u16).map_err(|e| {
+                            FerrumError::model(format!("{prefix} marlin scales: {e}"))
+                        })?;
+                        // Reinterpret u16 as f16 on GPU (same size, same bits)
                         let scales_f16: candle_core::cuda_backend::cudarc::driver::CudaSlice<
                             half::f16,
-                        > = unsafe { std::mem::transmute(scales) };
+                        > = unsafe { std::mem::transmute(scales_gpu_u16) };
                         let ws_size = (gw.n / 128) * 16;
                         let workspace = stream
                             .clone_htod(&vec![0i32; ws_size])
@@ -992,12 +995,13 @@ impl Qwen3ModelWrapper {
                     let qweight = stream
                         .clone_htod(&gw.qweight)
                         .map_err(|e| FerrumError::model(format!("{prefix} qweight upload: {e}")))?;
-                    let scales = stream
-                        .clone_htod(bytemuck::cast_slice::<half::f16, u8>(&gw.scales))
+                    let scales_u16: &[u16] = bytemuck::cast_slice::<half::f16, u16>(&gw.scales);
+                    let scales_gpu = stream
+                        .clone_htod(scales_u16)
                         .map_err(|e| FerrumError::model(format!("{prefix} scales upload: {e}")))?;
                     let scales_f16: candle_core::cuda_backend::cudarc::driver::CudaSlice<
                         half::f16,
-                    > = unsafe { std::mem::transmute(scales) };
+                    > = unsafe { std::mem::transmute(scales_gpu) };
                     let qzeros = if let Some(ref qz) = gw.qzeros {
                         Some(stream.clone_htod(qz).map_err(|e| {
                             FerrumError::model(format!("{prefix} qzeros upload: {e}"))
