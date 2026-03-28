@@ -5,7 +5,7 @@
 //!
 //! Constraints: K % 128 == 0, N % 256 == 0, SM >= 8.0 (Ampere+).
 
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::Arc;
 
 // FFI declaration for the Marlin CUDA kernel
@@ -63,7 +63,7 @@ pub fn marlin_gemm(
     let (s_ptr, _s_guard) = weight.scales.device_ptr(stream);
     let (ws_ptr, _ws_guard) = weight.workspace.device_ptr(stream);
 
-    let raw_stream = **stream;
+    let raw_stream = stream.cu_stream();
 
     let ret = unsafe {
         marlin_cuda(
