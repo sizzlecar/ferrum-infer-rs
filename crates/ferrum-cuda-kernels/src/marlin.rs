@@ -154,45 +154,18 @@ pub fn repack_gptq_to_marlin(
         }
     }
 
-    // Step 3: Apply Marlin's full _perm permutation.
-    // This combines tile reordering with m16n8k16 mma fragment layout.
-    // Reference: IST-DASLab/marlin __init__.py _perm construction.
-    //
-    // The permutation operates on [N, K] viewed as [N/16, K*16] where
-    // each row of K*16 elements is permuted in blocks of 1024.
+    // Step 3: Apply Marlin's _perm directly to [N, K] flat data.
+    // _perm combines tiling + m16n8k16 mma fragment layout in one permutation.
+    // Applied as: W.reshape((-1, 1024))[:, _perm].reshape(W.shape)
+    // NO separate tiling step needed — _perm encodes everything.
     let perm = build_marlin_perm();
-    let row_len = k * 16; // NOT k — this is the tiled row length
-                          // Actually, we first need to tile, THEN apply _perm to each row.
-
-    // Step 3a: Tile — reshape [N, K] → [N/16, 16, K/16, 16] → permute → [N/16, K*16]
-    let tile_n = n / 16;
-    let tile_k = k / 16;
-    let mut tiled = vec![0u8; n * k]; // [N/16, K*16]
-    for tn in 0..tile_n {
-        for tk in 0..tile_k {
-            for in_ in 0..16 {
-                for ik in 0..16 {
-                    let src_idx = (tn * 16 + in_) * k + (tk * 16 + ik);
-                    let dst_idx = tn * (k * 16) + tk * 256 + in_ * 16 + ik;
-                    tiled[dst_idx] = w[src_idx];
-                }
-            }
-        }
-    }
-
-    // Step 3b: Apply _perm to each row (in blocks of 1024)
     let total = n * k;
     let mut permuted = vec![0u8; total];
-    let rows = n / 16;
-    let cols = k * 16;
-    for row in 0..rows {
-        let row_offset = row * cols;
-        let num_blocks = cols / 1024;
-        for blk in 0..num_blocks {
-            let base = row_offset + blk * 1024;
-            for (dst, &src) in perm.iter().enumerate() {
-                permuted[base + dst] = tiled[base + src];
-            }
+    let num_blocks = total / 1024;
+    for blk in 0..num_blocks {
+        let base = blk * 1024;
+        for (dst, &src) in perm.iter().enumerate() {
+            permuted[base + dst] = w[base + src];
         }
     }
 
