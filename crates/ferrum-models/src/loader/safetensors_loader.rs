@@ -161,17 +161,23 @@ impl SafeTensorsLoader {
         for (prefix, gw) in &gptq_weights {
             let dequant = gw.dequantize_cpu();
             let f32_data: Vec<f32> = dequant.iter().map(|x| x.to_f32()).collect();
+            // GPTQ stores [K, N] (in_features, out_features) but candle Linear
+            // expects [N, K] (out_features, in_features). Transpose after reshape.
             let tensor = Tensor::new(&f32_data[..], &CandleDevice::Cpu)
                 .map_err(|e| FerrumError::model(format!("dequant {prefix}: {e}")))?
                 .reshape(&[gw.k, gw.n])
                 .map_err(|e| FerrumError::model(format!("dequant {prefix} reshape: {e}")))?
+                .t()
+                .map_err(|e| FerrumError::model(format!("dequant {prefix} transpose: {e}")))?
+                .contiguous()
+                .map_err(|e| FerrumError::model(format!("dequant {prefix} contiguous: {e}")))?
                 .to_device(device)
                 .map_err(|e| FerrumError::model(format!("dequant {prefix} to device: {e}")))?
                 .to_dtype(dtype)
                 .map_err(|e| FerrumError::model(format!("dequant {prefix} to dtype: {e}")))?;
 
             let weight_name = format!("{prefix}.weight");
-            debug!("Dequantized: {weight_name} [{}, {}]", gw.k, gw.n);
+            debug!("Dequantized: {weight_name} [{}, {}]", gw.n, gw.k);
             tensor_map.insert(weight_name, tensor);
         }
         info!(
