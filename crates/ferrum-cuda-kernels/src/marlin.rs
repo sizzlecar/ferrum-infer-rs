@@ -110,6 +110,18 @@ pub fn marlin_gemm(
             weight.group_size
         )));
     }
+
+    // Sync and check for NaN in output (diagnostic)
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("marlin sync: {e}")))?;
+    let cuda_err = unsafe { cudarc::driver::sys::cuStreamQuery(stream.cu_stream()) };
+    if cuda_err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin post-kernel error: {cuda_err:?}"
+        )));
+    }
+
     Ok(())
 }
 
