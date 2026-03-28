@@ -939,14 +939,60 @@ impl Qwen3ModelWrapper {
 
             if let Some(gptq_map) = gptq {
                 if let Some(gw) = gptq_map.get(prefix) {
-                    // Upload packed INT4 weights to GPU
+                    // Try Marlin (fused, 3.9x) if dimensions are compatible
+                    let use_marlin = gw.k % 128 == 0
+                        && gw.n % 256 == 0
+                        && (gw.group_size == 128 || gw.group_size == gw.k)
+                        && std::env::var("FERRUM_NO_MARLIN").is_err();
+
+                    if use_marlin {
+                        use ferrum_cuda_kernels::marlin::{
+                            repack_gptq_to_marlin, repack_scales_to_marlin, MarlinWeight,
+                        };
+                        let marlin_qw = repack_gptq_to_marlin(&gw.qweight, gw.k, gw.n);
+                        let marlin_scales =
+                            repack_scales_to_marlin(&gw.scales, gw.k, gw.n, gw.group_size);
+                        let gs_marlin = if gw.group_size == gw.k {
+                            -1i32
+                        } else {
+                            gw.group_size as i32
+                        };
+                        let qweight = stream
+                            .clone_htod(&marlin_qw)
+                            .map_err(|e| FerrumError::model(format!("{prefix} marlin qw: {e}")))?;
+                        let scales = stream
+                            .clone_htod(bytemuck::cast_slice::<half::f16, u8>(&marlin_scales))
+                            .map_err(|e| {
+                                FerrumError::model(format!("{prefix} marlin scales: {e}"))
+                            })?;
+                        let scales_f16: cudarc::driver::CudaSlice<half::f16> =
+                            unsafe { std::mem::transmute(scales) };
+                        let ws_size = (gw.n / 128) * 16;
+                        let workspace = stream
+                            .clone_htod(&vec![0i32; ws_size])
+                            .map_err(|e| FerrumError::model(format!("{prefix} marlin ws: {e}")))?;
+                        tracing::warn!(
+                            "Marlin weight: {prefix} K={} N={} gs={gs_marlin}",
+                            gw.k,
+                            gw.n,
+                        );
+                        return Ok(LinearWeight::Marlin(MarlinWeight {
+                            qweight,
+                            scales: scales_f16,
+                            workspace,
+                            k: gw.k,
+                            n: gw.n,
+                            group_size: gs_marlin,
+                        }));
+                    }
+
+                    // Fallback: dequant + cuBLAS path
                     let qweight = stream
                         .clone_htod(&gw.qweight)
                         .map_err(|e| FerrumError::model(format!("{prefix} qweight upload: {e}")))?;
                     let scales = stream
                         .clone_htod(bytemuck::cast_slice::<half::f16, u8>(&gw.scales))
                         .map_err(|e| FerrumError::model(format!("{prefix} scales upload: {e}")))?;
-                    // Reinterpret u8 slice as f16 slice on GPU
                     let scales_f16: cudarc::driver::CudaSlice<half::f16> =
                         unsafe { std::mem::transmute(scales) };
                     let qzeros = if let Some(ref qz) = gw.qzeros {
@@ -956,8 +1002,8 @@ impl Qwen3ModelWrapper {
                     } else {
                         None
                     };
-                    tracing::info!(
-                        "INT4 weight: {prefix} K={} N={} gs={}",
+                    tracing::warn!(
+                        "INT4 dequant weight: {prefix} K={} N={} gs={}",
                         gw.k,
                         gw.n,
                         gw.group_size
