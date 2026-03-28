@@ -405,7 +405,7 @@ impl CudaDecodeRunner {
         crate::cublas::linear_f16(
             &self.blas,
             &self.buffers.norm_out,
-            &lw.qkv_w.slice,
+            lw.qkv_w.as_fp16(),
             &mut self.buffers.qkv_out,
             1,
             qkv_dim as i32,
@@ -621,7 +621,7 @@ impl CudaDecodeRunner {
         crate::cublas::linear_f16(
             &self.blas,
             &self.buffers.attn_out,
-            &lw.o_w.slice,
+            lw.o_w.as_fp16(),
             &mut self.buffers.o_proj_out,
             1,
             h as i32,
@@ -645,7 +645,7 @@ impl CudaDecodeRunner {
         crate::cublas::linear_f16(
             &self.blas,
             &self.buffers.post_norm_out,
-            &lw.gate_up_w.slice,
+            lw.gate_up_w.as_fp16(),
             &mut self.buffers.gate_up_out,
             1,
             (2 * inter) as i32,
@@ -658,7 +658,7 @@ impl CudaDecodeRunner {
         crate::cublas::linear_f16(
             &self.blas,
             &self.buffers.mlp_act,
-            &lw.down_w.slice,
+            lw.down_w.as_fp16(),
             &mut self.buffers.down_out,
             1,
             h as i32,
@@ -690,7 +690,7 @@ impl CudaDecodeRunner {
         crate::cublas::linear_f16(
             &self.blas,
             &self.buffers.final_norm_out,
-            &self.weights.lm_head_w.slice,
+            self.weights.lm_head_w.as_fp16(),
             &mut self.buffers.logits,
             1,
             self.dims.vocab_size as i32,
@@ -1209,7 +1209,7 @@ impl CudaDecodeRunner {
                 crate::cublas::linear_f16(
                     &self.blas,
                     &self.buffers.norm_out,
-                    &lw.qkv_w.slice,
+                    lw.qkv_w.as_fp16(),
                     &mut self.buffers.qkv_out,
                     m,
                     qkv_dim as i32,
@@ -1352,7 +1352,7 @@ impl CudaDecodeRunner {
                 crate::cublas::linear_f16(
                     &self.blas,
                     &self.buffers.attn_out,
-                    &lw.o_w.slice,
+                    lw.o_w.as_fp16(),
                     &mut self.buffers.o_proj_out,
                     m,
                     h as i32,
@@ -1375,7 +1375,7 @@ impl CudaDecodeRunner {
                 crate::cublas::linear_f16(
                     &self.blas,
                     &self.buffers.post_norm_out,
-                    &lw.gate_up_w.slice,
+                    lw.gate_up_w.as_fp16(),
                     &mut self.buffers.gate_up_out,
                     m,
                     (2 * inter) as i32,
@@ -1392,7 +1392,7 @@ impl CudaDecodeRunner {
                 crate::cublas::linear_f16(
                     &self.blas,
                     &self.buffers.mlp_act,
-                    &lw.down_w.slice,
+                    lw.down_w.as_fp16(),
                     &mut self.buffers.down_out,
                     m,
                     h as i32,
@@ -1437,7 +1437,7 @@ impl CudaDecodeRunner {
         crate::cublas::linear_f16(
             &self.blas,
             &self.buffers.final_norm_out,
-            &self.weights.lm_head_w.slice,
+            self.weights.lm_head_w.as_fp16(),
             &mut self.buffers.logits,
             m,
             self.dims.vocab_size as i32,
