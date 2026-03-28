@@ -119,6 +119,8 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     // Warmup
     eprintln!("{}", "Warmup...".dimmed());
     let _ = run_single(&*engine, &model_id, "Hello", 16).await;
+    // Let engine finish cleanup before starting benchmark rounds
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     if cmd.concurrency > 1 {
         run_concurrent_bench(&*engine, &model_id, &prompt, &cmd).await
@@ -161,6 +163,9 @@ async fn run_sequential_bench(
             "  {} tokens in {:.1}ms ({:.1} tok/s, TTFT {:.1}ms, TPOT {:.2}ms, decode {:.1} tok/s)",
             result.token_count, result.total_ms, tps, result.ttft_ms, tpot_ms, decode_tps
         );
+
+        // Let engine finish cleanup between rounds
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     print_summary(
