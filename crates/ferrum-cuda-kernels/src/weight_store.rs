@@ -75,16 +75,18 @@ pub enum LinearWeight {
 }
 
 impl LinearWeight {
-    /// Get the FP16 weight slice (panics for INT4 — use linear_dispatch instead).
+    /// Get the FP16 weight slice (panics for quantized — use linear_dispatch instead).
     pub fn as_fp16(&self) -> &CudaSlice<half::f16> {
         match self {
             LinearWeight::Fp16(w) => &w.slice,
-            LinearWeight::Int4(_) => panic!("Cannot get fp16 slice from INT4 weight"),
+            LinearWeight::Int4(_) | LinearWeight::Marlin(_) => {
+                panic!("Cannot get fp16 slice from quantized weight")
+            }
         }
     }
 
     pub fn is_quantized(&self) -> bool {
-        matches!(self, LinearWeight::Int4(_))
+        matches!(self, LinearWeight::Int4(_) | LinearWeight::Marlin(_))
     }
 }
 

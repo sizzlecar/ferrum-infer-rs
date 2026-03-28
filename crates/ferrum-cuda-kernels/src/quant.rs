@@ -106,5 +106,11 @@ pub fn linear_dispatch(
             // Step 2: cuBLAS GEMM with dequantized weight
             crate::cublas::linear_f16(blas, input, temp_fp16, output, m, n, k)
         }
+        LinearWeight::Marlin(_) => {
+            // Marlin dispatch handled in CudaDecodeRunner::linear(), not here
+            Err(candle_core::Error::Msg(
+                "Marlin should be dispatched via CudaDecodeRunner::linear()".into(),
+            ))
+        }
     }
 }

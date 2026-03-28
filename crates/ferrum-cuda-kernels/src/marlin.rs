@@ -5,7 +5,7 @@
 //!
 //! Constraints: K % 128 == 0, N % 256 == 0, SM >= 8.0 (Ampere+).
 
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use std::sync::Arc;
 
 // FFI declaration for the Marlin CUDA kernel
@@ -59,11 +59,11 @@ pub fn marlin_gemm(
     // Get raw device pointers
     let (a_ptr, _a_guard) = input.device_ptr(stream);
     let (b_ptr, _b_guard) = weight.qweight.device_ptr(stream);
-    let (c_ptr, _c_guard) = output.device_ptr_mut(stream);
+    let (c_ptr, _c_guard) = output.device_ptr(stream);
     let (s_ptr, _s_guard) = weight.scales.device_ptr(stream);
-    let (ws_ptr, _ws_guard) = weight.workspace.device_ptr_mut(stream);
+    let (ws_ptr, _ws_guard) = weight.workspace.device_ptr(stream);
 
-    let raw_stream = stream.stream;
+    let raw_stream = **stream;
 
     let ret = unsafe {
         marlin_cuda(
