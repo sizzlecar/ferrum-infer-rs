@@ -154,9 +154,17 @@ pub fn repack_gptq_to_marlin(
         }
     }
 
-    // Step 3: Tile — reshape [N, K] into [N/16, 16, K/16, 16]
-    //         permute to [N/16, K/16, 16, 16]
-    //         flatten to [N/16, K*16]
+    // Step 3: Apply Marlin's full _perm permutation.
+    // This combines tile reordering with m16n8k16 mma fragment layout.
+    // Reference: IST-DASLab/marlin __init__.py _perm construction.
+    //
+    // The permutation operates on [N, K] viewed as [N/16, K*16] where
+    // each row of K*16 elements is permuted in blocks of 1024.
+    let perm = build_marlin_perm();
+    let row_len = k * 16; // NOT k — this is the tiled row length
+                          // Actually, we first need to tile, THEN apply _perm to each row.
+
+    // Step 3a: Tile — reshape [N, K] → [N/16, 16, K/16, 16] → permute → [N/16, K*16]
     let tile_n = n / 16;
     let tile_k = k / 16;
     let mut tiled = vec![0u8; n * k]; // [N/16, K*16]
@@ -172,17 +180,23 @@ pub fn repack_gptq_to_marlin(
         }
     }
 
-    // Step 4: Interleave within groups of 8 — [0,2,4,6,1,3,5,7]
-    let interleave = [0usize, 2, 4, 6, 1, 3, 5, 7];
+    // Step 3b: Apply _perm to each row (in blocks of 1024)
     let total = n * k;
     let mut permuted = vec![0u8; total];
-    for g in 0..(total / 8) {
-        for i in 0..8 {
-            permuted[g * 8 + i] = tiled[g * 8 + interleave[i]];
+    let rows = n / 16;
+    let cols = k * 16;
+    for row in 0..rows {
+        let row_offset = row * cols;
+        let num_blocks = cols / 1024;
+        for blk in 0..num_blocks {
+            let base = row_offset + blk * 1024;
+            for (dst, &src) in perm.iter().enumerate() {
+                permuted[base + dst] = tiled[base + src];
+            }
         }
     }
 
-    // Step 5: Pack 8 INT4 values → int32, taking every 8th element
+    // Step 4: Pack 8 INT4 values → int32, taking every 8th element
     //         result shape: [N/16, K*16/8] = [N/16, K*2]
     let packed_len = total / 8;
     let mut result = vec![0i32; packed_len];
@@ -244,4 +258,53 @@ pub fn repack_scales_to_marlin(
         result[i] = scales_gptq[i];
     }
     result
+}
+
+/// Build the 1024-element Marlin weight permutation array.
+///
+/// This encodes the m16n8k16 tensor core mma fragment layout.
+/// Each 1024-element block of the tiled weight [N/16, K*16] is
+/// permuted to match how the Marlin kernel loads data into
+/// tensor core fragments via shared memory.
+///
+/// Reference: IST-DASLab/marlin __init__.py _perm construction
+fn build_marlin_perm() -> Vec<usize> {
+    let mut perm = Vec::with_capacity(1024);
+
+    for i in 0..32 {
+        let col = i / 4;
+        let mut perm1 = Vec::with_capacity(8);
+
+        for block in 0..2 {
+            for &row_off in &[0, 1, 8, 9] {
+                let row = 2 * (i % 4) + row_off / 8 * 8 + row_off % 8;
+                // Actually, the original Python is:
+                // for row in [2*(i%4), 2*(i%4)+1, 2*(i%4+4), 2*(i%4+4)+1]:
+                //     perm1.append(16*row + col + 8*block)
+                let _ = row; // ignore, use direct construction below
+            }
+        }
+
+        // Direct from Python: for block in [0,1]: for row in [...]: perm1.append(...)
+        perm1.clear();
+        for block in 0..2 {
+            for &row in &[
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
+            ] {
+                perm1.push(16 * row + col + 8 * block);
+            }
+        }
+
+        for j in 0..4 {
+            for &p in &perm1 {
+                perm.push(p + 256 * j);
+            }
+        }
+    }
+
+    assert_eq!(perm.len(), 1024);
+    perm
 }
