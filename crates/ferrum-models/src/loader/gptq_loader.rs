@@ -216,9 +216,11 @@ fn fuse_qkv_and_gate_up(weights: &mut HashMap<String, GptqLayerWeights>) {
         let q_key = format!("{layer_prefix}.self_attn.q_proj");
         let k_key = format!("{layer_prefix}.self_attn.k_proj");
         let v_key = format!("{layer_prefix}.self_attn.v_proj");
-        if let (Some(q), Some(k), Some(v)) =
-            (weights.get(&q_key), weights.get(&k_key), weights.get(&v_key))
-        {
+        if let (Some(q), Some(k), Some(v)) = (
+            weights.get(&q_key),
+            weights.get(&k_key),
+            weights.get(&v_key),
+        ) {
             if q.k == k.k && q.k == v.k {
                 let fused = fuse_columns(&[q, k, v]);
                 let fused_key = format!("{layer_prefix}.self_attn.qkv_proj");
@@ -269,8 +271,7 @@ fn fuse_columns(parts: &[&GptqLayerWeights]) -> GptqLayerWeights {
     for part in parts {
         for row in 0..packed_k {
             for col in 0..part.n {
-                qweight[row * total_n + col_offset + col] =
-                    part.qweight[row * part.n + col];
+                qweight[row * total_n + col_offset + col] = part.qweight[row * part.n + col];
             }
         }
         col_offset += part.n;
@@ -282,8 +283,7 @@ fn fuse_columns(parts: &[&GptqLayerWeights]) -> GptqLayerWeights {
     for part in parts {
         for row in 0..num_groups {
             for col in 0..part.n {
-                scales[row * total_n + col_offset + col] =
-                    part.scales[row * part.n + col];
+                scales[row * total_n + col_offset + col] = part.scales[row * part.n + col];
             }
         }
         col_offset += part.n;
