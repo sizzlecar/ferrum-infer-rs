@@ -68,12 +68,12 @@ pub fn marlin_gemm(
 
     let raw_stream = stream.cu_stream();
 
-    // Zero workspace — Marlin uses it as mutex locks.
-    // Use sync memset to ensure zeroing completes before kernel launch.
+    // Zero workspace on the runner's stream — Marlin uses it as mutex locks.
+    // All operations (memset + kernel) on same stream → naturally ordered.
     {
         let (ws_ptr, _guard) = weight.workspace.device_ptr(stream);
         unsafe {
-            cudarc::driver::sys::cuMemsetD32_v2(ws_ptr, 0, weight.workspace.len());
+            cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, weight.workspace.len(), raw_stream);
         }
     }
 
