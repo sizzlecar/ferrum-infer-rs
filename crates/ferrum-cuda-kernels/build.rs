@@ -98,11 +98,10 @@ fn compile_marlin(out_dir: &PathBuf) {
         .args(["-c", "kernels/marlin_cuda_kernel.cu", "-o"])
         .arg(obj_file.to_str().unwrap())
         .args([
-            // Use PTX forward compatibility: generate PTX for compute_80,
-            // let the GPU driver JIT-compile to native SASS at runtime.
-            // This handles architecture differences automatically.
-            "-gencode",
-            &format!("arch=compute_80,code=compute_{compute_cap}"),
+            // Generate PTX for compute_80, embed as PTX (not SASS).
+            // The GPU driver JIT-compiles to native code at runtime.
+            // This provides forward compatibility across GPU architectures.
+            "-arch=compute_80",
             "-std=c++17",
             "-O3",
             "--use_fast_math",
