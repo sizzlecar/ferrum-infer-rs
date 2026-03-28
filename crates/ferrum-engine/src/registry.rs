@@ -980,7 +980,20 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 // Load weights (non-Metal path)
                 info!("Loading model weights...");
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
-                let vb = loader.load_varbuilder(&candle_device, dtype)?;
+
+                let model_dir_path: std::path::PathBuf = model_path.clone().into();
+                let qconfig =
+                    ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
+                        .unwrap_or(None);
+                let vb = if let Some(ref qc) = qconfig {
+                    info!(
+                        "GPTQ Llama detected ({}bit, gs={}), dequantizing...",
+                        qc.bits, qc.group_size
+                    );
+                    loader.load_varbuilder_gptq(qc, &candle_device, dtype)?
+                } else {
+                    loader.load_varbuilder(&candle_device, dtype)?
+                };
 
                 // Standard Candle executor for CPU/CUDA
                 let llama_model = ferrum_models::LlamaModelWrapper::from_varbuilder(
@@ -1014,7 +1027,21 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 // Load weights (non-Metal path)
                 info!("Loading model weights...");
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
-                let vb = loader.load_varbuilder(&candle_device, dtype)?;
+
+                // Auto-detect GPTQ
+                let model_dir_path: std::path::PathBuf = model_path.clone().into();
+                let qconfig =
+                    ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
+                        .unwrap_or(None);
+                let vb = if let Some(ref qc) = qconfig {
+                    info!(
+                        "GPTQ Qwen2 detected ({}bit, gs={}), dequantizing for prefill...",
+                        qc.bits, qc.group_size
+                    );
+                    loader.load_varbuilder_gptq(qc, &candle_device, dtype)?
+                } else {
+                    loader.load_varbuilder(&candle_device, dtype)?
+                };
 
                 let qwen2_model = ferrum_models::Qwen2ModelWrapper::from_varbuilder(
                     vb,
