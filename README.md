@@ -36,6 +36,11 @@ cargo build --release -p ferrum-cli --bin ferrum
 | `llama3.2:1b` / `3b` | Llama-3.2-Instruct | LLaMA |
 | `tinyllama` | TinyLlama-1.1B-Chat | LLaMA |
 
+GPTQ INT4 quantized models are auto-detected and use the Marlin fused kernel:
+```bash
+./target/release/ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
+```
+
 Any Hugging Face model ID with a supported architecture also works directly:
 ```bash
 ./target/release/ferrum run Qwen/Qwen3-0.6B
@@ -50,6 +55,7 @@ Any Hugging Face model ID with a supported architecture also works directly:
 | `ferrum stop` | Stop running server |
 | `ferrum pull <model>` | Download model from Hugging Face |
 | `ferrum list` | Show cached models |
+| `ferrum bench <model>` | Performance benchmark |
 | `ferrum embed <model>` | Generate BERT embeddings |
 
 ## API Endpoints
@@ -69,45 +75,39 @@ curl http://localhost:8000/health
 
 ## Performance
 
-Benchmarked on **NVIDIA RTX 5090**, Qwen3-4B, FP16, decode throughput:
+Benchmarked on **RTX PRO 6000 (Blackwell)**, Qwen3-4B:
 
-| Version | Optimization | Tokens/s |
-|---------|-------------|----------|
-| Baseline | Stock candle ops | ~33.5 |
-| +Fused kernels | `candle_nn::RmsNorm` + fused RoPE (CUDA) | ~88.3 |
-| +Pre-alloc KV cache | O(1) `slice_set` writes, zero-copy `narrow` views | ~94.4 |
-| +Fused projections | QKV 3→1 matmul, gate+up 2→1 matmul | ~100+ |
+| Mode | FP16 | INT4 (GPTQ + Marlin) |
+|------|------|----------------------|
+| Single request decode | 88.1 tok/s | **112.4 tok/s (+28%)** |
+| 4 concurrent (batch) | 109.4 tok/s | — |
+| VRAM | ~8 GB | **~2.5 GB (-69%)** |
 
-**Current**: ~100 tok/s average, peaks at 103+ tok/s on Qwen3-4B.
-
-Ongoing CUDA kernel work (`ferrum-cuda-kernels` crate):
-- `fused_add_rms_norm` — residual add + RMS norm in 1 kernel (saves 1 launch + 1 memory round-trip per layer)
-- `fused_silu_mul` — SiLU activation + elementwise multiply in 1 kernel
+Key optimizations:
+- **INT4 quantization**: GPTQ models auto-detected, Marlin fused INT4×FP16 kernel
+- **Custom CUDA kernels**: fused RmsNorm, SiLU×mul, RoPE, decode attention
+- **Flash Decoding**: split-K for long-context decode (auto at KV > 256)
+- **Batch decode**: batched cuBLAS GEMM for concurrent requests
+- **Paged KV attention**: GPU block pool with block-table indirection
+- **Double-buffered residual**: cross-layer norm fusion (-108 kernel launches)
 
 ## Current Status
 
-**v0.2.0 — Functional MVP, pre-production.**
-
 What works:
-- CLI chat and HTTP serving with streaming
+- CLI chat, HTTP serving with streaming, benchmarking
 - Qwen3, Qwen2/2.5, LLaMA 3.x, TinyLlama architectures
-- Metal GPU acceleration (macOS), CUDA (NVIDIA), CPU cross-platform
-- Fused CUDA kernels via cudarc/nvrtc: RmsNorm, RoPE, QKV projection, SiLU+mul
-- FlashAttention-2 on CUDA (zero-copy KV cache views)
+- Metal GPU acceleration (macOS), CUDA (NVIDIA), CPU
+- INT4 GPTQ quantization with Marlin fused kernel (Blackwell compatible)
+- FlashAttention-2 prefill + custom CUDA decode runner
+- Paged KV cache with block reclamation
+- Continuous batching with batch decode
 - Top-k/top-p/temperature/repetition-penalty sampling
-- Hugging Face model download and cache management
-
-What's in progress:
-- Paged attention for production-grade KV cache management
-- Continuous batching for concurrent request serving
-- CUDA Graph capture for decode-step latency reduction
 
 ## Roadmap
 
-1. **Paged KV cache** — PagedAttention for high-concurrency production serving
-2. **Continuous batching** — iteration-level scheduling with preemption
-3. **CUDA Graphs** — eliminate CPU→GPU scheduling overhead in decode loop
-4. **Quantization** — GPTQ/AWQ/GGUF support for larger models on consumer hardware
+- **Tensor parallelism** — multi-GPU via NCCL
+- **Speculative decoding** — draft model verification
+- **More model architectures** — Mistral, Phi, etc.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
@@ -122,6 +122,9 @@ cargo build --release -p ferrum-cli --features metal
 
 # With CUDA acceleration (NVIDIA, requires CUDA toolkit)
 cargo build --release -p ferrum-cli --features cuda
+
+# With CUDA + Marlin INT4 kernel (requires nvcc, SM >= 8.0)
+cargo build --release -p ferrum-cli --features cuda,marlin
 ```
 
 Prerequisites: Rust stable toolchain.
