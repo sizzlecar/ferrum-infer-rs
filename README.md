@@ -79,13 +79,13 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**, Qwen3-4B:
 
 | Mode | FP16 | INT4 (GPTQ + Marlin) |
 |------|------|----------------------|
-| Single request decode | 88.1 tok/s | **112.4 tok/s (+28%)** |
+| Single request decode | 88.1 tok/s | **130.4 tok/s (+48%)** |
 | 4 concurrent (batch) | 109.4 tok/s | — |
 | VRAM | ~8 GB | **~2.5 GB (-69%)** |
 
 Key optimizations:
 - **INT4 quantization**: GPTQ models auto-detected, Marlin fused INT4×FP16 kernel
-- **Custom CUDA kernels**: fused RmsNorm, SiLU×mul, RoPE, decode attention
+- **Custom CUDA kernels**: fused RmsNorm, SiLU×mul, RoPE, decode attention (all on single stream)
 - **Flash Decoding**: split-K for long-context decode (auto at KV > 256)
 - **Batch decode**: batched cuBLAS GEMM for concurrent requests
 - **Paged KV attention**: GPU block pool with block-table indirection
