@@ -6,10 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Ferrum Infer is a Rust-native LLM inference engine. Single binary, no Python — supports Metal (macOS), CUDA (NVIDIA), and CPU backends. Targets vLLM-level performance with PagedAttention, continuous batching, and custom CUDA kernels.
 
-**Current performance (RTX PRO 6000, Qwen3-4B FP16):**
-- Single request: 88.8 tok/s decode (TPOT 11.26ms)
-- 4 concurrent (batch decode): 109.4 tok/s total throughput
+**Current performance (RTX PRO 6000 Blackwell, Qwen3-4B):**
+
+| Mode | FP16 | INT4 (Marlin) |
+|------|------|---------------|
+| Single request | 88.8 tok/s (TPOT 11.35ms) | **112.4 tok/s (TPOT 8.90ms)** |
+| 4 concurrent | 109.4 tok/s | — |
+| VRAM usage | ~8 GB | **~2.5 GB (-69%)** |
+
+- INT4 quantization: GPTQ format auto-detected, Marlin fused kernel on Blackwell
 - Paged KV attention with block reclamation
+- Flash Decoding (split-K) for long contexts
 
 ## Build & Development Commands
 

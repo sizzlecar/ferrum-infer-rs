@@ -142,6 +142,9 @@ RTX 5090 上正确的代码在 RTX PRO 6000 上乱码。不同 GPU 的 timing、
 | Flash Decoding (split-K) | ✅ 长上下文自动启用（kv_len > 256） |
 | Paged KV Attention | ✅ GPU block pool + block-table 间接寻址 + free-list 回收 |
 | Batch Decode | ✅ batched GEMM + per-item attention，executor/engine 端到端集成 |
+| INT4 量化 (GPTQ) | ✅ 自动检测 quantize_config.json，CPU dequant for prefill |
+| Marlin INT4xFP16 | ✅ fused kernel on Blackwell (sm_120)，3.9x 理论加速 |
+| GPTQ 权重融合 | ✅ q/k/v → qkv_proj, gate/up → gate_up_proj |
 | CUDA Graphs | ⚠️ 架构就绪但默认禁用（比 eager 慢） |
 | TransformerWeights 抽象 | ✅ Qwen3 已实现，Llama/Qwen2 待做 |
 | 运行时诊断 | ✅ FERRUM_DIAG=1 控制 shapes/attn/timing 日志 |
@@ -149,15 +152,24 @@ RTX 5090 上正确的代码在 RTX PRO 6000 上乱码。不同 GPU 的 timing、
 
 ## 性能数据
 
-### RTX PRO 6000, Qwen3-4B FP16（最新）
+### RTX PRO 6000 (Blackwell), Qwen3-4B
+
+#### FP16 vs INT4 量化
+
+| 场景 | FP16 | INT4 (Marlin) | 提升 |
+|------|------|---------------|------|
+| 单请求 decode | 88.1 tok/s (11.35ms) | **112.4 tok/s (8.90ms)** | **+28%** |
+| 显存占用 | ~8 GB | ~2.5 GB | **-69%** |
+
+#### FP16 优化历程
 
 | 场景 | Decode tok/s | TPOT | 备注 |
 |------|-------------|------|------|
 | 优化前基线 | 73.5 | 13.60ms | 旧 CUDA runner |
-| 单请求（优化后） | **88.8** | 11.26ms | +21%，双缓冲+跨层融合 |
+| 双缓冲+跨层融合 | **88.8** | 11.26ms | +21% |
 | 4 并发 batch decode | **109.4** | 4.75ms | batched GEMM |
 | 4 并发 paged KV | **102.9** | 5.05ms | block-table attention |
-| 长 decode (1024 tok) | 79.7 | 12.54ms | flash decode 自动启用 |
+| 长 decode (1024 tok) | 79.7 | 12.54ms | flash decode split-K |
 | 长 prompt (~2k tok) | 78.1 | 12.81ms | flash decode + 长 prefill |
 
 ### RTX 5090, Qwen3-4B FP16

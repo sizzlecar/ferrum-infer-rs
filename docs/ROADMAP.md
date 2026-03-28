@@ -83,7 +83,7 @@ MVP phase on the `mvp` branch. Phase 1 (Core Scheduling Engine) is complete.
 | Prefix Caching | Yes | **Done** — exact-match prefix cache with LRU eviction | Closed |
 | CUDA Kernel Optimization | FlashAttention / FlashInfer | **Done** — custom decode kernels, flash decoding (split-K), fused ops | Closed |
 | Batch Decode | Batched GEMM + attention | **Done** — batched cuBLAS GEMM (m=batch), per-item attention | Partial (attention not yet batched) |
-| Quantization | AWQ / GPTQ / FP8 | None | **Critical** |
+| Quantization | AWQ / GPTQ / FP8 | **Done** — GPTQ INT4 auto-detect, Marlin fused kernel (+28% vs FP16), Blackwell compatible | Closed |
 | Tensor Parallelism | Multi-GPU via NCCL | Type stubs only | Large |
 | Model Support | Dozens | 4 | Medium |
 | Structured Output | JSON mode / grammar-guided | **Done** — JSON mode via logits biasing, OpenAI API support | Partial (grammar-guided future) |
