@@ -69,45 +69,39 @@ curl http://localhost:8000/health
 
 ## 性能测试
 
-测试环境：**NVIDIA RTX 5090**，Qwen3-4B，FP16，解码吞吐量：
+测试环境：**RTX PRO 6000 (Blackwell)**，Qwen3-4B：
 
-| 版本 | 优化内容 | Tokens/s |
-|------|---------|----------|
-| 基准 | 原始 candle 算子 | ~33.5 |
-| +融合内核 | `candle_nn::RmsNorm` + 融合 RoPE（CUDA） | ~88.3 |
-| +预分配 KV 缓存 | O(1) `slice_set` 写入，零拷贝 `narrow` 视图 | ~94.4 |
-| +融合投影 | QKV 3→1 矩阵乘，gate+up 2→1 矩阵乘 | ~100+ |
+| 模式 | FP16 | INT4 (GPTQ + Marlin) |
+|------|------|----------------------|
+| 单请求 decode | 88.1 tok/s | **112.4 tok/s (+28%)** |
+| 4 并发 (batch decode) | 109.4 tok/s | — |
+| 显存占用 | ~8 GB | **~2.5 GB (-69%)** |
 
-**当前**：Qwen3-4B 平均 ~100 tok/s，峰值超过 103 tok/s。
-
-进行中的 CUDA 内核工作（`ferrum-cuda-kernels` crate）：
-- `fused_add_rms_norm` — residual add + RMS Norm 合并为 1 个内核（每层节省 1 次 kernel launch + 1 次显存读写）
-- `fused_silu_mul` — SiLU 激活 + 逐元素乘合并为 1 个内核
+核心优化：
+- **INT4 量化**：GPTQ 模型自动检测，Marlin fused INT4×FP16 内核
+- **自定义 CUDA 内核**：fused RmsNorm、SiLU×mul、RoPE、decode attention
+- **Flash Decoding**：长上下文 split-K（KV > 256 时自动启用）
+- **Batch decode**：batched cuBLAS GEMM 支持并发请求
+- **Paged KV attention**：GPU block pool + block-table 间接寻址
+- **双缓冲 residual**：跨层 norm 融合（-108 次 kernel launch）
 
 ## 当前状态
 
-**v0.2.0 — 可用的 MVP，尚未达到生产级别。**
-
 已完成：
-- CLI 对话和 HTTP 服务（支持流式输出）
+- CLI 对话、HTTP 服务（流式输出）、性能基准测试
 - Qwen3、Qwen2/2.5、LLaMA 3.x、TinyLlama 架构
-- Metal GPU 加速（macOS）、CUDA（NVIDIA）、CPU 跨平台
-- 通过 cudarc/nvrtc 实现的融合 CUDA 内核：RmsNorm、RoPE、QKV 投影、SiLU+mul
-- CUDA 上的 FlashAttention-2（KV 缓存零拷贝视图）
+- Metal GPU 加速（macOS）、CUDA（NVIDIA）、CPU
+- INT4 GPTQ 量化 + Marlin fused kernel（Blackwell 兼容）
+- FlashAttention-2 prefill + 自定义 CUDA decode runner
+- Paged KV cache + block 回收
+- 连续批处理 + batch decode
 - Top-k / Top-p / Temperature / 重复惩罚采样
-- Hugging Face 模型下载与缓存管理
-
-进行中：
-- Paged Attention——生产级 KV 缓存管理
-- 连续批处理——并发请求服务
-- CUDA Graph——消除解码循环中的 CPU→GPU 调度开销
 
 ## 路线图
 
-1. **Paged KV 缓存** — PagedAttention，支持高并发生产服务
-2. **连续批处理** — 迭代级调度与抢占
-3. **CUDA Graph** — 消除解码步骤的 CPU→GPU 调度延迟
-4. **量化支持** — GPTQ/AWQ/GGUF，让消费级硬件跑更大模型
+- **张量并行** — 多 GPU NCCL
+- **推测解码** — draft model 验证
+- **更多模型架构** — Mistral、Phi 等
 
 详见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
@@ -122,6 +116,9 @@ cargo build --release -p ferrum-cli --features metal
 
 # 启用 CUDA 加速（NVIDIA，需要 CUDA Toolkit）
 cargo build --release -p ferrum-cli --features cuda
+
+# 启用 CUDA + Marlin INT4 内核（需要 nvcc，SM >= 8.0）
+cargo build --release -p ferrum-cli --features cuda,marlin
 ```
 
 前置条件：Rust stable 工具链。

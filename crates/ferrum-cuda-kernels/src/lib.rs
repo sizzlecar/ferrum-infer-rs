@@ -54,6 +54,12 @@ pub mod weight_store;
 pub mod cuda_graph;
 
 #[cfg(feature = "cuda")]
+pub mod quant;
+
+#[cfg(feature = "cuda")]
+pub mod marlin;
+
+#[cfg(feature = "cuda")]
 pub mod gpu_paged_kv;
 
 #[cfg(feature = "cuda")]

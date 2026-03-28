@@ -671,21 +671,11 @@ impl InferenceEngine for DefaultInferenceEngine {
                             "Failed to mark streaming request {} complete in scheduler: {}",
                             request_id, complete_err
                         );
-                        if let Err(cancel_err) = scheduler_guard.cancel_now().await {
-                            warn!(
-                                "Failed to rollback streaming request {} after completion failure: {}",
-                                request_id, cancel_err
-                            );
-                        }
-                        let _ = tx
-                            .send(Err(FerrumError::scheduler(format!(
-                                "Scheduler completion failed for request {}: {}",
-                                request_id, complete_err
-                            ))))
-                            .await;
-                        return;
+                        let _ = scheduler_guard.cancel_now().await;
                     }
 
+                    // ALWAYS send the final chunk with finish_reason,
+                    // even if scheduler completion failed.
                     let final_chunk = StreamChunk {
                         request_id: request_id.clone(),
                         text: String::new(),
@@ -705,7 +695,19 @@ impl InferenceEngine for DefaultInferenceEngine {
                     }
                 }
                 Err(e) => {
+                    // Send error and a final chunk so the stream consumer knows it's done
                     let _ = tx.send(Err(e.clone())).await;
+                    let _ = tx
+                        .send(Ok(StreamChunk {
+                            request_id: request_id.clone(),
+                            text: String::new(),
+                            token: None,
+                            finish_reason: Some(FinishReason::Error),
+                            usage: None,
+                            created_at: chrono::Utc::now(),
+                            metadata: HashMap::new(),
+                        }))
+                        .await;
                     if let Err(cancel_err) = scheduler_guard.cancel_now().await {
                         warn!(
                             "Failed to cancel request {} after stream error: {}",

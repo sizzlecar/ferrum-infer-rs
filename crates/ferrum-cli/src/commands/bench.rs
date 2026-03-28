@@ -85,8 +85,10 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let device = super::run::select_device(&cmd.backend);
     eprintln!("{} {:?}", "Device:".dimmed(), device);
 
-    // Create engine
-    let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    // Create engine with ContinuousBatch scheduler (not Priority).
+    // DefaultInferenceEngine (Priority) has stream lifecycle issues with bench.
+    let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
 
     let prompt = if cmd.long_context {
@@ -119,6 +121,8 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     // Warmup
     eprintln!("{}", "Warmup...".dimmed());
     let _ = run_single(&*engine, &model_id, "Hello", 16).await;
+    // Let engine finish cleanup before starting benchmark rounds
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     if cmd.concurrency > 1 {
         run_concurrent_bench(&*engine, &model_id, &prompt, &cmd).await
@@ -161,6 +165,9 @@ async fn run_sequential_bench(
             "  {} tokens in {:.1}ms ({:.1} tok/s, TTFT {:.1}ms, TPOT {:.2}ms, decode {:.1} tok/s)",
             result.token_count, result.total_ms, tps, result.ttft_ms, tpot_ms, decode_tps
         );
+
+        // Let engine finish cleanup between rounds
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     print_summary(

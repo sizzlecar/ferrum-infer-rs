@@ -49,16 +49,57 @@ impl GpuWeight {
     }
 }
 
+/// INT4 quantized weight on GPU (GPTQ format).
+pub struct GpuQuantWeight {
+    /// Packed INT4 weights: [K/8, N] int32 (8 values per word)
+    pub qweight: CudaSlice<i32>,
+    /// Per-group FP16 scales: [K/group_size, N]
+    pub scales: CudaSlice<half::f16>,
+    /// Per-group packed zero-points: [K/group_size, N/8] int32 (None for symmetric)
+    pub qzeros: Option<CudaSlice<i32>>,
+    /// Input dimension (K)
+    pub k: usize,
+    /// Output dimension (N)
+    pub n: usize,
+    /// Quantization group size (typically 128)
+    pub group_size: usize,
+    /// Whether symmetric quantization (zero_point fixed at 8)
+    pub symmetric: bool,
+}
+
+/// A linear layer weight — FP16, INT4 (dequant+cuBLAS), or Marlin (fused INT4xFP16).
+pub enum LinearWeight {
+    Fp16(GpuWeight),
+    Int4(GpuQuantWeight),
+    Marlin(crate::marlin::MarlinWeight),
+}
+
+impl LinearWeight {
+    /// Get the FP16 weight slice (panics for quantized — use linear_dispatch instead).
+    pub fn as_fp16(&self) -> &CudaSlice<half::f16> {
+        match self {
+            LinearWeight::Fp16(w) => &w.slice,
+            LinearWeight::Int4(_) | LinearWeight::Marlin(_) => {
+                panic!("Cannot get fp16 slice from quantized weight")
+            }
+        }
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, LinearWeight::Int4(_) | LinearWeight::Marlin(_))
+    }
+}
+
 /// Per-layer weights for a transformer decoder layer.
 pub struct LayerWeights {
     pub input_ln_w: GpuWeight,
-    pub qkv_w: GpuWeight,
+    pub qkv_w: LinearWeight,
     pub q_norm_w: Option<GpuWeight>,
     pub k_norm_w: Option<GpuWeight>,
-    pub o_w: GpuWeight,
+    pub o_w: LinearWeight,
     pub post_ln_w: GpuWeight,
-    pub gate_up_w: GpuWeight,
-    pub down_w: GpuWeight,
+    pub gate_up_w: LinearWeight,
+    pub down_w: LinearWeight,
 }
 
 /// All weights for a transformer model on GPU.
@@ -67,7 +108,7 @@ pub struct TransformerGpuWeights {
     pub embed_table: GpuWeight,
     pub layers: Vec<LayerWeights>,
     pub final_norm_w: GpuWeight,
-    pub lm_head_w: GpuWeight,
+    pub lm_head_w: LinearWeight,
     pub rope_cos: GpuWeight,
     pub rope_sin: GpuWeight,
 }

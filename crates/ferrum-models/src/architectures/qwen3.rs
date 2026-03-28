@@ -704,6 +704,8 @@ pub struct Qwen3ModelWrapper {
     config: Config,
     device: CandleDevice,
     dtype: DType,
+    /// Model directory path (for loading GPTQ weights directly from safetensors).
+    model_dir: Option<std::path::PathBuf>,
 }
 
 impl Qwen3ModelWrapper {
@@ -785,7 +787,13 @@ impl Qwen3ModelWrapper {
             config: qwen3_config,
             device,
             dtype,
+            model_dir: None,
         })
+    }
+
+    /// Set model directory path (for GPTQ weight loading).
+    pub fn set_model_dir(&mut self, path: std::path::PathBuf) {
+        self.model_dir = Some(path);
     }
 
     pub fn forward_prefill(&self, input_ids: &Tensor, cache_key: &str) -> Result<Tensor> {
@@ -861,7 +869,9 @@ impl Qwen3ModelWrapper {
         &self,
     ) -> Result<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner> {
         use ferrum_cuda_kernels::decode_buffers::ModelDims;
-        use ferrum_cuda_kernels::weight_store::{GpuWeight, LayerWeights, Qwen3Weights};
+        use ferrum_cuda_kernels::weight_store::{
+            GpuWeight, LayerWeights, LinearWeight, Qwen3Weights,
+        };
 
         let model = self.model.lock();
         let cfg = &self.config;
@@ -884,6 +894,24 @@ impl Qwen3ModelWrapper {
             .new_stream()
             .map_err(|e| FerrumError::model(format!("new_stream: {e}")))?;
 
+        // Detect GPTQ quantization
+        let qconfig = self.model_dir.as_ref().and_then(|dir| {
+            crate::loader::QuantizeConfig::from_model_dir(dir)
+                .ok()
+                .flatten()
+        });
+        let is_gptq = qconfig.is_some();
+
+        // Load GPTQ packed weights if quantized
+        let gptq_weights = if let (Some(dir), Some(ref qc)) = (&self.model_dir, &qconfig) {
+            Some(
+                crate::loader::load_gptq_weights(dir, qc)
+                    .map_err(|e| FerrumError::model(format!("GPTQ load: {e}")))?,
+            )
+        } else {
+            None
+        };
+
         let dims = ModelDims {
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
@@ -893,23 +921,124 @@ impl Qwen3ModelWrapper {
             vocab_size: cfg.vocab_size,
             num_layers: cfg.num_hidden_layers,
             max_seq_len: cfg.max_position_embeddings,
+            quantized: is_gptq,
             max_batch_size: std::env::var("FERRUM_MAX_BATCH")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
         };
 
+        /// Helper: try to load GPTQ INT4 weight, fall back to FP16 from candle tensor.
+        fn load_linear_weight(
+            prefix: &str,
+            candle_tensor: &candle_core::Tensor,
+            gptq: Option<&std::collections::HashMap<String, crate::loader::GptqLayerWeights>>,
+            stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+        ) -> std::result::Result<LinearWeight, FerrumError> {
+            use ferrum_cuda_kernels::weight_store::GpuQuantWeight;
+
+            if let Some(gptq_map) = gptq {
+                if let Some(gw) = gptq_map.get(prefix) {
+                    // Try Marlin (fused, 3.9x) if dimensions are compatible
+                    let use_marlin = ferrum_cuda_kernels::marlin::is_available()
+                        && gw.k % 128 == 0
+                        && gw.n % 256 == 0
+                        && (gw.group_size == 128 || gw.group_size == gw.k)
+                        && std::env::var("FERRUM_NO_MARLIN").is_err();
+
+                    if use_marlin {
+                        use ferrum_cuda_kernels::marlin::{
+                            repack_gptq_to_marlin, repack_scales_to_marlin, MarlinWeight,
+                        };
+                        let marlin_qw = repack_gptq_to_marlin(&gw.qweight, gw.k, gw.n);
+                        let marlin_scales =
+                            repack_scales_to_marlin(&gw.scales, gw.k, gw.n, gw.group_size);
+                        let gs_marlin = if gw.group_size == gw.k {
+                            -1i32
+                        } else {
+                            gw.group_size as i32
+                        };
+                        let qweight = stream
+                            .clone_htod(&marlin_qw)
+                            .map_err(|e| FerrumError::model(format!("{prefix} marlin qw: {e}")))?;
+                        // Upload f16 scales directly (cudarc f16 feature)
+                        let scales_f16 = stream.clone_htod(&marlin_scales).map_err(|e| {
+                            FerrumError::model(format!("{prefix} marlin scales: {e}"))
+                        })?;
+                        let ws_size = (gw.n / 128) * 16;
+                        let workspace = stream
+                            .clone_htod(&vec![0i32; ws_size])
+                            .map_err(|e| FerrumError::model(format!("{prefix} marlin ws: {e}")))?;
+                        tracing::warn!(
+                            "Marlin weight: {prefix} K={} N={} gs={gs_marlin}",
+                            gw.k,
+                            gw.n,
+                        );
+                        return Ok(LinearWeight::Marlin(MarlinWeight {
+                            qweight,
+                            scales: scales_f16,
+                            workspace,
+                            k: gw.k,
+                            n: gw.n,
+                            group_size: gs_marlin,
+                        }));
+                    }
+
+                    // Fallback: dequant + cuBLAS path
+                    let qweight = stream
+                        .clone_htod(&gw.qweight)
+                        .map_err(|e| FerrumError::model(format!("{prefix} qweight upload: {e}")))?;
+                    let scales_f16 = stream
+                        .clone_htod(&gw.scales)
+                        .map_err(|e| FerrumError::model(format!("{prefix} scales upload: {e}")))?;
+                    let qzeros = if let Some(ref qz) = gw.qzeros {
+                        Some(stream.clone_htod(qz).map_err(|e| {
+                            FerrumError::model(format!("{prefix} qzeros upload: {e}"))
+                        })?)
+                    } else {
+                        None
+                    };
+                    tracing::warn!(
+                        "INT4 dequant weight: {prefix} K={} N={} gs={}",
+                        gw.k,
+                        gw.n,
+                        gw.group_size
+                    );
+                    return Ok(LinearWeight::Int4(GpuQuantWeight {
+                        qweight,
+                        scales: scales_f16,
+                        qzeros,
+                        k: gw.k,
+                        n: gw.n,
+                        group_size: gw.group_size,
+                        symmetric: gw.symmetric,
+                    }));
+                }
+            }
+            // Fall back to FP16
+            Ok(LinearWeight::Fp16(
+                GpuWeight::from_tensor(candle_tensor, stream)
+                    .map_err(|e| FerrumError::model(format!("{prefix}: {e}")))?,
+            ))
+        }
+
         // Extract weights — copy to runner's non-blocking stream
         let embed_table = GpuWeight::from_tensor(model.base_model.embed_tokens.embeddings(), &rs)
             .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
 
+        let gptq_ref = gptq_weights.as_ref();
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for layer in &model.base_model.layers {
+        for (li, layer) in model.base_model.layers.iter().enumerate() {
+            let prefix = format!("model.layers.{li}");
             let lw = LayerWeights {
                 input_ln_w: GpuWeight::from_tensor(&layer.input_layernorm.weight, &rs)
                     .map_err(|e| FerrumError::model(format!("input_ln: {e}")))?,
-                qkv_w: GpuWeight::from_tensor(layer.self_attn.qkv_proj.weight(), &rs)
-                    .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
+                qkv_w: load_linear_weight(
+                    &format!("{prefix}.self_attn.qkv_proj"),
+                    layer.self_attn.qkv_proj.weight(),
+                    gptq_ref,
+                    &rs,
+                )?,
                 q_norm_w: Some(
                     GpuWeight::from_tensor(&layer.self_attn.q_norm.weight, &rs)
                         .map_err(|e| FerrumError::model(format!("q_norm: {e}")))?,
@@ -918,22 +1047,36 @@ impl Qwen3ModelWrapper {
                     GpuWeight::from_tensor(&layer.self_attn.k_norm.weight, &rs)
                         .map_err(|e| FerrumError::model(format!("k_norm: {e}")))?,
                 ),
-                o_w: GpuWeight::from_tensor(layer.self_attn.o_proj.weight(), &rs)
-                    .map_err(|e| FerrumError::model(format!("o_proj: {e}")))?,
+                o_w: load_linear_weight(
+                    &format!("{prefix}.self_attn.o_proj"),
+                    layer.self_attn.o_proj.weight(),
+                    gptq_ref,
+                    &rs,
+                )?,
                 post_ln_w: GpuWeight::from_tensor(&layer.post_attention_layernorm.weight, &rs)
                     .map_err(|e| FerrumError::model(format!("post_ln: {e}")))?,
-                gate_up_w: GpuWeight::from_tensor(layer.mlp.gate_up_proj.weight(), &rs)
-                    .map_err(|e| FerrumError::model(format!("gate_up: {e}")))?,
-                down_w: GpuWeight::from_tensor(layer.mlp.down_proj.weight(), &rs)
-                    .map_err(|e| FerrumError::model(format!("down: {e}")))?,
+                gate_up_w: load_linear_weight(
+                    &format!("{prefix}.mlp.gate_up_proj"),
+                    layer.mlp.gate_up_proj.weight(),
+                    gptq_ref,
+                    &rs,
+                )?,
+                down_w: load_linear_weight(
+                    &format!("{prefix}.mlp.down_proj"),
+                    layer.mlp.down_proj.weight(),
+                    gptq_ref,
+                    &rs,
+                )?,
             };
             layers.push(lw);
         }
 
         let final_norm_w = GpuWeight::from_tensor(&model.base_model.norm.weight, &rs)
             .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
-        let lm_head_w = GpuWeight::from_tensor(model.lm_head.weight(), &rs)
-            .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
+        let lm_head_w = LinearWeight::Fp16(
+            GpuWeight::from_tensor(model.lm_head.weight(), &rs)
+                .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?,
+        );
         let rope_cos =
             GpuWeight::from_tensor(&model.base_model.layers[0].self_attn.rotary_emb.cos, &rs)
                 .map_err(|e| FerrumError::model(format!("rope_cos: {e}")))?;
