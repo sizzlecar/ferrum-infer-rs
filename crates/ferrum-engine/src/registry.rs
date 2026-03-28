@@ -1032,7 +1032,22 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             ferrum_models::Architecture::Qwen3 => {
                 info!("Loading Qwen3 model weights...");
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
-                let vb = loader.load_varbuilder(&candle_device, dtype)?;
+
+                // Auto-detect GPTQ: dequantize INT4→FP16 for candle prefill
+                let model_dir_path: std::path::PathBuf = model_path.clone().into();
+                let qconfig =
+                    ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
+                        .unwrap_or(None);
+
+                let vb = if let Some(ref qc) = qconfig {
+                    info!(
+                        "GPTQ model detected ({}bit, gs={}), dequantizing for prefill...",
+                        qc.bits, qc.group_size
+                    );
+                    loader.load_varbuilder_gptq(qc, &candle_device, dtype)?
+                } else {
+                    loader.load_varbuilder(&candle_device, dtype)?
+                };
 
                 let mut qwen3_model = ferrum_models::Qwen3ModelWrapper::from_varbuilder(
                     vb,
@@ -1040,7 +1055,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     candle_device.clone(),
                     dtype,
                 )?;
-                qwen3_model.set_model_dir(model_path.clone().into());
+                qwen3_model.set_model_dir(model_dir_path);
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
