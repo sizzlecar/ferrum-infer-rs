@@ -44,6 +44,9 @@ thiserror = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# Quantization
+bytemuck = { version = "1.23", features = ["derive"] }
+
 # Utils
 uuid = { workspace = true }
 chrono = { workspace = true }
