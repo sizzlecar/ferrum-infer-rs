@@ -933,7 +933,7 @@ impl Qwen3ModelWrapper {
             prefix: &str,
             candle_tensor: &candle_core::Tensor,
             gptq: Option<&std::collections::HashMap<String, crate::loader::GptqLayerWeights>>,
-            stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+            stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
         ) -> std::result::Result<LinearWeight, FerrumError> {
             use ferrum_cuda_kernels::weight_store::GpuQuantWeight;
 
@@ -965,8 +965,9 @@ impl Qwen3ModelWrapper {
                             .map_err(|e| {
                                 FerrumError::model(format!("{prefix} marlin scales: {e}"))
                             })?;
-                        let scales_f16: cudarc::driver::CudaSlice<half::f16> =
-                            unsafe { std::mem::transmute(scales) };
+                        let scales_f16: candle_core::cuda_backend::cudarc::driver::CudaSlice<
+                            half::f16,
+                        > = unsafe { std::mem::transmute(scales) };
                         let ws_size = (gw.n / 128) * 16;
                         let workspace = stream
                             .clone_htod(&vec![0i32; ws_size])
@@ -993,8 +994,9 @@ impl Qwen3ModelWrapper {
                     let scales = stream
                         .clone_htod(bytemuck::cast_slice::<half::f16, u8>(&gw.scales))
                         .map_err(|e| FerrumError::model(format!("{prefix} scales upload: {e}")))?;
-                    let scales_f16: cudarc::driver::CudaSlice<half::f16> =
-                        unsafe { std::mem::transmute(scales) };
+                    let scales_f16: candle_core::cuda_backend::cudarc::driver::CudaSlice<
+                        half::f16,
+                    > = unsafe { std::mem::transmute(scales) };
                     let qzeros = if let Some(ref qz) = gw.qzeros {
                         Some(stream.clone_htod(qz).map_err(|e| {
                             FerrumError::model(format!("{prefix} qzeros upload: {e}"))
