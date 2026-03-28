@@ -1172,7 +1172,6 @@ impl CudaDecodeRunner {
         let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
         let qkv_dim = q_dim + 2 * kv_dim;
         let hd = self.dims.head_dim;
-        let half_dim = hd / 2;
         let inter = self.dims.intermediate_size;
         let eps = 1e-6f32;
         let nq = self.dims.num_attention_heads;
@@ -1407,19 +1406,14 @@ impl CudaDecodeRunner {
                     let valid_kv = kv.current_len + 1;
                     let num_splits = Self::compute_num_splits(valid_kv);
 
-                    // Copy this item's Q to scratch_attn (launchers need CudaSlice)
-                    {
-                        let q_src = self.buffers.q_rotated.slice(b * q_dim..(b + 1) * q_dim);
-                        self.stream
-                            .memcpy_dtod(&q_src, &mut self.buffers.scratch_attn)
-                            .map_err(|e| candle_core::Error::Msg(format!("q scratch: {e}")))?;
-                    }
+                    // Q is at q_rotated[b*q_dim..(b+1)*q_dim]
+                    let q_view = self.buffers.q_rotated.slice(b * q_dim..(b + 1) * q_dim);
 
                     if num_splits <= 1 {
-                        Self::launch_decode_attention(
+                        Self::launch_decode_attention_view(
                             &self.device,
                             &self.stream,
-                            &self.buffers.scratch_attn,
+                            &q_view,
                             &kv.k_caches[li],
                             &kv.v_caches[li],
                             &mut self.buffers.scratch_attn,
@@ -1431,10 +1425,10 @@ impl CudaDecodeRunner {
                             scale,
                         )?;
                     } else {
-                        Self::launch_flash_decode_attention(
+                        Self::launch_flash_decode_attention_view(
                             &self.device,
                             &self.stream,
-                            &self.buffers.scratch_attn,
+                            &q_view,
                             &kv.k_caches[li],
                             &kv.v_caches[li],
                             &mut self.buffers.flash_partial_out,
@@ -1842,6 +1836,140 @@ impl CudaDecodeRunner {
         }
         .map(|_| ())
         .map_err(|e| candle_core::Error::Msg(format!("attn: {e}")))
+    }
+
+    /// Decode attention accepting CudaView for Q (for batch fallback with sliced Q).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_decode_attention_view(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        q: &CudaView<half::f16>,
+        kc: &CudaSlice<half::f16>,
+        vc: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        max_kv: usize,
+        valid_kv: usize,
+        scale: f32,
+    ) -> candle_core::Result<()> {
+        let func = device.get_or_load_custom_func(
+            "decode_attention_f16",
+            "decode_attention",
+            ptx::DECODE_ATTENTION,
+        )?;
+        let kv = kc.slice(..);
+        let vv = vc.slice(..);
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let mki = max_kv as i32;
+        let vki = valid_kv as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(q);
+        b.arg(&kv);
+        b.arg(&vv);
+        b.arg(output);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mki);
+        b.arg(&vki);
+        b.arg(&scale);
+        let shared_bytes = (max_kv as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("attn: {e}")))
+    }
+
+    /// Flash decode attention accepting CudaView for Q.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_flash_decode_attention_view(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        q: &CudaView<half::f16>,
+        kc: &CudaSlice<half::f16>,
+        vc: &CudaSlice<half::f16>,
+        partial_out: &mut CudaSlice<f32>,
+        partial_m: &mut CudaSlice<f32>,
+        partial_l: &mut CudaSlice<f32>,
+        output: &mut CudaSlice<half::f16>,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        valid_kv: usize,
+        scale: f32,
+        num_splits: usize,
+    ) -> candle_core::Result<()> {
+        let func1 = device.get_or_load_custom_func(
+            "flash_decode_attn_f16",
+            "flash_decode_attention",
+            ptx::FLASH_DECODE_ATTENTION,
+        )?;
+        let kv = kc.slice(..);
+        let vv = vc.slice(..);
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let vki = valid_kv as i32;
+        let nsi = num_splits as i32;
+        let chunk_size = (valid_kv + num_splits - 1) / num_splits;
+        let shared_bytes = (chunk_size as u32) * 4;
+
+        let mut b1 = stream.launch_builder(&func1);
+        b1.arg(q);
+        b1.arg(&kv);
+        b1.arg(&vv);
+        b1.arg(&mut *partial_out);
+        b1.arg(&mut *partial_m);
+        b1.arg(&mut *partial_l);
+        b1.arg(&nqi);
+        b1.arg(&nkvi);
+        b1.arg(&hdi);
+        b1.arg(&vki);
+        b1.arg(&scale);
+        b1.arg(&nsi);
+        unsafe {
+            b1.launch(LaunchConfig {
+                grid_dim: (nq as u32, num_splits as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("flash_decode phase1: {e}")))?;
+
+        let func2 = device.get_or_load_custom_func(
+            "flash_decode_reduce_f16",
+            "flash_decode_attention",
+            ptx::FLASH_DECODE_ATTENTION,
+        )?;
+        let po = partial_out.slice(..);
+        let pm = partial_m.slice(..);
+        let pl = partial_l.slice(..);
+        let mut b2 = stream.launch_builder(&func2);
+        b2.arg(&po);
+        b2.arg(&pm);
+        b2.arg(&pl);
+        b2.arg(output);
+        b2.arg(&hdi);
+        b2.arg(&nsi);
+        unsafe {
+            b2.launch(LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (hd.min(256) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("flash_decode phase2: {e}")))
     }
 
     /// Batched decode attention: single launch for all batch items.
