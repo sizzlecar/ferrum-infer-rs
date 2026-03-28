@@ -396,6 +396,7 @@ impl CudaDecodeRunner {
 
         Self::launch_rms_norm(
             &self.device,
+            &self.stream,
             &self.buffers.residual,
             &lw.input_ln_w.slice,
             &mut self.buffers.norm_out,
@@ -418,6 +419,7 @@ impl CudaDecodeRunner {
         if let Some(ref qnw) = lw.q_norm_w {
             Self::launch_rms_norm_view(
                 &self.device,
+                &self.stream,
                 &q,
                 &qnw.slice,
                 &mut self.buffers.rope_q_temp,
@@ -432,6 +434,7 @@ impl CudaDecodeRunner {
         if let Some(ref knw) = lw.k_norm_w {
             Self::launch_rms_norm_view(
                 &self.device,
+                &self.stream,
                 &k,
                 &knw.slice,
                 &mut self.buffers.rope_k_temp,
@@ -449,6 +452,7 @@ impl CudaDecodeRunner {
         let sin = self.weights.rope_sin.slice.slice(co..co + half_dim);
         Self::launch_rope(
             &self.device,
+            &self.stream,
             &self.buffers.rope_q_temp,
             &self.buffers.rope_k_temp,
             &cos,
@@ -498,6 +502,7 @@ impl CudaDecodeRunner {
             // Short KV: use original single-block kernel (no Phase 2 overhead)
             Self::launch_decode_attention(
                 &self.device,
+                &self.stream,
                 &self.buffers.q_rotated,
                 &kv.k_caches[li],
                 &kv.v_caches[li],
@@ -513,6 +518,7 @@ impl CudaDecodeRunner {
             // Long KV: flash decode with split-K
             Self::launch_flash_decode_attention(
                 &self.device,
+                &self.stream,
                 &self.buffers.q_rotated,
                 &kv.k_caches[li],
                 &kv.v_caches[li],
@@ -597,6 +603,7 @@ impl CudaDecodeRunner {
         // Launch paged attention kernel
         Self::launch_paged_decode_attention(
             &self.device,
+            &self.stream,
             &self.buffers.q_rotated,
             pool.k_pool(li),
             pool.v_pool(li),
@@ -629,6 +636,7 @@ impl CudaDecodeRunner {
         )?;
         Self::launch_fused_add_rms_norm(
             &self.device,
+            &self.stream,
             &self.buffers.o_proj_out,
             &self.buffers.residual,
             &lw.post_ln_w.slice,
@@ -653,7 +661,14 @@ impl CudaDecodeRunner {
         )?;
         let g = self.buffers.gate_up_out.slice(..inter);
         let u = self.buffers.gate_up_out.slice(inter..2 * inter);
-        Self::launch_fused_silu_mul(&self.device, &g, &u, &mut self.buffers.mlp_act, inter)?;
+        Self::launch_fused_silu_mul(
+            &self.device,
+            &self.stream,
+            &g,
+            &u,
+            &mut self.buffers.mlp_act,
+            inter,
+        )?;
 
         crate::cublas::linear_f16(
             &self.blas,
@@ -666,6 +681,7 @@ impl CudaDecodeRunner {
         )?;
         Self::launch_residual_add(
             &self.device,
+            &self.stream,
             &self.buffers.residual,
             &self.buffers.down_out,
             &mut self.buffers.norm_out,
@@ -681,6 +697,7 @@ impl CudaDecodeRunner {
         let h = self.dims.hidden_size;
         Self::launch_rms_norm(
             &self.device,
+            &self.stream,
             &self.buffers.residual,
             &self.weights.final_norm_w.slice,
             &mut self.buffers.final_norm_out,
@@ -891,6 +908,7 @@ impl CudaDecodeRunner {
         // previous layer's exit fused_add_rms_norm)
         Self::launch_rms_norm(
             &self.device,
+            &self.stream,
             &self.buffers.residual,
             &self.weights.layers[0].input_ln_w.slice,
             &mut self.buffers.norm_out,
@@ -921,6 +939,7 @@ impl CudaDecodeRunner {
                 if let Some(ref qnw) = lw.q_norm_w {
                     Self::launch_rms_norm_view(
                         &self.device,
+                        &self.stream,
                         &q,
                         &qnw.slice,
                         &mut self.buffers.rope_q_temp,
@@ -935,6 +954,7 @@ impl CudaDecodeRunner {
                 if let Some(ref knw) = lw.k_norm_w {
                     Self::launch_rms_norm_view(
                         &self.device,
+                        &self.stream,
                         &k,
                         &knw.slice,
                         &mut self.buffers.rope_k_temp,
@@ -953,6 +973,7 @@ impl CudaDecodeRunner {
                 let sin = self.weights.rope_sin.slice.slice(co..co + half_dim);
                 Self::launch_rope(
                     &self.device,
+                    &self.stream,
                     &self.buffers.rope_q_temp,
                     &self.buffers.rope_k_temp,
                     &cos,
@@ -994,6 +1015,7 @@ impl CudaDecodeRunner {
                 // Double-buffer: residual (res_a) → post_norm_residual (res_b)
                 Self::launch_fused_add_rms_norm(
                     &self.device,
+                    &self.stream,
                     &self.buffers.o_proj_out,
                     &self.buffers.residual,
                     &lw.post_ln_w.slice,
@@ -1020,6 +1042,7 @@ impl CudaDecodeRunner {
                 let u = self.buffers.gate_up_out.slice(inter..2 * inter);
                 Self::launch_fused_silu_mul(
                     &self.device,
+                    &self.stream,
                     &g,
                     &u,
                     &mut self.buffers.mlp_act,
@@ -1043,6 +1066,7 @@ impl CudaDecodeRunner {
                 if li < n - 1 {
                     Self::launch_fused_add_rms_norm(
                         &self.device,
+                        &self.stream,
                         &self.buffers.down_out,
                         &self.buffers.post_norm_residual,
                         &self.weights.layers[li + 1].input_ln_w.slice,
@@ -1055,6 +1079,7 @@ impl CudaDecodeRunner {
                     // Last layer: fuse with final norm
                     Self::launch_fused_add_rms_norm(
                         &self.device,
+                        &self.stream,
                         &self.buffers.down_out,
                         &self.buffers.post_norm_residual,
                         &self.weights.final_norm_w.slice,
@@ -1195,6 +1220,7 @@ impl CudaDecodeRunner {
         // First layer: batched rms_norm (num_rows = B*H / H = B)
         Self::launch_rms_norm(
             &self.device,
+            &self.stream,
             &self.buffers.residual,
             &self.weights.layers[0].input_ln_w.slice,
             &mut self.buffers.norm_out,
@@ -1233,6 +1259,7 @@ impl CudaDecodeRunner {
                 if let Some(ref qnw) = lw.q_norm_w {
                     Self::launch_rms_norm_view(
                         &self.device,
+                        &self.stream,
                         &q_view,
                         &qnw.slice,
                         &mut self.buffers.rope_q_temp,
@@ -1247,6 +1274,7 @@ impl CudaDecodeRunner {
                 if let Some(ref knw) = lw.k_norm_w {
                     Self::launch_rms_norm_view(
                         &self.device,
+                        &self.stream,
                         &k_view,
                         &knw.slice,
                         &mut self.buffers.rope_k_temp,
@@ -1265,6 +1293,7 @@ impl CudaDecodeRunner {
                 let sin = self.weights.rope_sin.slice.slice(co..co + half_dim);
                 Self::launch_rope(
                     &self.device,
+                    &self.stream,
                     &self.buffers.rope_q_temp,
                     &self.buffers.rope_k_temp,
                     &cos,
@@ -1306,6 +1335,7 @@ impl CudaDecodeRunner {
                 if num_splits <= 1 {
                     Self::launch_decode_attention(
                         &self.device,
+                        &self.stream,
                         &self.buffers.q_rotated,
                         &kv.k_caches[li],
                         &kv.v_caches[li],
@@ -1320,6 +1350,7 @@ impl CudaDecodeRunner {
                 } else {
                     Self::launch_flash_decode_attention(
                         &self.device,
+                        &self.stream,
                         &self.buffers.q_rotated,
                         &kv.k_caches[li],
                         &kv.v_caches[li],
@@ -1362,6 +1393,7 @@ impl CudaDecodeRunner {
                 // Post-attention: fused_add_rms_norm, grid_dim = (B,)
                 Self::launch_fused_add_rms_norm(
                     &self.device,
+                    &self.stream,
                     &self.buffers.o_proj_out,
                     &self.buffers.residual,
                     &lw.post_ln_w.slice,
@@ -1384,6 +1416,7 @@ impl CudaDecodeRunner {
                 // Interleaved silu_mul: gate_up is [B, 2*inter] → mlp_act is [B, inter]
                 Self::launch_fused_silu_mul_interleaved(
                     &self.device,
+                    &self.stream,
                     &self.buffers.gate_up_out,
                     &mut self.buffers.mlp_act,
                     inter,
@@ -1403,6 +1436,7 @@ impl CudaDecodeRunner {
                 if li < n - 1 {
                     Self::launch_fused_add_rms_norm(
                         &self.device,
+                        &self.stream,
                         &self.buffers.down_out,
                         &self.buffers.post_norm_residual,
                         &self.weights.layers[li + 1].input_ln_w.slice,
@@ -1414,6 +1448,7 @@ impl CudaDecodeRunner {
                 } else {
                     Self::launch_fused_add_rms_norm(
                         &self.device,
+                        &self.stream,
                         &self.buffers.down_out,
                         &self.buffers.post_norm_residual,
                         &self.weights.final_norm_w.slice,
@@ -1543,6 +1578,7 @@ impl CudaDecodeRunner {
 
     fn launch_rms_norm(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         input: &CudaSlice<half::f16>,
         weight: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
@@ -1554,7 +1590,7 @@ impl CudaDecodeRunner {
         let inp = input.slice(..);
         let w = weight.slice(..);
         let rs = row_size as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(&inp);
         b.arg(&w);
         b.arg(output);
@@ -1573,6 +1609,7 @@ impl CudaDecodeRunner {
 
     fn launch_rms_norm_view(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         input: &CudaView<half::f16>,
         weight: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
@@ -1583,7 +1620,7 @@ impl CudaDecodeRunner {
         let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
         let w = weight.slice(..);
         let rs = row_size as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(input);
         b.arg(&w);
         b.arg(output);
@@ -1602,6 +1639,7 @@ impl CudaDecodeRunner {
 
     fn launch_rope(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         q: &CudaSlice<half::f16>,
         k: &CudaSlice<half::f16>,
         cos: &CudaView<half::f16>,
@@ -1618,7 +1656,7 @@ impl CudaDecodeRunner {
         let nqi = nq as i32;
         let nki = nk as i32;
         let hdi = hd as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(&qv);
         b.arg(&kv);
         b.arg(cos);
@@ -1641,6 +1679,7 @@ impl CudaDecodeRunner {
 
     fn launch_decode_attention(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         q: &CudaSlice<half::f16>,
         kc: &CudaSlice<half::f16>,
         vc: &CudaSlice<half::f16>,
@@ -1665,7 +1704,7 @@ impl CudaDecodeRunner {
         let hdi = hd as i32;
         let mki = max_kv as i32;
         let vki = valid_kv as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(&qv);
         b.arg(&kv);
         b.arg(&vv);
@@ -1706,6 +1745,7 @@ impl CudaDecodeRunner {
     #[allow(clippy::too_many_arguments)]
     fn launch_flash_decode_attention(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         q: &CudaSlice<half::f16>,
         kc: &CudaSlice<half::f16>,
         vc: &CudaSlice<half::f16>,
@@ -1791,6 +1831,7 @@ impl CudaDecodeRunner {
     #[allow(clippy::too_many_arguments)]
     fn launch_paged_decode_attention(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         q: &CudaSlice<half::f16>,
         k_pool: &CudaSlice<half::f16>,
         v_pool: &CudaSlice<half::f16>,
@@ -1817,7 +1858,7 @@ impl CudaDecodeRunner {
         let hdi = hd as i32;
         let vki = valid_kv as i32;
         let bsi = block_size as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(&qv);
         b.arg(&kp);
         b.arg(&vp);
@@ -1843,6 +1884,7 @@ impl CudaDecodeRunner {
 
     fn launch_fused_add_rms_norm(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         input: &CudaSlice<half::f16>,
         residual: &CudaSlice<half::f16>,
         weight: &CudaSlice<half::f16>,
@@ -1860,7 +1902,7 @@ impl CudaDecodeRunner {
         let rv = residual.slice(..);
         let wv = weight.slice(..);
         let hi = h as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(&iv);
         b.arg(&rv);
         b.arg(&wv);
@@ -1882,6 +1924,7 @@ impl CudaDecodeRunner {
 
     fn launch_fused_silu_mul(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         gate: &CudaView<half::f16>,
         up: &CudaView<half::f16>,
         output: &mut CudaSlice<half::f16>,
@@ -1893,7 +1936,7 @@ impl CudaDecodeRunner {
             ptx::FUSED_SILU_MUL,
         )?;
         let ni = n as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(gate);
         b.arg(up);
         b.arg(output);
@@ -1914,6 +1957,7 @@ impl CudaDecodeRunner {
     /// output:  [batch * inter], layout [act_0, act_1, ...] (contiguous)
     fn launch_fused_silu_mul_interleaved(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         gate_up: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
         inter: usize,
@@ -1927,7 +1971,7 @@ impl CudaDecodeRunner {
         let gv = gate_up.slice(..);
         let inter_i = inter as i32;
         let total = (batch * inter) as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(&gv);
         b.arg(output);
         b.arg(&inter_i);
@@ -1945,6 +1989,7 @@ impl CudaDecodeRunner {
 
     fn launch_residual_add(
         device: &CudaDevice,
+        stream: &Arc<CudaStream>,
         a: &CudaSlice<half::f16>,
         b_: &CudaSlice<half::f16>,
         output: &mut CudaSlice<half::f16>,
@@ -1958,7 +2003,7 @@ impl CudaDecodeRunner {
         let av = a.slice(..);
         let bv = b_.slice(..);
         let ni = n as i32;
-        let mut b = func.builder();
+        let mut b = stream.launch_builder(&func);
         b.arg(&av);
         b.arg(&bv);
         b.arg(output);

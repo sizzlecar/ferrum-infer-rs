@@ -66,12 +66,14 @@ pub fn marlin_gemm(
     let n = weight.n as i32;
     let k = weight.k as i32;
 
-    // Zero workspace before each call — Marlin uses it as mutex locks.
-    // Stale non-zero values from previous calls cause incorrect behavior.
+    let raw_stream = stream.cu_stream();
+
+    // Zero workspace on the runner's stream — Marlin uses it as mutex locks.
+    // All operations (memset + kernel) on same stream → naturally ordered.
     {
         let (ws_ptr, _guard) = weight.workspace.device_ptr(stream);
         unsafe {
-            cudarc::driver::sys::cuMemsetD32_v2(ws_ptr, 0, weight.workspace.len());
+            cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, weight.workspace.len(), raw_stream);
         }
     }
 
@@ -81,8 +83,6 @@ pub fn marlin_gemm(
     let (c_ptr, _c_guard) = output.device_ptr(stream);
     let (s_ptr, _s_guard) = weight.scales.device_ptr(stream);
     let (ws_ptr, _ws_guard) = weight.workspace.device_ptr(stream);
-
-    let raw_stream = stream.cu_stream();
 
     let ret = unsafe {
         marlin_cuda(
@@ -111,17 +111,8 @@ pub fn marlin_gemm(
         )));
     }
 
-    // Sync and check for NaN in output (diagnostic)
-    stream
-        .synchronize()
-        .map_err(|e| candle_core::Error::Msg(format!("marlin sync: {e}")))?;
-    let cuda_err = unsafe { cudarc::driver::sys::cuStreamQuery(stream.cu_stream()) };
-    if cuda_err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-        return Err(candle_core::Error::Msg(format!(
-            "marlin post-kernel error: {cuda_err:?}"
-        )));
-    }
-
+    // No per-call sync needed — all operations (memset + kernel) are on the
+    // runner's stream. decode_step syncs once at the end before returning logits.
     Ok(())
 }
 
