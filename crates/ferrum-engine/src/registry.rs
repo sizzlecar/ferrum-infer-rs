@@ -1034,12 +1034,13 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let vb = loader.load_varbuilder(&candle_device, dtype)?;
 
-                let qwen3_model = ferrum_models::Qwen3ModelWrapper::from_varbuilder(
+                let mut qwen3_model = ferrum_models::Qwen3ModelWrapper::from_varbuilder(
                     vb,
                     &model_def,
                     candle_device.clone(),
                     dtype,
                 )?;
+                qwen3_model.set_model_dir(model_path.clone().into());
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
