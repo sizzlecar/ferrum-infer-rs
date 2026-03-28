@@ -85,8 +85,10 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let device = super::run::select_device(&cmd.backend);
     eprintln!("{} {:?}", "Device:".dimmed(), device);
 
-    // Create engine
-    let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    // Create engine with ContinuousBatch scheduler (not Priority).
+    // DefaultInferenceEngine (Priority) has stream lifecycle issues with bench.
+    let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
 
     let prompt = if cmd.long_context {
