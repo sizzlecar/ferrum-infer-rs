@@ -122,57 +122,68 @@ pub fn marlin_gemm(
 
 /// Repack GPTQ INT4 weights to Marlin format on CPU.
 ///
-/// GPTQ format: qweight [K/8, N] int32, 8 values packed per word, row-major
-/// Marlin format: tiled, permuted, and repacked for tensor core access
+/// GPTQ format: qweight [K/8, N] int32 (in_features packed, out_features columns)
+/// Marlin format: [N/16, K*16/8] int32, tiled and permuted for tensor core access
 ///
-/// This is a one-time CPU operation during model loading.
+/// Key: Marlin operates on [N, K] layout (out_features first, like PyTorch Linear.weight).
+/// GPTQ stores [K, N]. Must transpose before tiling.
+///
+/// Reference: IST-DASLab/marlin __init__.py Layer.pack()
 pub fn repack_gptq_to_marlin(
     qweight_gptq: &[i32], // [K/8, N]
     k: usize,
     n: usize,
 ) -> Vec<i32> {
-    // Step 1: Unpack GPTQ to individual INT4 values [K, N]
+    // Step 1: Unpack GPTQ [K/8, N] → individual INT4 values [K, N]
     let packed_rows = k / 8;
-    let mut unpacked = vec![0u8; k * n];
+    let mut kn = vec![0u8; k * n]; // [K, N] layout
     for pr in 0..packed_rows {
         for col in 0..n {
             let packed = qweight_gptq[pr * n + col];
             for i in 0..8 {
-                unpacked[(pr * 8 + i) * n + col] = ((packed >> (i * 4)) & 0xF) as u8;
+                kn[(pr * 8 + i) * n + col] = ((packed >> (i * 4)) & 0xF) as u8;
             }
         }
     }
 
-    // Step 2: Tile transpose — reshape [K, N] into [K/16, 16, N/16, 16]
-    // then permute to [K/16, N/16, 16, 16], flatten to [K/16, N*16]
-    let tile_k = k / 16;
+    // Step 2: Transpose [K, N] → [N, K] (Marlin convention: out_features first)
+    let mut w = vec![0u8; n * k]; // [N, K]
+    for row in 0..k {
+        for col in 0..n {
+            w[col * k + row] = kn[row * n + col];
+        }
+    }
+
+    // Step 3: Tile — reshape [N, K] into [N/16, 16, K/16, 16]
+    //         permute to [N/16, K/16, 16, 16]
+    //         flatten to [N/16, K*16]
     let tile_n = n / 16;
-    let mut tiled = vec![0u8; k * n];
-    for tk in 0..tile_k {
-        for tn in 0..tile_n {
-            for ik in 0..16 {
-                for in_ in 0..16 {
-                    let src_idx = (tk * 16 + ik) * n + (tn * 16 + in_);
-                    let dst_idx = (tk * tile_n + tn) * 256 + ik * 16 + in_;
-                    tiled[dst_idx] = unpacked[src_idx];
+    let tile_k = k / 16;
+    let mut tiled = vec![0u8; n * k]; // [N/16, K*16]
+    for tn in 0..tile_n {
+        for tk in 0..tile_k {
+            for in_ in 0..16 {
+                for ik in 0..16 {
+                    let src_idx = (tn * 16 + in_) * k + (tk * 16 + ik);
+                    let dst_idx = tn * (k * 16) + tk * 256 + in_ * 16 + ik;
+                    tiled[dst_idx] = w[src_idx];
                 }
             }
         }
     }
 
-    // Step 3: Apply interleave permutation within each group of 8
-    // [0,2,4,6,1,3,5,7] — separates even/odd for half2 pairs
+    // Step 4: Interleave within groups of 8 — [0,2,4,6,1,3,5,7]
     let interleave = [0usize, 2, 4, 6, 1, 3, 5, 7];
-    let total = k * n;
-    let groups = total / 8;
+    let total = n * k;
     let mut permuted = vec![0u8; total];
-    for g in 0..groups {
+    for g in 0..(total / 8) {
         for i in 0..8 {
             permuted[g * 8 + i] = tiled[g * 8 + interleave[i]];
         }
     }
 
-    // Step 4: Pack 8 INT4 values into int32 (every 8th element shares a word)
+    // Step 5: Pack 8 INT4 values → int32, taking every 8th element
+    //         result shape: [N/16, K*16/8] = [N/16, K*2]
     let packed_len = total / 8;
     let mut result = vec![0i32; packed_len];
     for i in 0..packed_len {
@@ -187,57 +198,50 @@ pub fn repack_gptq_to_marlin(
 }
 
 /// Permute scales from GPTQ layout to Marlin access pattern.
+///
+/// GPTQ: [num_groups, N] row-major (groups along K, columns are out_features)
+/// Marlin: [num_groups, N] but reshuffled to match the kernel's tile access.
+///
+/// Reference: IST-DASLab/marlin __init__.py _scale_perm / _scale_perm_single
 pub fn repack_scales_to_marlin(
-    scales_gptq: &[half::f16], // [K/group_size, N]
+    scales_gptq: &[half::f16], // [num_groups, N]
     k: usize,
     n: usize,
     group_size: usize,
 ) -> Vec<half::f16> {
     let num_groups = k / group_size;
-    if num_groups == 1 {
-        // Per-channel: simpler permutation
-        return repack_scales_perchannel(scales_gptq, n);
+
+    // Build permutation table matching Marlin's scale access pattern
+    let scale_perm: Vec<usize> = if num_groups > 1 {
+        // Grouped quantization (group_size=128, group_blocks=8)
+        // _scale_perm = [i + 8*j for i in range(8) for j in range(8)]
+        (0..8)
+            .flat_map(|i| (0..8).map(move |j| i + 8 * j))
+            .collect()
+    } else {
+        // Per-channel (group_size=-1, group_blocks=-1)
+        // _scale_perm_single = [2*i+j for i in range(4) for j in [0,1,8,9,16,17,24,25]]
+        (0..4)
+            .flat_map(|i| [0, 1, 8, 9, 16, 17, 24, 25].map(move |j| 2 * i + j))
+            .collect()
+    };
+
+    // Flatten scales, apply permutation in blocks
+    let total = num_groups * n;
+    let perm_len = scale_perm.len();
+    let mut result = vec![half::f16::ZERO; total];
+
+    // Reshape scales as flat array, permute in blocks of perm_len
+    for blk in 0..(total / perm_len) {
+        let base = blk * perm_len;
+        for (dst, &src) in scale_perm.iter().enumerate() {
+            result[base + dst] = scales_gptq[base + src];
+        }
     }
-
-    // For grouped (group_size=128): tile and permute scales
-    // The Marlin kernel reads scales in a specific order matching its tile layout
-    let mut result = vec![half::f16::ZERO; num_groups * n];
-
-    // Scale permutation for group_size=128 (group_blocks=8):
-    // Groups are accessed in 8-row tiles, so reorder accordingly
-    let scale_perm: Vec<usize> = (0..8)
-        .flat_map(|i| (0..8).map(move |j| i + 8 * j))
-        .collect();
-
-    for col in 0..n {
-        for (dst_g, &src_g) in scale_perm.iter().enumerate().take(num_groups.min(64)) {
-            if src_g < num_groups {
-                result[dst_g * n + col] = scales_gptq[src_g * n + col];
-            }
-        }
-        // For num_groups > 64, copy remaining in order
-        for g in 64..num_groups {
-            result[g * n + col] = scales_gptq[g * n + col];
-        }
-    }
-
-    result
-}
-
-fn repack_scales_perchannel(scales: &[half::f16], n: usize) -> Vec<half::f16> {
-    // Per-channel scales: [1, N] → apply single permutation
-    let perm: Vec<usize> = (0..4)
-        .flat_map(|i| [0, 1, 8, 9, 16, 17, 24, 25].map(move |j| 2 * i + j))
-        .collect();
-
-    let mut result = vec![half::f16::ZERO; n];
-    let groups = n / 32;
-    for g in 0..groups {
-        for (dst, &src) in perm.iter().enumerate().take(32) {
-            if g * 32 + src < n {
-                result[g * 32 + dst] = scales[g * 32 + src];
-            }
-        }
+    // Remainder (if total not divisible by perm_len)
+    let rem_start = (total / perm_len) * perm_len;
+    for i in rem_start..total {
+        result[i] = scales_gptq[i];
     }
     result
 }
