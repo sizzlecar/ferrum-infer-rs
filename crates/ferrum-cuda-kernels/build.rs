@@ -102,6 +102,7 @@ fn compile_marlin(out_dir: &PathBuf) {
             "-std=c++17",
             "-O3",
             "--use_fast_math",
+            "--expt-relaxed-constexpr",
             "-Xcompiler",
             "-fPIC",
         ])
