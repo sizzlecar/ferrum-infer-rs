@@ -25,7 +25,7 @@
 #include <iostream>
 
 
-constexpr int ceildiv(int a, int b) {
+__host__ __device__ constexpr int ceildiv(int a, int b) {
   return (a + b - 1) / b;
 }
 
