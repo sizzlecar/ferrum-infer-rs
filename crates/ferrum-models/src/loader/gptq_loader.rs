@@ -189,8 +189,146 @@ pub fn load_gptq_weights(
         }
     }
 
-    tracing::info!("Loaded {} GPTQ quantized layers", result.len());
+    tracing::info!("Loaded {} GPTQ quantized layers (raw)", result.len());
+
+    // Fuse separate q/k/v → qkv_proj and gate/up → gate_up_proj.
+    // GPTQ stores separate projections, but the CUDA runner expects fused weights.
+    fuse_qkv_and_gate_up(&mut result);
+
+    tracing::info!(
+        "After fusion: {} GPTQ layers (includes fused qkv_proj, gate_up_proj)",
+        result.len()
+    );
     Ok(result)
+}
+
+/// Fuse separate q/k/v projections into qkv_proj, and gate/up into gate_up_proj.
+/// GPTQ packing is [K/8, N] — fusing along N dimension means concatenating columns.
+fn fuse_qkv_and_gate_up(weights: &mut HashMap<String, GptqLayerWeights>) {
+    let prefixes: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".self_attn.q_proj"))
+        .map(|k| k.strip_suffix(".self_attn.q_proj").unwrap().to_string())
+        .collect();
+
+    for layer_prefix in &prefixes {
+        // Fuse q + k + v → qkv_proj
+        let q_key = format!("{layer_prefix}.self_attn.q_proj");
+        let k_key = format!("{layer_prefix}.self_attn.k_proj");
+        let v_key = format!("{layer_prefix}.self_attn.v_proj");
+        if let (Some(q), Some(k), Some(v)) =
+            (weights.get(&q_key), weights.get(&k_key), weights.get(&v_key))
+        {
+            if q.k == k.k && q.k == v.k {
+                let fused = fuse_columns(&[q, k, v]);
+                let fused_key = format!("{layer_prefix}.self_attn.qkv_proj");
+                tracing::info!(
+                    "Fused {q_key}+{k_key}+{v_key} → {fused_key} K={} N={}",
+                    fused.k,
+                    fused.n
+                );
+                weights.insert(fused_key, fused);
+            }
+        }
+
+        // Fuse gate + up → gate_up_proj
+        let gate_key = format!("{layer_prefix}.mlp.gate_proj");
+        let up_key = format!("{layer_prefix}.mlp.up_proj");
+        if let (Some(gate), Some(up)) = (weights.get(&gate_key), weights.get(&up_key)) {
+            if gate.k == up.k {
+                let fused = fuse_columns(&[gate, up]);
+                let fused_key = format!("{layer_prefix}.mlp.gate_up_proj");
+                tracing::info!(
+                    "Fused {gate_key}+{up_key} → {fused_key} K={} N={}",
+                    fused.k,
+                    fused.n
+                );
+                weights.insert(fused_key, fused);
+            }
+        }
+    }
+}
+
+/// Fuse multiple GPTQ weights along the N (output) dimension.
+/// All weights must have the same K. Result has N = sum(w.n for w in weights).
+///
+/// qweight layout: [K/8, N] — concatenate columns.
+/// scales layout: [K/gs, N] — concatenate columns.
+/// qzeros layout: [K/gs, N/8] — concatenate columns (trickier due to packing).
+fn fuse_columns(parts: &[&GptqLayerWeights]) -> GptqLayerWeights {
+    let k = parts[0].k;
+    let gs = parts[0].group_size;
+    let sym = parts[0].symmetric;
+    let total_n: usize = parts.iter().map(|p| p.n).sum();
+    let packed_k = k / 8;
+    let num_groups = k / gs;
+
+    // Fuse qweight [K/8, N] — row by row, concatenate columns
+    let mut qweight = vec![0i32; packed_k * total_n];
+    let mut col_offset = 0;
+    for part in parts {
+        for row in 0..packed_k {
+            for col in 0..part.n {
+                qweight[row * total_n + col_offset + col] =
+                    part.qweight[row * part.n + col];
+            }
+        }
+        col_offset += part.n;
+    }
+
+    // Fuse scales [K/gs, N]
+    let mut scales = vec![half::f16::ZERO; num_groups * total_n];
+    col_offset = 0;
+    for part in parts {
+        for row in 0..num_groups {
+            for col in 0..part.n {
+                scales[row * total_n + col_offset + col] =
+                    part.scales[row * part.n + col];
+            }
+        }
+        col_offset += part.n;
+    }
+
+    // Fuse qzeros [K/gs, N/8] — need to unpack, concatenate, repack
+    let qzeros = if !sym {
+        let mut all_zeros = vec![0u8; num_groups * total_n];
+        let mut col_off = 0usize;
+        for part in parts {
+            if let Some(ref qz) = part.qzeros {
+                let part_n8 = part.n / 8;
+                for row in 0..num_groups {
+                    for col in 0..part.n {
+                        let packed = qz[row * part_n8 + col / 8];
+                        let val = ((packed >> ((col % 8) * 4)) & 0xF) as u8;
+                        all_zeros[row * total_n + col_off + col] = val;
+                    }
+                }
+            }
+            col_off += part.n;
+        }
+        // Repack
+        let total_n8 = total_n / 8;
+        let mut packed_zeros = vec![0i32; num_groups * total_n8];
+        for row in 0..num_groups {
+            for col in 0..total_n {
+                let val = all_zeros[row * total_n + col] as i32;
+                packed_zeros[row * total_n8 + col / 8] |= val << ((col % 8) * 4);
+            }
+        }
+        Some(packed_zeros)
+    } else {
+        None
+    };
+
+    GptqLayerWeights {
+        qweight,
+        scales,
+        qzeros,
+        k,
+        n: total_n,
+        group_size: gs,
+        symmetric: sym,
+    }
 }
 
 fn find_safetensor_files(model_dir: &Path) -> Result<Vec<PathBuf>> {
