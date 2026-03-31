@@ -54,9 +54,9 @@ fn multiple_handles_independent() {
     assert_eq!(h1.block_table().sequence_length, 10);
     assert_eq!(h2.block_table().sequence_length, 20);
 
-    // Cloning one doesn't affect the other
+    // Cloning one doesn't affect the other; clone gets unique ID
     let h1_clone = h1.clone_handle().unwrap();
-    assert_eq!(h1_clone.cache_id(), "seq-1");
+    assert!(h1_clone.cache_id().starts_with("seq-1-clone-"));
 }
 
 #[test]
