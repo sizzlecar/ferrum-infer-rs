@@ -21,10 +21,7 @@ pub use architectures::{
 };
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
-pub use executor::{
-    BertModelExecutor, CandleModelExecutor, Qwen2ModelExecutor, Qwen3ModelExecutor,
-    StubModelExecutor,
-};
+pub use executor::{BertModelExecutor, CandleModelExecutor, Qwen3ModelExecutor, StubModelExecutor};
 pub use hf_download::HfDownloader;
 pub use loader::SafeTensorsLoader;
 pub use registry::{

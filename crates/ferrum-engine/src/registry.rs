@@ -1050,10 +1050,13 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     candle_device.clone(),
                     dtype,
                 )?;
+                // Qwen2 reuses Llama internals — unwrap and use CandleModelExecutor
+                let mut llama_model = qwen2_model.into_inner();
+                llama_model.set_model_dir(model_dir_path);
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                let executor = ferrum_models::Qwen2ModelExecutor::new(qwen2_model, model_info);
+                let executor = ferrum_models::CandleModelExecutor::new(llama_model, model_info);
 
                 Ok(Arc::new(executor))
             }

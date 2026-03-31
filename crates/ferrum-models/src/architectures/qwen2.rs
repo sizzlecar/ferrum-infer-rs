@@ -1,139 +1,93 @@
-//! Qwen2 architecture using Candle's built-in implementation
+//! Qwen2 architecture — reuses Llama model implementation.
+//!
+//! Qwen2 and Llama share the same transformer structure:
+//! GQA attention (no Q/K norm), SiLU MLP (separate gate/up), RoPE.
+//! The only difference is config defaults (rope_theta, etc.).
 
 use candle_core::{DType, Device as CandleDevice, Tensor};
-use candle_nn::{Activation, VarBuilder};
-use candle_transformers::models::qwen2 as candle_qwen2;
+use candle_nn::VarBuilder;
 use ferrum_types::{FerrumError, Result};
-use parking_lot::Mutex;
 use tracing::{debug, info};
 
-/// Qwen2 model wrapper
+// Re-use Llama's model implementation (identical architecture)
+use super::llama;
+
+/// Qwen2 model wrapper — delegates to Llama model internals.
 pub struct Qwen2ModelWrapper {
-    model: Mutex<candle_qwen2::ModelForCausalLM>,
-    config: candle_qwen2::Config,
-    device: CandleDevice,
-    dtype: DType,
+    inner: llama::LlamaModelWrapper,
 }
 
 impl Qwen2ModelWrapper {
-    /// Create from VarBuilder and config
     pub fn from_varbuilder(
         vb: VarBuilder,
         config: &crate::definition::ModelDefinition,
         device: CandleDevice,
         dtype: DType,
     ) -> Result<Self> {
-        info!("🔨 Creating Qwen2 model from weights...");
-
-        // Build Candle's Qwen2 config
-        // Read optional fields from extra_params (raw config.json)
-        let tie_word_embeddings = config
-            .extra_params
-            .get("tie_word_embeddings")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let sliding_window = config
-            .extra_params
-            .get("sliding_window")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(32768) as usize;
-
-        let max_window_layers = config
-            .extra_params
-            .get("max_window_layers")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(config.num_hidden_layers as u64) as usize;
-
-        let use_sliding_window = config
-            .extra_params
-            .get("use_sliding_window")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let candle_config = candle_qwen2::Config {
-            vocab_size: config.vocab_size,
-            hidden_size: config.hidden_size,
-            intermediate_size: config.intermediate_size,
-            num_hidden_layers: config.num_hidden_layers,
-            num_attention_heads: config.num_attention_heads,
-            num_key_value_heads: config
-                .num_key_value_heads
-                .unwrap_or(config.num_attention_heads),
-            max_position_embeddings: config.max_position_embeddings,
-            rope_theta: config.rope_theta.unwrap_or(1000000.0),
-            rms_norm_eps: config.norm_eps,
-            tie_word_embeddings,
-            sliding_window,
-            max_window_layers,
-            use_sliding_window,
-            hidden_act: Activation::Silu,
-        };
+        info!("Creating Qwen2 model from weights...");
 
         debug!(
             "Qwen2 config: hidden={}, layers={}, heads={}, kv_heads={}",
-            candle_config.hidden_size,
-            candle_config.num_hidden_layers,
-            candle_config.num_attention_heads,
-            candle_config.num_key_value_heads
+            config.hidden_size,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            config
+                .num_key_value_heads
+                .unwrap_or(config.num_attention_heads),
         );
 
-        // Load model - Qwen2 uses new() not load()
-        let model = candle_qwen2::ModelForCausalLM::new(&candle_config, vb)
-            .map_err(|e| FerrumError::model(format!("Failed to create Qwen2 model: {}", e)))?;
+        // Qwen2 uses same architecture as Llama, just different config defaults
+        let inner = llama::LlamaModelWrapper::from_varbuilder(vb, config, device, dtype)?;
 
-        info!("✅ Qwen2 model created successfully");
-
-        Ok(Self {
-            model: Mutex::new(model),
-            config: candle_config,
-            device,
-            dtype,
-        })
+        info!("Qwen2 model created successfully");
+        Ok(Self { inner })
     }
 
-    /// Forward pass for prefill (full sequence)
-    /// Note: Qwen2 manages cache internally
-    pub fn forward_prefill(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let mut model = self.model.lock();
-
-        model
-            .forward(input_ids, 0)
-            .map_err(|e| FerrumError::model(format!("Prefill forward failed: {}", e)))
+    pub fn forward_prefill(&self, input_ids: &Tensor, cache_key: &str) -> Result<Tensor> {
+        self.inner.forward_prefill(input_ids, cache_key)
     }
 
-    /// Forward pass for decode (single token)
-    /// Note: Qwen2 manages cache internally
-    pub fn forward_decode(&self, token_id: &Tensor, pos: usize) -> Result<Tensor> {
-        let mut model = self.model.lock();
-
-        model
-            .forward(token_id, pos)
-            .map_err(|e| FerrumError::model(format!("Decode forward failed: {}", e)))
+    pub fn forward_decode(&self, token_id: &Tensor, pos: usize, cache_key: &str) -> Result<Tensor> {
+        self.inner.forward_decode(token_id, pos, cache_key)
     }
 
-    /// Reset internal KV cache (for new requests)
-    pub fn reset_cache(&self) -> Result<()> {
-        self.model.lock().clear_kv_cache();
-        Ok(())
+    pub fn export_kv_cache(&self, cache_key: &str) -> Option<Vec<(Tensor, Tensor, usize, usize)>> {
+        self.inner.export_kv_cache(cache_key)
     }
 
-    /// Get Candle config reference
-    pub fn config(&self) -> &candle_qwen2::Config {
-        &self.config
+    pub fn release_cache(&self, cache_key: &str) {
+        self.inner.release_cache(cache_key);
+    }
+
+    pub fn config(&self) -> &llama::Config {
+        self.inner.config()
     }
 
     pub fn device(&self) -> &CandleDevice {
-        &self.device
+        self.inner.device()
     }
 
-    /// Get raw Candle device
     pub fn candle_device(&self) -> &CandleDevice {
-        &self.device
+        self.inner.candle_device()
     }
 
-    /// Get dtype
     pub fn dtype(&self) -> DType {
-        self.dtype
+        self.inner.dtype()
+    }
+
+    pub fn set_model_dir(&mut self, dir: std::path::PathBuf) {
+        self.inner.set_model_dir(dir);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn create_decode_runner(
+        &self,
+    ) -> Result<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner> {
+        self.inner.create_decode_runner()
+    }
+
+    /// Unwrap into the inner LlamaModelWrapper (for CandleModelExecutor reuse).
+    pub fn into_inner(self) -> llama::LlamaModelWrapper {
+        self.inner
     }
 }
