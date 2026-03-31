@@ -19,9 +19,24 @@ fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> CandleResult
     Ok(Linear::new(w, None))
 }
 
-fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> CandleResult<RmsNorm> {
+/// RmsNorm with public weight access for CUDA runner extraction.
+pub struct RmsNormWithWeight {
+    norm: RmsNorm,
+    pub weight: Tensor,
+}
+
+impl Module for RmsNormWithWeight {
+    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        self.norm.forward(xs)
+    }
+}
+
+fn rms_norm_with_weight(size: usize, eps: f64, vb: VarBuilder) -> CandleResult<RmsNormWithWeight> {
     let w = vb.get(size, "weight")?;
-    Ok(RmsNorm::new(w, eps))
+    Ok(RmsNormWithWeight {
+        norm: RmsNorm::new(w.clone(), eps),
+        weight: w,
+    })
 }
 use ferrum_types::{FerrumError, Result};
 use std::collections::HashMap;
@@ -259,8 +274,8 @@ impl Mlp {
 pub struct DecoderLayer {
     pub self_attn: Attention,
     pub mlp: Mlp,
-    pub input_layernorm: RmsNorm,
-    pub post_attention_layernorm: RmsNorm,
+    pub input_layernorm: RmsNormWithWeight,
+    pub post_attention_layernorm: RmsNormWithWeight,
 }
 
 impl DecoderLayer {
@@ -290,8 +305,12 @@ impl DecoderLayer {
         Ok(Self {
             self_attn: Attention::load(vb.pp("self_attn"), cfg)?,
             mlp: Mlp::load(vb.pp("mlp"), cfg)?,
-            input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            post_attention_layernorm: rms_norm(
+            input_layernorm: rms_norm_with_weight(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("input_layernorm"),
+            )?,
+            post_attention_layernorm: rms_norm_with_weight(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
                 vb.pp("post_attention_layernorm"),
@@ -305,7 +324,7 @@ impl DecoderLayer {
 pub struct Model {
     pub embed_tokens: Embedding,
     pub layers: Vec<DecoderLayer>,
-    pub norm: RmsNorm,
+    pub norm: RmsNormWithWeight,
     pub lm_head: Linear,
     pub rotary_emb: RotaryEmbedding,
     pub config: Config,
@@ -327,7 +346,7 @@ impl Model {
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        let norm = rms_norm_with_weight(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let layers: Vec<DecoderLayer> = (0..cfg.num_hidden_layers)
             .map(|i| DecoderLayer::load(vb.pp(format!("model.layers.{i}")), cfg))
             .collect::<CandleResult<_>>()?;
@@ -406,7 +425,7 @@ impl Model {
 // ======================== Model Wrapper ========================
 
 pub struct LlamaModelWrapper {
-    model: parking_lot::Mutex<Model>,
+    pub(crate) model: parking_lot::Mutex<Model>,
     config: Config,
     device: CandleDevice,
     dtype: DType,
@@ -505,48 +524,125 @@ impl LlamaModelWrapper {
         self.model_dir = Some(dir);
     }
 
-    /// Create CUDA decode runner by loading weights from safetensors.
+    /// Create CUDA decode runner by extracting weights directly from the model.
     #[cfg(feature = "cuda")]
     pub fn create_decode_runner(
         &self,
     ) -> Result<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner> {
-        use crate::loader::runner_weights::{self, WeightConfig};
-
-        let model_dir = self
-            .model_dir
-            .as_ref()
-            .ok_or_else(|| FerrumError::model("model_dir not set for CUDA runner"))?;
-
-        let loader = crate::loader::SafeTensorsLoader::new(model_dir);
-        let vb = loader.load_varbuilder(&self.device, self.dtype)?;
-
-        let cfg = WeightConfig {
-            num_hidden_layers: self.config.num_hidden_layers,
-            hidden_size: self.config.hidden_size,
-            intermediate_size: self.config.intermediate_size,
-            num_attention_heads: self.config.num_attention_heads,
-            num_kv_heads: self.config.num_key_value_heads,
-            head_dim: self.config.head_dim,
-            vocab_size: self.config.vocab_size,
-            max_seq_len: self.config.max_position_embeddings,
-            rope_theta: self.config.rope_theta as f64,
-            has_qk_norm: false,
-            qkv_fused: false,
-            gate_up_fused: false,
+        use ferrum_cuda_kernels::decode_buffers::ModelDims;
+        use ferrum_cuda_kernels::weight_store::{
+            GpuWeight, LayerWeights, LinearWeight, TransformerGpuWeights,
         };
 
-        let (weights, dims, stream) = runner_weights::load_runner_weights(&vb, &cfg, &self.device)?;
+        let model = self.model.lock();
+        let cfg = &self.config;
 
         let cuda_device = self
             .device
             .as_cuda_device()
             .map_err(|e| FerrumError::model(format!("not CUDA: {e}")))?;
+        let candle_stream = cuda_device.cuda_stream();
+        candle_stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("sync: {e}")))?;
+        let rs = candle_stream
+            .context()
+            .new_stream()
+            .map_err(|e| FerrumError::model(format!("new_stream: {e}")))?;
+
+        let embed_table = GpuWeight::from_tensor(model.embed_tokens.embeddings(), &rs)
+            .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for (li, layer) in model.layers.iter().enumerate() {
+            // Fuse Q+K+V → QKV
+            let qkv_fused = candle_core::Tensor::cat(
+                &[
+                    layer.self_attn.q_proj.weight(),
+                    layer.self_attn.k_proj.weight(),
+                    layer.self_attn.v_proj.weight(),
+                ],
+                0,
+            )
+            .map_err(|e| FerrumError::model(format!("qkv cat L{li}: {e}")))?;
+
+            // Fuse gate+up
+            let gate_up_fused = candle_core::Tensor::cat(
+                &[layer.mlp.gate_proj.weight(), layer.mlp.up_proj.weight()],
+                0,
+            )
+            .map_err(|e| FerrumError::model(format!("gate_up cat L{li}: {e}")))?;
+
+            layers.push(LayerWeights {
+                input_ln_w: GpuWeight::from_tensor(&layer.input_layernorm.weight, &rs)
+                    .map_err(|e| FerrumError::model(format!("input_ln: {e}")))?,
+                qkv_w: LinearWeight::Fp16(
+                    GpuWeight::from_tensor(&qkv_fused, &rs)
+                        .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
+                ),
+                q_norm_w: None,
+                k_norm_w: None,
+                o_w: LinearWeight::Fp16(
+                    GpuWeight::from_tensor(layer.self_attn.o_proj.weight(), &rs)
+                        .map_err(|e| FerrumError::model(format!("o: {e}")))?,
+                ),
+                post_ln_w: GpuWeight::from_tensor(&layer.post_attention_layernorm.weight, &rs)
+                    .map_err(|e| FerrumError::model(format!("post_ln: {e}")))?,
+                gate_up_w: LinearWeight::Fp16(
+                    GpuWeight::from_tensor(&gate_up_fused, &rs)
+                        .map_err(|e| FerrumError::model(format!("gate_up: {e}")))?,
+                ),
+                down_w: LinearWeight::Fp16(
+                    GpuWeight::from_tensor(layer.mlp.down_proj.weight(), &rs)
+                        .map_err(|e| FerrumError::model(format!("down: {e}")))?,
+                ),
+            });
+        }
+
+        let final_norm_w = GpuWeight::from_tensor(&model.norm.weight, &rs)
+            .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
+        let lm_head_w = LinearWeight::Fp16(
+            GpuWeight::from_tensor(model.lm_head.weight(), &rs)
+                .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?,
+        );
+        let rope_cos = GpuWeight::from_tensor(&model.rotary_emb.cos, &rs)
+            .map_err(|e| FerrumError::model(format!("rope_cos: {e}")))?;
+        let rope_sin = GpuWeight::from_tensor(&model.rotary_emb.sin, &rs)
+            .map_err(|e| FerrumError::model(format!("rope_sin: {e}")))?;
+
+        let weights = TransformerGpuWeights {
+            embed_table,
+            layers,
+            final_norm_w,
+            lm_head_w,
+            rope_cos,
+            rope_sin,
+        };
+
+        let dims = ModelDims {
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+            num_attention_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            vocab_size: cfg.vocab_size,
+            num_layers: cfg.num_hidden_layers,
+            max_seq_len: cfg.max_position_embeddings,
+            quantized: false,
+            max_batch_size: std::env::var("FERRUM_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+        };
+
+        rs.synchronize()
+            .map_err(|e| FerrumError::model(format!("sync: {e}")))?;
 
         ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
             weights,
             dims,
             cuda_device.clone(),
-            stream,
+            rs,
         )
         .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
     }
