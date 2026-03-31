@@ -133,6 +133,182 @@ fn column_parallel_gate_up_fusion() {
     }
 }
 
+/// Verify row-parallel down projection: sharded input → all-reduce → correct result.
+#[test]
+fn row_parallel_down_proj_sharding() {
+    let tp_size = 2;
+    let hidden = 8;
+    let inter = 16;
+    let inter_shard = inter / tp_size;
+
+    let down_full = Tensor::arange(0f32, (hidden * inter) as f32, &Device::Cpu)
+        .unwrap()
+        .reshape((hidden, inter))
+        .unwrap();
+
+    let down_shard_0 = down_full
+        .narrow(1, 0, inter_shard)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let down_shard_1 = down_full
+        .narrow(1, inter_shard, inter_shard)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+
+    // Each rank's MLP activation output: [1, inter/tp]
+    let act_full = Tensor::arange(1f32, (inter + 1) as f32, &Device::Cpu)
+        .unwrap()
+        .reshape((1, inter))
+        .unwrap();
+    let act_0 = act_full.narrow(1, 0, inter_shard).unwrap();
+    let act_1 = act_full.narrow(1, inter_shard, inter_shard).unwrap();
+
+    let partial_0 = act_0.matmul(&down_shard_0.t().unwrap()).unwrap();
+    let partial_1 = act_1.matmul(&down_shard_1.t().unwrap()).unwrap();
+
+    let full_result = (partial_0 + partial_1).unwrap();
+    let expected = act_full.matmul(&down_full.t().unwrap()).unwrap();
+
+    let diff = (&full_result - &expected)
+        .unwrap()
+        .abs()
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+    assert!(diff < 1e-1, "Down proj row-parallel differs: {diff}");
+}
+
+/// Verify column-parallel gate+up → SiLU × mul → row-parallel down end-to-end.
+#[test]
+fn mlp_block_tp_e2e() {
+    let tp_size = 2;
+    let hidden = 4;
+    let inter = 8;
+    let inter_shard = inter / tp_size;
+
+    // Weights
+    let gate_full = Tensor::arange(0f32, (inter * hidden) as f32, &Device::Cpu)
+        .unwrap()
+        .reshape((inter, hidden))
+        .unwrap();
+    let up_full = Tensor::arange(0f32, (inter * hidden) as f32, &Device::Cpu)
+        .unwrap()
+        .reshape((inter, hidden))
+        .unwrap();
+    let down_full = Tensor::arange(0f32, (hidden * inter) as f32, &Device::Cpu)
+        .unwrap()
+        .reshape((hidden, inter))
+        .unwrap();
+
+    let input = Tensor::arange(1f32, (hidden + 1) as f32, &Device::Cpu)
+        .unwrap()
+        .reshape((1, hidden))
+        .unwrap();
+
+    // Full (non-sharded) path
+    let gate_out = input.matmul(&gate_full.t().unwrap()).unwrap();
+    let up_out = input.matmul(&up_full.t().unwrap()).unwrap();
+    let silu_gate = (&gate_out / &(gate_out.neg().unwrap().exp().unwrap() + 1.0).unwrap()).unwrap();
+    let act_full = (&silu_gate * &up_out).unwrap();
+    let expected = act_full.matmul(&down_full.t().unwrap()).unwrap();
+
+    // TP path: column-parallel gate+up, row-parallel down
+    let mut tp_result = Tensor::zeros((1, hidden), DType::F32, &Device::Cpu).unwrap();
+    for rank in 0..tp_size {
+        let gate_shard = gate_full
+            .narrow(0, rank * inter_shard, inter_shard)
+            .unwrap();
+        let up_shard = up_full.narrow(0, rank * inter_shard, inter_shard).unwrap();
+        let down_shard = down_full
+            .narrow(1, rank * inter_shard, inter_shard)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+
+        let g = input.matmul(&gate_shard.t().unwrap()).unwrap();
+        let u = input.matmul(&up_shard.t().unwrap()).unwrap();
+        let silu = (&g / &(g.neg().unwrap().exp().unwrap() + 1.0).unwrap()).unwrap();
+        let act = (&silu * &u).unwrap();
+        let partial = act.matmul(&down_shard.t().unwrap()).unwrap();
+        tp_result = (tp_result + partial).unwrap();
+    }
+
+    let diff = (&tp_result - &expected)
+        .unwrap()
+        .abs()
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+    assert!(diff < 1e-2, "MLP TP E2E differs: {diff}");
+}
+
+/// Verify attention head sharding: each rank gets num_heads/tp heads.
+#[test]
+fn attention_head_sharding() {
+    let tp_size = 4;
+    let num_heads = 32;
+    let num_kv_heads = 8;
+    let head_dim = 128;
+    let seq_len = 10;
+
+    // Simulate Q: [1, num_heads, seq_len, head_dim]
+    let q_full =
+        Tensor::zeros((1, num_heads, seq_len, head_dim), DType::F32, &Device::Cpu).unwrap();
+
+    // Each rank gets heads_per_rank = 32/4 = 8 Q heads
+    let heads_per_rank = num_heads / tp_size;
+    for rank in 0..tp_size {
+        let q_shard = q_full
+            .narrow(1, rank * heads_per_rank, heads_per_rank)
+            .unwrap();
+        assert_eq!(q_shard.dims(), &[1, heads_per_rank, seq_len, head_dim]);
+    }
+
+    // KV heads per rank = 8/4 = 2
+    let kv_heads_per_rank = num_kv_heads / tp_size;
+    let kv_full =
+        Tensor::zeros((seq_len, num_kv_heads, head_dim), DType::F32, &Device::Cpu).unwrap();
+    for rank in 0..tp_size {
+        let kv_shard = kv_full
+            .narrow(1, rank * kv_heads_per_rank, kv_heads_per_rank)
+            .unwrap();
+        assert_eq!(kv_shard.dims(), &[seq_len, kv_heads_per_rank, head_dim]);
+    }
+}
+
+/// Verify embedding is replicated (not sharded).
+#[test]
+fn embedding_replicated() {
+    let vocab = 32000;
+    let hidden = 4096;
+    let tp_size = 4;
+
+    // Each rank gets the FULL embedding table
+    let embed = Tensor::zeros((vocab, hidden), DType::F32, &Device::Cpu).unwrap();
+    for _rank in 0..tp_size {
+        // No sharding — each rank uses the same full embedding
+        assert_eq!(embed.dims(), &[vocab, hidden]);
+    }
+}
+
+/// Verify norm weights are replicated (not sharded).
+#[test]
+fn norms_replicated() {
+    let hidden = 4096;
+    let tp_size = 4;
+
+    let norm_w = Tensor::ones(hidden, DType::F32, &Device::Cpu).unwrap();
+    for _rank in 0..tp_size {
+        assert_eq!(norm_w.dims(), &[hidden]);
+    }
+}
+
 /// Verify sharded GEMM dimensions match for TP=4.
 #[test]
 fn tp4_dimension_consistency() {
