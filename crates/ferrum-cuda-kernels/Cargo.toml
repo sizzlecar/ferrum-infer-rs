@@ -17,5 +17,5 @@ bindgen_cuda = "0.1.6"
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "dep:cudarc"]
-marlin = ["cuda"]  # Marlin INT4xFP16 kernel (requires nvcc + SM >= 8.0)
+cuda = ["candle-core/cuda", "dep:cudarc", "marlin"]
+marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)

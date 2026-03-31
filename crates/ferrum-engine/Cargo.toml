@@ -81,7 +81,7 @@ cuda = [
     "dep:candle-flash-attn",
     "ferrum-models/cuda",
 ]
-marlin = ["cuda", "ferrum-models/marlin"]
+marlin = ["cuda"]  # kept for backward compat, cuda already enables marlin
 metal = ["candle-core/metal", "dep:candle-metal-kernels", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray"]
 
 # Metal dependencies for Apple GPU support (only on macOS/iOS)
