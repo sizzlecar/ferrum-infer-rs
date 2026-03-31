@@ -13,7 +13,7 @@ use cudarc::driver::{CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelAr
 
 use crate::decode_buffers::{DecodeBuffers, ModelDims};
 use crate::ptx;
-use crate::weight_store::TransformerGpuWeights;
+use crate::weight_store::{LayerWeights, TransformerGpuWeights};
 
 // ======================== Runtime Diagnostics ========================
 //
@@ -199,6 +199,11 @@ impl CudaDecodeRunner {
             capture_attempted: false,
             diag,
         })
+    }
+
+    /// Access weight layers (diagnostic only).
+    pub fn weight_layers(&self) -> &[LayerWeights] {
+        &self.weights.layers
     }
 
     pub fn init_kv_cache(
