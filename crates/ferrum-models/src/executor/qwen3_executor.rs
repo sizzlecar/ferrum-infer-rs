@@ -7,7 +7,7 @@ use ferrum_interfaces::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
         MemoryRequirements, PrefillInput, PrefillOutput,
     },
-    ModelExecutor, TensorRef,
+    KvCacheHandle, ModelExecutor, TensorRef,
 };
 use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
 use parking_lot::Mutex;
@@ -297,32 +297,19 @@ impl ModelExecutor for Qwen3ModelExecutor {
 
         let seq_len = {
             let mut states = self.states.lock();
-            let state = states.get(&req_cache_id).or_else(|| {
-                // For prefix cache clones ("base-clone-N"), fall back to base ID
-                req_cache_id
-                    .rfind("-clone-")
-                    .and_then(|pos| states.get(&req_cache_id[..pos]))
-            });
-            match state {
-                Some(s) => {
-                    let len = s.sequence_length;
-                    // Register clone ID so subsequent decodes find it directly
-                    if !states.contains_key(&req_cache_id) {
-                        states.insert(
-                            req_cache_id.clone(),
-                            Qwen3CacheState {
-                                sequence_length: len,
-                            },
-                        );
-                    }
-                    len
-                }
-                None => {
-                    return Err(FerrumError::model(format!(
-                        "Decode called for unknown sequence: {}",
-                        req_cache_id
-                    )));
-                }
+            if let Some(s) = states.get(&req_cache_id) {
+                s.sequence_length
+            } else {
+                // For prefix cache clones: base entry may have been released.
+                // Use KV handle's sequence_length and register clone state.
+                let len = input_handle.block_table().sequence_length;
+                states.insert(
+                    req_cache_id.clone(),
+                    Qwen3CacheState {
+                        sequence_length: len,
+                    },
+                );
+                len
             }
         };
 
@@ -477,25 +464,18 @@ impl ModelExecutor for Qwen3ModelExecutor {
             let cache_id = handle.request_cache_id().to_string();
             let seq_len = {
                 let mut states = self.states.lock();
-                let len = states
-                    .get(&cache_id)
-                    .or_else(|| {
-                        cache_id
-                            .rfind("-clone-")
-                            .and_then(|pos| states.get(&cache_id[..pos]))
-                    })
-                    .map(|s| s.sequence_length)
-                    .unwrap_or(0);
-                // Register clone ID for subsequent lookups
-                if len > 0 && !states.contains_key(&cache_id) {
+                if let Some(s) = states.get(&cache_id) {
+                    s.sequence_length
+                } else {
+                    let len = handle.block_table().sequence_length;
                     states.insert(
                         cache_id.clone(),
                         Qwen3CacheState {
                             sequence_length: len,
                         },
                     );
+                    len
                 }
-                len
             };
             let tokens = self.tensor_to_tokens(&input.input_ids)?;
             if tokens.len() != 1 {
