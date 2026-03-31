@@ -1,5 +1,8 @@
 # Ferrum Infer
 
+[![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A Rust-native LLM inference engine. Load models from Hugging Face, chat locally or serve via OpenAI-compatible API. Single binary, no Python, no runtime dependencies.
 
 [中文说明](README_zh.md)
@@ -29,12 +32,12 @@ cargo build --release -p ferrum-cli --bin ferrum
 
 ## Supported Models
 
-| Alias | Model | Architecture |
-|-------|-------|-------------|
-| `qwen3:0.6b` / `1.7b` / `4b` | Qwen3 | Qwen3 |
-| `qwen2.5:0.5b` / `1.5b` / `3b` / `7b` | Qwen2.5-Instruct | Qwen2 |
-| `llama3.2:1b` / `3b` | Llama-3.2-Instruct | LLaMA |
-| `tinyllama` | TinyLlama-1.1B-Chat | LLaMA |
+| Alias | Model | Architecture | CUDA Runner |
+|-------|-------|-------------|-------------|
+| `qwen3:0.6b` / `1.7b` / `4b` | Qwen3 | Qwen3 | Yes |
+| `qwen2.5:0.5b` / `1.5b` / `3b` / `7b` | Qwen2.5-Instruct | Qwen2 | — |
+| `llama3.2:1b` / `3b` | Llama-3.2-Instruct | LLaMA | Yes |
+| `tinyllama` | TinyLlama-1.1B-Chat | LLaMA | Yes |
 
 GPTQ INT4 quantized models are auto-detected and use the Marlin fused kernel:
 ```bash
@@ -75,7 +78,9 @@ curl http://localhost:8000/health
 
 ## Performance
 
-Benchmarked on **RTX PRO 6000 (Blackwell)**, Qwen3-4B:
+Benchmarked on **RTX PRO 6000 (Blackwell)**:
+
+### Qwen3-4B
 
 | Mode | FP16 | INT4 (GPTQ + Marlin) |
 |------|------|----------------------|
@@ -83,7 +88,15 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**, Qwen3-4B:
 | 4 concurrent (batch) | 109.4 tok/s | **124.2 tok/s** |
 | VRAM | ~8 GB | **~2.5 GB (-69%)** |
 
-Key optimizations:
+### TinyLlama-1.1B (Llama architecture)
+
+| Mode | Candle | CUDA Runner |
+|------|--------|-------------|
+| Decode | 126 tok/s | **256.5 tok/s (+103%)** |
+
+### Key Optimizations
+
+- **Custom CUDA decode runner**: bypasses candle for the decode hot path (Qwen3 + LLaMA)
 - **INT4 quantization**: GPTQ models auto-detected, Marlin fused INT4×FP16 kernel
 - **Batched attention kernel**: single launch for all batch items (SM utilization 17%→67%)
 - **Batched RoPE**: per-item positions in single kernel launch
@@ -98,6 +111,7 @@ Key optimizations:
 What works:
 - CLI chat, HTTP serving with streaming, benchmarking
 - Qwen3, Qwen2/2.5, LLaMA 3.x, TinyLlama architectures
+- Custom CUDA decode runner for Qwen3 and LLaMA (2x speedup)
 - Metal GPU acceleration (macOS), CUDA (NVIDIA), CPU
 - INT4 GPTQ quantization with Marlin fused kernel (Blackwell compatible)
 - FlashAttention-2 prefill + custom CUDA decode runner
@@ -109,7 +123,8 @@ What works:
 
 - **Tensor parallelism** — multi-GPU via NCCL
 - **Speculative decoding** — draft model verification
-- **More model architectures** — Mistral, Phi, etc.
+- **More model architectures** — Mistral, Phi, DeepSeek, etc.
+- **Qwen2 CUDA runner** — same pattern as LLaMA
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
@@ -135,18 +150,19 @@ Prerequisites: Rust stable toolchain.
 
 ```
 crates/
-├── ferrum-types        # Shared type definitions
-├── ferrum-interfaces   # Core trait contracts (ComputeBackend, KernelOps, ModelExecutor)
-├── ferrum-runtime      # Backend implementations (Candle, CPU)
-├── ferrum-engine       # Metal kernels, model orchestration
-├── ferrum-models       # Model architectures (LLaMA, Qwen2, Qwen3, BERT)
-├── ferrum-tokenizer    # Tokenization
-├── ferrum-sampler      # Sampling strategies
-├── ferrum-scheduler    # Request scheduling
-├── ferrum-kv           # KV cache management
-├── ferrum-server       # HTTP API server
-├── ferrum-cli          # CLI binary
-└── ferrum-testkit      # Testing utilities
+├── ferrum-types          # Shared type definitions
+├── ferrum-interfaces     # Core trait contracts (ComputeBackend, KernelOps, ModelExecutor)
+├── ferrum-runtime        # Backend implementations (Candle, CPU)
+├── ferrum-engine         # Metal kernels, model orchestration
+├── ferrum-models         # Model architectures (LLaMA, Qwen2, Qwen3, BERT)
+├── ferrum-cuda-kernels   # Custom CUDA kernels + decode runner
+├── ferrum-tokenizer      # Tokenization
+├── ferrum-sampler        # Sampling strategies
+├── ferrum-scheduler      # Request scheduling
+├── ferrum-kv             # KV cache management
+├── ferrum-server         # HTTP API server
+├── ferrum-cli            # CLI binary
+└── ferrum-testkit        # Testing utilities
 ```
 
 ## License
