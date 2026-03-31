@@ -866,14 +866,6 @@ impl CudaDecodeRunner {
         let inter = self.dims.intermediate_size;
         let eps = 1e-6f32;
 
-        eprintln!(
-            "[decode_step] token={token_id} pos={position} h={h} q_dim={q_dim} kv_dim={kv_dim} \
-             hd={hd} inter={inter} embed_len={} residual_len={} qkv_len={}",
-            self.weights.embed_table.slice.len(),
-            self.buffers.residual.len(),
-            self.buffers.qkv_out.len(),
-        );
-
         let step_start = if self.diag.timing {
             self.stream.synchronize().ok();
             Some(std::time::Instant::now())
