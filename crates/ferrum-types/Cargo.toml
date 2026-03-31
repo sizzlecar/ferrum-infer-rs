@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Shared type definitions for the Ferrum LLM inference engine"
+readme = "../../README.md"
 
 [dependencies]
 # Serialization

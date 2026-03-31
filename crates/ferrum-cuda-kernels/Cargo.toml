@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+description = "Custom CUDA kernels and decode runner for Ferrum inference"
+readme = "../../README.md"
 
 [dependencies]
 ferrum-types = { workspace = true }

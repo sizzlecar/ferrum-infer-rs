@@ -7,9 +7,17 @@ A Rust-native LLM inference engine. Load models from Hugging Face, chat locally 
 
 [中文说明](README_zh.md)
 
-## Quick Start
+## Install
 
-Prerequisites: Rust stable toolchain.
+```bash
+# From crates.io
+cargo install ferrum-cli
+
+# Or build from source
+cargo build --release -p ferrum-cli --bin ferrum
+```
+
+## Quick Start
 
 For gated models (e.g. Llama 3.2), set your Hugging Face token first:
 ```bash
@@ -17,17 +25,14 @@ export HF_TOKEN=hf_your_token_here
 ```
 
 ```bash
-# Build
-cargo build --release -p ferrum-cli --bin ferrum
-
 # Download a model
-./target/release/ferrum pull qwen3:0.6b
+ferrum pull qwen3:0.6b
 
 # Chat
-./target/release/ferrum run qwen3:0.6b
+ferrum run qwen3:0.6b
 
 # Or start an API server
-./target/release/ferrum serve --model qwen3:0.6b --port 8000
+ferrum serve --model qwen3:0.6b --port 8000
 ```
 
 ## Supported Models
@@ -132,15 +137,20 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
 ```bash
 # CPU only (default)
-cargo build --release -p ferrum-cli
+cargo install ferrum-cli
 
 # With Metal acceleration (macOS)
-cargo build --release -p ferrum-cli --features metal
+cargo install ferrum-cli --features metal
 
-# With CUDA acceleration (NVIDIA, requires CUDA toolkit)
-cargo build --release -p ferrum-cli --features cuda
+# With CUDA acceleration (NVIDIA, requires CUDA toolkit + nvcc)
+cargo install ferrum-cli --features cuda
+```
 
-# CUDA includes Marlin INT4 kernel automatically (requires nvcc, SM >= 8.0)
+Or build from source:
+```bash
+cargo build --release -p ferrum-cli                    # CPU
+cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
+cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
 ```
 
 Prerequisites: Rust stable toolchain.
