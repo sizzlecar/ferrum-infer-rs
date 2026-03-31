@@ -1210,14 +1210,6 @@ impl CudaDecodeRunner {
         // Extract all KV states for the batch.
         // If any is missing, restore already-extracted ones before returning error.
         let mut kv_batch: Vec<SequenceKvState> = Vec::with_capacity(batch);
-        {
-            let available: Vec<&str> = self.kv_states.keys().map(|k| k.as_str()).collect();
-            let requested: Vec<&str> = requests.iter().map(|r| r.cache_key).collect();
-            eprintln!(
-                "[batch_decode] kv_states has {:?}, requested {:?}",
-                available, requested
-            );
-        }
         for (i, req) in requests.iter().enumerate() {
             match self.kv_states.remove(req.cache_key) {
                 Some(kv) => kv_batch.push(kv),
@@ -1249,11 +1241,14 @@ impl CudaDecodeRunner {
             // ---- Batched QKV GEMM: [B*H] × [qkv_dim, H]^T → [B*qkv_dim] ----
             {
                 let lw = &self.weights.layers[li];
-                crate::cublas::linear_f16(
+                Self::linear(
                     &self.blas,
+                    &self.device,
+                    &self.stream,
                     &self.buffers.norm_out,
-                    lw.qkv_w.as_fp16(),
+                    &lw.qkv_w,
                     &mut self.buffers.qkv_out,
+                    &mut self.buffers.temp_dequant,
                     m,
                     qkv_dim as i32,
                     h as i32,
@@ -1477,11 +1472,14 @@ impl CudaDecodeRunner {
                 let lw = &self.weights.layers[li];
 
                 // O proj: [B*q_dim] → [B*H]
-                crate::cublas::linear_f16(
+                Self::linear(
                     &self.blas,
+                    &self.device,
+                    &self.stream,
                     &self.buffers.attn_out,
-                    lw.o_w.as_fp16(),
+                    &lw.o_w,
                     &mut self.buffers.o_proj_out,
+                    &mut self.buffers.temp_dequant,
                     m,
                     h as i32,
                     q_dim as i32,
@@ -1501,11 +1499,14 @@ impl CudaDecodeRunner {
                 )?;
 
                 // MLP: batched gate+up → silu_mul → down
-                crate::cublas::linear_f16(
+                Self::linear(
                     &self.blas,
+                    &self.device,
+                    &self.stream,
                     &self.buffers.post_norm_out,
-                    lw.gate_up_w.as_fp16(),
+                    &lw.gate_up_w,
                     &mut self.buffers.gate_up_out,
+                    &mut self.buffers.temp_dequant,
                     m,
                     (2 * inter) as i32,
                     h as i32,
@@ -1519,11 +1520,14 @@ impl CudaDecodeRunner {
                     inter,
                     batch,
                 )?;
-                crate::cublas::linear_f16(
+                Self::linear(
                     &self.blas,
+                    &self.device,
+                    &self.stream,
                     &self.buffers.mlp_act,
-                    lw.down_w.as_fp16(),
+                    &lw.down_w,
                     &mut self.buffers.down_out,
+                    &mut self.buffers.temp_dequant,
                     m,
                     h as i32,
                     inter as i32,
@@ -1565,11 +1569,14 @@ impl CudaDecodeRunner {
         }
 
         // Batched LM head: [B*H] → [B*vocab]
-        crate::cublas::linear_f16(
+        Self::linear(
             &self.blas,
+            &self.device,
+            &self.stream,
             &self.buffers.final_norm_out,
-            self.weights.lm_head_w.as_fp16(),
+            &self.weights.lm_head_w,
             &mut self.buffers.logits,
+            &mut self.buffers.temp_dequant,
             m,
             self.dims.vocab_size as i32,
             h as i32,
