@@ -140,8 +140,7 @@ cargo build --release -p ferrum-cli --features metal
 # 启用 CUDA 加速（NVIDIA，需要 CUDA Toolkit）
 cargo build --release -p ferrum-cli --features cuda
 
-# 启用 CUDA + Marlin INT4 内核（需要 nvcc，SM >= 8.0）
-cargo build --release -p ferrum-cli --features cuda,marlin
+# CUDA 自动包含 Marlin INT4 内核（需要 nvcc，SM >= 8.0）
 ```
 
 前置条件：Rust stable 工具链。

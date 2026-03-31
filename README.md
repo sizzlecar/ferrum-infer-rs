@@ -140,8 +140,7 @@ cargo build --release -p ferrum-cli --features metal
 # With CUDA acceleration (NVIDIA, requires CUDA toolkit)
 cargo build --release -p ferrum-cli --features cuda
 
-# With CUDA + Marlin INT4 kernel (requires nvcc, SM >= 8.0)
-cargo build --release -p ferrum-cli --features cuda,marlin
+# CUDA includes Marlin INT4 kernel automatically (requires nvcc, SM >= 8.0)
 ```
 
 Prerequisites: Rust stable toolchain.
