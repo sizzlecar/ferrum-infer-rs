@@ -130,10 +130,21 @@ impl Qwen3ModelExecutor {
             return Ok(());
         }
 
-        // Export KV data from candle model
-        let kv_data_tensors = self.model.export_kv_cache(cache_id).ok_or_else(|| {
-            FerrumError::model(format!("No candle KV cache to export for: {cache_id}"))
-        })?;
+        // Export KV data from candle model.
+        // For prefix cache clones (cache_id like "qwen3-cache-2-clone-0"),
+        // try the base ID ("qwen3-cache-2") since candle only has the original.
+        let kv_data_tensors = self
+            .model
+            .export_kv_cache(cache_id)
+            .or_else(|| {
+                // Strip "-clone-N" suffix and try original
+                cache_id
+                    .rfind("-clone-")
+                    .and_then(|pos| self.model.export_kv_cache(&cache_id[..pos]))
+            })
+            .ok_or_else(|| {
+                FerrumError::model(format!("No candle KV cache to export for: {cache_id}"))
+            })?;
 
         if kv_data_tensors.is_empty() {
             return Err(FerrumError::model("Empty KV cache export"));
