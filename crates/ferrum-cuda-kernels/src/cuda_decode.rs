@@ -1385,10 +1385,8 @@ impl CudaDecodeRunner {
                 .map(|kv| kv.current_len + 1)
                 .max()
                 .unwrap_or(1);
-            let all_short = max_valid_kv <= 256;
-
-            if all_short {
-                // Build device pointer arrays for K/V caches
+            // Build device pointer arrays for K/V caches (shared by both kernels)
+            {
                 use cudarc::driver::DevicePtr;
                 let mut k_ptrs_host = Vec::with_capacity(batch);
                 let mut v_ptrs_host = Vec::with_capacity(batch);
@@ -1410,7 +1408,11 @@ impl CudaDecodeRunner {
                 self.stream
                     .memcpy_htod(&kv_lens_host, &mut self.buffers.batched_kv_lens)
                     .map_err(|e| candle_core::Error::Msg(format!("kv_lens: {e}")))?;
+            }
 
+            let num_splits = Self::compute_num_splits(max_valid_kv);
+            if num_splits <= 1 {
+                // Short KV: batched single-block attention
                 Self::launch_batched_decode_attention(
                     &self.device,
                     &self.stream,
@@ -1427,58 +1429,25 @@ impl CudaDecodeRunner {
                     scale,
                 )?;
             } else {
-                // Fallback: per-item attention for long KV (flash decode)
-                for b in 0..batch {
-                    let kv = &kv_batch[b];
-                    let valid_kv = kv.current_len + 1;
-                    let num_splits = Self::compute_num_splits(valid_kv);
-
-                    // Q is at q_rotated[b*q_dim..(b+1)*q_dim]
-                    let q_view = self.buffers.q_rotated.slice(b * q_dim..(b + 1) * q_dim);
-
-                    if num_splits <= 1 {
-                        Self::launch_decode_attention_view(
-                            &self.device,
-                            &self.stream,
-                            &q_view,
-                            &kv.k_caches[li],
-                            &kv.v_caches[li],
-                            &mut self.buffers.scratch_attn,
-                            nq,
-                            nkv,
-                            hd,
-                            kv.max_len,
-                            valid_kv,
-                            scale,
-                        )?;
-                    } else {
-                        Self::launch_flash_decode_attention_view(
-                            &self.device,
-                            &self.stream,
-                            &q_view,
-                            &kv.k_caches[li],
-                            &kv.v_caches[li],
-                            &mut self.buffers.flash_partial_out,
-                            &mut self.buffers.flash_partial_m,
-                            &mut self.buffers.flash_partial_l,
-                            &mut self.buffers.scratch_attn,
-                            nq,
-                            nkv,
-                            hd,
-                            valid_kv,
-                            scale,
-                            num_splits,
-                        )?;
-                    }
-                    // Copy scratch → attn_out[b*q_dim..]
-                    {
-                        let src = self.buffers.scratch_attn.slice(..q_dim);
-                        let mut dst = self.buffers.attn_out.slice_mut(b * q_dim..(b + 1) * q_dim);
-                        self.stream
-                            .memcpy_dtod(&src, &mut dst)
-                            .map_err(|e| candle_core::Error::Msg(format!("attn cp: {e}")))?;
-                    }
-                }
+                // Long KV: batched flash decode (split-K) — single launch for all items
+                Self::launch_batched_flash_decode_attention(
+                    &self.device,
+                    &self.stream,
+                    &self.buffers.q_rotated,
+                    &self.buffers.batched_k_ptrs,
+                    &self.buffers.batched_v_ptrs,
+                    &self.buffers.batched_kv_lens,
+                    &mut self.buffers.flash_partial_out,
+                    &mut self.buffers.flash_partial_m,
+                    &mut self.buffers.flash_partial_l,
+                    &mut self.buffers.attn_out,
+                    batch,
+                    nq,
+                    nkv,
+                    hd,
+                    max_valid_kv,
+                    scale,
+                )?;
             }
 
             // ---- Batched O proj + post-attn residual/norm + MLP + layer exit ----
@@ -2110,6 +2079,94 @@ impl CudaDecodeRunner {
         }
         .map(|_| ())
         .map_err(|e| candle_core::Error::Msg(format!("batched_rope: {e}")))
+    }
+
+    /// Batched flash decode: two-phase split-K for all batch items in one launch.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_batched_flash_decode_attention(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        q: &CudaSlice<half::f16>,          // [B * nq * hd]
+        k_ptrs: &CudaSlice<u64>,           // [B] device pointers
+        v_ptrs: &CudaSlice<u64>,           // [B] device pointers
+        kv_lens: &CudaSlice<i32>,          // [B] valid kv lengths
+        partial_out: &mut CudaSlice<f32>,  // [B * nq * max_splits * hd]
+        partial_m: &mut CudaSlice<f32>,    // [B * nq * max_splits]
+        partial_l: &mut CudaSlice<f32>,    // [B * nq * max_splits]
+        output: &mut CudaSlice<half::f16>, // [B * nq * hd]
+        batch: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        max_valid_kv: usize,
+        scale: f32,
+    ) -> candle_core::Result<()> {
+        let max_num_splits = Self::compute_num_splits(max_valid_kv);
+        let chunk_size = (max_valid_kv + max_num_splits - 1) / max_num_splits;
+
+        // Phase 1: split-K attention
+        let func1 = device.get_or_load_custom_func(
+            "batched_flash_decode_attn_f16",
+            "batched_flash_decode_attention",
+            ptx::BATCHED_FLASH_DECODE_ATTENTION,
+        )?;
+        let qv = q.slice(..);
+        let kp = k_ptrs.slice(..);
+        let vp = v_ptrs.slice(..);
+        let kl = kv_lens.slice(..);
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let mns = max_num_splits as i32;
+        let mut b1 = stream.launch_builder(&func1);
+        b1.arg(&qv);
+        b1.arg(&kp);
+        b1.arg(&vp);
+        b1.arg(&mut *partial_out);
+        b1.arg(&mut *partial_m);
+        b1.arg(&mut *partial_l);
+        b1.arg(&kl);
+        b1.arg(&nqi);
+        b1.arg(&nkvi);
+        b1.arg(&hdi);
+        b1.arg(&scale);
+        b1.arg(&mns);
+        let shared_bytes = (chunk_size as u32) * 4;
+        unsafe {
+            b1.launch(LaunchConfig {
+                grid_dim: (nq as u32, max_num_splits as u32, batch as u32),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("batched_flash_decode p1: {e}")))?;
+
+        // Phase 2: reduce across splits
+        let func2 = device.get_or_load_custom_func(
+            "batched_flash_decode_reduce_f16",
+            "batched_flash_decode_attention",
+            ptx::BATCHED_FLASH_DECODE_ATTENTION,
+        )?;
+        let po = partial_out.slice(..);
+        let pm = partial_m.slice(..);
+        let pl = partial_l.slice(..);
+        let mut b2 = stream.launch_builder(&func2);
+        b2.arg(&po);
+        b2.arg(&pm);
+        b2.arg(&pl);
+        b2.arg(output);
+        b2.arg(&hdi);
+        b2.arg(&mns);
+        unsafe {
+            b2.launch(LaunchConfig {
+                grid_dim: (nq as u32, batch as u32, 1),
+                block_dim: (hd.min(256) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("batched_flash_decode p2: {e}")))
     }
 
     /// Determine number of KV splits for flash decoding.

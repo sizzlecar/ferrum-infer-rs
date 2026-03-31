@@ -106,15 +106,14 @@ pub struct DecodeBuffers {
     /// Positions per batch item (for batched RoPE): [max_batch_size] i32
     pub batched_positions: CudaSlice<i32>,
 
-    // ---- Flash Decode partial buffers (f32, NOT batch-scaled) ----
-    // Reused across batch items since attention is sequential per-item.
-    /// Partial V accumulation: [num_q_heads * MAX_SPLITS * head_dim]
+    // ---- Flash Decode partial buffers (f32, batch-scaled for batched flash decode) ----
+    /// Partial V accumulation: [B * num_q_heads * MAX_SPLITS * head_dim]
     pub flash_partial_out: CudaSlice<f32>,
 
-    /// Per-split max score: [num_q_heads * MAX_SPLITS]
+    /// Per-split max score: [B * num_q_heads * MAX_SPLITS]
     pub flash_partial_m: CudaSlice<f32>,
 
-    /// Per-split exp sum: [num_q_heads * MAX_SPLITS]
+    /// Per-split exp sum: [B * num_q_heads * MAX_SPLITS]
     pub flash_partial_l: CudaSlice<f32>,
 
     /// Model dimensions (for reference)
@@ -169,13 +168,14 @@ impl DecodeBuffers {
             batched_kv_lens: unsafe { stream.alloc::<i32>(b)? },
             batched_positions: unsafe { stream.alloc::<i32>(b)? },
             flash_partial_out: unsafe {
-                stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS * dims.head_dim)?
+                stream
+                    .alloc::<f32>(b * dims.num_attention_heads * Self::MAX_SPLITS * dims.head_dim)?
             },
             flash_partial_m: unsafe {
-                stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS)?
+                stream.alloc::<f32>(b * dims.num_attention_heads * Self::MAX_SPLITS)?
             },
             flash_partial_l: unsafe {
-                stream.alloc::<f32>(dims.num_attention_heads * Self::MAX_SPLITS)?
+                stream.alloc::<f32>(b * dims.num_attention_heads * Self::MAX_SPLITS)?
             },
             dims,
         })
@@ -201,9 +201,9 @@ impl DecodeBuffers {
         // Single-token scratch
         let scratch_fp16 = q_dim; // scratch_attn
 
-        // Flash decode partials (f32, not batched)
+        // Flash decode partials (f32, batch-scaled)
         let flash_f32 =
-            q_dim * Self::MAX_SPLITS + self.dims.num_attention_heads * Self::MAX_SPLITS * 2;
+            b * (q_dim * Self::MAX_SPLITS + self.dims.num_attention_heads * Self::MAX_SPLITS * 2);
 
         (batch_fp16 + scratch_fp16) * std::mem::size_of::<half::f16>()
             + flash_f32 * std::mem::size_of::<f32>()
