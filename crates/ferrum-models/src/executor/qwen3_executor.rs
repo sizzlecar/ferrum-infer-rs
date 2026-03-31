@@ -181,6 +181,26 @@ impl Qwen3ModelExecutor {
             .init_kv_cache(cache_id, kv_slices, prefill_len, max_len)
             .map_err(|e| FerrumError::model(format!("CUDA runner KV init failed: {e}")))?;
 
+        // For prefix cache clones: register clone ID in executor states
+        // so decode() can find the sequence_length for this cache_id.
+        if !self.states.lock().contains_key(cache_id) {
+            let base_len = cache_id
+                .rfind("-clone-")
+                .and_then(|pos| {
+                    self.states
+                        .lock()
+                        .get(&cache_id[..pos])
+                        .map(|s| s.sequence_length)
+                })
+                .unwrap_or(prefill_len);
+            self.states.lock().insert(
+                cache_id.to_string(),
+                Qwen3CacheState {
+                    sequence_length: base_len,
+                },
+            );
+        }
+
         debug!("Migrated KV cache to CUDA runner for sequence: {cache_id}");
         Ok(())
     }
