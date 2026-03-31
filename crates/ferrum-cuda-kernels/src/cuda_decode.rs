@@ -873,6 +873,15 @@ impl CudaDecodeRunner {
             None
         };
 
+        // Diagnostic: log first step's embed values
+        if position <= 2 {
+            self.stream.synchronize().ok();
+            eprintln!(
+                "[runner] q_norm_w={}",
+                self.weights.layers[0].q_norm_w.is_some()
+            );
+        }
+
         self.embed_eager(token_id)?;
 
         // Extract KV state (contiguous or paged)
