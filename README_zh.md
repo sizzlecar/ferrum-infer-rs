@@ -7,9 +7,17 @@
 
 [English](README.md)
 
-## 快速开始
+## 安装
 
-前置条件：Rust stable 工具链。
+```bash
+# 从 crates.io 安装
+cargo install ferrum-cli
+
+# 或从源码编译
+cargo build --release -p ferrum-cli --bin ferrum
+```
+
+## 快速开始
 
 访问受限模型（如 Llama 3.2）需先设置 Hugging Face token：
 ```bash
@@ -17,17 +25,14 @@ export HF_TOKEN=hf_your_token_here
 ```
 
 ```bash
-# 编译
-cargo build --release -p ferrum-cli --bin ferrum
-
 # 下载模型
-./target/release/ferrum pull qwen3:0.6b
+ferrum pull qwen3:0.6b
 
 # 对话
-./target/release/ferrum run qwen3:0.6b
+ferrum run qwen3:0.6b
 
 # 或启动 API 服务
-./target/release/ferrum serve --model qwen3:0.6b --port 8000
+ferrum serve --model qwen3:0.6b --port 8000
 ```
 
 ## 支持的模型
@@ -132,15 +137,20 @@ curl http://localhost:8000/health
 
 ```bash
 # 仅 CPU（默认）
-cargo build --release -p ferrum-cli
+cargo install ferrum-cli
 
 # 启用 Metal 加速（macOS）
-cargo build --release -p ferrum-cli --features metal
+cargo install ferrum-cli --features metal
 
-# 启用 CUDA 加速（NVIDIA，需要 CUDA Toolkit）
-cargo build --release -p ferrum-cli --features cuda
+# 启用 CUDA 加速（NVIDIA，需要 CUDA Toolkit + nvcc）
+cargo install ferrum-cli --features cuda
+```
 
-# CUDA 自动包含 Marlin INT4 内核（需要 nvcc，SM >= 8.0）
+或从源码编译：
+```bash
+cargo build --release -p ferrum-cli                    # CPU
+cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
+cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
 ```
 
 前置条件：Rust stable 工具链。

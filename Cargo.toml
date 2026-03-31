@@ -25,11 +25,12 @@ resolver = "2"
 
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Ferrum Team"]
 license = "MIT"
-repository = "https://github.com/ferrum-rs/ferrum-infer"
+repository = "https://github.com/sizzlecar/ferrum-infer-rs"
+homepage = "https://github.com/sizzlecar/ferrum-infer-rs"
 
 [workspace.dependencies]
 # Async runtime
@@ -124,25 +125,25 @@ candle-flash-attn = "0.9.2"
 candle-metal-kernels = "0.9.2"
 
 # Internal crates - New refactored crates
-ferrum-types = { path = "crates/ferrum-types" }
-ferrum-interfaces = { path = "crates/ferrum-interfaces" }
+ferrum-types = { path = "crates/ferrum-types", version = "0.3.0" }
+ferrum-interfaces = { path = "crates/ferrum-interfaces", version = "0.3.0" }
 
 # Internal crates - Implementation crates
-ferrum-runtime = { path = "crates/ferrum-runtime" }
-ferrum-scheduler = { path = "crates/ferrum-scheduler" }
-ferrum-tokenizer = { path = "crates/ferrum-tokenizer" }
-ferrum-sampler = { path = "crates/ferrum-sampler" }
-ferrum-kv = { path = "crates/ferrum-kv" }
+ferrum-runtime = { path = "crates/ferrum-runtime", version = "0.3.0" }
+ferrum-scheduler = { path = "crates/ferrum-scheduler", version = "0.3.0" }
+ferrum-tokenizer = { path = "crates/ferrum-tokenizer", version = "0.3.0" }
+ferrum-sampler = { path = "crates/ferrum-sampler", version = "0.3.0" }
+ferrum-kv = { path = "crates/ferrum-kv", version = "0.3.0" }
 
 # CUDA kernel crate
-ferrum-cuda-kernels = { path = "crates/ferrum-cuda-kernels" }
+ferrum-cuda-kernels = { path = "crates/ferrum-cuda-kernels", version = "0.3.0" }
 
 # Internal crates - Existing crates (to be refactored)
-ferrum-engine = { path = "crates/ferrum-engine" }
-ferrum-models = { path = "crates/ferrum-models" }
-ferrum-server = { path = "crates/ferrum-server" }
-ferrum-cli = { path = "crates/ferrum-cli" }
-ferrum-testkit = { path = "crates/ferrum-testkit" }
+ferrum-engine = { path = "crates/ferrum-engine", version = "0.3.0" }
+ferrum-models = { path = "crates/ferrum-models", version = "0.3.0" }
+ferrum-server = { path = "crates/ferrum-server", version = "0.3.0" }
+ferrum-cli = { path = "crates/ferrum-cli", version = "0.3.0" }
+ferrum-testkit = { path = "crates/ferrum-testkit", version = "0.3.0" }
 
 
 [profile.release]
