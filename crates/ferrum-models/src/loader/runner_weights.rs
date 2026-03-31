@@ -50,7 +50,7 @@ pub fn load_runner_weights(
 ) -> Result<(
     TransformerGpuWeights,
     ModelDims,
-    Arc<cudarc::driver::CudaStream>,
+    Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
 )> {
     use candle_core::cuda_backend::CudaDevice;
 
@@ -279,7 +279,7 @@ pub fn load_runner_weights(
 fn compute_rope_tables(
     cfg: &WeightConfig,
     device: &CandleDevice,
-    stream: &Arc<cudarc::driver::CudaStream>,
+    stream: &Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
 ) -> Result<(GpuWeight, GpuWeight)> {
     let half_dim = cfg.head_dim / 2;
     let max_len = cfg.max_seq_len;
