@@ -12,6 +12,8 @@ pub struct LlamaModelWrapper {
     config: candle_llama::Config,
     device: CandleDevice,
     dtype: DType,
+    /// Model directory for weight re-loading (CUDA runner weight extraction)
+    model_dir: Option<std::path::PathBuf>,
 }
 
 impl LlamaModelWrapper {
@@ -63,6 +65,7 @@ impl LlamaModelWrapper {
             config: candle_config,
             device,
             dtype,
+            model_dir: None,
         })
     }
 
@@ -100,5 +103,62 @@ impl LlamaModelWrapper {
     /// Get dtype
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// Get config
+    pub fn config(&self) -> &candle_llama::Config {
+        &self.config
+    }
+
+    /// Set model directory (for CUDA runner weight loading)
+    pub fn set_model_dir(&mut self, dir: std::path::PathBuf) {
+        self.model_dir = Some(dir);
+    }
+
+    /// Create CUDA decode runner by loading weights from safetensors.
+    #[cfg(feature = "cuda")]
+    pub fn create_decode_runner(
+        &self,
+    ) -> Result<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner> {
+        use crate::loader::runner_weights::{self, WeightConfig};
+
+        let model_dir = self
+            .model_dir
+            .as_ref()
+            .ok_or_else(|| FerrumError::model("model_dir not set for CUDA runner"))?;
+
+        // Load safetensors VarBuilder
+        let loader = crate::loader::SafeTensorsLoader::new(model_dir);
+        let vb = loader.load_varbuilder(&self.device, self.dtype)?;
+
+        let cfg = WeightConfig {
+            num_hidden_layers: self.config.num_hidden_layers,
+            hidden_size: self.config.hidden_size,
+            intermediate_size: self.config.intermediate_size,
+            num_attention_heads: self.config.num_attention_heads,
+            num_kv_heads: self.config.num_key_value_heads,
+            head_dim: self.config.hidden_size / self.config.num_attention_heads,
+            vocab_size: self.config.vocab_size,
+            max_seq_len: self.config.max_position_embeddings,
+            rope_theta: self.config.rope_theta as f64,
+            has_qk_norm: false,
+            qkv_fused: false,
+            gate_up_fused: false,
+        };
+
+        let (weights, dims, stream) = runner_weights::load_runner_weights(&vb, &cfg, &self.device)?;
+
+        let cuda_device = self
+            .device
+            .as_cuda_device()
+            .map_err(|e| FerrumError::model(format!("not CUDA: {e}")))?;
+
+        ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
+            weights,
+            dims,
+            cuda_device.clone(),
+            stream,
+        )
+        .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
     }
 }
