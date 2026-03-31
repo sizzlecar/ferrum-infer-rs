@@ -393,60 +393,68 @@ impl EngineInner {
         // ── Check prefix cache ──────────────────────────────────────────
         // On an exact match we can skip the executor prefill entirely:
         // clone the cached KV handle and reuse the stored logits.
-        if let Some((_prefix_id, cached_kv, cached_logits)) =
-            self.prefix_cache.find_prefix(&input_tokens_clone)
-        {
-            debug!(
-                "Prefix cache hit for {}: reusing {} cached tokens",
-                request_id, num_tokens,
-            );
+        // NOTE: Skip prefix cache when CUDA decode runner is active — the runner
+        // needs its own KV cache from a real prefill (candle KV export).
+        // Prefix cache clones share the original candle KV which gets released
+        // on completion, causing "No candle KV cache to export" on later requests.
+        let skip_prefix_cache = cfg!(feature = "cuda")
+            && std::env::var("FERRUM_DISABLE_CUDA_RUNNER").map_or(true, |v| v != "1");
+        if !skip_prefix_cache {
+            if let Some((_prefix_id, cached_kv, cached_logits)) =
+                self.prefix_cache.find_prefix(&input_tokens_clone)
+            {
+                debug!(
+                    "Prefix cache hit for {}: reusing {} cached tokens",
+                    request_id, num_tokens,
+                );
 
-            let cloned_kv = cached_kv.clone_handle()?;
+                let cloned_kv = cached_kv.clone_handle()?;
 
-            let first_token = {
-                let mut sequences = self.sequences.write();
-                let seq = sequences
-                    .get_mut(request_id)
-                    .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                if let Some(ref jp) = seq.json_processor {
-                    jp.reset();
+                let first_token = {
+                    let mut sequences = self.sequences.write();
+                    let seq = sequences
+                        .get_mut(request_id)
+                        .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+                    if let Some(ref jp) = seq.json_processor {
+                        jp.reset();
+                    }
+                    let mut logits = cached_logits;
+                    let token = seq.sample_with_processors(&mut logits)?;
+                    seq.generated_tokens.push(token);
+                    seq.model_cache_id = Some(cloned_kv.cache_id());
+                    seq.kv_cache = Some(cloned_kv);
+                    seq.prefill_complete = true;
+                    seq.phase = RequestPhase::Decoding;
+                    token
+                };
+
+                self.scheduler.mark_prefill_complete(request_id, num_tokens);
+                self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+                counter!("ferrum.engine.prefix_cache_hits").increment(1);
+
+                debug!(
+                    "Prefix cache prefill for {}: first generated: {}",
+                    request_id,
+                    first_token.get()
+                );
+
+                self.send_stream_update(request_id, first_token).await;
+
+                let should_stop = {
+                    let sequences = self.sequences.read();
+                    sequences.get(request_id).map_or(true, |s| {
+                        s.should_stop(self.model_executor.info().vocab_size)
+                    })
+                };
+                if should_stop {
+                    self.complete_request(request_id, FinishReason::EOS).await?;
                 }
-                let mut logits = cached_logits;
-                let token = seq.sample_with_processors(&mut logits)?;
-                seq.generated_tokens.push(token);
-                seq.model_cache_id = Some(cloned_kv.cache_id());
-                seq.kv_cache = Some(cloned_kv);
-                seq.prefill_complete = true;
-                seq.phase = RequestPhase::Decoding;
-                token
-            };
 
-            self.scheduler.mark_prefill_complete(request_id, num_tokens);
-            self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
-            counter!("ferrum.engine.prefix_cache_hits").increment(1);
-
-            debug!(
-                "Prefix cache prefill for {}: first generated: {}",
-                request_id,
-                first_token.get()
-            );
-
-            self.send_stream_update(request_id, first_token).await;
-
-            let should_stop = {
-                let sequences = self.sequences.read();
-                sequences.get(request_id).map_or(true, |s| {
-                    s.should_stop(self.model_executor.info().vocab_size)
-                })
-            };
-            if should_stop {
-                self.complete_request(request_id, FinishReason::EOS).await?;
+                return Ok(());
             }
+        } // skip_prefix_cache
 
-            return Ok(());
-        }
-
-        // ── Cache miss — full prefill ───────────────────────────────────
+        // ── Cache miss (or prefix cache skipped) — full prefill ─────────
         let input_tensor = {
             let token_u32s: Vec<u32> = input_tokens_clone.iter().map(|t| t.get()).collect();
             self.tokens_to_tensor(&token_u32s)?
