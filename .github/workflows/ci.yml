@@ -2,51 +2,74 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  checks:
-    name: Minimal Checks
+  check:
+    name: Check & Test
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config build-essential
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo dependencies
-        uses: actions/cache@v3
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Check formatting
+      - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Compile (workspace, all targets)
+      - name: Compile check
         run: cargo check --workspace --all-targets
 
-      - name: Clippy (advisory)
+      - name: Clippy
         run: cargo clippy --workspace --all-targets -- -A warnings
         continue-on-error: true
 
-      - name: CLI E2E smoke tests
+      - name: Tests
+        run: cargo test --workspace
+
+  cuda-compile:
+    name: CUDA Compile Check
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
         run: |
-          cargo build -p ferrum-cli --bin ferrum
-          cargo test -p ferrum-cli --test cli_e2e
+          apt-get update && apt-get install -y curl pkg-config libssl-dev git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cuda-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cuda-cargo-
+
+      - name: CUDA compile check
+        run: |
+          . "$HOME/.cargo/env"
+          export CUDA_HOME=/usr/local/cuda
+          cargo check -p ferrum-cli --features cuda

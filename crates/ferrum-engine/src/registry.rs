@@ -1060,6 +1060,37 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
 
                 Ok(Arc::new(executor))
             }
+            ferrum_models::Architecture::Mistral => {
+                info!("Loading Mistral model weights...");
+                let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
+                let model_dir_path: std::path::PathBuf = model_path.clone().into();
+                let qconfig =
+                    ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
+                        .unwrap_or(None);
+                let vb = if let Some(ref qc) = qconfig {
+                    info!(
+                        "GPTQ Mistral detected ({}bit, gs={})",
+                        qc.bits, qc.group_size
+                    );
+                    loader.load_varbuilder_gptq(qc, &candle_device, dtype)?
+                } else {
+                    loader.load_varbuilder(&candle_device, dtype)?
+                };
+
+                let mistral_model = ferrum_models::MistralModelWrapper::from_varbuilder(
+                    vb,
+                    &model_def,
+                    candle_device.clone(),
+                    dtype,
+                )?;
+                let mut llama_model = mistral_model.into_inner();
+                llama_model.set_model_dir(model_dir_path);
+
+                let model_info =
+                    model_def.to_model_info(config.engine_config.model.model_id.to_string());
+                let executor = ferrum_models::CandleModelExecutor::new(llama_model, model_info);
+                Ok(Arc::new(executor))
+            }
             ferrum_models::Architecture::Qwen3 => {
                 info!("Loading Qwen3 model weights...");
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);

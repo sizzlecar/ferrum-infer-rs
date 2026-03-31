@@ -17,7 +17,7 @@ pub mod tokenizer;
 pub mod weights;
 
 pub use architectures::{
-    BertModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper,
+    BertModelWrapper, LlamaModelWrapper, MistralModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper,
 };
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
