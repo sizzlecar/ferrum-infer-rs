@@ -265,6 +265,55 @@ impl ModelExecutor for CandleModelExecutor {
                             .map_err(|e| FerrumError::model(format!("decode: {e}")))?
                     };
 
+                    // Diagnostic: compare runner logits with candle
+                    if std::env::var("FERRUM_DIAG").is_ok() {
+                        // Compare weight norms
+                        if seq_len <= 12 {
+                            let model = self.model.model.lock();
+                            let qw = model.layers[0].self_attn.q_proj.weight();
+                            eprintln!(
+                                "[DIAG] candle q_proj shape={:?} dtype={:?}",
+                                qw.shape(),
+                                qw.dtype()
+                            );
+                            if let Ok(sum) = qw
+                                .to_dtype(candle_core::DType::F32)
+                                .and_then(|t| t.abs()?.sum_all()?.to_scalar::<f32>())
+                            {
+                                eprintln!("[DIAG] candle q_proj abs_sum={sum}");
+                            }
+                            drop(model);
+                            let mut runner = self.cuda_runner.lock();
+                            if let Some(ref r) = *runner {
+                                eprintln!(
+                                    "[DIAG] runner qkv_w len={}",
+                                    match &r.weight_layers()[0].qkv_w {
+                                        ferrum_cuda_kernels::weight_store::LinearWeight::Fp16(
+                                            w,
+                                        ) => w.len,
+                                        _ => 0,
+                                    }
+                                );
+                            }
+                            drop(runner);
+                        }
+                        // Use same cache_id to compare with identical KV context.
+                        // This advances the candle KV by 1 token (side-effect), but
+                        // the runner manages its own KV separately.
+                        let candle_logits = self.model.forward_decode(
+                            &self.tokens_to_tensor(&tokens)?,
+                            seq_len,
+                            &cache_id,
+                        )?;
+                        if let Ok(cl) = candle_logits.flatten_all().and_then(|t| t.to_vec1::<f32>())
+                        {
+                            let mut ci: Vec<(usize, f32)> =
+                                cl.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                            ci.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                            eprintln!("[DIAG] candle top5: {:?}", &ci[..5]);
+                        }
+                    }
+
                     let cuda_dev = self
                         .model
                         .candle_device()
@@ -281,6 +330,23 @@ impl ModelExecutor for CandleModelExecutor {
                         candle_core::op::BackpropOp::none(),
                         false,
                     );
+
+                    // Diagnostic: runner top-5
+                    if std::env::var("FERRUM_DIAG").is_ok() {
+                        if let Ok(rl) = logits_tensor
+                            .flatten_all()
+                            .and_then(|t| t.to_vec1::<half::f16>())
+                        {
+                            let mut ri: Vec<(usize, f32)> = rl
+                                .iter()
+                                .enumerate()
+                                .map(|(i, v)| (i, v.to_f32()))
+                                .collect();
+                            ri.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                            eprintln!("[DIAG] runner top5: {:?}", &ri[..5]);
+                        }
+                    }
+
                     let logits_ref = self.wrap_tensor(logits_tensor);
 
                     let new_seq_len = seq_len + 1;
