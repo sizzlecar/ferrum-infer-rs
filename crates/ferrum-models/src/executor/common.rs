@@ -264,7 +264,8 @@ mod tests {
         let handle =
             GenericKvCacheHandle::new(4, 8, 64, CandleDevice::Cpu, 5, "cache-2".to_string());
         let cloned = handle.clone_handle().unwrap();
-        assert_eq!(cloned.cache_id(), "cache-2");
+        // Clone gets unique ID: "cache-2-clone-N"
+        assert!(cloned.cache_id().starts_with("cache-2-clone-"));
         assert_eq!(cloned.num_layers(), 4);
     }
 
