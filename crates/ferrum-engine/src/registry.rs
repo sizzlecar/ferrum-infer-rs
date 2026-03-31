@@ -996,12 +996,13 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 };
 
                 // Standard Candle executor for CPU/CUDA
-                let llama_model = ferrum_models::LlamaModelWrapper::from_varbuilder(
+                let mut llama_model = ferrum_models::LlamaModelWrapper::from_varbuilder(
                     vb,
                     &model_def,
                     candle_device.clone(),
                     dtype,
                 )?;
+                llama_model.set_model_dir(model_dir_path);
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
