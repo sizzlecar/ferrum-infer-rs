@@ -274,6 +274,30 @@ pub fn load_runner_weights(
     Ok((weights, dims, rs))
 }
 
+/// Compute RoPE tables for TP (public wrapper).
+#[cfg(feature = "tensor-parallel")]
+pub fn compute_rope_tables_for_tp(
+    cfg: &super::tp_weight_loader::TpWeightConfig,
+    device: &CandleDevice,
+    stream: &Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+) -> Result<(GpuWeight, GpuWeight)> {
+    let w = WeightConfig {
+        num_hidden_layers: cfg.num_hidden_layers,
+        hidden_size: cfg.hidden_size,
+        intermediate_size: cfg.intermediate_size,
+        num_attention_heads: cfg.num_attention_heads,
+        num_kv_heads: cfg.num_kv_heads,
+        head_dim: cfg.head_dim,
+        vocab_size: cfg.vocab_size,
+        max_seq_len: cfg.max_seq_len,
+        rope_theta: cfg.rope_theta,
+        has_qk_norm: cfg.has_qk_norm,
+        qkv_fused: false,
+        gate_up_fused: false,
+    };
+    compute_rope_tables(&w, device, stream)
+}
+
 /// Compute RoPE cos/sin tables from config parameters.
 #[cfg(feature = "cuda")]
 fn compute_rope_tables(
