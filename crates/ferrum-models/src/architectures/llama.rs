@@ -167,21 +167,11 @@ impl Attention {
         let k_squeezed = k_for_cache.squeeze(0)?; // [seq, nkv, hd]
         let v_squeezed = v_for_cache.squeeze(0)?;
 
-        // Append to KV cache (concat approach for simplicity)
+        // Write into pre-allocated cache using slice_set (in-place)
         let start = kv_cache.current_len;
         let valid_len = start + seq_len;
-
-        if start == 0 {
-            // First write — just assign
-            kv_cache.k_caches[layer_idx] = k_squeezed;
-            kv_cache.v_caches[layer_idx] = v_squeezed;
-        } else {
-            // Concat with existing
-            let existing_k = kv_cache.k_caches[layer_idx].narrow(0, 0, start)?;
-            let existing_v = kv_cache.v_caches[layer_idx].narrow(0, 0, start)?;
-            kv_cache.k_caches[layer_idx] = Tensor::cat(&[&existing_k, &k_squeezed], 0)?;
-            kv_cache.v_caches[layer_idx] = Tensor::cat(&[&existing_v, &v_squeezed], 0)?;
-        }
+        kv_cache.k_caches[layer_idx].slice_set(&k_squeezed, 0, start)?;
+        kv_cache.v_caches[layer_idx].slice_set(&v_squeezed, 0, start)?;
 
         // Read back full KV for attention: [b, nkv, valid_len, hd]
         let k_full = kv_cache.k_caches[layer_idx]
