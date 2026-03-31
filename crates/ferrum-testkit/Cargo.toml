@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Mock components for testing ferrum inference engine without GPU"
+description = "Testing utilities for Ferrum inference (not published)"
+readme = "../../README.md"
+publish = false
 
 [dependencies]
 ferrum-types = { workspace = true }
