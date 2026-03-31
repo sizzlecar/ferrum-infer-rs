@@ -206,6 +206,287 @@ impl CudaDecodeRunner {
         &self.weights.layers
     }
 
+    // ======================== TP Sub-Phase Methods ========================
+    //
+    // These expose individual pipeline stages for TpDecodeGroup to orchestrate.
+    // The full decode_step calls them in sequence; TP inserts all-reduce between
+    // o_proj and post_attn_norm, and between down_proj and post_mlp_norm.
+
+    /// TP Phase: embed token into residual buffer.
+    pub(crate) fn tp_embed(&mut self, token_id: u32) -> candle_core::Result<()> {
+        self.embed_eager(token_id)
+    }
+
+    /// TP Phase: first layer's input norm (only for layer 0).
+    pub(crate) fn tp_first_norm(&mut self) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let eps = 1e-6f32;
+        Self::launch_rms_norm(
+            &self.device,
+            &self.stream,
+            &self.buffers.residual,
+            &self.weights.layers[0].input_ln_w.slice,
+            &mut self.buffers.norm_out,
+            h,
+            eps,
+        )
+    }
+
+    /// TP Phase: QKV projection + Q/K norm + RoPE + attention for one layer.
+    /// After this, attn_out contains the attention output.
+    pub(crate) fn tp_pre_o_proj(
+        &mut self,
+        li: usize,
+        position: usize,
+        cache_key: &str,
+    ) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let hd = self.dims.head_dim;
+        let half_dim = hd / 2;
+        let eps = 1e-6f32;
+
+        let lw = &self.weights.layers[li];
+
+        // QKV GEMM
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.norm_out,
+            &lw.qkv_w,
+            &mut self.buffers.qkv_out,
+            &mut self.buffers.temp_dequant,
+            1,
+            qkv_dim as i32,
+            h as i32,
+        )?;
+
+        // Q/K norm
+        let q = self.buffers.qkv_out.slice(..q_dim);
+        let k = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
+        if let Some(ref qnw) = lw.q_norm_w {
+            Self::launch_rms_norm_view(
+                &self.device,
+                &self.stream,
+                &q,
+                &qnw.slice,
+                &mut self.buffers.rope_q_temp,
+                hd,
+                eps,
+            )?;
+        } else {
+            self.stream
+                .memcpy_dtod(&q, &mut self.buffers.rope_q_temp)
+                .map_err(|e| candle_core::Error::Msg(format!("q copy: {e}")))?;
+        }
+        if let Some(ref knw) = lw.k_norm_w {
+            Self::launch_rms_norm_view(
+                &self.device,
+                &self.stream,
+                &k,
+                &knw.slice,
+                &mut self.buffers.rope_k_temp,
+                hd,
+                eps,
+            )?;
+        } else {
+            self.stream
+                .memcpy_dtod(&k, &mut self.buffers.rope_k_temp)
+                .map_err(|e| candle_core::Error::Msg(format!("k copy: {e}")))?;
+        }
+
+        // RoPE
+        let co = position * half_dim;
+        let cos = self.weights.rope_cos.slice.slice(co..co + half_dim);
+        let sin = self.weights.rope_sin.slice.slice(co..co + half_dim);
+        Self::launch_rope(
+            &self.device,
+            &self.stream,
+            &self.buffers.rope_q_temp,
+            &self.buffers.rope_k_temp,
+            &cos,
+            &sin,
+            &mut self.buffers.q_rotated,
+            &mut self.buffers.k_rotated,
+            self.dims.num_attention_heads,
+            self.dims.num_kv_heads,
+            hd,
+        )?;
+
+        // Attention (contiguous KV only for TP — paged KV is separate concern)
+        let mut kv = self
+            .kv_states
+            .remove(cache_key)
+            .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
+        self.attention_eager(li, &mut kv)?;
+        self.kv_states.insert(cache_key.to_string(), kv);
+
+        Ok(())
+    }
+
+    /// TP Phase: O projection GEMM only. Output in o_proj_out.
+    /// After this, TpDecodeGroup calls all_reduce(o_proj_out).
+    pub(crate) fn tp_o_proj(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let lw = &self.weights.layers[li];
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.attn_out,
+            &lw.o_w,
+            &mut self.buffers.o_proj_out,
+            &mut self.buffers.temp_dequant,
+            1,
+            h as i32,
+            q_dim as i32,
+        )
+    }
+
+    /// TP Phase: post-attention residual add + norm (after all-reduce of o_proj_out).
+    pub(crate) fn tp_post_attn_norm(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let eps = 1e-6f32;
+        let lw = &self.weights.layers[li];
+        Self::launch_fused_add_rms_norm(
+            &self.device,
+            &self.stream,
+            &self.buffers.o_proj_out,
+            &self.buffers.residual,
+            &lw.post_ln_w.slice,
+            &mut self.buffers.post_norm_out,
+            &mut self.buffers.post_norm_residual,
+            h,
+            eps,
+        )
+    }
+
+    /// TP Phase: MLP GEMMs (gate_up + SiLU + down). Output in down_out.
+    /// After this, TpDecodeGroup calls all_reduce(down_out).
+    pub(crate) fn tp_mlp(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let inter = self.dims.intermediate_size;
+        let lw = &self.weights.layers[li];
+
+        // gate_up GEMM
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.post_norm_out,
+            &lw.gate_up_w,
+            &mut self.buffers.gate_up_out,
+            &mut self.buffers.temp_dequant,
+            1,
+            (2 * inter) as i32,
+            h as i32,
+        )?;
+
+        // SiLU * mul
+        let g = self.buffers.gate_up_out.slice(..inter);
+        let u = self.buffers.gate_up_out.slice(inter..2 * inter);
+        Self::launch_fused_silu_mul(
+            &self.device,
+            &self.stream,
+            &g,
+            &u,
+            &mut self.buffers.mlp_act,
+            inter,
+        )?;
+
+        // down GEMM
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.mlp_act,
+            &lw.down_w,
+            &mut self.buffers.down_out,
+            &mut self.buffers.temp_dequant,
+            1,
+            h as i32,
+            inter as i32,
+        )
+    }
+
+    /// TP Phase: post-MLP residual add + next layer norm (after all-reduce of down_out).
+    pub(crate) fn tp_post_mlp_norm(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let n = self.dims.num_layers;
+        let eps = 1e-6f32;
+
+        if li < n - 1 {
+            Self::launch_fused_add_rms_norm(
+                &self.device,
+                &self.stream,
+                &self.buffers.down_out,
+                &self.buffers.post_norm_residual,
+                &self.weights.layers[li + 1].input_ln_w.slice,
+                &mut self.buffers.norm_out,
+                &mut self.buffers.residual,
+                h,
+                eps,
+            )
+        } else {
+            Self::launch_fused_add_rms_norm(
+                &self.device,
+                &self.stream,
+                &self.buffers.down_out,
+                &self.buffers.post_norm_residual,
+                &self.weights.final_norm_w.slice,
+                &mut self.buffers.final_norm_out,
+                &mut self.buffers.residual,
+                h,
+                eps,
+            )
+        }
+    }
+
+    /// TP Phase: LM head GEMM. Output in logits buffer.
+    pub(crate) fn tp_lm_head(&mut self) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.final_norm_out,
+            &self.weights.lm_head_w,
+            &mut self.buffers.logits,
+            &mut self.buffers.temp_dequant,
+            1,
+            self.dims.vocab_size as i32,
+            h as i32,
+        )
+    }
+
+    /// Access o_proj_out buffer for all-reduce.
+    pub(crate) fn o_proj_out_mut(&mut self) -> &mut CudaSlice<half::f16> {
+        &mut self.buffers.o_proj_out
+    }
+
+    /// Access down_out buffer for all-reduce.
+    pub(crate) fn down_out_mut(&mut self) -> &mut CudaSlice<half::f16> {
+        &mut self.buffers.down_out
+    }
+
+    /// Sync runner's stream.
+    pub(crate) fn sync_stream(&self) -> candle_core::Result<()> {
+        self.stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("stream sync: {e}")))
+    }
+
+    /// Clone logits from runner's buffer.
+    pub(crate) fn clone_logits(&self) -> candle_core::Result<CudaSlice<half::f16>> {
+        self.stream
+            .clone_dtod(&self.buffers.logits)
+            .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
+    }
+
     pub fn init_kv_cache(
         &mut self,
         cache_key: &str,
