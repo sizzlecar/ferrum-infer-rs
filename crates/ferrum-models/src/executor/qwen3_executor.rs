@@ -7,7 +7,7 @@ use ferrum_interfaces::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
         MemoryRequirements, PrefillInput, PrefillOutput,
     },
-    ModelExecutor, TensorRef,
+    KvCacheHandle, ModelExecutor, TensorRef,
 };
 use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
 use parking_lot::Mutex;
@@ -181,6 +181,26 @@ impl Qwen3ModelExecutor {
             .init_kv_cache(cache_id, kv_slices, prefill_len, max_len)
             .map_err(|e| FerrumError::model(format!("CUDA runner KV init failed: {e}")))?;
 
+        // For prefix cache clones: register clone ID in executor states
+        // so decode() can find the sequence_length for this cache_id.
+        if !self.states.lock().contains_key(cache_id) {
+            let base_len = cache_id
+                .rfind("-clone-")
+                .and_then(|pos| {
+                    self.states
+                        .lock()
+                        .get(&cache_id[..pos])
+                        .map(|s| s.sequence_length)
+                })
+                .unwrap_or(prefill_len);
+            self.states.lock().insert(
+                cache_id.to_string(),
+                Qwen3CacheState {
+                    sequence_length: base_len,
+                },
+            );
+        }
+
         debug!("Migrated KV cache to CUDA runner for sequence: {cache_id}");
         Ok(())
     }
@@ -276,14 +296,21 @@ impl ModelExecutor for Qwen3ModelExecutor {
         let req_cache_id = input_handle.request_cache_id().to_string();
 
         let seq_len = {
-            let states = self.states.lock();
-            let state = states.get(&req_cache_id).ok_or_else(|| {
-                FerrumError::model(format!(
-                    "Decode called for unknown sequence: {}",
-                    req_cache_id
-                ))
-            })?;
-            state.sequence_length
+            let mut states = self.states.lock();
+            if let Some(s) = states.get(&req_cache_id) {
+                s.sequence_length
+            } else {
+                // For prefix cache clones: base entry may have been released.
+                // Use KV handle's sequence_length and register clone state.
+                let len = input_handle.block_table().sequence_length;
+                states.insert(
+                    req_cache_id.clone(),
+                    Qwen3CacheState {
+                        sequence_length: len,
+                    },
+                );
+                len
+            }
         };
 
         let tokens = self.tensor_to_tokens(&input.input_ids)?;
@@ -436,11 +463,19 @@ impl ModelExecutor for Qwen3ModelExecutor {
                 .ok_or_else(|| FerrumError::model("Invalid KV cache handle"))?;
             let cache_id = handle.request_cache_id().to_string();
             let seq_len = {
-                let states = self.states.lock();
-                states
-                    .get(&cache_id)
-                    .map(|s| s.sequence_length)
-                    .unwrap_or(0)
+                let mut states = self.states.lock();
+                if let Some(s) = states.get(&cache_id) {
+                    s.sequence_length
+                } else {
+                    let len = handle.block_table().sequence_length;
+                    states.insert(
+                        cache_id.clone(),
+                        Qwen3CacheState {
+                            sequence_length: len,
+                        },
+                    );
+                    len
+                }
             };
             let tokens = self.tensor_to_tokens(&input.input_ids)?;
             if tokens.len() != 1 {
