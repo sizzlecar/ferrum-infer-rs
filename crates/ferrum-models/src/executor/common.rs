@@ -7,7 +7,11 @@ use ferrum_interfaces::{
     KvCacheHandle, TensorRef,
 };
 use ferrum_types::{Device, FerrumError, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Global counter for generating unique clone cache IDs.
+static CLONE_COUNTER: AtomicU64 = AtomicU64::new(0);
 use std::time::Instant;
 
 use crate::tensor_wrapper::CandleTensorWrapper;
@@ -138,7 +142,12 @@ impl KvCacheHandle for GenericKvCacheHandle {
         Ok(None)
     }
     fn clone_handle(&self) -> Result<Arc<dyn KvCacheHandle>> {
-        Ok(Arc::new(self.clone()))
+        // Each clone gets a unique cache_id so CUDA runner's kv_states
+        // HashMap can distinguish between sequences with same prompt.
+        let mut cloned = self.clone();
+        let n = CLONE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        cloned.cache_id = format!("{}-clone-{n}", self.cache_id);
+        Ok(Arc::new(cloned))
     }
     fn stats(&self) -> CacheHandleStats {
         CacheHandleStats {
