@@ -210,7 +210,8 @@ impl Attention {
             let mask: Vec<u8> = (0..seq_len)
                 .flat_map(|i| (0..valid_len).map(move |j| u8::from(j > i + start)))
                 .collect();
-            let mask = Tensor::from_slice(&mask, (1, 1, seq_len, valid_len), x.device())?;
+            let mask = Tensor::from_slice(&mask, (1, 1, seq_len, valid_len), x.device())?
+                .broadcast_as(att.shape())?;
             let neg_inf = Tensor::new(f32::NEG_INFINITY, x.device())?.broadcast_as(att.shape())?;
             mask.where_cond(&neg_inf, &att)?
         } else {
