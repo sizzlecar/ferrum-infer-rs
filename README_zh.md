@@ -74,14 +74,16 @@ curl http://localhost:8000/health
 | 模式 | FP16 | INT4 (GPTQ + Marlin) |
 |------|------|----------------------|
 | 单请求 decode | 88.1 tok/s | **130.4 tok/s (+48%)** |
-| 4 并发 (batch decode) | 109.4 tok/s | — |
+| 4 并发 (batch decode) | 109.4 tok/s | **124.2 tok/s** |
 | 显存占用 | ~8 GB | **~2.5 GB (-69%)** |
 
 核心优化：
 - **INT4 量化**：GPTQ 模型自动检测，Marlin fused INT4×FP16 内核
+- **Batched attention 内核**：单次 launch 处理所有 batch 项（SM 利用率 17%→67%）
+- **Batched RoPE**：单次 launch + per-item position 数组
 - **自定义 CUDA 内核**：fused RmsNorm、SiLU×mul、RoPE、decode attention（统一 stream 零同步）
 - **Flash Decoding**：长上下文 split-K（KV > 256 时自动启用）
-- **Batch decode**：batched cuBLAS GEMM 支持并发请求
+- **Batch decode**：batched cuBLAS GEMM + batched attention 支持并发请求
 - **Paged KV attention**：GPU block pool + block-table 间接寻址
 - **双缓冲 residual**：跨层 norm 融合（-108 次 kernel launch）
 
