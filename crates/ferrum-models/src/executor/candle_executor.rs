@@ -135,82 +135,60 @@ impl CandleModelExecutor {
             }
         };
 
-        // Load sharded weights for each rank first (sequential, no NCCL needed)
-        let mut per_rank_data: Vec<(
-            ferrum_cuda_kernels::weight_store::TransformerGpuWeights,
-            ferrum_cuda_kernels::decode_buffers::ModelDims,
-            std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
-            candle_core::cuda_backend::CudaDevice,
-        )> = Vec::with_capacity(tp);
+        // Each rank runs on its own thread — CUDA context is thread-local.
+        // Weight loading, NCCL init, and runner creation all on per-rank threads.
+        type RankResult = candle_core::Result<(
+            ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner,
+            ferrum_cuda_kernels::nccl_comm::NcclRank,
+        )>;
 
+        let mut handles: Vec<std::thread::JoinHandle<RankResult>> = Vec::with_capacity(tp);
         for rank in 0..tp {
             let mut rank_cfg = tp_cfg.clone();
             rank_cfg.rank = rank;
-
-            let device = match candle_core::Device::new_cuda(rank) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("CUDA device {rank}: {e}");
-                    return false;
-                }
-            };
-
-            let (weights, dims, stream) =
-                match crate::loader::tp_weight_loader::load_sharded_weights(&vb, &rank_cfg, &device)
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("TP weight shard rank {rank}: {e}");
-                        return false;
-                    }
-                };
-
-            let cuda_dev = match device.as_cuda_device() {
-                Ok(d) => d.clone(),
-                Err(e) => {
-                    tracing::warn!("TP cuda device {rank}: {e}");
-                    return false;
-                }
-            };
-
-            per_rank_data.push((weights, dims, stream, cuda_dev));
-        }
-
-        // NCCL init is collective — all ranks must call from_rank simultaneously.
-        // Use threads: one per rank, all init in parallel.
-        let mut handles = Vec::with_capacity(tp);
-        for rank in 0..tp {
             let id = nccl_id;
-            let stream = per_rank_data[rank].2.clone();
+            let model_dir = model_dir.clone();
+            let dtype = self.model.dtype();
+
             handles.push(std::thread::spawn(move || {
-                ferrum_cuda_kernels::nccl_comm::NcclRank::init(&id, rank, tp, stream)
+                // Each thread gets its own CUDA context for this GPU
+                let device = candle_core::Device::new_cuda(rank)?;
+                let loader = crate::loader::SafeTensorsLoader::new(&model_dir);
+                let vb = loader
+                    .load_varbuilder(&device, dtype)
+                    .map_err(|e| candle_core::Error::Msg(format!("VB rank {rank}: {e}")))?;
+
+                let (weights, dims, stream) =
+                    crate::loader::tp_weight_loader::load_sharded_weights(&vb, &rank_cfg, &device)
+                        .map_err(|e| candle_core::Error::Msg(format!("shard {rank}: {e}")))?;
+
+                let cuda_dev = device.as_cuda_device()?.clone();
+
+                // NCCL init — collective, all threads call simultaneously
+                let nccl_rank =
+                    ferrum_cuda_kernels::nccl_comm::NcclRank::init(&id, rank, tp, stream.clone())?;
+
+                let runner = ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
+                    weights, dims, cuda_dev, stream,
+                )?;
+                Ok((runner, nccl_rank))
             }));
         }
 
+        let mut runners = Vec::with_capacity(tp);
         let mut nccl_ranks = Vec::with_capacity(tp);
         for (rank, handle) in handles.into_iter().enumerate() {
             match handle.join() {
-                Ok(Ok(nr)) => nccl_ranks.push(nr),
+                Ok(Ok((runner, nccl))) => {
+                    runners.push(runner);
+                    nccl_ranks.push(nccl);
+                }
                 Ok(Err(e)) => {
-                    tracing::warn!("NCCL init rank {rank}: {e}");
+                    tracing::warn!("TP rank {rank} failed: {e}");
                     return false;
                 }
                 Err(_) => {
-                    tracing::warn!("NCCL init thread panicked rank {rank}");
-                    return false;
-                }
-            }
-        }
-
-        // Create runners
-        let mut runners = Vec::with_capacity(tp);
-        for (weights, dims, stream, cuda_dev) in per_rank_data {
-            match ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
-                weights, dims, cuda_dev, stream,
-            ) {
-                Ok(r) => runners.push(r),
-                Err(e) => {
-                    tracing::warn!("TP runner init: {e}");
+                    tracing::warn!("TP rank {rank} panicked");
                     return false;
                 }
             }
