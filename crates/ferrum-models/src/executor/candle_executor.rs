@@ -428,31 +428,14 @@ impl ModelExecutor for CandleModelExecutor {
                                     )>,
                                 > = (0..tp).map(|_| Vec::new()).collect();
 
-                                // Save GPU 0 context for restoration after cross-GPU ops
-                                let gpu0_ctx = self
-                                    .model
-                                    .candle_device()
-                                    .as_cuda_device()
-                                    .map_err(|e| FerrumError::model(format!("gpu0 ctx: {e}")))?
-                                    .cuda_stream()
-                                    .context()
-                                    .clone();
-
-                                // Create target devices for each rank
-                                let rank_devices: Vec<candle_core::Device> = (0..tp)
-                                    .map(|r| candle_core::Device::new_cuda(r))
-                                    .collect::<candle_core::Result<Vec<_>>>()
-                                    .map_err(|e| FerrumError::model(format!("rank devs: {e}")))?;
-
-                                // Restore GPU 0 context after creating rank devices
-                                gpu0_ctx
-                                    .bind_to_thread()
-                                    .map_err(|e| FerrumError::model(format!("restore ctx: {e}")))?;
+                                // Shard on GPU 0, per-rank threads move to target GPU
+                                let mut per_layer_shards: Vec<
+                                    Vec<(candle_core::Tensor, candle_core::Tensor)>,
+                                > = (0..tp).map(|_| Vec::new()).collect();
 
                                 for (k_tensor, v_tensor, _len, _max) in &kv_data {
                                     for rank in 0..tp {
                                         let start = rank * heads_per_rank;
-                                        // Shard on GPU 0 (narrow + contiguous in GPU 0 context)
                                         let k_shard = k_tensor
                                             .narrow(1, start, heads_per_rank)
                                             .and_then(|t| t.contiguous())
@@ -465,52 +448,62 @@ impl ModelExecutor for CandleModelExecutor {
                                             .map_err(|e| {
                                                 FerrumError::model(format!("KV shard: {e}"))
                                             })?;
-
-                                        // Move to target GPU (peer copy for rank > 0)
-                                        let k_on_dev = k_shard
-                                            .to_device(&rank_devices[rank])
-                                            .map_err(|e| {
-                                                FerrumError::model(format!("KV to GPU{rank}: {e}"))
-                                            })?;
-                                        let v_on_dev = v_shard
-                                            .to_device(&rank_devices[rank])
-                                            .map_err(|e| {
-                                                FerrumError::model(format!("KV to GPU{rank}: {e}"))
-                                            })?;
-
-                                        // Restore GPU 0 context for next iteration
-                                        gpu0_ctx.bind_to_thread().map_err(|e| {
-                                            FerrumError::model(format!("restore ctx: {e}"))
-                                        })?;
-
-                                        // Extract CudaSlice (now on correct GPU)
-                                        use candle_core::Storage;
-                                        let (ks, _) = k_on_dev.storage_and_layout();
-                                        let (vs, _) = v_on_dev.storage_and_layout();
-                                        let k_cuda = match &*ks {
-                                            Storage::Cuda(cs) => cs
-                                                .as_cuda_slice::<half::f16>()
-                                                .map_err(|e| {
-                                                    FerrumError::model(format!("KV: {e}"))
-                                                })?
-                                                .clone(),
-                                            _ => return Err(FerrumError::model("KV not CUDA")),
-                                        };
-                                        let v_cuda = match &*vs {
-                                            Storage::Cuda(cs) => cs
-                                                .as_cuda_slice::<half::f16>()
-                                                .map_err(|e| {
-                                                    FerrumError::model(format!("KV: {e}"))
-                                                })?
-                                                .clone(),
-                                            _ => return Err(FerrumError::model("KV not CUDA")),
-                                        };
-                                        drop(ks);
-                                        drop(vs);
-                                        per_rank_kv[rank].push((k_cuda, v_cuda));
+                                        per_layer_shards[rank].push((k_shard, v_shard));
                                     }
                                 }
 
+                                // Per-rank threads: to_device + extract CudaSlice
+                                type KvPair = (
+                                    candle_core::cuda_backend::cudarc::driver::CudaSlice<half::f16>,
+                                    candle_core::cuda_backend::cudarc::driver::CudaSlice<half::f16>,
+                                );
+                                let mut kv_handles: Vec<
+                                    std::thread::JoinHandle<candle_core::Result<Vec<KvPair>>>,
+                                > = Vec::with_capacity(tp);
+                                for (rank, shards) in per_layer_shards.into_iter().enumerate() {
+                                    kv_handles.push(std::thread::spawn(move || {
+                                        let device = candle_core::Device::new_cuda(rank)?;
+                                        let mut out = Vec::with_capacity(shards.len());
+                                        for (k, v) in shards {
+                                            let k = k.to_device(&device)?;
+                                            let v = v.to_device(&device)?;
+                                            use candle_core::Storage;
+                                            let (ks, _) = k.storage_and_layout();
+                                            let (vs, _) = v.storage_and_layout();
+                                            let kc = match &*ks {
+                                                Storage::Cuda(cs) => {
+                                                    cs.as_cuda_slice::<half::f16>()?.clone()
+                                                }
+                                                _ => candle_core::bail!("not cuda"),
+                                            };
+                                            let vc = match &*vs {
+                                                Storage::Cuda(cs) => {
+                                                    cs.as_cuda_slice::<half::f16>()?.clone()
+                                                }
+                                                _ => candle_core::bail!("not cuda"),
+                                            };
+                                            drop(ks);
+                                            drop(vs);
+                                            out.push((kc, vc));
+                                        }
+                                        Ok(out)
+                                    }));
+                                }
+                                for (rank, h) in kv_handles.into_iter().enumerate() {
+                                    match h.join() {
+                                        Ok(Ok(s)) => per_rank_kv[rank] = s,
+                                        Ok(Err(e)) => {
+                                            return Err(FerrumError::model(format!(
+                                                "KV r{rank}: {e}"
+                                            )))
+                                        }
+                                        Err(_) => {
+                                            return Err(FerrumError::model(format!(
+                                                "KV thread {rank} panic"
+                                            )))
+                                        }
+                                    }
+                                }
                                 g.init_kv_cache(&cache_id, per_rank_kv, prefill_len, max_len)
                                     .map_err(|e| FerrumError::model(format!("TP KV init: {e}")))?;
                             }
