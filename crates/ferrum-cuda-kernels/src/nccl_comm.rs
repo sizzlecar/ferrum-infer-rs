@@ -33,13 +33,14 @@ impl NcclRank {
     }
 
     pub fn all_reduce_f16_inplace(
-        &self,
+        &mut self,
         buf: &mut CudaSlice<half::f16>,
     ) -> candle_core::Result<()> {
-        // NCCL all_reduce needs &mut stream — clone the Arc and get mut ref
-        let mut stream_clone = (*self.stream).clone();
+        let stream = Arc::get_mut(&mut self.stream).ok_or_else(|| {
+            candle_core::Error::Msg("Cannot get mutable stream for NCCL".into())
+        })?;
         self.comm
-            .all_reduce(buf, &mut stream_clone, &cudarc::nccl::ReduceOp::Sum)
+            .all_reduce(buf, stream, &cudarc::nccl::ReduceOp::Sum)
             .map_err(|e| candle_core::Error::Msg(format!("NCCL all_reduce: {e:?}")))?;
         Ok(())
     }
