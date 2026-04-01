@@ -428,33 +428,65 @@ impl ModelExecutor for CandleModelExecutor {
                                     )>,
                                 > = (0..tp).map(|_| Vec::new()).collect();
 
-                                // Create target devices for cross-GPU transfer
+                                // Save GPU 0 context for restoration after cross-GPU ops
+                                let gpu0_ctx = self
+                                    .model
+                                    .candle_device()
+                                    .as_cuda_device()
+                                    .map_err(|e| FerrumError::model(format!("gpu0 ctx: {e}")))?
+                                    .cuda_stream()
+                                    .context()
+                                    .clone();
+
+                                // Create target devices for each rank
                                 let rank_devices: Vec<candle_core::Device> = (0..tp)
                                     .map(|r| candle_core::Device::new_cuda(r))
                                     .collect::<candle_core::Result<Vec<_>>>()
                                     .map_err(|e| FerrumError::model(format!("rank devs: {e}")))?;
 
+                                // Restore GPU 0 context after creating rank devices
+                                gpu0_ctx
+                                    .bind_to_thread()
+                                    .map_err(|e| FerrumError::model(format!("restore ctx: {e}")))?;
+
                                 for (k_tensor, v_tensor, _len, _max) in &kv_data {
                                     for rank in 0..tp {
                                         let start = rank * heads_per_rank;
+                                        // Shard on GPU 0 (narrow + contiguous in GPU 0 context)
                                         let k_shard = k_tensor
                                             .narrow(1, start, heads_per_rank)
                                             .and_then(|t| t.contiguous())
-                                            .and_then(|t| t.to_device(&rank_devices[rank]))
                                             .map_err(|e| {
-                                                FerrumError::model(format!("KV shard r{rank}: {e}"))
+                                                FerrumError::model(format!("KV shard: {e}"))
                                             })?;
                                         let v_shard = v_tensor
                                             .narrow(1, start, heads_per_rank)
                                             .and_then(|t| t.contiguous())
-                                            .and_then(|t| t.to_device(&rank_devices[rank]))
                                             .map_err(|e| {
-                                                FerrumError::model(format!("KV shard r{rank}: {e}"))
+                                                FerrumError::model(format!("KV shard: {e}"))
                                             })?;
 
+                                        // Move to target GPU (peer copy for rank > 0)
+                                        let k_on_dev = k_shard
+                                            .to_device(&rank_devices[rank])
+                                            .map_err(|e| {
+                                                FerrumError::model(format!("KV to GPU{rank}: {e}"))
+                                            })?;
+                                        let v_on_dev = v_shard
+                                            .to_device(&rank_devices[rank])
+                                            .map_err(|e| {
+                                                FerrumError::model(format!("KV to GPU{rank}: {e}"))
+                                            })?;
+
+                                        // Restore GPU 0 context for next iteration
+                                        gpu0_ctx.bind_to_thread().map_err(|e| {
+                                            FerrumError::model(format!("restore ctx: {e}"))
+                                        })?;
+
+                                        // Extract CudaSlice (now on correct GPU)
                                         use candle_core::Storage;
-                                        let (ks, _) = k_shard.storage_and_layout();
-                                        let (vs, _) = v_shard.storage_and_layout();
+                                        let (ks, _) = k_on_dev.storage_and_layout();
+                                        let (vs, _) = v_on_dev.storage_and_layout();
                                         let k_cuda = match &*ks {
                                             Storage::Cuda(cs) => cs
                                                 .as_cuda_slice::<half::f16>()
