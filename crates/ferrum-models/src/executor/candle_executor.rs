@@ -37,6 +37,8 @@ pub struct CandleModelExecutor {
     next_cache_id: AtomicU64,
     #[cfg(feature = "cuda")]
     cuda_runner: Mutex<Option<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner>>,
+    #[cfg(feature = "tensor-parallel")]
+    tp_group: Mutex<Option<ferrum_cuda_kernels::tp_decode::TpDecodeGroup>>,
 }
 
 impl CandleModelExecutor {
@@ -49,6 +51,8 @@ impl CandleModelExecutor {
             next_cache_id: AtomicU64::new(1),
             #[cfg(feature = "cuda")]
             cuda_runner: Mutex::new(None),
+            #[cfg(feature = "tensor-parallel")]
+            tp_group: Mutex::new(None),
         }
     }
 
@@ -65,6 +69,138 @@ impl CandleModelExecutor {
 
     fn tensor_to_tokens(&self, tensor: &TensorRef) -> Result<Vec<u32>> {
         common::tensor_to_tokens(tensor)
+    }
+
+    /// Get TP size from FERRUM_TP env var (0 or 1 = disabled).
+    fn tp_size() -> usize {
+        std::env::var("FERRUM_TP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Initialize TP decode group if FERRUM_TP > 1.
+    #[cfg(feature = "tensor-parallel")]
+    fn ensure_tp_group(&self) -> bool {
+        if self.tp_group.lock().is_some() {
+            return true;
+        }
+        let tp = Self::tp_size();
+        if tp <= 1 {
+            return false;
+        }
+
+        info!("Initializing tensor parallel group: tp_size={tp}");
+
+        let model_dir = match self.model.model_dir.as_ref() {
+            Some(d) => d.clone(),
+            None => {
+                tracing::warn!("TP requires model_dir");
+                return false;
+            }
+        };
+
+        // Load sharded weights for each rank
+        let loader = crate::loader::SafeTensorsLoader::new(&model_dir);
+        let vb = match loader.load_varbuilder(self.model.device(), self.model.dtype()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("TP weight load failed: {e}");
+                return false;
+            }
+        };
+
+        let cfg = self.model.config();
+        let tp_cfg = crate::loader::tp_weight_loader::TpWeightConfig {
+            num_hidden_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+            num_attention_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            vocab_size: cfg.vocab_size,
+            max_seq_len: cfg.max_position_embeddings,
+            rope_theta: cfg.rope_theta as f64,
+            has_qk_norm: false,
+            tp_size: tp,
+            rank: 0, // will be set per-rank below
+        };
+
+        let mut runners = Vec::with_capacity(tp);
+        let mut nccl_ranks = Vec::new();
+
+        // Generate NCCL unique ID
+        let nccl_id = match ferrum_cuda_kernels::nccl_comm::NcclRank::unique_id() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("NCCL unique_id failed: {e}");
+                return false;
+            }
+        };
+
+        for rank in 0..tp {
+            let mut rank_cfg = tp_cfg.clone();
+            rank_cfg.rank = rank;
+
+            // Create device for this rank
+            let device = match candle_core::Device::new_cuda(rank) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("CUDA device {rank}: {e}");
+                    return false;
+                }
+            };
+
+            let (weights, dims, stream) =
+                match crate::loader::tp_weight_loader::load_sharded_weights(&vb, &rank_cfg, &device)
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("TP weight shard rank {rank}: {e}");
+                        return false;
+                    }
+                };
+
+            let cuda_dev = match device.as_cuda_device() {
+                Ok(d) => d.clone(),
+                Err(e) => {
+                    tracing::warn!("TP cuda device {rank}: {e}");
+                    return false;
+                }
+            };
+
+            // Init NCCL communicator for this rank
+            match ferrum_cuda_kernels::nccl_comm::NcclRank::init(&nccl_id, rank, tp, stream.clone())
+            {
+                Ok(nr) => nccl_ranks.push(nr),
+                Err(e) => {
+                    tracing::warn!("NCCL init rank {rank}: {e}");
+                    return false;
+                }
+            };
+
+            match ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
+                weights, dims, cuda_dev, stream,
+            ) {
+                Ok(r) => runners.push(r),
+                Err(e) => {
+                    tracing::warn!("TP runner rank {rank}: {e}");
+                    return false;
+                }
+            }
+        }
+
+        match ferrum_cuda_kernels::tp_decode::TpDecodeGroup::new(runners, nccl_ranks) {
+            Ok(group) => {
+                info!("Tensor parallel group initialized: {tp} GPUs");
+                *self.tp_group.lock() = Some(group);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("TpDecodeGroup init: {e}");
+                false
+            }
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -248,7 +384,63 @@ impl ModelExecutor for CandleModelExecutor {
             return Err(FerrumError::model("Empty decode input"));
         }
 
-        // Try CUDA runner path
+        // Try TP path first (FERRUM_TP > 1)
+        #[cfg(feature = "tensor-parallel")]
+        {
+            if Self::tp_size() > 1 && self.ensure_tp_group() {
+                // Ensure KV cache exists on all TP ranks
+                // TODO: migrate candle KV to per-rank sharded KV
+                // For now, init empty KV on all ranks
+                {
+                    let mut group = self.tp_group.lock();
+                    if let Some(ref mut g) = *group {
+                        if !g.has_kv_cache(&cache_id) {
+                            self.ensure_runner_kv_cache(&cache_id, seq_len)?;
+                            // TODO: distribute KV across ranks
+                        }
+                    }
+                }
+
+                let logits = {
+                    let mut group = self.tp_group.lock();
+                    let group = group
+                        .as_mut()
+                        .ok_or_else(|| FerrumError::model("TP group gone"))?;
+                    group
+                        .decode_step(tokens[0], seq_len, &cache_id)
+                        .map_err(|e| FerrumError::model(format!("tp_decode: {e}")))?
+                };
+
+                let cuda_dev = self
+                    .model
+                    .candle_device()
+                    .as_cuda_device()
+                    .map_err(|e| FerrumError::model(format!("not CUDA: {e}")))?;
+                let vocab = self.info.vocab_size;
+                let storage = candle_core::cuda_backend::CudaStorage::wrap_cuda_slice(
+                    logits,
+                    cuda_dev.clone(),
+                );
+                let logits_tensor = candle_core::Tensor::from_storage(
+                    candle_core::Storage::Cuda(storage),
+                    (1, 1, vocab),
+                    candle_core::op::BackpropOp::none(),
+                    false,
+                );
+                let logits_ref = self.wrap_tensor(logits_tensor);
+                let new_seq_len = seq_len + 1;
+                {
+                    let mut states = self.states.lock();
+                    if let Some(s) = states.get_mut(&cache_id) {
+                        s.sequence_length = new_seq_len;
+                    }
+                }
+                let new_handle = Arc::new(handle.with_sequence_length(new_seq_len));
+                return Ok(DecodeOutput::new(logits_ref, new_handle));
+            }
+        }
+
+        // Try single-GPU CUDA runner path
         #[cfg(feature = "cuda")]
         {
             if std::env::var("FERRUM_DISABLE_CUDA_RUNNER").map_or(true, |v| v != "1") {

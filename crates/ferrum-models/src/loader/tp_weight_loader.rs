@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 /// Tensor parallel weight config — extends base WeightConfig with TP params.
 #[cfg(feature = "tensor-parallel")]
+#[derive(Clone)]
 pub struct TpWeightConfig {
     pub num_hidden_layers: usize,
     pub hidden_size: usize,
