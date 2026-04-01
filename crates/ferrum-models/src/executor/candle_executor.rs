@@ -392,15 +392,86 @@ impl ModelExecutor for CandleModelExecutor {
         #[cfg(feature = "tensor-parallel")]
         {
             if Self::tp_size() > 1 && self.ensure_tp_group() {
-                // Ensure KV cache exists on all TP ranks
-                // TODO: migrate candle KV to per-rank sharded KV
-                // For now, init empty KV on all ranks
+                // Ensure KV cache exists on all TP ranks.
+                // Export candle KV and shard by heads across ranks.
                 {
                     let mut group = self.tp_group.lock();
                     if let Some(ref mut g) = *group {
                         if !g.has_kv_cache(&cache_id) {
-                            self.ensure_runner_kv_cache(&cache_id, seq_len)?;
-                            // TODO: distribute KV across ranks
+                            let tp = g.world_size();
+                            let kv_data = self
+                                .model
+                                .export_kv_cache(&cache_id)
+                                .or_else(|| {
+                                    cache_id.rfind("-clone-").and_then(|pos| {
+                                        self.model.export_kv_cache(&cache_id[..pos])
+                                    })
+                                })
+                                .ok_or_else(|| {
+                                    FerrumError::model(format!("No KV for TP: {cache_id}"))
+                                })?;
+
+                            if !kv_data.is_empty() {
+                                let prefill_len = kv_data[0].2;
+                                let max_len = kv_data[0].3;
+                                let num_kv_heads = self.model.config().num_key_value_heads;
+                                let heads_per_rank = num_kv_heads / tp;
+
+                                let mut per_rank_kv: Vec<
+                                    Vec<(
+                                        cudarc::driver::CudaSlice<half::f16>,
+                                        cudarc::driver::CudaSlice<half::f16>,
+                                    )>,
+                                > = (0..tp).map(|_| Vec::new()).collect();
+
+                                for (k_tensor, v_tensor, _len, _max) in &kv_data {
+                                    for rank in 0..tp {
+                                        let start = rank * heads_per_rank;
+                                        // Shard KV by heads: narrow dim 1 (head dim)
+                                        let k_shard = k_tensor
+                                            .narrow(1, start, heads_per_rank)
+                                            .and_then(|t| t.contiguous())
+                                            .map_err(|e| {
+                                                FerrumError::model(format!("KV shard: {e}"))
+                                            })?;
+                                        let v_shard = v_tensor
+                                            .narrow(1, start, heads_per_rank)
+                                            .and_then(|t| t.contiguous())
+                                            .map_err(|e| {
+                                                FerrumError::model(format!("KV shard: {e}"))
+                                            })?;
+
+                                        // Extract CudaSlice
+                                        use candle_core::Storage;
+                                        let (ks, _) = k_shard.storage_and_layout();
+                                        let (vs, _) = v_shard.storage_and_layout();
+                                        let k_cuda = match &*ks {
+                                            Storage::Cuda(cs) => cs
+                                                .as_cuda_slice::<half::f16>()
+                                                .map_err(|e| {
+                                                    FerrumError::model(format!("KV: {e}"))
+                                                })?
+                                                .clone(),
+                                            _ => return Err(FerrumError::model("KV not CUDA")),
+                                        };
+                                        let v_cuda = match &*vs {
+                                            Storage::Cuda(cs) => cs
+                                                .as_cuda_slice::<half::f16>()
+                                                .map_err(|e| {
+                                                    FerrumError::model(format!("KV: {e}"))
+                                                })?
+                                                .clone(),
+                                            _ => return Err(FerrumError::model("KV not CUDA")),
+                                        };
+                                        drop(ks);
+                                        drop(vs);
+                                        per_rank_kv[rank].push((k_cuda, v_cuda));
+                                    }
+                                }
+
+                                g.init_kv_cache(&cache_id, per_rank_kv, prefill_len, max_len)
+                                    .map_err(|e| FerrumError::model(format!("TP KV init: {e}")))?;
+                            }
                         }
                     }
                 }
