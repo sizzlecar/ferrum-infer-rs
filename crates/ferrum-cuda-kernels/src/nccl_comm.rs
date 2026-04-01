@@ -12,7 +12,6 @@ pub struct NcclRank {
     comm: Comm,
     rank: usize,
     world_size: usize,
-    stream: Arc<CudaStream>,
 }
 
 #[cfg(feature = "tensor-parallel")]
@@ -23,32 +22,25 @@ impl NcclRank {
         world_size: usize,
         stream: Arc<CudaStream>,
     ) -> candle_core::Result<Self> {
-        let comm = Comm::from_rank(stream.clone(), rank, world_size, *id)
+        // Comm::from_rank takes the stream and owns it internally
+        let comm = Comm::from_rank(stream, rank, world_size, *id)
             .map_err(|e| candle_core::Error::Msg(format!("NCCL init rank {rank}: {e:?}")))?;
-        Ok(Self { comm, rank, world_size, stream })
+        Ok(Self { comm, rank, world_size })
     }
 
     pub fn unique_id() -> candle_core::Result<Id> {
         Id::new().map_err(|e| candle_core::Error::Msg(format!("NCCL unique_id: {e:?}")))
     }
 
+    /// In-place all-reduce (sum). Comm holds its own stream.
     pub fn all_reduce_f16_inplace(
-        &mut self,
+        &self,
         buf: &mut CudaSlice<half::f16>,
     ) -> candle_core::Result<()> {
-        let stream = Arc::get_mut(&mut self.stream).ok_or_else(|| {
-            candle_core::Error::Msg("Cannot get mutable stream for NCCL".into())
-        })?;
         self.comm
-            .all_reduce(buf, stream, &cudarc::nccl::ReduceOp::Sum)
+            .all_reduce_in_place(buf, &cudarc::nccl::ReduceOp::Sum)
             .map_err(|e| candle_core::Error::Msg(format!("NCCL all_reduce: {e:?}")))?;
         Ok(())
-    }
-
-    pub fn sync(&self) -> candle_core::Result<()> {
-        self.stream
-            .synchronize()
-            .map_err(|e| candle_core::Error::Msg(format!("NCCL stream sync: {e}")))
     }
 
     pub fn rank(&self) -> usize { self.rank }
