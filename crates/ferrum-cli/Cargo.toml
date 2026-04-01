@@ -83,4 +83,4 @@ interactive = [] # Enable interactive mode
 metal = ["ferrum-engine/metal"]  # Enable Apple GPU acceleration
 cuda = ["ferrum-engine/cuda"]    # Enable NVIDIA CUDA acceleration (includes Marlin INT4)
 marlin = ["cuda"]  # backward compat alias
-tensor-parallel = ["ferrum-engine/tensor-parallel"]  # Multi-GPU tensor parallelism
+tensor-parallel = ["cuda", "ferrum-engine/tensor-parallel"]  # Multi-GPU tensor parallelism
