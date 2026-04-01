@@ -419,8 +419,12 @@ impl ModelExecutor for CandleModelExecutor {
 
                                 let mut per_rank_kv: Vec<
                                     Vec<(
-                                        cudarc::driver::CudaSlice<half::f16>,
-                                        cudarc::driver::CudaSlice<half::f16>,
+                                        candle_core::cuda_backend::cudarc::driver::CudaSlice<
+                                            half::f16,
+                                        >,
+                                        candle_core::cuda_backend::cudarc::driver::CudaSlice<
+                                            half::f16,
+                                        >,
                                     )>,
                                 > = (0..tp).map(|_| Vec::new()).collect();
 
