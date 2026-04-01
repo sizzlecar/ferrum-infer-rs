@@ -226,21 +226,18 @@ impl CudaDecodeRunner {
                 .alloc::<half::f16>(len)
                 .map_err(|e| candle_core::Error::Msg(format!("peer alloc: {e}")))?
         };
-        let num_bytes = len * std::mem::size_of::<half::f16>();
-        // Read raw CUdeviceptr directly from struct layout (first field).
-        // cudarc's safe API uses event tracking which deadlocks cross-GPU.
-        let src_ptr: u64 = unsafe { *(src as *const _ as *const u64) };
-        let dst_ptr: u64 = unsafe { *(&dst as *const _ as *const u64) };
+        // Disable event tracking to avoid cross-context deadlock,
+        // then use cudarc's safe memcpy_dtod which handles peer copy.
         unsafe {
-            cudarc::driver::result::memcpy_peer_async(
-                self.stream.context().cu_ctx(),
-                dst_ptr,
-                src_ctx.cu_ctx(),
-                src_ptr,
-                num_bytes,
-                self.stream.cu_stream(),
-            )
+            src_ctx.disable_event_tracking();
+            self.stream.context().disable_event_tracking();
+        }
+        self.stream
+            .memcpy_dtod(src, &mut dst)
             .map_err(|e| candle_core::Error::Msg(format!("peer copy: {e}")))?;
+        unsafe {
+            src_ctx.enable_event_tracking();
+            self.stream.context().enable_event_tracking();
         }
         Ok(dst)
     }
