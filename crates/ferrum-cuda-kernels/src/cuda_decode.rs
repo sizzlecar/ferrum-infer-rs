@@ -201,6 +201,15 @@ impl CudaDecodeRunner {
         })
     }
 
+    /// Bind this runner's CUDA context to the current thread.
+    /// Required before any operation when driving multiple GPUs from one thread.
+    pub fn bind_context(&self) -> candle_core::Result<()> {
+        self.stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| candle_core::Error::Msg(format!("bind_context: {e}")))
+    }
+
     /// Access weight layers (diagnostic only).
     pub fn weight_layers(&self) -> &[LayerWeights] {
         &self.weights.layers

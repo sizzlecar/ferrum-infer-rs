@@ -71,65 +71,62 @@ impl TpDecodeGroup {
         let n = self.num_layers;
         let ws = self.runners.len();
 
-        // Embed (replicated — each rank does the same embed lookup)
-        for r in 0..ws {
-            self.runners[r].tp_embed(token_id)?;
+        // Helper: bind CUDA context before operating on each rank
+        macro_rules! for_each_rank {
+            ($body:expr) => {
+                for r in 0..ws {
+                    self.runners[r].bind_context()?;
+                    $body(r)?;
+                }
+            };
         }
 
+        // Embed (replicated)
+        for_each_rank!(|r: usize| self.runners[r].tp_embed(token_id));
+
         // First layer norm (replicated)
-        for r in 0..ws {
-            self.runners[r].tp_first_norm()?;
-        }
+        for_each_rank!(|r: usize| self.runners[r].tp_first_norm());
 
         // Per-layer pipeline
         for li in 0..n {
-            // 1. QKV + norm + RoPE + attention (local heads per rank)
-            for r in 0..ws {
-                self.runners[r].tp_pre_o_proj(li, position, cache_key)?;
-            }
+            // 1. QKV + norm + RoPE + attention (local heads)
+            for_each_rank!(|r: usize| self.runners[r].tp_pre_o_proj(li, position, cache_key));
 
-            // 2. O projection (row-parallel: partial hidden_size output)
-            for r in 0..ws {
-                self.runners[r].tp_o_proj(li)?;
-            }
+            // 2. O projection (row-parallel: partial output)
+            for_each_rank!(|r: usize| self.runners[r].tp_o_proj(li));
 
-            // 3. ALL-REDUCE on o_proj_out (sum partial results)
+            // 3. ALL-REDUCE o_proj_out
             for r in 0..ws {
+                self.runners[r].bind_context()?;
                 self.nccl[r].all_reduce_f16_inplace(self.runners[r].o_proj_out_mut())?;
             }
 
-            // 4. Post-attention residual + norm (replicated, on full hidden_size)
-            for r in 0..ws {
-                self.runners[r].tp_post_attn_norm(li)?;
-            }
+            // 4. Post-attention residual + norm
+            for_each_rank!(|r: usize| self.runners[r].tp_post_attn_norm(li));
 
-            // 5. MLP: gate_up (column-parallel) + SiLU + down (row-parallel)
-            for r in 0..ws {
-                self.runners[r].tp_mlp(li)?;
-            }
+            // 5. MLP
+            for_each_rank!(|r: usize| self.runners[r].tp_mlp(li));
 
-            // 6. ALL-REDUCE on down_out (sum partial results)
+            // 6. ALL-REDUCE down_out
             for r in 0..ws {
+                self.runners[r].bind_context()?;
                 self.nccl[r].all_reduce_f16_inplace(self.runners[r].down_out_mut())?;
             }
 
-            // 7. Post-MLP residual + next layer norm (replicated)
-            for r in 0..ws {
-                self.runners[r].tp_post_mlp_norm(li)?;
-            }
+            // 7. Post-MLP residual + next layer norm
+            for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
         }
 
-        // LM head (replicated — each rank computes full logits)
-        for r in 0..ws {
-            self.runners[r].tp_lm_head()?;
-        }
+        // LM head (replicated)
+        for_each_rank!(|r: usize| self.runners[r].tp_lm_head());
 
         // Sync rank 0 and return its logits
+        self.runners[0].bind_context()?;
         self.runners[0].sync_stream()?;
         self.runners[0].clone_logits()
     }
 
-    /// Initialize KV cache on all ranks.
+    /// Initialize KV cache on all ranks (with context binding).
     pub fn init_kv_cache(
         &mut self,
         cache_key: &str,
@@ -138,6 +135,7 @@ impl TpDecodeGroup {
         max_len: usize,
     ) -> candle_core::Result<()> {
         for (r, kv_data) in kv_data_per_rank.into_iter().enumerate() {
+            self.runners[r].bind_context()?;
             self.runners[r].init_kv_cache(cache_key, kv_data, prefill_len, max_len)?;
         }
         Ok(())
