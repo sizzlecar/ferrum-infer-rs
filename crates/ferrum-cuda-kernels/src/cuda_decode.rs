@@ -228,7 +228,9 @@ impl CudaDecodeRunner {
         };
         let num_bytes = len * std::mem::size_of::<half::f16>();
         use cudarc::driver::DevicePtr;
-        let (src_ptr, _) = src.device_ptr(&self.stream);
+        // Use each slice's own stream to get pointer (avoids cross-context event tracking)
+        let src_own_stream = DevicePtr::<half::f16>::stream(src);
+        let (src_ptr, _) = src.device_ptr(src_own_stream);
         let (dst_ptr, _) = dst.device_ptr_mut(&self.stream);
         unsafe {
             cudarc::driver::result::memcpy_peer_async(
