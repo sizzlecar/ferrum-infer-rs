@@ -67,6 +67,12 @@ pub fn load_sharded_weights(
     candle_stream
         .synchronize()
         .map_err(|e| FerrumError::model(format!("sync: {e}")))?;
+
+    // Helper: move tensor to target device (cross-GPU transfer for rank > 0)
+    let to_dev = |t: &Tensor| -> Result<Tensor> {
+        t.to_device(device)
+            .map_err(|e| FerrumError::model(format!("to_device: {e}")))
+    };
     let rs = candle_stream
         .context()
         .new_stream()
@@ -87,6 +93,7 @@ pub fn load_sharded_weights(
             "model.embed_tokens.weight",
         )
         .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
+    let embed_t = to_dev(&embed_t)?;
     let embed_table = GpuWeight::from_tensor(&embed_t, &rs)
         .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
 
@@ -99,6 +106,7 @@ pub fn load_sharded_weights(
         let ln_w = vb
             .get(cfg.hidden_size, &format!("{prefix}.input_layernorm.weight"))
             .map_err(|e| FerrumError::model(format!("input_ln L{li}: {e}")))?;
+        let ln_w = to_dev(&ln_w)?;
         let input_ln_w = GpuWeight::from_tensor(&ln_w, &rs)
             .map_err(|e| FerrumError::model(format!("input_ln: {e}")))?;
 
@@ -135,6 +143,7 @@ pub fn load_sharded_weights(
         let qkv_shard = Tensor::cat(&[&q_shard, &k_shard, &v_shard], 0)
             .map_err(|e| FerrumError::model(format!("qkv cat L{li}: {e}")))?;
 
+        let qkv_shard = to_dev(&qkv_shard)?;
         let qkv_w = LinearWeight::Fp16(
             GpuWeight::from_tensor(&qkv_shard, &rs)
                 .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
@@ -145,6 +154,7 @@ pub fn load_sharded_weights(
             let t = vb
                 .get(cfg.head_dim, &format!("{prefix}.self_attn.q_norm.weight"))
                 .map_err(|e| FerrumError::model(format!("q_norm L{li}: {e}")))?;
+            let t = to_dev(&t)?;
             Some(
                 GpuWeight::from_tensor(&t, &rs)
                     .map_err(|e| FerrumError::model(format!("q_norm: {e}")))?,
@@ -156,6 +166,7 @@ pub fn load_sharded_weights(
             let t = vb
                 .get(cfg.head_dim, &format!("{prefix}.self_attn.k_norm.weight"))
                 .map_err(|e| FerrumError::model(format!("k_norm L{li}: {e}")))?;
+            let t = to_dev(&t)?;
             Some(
                 GpuWeight::from_tensor(&t, &rs)
                     .map_err(|e| FerrumError::model(format!("k_norm: {e}")))?,
@@ -176,6 +187,7 @@ pub fn load_sharded_weights(
             .map_err(|e| FerrumError::model(format!("o shard L{li}: {e}")))?
             .contiguous()
             .map_err(|e| FerrumError::model(format!("o contiguous L{li}: {e}")))?;
+        let o_shard = to_dev(&o_shard)?;
         let o_w = LinearWeight::Fp16(
             GpuWeight::from_tensor(&o_shard, &rs)
                 .map_err(|e| FerrumError::model(format!("o: {e}")))?,
@@ -188,6 +200,7 @@ pub fn load_sharded_weights(
                 &format!("{prefix}.post_attention_layernorm.weight"),
             )
             .map_err(|e| FerrumError::model(format!("post_ln L{li}: {e}")))?;
+        let pln_t = to_dev(&pln_t)?;
         let post_ln_w = GpuWeight::from_tensor(&pln_t, &rs)
             .map_err(|e| FerrumError::model(format!("post_ln: {e}")))?;
 
@@ -212,6 +225,7 @@ pub fn load_sharded_weights(
             .map_err(|e| FerrumError::model(format!("up shard L{li}: {e}")))?;
         let gate_up_shard = Tensor::cat(&[&gate_shard, &up_shard], 0)
             .map_err(|e| FerrumError::model(format!("gate_up cat L{li}: {e}")))?;
+        let gate_up_shard = to_dev(&gate_up_shard)?;
         let gate_up_w = LinearWeight::Fp16(
             GpuWeight::from_tensor(&gate_up_shard, &rs)
                 .map_err(|e| FerrumError::model(format!("gate_up: {e}")))?,
@@ -229,6 +243,7 @@ pub fn load_sharded_weights(
             .map_err(|e| FerrumError::model(format!("down shard L{li}: {e}")))?
             .contiguous()
             .map_err(|e| FerrumError::model(format!("down contiguous L{li}: {e}")))?;
+        let down_shard = to_dev(&down_shard)?;
         let down_w = LinearWeight::Fp16(
             GpuWeight::from_tensor(&down_shard, &rs)
                 .map_err(|e| FerrumError::model(format!("down: {e}")))?,
@@ -250,6 +265,7 @@ pub fn load_sharded_weights(
     let fn_t = vb
         .get(cfg.hidden_size, "model.norm.weight")
         .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
+    let fn_t = to_dev(&fn_t)?;
     let final_norm_w = GpuWeight::from_tensor(&fn_t, &rs)
         .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
 
@@ -257,6 +273,7 @@ pub fn load_sharded_weights(
     let lm_t = vb
         .get((cfg.vocab_size, cfg.hidden_size), "lm_head.weight")
         .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
+    let lm_t = to_dev(&lm_t)?;
     let lm_head_w = LinearWeight::Fp16(
         GpuWeight::from_tensor(&lm_t, &rs)
             .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?,
