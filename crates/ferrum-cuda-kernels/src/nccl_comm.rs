@@ -23,8 +23,7 @@ impl NcclRank {
         world_size: usize,
         stream: Arc<CudaStream>,
     ) -> candle_core::Result<Self> {
-        let device = stream.device().clone();
-        let comm = Comm::from_rank(device, rank, world_size, *id)
+        let comm = Comm::from_rank(stream.context().clone(), rank, world_size, *id)
             .map_err(|e| candle_core::Error::Msg(format!("NCCL init rank {rank}: {e:?}")))?;
         Ok(Self {
             comm,
@@ -43,7 +42,7 @@ impl NcclRank {
         buf: &mut CudaSlice<half::f16>,
     ) -> candle_core::Result<()> {
         self.comm
-            .all_reduce(buf, &self.stream, cudarc::nccl::ReduceOp::Sum)
+            .all_reduce(buf, &self.stream, &cudarc::nccl::ReduceOp::Sum)
             .map_err(|e| candle_core::Error::Msg(format!("NCCL all_reduce: {e:?}")))?;
         Ok(())
     }
