@@ -25,7 +25,11 @@ impl NcclRank {
         // Comm::from_rank takes the stream and owns it internally
         let comm = Comm::from_rank(stream, rank, world_size, *id)
             .map_err(|e| candle_core::Error::Msg(format!("NCCL init rank {rank}: {e:?}")))?;
-        Ok(Self { comm, rank, world_size })
+        Ok(Self {
+            comm,
+            rank,
+            world_size,
+        })
     }
 
     pub fn unique_id() -> candle_core::Result<Id> {
@@ -43,6 +47,10 @@ impl NcclRank {
         Ok(())
     }
 
-    pub fn rank(&self) -> usize { self.rank }
-    pub fn world_size(&self) -> usize { self.world_size }
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+    pub fn world_size(&self) -> usize {
+        self.world_size
+    }
 }
