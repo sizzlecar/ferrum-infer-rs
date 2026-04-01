@@ -428,24 +428,30 @@ impl ModelExecutor for CandleModelExecutor {
                                     )>,
                                 > = (0..tp).map(|_| Vec::new()).collect();
 
+                                // Create target devices for cross-GPU transfer
+                                let rank_devices: Vec<candle_core::Device> = (0..tp)
+                                    .map(|r| candle_core::Device::new_cuda(r))
+                                    .collect::<candle_core::Result<Vec<_>>>()
+                                    .map_err(|e| FerrumError::model(format!("rank devs: {e}")))?;
+
                                 for (k_tensor, v_tensor, _len, _max) in &kv_data {
                                     for rank in 0..tp {
                                         let start = rank * heads_per_rank;
-                                        // Shard KV by heads: narrow dim 1 (head dim)
                                         let k_shard = k_tensor
                                             .narrow(1, start, heads_per_rank)
                                             .and_then(|t| t.contiguous())
+                                            .and_then(|t| t.to_device(&rank_devices[rank]))
                                             .map_err(|e| {
-                                                FerrumError::model(format!("KV shard: {e}"))
+                                                FerrumError::model(format!("KV shard r{rank}: {e}"))
                                             })?;
                                         let v_shard = v_tensor
                                             .narrow(1, start, heads_per_rank)
                                             .and_then(|t| t.contiguous())
+                                            .and_then(|t| t.to_device(&rank_devices[rank]))
                                             .map_err(|e| {
-                                                FerrumError::model(format!("KV shard: {e}"))
+                                                FerrumError::model(format!("KV shard r{rank}: {e}"))
                                             })?;
 
-                                        // Extract CudaSlice
                                         use candle_core::Storage;
                                         let (ks, _) = k_shard.storage_and_layout();
                                         let (vs, _) = v_shard.storage_and_layout();
