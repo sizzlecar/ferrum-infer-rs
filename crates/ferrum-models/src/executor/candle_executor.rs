@@ -126,10 +126,7 @@ impl CandleModelExecutor {
             rank: 0, // will be set per-rank below
         };
 
-        let mut runners = Vec::with_capacity(tp);
-        let mut nccl_ranks = Vec::new();
-
-        // Generate NCCL unique ID
+        // Generate NCCL unique ID (rank 0 generates, shared with all)
         let nccl_id = match ferrum_cuda_kernels::nccl_comm::NcclRank::unique_id() {
             Ok(id) => id,
             Err(e) => {
@@ -138,11 +135,18 @@ impl CandleModelExecutor {
             }
         };
 
+        // Load sharded weights for each rank first (sequential, no NCCL needed)
+        let mut per_rank_data: Vec<(
+            ferrum_cuda_kernels::weight_store::TransformerGpuWeights,
+            ferrum_cuda_kernels::decode_buffers::ModelDims,
+            std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+            candle_core::cuda_backend::CudaDevice,
+        )> = Vec::with_capacity(tp);
+
         for rank in 0..tp {
             let mut rank_cfg = tp_cfg.clone();
             rank_cfg.rank = rank;
 
-            // Create device for this rank
             let device = match candle_core::Device::new_cuda(rank) {
                 Ok(d) => d,
                 Err(e) => {
@@ -169,22 +173,44 @@ impl CandleModelExecutor {
                 }
             };
 
-            // Init NCCL communicator for this rank
-            match ferrum_cuda_kernels::nccl_comm::NcclRank::init(&nccl_id, rank, tp, stream.clone())
-            {
-                Ok(nr) => nccl_ranks.push(nr),
-                Err(e) => {
+            per_rank_data.push((weights, dims, stream, cuda_dev));
+        }
+
+        // NCCL init is collective — all ranks must call from_rank simultaneously.
+        // Use threads: one per rank, all init in parallel.
+        let mut handles = Vec::with_capacity(tp);
+        for rank in 0..tp {
+            let id = nccl_id;
+            let stream = per_rank_data[rank].2.clone();
+            handles.push(std::thread::spawn(move || {
+                ferrum_cuda_kernels::nccl_comm::NcclRank::init(&id, rank, tp, stream)
+            }));
+        }
+
+        let mut nccl_ranks = Vec::with_capacity(tp);
+        for (rank, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(Ok(nr)) => nccl_ranks.push(nr),
+                Ok(Err(e)) => {
                     tracing::warn!("NCCL init rank {rank}: {e}");
                     return false;
                 }
-            };
+                Err(_) => {
+                    tracing::warn!("NCCL init thread panicked rank {rank}");
+                    return false;
+                }
+            }
+        }
 
+        // Create runners
+        let mut runners = Vec::with_capacity(tp);
+        for (weights, dims, stream, cuda_dev) in per_rank_data {
             match ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
                 weights, dims, cuda_dev, stream,
             ) {
                 Ok(r) => runners.push(r),
                 Err(e) => {
-                    tracing::warn!("TP runner rank {rank}: {e}");
+                    tracing::warn!("TP runner init: {e}");
                     return false;
                 }
             }
