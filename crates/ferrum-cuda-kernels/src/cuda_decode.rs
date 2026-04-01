@@ -227,19 +227,10 @@ impl CudaDecodeRunner {
                 .map_err(|e| candle_core::Error::Msg(format!("peer alloc: {e}")))?
         };
         let num_bytes = len * std::mem::size_of::<half::f16>();
-        use cudarc::driver::{DevicePtr, DevicePtrMut};
-        // Get src pointer using src's own context (avoid cross-context event)
-        src_ctx
-            .bind_to_thread()
-            .map_err(|e| candle_core::Error::Msg(format!("src bind: {e}")))?;
-        let src_stream = src_ctx.default_stream();
-        let (src_ptr, _) = src.device_ptr(&src_stream);
-        // Switch to dst context for dst pointer
-        self.stream
-            .context()
-            .bind_to_thread()
-            .map_err(|e| candle_core::Error::Msg(format!("dst bind: {e}")))?;
-        let (dst_ptr, _) = dst.device_ptr_mut(&self.stream);
+        // Read raw CUdeviceptr directly from struct layout (first field).
+        // cudarc's safe API uses event tracking which deadlocks cross-GPU.
+        let src_ptr: u64 = unsafe { *(src as *const _ as *const u64) };
+        let dst_ptr: u64 = unsafe { *(&dst as *const _ as *const u64) };
         unsafe {
             cudarc::driver::result::memcpy_peer_async(
                 self.stream.context().cu_ctx(),
