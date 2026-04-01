@@ -228,7 +228,7 @@ impl CudaDecodeRunner {
         };
         let num_bytes = len * std::mem::size_of::<half::f16>();
         use cudarc::driver::{DevicePtr, DevicePtrMut};
-        let src_own_stream = DevicePtr::<half::f16>::stream(src);
+        let src_own_stream = <CudaSlice<half::f16> as DevicePtr<half::f16>>::stream(src);
         let (src_ptr, _) = src.device_ptr(src_own_stream);
         let (dst_ptr, _) = dst.device_ptr_mut(&self.stream);
         unsafe {
