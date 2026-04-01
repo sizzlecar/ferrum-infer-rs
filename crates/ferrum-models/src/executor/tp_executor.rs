@@ -222,10 +222,10 @@ impl ModelExecutor for TpModelExecutor {
             supported_dtypes: vec![DataType::FP16],
             supported_devices: vec![self.info.device.clone()],
             memory_requirements: MemoryRequirements {
-                parameter_memory: (self.info.num_parameters * 2 / self.tp_size) as u64,
+                parameter_memory: (self.info.num_parameters * 2 / self.tp_size as u64) as u64,
                 activation_memory_per_token: 4 * self.info.hidden_size,
                 kv_cache_memory_per_token: 2 * self.info.num_layers * self.info.hidden_size
-                    / self.tp_size,
+                    / self.tp_size as u64,
                 overhead_memory: 1024 * 1024 * 1024,
             },
         }

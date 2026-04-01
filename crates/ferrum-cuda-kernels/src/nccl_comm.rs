@@ -14,6 +14,12 @@ pub struct NcclRank {
     world_size: usize,
 }
 
+// Safety: NcclRank is accessed via Mutex, one thread at a time.
+// *mut ncclComm is not Send by default but NCCL comms are safe
+// when used from the thread that created them.
+#[cfg(feature = "tensor-parallel")]
+unsafe impl Send for NcclRank {}
+
 #[cfg(feature = "tensor-parallel")]
 impl NcclRank {
     pub fn init(
