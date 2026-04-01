@@ -202,12 +202,46 @@ impl CudaDecodeRunner {
     }
 
     /// Bind this runner's CUDA context to the current thread.
-    /// Required before any operation when driving multiple GPUs from one thread.
     pub fn bind_context(&self) -> candle_core::Result<()> {
         self.stream
             .context()
             .bind_to_thread()
             .map_err(|e| candle_core::Error::Msg(format!("bind_context: {e}")))
+    }
+
+    /// Cross-GPU copy: src CudaSlice (any GPU) → new CudaSlice on this runner's GPU.
+    /// Uses raw cuMemcpyPeerAsync, bypassing cudarc event tracking.
+    pub fn peer_copy_to_self(
+        &self,
+        src: &CudaSlice<half::f16>,
+        src_ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+    ) -> candle_core::Result<CudaSlice<half::f16>> {
+        self.stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| candle_core::Error::Msg(format!("peer bind: {e}")))?;
+        let len = src.len();
+        let mut dst = unsafe {
+            self.stream
+                .alloc::<half::f16>(len)
+                .map_err(|e| candle_core::Error::Msg(format!("peer alloc: {e}")))?
+        };
+        let num_bytes = len * std::mem::size_of::<half::f16>();
+        use cudarc::driver::DevicePtr;
+        let (src_ptr, _) = src.device_ptr(&self.stream);
+        let (dst_ptr, _) = dst.device_ptr_mut(&self.stream);
+        unsafe {
+            cudarc::driver::result::memcpy_peer_async(
+                self.stream.context().cu_ctx,
+                dst_ptr,
+                src_ctx.cu_ctx,
+                src_ptr,
+                num_bytes,
+                self.stream.cu_stream,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("peer copy: {e}")))?;
+        }
+        Ok(dst)
     }
 
     /// Access weight layers (diagnostic only).

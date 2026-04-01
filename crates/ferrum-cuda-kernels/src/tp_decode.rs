@@ -51,6 +51,10 @@ impl TpDecodeGroup {
         self.runners.len()
     }
 
+    pub fn runner_mut(&mut self, rank: usize) -> &mut CudaDecodeRunner {
+        &mut self.runners[rank]
+    }
+
     /// Tensor-parallel decode step for a single token.
     ///
     /// All ranks execute each sub-phase in lockstep on their own stream.
