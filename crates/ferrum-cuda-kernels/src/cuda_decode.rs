@@ -227,19 +227,18 @@ impl CudaDecodeRunner {
                 .map_err(|e| candle_core::Error::Msg(format!("peer alloc: {e}")))?
         };
         let num_bytes = len * std::mem::size_of::<half::f16>();
-        use cudarc::driver::DevicePtr;
-        // Use each slice's own stream to get pointer (avoids cross-context event tracking)
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
         let src_own_stream = DevicePtr::<half::f16>::stream(src);
         let (src_ptr, _) = src.device_ptr(src_own_stream);
         let (dst_ptr, _) = dst.device_ptr_mut(&self.stream);
         unsafe {
             cudarc::driver::result::memcpy_peer_async(
-                self.stream.context().cu_ctx,
+                self.stream.context().cu_ctx(),
                 dst_ptr,
-                src_ctx.cu_ctx,
+                src_ctx.cu_ctx(),
                 src_ptr,
                 num_bytes,
-                self.stream.cu_stream,
+                self.stream.cu_stream(),
             )
             .map_err(|e| candle_core::Error::Msg(format!("peer copy: {e}")))?;
         }
