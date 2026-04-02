@@ -19,6 +19,8 @@ pub struct NcclRank {
 // when used from the thread that created them.
 #[cfg(feature = "tensor-parallel")]
 unsafe impl Send for NcclRank {}
+#[cfg(feature = "tensor-parallel")]
+unsafe impl Sync for NcclRank {}
 
 #[cfg(feature = "tensor-parallel")]
 impl NcclRank {
