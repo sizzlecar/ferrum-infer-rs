@@ -493,6 +493,18 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("attn_out d2h: {e}")))
     }
 
+    /// Read layer norm weight to host for diagnostics.
+    pub(crate) fn diag_layer_norm_weight(
+        &self,
+        li: usize,
+    ) -> candle_core::Result<Vec<half::f16>> {
+        let w = &self.weights.layers[li].input_ln_w;
+        let view = w.slice.slice(..w.len);
+        self.stream
+            .clone_dtoh(&view)
+            .map_err(|e| candle_core::Error::Msg(format!("diag norm weight L{li}: {e}")))
+    }
+
     /// Read named buffer to host for diagnostics.
     pub(crate) fn diag_buf(&self, name: &str) -> candle_core::Result<Vec<half::f16>> {
         let h = self.dims.hidden_size;
@@ -500,6 +512,7 @@ impl CudaDecodeRunner {
             "o_proj_out" => (&self.buffers.o_proj_out, h),
             "residual" => (&self.buffers.residual, h),
             "post_norm_out" => (&self.buffers.post_norm_out, h),
+            "post_norm_residual" => (&self.buffers.post_norm_residual, h),
             "down_out" => (&self.buffers.down_out, h),
             "norm_out" => (&self.buffers.norm_out, h),
             "final_norm_out" => (&self.buffers.final_norm_out, h),

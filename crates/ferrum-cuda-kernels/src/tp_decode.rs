@@ -122,6 +122,23 @@ impl TpDecodeGroup {
         // Embed (replicated)
         for_each_rank!(|r: usize| self.runners[r].tp_embed(token_id));
 
+        // Compare norm weights for first 2 layers (should be identical — replicated)
+        for check_li in 0..2 {
+            self.runners[0].bind_context()?;
+            self.runners[0].sync_stream()?;
+            let w0 = self.runners[0].diag_layer_norm_weight(check_li)?;
+            self.runners[1].bind_context()?;
+            self.runners[1].sync_stream()?;
+            let w1 = self.runners[1].diag_layer_norm_weight(check_li)?;
+            let max_diff = w0.iter().zip(w1.iter())
+                .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "[TP WEIGHT] L{check_li} input_ln_w max_diff={max_diff:.6} len={}",
+                w0.len()
+            );
+        }
+
         // First layer norm (replicated)
         for_each_rank!(|r: usize| self.runners[r].tp_first_norm());
 
@@ -166,6 +183,7 @@ impl TpDecodeGroup {
 
             if diag {
                 diag_rank_cmp!(&format!("L{li} post_attn_norm"), "post_norm_out");
+                diag_rank_cmp!(&format!("L{li} post_norm_residual"), "post_norm_residual");
             }
 
             // 5. MLP
