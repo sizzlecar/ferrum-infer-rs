@@ -78,6 +78,16 @@ pub fn load_sharded_weights(
         .new_stream()
         .map_err(|e| FerrumError::model(format!("new_stream: {e}")))?;
 
+    // CRITICAL: candle operations (vb.get, narrow, cat, to_device) run on
+    // candle_stream. GpuWeight::from_tensor copies on runner's stream (rs).
+    // Without syncing candle_stream before each from_tensor, the clone_dtod
+    // reads stale/uninitialized GPU data — causing completely wrong weights.
+    let sync_candle = || -> Result<()> {
+        candle_stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("candle sync: {e}")))
+    };
+
     let tp = cfg.tp_size;
     let rank = cfg.rank;
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
@@ -94,12 +104,15 @@ pub fn load_sharded_weights(
         )
         .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
     let embed_t = to_dev(&embed_t)?;
+    sync_candle()?;
     let embed_table = GpuWeight::from_tensor(&embed_t, &rs)
         .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
 
     for li in 0..cfg.num_hidden_layers {
+        // Sync candle stream before extracting weights to runner stream.
+        sync_candle()?;
         let prefix = format!("model.layers.{li}");
 
         // Input norm — replicated
@@ -284,6 +297,7 @@ pub fn load_sharded_weights(
         .get(cfg.hidden_size, "model.norm.weight")
         .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
     let fn_t = to_dev(&fn_t)?;
+    sync_candle()?;
     let final_norm_w = GpuWeight::from_tensor(&fn_t, &rs)
         .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
 
@@ -298,6 +312,7 @@ pub fn load_sharded_weights(
         })
         .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
     let lm_t = to_dev(&lm_t)?;
+    sync_candle()?;
     let lm_head_w = LinearWeight::Fp16(
         GpuWeight::from_tensor(&lm_t, &rs)
             .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?,
