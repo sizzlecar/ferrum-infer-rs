@@ -493,6 +493,113 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("attn_out d2h: {e}")))
     }
 
+    /// Copy a GpuWeight from host data into this runner's weight slice.
+    fn overwrite_gpu_weight(
+        stream: &Arc<CudaStream>,
+        dst: &mut crate::weight_store::GpuWeight,
+        host_data: &[half::f16],
+    ) -> candle_core::Result<()> {
+        let new_slice = stream
+            .clone_htod(host_data)
+            .map_err(|e| candle_core::Error::Msg(format!("htod: {e}")))?;
+        dst.slice = new_slice;
+        dst.len = host_data.len();
+        Ok(())
+    }
+
+    /// Sync replicated weights from a source runner (via D2H from source + H2D to self).
+    ///
+    /// Fixes candle VarBuilder producing different BF16→F16 conversions on different GPUs.
+    /// Only copies replicated (non-sharded) weights: norms, embed, lm_head, RoPE.
+    pub(crate) fn sync_replicated_weights_from(
+        &mut self,
+        source: &CudaDecodeRunner,
+    ) -> candle_core::Result<()> {
+        // Helper: read GpuWeight from source to host
+        let read = |w: &crate::weight_store::GpuWeight,
+                    src_stream: &Arc<CudaStream>|
+         -> candle_core::Result<Vec<half::f16>> {
+            let v = w.slice.slice(..w.len);
+            src_stream
+                .clone_dtoh(&v)
+                .map_err(|e| candle_core::Error::Msg(format!("dtoh: {e}")))
+        };
+
+        let src_stream = &source.stream;
+
+        // Embed table
+        source.bind_context()?;
+        let data = read(&source.weights.embed_table, src_stream)?;
+        self.bind_context()?;
+        Self::overwrite_gpu_weight(&self.stream, &mut self.weights.embed_table, &data)?;
+
+        // Final norm
+        source.bind_context()?;
+        let data = read(&source.weights.final_norm_w, src_stream)?;
+        self.bind_context()?;
+        Self::overwrite_gpu_weight(&self.stream, &mut self.weights.final_norm_w, &data)?;
+
+        // LM head
+        if let crate::weight_store::LinearWeight::Fp16(ref src_w) = source.weights.lm_head_w {
+            source.bind_context()?;
+            let data = read(src_w, src_stream)?;
+            self.bind_context()?;
+            if let crate::weight_store::LinearWeight::Fp16(ref mut dst_w) = self.weights.lm_head_w {
+                Self::overwrite_gpu_weight(&self.stream, dst_w, &data)?;
+            }
+        }
+
+        // RoPE tables
+        source.bind_context()?;
+        let cos_data = read(&source.weights.rope_cos, src_stream)?;
+        let sin_data = read(&source.weights.rope_sin, src_stream)?;
+        self.bind_context()?;
+        Self::overwrite_gpu_weight(&self.stream, &mut self.weights.rope_cos, &cos_data)?;
+        Self::overwrite_gpu_weight(&self.stream, &mut self.weights.rope_sin, &sin_data)?;
+
+        // Per-layer replicated weights: input_ln, post_ln, q_norm, k_norm
+        for li in 0..self.weights.layers.len() {
+            source.bind_context()?;
+            let iln = read(&source.weights.layers[li].input_ln_w, src_stream)?;
+            let pln = read(&source.weights.layers[li].post_ln_w, src_stream)?;
+            let qn = source.weights.layers[li]
+                .q_norm_w
+                .as_ref()
+                .map(|w| read(w, src_stream))
+                .transpose()?;
+            let kn = source.weights.layers[li]
+                .k_norm_w
+                .as_ref()
+                .map(|w| read(w, src_stream))
+                .transpose()?;
+
+            self.bind_context()?;
+            Self::overwrite_gpu_weight(
+                &self.stream,
+                &mut self.weights.layers[li].input_ln_w,
+                &iln,
+            )?;
+            Self::overwrite_gpu_weight(
+                &self.stream,
+                &mut self.weights.layers[li].post_ln_w,
+                &pln,
+            )?;
+            if let (Some(data), Some(ref mut dst)) =
+                (qn, self.weights.layers[li].q_norm_w.as_mut())
+            {
+                Self::overwrite_gpu_weight(&self.stream, dst, &data)?;
+            }
+            if let (Some(data), Some(ref mut dst)) =
+                (kn, self.weights.layers[li].k_norm_w.as_mut())
+            {
+                Self::overwrite_gpu_weight(&self.stream, dst, &data)?;
+            }
+        }
+
+        self.sync_stream()?;
+        Ok(())
+    }
+
     /// Read layer norm weight to host for diagnostics.
     pub(crate) fn diag_layer_norm_weight(
         &self,
