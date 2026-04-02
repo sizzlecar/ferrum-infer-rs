@@ -168,6 +168,19 @@ impl CudaDecodeRunner {
             (None, 0)
         };
 
+        // Dump first 5 values of L0 gate_up weight for cross-path comparison
+        {
+            let gw = &weights.layers[0].gate_up_w;
+            if let crate::weight_store::LinearWeight::Fp16(ref w) = gw {
+                let v = w.slice.slice(..5.min(w.len));
+                if let Ok(data) = stream.clone_dtoh(&v) {
+                    let vals: Vec<half::f16> = data;
+                    let f: Vec<f32> = vals.iter().map(|x| x.to_f32()).collect();
+                    eprintln!("[WEIGHT] L0 gate_up first5: {:?} total={}", f, w.len);
+                }
+            }
+        }
+
         tracing::warn!(
             "CudaDecodeRunner initialized: {}MB, {} layers, h={} nq={} nkv={} hd={} inter={} paged={}{}",
             buffers.memory_bytes() / (1024 * 1024),
