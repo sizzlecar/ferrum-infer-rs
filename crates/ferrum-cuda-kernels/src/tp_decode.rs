@@ -96,6 +96,23 @@ impl TpDecodeGroup {
             // 1. QKV + norm + RoPE + attention (local heads)
             for_each_rank!(|r: usize| self.runners[r].tp_pre_o_proj(li, position, cache_key));
 
+            if li == 0 {
+                for r in 0..ws {
+                    self.runners[r].bind_context()?;
+                    self.runners[r].sync_stream()?;
+                    let attn = self.runners[r].attn_out_to_host()?;
+                    let has_nan = attn.iter().any(|v| v.is_nan());
+                    let max = attn
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    eprintln!(
+                        "[TP L0] r{r} after pre_o_proj: attn_out len={} nan={has_nan} max={max:.4}",
+                        attn.len()
+                    );
+                }
+            }
+
             // 2. O projection (row-parallel: partial output)
             for_each_rank!(|r: usize| self.runners[r].tp_o_proj(li));
 

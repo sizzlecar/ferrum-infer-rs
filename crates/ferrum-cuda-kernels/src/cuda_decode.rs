@@ -484,6 +484,15 @@ impl CudaDecodeRunner {
         )
     }
 
+    /// Read attn_out to host for diagnostics.
+    pub(crate) fn attn_out_to_host(&self) -> candle_core::Result<Vec<half::f16>> {
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let view = self.buffers.attn_out.slice(..q_dim);
+        self.stream
+            .clone_dtoh(&view)
+            .map_err(|e| candle_core::Error::Msg(format!("attn_out d2h: {e}")))
+    }
+
     /// Access o_proj_out buffer for all-reduce.
     pub(crate) fn o_proj_out_mut(&mut self) -> &mut CudaSlice<half::f16> {
         &mut self.buffers.o_proj_out
