@@ -175,6 +175,17 @@ impl CandleModelExecutor {
                 }
             };
 
+            // Bind this GPU's CUDA context on the main thread before weight loading.
+            // Required because GpuWeight::from_tensor uses cudarc clone_dtod which
+            // needs the correct context active.
+            if let Ok(cuda_dev) = device.as_cuda_device() {
+                let ctx = cuda_dev.cuda_stream().context().clone();
+                if let Err(e) = ctx.bind_to_thread() {
+                    tracing::warn!("Cannot bind GPU {rank} context: {e}");
+                    return false;
+                }
+            }
+
             let (weights, dims, stream) =
                 match crate::loader::tp_weight_loader::load_sharded_weights(
                     &vb, &rank_cfg, &device,
