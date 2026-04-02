@@ -130,8 +130,12 @@ impl CandleModelExecutor {
                 })
                 .unwrap_or(false),
             tp_size: tp,
-            rank: 0, // will be set per-rank below
+            rank: 0,
         };
+        info!(
+            "TP config: has_qk_norm={}, head_dim={}, nq={}, nkv={}",
+            tp_cfg.has_qk_norm, tp_cfg.head_dim, tp_cfg.num_attention_heads, tp_cfg.num_kv_heads
+        );
 
         // Generate NCCL unique ID (rank 0 generates, shared with all)
         let nccl_id = match ferrum_cuda_kernels::nccl_comm::NcclRank::unique_id() {
