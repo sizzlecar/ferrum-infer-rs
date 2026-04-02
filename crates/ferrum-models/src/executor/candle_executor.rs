@@ -555,6 +555,35 @@ impl ModelExecutor for CandleModelExecutor {
                     candle_core::op::BackpropOp::none(),
                     false,
                 );
+                // Diagnostic: print TP logits top-5
+                if let Ok(vals) = logits_tensor
+                    .flatten_all()
+                    .and_then(|t| t.to_vec1::<half::f16>())
+                {
+                    let has_nan = vals.iter().any(|v| v.is_nan());
+                    let has_inf = vals.iter().any(|v| v.is_infinite());
+                    let max_val = vals
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let min_val = vals
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .fold(f32::INFINITY, f32::min);
+                    let mut indexed: Vec<(usize, f32)> = vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (i, v.to_f32()))
+                        .collect();
+                    indexed
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let top5: Vec<String> = indexed[..5.min(indexed.len())]
+                        .iter()
+                        .map(|(i, v)| format!("{i}:{v:.2}"))
+                        .collect();
+                    eprintln!("[TP DIAG] logits: len={} nan={has_nan} inf={has_inf} min={min_val:.2} max={max_val:.2} top5=[{}]", vals.len(), top5.join(", "));
+                }
+
                 let logits_ref = self.wrap_tensor(logits_tensor);
                 let new_seq_len = seq_len + 1;
                 {
