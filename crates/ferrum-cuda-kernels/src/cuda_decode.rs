@@ -511,7 +511,7 @@ impl CudaDecodeRunner {
     ///
     /// Fixes candle VarBuilder producing different BF16→F16 conversions on different GPUs.
     /// Only copies replicated (non-sharded) weights: norms, embed, lm_head, RoPE.
-    pub(crate) fn sync_replicated_weights_from(
+    pub fn sync_replicated_weights_from(
         &mut self,
         source: &CudaDecodeRunner,
     ) -> candle_core::Result<()> {
