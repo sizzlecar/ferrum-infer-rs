@@ -441,7 +441,12 @@ impl LlamaModelWrapper {
     ) -> Result<Self> {
         info!("Creating Llama model from weights...");
 
-        let head_dim = config.hidden_size / config.num_attention_heads;
+        let head_dim = config
+            .extra_params
+            .get("head_dim")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(config.hidden_size / config.num_attention_heads);
         let cfg = Config {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
