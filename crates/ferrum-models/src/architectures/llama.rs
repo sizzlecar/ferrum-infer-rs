@@ -95,7 +95,7 @@ pub struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     pub fn new(cfg: &Config, dtype: DType, device: &CandleDevice) -> CandleResult<Self> {
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
         let inv_freq: Vec<f32> = (0..head_dim)
             .step_by(2)
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / head_dim as f32))
