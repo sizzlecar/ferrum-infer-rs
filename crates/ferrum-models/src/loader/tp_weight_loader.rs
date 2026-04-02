@@ -269,9 +269,15 @@ pub fn load_sharded_weights(
     let final_norm_w = GpuWeight::from_tensor(&fn_t, &rs)
         .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
 
-    // LM head — replicated
+    // LM head — replicated (or tied to embed_tokens)
     let lm_t = vb
         .get((cfg.vocab_size, cfg.hidden_size), "lm_head.weight")
+        .or_else(|_| {
+            vb.get(
+                (cfg.vocab_size, cfg.hidden_size),
+                "model.embed_tokens.weight",
+            )
+        })
         .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
     let lm_t = to_dev(&lm_t)?;
     let lm_head_w = LinearWeight::Fp16(
