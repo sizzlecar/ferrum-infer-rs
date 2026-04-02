@@ -99,11 +99,23 @@ impl TpDecodeGroup {
             // 2. O projection (row-parallel: partial output)
             for_each_rank!(|r: usize| self.runners[r].tp_o_proj(li));
 
-            // 3. ALL-REDUCE o_proj_out
-            for r in 0..ws {
-                self.runners[r].bind_context()?;
-                self.nccl[r].all_reduce_f16_inplace(self.runners[r].o_proj_out_mut())?;
-            }
+            // 3. ALL-REDUCE o_proj_out (must be simultaneous across ranks)
+            std::thread::scope(|s| -> candle_core::Result<()> {
+                let mut handles = Vec::with_capacity(ws);
+                for r in 0..ws {
+                    let runner = &mut self.runners[r];
+                    let nccl = &self.nccl[r];
+                    handles.push(s.spawn(move || {
+                        runner.bind_context()?;
+                        nccl.all_reduce_f16_inplace(runner.o_proj_out_mut())
+                    }));
+                }
+                for h in handles {
+                    h.join()
+                        .map_err(|_| candle_core::Error::Msg("AR thread panic".into()))??;
+                }
+                Ok(())
+            })?;
 
             // 4. Post-attention residual + norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_attn_norm(li));
@@ -111,11 +123,23 @@ impl TpDecodeGroup {
             // 5. MLP
             for_each_rank!(|r: usize| self.runners[r].tp_mlp(li));
 
-            // 6. ALL-REDUCE down_out
-            for r in 0..ws {
-                self.runners[r].bind_context()?;
-                self.nccl[r].all_reduce_f16_inplace(self.runners[r].down_out_mut())?;
-            }
+            // 6. ALL-REDUCE down_out (must be simultaneous)
+            std::thread::scope(|s| -> candle_core::Result<()> {
+                let mut handles = Vec::with_capacity(ws);
+                for r in 0..ws {
+                    let runner = &mut self.runners[r];
+                    let nccl = &self.nccl[r];
+                    handles.push(s.spawn(move || {
+                        runner.bind_context()?;
+                        nccl.all_reduce_f16_inplace(runner.down_out_mut())
+                    }));
+                }
+                for h in handles {
+                    h.join()
+                        .map_err(|_| candle_core::Error::Msg("AR thread panic".into()))??;
+                }
+                Ok(())
+            })?;
 
             // 7. Post-MLP residual + next layer norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
