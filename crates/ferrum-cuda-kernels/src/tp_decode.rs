@@ -85,7 +85,7 @@ impl TpDecodeGroup {
             };
         }
 
-        // Diagnostic helper: check buffer on rank 0 for NaN
+        // Diagnostic helpers
         macro_rules! diag_check {
             ($label:expr, $buf:expr) => {
                 self.runners[0].bind_context()?;
@@ -100,6 +100,23 @@ impl TpDecodeGroup {
                     eprintln!("[TP DIAG] {} ok min={min:.4} max={max:.4}", $label);
                 }
             };
+        }
+        // Check that rank 0 and rank 1 have same buffer (replicated invariant)
+        macro_rules! diag_rank_cmp {
+            ($label:expr, $buf:expr) => {{
+                self.runners[0].bind_context()?;
+                self.runners[0].sync_stream()?;
+                let d0 = self.runners[0].diag_buf($buf)?;
+                self.runners[1].bind_context()?;
+                self.runners[1].sync_stream()?;
+                let d1 = self.runners[1].diag_buf($buf)?;
+                let max_diff = d0.iter().zip(d1.iter())
+                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                    .fold(0.0f32, f32::max);
+                let any_nan0 = d0.iter().any(|v| v.is_nan());
+                let any_nan1 = d1.iter().any(|v| v.is_nan());
+                eprintln!("[TP CMP] {} max_diff={max_diff:.4} nan0={any_nan0} nan1={any_nan1}", $label);
+            }};
         }
 
         // Embed (replicated)
@@ -118,10 +135,6 @@ impl TpDecodeGroup {
 
             // 2. O projection (row-parallel: partial output)
             for_each_rank!(|r: usize| self.runners[r].tp_o_proj(li));
-
-            if diag {
-                diag_check!(&format!("L{li} o_proj(pre-AR)"), "o_proj_out");
-            }
 
             // 3. ALL-REDUCE o_proj_out (must be simultaneous across ranks)
             std::thread::scope(|s| -> candle_core::Result<()> {
@@ -144,22 +157,19 @@ impl TpDecodeGroup {
             })?;
 
             if diag {
-                diag_check!(&format!("L{li} o_proj(post-AR)"), "o_proj_out");
+                // KEY: check rank 0 vs rank 1 after all-reduce (should be identical)
+                diag_rank_cmp!(&format!("L{li} o_proj(AR)"), "o_proj_out");
             }
 
             // 4. Post-attention residual + norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_attn_norm(li));
 
             if diag {
-                diag_check!(&format!("L{li} post_attn_norm"), "post_norm_out");
+                diag_rank_cmp!(&format!("L{li} post_attn_norm"), "post_norm_out");
             }
 
             // 5. MLP
             for_each_rank!(|r: usize| self.runners[r].tp_mlp(li));
-
-            if diag {
-                diag_check!(&format!("L{li} down(pre-AR)"), "down_out");
-            }
 
             // 6. ALL-REDUCE down_out (must be simultaneous)
             std::thread::scope(|s| -> candle_core::Result<()> {
@@ -182,14 +192,16 @@ impl TpDecodeGroup {
             })?;
 
             if diag {
-                diag_check!(&format!("L{li} down(post-AR)"), "down_out");
+                // KEY: check rank 0 vs rank 1 after all-reduce
+                diag_rank_cmp!(&format!("L{li} down(AR)"), "down_out");
             }
 
             // 7. Post-MLP residual + next layer norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
 
             if diag {
-                diag_check!(&format!("L{li} residual"), "residual");
+                diag_rank_cmp!(&format!("L{li} residual"), "residual");
+                diag_rank_cmp!(&format!("L{li} norm_out"), "norm_out");
             }
         }
 
