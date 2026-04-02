@@ -210,36 +210,26 @@ impl CudaDecodeRunner {
     }
 
     /// Cross-GPU copy: src CudaSlice (any GPU) → new CudaSlice on this runner's GPU.
-    /// Uses raw cuMemcpyPeerAsync, bypassing cudarc event tracking.
+    /// Uses D2H sync + H2D to avoid all cross-context issues.
     pub fn peer_copy_to_self(
         &self,
         src: &CudaSlice<half::f16>,
-        src_ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        _src_ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        self.stream
-            .context()
-            .bind_to_thread()
-            .map_err(|e| candle_core::Error::Msg(format!("peer bind: {e}")))?;
         let len = src.len();
-        let mut dst = unsafe {
-            self.stream
-                .alloc::<half::f16>(len)
-                .map_err(|e| candle_core::Error::Msg(format!("peer alloc: {e}")))?
-        };
-        // Disable event tracking to avoid cross-context deadlock,
-        // then use cudarc's safe memcpy_dtod which handles peer copy.
-        unsafe {
-            src_ctx.disable_event_tracking();
-            self.stream.context().disable_event_tracking();
-        }
+        // D2H: read src to host (sync, uses src's context internally)
+        let mut host = vec![half::f16::ZERO; len];
         self.stream
-            .memcpy_dtod(src, &mut dst)
-            .map_err(|e| candle_core::Error::Msg(format!("peer copy: {e}")))?;
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("peer sync: {e}")))?;
         unsafe {
-            src_ctx.enable_event_tracking();
-            self.stream.context().enable_event_tracking();
+            cudarc::driver::result::memcpy_dtoh_sync(&mut host, src.cu_device_ptr)
+                .map_err(|e| candle_core::Error::Msg(format!("peer d2h: {e}")))?;
         }
-        Ok(dst)
+        // H2D: upload to this runner's GPU
+        self.stream
+            .clone_htod(&host)
+            .map_err(|e| candle_core::Error::Msg(format!("peer h2d: {e}")))
     }
 
     /// Access weight layers (diagnostic only).
