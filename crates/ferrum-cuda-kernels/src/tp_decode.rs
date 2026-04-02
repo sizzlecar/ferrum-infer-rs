@@ -165,6 +165,22 @@ impl TpDecodeGroup {
 
             // 7. Post-MLP residual + next layer norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
+
+            // Per-layer NaN + magnitude check (rank 0)
+            if li < 6 || li % 6 == 0 {
+                self.runners[0].bind_context()?;
+                self.runners[0].sync_stream()?;
+                let data = self.runners[0].diag_buf("residual")?;
+                let has_nan = data.iter().any(|v| v.is_nan());
+                let has_inf = data.iter().any(|v| v.is_infinite());
+                let max = data.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                if has_nan || has_inf {
+                    eprintln!("[TP] L{li} residual: NaN={has_nan} inf={has_inf}");
+                    break;
+                } else if li < 6 {
+                    eprintln!("[TP] L{li} residual: abs_max={max:.1}");
+                }
+            }
         }
 
         // LM head (replicated)
