@@ -101,18 +101,20 @@ impl TpDecodeGroup {
 
             // 3. ALL-REDUCE o_proj_out (must be simultaneous across ranks)
             std::thread::scope(|s| -> candle_core::Result<()> {
-                let mut handles = Vec::with_capacity(ws);
-                for r in 0..ws {
-                    let runner = &mut self.runners[r];
-                    let nccl = &self.nccl[r];
-                    handles.push(s.spawn(move || {
-                        runner.bind_context()?;
-                        nccl.all_reduce_f16_inplace(runner.o_proj_out_mut())
-                    }));
-                }
+                let handles: Vec<_> = self
+                    .runners
+                    .iter_mut()
+                    .zip(self.nccl.iter())
+                    .map(|(runner, nccl)| {
+                        s.spawn(move || {
+                            runner.bind_context()?;
+                            nccl.all_reduce_f16_inplace(runner.o_proj_out_mut())
+                        })
+                    })
+                    .collect();
                 for h in handles {
                     h.join()
-                        .map_err(|_| candle_core::Error::Msg("AR thread panic".into()))??;
+                        .map_err(|_| candle_core::Error::Msg("AR panic".into()))??;
                 }
                 Ok(())
             })?;
@@ -125,18 +127,20 @@ impl TpDecodeGroup {
 
             // 6. ALL-REDUCE down_out (must be simultaneous)
             std::thread::scope(|s| -> candle_core::Result<()> {
-                let mut handles = Vec::with_capacity(ws);
-                for r in 0..ws {
-                    let runner = &mut self.runners[r];
-                    let nccl = &self.nccl[r];
-                    handles.push(s.spawn(move || {
-                        runner.bind_context()?;
-                        nccl.all_reduce_f16_inplace(runner.down_out_mut())
-                    }));
-                }
+                let handles: Vec<_> = self
+                    .runners
+                    .iter_mut()
+                    .zip(self.nccl.iter())
+                    .map(|(runner, nccl)| {
+                        s.spawn(move || {
+                            runner.bind_context()?;
+                            nccl.all_reduce_f16_inplace(runner.down_out_mut())
+                        })
+                    })
+                    .collect();
                 for h in handles {
                     h.join()
-                        .map_err(|_| candle_core::Error::Msg("AR thread panic".into()))??;
+                        .map_err(|_| candle_core::Error::Msg("AR panic".into()))??;
                 }
                 Ok(())
             })?;
