@@ -194,6 +194,12 @@ impl CandleModelExecutor {
             }
         }
 
+        // Retain primary context for all GPUs on main thread.
+        // Init threads retained their own, but those may not carry over.
+        let _main_thread_devices: Vec<_> = (0..tp)
+            .filter_map(|r| candle_core::Device::new_cuda(r).ok())
+            .collect();
+
         match ferrum_cuda_kernels::tp_decode::TpDecodeGroup::new(runners, nccl_ranks) {
             Ok(group) => {
                 info!("Tensor parallel group initialized: {tp} GPUs");
