@@ -137,89 +137,79 @@ impl CandleModelExecutor {
             tp_cfg.has_qk_norm, tp_cfg.head_dim, tp_cfg.num_attention_heads, tp_cfg.num_kv_heads
         );
 
-        // Load VarBuilder ONCE on GPU 0 to guarantee replicated weights are
-        // bit-identical across ranks. Candle's mmaped VarBuilder can produce
-        // subtly different BF16→F16 conversions when loaded independently on
-        // different GPUs. Using a single VarBuilder + cross-device to_device()
-        // eliminates this. Weight sharding (narrow/cat) and GPU transfer happen
-        // sequentially per rank — acceptable since this is a one-time init cost.
+        // Each rank loads weights in its own thread (correct CUDA context).
+        // After loading, we sync replicated weights from rank 0 to other ranks
+        // to fix candle VarBuilder producing different BF16→F16 conversions
+        // when loaded independently on different GPUs.
+        type RankResult = candle_core::Result<(
+            ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner,
+            std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+        )>;
+
+        let mut handles: Vec<std::thread::JoinHandle<RankResult>> = Vec::with_capacity(tp);
         let dtype = self.model.dtype();
-        let device0 = match candle_core::Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("Cannot create CUDA device 0: {e}");
-                return false;
-            }
-        };
-        let loader = crate::loader::SafeTensorsLoader::new(&model_dir);
-        let vb = match loader.load_varbuilder(&device0, dtype) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("TP VarBuilder load failed: {e}");
-                return false;
-            }
-        };
-
-        let mut runners = Vec::with_capacity(tp);
-        let mut nccl_streams = Vec::with_capacity(tp);
-
         for rank in 0..tp {
             let mut rank_cfg = tp_cfg.clone();
             rank_cfg.rank = rank;
-            // Target device for this rank's weights
-            let device = match candle_core::Device::new_cuda(rank) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Cannot create CUDA device {rank}: {e}");
+            let model_dir = model_dir.clone();
+
+            handles.push(std::thread::spawn(move || {
+                let device = candle_core::Device::new_cuda(rank)?;
+                let loader = crate::loader::SafeTensorsLoader::new(&model_dir);
+                let vb = loader
+                    .load_varbuilder(&device, dtype)
+                    .map_err(|e| candle_core::Error::Msg(format!("VB rank {rank}: {e}")))?;
+
+                let (weights, dims, stream) =
+                    crate::loader::tp_weight_loader::load_sharded_weights(&vb, &rank_cfg, &device)
+                        .map_err(|e| candle_core::Error::Msg(format!("shard {rank}: {e}")))?;
+
+                let cuda_dev = device.as_cuda_device()?.clone();
+
+                let runner = ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
+                    weights,
+                    dims,
+                    cuda_dev,
+                    stream.clone(),
+                )?;
+                Ok((runner, stream))
+            }));
+        }
+
+        let mut runners = Vec::with_capacity(tp);
+        let mut nccl_streams = Vec::with_capacity(tp);
+        for (rank, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(Ok((runner, stream))) => {
+                    runners.push(runner);
+                    nccl_streams.push(stream);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("TP rank {rank} failed: {e}");
                     return false;
                 }
-            };
-
-            // Bind this GPU's CUDA context on the main thread before weight loading.
-            // Required because GpuWeight::from_tensor uses cudarc clone_dtod which
-            // needs the correct context active.
-            if let Ok(cuda_dev) = device.as_cuda_device() {
-                let ctx = cuda_dev.cuda_stream().context().clone();
-                if let Err(e) = ctx.bind_to_thread() {
-                    tracing::warn!("Cannot bind GPU {rank} context: {e}");
+                Err(_) => {
+                    tracing::warn!("TP rank {rank} panicked");
                     return false;
                 }
             }
+        }
 
-            let (weights, dims, stream) =
-                match crate::loader::tp_weight_loader::load_sharded_weights(
-                    &vb, &rank_cfg, &device,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("TP shard {rank} failed: {e}");
-                        return false;
-                    }
-                };
-
-            let cuda_dev = match device.as_cuda_device() {
-                Ok(d) => d.clone(),
-                Err(e) => {
-                    tracing::warn!("TP rank {rank} not CUDA: {e}");
-                    return false;
-                }
+        // Sync replicated weights: copy from rank 0 to all other ranks.
+        // Fixes candle VarBuilder BF16→F16 divergence across GPUs.
+        for rank in 1..tp {
+            let (src, dst) = if rank == 1 {
+                let (first, rest) = runners.split_at_mut(1);
+                (&first[0], &mut rest[0])
+            } else {
+                let (first, rest) = runners.split_at_mut(1);
+                (&first[0], &mut rest[rank - 1])
             };
-
-            let runner = match ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
-                weights,
-                dims,
-                cuda_dev,
-                stream.clone(),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("TP runner {rank} failed: {e}");
-                    return false;
-                }
-            };
-
-            runners.push(runner);
-            nccl_streams.push(stream);
+            if let Err(e) = dst.sync_replicated_weights_from(src) {
+                tracing::warn!("TP weight sync rank 0→{rank} failed: {e}");
+                return false;
+            }
+            info!("Synced replicated weights: rank 0 → rank {rank}");
         }
 
         // Retain primary context for all GPUs on main thread.
