@@ -166,19 +166,28 @@ impl TpDecodeGroup {
             // 7. Post-MLP residual + next layer norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
 
-            // Per-layer NaN + magnitude check (rank 0)
+            // Per-layer diagnostic (rank 0)
             if li < 6 || li % 6 == 0 {
                 self.runners[0].bind_context()?;
                 self.runners[0].sync_stream()?;
-                let data = self.runners[0].diag_buf("residual")?;
-                let has_nan = data.iter().any(|v| v.is_nan());
-                let has_inf = data.iter().any(|v| v.is_infinite());
-                let max = data.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                let abs_max = |name: &str| -> f32 {
+                    self.runners[0].diag_buf(name).map(|d| {
+                        d.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max)
+                    }).unwrap_or(-1.0)
+                };
+                let res = abs_max("residual");
+                let has_inf = res.is_infinite();
+                let has_nan = res.is_nan();
                 if has_nan || has_inf {
                     eprintln!("[TP] L{li} residual: NaN={has_nan} inf={has_inf}");
                     break;
                 } else if li < 6 {
-                    eprintln!("[TP] L{li} residual: abs_max={max:.1}");
+                    let oproj = abs_max("o_proj_out");
+                    let pno = abs_max("post_norm_out");
+                    let down = abs_max("down_out");
+                    eprintln!(
+                        "[TP] L{li} res={res:.1} oproj={oproj:.1} pnorm={pno:.2} down={down:.1}"
+                    );
                 }
             }
         }
