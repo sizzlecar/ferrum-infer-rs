@@ -100,13 +100,26 @@ impl TpDecodeGroup {
             for_each_rank!(|r: usize| self.runners[r].tp_o_proj(li));
 
             // 3. ALL-REDUCE o_proj_out
-            // NCCL ops are stream-ordered: just enqueue on each rank's stream
-            // sequentially. NCCL handles inter-GPU sync internally.
-            for r in 0..ws {
-                self.runners[r].bind_context()?;
-                self.nccl[r]
-                    .all_reduce_f16_inplace(self.runners[r].o_proj_out_mut())?;
-            }
+            // NCCL all-reduce requires simultaneous participation from all ranks.
+            // Sequential calls deadlock (ncclAllReduce blocks until peer enqueues).
+            std::thread::scope(|s| -> candle_core::Result<()> {
+                let handles: Vec<_> = self
+                    .runners
+                    .iter_mut()
+                    .zip(self.nccl.iter())
+                    .map(|(runner, nccl)| {
+                        s.spawn(move || {
+                            runner.bind_context()?;
+                            nccl.all_reduce_f16_inplace(runner.o_proj_out_mut())
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join()
+                        .map_err(|_| candle_core::Error::Msg("AR panic".into()))??;
+                }
+                Ok(())
+            })?;
 
             // 4. Post-attention residual + norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_attn_norm(li));
@@ -115,11 +128,24 @@ impl TpDecodeGroup {
             for_each_rank!(|r: usize| self.runners[r].tp_mlp(li));
 
             // 6. ALL-REDUCE down_out
-            for r in 0..ws {
-                self.runners[r].bind_context()?;
-                self.nccl[r]
-                    .all_reduce_f16_inplace(self.runners[r].down_out_mut())?;
-            }
+            std::thread::scope(|s| -> candle_core::Result<()> {
+                let handles: Vec<_> = self
+                    .runners
+                    .iter_mut()
+                    .zip(self.nccl.iter())
+                    .map(|(runner, nccl)| {
+                        s.spawn(move || {
+                            runner.bind_context()?;
+                            nccl.all_reduce_f16_inplace(runner.down_out_mut())
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join()
+                        .map_err(|_| candle_core::Error::Msg("AR panic".into()))??;
+                }
+                Ok(())
+            })?;
 
             // 7. Post-MLP residual + next layer norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
