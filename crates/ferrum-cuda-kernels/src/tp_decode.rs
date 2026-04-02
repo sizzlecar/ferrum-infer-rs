@@ -88,24 +88,6 @@ impl TpDecodeGroup {
         // Embed (replicated)
         for_each_rank!(|r: usize| self.runners[r].tp_embed(token_id));
 
-        // Verify replicated weight integrity (first step only)
-        if position <= 1 && ws > 1 {
-            for check_li in 0..2.min(n) {
-                self.runners[0].bind_context()?;
-                self.runners[0].sync_stream()?;
-                let w0 = self.runners[0].diag_layer_norm_weight(check_li)?;
-                self.runners[1].bind_context()?;
-                self.runners[1].sync_stream()?;
-                let w1 = self.runners[1].diag_layer_norm_weight(check_li)?;
-                let max_diff = w0.iter().zip(w1.iter())
-                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                    .fold(0.0f32, f32::max);
-                eprintln!(
-                    "[TP WEIGHT] L{check_li} input_ln_w max_diff={max_diff:.6}",
-                );
-            }
-        }
-
         // First layer norm (replicated)
         for_each_rank!(|r: usize| self.runners[r].tp_first_norm());
 
@@ -165,31 +147,6 @@ impl TpDecodeGroup {
 
             // 7. Post-MLP residual + next layer norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
-
-            // Per-layer diagnostic (rank 0)
-            if li < 6 || li % 6 == 0 {
-                self.runners[0].bind_context()?;
-                self.runners[0].sync_stream()?;
-                let abs_max = |name: &str| -> f32 {
-                    self.runners[0].diag_buf(name).map(|d| {
-                        d.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max)
-                    }).unwrap_or(-1.0)
-                };
-                let res = abs_max("residual");
-                let has_inf = res.is_infinite();
-                let has_nan = res.is_nan();
-                if has_nan || has_inf {
-                    eprintln!("[TP] L{li} residual: NaN={has_nan} inf={has_inf}");
-                    break;
-                } else if li < 6 {
-                    let oproj = abs_max("o_proj_out");
-                    let pno = abs_max("post_norm_out");
-                    let down = abs_max("down_out");
-                    eprintln!(
-                        "[TP] L{li} res={res:.1} oproj={oproj:.1} pnorm={pno:.2} down={down:.1}"
-                    );
-                }
-            }
         }
 
         // LM head (replicated)

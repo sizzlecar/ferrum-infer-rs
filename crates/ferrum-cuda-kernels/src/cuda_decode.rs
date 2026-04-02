@@ -168,19 +168,6 @@ impl CudaDecodeRunner {
             (None, 0)
         };
 
-        // Dump first 5 values of L0 gate_up weight for cross-path comparison
-        {
-            let gw = &weights.layers[0].gate_up_w;
-            if let crate::weight_store::LinearWeight::Fp16(ref w) = gw {
-                let v = w.slice.slice(..5.min(w.len));
-                if let Ok(data) = stream.clone_dtoh(&v) {
-                    let vals: Vec<half::f16> = data;
-                    let f: Vec<f32> = vals.iter().map(|x| x.to_f32()).collect();
-                    eprintln!("[WEIGHT] L0 gate_up first5: {:?} total={}", f, w.len);
-                }
-            }
-        }
-
         tracing::warn!(
             "CudaDecodeRunner initialized: {}MB, {} layers, h={} nq={} nkv={} hd={} inter={} paged={}{}",
             buffers.memory_bytes() / (1024 * 1024),
@@ -502,15 +489,6 @@ impl CudaDecodeRunner {
         )
     }
 
-    /// Read attn_out to host for diagnostics.
-    pub(crate) fn attn_out_to_host(&self) -> candle_core::Result<Vec<half::f16>> {
-        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
-        let view = self.buffers.attn_out.slice(..q_dim);
-        self.stream
-            .clone_dtoh(&view)
-            .map_err(|e| candle_core::Error::Msg(format!("attn_out d2h: {e}")))
-    }
-
     /// Copy a GpuWeight from host data into this runner's weight slice.
     fn overwrite_gpu_weight(
         stream: &Arc<CudaStream>,
@@ -616,37 +594,6 @@ impl CudaDecodeRunner {
 
         self.sync_stream()?;
         Ok(())
-    }
-
-    /// Read layer norm weight to host for diagnostics.
-    pub(crate) fn diag_layer_norm_weight(
-        &self,
-        li: usize,
-    ) -> candle_core::Result<Vec<half::f16>> {
-        let w = &self.weights.layers[li].input_ln_w;
-        let view = w.slice.slice(..w.len);
-        self.stream
-            .clone_dtoh(&view)
-            .map_err(|e| candle_core::Error::Msg(format!("diag norm weight L{li}: {e}")))
-    }
-
-    /// Read named buffer to host for diagnostics.
-    pub(crate) fn diag_buf(&self, name: &str) -> candle_core::Result<Vec<half::f16>> {
-        let h = self.dims.hidden_size;
-        let (slice_ref, len) = match name {
-            "o_proj_out" => (&self.buffers.o_proj_out, h),
-            "residual" => (&self.buffers.residual, h),
-            "post_norm_out" => (&self.buffers.post_norm_out, h),
-            "post_norm_residual" => (&self.buffers.post_norm_residual, h),
-            "down_out" => (&self.buffers.down_out, h),
-            "norm_out" => (&self.buffers.norm_out, h),
-            "final_norm_out" => (&self.buffers.final_norm_out, h),
-            _ => return Err(candle_core::Error::Msg(format!("unknown diag buf: {name}"))),
-        };
-        let view = slice_ref.slice(..len);
-        self.stream
-            .clone_dtoh(&view)
-            .map_err(|e| candle_core::Error::Msg(format!("diag {name}: {e}")))
     }
 
     /// Access o_proj_out buffer for all-reduce.
@@ -1345,15 +1292,6 @@ impl CudaDecodeRunner {
             None
         };
 
-        // Diagnostic: log first step's embed values
-        if position <= 2 {
-            self.stream.synchronize().ok();
-            eprintln!(
-                "[runner] q_norm_w={}",
-                self.weights.layers[0].q_norm_w.is_some()
-            );
-        }
-
         self.embed_eager(token_id)?;
 
         // Extract KV state (contiguous or paged)
@@ -1571,23 +1509,6 @@ impl CudaDecodeRunner {
                     )?;
                 }
 
-                // Diagnostic: compare key buffers (first 6 layers, first 2 positions)
-                if li < 6 && position <= 2 {
-                    self.stream.synchronize().ok();
-                    let read_max = |buf: &CudaSlice<half::f16>, len: usize| -> f32 {
-                        let v = buf.slice(..len);
-                        self.stream.clone_dtoh(&v).map(|d: Vec<half::f16>| {
-                            d.iter().map(|x| x.to_f32().abs()).fold(0.0f32, f32::max)
-                        }).unwrap_or(-1.0)
-                    };
-                    let res = read_max(&self.buffers.residual, h);
-                    let pno = read_max(&self.buffers.post_norm_out, h);
-                    let down = read_max(&self.buffers.down_out, h);
-                    let oproj = read_max(&self.buffers.o_proj_out, h);
-                    eprintln!(
-                        "[1GPU] L{li} res={res:.1} oproj={oproj:.1} pnorm={pno:.2} down={down:.1}"
-                    );
-                }
             }
         }
 
