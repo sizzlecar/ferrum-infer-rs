@@ -169,9 +169,14 @@ impl CudaDecodeRunner {
         };
 
         tracing::warn!(
-            "CudaDecodeRunner initialized: {}MB decode buffers, {} layers, paged_kv={}{}",
+            "CudaDecodeRunner initialized: {}MB, {} layers, h={} nq={} nkv={} hd={} inter={} paged={}{}",
             buffers.memory_bytes() / (1024 * 1024),
             dims.num_layers,
+            dims.hidden_size,
+            dims.num_attention_heads,
+            dims.num_kv_heads,
+            dims.head_dim,
+            dims.intermediate_size,
             use_paged_kv,
             if diag.any_enabled() {
                 format!(", diag={diag:?}")
