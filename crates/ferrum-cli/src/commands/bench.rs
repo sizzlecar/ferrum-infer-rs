@@ -85,6 +85,26 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let device = super::run::select_device(&cmd.backend);
     eprintln!("{} {:?}", "Device:".dimmed(), device);
 
+    // Show GPU info
+    #[cfg(feature = "cuda")]
+    {
+        if let Ok(d) = candle_core::Device::new_cuda(0) {
+            if let Ok(cd) = d.as_cuda_device() {
+                let name = cd.cuda_stream().context().device_name().unwrap_or_default();
+                eprintln!("GPU 0: {name}");
+            }
+        }
+        if let Ok(d) = candle_core::Device::new_cuda(1) {
+            if let Ok(cd) = d.as_cuda_device() {
+                let name = cd.cuda_stream().context().device_name().unwrap_or_default();
+                eprintln!("GPU 1: {name}");
+            }
+        }
+        if let Ok(tp) = std::env::var("FERRUM_TP") {
+            eprintln!("Tensor Parallel: TP={tp}");
+        }
+    }
+
     // Create engine with ContinuousBatch scheduler (not Priority).
     // DefaultInferenceEngine (Priority) has stream lifecycle issues with bench.
     let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);

@@ -121,7 +121,14 @@ impl CandleModelExecutor {
             vocab_size: cfg.vocab_size,
             max_seq_len: cfg.max_position_embeddings,
             rope_theta: cfg.rope_theta as f64,
-            has_qk_norm: false,
+            // Auto-detect Q/K norm by probing safetensors
+            has_qk_norm: crate::loader::SafeTensorsLoader::new(&model_dir)
+                .load_varbuilder(self.model.device(), self.model.dtype())
+                .map(|vb| {
+                    vb.get(cfg.head_dim, "model.layers.0.self_attn.q_norm.weight")
+                        .is_ok()
+                })
+                .unwrap_or(false),
             tp_size: tp,
             rank: 0, // will be set per-rank below
         };

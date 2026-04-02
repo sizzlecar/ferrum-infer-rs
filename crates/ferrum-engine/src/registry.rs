@@ -1060,9 +1060,30 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             ferrum_models::Architecture::Qwen3 => {
                 info!("Loading Qwen3 model weights...");
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
+                let model_dir_path: std::path::PathBuf = model_path.clone().into();
+
+                // Qwen3 + TP: use Llama wrapper (same safetensors layout + has_qk_norm)
+                let tp_size: usize = std::env::var("FERRUM_TP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if tp_size > 1 {
+                    info!("Qwen3 TP={tp_size}: using Llama wrapper for tensor parallel");
+                    let vb = loader.load_varbuilder(&candle_device, dtype)?;
+                    let mut llama_model = ferrum_models::LlamaModelWrapper::from_varbuilder(
+                        vb,
+                        &model_def,
+                        candle_device.clone(),
+                        dtype,
+                    )?;
+                    llama_model.set_model_dir(model_dir_path);
+                    let model_info =
+                        model_def.to_model_info(config.engine_config.model.model_id.to_string());
+                    let executor = ferrum_models::CandleModelExecutor::new(llama_model, model_info);
+                    return Ok(Arc::new(executor));
+                }
 
                 // Auto-detect GPTQ: dequantize INT4→FP16 for candle prefill
-                let model_dir_path: std::path::PathBuf = model_path.clone().into();
                 let qconfig =
                     ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
                         .unwrap_or(None);
