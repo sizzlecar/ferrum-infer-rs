@@ -90,13 +90,13 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     {
         if let Ok(d) = candle_core::Device::new_cuda(0) {
             if let Ok(cd) = d.as_cuda_device() {
-                let name = cd.cuda_stream().context().device_name().unwrap_or_default();
+                let name = cd.cuda_stream().context().name().unwrap_or_default();
                 eprintln!("GPU 0: {name}");
             }
         }
         if let Ok(d) = candle_core::Device::new_cuda(1) {
             if let Ok(cd) = d.as_cuda_device() {
-                let name = cd.cuda_stream().context().device_name().unwrap_or_default();
+                let name = cd.cuda_stream().context().name().unwrap_or_default();
                 eprintln!("GPU 1: {name}");
             }
         }
