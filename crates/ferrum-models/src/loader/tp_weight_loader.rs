@@ -78,15 +78,6 @@ pub fn load_sharded_weights(
         .new_stream()
         .map_err(|e| FerrumError::model(format!("new_stream: {e}")))?;
 
-    // CRITICAL: candle operations (vb.get, narrow, cat, to_device) run on
-    // candle_stream. GpuWeight::from_tensor copies on runner's stream (rs).
-    // Without syncing candle_stream before each from_tensor, the clone_dtod
-    // reads stale/uninitialized GPU data — causing completely wrong weights.
-    let sync_candle = || -> Result<()> {
-        candle_stream
-            .synchronize()
-            .map_err(|e| FerrumError::model(format!("candle sync: {e}")))
-    };
 
     let tp = cfg.tp_size;
     let rank = cfg.rank;
@@ -104,15 +95,29 @@ pub fn load_sharded_weights(
         )
         .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
     let embed_t = to_dev(&embed_t)?;
-    sync_candle()?;
-    let embed_table = GpuWeight::from_tensor(&embed_t, &rs)
-        .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
+    let embed_table = {
+        candle_stream.synchronize().map_err(|e| FerrumError::model(format!("sync: {e}")))?;
+        GpuWeight::from_tensor(&embed_t, &rs)
+            .map_err(|e| FerrumError::model(format!("embed: {e}")))?
+    };
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
 
+    // Helper: sync candle stream then copy tensor to runner stream.
+    // CRITICAL: candle ops (vb.get, narrow, cat, to_device) run on candle_stream.
+    // GpuWeight::from_tensor copies on the runner's stream (rs). Without syncing
+    // candle_stream immediately before from_tensor, the copy reads stale GPU data.
+    let to_gpu = |t: &Tensor| -> Result<GpuWeight> {
+        candle_stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("candle sync: {e}")))?;
+        GpuWeight::from_tensor(t, &rs).map_err(|e| FerrumError::model(format!("from_tensor: {e}")))
+    };
+    let to_gpu_linear = |t: &Tensor| -> Result<LinearWeight> {
+        Ok(LinearWeight::Fp16(to_gpu(t)?))
+    };
+
     for li in 0..cfg.num_hidden_layers {
-        // Sync candle stream before extracting weights to runner stream.
-        sync_candle()?;
         let prefix = format!("model.layers.{li}");
 
         // Input norm — replicated
@@ -120,8 +125,7 @@ pub fn load_sharded_weights(
             .get(cfg.hidden_size, &format!("{prefix}.input_layernorm.weight"))
             .map_err(|e| FerrumError::model(format!("input_ln L{li}: {e}")))?;
         let ln_w = to_dev(&ln_w)?;
-        let input_ln_w = GpuWeight::from_tensor(&ln_w, &rs)
-            .map_err(|e| FerrumError::model(format!("input_ln: {e}")))?;
+        let input_ln_w = to_gpu(&ln_w)?;
 
         // QKV — column-parallel (split output dim = rows for [out, in] weight)
         let q_full = vb
@@ -155,12 +159,8 @@ pub fn load_sharded_weights(
             .map_err(|e| FerrumError::model(format!("v shard L{li}: {e}")))?;
         let qkv_shard = Tensor::cat(&[&q_shard, &k_shard, &v_shard], 0)
             .map_err(|e| FerrumError::model(format!("qkv cat L{li}: {e}")))?;
-
         let qkv_shard = to_dev(&qkv_shard)?;
-        let qkv_w = LinearWeight::Fp16(
-            GpuWeight::from_tensor(&qkv_shard, &rs)
-                .map_err(|e| FerrumError::model(format!("qkv: {e}")))?,
-        );
+        let qkv_w = to_gpu_linear(&qkv_shard)?;
 
         // Q/K norms — replicated (if present)
         let q_norm_w = if cfg.has_qk_norm {
@@ -168,10 +168,7 @@ pub fn load_sharded_weights(
                 .get(cfg.head_dim, &format!("{prefix}.self_attn.q_norm.weight"))
                 .map_err(|e| FerrumError::model(format!("q_norm L{li}: {e}")))?;
             let t = to_dev(&t)?;
-            Some(
-                GpuWeight::from_tensor(&t, &rs)
-                    .map_err(|e| FerrumError::model(format!("q_norm: {e}")))?,
-            )
+            Some(to_gpu(&t)?)
         } else {
             None
         };
@@ -180,10 +177,7 @@ pub fn load_sharded_weights(
                 .get(cfg.head_dim, &format!("{prefix}.self_attn.k_norm.weight"))
                 .map_err(|e| FerrumError::model(format!("k_norm L{li}: {e}")))?;
             let t = to_dev(&t)?;
-            Some(
-                GpuWeight::from_tensor(&t, &rs)
-                    .map_err(|e| FerrumError::model(format!("k_norm: {e}")))?,
-            )
+            Some(to_gpu(&t)?)
         } else {
             None
         };
@@ -201,10 +195,7 @@ pub fn load_sharded_weights(
             .contiguous()
             .map_err(|e| FerrumError::model(format!("o contiguous L{li}: {e}")))?;
         let o_shard = to_dev(&o_shard)?;
-        let o_w = LinearWeight::Fp16(
-            GpuWeight::from_tensor(&o_shard, &rs)
-                .map_err(|e| FerrumError::model(format!("o: {e}")))?,
-        );
+        let o_w = to_gpu_linear(&o_shard)?;
 
         // Post-attn norm — replicated
         let pln_t = vb
@@ -214,8 +205,7 @@ pub fn load_sharded_weights(
             )
             .map_err(|e| FerrumError::model(format!("post_ln L{li}: {e}")))?;
         let pln_t = to_dev(&pln_t)?;
-        let post_ln_w = GpuWeight::from_tensor(&pln_t, &rs)
-            .map_err(|e| FerrumError::model(format!("post_ln: {e}")))?;
+        let post_ln_w = to_gpu(&pln_t)?;
 
         // MLP gate+up — column-parallel (split output dim)
         let gate_full = vb
@@ -224,24 +214,6 @@ pub fn load_sharded_weights(
                 &format!("{prefix}.mlp.gate_proj.weight"),
             )
             .map_err(|e| FerrumError::model(format!("gate L{li}: {e}")))?;
-        // Diagnostic: check gate weight dtype and values for L0
-        if li == 0 && rank == 0 {
-            let dtype = gate_full.dtype();
-            let shape = gate_full.shape().clone();
-            // Read first 5 values
-            let flat = gate_full.flatten_all().ok();
-            let vals: Option<Vec<f32>> = flat.as_ref().and_then(|f| {
-                f.to_dtype(candle_core::DType::F32).ok()
-            }).and_then(|f32t| f32t.to_vec1::<f32>().ok());
-            if let Some(v) = vals {
-                let first5: Vec<f32> = v.iter().take(5).copied().collect();
-                let abs_max = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-                eprintln!(
-                    "[TP LOAD] L0 gate_proj: dtype={:?} shape={:?} first5={:?} abs_max={:.4}",
-                    dtype, shape, first5, abs_max
-                );
-            }
-        }
         let up_full = vb
             .get(
                 (cfg.intermediate_size, cfg.hidden_size),
@@ -257,10 +229,7 @@ pub fn load_sharded_weights(
         let gate_up_shard = Tensor::cat(&[&gate_shard, &up_shard], 0)
             .map_err(|e| FerrumError::model(format!("gate_up cat L{li}: {e}")))?;
         let gate_up_shard = to_dev(&gate_up_shard)?;
-        let gate_up_w = LinearWeight::Fp16(
-            GpuWeight::from_tensor(&gate_up_shard, &rs)
-                .map_err(|e| FerrumError::model(format!("gate_up: {e}")))?,
-        );
+        let gate_up_w = to_gpu_linear(&gate_up_shard)?;
 
         // MLP down — row-parallel (split input dim)
         let down_full = vb
@@ -275,10 +244,7 @@ pub fn load_sharded_weights(
             .contiguous()
             .map_err(|e| FerrumError::model(format!("down contiguous L{li}: {e}")))?;
         let down_shard = to_dev(&down_shard)?;
-        let down_w = LinearWeight::Fp16(
-            GpuWeight::from_tensor(&down_shard, &rs)
-                .map_err(|e| FerrumError::model(format!("down: {e}")))?,
-        );
+        let down_w = to_gpu_linear(&down_shard)?;
 
         layers.push(LayerWeights {
             input_ln_w,
@@ -297,9 +263,7 @@ pub fn load_sharded_weights(
         .get(cfg.hidden_size, "model.norm.weight")
         .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
     let fn_t = to_dev(&fn_t)?;
-    sync_candle()?;
-    let final_norm_w = GpuWeight::from_tensor(&fn_t, &rs)
-        .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
+    let final_norm_w = to_gpu(&fn_t)?;
 
     // LM head — replicated (or tied to embed_tokens)
     let lm_t = vb
@@ -312,11 +276,7 @@ pub fn load_sharded_weights(
         })
         .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
     let lm_t = to_dev(&lm_t)?;
-    sync_candle()?;
-    let lm_head_w = LinearWeight::Fp16(
-        GpuWeight::from_tensor(&lm_t, &rs)
-            .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?,
-    );
+    let lm_head_w = to_gpu_linear(&lm_t)?;
 
     // RoPE — compute and replicate
     let (rope_cos, rope_sin) = super::runner_weights::compute_rope_tables_for_tp(cfg, device, &rs)?;
