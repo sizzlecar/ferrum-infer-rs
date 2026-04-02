@@ -137,27 +137,19 @@ impl CandleModelExecutor {
             tp_cfg.has_qk_norm, tp_cfg.head_dim, tp_cfg.num_attention_heads, tp_cfg.num_kv_heads
         );
 
-        // Generate NCCL unique ID (rank 0 generates, shared with all)
-        let nccl_id = match ferrum_cuda_kernels::nccl_comm::NcclRank::unique_id() {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!("NCCL unique_id failed: {e}");
-                return false;
-            }
-        };
+        // NCCL will be initialized after weight loading threads complete
 
         // Each rank runs on its own thread — CUDA context is thread-local.
         // Weight loading, NCCL init, and runner creation all on per-rank threads.
         type RankResult = candle_core::Result<(
             ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner,
-            ferrum_cuda_kernels::nccl_comm::NcclRank,
+            std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
         )>;
 
         let mut handles: Vec<std::thread::JoinHandle<RankResult>> = Vec::with_capacity(tp);
         for rank in 0..tp {
             let mut rank_cfg = tp_cfg.clone();
             rank_cfg.rank = rank;
-            let id = nccl_id;
             let model_dir = model_dir.clone();
             let dtype = self.model.dtype();
 
@@ -187,12 +179,12 @@ impl CandleModelExecutor {
         }
 
         let mut runners = Vec::with_capacity(tp);
-        let mut nccl_ranks = Vec::with_capacity(tp);
+        let mut nccl_streams = Vec::with_capacity(tp);
         for (rank, handle) in handles.into_iter().enumerate() {
             match handle.join() {
-                Ok(Ok((runner, nccl))) => {
+                Ok(Ok((runner, stream))) => {
                     runners.push(runner);
-                    nccl_ranks.push(nccl);
+                    nccl_streams.push(stream);
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("TP rank {rank} failed: {e}");
@@ -210,6 +202,15 @@ impl CandleModelExecutor {
         let _main_thread_devices: Vec<_> = (0..tp)
             .filter_map(|r| candle_core::Device::new_cuda(r).ok())
             .collect();
+
+        // Init NCCL using ncclCommInitAll (single thread, no deadlock)
+        let nccl_ranks = match ferrum_cuda_kernels::nccl_comm::NcclRank::init_all(nccl_streams) {
+            Ok(ranks) => ranks,
+            Err(e) => {
+                tracing::warn!("NCCL init_all failed: {e}");
+                return false;
+            }
+        };
 
         match ferrum_cuda_kernels::tp_decode::TpDecodeGroup::new(runners, nccl_ranks) {
             Ok(group) => {
