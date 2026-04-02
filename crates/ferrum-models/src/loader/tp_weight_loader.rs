@@ -211,6 +211,24 @@ pub fn load_sharded_weights(
                 &format!("{prefix}.mlp.gate_proj.weight"),
             )
             .map_err(|e| FerrumError::model(format!("gate L{li}: {e}")))?;
+        // Diagnostic: check gate weight dtype and values for L0
+        if li == 0 && rank == 0 {
+            let dtype = gate_full.dtype();
+            let shape = gate_full.shape().clone();
+            // Read first 5 values
+            let flat = gate_full.flatten_all().ok();
+            let vals: Option<Vec<f32>> = flat.as_ref().and_then(|f| {
+                f.to_dtype(candle_core::DType::F32).ok()
+            }).and_then(|f32t| f32t.to_vec1::<f32>().ok());
+            if let Some(v) = vals {
+                let first5: Vec<f32> = v.iter().take(5).copied().collect();
+                let abs_max = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                eprintln!(
+                    "[TP LOAD] L0 gate_proj: dtype={:?} shape={:?} first5={:?} abs_max={:.4}",
+                    dtype, shape, first5, abs_max
+                );
+            }
+        }
         let up_full = vb
             .get(
                 (cfg.intermediate_size, cfg.hidden_size),
