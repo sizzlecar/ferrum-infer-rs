@@ -167,14 +167,13 @@ impl CandleModelExecutor {
 
                 let cuda_dev = device.as_cuda_device()?.clone();
 
-                // NCCL init — collective, all threads call simultaneously
-                let nccl_rank =
-                    ferrum_cuda_kernels::nccl_comm::NcclRank::init(&id, rank, tp, stream.clone())?;
-
                 let runner = ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
-                    weights, dims, cuda_dev, stream,
+                    weights,
+                    dims,
+                    cuda_dev,
+                    stream.clone(),
                 )?;
-                Ok((runner, nccl_rank))
+                Ok((runner, stream))
             }));
         }
 
