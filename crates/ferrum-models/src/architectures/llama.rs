@@ -454,7 +454,11 @@ impl LlamaModelWrapper {
             rms_norm_eps: config.norm_eps,
             rope_theta: config.rope_theta.unwrap_or(10000.0) as f32,
             max_position_embeddings: config.max_position_embeddings,
-            tie_word_embeddings: false,
+            tie_word_embeddings: config
+                .extra_params
+                .get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             head_dim,
         };
 
