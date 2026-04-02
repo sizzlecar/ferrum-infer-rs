@@ -203,6 +203,9 @@ impl CudaDecodeRunner {
 
     /// Bind this runner's CUDA context to the current thread.
     pub fn bind_context(&self) -> candle_core::Result<()> {
+        // Clear any stale error state first — check_err() inside bind_to_thread
+        // would return a previous error instead of actually binding.
+        let _ = self.stream.context().check_err();
         self.stream
             .context()
             .bind_to_thread()
