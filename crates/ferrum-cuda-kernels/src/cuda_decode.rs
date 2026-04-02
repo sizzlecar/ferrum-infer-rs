@@ -2166,7 +2166,7 @@ impl CudaDecodeRunner {
         b.arg(&vki);
         b.arg(&scale);
         // Shared: max_kv_len floats for attention scores
-        let shared_bytes = (max_kv as u32) * 4;
+        let shared_bytes = (valid_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (nq as u32, 1, 1),
@@ -2217,7 +2217,7 @@ impl CudaDecodeRunner {
         b.arg(&mki);
         b.arg(&vki);
         b.arg(&scale);
-        let shared_bytes = (max_kv as u32) * 4;
+        let shared_bytes = (valid_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (nq as u32, 1, 1),
