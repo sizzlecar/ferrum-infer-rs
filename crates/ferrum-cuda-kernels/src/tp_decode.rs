@@ -85,6 +85,23 @@ impl TpDecodeGroup {
             };
         }
 
+        // Diagnostic helper: check buffer on rank 0 for NaN
+        macro_rules! diag_check {
+            ($label:expr, $buf:expr) => {
+                self.runners[0].bind_context()?;
+                self.runners[0].sync_stream()?;
+                let data = self.runners[0].diag_buf($buf)?;
+                let has_nan = data.iter().any(|v| v.is_nan());
+                let max = data.iter().map(|v| v.to_f32()).fold(f32::NEG_INFINITY, f32::max);
+                let min = data.iter().map(|v| v.to_f32()).fold(f32::INFINITY, f32::min);
+                if has_nan {
+                    eprintln!("[TP DIAG] {} NaN! len={}", $label, data.len());
+                } else {
+                    eprintln!("[TP DIAG] {} ok min={min:.4} max={max:.4}", $label);
+                }
+            };
+        }
+
         // Embed (replicated)
         for_each_rank!(|r: usize| self.runners[r].tp_embed(token_id));
 
@@ -102,12 +119,9 @@ impl TpDecodeGroup {
                     self.runners[r].sync_stream()?;
                     let attn = self.runners[r].attn_out_to_host()?;
                     let has_nan = attn.iter().any(|v| v.is_nan());
-                    let max = attn
-                        .iter()
-                        .map(|v| v.to_f32())
-                        .fold(f32::NEG_INFINITY, f32::max);
+                    let max = attn.iter().map(|v| v.to_f32()).fold(f32::NEG_INFINITY, f32::max);
                     eprintln!(
-                        "[TP L0] r{r} after pre_o_proj: attn_out len={} nan={has_nan} max={max:.4}",
+                        "[TP L0] r{r} attn_out: len={} nan={has_nan} max={max:.4}",
                         attn.len()
                     );
                 }
@@ -115,6 +129,20 @@ impl TpDecodeGroup {
 
             // 2. O projection (row-parallel: partial output)
             for_each_rank!(|r: usize| self.runners[r].tp_o_proj(li));
+
+            if li == 0 {
+                // Check o_proj_out BEFORE all-reduce (partial sums)
+                for r in 0..ws {
+                    self.runners[r].bind_context()?;
+                    self.runners[r].sync_stream()?;
+                    let data = self.runners[r].diag_buf("o_proj_out")?;
+                    let has_nan = data.iter().any(|v| v.is_nan());
+                    let max = data.iter().map(|v| v.to_f32()).fold(f32::NEG_INFINITY, f32::max);
+                    eprintln!(
+                        "[TP L0] r{r} o_proj(pre-AR): nan={has_nan} max={max:.4}"
+                    );
+                }
+            }
 
             // 3. ALL-REDUCE o_proj_out (must be simultaneous across ranks)
             std::thread::scope(|s| -> candle_core::Result<()> {
@@ -136,11 +164,33 @@ impl TpDecodeGroup {
                 Ok(())
             })?;
 
+            if li == 0 {
+                diag_check!("L0 o_proj(post-AR)", "o_proj_out");
+            }
+
             // 4. Post-attention residual + norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_attn_norm(li));
 
+            if li == 0 {
+                diag_check!("L0 post_attn_norm", "post_norm_out");
+            }
+
             // 5. MLP
             for_each_rank!(|r: usize| self.runners[r].tp_mlp(li));
+
+            if li == 0 {
+                // Check down_out BEFORE all-reduce
+                for r in 0..ws {
+                    self.runners[r].bind_context()?;
+                    self.runners[r].sync_stream()?;
+                    let data = self.runners[r].diag_buf("down_out")?;
+                    let has_nan = data.iter().any(|v| v.is_nan());
+                    let max = data.iter().map(|v| v.to_f32()).fold(f32::NEG_INFINITY, f32::max);
+                    eprintln!(
+                        "[TP L0] r{r} down(pre-AR): nan={has_nan} max={max:.4}"
+                    );
+                }
+            }
 
             // 6. ALL-REDUCE down_out (must be simultaneous)
             std::thread::scope(|s| -> candle_core::Result<()> {
@@ -162,8 +212,30 @@ impl TpDecodeGroup {
                 Ok(())
             })?;
 
+            if li == 0 {
+                diag_check!("L0 down(post-AR)", "down_out");
+            }
+
             // 7. Post-MLP residual + next layer norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
+
+            if li == 0 {
+                diag_check!("L0 post_mlp_norm residual", "residual");
+                diag_check!("L0 post_mlp_norm norm_out", "norm_out");
+            }
+
+            // Quick NaN check on residual for layers > 0 (rank 0 only)
+            if li > 0 {
+                self.runners[0].bind_context()?;
+                self.runners[0].sync_stream()?;
+                let data = self.runners[0].diag_buf("residual")?;
+                let has_nan = data.iter().any(|v| v.is_nan());
+                if has_nan {
+                    eprintln!("[TP DIAG] L{li} residual: NaN detected!");
+                    // Don't spam — break after first NaN layer
+                    break;
+                }
+            }
         }
 
         // LM head (replicated)

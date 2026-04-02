@@ -493,6 +493,24 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("attn_out d2h: {e}")))
     }
 
+    /// Read named buffer to host for diagnostics.
+    pub(crate) fn diag_buf(&self, name: &str) -> candle_core::Result<Vec<half::f16>> {
+        let h = self.dims.hidden_size;
+        let (slice_ref, len) = match name {
+            "o_proj_out" => (&self.buffers.o_proj_out, h),
+            "residual" => (&self.buffers.residual, h),
+            "post_norm_out" => (&self.buffers.post_norm_out, h),
+            "down_out" => (&self.buffers.down_out, h),
+            "norm_out" => (&self.buffers.norm_out, h),
+            "final_norm_out" => (&self.buffers.final_norm_out, h),
+            _ => return Err(candle_core::Error::Msg(format!("unknown diag buf: {name}"))),
+        };
+        let view = slice_ref.slice(..len);
+        self.stream
+            .clone_dtoh(&view)
+            .map_err(|e| candle_core::Error::Msg(format!("diag {name}: {e}")))
+    }
+
     /// Access o_proj_out buffer for all-reduce.
     pub(crate) fn o_proj_out_mut(&mut self) -> &mut CudaSlice<half::f16> {
         &mut self.buffers.o_proj_out
