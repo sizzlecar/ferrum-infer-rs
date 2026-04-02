@@ -85,68 +85,32 @@ impl TpDecodeGroup {
             };
         }
 
-        // Diagnostic helpers
-        macro_rules! diag_check {
-            ($label:expr, $buf:expr) => {
-                self.runners[0].bind_context()?;
-                self.runners[0].sync_stream()?;
-                let data = self.runners[0].diag_buf($buf)?;
-                let has_nan = data.iter().any(|v| v.is_nan());
-                let max = data.iter().map(|v| v.to_f32()).fold(f32::NEG_INFINITY, f32::max);
-                let min = data.iter().map(|v| v.to_f32()).fold(f32::INFINITY, f32::min);
-                if has_nan {
-                    eprintln!("[TP DIAG] {} NaN! len={}", $label, data.len());
-                } else {
-                    eprintln!("[TP DIAG] {} ok min={min:.4} max={max:.4}", $label);
-                }
-            };
-        }
-        // Check that rank 0 and rank 1 have same buffer (replicated invariant)
-        macro_rules! diag_rank_cmp {
-            ($label:expr, $buf:expr) => {{
-                self.runners[0].bind_context()?;
-                self.runners[0].sync_stream()?;
-                let d0 = self.runners[0].diag_buf($buf)?;
-                self.runners[1].bind_context()?;
-                self.runners[1].sync_stream()?;
-                let d1 = self.runners[1].diag_buf($buf)?;
-                let max_diff = d0.iter().zip(d1.iter())
-                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                    .fold(0.0f32, f32::max);
-                let any_nan0 = d0.iter().any(|v| v.is_nan());
-                let any_nan1 = d1.iter().any(|v| v.is_nan());
-                eprintln!("[TP CMP] {} max_diff={max_diff:.4} nan0={any_nan0} nan1={any_nan1}", $label);
-            }};
-        }
-
         // Embed (replicated)
         for_each_rank!(|r: usize| self.runners[r].tp_embed(token_id));
 
-        // Compare norm weights for first 2 layers (should be identical — replicated)
-        for check_li in 0..2 {
-            self.runners[0].bind_context()?;
-            self.runners[0].sync_stream()?;
-            let w0 = self.runners[0].diag_layer_norm_weight(check_li)?;
-            self.runners[1].bind_context()?;
-            self.runners[1].sync_stream()?;
-            let w1 = self.runners[1].diag_layer_norm_weight(check_li)?;
-            let max_diff = w0.iter().zip(w1.iter())
-                .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                .fold(0.0f32, f32::max);
-            eprintln!(
-                "[TP WEIGHT] L{check_li} input_ln_w max_diff={max_diff:.6} len={}",
-                w0.len()
-            );
+        // Verify replicated weight integrity (first step only)
+        if position <= 1 && ws > 1 {
+            for check_li in 0..2.min(n) {
+                self.runners[0].bind_context()?;
+                self.runners[0].sync_stream()?;
+                let w0 = self.runners[0].diag_layer_norm_weight(check_li)?;
+                self.runners[1].bind_context()?;
+                self.runners[1].sync_stream()?;
+                let w1 = self.runners[1].diag_layer_norm_weight(check_li)?;
+                let max_diff = w0.iter().zip(w1.iter())
+                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "[TP WEIGHT] L{check_li} input_ln_w max_diff={max_diff:.6}",
+                );
+            }
         }
 
         // First layer norm (replicated)
         for_each_rank!(|r: usize| self.runners[r].tp_first_norm());
 
         // Per-layer pipeline
-        let diag_layers = 5; // Check sub-phases for first N layers
         for li in 0..n {
-            let diag = li < diag_layers;
-
             // 1. QKV + norm + RoPE + attention (local heads)
             for_each_rank!(|r: usize| self.runners[r].tp_pre_o_proj(li, position, cache_key));
 
@@ -173,18 +137,8 @@ impl TpDecodeGroup {
                 Ok(())
             })?;
 
-            if diag {
-                // KEY: check rank 0 vs rank 1 after all-reduce (should be identical)
-                diag_rank_cmp!(&format!("L{li} o_proj(AR)"), "o_proj_out");
-            }
-
             // 4. Post-attention residual + norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_attn_norm(li));
-
-            if diag {
-                diag_rank_cmp!(&format!("L{li} post_attn_norm"), "post_norm_out");
-                diag_rank_cmp!(&format!("L{li} post_norm_residual"), "post_norm_residual");
-            }
 
             // 5. MLP
             for_each_rank!(|r: usize| self.runners[r].tp_mlp(li));
@@ -209,18 +163,8 @@ impl TpDecodeGroup {
                 Ok(())
             })?;
 
-            if diag {
-                // KEY: check rank 0 vs rank 1 after all-reduce
-                diag_rank_cmp!(&format!("L{li} down(AR)"), "down_out");
-            }
-
             // 7. Post-MLP residual + next layer norm
             for_each_rank!(|r: usize| self.runners[r].tp_post_mlp_norm(li));
-
-            if diag {
-                diag_rank_cmp!(&format!("L{li} residual"), "residual");
-                diag_rank_cmp!(&format!("L{li} norm_out"), "norm_out");
-            }
         }
 
         // LM head (replicated)
