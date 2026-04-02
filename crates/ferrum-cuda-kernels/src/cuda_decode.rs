@@ -209,27 +209,14 @@ impl CudaDecodeRunner {
             .map_err(|e| candle_core::Error::Msg(format!("bind_context: {e}")))
     }
 
-    /// Cross-GPU copy: src CudaSlice (any GPU) → new CudaSlice on this runner's GPU.
-    /// Uses D2H sync + H2D to avoid all cross-context issues.
-    pub fn peer_copy_to_self(
+    /// Cross-GPU copy: host f16 data → new CudaSlice on this runner's GPU.
+    pub fn upload_to_self(
         &self,
-        src: &CudaSlice<half::f16>,
-        _src_ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        host_data: &[half::f16],
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        let len = src.len();
-        // D2H: read src to host (sync, uses src's context internally)
-        let mut host = vec![half::f16::ZERO; len];
         self.stream
-            .synchronize()
-            .map_err(|e| candle_core::Error::Msg(format!("peer sync: {e}")))?;
-        unsafe {
-            cudarc::driver::result::memcpy_dtoh_sync(&mut host, src.cu_device_ptr)
-                .map_err(|e| candle_core::Error::Msg(format!("peer d2h: {e}")))?;
-        }
-        // H2D: upload to this runner's GPU
-        self.stream
-            .clone_htod(&host)
-            .map_err(|e| candle_core::Error::Msg(format!("peer h2d: {e}")))
+            .clone_htod(host_data)
+            .map_err(|e| candle_core::Error::Msg(format!("upload h2d: {e}")))
     }
 
     /// Access weight layers (diagnostic only).

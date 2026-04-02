@@ -434,16 +434,7 @@ impl ModelExecutor for CandleModelExecutor {
                                     )>,
                                 > = (0..tp).map(|_| Vec::new()).collect();
 
-                                // Shard on GPU 0, peer copy to each rank's GPU
-                                let gpu0_ctx = self
-                                    .model
-                                    .candle_device()
-                                    .as_cuda_device()
-                                    .map_err(|e| FerrumError::model(format!("ctx: {e}")))?
-                                    .cuda_stream()
-                                    .context()
-                                    .clone();
-
+                                // Shard on GPU 0, D2H via candle, H2D via runner
                                 for (k_tensor, v_tensor, _len, _max) in &kv_data {
                                     for rank in 0..tp {
                                         let start = rank * heads_per_rank;
@@ -460,52 +451,64 @@ impl ModelExecutor for CandleModelExecutor {
                                                 FerrumError::model(format!("KV shard: {e}"))
                                             })?;
 
-                                        // Extract CudaSlice from GPU 0 tensor
-                                        use candle_core::Storage;
-                                        let (ks, _) = k_shard.storage_and_layout();
-                                        let (vs, _) = v_shard.storage_and_layout();
-                                        let k_src = match &*ks {
-                                            Storage::Cuda(cs) => {
-                                                cs.as_cuda_slice::<half::f16>().map_err(|e| {
-                                                    FerrumError::model(format!("KV: {e}"))
-                                                })?
-                                            }
-                                            _ => return Err(FerrumError::model("KV not CUDA")),
-                                        };
-                                        let v_src = match &*vs {
-                                            Storage::Cuda(cs) => {
-                                                cs.as_cuda_slice::<half::f16>().map_err(|e| {
-                                                    FerrumError::model(format!("KV: {e}"))
-                                                })?
-                                            }
-                                            _ => return Err(FerrumError::model("KV not CUDA")),
-                                        };
-
                                         if rank == 0 {
-                                            // Same GPU: just clone
-                                            per_rank_kv[rank].push((k_src.clone(), v_src.clone()));
+                                            // Same GPU: extract CudaSlice directly
+                                            use candle_core::Storage;
+                                            let (ks, _) = k_shard.storage_and_layout();
+                                            let (vs, _) = v_shard.storage_and_layout();
+                                            let kc = match &*ks {
+                                                Storage::Cuda(cs) => cs
+                                                    .as_cuda_slice::<half::f16>()
+                                                    .map_err(|e| {
+                                                        FerrumError::model(format!("KV: {e}"))
+                                                    })?
+                                                    .clone(),
+                                                _ => return Err(FerrumError::model("KV not CUDA")),
+                                            };
+                                            let vc = match &*vs {
+                                                Storage::Cuda(cs) => cs
+                                                    .as_cuda_slice::<half::f16>()
+                                                    .map_err(|e| {
+                                                        FerrumError::model(format!("KV: {e}"))
+                                                    })?
+                                                    .clone(),
+                                                _ => return Err(FerrumError::model("KV not CUDA")),
+                                            };
+                                            drop(ks);
+                                            drop(vs);
+                                            per_rank_kv[rank].push((kc, vc));
                                         } else {
-                                            // Cross-GPU: raw peer copy via runner
-                                            let k_dst = g
+                                            // Cross-GPU: D2H via candle → H2D via runner
+                                            let k_host = k_shard
+                                                .flatten_all()
+                                                .and_then(|t| t.to_vec1::<half::f16>())
+                                                .map_err(|e| {
+                                                    FerrumError::model(format!("KV d2h: {e}"))
+                                                })?;
+                                            let v_host = v_shard
+                                                .flatten_all()
+                                                .and_then(|t| t.to_vec1::<half::f16>())
+                                                .map_err(|e| {
+                                                    FerrumError::model(format!("KV d2h: {e}"))
+                                                })?;
+                                            let kc = g
                                                 .runner_mut(rank)
-                                                .peer_copy_to_self(k_src, &gpu0_ctx)
+                                                .upload_to_self(&k_host)
                                                 .map_err(|e| {
                                                     FerrumError::model(format!(
-                                                        "KV peer r{rank}: {e}"
+                                                        "KV h2d r{rank}: {e}"
                                                     ))
                                                 })?;
-                                            let v_dst = g
+                                            let vc = g
                                                 .runner_mut(rank)
-                                                .peer_copy_to_self(v_src, &gpu0_ctx)
+                                                .upload_to_self(&v_host)
                                                 .map_err(|e| {
                                                     FerrumError::model(format!(
-                                                        "KV peer r{rank}: {e}"
+                                                        "KV h2d r{rank}: {e}"
                                                     ))
                                                 })?;
-                                            per_rank_kv[rank].push((k_dst, v_dst));
+                                            per_rank_kv[rank].push((kc, vc));
                                         }
-                                        drop(ks);
-                                        drop(vs);
                                     }
                                 }
                                 g.init_kv_cache(&cache_id, per_rank_kv, prefill_len, max_len)
