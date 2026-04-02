@@ -1558,16 +1558,22 @@ impl CudaDecodeRunner {
                     )?;
                 }
 
-                // Residual magnitude diagnostic (first 6 layers, first 2 positions)
+                // Diagnostic: compare key buffers (first 6 layers, first 2 positions)
                 if li < 6 && position <= 2 {
                     self.stream.synchronize().ok();
-                    let rv = self.buffers.residual.slice(..h);
-                    if let Ok(data) = self.stream.clone_dtoh(&rv) {
-                        let data: Vec<half::f16> = data;
-                        let max = data.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
-                        let has_inf = data.iter().any(|v| v.is_infinite());
-                        eprintln!("[1GPU] L{li} residual: abs_max={max:.1} inf={has_inf}");
-                    }
+                    let read_max = |buf: &CudaSlice<half::f16>, len: usize| -> f32 {
+                        let v = buf.slice(..len);
+                        self.stream.clone_dtoh(&v).map(|d: Vec<half::f16>| {
+                            d.iter().map(|x| x.to_f32().abs()).fold(0.0f32, f32::max)
+                        }).unwrap_or(-1.0)
+                    };
+                    let res = read_max(&self.buffers.residual, h);
+                    let pno = read_max(&self.buffers.post_norm_out, h);
+                    let down = read_max(&self.buffers.down_out, h);
+                    let oproj = read_max(&self.buffers.o_proj_out, h);
+                    eprintln!(
+                        "[1GPU] L{li} res={res:.1} oproj={oproj:.1} pnorm={pno:.2} down={down:.1}"
+                    );
                 }
             }
         }
