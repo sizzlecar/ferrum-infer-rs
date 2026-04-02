@@ -1557,7 +1557,8 @@ impl CudaDecodeRunner {
                 if li < 6 && position <= 2 {
                     self.stream.synchronize().ok();
                     let rv = self.buffers.residual.slice(..h);
-                    if let Ok(data) = self.stream.clone_dtoh::<half::f16>(&rv) {
+                    if let Ok(data) = self.stream.clone_dtoh(&rv) {
+                        let data: Vec<half::f16> = data;
                         let max = data.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
                         let has_inf = data.iter().any(|v| v.is_infinite());
                         eprintln!("[1GPU] L{li} residual: abs_max={max:.1} inf={has_inf}");
