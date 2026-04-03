@@ -606,6 +606,15 @@ impl CudaDecodeRunner {
         &mut self.buffers.down_out
     }
 
+    /// Disable cudarc's per-op event tracking on this runner's stream context.
+    /// Safe when all ops are on the same stream (no cross-stream sync needed).
+    /// Eliminates ~500µs overhead per NCCL call from DevicePtrMut::device_ptr_mut().
+    pub(crate) fn disable_event_tracking(&self) {
+        unsafe {
+            self.stream.context().disable_event_tracking();
+        }
+    }
+
     /// Sync runner's stream.
     pub(crate) fn sync_stream(&self) -> candle_core::Result<()> {
         self.stream
