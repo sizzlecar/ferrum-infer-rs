@@ -9,6 +9,7 @@ pub mod builder;
 pub mod definition;
 pub mod executor;
 pub mod hf_download;
+pub mod image_processor;
 pub mod loader;
 pub mod registry;
 pub mod source;
@@ -17,15 +18,16 @@ pub mod tokenizer;
 pub mod weights;
 
 pub use architectures::{
-    BertModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper,
+    BertModelWrapper, ClipModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper,
 };
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    BertModelExecutor, CandleModelExecutor, Qwen2ModelExecutor, Qwen3ModelExecutor,
-    StubModelExecutor,
+    BertModelExecutor, CandleModelExecutor, ClipModelExecutor, Qwen2ModelExecutor,
+    Qwen3ModelExecutor, StubModelExecutor,
 };
 pub use hf_download::HfDownloader;
+pub use image_processor::ClipImageProcessor;
 pub use loader::SafeTensorsLoader;
 pub use registry::{
     Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,
