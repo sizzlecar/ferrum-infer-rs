@@ -196,12 +196,37 @@ pub fn load_tokenizer(model_dir: &std::path::Path) -> Result<tokenizers::Tokeniz
     let vocab_txt = model_dir.join("vocab.txt");
     if vocab_txt.exists() {
         use tokenizers::models::wordpiece::WordPiece;
+        use tokenizers::processors::template::TemplateProcessing;
+        use tokenizers::Model;
         let wp = WordPiece::from_file(vocab_txt.to_str().unwrap())
             .unk_token("[UNK]".to_string())
             .build()
             .map_err(|e| ferrum_types::FerrumError::model(format!("Load vocab.txt: {e}")))?;
+
+        // Look up [CLS] and [SEP] IDs from vocab dynamically
+        let vocab = wp.get_vocab();
+        let cls_id = vocab.get("[CLS]").copied().unwrap_or(101);
+        let sep_id = vocab.get("[SEP]").copied().unwrap_or(102);
+
         let mut tokenizer = tokenizers::Tokenizer::new(wp);
-        tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::bert::BertPreTokenizer));
+        // BertPreTokenizer + Chinese char splitting (add spaces around CJK chars
+        // so WordPiece treats each character as a separate token, matching Python's
+        // BertTokenizer._tokenize_chinese_chars behavior)
+        use tokenizers::pre_tokenizers::sequence::Sequence;
+        use tokenizers::pre_tokenizers::unicode_scripts::UnicodeScripts;
+        tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![
+            tokenizers::pre_tokenizers::PreTokenizerWrapper::UnicodeScripts(UnicodeScripts),
+            tokenizers::pre_tokenizers::PreTokenizerWrapper::BertPreTokenizer(
+                tokenizers::pre_tokenizers::bert::BertPreTokenizer,
+            ),
+        ])));
+        let template = TemplateProcessing::builder()
+            .try_single("[CLS] $A [SEP]")
+            .unwrap()
+            .special_tokens(vec![("[CLS]", cls_id), ("[SEP]", sep_id)])
+            .build()
+            .map_err(|e| ferrum_types::FerrumError::model(format!("Template: {e}")))?;
+        tokenizer.with_post_processor(Some(template));
         return Ok(tokenizer);
     }
 
