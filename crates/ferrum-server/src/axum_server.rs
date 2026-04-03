@@ -69,6 +69,7 @@ impl AxumServer {
             // OpenAI API routes
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/v1/embeddings", post(embeddings_handler))
             .route("/v1/models", get(models_handler))
             // Health & observability
             .route("/health", get(health_handler))
@@ -397,6 +398,80 @@ async fn completions_handler(
     Err(ServerError::NotImplemented(
         "Legacy completions not implemented in MVP".to_string(),
     ))
+}
+
+/// Embeddings handler — text and image embedding via OpenAI-compatible API.
+async fn embeddings_handler(
+    State(state): State<AppState>,
+    Json(request): Json<EmbeddingsRequest>,
+) -> std::result::Result<Response, ServerError> {
+    let span = span!(Level::INFO, "embeddings", model = %request.model);
+    let _enter = span.enter();
+
+    // Flatten input into individual items
+    let items: Vec<EmbeddingItem> = match request.input {
+        EmbeddingInput::Single(text) => vec![EmbeddingItem {
+            text: Some(text),
+            image: None,
+        }],
+        EmbeddingInput::Batch(texts) => texts
+            .into_iter()
+            .map(|t| EmbeddingItem {
+                text: Some(t),
+                image: None,
+            })
+            .collect(),
+        EmbeddingInput::SingleObject(item) => vec![item],
+        EmbeddingInput::BatchObjects(items) => items,
+    };
+
+    if items.is_empty() {
+        return Err(ServerError::BadRequest("Empty input".to_string()));
+    }
+
+    let mut data = Vec::with_capacity(items.len());
+    let mut total_tokens = 0u32;
+
+    for (idx, item) in items.iter().enumerate() {
+        let embedding = if let Some(ref image) = item.image {
+            state
+                .engine
+                .embed_image(image)
+                .await
+                .map_err(|e| ServerError::InternalError(format!("embed_image: {e}")))?
+        } else if let Some(ref text) = item.text {
+            // Tokenize text (simple: use bytes as token IDs for now, real tokenizer in engine)
+            let tokens: Vec<u32> = text.encode_utf16().map(|c| c as u32).collect();
+            total_tokens += tokens.len() as u32;
+            state
+                .engine
+                .embed_text(&tokens)
+                .await
+                .map_err(|e| ServerError::InternalError(format!("embed_text: {e}")))?
+        } else {
+            return Err(ServerError::BadRequest(
+                "Each input must have either 'text' or 'image'".to_string(),
+            ));
+        };
+
+        data.push(EmbeddingData {
+            object: "embedding".to_string(),
+            embedding,
+            index: idx,
+        });
+    }
+
+    let response = EmbeddingsResponse {
+        object: "list".to_string(),
+        data,
+        model: request.model,
+        usage: EmbeddingUsage {
+            prompt_tokens: total_tokens,
+            total_tokens,
+        },
+    };
+
+    Ok(Json(response).into_response())
 }
 
 async fn models_handler(
