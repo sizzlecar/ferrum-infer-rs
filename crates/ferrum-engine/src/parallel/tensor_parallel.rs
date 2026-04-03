@@ -410,4 +410,165 @@ mod tests {
         assert_eq!(shard.parallel_type, LayerParallelType::ColumnParallel);
         assert_eq!(shard.shard_range, (1024, 2048));
     }
+
+    // ======== TransformerParallelMapping comprehensive tests ========
+
+    #[test]
+    fn mapping_qwen3_4b_tp2() {
+        // Qwen3-4B: 32 heads, 8 kv_heads, hd=128, hidden=2560, inter=9728
+        let m = TransformerParallelMapping::new(32, 8, 128, 2560, 9728, 2).unwrap();
+        assert_eq!(m.heads_per_rank, 16);
+        assert_eq!(m.kv_heads_per_rank, 4);
+        assert_eq!(m.head_dim, 128);
+        assert_eq!(m.q_proj_size(), 2048); // 16 * 128
+        assert_eq!(m.k_proj_size(), 512); // 4 * 128
+        assert_eq!(m.v_proj_size(), 512);
+        assert_eq!(m.o_proj_in_size(), 2048);
+        assert_eq!(m.intermediate_per_rank, 4864); // 9728 / 2
+        assert_eq!(m.hidden_per_rank, 2560); // NOT sharded
+    }
+
+    #[test]
+    fn mapping_llama_70b_tp8() {
+        // Llama-70B: 64 heads, 8 kv_heads, hd=128, hidden=8192, inter=28672
+        let m = TransformerParallelMapping::new(64, 8, 128, 8192, 28672, 8).unwrap();
+        assert_eq!(m.heads_per_rank, 8);
+        assert_eq!(m.kv_heads_per_rank, 1);
+        assert_eq!(m.q_proj_size(), 1024);
+        assert_eq!(m.k_proj_size(), 128);
+        assert_eq!(m.intermediate_per_rank, 3584);
+    }
+
+    #[test]
+    fn mapping_tinyllama_tp2() {
+        // TinyLlama: 32 heads, 4 kv_heads, hd=64, hidden=2048, inter=5632
+        let m = TransformerParallelMapping::new(32, 4, 64, 2048, 5632, 2).unwrap();
+        assert_eq!(m.heads_per_rank, 16);
+        assert_eq!(m.kv_heads_per_rank, 2);
+        assert_eq!(m.q_proj_size(), 1024);
+        assert_eq!(m.k_proj_size(), 128);
+        assert_eq!(m.intermediate_per_rank, 2816);
+    }
+
+    #[test]
+    fn mapping_tp1_noop() {
+        // TP=1: no sharding, all dimensions stay full
+        let m = TransformerParallelMapping::new(32, 8, 128, 4096, 11008, 1).unwrap();
+        assert_eq!(m.heads_per_rank, 32);
+        assert_eq!(m.kv_heads_per_rank, 8);
+        assert_eq!(m.intermediate_per_rank, 11008);
+    }
+
+    #[test]
+    fn mapping_rejects_indivisible_heads() {
+        assert!(TransformerParallelMapping::new(7, 7, 64, 448, 1024, 2).is_err());
+    }
+
+    #[test]
+    fn mapping_rejects_indivisible_kv_heads() {
+        assert!(TransformerParallelMapping::new(32, 3, 64, 2048, 5632, 2).is_err());
+    }
+
+    #[test]
+    fn mapping_rejects_indivisible_intermediate() {
+        assert!(TransformerParallelMapping::new(32, 8, 128, 4096, 11009, 4).is_err());
+    }
+
+    #[test]
+    fn attention_weight_shards_correct() {
+        let m = TransformerParallelMapping::new(32, 8, 128, 4096, 11008, 4).unwrap();
+        let cfg = TensorParallelConfig::new(4, 2, Device::CUDA(2));
+        let shards = m.attention_weight_shards(5, &cfg);
+
+        assert_eq!(shards.len(), 4); // Q, K, V, O
+                                     // Q: column-parallel, full q_dim = 4096, rank 2 gets [2048, 3072)
+        assert_eq!(shards[0].name, "model.layers.5.self_attn.q_proj.weight");
+        assert_eq!(shards[0].parallel_type, LayerParallelType::ColumnParallel);
+        assert_eq!(shards[0].shard_range, (2048, 3072));
+        // K: column-parallel, full kv_dim = 1024, rank 2 gets [512, 768)
+        assert_eq!(shards[1].shard_range, (512, 768));
+        // V: same as K
+        assert_eq!(shards[2].shard_range, (512, 768));
+        // O: row-parallel, full q_dim = 4096, rank 2 gets [2048, 3072)
+        assert_eq!(shards[3].name, "model.layers.5.self_attn.o_proj.weight");
+        assert_eq!(shards[3].parallel_type, LayerParallelType::RowParallel);
+        assert_eq!(shards[3].shard_range, (2048, 3072));
+    }
+
+    #[test]
+    fn mlp_weight_shards_correct() {
+        let m = TransformerParallelMapping::new(32, 8, 128, 4096, 11008, 4).unwrap();
+        let cfg = TensorParallelConfig::new(4, 0, Device::CUDA(0));
+        let shards = m.mlp_weight_shards(3, &cfg);
+
+        assert_eq!(shards.len(), 3); // gate, up, down
+                                     // gate: column-parallel, full inter = 11008, rank 0 gets [0, 2752)
+        assert_eq!(shards[0].name, "model.layers.3.mlp.gate_proj.weight");
+        assert_eq!(shards[0].parallel_type, LayerParallelType::ColumnParallel);
+        assert_eq!(shards[0].shard_range, (0, 2752));
+        // up: same ranges
+        assert_eq!(shards[1].shard_range, (0, 2752));
+        // down: row-parallel
+        assert_eq!(shards[2].name, "model.layers.3.mlp.down_proj.weight");
+        assert_eq!(shards[2].parallel_type, LayerParallelType::RowParallel);
+        assert_eq!(shards[2].shard_range, (0, 2752));
+    }
+
+    #[test]
+    fn weight_shard_replicated() {
+        let shard = WeightShard::replicated("model.norm.weight");
+        assert_eq!(shard.parallel_type, LayerParallelType::Replicated);
+        assert_eq!(shard.shard_range, (0, 0));
+    }
+
+    #[test]
+    fn config_shard_range_all_ranks_cover_full_dim() {
+        let dim = 4096;
+        let tp_size = 4;
+        let mut covered = vec![false; dim];
+
+        for rank in 0..tp_size {
+            let cfg = TensorParallelConfig::new(tp_size, rank, Device::CUDA(rank));
+            let (start, end) = cfg.shard_range(dim);
+            assert_eq!(end - start, dim / tp_size);
+            for i in start..end {
+                assert!(!covered[i], "Overlap at index {i}");
+                covered[i] = true;
+            }
+        }
+        assert!(covered.iter().all(|&c| c), "Not all indices covered");
+    }
+
+    #[test]
+    fn config_non_parallel() {
+        let cfg = TensorParallelConfig::new(1, 0, Device::CPU);
+        assert!(!cfg.is_parallel());
+        assert_eq!(cfg.shard_size(4096), 4096);
+        assert_eq!(cfg.shard_range(4096), (0, 4096));
+    }
+
+    #[test]
+    fn group_rejects_invalid_rank() {
+        let devices = vec![Device::CUDA(0), Device::CUDA(1)];
+        assert!(TensorParallelGroup::new(devices, 5).is_err());
+    }
+
+    #[test]
+    fn group_rejects_empty_devices() {
+        assert!(TensorParallelGroup::new(vec![], 0).is_err());
+    }
+
+    #[test]
+    fn row_parallel_shard_dim_is_1() {
+        let cfg = TensorParallelConfig::new(2, 0, Device::CUDA(0));
+        let shard = WeightShard::row_parallel("test", 4096, &cfg);
+        assert_eq!(shard.shard_dim, 1); // input dimension
+    }
+
+    #[test]
+    fn column_parallel_shard_dim_is_0() {
+        let cfg = TensorParallelConfig::new(2, 0, Device::CUDA(0));
+        let shard = WeightShard::column_parallel("test", 4096, &cfg);
+        assert_eq!(shard.shard_dim, 0); // output dimension
+    }
 }

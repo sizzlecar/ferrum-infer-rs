@@ -231,9 +231,15 @@ pub fn load_runner_weights(
     let final_norm_w = GpuWeight::from_tensor(&fn_t, &rs)
         .map_err(|e| FerrumError::model(format!("final_norm: {e}")))?;
 
-    // LM head
+    // LM head (or tied to embed_tokens)
     let lm_t = vb
         .get((cfg.vocab_size, cfg.hidden_size), "lm_head.weight")
+        .or_else(|_| {
+            vb.get(
+                (cfg.vocab_size, cfg.hidden_size),
+                "model.embed_tokens.weight",
+            )
+        })
         .map_err(|e| FerrumError::model(format!("lm_head: {e}")))?;
     let lm_head_w = LinearWeight::Fp16(
         GpuWeight::from_tensor(&lm_t, &rs)
@@ -272,6 +278,30 @@ pub fn load_runner_weights(
         .map_err(|e| FerrumError::model(format!("stream sync: {e}")))?;
 
     Ok((weights, dims, rs))
+}
+
+/// Compute RoPE tables for TP (public wrapper).
+#[cfg(feature = "cuda")]
+pub fn compute_rope_tables_for_tp(
+    cfg: &super::tp_weight_loader::TpWeightConfig,
+    device: &CandleDevice,
+    stream: &Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+) -> Result<(GpuWeight, GpuWeight)> {
+    let w = WeightConfig {
+        num_hidden_layers: cfg.num_hidden_layers,
+        hidden_size: cfg.hidden_size,
+        intermediate_size: cfg.intermediate_size,
+        num_attention_heads: cfg.num_attention_heads,
+        num_kv_heads: cfg.num_kv_heads,
+        head_dim: cfg.head_dim,
+        vocab_size: cfg.vocab_size,
+        max_seq_len: cfg.max_seq_len,
+        rope_theta: cfg.rope_theta,
+        has_qk_norm: cfg.has_qk_norm,
+        qkv_fused: false,
+        gate_up_fused: false,
+    };
+    compute_rope_tables(&w, device, stream)
 }
 
 /// Compute RoPE cos/sin tables from config parameters.
