@@ -100,7 +100,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
                 eprintln!("GPU 1: {name}");
             }
         }
-        #[cfg(feature = "tensor-parallel")]
+        #[cfg(feature = "cuda")]
         {
             let tp = std::env::var("FERRUM_TP")
                 .ok()

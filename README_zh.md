@@ -161,7 +161,7 @@ cargo install ferrum-cli --features cuda
 cargo build --release -p ferrum-cli                    # CPU
 cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
 cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
-cargo build --release -p ferrum-cli --features cuda,tensor-parallel  # 多卡（自动检测 GPU 数量）
+cargo build --release -p ferrum-cli --features cuda    # 多卡自动检测
 ```
 
 前置条件：Rust stable 工具链。

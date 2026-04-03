@@ -1067,13 +1067,13 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| {
-                        #[cfg(feature = "tensor-parallel")]
+                        #[cfg(feature = "cuda")]
                         {
                             candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
                                 .map(|n| n as usize)
                                 .unwrap_or(1)
                         }
-                        #[cfg(not(feature = "tensor-parallel"))]
+                        #[cfg(not(feature = "cuda"))]
                         {
                             0
                         }

@@ -281,7 +281,7 @@ pub fn load_runner_weights(
 }
 
 /// Compute RoPE tables for TP (public wrapper).
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub fn compute_rope_tables_for_tp(
     cfg: &super::tp_weight_loader::TpWeightConfig,
     device: &CandleDevice,
