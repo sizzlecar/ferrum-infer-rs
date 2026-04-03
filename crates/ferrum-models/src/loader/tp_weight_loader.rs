@@ -78,7 +78,6 @@ pub fn load_sharded_weights(
         .new_stream()
         .map_err(|e| FerrumError::model(format!("new_stream: {e}")))?;
 
-
     let tp = cfg.tp_size;
     let rank = cfg.rank;
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
@@ -96,7 +95,9 @@ pub fn load_sharded_weights(
         .map_err(|e| FerrumError::model(format!("embed: {e}")))?;
     let embed_t = to_dev(&embed_t)?;
     let embed_table = {
-        candle_stream.synchronize().map_err(|e| FerrumError::model(format!("sync: {e}")))?;
+        candle_stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("sync: {e}")))?;
         GpuWeight::from_tensor(&embed_t, &rs)
             .map_err(|e| FerrumError::model(format!("embed: {e}")))?
     };
@@ -113,9 +114,7 @@ pub fn load_sharded_weights(
             .map_err(|e| FerrumError::model(format!("candle sync: {e}")))?;
         GpuWeight::from_tensor(t, &rs).map_err(|e| FerrumError::model(format!("from_tensor: {e}")))
     };
-    let to_gpu_linear = |t: &Tensor| -> Result<LinearWeight> {
-        Ok(LinearWeight::Fp16(to_gpu(t)?))
-    };
+    let to_gpu_linear = |t: &Tensor| -> Result<LinearWeight> { Ok(LinearWeight::Fp16(to_gpu(t)?)) };
 
     for li in 0..cfg.num_hidden_layers {
         let prefix = format!("model.layers.{li}");

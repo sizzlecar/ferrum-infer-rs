@@ -575,18 +575,12 @@ impl CudaDecodeRunner {
                 &mut self.weights.layers[li].input_ln_w,
                 &iln,
             )?;
-            Self::overwrite_gpu_weight(
-                &self.stream,
-                &mut self.weights.layers[li].post_ln_w,
-                &pln,
-            )?;
-            if let (Some(data), Some(ref mut dst)) =
-                (qn, self.weights.layers[li].q_norm_w.as_mut())
+            Self::overwrite_gpu_weight(&self.stream, &mut self.weights.layers[li].post_ln_w, &pln)?;
+            if let (Some(data), Some(ref mut dst)) = (qn, self.weights.layers[li].q_norm_w.as_mut())
             {
                 Self::overwrite_gpu_weight(&self.stream, dst, &data)?;
             }
-            if let (Some(data), Some(ref mut dst)) =
-                (kn, self.weights.layers[li].k_norm_w.as_mut())
+            if let (Some(data), Some(ref mut dst)) = (kn, self.weights.layers[li].k_norm_w.as_mut())
             {
                 Self::overwrite_gpu_weight(&self.stream, dst, &data)?;
             }
@@ -1517,7 +1511,6 @@ impl CudaDecodeRunner {
                         eps,
                     )?;
                 }
-
             }
         }
 

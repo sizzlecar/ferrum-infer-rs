@@ -99,10 +99,20 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 |------|--------|-------------|
 | Decode | 126 tok/s | **256.5 tok/s (+103%)** |
 
+### Tensor Parallelism (multi-GPU)
+
+| Config | Qwen3-4B FP16 |
+|--------|---------------|
+| 1× GPU | 82.3 tok/s (TPOT 12.1ms) |
+| 2× GPU TP | 26.1 tok/s (TPOT 38.4ms) |
+
+> TP decode uses persistent per-rank threads with NCCL all-reduce. Current bottleneck is PCIe interconnect latency (~0.44ms × 72 NCCL calls/step). TP is most beneficial for models that don't fit on a single GPU, or with NVLink interconnect.
+
 ### Key Optimizations
 
 - **Custom CUDA decode runner**: bypasses candle for the decode hot path (Qwen3 + LLaMA)
 - **INT4 quantization**: GPTQ models auto-detected, Marlin fused INT4×FP16 kernel
+- **Tensor parallelism**: persistent per-rank threads, barrier sync, NCCL all-reduce (Megatron-LM pattern)
 - **Batched attention kernel**: single launch for all batch items (SM utilization 17%→67%)
 - **Batched RoPE**: per-item positions in single kernel launch
 - **Custom CUDA kernels**: fused RmsNorm, SiLU×mul, RoPE, decode attention (all on single stream)
@@ -122,11 +132,11 @@ What works:
 - FlashAttention-2 prefill + custom CUDA decode runner
 - Paged KV cache with block reclamation
 - Continuous batching with batch decode
+- Tensor parallelism (multi-GPU NCCL, auto-detects GPU count)
 - Top-k/top-p/temperature/repetition-penalty sampling
 
 ## Roadmap
 
-- **Tensor parallelism** — multi-GPU via NCCL
 - **Speculative decoding** — draft model verification
 - **More model architectures** — Mistral, Phi, DeepSeek, etc.
 - **Qwen2 CUDA runner** — same pattern as LLaMA
@@ -151,6 +161,7 @@ Or build from source:
 cargo build --release -p ferrum-cli                    # CPU
 cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
 cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
+cargo build --release -p ferrum-cli --features cuda,tensor-parallel  # Multi-GPU (auto-detects GPUs)
 ```
 
 Prerequisites: Rust stable toolchain.

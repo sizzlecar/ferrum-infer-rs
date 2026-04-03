@@ -100,8 +100,19 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
                 eprintln!("GPU 1: {name}");
             }
         }
-        if let Ok(tp) = std::env::var("FERRUM_TP") {
-            eprintln!("Tensor Parallel: TP={tp}");
+        #[cfg(feature = "tensor-parallel")]
+        {
+            let tp = std::env::var("FERRUM_TP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
+                        .map(|n| n as usize)
+                        .unwrap_or(1)
+                });
+            if tp > 1 {
+                eprintln!("Tensor Parallel: TP={tp}");
+            }
         }
     }
 
