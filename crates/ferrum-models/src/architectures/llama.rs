@@ -95,7 +95,7 @@ pub struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     pub fn new(cfg: &Config, dtype: DType, device: &CandleDevice) -> CandleResult<Self> {
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
         let inv_freq: Vec<f32> = (0..head_dim)
             .step_by(2)
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / head_dim as f32))
@@ -441,7 +441,12 @@ impl LlamaModelWrapper {
     ) -> Result<Self> {
         info!("Creating Llama model from weights...");
 
-        let head_dim = config.hidden_size / config.num_attention_heads;
+        let head_dim = config
+            .extra_params
+            .get("head_dim")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(config.hidden_size / config.num_attention_heads);
         let cfg = Config {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
@@ -454,7 +459,11 @@ impl LlamaModelWrapper {
             rms_norm_eps: config.norm_eps,
             rope_theta: config.rope_theta.unwrap_or(10000.0) as f32,
             max_position_embeddings: config.max_position_embeddings,
-            tie_word_embeddings: false,
+            tie_word_embeddings: config
+                .extra_params
+                .get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             head_dim,
         };
 

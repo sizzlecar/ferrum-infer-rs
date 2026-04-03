@@ -169,9 +169,14 @@ impl CudaDecodeRunner {
         };
 
         tracing::warn!(
-            "CudaDecodeRunner initialized: {}MB decode buffers, {} layers, paged_kv={}{}",
+            "CudaDecodeRunner initialized: {}MB, {} layers, h={} nq={} nkv={} hd={} inter={} paged={}{}",
             buffers.memory_bytes() / (1024 * 1024),
             dims.num_layers,
+            dims.hidden_size,
+            dims.num_attention_heads,
+            dims.num_kv_heads,
+            dims.head_dim,
+            dims.intermediate_size,
             use_paged_kv,
             if diag.any_enabled() {
                 format!(", diag={diag:?}")
@@ -201,9 +206,421 @@ impl CudaDecodeRunner {
         })
     }
 
+    /// Bind this runner's CUDA context to the current thread.
+    pub fn bind_context(&self) -> candle_core::Result<()> {
+        // Clear any stale error state first — check_err() inside bind_to_thread
+        // would return a previous error instead of actually binding.
+        let _ = self.stream.context().check_err();
+        self.stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| candle_core::Error::Msg(format!("bind_context: {e}")))
+    }
+
+    /// Cross-GPU copy: host f16 data → new CudaSlice on this runner's GPU.
+    pub fn upload_to_self(
+        &self,
+        host_data: &[half::f16],
+    ) -> candle_core::Result<CudaSlice<half::f16>> {
+        self.stream
+            .clone_htod(host_data)
+            .map_err(|e| candle_core::Error::Msg(format!("upload h2d: {e}")))
+    }
+
     /// Access weight layers (diagnostic only).
     pub fn weight_layers(&self) -> &[LayerWeights] {
         &self.weights.layers
+    }
+
+    // ======================== TP Sub-Phase Methods ========================
+    //
+    // These expose individual pipeline stages for TpDecodeGroup to orchestrate.
+    // The full decode_step calls them in sequence; TP inserts all-reduce between
+    // o_proj and post_attn_norm, and between down_proj and post_mlp_norm.
+
+    /// TP Phase: embed token into residual buffer.
+    pub(crate) fn tp_embed(&mut self, token_id: u32) -> candle_core::Result<()> {
+        self.embed_eager(token_id)
+    }
+
+    /// TP Phase: first layer's input norm (only for layer 0).
+    pub(crate) fn tp_first_norm(&mut self) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let eps = 1e-6f32;
+        Self::launch_rms_norm(
+            &self.device,
+            &self.stream,
+            &self.buffers.residual,
+            &self.weights.layers[0].input_ln_w.slice,
+            &mut self.buffers.norm_out,
+            h,
+            eps,
+        )
+    }
+
+    /// TP Phase: QKV projection + Q/K norm + RoPE + attention for one layer.
+    /// After this, attn_out contains the attention output.
+    pub(crate) fn tp_pre_o_proj(
+        &mut self,
+        li: usize,
+        position: usize,
+        cache_key: &str,
+    ) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let kv_dim = self.dims.num_kv_heads * self.dims.head_dim;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let hd = self.dims.head_dim;
+        let half_dim = hd / 2;
+        let eps = 1e-6f32;
+
+        let lw = &self.weights.layers[li];
+
+        // QKV GEMM
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.norm_out,
+            &lw.qkv_w,
+            &mut self.buffers.qkv_out,
+            &mut self.buffers.temp_dequant,
+            1,
+            qkv_dim as i32,
+            h as i32,
+        )?;
+
+        // Q/K norm
+        let q = self.buffers.qkv_out.slice(..q_dim);
+        let k = self.buffers.qkv_out.slice(q_dim..q_dim + kv_dim);
+        if let Some(ref qnw) = lw.q_norm_w {
+            Self::launch_rms_norm_view(
+                &self.device,
+                &self.stream,
+                &q,
+                &qnw.slice,
+                &mut self.buffers.rope_q_temp,
+                hd,
+                eps,
+            )?;
+        } else {
+            self.stream
+                .memcpy_dtod(&q, &mut self.buffers.rope_q_temp)
+                .map_err(|e| candle_core::Error::Msg(format!("q copy: {e}")))?;
+        }
+        if let Some(ref knw) = lw.k_norm_w {
+            Self::launch_rms_norm_view(
+                &self.device,
+                &self.stream,
+                &k,
+                &knw.slice,
+                &mut self.buffers.rope_k_temp,
+                hd,
+                eps,
+            )?;
+        } else {
+            self.stream
+                .memcpy_dtod(&k, &mut self.buffers.rope_k_temp)
+                .map_err(|e| candle_core::Error::Msg(format!("k copy: {e}")))?;
+        }
+
+        // RoPE
+        let co = position * half_dim;
+        let cos = self.weights.rope_cos.slice.slice(co..co + half_dim);
+        let sin = self.weights.rope_sin.slice.slice(co..co + half_dim);
+        Self::launch_rope(
+            &self.device,
+            &self.stream,
+            &self.buffers.rope_q_temp,
+            &self.buffers.rope_k_temp,
+            &cos,
+            &sin,
+            &mut self.buffers.q_rotated,
+            &mut self.buffers.k_rotated,
+            self.dims.num_attention_heads,
+            self.dims.num_kv_heads,
+            hd,
+        )?;
+
+        // Attention (contiguous KV only for TP — paged KV is separate concern)
+        let mut kv = self
+            .kv_states
+            .remove(cache_key)
+            .ok_or_else(|| candle_core::Error::Msg(format!("No KV cache: {cache_key}")))?;
+        self.attention_eager(li, &mut kv)?;
+        self.kv_states.insert(cache_key.to_string(), kv);
+
+        Ok(())
+    }
+
+    /// TP Phase: O projection GEMM only. Output in o_proj_out.
+    /// After this, TpDecodeGroup calls all_reduce(o_proj_out).
+    pub(crate) fn tp_o_proj(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let q_dim = self.dims.num_attention_heads * self.dims.head_dim;
+        let lw = &self.weights.layers[li];
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.attn_out,
+            &lw.o_w,
+            &mut self.buffers.o_proj_out,
+            &mut self.buffers.temp_dequant,
+            1,
+            h as i32,
+            q_dim as i32,
+        )
+    }
+
+    /// TP Phase: post-attention residual add + norm (after all-reduce of o_proj_out).
+    pub(crate) fn tp_post_attn_norm(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let eps = 1e-6f32;
+        let lw = &self.weights.layers[li];
+        Self::launch_fused_add_rms_norm(
+            &self.device,
+            &self.stream,
+            &self.buffers.o_proj_out,
+            &self.buffers.residual,
+            &lw.post_ln_w.slice,
+            &mut self.buffers.post_norm_out,
+            &mut self.buffers.post_norm_residual,
+            h,
+            eps,
+        )
+    }
+
+    /// TP Phase: MLP GEMMs (gate_up + SiLU + down). Output in down_out.
+    /// After this, TpDecodeGroup calls all_reduce(down_out).
+    pub(crate) fn tp_mlp(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let inter = self.dims.intermediate_size;
+        let lw = &self.weights.layers[li];
+
+        // gate_up GEMM
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.post_norm_out,
+            &lw.gate_up_w,
+            &mut self.buffers.gate_up_out,
+            &mut self.buffers.temp_dequant,
+            1,
+            (2 * inter) as i32,
+            h as i32,
+        )?;
+
+        // SiLU * mul
+        let g = self.buffers.gate_up_out.slice(..inter);
+        let u = self.buffers.gate_up_out.slice(inter..2 * inter);
+        Self::launch_fused_silu_mul(
+            &self.device,
+            &self.stream,
+            &g,
+            &u,
+            &mut self.buffers.mlp_act,
+            inter,
+        )?;
+
+        // down GEMM
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.mlp_act,
+            &lw.down_w,
+            &mut self.buffers.down_out,
+            &mut self.buffers.temp_dequant,
+            1,
+            h as i32,
+            inter as i32,
+        )
+    }
+
+    /// TP Phase: post-MLP residual add + next layer norm (after all-reduce of down_out).
+    pub(crate) fn tp_post_mlp_norm(&mut self, li: usize) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        let n = self.dims.num_layers;
+        let eps = 1e-6f32;
+
+        if li < n - 1 {
+            Self::launch_fused_add_rms_norm(
+                &self.device,
+                &self.stream,
+                &self.buffers.down_out,
+                &self.buffers.post_norm_residual,
+                &self.weights.layers[li + 1].input_ln_w.slice,
+                &mut self.buffers.norm_out,
+                &mut self.buffers.residual,
+                h,
+                eps,
+            )
+        } else {
+            Self::launch_fused_add_rms_norm(
+                &self.device,
+                &self.stream,
+                &self.buffers.down_out,
+                &self.buffers.post_norm_residual,
+                &self.weights.final_norm_w.slice,
+                &mut self.buffers.final_norm_out,
+                &mut self.buffers.residual,
+                h,
+                eps,
+            )
+        }
+    }
+
+    /// TP Phase: LM head GEMM. Output in logits buffer.
+    pub(crate) fn tp_lm_head(&mut self) -> candle_core::Result<()> {
+        let h = self.dims.hidden_size;
+        Self::linear(
+            &self.blas,
+            &self.device,
+            &self.stream,
+            &self.buffers.final_norm_out,
+            &self.weights.lm_head_w,
+            &mut self.buffers.logits,
+            &mut self.buffers.temp_dequant,
+            1,
+            self.dims.vocab_size as i32,
+            h as i32,
+        )
+    }
+
+    /// Copy a GpuWeight from host data into this runner's weight slice.
+    fn overwrite_gpu_weight(
+        stream: &Arc<CudaStream>,
+        dst: &mut crate::weight_store::GpuWeight,
+        host_data: &[half::f16],
+    ) -> candle_core::Result<()> {
+        let new_slice = stream
+            .clone_htod(host_data)
+            .map_err(|e| candle_core::Error::Msg(format!("htod: {e}")))?;
+        dst.slice = new_slice;
+        dst.len = host_data.len();
+        Ok(())
+    }
+
+    /// Sync replicated weights from a source runner (via D2H from source + H2D to self).
+    ///
+    /// Fixes candle VarBuilder producing different BF16→F16 conversions on different GPUs.
+    /// Only copies replicated (non-sharded) weights: norms, embed, lm_head, RoPE.
+    pub fn sync_replicated_weights_from(
+        &mut self,
+        source: &CudaDecodeRunner,
+    ) -> candle_core::Result<()> {
+        // Helper: read GpuWeight from source to host
+        let read = |w: &crate::weight_store::GpuWeight,
+                    src_stream: &Arc<CudaStream>|
+         -> candle_core::Result<Vec<half::f16>> {
+            let v = w.slice.slice(..w.len);
+            src_stream
+                .clone_dtoh(&v)
+                .map_err(|e| candle_core::Error::Msg(format!("dtoh: {e}")))
+        };
+
+        let src_stream = &source.stream;
+
+        // Embed table
+        source.bind_context()?;
+        let data = read(&source.weights.embed_table, src_stream)?;
+        self.bind_context()?;
+        Self::overwrite_gpu_weight(&self.stream, &mut self.weights.embed_table, &data)?;
+
+        // Final norm
+        source.bind_context()?;
+        let data = read(&source.weights.final_norm_w, src_stream)?;
+        self.bind_context()?;
+        Self::overwrite_gpu_weight(&self.stream, &mut self.weights.final_norm_w, &data)?;
+
+        // LM head
+        if let crate::weight_store::LinearWeight::Fp16(ref src_w) = source.weights.lm_head_w {
+            source.bind_context()?;
+            let data = read(src_w, src_stream)?;
+            self.bind_context()?;
+            if let crate::weight_store::LinearWeight::Fp16(ref mut dst_w) = self.weights.lm_head_w {
+                Self::overwrite_gpu_weight(&self.stream, dst_w, &data)?;
+            }
+        }
+
+        // RoPE tables
+        source.bind_context()?;
+        let cos_data = read(&source.weights.rope_cos, src_stream)?;
+        let sin_data = read(&source.weights.rope_sin, src_stream)?;
+        self.bind_context()?;
+        Self::overwrite_gpu_weight(&self.stream, &mut self.weights.rope_cos, &cos_data)?;
+        Self::overwrite_gpu_weight(&self.stream, &mut self.weights.rope_sin, &sin_data)?;
+
+        // Per-layer replicated weights: input_ln, post_ln, q_norm, k_norm
+        for li in 0..self.weights.layers.len() {
+            source.bind_context()?;
+            let iln = read(&source.weights.layers[li].input_ln_w, src_stream)?;
+            let pln = read(&source.weights.layers[li].post_ln_w, src_stream)?;
+            let qn = source.weights.layers[li]
+                .q_norm_w
+                .as_ref()
+                .map(|w| read(w, src_stream))
+                .transpose()?;
+            let kn = source.weights.layers[li]
+                .k_norm_w
+                .as_ref()
+                .map(|w| read(w, src_stream))
+                .transpose()?;
+
+            self.bind_context()?;
+            Self::overwrite_gpu_weight(
+                &self.stream,
+                &mut self.weights.layers[li].input_ln_w,
+                &iln,
+            )?;
+            Self::overwrite_gpu_weight(&self.stream, &mut self.weights.layers[li].post_ln_w, &pln)?;
+            if let (Some(data), Some(ref mut dst)) = (qn, self.weights.layers[li].q_norm_w.as_mut())
+            {
+                Self::overwrite_gpu_weight(&self.stream, dst, &data)?;
+            }
+            if let (Some(data), Some(ref mut dst)) = (kn, self.weights.layers[li].k_norm_w.as_mut())
+            {
+                Self::overwrite_gpu_weight(&self.stream, dst, &data)?;
+            }
+        }
+
+        self.sync_stream()?;
+        Ok(())
+    }
+
+    /// Access o_proj_out buffer for all-reduce.
+    pub(crate) fn o_proj_out_mut(&mut self) -> &mut CudaSlice<half::f16> {
+        &mut self.buffers.o_proj_out
+    }
+
+    /// Access down_out buffer for all-reduce.
+    pub(crate) fn down_out_mut(&mut self) -> &mut CudaSlice<half::f16> {
+        &mut self.buffers.down_out
+    }
+
+    /// Disable cudarc's per-op event tracking on this runner's stream context.
+    /// Safe when all ops are on the same stream (no cross-stream sync needed).
+    /// Eliminates ~500µs overhead per NCCL call from DevicePtrMut::device_ptr_mut().
+    pub(crate) fn disable_event_tracking(&self) {
+        unsafe {
+            self.stream.context().disable_event_tracking();
+        }
+    }
+
+    /// Sync runner's stream.
+    pub(crate) fn sync_stream(&self) -> candle_core::Result<()> {
+        self.stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("stream sync: {e}")))
+    }
+
+    /// Clone logits from runner's buffer.
+    pub(crate) fn clone_logits(&self) -> candle_core::Result<CudaSlice<half::f16>> {
+        self.stream
+            .clone_dtod(&self.buffers.logits)
+            .map_err(|e| candle_core::Error::Msg(format!("logits: {e}")))
     }
 
     pub fn init_kv_cache(
@@ -877,15 +1294,6 @@ impl CudaDecodeRunner {
         } else {
             None
         };
-
-        // Diagnostic: log first step's embed values
-        if position <= 2 {
-            self.stream.synchronize().ok();
-            eprintln!(
-                "[runner] q_norm_w={}",
-                self.weights.layers[0].q_norm_w.is_some()
-            );
-        }
 
         self.embed_eager(token_id)?;
 
@@ -1864,7 +2272,7 @@ impl CudaDecodeRunner {
         b.arg(&vki);
         b.arg(&scale);
         // Shared: max_kv_len floats for attention scores
-        let shared_bytes = (max_kv as u32) * 4;
+        let shared_bytes = (valid_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (nq as u32, 1, 1),
@@ -1915,7 +2323,7 @@ impl CudaDecodeRunner {
         b.arg(&mki);
         b.arg(&vki);
         b.arg(&scale);
-        let shared_bytes = (max_kv as u32) * 4;
+        let shared_bytes = (valid_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (nq as u32, 1, 1),

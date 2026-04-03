@@ -35,23 +35,29 @@ ferrum run qwen3:0.6b
 ferrum serve --model qwen3:0.6b --port 8000
 ```
 
-## Supported Models
+## Supported Architectures
 
-| Alias | Model | Architecture | CUDA Runner |
-|-------|-------|-------------|-------------|
-| `qwen3:0.6b` / `1.7b` / `4b` | Qwen3 | Qwen3 | Yes |
-| `qwen2.5:0.5b` / `1.5b` / `3b` / `7b` | Qwen2.5-Instruct | Qwen2 | — |
-| `llama3.2:1b` / `3b` | Llama-3.2-Instruct | LLaMA | Yes |
-| `tinyllama` | TinyLlama-1.1B-Chat | LLaMA | Yes |
+Any Hugging Face model using a supported architecture works out of the box:
 
-GPTQ INT4 quantized models are auto-detected and use the Marlin fused kernel:
+| Architecture | CUDA Decode | INT4 (GPTQ) | Tensor Parallel | Example Models |
+|-------------|-------------|-------------|-----------------|----------------|
+| **LLaMA** | Yes | Yes | Yes | Llama-3.x, TinyLlama, Vicuna, Alpaca, ... |
+| **Qwen3** | Yes | Yes | Yes | Qwen3-0.6B ~ 4B |
+| **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
+| **BERT** | — | — | — | any BERT model (embeddings only) |
+
 ```bash
-./target/release/ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
-```
+# Use any Hugging Face model ID directly
+ferrum run Qwen/Qwen3-4B
+ferrum run meta-llama/Llama-3.2-3B-Instruct
 
-Any Hugging Face model ID with a supported architecture also works directly:
-```bash
-./target/release/ferrum run Qwen/Qwen3-0.6B
+# GPTQ INT4 quantized models are auto-detected
+ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
+
+# Or use built-in aliases for convenience
+ferrum run qwen3:4b
+ferrum run llama3.2:3b
+ferrum run tinyllama
 ```
 
 ## Commands
@@ -99,10 +105,20 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 |------|--------|-------------|
 | Decode | 126 tok/s | **256.5 tok/s (+103%)** |
 
+### Tensor Parallelism (multi-GPU)
+
+| Config | Qwen3-4B FP16 |
+|--------|---------------|
+| 1× GPU | 82.3 tok/s (TPOT 12.1ms) |
+| 2× GPU TP | 26.1 tok/s (TPOT 38.4ms) |
+
+> TP decode uses persistent per-rank threads with NCCL all-reduce. Current bottleneck is PCIe interconnect latency (~0.44ms × 72 NCCL calls/step). TP is most beneficial for models that don't fit on a single GPU, or with NVLink interconnect.
+
 ### Key Optimizations
 
 - **Custom CUDA decode runner**: bypasses candle for the decode hot path (Qwen3 + LLaMA)
 - **INT4 quantization**: GPTQ models auto-detected, Marlin fused INT4×FP16 kernel
+- **Tensor parallelism**: persistent per-rank threads, barrier sync, NCCL all-reduce (Megatron-LM pattern)
 - **Batched attention kernel**: single launch for all batch items (SM utilization 17%→67%)
 - **Batched RoPE**: per-item positions in single kernel launch
 - **Custom CUDA kernels**: fused RmsNorm, SiLU×mul, RoPE, decode attention (all on single stream)
@@ -122,11 +138,11 @@ What works:
 - FlashAttention-2 prefill + custom CUDA decode runner
 - Paged KV cache with block reclamation
 - Continuous batching with batch decode
+- Tensor parallelism (multi-GPU NCCL, auto-detects GPU count)
 - Top-k/top-p/temperature/repetition-penalty sampling
 
 ## Roadmap
 
-- **Tensor parallelism** — multi-GPU via NCCL
 - **Speculative decoding** — draft model verification
 - **More model architectures** — Mistral, Phi, DeepSeek, etc.
 - **Qwen2 CUDA runner** — same pattern as LLaMA
@@ -151,6 +167,7 @@ Or build from source:
 cargo build --release -p ferrum-cli                    # CPU
 cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
 cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
+cargo build --release -p ferrum-cli --features cuda    # Multi-GPU auto-detected when available
 ```
 
 Prerequisites: Rust stable toolchain.

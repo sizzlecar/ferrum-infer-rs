@@ -19,5 +19,6 @@ bindgen_cuda = "0.1.6"
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "dep:cudarc", "marlin"]
+cuda = ["candle-core/cuda", "dep:cudarc", "marlin", "cudarc?/nccl"]
 marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)
+tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
