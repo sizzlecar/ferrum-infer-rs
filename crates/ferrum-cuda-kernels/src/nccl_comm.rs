@@ -1,23 +1,23 @@
 //! NCCL communication primitives for tensor parallelism.
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use cudarc::nccl::safe::Comm;
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub struct NcclRank {
     comm: Comm,
     rank: usize,
     world_size: usize,
 }
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 unsafe impl Send for NcclRank {}
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 unsafe impl Sync for NcclRank {}
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 impl NcclRank {
     /// Init all comms at once using ncclCommInitAll (single thread, no deadlock).
     pub fn init_all(

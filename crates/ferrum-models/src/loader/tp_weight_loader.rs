@@ -8,22 +8,22 @@
 //!
 //! Feature-gated: only available with `tensor-parallel` feature.
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use candle_core::{DType, Device as CandleDevice, Tensor};
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use candle_nn::VarBuilder;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use ferrum_cuda_kernels::{
     decode_buffers::ModelDims,
     weight_store::{GpuWeight, LayerWeights, LinearWeight, TransformerGpuWeights},
 };
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use ferrum_types::{FerrumError, Result};
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use std::sync::Arc;
 
 /// Tensor parallel weight config — extends base WeightConfig with TP params.
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 #[derive(Clone)]
 pub struct TpWeightConfig {
     pub num_hidden_layers: usize,
@@ -50,7 +50,7 @@ pub struct TpWeightConfig {
 /// - gate_up: only this rank's intermediate slice (2*inter/tp, hidden)
 /// - down: only this rank's input slice (hidden, inter/tp)
 /// - Norms, embed, lm_head, RoPE: full (replicated)
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub fn load_sharded_weights(
     vb: &VarBuilder,
     cfg: &TpWeightConfig,

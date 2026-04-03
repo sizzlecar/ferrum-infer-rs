@@ -37,7 +37,7 @@ pub struct CandleModelExecutor {
     next_cache_id: AtomicU64,
     #[cfg(feature = "cuda")]
     cuda_runner: Mutex<Option<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner>>,
-    #[cfg(feature = "tensor-parallel")]
+    #[cfg(feature = "cuda")]
     tp_group: Mutex<Option<ferrum_cuda_kernels::tp_decode::TpDecodeGroup>>,
 }
 
@@ -51,7 +51,7 @@ impl CandleModelExecutor {
             next_cache_id: AtomicU64::new(1),
             #[cfg(feature = "cuda")]
             cuda_runner: Mutex::new(None),
-            #[cfg(feature = "tensor-parallel")]
+            #[cfg(feature = "cuda")]
             tp_group: Mutex::new(None),
         }
     }
@@ -73,7 +73,7 @@ impl CandleModelExecutor {
 
     /// Get TP size: FERRUM_TP env overrides, otherwise auto-detect GPU count.
     /// FERRUM_TP=0 or FERRUM_TP=1 explicitly disables TP.
-    #[cfg(feature = "tensor-parallel")]
+    #[cfg(feature = "cuda")]
     fn tp_size() -> usize {
         if let Ok(v) = std::env::var("FERRUM_TP") {
             if let Ok(n) = v.parse::<usize>() {
@@ -86,13 +86,13 @@ impl CandleModelExecutor {
             .unwrap_or(1)
     }
 
-    #[cfg(not(feature = "tensor-parallel"))]
+    #[cfg(not(feature = "cuda"))]
     fn tp_size() -> usize {
         0
     }
 
     /// Initialize TP decode group if FERRUM_TP > 1.
-    #[cfg(feature = "tensor-parallel")]
+    #[cfg(feature = "cuda")]
     fn ensure_tp_group(&self) -> bool {
         if self.tp_group.lock().is_some() {
             return true;
@@ -434,7 +434,7 @@ impl ModelExecutor for CandleModelExecutor {
         }
 
         // Try TP path first (FERRUM_TP > 1)
-        #[cfg(feature = "tensor-parallel")]
+        #[cfg(feature = "cuda")]
         {
             if Self::tp_size() > 1 && self.ensure_tp_group() {
                 // Ensure KV cache exists on all TP ranks.

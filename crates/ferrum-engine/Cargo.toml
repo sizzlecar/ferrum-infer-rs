@@ -84,7 +84,7 @@ cuda = [
     "ferrum-models/cuda",
 ]
 marlin = ["cuda"]  # kept for backward compat, cuda already enables marlin
-tensor-parallel = ["cuda", "ferrum-models/tensor-parallel"]
+tensor-parallel = ["cuda"]  # backward compat alias
 metal = ["candle-core/metal", "dep:candle-metal-kernels", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray"]
 
 # Metal dependencies for Apple GPU support (only on macOS/iOS)

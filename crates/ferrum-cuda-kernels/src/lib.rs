@@ -65,8 +65,8 @@ pub mod gpu_paged_kv;
 #[cfg(feature = "cuda")]
 pub mod cuda_decode;
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub mod nccl_comm;
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub mod tp_decode;

@@ -161,7 +161,7 @@ Or build from source:
 cargo build --release -p ferrum-cli                    # CPU
 cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
 cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
-cargo build --release -p ferrum-cli --features cuda,tensor-parallel  # Multi-GPU (auto-detects GPUs)
+cargo build --release -p ferrum-cli --features cuda    # Multi-GPU auto-detected when available
 ```
 
 Prerequisites: Rust stable toolchain.

@@ -13,5 +13,5 @@ pub use candle_executor::CandleModelExecutor;
 pub use qwen2_executor::Qwen2ModelExecutor;
 pub use qwen3_executor::Qwen3ModelExecutor;
 pub use stub_executor::StubModelExecutor;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub use tp_executor::TpModelExecutor;

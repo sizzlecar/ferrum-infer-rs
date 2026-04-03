@@ -4,30 +4,30 @@
 //! Control operations (KV init/release) use mpsc channels (infrequent).
 //! cudarc event tracking is disabled per-worker (all ops on same stream).
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use crate::cuda_decode::CudaDecodeRunner;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use crate::nccl_comm::NcclRank;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use std::collections::HashSet;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use std::sync::{mpsc, Arc, Barrier};
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use std::thread::JoinHandle;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use std::time::Duration;
 
 // Mode constants for shared state
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 const MODE_DECODE: u8 = 0;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 const MODE_CONTROL: u8 = 1;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 const MODE_SHUTDOWN: u8 = 2;
 
 // ---------------------------------------------------------------------------
@@ -35,7 +35,7 @@ const MODE_SHUTDOWN: u8 = 2;
 // ---------------------------------------------------------------------------
 
 /// How KV cache data is provided to a worker thread.
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub enum KvSource {
     /// Already on the correct GPU (e.g., rank 0 sharing candle's device).
     Gpu(CudaSlice<half::f16>),
@@ -47,7 +47,7 @@ pub enum KvSource {
 // Shared state (hot path — zero allocation)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 struct SharedDecode {
     // Main → Workers (written before start_barrier, read after)
     mode: AtomicU8,
@@ -63,7 +63,7 @@ struct SharedDecode {
 // Control channel types (cold path)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 enum TpCommand {
     InitKvCache {
         cache_key: String,
@@ -80,7 +80,7 @@ enum TpCommand {
 // TpDecodeGroup
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub struct TpDecodeGroup {
     // Hot path: barrier sync
     start_barrier: Arc<Barrier>,
@@ -94,7 +94,7 @@ pub struct TpDecodeGroup {
     cache_keys: HashSet<String>,
 }
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 impl TpDecodeGroup {
     pub fn new(runners: Vec<CudaDecodeRunner>, nccl: Vec<NcclRank>) -> candle_core::Result<Self> {
         let world_size = runners.len();
@@ -252,7 +252,7 @@ impl TpDecodeGroup {
     }
 }
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 impl Drop for TpDecodeGroup {
     fn drop(&mut self) {
         self.shared.mode.store(MODE_SHUTDOWN, Ordering::Release);
@@ -270,7 +270,7 @@ impl Drop for TpDecodeGroup {
 // Worker thread
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 fn worker_loop(
     rank: usize,
     mut runner: CudaDecodeRunner,
@@ -347,7 +347,7 @@ fn worker_loop(
 }
 
 /// Execute full decode pipeline on one rank. NCCL provides inter-rank sync.
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 fn run_decode_step(
     runner: &mut CudaDecodeRunner,
     nccl: &NcclRank,
@@ -375,7 +375,7 @@ fn run_decode_step(
 }
 
 /// Upload KV data and initialize cache on one rank.
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 fn init_kv_on_rank(
     runner: &mut CudaDecodeRunner,
     cache_key: &str,

@@ -5,9 +5,9 @@
 //!
 //! Feature-gated: only available with `tensor-parallel` feature.
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use async_trait::async_trait;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use ferrum_interfaces::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
@@ -15,27 +15,27 @@ use ferrum_interfaces::{
     },
     KvCacheHandle, ModelExecutor, TensorRef,
 };
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use tracing::info;
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use super::common::{self, GenericKvCacheHandle};
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use crate::tensor_wrapper::CandleTensorWrapper;
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use parking_lot::Mutex;
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 use ferrum_cuda_kernels::tp_decode::TpDecodeGroup;
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 struct TpCacheState {
     sequence_length: usize,
 }
@@ -44,7 +44,7 @@ struct TpCacheState {
 ///
 /// - Prefill: single GPU (candle FlashAttention-2 on GPU 0)
 /// - Decode: all GPUs via TpDecodeGroup with NCCL all-reduce
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 pub struct TpModelExecutor {
     /// Candle model on GPU 0 for prefill
     model: Arc<crate::architectures::llama::LlamaModelWrapper>,
@@ -56,7 +56,7 @@ pub struct TpModelExecutor {
     tp_size: usize,
 }
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 impl TpModelExecutor {
     pub fn new(
         model: crate::architectures::llama::LlamaModelWrapper,
@@ -94,7 +94,7 @@ impl TpModelExecutor {
     }
 }
 
-#[cfg(feature = "tensor-parallel")]
+#[cfg(feature = "cuda")]
 #[async_trait]
 impl ModelExecutor for TpModelExecutor {
     fn info(&self) -> &ModelInfo {
