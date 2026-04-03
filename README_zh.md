@@ -35,23 +35,29 @@ ferrum run qwen3:0.6b
 ferrum serve --model qwen3:0.6b --port 8000
 ```
 
-## 支持的模型
+## 支持的架构
 
-| 别名 | 模型 | 架构 | CUDA Runner |
-|------|------|------|-------------|
-| `qwen3:0.6b` / `1.7b` / `4b` | Qwen3 | Qwen3 | 支持 |
-| `qwen2.5:0.5b` / `1.5b` / `3b` / `7b` | Qwen2.5-Instruct | Qwen2 | — |
-| `llama3.2:1b` / `3b` | Llama-3.2-Instruct | LLaMA | 支持 |
-| `tinyllama` | TinyLlama-1.1B-Chat | LLaMA | 支持 |
+任何使用以下架构的 Hugging Face 模型都可以直接运行：
 
-GPTQ INT4 量化模型自动检测，使用 Marlin fused 内核：
+| 架构 | CUDA Decode | INT4 (GPTQ) | 张量并行 | 示例模型 |
+|------|-------------|-------------|---------|----------|
+| **LLaMA** | 支持 | 支持 | 支持 | Llama-3.x, TinyLlama, Vicuna, Alpaca, ... |
+| **Qwen3** | 支持 | 支持 | 支持 | Qwen3-0.6B ~ 4B |
+| **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
+| **BERT** | — | — | — | 任意 BERT 模型（仅向量化） |
+
 ```bash
-./target/release/ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
-```
+# 直接使用 Hugging Face 模型 ID
+ferrum run Qwen/Qwen3-4B
+ferrum run meta-llama/Llama-3.2-3B-Instruct
 
-也可直接使用 Hugging Face 模型 ID：
-```bash
-./target/release/ferrum run Qwen/Qwen3-0.6B
+# GPTQ INT4 量化模型自动检测
+ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
+
+# 也可使用内置别名
+ferrum run qwen3:4b
+ferrum run llama3.2:3b
+ferrum run tinyllama
 ```
 
 ## 命令
