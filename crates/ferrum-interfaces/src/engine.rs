@@ -36,8 +36,8 @@ pub trait InferenceEngine: Send + Sync {
     /// Health check
     async fn health_check(&self) -> ferrum_types::HealthStatus;
 
-    /// Embed text tokens → float vector. Default: not supported.
-    async fn embed_text(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
+    /// Embed raw text string → float vector (engine handles tokenization).
+    async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
         Err(ferrum_types::FerrumError::model(
             "This engine does not support text embedding",
         ))
