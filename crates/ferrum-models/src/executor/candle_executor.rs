@@ -71,12 +71,24 @@ impl CandleModelExecutor {
         common::tensor_to_tokens(tensor)
     }
 
-    /// Get TP size from FERRUM_TP env var (0 or 1 = disabled).
+    /// Get TP size: FERRUM_TP env overrides, otherwise auto-detect GPU count.
+    /// FERRUM_TP=0 or FERRUM_TP=1 explicitly disables TP.
+    #[cfg(feature = "tensor-parallel")]
     fn tp_size() -> usize {
-        std::env::var("FERRUM_TP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+        if let Ok(v) = std::env::var("FERRUM_TP") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n;
+            }
+        }
+        // Auto-detect: use all available GPUs
+        candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
+            .map(|n| n as usize)
+            .unwrap_or(1)
+    }
+
+    #[cfg(not(feature = "tensor-parallel"))]
+    fn tp_size() -> usize {
+        0
     }
 
     /// Initialize TP decode group if FERRUM_TP > 1.

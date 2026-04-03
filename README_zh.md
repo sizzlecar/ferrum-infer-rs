@@ -99,10 +99,20 @@ curl http://localhost:8000/health
 |------|--------|-------------|
 | Decode | 126 tok/s | **256.5 tok/s (+103%)** |
 
+### 张量并行（多 GPU）
+
+| 配置 | Qwen3-4B FP16 |
+|------|---------------|
+| 单卡 | 82.3 tok/s (TPOT 12.1ms) |
+| 双卡 TP | 26.1 tok/s (TPOT 38.4ms) |
+
+> TP decode 使用持久化 per-rank 线程 + NCCL all-reduce。当前瓶颈为 PCIe 互联延迟（~0.44ms × 72 次 NCCL 调用/步）。TP 主要适用于单卡放不下的大模型，或 NVLink 互联场景。
+
 ### 核心优化
 
 - **自定义 CUDA decode runner**：绕过 candle 的 decode 热路径（Qwen3 + LLaMA）
 - **INT4 量化**：GPTQ 模型自动检测，Marlin fused INT4×FP16 内核
+- **张量并行**：持久化 per-rank 线程、Barrier 同步、NCCL all-reduce（Megatron-LM 模式）
 - **Batched attention 内核**：单次 launch 处理所有 batch 项（SM 利用率 17%→67%）
 - **Batched RoPE**：单次 launch + per-item position 数组
 - **自定义 CUDA 内核**：fused RmsNorm、SiLU×mul、RoPE、decode attention（统一 stream 零同步）
@@ -122,11 +132,11 @@ curl http://localhost:8000/health
 - FlashAttention-2 prefill + 自定义 CUDA decode runner
 - Paged KV cache + block 回收
 - 连续批处理 + batch decode
+- 张量并行（多 GPU NCCL，自动检测 GPU 数量）
 - Top-k / Top-p / Temperature / 重复惩罚采样
 
 ## 路线图
 
-- **张量并行** — 多 GPU NCCL
 - **推测解码** — draft model 验证
 - **更多模型架构** — Mistral、Phi、DeepSeek 等
 - **Qwen2 CUDA runner** — 同 LLaMA 模式
@@ -151,6 +161,7 @@ cargo install ferrum-cli --features cuda
 cargo build --release -p ferrum-cli                    # CPU
 cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
 cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
+cargo build --release -p ferrum-cli --features cuda,tensor-parallel  # 多卡（自动检测 GPU 数量）
 ```
 
 前置条件：Rust stable 工具链。

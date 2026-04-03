@@ -1066,7 +1066,18 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 let tp_size: usize = std::env::var("FERRUM_TP")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| {
+                        #[cfg(feature = "tensor-parallel")]
+                        {
+                            candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
+                                .map(|n| n as usize)
+                                .unwrap_or(1)
+                        }
+                        #[cfg(not(feature = "tensor-parallel"))]
+                        {
+                            0
+                        }
+                    });
                 if tp_size > 1 {
                     info!("Qwen3 TP={tp_size}: using Llama wrapper for tensor parallel");
                     let vb = loader.load_varbuilder(&candle_device, dtype)?;

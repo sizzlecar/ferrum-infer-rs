@@ -121,9 +121,7 @@ impl TpDecodeGroup {
         let mut cmd_txs = Vec::with_capacity(world_size);
         let mut workers = Vec::with_capacity(world_size);
 
-        for (rank, (runner, nccl_rank)) in
-            runners.into_iter().zip(nccl.into_iter()).enumerate()
-        {
+        for (rank, (runner, nccl_rank)) in runners.into_iter().zip(nccl.into_iter()).enumerate() {
             let (cmd_tx, cmd_rx) = mpsc::sync_channel::<TpCommand>(1);
             let sb = Arc::clone(&start_barrier);
             let db = Arc::clone(&done_barrier);
@@ -259,7 +257,7 @@ impl Drop for TpDecodeGroup {
     fn drop(&mut self) {
         self.shared.mode.store(MODE_SHUTDOWN, Ordering::Release);
         self.start_barrier.wait(); // workers see shutdown and break
-        // Workers do NOT call done_barrier on shutdown — just join them.
+                                   // Workers do NOT call done_barrier on shutdown — just join them.
         for worker in &mut self.workers {
             if let Some(handle) = worker.take() {
                 let _ = handle.join();
@@ -331,8 +329,7 @@ fn worker_loop(
                         prefill_len,
                         max_len,
                     } => {
-                        init_kv_on_rank(&mut runner, cache_key, kv_data, prefill_len, max_len)
-                            .err()
+                        init_kv_on_rank(&mut runner, cache_key, kv_data, prefill_len, max_len).err()
                     }
                     TpCommand::ReleaseKvCache { ref cache_key } => {
                         runner.release_kv_cache(cache_key);
