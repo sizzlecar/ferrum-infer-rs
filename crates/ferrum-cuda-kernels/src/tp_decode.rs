@@ -1,11 +1,8 @@
-//! Tensor Parallel Decode Group — persistent-thread architecture.
+//! Tensor Parallel Decode Group — persistent threads + barrier sync.
 //!
-//! Each GPU rank runs on its own persistent OS thread. The main thread sends
-//! commands via per-rank channels; workers execute the full decode pipeline
-//! with NCCL all-reduce providing inter-rank synchronization.
-//!
-//! This eliminates the per-step thread::scope overhead (was 72 spawns/step,
-//! now 0 — threads are created once at init and reused for all steps).
+//! Performance-critical decode path uses std::sync::Barrier (zero allocation).
+//! Control operations (KV init/release) use mpsc channels (infrequent).
+//! cudarc event tracking is disabled per-worker (all ops on same stream).
 
 #[cfg(feature = "tensor-parallel")]
 use crate::cuda_decode::CudaDecodeRunner;
@@ -17,11 +14,21 @@ use cudarc::driver::CudaSlice;
 #[cfg(feature = "tensor-parallel")]
 use std::collections::HashSet;
 #[cfg(feature = "tensor-parallel")]
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+#[cfg(feature = "tensor-parallel")]
+use std::sync::{mpsc, Arc, Barrier};
 #[cfg(feature = "tensor-parallel")]
 use std::thread::JoinHandle;
 #[cfg(feature = "tensor-parallel")]
 use std::time::Duration;
+
+// Mode constants for shared state
+#[cfg(feature = "tensor-parallel")]
+const MODE_DECODE: u8 = 0;
+#[cfg(feature = "tensor-parallel")]
+const MODE_CONTROL: u8 = 1;
+#[cfg(feature = "tensor-parallel")]
+const MODE_SHUTDOWN: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -37,16 +44,27 @@ pub enum KvSource {
 }
 
 // ---------------------------------------------------------------------------
-// Internal command / result protocol
+// Shared state (hot path — zero allocation)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tensor-parallel")]
+struct SharedDecode {
+    // Main → Workers (written before start_barrier, read after)
+    mode: AtomicU8,
+    token_id: AtomicU32,
+    position: AtomicU64,
+    cache_key: std::sync::RwLock<String>,
+    // Workers → Main (written before done_barrier, read after)
+    logits: std::sync::Mutex<Option<CudaSlice<half::f16>>>,
+    error: std::sync::Mutex<Option<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// Control channel types (cold path)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tensor-parallel")]
 enum TpCommand {
-    Decode {
-        token_id: u32,
-        position: usize,
-        cache_key: String,
-    },
     InitKvCache {
         cache_key: String,
         kv_data: Vec<(KvSource, KvSource)>,
@@ -56,40 +74,28 @@ enum TpCommand {
     ReleaseKvCache {
         cache_key: String,
     },
-    Shutdown,
-}
-
-#[cfg(feature = "tensor-parallel")]
-struct TpResult {
-    rank: usize,
-    logits: Option<CudaSlice<half::f16>>,
-    error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // TpDecodeGroup
 // ---------------------------------------------------------------------------
 
-/// Tensor parallel decode group with persistent per-rank threads.
-///
-/// Workers are spawned once at construction and reused for every decode step.
-/// NCCL all-reduce is the only inter-rank synchronization — no thread::scope.
 #[cfg(feature = "tensor-parallel")]
 pub struct TpDecodeGroup {
+    // Hot path: barrier sync
+    start_barrier: Arc<Barrier>,
+    done_barrier: Arc<Barrier>,
+    shared: Arc<SharedDecode>,
+    // Cold path: per-rank control channels
     cmd_txs: Vec<mpsc::SyncSender<TpCommand>>,
-    result_rx: mpsc::Receiver<TpResult>,
+    // Lifecycle
     workers: Vec<Option<JoinHandle<()>>>,
     world_size: usize,
-    /// Tracked on main thread to avoid round-trip for has_kv_cache().
     cache_keys: HashSet<String>,
 }
 
 #[cfg(feature = "tensor-parallel")]
 impl TpDecodeGroup {
-    /// Spawn persistent worker threads and return the group handle.
-    ///
-    /// Runners and NCCL ranks are moved into their respective threads.
-    /// All subsequent interaction goes through channels.
     pub fn new(runners: Vec<CudaDecodeRunner>, nccl: Vec<NcclRank>) -> candle_core::Result<Self> {
         let world_size = runners.len();
         if nccl.len() != world_size || world_size == 0 {
@@ -100,32 +106,43 @@ impl TpDecodeGroup {
             )));
         }
 
-        let (result_tx, result_rx) = mpsc::sync_channel::<TpResult>(world_size);
+        let parties = world_size + 1; // workers + main
+        let start_barrier = Arc::new(Barrier::new(parties));
+        let done_barrier = Arc::new(Barrier::new(parties));
+        let shared = Arc::new(SharedDecode {
+            mode: AtomicU8::new(MODE_DECODE),
+            token_id: AtomicU32::new(0),
+            position: AtomicU64::new(0),
+            cache_key: std::sync::RwLock::new(String::new()),
+            logits: std::sync::Mutex::new(None),
+            error: std::sync::Mutex::new(None),
+        });
+
         let mut cmd_txs = Vec::with_capacity(world_size);
         let mut workers = Vec::with_capacity(world_size);
 
         for (rank, (runner, nccl_rank)) in
             runners.into_iter().zip(nccl.into_iter()).enumerate()
         {
-            // Bounded(1): main thread blocks until worker consumes previous cmd
             let (cmd_tx, cmd_rx) = mpsc::sync_channel::<TpCommand>(1);
-            let res_tx = result_tx.clone();
+            let sb = Arc::clone(&start_barrier);
+            let db = Arc::clone(&done_barrier);
+            let sh = Arc::clone(&shared);
 
             let handle = std::thread::Builder::new()
                 .name(format!("tp-rank-{rank}"))
-                .spawn(move || worker_loop(rank, runner, nccl_rank, cmd_rx, res_tx))
+                .spawn(move || worker_loop(rank, runner, nccl_rank, cmd_rx, sb, db, sh))
                 .map_err(|e| candle_core::Error::Msg(format!("spawn rank {rank}: {e}")))?;
 
             cmd_txs.push(cmd_tx);
             workers.push(Some(handle));
         }
 
-        // Drop the original sender so result_rx sees hangup when all workers exit.
-        drop(result_tx);
-
         Ok(Self {
+            start_barrier,
+            done_barrier,
+            shared,
             cmd_txs,
-            result_rx,
             workers,
             world_size,
             cache_keys: HashSet::new(),
@@ -137,29 +154,48 @@ impl TpDecodeGroup {
     }
 
     /// Tensor-parallel decode step. Returns logits from rank 0.
+    /// Hot path: barrier sync + atomics, zero allocation per step.
     pub fn decode_step(
         &mut self,
         token_id: u32,
         position: usize,
         cache_key: &str,
     ) -> candle_core::Result<CudaSlice<half::f16>> {
-        // Broadcast decode command to all ranks
-        for tx in &self.cmd_txs {
-            tx.send(TpCommand::Decode {
-                token_id,
-                position,
-                cache_key: cache_key.to_string(),
-            })
-            .map_err(|_| candle_core::Error::Msg("worker dead".into()))?;
+        // Set decode params
+        self.shared.mode.store(MODE_DECODE, Ordering::Release);
+        self.shared.token_id.store(token_id, Ordering::Release);
+        self.shared
+            .position
+            .store(position as u64, Ordering::Release);
+        {
+            let mut key = self.shared.cache_key.write().unwrap();
+            if *key != cache_key {
+                key.clear();
+                key.push_str(cache_key);
+            }
+        }
+        *self.shared.error.lock().unwrap() = None;
+
+        // Signal workers to start
+        self.start_barrier.wait();
+        // Wait for all workers to finish
+        self.done_barrier.wait();
+
+        // Check error
+        if let Some(err) = self.shared.error.lock().unwrap().take() {
+            return Err(candle_core::Error::Msg(err));
         }
 
-        self.collect_decode_results()
+        // Take logits from rank 0
+        self.shared
+            .logits
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| candle_core::Error::Msg("no logits from rank 0".into()))
     }
 
-    /// Initialize KV cache on all ranks.
-    ///
-    /// Each rank receives its own shard of KV data. Workers handle H2D upload
-    /// for `KvSource::Host` entries.
+    /// Initialize KV cache on all ranks (cold path, uses channels).
     pub fn init_kv_cache(
         &mut self,
         cache_key: &str,
@@ -175,6 +211,7 @@ impl TpDecodeGroup {
             )));
         }
 
+        // Send per-rank data BEFORE barrier (workers read after barrier)
         for (tx, kv_data) in self.cmd_txs.iter().zip(kv_data_per_rank.into_iter()) {
             tx.send(TpCommand::InitKvCache {
                 cache_key: cache_key.to_string(),
@@ -185,12 +222,21 @@ impl TpDecodeGroup {
             .map_err(|_| candle_core::Error::Msg("worker dead".into()))?;
         }
 
-        self.collect_ack_results()?;
+        self.shared.mode.store(MODE_CONTROL, Ordering::Release);
+        *self.shared.error.lock().unwrap() = None;
+
+        self.start_barrier.wait();
+        self.done_barrier.wait();
+
+        if let Some(err) = self.shared.error.lock().unwrap().take() {
+            return Err(candle_core::Error::Msg(err));
+        }
+
         self.cache_keys.insert(cache_key.to_string());
         Ok(())
     }
 
-    /// Release KV cache on all ranks.
+    /// Release KV cache on all ranks (cold path).
     pub fn release_kv_cache(&mut self, cache_key: &str) {
         self.cache_keys.remove(cache_key);
         for tx in &self.cmd_txs {
@@ -198,68 +244,22 @@ impl TpDecodeGroup {
                 cache_key: cache_key.to_string(),
             });
         }
-        // Wait for ack so results don't leak into the next decode_step.
-        let _ = self.collect_ack_results();
+        self.shared.mode.store(MODE_CONTROL, Ordering::Release);
+        self.start_barrier.wait();
+        self.done_barrier.wait();
     }
 
-    /// Check if KV cache exists (tracked on main thread, no round-trip).
     pub fn has_kv_cache(&self, cache_key: &str) -> bool {
         self.cache_keys.contains(cache_key)
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
-
-    /// Collect world_size results, returning logits from rank 0.
-    fn collect_decode_results(&self) -> candle_core::Result<CudaSlice<half::f16>> {
-        let mut logits: Option<CudaSlice<half::f16>> = None;
-
-        for _ in 0..self.world_size {
-            let res = self
-                .result_rx
-                .recv_timeout(Duration::from_secs(30))
-                .map_err(|e| candle_core::Error::Msg(format!("worker timeout/dead: {e}")))?;
-
-            if let Some(err) = res.error {
-                return Err(candle_core::Error::Msg(format!(
-                    "rank {} error: {err}",
-                    res.rank
-                )));
-            }
-            if let Some(l) = res.logits {
-                logits = Some(l);
-            }
-        }
-
-        logits.ok_or_else(|| candle_core::Error::Msg("no logits from rank 0".into()))
-    }
-
-    /// Collect world_size ack results (no logits expected).
-    fn collect_ack_results(&self) -> candle_core::Result<()> {
-        for _ in 0..self.world_size {
-            let res = self
-                .result_rx
-                .recv_timeout(Duration::from_secs(30))
-                .map_err(|e| candle_core::Error::Msg(format!("worker timeout/dead: {e}")))?;
-
-            if let Some(err) = res.error {
-                return Err(candle_core::Error::Msg(format!(
-                    "rank {} error: {err}",
-                    res.rank
-                )));
-            }
-        }
-        Ok(())
     }
 }
 
 #[cfg(feature = "tensor-parallel")]
 impl Drop for TpDecodeGroup {
     fn drop(&mut self) {
-        for tx in &self.cmd_txs {
-            let _ = tx.send(TpCommand::Shutdown);
-        }
+        self.shared.mode.store(MODE_SHUTDOWN, Ordering::Release);
+        self.start_barrier.wait(); // workers see shutdown and break
+        // Workers do NOT call done_barrier on shutdown — just join them.
         for worker in &mut self.workers {
             if let Some(handle) = worker.take() {
                 let _ = handle.join();
@@ -272,88 +272,84 @@ impl Drop for TpDecodeGroup {
 // Worker thread
 // ---------------------------------------------------------------------------
 
-/// Per-rank worker loop. Binds CUDA context once, then processes commands.
 #[cfg(feature = "tensor-parallel")]
 fn worker_loop(
     rank: usize,
     mut runner: CudaDecodeRunner,
     nccl: NcclRank,
     cmd_rx: mpsc::Receiver<TpCommand>,
-    result_tx: mpsc::SyncSender<TpResult>,
+    start_barrier: Arc<Barrier>,
+    done_barrier: Arc<Barrier>,
+    shared: Arc<SharedDecode>,
 ) {
-    // Bind CUDA context once for this thread's lifetime.
+    // Bind CUDA context once
     if let Err(e) = runner.bind_context() {
-        let _ = result_tx.send(TpResult {
-            rank,
-            logits: None,
-            error: Some(format!("bind_context: {e}")),
-        });
+        eprintln!("[tp-rank-{rank}] bind_context failed: {e}");
         return;
     }
 
-    loop {
-        let cmd = match cmd_rx.recv() {
-            Ok(cmd) => cmd,
-            Err(_) => break, // channel closed
-        };
+    // Disable cudarc event tracking — all ops on same stream, no cross-stream sync needed.
+    // This eliminates ~500µs overhead per NCCL call from DevicePtrMut::device_ptr_mut().
+    runner.disable_event_tracking();
 
-        match cmd {
-            TpCommand::Decode {
-                token_id,
-                position,
-                ref cache_key,
-            } => {
-                let res = run_decode_step(&mut runner, &nccl, token_id, position, cache_key);
-                let (logits, error) = match res {
-                    Ok(()) if rank == 0 => {
-                        match runner.sync_stream().and_then(|_| runner.clone_logits()) {
-                            Ok(l) => (Some(l), None),
-                            Err(e) => (None, Some(format!("{e}"))),
-                        }
-                    }
-                    Ok(()) => (None, None),
-                    Err(e) => (None, Some(format!("{e}"))),
-                };
-                let _ = result_tx.send(TpResult {
-                    rank,
-                    logits,
-                    error,
-                });
-            }
-            TpCommand::InitKvCache {
-                ref cache_key,
-                kv_data,
-                prefill_len,
-                max_len,
-            } => {
-                let error =
-                    match init_kv_on_rank(&mut runner, cache_key, kv_data, prefill_len, max_len) {
-                        Ok(()) => None,
-                        Err(e) => Some(format!("{e}")),
-                    };
-                let _ = result_tx.send(TpResult {
-                    rank,
-                    logits: None,
-                    error,
-                });
-            }
-            TpCommand::ReleaseKvCache { ref cache_key } => {
-                runner.release_kv_cache(cache_key);
-                let _ = result_tx.send(TpResult {
-                    rank,
-                    logits: None,
-                    error: None,
-                });
-            }
-            TpCommand::Shutdown => break,
+    loop {
+        start_barrier.wait(); // wait for main signal
+
+        let mode = shared.mode.load(Ordering::Acquire);
+
+        if mode == MODE_SHUTDOWN {
+            break; // no done_barrier on shutdown
         }
+
+        if mode == MODE_DECODE {
+            let token_id = shared.token_id.load(Ordering::Acquire);
+            let position = shared.position.load(Ordering::Acquire) as usize;
+            let cache_key = shared.cache_key.read().unwrap();
+
+            let res = run_decode_step(&mut runner, &nccl, token_id, position, &cache_key);
+            drop(cache_key); // release read lock before writing results
+
+            match res {
+                Ok(()) if rank == 0 => {
+                    match runner.sync_stream().and_then(|_| runner.clone_logits()) {
+                        Ok(l) => *shared.logits.lock().unwrap() = Some(l),
+                        Err(e) => *shared.error.lock().unwrap() = Some(format!("{e}")),
+                    }
+                }
+                Err(e) => {
+                    *shared.error.lock().unwrap() = Some(format!("rank {rank}: {e}"));
+                }
+                _ => {}
+            }
+        } else {
+            // MODE_CONTROL: read command from channel
+            if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_secs(10)) {
+                let err = match cmd {
+                    TpCommand::InitKvCache {
+                        ref cache_key,
+                        kv_data,
+                        prefill_len,
+                        max_len,
+                    } => {
+                        init_kv_on_rank(&mut runner, cache_key, kv_data, prefill_len, max_len)
+                            .err()
+                    }
+                    TpCommand::ReleaseKvCache { ref cache_key } => {
+                        runner.release_kv_cache(cache_key);
+                        None
+                    }
+                };
+                if let Some(e) = err {
+                    *shared.error.lock().unwrap() = Some(format!("rank {rank}: {e}"));
+                }
+            }
+        }
+
+        done_barrier.wait(); // signal completion
     }
 }
 
 /// Execute full decode pipeline on one rank. NCCL provides inter-rank sync.
-///
-/// No thread::scope needed — each rank thread calls NCCL all-reduce directly,
-/// and NCCL blocks until all ranks participate (implicit barrier).
 #[cfg(feature = "tensor-parallel")]
 fn run_decode_step(
     runner: &mut CudaDecodeRunner,
