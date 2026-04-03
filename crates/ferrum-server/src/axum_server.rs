@@ -440,12 +440,10 @@ async fn embeddings_handler(
                 .await
                 .map_err(|e| ServerError::InternalError(format!("embed_image: {e}")))?
         } else if let Some(ref text) = item.text {
-            // Tokenize text (simple: use bytes as token IDs for now, real tokenizer in engine)
-            let tokens: Vec<u32> = text.encode_utf16().map(|c| c as u32).collect();
-            total_tokens += tokens.len() as u32;
+            total_tokens += text.len() as u32;
             state
                 .engine
-                .embed_text(&tokens)
+                .embed_text(text)
                 .await
                 .map_err(|e| ServerError::InternalError(format!("embed_text: {e}")))?
         } else {

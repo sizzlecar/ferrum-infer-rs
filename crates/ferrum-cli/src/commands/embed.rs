@@ -185,7 +185,7 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
 }
 
 /// Load tokenizer: try tokenizer.json first, fall back to vocab.txt (BERT-style).
-fn load_tokenizer(model_dir: &std::path::Path) -> Result<tokenizers::Tokenizer> {
+pub fn load_tokenizer(model_dir: &std::path::Path) -> Result<tokenizers::Tokenizer> {
     let tokenizer_json = model_dir.join("tokenizer.json");
     if tokenizer_json.exists() {
         return tokenizers::Tokenizer::from_file(&tokenizer_json)

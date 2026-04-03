@@ -18,6 +18,7 @@ use std::sync::Arc;
 /// Embedding-only engine wrapping a ClipModelExecutor.
 pub struct EmbeddingEngine {
     executor: Arc<ClipModelExecutor>,
+    tokenizer: Option<tokenizers::Tokenizer>,
     config: EngineConfig,
 }
 
@@ -25,8 +26,15 @@ impl EmbeddingEngine {
     pub fn new(executor: ClipModelExecutor, config: EngineConfig) -> Self {
         Self {
             executor: Arc::new(executor),
+            tokenizer: None,
             config,
         }
+    }
+
+    /// Set tokenizer for text embedding.
+    pub fn with_tokenizer(mut self, tokenizer: tokenizers::Tokenizer) -> Self {
+        self.tokenizer = Some(tokenizer);
+        self
     }
 }
 
@@ -97,8 +105,15 @@ impl InferenceEngine for EmbeddingEngine {
         ferrum_types::HealthStatus::healthy()
     }
 
-    async fn embed_text(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let embedding = self.executor.embed_text(tokens)?;
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| FerrumError::model("No tokenizer loaded for text embedding"))?;
+        let encoding = tokenizer
+            .encode(text, true)
+            .map_err(|e| FerrumError::model(format!("tokenize: {e}")))?;
+        let embedding = self.executor.embed_text(encoding.get_ids())?;
         embedding
             .squeeze(0)
             .and_then(|t| t.to_dtype(candle_core::DType::F32))
