@@ -450,18 +450,11 @@ impl ModelExecutor for CandleModelExecutor {
                                 let num_kv_heads = self.model.config().num_key_value_heads;
                                 let heads_per_rank = num_kv_heads / tp;
 
-                                let mut per_rank_kv: Vec<
-                                    Vec<(
-                                        candle_core::cuda_backend::cudarc::driver::CudaSlice<
-                                            half::f16,
-                                        >,
-                                        candle_core::cuda_backend::cudarc::driver::CudaSlice<
-                                            half::f16,
-                                        >,
-                                    )>,
-                                > = (0..tp).map(|_| Vec::new()).collect();
+                                use ferrum_cuda_kernels::tp_decode::KvSource;
 
-                                // Shard on GPU 0, D2H via candle, H2D via runner
+                                let mut per_rank_kv: Vec<Vec<(KvSource, KvSource)>> =
+                                    (0..tp).map(|_| Vec::new()).collect();
+
                                 for (k_tensor, v_tensor, _len, _max) in &kv_data {
                                     for rank in 0..tp {
                                         let start = rank * heads_per_rank;
@@ -503,9 +496,10 @@ impl ModelExecutor for CandleModelExecutor {
                                             };
                                             drop(ks);
                                             drop(vs);
-                                            per_rank_kv[rank].push((kc, vc));
+                                            per_rank_kv[rank]
+                                                .push((KvSource::Gpu(kc), KvSource::Gpu(vc)));
                                         } else {
-                                            // Cross-GPU: D2H via candle → H2D via runner
+                                            // Cross-GPU: D2H here, worker does H2D
                                             let k_host = k_shard
                                                 .flatten_all()
                                                 .and_then(|t| t.to_vec1::<half::f16>())
@@ -518,23 +512,10 @@ impl ModelExecutor for CandleModelExecutor {
                                                 .map_err(|e| {
                                                     FerrumError::model(format!("KV d2h: {e}"))
                                                 })?;
-                                            let kc = g
-                                                .runner_mut(rank)
-                                                .upload_to_self(&k_host)
-                                                .map_err(|e| {
-                                                    FerrumError::model(format!(
-                                                        "KV h2d r{rank}: {e}"
-                                                    ))
-                                                })?;
-                                            let vc = g
-                                                .runner_mut(rank)
-                                                .upload_to_self(&v_host)
-                                                .map_err(|e| {
-                                                    FerrumError::model(format!(
-                                                        "KV h2d r{rank}: {e}"
-                                                    ))
-                                                })?;
-                                            per_rank_kv[rank].push((kc, vc));
+                                            per_rank_kv[rank].push((
+                                                KvSource::Host(k_host),
+                                                KvSource::Host(v_host),
+                                            ));
                                         }
                                     }
                                 }
