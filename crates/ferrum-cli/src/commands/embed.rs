@@ -103,11 +103,7 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
 
         let texts = collect_texts(&cmd)?;
         if !texts.is_empty() {
-            let tokenizer =
-                tokenizers::Tokenizer::from_file(source.local_path.join("tokenizer.json"))
-                    .map_err(|e| {
-                        ferrum_types::FerrumError::model(format!("Load tokenizer: {e}"))
-                    })?;
+            let tokenizer = load_tokenizer(&source.local_path)?;
 
             for text in &texts {
                 let encoding = tokenizer
@@ -128,8 +124,7 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
         let executor = BertModelExecutor::from_path(&model_path, &model_def, device).await?;
         eprintln!("{}", "BERT model loaded.".green());
 
-        let tokenizer = tokenizers::Tokenizer::from_file(source.local_path.join("tokenizer.json"))
-            .map_err(|e| ferrum_types::FerrumError::model(format!("Load tokenizer: {e}")))?;
+        let tokenizer = load_tokenizer(&source.local_path)?;
 
         let texts = collect_texts(&cmd)?;
         if texts.is_empty() {
@@ -187,6 +182,32 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Load tokenizer: try tokenizer.json first, fall back to vocab.txt (BERT-style).
+fn load_tokenizer(model_dir: &std::path::Path) -> Result<tokenizers::Tokenizer> {
+    let tokenizer_json = model_dir.join("tokenizer.json");
+    if tokenizer_json.exists() {
+        return tokenizers::Tokenizer::from_file(&tokenizer_json)
+            .map_err(|e| ferrum_types::FerrumError::model(format!("Load tokenizer.json: {e}")));
+    }
+
+    // Fall back to vocab.txt (Chinese-CLIP, older BERT models)
+    let vocab_txt = model_dir.join("vocab.txt");
+    if vocab_txt.exists() {
+        use tokenizers::models::wordpiece::WordPiece;
+        let wp = WordPiece::from_file(vocab_txt.to_str().unwrap())
+            .unk_token("[UNK]".to_string())
+            .build()
+            .map_err(|e| ferrum_types::FerrumError::model(format!("Load vocab.txt: {e}")))?;
+        let mut tokenizer = tokenizers::Tokenizer::new(wp);
+        tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::bert::BertPreTokenizer));
+        return Ok(tokenizer);
+    }
+
+    Err(ferrum_types::FerrumError::model(
+        "No tokenizer.json or vocab.txt found in model directory",
+    ))
 }
 
 fn collect_texts(cmd: &EmbedCommand) -> Result<Vec<String>> {
