@@ -35,23 +35,29 @@ ferrum run qwen3:0.6b
 ferrum serve --model qwen3:0.6b --port 8000
 ```
 
-## Supported Models
+## Supported Architectures
 
-| Alias | Model | Architecture | CUDA Runner |
-|-------|-------|-------------|-------------|
-| `qwen3:0.6b` / `1.7b` / `4b` | Qwen3 | Qwen3 | Yes |
-| `qwen2.5:0.5b` / `1.5b` / `3b` / `7b` | Qwen2.5-Instruct | Qwen2 | — |
-| `llama3.2:1b` / `3b` | Llama-3.2-Instruct | LLaMA | Yes |
-| `tinyllama` | TinyLlama-1.1B-Chat | LLaMA | Yes |
+Any Hugging Face model using a supported architecture works out of the box:
 
-GPTQ INT4 quantized models are auto-detected and use the Marlin fused kernel:
+| Architecture | CUDA Decode | INT4 (GPTQ) | Tensor Parallel | Example Models |
+|-------------|-------------|-------------|-----------------|----------------|
+| **LLaMA** | Yes | Yes | Yes | Llama-3.x, TinyLlama, Vicuna, Alpaca, ... |
+| **Qwen3** | Yes | Yes | Yes | Qwen3-0.6B ~ 4B |
+| **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
+| **BERT** | — | — | — | any BERT model (embeddings only) |
+
 ```bash
-./target/release/ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
-```
+# Use any Hugging Face model ID directly
+ferrum run Qwen/Qwen3-4B
+ferrum run meta-llama/Llama-3.2-3B-Instruct
 
-Any Hugging Face model ID with a supported architecture also works directly:
-```bash
-./target/release/ferrum run Qwen/Qwen3-0.6B
+# GPTQ INT4 quantized models are auto-detected
+ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
+
+# Or use built-in aliases for convenience
+ferrum run qwen3:4b
+ferrum run llama3.2:3b
+ferrum run tinyllama
 ```
 
 ## Commands
