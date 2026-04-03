@@ -11,16 +11,20 @@ use ferrum_types::Result;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 
-/// Generate embeddings using a BERT model
+/// Generate embeddings using BERT or CLIP models
 #[derive(Args, Debug)]
 pub struct EmbedCommand {
-    /// Model name (e.g., google-bert/bert-base-chinese)
+    /// Model name (e.g., google-bert/bert-base-chinese, OFA-Sys/chinese-clip-vit-base-patch16)
     #[arg(required = true)]
     pub model: String,
 
     /// Text to embed (if not provided, reads from stdin)
     #[arg(short, long)]
     pub text: Option<String>,
+
+    /// Image path to embed (CLIP models only)
+    #[arg(short, long)]
+    pub image: Option<String>,
 
     /// Output format: json, csv, or raw
     #[arg(short, long, default_value = "json")]
@@ -73,71 +77,74 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
     let model_path = source.local_path.to_string_lossy().to_string();
     eprintln!("{}", "Using CPU backend".dimmed());
 
-    // Load model definition
+    // Load model definition to detect architecture
     let mut config_manager = ConfigManager::new();
     let model_def = config_manager.load_from_path(&source.local_path).await?;
 
-    // Load BERT executor
     let device = CandleDevice::Cpu;
-    let executor = BertModelExecutor::from_path(&model_path, &model_def, device).await?;
+    let is_clip = model_def.architecture == ferrum_models::Architecture::Clip;
 
-    eprintln!("{}", "Model loaded. Ready for embedding.".green());
+    let mut all_embeddings: Vec<(String, Vec<f32>)> = Vec::new();
 
-    // Load tokenizer
-    let tokenizer = tokenizers::Tokenizer::from_file(source.local_path.join("tokenizer.json"))
-        .map_err(|e| {
-            ferrum_types::FerrumError::model(format!("Failed to load tokenizer: {}", e))
-        })?;
+    if is_clip {
+        // CLIP path: supports both text and image
+        let executor = ferrum_models::ClipModelExecutor::from_path(
+            &model_path,
+            device.clone(),
+            candle_core::DType::F32,
+        )?;
+        eprintln!("{}", "CLIP model loaded.".green());
 
-    // Process input text
-    let texts: Vec<String> = if let Some(text) = cmd.text {
-        vec![text]
-    } else {
-        eprintln!(
-            "{}",
-            "Reading text from stdin (one text per line, Ctrl+D to finish):".dimmed()
-        );
-        let stdin = io::stdin();
-        stdin.lock().lines().filter_map(|l| l.ok()).collect()
-    };
+        if let Some(ref image_path) = cmd.image {
+            let embedding_tensor = executor.embed_image_path(image_path)?;
+            let embedding = tensor_to_vec(&embedding_tensor, cmd.normalize)?;
+            all_embeddings.push((format!("[image] {image_path}"), embedding));
+        }
 
-    if texts.is_empty() {
-        eprintln!("{}", "No text provided.".yellow());
-        return Ok(());
-    }
+        let texts = collect_texts(&cmd)?;
+        if !texts.is_empty() {
+            let tokenizer =
+                tokenizers::Tokenizer::from_file(source.local_path.join("tokenizer.json"))
+                    .map_err(|e| {
+                        ferrum_types::FerrumError::model(format!("Load tokenizer: {e}"))
+                    })?;
 
-    // Generate embeddings for each text
-    let mut all_embeddings = Vec::new();
-
-    for text in &texts {
-        // Tokenize
-        let encoding = tokenizer
-            .encode(text.as_str(), true)
-            .map_err(|e| ferrum_types::FerrumError::model(format!("Tokenization failed: {}", e)))?;
-
-        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-
-        // Get embeddings
-        let embedding_tensor = executor.get_embeddings(&token_ids)?;
-
-        // Convert to vec
-        let mut embedding = embedding_tensor
-            .flatten_all()
-            .map_err(|e| ferrum_types::FerrumError::model(format!("Flatten failed: {}", e)))?
-            .to_vec1::<f32>()
-            .map_err(|e| ferrum_types::FerrumError::model(format!("to_vec1 failed: {}", e)))?;
-
-        // Normalize if requested
-        if cmd.normalize {
-            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for v in &mut embedding {
-                    *v /= norm;
-                }
+            for text in &texts {
+                let encoding = tokenizer
+                    .encode(text.as_str(), true)
+                    .map_err(|e| ferrum_types::FerrumError::model(format!("Tokenize: {e}")))?;
+                let embedding_tensor = executor.embed_text(encoding.get_ids())?;
+                let embedding = tensor_to_vec(&embedding_tensor, cmd.normalize)?;
+                all_embeddings.push((text.clone(), embedding));
             }
         }
 
-        all_embeddings.push((text.clone(), embedding));
+        if all_embeddings.is_empty() {
+            eprintln!("{}", "No input provided. Use --text or --image.".yellow());
+            return Ok(());
+        }
+    } else {
+        // BERT path (existing)
+        let executor = BertModelExecutor::from_path(&model_path, &model_def, device).await?;
+        eprintln!("{}", "BERT model loaded.".green());
+
+        let tokenizer = tokenizers::Tokenizer::from_file(source.local_path.join("tokenizer.json"))
+            .map_err(|e| ferrum_types::FerrumError::model(format!("Load tokenizer: {e}")))?;
+
+        let texts = collect_texts(&cmd)?;
+        if texts.is_empty() {
+            eprintln!("{}", "No text provided.".yellow());
+            return Ok(());
+        }
+
+        for text in &texts {
+            let encoding = tokenizer
+                .encode(text.as_str(), true)
+                .map_err(|e| ferrum_types::FerrumError::model(format!("Tokenize: {e}")))?;
+            let embedding_tensor = executor.get_embeddings(encoding.get_ids())?;
+            let embedding = tensor_to_vec(&embedding_tensor, cmd.normalize)?;
+            all_embeddings.push((text.clone(), embedding));
+        }
     }
 
     // Output embeddings
@@ -180,6 +187,40 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn collect_texts(cmd: &EmbedCommand) -> Result<Vec<String>> {
+    if let Some(ref text) = cmd.text {
+        Ok(vec![text.clone()])
+    } else if cmd.image.is_some() {
+        // Image-only mode, no text needed
+        Ok(vec![])
+    } else {
+        eprintln!(
+            "{}",
+            "Reading text from stdin (one per line, Ctrl+D to finish):".dimmed()
+        );
+        let stdin = io::stdin();
+        Ok(stdin.lock().lines().filter_map(|l| l.ok()).collect())
+    }
+}
+
+fn tensor_to_vec(tensor: &candle_core::Tensor, normalize: bool) -> Result<Vec<f32>> {
+    let mut embedding = tensor
+        .flatten_all()
+        .map_err(|e| ferrum_types::FerrumError::model(format!("Flatten: {e}")))?
+        .to_vec1::<f32>()
+        .map_err(|e| ferrum_types::FerrumError::model(format!("to_vec1: {e}")))?;
+
+    if normalize {
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for v in &mut embedding {
+                *v /= norm;
+            }
+        }
+    }
+    Ok(embedding)
 }
 
 fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedModelSource> {
