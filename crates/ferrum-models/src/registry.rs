@@ -44,6 +44,7 @@ impl Architecture {
             }
             "clip" | "clipmodel" => Architecture::Clip,
             "chinese_clip" | "chineseclipmodel" => Architecture::Clip,
+            "siglip" | "siglipmodel" => Architecture::Clip,
             _ => Architecture::Unknown,
         }
     }

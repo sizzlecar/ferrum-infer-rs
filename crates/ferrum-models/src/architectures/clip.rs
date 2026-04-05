@@ -1,12 +1,13 @@
-//! CLIP model wrapper — supports OpenAI CLIP and Chinese-CLIP.
+//! CLIP model wrapper — supports OpenAI CLIP, Chinese-CLIP, and SigLIP.
 //!
-//! Wraps candle-transformers' ClipModel / ChineseClipModel with a unified interface
-//! for text and image embedding extraction.
+//! Wraps candle-transformers' ClipModel / ChineseClipModel / siglip::Model
+//! with a unified interface for text and image embedding extraction.
 
 use candle_core::{DType, Device as CandleDevice, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::chinese_clip::{ChineseClipConfig, ChineseClipModel};
 use candle_transformers::models::clip::{self, ClipConfig, ClipModel};
+use candle_transformers::models::siglip;
 use ferrum_types::{FerrumError, Result};
 use parking_lot::Mutex;
 use tracing::info;
@@ -15,6 +16,7 @@ use tracing::info;
 enum ClipVariant {
     OpenAI(ClipModel),
     Chinese(ChineseClipModel),
+    SigLIP(siglip::Model),
 }
 
 /// Unified CLIP model wrapper.
@@ -68,6 +70,30 @@ impl ClipModelWrapper {
         })
     }
 
+    /// Load SigLIP from VarBuilder.
+    pub fn new_siglip(
+        vb: VarBuilder,
+        config: &siglip::Config,
+        device: CandleDevice,
+        dtype: DType,
+    ) -> Result<Self> {
+        let image_size = config.vision_config.image_size;
+        let projection_dim = config.vision_config.hidden_size;
+        info!(
+            "Loading SigLIP (image_size={}, hidden_size={})",
+            image_size, projection_dim
+        );
+        let model = siglip::Model::new(config, vb)
+            .map_err(|e| FerrumError::model(format!("SigLIP load: {e}")))?;
+        Ok(Self {
+            projection_dim,
+            image_size,
+            model: Mutex::new(ClipVariant::SigLIP(model)),
+            device,
+            dtype,
+        })
+    }
+
     /// Load from config.json — auto-detects CLIP variant.
     ///
     /// candle's ClipConfig doesn't derive Deserialize, so we use preset configs
@@ -85,6 +111,13 @@ impl ClipModelWrapper {
         .map_err(|e| FerrumError::model(format!("parse config: {e}")))?;
 
         let model_type = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if model_type == "siglip" {
+            // SigLIP config derives Deserialize — parse directly
+            let config: siglip::Config =
+                serde_json::from_value(raw).unwrap_or_else(|_| siglip::Config::base_patch16_224());
+            return Self::new_siglip(vb, &config, device, dtype);
+        }
 
         if model_type == "chinese_clip" {
             let mut config = ChineseClipConfig::clip_vit_base_patch16();
@@ -123,6 +156,9 @@ impl ClipModelWrapper {
             ClipVariant::Chinese(m) => m
                 .get_text_features(input_ids, None, None)
                 .map_err(|e| FerrumError::model(format!("text features: {e}")))?,
+            ClipVariant::SigLIP(m) => m
+                .get_text_features(input_ids)
+                .map_err(|e| FerrumError::model(format!("text features: {e}")))?,
         };
         clip::div_l2_norm(&features).map_err(|e| FerrumError::model(format!("l2 norm: {e}")))
     }
@@ -135,6 +171,9 @@ impl ClipModelWrapper {
                 .get_image_features(pixel_values)
                 .map_err(|e| FerrumError::model(format!("image features: {e}")))?,
             ClipVariant::Chinese(m) => m
+                .get_image_features(pixel_values)
+                .map_err(|e| FerrumError::model(format!("image features: {e}")))?,
+            ClipVariant::SigLIP(m) => m
                 .get_image_features(pixel_values)
                 .map_err(|e| FerrumError::model(format!("image features: {e}")))?,
         };
