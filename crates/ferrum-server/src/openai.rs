@@ -231,6 +231,74 @@ pub struct ModelPermission {
     pub is_blocking: bool,
 }
 
+// ======================== Embeddings API ========================
+
+/// Embeddings request (OpenAI-compatible, extended for images)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsRequest {
+    /// Model identifier
+    pub model: String,
+
+    /// Input to embed — text string, array of strings, or objects with text/image fields
+    pub input: EmbeddingInput,
+
+    /// Encoding format: "float" (default) or "base64"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+}
+
+/// Polymorphic embedding input.
+/// Supports: single string, array of strings, single object, array of objects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    /// Single text string (OpenAI standard)
+    Single(String),
+    /// Batch of text strings (OpenAI standard)
+    Batch(Vec<String>),
+    /// Single multimodal item (Jina-style extension)
+    SingleObject(EmbeddingItem),
+    /// Batch of multimodal items
+    BatchObjects(Vec<EmbeddingItem>),
+}
+
+/// A single embedding input item — text or image.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingItem {
+    /// Text to embed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Image: file path or base64 data URI
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// Embeddings response (OpenAI-compatible)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsResponse {
+    pub object: String,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+/// Single embedding result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingData {
+    pub object: String,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
+/// Token usage for embeddings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+// ======================== Error types ========================
+
 /// OpenAI API error
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiError {

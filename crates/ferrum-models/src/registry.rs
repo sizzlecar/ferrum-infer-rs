@@ -26,6 +26,7 @@ pub enum Architecture {
     Phi,
     GPT2,
     Bert,
+    Clip,
     Unknown,
 }
 
@@ -41,6 +42,9 @@ impl Architecture {
             "bert" | "bertmodel" | "bertformaskedlm" | "bertforsequenceclassification" => {
                 Architecture::Bert
             }
+            "clip" | "clipmodel" => Architecture::Clip,
+            "chinese_clip" | "chineseclipmodel" => Architecture::Clip,
+            "siglip" | "siglipmodel" => Architecture::Clip,
             _ => Architecture::Unknown,
         }
     }

@@ -1134,6 +1134,15 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
 
                 Ok(Arc::new(executor))
             }
+            ferrum_models::Architecture::Clip => {
+                info!("Using CLIP executor for multimodal embeddings");
+                let executor = ferrum_models::ClipModelExecutor::from_path(
+                    &model_path,
+                    candle_device.clone(),
+                    dtype,
+                )?;
+                Ok(Arc::new(executor))
+            }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
@@ -1151,6 +1160,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 "llama".to_string(),
                 "qwen2".to_string(),
                 "qwen3".to_string(),
+                "clip".to_string(),
                 "fp16".to_string(),
                 "fp32".to_string(),
             ],
