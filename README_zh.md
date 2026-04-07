@@ -39,25 +39,36 @@ ferrum serve --model qwen3:0.6b --port 8000
 
 任何使用以下架构的 Hugging Face 模型都可以直接运行：
 
+### 文本生成
+
 | 架构 | CUDA Decode | INT4 (GPTQ) | 张量并行 | 示例模型 |
 |------|-------------|-------------|---------|----------|
 | **LLaMA** | 支持 | 支持 | 支持 | Llama-3.x, TinyLlama, Vicuna, Alpaca, ... |
 | **Qwen3** | 支持 | 支持 | 支持 | Qwen3-0.6B ~ 4B |
 | **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
-| **BERT** | — | — | — | 任意 BERT 模型（仅向量化） |
+
+### 向量化（文本 + 图片）
+
+| 架构 | 模态 | 向量维度 | 示例模型 |
+|------|------|---------|----------|
+| **CLIP** | 文本 + 图片 | 512/768 | openai/clip-vit-base-patch32 |
+| **Chinese-CLIP** | 文本 + 图片 | 512 | OFA-Sys/chinese-clip-vit-base-patch16 |
+| **SigLIP** | 文本 + 图片 | 768 | google/siglip-base-patch16-224 |
+| **BERT** | 文本 | 768 | google-bert/bert-base-chinese |
 
 ```bash
-# 直接使用 Hugging Face 模型 ID
+# 文本生成
 ferrum run Qwen/Qwen3-4B
-ferrum run meta-llama/Llama-3.2-3B-Instruct
-
-# GPTQ INT4 量化模型自动检测
-ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
-
-# 也可使用内置别名
-ferrum run qwen3:4b
 ferrum run llama3.2:3b
-ferrum run tinyllama
+
+# 向量化（文本 + 图片）
+ferrum embed OFA-Sys/chinese-clip-vit-base-patch16 --text "海边日落"
+ferrum embed google/siglip-base-patch16-224 --image photo.jpg
+
+# Embedding API 服务
+ferrum serve --model OFA-Sys/chinese-clip-vit-base-patch16
+curl localhost:8000/v1/embeddings -d '{"model":"clip","input":"你好"}'
+curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to/photo.jpg"}}'
 ```
 
 ## 命令
@@ -70,7 +81,7 @@ ferrum run tinyllama
 | `ferrum pull <model>` | 从 Hugging Face 下载模型 |
 | `ferrum list` | 查看已缓存模型 |
 | `ferrum bench <model>` | 性能基准测试 |
-| `ferrum embed <model>` | 生成 BERT 向量 |
+| `ferrum embed <model>` | 生成向量（BERT/CLIP/SigLIP，文本 + 图片） |
 
 ## API 接口
 
@@ -139,6 +150,7 @@ curl http://localhost:8000/health
 - Paged KV cache + block 回收
 - 连续批处理 + batch decode
 - 张量并行（多 GPU NCCL，自动检测 GPU 数量）
+- CLIP/Chinese-CLIP/SigLIP 向量化（文本 + 图片，`/v1/embeddings` API）
 - Top-k / Top-p / Temperature / 重复惩罚采样
 
 ## 路线图
