@@ -91,8 +91,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let mut config_manager = ferrum_models::ConfigManager::new();
     let model_def = config_manager.load_from_path(&source.local_path).await?;
 
-    let engine: Arc<dyn InferenceEngine + Send + Sync> =
-        if model_def.architecture == ferrum_models::Architecture::Clip {
+    let engine: Arc<dyn InferenceEngine + Send + Sync> = match model_def.architecture {
+        ferrum_models::Architecture::Clip => {
             println!("{}", "Initializing CLIP embedding engine...".dimmed());
             let candle_device = candle_core::Device::Cpu;
             let executor = ferrum_models::ClipModelExecutor::from_path(
@@ -100,14 +100,30 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 candle_device,
                 candle_core::DType::F32,
             )?;
-            // Load tokenizer for text embedding
             let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
             let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
             Arc::new(
                 ferrum_engine::embedding_engine::EmbeddingEngine::new(executor, engine_config)
                     .with_tokenizer(tokenizer),
             )
-        } else {
+        }
+        ferrum_models::Architecture::Whisper => {
+            println!("{}", "Initializing Whisper ASR engine...".dimmed());
+            let candle_device = candle_core::Device::Cpu;
+            let executor = ferrum_models::WhisperModelExecutor::from_path(
+                &source.local_path.to_string_lossy(),
+                candle_device,
+                candle_core::DType::F32,
+            )?;
+            let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+            Arc::new(
+                ferrum_engine::transcription_engine::TranscriptionEngine::new(
+                    executor,
+                    engine_config,
+                ),
+            )
+        }
+        _ => {
             println!(
                 "{}",
                 "Initializing engine (continuous batching)...".dimmed()
@@ -117,7 +133,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
             let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
             Arc::from(engine)
-        };
+        }
+    };
 
     // Create server config
     let server_config = ServerConfig {
