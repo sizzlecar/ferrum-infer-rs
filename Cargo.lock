@@ -1343,6 +1343,7 @@ dependencies = [
  "futures-util",
  "half",
  "hf-hub",
+ "hound",
  "image",
  "indicatif",
  "once_cell",
@@ -2107,6 +2108,12 @@ dependencies = [
  "ureq",
  "windows-sys 0.60.2",
 ]
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "http"

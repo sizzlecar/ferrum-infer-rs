@@ -27,6 +27,7 @@ pub enum Architecture {
     GPT2,
     Bert,
     Clip,
+    Whisper,
     Unknown,
 }
 
@@ -45,6 +46,7 @@ impl Architecture {
             "clip" | "clipmodel" => Architecture::Clip,
             "chinese_clip" | "chineseclipmodel" => Architecture::Clip,
             "siglip" | "siglipmodel" => Architecture::Clip,
+            "whisper" | "whisperforconditionalgeneration" => Architecture::Whisper,
             _ => Architecture::Unknown,
         }
     }

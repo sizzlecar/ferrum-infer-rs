@@ -5,12 +5,14 @@ pub mod clip;
 pub mod llama;
 pub mod qwen2;
 pub mod qwen3;
+pub mod whisper;
 
 pub use bert::BertModelWrapper;
 pub use clip::ClipModelWrapper;
 pub use llama::LlamaModelWrapper;
 pub use qwen2::Qwen2ModelWrapper;
 pub use qwen3::Qwen3ModelWrapper;
+pub use whisper::WhisperModelWrapper;
 
 /// GQA repeat_kv: repeat K/V heads to match Q heads.
 pub(crate) fn repeat_kv(

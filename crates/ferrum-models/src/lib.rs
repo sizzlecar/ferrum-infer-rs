@@ -5,6 +5,7 @@
 //! 重构阶段编译。
 
 pub mod architectures;
+pub mod audio_processor;
 pub mod builder;
 pub mod definition;
 pub mod executor;
@@ -19,6 +20,7 @@ pub mod weights;
 
 pub use architectures::{
     BertModelWrapper, ClipModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper,
+    WhisperModelWrapper,
 };
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};

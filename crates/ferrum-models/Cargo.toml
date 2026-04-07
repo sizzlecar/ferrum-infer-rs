@@ -63,6 +63,7 @@ pathdiff = "0.2"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 base64 = "0.22"
+hound = "3.5"
 
 [dev-dependencies]
 tokio-test = "0.4"
