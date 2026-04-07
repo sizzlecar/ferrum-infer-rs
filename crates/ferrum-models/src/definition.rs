@@ -170,10 +170,16 @@ impl ConfigManager {
         // Detect architecture
         let architecture = self.detect_architecture(raw)?;
 
-        // Parse common fields
+        // Parse common fields (CLIP stores these in text_config/vision_config)
+        let text_cfg = obj.get("text_config");
         let hidden_size = obj
             .get("hidden_size")
             .and_then(|v| v.as_u64())
+            .or_else(|| {
+                text_cfg
+                    .and_then(|tc| tc.get("hidden_size"))
+                    .and_then(|v| v.as_u64())
+            })
             .unwrap_or(4096) as usize;
 
         let intermediate_size = obj
@@ -182,11 +188,16 @@ impl ConfigManager {
             .or_else(|| obj.get("ffn_dim").and_then(|v| v.as_u64()))
             .unwrap_or(11008) as usize;
 
+        // CLIP models store vocab_size in text_config, not at top level
         let vocab_size = obj
             .get("vocab_size")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| FerrumError::model("vocab_size not found in config"))?
-            as usize;
+            .or_else(|| {
+                text_cfg
+                    .and_then(|tc| tc.get("vocab_size"))
+                    .and_then(|v| v.as_u64())
+            })
+            .unwrap_or(0) as usize;
 
         let num_hidden_layers = obj
             .get("num_hidden_layers")

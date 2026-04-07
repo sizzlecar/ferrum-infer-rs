@@ -19,6 +19,10 @@ pub enum ModelType {
     Gemma,
     /// Code-specific models
     Code(String),
+    /// Embedding models (BERT, etc.)
+    Embedding,
+    /// CLIP vision-language models
+    Clip,
     /// Custom model implementation
     Custom(String),
 }
@@ -31,6 +35,8 @@ impl std::fmt::Display for ModelType {
             ModelType::Qwen => write!(f, "qwen"),
             ModelType::Phi => write!(f, "phi"),
             ModelType::Gemma => write!(f, "gemma"),
+            ModelType::Embedding => write!(f, "embedding"),
+            ModelType::Clip => write!(f, "clip"),
             ModelType::Code(name) => write!(f, "code-{}", name),
             ModelType::Custom(name) => write!(f, "custom-{}", name),
         }

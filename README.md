@@ -39,25 +39,36 @@ ferrum serve --model qwen3:0.6b --port 8000
 
 Any Hugging Face model using a supported architecture works out of the box:
 
+### Text Generation
+
 | Architecture | CUDA Decode | INT4 (GPTQ) | Tensor Parallel | Example Models |
 |-------------|-------------|-------------|-----------------|----------------|
 | **LLaMA** | Yes | Yes | Yes | Llama-3.x, TinyLlama, Vicuna, Alpaca, ... |
 | **Qwen3** | Yes | Yes | Yes | Qwen3-0.6B ~ 4B |
 | **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
-| **BERT** | — | — | — | any BERT model (embeddings only) |
+
+### Embeddings (text + image)
+
+| Architecture | Modality | Embedding Dim | Example Models |
+|-------------|----------|--------------|----------------|
+| **CLIP** | Text + Image | 512/768 | openai/clip-vit-base-patch32 |
+| **Chinese-CLIP** | Text + Image | 512 | OFA-Sys/chinese-clip-vit-base-patch16 |
+| **SigLIP** | Text + Image | 768 | google/siglip-base-patch16-224 |
+| **BERT** | Text | 768 | google-bert/bert-base-chinese |
 
 ```bash
-# Use any Hugging Face model ID directly
+# Text generation
 ferrum run Qwen/Qwen3-4B
-ferrum run meta-llama/Llama-3.2-3B-Instruct
-
-# GPTQ INT4 quantized models are auto-detected
-ferrum run JunHowie/Qwen3-4B-GPTQ-Int4
-
-# Or use built-in aliases for convenience
-ferrum run qwen3:4b
 ferrum run llama3.2:3b
-ferrum run tinyllama
+
+# Embeddings (text + image)
+ferrum embed OFA-Sys/chinese-clip-vit-base-patch16 --text "sunset at the beach"
+ferrum embed google/siglip-base-patch16-224 --image photo.jpg
+
+# Embedding API server
+ferrum serve --model OFA-Sys/chinese-clip-vit-base-patch16
+curl localhost:8000/v1/embeddings -d '{"model":"clip","input":"hello"}'
+curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to/photo.jpg"}}'
 ```
 
 ## Commands
@@ -70,7 +81,7 @@ ferrum run tinyllama
 | `ferrum pull <model>` | Download model from Hugging Face |
 | `ferrum list` | Show cached models |
 | `ferrum bench <model>` | Performance benchmark |
-| `ferrum embed <model>` | Generate BERT embeddings |
+| `ferrum embed <model>` | Generate embeddings (BERT/CLIP/SigLIP, text + image) |
 
 ## API Endpoints
 
@@ -139,6 +150,7 @@ What works:
 - Paged KV cache with block reclamation
 - Continuous batching with batch decode
 - Tensor parallelism (multi-GPU NCCL, auto-detects GPU count)
+- CLIP/Chinese-CLIP/SigLIP embeddings (text + image, `/v1/embeddings` API)
 - Top-k/top-p/temperature/repetition-penalty sampling
 
 ## Roadmap

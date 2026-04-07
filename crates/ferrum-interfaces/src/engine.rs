@@ -35,6 +35,25 @@ pub trait InferenceEngine: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> ferrum_types::HealthStatus;
+
+    /// Embed raw text string → float vector (engine handles tokenization).
+    async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+        Err(ferrum_types::FerrumError::model(
+            "This engine does not support text embedding",
+        ))
+    }
+
+    /// Embed image (file path or base64) → float vector. Default: not supported.
+    async fn embed_image(&self, _image: &str) -> Result<Vec<f32>> {
+        Err(ferrum_types::FerrumError::model(
+            "This engine does not support image embedding",
+        ))
+    }
+
+    /// Get embedding dimension. Default: 0 (not an embedding model).
+    fn embedding_dim(&self) -> usize {
+        0
+    }
 }
 
 /// Advanced engine capabilities

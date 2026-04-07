@@ -57,6 +57,7 @@
 
 pub mod builder;
 pub mod continuous_engine;
+pub mod embedding_engine;
 pub mod engine;
 pub mod factory;
 pub mod kernels;
