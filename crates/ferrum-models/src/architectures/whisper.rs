@@ -20,6 +20,37 @@ fn softmax_last_dim(x: &Tensor) -> candle_core::Result<Tensor> {
     exp.broadcast_div(&sum)
 }
 
+// ── Suppress special tokens during Whisper decode ───────────────────────
+//
+// Whisper's decode requires suppressing non-text tokens to avoid degenerate
+// output. We set logits to -inf for: <|nocaptions|> (no_timestamps-1),
+// <|notimestamps|>, and all timestamp tokens (>= no_timestamps+1).
+
+fn suppress_tokens(
+    logits: &Tensor,
+    no_timestamps_token: u32,
+    _eot_token: u32,
+) -> candle_core::Result<Tensor> {
+    let vocab = logits.dim(D::Minus1)?;
+    // Suppress: nocaptions (no_timestamps-1), notimestamps, all timestamps
+    // nocaptions = no_timestamps_token - 1 = 50362
+    // notimestamps = no_timestamps_token = 50363
+    // timestamps = no_timestamps_token + 1 .. vocab
+    let nocaptions = no_timestamps_token.saturating_sub(1) as usize;
+    let suppress_start = nocaptions; // 50362
+    let suppress_count = vocab - suppress_start; // everything from 50362 to end
+
+    // Create mask: 0 for normal tokens, -inf for suppressed
+    let mut mask = vec![0f32; vocab];
+    for i in suppress_start..vocab {
+        mask[i] = f32::NEG_INFINITY;
+    }
+    // Don't suppress EOT (50257) — it's below suppress_start so it's fine
+
+    let mask = Tensor::from_vec(mask, (1, 1, vocab), logits.device())?;
+    logits.broadcast_add(&mask)
+}
+
 // ── Manual LayerNorm (pure tensor ops — works on CPU/Metal/CUDA) ─────────
 
 struct LayerNorm {
@@ -90,7 +121,10 @@ struct MultiHeadAttention {
     value: Linear,
     out: Linear,
     n_head: usize,
-    kv_cache: Option<(Tensor, Tensor)>,
+    /// Cross-attention cache (encoder output, computed once)
+    cross_kv_cache: Option<(Tensor, Tensor)>,
+    /// Self-attention cache (accumulated K/V across decode steps)
+    self_kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl MultiHeadAttention {
@@ -105,7 +139,8 @@ impl MultiHeadAttention {
             value,
             out,
             n_head,
-            kv_cache: None,
+            cross_kv_cache: None,
+            self_kv_cache: None,
         })
     }
 
@@ -118,17 +153,33 @@ impl MultiHeadAttention {
     ) -> candle_core::Result<Tensor> {
         let q = self.query.forward(x)?;
         let (k, v) = match xa {
-            None => (self.key.forward(x)?, self.value.forward(x)?),
+            // Self-attention: cache and accumulate K/V
+            None => {
+                let new_k = self.key.forward(x)?;
+                let new_v = self.value.forward(x)?;
+                let (k, v) = if let Some((prev_k, prev_v)) = &self.self_kv_cache {
+                    // Cat along sequence dimension (dim 1)
+                    (
+                        Tensor::cat(&[prev_k, &new_k], 1)?,
+                        Tensor::cat(&[prev_v, &new_v], 1)?,
+                    )
+                } else {
+                    (new_k, new_v)
+                };
+                self.self_kv_cache = Some((k.clone(), v.clone()));
+                (k, v)
+            }
+            // Cross-attention: compute once, cache forever
             Some(xa_t) => {
                 if flush_cache {
-                    self.kv_cache = None;
+                    self.cross_kv_cache = None;
                 }
-                if let Some((k, v)) = &self.kv_cache {
+                if let Some((k, v)) = &self.cross_kv_cache {
                     (k.clone(), v.clone())
                 } else {
                     let k = self.key.forward(xa_t)?;
                     let v = self.value.forward(xa_t)?;
-                    self.kv_cache = Some((k.clone(), v.clone()));
+                    self.cross_kv_cache = Some((k.clone(), v.clone()));
                     (k, v)
                 }
             }
@@ -150,14 +201,18 @@ impl MultiHeadAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
     ) -> candle_core::Result<Tensor> {
-        let (_, n_ctx, n_state) = q.dims3()?;
+        let (_, q_len, n_state) = q.dims3()?;
+        let kv_len = k.dim(1)?;
         let scale = ((n_state / self.n_head) as f64).powf(-0.25);
         let q = (self.reshape_head(q)? * scale)?;
         let k = (self.reshape_head(k)?.transpose(2, 3)? * scale)?;
         let v = self.reshape_head(v)?.contiguous()?;
         let mut qk = q.matmul(&k)?;
         if let Some(mask) = mask {
-            let mask = mask.i((0..n_ctx, 0..n_ctx))?;
+            // With KV cache: q_len=1, kv_len=accumulated. Take the row
+            // corresponding to the current position in the causal mask.
+            let q_start = kv_len - q_len;
+            let mask = mask.i((q_start..kv_len, 0..kv_len))?;
             qk = qk.broadcast_add(&mask)?;
         }
         let w = softmax_last_dim(&qk)?;
@@ -165,7 +220,8 @@ impl MultiHeadAttention {
     }
 
     fn reset_kv_cache(&mut self) {
-        self.kv_cache = None;
+        self.cross_kv_cache = None;
+        self.self_kv_cache = None;
     }
 }
 
@@ -331,6 +387,8 @@ struct TextDecoder {
     blocks: Vec<ResidualAttentionBlock>,
     ln: LayerNorm,
     mask: Tensor,
+    /// Tracks number of tokens processed so far (for positional embedding offset)
+    tokens_seen: usize,
 }
 
 impl TextDecoder {
@@ -356,6 +414,7 @@ impl TextDecoder {
             blocks,
             ln,
             mask,
+            tokens_seen: 0,
         })
     }
 
@@ -370,7 +429,9 @@ impl TextDecoder {
         let flat_tokens = tokens.flatten_all()?;
         let te = self.token_embedding.index_select(&flat_tokens, 0)?;
         let te = te.reshape((tokens.dim(0)?, seq_len, self.token_embedding.dim(1)?))?;
-        let pe = self.positional_embedding.narrow(0, 0, seq_len)?;
+        // Use positional embedding at the correct offset (not always 0)
+        let pe = self.positional_embedding.narrow(0, self.tokens_seen, seq_len)?;
+        self.tokens_seen += seq_len;
         let mut x = te.broadcast_add(&pe)?;
         for block in &mut self.blocks {
             x = block.forward(&x, Some(xa), Some(&self.mask), flush)?;
@@ -385,6 +446,7 @@ impl TextDecoder {
     }
 
     fn reset_kv_cache(&mut self) {
+        self.tokens_seen = 0;
         for block in &mut self.blocks {
             block.reset_kv_cache();
         }
@@ -528,7 +590,8 @@ impl WhisperModelWrapper {
             vec![sot_token, language_token, task_token, no_timestamps_token];
         let mut result: Vec<u32> = Vec::new();
 
-        for _ in 0..max_tokens {
+        let effective_max = max_tokens.min(self.config.max_target_positions.saturating_sub(tokens.len()));
+        for _ in 0..effective_max {
             let t = Tensor::new(tokens.as_slice(), &self.device)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?;
@@ -548,6 +611,10 @@ impl WhisperModelWrapper {
             let logits_out = dec
                 .final_linear(&last_hidden)
                 .map_err(|e| FerrumError::model(format!("final_linear: {e}")))?;
+
+            // Suppress special tokens: nocaptions, notimestamps, all timestamps
+            let logits_out = suppress_tokens(&logits_out, no_timestamps_token, eot_token)
+                .map_err(|e| FerrumError::model(format!("suppress: {e}")))?;
 
             let next_token = logits_out
                 .squeeze(0)
