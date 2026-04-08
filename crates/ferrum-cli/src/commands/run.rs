@@ -263,6 +263,12 @@ pub fn resolve_model_alias(name: &str) -> String {
         "qwen3:4b" => "Qwen/Qwen3-4B".to_string(),
         "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
         "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
+        "whisper-tiny" | "whisper:tiny" => "openai/whisper-tiny".to_string(),
+        "whisper-base" | "whisper:base" => "openai/whisper-base".to_string(),
+        "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
+        "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
+        "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
+        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => "openai/whisper-large-v3-turbo".to_string(),
         _ => name.to_string(),
     }
 }

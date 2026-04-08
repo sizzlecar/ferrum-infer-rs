@@ -107,35 +107,48 @@ impl WhisperModelExecutor {
         self.transcribe_pcm(&pcm, language)
     }
 
-    /// Transcribe PCM samples → text.
+    /// Transcribe PCM samples → text. Automatically chunks long audio into 30s segments.
     fn transcribe_pcm(&self, pcm: &[f32], language: Option<&str>) -> Result<String> {
         let lang_token = language
             .and_then(|l| self.language_tokens.get(l).copied())
             .unwrap_or_else(|| {
-                // Default to English
                 self.language_tokens
                     .get("en")
                     .copied()
                     .unwrap_or(self.sot_token + 1)
             });
 
-        let token_ids = self.model.transcribe(
-            pcm,
-            lang_token,
-            self.transcribe_token,
-            self.no_timestamps_token,
-            self.eot_token,
-            self.sot_token,
-            448, // max tokens
-        )?;
+        let chunks = audio_processor::chunk_pcm(pcm);
+        let total = chunks.len();
+        let mut all_text = Vec::new();
 
-        // Decode token IDs to text
-        let text = self
-            .tokenizer
-            .decode(&token_ids, true)
-            .map_err(|e| FerrumError::model(format!("decode tokens: {e}")))?;
+        for (i, chunk) in chunks.iter().enumerate() {
+            if total > 1 {
+                tracing::info!("Transcribing chunk {}/{} ...", i + 1, total);
+            }
 
-        Ok(text.trim().to_string())
+            let token_ids = self.model.transcribe(
+                chunk,
+                lang_token,
+                self.transcribe_token,
+                self.no_timestamps_token,
+                self.eot_token,
+                self.sot_token,
+                448,
+            )?;
+
+            let text = self
+                .tokenizer
+                .decode(&token_ids, true)
+                .map_err(|e| FerrumError::model(format!("decode tokens: {e}")))?;
+
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                all_text.push(trimmed);
+            }
+        }
+
+        Ok(all_text.join(" "))
     }
 }
 
@@ -145,6 +158,7 @@ fn token_id(tokenizer: &tokenizers::Tokenizer, token: &str) -> u32 {
 
 // Dummy KV cache (same pattern as CLIP/BERT)
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct DummyWhisperCache;
 
 impl ferrum_interfaces::KvCacheHandle for DummyWhisperCache {

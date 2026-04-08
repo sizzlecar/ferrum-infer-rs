@@ -109,7 +109,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         }
         ferrum_models::Architecture::Whisper => {
             println!("{}", "Initializing Whisper ASR engine...".dimmed());
-            let candle_device = candle_core::Device::Cpu;
+            let candle_device = to_candle_device(&device);
             let executor = ferrum_models::WhisperModelExecutor::from_path(
                 &source.local_path.to_string_lossy(),
                 candle_device,
@@ -155,9 +155,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     );
     println!();
     println!("Endpoints:");
-    println!("  POST /v1/chat/completions  - OpenAI-compatible chat");
-    println!("  GET  /v1/models            - List models");
-    println!("  GET  /health               - Health check");
+    println!("  POST /v1/chat/completions      - OpenAI-compatible chat");
+    println!("  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)");
+    println!("  POST /v1/embeddings            - Text/image embeddings");
+    println!("  GET  /v1/models                - List models");
+    println!("  GET  /health                   - Health check");
     println!();
     println!("{}", "Press Ctrl+C to stop.".dimmed());
     println!();
@@ -214,6 +216,12 @@ fn resolve_model_alias(name: &str) -> String {
         "qwen3:4b" => "Qwen/Qwen3-4B".to_string(),
         "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
         "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
+        "whisper-tiny" | "whisper:tiny" => "openai/whisper-tiny".to_string(),
+        "whisper-base" | "whisper:base" => "openai/whisper-base".to_string(),
+        "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
+        "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
+        "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
+        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => "openai/whisper-large-v3-turbo".to_string(),
         _ => name.to_string(),
     }
 }
@@ -300,4 +308,16 @@ fn select_device() -> ferrum_types::Device {
 
     #[allow(unreachable_code)]
     ferrum_types::Device::CPU
+}
+
+fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
+    match device {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        ferrum_types::Device::Metal => candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu),
+        #[cfg(feature = "cuda")]
+        ferrum_types::Device::CUDA(id) => {
+            candle_core::Device::new_cuda(*id as usize).unwrap_or(candle_core::Device::Cpu)
+        }
+        _ => candle_core::Device::Cpu,
+    }
 }

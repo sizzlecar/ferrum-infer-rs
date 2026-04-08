@@ -113,6 +113,15 @@ impl DefaultModelRegistry {
         registry.register_alias("mistral-7b-instruct", "mistralai/Mistral-7B-Instruct-v0.2");
         registry.register_alias("phi3-mini", "microsoft/Phi-3-mini-4k-instruct");
 
+        // Whisper ASR models
+        registry.register_alias("whisper-tiny", "openai/whisper-tiny");
+        registry.register_alias("whisper-base", "openai/whisper-base");
+        registry.register_alias("whisper-small", "openai/whisper-small");
+        registry.register_alias("whisper-medium", "openai/whisper-medium");
+        registry.register_alias("whisper-large-v3", "openai/whisper-large-v3");
+        registry.register_alias("whisper-turbo", "openai/whisper-large-v3-turbo");
+        registry.register_alias("whisper-large-v3-turbo", "openai/whisper-large-v3-turbo");
+
         registry
     }
 

@@ -4,6 +4,7 @@
 //! - serve: Start the inference server
 //! - run: Run a model and start interactive chat
 //! - embed: Generate text embeddings using BERT models
+//! - transcribe: Transcribe audio files using Whisper models
 //! - stop: Stop the running server
 //! - pull: Download a model
 //! - list: List downloaded models
@@ -41,6 +42,10 @@ enum Commands {
     /// Generate text embeddings using BERT models
     #[command(visible_alias = "e")]
     Embed(embed::EmbedCommand),
+
+    /// Transcribe audio files using Whisper models
+    #[command(visible_alias = "t")]
+    Transcribe(transcribe::TranscribeCommand),
 
     /// Start the inference HTTP server
     Serve(serve::ServeCommand),
@@ -82,6 +87,7 @@ async fn main() {
         Commands::Run(cmd) => run::execute(cmd, config).await,
         Commands::Bench(cmd) => bench::execute(cmd, config).await,
         Commands::Embed(cmd) => embed::execute(cmd, config).await,
+        Commands::Transcribe(cmd) => transcribe::execute(cmd, config).await,
         Commands::Serve(cmd) => serve::execute(cmd, config).await,
         Commands::Stop(cmd) => stop::execute(cmd).await,
         Commands::Pull(cmd) => pull::execute(cmd, config).await,
