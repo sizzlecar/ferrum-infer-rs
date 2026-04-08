@@ -20,37 +20,6 @@ fn softmax_last_dim(x: &Tensor) -> candle_core::Result<Tensor> {
     exp.broadcast_div(&sum)
 }
 
-// ── Suppress special tokens during Whisper decode ───────────────────────
-//
-// Whisper's decode requires suppressing non-text tokens to avoid degenerate
-// output. We set logits to -inf for: <|nocaptions|> (no_timestamps-1),
-// <|notimestamps|>, and all timestamp tokens (>= no_timestamps+1).
-
-fn suppress_tokens(
-    logits: &Tensor,
-    no_timestamps_token: u32,
-    _eot_token: u32,
-) -> candle_core::Result<Tensor> {
-    let vocab = logits.dim(D::Minus1)?;
-    // Suppress: nocaptions (no_timestamps-1), notimestamps, all timestamps
-    // nocaptions = no_timestamps_token - 1 = 50362
-    // notimestamps = no_timestamps_token = 50363
-    // timestamps = no_timestamps_token + 1 .. vocab
-    let nocaptions = no_timestamps_token.saturating_sub(1) as usize;
-    let suppress_start = nocaptions; // 50362
-    let suppress_count = vocab - suppress_start; // everything from 50362 to end
-
-    // Create mask: 0 for normal tokens, -inf for suppressed
-    let mut mask = vec![0f32; vocab];
-    for i in suppress_start..vocab {
-        mask[i] = f32::NEG_INFINITY;
-    }
-    // Don't suppress EOT (50257) — it's below suppress_start so it's fine
-
-    let mask = Tensor::from_vec(mask, (1, 1, vocab), logits.device())?;
-    logits.broadcast_add(&mask)
-}
-
 // ── Manual LayerNorm (pure tensor ops — works on CPU/Metal/CUDA) ─────────
 
 struct LayerNorm {
@@ -561,77 +530,46 @@ impl WhisperModelWrapper {
             .map_err(|e| FerrumError::model(format!("mel tensor: {e}")))
     }
 
-    /// Full transcription: PCM → token IDs.
-    pub fn transcribe(
+    /// Encode a mel segment → encoder hidden states.
+    pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
+        let mut enc = self.encoder.lock();
+        enc.blocks.iter_mut().for_each(|b| b.reset_kv_cache());
+        enc.forward(mel, true)
+            .map_err(|e| FerrumError::model(format!("encode: {e}")))
+    }
+
+    /// Run one decode pass: tokens → logits (includes KV cache, final_linear).
+    /// On first call pass full initial_tokens; on subsequent calls pass only the new token.
+    pub fn decode_step(
         &self,
-        pcm: &[f32],
-        language_token: u32,
-        task_token: u32,
-        no_timestamps_token: u32,
-        eot_token: u32,
-        sot_token: u32,
-        max_tokens: usize,
-    ) -> Result<Vec<u32>> {
-        let mel = self.pcm_to_mel_tensor(pcm)?;
-
-        // Encode
-        let encoder_out = {
-            let mut enc = self.encoder.lock();
-            enc.blocks.iter_mut().for_each(|b| b.reset_kv_cache());
-            enc.forward(&mel, true)
-                .map_err(|e| FerrumError::model(format!("encode: {e}")))?
-        };
-
-        // Decode
+        tokens: &[u32],
+        encoder_out: &Tensor,
+    ) -> Result<Vec<f32>> {
         let mut dec = self.decoder.lock();
-        dec.reset_kv_cache();
+        let t = Tensor::new(tokens, &self.device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?;
+        let hidden = dec
+            .forward(&t, encoder_out, false)
+            .map_err(|e| FerrumError::model(format!("decode: {e}")))?;
+        let last_pos = hidden.dim(1).map_err(|e| FerrumError::model(format!("dim: {e}")))? - 1;
+        let last_hidden = hidden
+            .i((.., last_pos..last_pos + 1))
+            .map_err(|e| FerrumError::model(format!("slice: {e}")))?;
+        let logits = dec
+            .final_linear(&last_hidden)
+            .map_err(|e| FerrumError::model(format!("final_linear: {e}")))?;
+        logits
+            .squeeze(0)
+            .and_then(|t| t.squeeze(0))
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| FerrumError::model(format!("logits to vec: {e}")))
+    }
 
-        let mut tokens: Vec<u32> =
-            vec![sot_token, language_token, task_token, no_timestamps_token];
-        let mut result: Vec<u32> = Vec::new();
-
-        let effective_max = max_tokens.min(self.config.max_target_positions.saturating_sub(tokens.len()));
-        for _ in 0..effective_max {
-            let t = Tensor::new(tokens.as_slice(), &self.device)
-                .and_then(|t| t.unsqueeze(0))
-                .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?;
-
-            let logits = dec
-                .forward(&t, &encoder_out, false)
-                .map_err(|e| FerrumError::model(format!("decode: {e}")))?;
-
-            // final_linear on last position
-            let last_pos = logits
-                .dim(1)
-                .map_err(|e| FerrumError::model(format!("dim: {e}")))?
-                - 1;
-            let last_hidden = logits
-                .i((.., last_pos..last_pos + 1))
-                .map_err(|e| FerrumError::model(format!("slice: {e}")))?;
-            let logits_out = dec
-                .final_linear(&last_hidden)
-                .map_err(|e| FerrumError::model(format!("final_linear: {e}")))?;
-
-            // Suppress special tokens: nocaptions, notimestamps, all timestamps
-            let logits_out = suppress_tokens(&logits_out, no_timestamps_token, eot_token)
-                .map_err(|e| FerrumError::model(format!("suppress: {e}")))?;
-
-            let next_token = logits_out
-                .squeeze(0)
-                .and_then(|t| t.squeeze(0))
-                .and_then(|t| t.argmax(0))
-                .and_then(|t| t.to_scalar::<u32>())
-                .map_err(|e| FerrumError::model(format!("argmax: {e}")))?;
-
-            if next_token == eot_token {
-                break;
-            }
-
-            result.push(next_token);
-            tokens = vec![next_token];
-        }
-
-        Ok(result)
+    /// Reset decoder KV cache (call between segments).
+    pub fn reset_decoder(&self) {
+        self.decoder.lock().reset_kv_cache();
     }
 
     pub fn config(&self) -> &Config {
