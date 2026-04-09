@@ -37,6 +37,10 @@ cargo run -p ferrum-cli --bin ferrum -- list
 # With Metal acceleration (macOS)
 cargo run -p ferrum-cli --bin ferrum --features metal -- run qwen3:0.6b
 
+# Whisper ASR transcription
+cargo run -p ferrum-cli --bin ferrum --features metal -- transcribe whisper-turbo audio.wav -l zh
+cargo run -p ferrum-cli --bin ferrum --features metal -- serve whisper-turbo
+
 # Benchmarks
 cargo run -p ferrum-cli --bin ferrum -- bench qwen3:4b                          # sequential baseline
 cargo run -p ferrum-cli --bin ferrum -- bench qwen3:4b --concurrency 4          # batch decode
@@ -96,7 +100,51 @@ Candle handles weight loading and prefill (FlashAttention-2). Decode is fully co
 
 ## Model Support
 
-Qwen3 (0.6B–4B), Qwen2.5-Instruct (0.5B–7B), Llama-3.2-Instruct (1B–3B), TinyLlama-1.1B-Chat. Models are downloaded from HuggingFace and cached locally.
+**LLM:** Qwen3 (0.6B–4B), Qwen2.5-Instruct (0.5B–7B), Llama-3.2-Instruct (1B–3B), TinyLlama-1.1B-Chat.
+
+**ASR (Speech-to-Text):** Whisper (tiny, base, small, medium, large-v3, large-v3-turbo). Recommended: `whisper-turbo` for best quality/speed tradeoff.
+
+Models are downloaded from HuggingFace and cached locally.
+
+## Whisper ASR
+
+Custom Whisper forward pass — candle loads weights only, inference is ours (Metal/CUDA/CPU).
+
+**Architecture:**
+- Custom LayerNorm, Softmax, Linear (bypasses candle-nn CustomOp which lacks Metal support)
+- rustfft-based STFT for mel spectrogram (matches Python whisper to float32 precision)
+- Mel filterbank extracted from Python whisper (identical to torch version)
+- Self-attention KV cache with positional embedding offset tracking
+- Cross-attention KV cache (compute once per segment)
+
+**Decode pipeline (matches Python whisper.transcribe):**
+- Timestamp-based sequential decode (not no_timestamps mode)
+- Three logit filters: SuppressBlank, SuppressTokens (82 non-speech + special), ApplyTimestampRules
+- Temperature fallback: 0.0 → 0.2 → 0.4 → 0.6 → 0.8 → 1.0
+- Compression ratio check (real zlib via flate2) + avg logprob threshold
+- No-speech detection and segment skipping
+- Seek-based segmentation from timestamp tokens
+- Repetition detection (consecutive token limit)
+
+**CLI:**
+```bash
+# Transcribe audio file (WAV/M4A/MP3 — auto ffmpeg conversion)
+cargo run -p ferrum-cli --bin ferrum --features metal -- transcribe whisper-turbo audio.m4a -l zh
+
+# HTTP server with /v1/audio/transcriptions endpoint
+cargo run -p ferrum-cli --bin ferrum --features metal -- serve whisper-turbo
+curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.wav" -F "language=zh"
+```
+
+**Performance (5-min Chinese audio, whisper-large-v3-turbo):**
+
+| Backend | Time | vs Python |
+|---------|------|-----------|
+| Rust Metal (release) | ~72s | 1.5x faster |
+| Python CPU (torch) | 107s | baseline |
+| Python MPS | N/A (PyTorch bug) | — |
+
+**Known limitation:** Metal float32 matmul accumulation order differs from CPU, causing minor character-level differences (e.g., "核销" vs "和销") after 4 encoder transformer layers. Not fixable at software level — hardware floating-point behavior. On CUDA, this is controllable via cuBLAS compute type.
 
 ## Config
 
