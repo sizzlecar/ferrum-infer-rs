@@ -95,21 +95,34 @@ impl HfDownloader {
         // Get file list from HuggingFace API
         let files = self.list_files(model_id, revision).await?;
 
-        // Determine which files to download (only files, not directories)
+        // Determine which files to download (only files, not directories).
+        // Download all model-related files: weights (.safetensors, .pt, .bin, .onnx),
+        // configs (.json, .yaml), tokenizers, and other assets.
         let files_to_download: Vec<_> = files
             .iter()
             .filter(|f| {
                 if f.file_type.as_deref() == Some("directory") {
                     return false;
                 }
-                REQUIRED_FILES.contains(&f.path.as_str())
-                    || MODEL_FILES
-                        .iter()
-                        .any(|m| f.path.starts_with(m) || f.path == *m)
-                    || TOKENIZER_FILES.contains(&f.path.as_str())
-                    || f.path == "generation_config.json"
-                    || f.path == "special_tokens_map.json"
-                    || f.path.ends_with(".safetensors")
+                let path = f.path.as_str();
+                // Skip large non-essential files
+                if path.ends_with(".md") || path.starts_with(".git") {
+                    return false;
+                }
+                // Include all model weight formats
+                path.ends_with(".safetensors")
+                    || path.ends_with(".pt")
+                    || path.ends_with(".bin")
+                    || path.ends_with(".onnx")
+                    // Config and tokenizer files
+                    || path.ends_with(".json")
+                    || path.ends_with(".yaml")
+                    || path.ends_with(".yml")
+                    || path.ends_with(".model")  // sentencepiece tokenizer
+                    || path.ends_with(".txt")    // vocab.txt
+                    // Image/audio assets (small)
+                    || path.ends_with(".png")
+                    || path.ends_with(".wav")
             })
             .collect();
 
