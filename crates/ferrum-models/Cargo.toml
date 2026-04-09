@@ -65,6 +65,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 base64 = "0.22"
 hound = "3.5"
 flate2 = "1"
+rustfft = "6"
 
 [dev-dependencies]
 tokio-test = "0.4"

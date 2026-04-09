@@ -6,6 +6,7 @@
 
 pub mod architectures;
 pub mod audio_processor;
+pub mod mel;
 pub mod builder;
 pub mod definition;
 pub mod executor;

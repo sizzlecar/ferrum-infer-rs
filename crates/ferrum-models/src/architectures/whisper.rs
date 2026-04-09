@@ -504,29 +504,23 @@ impl WhisperModelWrapper {
         Self::new(vb, config, mel_filters, device, dtype)
     }
 
-    /// PCM → mel spectrogram tensor.
-    /// Pads or truncates PCM to exactly 30 seconds (N_SAMPLES = 480000) as Whisper expects.
+    /// PCM → mel spectrogram tensor (matching Python whisper exactly).
+    /// Pads or truncates PCM to exactly 30 seconds (N_SAMPLES = 480000).
     pub fn pcm_to_mel_tensor(&self, pcm: &[f32]) -> Result<Tensor> {
-        // Whisper expects exactly 480000 samples (30 seconds at 16kHz)
         let n_samples = whisper::N_SAMPLES;
-        let padded: std::borrow::Cow<[f32]> = if pcm.len() >= n_samples {
-            std::borrow::Cow::Borrowed(&pcm[..n_samples])
+        let mut samples = if pcm.len() >= n_samples {
+            pcm[..n_samples].to_vec()
         } else {
             let mut buf = pcm.to_vec();
             buf.resize(n_samples, 0.0);
-            std::borrow::Cow::Owned(buf)
+            buf
         };
-        let mel = whisper::audio::pcm_to_mel(&self.config, &padded, &self.mel_filters);
-        let mel_len = mel.len() / self.config.num_mel_bins;
-        // Truncate mel to N_FRAMES (3000) if STFT padding produced extra frames
-        let mel_len = mel_len.min(whisper::N_FRAMES);
-        let mel_trimmed: Vec<f32> = (0..self.config.num_mel_bins)
-            .flat_map(|bin| {
-                let start = bin * (mel.len() / self.config.num_mel_bins);
-                mel[start..start + mel_len].iter().copied()
-            })
-            .collect();
-        Tensor::from_vec(mel_trimmed, (1, self.config.num_mel_bins, mel_len), &self.device)
+
+        let n_mels = self.config.num_mel_bins;
+        let mel = crate::mel::log_mel_spectrogram(&samples, n_mels, &self.mel_filters);
+        let n_frames = mel.len() / n_mels;
+
+        Tensor::from_vec(mel, (1, n_mels, n_frames), &self.device)
             .map_err(|e| FerrumError::model(format!("mel tensor: {e}")))
     }
 
