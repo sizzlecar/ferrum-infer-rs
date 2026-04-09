@@ -150,10 +150,10 @@ curl http://localhost:8000/health
 
 ### Whisper ASR（Apple Silicon Metal）
 
-| 模型 | 5 分钟中文音频 | 对比 Python CPU |
-|------|--------------|----------------|
-| whisper-large-v3-turbo | **~72s**（release Metal） | **快 1.5 倍**（Python: 107s） |
-| whisper-tiny | ~20s（release Metal） | — |
+| 模型 | 5 分钟音频 | 实时率 |
+|------|-----------|--------|
+| whisper-large-v3-turbo | **~72s** | **4.2 倍实时** |
+| whisper-tiny | ~20s | 15 倍实时 |
 
 > 自研 Whisper 前向推理 + rustfft STFT，mel 精度与 Python whisper 完全一致。完整解码管线：带时间戳的顺序解码、温度回退、压缩率检测。
 

@@ -150,12 +150,12 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 
 ### Whisper ASR (Apple Silicon Metal)
 
-| Model | 5-min Chinese audio | vs Python CPU |
-|-------|-------------------|---------------|
-| whisper-large-v3-turbo | **~72s** (release Metal) | **1.5x faster** (Python: 107s) |
-| whisper-tiny | ~20s (release Metal) | — |
+| Model | 5-min audio | Realtime factor |
+|-------|------------|-----------------|
+| whisper-large-v3-turbo | **~72s** | **4.2x realtime** |
+| whisper-tiny | ~20s | 15x realtime |
 
-> Custom Whisper forward pass with rustfft STFT matching Python whisper precision. Full decode pipeline: timestamp-based sequential decode, temperature fallback, compression ratio check.
+> Custom Whisper forward pass with rustfft STFT. Full decode pipeline: timestamp-based sequential decode, temperature fallback, compression ratio check. Mel precision matches Python whisper exactly.
 
 ### Key Optimizations
 
