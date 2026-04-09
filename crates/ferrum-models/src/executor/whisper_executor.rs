@@ -214,7 +214,7 @@ impl WhisperModelExecutor {
             let encoder_out = self.model.encode(&mel)?;
 
             // Decode with temperature fallback
-            let (tokens, _avg_logprob, _no_speech_prob, _temperature) = self
+            let (tokens, avg_logprob, no_speech_prob, _temperature) = self
                 .decode_with_fallback(
                     &encoder_out,
                     &sot_sequence,
@@ -223,6 +223,14 @@ impl WhisperModelExecutor {
                     max_initial_timestamp_index,
                     temperatures,
                 )?;
+
+            // No speech check (matching Python transcribe.py):
+            // Skip segment if no_speech_prob is high, unless logprob is also high
+            let should_skip = no_speech_prob > 0.6 && avg_logprob < -1.0;
+            if should_skip {
+                seek += segment_size;
+                continue;
+            }
 
             // Parse timestamp tokens to determine seek advancement
             let sampled = &tokens[sample_begin..];
@@ -326,8 +334,19 @@ impl WhisperModelExecutor {
                 .unwrap_or_default();
 
             let cr = compression_ratio(&text);
-            let needs_fallback =
-                cr > 2.4 || (avg_logprob < -1.0 && no_speech_prob < 0.6);
+
+            // Matching Python: fallback if too repetitive or logprob too low,
+            // but NOT if it's silence (high no_speech_prob overrides).
+            let mut needs_fallback = false;
+            if cr > 2.4 {
+                needs_fallback = true;
+            }
+            if avg_logprob < -1.0 {
+                needs_fallback = true;
+            }
+            if no_speech_prob > 0.6 {
+                needs_fallback = false; // silence — accept as-is
+            }
 
             last_result = Some((tokens, avg_logprob, no_speech_prob, temp));
 
@@ -414,6 +433,31 @@ impl WhisperModelExecutor {
                 || tokens.len() > self.model.config().max_target_positions
             {
                 break;
+            }
+
+            // Repetition detection on text tokens only (ignoring timestamps).
+            // If a text token repeats > 5 times in the last 10 text tokens, stop.
+            let text_tail: Vec<u32> = tokens[sample_begin..]
+                .iter()
+                .copied()
+                .filter(|&t| t < TIMESTAMP_BEGIN && t != self.eot_token)
+                .collect();
+            if text_tail.len() >= 6 {
+                let last = *text_tail.last().unwrap();
+                let consecutive = text_tail.iter().rev().take_while(|&&t| t == last).count();
+                if consecutive >= 5 {
+                    // Trim: remove the repeated tokens, keep 1
+                    let mut keep = tokens.len();
+                    let mut removed = 0;
+                    while keep > sample_begin && removed < consecutive - 1 {
+                        keep -= 1;
+                        if tokens[keep] == last {
+                            removed += 1;
+                        }
+                    }
+                    tokens.truncate(keep + 1);
+                    break;
+                }
             }
 
             // Next step: feed only the new token
@@ -580,17 +624,19 @@ fn rand_f32() -> f32 {
     (s as f32) / (u64::MAX as f32)
 }
 
-/// Compression ratio using simple byte-level counting (matches Python whisper.utils).
+/// Compression ratio using zlib deflate (matches Python whisper.utils.compression_ratio).
 fn compression_ratio(text: &str) -> f32 {
     if text.is_empty() {
         return 0.0;
     }
-    let raw = text.as_bytes().len();
-    // Simple zlib-like compression ratio estimate
-    use std::collections::HashSet;
-    let unique_chars: HashSet<u8> = text.bytes().collect();
-    let compressed_est = unique_chars.len() * 2 + text.len() / 4;
-    raw as f32 / compressed_est.max(1) as f32
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let text_bytes = text.as_bytes();
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(text_bytes).unwrap();
+    let compressed = encoder.finish().unwrap();
+    text_bytes.len() as f32 / compressed.len().max(1) as f32
 }
 
 // ── Dummy KV cache + ModelExecutor trait impl ───────────────────────────

@@ -1340,6 +1340,7 @@ dependencies = [
  "ferrum-runtime",
  "ferrum-testkit",
  "ferrum-types",
+ "flate2",
  "futures",
  "futures-util",
  "half",
