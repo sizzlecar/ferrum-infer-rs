@@ -210,35 +210,55 @@ impl HfDownloader {
         Ok(snapshot_dir)
     }
 
-    /// List files in a HuggingFace repository
+    /// List files in a HuggingFace repository (recursively traverses subdirectories).
     async fn list_files(&self, model_id: &str, revision: &str) -> Result<Vec<HfFileInfo>> {
-        let url = format!("{}/api/models/{}/tree/{}", HF_API_URL, model_id, revision);
+        let mut all_files = Vec::new();
+        let mut dirs_to_visit = vec![String::new()]; // start with root
 
-        let mut request = self.client.get(&url);
-        if let Some(token) = &self.token {
-            request = request.header("Authorization", format!("Bearer {}", token));
+        while let Some(dir) = dirs_to_visit.pop() {
+            let url = if dir.is_empty() {
+                format!("{}/api/models/{}/tree/{}", HF_API_URL, model_id, revision)
+            } else {
+                format!(
+                    "{}/api/models/{}/tree/{}/{}",
+                    HF_API_URL, model_id, revision, dir
+                )
+            };
+
+            let mut request = self.client.get(&url);
+            if let Some(token) = &self.token {
+                request = request.header("Authorization", format!("Bearer {}", token));
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| FerrumError::model(format!("Failed to list files: {}", e)))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(FerrumError::model(format!(
+                    "API error ({}): {}",
+                    status, text
+                )));
+            }
+
+            let entries: Vec<HfFileInfo> = response
+                .json()
+                .await
+                .map_err(|e| FerrumError::model(format!("Failed to parse file list: {}", e)))?;
+
+            for entry in entries {
+                if entry.file_type.as_deref() == Some("directory") {
+                    dirs_to_visit.push(entry.path.clone());
+                } else {
+                    all_files.push(entry);
+                }
+            }
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| FerrumError::model(format!("Failed to list files: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(FerrumError::model(format!(
-                "API error ({}): {}",
-                status, text
-            )));
-        }
-
-        let files: Vec<HfFileInfo> = response
-            .json()
-            .await
-            .map_err(|e| FerrumError::model(format!("Failed to parse file list: {}", e)))?;
-
-        Ok(files)
+        Ok(all_files)
     }
 
     /// Get the commit SHA for a revision
