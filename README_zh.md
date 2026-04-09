@@ -47,6 +47,12 @@ ferrum serve --model qwen3:0.6b --port 8000
 | **Qwen3** | 支持 | 支持 | 支持 | Qwen3-0.6B ~ 4B |
 | **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
 
+### 语音转文字（Whisper ASR）
+
+| 架构 | Metal | CUDA | 示例模型 |
+|------|-------|------|----------|
+| **Whisper** | 支持 | — | whisper-tiny, whisper-base, whisper-small, whisper-medium, whisper-large-v3, **whisper-turbo**（推荐） |
+
 ### 向量化（文本 + 图片）
 
 | 架构 | 模态 | 向量维度 | 示例模型 |
@@ -60,6 +66,14 @@ ferrum serve --model qwen3:0.6b --port 8000
 # 文本生成
 ferrum run Qwen/Qwen3-4B
 ferrum run llama3.2:3b
+
+# 语音转文字（支持 WAV/M4A/MP3/FLAC，自动 ffmpeg 转码）
+ferrum transcribe whisper-turbo 录音.m4a -l zh
+ferrum transcribe whisper-turbo meeting.wav -l en
+
+# Whisper API 服务（OpenAI 兼容）
+ferrum serve whisper-turbo
+curl localhost:8000/v1/audio/transcriptions -F "file=@audio.wav" -F "language=zh"
 
 # 向量化（文本 + 图片）
 ferrum embed OFA-Sys/chinese-clip-vit-base-patch16 --text "海边日落"
@@ -81,6 +95,7 @@ curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to
 | `ferrum pull <model>` | 从 Hugging Face 下载模型 |
 | `ferrum list` | 查看已缓存模型 |
 | `ferrum bench <model>` | 性能基准测试 |
+| `ferrum transcribe <model> <audio>` | 语音转文字（Whisper，支持 WAV/M4A/MP3） |
 | `ferrum embed <model>` | 生成向量（BERT/CLIP/SigLIP，文本 + 图片） |
 
 ## API 接口
@@ -90,6 +105,14 @@ curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"你好"}]}'
+
+# 语音转文字（OpenAI 兼容，multipart form）
+curl http://localhost:8000/v1/audio/transcriptions \
+  -F "file=@audio.wav" -F "language=zh"
+
+# 向量化
+curl http://localhost:8000/v1/embeddings \
+  -d '{"model":"clip","input":"你好"}'
 
 # 模型列表
 curl http://localhost:8000/v1/models
@@ -125,6 +148,15 @@ curl http://localhost:8000/health
 
 > TP decode 使用持久化 per-rank 线程 + NCCL all-reduce。当前瓶颈为 PCIe 互联延迟（~0.44ms × 72 次 NCCL 调用/步）。TP 主要适用于单卡放不下的大模型，或 NVLink 互联场景。
 
+### Whisper ASR（Apple Silicon Metal）
+
+| 模型 | 5 分钟中文音频 | 对比 Python CPU |
+|------|--------------|----------------|
+| whisper-large-v3-turbo | **~72s**（release Metal） | **快 1.5 倍**（Python: 107s） |
+| whisper-tiny | ~20s（release Metal） | — |
+
+> 自研 Whisper 前向推理 + rustfft STFT，mel 精度与 Python whisper 完全一致。完整解码管线：带时间戳的顺序解码、温度回退、压缩率检测。
+
 ### 核心优化
 
 - **自定义 CUDA decode runner**：绕过 candle 的 decode 热路径（Qwen3 + LLaMA）
@@ -151,6 +183,8 @@ curl http://localhost:8000/health
 - 连续批处理 + batch decode
 - 张量并行（多 GPU NCCL，自动检测 GPU 数量）
 - CLIP/Chinese-CLIP/SigLIP 向量化（文本 + 图片，`/v1/embeddings` API）
+- Whisper 语音识别（Metal 加速，`/v1/audio/transcriptions` API）
+- 多格式音频支持（WAV/M4A/MP3/FLAC，自动 ffmpeg 转码）
 - Top-k / Top-p / Temperature / 重复惩罚采样
 
 ## 路线图
@@ -192,7 +226,7 @@ crates/
 ├── ferrum-interfaces     # 核心 trait 契约（ComputeBackend, KernelOps, ModelExecutor）
 ├── ferrum-runtime        # 后端实现（Candle, CPU）
 ├── ferrum-engine         # Metal 内核、模型编排
-├── ferrum-models         # 模型架构（LLaMA, Qwen2, Qwen3, BERT）
+├── ferrum-models         # 模型架构（LLaMA, Qwen2, Qwen3, BERT, Whisper）
 ├── ferrum-cuda-kernels   # 自定义 CUDA 内核 + decode runner
 ├── ferrum-tokenizer      # 分词器
 ├── ferrum-sampler        # 采样策略
