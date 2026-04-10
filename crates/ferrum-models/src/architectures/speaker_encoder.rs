@@ -30,6 +30,8 @@ fn reflect_pad_1d(x: &Tensor, pad_left: usize, pad_right: usize) -> candle_core:
     let t = x.dim(2)?;
     let mut parts: Vec<Tensor> = Vec::new();
 
+    let x = x.contiguous()?;
+
     // Left reflection: indices pad_left, pad_left-1, ..., 1
     if pad_left > 0 {
         let mut left_indices = Vec::with_capacity(pad_left);

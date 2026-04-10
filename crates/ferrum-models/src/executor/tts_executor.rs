@@ -641,9 +641,27 @@ impl TtsModelExecutor {
         let mut all_codec_tokens: Vec<Vec<u32>> = Vec::new();
         let mut current_logits = current_logits;
 
+        // Suppress special tokens [vocab_size-1024, vocab_size) except EOS
+        let suppress_start = self.config.vocab_size.saturating_sub(1024);
+        let suppress_end = self.config.vocab_size;
+
         for step in 0..MAX_CODEC_TOKENS {
-            let logits_vec = logits_to_vec(&current_logits)?;
+            let mut logits_vec = logits_to_vec(&current_logits)?;
+            // Suppress special tokens
+            for i in suppress_start..suppress_end.min(logits_vec.len()) {
+                if i as u32 != codec_eos {
+                    logits_vec[i] = f32::NEG_INFINITY;
+                }
+            }
             let next_token = sample_token(&logits_vec, TEMPERATURE, TOP_K, REPETITION_PENALTY);
+
+            if step < 3 {
+                // Dump top-5 logits for comparison
+                let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top5: Vec<(usize, f32)> = indexed.into_iter().take(5).collect();
+                info!("  decode step {}: token={}, top5={:?}", step, next_token, top5);
+            }
 
             if next_token == codec_eos {
                 info!("TTS: codec EOS at step {}", step);
