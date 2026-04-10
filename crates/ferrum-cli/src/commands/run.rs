@@ -268,7 +268,9 @@ pub fn resolve_model_alias(name: &str) -> String {
         "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
         "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
         "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
-        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => "openai/whisper-large-v3-turbo".to_string(),
+        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
+            "openai/whisper-large-v3-turbo".to_string()
+        }
         _ => name.to_string(),
     }
 }

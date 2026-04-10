@@ -98,6 +98,8 @@ impl LinearNoBias {
 struct CausalConv {
     conv: Conv1d,
     pad_left: usize,
+    kernel_size: usize,
+    stride: usize,
 }
 
 impl CausalConv {
@@ -127,11 +129,22 @@ impl CausalConv {
         Ok(Self {
             conv: Conv1d::new(w, b, cfg),
             pad_left,
+            kernel_size,
+            stride,
         })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let x = x.pad_with_zeros(2, self.pad_left, 0)?;
+        // Match Python MimiConv1d: add extra right padding for strided convs
+        // to ensure output = ceil(n_frames) instead of floor.
+        let length = x.dim(2)?;
+        let n_frames_f = (length + self.pad_left - self.kernel_size) as f64
+            / self.stride as f64 + 1.0;
+        let n_frames_ceil = n_frames_f.ceil() as usize;
+        let ideal_length =
+            (n_frames_ceil - 1) * self.stride + self.kernel_size - self.pad_left;
+        let extra_right = ideal_length.saturating_sub(length);
+        let x = x.pad_with_zeros(2, self.pad_left, extra_right)?;
         self.conv.forward(&x)
     }
 }
@@ -658,9 +671,22 @@ impl ResidualVQ {
         let mut residual = x.clone();
         let mut all_indices = Vec::with_capacity(self.layers.len());
 
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             let (indices, quantized) = layer.quantize(&residual)?;
-            all_indices.push(indices); // [B, T]
+            // Debug: dump first 2 layers for frame 0
+            if li < 2 {
+                if let Ok(idx) = indices.flatten_all().and_then(|t| t.to_vec1::<u32>()) {
+                    info!("  RVQ layer {}: frame 0 idx={}", li, idx[0]);
+                }
+                if let Ok(r) = residual.narrow(0, 0, 1)
+                    .and_then(|t| t.narrow(1, 0, 1))
+                    .and_then(|t| t.narrow(2, 0, 5))
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>()) {
+                    info!("  RVQ layer {} residual first 5: {:?}", li, r);
+                }
+            }
+            all_indices.push(indices);
             residual = (residual - quantized)?;
         }
 
@@ -753,24 +779,22 @@ impl SplitQuantizer {
         // Step 1: Semantic quantization
         // Project: [B, 512, T] → [B, 256, T]
         let sem_proj = self.semantic_input_proj.forward(hidden)?;
-        // Transpose for quantize: [B, T, 256]
-        let sem_input = sem_proj.transpose(1, 2)?;
-        // Quantize: 1 codebook → [1, B, T]
-        let sem_indices = self.semantic_rvq.quantize(&sem_input)?;
-        // Get quantized vectors for residual
-        let (_, sem_quantized) = self.semantic_rvq.layers[0].quantize(&sem_input)?;
-        // Residual in codebook space: [B, T, 256]
-        let sem_residual = (sem_input - sem_quantized)?;
-        // Project residual back: [B, 256, T] → [B, 512, T]
-        let sem_residual_proj = self
-            .semantic_output_proj
-            .forward(&sem_residual.transpose(1, 2)?)?;
+        let sem_input = sem_proj.transpose(1, 2)?; // [B, T, 256]
+        let sem_indices = self.semantic_rvq.quantize(&sem_input)?; // [1, B, T]
 
         // Step 2: Acoustic quantization
-        // Add semantic residual to original hidden for acoustic input
-        let acoustic_hidden = (hidden + sem_residual_proj)?;
-        // Project: [B, 512, T] → [B, 256, T]
-        let aco_proj = self.acoustic_input_proj.forward(&acoustic_hidden)?;
+        // Python passes the SAME hidden to both sub-quantizers (no residual between them).
+        let aco_proj = self.acoustic_input_proj.forward(hidden)?; // same hidden!
+
+        // Debug: dump acoustic input proj frame 0
+        if let Ok(vals) = aco_proj.narrow(0, 0, 1)
+            .and_then(|t| t.narrow(2, 0, 1))
+            .and_then(|t| t.narrow(1, 0, 10))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>()) {
+            info!("Acoustic input proj frame 0 first 10: {:?}", vals);
+        }
+
         // Transpose: [B, T, 256]
         let aco_input = aco_proj.transpose(1, 2)?;
         // Quantize all 31 acoustic codebooks → [31, B, T]

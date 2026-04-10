@@ -221,7 +221,9 @@ fn resolve_model_alias(name: &str) -> String {
         "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
         "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
         "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
-        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => "openai/whisper-large-v3-turbo".to_string(),
+        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
+            "openai/whisper-large-v3-turbo".to_string()
+        }
         _ => name.to_string(),
     }
 }
@@ -313,7 +315,9 @@ fn select_device() -> ferrum_types::Device {
 fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
     match device {
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        ferrum_types::Device::Metal => candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu),
+        ferrum_types::Device::Metal => {
+            candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+        }
         #[cfg(feature = "cuda")]
         ferrum_types::Device::CUDA(id) => {
             candle_core::Device::new_cuda(*id as usize).unwrap_or(candle_core::Device::Cpu)

@@ -98,9 +98,15 @@ impl TtsModelExecutor {
         let vocoder_config = VocoderConfig::default();
         let vocoder = Qwen3TTSVocoder::load(&vocoder_config, vocoder_vb.clone())?;
 
-        // Load Speech Tokenizer Encoder (for ICL voice cloning)
+        // Load Speech Tokenizer Encoder on CPU — Metal float32 accumulation order
+        // causes transformer output divergence that amplifies through RVQ codebook lookup.
+        // CPU is exact and encoder only runs once per reference audio.
         let speech_tokenizer_encoder = if vocoder_dir.join("config.json").exists() {
-            SpeechTokenizerEncoder::load(vocoder_vb.pp("encoder"), device.clone())
+            let cpu_vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&vocoder_weights, dtype, &CandleDevice::Cpu)
+                    .map_err(|e| FerrumError::model(format!("load encoder cpu: {e}")))?
+            };
+            SpeechTokenizerEncoder::load(cpu_vb.pp("encoder"), CandleDevice::Cpu)
                 .map_err(|e| {
                     tracing::warn!("Speech tokenizer encoder not available: {e}");
                     e
@@ -380,8 +386,20 @@ impl TtsModelExecutor {
             .speech_tokenizer_encoder
             .as_ref()
             .ok_or_else(|| FerrumError::model("speech tokenizer encoder not loaded"))?;
-        let ref_codes = speech_enc.encode(&ref_pcm)?;
-        // ref_codes: Vec<Vec<u32>> shape [T, 16]
+        // Allow pre-computed codec tokens for debugging (FERRUM_REF_CODES=/path/to/codes.bin)
+        let ref_codes = if let Ok(path) = std::env::var("FERRUM_REF_CODES") {
+            let data = std::fs::read(&path)
+                .map_err(|e| FerrumError::model(format!("read ref codes: {e}")))?;
+            let u32s: Vec<u32> = data.chunks(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let ncb = self.config.num_code_groups;
+            let nframes = u32s.len() / ncb;
+            info!("Loaded pre-computed ref codes: {} frames from {}", nframes, path);
+            u32s.chunks(ncb).map(|c| c.to_vec()).collect()
+        } else {
+            speech_enc.encode(&ref_pcm)?
+        };
         let ref_frames = ref_codes.len();
         info!(
             "TTS voice clone: ref_frames={}, spk_embed loaded",
@@ -588,10 +606,25 @@ impl TtsModelExecutor {
                 .map_err(|e| FerrumError::model(format!("talker+trailing cat: {e}")))?;
         }
 
-        info!(
-            "TTS voice clone: prefill seq_len={}",
-            talker_input.dim(1).unwrap_or(0),
-        );
+        let prefill_len = talker_input
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("prefill dim: {e}")))?;
+        info!("TTS voice clone: prefill seq_len={}", prefill_len);
+
+        // Debug: dump key positions for comparison with Python
+        for pos in [0usize, 8, 9, 10, 20, 40, 60, 70, 71, 72] {
+            if pos < prefill_len {
+                if let Ok(vals) = talker_input
+                    .narrow(0, 0, 1)
+                    .and_then(|t| t.narrow(1, pos, 1))
+                    .and_then(|t| t.narrow(2, 0, 5))
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                {
+                    info!("  prefill pos {}: {:?}", pos, vals);
+                }
+            }
+        }
 
         // Step 6: Prefill and decode
         let mut hidden = self.talker.forward_step(&talker_input)?;

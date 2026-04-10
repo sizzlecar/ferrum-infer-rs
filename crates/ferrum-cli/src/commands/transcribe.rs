@@ -33,11 +33,7 @@ pub async fn execute(cmd: TranscribeCommand, config: CliConfig) -> Result<()> {
     let model_id = resolve_whisper_alias(&cmd.model);
     let cache_dir = get_hf_cache_dir(&config);
 
-    eprintln!(
-        "{} {}",
-        "Model:".dimmed(),
-        model_id.cyan()
-    );
+    eprintln!("{} {}", "Model:".dimmed(), model_id.cyan());
 
     // Find or download model
     let source = match find_cached_model(&cache_dir, &model_id) {
@@ -89,21 +85,13 @@ pub async fn execute(cmd: TranscribeCommand, config: CliConfig) -> Result<()> {
     eprintln!("{}", "Model loaded.".green());
 
     // Transcribe
-    eprintln!(
-        "{} {}",
-        "Audio:".dimmed(),
-        cmd.audio.cyan()
-    );
+    eprintln!("{} {}", "Audio:".dimmed(), cmd.audio.cyan());
     let start = std::time::Instant::now();
     let text = executor.transcribe_file(&cmd.audio, cmd.language.as_deref())?;
     let elapsed = start.elapsed();
 
     println!("{}", text);
-    eprintln!(
-        "\n{} {:.2}s",
-        "Time:".dimmed(),
-        elapsed.as_secs_f64()
-    );
+    eprintln!("\n{} {:.2}s", "Time:".dimmed(), elapsed.as_secs_f64());
 
     Ok(())
 }
@@ -115,7 +103,9 @@ fn resolve_whisper_alias(name: &str) -> String {
         "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
         "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
         "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
-        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => "openai/whisper-large-v3-turbo".to_string(),
+        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
+            "openai/whisper-large-v3-turbo".to_string()
+        }
         _ => name.to_string(),
     }
 }

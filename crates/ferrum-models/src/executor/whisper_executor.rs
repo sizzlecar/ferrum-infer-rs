@@ -52,7 +52,7 @@ pub struct WhisperModelExecutor {
     transcribe_token: u32,
     translate_token: u32,
     no_timestamps_token: u32,
-    no_speech_token: u32,  // <|nocaptions|> = 50362
+    no_speech_token: u32, // <|nocaptions|> = 50362
     sot_prev: u32,
     sot_lm: u32,
     language_tokens: HashMap<String, u32>,
@@ -214,15 +214,14 @@ impl WhisperModelExecutor {
             let encoder_out = self.model.encode(&mel)?;
 
             // Decode with temperature fallback
-            let (tokens, avg_logprob, no_speech_prob, _temperature) = self
-                .decode_with_fallback(
-                    &encoder_out,
-                    &sot_sequence,
-                    sample_begin,
-                    blank_token,
-                    max_initial_timestamp_index,
-                    temperatures,
-                )?;
+            let (tokens, avg_logprob, no_speech_prob, _temperature) = self.decode_with_fallback(
+                &encoder_out,
+                &sot_sequence,
+                sample_begin,
+                blank_token,
+                max_initial_timestamp_index,
+                temperatures,
+            )?;
 
             // No speech check (matching Python transcribe.py):
             // Skip segment if no_speech_prob is high, unless logprob is also high
@@ -488,11 +487,11 @@ impl WhisperModelExecutor {
         logits[self.no_timestamps_token as usize] = f32::NEG_INFINITY;
 
         // Timestamp pairing rules
-        let last_was_timestamp = !sampled_tokens.is_empty()
-            && *sampled_tokens.last().unwrap() >= TIMESTAMP_BEGIN;
+        let last_was_timestamp =
+            !sampled_tokens.is_empty() && *sampled_tokens.last().unwrap() >= TIMESTAMP_BEGIN;
 
-        let penultimate_was_timestamp = sampled_tokens.len() < 2
-            || sampled_tokens[sampled_tokens.len() - 2] >= TIMESTAMP_BEGIN;
+        let penultimate_was_timestamp =
+            sampled_tokens.len() < 2 || sampled_tokens[sampled_tokens.len() - 2] >= TIMESTAMP_BEGIN;
 
         if last_was_timestamp {
             if penultimate_was_timestamp {

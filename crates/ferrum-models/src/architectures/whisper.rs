@@ -249,9 +249,12 @@ impl ResidualAttentionBlock {
         if let Some((ref mut ca, ref ln)) = self.cross_attn {
             x = (&x + ca.forward(&ln.forward(&x)?, xa, None, flush_kv)?)?;
         }
-        let mlp = self
-            .mlp_linear2
-            .forward(&self.mlp_linear1.forward(&self.mlp_ln.forward(&x)?)?.gelu()?)?;
+        let mlp = self.mlp_linear2.forward(
+            &self
+                .mlp_linear1
+                .forward(&self.mlp_ln.forward(&x)?)?
+                .gelu()?,
+        )?;
         x + mlp
     }
 
@@ -320,9 +323,7 @@ impl AudioEncoder {
         };
         let pe = sinusoids(cfg.max_source_positions, n, vb.device())?;
         let blocks = (0..cfg.encoder_layers)
-            .map(|i| {
-                ResidualAttentionBlock::load(n, h, false, vb.pp(format!("layers.{i}")))
-            })
+            .map(|i| ResidualAttentionBlock::load(n, h, false, vb.pp(format!("layers.{i}"))))
             .collect::<candle_core::Result<Vec<_>>>()?;
         let ln_post = LayerNorm::load(n, 1e-5, vb.pp("layer_norm"))?;
         Ok(Self {
@@ -351,7 +352,7 @@ impl AudioEncoder {
 // ── Text Decoder ────────────────────────────────────────────────────────
 
 struct TextDecoder {
-    token_embedding: Tensor, // (vocab, d_model)
+    token_embedding: Tensor,      // (vocab, d_model)
     positional_embedding: Tensor, // (max_target_positions, d_model)
     blocks: Vec<ResidualAttentionBlock>,
     ln: LayerNorm,
@@ -368,9 +369,7 @@ impl TextDecoder {
         let token_embedding = vb.get((cfg.vocab_size, n), "embed_tokens.weight")?;
         let positional_embedding = vb.get((ctx, n), "embed_positions.weight")?;
         let blocks = (0..cfg.decoder_layers)
-            .map(|i| {
-                ResidualAttentionBlock::load(n, h, true, vb.pp(format!("layers.{i}")))
-            })
+            .map(|i| ResidualAttentionBlock::load(n, h, true, vb.pp(format!("layers.{i}"))))
             .collect::<candle_core::Result<Vec<_>>>()?;
         let ln = LayerNorm::load(n, 1e-5, vb.pp("layer_norm"))?;
         let mask_data: Vec<f32> = (0..ctx)
@@ -399,7 +398,9 @@ impl TextDecoder {
         let te = self.token_embedding.index_select(&flat_tokens, 0)?;
         let te = te.reshape((tokens.dim(0)?, seq_len, self.token_embedding.dim(1)?))?;
         // Use positional embedding at the correct offset (not always 0)
-        let pe = self.positional_embedding.narrow(0, self.tokens_seen, seq_len)?;
+        let pe = self
+            .positional_embedding
+            .narrow(0, self.tokens_seen, seq_len)?;
         self.tokens_seen += seq_len;
         let mut x = te.broadcast_add(&pe)?;
         for block in &mut self.blocks {
@@ -534,11 +535,7 @@ impl WhisperModelWrapper {
 
     /// Run one decode pass: tokens → logits (includes KV cache, final_linear).
     /// On first call pass full initial_tokens; on subsequent calls pass only the new token.
-    pub fn decode_step(
-        &self,
-        tokens: &[u32],
-        encoder_out: &Tensor,
-    ) -> Result<Vec<f32>> {
+    pub fn decode_step(&self, tokens: &[u32], encoder_out: &Tensor) -> Result<Vec<f32>> {
         let mut dec = self.decoder.lock();
         let t = Tensor::new(tokens, &self.device)
             .and_then(|t| t.unsqueeze(0))
@@ -546,7 +543,10 @@ impl WhisperModelWrapper {
         let hidden = dec
             .forward(&t, encoder_out, false)
             .map_err(|e| FerrumError::model(format!("decode: {e}")))?;
-        let last_pos = hidden.dim(1).map_err(|e| FerrumError::model(format!("dim: {e}")))? - 1;
+        let last_pos = hidden
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("dim: {e}")))?
+            - 1;
         let last_hidden = hidden
             .i((.., last_pos..last_pos + 1))
             .map_err(|e| FerrumError::model(format!("slice: {e}")))?;
