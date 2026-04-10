@@ -449,6 +449,21 @@ impl TransformerLayer {
     fn forward(&mut self, x: &Tensor, pos_offset: usize) -> candle_core::Result<Tensor> {
         let residual = x.clone();
         let x = x.apply(&self.input_layernorm)?;
+
+        // Debug: dump layernorm output for layer 0 comparison
+        if pos_offset == 0 && x.dim(1).unwrap_or(0) > 1 {
+            if let Ok(vals) = x.narrow(0, 0, 1)
+                .and_then(|t| {
+                    let sl = t.dim(1).unwrap_or(1);
+                    t.narrow(1, sl - 1, 1)
+                })
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>()) {
+                tracing::info!("  layernorm pos -1 first 5: {:?}", vals);
+            }
+        }
+
         let x = self.self_attn.forward(&x, pos_offset)?;
         let x = (residual + x)?;
         let residual = x.clone();
