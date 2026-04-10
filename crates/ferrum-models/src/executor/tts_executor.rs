@@ -675,6 +675,16 @@ impl TtsModelExecutor {
                 .narrow(1, cur_hidden_len - 1, 1)
                 .map_err(|e| FerrumError::model(format!("last_hidden: {e}")))?;
 
+            if step < 2 {
+                if let Ok(vals) = last_hidden.narrow(0, 0, 1)
+                    .and_then(|t| t.narrow(1, 0, 1))
+                    .and_then(|t| t.narrow(2, 0, 5))
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>()) {
+                    info!("  step {} past_hidden first 5: {:?}", step, vals);
+                }
+            }
+
             let token_tensor = Tensor::new(&[next_token], &device)
                 .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?
                 .unsqueeze(0)
@@ -700,6 +710,12 @@ impl TtsModelExecutor {
                     .map_err(|e| FerrumError::model(format!("sub_embed: {e}")))?;
                 combined_embed = (combined_embed + sub_embed)
                     .map_err(|e| FerrumError::model(format!("add embed: {e}")))?;
+            }
+
+            if step < 3 {
+                let mut all_ids = vec![next_token];
+                all_ids.extend_from_slice(&extra_codes);
+                info!("  step {} codec_ids: {:?}", step, all_ids);
             }
 
             // Add tts_pad to codec embedding (dual-stream sum)

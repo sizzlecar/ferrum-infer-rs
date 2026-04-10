@@ -592,10 +592,20 @@ impl Qwen3TTSTalker {
             .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
 
         let mut hidden = input_embeds.clone();
-        for layer in &mut self.layers {
+        for (li, layer) in self.layers.iter_mut().enumerate() {
             hidden = layer
                 .forward(&hidden, pos_offset)
-                .map_err(|e| FerrumError::model(format!("layer forward: {e}")))?;
+                .map_err(|e| FerrumError::model(format!("layer {li} forward: {e}")))?;
+            if li == 0 && seq_len > 1 {
+                // Debug: dump layer 0 output at last position
+                if let Ok(vals) = hidden.narrow(0, 0, 1)
+                    .and_then(|t| t.narrow(1, seq_len - 1, 1))
+                    .and_then(|t| t.narrow(2, 0, 5))
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>()) {
+                    info!("Talker layer 0, pos -1 first 5: {:?}", vals);
+                }
+            }
         }
         hidden = hidden
             .apply(&self.norm)
