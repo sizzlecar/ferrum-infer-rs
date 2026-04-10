@@ -47,6 +47,9 @@ enum Commands {
     #[command(visible_alias = "t")]
     Transcribe(transcribe::TranscribeCommand),
 
+    /// Text-to-speech synthesis using Qwen3-TTS models
+    Tts(tts::TtsCommand),
+
     /// Start the inference HTTP server
     Serve(serve::ServeCommand),
 
@@ -88,6 +91,7 @@ async fn main() {
         Commands::Bench(cmd) => bench::execute(cmd, config).await,
         Commands::Embed(cmd) => embed::execute(cmd, config).await,
         Commands::Transcribe(cmd) => transcribe::execute(cmd, config).await,
+        Commands::Tts(cmd) => tts::execute(cmd, config).await,
         Commands::Serve(cmd) => serve::execute(cmd, config).await,
         Commands::Stop(cmd) => stop::execute(cmd).await,
         Commands::Pull(cmd) => pull::execute(cmd, config).await,

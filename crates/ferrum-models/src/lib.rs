@@ -27,7 +27,7 @@ pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
     BertModelExecutor, CandleModelExecutor, ClipModelExecutor, Qwen2ModelExecutor,
-    Qwen3ModelExecutor, StubModelExecutor, WhisperModelExecutor,
+    Qwen3ModelExecutor, StubModelExecutor, TtsModelExecutor, WhisperModelExecutor,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;

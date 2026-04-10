@@ -98,32 +98,47 @@ impl TalkerConfig {
         Ok(Self {
             vocab_size: get_usize("vocab_size", 3072),
             hidden_size: get_usize("hidden_size", 1024),
-            intermediate_size: get_usize("intermediate_size", 2816),
-            num_hidden_layers: get_usize("num_hidden_layers", 20),
+            intermediate_size: get_usize("intermediate_size", 3072),
+            num_hidden_layers: get_usize("num_hidden_layers", 28),
             num_attention_heads: get_usize("num_attention_heads", 16),
-            num_key_value_heads: get_usize("num_key_value_heads", 2),
-            head_dim: get_usize("head_dim", 64),
+            num_key_value_heads: get_usize("num_key_value_heads", 8),
+            head_dim: get_usize("head_dim", 128),
             max_position_embeddings: get_usize("max_position_embeddings", 32768),
             rope_theta: get_f64("rope_theta", 1000000.0),
             rms_norm_eps: get_f64("rms_norm_eps", 1e-6),
             text_vocab_size: get_usize("text_vocab_size", 151936),
             text_hidden_size: get_usize("text_hidden_size", 2048),
-            num_code_groups: get_usize("num_code_groups", 32),
-            codec_eos_token_id: get_u32("codec_eos_token_id", 4198),
-            codec_pad_id: get_u32("codec_pad_id", 4196),
-            codec_bos_id: get_u32("codec_bos_id", 4197),
-            codec_think_id: get_u32("codec_think_id", 4202),
-            codec_nothink_id: get_u32("codec_nothink_id", 4203),
-            codec_think_bos_id: get_u32("codec_think_bos_id", 4204),
-            codec_think_eos_id: get_u32("codec_think_eos_id", 4205),
-            tts_bos_token_id: get_u32("tts_bos_token_id", 151672),
-            tts_eos_token_id: get_u32("tts_eos_token_id", 151673),
-            tts_pad_token_id: get_u32("tts_pad_token_id", 151671),
-            code_predictor_vocab_size: get_usize("code_predictor_vocab_size", 2048),
-            code_predictor_hidden_size: get_usize("code_predictor_hidden_size", 1024),
-            code_predictor_num_layers: get_usize("code_predictor_num_layers", 4),
-            code_predictor_num_heads: get_usize("code_predictor_num_heads", 16),
-            code_predictor_num_kv_heads: get_usize("code_predictor_num_kv_heads", 2),
+            num_code_groups: get_usize("num_code_groups", 16),
+            codec_eos_token_id: get_u32("codec_eos_token_id", 2150),
+            codec_pad_id: get_u32("codec_pad_id", 2148),
+            codec_bos_id: get_u32("codec_bos_id", 2149),
+            codec_think_id: get_u32("codec_think_id", 2154),
+            codec_nothink_id: get_u32("codec_nothink_id", 2155),
+            codec_think_bos_id: get_u32("codec_think_bos_id", 2156),
+            codec_think_eos_id: get_u32("codec_think_eos_id", 2157),
+            tts_bos_token_id: v.get("tts_bos_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(151672),
+            tts_eos_token_id: v.get("tts_eos_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(151673),
+            tts_pad_token_id: v.get("tts_pad_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(151671),
+            code_predictor_vocab_size: {
+                let cp = tc.get("code_predictor_config");
+                cp.and_then(|c| c.get("vocab_size")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(2048)
+            },
+            code_predictor_hidden_size: {
+                let cp = tc.get("code_predictor_config");
+                cp.and_then(|c| c.get("hidden_size")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(1024)
+            },
+            code_predictor_num_layers: {
+                let cp = tc.get("code_predictor_config");
+                cp.and_then(|c| c.get("num_hidden_layers")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(5)
+            },
+            code_predictor_num_heads: {
+                let cp = tc.get("code_predictor_config");
+                cp.and_then(|c| c.get("num_attention_heads")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(16)
+            },
+            code_predictor_num_kv_heads: {
+                let cp = tc.get("code_predictor_config");
+                cp.and_then(|c| c.get("num_key_value_heads")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(8)
+            },
             spk_id,
             codec_language_id,
         })
@@ -381,8 +396,9 @@ struct TextProjection {
 
 impl TextProjection {
     fn new(text_hidden: usize, hidden: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let linear1 = candle_nn::linear_no_bias(text_hidden, text_hidden, vb.pp("linear1"))?;
-        let linear2 = candle_nn::linear_no_bias(text_hidden, hidden, vb.pp("linear2"))?;
+        // Keys: talker.text_projection.linear_fc1.weight/bias, linear_fc2.weight/bias
+        let linear1 = candle_nn::linear(text_hidden, text_hidden, vb.pp("linear_fc1"))?;
+        let linear2 = candle_nn::linear(text_hidden, hidden, vb.pp("linear_fc2"))?;
         Ok(Self { linear1, linear2 })
     }
 
@@ -409,12 +425,12 @@ pub struct Qwen3TTSTalker {
 impl Qwen3TTSTalker {
     pub fn load(cfg: &TalkerConfig, vb: VarBuilder, device: CandleDevice) -> Result<Self> {
         let dtype = vb.dtype();
-        let talker_vb = vb.pp("talker").pp("talker");
+        let model_vb = vb.pp("talker").pp("model");
 
         let text_embedding = candle_nn::embedding(
             cfg.text_vocab_size,
             cfg.text_hidden_size,
-            talker_vb.pp("text_embedding"),
+            model_vb.pp("text_embedding"),
         )
         .map_err(|e| FerrumError::model(format!("text_embedding: {e}")))?;
 
@@ -428,7 +444,7 @@ impl Qwen3TTSTalker {
         let codec_embedding = candle_nn::embedding(
             cfg.vocab_size,
             cfg.hidden_size,
-            talker_vb.pp("embed_tokens"),
+            model_vb.pp("codec_embedding"),
         )
         .map_err(|e| FerrumError::model(format!("codec_embedding: {e}")))?;
 
@@ -437,12 +453,12 @@ impl Qwen3TTSTalker {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            let layer = TransformerLayer::new(cfg, rotary.clone(), talker_vb.pp(format!("layers.{i}")))
+            let layer = TransformerLayer::new(cfg, rotary.clone(), model_vb.pp(format!("layers.{i}")))
                 .map_err(|e| FerrumError::model(format!("layer {i}: {e}")))?;
             layers.push(layer);
         }
 
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, talker_vb.pp("norm"))
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, model_vb.pp("norm"))
             .map_err(|e| FerrumError::model(format!("norm: {e}")))?;
 
         let codec_head = candle_nn::linear_no_bias(

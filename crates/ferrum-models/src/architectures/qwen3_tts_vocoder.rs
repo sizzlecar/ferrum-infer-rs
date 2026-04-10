@@ -36,14 +36,14 @@ impl Default for VocoderConfig {
     fn default() -> Self {
         Self {
             codebook_size: 2048,
-            codebook_dim: 256,
+            codebook_dim: 512,
             num_quantizers: 16,
             latent_dim: 1024,
-            hidden_size: 1024,
+            hidden_size: 512,
             num_hidden_layers: 8,
             num_attention_heads: 16,
             num_key_value_heads: 16,
-            intermediate_size: 3072,
+            intermediate_size: 1024,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             sliding_window: 72,
@@ -221,7 +221,9 @@ struct SplitResidualVectorQuantizer {
 
 impl SplitResidualVectorQuantizer {
     fn load(cfg: &VocoderConfig, vb: VarBuilder) -> candle_core::Result<Self> {
-        let dim = cfg.codebook_dim / 2; // 128
+        // dimension = codebook_dim // 2 = 256 (internal RVQ dimension)
+        // codebook entries are 256-dim, but input/output projected to codebook_dim (512)
+        let dim = cfg.codebook_dim / 2; // 256
         let n_q_semantic = 1;
         let n_q_acoustic = cfg.num_quantizers - n_q_semantic;
 
@@ -230,7 +232,7 @@ impl SplitResidualVectorQuantizer {
             dim,
             cfg.codebook_size,
             dim,
-            cfg.codebook_dim,
+            cfg.codebook_dim,  // output_dimension = 512
             vb.pp("rvq_first"),
         )?;
         let rvq_rest = ResidualVectorQuantizer::load(
@@ -238,7 +240,7 @@ impl SplitResidualVectorQuantizer {
             dim,
             cfg.codebook_size,
             dim,
-            cfg.codebook_dim,
+            cfg.codebook_dim,  // output_dimension = 512
             vb.pp("rvq_rest"),
         )?;
 
@@ -515,6 +517,7 @@ impl Qwen3TTSVocoder {
         let quantizer = SplitResidualVectorQuantizer::load(cfg, decoder_vb.pp("quantizer"))
             .map_err(|e| FerrumError::model(format!("quantizer: {e}")))?;
 
+        // pre_conv: codebook_dim (512, from RVQ output) → latent_dim (1024)
         let pre_conv = CausalConv::load(cfg.codebook_dim, cfg.latent_dim, 3, 1, 1, 1, decoder_vb.pp("pre_conv"))
             .map_err(|e| FerrumError::model(format!("pre_conv: {e}")))?;
 
