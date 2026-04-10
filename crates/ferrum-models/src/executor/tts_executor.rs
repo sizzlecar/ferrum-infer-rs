@@ -22,11 +22,13 @@ use tracing::info;
 use super::common;
 use crate::architectures::qwen3_tts::{Qwen3TTSTalker, SubTalker, TalkerConfig};
 use crate::architectures::qwen3_tts_vocoder::{Qwen3TTSVocoder, VocoderConfig};
+use crate::architectures::speaker_encoder::{mel_spectrogram_speaker_encoder, SpeakerEncoder};
+use crate::architectures::speech_tokenizer_encoder::SpeechTokenizerEncoder;
 
 // ── Constants ────────────────────────────────────────────────────────────
 
 const SAMPLE_RATE: usize = 24000;
-const MAX_CODEC_TOKENS: usize = 4096;
+const MAX_CODEC_TOKENS: usize = 2000;
 
 /// Sampling parameters for codec token generation.
 const TEMPERATURE: f32 = 0.9;
@@ -41,6 +43,8 @@ pub struct TtsModelExecutor {
     text_tokenizer: tokenizers::Tokenizer,
     config: TalkerConfig,
     info: ModelInfo,
+    speaker_encoder: Option<SpeakerEncoder>,
+    speech_tokenizer_encoder: Option<SpeechTokenizerEncoder>,
 }
 
 impl TtsModelExecutor {
@@ -55,12 +59,10 @@ impl TtsModelExecutor {
         // Parse TalkerConfig from config.json
         let config_json: serde_json::Value = {
             let config_path = dir.join("config.json");
-            let data = std::fs::read_to_string(&config_path).map_err(|e| {
-                FerrumError::model(format!("read config.json: {e}"))
-            })?;
-            serde_json::from_str(&data).map_err(|e| {
-                FerrumError::model(format!("parse config.json: {e}"))
-            })?
+            let data = std::fs::read_to_string(&config_path)
+                .map_err(|e| FerrumError::model(format!("read config.json: {e}")))?;
+            serde_json::from_str(&data)
+                .map_err(|e| FerrumError::model(format!("parse config.json: {e}")))?
         };
         let config = TalkerConfig::from_json(&config_json)?;
 
@@ -76,7 +78,15 @@ impl TtsModelExecutor {
         let talker = Qwen3TTSTalker::load(&config, talker_vb.clone(), device.clone())?;
 
         // Load SubTalker (code predictor) from same weights file
-        let sub_talker = SubTalker::load(&config, talker_vb, device.clone())?;
+        let sub_talker = SubTalker::load(&config, talker_vb.clone(), device.clone())?;
+
+        // Load Speaker Encoder (for voice cloning, base models only)
+        let speaker_encoder = SpeakerEncoder::load(talker_vb.pp("speaker_encoder"))
+            .map_err(|e| {
+                tracing::warn!("Speaker encoder not available: {e}");
+                e
+            })
+            .ok();
 
         // Load Vocoder weights from speech_tokenizer/model.safetensors
         let vocoder_dir = dir.join("speech_tokenizer");
@@ -86,7 +96,19 @@ impl TtsModelExecutor {
                 .map_err(|e| FerrumError::model(format!("load vocoder weights: {e}")))?
         };
         let vocoder_config = VocoderConfig::default();
-        let vocoder = Qwen3TTSVocoder::load(&vocoder_config, vocoder_vb)?;
+        let vocoder = Qwen3TTSVocoder::load(&vocoder_config, vocoder_vb.clone())?;
+
+        // Load Speech Tokenizer Encoder (for ICL voice cloning)
+        let speech_tokenizer_encoder = if vocoder_dir.join("config.json").exists() {
+            SpeechTokenizerEncoder::load(vocoder_vb.pp("encoder"), device.clone())
+                .map_err(|e| {
+                    tracing::warn!("Speech tokenizer encoder not available: {e}");
+                    e
+                })
+                .ok()
+        } else {
+            None
+        };
 
         let info = ModelInfo {
             model_id: ferrum_types::ModelId(model_path.to_string()),
@@ -119,10 +141,7 @@ impl TtsModelExecutor {
 
         info!(
             "TtsModelExecutor: {} (hidden={}, layers={}, codec_groups={})",
-            model_path,
-            config.hidden_size,
-            config.num_hidden_layers,
-            config.num_code_groups,
+            model_path, config.hidden_size, config.num_hidden_layers, config.num_code_groups,
         );
 
         Ok(Self {
@@ -132,6 +151,8 @@ impl TtsModelExecutor {
             text_tokenizer,
             config,
             info,
+            speaker_encoder,
+            speech_tokenizer_encoder,
         })
     }
 
@@ -192,7 +213,8 @@ impl TtsModelExecutor {
 
         // Get logits from last position
         let current_logits = self.talker.logits(
-            &hidden.narrow(1, hidden.dim(1).unwrap() - 1, 1)
+            &hidden
+                .narrow(1, hidden.dim(1).unwrap() - 1, 1)
                 .map_err(|e| FerrumError::model(format!("narrow: {e}")))?,
         )?;
 
@@ -224,12 +246,9 @@ impl TtsModelExecutor {
             let first_codec_embed = self.talker.embed_codec(&token_tensor)?;
 
             // SubTalker: predict remaining codec tokens 1..num_code_groups-1
-            let extra_codes = self.sub_talker.predict(
-                &last_hidden,
-                &first_codec_embed,
-                TEMPERATURE,
-                TOP_K,
-            )?;
+            let extra_codes =
+                self.sub_talker
+                    .predict(&last_hidden, &first_codec_embed, TEMPERATURE, TOP_K)?;
 
             let mut frame_codes = vec![next_token];
             frame_codes.extend_from_slice(&extra_codes);
@@ -250,7 +269,7 @@ impl TtsModelExecutor {
             }
 
             // Forward combined embedding through talker
-            let hidden = self.talker.forward_step(&combined_embed)?;
+            hidden = self.talker.forward_step(&combined_embed)?;
             current_logits = self.talker.logits(&hidden)?;
         }
 
@@ -279,11 +298,10 @@ impl TtsModelExecutor {
             }
         }
 
-        let codes_tensor =
-            Tensor::new(&flat_codes[..], &device)
-                .map_err(|e| FerrumError::model(format!("codes tensor: {e}")))?
-                .reshape((1, num_groups, num_frames))
-                .map_err(|e| FerrumError::model(format!("reshape codes: {e}")))?;
+        let codes_tensor = Tensor::new(&flat_codes[..], &device)
+            .map_err(|e| FerrumError::model(format!("codes tensor: {e}")))?
+            .reshape((1, num_groups, num_frames))
+            .map_err(|e| FerrumError::model(format!("reshape codes: {e}")))?;
 
         // 6. Vocoder: codec tokens → waveform
         let waveform = self.vocoder.decode(&codes_tensor)?;
@@ -315,15 +333,398 @@ impl TtsModelExecutor {
     pub fn config(&self) -> &TalkerConfig {
         &self.config
     }
+
+    /// Synthesize speech with voice cloning from a reference audio.
+    ///
+    /// Uses ICL (in-context learning) prompting: the reference audio is
+    /// encoded to codec tokens and prepended to the generation prompt,
+    /// along with a speaker embedding extracted via ECAPA-TDNN.
+    ///
+    /// Returns PCM samples at 24kHz as Vec<f32>.
+    pub fn synthesize_voice_clone(
+        &mut self,
+        text: &str,
+        language: &str,
+        ref_audio_path: &str,
+        ref_text: &str,
+    ) -> Result<Vec<f32>> {
+        let device = self.talker.device().clone();
+
+        // Step 1: Load and process reference audio at 24kHz
+        let ref_pcm = crate::audio_processor::load_audio_at_rate(ref_audio_path, 24000)?;
+        info!(
+            "TTS voice clone: loaded ref audio {} samples ({:.2}s)",
+            ref_pcm.len(),
+            ref_pcm.len() as f64 / 24000.0
+        );
+
+        // Step 2: Extract speaker embedding via ECAPA-TDNN
+        let speaker_encoder = self
+            .speaker_encoder
+            .as_ref()
+            .ok_or_else(|| FerrumError::model("speaker encoder not loaded"))?;
+        let mel = mel_spectrogram_speaker_encoder(&ref_pcm);
+        let n_mel_frames = mel.len() / 128;
+        let mel_tensor = Tensor::from_vec(mel, (1, n_mel_frames, 128), &device)
+            .map_err(|e| FerrumError::model(format!("mel tensor: {e}")))?;
+        let spk_embed = speaker_encoder.forward(&mel_tensor)?;
+        // spk_embed shape: [1024] -> reshape to [1, 1, 1024]
+        let spk_embed = spk_embed
+            .unsqueeze(0)
+            .map_err(|e| FerrumError::model(format!("spk unsqueeze(0): {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| FerrumError::model(format!("spk unsqueeze(0) 2: {e}")))?;
+
+        // Step 3: Encode reference audio to codec tokens (ICL)
+        let speech_enc = self
+            .speech_tokenizer_encoder
+            .as_ref()
+            .ok_or_else(|| FerrumError::model("speech tokenizer encoder not loaded"))?;
+        let ref_codes = speech_enc.encode(&ref_pcm)?;
+        // ref_codes: Vec<Vec<u32>> shape [T, 16]
+        let ref_frames = ref_codes.len();
+        info!(
+            "TTS voice clone: ref_frames={}, spk_embed loaded",
+            ref_frames
+        );
+        // Debug: dump first 5 codec frames for comparison with Python
+        for i in 0..ref_frames.min(5) {
+            info!("  rust codec frame {}: {:?}", i, &ref_codes[i]);
+        }
+
+        // Step 4: Tokenize target text with chat template
+        let chat_text = format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n");
+        let encoding = self
+            .text_tokenizer
+            .encode(chat_text.as_str(), false)
+            .map_err(|e| FerrumError::model(format!("tokenize: {e}")))?;
+        let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+        // role = input_ids[..3], text_content = input_ids[3..input_ids.len()-5]
+        let role_ids = &input_ids[..3];
+        let text_content_ids = &input_ids[3..input_ids.len().saturating_sub(5)];
+
+        // Tokenize ref_text
+        let ref_chat_text = format!("<|im_start|>assistant\n{ref_text}<|im_end|>\n");
+        let ref_encoding = self
+            .text_tokenizer
+            .encode(ref_chat_text.as_str(), false)
+            .map_err(|e| FerrumError::model(format!("tokenize ref: {e}")))?;
+        let ref_ids: Vec<u32> = ref_encoding.get_ids().to_vec();
+        // ref text content: ref_ids[3..ref_ids.len()-2]
+        let ref_text_ids = &ref_ids[3..ref_ids.len().saturating_sub(2)];
+
+        // Step 5: Build prefill prompt (dual-stream text+codec summing)
+        self.talker.reset();
+
+        let tts_bos = self.config.tts_bos_token_id;
+        let tts_eos = self.config.tts_eos_token_id;
+        let tts_pad = self.config.tts_pad_token_id;
+        let codec_bos = self.config.codec_bos_id;
+        let codec_eos = self.config.codec_eos_token_id;
+        let codec_pad = self.config.codec_pad_id;
+
+        // Helper: embed codec and text tokens
+        let embed_codec_ids = |ids: &[u32]| -> Result<Tensor> {
+            let t = Tensor::new(ids, &device)
+                .map_err(|e| FerrumError::model(format!("codec tensor: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("codec unsqueeze: {e}")))?;
+            self.talker.embed_codec(&t)
+        };
+        let embed_text_ids = |ids: &[u32]| -> Result<Tensor> {
+            let t = Tensor::new(ids, &device)
+                .map_err(|e| FerrumError::model(format!("text tensor: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("text unsqueeze: {e}")))?;
+            self.talker.embed_text(&t)
+        };
+
+        // Get tts special embeddings
+        let tts_special = embed_text_ids(&[tts_bos, tts_eos, tts_pad])?;
+        let tts_bos_embed = tts_special
+            .narrow(1, 0, 1)
+            .map_err(|e| FerrumError::model(format!("tts_bos narrow: {e}")))?;
+        let tts_eos_embed = tts_special
+            .narrow(1, 1, 1)
+            .map_err(|e| FerrumError::model(format!("tts_eos narrow: {e}")))?;
+        let tts_pad_embed = tts_special
+            .narrow(1, 2, 1)
+            .map_err(|e| FerrumError::model(format!("tts_pad narrow: {e}")))?;
+
+        // Resolve language_id
+        let language_id = self.config.codec_language_id.get(&language.to_lowercase());
+
+        // Codec prefix: [think, think_bos, lang, think_eos] or [nothink, think_bos, think_eos]
+        let codec_prefix_ids = if let Some(&lang_id) = language_id {
+            vec![
+                self.config.codec_think_id,
+                self.config.codec_think_bos_id,
+                lang_id,
+                self.config.codec_think_eos_id,
+            ]
+        } else {
+            vec![
+                self.config.codec_nothink_id,
+                self.config.codec_think_bos_id,
+                self.config.codec_think_eos_id,
+            ]
+        };
+        let codec_prefix_embed = embed_codec_ids(&codec_prefix_ids)?;
+
+        // Codec suffix: [pad, bos]
+        let codec_suffix_embed = embed_codec_ids(&[codec_pad, codec_bos])?;
+
+        // Speaker embed inserted between prefix and suffix
+        let codec_input = Tensor::cat(&[&codec_prefix_embed, &spk_embed, &codec_suffix_embed], 1)
+            .map_err(|e| FerrumError::model(format!("codec_input cat: {e}")))?;
+        let codec_len = codec_input
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("codec_len dim: {e}")))?;
+
+        // Role embedding
+        let role_embed = embed_text_ids(role_ids)?;
+
+        // Text-codec prefix: (codec_len - 2) pads + tts_bos, summed with codec[:-1]
+        let n_pads = codec_len - 2;
+        let mut text_prefix_parts = Vec::new();
+        for _ in 0..n_pads {
+            text_prefix_parts.push(tts_pad_embed.clone());
+        }
+        text_prefix_parts.push(tts_bos_embed.clone());
+        let text_prefix_refs: Vec<&Tensor> = text_prefix_parts.iter().collect();
+        let text_prefix = Tensor::cat(&text_prefix_refs, 1)
+            .map_err(|e| FerrumError::model(format!("text_prefix cat: {e}")))?;
+        let codec_prefix_part = codec_input
+            .narrow(1, 0, codec_len - 1)
+            .map_err(|e| FerrumError::model(format!("codec prefix narrow: {e}")))?;
+        let text_codec_prefix = (&text_prefix + &codec_prefix_part)
+            .map_err(|e| FerrumError::model(format!("text+codec prefix sum: {e}")))?;
+
+        let mut talker_input = Tensor::cat(&[&role_embed, &text_codec_prefix], 1)
+            .map_err(|e| FerrumError::model(format!("talker_input cat: {e}")))?;
+
+        // ICL prompt: embed ref text + target text, ref codec, and sum them
+        // Text stream: text_projection(text_embed([ref_text_content, text_content]))
+        let all_text_ids: Vec<u32> = ref_text_ids
+            .iter()
+            .chain(text_content_ids.iter())
+            .copied()
+            .collect();
+        let text_embed = embed_text_ids(&all_text_ids)?;
+        let text_embed_with_eos = Tensor::cat(&[&text_embed, &tts_eos_embed], 1)
+            .map_err(|e| FerrumError::model(format!("text+eos cat: {e}")))?;
+        let text_len = text_embed_with_eos
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("text_len dim: {e}")))?;
+
+        // Codec stream: codec_bos + sum of all 16 codebook embeddings for ref codes
+        let mut codec_frame_embeds = Vec::new();
+        for frame in &ref_codes {
+            // First codebook: main codec embedding
+            let first_embed = embed_codec_ids(&[frame[0]])?;
+            let mut frame_embed = first_embed;
+            // Remaining codebooks: sub-talker embeddings
+            for (i, &code) in frame[1..self.config.num_code_groups].iter().enumerate() {
+                let code_t = Tensor::new(&[code], &device)
+                    .map_err(|e| FerrumError::model(format!("ref code_t: {e}")))?
+                    .unsqueeze(0)
+                    .map_err(|e| FerrumError::model(format!("ref code unsqueeze: {e}")))?;
+                let sub_embed = code_t
+                    .apply(&self.sub_talker.codec_embeddings[i])
+                    .map_err(|e| FerrumError::model(format!("ref sub_embed: {e}")))?;
+                frame_embed = (frame_embed + sub_embed)
+                    .map_err(|e| FerrumError::model(format!("ref frame_embed add: {e}")))?;
+            }
+            codec_frame_embeds.push(frame_embed);
+        }
+        let codec_frames_refs: Vec<&Tensor> = codec_frame_embeds.iter().collect();
+        let codec_frames_cat = Tensor::cat(&codec_frames_refs, 1)
+            .map_err(|e| FerrumError::model(format!("codec_frames cat: {e}")))?;
+
+        // Prepend codec_bos to codec frames: [codec_bos_embed, codec_frames]
+        let codec_bos_for_icl = embed_codec_ids(&[codec_bos])?;
+        let icl_codec = Tensor::cat(&[&codec_bos_for_icl, &codec_frames_cat], 1)
+            .map_err(|e| FerrumError::model(format!("icl_codec cat: {e}")))?;
+        let codec_icl_len = icl_codec
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("codec_icl_len dim: {e}")))?;
+
+        // Merge text and codec (element-wise sum, handling different lengths)
+        let trailing_text: Option<Tensor>;
+        if text_len > codec_icl_len {
+            // text is longer: sum first codec_len positions, trailing text is separate
+            let text_part = text_embed_with_eos
+                .narrow(1, 0, codec_icl_len)
+                .map_err(|e| FerrumError::model(format!("text_part narrow: {e}")))?;
+            let summed = (&text_part + &icl_codec)
+                .map_err(|e| FerrumError::model(format!("text+codec sum: {e}")))?;
+            let trailing = text_embed_with_eos
+                .narrow(1, codec_icl_len, text_len - codec_icl_len)
+                .map_err(|e| FerrumError::model(format!("trailing narrow: {e}")))?;
+            talker_input = Tensor::cat(&[&talker_input, &summed], 1)
+                .map_err(|e| FerrumError::model(format!("talker+summed cat: {e}")))?;
+            trailing_text = Some(trailing);
+        } else {
+            // codec is longer or equal: pad text with tts_pad
+            let mut text_padded_parts = vec![text_embed_with_eos.clone()];
+            for _ in 0..(codec_icl_len - text_len) {
+                text_padded_parts.push(tts_pad_embed.clone());
+            }
+            let padded_refs: Vec<&Tensor> = text_padded_parts.iter().collect();
+            let text_padded = Tensor::cat(&padded_refs, 1)
+                .map_err(|e| FerrumError::model(format!("text_padded cat: {e}")))?;
+            let summed = (&text_padded + &icl_codec)
+                .map_err(|e| FerrumError::model(format!("padded+codec sum: {e}")))?;
+            talker_input = Tensor::cat(&[&talker_input, &summed], 1)
+                .map_err(|e| FerrumError::model(format!("talker+summed cat: {e}")))?;
+            trailing_text = None;
+        }
+
+        // Add trailing text if any (in streaming mode, trailing text is fed during decode)
+        // Note: Python streaming ICL does NOT add a decode_start position.
+        // The first token is generated from the last ICL position directly.
+        if let Some(trailing) = &trailing_text {
+            talker_input = Tensor::cat(&[&talker_input, trailing], 1)
+                .map_err(|e| FerrumError::model(format!("talker+trailing cat: {e}")))?;
+        }
+
+        info!(
+            "TTS voice clone: prefill seq_len={}",
+            talker_input.dim(1).unwrap_or(0),
+        );
+
+        // Step 6: Prefill and decode
+        let mut hidden = self.talker.forward_step(&talker_input)?;
+        let hidden_len = hidden
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("hidden dim: {e}")))?;
+        let current_logits = self.talker.logits(
+            &hidden
+                .narrow(1, hidden_len - 1, 1)
+                .map_err(|e| FerrumError::model(format!("narrow last: {e}")))?,
+        )?;
+
+        // Decode loop
+        let mut all_codec_tokens: Vec<Vec<u32>> = Vec::new();
+        let mut current_logits = current_logits;
+
+        for step in 0..MAX_CODEC_TOKENS {
+            let logits_vec = logits_to_vec(&current_logits)?;
+            let next_token = sample_token(&logits_vec, TEMPERATURE, TOP_K, REPETITION_PENALTY);
+
+            if next_token == codec_eos {
+                info!("TTS: codec EOS at step {}", step);
+                break;
+            }
+
+            let cur_hidden_len = hidden
+                .dim(1)
+                .map_err(|e| FerrumError::model(format!("hidden dim: {e}")))?;
+            let last_hidden = hidden
+                .narrow(1, cur_hidden_len - 1, 1)
+                .map_err(|e| FerrumError::model(format!("last_hidden: {e}")))?;
+
+            let token_tensor = Tensor::new(&[next_token], &device)
+                .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?;
+            let first_codec_embed = self.talker.embed_codec(&token_tensor)?;
+
+            let extra_codes =
+                self.sub_talker
+                    .predict(&last_hidden, &first_codec_embed, TEMPERATURE, TOP_K)?;
+
+            let mut frame_codes = vec![next_token];
+            frame_codes.extend_from_slice(&extra_codes);
+            all_codec_tokens.push(frame_codes);
+
+            // Sum all codebook embeddings
+            let mut combined_embed = first_codec_embed.clone();
+            for (i, &code) in extra_codes.iter().enumerate() {
+                let code_t = Tensor::new(&[code], &device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| FerrumError::model(format!("code_t: {e}")))?;
+                let sub_embed = code_t
+                    .apply(&self.sub_talker.codec_embeddings[i])
+                    .map_err(|e| FerrumError::model(format!("sub_embed: {e}")))?;
+                combined_embed = (combined_embed + sub_embed)
+                    .map_err(|e| FerrumError::model(format!("add embed: {e}")))?;
+            }
+
+            // Add tts_pad to codec embedding (dual-stream sum)
+            combined_embed = (combined_embed + &tts_pad_embed)
+                .map_err(|e| FerrumError::model(format!("add tts_pad: {e}")))?;
+
+            hidden = self.talker.forward_step(&combined_embed)?;
+            current_logits = self.talker.logits(&hidden)?;
+        }
+
+        if all_codec_tokens.is_empty() {
+            return Err(FerrumError::model("no codec tokens generated"));
+        }
+        info!(
+            "TTS voice clone: generated {} codec frames",
+            all_codec_tokens.len()
+        );
+
+        // Step 7: Prepend ref codes and decode with vocoder
+        let mut all_codes_with_ref = ref_codes.clone();
+        all_codes_with_ref.extend_from_slice(&all_codec_tokens);
+
+        let num_frames = all_codes_with_ref.len();
+        let num_groups = self.config.num_code_groups;
+
+        // Build codec tensor [1, num_groups, T]
+        let mut flat_codes: Vec<u32> = vec![0; num_groups * num_frames];
+        for (t, frame) in all_codes_with_ref.iter().enumerate() {
+            for (g, &code) in frame.iter().take(num_groups).enumerate() {
+                flat_codes[g * num_frames + t] = code;
+            }
+        }
+
+        // Clamp to valid range
+        let codebook_size = 2048u32;
+        for code in &mut flat_codes {
+            if *code >= codebook_size {
+                *code = 0;
+            }
+        }
+
+        let codes_tensor = Tensor::new(&flat_codes[..], &device)
+            .map_err(|e| FerrumError::model(format!("codes tensor: {e}")))?
+            .reshape((1, num_groups, num_frames))
+            .map_err(|e| FerrumError::model(format!("reshape codes: {e}")))?;
+
+        let waveform = self.vocoder.decode(&codes_tensor)?;
+
+        let samples: Vec<f32> = waveform
+            .squeeze(0)
+            .map_err(|e| FerrumError::model(format!("squeeze batch: {e}")))?
+            .squeeze(0)
+            .map_err(|e| FerrumError::model(format!("squeeze channel: {e}")))?
+            .to_vec1()
+            .map_err(|e| FerrumError::model(format!("to_vec1: {e}")))?;
+
+        // Trim reference portion
+        let ref_ratio = ref_frames as f64 / num_frames as f64;
+        let cut = (ref_ratio * samples.len() as f64) as usize;
+        let output_samples = samples[cut..].to_vec();
+
+        info!(
+            "TTS voice clone: waveform {} samples ({:.2}s), trimmed ref {} samples",
+            output_samples.len(),
+            output_samples.len() as f64 / SAMPLE_RATE as f64,
+            cut,
+        );
+
+        Ok(output_samples)
+    }
 }
 
 // ── Utility functions ───────────────────────────────────────────────────
 
 /// Find safetensor files matching a prefix in a directory.
-fn find_safetensor_files(
-    dir: &std::path::Path,
-    prefix: &str,
-) -> Result<Vec<std::path::PathBuf>> {
+fn find_safetensor_files(dir: &std::path::Path, prefix: &str) -> Result<Vec<std::path::PathBuf>> {
     // Try single file first
     let single = dir.join(format!("{prefix}.safetensors"));
     if single.exists() {
@@ -444,8 +845,7 @@ pub fn sample_token(
     let scaled: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
 
     // Top-k filtering
-    let mut indexed: Vec<(usize, f32)> =
-        scaled.iter().copied().enumerate().collect();
+    let mut indexed: Vec<(usize, f32)> = scaled.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     indexed.truncate(top_k);
 

@@ -6,7 +6,9 @@
 //! Loaded from speech_tokenizer/model.safetensors.
 
 use candle_core::{DType, Device as CandleDevice, IndexOp, Module, Tensor, D};
-use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, RmsNorm, VarBuilder};
+use candle_nn::{
+    Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, RmsNorm, VarBuilder,
+};
 use ferrum_types::{FerrumError, Result};
 use tracing::info;
 
@@ -14,22 +16,22 @@ use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct VocoderConfig {
-    pub codebook_size: usize,     // 2048
-    pub codebook_dim: usize,      // 256 (but split into 128 per sub-quantizer)
-    pub num_quantizers: usize,    // 16
-    pub latent_dim: usize,        // 1024
-    pub hidden_size: usize,       // 1024
-    pub num_hidden_layers: usize, // 8
-    pub num_attention_heads: usize, // 16
-    pub num_key_value_heads: usize, // 16
-    pub intermediate_size: usize, // 3072
-    pub rms_norm_eps: f64,        // 1e-5
-    pub rope_theta: f64,          // 10000.0
-    pub sliding_window: usize,    // 72
-    pub decoder_dim: usize,       // 1536
-    pub upsample_rates: Vec<usize>, // [8, 5, 4, 3]
+    pub codebook_size: usize,          // 2048
+    pub codebook_dim: usize,           // 256 (but split into 128 per sub-quantizer)
+    pub num_quantizers: usize,         // 16
+    pub latent_dim: usize,             // 1024
+    pub hidden_size: usize,            // 1024
+    pub num_hidden_layers: usize,      // 8
+    pub num_attention_heads: usize,    // 16
+    pub num_key_value_heads: usize,    // 16
+    pub intermediate_size: usize,      // 3072
+    pub rms_norm_eps: f64,             // 1e-5
+    pub rope_theta: f64,               // 10000.0
+    pub sliding_window: usize,         // 72
+    pub decoder_dim: usize,            // 1536
+    pub upsample_rates: Vec<usize>,    // [8, 5, 4, 3]
     pub upsampling_ratios: Vec<usize>, // [2, 2]
-    pub output_sample_rate: usize, // 24000
+    pub output_sample_rate: usize,     // 24000
 }
 
 impl Default for VocoderConfig {
@@ -99,7 +101,12 @@ struct VectorQuantization {
 }
 
 impl VectorQuantization {
-    fn load(dim: usize, codebook_size: usize, codebook_dim: usize, vb: VarBuilder) -> candle_core::Result<Self> {
+    fn load(
+        dim: usize,
+        codebook_size: usize,
+        codebook_dim: usize,
+        vb: VarBuilder,
+    ) -> candle_core::Result<Self> {
         let codebook = EuclideanCodebook::load(codebook_dim, codebook_size, vb.pp("_codebook"))?;
         let project_out = if codebook_dim != dim {
             Some(candle_nn::linear(codebook_dim, dim, vb.pp("project_out"))?)
@@ -181,7 +188,13 @@ impl ResidualVectorQuantizer {
         output_dimension: usize,
         vb: VarBuilder,
     ) -> candle_core::Result<Self> {
-        let vq = ResidualVectorQuantization::load(n_q, dimension, codebook_size, codebook_dim, vb.pp("vq"))?;
+        let vq = ResidualVectorQuantization::load(
+            n_q,
+            dimension,
+            codebook_size,
+            codebook_dim,
+            vb.pp("vq"),
+        )?;
         let output_proj = if output_dimension != dimension {
             let cfg = Conv1dConfig {
                 padding: 0,
@@ -190,7 +203,9 @@ impl ResidualVectorQuantizer {
                 groups: 1,
                 cudnn_fwd_algo: None,
             };
-            let w = vb.pp("output_proj").get((output_dimension, dimension, 1), "weight")?;
+            let w = vb
+                .pp("output_proj")
+                .get((output_dimension, dimension, 1), "weight")?;
             let b = vb.pp("output_proj").get(output_dimension, "bias").ok();
             Some(Conv1d::new(w, b, cfg))
         } else {
@@ -214,8 +229,8 @@ impl ResidualVectorQuantizer {
 // ── SplitResidualVectorQuantizer ────────────────────────────────────────
 
 struct SplitResidualVectorQuantizer {
-    rvq_first: ResidualVectorQuantizer,  // semantic (1 codebook)
-    rvq_rest: ResidualVectorQuantizer,   // acoustic (15 codebooks)
+    rvq_first: ResidualVectorQuantizer, // semantic (1 codebook)
+    rvq_rest: ResidualVectorQuantizer,  // acoustic (15 codebooks)
     n_q_semantic: usize,
 }
 
@@ -232,7 +247,7 @@ impl SplitResidualVectorQuantizer {
             dim,
             cfg.codebook_size,
             dim,
-            cfg.codebook_dim,  // output_dimension = 512
+            cfg.codebook_dim, // output_dimension = 512
             vb.pp("rvq_first"),
         )?;
         let rvq_rest = ResidualVectorQuantizer::load(
@@ -240,7 +255,7 @@ impl SplitResidualVectorQuantizer {
             dim,
             cfg.codebook_size,
             dim,
-            cfg.codebook_dim,  // output_dimension = 512
+            cfg.codebook_dim, // output_dimension = 512
             vb.pp("rvq_rest"),
         )?;
 
@@ -294,7 +309,9 @@ impl CausalConv {
             groups,
             cudnn_fwd_algo: None,
         };
-        let w = vb.pp("conv").get((out_ch, in_ch / groups, kernel_size), "weight")?;
+        let w = vb
+            .pp("conv")
+            .get((out_ch, in_ch / groups, kernel_size), "weight")?;
         let b = vb.pp("conv").get(out_ch, "bias").ok();
         Ok(Self {
             conv: Conv1d::new(w, b, cfg),
@@ -371,7 +388,7 @@ impl SnakeBeta {
         // x: [B, C, T]
         // SnakeBeta(x) = x + (1/beta) * sin^2(x * alpha)
         let alpha = self.alpha.exp()?.unsqueeze(0)?.unsqueeze(2)?; // [1, C, 1]
-        let beta = self.beta.exp()?.unsqueeze(0)?.unsqueeze(2)?;   // [1, C, 1]
+        let beta = self.beta.exp()?.unsqueeze(0)?.unsqueeze(2)?; // [1, C, 1]
         let sin_val = (x.broadcast_mul(&alpha))?.sin()?;
         let sin_sq = (&sin_val * &sin_val)?;
         let eps = 1e-9f64;
@@ -407,14 +424,14 @@ impl ConvNeXtBlock {
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let residual = x.clone();
-        let h = self.dwconv.forward(x)?;          // [B, C, T]
-        let h = h.transpose(1, 2)?;                // [B, T, C]
+        let h = self.dwconv.forward(x)?; // [B, C, T]
+        let h = h.transpose(1, 2)?; // [B, T, C]
         let h = h.apply(&self.norm)?;
         let h = h.apply(&self.pwconv1)?.gelu()?;
         let h = h.apply(&self.pwconv2)?;
-        let gamma = self.gamma.unsqueeze(0)?;       // [1, C]
+        let gamma = self.gamma.unsqueeze(0)?; // [1, C]
         let h = h.broadcast_mul(&gamma)?;
-        let h = h.transpose(1, 2)?;                // [B, C, T]
+        let h = h.transpose(1, 2)?; // [B, C, T]
         (residual + h)
     }
 }
@@ -518,8 +535,16 @@ impl Qwen3TTSVocoder {
             .map_err(|e| FerrumError::model(format!("quantizer: {e}")))?;
 
         // pre_conv: codebook_dim (512, from RVQ output) → latent_dim (1024)
-        let pre_conv = CausalConv::load(cfg.codebook_dim, cfg.latent_dim, 3, 1, 1, 1, decoder_vb.pp("pre_conv"))
-            .map_err(|e| FerrumError::model(format!("pre_conv: {e}")))?;
+        let pre_conv = CausalConv::load(
+            cfg.codebook_dim,
+            cfg.latent_dim,
+            3,
+            1,
+            1,
+            1,
+            decoder_vb.pp("pre_conv"),
+        )
+        .map_err(|e| FerrumError::model(format!("pre_conv: {e}")))?;
 
         // Upsampling stages (before decoder)
         let mut upsample_blocks = Vec::new();
@@ -532,8 +557,9 @@ impl Qwen3TTSVocoder {
                 decoder_vb.pp(format!("upsample.{i}.0")),
             )
             .map_err(|e| FerrumError::model(format!("upsample.{i}.0: {e}")))?;
-            let conv_next = ConvNeXtBlock::load(cfg.latent_dim, decoder_vb.pp(format!("upsample.{i}.1")))
-                .map_err(|e| FerrumError::model(format!("upsample.{i}.1: {e}")))?;
+            let conv_next =
+                ConvNeXtBlock::load(cfg.latent_dim, decoder_vb.pp(format!("upsample.{i}.1")))
+                    .map_err(|e| FerrumError::model(format!("upsample.{i}.1: {e}")))?;
             upsample_blocks.push((trans_conv, conv_next));
         }
 

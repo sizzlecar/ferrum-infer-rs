@@ -7,6 +7,8 @@ pub mod qwen2;
 pub mod qwen3;
 pub mod qwen3_tts;
 pub mod qwen3_tts_vocoder;
+pub mod speaker_encoder;
+pub mod speech_tokenizer_encoder;
 pub mod whisper;
 
 pub use bert::BertModelWrapper;

@@ -29,6 +29,27 @@ pub fn load_audio(path: &str) -> Result<Vec<f32>> {
     convert_with_ffmpeg(path)
 }
 
+/// Load audio file and return mono f32 PCM samples at a configurable sample rate.
+///
+/// Similar to `load_audio` but resamples to `target_rate` instead of 16kHz.
+/// Useful for TTS speaker encoder which expects 24kHz input.
+pub fn load_audio_at_rate(path: &str, target_rate: u32) -> Result<Vec<f32>> {
+    let p = Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // WAV: decode then resample to target_rate
+    if ext == "wav" {
+        return load_wav_file_at_rate(path, target_rate);
+    }
+
+    // Non-WAV: convert via ffmpeg to target_rate
+    convert_with_ffmpeg_at_rate(path, target_rate)
+}
+
 /// Load audio from raw bytes.
 /// Tries WAV first; if that fails and bytes look non-WAV, tries ffmpeg.
 pub fn load_audio_bytes(data: &[u8]) -> Result<Vec<f32>> {
@@ -40,8 +61,7 @@ pub fn load_audio_bytes(data: &[u8]) -> Result<Vec<f32>> {
 
     // Fallback: write to temp file and convert via ffmpeg
     let tmp = std::env::temp_dir().join("ferrum_audio_tmp");
-    std::fs::write(&tmp, data)
-        .map_err(|e| FerrumError::model(format!("write temp audio: {e}")))?;
+    std::fs::write(&tmp, data).map_err(|e| FerrumError::model(format!("write temp audio: {e}")))?;
     let result = convert_with_ffmpeg(tmp.to_str().unwrap_or(""));
     let _ = std::fs::remove_file(&tmp);
     result
@@ -150,9 +170,100 @@ fn convert_with_ffmpeg(input_path: &str) -> Result<Vec<f32>> {
     }
 }
 
+// ── WAV loading at configurable rate ─────────────────────────────────────
+
+fn load_wav_file_at_rate(path: &str, target_rate: u32) -> Result<Vec<f32>> {
+    let reader = hound::WavReader::open(path)
+        .map_err(|e| FerrumError::model(format!("open audio {path}: {e}")))?;
+    decode_wav_at_rate(reader, target_rate)
+}
+
+fn decode_wav_at_rate<R: std::io::Read>(
+    reader: hound::WavReader<R>,
+    target_rate: u32,
+) -> Result<Vec<f32>> {
+    let spec = reader.spec();
+    let sample_rate = spec.sample_rate as f64;
+    let channels = spec.channels as usize;
+
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .into_samples::<f32>()
+            .filter_map(|s| s.ok())
+            .collect(),
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample;
+            let max_val = (1u32 << (bits - 1)) as f32;
+            reader
+                .into_samples::<i32>()
+                .filter_map(|s| s.ok())
+                .map(|s| s as f32 / max_val)
+                .collect()
+        }
+    };
+
+    // Mix to mono
+    let mono: Vec<f32> = if channels == 1 {
+        samples
+    } else {
+        samples
+            .chunks(channels)
+            .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
+            .collect()
+    };
+
+    // Resample to target_rate if needed
+    let target = target_rate as f64;
+    if (sample_rate - target).abs() < 1.0 {
+        Ok(mono)
+    } else {
+        Ok(resample(&mono, sample_rate, target))
+    }
+}
+
+fn convert_with_ffmpeg_at_rate(input_path: &str, target_rate: u32) -> Result<Vec<f32>> {
+    let output = std::env::temp_dir().join("ferrum_ffmpeg_out_rate.wav");
+    let output_str = output.to_string_lossy().to_string();
+    let rate_str = target_rate.to_string();
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            input_path,
+            "-ar",
+            &rate_str,
+            "-ac",
+            "1",
+            "-sample_fmt",
+            "s16",
+            "-f",
+            "wav",
+            &output_str,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            let result = load_wav_file_at_rate(&output_str, target_rate);
+            let _ = std::fs::remove_file(&output);
+            result
+        }
+        Ok(s) => Err(FerrumError::model(format!(
+            "ffmpeg exited with code {}. Is the audio file valid?",
+            s.code().unwrap_or(-1)
+        ))),
+        Err(_) => Err(FerrumError::model(
+            "ffmpeg not found. Install ffmpeg to process non-WAV audio (brew install ffmpeg)",
+        )),
+    }
+}
+
 // ── Resampler ───────────────────────────────────────────────────────────
 
-fn resample(input: &[f32], from_rate: f64, to_rate: f64) -> Vec<f32> {
+pub(crate) fn resample(input: &[f32], from_rate: f64, to_rate: f64) -> Vec<f32> {
     let ratio = from_rate / to_rate;
     let output_len = (input.len() as f64 / ratio) as usize;
     let mut output = Vec::with_capacity(output_len);

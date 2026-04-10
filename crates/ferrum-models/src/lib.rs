@@ -6,13 +6,13 @@
 
 pub mod architectures;
 pub mod audio_processor;
-pub mod mel;
 pub mod builder;
 pub mod definition;
 pub mod executor;
 pub mod hf_download;
 pub mod image_processor;
 pub mod loader;
+pub mod mel;
 pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;

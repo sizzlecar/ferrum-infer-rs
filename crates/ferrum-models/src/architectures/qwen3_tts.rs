@@ -19,33 +19,33 @@ use super::repeat_kv;
 /// Talker LM config (from config.json talker_config section).
 #[derive(Debug, Clone)]
 pub struct TalkerConfig {
-    pub vocab_size: usize,        // 3072 (codec token vocabulary)
-    pub hidden_size: usize,       // 1024
-    pub intermediate_size: usize, // 2816
-    pub num_hidden_layers: usize, // 20
-    pub num_attention_heads: usize, // 16
-    pub num_key_value_heads: usize, // 2
-    pub head_dim: usize,          // 64
-    pub max_position_embeddings: usize, // 32768
-    pub rope_theta: f64,          // 1000000.0
-    pub rms_norm_eps: f64,        // 1e-6
-    pub text_vocab_size: usize,   // 151936
-    pub text_hidden_size: usize,  // 2048
-    pub num_code_groups: usize,   // 32
-    pub codec_eos_token_id: u32,  // 4198
-    pub codec_pad_id: u32,        // 4196
-    pub codec_bos_id: u32,        // 4197
-    pub codec_think_id: u32,      // 4202
-    pub codec_nothink_id: u32,    // 4203
-    pub codec_think_bos_id: u32,  // 4204
-    pub codec_think_eos_id: u32,  // 4205
-    pub tts_bos_token_id: u32,    // 151672
-    pub tts_eos_token_id: u32,    // 151673
-    pub tts_pad_token_id: u32,    // 151671
-    pub code_predictor_vocab_size: usize, // 2048
-    pub code_predictor_hidden_size: usize, // 1024
-    pub code_predictor_num_layers: usize,  // typically 4
-    pub code_predictor_num_heads: usize,   // 16
+    pub vocab_size: usize,                  // 3072 (codec token vocabulary)
+    pub hidden_size: usize,                 // 1024
+    pub intermediate_size: usize,           // 2816
+    pub num_hidden_layers: usize,           // 20
+    pub num_attention_heads: usize,         // 16
+    pub num_key_value_heads: usize,         // 2
+    pub head_dim: usize,                    // 64
+    pub max_position_embeddings: usize,     // 32768
+    pub rope_theta: f64,                    // 1000000.0
+    pub rms_norm_eps: f64,                  // 1e-6
+    pub text_vocab_size: usize,             // 151936
+    pub text_hidden_size: usize,            // 2048
+    pub num_code_groups: usize,             // 32
+    pub codec_eos_token_id: u32,            // 4198
+    pub codec_pad_id: u32,                  // 4196
+    pub codec_bos_id: u32,                  // 4197
+    pub codec_think_id: u32,                // 4202
+    pub codec_nothink_id: u32,              // 4203
+    pub codec_think_bos_id: u32,            // 4204
+    pub codec_think_eos_id: u32,            // 4205
+    pub tts_bos_token_id: u32,              // 151672
+    pub tts_eos_token_id: u32,              // 151673
+    pub tts_pad_token_id: u32,              // 151671
+    pub code_predictor_vocab_size: usize,   // 2048
+    pub code_predictor_hidden_size: usize,  // 1024
+    pub code_predictor_num_layers: usize,   // typically 4
+    pub code_predictor_num_heads: usize,    // 16
     pub code_predictor_num_kv_heads: usize, // 2
     /// Speaker ID mapping (speaker_name → token_id)
     pub spk_id: HashMap<String, Vec<u32>>,
@@ -80,7 +80,10 @@ impl TalkerConfig {
         if let Some(obj) = tc.get("spk_id").and_then(|v| v.as_object()) {
             for (k, v) in obj {
                 if let Some(arr) = v.as_array() {
-                    let ids: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
+                    let ids: Vec<u32> = arr
+                        .iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as u32))
+                        .collect();
                     spk_id.insert(k.clone(), ids);
                 }
             }
@@ -116,28 +119,55 @@ impl TalkerConfig {
             codec_nothink_id: get_u32("codec_nothink_id", 2155),
             codec_think_bos_id: get_u32("codec_think_bos_id", 2156),
             codec_think_eos_id: get_u32("codec_think_eos_id", 2157),
-            tts_bos_token_id: v.get("tts_bos_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(151672),
-            tts_eos_token_id: v.get("tts_eos_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(151673),
-            tts_pad_token_id: v.get("tts_pad_token_id").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(151671),
+            tts_bos_token_id: v
+                .get("tts_bos_token_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(151672),
+            tts_eos_token_id: v
+                .get("tts_eos_token_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(151673),
+            tts_pad_token_id: v
+                .get("tts_pad_token_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(151671),
             code_predictor_vocab_size: {
                 let cp = tc.get("code_predictor_config");
-                cp.and_then(|c| c.get("vocab_size")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(2048)
+                cp.and_then(|c| c.get("vocab_size"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(2048)
             },
             code_predictor_hidden_size: {
                 let cp = tc.get("code_predictor_config");
-                cp.and_then(|c| c.get("hidden_size")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(1024)
+                cp.and_then(|c| c.get("hidden_size"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(1024)
             },
             code_predictor_num_layers: {
                 let cp = tc.get("code_predictor_config");
-                cp.and_then(|c| c.get("num_hidden_layers")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(5)
+                cp.and_then(|c| c.get("num_hidden_layers"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(5)
             },
             code_predictor_num_heads: {
                 let cp = tc.get("code_predictor_config");
-                cp.and_then(|c| c.get("num_attention_heads")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(16)
+                cp.and_then(|c| c.get("num_attention_heads"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(16)
             },
             code_predictor_num_kv_heads: {
                 let cp = tc.get("code_predictor_config");
-                cp.and_then(|c| c.get("num_key_value_heads")).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(8)
+                cp.and_then(|c| c.get("num_key_value_heads"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(8)
             },
             spk_id,
             codec_language_id,
@@ -173,7 +203,12 @@ impl RotaryEmbedding {
         })
     }
 
-    fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> candle_core::Result<(Tensor, Tensor)> {
+    fn apply(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        offset: usize,
+    ) -> candle_core::Result<(Tensor, Tensor)> {
         let (_, _, seq_len, _) = q.dims4()?;
         let cos = self.cos.narrow(0, offset, seq_len)?;
         let sin = self.sin.narrow(0, offset, seq_len)?;
@@ -344,8 +379,13 @@ impl Attention {
             let kv_len = pos_offset + seq_len;
             let mask_data: Vec<f32> = (0..seq_len)
                 .flat_map(|i| {
-                    (0..kv_len)
-                        .map(move |j| if j <= pos_offset + i { 0f32 } else { f32::NEG_INFINITY })
+                    (0..kv_len).map(move |j| {
+                        if j <= pos_offset + i {
+                            0f32
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
                 })
                 .collect();
             let mask = Tensor::from_vec(mask_data, (1, 1, seq_len, kv_len), x.device())?;
@@ -361,7 +401,10 @@ impl Attention {
             let sum = exp.sum_keepdim(D::Minus1)?;
             exp.broadcast_div(&sum)?
         };
-        let out = attn.matmul(&v)?.transpose(1, 2)?.reshape((b, seq_len, ()))?;
+        let out = attn
+            .matmul(&v)?
+            .transpose(1, 2)?
+            .reshape((b, seq_len, ()))?;
         out.apply(&self.o_proj)
     }
 
@@ -388,9 +431,13 @@ impl TransformerLayer {
     ) -> candle_core::Result<Self> {
         let self_attn = Attention::new(cfg, rotary, vb.pp("self_attn"))?;
         let mlp = MLP::new(cfg, vb.pp("mlp"))?;
-        let input_layernorm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
+        let input_layernorm =
+            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
         Ok(Self {
             self_attn,
             mlp,
@@ -482,8 +529,9 @@ impl Qwen3TTSTalker {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            let layer = TransformerLayer::new(cfg, rotary.clone(), model_vb.pp(format!("layers.{i}")))
-                .map_err(|e| FerrumError::model(format!("layer {i}: {e}")))?;
+            let layer =
+                TransformerLayer::new(cfg, rotary.clone(), model_vb.pp(format!("layers.{i}")))
+                    .map_err(|e| FerrumError::model(format!("layer {i}: {e}")))?;
             layers.push(layer);
         }
 
@@ -625,8 +673,12 @@ impl SubTalker {
             );
         }
 
-        let norm = rms_norm(cfg.code_predictor_hidden_size, cfg.rms_norm_eps, model_vb.pp("norm"))
-            .map_err(|e| FerrumError::model(format!("subtalker norm: {e}")))?;
+        let norm = rms_norm(
+            cfg.code_predictor_hidden_size,
+            cfg.rms_norm_eps,
+            model_vb.pp("norm"),
+        )
+        .map_err(|e| FerrumError::model(format!("subtalker norm: {e}")))?;
 
         // Per-codebook embeddings (num_code_groups - 1)
         let n_extra = cfg.num_code_groups - 1;
@@ -739,7 +791,8 @@ impl SubTalker {
                 .and_then(|t| t.to_vec1::<f32>())
                 .map_err(|e| FerrumError::model(format!("logits vec: {e}")))?;
 
-            let token = crate::executor::tts_executor::sample_token(&logits_vec, temperature, top_k, 1.0);
+            let token =
+                crate::executor::tts_executor::sample_token(&logits_vec, temperature, top_k, 1.0);
             predicted_tokens.push(token);
 
             // If not last, embed and forward for next step
@@ -752,7 +805,9 @@ impl SubTalker {
                     .map_err(|e| FerrumError::model(format!("codec_embed.{i}: {e}")))?;
                 // Project if needed
                 let embed = if let Some(proj) = &self.projection {
-                    embed.apply(proj).map_err(|e| FerrumError::model(format!("proj: {e}")))?
+                    embed
+                        .apply(proj)
+                        .map_err(|e| FerrumError::model(format!("proj: {e}")))?
                 } else {
                     embed
                 };
@@ -765,7 +820,9 @@ impl SubTalker {
 
     fn forward_layers(&mut self, input: &Tensor) -> Result<Tensor> {
         let pos_offset = self.tokens_generated;
-        let seq_len = input.dim(1).map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+        let seq_len = input
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
 
         let mut h = input.clone();
         for layer in &mut self.layers {

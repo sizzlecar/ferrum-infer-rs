@@ -46,10 +46,7 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mels: usize, mel_filters: &[f32]) -> V
     }
 
     // Step 5: max(x, global_max - 8.0)
-    let global_max = mel_spec
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let global_max = mel_spec.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let clamp_min = global_max - 8.0;
     for v in &mut mel_spec {
         *v = v.max(clamp_min);
@@ -87,9 +84,7 @@ fn stft_magnitudes_squared(padded: &[f32]) -> Vec<f32> {
 
     // Hann window
     let hann: Vec<f32> = (0..N_FFT)
-        .map(|i| {
-            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / N_FFT as f32).cos())
-        })
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / N_FFT as f32).cos()))
         .collect();
 
     let mut planner = FftPlanner::<f32>::new();

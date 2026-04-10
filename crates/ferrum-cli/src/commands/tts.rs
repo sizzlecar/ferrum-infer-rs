@@ -31,6 +31,14 @@ pub struct TtsCommand {
     /// Backend: auto, cpu, metal (default: auto)
     #[arg(short, long, default_value = "auto")]
     pub backend: String,
+
+    /// Reference audio for voice cloning (WAV/M4A/MP3)
+    #[arg(long)]
+    pub ref_audio: Option<String>,
+
+    /// Reference audio transcript (required for ICL voice cloning)
+    #[arg(long)]
+    pub ref_text: Option<String>,
 }
 
 pub async fn execute(cmd: TtsCommand, config: CliConfig) -> Result<()> {
@@ -70,12 +78,10 @@ pub async fn execute(cmd: TtsCommand, config: CliConfig) -> Result<()> {
 
     // Verify architecture — Qwen3-TTS config.json has "talker_config" key
     let config_path = source.local_path.join("config.json");
-    let config_data = std::fs::read_to_string(&config_path).map_err(|e| {
-        ferrum_types::FerrumError::model(format!("read config.json: {e}"))
-    })?;
-    let config_json: serde_json::Value = serde_json::from_str(&config_data).map_err(|e| {
-        ferrum_types::FerrumError::model(format!("parse config.json: {e}"))
-    })?;
+    let config_data = std::fs::read_to_string(&config_path)
+        .map_err(|e| ferrum_types::FerrumError::model(format!("read config.json: {e}")))?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_data)
+        .map_err(|e| ferrum_types::FerrumError::model(format!("parse config.json: {e}")))?;
 
     if config_json.get("talker_config").is_none() {
         return Err(ferrum_types::FerrumError::model(format!(
@@ -99,8 +105,9 @@ pub async fn execute(cmd: TtsCommand, config: CliConfig) -> Result<()> {
     eprintln!(
         "{} \"{}\"",
         "Text:".dimmed(),
-        if cmd.text.len() > 80 {
-            format!("{}...", &cmd.text[..77])
+        if cmd.text.chars().count() > 80 {
+            let truncated: String = cmd.text.chars().take(77).collect();
+            format!("{truncated}...")
         } else {
             cmd.text.clone()
         }
@@ -108,7 +115,15 @@ pub async fn execute(cmd: TtsCommand, config: CliConfig) -> Result<()> {
     );
 
     let start = std::time::Instant::now();
-    let samples = executor.synthesize(&cmd.text, &cmd.language)?;
+    let samples = if let Some(ref_audio) = &cmd.ref_audio {
+        let ref_text = cmd.ref_text.as_deref().ok_or_else(|| {
+            ferrum_types::FerrumError::model("--ref-text required for voice cloning")
+        })?;
+        eprintln!("{} {}", "Ref audio:".dimmed(), ref_audio.cyan());
+        executor.synthesize_voice_clone(&cmd.text, &cmd.language, ref_audio, ref_text)?
+    } else {
+        executor.synthesize(&cmd.text, &cmd.language)?
+    };
     let elapsed = start.elapsed();
 
     let sample_rate = executor.sample_rate();
@@ -118,11 +133,7 @@ pub async fn execute(cmd: TtsCommand, config: CliConfig) -> Result<()> {
     let output_path = &cmd.output;
     save_wav(output_path, &samples, sample_rate as u32)?;
 
-    eprintln!(
-        "\n{} {}",
-        "Output:".dimmed(),
-        output_path.green()
-    );
+    eprintln!("\n{} {}", "Output:".dimmed(), output_path.green());
     eprintln!(
         "{} {:.2}s audio, {:.2}s elapsed (RTF={:.2}x)",
         "Stats:".dimmed(),
@@ -183,9 +194,7 @@ fn save_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
 
 fn resolve_tts_alias(name: &str) -> String {
     match name.to_lowercase().as_str() {
-        "qwen3-tts" | "qwen3:tts" | "qwen3-tts:0.6b" => {
-            "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string()
-        }
+        "qwen3-tts" | "qwen3:tts" | "qwen3-tts:0.6b" => "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string(),
         "qwen3-tts:instruct" | "qwen3-tts-instruct" => {
             "Qwen/Qwen3-TTS-12Hz-0.6B-Instruct".to_string()
         }
