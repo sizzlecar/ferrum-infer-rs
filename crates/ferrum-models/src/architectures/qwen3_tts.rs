@@ -183,11 +183,33 @@ impl RotaryEmbedding {
     }
 }
 
-// ── RMSNorm ─────────────────────────────────────────────────────────────
+// ── RMSNorm (manual ops for Metal compatibility) ────────────────────────
 
-fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<RmsNorm> {
+#[derive(Debug, Clone)]
+struct ManualRmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl ManualRmsNorm {
+    fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+}
+
+impl Module for ManualRmsNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let normed = normed.to_dtype(x.dtype())?;
+        normed.broadcast_mul(&self.weight)
+    }
+}
+
+fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<ManualRmsNorm> {
     let w = vb.get(size, "weight")?;
-    Ok(RmsNorm::new(w, eps))
+    Ok(ManualRmsNorm::new(w, eps))
 }
 
 // ── MLP ─────────────────────────────────────────────────────────────────
@@ -232,8 +254,8 @@ struct Attention {
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    q_norm: ManualRmsNorm,
+    k_norm: ManualRmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -331,7 +353,14 @@ impl Attention {
         } else {
             attn
         };
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        // Manual softmax for Metal compatibility
+        let attn = {
+            let max = attn.max_keepdim(D::Minus1)?;
+            let shifted = attn.broadcast_sub(&max)?;
+            let exp = shifted.exp()?;
+            let sum = exp.sum_keepdim(D::Minus1)?;
+            exp.broadcast_div(&sum)?
+        };
         let out = attn.matmul(&v)?.transpose(1, 2)?.reshape((b, seq_len, ()))?;
         out.apply(&self.o_proj)
     }
@@ -347,8 +376,8 @@ impl Attention {
 struct TransformerLayer {
     self_attn: Attention,
     mlp: MLP,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    input_layernorm: ManualRmsNorm,
+    post_attention_layernorm: ManualRmsNorm,
 }
 
 impl TransformerLayer {
@@ -415,7 +444,7 @@ pub struct Qwen3TTSTalker {
     text_projection: TextProjection,
     codec_embedding: Embedding,
     layers: Vec<TransformerLayer>,
-    norm: RmsNorm,
+    norm: ManualRmsNorm,
     codec_head: Linear,
     config: TalkerConfig,
     device: CandleDevice,
@@ -548,5 +577,214 @@ impl Qwen3TTSTalker {
 
     pub fn device(&self) -> &CandleDevice {
         &self.device
+    }
+}
+
+// ── SubTalker (Code Predictor) ──────────────────────────────────────────
+//
+// Predicts codec tokens 1..num_code_groups-1 given the talker hidden state
+// and the first codec token embedding. 5-layer transformer with per-codebook
+// lm_head and embedding.
+
+pub struct SubTalker {
+    layers: Vec<TransformerLayer>,
+    norm: ManualRmsNorm,
+    /// Per-codebook embeddings: codec_embedding[i] maps token → hidden for codebook i+1
+    pub codec_embeddings: Vec<Embedding>,
+    /// Per-codebook prediction heads: lm_head[i] maps hidden → logits for codebook i+1
+    lm_heads: Vec<Linear>,
+    /// Projection from talker hidden to subtalker hidden (if sizes differ)
+    projection: Option<Linear>,
+    num_code_groups: usize,
+    tokens_generated: usize,
+}
+
+impl SubTalker {
+    pub fn load(cfg: &TalkerConfig, vb: VarBuilder, device: CandleDevice) -> Result<Self> {
+        let dtype = vb.dtype();
+        let cp_vb = vb.pp("talker").pp("code_predictor");
+        let model_vb = cp_vb.pp("model");
+
+        let cp_cfg = TalkerConfig {
+            hidden_size: cfg.code_predictor_hidden_size,
+            intermediate_size: cfg.code_predictor_hidden_size * 3, // ~3072
+            num_hidden_layers: cfg.code_predictor_num_layers,
+            num_attention_heads: cfg.code_predictor_num_heads,
+            num_key_value_heads: cfg.code_predictor_num_kv_heads,
+            ..cfg.clone()
+        };
+
+        let rotary = RotaryEmbedding::new(dtype, &cp_cfg, &device)
+            .map_err(|e| FerrumError::model(format!("subtalker rotary: {e}")))?;
+
+        let mut layers = Vec::new();
+        for i in 0..cfg.code_predictor_num_layers {
+            layers.push(
+                TransformerLayer::new(&cp_cfg, rotary.clone(), model_vb.pp(format!("layers.{i}")))
+                    .map_err(|e| FerrumError::model(format!("subtalker layer {i}: {e}")))?,
+            );
+        }
+
+        let norm = rms_norm(cfg.code_predictor_hidden_size, cfg.rms_norm_eps, model_vb.pp("norm"))
+            .map_err(|e| FerrumError::model(format!("subtalker norm: {e}")))?;
+
+        // Per-codebook embeddings (num_code_groups - 1)
+        let n_extra = cfg.num_code_groups - 1;
+        let mut codec_embeddings = Vec::new();
+        for i in 0..n_extra {
+            codec_embeddings.push(
+                candle_nn::embedding(
+                    cfg.code_predictor_vocab_size,
+                    cfg.hidden_size, // embedding dim = talker hidden size
+                    model_vb.pp(format!("codec_embedding.{i}")),
+                )
+                .map_err(|e| FerrumError::model(format!("subtalker codec_embedding.{i}: {e}")))?,
+            );
+        }
+
+        // Per-codebook lm_heads
+        let mut lm_heads = Vec::new();
+        for i in 0..n_extra {
+            lm_heads.push(
+                candle_nn::linear_no_bias(
+                    cfg.code_predictor_hidden_size,
+                    cfg.code_predictor_vocab_size,
+                    cp_vb.pp(format!("lm_head.{i}")),
+                )
+                .map_err(|e| FerrumError::model(format!("subtalker lm_head.{i}: {e}")))?,
+            );
+        }
+
+        // Projection if hidden sizes differ
+        let projection = if cfg.hidden_size != cfg.code_predictor_hidden_size {
+            Some(
+                candle_nn::linear(
+                    cfg.hidden_size,
+                    cfg.code_predictor_hidden_size,
+                    cp_vb.pp("small_to_mtp_projection"),
+                )
+                .map_err(|e| FerrumError::model(format!("subtalker projection: {e}")))?,
+            )
+        } else {
+            None
+        };
+
+        info!(
+            "SubTalker loaded: layers={}, heads={}/{}, codebooks={}",
+            cfg.code_predictor_num_layers,
+            cfg.code_predictor_num_heads,
+            cfg.code_predictor_num_kv_heads,
+            n_extra,
+        );
+
+        Ok(Self {
+            layers,
+            norm,
+            codec_embeddings,
+            lm_heads,
+            projection,
+            num_code_groups: cfg.num_code_groups,
+            tokens_generated: 0,
+        })
+    }
+
+    /// Predict codec tokens 1..num_code_groups-1 given talker hidden state and first codec token.
+    ///
+    /// - `talker_hidden`: [1, 1, hidden_size] — last hidden from main talker
+    /// - `first_codec_embed`: [1, 1, hidden_size] — embedding of first codec token (from main talker's codec_embedding)
+    ///
+    /// Returns Vec of (num_code_groups - 1) token IDs.
+    pub fn predict(
+        &mut self,
+        talker_hidden: &Tensor,
+        first_codec_embed: &Tensor,
+        temperature: f32,
+        top_k: usize,
+    ) -> Result<Vec<u32>> {
+        self.reset();
+
+        // Input: [talker_hidden, first_codec_embed] → [1, 2, hidden]
+        let input = Tensor::cat(&[talker_hidden, first_codec_embed], 1)
+            .map_err(|e| FerrumError::model(format!("subtalker cat: {e}")))?;
+
+        // Project if needed
+        let input = if let Some(proj) = &self.projection {
+            input
+                .apply(proj)
+                .map_err(|e| FerrumError::model(format!("subtalker proj: {e}")))?
+        } else {
+            input
+        };
+
+        // Prefill
+        let mut hidden = self.forward_layers(&input)?;
+
+        let n_extra = self.num_code_groups - 1;
+        let mut predicted_tokens = Vec::with_capacity(n_extra);
+
+        for i in 0..n_extra {
+            // Get logits from last position using lm_head[i]
+            let last = hidden
+                .narrow(1, hidden.dim(1).unwrap() - 1, 1)
+                .map_err(|e| FerrumError::model(format!("narrow: {e}")))?;
+            let logits = last
+                .apply(&self.lm_heads[i])
+                .map_err(|e| FerrumError::model(format!("lm_head.{i}: {e}")))?;
+
+            // Sample
+            let logits_vec = logits
+                .squeeze(0)
+                .and_then(|t| t.squeeze(0))
+                .and_then(|t| t.to_dtype(candle_core::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(|e| FerrumError::model(format!("logits vec: {e}")))?;
+
+            let token = crate::executor::tts_executor::sample_token(&logits_vec, temperature, top_k, 1.0);
+            predicted_tokens.push(token);
+
+            // If not last, embed and forward for next step
+            if i < n_extra - 1 {
+                let token_tensor = Tensor::new(&[token], hidden.device())
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?;
+                let embed = token_tensor
+                    .apply(&self.codec_embeddings[i])
+                    .map_err(|e| FerrumError::model(format!("codec_embed.{i}: {e}")))?;
+                // Project if needed
+                let embed = if let Some(proj) = &self.projection {
+                    embed.apply(proj).map_err(|e| FerrumError::model(format!("proj: {e}")))?
+                } else {
+                    embed
+                };
+                hidden = self.forward_layers(&embed)?;
+            }
+        }
+
+        Ok(predicted_tokens)
+    }
+
+    fn forward_layers(&mut self, input: &Tensor) -> Result<Tensor> {
+        let pos_offset = self.tokens_generated;
+        let seq_len = input.dim(1).map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+
+        let mut h = input.clone();
+        for layer in &mut self.layers {
+            h = layer
+                .forward(&h, pos_offset)
+                .map_err(|e| FerrumError::model(format!("subtalker layer: {e}")))?;
+        }
+        h = h
+            .apply(&self.norm)
+            .map_err(|e| FerrumError::model(format!("subtalker norm: {e}")))?;
+
+        self.tokens_generated += seq_len;
+        Ok(h)
+    }
+
+    pub fn reset(&mut self) {
+        self.tokens_generated = 0;
+        for layer in &mut self.layers {
+            layer.reset_cache();
+        }
     }
 }

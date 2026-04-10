@@ -20,7 +20,7 @@ use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, Result};
 use tracing::info;
 
 use super::common;
-use crate::architectures::qwen3_tts::{Qwen3TTSTalker, TalkerConfig};
+use crate::architectures::qwen3_tts::{Qwen3TTSTalker, SubTalker, TalkerConfig};
 use crate::architectures::qwen3_tts_vocoder::{Qwen3TTSVocoder, VocoderConfig};
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -36,6 +36,7 @@ const REPETITION_PENALTY: f32 = 1.05;
 /// Qwen3-TTS executor: text-to-speech synthesis.
 pub struct TtsModelExecutor {
     talker: Qwen3TTSTalker,
+    sub_talker: SubTalker,
     vocoder: Qwen3TTSVocoder,
     text_tokenizer: tokenizers::Tokenizer,
     config: TalkerConfig,
@@ -72,7 +73,10 @@ impl TtsModelExecutor {
             VarBuilder::from_mmaped_safetensors(&talker_weights, dtype, &device)
                 .map_err(|e| FerrumError::model(format!("load talker weights: {e}")))?
         };
-        let talker = Qwen3TTSTalker::load(&config, talker_vb, device.clone())?;
+        let talker = Qwen3TTSTalker::load(&config, talker_vb.clone(), device.clone())?;
+
+        // Load SubTalker (code predictor) from same weights file
+        let sub_talker = SubTalker::load(&config, talker_vb, device.clone())?;
 
         // Load Vocoder weights from speech_tokenizer/model.safetensors
         let vocoder_dir = dir.join("speech_tokenizer");
@@ -123,6 +127,7 @@ impl TtsModelExecutor {
 
         Ok(Self {
             talker,
+            sub_talker,
             vocoder,
             text_tokenizer,
             config,
@@ -183,17 +188,17 @@ impl TtsModelExecutor {
             .map_err(|e| FerrumError::model(format!("cat embeds: {e}")))?;
 
         // 3. Prefill: forward through transformer
-        let hidden = self.talker.forward_step(&prefill_embeds)?;
+        let mut hidden = self.talker.forward_step(&prefill_embeds)?;
 
         // Get logits from last position
-        let last_hidden = hidden
-            .narrow(1, hidden.dim(1).unwrap() - 1, 1)
-            .map_err(|e| FerrumError::model(format!("narrow: {e}")))?;
-        let logits = self.talker.logits(&last_hidden)?;
+        let current_logits = self.talker.logits(
+            &hidden.narrow(1, hidden.dim(1).unwrap() - 1, 1)
+                .map_err(|e| FerrumError::model(format!("narrow: {e}")))?,
+        )?;
 
         // 4. Autoregressive decode loop: generate codec token 0 per step
         let mut all_codec_tokens: Vec<Vec<u32>> = Vec::new();
-        let mut current_logits = logits;
+        let mut current_logits = current_logits;
 
         for step in 0..MAX_CODEC_TOKENS {
             // Sample next codec token from logits
@@ -206,25 +211,46 @@ impl TtsModelExecutor {
                 break;
             }
 
-            // For code group 0, we have the token from the main talker
-            let mut frame_codes = vec![next_token];
+            // Get last hidden state from talker for SubTalker
+            let last_hidden = hidden
+                .narrow(1, hidden.dim(1).unwrap() - 1, 1)
+                .map_err(|e| FerrumError::model(format!("last_hidden: {e}")))?;
 
-            // TODO: Use SubTalker (code_predictor) to predict remaining codec tokens
-            // for code groups 1..num_code_groups-1.
-            // For now, pad with codec_pad_id.
-            for _g in 1..self.config.num_code_groups {
-                frame_codes.push(self.config.codec_pad_id);
-            }
-
-            all_codec_tokens.push(frame_codes);
-
-            // Embed the generated token and forward one step
+            // Embed first codec token
             let token_tensor = Tensor::new(&[next_token], &device)
                 .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?
                 .unsqueeze(0)
                 .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?;
-            let token_embed = self.talker.embed_codec(&token_tensor)?;
-            let hidden = self.talker.forward_step(&token_embed)?;
+            let first_codec_embed = self.talker.embed_codec(&token_tensor)?;
+
+            // SubTalker: predict remaining codec tokens 1..num_code_groups-1
+            let extra_codes = self.sub_talker.predict(
+                &last_hidden,
+                &first_codec_embed,
+                TEMPERATURE,
+                TOP_K,
+            )?;
+
+            let mut frame_codes = vec![next_token];
+            frame_codes.extend_from_slice(&extra_codes);
+            all_codec_tokens.push(frame_codes);
+
+            // Build combined embedding for next talker step:
+            // sum of all codec embeddings (token 0 from main talker + tokens 1-15 from sub-talker)
+            let mut combined_embed = first_codec_embed.clone();
+            for (i, &code) in extra_codes.iter().enumerate() {
+                let code_t = Tensor::new(&[code], &device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| FerrumError::model(format!("code_t: {e}")))?;
+                let sub_embed = code_t
+                    .apply(&self.sub_talker.codec_embeddings[i])
+                    .map_err(|e| FerrumError::model(format!("sub_embed: {e}")))?;
+                combined_embed = (combined_embed + sub_embed)
+                    .map_err(|e| FerrumError::model(format!("add embed: {e}")))?;
+            }
+
+            // Forward combined embedding through talker
+            let hidden = self.talker.forward_step(&combined_embed)?;
             current_logits = self.talker.logits(&hidden)?;
         }
 
@@ -404,7 +430,7 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
 }
 
 /// Sample a token from logits with temperature, top-k, and repetition penalty.
-fn sample_token(
+pub fn sample_token(
     logits: &[f32],
     temperature: f32,
     top_k: usize,
