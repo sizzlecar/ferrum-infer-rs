@@ -469,8 +469,13 @@ impl TtsModelExecutor {
             .narrow(1, 2, 1)
             .map_err(|e| FerrumError::model(format!("tts_pad narrow: {e}")))?;
 
-        // Resolve language_id
-        let language_id = self.config.codec_language_id.get(&language.to_lowercase());
+        // Resolve language_id — "auto" defaults to "chinese"
+        let resolved_lang = if language.eq_ignore_ascii_case("auto") {
+            "chinese"
+        } else {
+            language
+        };
+        let language_id = self.config.codec_language_id.get(&resolved_lang.to_lowercase());
 
         // Codec prefix: [think, think_bos, lang, think_eos] or [nothink, think_bos, think_eos]
         let codec_prefix_ids = if let Some(&lang_id) = language_id {
