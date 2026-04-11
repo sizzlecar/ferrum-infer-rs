@@ -1,0 +1,15 @@
+[package]
+name = "ferrum-attention"
+version = "0.1.0"
+edition = "2021"
+description = "Fused flash attention for Metal and CPU — production-grade, framework-independent"
+
+[features]
+default = []
+metal = ["dep:metal", "dep:objc2", "dep:objc2-foundation"]
+
+[dependencies]
+# Metal (macOS only)
+metal = { version = "0.31", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", features = ["NSString"], optional = true }
