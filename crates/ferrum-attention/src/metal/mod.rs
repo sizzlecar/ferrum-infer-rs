@@ -3,6 +3,9 @@
 //! Fused single-kernel attention on GPU. No intermediate buffers.
 //! Accepts raw Metal Buffer references to avoid CPU↔GPU copies.
 
+pub mod pipelines;
+pub mod transformer;
+
 use crate::AttentionParams;
 use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLSize, MTLResourceOptions};
 use std::ffi::c_void;
