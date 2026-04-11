@@ -7,9 +7,16 @@
 - Prefill (73 tokens × 28 layers, 新的 fused path)
 - Decode loop
 
-**已加计时日志**但未能成功运行收集数据。管道 (`| grep`) 会截断后台进程的 stdout 导致进程被 SIGPIPE 杀死。
+**部分计时数据收集到**（进程被管道 SIGPIPE 杀死，但前几步数据在）：
 
-**正确的调试方式**：`2>&1 > /tmp/log.txt` 重定向到文件，不用管道。
+```
+Step 2 (speaker embed):    36.8ms  ✓ 正常
+Step 3 (speech tokenizer): 587.1ms ✓ 正常
+Steps 4-5 (tokenize+prompt): 89.7ms ✓ 正常
+Prefill (28 layers fused): ??? — 进程被杀，未出数据
+```
+
+**卡点确认在 Prefill** — 28 层 fused transformer forward。每层 4 次 Metal cmd.commit()+wait() = 112 次 GPU sync。
 
 ## 架构
 
