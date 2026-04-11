@@ -366,45 +366,33 @@ impl Attention {
         };
         self.kv_cache = Some((k.clone(), v.clone()));
 
-        // GQA: repeat KV heads
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(k, n_rep)?;
-        let v = repeat_kv(v, n_rep)?;
+        // Fused flash attention via ferrum-attention
+        let kv_len = k.dim(2)?;
+        let nh = self.num_heads;
+        let nkv = self.num_kv_heads;
 
-        // Scaled dot-product attention
-        let scale = (hd as f64).sqrt();
-        let attn = (q.matmul(&k.transpose(2, 3)?)? / scale)?;
-        // Causal mask: only needed for seq_len > 1 (prefill)
-        let attn = if seq_len > 1 {
-            let kv_len = pos_offset + seq_len;
-            let mask_data: Vec<f32> = (0..seq_len)
-                .flat_map(|i| {
-                    (0..kv_len).map(move |j| {
-                        if j <= pos_offset + i {
-                            0f32
-                        } else {
-                            f32::NEG_INFINITY
-                        }
-                    })
-                })
-                .collect();
-            let mask = Tensor::from_vec(mask_data, (1, 1, seq_len, kv_len), x.device())?;
-            attn.broadcast_add(&mask)?
-        } else {
-            attn
+        let params = ferrum_attention::AttentionParams {
+            batch: b, num_heads: nh, num_kv_heads: nkv,
+            q_len: seq_len, kv_len, head_dim: hd,
+            causal: seq_len > 1, pos_offset,
         };
-        // Manual softmax for Metal compatibility
-        let attn = {
-            let max = attn.max_keepdim(D::Minus1)?;
-            let shifted = attn.broadcast_sub(&max)?;
-            let exp = shifted.exp()?;
-            let sum = exp.sum_keepdim(D::Minus1)?;
-            exp.broadcast_div(&sum)?
-        };
-        let out = attn
-            .matmul(&v)?
-            .transpose(1, 2)?
-            .reshape((b, seq_len, ()))?;
+
+        // Make Q/K/V contiguous in [b*heads, seq, hd] layout
+        let q_c = q.reshape((b * nh, seq_len, hd))?.contiguous()?;
+        let k_c = k.reshape((b * nkv, kv_len, hd))?.contiguous()?;
+        let v_c = v.reshape((b * nkv, kv_len, hd))?.contiguous()?;
+
+        // Fused attention: extract to CPU, run via ferrum-attention (Metal or CPU auto)
+        let cpu = candle_core::Device::Cpu;
+        let q_data: Vec<f32> = q_c.to_device(&cpu)?.flatten_all()?.to_vec1()?;
+        let k_data: Vec<f32> = k_c.to_device(&cpu)?.flatten_all()?.to_vec1()?;
+        let v_data: Vec<f32> = v_c.to_device(&cpu)?.flatten_all()?.to_vec1()?;
+        let mut out_data = vec![0.0f32; b * nh * seq_len * hd];
+        ferrum_attention::attention(&q_data, &k_data, &v_data, &mut out_data, &params);
+        let out = Tensor::from_vec(out_data, (b, nh, seq_len, hd), &cpu)?
+            .to_device(x.device())?;
+
+        let out = out.transpose(1, 2)?.reshape((b, seq_len, nh * hd))?;
         out.apply(&self.o_proj)
     }
 
