@@ -364,6 +364,7 @@ impl TtsModelExecutor {
             ref_pcm.len() as f64 / 24000.0
         );
 
+        let t0 = std::time::Instant::now();
         // Step 2: Extract speaker embedding via ECAPA-TDNN
         let speaker_encoder = self
             .speaker_encoder
@@ -381,6 +382,8 @@ impl TtsModelExecutor {
             .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("spk unsqueeze(0) 2: {e}")))?;
 
+        info!("Step 2 (speaker embed): {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        let t1 = std::time::Instant::now();
         // Step 3: Encode reference audio to codec tokens (ICL)
         let speech_enc = self
             .speech_tokenizer_encoder
@@ -410,6 +413,8 @@ impl TtsModelExecutor {
             info!("  rust codec frame {}: {:?}", i, &ref_codes[i]);
         }
 
+        info!("Step 3 (speech tokenizer): {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
+        let t2 = std::time::Instant::now();
         // Step 4: Tokenize target text with chat template
         let chat_text = format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n");
         let encoding = self
@@ -631,8 +636,11 @@ impl TtsModelExecutor {
             }
         }
 
+        info!("Steps 4-5 (tokenize+prompt): {:.1}ms", t2.elapsed().as_secs_f64() * 1000.0);
+        let t3 = std::time::Instant::now();
         // Step 6: Prefill and decode
         let mut hidden = self.talker.forward_step(&talker_input)?;
+        info!("Prefill ({} tokens, {} layers): {:.1}ms", prefill_len, self.config.num_hidden_layers, t3.elapsed().as_secs_f64() * 1000.0);
         let hidden_len = hidden
             .dim(1)
             .map_err(|e| FerrumError::model(format!("hidden dim: {e}")))?;

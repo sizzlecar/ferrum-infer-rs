@@ -66,29 +66,26 @@ impl MetalPipelines {
     }
 
     /// Run GEMM: C[M,N] = A[M,K] @ B[N,K]^T
-    pub fn gemm(&self, cmd: &CommandBufferRef, a: &Buffer, b: &Buffer, c: &Buffer, m: usize, n: usize, k: usize) {
-        #[repr(C)]
-        struct P { m: i32, n: i32, k: i32 }
-        let params = P { m: m as i32, n: n as i32, k: k as i32 };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void, 12, MTLResourceOptions::StorageModeShared);
-
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(self.pipeline("gemm_f32"));
-        enc.set_buffer(0, Some(a), 0);
-        enc.set_buffer(1, Some(b), 0);
-        enc.set_buffer(2, Some(c), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
-        // Threadgroup shared memory for A and B tiles (64 floats each)
-        enc.set_threadgroup_memory_length(0, 256); // shmem_a: 8*8*4 bytes
-        enc.set_threadgroup_memory_length(1, 256); // shmem_b: 8*8*4 bytes
-        // Grid: one threadgroup per 8x8 output tile
-        let tiles_n = (n + 7) / 8;
-        let tiles_m = (m + 7) / 8;
-        let grid = MTLSize::new(tiles_n as u64, tiles_m as u64, 1);
-        let tg = MTLSize::new(32, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+    /// Uses Accelerate cblas_sgemm on shared Metal buffers (zero-copy on Apple Silicon).
+    pub fn gemm(&self, _cmd: &CommandBufferRef, a: &Buffer, b: &Buffer, c: &Buffer, m: usize, n: usize, k: usize) {
+        extern "C" {
+            fn cblas_sgemm(
+                order: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32,
+                alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32,
+                beta: f32, c: *mut f32, ldc: i32,
+            );
+        }
+        unsafe {
+            cblas_sgemm(
+                101, 111, 112, // RowMajor, NoTrans, Trans
+                m as i32, n as i32, k as i32,
+                1.0,
+                a.contents() as *const f32, k as i32,
+                b.contents() as *const f32, k as i32,
+                0.0,
+                c.contents() as *mut f32, n as i32,
+            );
+        }
     }
 
     /// Run RMS norm: out = rms_norm(input) * weight

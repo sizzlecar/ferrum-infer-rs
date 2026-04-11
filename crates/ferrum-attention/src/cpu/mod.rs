@@ -1,5 +1,7 @@
 //! CPU fused attention using Accelerate cblas_sgemm + single-pass softmax.
 
+pub mod transformer;
+
 use crate::AttentionParams;
 
 // ── BLAS binding ────────────────────────────────────────────────────��───

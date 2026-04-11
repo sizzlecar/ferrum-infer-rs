@@ -499,6 +499,7 @@ pub struct Qwen3TTSTalker {
     config: TalkerConfig,
     device: CandleDevice,
     tokens_generated: usize,
+    fused: ferrum_attention::FusedTransformer,
 }
 
 impl Qwen3TTSTalker {
@@ -548,13 +549,56 @@ impl Qwen3TTSTalker {
         )
         .map_err(|e| FerrumError::model(format!("codec_head: {e}")))?;
 
+        // Build fused transformer (Metal or CPU, bypasses candle for precision)
+        let to_cpu_vec = |t: &Tensor| -> candle_core::Result<Vec<f32>> {
+            t.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()
+        };
+        let get_w = |vb: &VarBuilder, shape: candle_core::Shape, name: &str| -> Result<Vec<f32>> {
+            let t = vb.get(shape, name).map_err(|e| FerrumError::model(format!("w {name}: {e}")))?;
+            to_cpu_vec(&t).map_err(|e| FerrumError::model(format!("vec {name}: {e}")))
+        };
+
+        let mut fused_layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            let lv = model_vb.pp(format!("layers.{i}"));
+            let av = lv.pp("self_attn");
+            let mv = lv.pp("mlp");
+            fused_layers.push(ferrum_attention::LayerWeights {
+                input_ln_w: get_w(&lv.pp("input_layernorm"), cfg.hidden_size.into(), "weight")?,
+                q_proj_w: get_w(&av.pp("q_proj"), (cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size).into(), "weight")?,
+                k_proj_w: get_w(&av.pp("k_proj"), (cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size).into(), "weight")?,
+                v_proj_w: get_w(&av.pp("v_proj"), (cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size).into(), "weight")?,
+                o_proj_w: get_w(&av.pp("o_proj"), (cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim).into(), "weight")?,
+                q_norm_w: get_w(&av.pp("q_norm"), cfg.head_dim.into(), "weight")?,
+                k_norm_w: get_w(&av.pp("k_norm"), cfg.head_dim.into(), "weight")?,
+                post_ln_w: get_w(&lv.pp("post_attention_layernorm"), cfg.hidden_size.into(), "weight")?,
+                gate_proj_w: get_w(&mv.pp("gate_proj"), (cfg.intermediate_size, cfg.hidden_size).into(), "weight")?,
+                up_proj_w: get_w(&mv.pp("up_proj"), (cfg.intermediate_size, cfg.hidden_size).into(), "weight")?,
+                down_proj_w: get_w(&mv.pp("down_proj"), (cfg.hidden_size, cfg.intermediate_size).into(), "weight")?,
+            });
+        }
+        let norm_w = to_cpu_vec(&norm.weight)
+            .map_err(|e| FerrumError::model(format!("norm_w: {e}")))?;
+
+        let fused = ferrum_attention::FusedTransformer::new(
+            ferrum_attention::TransformerConfig {
+                hidden_size: cfg.hidden_size,
+                intermediate_size: cfg.intermediate_size,
+                num_heads: cfg.num_attention_heads,
+                num_kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                num_layers: cfg.num_hidden_layers,
+                rms_norm_eps: cfg.rms_norm_eps,
+                rope_theta: cfg.rope_theta,
+                max_position_embeddings: cfg.max_position_embeddings,
+            },
+            fused_layers,
+            norm_w,
+        );
+
         info!(
-            "Qwen3TTSTalker loaded: hidden={}, layers={}, heads={}/{}, vocab={}",
-            cfg.hidden_size,
-            cfg.num_hidden_layers,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.vocab_size,
+            "Qwen3TTSTalker loaded: hidden={}, layers={}, heads={}/{}, vocab={} (fused transformer ready)",
+            cfg.hidden_size, cfg.num_hidden_layers, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.vocab_size,
         );
 
         Ok(Self {
@@ -567,6 +611,7 @@ impl Qwen3TTSTalker {
             config: cfg.clone(),
             device,
             tokens_generated: 0,
+            fused,
         })
     }
 
@@ -587,35 +632,29 @@ impl Qwen3TTSTalker {
             .map_err(|e| FerrumError::model(format!("codec_embed: {e}")))
     }
 
-    /// Forward one step through transformer layers. Returns hidden states.
+    /// Forward through fused transformer (Metal or CPU, bypasses candle).
     pub fn forward_step(&mut self, input_embeds: &Tensor) -> Result<Tensor> {
-        let pos_offset = self.tokens_generated;
-        let seq_len = input_embeds
-            .dim(1)
+        let seq_len = input_embeds.dim(1)
             .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+        let h = self.config.hidden_size;
 
-        let mut hidden = input_embeds.clone();
-        for (li, layer) in self.layers.iter_mut().enumerate() {
-            hidden = layer
-                .forward(&hidden, pos_offset)
-                .map_err(|e| FerrumError::model(format!("layer {li} forward: {e}")))?;
-            if li == 0 && seq_len > 1 {
-                // Debug: dump layer 0 output at last position
-                if let Ok(vals) = hidden.narrow(0, 0, 1)
-                    .and_then(|t| t.narrow(1, seq_len - 1, 1))
-                    .and_then(|t| t.narrow(2, 0, 5))
-                    .and_then(|t| t.flatten_all())
-                    .and_then(|t| t.to_vec1::<f32>()) {
-                    info!("Talker layer 0, pos -1 first 5: {:?}", vals);
-                }
-            }
-        }
-        hidden = hidden
-            .apply(&self.norm)
-            .map_err(|e| FerrumError::model(format!("norm: {e}")))?;
+        // Extract input to CPU f32
+        let input_data: Vec<f32> = input_embeds
+            .to_device(&candle_core::Device::Cpu)
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+            .map_err(|e| FerrumError::model(format!("input extract: {e}")))?;
+
+        // Run through fused transformer (all layers + final norm)
+        let output = self.fused.forward(&input_data, seq_len);
 
         self.tokens_generated += seq_len;
-        Ok(hidden)
+
+        // Convert back to tensor
+        Tensor::from_vec(output, (1, seq_len, h), &candle_core::Device::Cpu)
+            .and_then(|t| t.to_device(&self.device))
+            .map_err(|e| FerrumError::model(format!("output tensor: {e}")))
     }
 
     /// Get logits from hidden states.
@@ -627,6 +666,7 @@ impl Qwen3TTSTalker {
 
     pub fn reset(&mut self) {
         self.tokens_generated = 0;
+        self.fused.reset();
         for layer in &mut self.layers {
             layer.reset_cache();
         }
