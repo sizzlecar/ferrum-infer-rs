@@ -80,6 +80,7 @@ default = []
 benchmark = []  # Enable benchmarking utilities
 dev-tools = []  # Enable development tools
 interactive = [] # Enable interactive mode
+accelerate = ["ferrum-engine/accelerate"]  # Use Apple Accelerate BLAS (matches PyTorch precision)
 metal = ["ferrum-engine/metal"]  # Enable Apple GPU acceleration
 cuda = ["ferrum-engine/cuda"]    # Enable NVIDIA CUDA acceleration (includes Marlin INT4)
 marlin = ["cuda"]  # backward compat alias
