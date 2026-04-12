@@ -42,17 +42,14 @@ pub fn cpu_layer_forward(
     // 4. KV cache
     let (full_k, full_v, kv_len) = update_kv(kv_cache, &k_r, &v_r, nkv, tokens, hd);
 
-    // 5. Fused attention
-    let n_rep = nh / nkv;
-    let k_rep = repeat_kv(&full_k, nkv, n_rep, kv_len, hd);
-    let v_rep = repeat_kv(&full_v, nkv, n_rep, kv_len, hd);
+    // 5. Fused attention (GQA handled internally — no repeat_kv needed)
     let params = AttentionParams {
         batch: 1, num_heads: nh, num_kv_heads: nkv,
         q_len: tokens, kv_len, head_dim: hd,
         causal: tokens > 1, pos_offset,
     };
     let mut attn_out = vec![0.0f32; nh * tokens * hd];
-    super::fused_attention(&q_r, &k_rep, &v_rep, &mut attn_out, &params);
+    super::fused_attention(&q_r, &full_k, &full_v, &mut attn_out, &params);
 
     // 6. Transpose back + O projection
     let attn_flat = untranspose(&attn_out, tokens, nh, hd);
@@ -79,6 +76,10 @@ extern "C" {
     fn cblas_sgemm(order: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32,
         alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32,
         beta: f32, c: *mut f32, ldc: i32);
+    /// vDSP dot product: sum of a[i]*b[i] with SIMD acceleration
+    fn vDSP_dotpr(a: *const f32, a_stride: i32, b: *const f32, b_stride: i32, result: *mut f32, n: u64);
+    /// vDSP vector-scalar multiply
+    fn vDSP_vsmul(a: *const f32, a_stride: i32, scalar: *const f32, result: *mut f32, r_stride: i32, n: u64);
 }
 
 fn matmul_at_bt(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
@@ -102,27 +103,53 @@ fn matmul_at_bt(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> 
 
 fn rms_norm(x: &[f32], w: &[f32], tokens: usize, dim: usize, eps: f64) -> Vec<f32> {
     let mut out = vec![0.0f32; tokens * dim];
+    let eps_f32 = eps as f32;
     for t in 0..tokens {
         let row = &x[t*dim..(t+1)*dim];
         let o = &mut out[t*dim..(t+1)*dim];
-        let mut v = 0.0f64;
-        for &val in row { let f = val as f64; v += f * f; }
-        let inv = 1.0 / (v / dim as f64 + eps).sqrt();
-        for i in 0..dim { o[i] = (row[i] as f64 * inv) as f32 * w[i]; }
+        // Use vDSP_dotpr for sum-of-squares (same SIMD reduction as PyTorch on macOS ARM)
+        let sum_sq;
+        #[cfg(target_os = "macos")]
+        {
+            let mut dot = 0.0f32;
+            unsafe { vDSP_dotpr(row.as_ptr(), 1, row.as_ptr(), 1, &mut dot, dim as u64); }
+            sum_sq = dot;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut v = 0.0f32;
+            for &val in row { v += val * val; }
+            sum_sq = v;
+        }
+        let inv = 1.0f32 / (sum_sq / dim as f32 + eps_f32).sqrt();
+        for i in 0..dim { o[i] = row[i] * inv * w[i]; }
     }
     out
 }
 
 fn transpose_and_norm(flat: &[f32], tokens: usize, heads: usize, hd: usize, w: &[f32], eps: f64) -> Vec<f32> {
     let mut out = vec![0.0f32; heads * tokens * hd];
+    let eps_f32 = eps as f32;
     for t in 0..tokens {
         for hi in 0..heads {
             let src = t * heads * hd + hi * hd;
             let dst = hi * tokens * hd + t * hd;
-            let mut v = 0.0f64;
-            for d in 0..hd { let f = flat[src+d] as f64; v += f * f; }
-            let inv = 1.0 / (v / hd as f64 + eps).sqrt();
-            for d in 0..hd { out[dst+d] = (flat[src+d] as f64 * inv) as f32 * w[d]; }
+            // vDSP_dotpr for sum-of-squares (same SIMD as PyTorch)
+            let sum_sq;
+            #[cfg(target_os = "macos")]
+            {
+                let mut dot = 0.0f32;
+                unsafe { vDSP_dotpr(flat[src..].as_ptr(), 1, flat[src..].as_ptr(), 1, &mut dot, hd as u64); }
+                sum_sq = dot;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let mut v = 0.0f32;
+                for d in 0..hd { v += flat[src+d] * flat[src+d]; }
+                sum_sq = v;
+            }
+            let inv = 1.0f32 / (sum_sq / hd as f32 + eps_f32).sqrt();
+            for d in 0..hd { out[dst+d] = flat[src+d] * inv * w[d]; }
         }
     }
     out

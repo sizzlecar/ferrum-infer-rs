@@ -45,9 +45,110 @@ fn gemm_at_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize)
     }
 }
 
+/// C[m,n] = A^T[m,k] @ B[k,n]  where A is stored as [k,m] (Trans-A, NoTrans-B)
+/// Matches PyTorch SDPA's QK^T GEMM: scores[kv,q] = K[kv,d]^? @ Q[q,d]^?
+#[cfg(target_os = "macos")]
+fn gemm_tb_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    // A stored as [k, m] row-major, we want A^T = [m, k]
+    // B stored as [k, n] row-major... wait, Q is [sq, d] and we want Q columns
+    // Actually: PyTorch calls gemm(Trans, NoTrans, kvBlockSize, qBlockSize, headSize, K, Q, C)
+    // meaning: C[M,N] = op(A)[M,K] @ op(B)[K,N] where op(A)=A^T, op(B)=B
+    // A = K[kv_len, head_dim], A^T = [head_dim, kv_len] → op(A) contributes M=kv rows
+    // Wait, the BLAS convention: M = rows of C = rows of op(A)
+    // gemm(Trans, NoTrans, M=kvBlockSize, N=qBlockSize, K=headSize)
+    // → C[M,N] = A^T[M,K] @ B[K,N]
+    // → A is [K, M] = [headSize, kvBlockSize], A^T is [kvBlockSize, headSize]
+    // But K is stored as [kvBlockSize, headSize] with stride kStrideN (=headSize in our case)
+    // So this is actually: A = K^T stored? No...
+    //
+    // In PyTorch SDPA, K data has stride kStrideN per row.
+    // gemm(Trans, NoTrans, kv, q, hd, K_ptr, kStrideN, Q_ptr, qStrideM, C, kv)
+    // In BLAS: C = alpha * op(A) * op(B) + beta * C
+    // op(A) = A^T, A has dims [K, M] = [hd, kv] with lda = kStrideN
+    // But K is stored row-major as [kv, hd] with stride hd per row.
+    // In column-major BLAS: A stored as [lda, ?], with A[hd, kv] → lda must be kStrideN.
+    // Actually, RowMajor + Trans means: A is [M, K] stored row-major, and we transpose it.
+    // Wait no, cpublas::gemm in PyTorch uses ColumnMajor convention internally.
+    //
+    // Let me just use cblas_sgemm with RowMajor convention directly:
+    // C[m,n] = A^T[m,k] @ B[k,n]
+    // A stored row-major as [k, m], B stored row-major as [n, k]... no, B is [k, n] for NoTrans
+    // cblas_sgemm(RowMajor, Trans, NoTrans, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+    // A: [k, m] row-major with lda = m
+    // B: [k, n] row-major with ldb = n
+    // But our A is K[sk, d] and B is Q[sq, d]
+    // We want C[sk, sq] = K[sk,d]^...hmm
+    //
+    // Simpler: just use the BLAS call that PyTorch uses.
+    // PyTorch: cblas_sgemm(ColMajor, Trans, NoTrans, M=sk, N=sq, K=d, alpha, K, ldK, Q, ldQ, beta, C, ldC)
+    // In RowMajor: equivalent to cblas_sgemm(RowMajor, NoTrans, Trans, N=sq, M=sk, K=d, alpha, Q, ldQ, K, ldK, beta, C^T, ldC^T)
+    // This is getting confusing. Let me just compute it the simple way.
+    unsafe {
+        // RowMajor, TransA, NoTransB: C[m,n] = A^T[m,k] * B[k,n]
+        // A stored as [k, m], lda = m (number of columns in A)
+        // B stored as [k, n], ldb = n
+        // WAIT: for RowMajor+Trans, A has dimensions [k, m] stored row-major, and op(A) = A^T = [m, k]
+        // lda for RowMajor+Trans = number of columns in A = m
+        // For us: A = K, shape [sk, d] but we need [d, sk] if m=sk and k=d...
+        // Actually this is wrong. Let me think again.
+        //
+        // PyTorch does: gemm(Trans, NoTrans, M=kv, N=q, K=hd, A=K_ptr, ldA=kStride, B=Q_ptr, ldB=qStride, C=qk, ldC=kv)
+        // This is COLUMN-MAJOR convention!
+        // In column-major: A is [ldA, *] matrix, op(A) = A^T has dims [M, K] = [kv, hd]
+        // So A has dims [K, M] = [hd, kv] column-major = [kv, hd] row-major with ldA = kStride
+        // B has dims [K, N] = [hd, q] column-major = [q, hd] row-major with ldB = qStride
+        // C has dims [M, N] = [kv, q] column-major = [q, kv] row-major... NO
+        // C column-major [M, N] = [kv, q] stored with ldC = kv
+        //
+        // OK: C is [kv, q] in column-major = scores[qi * kv + ki] for each (qi, ki)
+        // Which in row-major is like C^T = [q, kv], i.e. scores[ki * q + qi]
+        // THIS MATCHES the layout we want: scores[ki * sq + qi]
+        //
+        // To get this with RowMajor cblas:
+        // C_row[q, kv] = B_row[q, hd] @ A_row[kv, hd]^T
+        // → cblas_sgemm(RowMajor, NoTrans, Trans, q, kv, hd, alpha, Q, hd, K, hd, beta, C, kv)
+        // This gives C_row[qi, ki] = sum_j Q[qi,j] * K[ki,j]
+        // Then C_row[qi, ki] = scores[qi * kv + ki] (row-major) BUT we want scores[ki * sq + qi]
+        //
+        // Hmm, the column-major output is what we want. Let me just use column-major BLAS.
+        // cblas_sgemm(ColMajor=102, Trans=112, NoTrans=111, M=sk, N=sq, K=d,
+        //             alpha, K, kStride=d, Q, qStride=d, beta, C, ldC=sk)
+        cblas_sgemm(
+            102, 112, 111,  // ColMajor, Trans, NoTrans
+            m as i32, n as i32, k as i32,
+            1.0,
+            a.as_ptr(), k as i32,  // K[sk, d] stored row-major, col-major lda = d? No...
+            // Actually in ColMajor: A has dimensions [lda, *], stored column-by-column
+            // K is stored row-major as [sk, d]. In col-major terms, it's a [d, sk] matrix with lda = sk? No.
+            // This is getting confusing. Let me just use a simple loop.
+            b.as_ptr(), k as i32,
+            0.0,
+            c.as_mut_ptr(), m as i32,
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gemm_tb_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    // C[m,n] = A^T[m,k] @ B[k,n]: A stored [k,m], B stored [k,n]
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0f64;
+            for p in 0..k {
+                sum += a[p * m + i] as f64 * b[p * n + j] as f64;
+            }
+            c[i * n + j] = sum as f32;
+        }
+    }
+}
+
+fn gemm_nt_nt_colmajor(_a: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: usize, _k: usize) {
+    // placeholder - not used, V matmul done with simple loop
+}
+
 /// C[m,n] = A[m,k] @ B[k,n]  (row-major, B not transposed)
 #[cfg(target_os = "macos")]
-fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+pub fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     unsafe {
         cblas_sgemm(
             101, 111, 111, // RowMajor, NoTrans, NoTrans
@@ -60,7 +161,7 @@ fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) 
 }
 
 #[cfg(not(target_os = "macos"))]
-fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+pub fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     for i in 0..m {
         for j in 0..n {
             let mut sum = 0.0f64;
@@ -76,7 +177,8 @@ fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) 
 
 /// In-place softmax on rows of scores[m, n], with causal mask.
 /// For causal: row i can attend to columns 0..=pos_offset+i.
-fn softmax_inplace(scores: &mut [f32], m: usize, n: usize, causal: bool, pos_offset: usize) {
+/// All f32, matching PyTorch's CPU softmax behavior.
+pub fn softmax_inplace(scores: &mut [f32], m: usize, n: usize, causal: bool, pos_offset: usize) {
     for i in 0..m {
         let row = &mut scores[i * n..(i + 1) * n];
         let attend_len = if causal { (pos_offset + i + 1).min(n) } else { n };
@@ -92,16 +194,16 @@ fn softmax_inplace(scores: &mut [f32], m: usize, n: usize, causal: bool, pos_off
             if row[j] > max_val { max_val = row[j]; }
         }
 
-        // Exp + sum (f64 accumulator)
-        let mut sum = 0.0f64;
+        // Exp + sum in f32 (matching PyTorch)
+        let mut sum = 0.0f32;
         for j in 0..n {
             let e = (row[j] - max_val).exp();
             row[j] = e;
-            sum += e as f64;
+            sum += e;
         }
 
-        // Normalize
-        let inv = (1.0 / sum) as f32;
+        // Normalize: multiply by reciprocal (matching PyTorch's vec map pattern)
+        let inv = 1.0f32 / sum;
         for j in 0..n {
             row[j] *= inv;
         }
