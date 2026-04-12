@@ -512,13 +512,183 @@ impl DecoderBlock {
     }
 }
 
+// ── Vocoder Pre-Transformer (8-layer decoder with layer_scale) ──────────
+
+/// Single transformer layer for the vocoder's pre_transformer.
+/// hidden_size=512, num_heads=16, head_dim=64, intermediate=1024, with layer_scale.
+struct VocoderTransformerLayer {
+    input_ln: RmsNorm,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    attn_layer_scale: Tensor,  // [512] scalar broadcast
+    post_ln: RmsNorm,
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+    mlp_layer_scale: Tensor,   // [512] scalar broadcast
+}
+
+impl VocoderTransformerLayer {
+    fn load(vb: VarBuilder, hidden: usize, eps: f64) -> candle_core::Result<Self> {
+        Ok(Self {
+            input_ln: candle_nn::rms_norm(hidden, eps, vb.pp("input_layernorm"))?,
+            q_proj: candle_nn::linear_no_bias(hidden, 16 * 64, vb.pp("self_attn").pp("q_proj"))?,
+            k_proj: candle_nn::linear_no_bias(hidden, 16 * 64, vb.pp("self_attn").pp("k_proj"))?,
+            v_proj: candle_nn::linear_no_bias(hidden, 16 * 64, vb.pp("self_attn").pp("v_proj"))?,
+            o_proj: candle_nn::linear_no_bias(16 * 64, hidden, vb.pp("self_attn").pp("o_proj"))?,
+            attn_layer_scale: vb.pp("self_attn_layer_scale").get(hidden, "scale")?,
+            post_ln: candle_nn::rms_norm(hidden, eps, vb.pp("post_attention_layernorm"))?,
+            gate_proj: candle_nn::linear_no_bias(hidden, 1024, vb.pp("mlp").pp("gate_proj"))?,
+            up_proj: candle_nn::linear_no_bias(hidden, 1024, vb.pp("mlp").pp("up_proj"))?,
+            down_proj: candle_nn::linear_no_bias(1024, hidden, vb.pp("mlp").pp("down_proj"))?,
+            mlp_layer_scale: vb.pp("mlp_layer_scale").get(hidden, "scale")?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        let residual = x;
+        let h = self.input_ln.forward(x)?;
+
+        // Self-attention (16 heads, head_dim=64, no GQA)
+        let (b, seq, _) = h.dims3()?;
+        let q = h.apply(&self.q_proj)?.reshape((b, seq, 16, 64))?.transpose(1, 2)?;
+        let k = h.apply(&self.k_proj)?.reshape((b, seq, 16, 64))?.transpose(1, 2)?;
+        let v = h.apply(&self.v_proj)?.reshape((b, seq, 16, 64))?.transpose(1, 2)?;
+
+        // RoPE
+        let q = apply_rope_vocoder(&q, cos, sin)?;
+        let k = apply_rope_vocoder(&k, cos, sin)?;
+
+        // Attention: Q@K^T * scale → mask → softmax → @V
+        let scale = (64.0f64).powf(-0.5);
+        let mut attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        if let Some(m) = mask {
+            attn = attn.broadcast_add(m)?;
+        }
+        let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
+        let attn_out = attn.matmul(&v)?
+            .transpose(1, 2)?
+            .reshape((b, seq, 16 * 64))?;
+        let attn_out = attn_out.apply(&self.o_proj)?;
+
+        // Layer scale + residual
+        let h = (residual + attn_out.broadcast_mul(&self.attn_layer_scale)?)?;
+
+        // MLP
+        let residual = &h;
+        let normed = self.post_ln.forward(&h)?;
+        let gate = normed.apply(&self.gate_proj)?;
+        let up = normed.apply(&self.up_proj)?;
+        let silu_gate = (gate.silu()? * up)?;
+        let mlp_out = silu_gate.apply(&self.down_proj)?;
+
+        // Layer scale + residual
+        (residual + mlp_out.broadcast_mul(&self.mlp_layer_scale)?)
+    }
+}
+
+/// RoPE for vocoder (standard, theta=10000, head_dim=64)
+fn apply_rope_vocoder(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    let d = x.dim(D::Minus1)?;
+    let x1 = x.narrow(D::Minus1, 0, d / 2)?;
+    let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
+    let cos = cos.broadcast_as(x1.shape())?;
+    let sin = sin.broadcast_as(x1.shape())?;
+    Tensor::cat(&[
+        &(x1.mul(&cos)? - x2.mul(&sin)?)?,
+        &(x2.mul(&cos)? + x1.mul(&sin)?)?,
+    ], D::Minus1)
+}
+
+/// Vocoder pre-transformer: input_proj → 8 layers → norm → output_proj
+struct VocoderPreTransformer {
+    input_proj: Linear,
+    layers: Vec<VocoderTransformerLayer>,
+    norm: RmsNorm,
+    output_proj: Linear,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+}
+
+impl VocoderPreTransformer {
+    fn load(cfg: &VocoderConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let h = cfg.hidden_size; // 512
+        let input_proj = candle_nn::linear(cfg.latent_dim, h, vb.pp("input_proj"))?;
+        let output_proj = candle_nn::linear(h, cfg.latent_dim, vb.pp("output_proj"))?;
+        let norm = candle_nn::rms_norm(h, cfg.rms_norm_eps, vb.pp("norm"))?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            layers.push(VocoderTransformerLayer::load(
+                vb.pp(format!("layers.{i}")), h, cfg.rms_norm_eps,
+            )?);
+        }
+
+        // Precompute cos/sin for RoPE (head_dim=64, theta=10000)
+        let head_dim = 64usize;
+        let half = head_dim / 2;
+        let max_seq = 4096;
+        let mut cos_data = vec![0.0f32; max_seq * half];
+        let mut sin_data = vec![0.0f32; max_seq * half];
+        for pos in 0..max_seq {
+            for i in 0..half {
+                let freq = 1.0f64 / cfg.rope_theta.powf((2 * i) as f64 / head_dim as f64);
+                let angle = pos as f64 * freq;
+                cos_data[pos * half + i] = angle.cos() as f32;
+                sin_data[pos * half + i] = angle.sin() as f32;
+            }
+        }
+        let dev = vb.device();
+        let cos_cache = Tensor::from_vec(cos_data, (max_seq, half), dev)?;
+        let sin_cache = Tensor::from_vec(sin_data, (max_seq, half), dev)?;
+
+        Ok(Self { input_proj, layers, norm, output_proj, cos_cache, sin_cache })
+    }
+
+    /// Forward: [B, T, latent_dim] → [B, T, latent_dim]
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let seq_len = x.dim(1)?;
+
+        // Input projection: 1024 → 512
+        let mut h = x.apply(&self.input_proj)?;
+
+        // Cos/sin for this sequence length
+        let cos = self.cos_cache.narrow(0, 0, seq_len)?
+            .unsqueeze(0)?.unsqueeze(0)?;
+        let sin = self.sin_cache.narrow(0, 0, seq_len)?
+            .unsqueeze(0)?.unsqueeze(0)?;
+
+        // Causal mask
+        let mask = {
+            let mut data = vec![0.0f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                for j in (i + 1)..seq_len {
+                    data[i * seq_len + j] = f32::NEG_INFINITY;
+                }
+            }
+            Tensor::from_vec(data, (1, 1, seq_len, seq_len), h.device())?
+        };
+
+        // 8 transformer layers
+        for layer in &self.layers {
+            h = layer.forward(&h, &cos, &sin, Some(&mask))?;
+        }
+
+        // Final norm + output projection: 512 → 1024
+        h = self.norm.forward(&h)?;
+        h.apply(&self.output_proj)
+    }
+}
+
 // ── Vocoder (top-level) ─────────────────────────────────────────────────
 
 /// Qwen3-TTS Vocoder: codec tokens → audio waveform.
 pub struct Qwen3TTSVocoder {
     quantizer: SplitResidualVectorQuantizer,
     pre_conv: CausalConv,
-    // pre_transformer omitted for now — will add when needed
+    pre_transformer: VocoderPreTransformer,
     upsample_blocks: Vec<(CausalTransConv, ConvNeXtBlock)>,
     decoder_first_conv: CausalConv,
     decoder_blocks: Vec<DecoderBlock>,
@@ -545,6 +715,10 @@ impl Qwen3TTSVocoder {
             decoder_vb.pp("pre_conv"),
         )
         .map_err(|e| FerrumError::model(format!("pre_conv: {e}")))?;
+
+        let pre_transformer = VocoderPreTransformer::load(cfg, decoder_vb.pp("pre_transformer"))
+            .map_err(|e| FerrumError::model(format!("pre_transformer: {e}")))?;
+        info!("Vocoder pre_transformer loaded: {} layers, hidden={}", cfg.num_hidden_layers, cfg.hidden_size);
 
         // Upsampling stages (before decoder)
         let mut upsample_blocks = Vec::new();
@@ -614,6 +788,7 @@ impl Qwen3TTSVocoder {
         Ok(Self {
             quantizer,
             pre_conv,
+            pre_transformer,
             upsample_blocks,
             decoder_first_conv,
             decoder_blocks,
@@ -640,14 +815,15 @@ impl Qwen3TTSVocoder {
             .forward(&hidden)
             .map_err(|e| FerrumError::model(format!("pre_conv: {e}")))?;
 
-        // Pre-transformer (skip for now — pass through)
-        // TODO: implement 8-layer transformer with sliding window attention
+        // Pre-transformer: [B, 1024, T] → transpose → 8-layer transformer → transpose back
         let hidden = hidden
             .transpose(1, 2)
-            .map_err(|e| FerrumError::model(format!("transpose: {e}")))?; // [B, T, latent]
+            .map_err(|e| FerrumError::model(format!("transpose: {e}")))?; // [B, T, 1024]
+        let hidden = self.pre_transformer.forward(&hidden)
+            .map_err(|e| FerrumError::model(format!("pre_transformer: {e}")))?; // [B, T, 1024]
         let hidden = hidden
             .transpose(1, 2)
-            .map_err(|e| FerrumError::model(format!("transpose back: {e}")))?; // [B, latent, T]
+            .map_err(|e| FerrumError::model(format!("transpose back: {e}")))?; // [B, 1024, T]
 
         // Upsampling: (2, 2)
         let mut hidden = hidden;
