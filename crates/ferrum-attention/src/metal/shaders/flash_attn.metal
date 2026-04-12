@@ -26,6 +26,7 @@ struct FlashAttnParams {
     float scale;
     int causal;       // 0 or 1
     int pos_offset;
+    int kv_seq_stride; // seq dimension stride for K/V (= kv_len for contiguous, = max_len for paged cache)
 };
 
 // Block size for KV processing — process this many KV positions per iteration
@@ -54,8 +55,9 @@ kernel void flash_attn_f32(
 
     // Pointers
     device const float* q_row = Q + ((bi * p.num_heads + hi) * p.q_len + qi) * d;
-    device const float* k_base = K + (bi * p.num_kv_heads + kv_hi) * sk * d;
-    device const float* v_base = V + (bi * p.num_kv_heads + kv_hi) * sk * d;
+    const int kv_stride = (p.kv_seq_stride > 0) ? p.kv_seq_stride : sk;
+    device const float* k_base = K + (bi * p.num_kv_heads + kv_hi) * kv_stride * d;
+    device const float* v_base = V + (bi * p.num_kv_heads + kv_hi) * kv_stride * d;
     device       float* o_row = O + ((bi * p.num_heads + hi) * p.q_len + qi) * d;
 
     // Online softmax state (per thread, then reduced)

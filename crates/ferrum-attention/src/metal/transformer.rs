@@ -1,5 +1,5 @@
-//! Full transformer layer — GEMM on Accelerate, attention + element-wise on Metal.
-//! All data in Metal shared buffers (zero-copy on Apple Silicon unified memory).
+//! All-Metal transformer layer — single command buffer, zero CPU-GPU sync.
+//! GEMM via simdgroup_multiply_accumulate (64x32 tiles), all ops on GPU.
 
 use metal::*;
 use super::pipelines::MetalPipelines;
@@ -11,8 +11,8 @@ pub struct MetalLayerWeights {
     pub k_proj_w: Buffer,
     pub v_proj_w: Buffer,
     pub o_proj_w: Buffer,
-    pub q_norm_w: Vec<f32>,  // small, keep on CPU
-    pub k_norm_w: Vec<f32>,
+    pub q_norm_w: Buffer,  // on GPU for fused kernel
+    pub k_norm_w: Buffer,
     pub post_ln_w: Buffer,
     pub gate_proj_w: Buffer,
     pub up_proj_w: Buffer,
@@ -28,19 +28,77 @@ pub struct MetalTransformerConfig {
     pub rms_norm_eps: f32,
 }
 
+/// GPU-resident KV cache with pre-allocated buffers.
 pub struct MetalKvCache {
-    pub k: Vec<f32>,  // [nkv, cached_len, hd]
-    pub v: Vec<f32>,
+    pub k_buf: Buffer,   // [nkv, max_len, hd]
+    pub v_buf: Buffer,   // [nkv, max_len, hd]
     pub len: usize,
+    pub max_len: usize,
 }
 
 impl MetalKvCache {
-    pub fn new() -> Self { Self { k: Vec::new(), v: Vec::new(), len: 0 } }
-    pub fn reset(&mut self) { self.k.clear(); self.v.clear(); self.len = 0; }
+    pub fn new(pipes: &MetalPipelines, nkv: usize, hd: usize, max_len: usize) -> Self {
+        let size = nkv * max_len * hd;
+        Self {
+            k_buf: pipes.buffer_empty(size),
+            v_buf: pipes.buffer_empty(size),
+            len: 0,
+            max_len,
+        }
+    }
+    pub fn reset(&mut self) { self.len = 0; }
 }
 
-/// Run one transformer layer. Input/output are Metal shared buffers.
-pub fn metal_layer_forward(
+/// Pre-allocated scratch buffers for one layer forward (reused across layers).
+pub struct LayerScratch {
+    pub ln_out: Buffer,
+    pub q_buf: Buffer,
+    pub k_buf: Buffer,
+    pub v_buf: Buffer,
+    pub q_ready: Buffer,
+    pub k_ready: Buffer,
+    pub v_ready: Buffer,
+    pub attn_out: Buffer,
+    pub attn_flat: Buffer,
+    pub o_out: Buffer,
+    pub hidden: Buffer,
+    pub post_ln: Buffer,
+    pub gate_buf: Buffer,
+    pub up_buf: Buffer,
+    pub silu_out: Buffer,
+    pub mlp_out: Buffer,
+    pub output: Buffer,
+}
+
+impl LayerScratch {
+    pub fn new(pipes: &MetalPipelines, tokens: usize, h: usize, im: usize, nh: usize, nkv: usize, hd: usize) -> Self {
+        Self {
+            ln_out: pipes.buffer_empty(tokens * h),
+            q_buf: pipes.buffer_empty(tokens * nh * hd),
+            k_buf: pipes.buffer_empty(tokens * nkv * hd),
+            v_buf: pipes.buffer_empty(tokens * nkv * hd),
+            q_ready: pipes.buffer_empty(nh * tokens * hd),
+            k_ready: pipes.buffer_empty(nkv * tokens * hd),
+            v_ready: pipes.buffer_empty(nkv * tokens * hd),
+            attn_out: pipes.buffer_empty(nh * tokens * hd),
+            attn_flat: pipes.buffer_empty(tokens * nh * hd),
+            o_out: pipes.buffer_empty(tokens * h),
+            hidden: pipes.buffer_empty(tokens * h),
+            post_ln: pipes.buffer_empty(tokens * h),
+            gate_buf: pipes.buffer_empty(tokens * im),
+            up_buf: pipes.buffer_empty(tokens * im),
+            silu_out: pipes.buffer_empty(tokens * im),
+            mlp_out: pipes.buffer_empty(tokens * h),
+            output: pipes.buffer_empty(tokens * h),
+        }
+    }
+}
+
+/// Run one transformer layer entirely on Metal.
+/// Encodes into `cmd` WITHOUT commit — caller commits after all layers.
+/// Output is written to `s.output`. Caller should use `&s.output` as input to the next layer.
+pub fn metal_layer_forward_v2(
+    cmd: &CommandBufferRef,
     pipes: &MetalPipelines,
     input: &Buffer,
     tokens: usize,
@@ -48,201 +106,124 @@ pub fn metal_layer_forward(
     cfg: &MetalTransformerConfig,
     kv_cache: &mut MetalKvCache,
     pos_offset: usize,
-    cos: &[f32],
-    sin: &[f32],
-) -> Buffer {
+    cos_buf: &Buffer,
+    sin_buf: &Buffer,
+    s: &LayerScratch,
+) {
     let h = cfg.hidden_size;
     let nh = cfg.num_heads;
     let nkv = cfg.num_kv_heads;
     let hd = cfg.head_dim;
     let im = cfg.intermediate_size;
 
-    // 1. RMSNorm (Metal kernel)
-    let ln_out = pipes.buffer_empty(tokens * h);
+    // Encoder 1: RMSNorm
     {
-        let cmd = pipes.queue.new_command_buffer();
-        pipes.rms_norm(cmd, input, &w.input_ln_w, &ln_out, tokens, h, cfg.rms_norm_eps);
-        cmd.commit();
-        cmd.wait_until_completed();
+        let enc = cmd.new_compute_command_encoder();
+        pipes.rms_norm_enc(enc, input, &w.input_ln_w, &s.ln_out, tokens, h, cfg.rms_norm_eps);
+        enc.end_encoding();
     }
 
-    // 2. Q/K/V projections (Accelerate sgemm on shared buffers — zero-copy)
-    let q_buf = pipes.buffer_empty(tokens * nh * hd);
-    let k_buf = pipes.buffer_empty(tokens * nkv * hd);
-    let v_buf = pipes.buffer_empty(tokens * nkv * hd);
-    let dummy_cmd = pipes.queue.new_command_buffer();
-    pipes.gemm(dummy_cmd, &ln_out, &w.q_proj_w, &q_buf, tokens, nh * hd, h);
-    pipes.gemm(dummy_cmd, &ln_out, &w.k_proj_w, &k_buf, tokens, nkv * hd, h);
-    pipes.gemm(dummy_cmd, &ln_out, &w.v_proj_w, &v_buf, tokens, nkv * hd, h);
-    // No commit needed — cblas_sgemm runs synchronously on CPU
+    // Encoder 2: Q/K/V GEMM (3 independent dispatches, 1 encoder)
+    {
+        let enc = cmd.new_compute_command_encoder();
+        pipes.gemm_v2(enc, &s.ln_out, &w.q_proj_w, &s.q_buf, tokens, nh * hd, h);
+        pipes.gemm_v2(enc, &s.ln_out, &w.k_proj_w, &s.k_buf, tokens, nkv * hd, h);
+        pipes.gemm_v2(enc, &s.ln_out, &w.v_proj_w, &s.v_buf, tokens, nkv * hd, h);
+        enc.end_encoding();
+    }
 
-    // 3. QK-norm + RoPE (CPU, fast element-wise)
-    let q_data = read_buf(&q_buf, tokens * nh * hd);
-    let k_data = read_buf(&k_buf, tokens * nkv * hd);
-    let v_data = read_buf(&v_buf, tokens * nkv * hd);
+    // Encoder 3: QK-norm + RoPE + transpose (3 independent dispatches)
+    {
+        let enc = cmd.new_compute_command_encoder();
+        pipes.qk_norm_rope(enc, &s.q_buf, &w.q_norm_w, cos_buf, sin_buf, &s.q_ready,
+            tokens, nh, hd, pos_offset, cfg.rms_norm_eps, true);
+        pipes.qk_norm_rope(enc, &s.k_buf, &w.k_norm_w, cos_buf, sin_buf, &s.k_ready,
+            tokens, nkv, hd, pos_offset, cfg.rms_norm_eps, true);
+        // V: transpose only (no norm, no RoPE)
+        pipes.qk_norm_rope(enc, &s.v_buf, &w.k_norm_w, cos_buf, sin_buf, &s.v_ready,
+            tokens, nkv, hd, pos_offset, cfg.rms_norm_eps, false);
+        enc.end_encoding();
+    }
 
-    let mut q_r = transpose_and_norm(&q_data, tokens, nh, hd, &w.q_norm_w, cfg.rms_norm_eps as f64);
-    let mut k_r = transpose_and_norm(&k_data, tokens, nkv, hd, &w.k_norm_w, cfg.rms_norm_eps as f64);
-    let v_r = transpose_no_norm(&v_data, tokens, nkv, hd);
+    // Encoder 4: KV cache append
+    {
+        let enc = cmd.new_compute_command_encoder();
+        pipes.kv_cache_append(enc, &s.k_ready, &kv_cache.k_buf,
+            nkv, hd, kv_cache.len, tokens, kv_cache.max_len);
+        pipes.kv_cache_append(enc, &s.v_ready, &kv_cache.v_buf,
+            nkv, hd, kv_cache.len, tokens, kv_cache.max_len);
+        enc.end_encoding();
+    }
+    let kv_len = kv_cache.len + tokens;
+    kv_cache.len = kv_len;
 
-    apply_rope(&mut q_r, nh, tokens, hd, cos, sin, pos_offset);
-    apply_rope(&mut k_r, nkv, tokens, hd, cos, sin, pos_offset);
-
-    // 4. KV cache
-    update_kv(kv_cache, &k_r, &v_r, nkv, tokens, hd);
-    let kv_len = kv_cache.len;
-
-    // 5. Flash attention (Metal kernel)
-    let n_rep = nh / nkv;
-    let k_rep = repeat_kv(&kv_cache.k, nkv, n_rep, kv_len, hd);
-    let v_rep = repeat_kv(&kv_cache.v, nkv, n_rep, kv_len, hd);
-
-    let q_metal = pipes.buffer_from_data(&q_r);
-    let k_metal = pipes.buffer_from_data(&k_rep);
-    let v_metal = pipes.buffer_from_data(&v_rep);
-    let attn_out_metal = pipes.buffer_empty(nh * tokens * hd);
+    // Encoder 5: Flash attention (GQA handled internally)
     {
         let params = AttentionParams {
             batch: 1, num_heads: nh, num_kv_heads: nkv,
             q_len: tokens, kv_len, head_dim: hd,
             causal: tokens > 1, pos_offset,
         };
-        let cmd = pipes.queue.new_command_buffer();
-        pipes.flash_attn(cmd, &q_metal, &k_metal, &v_metal, &attn_out_metal, &params);
-        cmd.commit();
-        cmd.wait_until_completed();
+        // flash_attn creates its own encoder; kv_seq_stride=max_len for GPU cache
+        pipes.flash_attn_v2(cmd, &s.q_ready, &kv_cache.k_buf, &kv_cache.v_buf, &s.attn_out,
+            &params, kv_cache.max_len);
     }
 
-    // 6. Untranspose + O projection (Accelerate sgemm)
-    let attn_out = read_buf(&attn_out_metal, nh * tokens * hd);
-    let attn_flat = untranspose(&attn_out, tokens, nh, hd);
-    let attn_flat_buf = pipes.buffer_from_data(&attn_flat);
-    let o_out = pipes.buffer_empty(tokens * h);
-    let dummy = pipes.queue.new_command_buffer();
-    pipes.gemm(dummy, &attn_flat_buf, &w.o_proj_w, &o_out, tokens, h, nh * hd);
-
-    // 7-10. Residual + PostLN + MLP + Residual (Metal kernels + Accelerate GEMM)
-    let hidden = pipes.buffer_empty(tokens * h);
-    let post_ln = pipes.buffer_empty(tokens * h);
-    let gate_buf = pipes.buffer_empty(tokens * im);
-    let up_buf = pipes.buffer_empty(tokens * im);
-    let silu_out = pipes.buffer_empty(tokens * im);
-    let mlp_out = pipes.buffer_empty(tokens * h);
-    let output = pipes.buffer_empty(tokens * h);
-
+    // Encoder 6: Untranspose
     {
-        let cmd = pipes.queue.new_command_buffer();
-        pipes.add(cmd, input, &o_out, &hidden, tokens * h);
-        pipes.rms_norm(cmd, &hidden, &w.post_ln_w, &post_ln, tokens, h, cfg.rms_norm_eps);
-        cmd.commit();
-        cmd.wait_until_completed();
+        let enc = cmd.new_compute_command_encoder();
+        pipes.transpose_out(enc, &s.attn_out, &s.attn_flat, tokens, nh, hd);
+        enc.end_encoding();
     }
 
-    // MLP GEMM (Accelerate)
-    let dummy = pipes.queue.new_command_buffer();
-    pipes.gemm(dummy, &post_ln, &w.gate_proj_w, &gate_buf, tokens, im, h);
-    pipes.gemm(dummy, &post_ln, &w.up_proj_w, &up_buf, tokens, im, h);
-
+    // Encoder 7: O projection GEMM
     {
-        let cmd = pipes.queue.new_command_buffer();
-        pipes.silu_mul(cmd, &gate_buf, &up_buf, &silu_out, tokens * im);
-        cmd.commit();
-        cmd.wait_until_completed();
+        let enc = cmd.new_compute_command_encoder();
+        pipes.gemm_v2(enc, &s.attn_flat, &w.o_proj_w, &s.o_out, tokens, h, nh * hd);
+        enc.end_encoding();
     }
 
-    let dummy = pipes.queue.new_command_buffer();
-    pipes.gemm(dummy, &silu_out, &w.down_proj_w, &mlp_out, tokens, h, im);
-
+    // Encoder 8: Residual add
     {
-        let cmd = pipes.queue.new_command_buffer();
-        pipes.add(cmd, &hidden, &mlp_out, &output, tokens * h);
-        cmd.commit();
-        cmd.wait_until_completed();
+        let enc = cmd.new_compute_command_encoder();
+        pipes.add_enc(enc, input, &s.o_out, &s.hidden, tokens * h);
+        enc.end_encoding();
     }
 
-    output
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-fn read_buf(buf: &Buffer, len: usize) -> Vec<f32> {
-    MetalPipelines::read_buffer(buf, len)
-}
-
-fn transpose_and_norm(flat: &[f32], tokens: usize, heads: usize, hd: usize, w: &[f32], eps: f64) -> Vec<f32> {
-    let mut out = vec![0.0f32; heads * tokens * hd];
-    for t in 0..tokens {
-        for hi in 0..heads {
-            let src = t * heads * hd + hi * hd;
-            let dst = hi * tokens * hd + t * hd;
-            let mut v = 0.0f64;
-            for d in 0..hd { let f = flat[src+d] as f64; v += f * f; }
-            let inv = 1.0 / (v / hd as f64 + eps).sqrt();
-            for d in 0..hd { out[dst+d] = (flat[src+d] as f64 * inv) as f32 * w[d]; }
-        }
+    // Encoder 9: Post-attention RMSNorm
+    {
+        let enc = cmd.new_compute_command_encoder();
+        pipes.rms_norm_enc(enc, &s.hidden, &w.post_ln_w, &s.post_ln, tokens, h, cfg.rms_norm_eps);
+        enc.end_encoding();
     }
-    out
-}
 
-fn transpose_no_norm(flat: &[f32], tokens: usize, heads: usize, hd: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; heads * tokens * hd];
-    for t in 0..tokens { for hi in 0..heads { for d in 0..hd {
-        out[hi * tokens * hd + t * hd + d] = flat[t * heads * hd + hi * hd + d];
-    }}}
-    out
-}
-
-fn untranspose(data: &[f32], tokens: usize, heads: usize, hd: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; tokens * heads * hd];
-    for t in 0..tokens { for hi in 0..heads { for d in 0..hd {
-        out[t * heads * hd + hi * hd + d] = data[hi * tokens * hd + t * hd + d];
-    }}}
-    out
-}
-
-fn apply_rope(data: &mut [f32], heads: usize, seq: usize, hd: usize, cos: &[f32], sin: &[f32], offset: usize) {
-    let half = hd / 2;
-    for h in 0..heads { for s in 0..seq {
-        let pos = offset + s;
-        let base = h * seq * hd + s * hd;
-        for i in 0..half {
-            let c = cos[pos * half + i]; let si = sin[pos * half + i];
-            let x0 = data[base + i]; let x1 = data[base + half + i];
-            data[base + i] = x0 * c - x1 * si;
-            data[base + half + i] = x1 * c + x0 * si;
-        }
-    }}
-}
-
-fn repeat_kv(kv: &[f32], nkv: usize, n_rep: usize, seq: usize, hd: usize) -> Vec<f32> {
-    if n_rep == 1 { return kv.to_vec(); }
-    let nh = nkv * n_rep;
-    let mut out = vec![0.0f32; nh * seq * hd];
-    for kh in 0..nkv { for r in 0..n_rep {
-        let dst = kh * n_rep + r;
-        out[dst*seq*hd..(dst+1)*seq*hd].copy_from_slice(&kv[kh*seq*hd..(kh+1)*seq*hd]);
-    }}
-    out
-}
-
-fn update_kv(cache: &mut MetalKvCache, k: &[f32], v: &[f32], nkv: usize, new: usize, hd: usize) {
-    if cache.len == 0 {
-        cache.k = k.to_vec();
-        cache.v = v.to_vec();
-        cache.len = new;
-    } else {
-        let old = cache.len;
-        let total = old + new;
-        let mut fk = vec![0.0f32; nkv * total * hd];
-        let mut fv = vec![0.0f32; nkv * total * hd];
-        for h in 0..nkv {
-            fk[h*total*hd..h*total*hd+old*hd].copy_from_slice(&cache.k[h*old*hd..(h+1)*old*hd]);
-            fk[h*total*hd+old*hd..h*total*hd+total*hd].copy_from_slice(&k[h*new*hd..(h+1)*new*hd]);
-            fv[h*total*hd..h*total*hd+old*hd].copy_from_slice(&cache.v[h*old*hd..(h+1)*old*hd]);
-            fv[h*total*hd+old*hd..h*total*hd+total*hd].copy_from_slice(&v[h*new*hd..(h+1)*new*hd]);
-        }
-        cache.k = fk;
-        cache.v = fv;
-        cache.len = total;
+    // Encoder 10: Gate/Up GEMM (2 independent dispatches)
+    {
+        let enc = cmd.new_compute_command_encoder();
+        pipes.gemm_v2(enc, &s.post_ln, &w.gate_proj_w, &s.gate_buf, tokens, im, h);
+        pipes.gemm_v2(enc, &s.post_ln, &w.up_proj_w, &s.up_buf, tokens, im, h);
+        enc.end_encoding();
     }
+
+    // Encoder 11: SiLU × gate
+    {
+        let enc = cmd.new_compute_command_encoder();
+        pipes.silu_mul_enc(enc, &s.gate_buf, &s.up_buf, &s.silu_out, tokens * im);
+        enc.end_encoding();
+    }
+
+    // Encoder 12: Down projection GEMM
+    {
+        let enc = cmd.new_compute_command_encoder();
+        pipes.gemm_v2(enc, &s.silu_out, &w.down_proj_w, &s.mlp_out, tokens, h, im);
+        enc.end_encoding();
+    }
+
+    // Encoder 13: Final residual add
+    {
+        let enc = cmd.new_compute_command_encoder();
+        pipes.add_enc(enc, &s.hidden, &s.mlp_out, &s.output, tokens * h);
+        enc.end_encoding();
+    }
+    // Output is in s.output. Caller reads it after commit+wait.
 }

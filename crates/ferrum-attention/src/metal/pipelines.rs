@@ -18,16 +18,24 @@ impl MetalPipelines {
         let opts = CompileOptions::new();
         let fa_src = include_str!("shaders/flash_attn.metal");
         let ops_src = include_str!("shaders/transformer_ops.metal");
+        let gemm_src = include_str!("shaders/gemm_f32.metal");
+        let nr_src = include_str!("shaders/norm_rope.metal");
 
         let fa_lib = device.new_library_with_source(fa_src, &opts)
             .expect("failed to compile flash_attn.metal");
         let ops_lib = device.new_library_with_source(ops_src, &opts)
             .expect("failed to compile transformer_ops.metal");
+        let gemm_lib = device.new_library_with_source(gemm_src, &opts)
+            .expect("failed to compile gemm_f32.metal");
+        let nr_lib = device.new_library_with_source(nr_src, &opts)
+            .expect("failed to compile norm_rope.metal");
 
         let mut pipelines = HashMap::new();
         for (lib, names) in [
             (&fa_lib, &["flash_attn_f32"][..]),
             (&ops_lib, &["rms_norm_f32", "silu_mul_f32", "add_f32", "gemm_f32"][..]),
+            (&gemm_lib, &["gemm_f32_v2"][..]),
+            (&nr_lib, &["qk_norm_rope_transpose_f32", "transpose_out_f32", "kv_cache_append_f32"][..]),
         ] {
             for name in names {
                 let func = lib.get_function(name, None)
@@ -86,6 +94,58 @@ impl MetalPipelines {
                 c.contents() as *mut f32, n as i32,
             );
         }
+    }
+
+    /// RMS norm on an existing encoder (no end_encoding)
+    pub fn rms_norm_enc(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, rows: usize, dim: usize, eps: f32) {
+        #[repr(C)]
+        struct P { dim: i32, eps: f32 }
+        let params = P { dim: dim as i32, eps };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 8, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("rms_norm_f32"));
+        enc.set_buffer(0, Some(input), 0);
+        enc.set_buffer(1, Some(weight), 0);
+        enc.set_buffer(2, Some(output), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_threadgroup_memory_length(0, 128);
+        let grid = MTLSize::new(rows as u64, 1, 1);
+        let tg = MTLSize::new(32, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// SiLU×gate on an existing encoder
+    pub fn silu_mul_enc(&self, enc: &ComputeCommandEncoderRef, gate: &Buffer, up: &Buffer, output: &Buffer, n: usize) {
+        #[repr(C)]
+        struct P { n: i32 }
+        let params = P { n: n as i32 };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 4, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("silu_mul_f32"));
+        enc.set_buffer(0, Some(gate), 0);
+        enc.set_buffer(1, Some(up), 0);
+        enc.set_buffer(2, Some(output), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Add on an existing encoder
+    pub fn add_enc(&self, enc: &ComputeCommandEncoderRef, a: &Buffer, b: &Buffer, output: &Buffer, n: usize) {
+        #[repr(C)]
+        struct P { n: i32 }
+        let params = P { n: n as i32 };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 4, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("add_f32"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(output), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
     }
 
     /// Run RMS norm: out = rms_norm(input) * weight
@@ -150,19 +210,109 @@ impl MetalPipelines {
         enc.end_encoding();
     }
 
-    /// Run flash attention
-    pub fn flash_attn(&self, cmd: &CommandBufferRef,
-        q: &Buffer, k: &Buffer, v: &Buffer, o: &Buffer,
-        params: &crate::AttentionParams)
+    // ── New all-Metal dispatch methods (encoder-based, no commit) ──────
+
+    /// GEMM v2: C[M,N] = A[M,K] @ B[N,K]^T — all on Metal, 64x32 tiles
+    pub fn gemm_v2(&self, enc: &ComputeCommandEncoderRef, a: &Buffer, b: &Buffer, c: &Buffer, m: usize, n: usize, k: usize) {
+        #[repr(C)]
+        struct P { m: i32, n: i32, k: i32 }
+        let params = P { m: m as i32, n: n as i32, k: k as i32 };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 12, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("gemm_f32_v2"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(c), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_threadgroup_memory_length(0, 12288);
+        let grid = MTLSize::new(((n + 31) / 32) as u64, ((m + 63) / 64) as u64, 1);
+        let tg = MTLSize::new(128, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// QK-norm + RoPE + transpose (fused). Set apply_norm=false for V (transpose only).
+    pub fn qk_norm_rope(&self, enc: &ComputeCommandEncoderRef,
+        input: &Buffer, weight: &Buffer, cos: &Buffer, sin: &Buffer, output: &Buffer,
+        tokens: usize, heads: usize, head_dim: usize, pos_offset: usize, eps: f32, apply_norm: bool)
     {
         #[repr(C)]
-        struct P { batch: i32, num_heads: i32, num_kv_heads: i32, q_len: i32, kv_len: i32, head_dim: i32, scale: f32, causal: i32, pos_offset: i32 }
+        struct P { tokens: i32, heads: i32, head_dim: i32, half_dim: i32, pos_offset: i32, eps: f32, apply_norm: i32 }
+        let params = P {
+            tokens: tokens as i32, heads: heads as i32, head_dim: head_dim as i32,
+            half_dim: (head_dim / 2) as i32, pos_offset: pos_offset as i32,
+            eps, apply_norm: if apply_norm { 1 } else { 0 },
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, std::mem::size_of::<P>() as u64,
+            MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("qk_norm_rope_transpose_f32"));
+        enc.set_buffer(0, Some(input), 0);
+        enc.set_buffer(1, Some(weight), 0);
+        enc.set_buffer(2, Some(cos), 0);
+        enc.set_buffer(3, Some(sin), 0);
+        enc.set_buffer(4, Some(output), 0);
+        enc.set_buffer(5, Some(&params_buf), 0);
+        let grid = MTLSize::new(tokens as u64, heads as u64, 1);
+        let tg = MTLSize::new(32, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Untranspose: [heads, tokens, hd] -> [tokens, heads*hd]
+    pub fn transpose_out(&self, enc: &ComputeCommandEncoderRef,
+        input: &Buffer, output: &Buffer, tokens: usize, heads: usize, head_dim: usize)
+    {
+        #[repr(C)]
+        struct P { tokens: i32, heads: i32, head_dim: i32 }
+        let params = P { tokens: tokens as i32, heads: heads as i32, head_dim: head_dim as i32 };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 12, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("transpose_out_f32"));
+        enc.set_buffer(0, Some(input), 0);
+        enc.set_buffer(1, Some(output), 0);
+        enc.set_buffer(2, Some(&params_buf), 0);
+        let n = tokens * heads * head_dim;
+        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// KV cache append: copy new data into pre-allocated cache
+    pub fn kv_cache_append(&self, enc: &ComputeCommandEncoderRef,
+        new_data: &Buffer, cache: &Buffer,
+        heads: usize, head_dim: usize, old_len: usize, new_len: usize, max_len: usize)
+    {
+        #[repr(C)]
+        struct P { heads: i32, head_dim: i32, old_len: i32, new_len: i32, max_len: i32 }
+        let params = P {
+            heads: heads as i32, head_dim: head_dim as i32,
+            old_len: old_len as i32, new_len: new_len as i32, max_len: max_len as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 20, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("kv_cache_append_f32"));
+        enc.set_buffer(0, Some(new_data), 0);
+        enc.set_buffer(1, Some(cache), 0);
+        enc.set_buffer(2, Some(&params_buf), 0);
+        let n = heads * new_len * head_dim;
+        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Run flash attention. kv_seq_stride: 0 = contiguous (use kv_len), >0 = strided cache.
+    pub fn flash_attn_v2(&self, cmd: &CommandBufferRef,
+        q: &Buffer, k: &Buffer, v: &Buffer, o: &Buffer,
+        params: &crate::AttentionParams, kv_seq_stride: usize)
+    {
+        #[repr(C)]
+        struct P { batch: i32, num_heads: i32, num_kv_heads: i32, q_len: i32, kv_len: i32, head_dim: i32, scale: f32, causal: i32, pos_offset: i32, kv_seq_stride: i32 }
         let p = P {
             batch: params.batch as i32, num_heads: params.num_heads as i32,
             num_kv_heads: params.num_kv_heads as i32, q_len: params.q_len as i32,
             kv_len: params.kv_len as i32, head_dim: params.head_dim as i32,
             scale: 1.0 / (params.head_dim as f32).sqrt(),
             causal: if params.causal { 1 } else { 0 }, pos_offset: params.pos_offset as i32,
+            kv_seq_stride: kv_seq_stride as i32,
         };
         let params_buf = self.device.new_buffer_with_data(
             &p as *const _ as *const c_void,
@@ -180,5 +330,13 @@ impl MetalPipelines {
         let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
+    }
+
+    /// Run flash attention (legacy API, contiguous KV)
+    pub fn flash_attn(&self, cmd: &CommandBufferRef,
+        q: &Buffer, k: &Buffer, v: &Buffer, o: &Buffer,
+        params: &crate::AttentionParams)
+    {
+        self.flash_attn_v2(cmd, q, k, v, o, params, 0);
     }
 }
