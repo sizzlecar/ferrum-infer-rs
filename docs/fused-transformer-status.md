@@ -77,13 +77,25 @@ ferrum-attention/
 | fused attention only (CPU) | 0.1-0.6 |
 | fused transformer (Metal+Accel) | 未测到 |
 
+## 已完成：CPU-default 后端选择
+
+**根因**：Metal 只跑轻量 element-wise ops（RMSNorm/SiLU/add），数据量 ≤206K floats，
+GPU launch overhead (~50-200μs/dispatch) 远超实际计算时间。20 层 × 5 次 commit+wait = 100 次同步屏障。
+
+**修复** (`ferrum-attention/src/lib.rs`)：
+- 新增 `use_cpu` 字段，`forward()` 检查后决定走 Metal 还是 CPU
+- 自动选择：`hidden_size ≤ 2048` → CPU path（Accelerate sgemm + 纯 Rust element-wise）
+- 环境变量覆盖：`FERRUM_FUSED_CPU=1` 强制 CPU，`FERRUM_FUSED_METAL=1` 强制 Metal
+- 启动时打印 `[fused-transformer] backend=CPU (Accelerate), hidden=1024, layers=20`
+
 ## 下一步
 
-1. **定位卡点**：重定向日志到文件，找出哪步耗时最长
-2. **减少 Metal sync**：合并 Metal dispatches，或改为 CPU-only path 先验证正确性
-3. **验证 ASR 输出**
-4. **优化 Metal GEMM**：移植 llama.cpp 的 `kernel_mul_mm`（64×32 tiles, 4 simdgroups）或用 MPS
-5. **Metal QK-norm + RoPE kernel**：消除 CPU 来回
+1. ~~定位卡点~~ ✓ Prefill 28层 Metal sync
+2. ~~减少 Metal sync~~ ✓ CPU-default 绕过
+3. **验证 TTS 精度**：CPU path dump past_hidden 对比 Python `[6.198, 2.600, -3.834, 3.134, 3.208]`
+4. **端到端验证**：TTS 生成 → Whisper ASR 验证输出文本
+5. **Phase 2 优化**：Metal hybrid（仅 attention 用 Metal，1 dispatch/layer = 20 syncs）
+6. **Phase 3**：移植 llama.cpp `kernel_mul_mm`，全 Metal 路径（大模型用）
 
 ## 参考代码
 

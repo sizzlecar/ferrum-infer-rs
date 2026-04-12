@@ -31,9 +31,24 @@ const SAMPLE_RATE: usize = 24000;
 const MAX_CODEC_TOKENS: usize = 2000;
 
 /// Sampling parameters for codec token generation.
+/// FERRUM_TTS_TEMP env var overrides (0.0 = greedy, 0.9 = default sampling)
 const TEMPERATURE: f32 = 0.9;
 const TOP_K: usize = 50;
 const REPETITION_PENALTY: f32 = 1.05;
+
+fn tts_temperature() -> f32 {
+    std::env::var("FERRUM_TTS_TEMP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TEMPERATURE)
+}
+
+fn st_temperature() -> f32 {
+    std::env::var("FERRUM_ST_TEMP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(tts_temperature())
+}
 
 /// Qwen3-TTS executor: text-to-speech synthesis.
 pub struct TtsModelExecutor {
@@ -165,56 +180,166 @@ impl TtsModelExecutor {
     /// Synthesize speech from text.
     ///
     /// Returns PCM samples at 24kHz as Vec<f32>.
+    ///
+    /// Prompt structure (matches Python/qwen3-tts-rs):
+    ///   Prefill: [role_prefix(3)] + [tts_text_prefix(6) + codec_prefix(6)] + [first_text + codec_bos]
+    ///   Trailing: text_projection(remaining_text + tts_eos) — added per decode step
     pub fn synthesize(&mut self, text: &str, language: &str) -> Result<Vec<f32>> {
         self.talker.reset();
 
         let device = self.talker.device().clone();
 
-        // 1. Tokenize text
+        // 1. Tokenize text (raw content only, no chat template)
         let encoding = self
             .text_tokenizer
-            .encode(text, true)
+            .encode(text, false)
             .map_err(|e| FerrumError::model(format!("tokenize: {e}")))?;
-        let text_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let content_ids: Vec<u32> = encoding.get_ids().to_vec();
 
-        if text_ids.is_empty() {
+        if content_ids.is_empty() {
             return Err(FerrumError::model("empty text after tokenization"));
         }
 
-        info!("TTS: text tokens = {}", text_ids.len());
+        info!("TTS: content tokens = {}", content_ids.len());
 
-        // 2. Build input sequence:
-        //    [tts_bos] + text_tokens + [tts_eos] + [codec_bos]
+        let codec_eos = self.config.codec_eos_token_id;
+        let tts_pad = self.config.tts_pad_token_id;
         let tts_bos = self.config.tts_bos_token_id;
         let tts_eos = self.config.tts_eos_token_id;
-        let codec_bos = self.config.codec_bos_id;
-        let codec_eos = self.config.codec_eos_token_id;
 
-        // Build text portion: embed through text_embedding + text_projection
-        let mut full_text_ids = Vec::with_capacity(text_ids.len() + 2);
-        full_text_ids.push(tts_bos);
-        full_text_ids.extend_from_slice(&text_ids);
-        full_text_ids.push(tts_eos);
+        // Helper: embed text token IDs through text_embedding + text_projection
+        let embed_text_ids = |ids: &[u32]| -> Result<Tensor> {
+            let t = Tensor::new(ids, &device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| FerrumError::model(format!("text ids: {e}")))?;
+            self.talker.embed_text(&t)
+        };
+        let embed_codec_ids = |ids: &[u32]| -> Result<Tensor> {
+            let t = Tensor::new(ids, &device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| FerrumError::model(format!("codec ids: {e}")))?;
+            self.talker.embed_codec(&t)
+        };
 
-        let text_tensor = Tensor::new(&full_text_ids[..], &device)
-            .map_err(|e| FerrumError::model(format!("text tensor: {e}")))?
-            .unsqueeze(0)
-            .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?;
+        // 2. Build prefill (matching qwen3-tts-rs prefill_custom_voice)
 
-        let text_embeds = self.talker.embed_text(&text_tensor)?;
+        // Role prefix: text_projection([<|im_start|>, assistant, \n])
+        // These are fixed special token IDs from the tokenizer
+        let im_start_id = 151644u32;  // <|im_start|>
+        let assistant_id = 77091u32;  // "assistant"
+        let newline_id = 198u32;      // "\n"
+        let role_prefix_ids = [im_start_id, assistant_id, newline_id];
 
-        // Build codec BOS embedding
-        let codec_bos_tensor = Tensor::new(&[codec_bos], &device)
-            .map_err(|e| FerrumError::model(format!("codec_bos tensor: {e}")))?
-            .unsqueeze(0)
-            .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?;
-        let codec_bos_embed = self.talker.embed_codec(&codec_bos_tensor)?;
+        info!("TTS: role_prefix={} content={} tokens", role_prefix_ids.len(), content_ids.len());
 
-        // Concatenate: text_embeds + codec_bos_embed along seq dimension
-        let prefill_embeds = Tensor::cat(&[&text_embeds, &codec_bos_embed], 1)
-            .map_err(|e| FerrumError::model(format!("cat embeds: {e}")))?;
+        // Role prefix embedding (text_projection)
+        let role_embed = embed_text_ids(&role_prefix_ids)?;
 
-        // 3. Prefill: forward through transformer
+        // Codec prefix: [think, think_bos, lang, think_eos, speaker, pad]
+        let resolved_lang = if language == "auto" { "chinese" } else { language };
+        let language_id = self.config.codec_language_id.get(&resolved_lang.to_lowercase());
+        let codec_prefix_ids = if let Some(&lang_id) = language_id {
+            vec![
+                self.config.codec_think_id,
+                self.config.codec_think_bos_id,
+                lang_id,
+                self.config.codec_think_eos_id,
+            ]
+        } else {
+            vec![
+                self.config.codec_nothink_id,
+                self.config.codec_think_bos_id,
+                self.config.codec_think_eos_id,
+            ]
+        };
+        // Codec sequence: [think, think_bos, lang, think_eos, SPEAKER, pad, bos]
+        // Speaker: use Vivian (3065) for Chinese, Ryan (3061) for English
+        let speaker_token = if resolved_lang == "chinese" { 3065u32 } else { 3061u32 };
+        let codec_full = {
+            let mut v = codec_prefix_ids.clone();
+            v.push(speaker_token);
+            v.push(self.config.codec_pad_id);
+            v.push(self.config.codec_bos_id);
+            v
+        };
+        let codec_embed = embed_codec_ids(&codec_full)?;
+
+        // tts_text_prefix: [tts_pad * (codec_len-1), tts_bos]
+        let n_codec = codec_full.len();
+        let mut tts_prefix_ids = vec![tts_pad; n_codec - 1];
+        tts_prefix_ids.push(tts_bos);
+        let tts_prefix_embed = embed_text_ids(&tts_prefix_ids)?;
+
+        // Sum: tts_prefix + codec_prefix[:-1]
+        let codec_first = codec_embed
+            .narrow(1, 0, n_codec - 1)
+            .map_err(|e| FerrumError::model(format!("codec narrow: {e}")))?;
+        // Actually we need codec_first to have same length as tts_prefix
+        // tts_prefix has n_codec elements, codec_first has n_codec-1
+        // Let me re-read the reference... codec_embed has 6 tokens [think..pad,bos], tts_prefix has 6 [pad*5,bos]
+        // They sum first 6 codec with first 6 tts_prefix, then codec_bos is separate
+        // codec_full has [think, think_bos, lang, think_eos, speaker, pad, bos] = 7 tokens
+        // tts_prefix: [pad*5, bos] overlaid on codec[0:6] (first 6, excluding last bos)
+        // Then: first_text + codec_bos (last token) summed
+        let n_prefix = n_codec - 1;  // 6: everything except codec_bos
+        let codec_prefix_part = codec_embed
+            .narrow(1, 0, n_prefix)
+            .map_err(|e| FerrumError::model(format!("codec narrow: {e}")))?;
+
+        // tts text prefix: [pad * (n_prefix-1), bos]
+        let mut tts_text_prefix_ids = vec![tts_pad; n_prefix - 1];
+        tts_text_prefix_ids.push(tts_bos);
+        let tts_text_embed = embed_text_ids(&tts_text_prefix_ids)?;
+
+        let codec_hidden = (&tts_text_embed + &codec_prefix_part)
+            .map_err(|e| FerrumError::model(format!("prefix sum: {e}")))?;
+
+        // codec_bos is the last element of codec_full
+        let codec_bos_embed = codec_embed
+            .narrow(1, n_prefix, 1)
+            .map_err(|e| FerrumError::model(format!("codec bos: {e}")))?;
+
+        // First text token + codec_bos (summed)
+        let first_text_combined = if !content_ids.is_empty() {
+            let first_text_embed = embed_text_ids(&content_ids[..1])?;
+            (&first_text_embed + &codec_bos_embed)
+                .map_err(|e| FerrumError::model(format!("first text+bos: {e}")))?
+        } else {
+            codec_bos_embed.clone()
+        };
+
+        // Full prefill: [role_prefix, codec_hidden, first_text+codec_bos]
+        let prefill_embeds = Tensor::cat(&[&role_embed, &codec_hidden, &first_text_combined], 1)
+            .map_err(|e| FerrumError::model(format!("prefill cat: {e}")))?;
+
+        let plen = prefill_embeds.dim(1).unwrap_or(0);
+        info!("TTS: prefill_len = {}", plen);
+        // Dump prefill input for comparison with reference
+        if let Ok(v) = prefill_embeds.narrow(0,0,1).and_then(|t| t.narrow(1,0,1)).and_then(|t| t.narrow(2,0,5)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()) {
+            info!("  prefill_input pos0[:5] = {:?}", v);
+        }
+        if plen > 0 {
+            if let Ok(v) = prefill_embeds.narrow(0,0,1).and_then(|t| t.narrow(1,plen-1,1)).and_then(|t| t.narrow(2,0,5)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()) {
+                info!("  prefill_input pos-1[:5] = {:?}", v);
+            }
+        }
+
+        // 3. Build trailing text: text_projection(remaining_content + tts_eos)
+        let mut trailing_ids: Vec<u32> = if content_ids.len() > 1 {
+            content_ids[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        trailing_ids.push(tts_eos);
+        let trailing_text_embeds = embed_text_ids(&trailing_ids)?;
+        let trailing_text_len = trailing_text_embeds
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("trailing dim: {e}")))?;
+        let tts_pad_embed = embed_text_ids(&[tts_pad])?;
+
+        info!("TTS: trailing_text_len = {}", trailing_text_len);
+
+        // 4. Prefill: forward through transformer
         let mut hidden = self.talker.forward_step(&prefill_embeds)?;
 
         // Get logits from last position
@@ -228,10 +353,42 @@ impl TtsModelExecutor {
         let mut all_codec_tokens: Vec<Vec<u32>> = Vec::new();
         let mut current_logits = current_logits;
 
+        // Token suppression: mask [vocab_size-1024, vocab_size) except EOS
+        let suppress_start = self.config.vocab_size.saturating_sub(1024);
+        let suppress_end = self.config.vocab_size;
+        let mut generated_tokens: Vec<u32> = Vec::new();
+
         for step in 0..MAX_CODEC_TOKENS {
-            // Sample next codec token from logits
-            let logits_vec = logits_to_vec(&current_logits)?;
-            let next_token = sample_token(&logits_vec, TEMPERATURE, TOP_K, REPETITION_PENALTY);
+            // Sample next codec token with suppression + repetition penalty
+            let mut logits_vec = logits_to_vec(&current_logits)?;
+            // Suppress special tokens
+            for i in suppress_start..suppress_end.min(logits_vec.len()) {
+                if i as u32 != codec_eos {
+                    logits_vec[i] = f32::NEG_INFINITY;
+                }
+            }
+            // Repetition penalty (matching Python's repetition_penalty=1.05)
+            for &prev_tok in &generated_tokens {
+                let idx = prev_tok as usize;
+                if idx < logits_vec.len() {
+                    if logits_vec[idx] > 0.0 {
+                        logits_vec[idx] /= REPETITION_PENALTY;
+                    } else {
+                        logits_vec[idx] *= REPETITION_PENALTY;
+                    }
+                }
+            }
+            let next_token = sample_token(&logits_vec, tts_temperature(), TOP_K, REPETITION_PENALTY);
+
+            if step < 10 {
+                // Find argmax (greedy token)
+                let argmax_tok = logits_vec.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, v)| (i, *v)).unwrap_or((0, 0.0));
+                info!("TOKEN step={} sampled={} argmax=({}, {:.2})", step, next_token, argmax_tok.0, argmax_tok.1);
+            }
+
+            generated_tokens.push(next_token);
 
             // Check for EOS
             if next_token == codec_eos {
@@ -254,7 +411,7 @@ impl TtsModelExecutor {
             // SubTalker: predict remaining codec tokens 1..num_code_groups-1
             let extra_codes =
                 self.sub_talker
-                    .predict(&last_hidden, &first_codec_embed, TEMPERATURE, TOP_K)?;
+                    .predict(&last_hidden, &first_codec_embed, st_temperature(), TOP_K)?;
 
             let mut frame_codes = vec![next_token];
             frame_codes.extend_from_slice(&extra_codes);
@@ -274,6 +431,35 @@ impl TtsModelExecutor {
                     .map_err(|e| FerrumError::model(format!("add embed: {e}")))?;
             }
 
+            if step == 0 {
+                if let Ok(v) = combined_embed.flatten_all().and_then(|t| t.narrow(0,0,5)).and_then(|t| t.to_vec1::<f32>()) {
+                    info!("STEP0 codec_sum[:5] = {:?} (before trailing)", v);
+                }
+            }
+            // Add trailing text embedding (guides generation toward target text)
+            // Python: inputs_embeds = codec_sum + trailing_text_hidden[:, gen_step]
+            // trailing_text = text_projection(remaining_text) + tts_eos
+            // For basic TTS, trailing covers all text tokens after the first
+            if step < trailing_text_len {
+                let trail = trailing_text_embeds
+                    .narrow(1, step, 1)
+                    .map_err(|e| FerrumError::model(format!("trailing narrow: {e}")))?;
+                combined_embed = (combined_embed + trail)
+                    .map_err(|e| FerrumError::model(format!("add trailing: {e}")))?;
+            } else {
+                combined_embed = (combined_embed + &tts_pad_embed)
+                    .map_err(|e| FerrumError::model(format!("add tts_pad: {e}")))?;
+            }
+
+            // Debug: dump step 0 components
+            if step == 0 {
+                if let Ok(v) = first_codec_embed.flatten_all().and_then(|t| t.narrow(0,0,5)).and_then(|t| t.to_vec1::<f32>()) {
+                    info!("STEP0 semantic[:5] = {:?}", v);
+                }
+                if let Ok(v) = combined_embed.flatten_all().and_then(|t| t.narrow(0,0,5)).and_then(|t| t.to_vec1::<f32>()) {
+                    info!("STEP0 combined[:5] = {:?}", v);
+                }
+            }
             // Forward combined embedding through talker
             hidden = self.talker.forward_step(&combined_embed)?;
             current_logits = self.talker.logits(&hidden)?;
@@ -641,6 +827,15 @@ impl TtsModelExecutor {
         // Step 6: Prefill and decode
         let mut hidden = self.talker.forward_step(&talker_input)?;
         info!("Prefill ({} tokens, {} layers): {:.1}ms", prefill_len, self.config.num_hidden_layers, t3.elapsed().as_secs_f64() * 1000.0);
+        // Debug: dump prefill output at last position
+        if let Ok(vals) = hidden.narrow(0, 0, 1)
+            .and_then(|t| t.narrow(1, prefill_len - 1, 1))
+            .and_then(|t| t.narrow(2, 0, 10))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>()) {
+            info!("  prefill hidden[-1,:10] = {:?}", vals);
+            info!("  Python reference:        [9.320, 3.522, -4.352, 0.385, 3.274, 4.379, 1.663, 2.466, 2.021, -3.127]");
+        }
         let hidden_len = hidden
             .dim(1)
             .map_err(|e| FerrumError::model(format!("hidden dim: {e}")))?;
@@ -666,7 +861,7 @@ impl TtsModelExecutor {
                     logits_vec[i] = f32::NEG_INFINITY;
                 }
             }
-            let next_token = sample_token(&logits_vec, TEMPERATURE, TOP_K, REPETITION_PENALTY);
+            let next_token = sample_token(&logits_vec, tts_temperature(), TOP_K, REPETITION_PENALTY);
 
             if step < 3 {
                 // Dump top-5 logits for comparison
@@ -706,7 +901,7 @@ impl TtsModelExecutor {
 
             let extra_codes =
                 self.sub_talker
-                    .predict(&last_hidden, &first_codec_embed, TEMPERATURE, TOP_K)?;
+                    .predict(&last_hidden, &first_codec_embed, st_temperature(), TOP_K)?;
 
             let mut frame_codes = vec![next_token];
             frame_codes.extend_from_slice(&extra_codes);
@@ -911,40 +1106,84 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
 }
 
 /// Sample a token from logits with temperature, top-k, and repetition penalty.
+/// Sample a token matching qwen3-tts-rs reference:
+/// 1. temperature scaling
+/// 2. top-k filter (keep top_k, rest = -inf)
+/// 3. top-p filter (keep smallest set with cumprob > top_p, rest = -inf)
+/// 4. softmax over filtered logits
+/// 5. multinomial sample from distribution
 pub fn sample_token(
     logits: &[f32],
     temperature: f32,
     top_k: usize,
     _repetition_penalty: f32,
 ) -> u32 {
-    if temperature == 0.0 {
+    if temperature < 0.01 {
         return argmax(logits);
     }
 
-    // Apply temperature
+    let vocab = logits.len();
+
+    // 1. Apply temperature
     let scaled: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
 
-    // Top-k filtering
-    let mut indexed: Vec<(usize, f32)> = scaled.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    indexed.truncate(top_k);
+    // 2. Top-k filter: keep top_k values, set rest to -inf
+    let mut filtered = scaled.clone();
+    if top_k > 0 && top_k < vocab {
+        let mut sorted = scaled.clone();
+        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let threshold = sorted[top_k - 1];
+        for v in &mut filtered {
+            if *v < threshold { *v = f32::NEG_INFINITY; }
+        }
+    }
 
-    // Softmax over top-k
-    let max_val = indexed[0].1;
-    let exps: Vec<f32> = indexed.iter().map(|(_, v)| (v - max_val).exp()).collect();
+    // 3. Top-p filter: keep smallest set of tokens whose cumulative prob >= top_p
+    const TOP_P: f32 = 0.9;
+    {
+        let mut indices: Vec<usize> = (0..vocab).collect();
+        indices.sort_unstable_by(|&a, &b| filtered[b].partial_cmp(&filtered[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Softmax over sorted values for cumulative prob
+        let max_val = filtered[indices[0]];
+        let exp_sorted: Vec<f32> = indices.iter().map(|&i| (filtered[i] - max_val).exp()).collect();
+        let sum: f32 = exp_sorted.iter().sum();
+        let probs_sorted: Vec<f32> = exp_sorted.iter().map(|e| e / sum).collect();
+
+        // Find cutoff
+        let mut cumsum = 0.0f32;
+        let mut cutoff_idx = vocab;
+        for (i, &p) in probs_sorted.iter().enumerate() {
+            cumsum += p;
+            if cumsum > TOP_P {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+
+        // Mask out tokens beyond cutoff
+        for &idx in &indices[cutoff_idx..] {
+            filtered[idx] = f32::NEG_INFINITY;
+        }
+    }
+
+    // 4. Softmax over filtered logits
+    let max_val = filtered.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = filtered.iter().map(|&v| (v - max_val).exp()).collect();
     let sum: f32 = exps.iter().sum();
     let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
 
-    // Weighted random sampling
+    // 5. Multinomial sample: cumsum and compare with random
     let r = rand_f32();
-    let mut cumulative = 0.0;
+    let mut cumulative = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cumulative += p;
         if cumulative >= r {
-            return indexed[i].0 as u32;
+            return i as u32;
         }
     }
-    indexed.last().map(|(idx, _)| *idx as u32).unwrap_or(0)
+    // Fallback
+    argmax(&probs)
 }
 
 fn argmax(v: &[f32]) -> u32 {
@@ -955,15 +1194,23 @@ fn argmax(v: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
+/// RNG matching qwen3-tts-rs: LCG with subsec_nanos seed + counter
 fn rand_f32() -> f32 {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0xdeadbeef_cafebabe);
-    let mut s = STATE.load(Ordering::Relaxed);
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    STATE.store(s, Ordering::Relaxed);
-    (s as f32) / (u64::MAX as f32)
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // LCG matching reference: seed + count * LCG constants
+    let state = seed
+        .wrapping_add(count)
+        .wrapping_mul(1103515245)
+        .wrapping_add(12345);
+    (state as f32) / (u64::MAX as f32)
 }
 
 // ── Dummy KV cache + ModelExecutor trait impl ───────────────────────────

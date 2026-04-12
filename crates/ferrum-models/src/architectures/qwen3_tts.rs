@@ -209,11 +209,29 @@ impl RotaryEmbedding {
         k: &Tensor,
         offset: usize,
     ) -> candle_core::Result<(Tensor, Tensor)> {
-        let (_, _, seq_len, _) = q.dims4()?;
-        let cos = self.cos.narrow(0, offset, seq_len)?;
-        let sin = self.sin.narrow(0, offset, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope_slow(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope_slow(&k.contiguous()?, &cos, &sin)?;
+        // Match reference project: narrow + manual rotation (not rope_slow)
+        let (_, _, seq_len, d) = q.dims4()?;
+        let cos = self.cos.narrow(0, offset, seq_len)?
+            .unsqueeze(0)?.unsqueeze(0)?
+            .to_dtype(q.dtype())?;
+        let sin = self.sin.narrow(0, offset, seq_len)?
+            .unsqueeze(0)?.unsqueeze(0)?
+            .to_dtype(q.dtype())?;
+
+        fn rope_rotate(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+            let d = x.dim(candle_core::D::Minus1)?;
+            let x1 = x.narrow(candle_core::D::Minus1, 0, d / 2)?;
+            let x2 = x.narrow(candle_core::D::Minus1, d / 2, d / 2)?;
+            let cos = cos.broadcast_as(x1.shape())?;
+            let sin = sin.broadcast_as(x1.shape())?;
+            Tensor::cat(&[
+                &(x1.mul(&cos)? - x2.mul(&sin)?)?,
+                &(x2.mul(&cos)? + x1.mul(&sin)?)?,
+            ], candle_core::D::Minus1)
+        }
+
+        let q_embed = rope_rotate(q, &cos, &sin)?;
+        let k_embed = rope_rotate(k, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -234,9 +252,12 @@ impl ManualRmsNorm {
 
 impl Module for ManualRmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        // Match candle_nn::RmsNorm formula: x / (sqrt(mean(x²)) + eps)
+        // NOT x / sqrt(mean(x²) + eps) — eps placement matters!
         let x_f32 = x.to_dtype(DType::F32)?;
-        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let hidden_size = x_f32.dim(candle_core::D::Minus1)?;
+        let norm_x = (x_f32.sqr()?.sum_keepdim(candle_core::D::Minus1)? / hidden_size as f64)?.sqrt()?;
+        let normed = x_f32.broadcast_div(&(norm_x + self.eps)?)?;
         let normed = normed.to_dtype(x.dtype())?;
         normed.broadcast_mul(&self.weight)
     }
@@ -337,20 +358,19 @@ impl Attention {
         let k = x.apply(&self.k_proj)?;
         let v = x.apply(&self.v_proj)?;
 
-        // Reshape: [b, seq, heads*hd] → [b, heads, seq, hd]
-        let q = q
-            .reshape((b, seq_len, self.num_heads, hd))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b, seq_len, self.num_kv_heads, hd))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, seq_len, self.num_kv_heads, hd))?
-            .transpose(1, 2)?;
+        // Reshape to [b, seq, heads, hd] for QK norm (matching reference: norm BEFORE transpose)
+        let q = q.reshape((b, seq_len, self.num_heads, hd))?;
+        let k = k.reshape((b, seq_len, self.num_kv_heads, hd))?;
+        let v = v.reshape((b, seq_len, self.num_kv_heads, hd))?;
 
-        // QK norm
+        // QK norm on [b, seq, heads, hd] — BEFORE transpose
         let q = q.apply(&self.q_norm)?;
         let k = k.apply(&self.k_norm)?;
+
+        // Transpose to [b, heads, seq, hd]
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
 
         // RoPE
         let (q, k) = self.rotary.apply(&q, &k, pos_offset)?;
@@ -366,33 +386,47 @@ impl Attention {
         };
         self.kv_cache = Some((k.clone(), v.clone()));
 
-        // Fused flash attention via ferrum-attention
+        // GQA: repeat KV heads to match Q heads
         let kv_len = k.dim(2)?;
-        let nh = self.num_heads;
-        let nkv = self.num_kv_heads;
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let k = if n_rep > 1 {
+            k.unsqueeze(2)?.expand((b, self.num_kv_heads, n_rep, kv_len, hd))?
+                .reshape((b, self.num_heads, kv_len, hd))?
+        } else { k };
+        let v = if n_rep > 1 {
+            v.unsqueeze(2)?.expand((b, self.num_kv_heads, n_rep, kv_len, hd))?
+                .reshape((b, self.num_heads, kv_len, hd))?
+        } else { v };
 
-        let params = ferrum_attention::AttentionParams {
-            batch: b, num_heads: nh, num_kv_heads: nkv,
-            q_len: seq_len, kv_len, head_dim: hd,
-            causal: seq_len > 1, pos_offset,
+        // Standard attention using candle ops (matching reference project)
+        let scale = (hd as f64).powf(-0.5);
+        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+
+        // Causal mask (only for prefill, not decode)
+        let attn_weights = if seq_len > 1 {
+            let mut mask_data = vec![0.0f32; seq_len * kv_len];
+            for i in 0..seq_len {
+                let attend_up_to = pos_offset + i + 1;
+                for j in attend_up_to..kv_len {
+                    mask_data[i * kv_len + j] = f32::NEG_INFINITY;
+                }
+            }
+            let mask = Tensor::from_vec(mask_data, (1, 1, seq_len, kv_len), x.device())?;
+            attn_weights.broadcast_add(&mask)?
+        } else {
+            attn_weights
         };
 
-        // Make Q/K/V contiguous in [b*heads, seq, hd] layout
-        let q_c = q.reshape((b * nh, seq_len, hd))?.contiguous()?;
-        let k_c = k.reshape((b * nkv, kv_len, hd))?.contiguous()?;
-        let v_c = v.reshape((b * nkv, kv_len, hd))?.contiguous()?;
+        // Use softmax_last_dim (fused single-pass, matches reference project)
+        // Falls back to decomposed softmax on Metal (no Metal impl)
+        let attn_weights = if x.device().is_cpu() {
+            candle_nn::ops::softmax_last_dim(&attn_weights)?
+        } else {
+            candle_nn::ops::softmax(&attn_weights, candle_core::D::Minus1)?
+        };
+        let out = attn_weights.matmul(&v)?;
 
-        // Fused attention: extract to CPU, run via ferrum-attention (Metal or CPU auto)
-        let cpu = candle_core::Device::Cpu;
-        let q_data: Vec<f32> = q_c.to_device(&cpu)?.flatten_all()?.to_vec1()?;
-        let k_data: Vec<f32> = k_c.to_device(&cpu)?.flatten_all()?.to_vec1()?;
-        let v_data: Vec<f32> = v_c.to_device(&cpu)?.flatten_all()?.to_vec1()?;
-        let mut out_data = vec![0.0f32; b * nh * seq_len * hd];
-        ferrum_attention::attention(&q_data, &k_data, &v_data, &mut out_data, &params);
-        let out = Tensor::from_vec(out_data, (b, nh, seq_len, hd), &cpu)?
-            .to_device(x.device())?;
-
-        let out = out.transpose(1, 2)?.reshape((b, seq_len, nh * hd))?;
+        let out = out.transpose(1, 2)?.reshape((b, seq_len, self.num_heads * hd))?;
         out.apply(&self.o_proj)
     }
 
@@ -632,29 +666,47 @@ impl Qwen3TTSTalker {
             .map_err(|e| FerrumError::model(format!("codec_embed: {e}")))
     }
 
-    /// Forward through fused transformer (Metal or CPU, bypasses candle).
+    /// Forward through transformer layers. Uses fused path by default,
+    /// set FERRUM_USE_CANDLE=1 to use candle's native ops (for precision testing).
     pub fn forward_step(&mut self, input_embeds: &Tensor) -> Result<Tensor> {
-        let seq_len = input_embeds.dim(1)
-            .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
-        let h = self.config.hidden_size;
+        let use_candle = std::env::var("FERRUM_USE_CANDLE").as_deref() == Ok("1");
 
-        // Extract input to CPU f32
-        let input_data: Vec<f32> = input_embeds
-            .to_device(&candle_core::Device::Cpu)
-            .and_then(|t| t.to_dtype(DType::F32))
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1())
-            .map_err(|e| FerrumError::model(format!("input extract: {e}")))?;
+        if use_candle {
+            // Candle path: use candle's layer.forward() with fused attention
+            let pos_offset = self.tokens_generated;
+            let seq_len = input_embeds.dim(1)
+                .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+            let mut hidden = input_embeds.clone();
+            for (li, layer) in self.layers.iter_mut().enumerate() {
+                hidden = layer
+                    .forward(&hidden, pos_offset)
+                    .map_err(|e| FerrumError::model(format!("layer {li}: {e}")))?;
+            }
+            hidden = hidden
+                .apply(&self.norm)
+                .map_err(|e| FerrumError::model(format!("norm: {e}")))?;
+            self.tokens_generated += seq_len;
+            Ok(hidden)
+        } else {
+            // Fused path: bypasses candle for Metal/CPU custom ops
+            let seq_len = input_embeds.dim(1)
+                .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+            let h = self.config.hidden_size;
 
-        // Run through fused transformer (all layers + final norm)
-        let output = self.fused.forward(&input_data, seq_len);
+            let input_data: Vec<f32> = input_embeds
+                .to_device(&candle_core::Device::Cpu)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1())
+                .map_err(|e| FerrumError::model(format!("input extract: {e}")))?;
 
-        self.tokens_generated += seq_len;
+            let output = self.fused.forward(&input_data, seq_len);
+            self.tokens_generated += seq_len;
 
-        // Convert back to tensor
-        Tensor::from_vec(output, (1, seq_len, h), &candle_core::Device::Cpu)
-            .and_then(|t| t.to_device(&self.device))
-            .map_err(|e| FerrumError::model(format!("output tensor: {e}")))
+            Tensor::from_vec(output, (1, seq_len, h), &candle_core::Device::Cpu)
+                .and_then(|t| t.to_device(&self.device))
+                .map_err(|e| FerrumError::model(format!("output tensor: {e}")))
+        }
     }
 
     /// Get logits from hidden states.
@@ -698,6 +750,9 @@ pub struct SubTalker {
     projection: Option<Linear>,
     num_code_groups: usize,
     tokens_generated: usize,
+    /// Fused transformer (bypasses candle for precision)
+    fused: ferrum_attention::FusedTransformer,
+    fused_hidden_size: usize,
 }
 
 impl SubTalker {
@@ -774,8 +829,61 @@ impl SubTalker {
             None
         };
 
+        // Build fused transformer for SubTalker (bypasses candle)
+        let to_cpu_vec = |t: &Tensor| -> candle_core::Result<Vec<f32>> {
+            t.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()
+        };
+        let get_w = |vb: &VarBuilder, shape: candle_core::Shape, name: &str| -> Result<Vec<f32>> {
+            let t = vb.get(shape, name).map_err(|e| FerrumError::model(format!("st w {name}: {e}")))?;
+            to_cpu_vec(&t).map_err(|e| FerrumError::model(format!("st vec {name}: {e}")))
+        };
+
+        let st_h = cp_cfg.hidden_size;
+        let st_im = cp_cfg.intermediate_size;
+        let st_nh = cp_cfg.num_attention_heads;
+        let st_nkv = cp_cfg.num_key_value_heads;
+        let st_hd = cp_cfg.head_dim;
+
+        let mut fused_layers = Vec::with_capacity(cfg.code_predictor_num_layers);
+        for i in 0..cfg.code_predictor_num_layers {
+            let lv = model_vb.pp(format!("layers.{i}"));
+            let av = lv.pp("self_attn");
+            let mv = lv.pp("mlp");
+            fused_layers.push(ferrum_attention::LayerWeights {
+                input_ln_w: get_w(&lv.pp("input_layernorm"), st_h.into(), "weight")?,
+                q_proj_w: get_w(&av.pp("q_proj"), (st_nh * st_hd, st_h).into(), "weight")?,
+                k_proj_w: get_w(&av.pp("k_proj"), (st_nkv * st_hd, st_h).into(), "weight")?,
+                v_proj_w: get_w(&av.pp("v_proj"), (st_nkv * st_hd, st_h).into(), "weight")?,
+                o_proj_w: get_w(&av.pp("o_proj"), (st_h, st_nh * st_hd).into(), "weight")?,
+                q_norm_w: get_w(&av.pp("q_norm"), st_hd.into(), "weight")?,
+                k_norm_w: get_w(&av.pp("k_norm"), st_hd.into(), "weight")?,
+                post_ln_w: get_w(&lv.pp("post_attention_layernorm"), st_h.into(), "weight")?,
+                gate_proj_w: get_w(&mv.pp("gate_proj"), (st_im, st_h).into(), "weight")?,
+                up_proj_w: get_w(&mv.pp("up_proj"), (st_im, st_h).into(), "weight")?,
+                down_proj_w: get_w(&mv.pp("down_proj"), (st_h, st_im).into(), "weight")?,
+            });
+        }
+        let st_norm_w = to_cpu_vec(&norm.weight)
+            .map_err(|e| FerrumError::model(format!("st norm_w: {e}")))?;
+
+        let fused = ferrum_attention::FusedTransformer::new(
+            ferrum_attention::TransformerConfig {
+                hidden_size: st_h,
+                intermediate_size: st_im,
+                num_heads: st_nh,
+                num_kv_heads: st_nkv,
+                head_dim: st_hd,
+                num_layers: cfg.code_predictor_num_layers,
+                rms_norm_eps: cfg.rms_norm_eps,
+                rope_theta: cfg.rope_theta,
+                max_position_embeddings: cfg.max_position_embeddings,
+            },
+            fused_layers,
+            st_norm_w,
+        );
+
         info!(
-            "SubTalker loaded: layers={}, heads={}/{}, codebooks={}",
+            "SubTalker loaded: layers={}, heads={}/{}, codebooks={} (fused transformer ready)",
             cfg.code_predictor_num_layers,
             cfg.code_predictor_num_heads,
             cfg.code_predictor_num_kv_heads,
@@ -790,6 +898,8 @@ impl SubTalker {
             projection,
             num_code_groups: cfg.num_code_groups,
             tokens_generated: 0,
+            fused,
+            fused_hidden_size: st_h,
         })
     }
 
@@ -850,6 +960,7 @@ impl SubTalker {
 
             // If not last, embed and forward for next step
             if i < n_extra - 1 {
+                // Hard embedding: argmax token → discrete lookup (matches reference impl)
                 let token_tensor = Tensor::new(&[token], hidden.device())
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?;
@@ -872,27 +983,28 @@ impl SubTalker {
     }
 
     fn forward_layers(&mut self, input: &Tensor) -> Result<Tensor> {
-        let pos_offset = self.tokens_generated;
-        let seq_len = input
-            .dim(1)
+        // Use fused path (better precision match with reference at step 0-1)
+        let seq_len = input.dim(1)
             .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+        let h = self.fused_hidden_size;
 
-        let mut h = input.clone();
-        for layer in &mut self.layers {
-            h = layer
-                .forward(&h, pos_offset)
-                .map_err(|e| FerrumError::model(format!("subtalker layer: {e}")))?;
-        }
-        h = h
-            .apply(&self.norm)
-            .map_err(|e| FerrumError::model(format!("subtalker norm: {e}")))?;
+        let input_data: Vec<f32> = input
+            .to_device(&candle_core::Device::Cpu)
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+            .map_err(|e| FerrumError::model(format!("st input extract: {e}")))?;
 
-        self.tokens_generated += seq_len;
-        Ok(h)
+        let output = self.fused.forward(&input_data, seq_len);
+
+        Tensor::from_vec(output, (1, seq_len, h), &candle_core::Device::Cpu)
+            .and_then(|t| t.to_device(input.device()))
+            .map_err(|e| FerrumError::model(format!("st output tensor: {e}")))
     }
 
     pub fn reset(&mut self) {
         self.tokens_generated = 0;
+        self.fused.reset();
         for layer in &mut self.layers {
             layer.reset_cache();
         }
