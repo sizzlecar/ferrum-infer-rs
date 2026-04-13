@@ -55,8 +55,11 @@ pub fn cpu_layer_forward(
     let attn_flat = untranspose(&attn_out, tokens, nh, hd);
     let o_out = matmul_at_bt(&attn_flat, &w.o_proj_w, tokens, h, nh * hd);
 
-    // 7. Residual add
-    let mut hidden = add_vecs(input, &o_out);
+    // 7. Attn layer_scale + Residual add
+    let o_scaled = if let Some(ref scale) = w.attn_layer_scale {
+        scale_vec(&o_out, scale)
+    } else { o_out };
+    let mut hidden = add_vecs(input, &o_scaled);
 
     // 8. Post LayerNorm + MLP
     let post_ln = rms_norm(&hidden, &w.post_ln_w, tokens, h, eps);
@@ -65,8 +68,11 @@ pub fn cpu_layer_forward(
     let silu_out = silu_mul(&gate, &up);
     let mlp_out = matmul_at_bt(&silu_out, &w.down_proj_w, tokens, h, im);
 
-    // 9. Residual add
-    add_vecs(&hidden, &mlp_out)
+    // 9. MLP layer_scale + Residual add
+    let mlp_scaled = if let Some(ref scale) = w.mlp_layer_scale {
+        scale_vec(&mlp_out, scale)
+    } else { mlp_out };
+    add_vecs(&hidden, &mlp_scaled)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -213,6 +219,12 @@ fn update_kv(cache: &mut CpuKvCache, k: &[f32], v: &[f32], nkv: usize, new: usiz
         cache.k = fk.clone(); cache.v = fv.clone(); cache.len = total;
         (fk, fv, total)
     }
+}
+
+/// Element-wise scale: out[i] = vec[i] * scale[i % scale.len()]
+fn scale_vec(vec: &[f32], scale: &[f32]) -> Vec<f32> {
+    let s_len = scale.len();
+    vec.iter().enumerate().map(|(i, &v)| v * scale[i % s_len]).collect()
 }
 
 fn add_vecs(a: &[f32], b: &[f32]) -> Vec<f32> {

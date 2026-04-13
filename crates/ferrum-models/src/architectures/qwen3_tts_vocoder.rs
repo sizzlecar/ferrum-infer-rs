@@ -512,173 +512,142 @@ impl DecoderBlock {
     }
 }
 
-// ── Vocoder Pre-Transformer (8-layer decoder with layer_scale) ──────────
+// ── Vocoder Pre-Transformer (FusedTransformer with layer_scale) ─────────
+//
+// Uses ferrum_attention::FusedTransformer for Metal/CPU acceleration.
+// 8 layers, hidden=512, heads=16 (no GQA), head_dim=64, intermediate=1024.
+// Includes layer_scale (learnable per-sublayer scalar weights).
 
-/// Single transformer layer for the vocoder's pre_transformer.
-/// hidden_size=512, num_heads=16, head_dim=64, intermediate=1024, with layer_scale.
-struct VocoderTransformerLayer {
-    input_ln: RmsNorm,
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    attn_layer_scale: Tensor,  // [512] scalar broadcast
-    post_ln: RmsNorm,
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-    mlp_layer_scale: Tensor,   // [512] scalar broadcast
-}
-
-impl VocoderTransformerLayer {
-    fn load(vb: VarBuilder, hidden: usize, eps: f64) -> candle_core::Result<Self> {
-        Ok(Self {
-            input_ln: candle_nn::rms_norm(hidden, eps, vb.pp("input_layernorm"))?,
-            q_proj: candle_nn::linear_no_bias(hidden, 16 * 64, vb.pp("self_attn").pp("q_proj"))?,
-            k_proj: candle_nn::linear_no_bias(hidden, 16 * 64, vb.pp("self_attn").pp("k_proj"))?,
-            v_proj: candle_nn::linear_no_bias(hidden, 16 * 64, vb.pp("self_attn").pp("v_proj"))?,
-            o_proj: candle_nn::linear_no_bias(16 * 64, hidden, vb.pp("self_attn").pp("o_proj"))?,
-            attn_layer_scale: vb.pp("self_attn_layer_scale").get(hidden, "scale")?,
-            post_ln: candle_nn::rms_norm(hidden, eps, vb.pp("post_attention_layernorm"))?,
-            gate_proj: candle_nn::linear_no_bias(hidden, 1024, vb.pp("mlp").pp("gate_proj"))?,
-            up_proj: candle_nn::linear_no_bias(hidden, 1024, vb.pp("mlp").pp("up_proj"))?,
-            down_proj: candle_nn::linear_no_bias(1024, hidden, vb.pp("mlp").pp("down_proj"))?,
-            mlp_layer_scale: vb.pp("mlp_layer_scale").get(hidden, "scale")?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
-        let residual = x;
-        let h = self.input_ln.forward(x)?;
-
-        // Self-attention (16 heads, head_dim=64, no GQA)
-        let (b, seq, _) = h.dims3()?;
-        let q = h.apply(&self.q_proj)?.reshape((b, seq, 16, 64))?.transpose(1, 2)?;
-        let k = h.apply(&self.k_proj)?.reshape((b, seq, 16, 64))?.transpose(1, 2)?;
-        let v = h.apply(&self.v_proj)?.reshape((b, seq, 16, 64))?.transpose(1, 2)?;
-
-        // RoPE
-        let q = apply_rope_vocoder(&q, cos, sin)?;
-        let k = apply_rope_vocoder(&k, cos, sin)?;
-
-        // Attention: Q@K^T * scale → mask → softmax → @V
-        let scale = (64.0f64).powf(-0.5);
-        let mut attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        if let Some(m) = mask {
-            attn = attn.broadcast_add(m)?;
-        }
-        let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
-        let attn_out = attn.matmul(&v)?
-            .transpose(1, 2)?
-            .reshape((b, seq, 16 * 64))?;
-        let attn_out = attn_out.apply(&self.o_proj)?;
-
-        // Layer scale + residual
-        let h = (residual + attn_out.broadcast_mul(&self.attn_layer_scale)?)?;
-
-        // MLP
-        let residual = &h;
-        let normed = self.post_ln.forward(&h)?;
-        let gate = normed.apply(&self.gate_proj)?;
-        let up = normed.apply(&self.up_proj)?;
-        let silu_gate = (gate.silu()? * up)?;
-        let mlp_out = silu_gate.apply(&self.down_proj)?;
-
-        // Layer scale + residual
-        (residual + mlp_out.broadcast_mul(&self.mlp_layer_scale)?)
-    }
-}
-
-/// RoPE for vocoder (standard, theta=10000, head_dim=64)
-fn apply_rope_vocoder(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
-    let d = x.dim(D::Minus1)?;
-    let x1 = x.narrow(D::Minus1, 0, d / 2)?;
-    let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
-    let cos = cos.broadcast_as(x1.shape())?;
-    let sin = sin.broadcast_as(x1.shape())?;
-    Tensor::cat(&[
-        &(x1.mul(&cos)? - x2.mul(&sin)?)?,
-        &(x2.mul(&cos)? + x1.mul(&sin)?)?,
-    ], D::Minus1)
-}
-
-/// Vocoder pre-transformer: input_proj → 8 layers → norm → output_proj
+/// Vocoder pre-transformer using FusedTransformer (Metal/CPU, no candle overhead).
+/// input_proj(1024→512) → 8 fused layers with layer_scale → norm → output_proj(512→1024)
 struct VocoderPreTransformer {
-    input_proj: Linear,
-    layers: Vec<VocoderTransformerLayer>,
-    norm: RmsNorm,
-    output_proj: Linear,
-    cos_cache: Tensor,
-    sin_cache: Tensor,
+    input_proj_w: Vec<f32>,  // [512, 1024]
+    input_proj_b: Vec<f32>,  // [512]
+    output_proj_w: Vec<f32>, // [1024, 512]
+    output_proj_b: Vec<f32>, // [1024]
+    fused: ferrum_attention::FusedTransformer,
+    hidden: usize,
+    latent: usize,
 }
 
 impl VocoderPreTransformer {
     fn load(cfg: &VocoderConfig, vb: VarBuilder) -> candle_core::Result<Self> {
         let h = cfg.hidden_size; // 512
-        let input_proj = candle_nn::linear(cfg.latent_dim, h, vb.pp("input_proj"))?;
-        let output_proj = candle_nn::linear(h, cfg.latent_dim, vb.pp("output_proj"))?;
-        let norm = candle_nn::rms_norm(h, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let lat = cfg.latent_dim; // 1024
+        let nh = cfg.num_attention_heads; // 16
+        let hd = 64usize; // head_dim
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            layers.push(VocoderTransformerLayer::load(
-                vb.pp(format!("layers.{i}")), h, cfg.rms_norm_eps,
-            )?);
-        }
-
-        // Precompute cos/sin for RoPE (head_dim=64, theta=10000)
-        let head_dim = 64usize;
-        let half = head_dim / 2;
-        let max_seq = 4096;
-        let mut cos_data = vec![0.0f32; max_seq * half];
-        let mut sin_data = vec![0.0f32; max_seq * half];
-        for pos in 0..max_seq {
-            for i in 0..half {
-                let freq = 1.0f64 / cfg.rope_theta.powf((2 * i) as f64 / head_dim as f64);
-                let angle = pos as f64 * freq;
-                cos_data[pos * half + i] = angle.cos() as f32;
-                sin_data[pos * half + i] = angle.sin() as f32;
-            }
-        }
-        let dev = vb.device();
-        let cos_cache = Tensor::from_vec(cos_data, (max_seq, half), dev)?;
-        let sin_cache = Tensor::from_vec(sin_data, (max_seq, half), dev)?;
-
-        Ok(Self { input_proj, layers, norm, output_proj, cos_cache, sin_cache })
-    }
-
-    /// Forward: [B, T, latent_dim] → [B, T, latent_dim]
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let seq_len = x.dim(1)?;
-
-        // Input projection: 1024 → 512
-        let mut h = x.apply(&self.input_proj)?;
-
-        // Cos/sin for this sequence length
-        let cos = self.cos_cache.narrow(0, 0, seq_len)?
-            .unsqueeze(0)?.unsqueeze(0)?;
-        let sin = self.sin_cache.narrow(0, 0, seq_len)?
-            .unsqueeze(0)?.unsqueeze(0)?;
-
-        // Causal mask
-        let mask = {
-            let mut data = vec![0.0f32; seq_len * seq_len];
-            for i in 0..seq_len {
-                for j in (i + 1)..seq_len {
-                    data[i * seq_len + j] = f32::NEG_INFINITY;
-                }
-            }
-            Tensor::from_vec(data, (1, 1, seq_len, seq_len), h.device())?
+        // Extract projection weights to raw f32
+        let to_vec = |t: &Tensor| -> candle_core::Result<Vec<f32>> {
+            t.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()
+        };
+        let get_w = |pp: &VarBuilder, shape: candle_core::Shape, name: &str| -> candle_core::Result<Vec<f32>> {
+            to_vec(&pp.get(shape, name)?)
         };
 
-        // 8 transformer layers
-        for layer in &self.layers {
-            h = layer.forward(&h, &cos, &sin, Some(&mask))?;
+        let input_proj_w = get_w(&vb.pp("input_proj"), (h, lat).into(), "weight")?;
+        let input_proj_b = get_w(&vb.pp("input_proj"), h.into(), "bias")?;
+        let output_proj_w = get_w(&vb.pp("output_proj"), (lat, h).into(), "weight")?;
+        let output_proj_b = get_w(&vb.pp("output_proj"), lat.into(), "bias")?;
+
+        // Extract transformer layer weights with layer_scale
+        let mut fused_layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            let lv = vb.pp(format!("layers.{i}"));
+            let av = lv.pp("self_attn");
+            let mv = lv.pp("mlp");
+            let attn_scale = to_vec(&lv.pp("self_attn_layer_scale").get(h, "scale")?)?;
+            let mlp_scale = to_vec(&lv.pp("mlp_layer_scale").get(h, "scale")?)?;
+            fused_layers.push(ferrum_attention::LayerWeights {
+                input_ln_w: get_w(&lv.pp("input_layernorm"), h.into(), "weight")?,
+                q_proj_w: get_w(&av.pp("q_proj"), (nh * hd, h).into(), "weight")?,
+                k_proj_w: get_w(&av.pp("k_proj"), (nh * hd, h).into(), "weight")?,
+                v_proj_w: get_w(&av.pp("v_proj"), (nh * hd, h).into(), "weight")?,
+                o_proj_w: get_w(&av.pp("o_proj"), (h, nh * hd).into(), "weight")?,
+                q_norm_w: vec![1.0f32; hd], // vocoder has no QK-norm, use identity
+                k_norm_w: vec![1.0f32; hd],
+                post_ln_w: get_w(&lv.pp("post_attention_layernorm"), h.into(), "weight")?,
+                gate_proj_w: get_w(&mv.pp("gate_proj"), (cfg.intermediate_size, h).into(), "weight")?,
+                up_proj_w: get_w(&mv.pp("up_proj"), (cfg.intermediate_size, h).into(), "weight")?,
+                down_proj_w: get_w(&mv.pp("down_proj"), (h, cfg.intermediate_size).into(), "weight")?,
+                attn_layer_scale: Some(attn_scale),
+                mlp_layer_scale: Some(mlp_scale),
+            });
+        }
+        let norm_w = get_w(&vb.pp("norm"), h.into(), "weight")?;
+
+        let fused = ferrum_attention::FusedTransformer::new(
+            ferrum_attention::TransformerConfig {
+                hidden_size: h,
+                intermediate_size: cfg.intermediate_size,
+                num_heads: nh,
+                num_kv_heads: nh, // no GQA in vocoder
+                head_dim: hd,
+                num_layers: cfg.num_hidden_layers,
+                rms_norm_eps: cfg.rms_norm_eps,
+                rope_theta: cfg.rope_theta,
+                max_position_embeddings: 4096,
+            },
+            fused_layers,
+            norm_w,
+        );
+
+        Ok(Self { input_proj_w, input_proj_b, output_proj_w, output_proj_b, fused, hidden: h, latent: lat })
+    }
+
+    /// Forward: [B, T, latent_dim] → [B, T, latent_dim]. All on CPU/Metal via FusedTransformer.
+    fn forward(&mut self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let seq_len = x.dim(1)?;
+        let h = self.hidden;
+        let lat = self.latent;
+
+        // Extract to raw f32
+        let x_data: Vec<f32> = x.to_device(&candle_core::Device::Cpu)?
+            .to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+        // Input projection: [T, 1024] @ [512, 1024]^T + bias → [T, 512]
+        let mut proj = vec![0.0f32; seq_len * h];
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn cblas_sgemm(order: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32,
+                    alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32,
+                    beta: f32, c: *mut f32, ldc: i32);
+            }
+            unsafe {
+                cblas_sgemm(101, 111, 112, seq_len as i32, h as i32, lat as i32,
+                    1.0, x_data.as_ptr(), lat as i32,
+                    self.input_proj_w.as_ptr(), lat as i32,
+                    0.0, proj.as_mut_ptr(), h as i32);
+            }
+        }
+        // Add bias
+        for t in 0..seq_len {
+            for j in 0..h { proj[t * h + j] += self.input_proj_b[j]; }
         }
 
-        // Final norm + output projection: 512 → 1024
-        h = self.norm.forward(&h)?;
-        h.apply(&self.output_proj)
+        // FusedTransformer: 8 layers
+        let transformed = self.fused.forward(&proj, seq_len);
+
+        // Output projection: [T, 512] @ [1024, 512]^T + bias → [T, 1024]
+        let mut out = vec![0.0f32; seq_len * lat];
+        #[cfg(target_os = "macos")]
+        unsafe {
+            extern "C" {
+                fn cblas_sgemm(order: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32,
+                    alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32,
+                    beta: f32, c: *mut f32, ldc: i32);
+            }
+            cblas_sgemm(101, 111, 112, seq_len as i32, lat as i32, h as i32,
+                1.0, transformed.as_ptr(), h as i32,
+                self.output_proj_w.as_ptr(), h as i32,
+                0.0, out.as_mut_ptr(), lat as i32);
+        }
+        for t in 0..seq_len {
+            for j in 0..lat { out[t * lat + j] += self.output_proj_b[j]; }
+        }
+
+        Tensor::from_vec(out, (1, seq_len, lat), x.device())
     }
 }
 
@@ -802,7 +771,7 @@ impl Qwen3TTSVocoder {
     ///
     /// Input: codes [B, num_quantizers, T] (u32 codec tokens)
     /// Output: waveform [B, 1, T * upsample_total] clamped to [-1, 1]
-    pub fn decode(&self, codes: &Tensor) -> Result<Tensor> {
+    pub fn decode(&mut self, codes: &Tensor) -> Result<Tensor> {
         // RVQ decode: [B, K, T] → [B, codebook_dim, T]
         let hidden = self
             .quantizer

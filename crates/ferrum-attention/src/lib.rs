@@ -72,6 +72,10 @@ pub struct LayerWeights {
     pub gate_proj_w: Vec<f32>,
     pub up_proj_w: Vec<f32>,
     pub down_proj_w: Vec<f32>,
+    /// Optional layer_scale for attention (vocoder transformer uses this, talker doesn't)
+    pub attn_layer_scale: Option<Vec<f32>>,
+    /// Optional layer_scale for MLP
+    pub mlp_layer_scale: Option<Vec<f32>>,
 }
 
 /// A complete N-layer fused transformer. All ops bypass candle.

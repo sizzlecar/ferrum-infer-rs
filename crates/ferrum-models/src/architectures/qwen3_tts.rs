@@ -609,6 +609,8 @@ impl Qwen3TTSTalker {
                 gate_proj_w: get_w(&mv.pp("gate_proj"), (cfg.intermediate_size, cfg.hidden_size).into(), "weight")?,
                 up_proj_w: get_w(&mv.pp("up_proj"), (cfg.intermediate_size, cfg.hidden_size).into(), "weight")?,
                 down_proj_w: get_w(&mv.pp("down_proj"), (cfg.hidden_size, cfg.intermediate_size).into(), "weight")?,
+                attn_layer_scale: None,
+                mlp_layer_scale: None,
             });
         }
         let norm_w = to_cpu_vec(&norm.weight)
@@ -746,6 +748,11 @@ pub struct SubTalker {
     pub codec_embeddings: Vec<Embedding>,
     /// Per-codebook prediction heads: lm_head[i] maps hidden → logits for codebook i+1
     lm_heads: Vec<Linear>,
+    /// Cached raw weights for zero-overhead predict loop
+    lm_raw: Vec<Vec<f32>>,    // [n_extra][vocab * hidden]
+    emb_raw: Vec<Vec<f32>>,   // [n_extra][vocab * emb_dim]
+    vocab_size: usize,
+    emb_dim: usize,
     /// Projection from talker hidden to subtalker hidden (if sizes differ)
     projection: Option<Linear>,
     num_code_groups: usize,
@@ -861,6 +868,8 @@ impl SubTalker {
                 gate_proj_w: get_w(&mv.pp("gate_proj"), (st_im, st_h).into(), "weight")?,
                 up_proj_w: get_w(&mv.pp("up_proj"), (st_im, st_h).into(), "weight")?,
                 down_proj_w: get_w(&mv.pp("down_proj"), (st_h, st_im).into(), "weight")?,
+                attn_layer_scale: None,
+                mlp_layer_scale: None,
             });
         }
         let st_norm_w = to_cpu_vec(&norm.weight)
@@ -890,11 +899,25 @@ impl SubTalker {
             n_extra,
         );
 
+        // Pre-extract raw weights for zero-overhead predict loop
+        let lm_raw: Vec<Vec<f32>> = lm_heads.iter().map(|lm| {
+            lm.weight().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        }).collect();
+        let emb_raw: Vec<Vec<f32>> = codec_embeddings.iter().map(|e| {
+            e.embeddings().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        }).collect();
+        let vocab_size = cfg.code_predictor_vocab_size;
+        let emb_dim = if !emb_raw.is_empty() { emb_raw[0].len() / vocab_size } else { st_h };
+
         Ok(Self {
             layers,
             norm,
             codec_embeddings,
             lm_heads,
+            lm_raw,
+            emb_raw,
+            vocab_size,
+            emb_dim,
             projection,
             num_code_groups: cfg.num_code_groups,
             tokens_generated: 0,
@@ -904,11 +927,7 @@ impl SubTalker {
     }
 
     /// Predict codec tokens 1..num_code_groups-1 given talker hidden state and first codec token.
-    ///
-    /// - `talker_hidden`: [1, 1, hidden_size] — last hidden from main talker
-    /// - `first_codec_embed`: [1, 1, hidden_size] — embedding of first codec token (from main talker's codec_embedding)
-    ///
-    /// Returns Vec of (num_code_groups - 1) token IDs.
+    /// Optimized: entire loop runs on raw f32 — no Tensor allocation in the hot path.
     pub fn predict(
         &mut self,
         talker_hidden: &Tensor,
@@ -917,89 +936,105 @@ impl SubTalker {
         top_k: usize,
     ) -> Result<Vec<u32>> {
         self.reset();
-
-        // Input: [talker_hidden, first_codec_embed] → [1, 2, hidden]
-        let input = Tensor::cat(&[talker_hidden, first_codec_embed], 1)
-            .map_err(|e| FerrumError::model(format!("subtalker cat: {e}")))?;
-
-        // Project if needed
-        let input = if let Some(proj) = &self.projection {
-            input
-                .apply(proj)
-                .map_err(|e| FerrumError::model(format!("subtalker proj: {e}")))?
-        } else {
-            input
-        };
-
-        // Prefill
-        let mut hidden = self.forward_layers(&input)?;
-
+        let h = self.fused_hidden_size;
         let n_extra = self.num_code_groups - 1;
+
+        // Extract input to raw f32: [hidden(h), embed(h)] = 2*h floats
+        let th: Vec<f32> = talker_hidden.flatten_all()
+            .and_then(|t| t.to_vec1())
+            .map_err(|e| FerrumError::model(format!("th: {e}")))?;
+        let fe: Vec<f32> = first_codec_embed.flatten_all()
+            .and_then(|t| t.to_vec1())
+            .map_err(|e| FerrumError::model(format!("fe: {e}")))?;
+        let mut input_data = Vec::with_capacity(2 * h);
+        input_data.extend_from_slice(&th);
+        input_data.extend_from_slice(&fe);
+
+        // Prefill (2 tokens through fused transformer)
+        let output = self.fused.forward(&input_data, 2);
+        // Last position = output[h..2h]
+        let mut last_hidden = output[h..2 * h].to_vec();
+
+        // Use pre-cached raw weights (extracted at init time)
+        let vocab = self.vocab_size;
+        let emb_dim = self.emb_dim;
+
+        #[cfg(target_os = "macos")]
+        extern "C" {
+            fn cblas_sgemm(order: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32,
+                alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32,
+                beta: f32, c: *mut f32, ldc: i32);
+        }
+
         let mut predicted_tokens = Vec::with_capacity(n_extra);
+        let mut logits_buf = vec![0.0f32; vocab];
 
         for i in 0..n_extra {
-            // Get logits from last position using lm_head[i]
-            let last = hidden
-                .narrow(1, hidden.dim(1).unwrap() - 1, 1)
-                .map_err(|e| FerrumError::model(format!("narrow: {e}")))?;
-            let logits = last
-                .apply(&self.lm_heads[i])
-                .map_err(|e| FerrumError::model(format!("lm_head.{i}: {e}")))?;
+            // lm_head matmul: logits = last_hidden @ lm_weights[i]^T
+            #[cfg(target_os = "macos")]
+            unsafe {
+                cblas_sgemm(101, 111, 112, 1, vocab as i32, h as i32,
+                    1.0, last_hidden.as_ptr(), h as i32,
+                    self.lm_raw[i].as_ptr(), h as i32,
+                    0.0, logits_buf.as_mut_ptr(), vocab as i32);
+            }
+            #[cfg(not(target_os = "macos"))]
+            for j in 0..vocab {
+                let mut s = 0.0f32;
+                for k in 0..h { s += last_hidden[k] * self.lm_raw[i][j * h + k]; }
+                logits_buf[j] = s;
+            }
 
-            // Sample
-            let logits_vec = logits
-                .squeeze(0)
-                .and_then(|t| t.squeeze(0))
-                .and_then(|t| t.to_dtype(candle_core::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-                .map_err(|e| FerrumError::model(format!("logits vec: {e}")))?;
-
-            let token =
-                crate::executor::tts_executor::sample_token(&logits_vec, temperature, top_k, 1.0);
+            let token = crate::executor::tts_executor::sample_token(&logits_buf, temperature, top_k, 1.0);
             predicted_tokens.push(token);
 
-            // If not last, embed and forward for next step
             if i < n_extra - 1 {
-                // Hard embedding: argmax token → discrete lookup (matches reference impl)
-                let token_tensor = Tensor::new(&[token], hidden.device())
-                    .and_then(|t| t.unsqueeze(0))
-                    .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?;
-                let embed = token_tensor
-                    .apply(&self.codec_embeddings[i])
-                    .map_err(|e| FerrumError::model(format!("codec_embed.{i}: {e}")))?;
-                // Project if needed
-                let embed = if let Some(proj) = &self.projection {
-                    embed
-                        .apply(proj)
-                        .map_err(|e| FerrumError::model(format!("proj: {e}")))?
-                } else {
-                    embed
-                };
-                hidden = self.forward_layers(&embed)?;
+                // Raw embedding lookup
+                let t = token as usize;
+                let embed = &self.emb_raw[i][t * emb_dim..(t + 1) * emb_dim];
+
+                // Forward through fused transformer (1 token)
+                let output = self.fused.forward(embed, 1);
+                last_hidden = output;
             }
         }
 
         Ok(predicted_tokens)
     }
 
+    // Keep old predict signature for compatibility (unused placeholder)
+    fn _predict_candle(
+        &mut self,
+        talker_hidden: &Tensor,
+        first_codec_embed: &Tensor,
+        temperature: f32,
+        top_k: usize,
+    ) -> Result<Vec<u32>> {
+        unreachable!()
+    }
+
     fn forward_layers(&mut self, input: &Tensor) -> Result<Tensor> {
-        // Use fused path (better precision match with reference at step 0-1)
         let seq_len = input.dim(1)
             .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
         let h = self.fused_hidden_size;
 
-        let input_data: Vec<f32> = input
-            .to_device(&candle_core::Device::Cpu)
-            .and_then(|t| t.to_dtype(DType::F32))
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1())
-            .map_err(|e| FerrumError::model(format!("st input extract: {e}")))?;
+        // Fast path: if already on CPU f32, avoid extra copies
+        let input_data = if input.device().is_cpu() && input.dtype() == DType::F32 {
+            input.flatten_all()
+                .and_then(|t| t.to_vec1())
+                .map_err(|e| FerrumError::model(format!("st extract: {e}")))?
+        } else {
+            input.to_device(&candle_core::Device::Cpu)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1())
+                .map_err(|e| FerrumError::model(format!("st extract: {e}")))?
+        };
 
         let output = self.fused.forward(&input_data, seq_len);
 
         Tensor::from_vec(output, (1, seq_len, h), &candle_core::Device::Cpu)
-            .and_then(|t| t.to_device(input.device()))
-            .map_err(|e| FerrumError::model(format!("st output tensor: {e}")))
+            .map_err(|e| FerrumError::model(format!("st output: {e}")))
     }
 
     pub fn reset(&mut self) {

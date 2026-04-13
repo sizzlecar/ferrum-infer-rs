@@ -409,9 +409,13 @@ impl TtsModelExecutor {
             let first_codec_embed = self.talker.embed_codec(&token_tensor)?;
 
             // SubTalker: predict remaining codec tokens 1..num_code_groups-1
+            let st_t0 = std::time::Instant::now();
             let extra_codes =
                 self.sub_talker
                     .predict(&last_hidden, &first_codec_embed, st_temperature(), TOP_K)?;
+            if step == 0 {
+                info!("  SubTalker: {:.1}ms", st_t0.elapsed().as_secs_f64() * 1000.0);
+            }
 
             let mut frame_codes = vec![next_token];
             frame_codes.extend_from_slice(&extra_codes);
@@ -461,8 +465,12 @@ impl TtsModelExecutor {
                 }
             }
             // Forward combined embedding through talker
+            let tk_t0 = std::time::Instant::now();
             hidden = self.talker.forward_step(&combined_embed)?;
             current_logits = self.talker.logits(&hidden)?;
+            if step == 0 {
+                info!("  Talker step: {:.1}ms", tk_t0.elapsed().as_secs_f64() * 1000.0);
+            }
         }
 
         if all_codec_tokens.is_empty() {
