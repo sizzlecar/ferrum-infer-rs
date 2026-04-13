@@ -624,6 +624,10 @@ impl TtsModelExecutor {
         let mel_tensor = Tensor::from_vec(mel, (1, n_mel_frames, 128), &device)
             .map_err(|e| FerrumError::model(format!("mel tensor: {e}")))?;
         let spk_embed = speaker_encoder.forward(&mel_tensor)?;
+        info!(
+            "Step 2 (speaker embed): {:.1}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
         // spk_embed shape: [1024] -> reshape to [1, 1, 1024]
         let spk_embed = spk_embed
             .unsqueeze(0)
@@ -631,10 +635,6 @@ impl TtsModelExecutor {
             .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("spk unsqueeze(0) 2: {e}")))?;
 
-        info!(
-            "Step 2 (speaker embed): {:.1}ms",
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
         let t1 = std::time::Instant::now();
         // Step 3: Encode reference audio to codec tokens (ICL)
         let speech_enc = self
@@ -651,13 +651,18 @@ impl TtsModelExecutor {
                 .collect();
             let ncb = self.config.num_code_groups;
             let nframes = u32s.len() / ncb;
-            info!(
-                "Loaded pre-computed ref codes: {} frames from {}",
+            eprintln!(
+                "[voice-clone] loaded pre-computed ref codes: {} frames from {}",
                 nframes, path
             );
             u32s.chunks(ncb).map(|c| c.to_vec()).collect()
         } else {
-            speech_enc.encode(&ref_pcm)?
+            let codes = speech_enc.encode(&ref_pcm)?;
+            info!(
+                "Step 3 (speech tokenizer): {:.1}ms",
+                t1.elapsed().as_secs_f64() * 1000.0
+            );
+            codes
         };
         let ref_frames = ref_codes.len();
         info!(
@@ -793,8 +798,8 @@ impl TtsModelExecutor {
         let mut talker_input = Tensor::cat(&[&role_embed, &text_codec_prefix], 1)
             .map_err(|e| FerrumError::model(format!("talker_input cat: {e}")))?;
 
-        // ICL prompt: embed ref text + target text, ref codec, and sum them
-        // Text stream: text_projection(text_embed([ref_text_content, text_content]))
+        // ICL prompt: [ref_text, target_text, tts_eos] + [codec_bos, ref_codec]
+        // Streaming mode: element-wise sum, trailing = text beyond codec length
         let all_text_ids: Vec<u32> = ref_text_ids
             .iter()
             .chain(text_content_ids.iter())
@@ -807,31 +812,38 @@ impl TtsModelExecutor {
             .dim(1)
             .map_err(|e| FerrumError::model(format!("text_len dim: {e}")))?;
 
-        // Codec stream: codec_bos + sum of all 16 codebook embeddings for ref codes
-        let mut codec_frame_embeds = Vec::new();
-        for frame in &ref_codes {
-            // First codebook: main codec embedding
-            let first_embed = embed_codec_ids(&[frame[0]])?;
-            let mut frame_embed = first_embed;
-            // Remaining codebooks: sub-talker embeddings
-            for (i, &code) in frame[1..self.config.num_code_groups].iter().enumerate() {
-                let code_t = Tensor::new(&[code], &device)
-                    .map_err(|e| FerrumError::model(format!("ref code_t: {e}")))?
+        // Codec stream: batch all codebook embeddings in one shot
+        // Collect all first-codebook IDs → single batch embed
+        let t_codec_start = std::time::Instant::now();
+        let ncg = self.config.num_code_groups;
+        let first_codes: Vec<u32> = ref_codes.iter().map(|f| f[0]).collect();
+        let codec_frames_cat = {
+            // Batch embed main codec: [1, nframes, hidden]
+            let mut sum = embed_codec_ids(&first_codes)?;
+            // Batch embed each sub-codebook and accumulate
+            for cb in 0..(ncg - 1) {
+                let codes: Vec<u32> = ref_codes.iter().map(|f| f[cb + 1]).collect();
+                let codes_t = Tensor::new(codes.as_slice(), &device)
+                    .map_err(|e| FerrumError::model(format!("batch codes: {e}")))?
                     .unsqueeze(0)
-                    .map_err(|e| FerrumError::model(format!("ref code unsqueeze: {e}")))?;
-                let sub_embed = code_t
-                    .apply(&self.sub_talker.codec_embeddings[i])
-                    .map_err(|e| FerrumError::model(format!("ref sub_embed: {e}")))?;
-                frame_embed = (frame_embed + sub_embed)
-                    .map_err(|e| FerrumError::model(format!("ref frame_embed add: {e}")))?;
+                    .map_err(|e| FerrumError::model(format!("batch unsqueeze: {e}")))?;
+                let sub_embed = codes_t
+                    .apply(&self.sub_talker.codec_embeddings[cb])
+                    .map_err(|e| FerrumError::model(format!("batch sub_embed: {e}")))?;
+                sum =
+                    (sum + sub_embed).map_err(|e| FerrumError::model(format!("batch add: {e}")))?;
             }
-            codec_frame_embeds.push(frame_embed);
-        }
-        let codec_frames_refs: Vec<&Tensor> = codec_frame_embeds.iter().collect();
-        let codec_frames_cat = Tensor::cat(&codec_frames_refs, 1)
-            .map_err(|e| FerrumError::model(format!("codec_frames cat: {e}")))?;
+            sum
+        };
+        info!(
+            "Codec embedding: {:.1}ms ({} frames × {} codebooks)",
+            t_codec_start.elapsed().as_secs_f64() * 1000.0,
+            ref_codes.len(),
+            ncg
+        );
 
         // Prepend codec_bos to codec frames: [codec_bos_embed, codec_frames]
+        let t_merge = std::time::Instant::now();
         let codec_bos_for_icl = embed_codec_ids(&[codec_bos])?;
         let icl_codec = Tensor::cat(&[&codec_bos_for_icl, &codec_frames_cat], 1)
             .map_err(|e| FerrumError::model(format!("icl_codec cat: {e}")))?;
@@ -855,14 +867,17 @@ impl TtsModelExecutor {
                 .map_err(|e| FerrumError::model(format!("talker+summed cat: {e}")))?;
             trailing_text = Some(trailing);
         } else {
-            // codec is longer or equal: pad text with tts_pad
-            let mut text_padded_parts = vec![text_embed_with_eos.clone()];
-            for _ in 0..(codec_icl_len - text_len) {
-                text_padded_parts.push(tts_pad_embed.clone());
-            }
-            let padded_refs: Vec<&Tensor> = text_padded_parts.iter().collect();
-            let text_padded = Tensor::cat(&padded_refs, 1)
-                .map_err(|e| FerrumError::model(format!("text_padded cat: {e}")))?;
+            // codec is longer or equal: pad text with tts_pad via expand (single op)
+            let n_pad = codec_icl_len - text_len;
+            let text_padded = if n_pad > 0 {
+                let pad_block = tts_pad_embed
+                    .expand((1, n_pad, 1024))
+                    .map_err(|e| FerrumError::model(format!("pad expand: {e}")))?;
+                Tensor::cat(&[&text_embed_with_eos, &pad_block], 1)
+                    .map_err(|e| FerrumError::model(format!("text_padded cat: {e}")))?
+            } else {
+                text_embed_with_eos.clone()
+            };
             let summed = (&text_padded + &icl_codec)
                 .map_err(|e| FerrumError::model(format!("padded+codec sum: {e}")))?;
             talker_input = Tensor::cat(&[&talker_input, &summed], 1)
@@ -870,33 +885,27 @@ impl TtsModelExecutor {
             trailing_text = None;
         }
 
-        // Add trailing text if any (in streaming mode, trailing text is fed during decode)
-        // Note: Python streaming ICL does NOT add a decode_start position.
-        // The first token is generated from the last ICL position directly.
-        if let Some(trailing) = &trailing_text {
-            talker_input = Tensor::cat(&[&talker_input, trailing], 1)
-                .map_err(|e| FerrumError::model(format!("talker+trailing cat: {e}")))?;
-        }
+        // Trailing text for decode: text positions beyond codec (if text > codec)
+        // Otherwise trailing is just tts_pad (matching reference project streaming mode)
+        let icl_trailing = if let Some(trailing) = &trailing_text {
+            trailing.clone()
+        } else {
+            tts_pad_embed.clone()
+        };
+        let trailing_text_len = icl_trailing
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("trailing dim: {e}")))?;
 
         let prefill_len = talker_input
             .dim(1)
             .map_err(|e| FerrumError::model(format!("prefill dim: {e}")))?;
-        info!("TTS voice clone: prefill seq_len={}", prefill_len);
-
-        // Debug: dump key positions for comparison with Python
-        for pos in [0usize, 8, 9, 10, 20, 40, 60, 70, 71, 72] {
-            if pos < prefill_len {
-                if let Ok(vals) = talker_input
-                    .narrow(0, 0, 1)
-                    .and_then(|t| t.narrow(1, pos, 1))
-                    .and_then(|t| t.narrow(2, 0, 5))
-                    .and_then(|t| t.flatten_all())
-                    .and_then(|t| t.to_vec1::<f32>())
-                {
-                    info!("  prefill pos {}: {:?}", pos, vals);
-                }
-            }
-        }
+        info!(
+            "ICL prompt: prefill={}, icl={}, trailing={}, {:.1}ms",
+            prefill_len,
+            codec_icl_len.min(text_len),
+            trailing_text_len,
+            t_merge.elapsed().as_secs_f64() * 1000.0
+        );
 
         info!(
             "Steps 4-5 (tokenize+prompt): {:.1}ms",
@@ -906,10 +915,10 @@ impl TtsModelExecutor {
         // Step 6: Prefill and decode
         let mut hidden = self.talker.forward_step(&talker_input)?;
         info!(
-            "Prefill ({} tokens, {} layers): {:.1}ms",
+            "Prefill: {:.1}ms ({} tokens × {} layers)",
+            t3.elapsed().as_secs_f64() * 1000.0,
             prefill_len,
             self.config.num_hidden_layers,
-            t3.elapsed().as_secs_f64() * 1000.0
         );
         // Debug: dump prefill output at last position
         if let Ok(vals) = hidden
@@ -939,7 +948,14 @@ impl TtsModelExecutor {
         let suppress_start = self.config.vocab_size.saturating_sub(1024);
         let suppress_end = self.config.vocab_size;
 
-        for step in 0..MAX_CODEC_TOKENS {
+        // ICL mode: stronger repetition penalty + max_tokens limit (matching reference)
+        const ICL_REPETITION_PENALTY: f32 = 1.5;
+        const ICL_FRAMES_PER_TOKEN: usize = 6;
+        const ICL_MIN_FRAMES: usize = 75;
+        let max_icl_tokens = ICL_MIN_FRAMES.max(text_content_ids.len() * ICL_FRAMES_PER_TOKEN);
+        let mut generated_tokens: Vec<u32> = Vec::new();
+
+        for step in 0..max_icl_tokens {
             let mut logits_vec = logits_to_vec(&current_logits)?;
             // Suppress special tokens
             for i in suppress_start..suppress_end.min(logits_vec.len()) {
@@ -947,23 +963,28 @@ impl TtsModelExecutor {
                     logits_vec[i] = f32::NEG_INFINITY;
                 }
             }
-            let next_token =
-                sample_token(&logits_vec, tts_temperature(), TOP_K, REPETITION_PENALTY);
-
-            if step < 3 {
-                // Dump top-5 logits for comparison
-                let mut indexed: Vec<(usize, f32)> =
-                    logits_vec.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let top5: Vec<(usize, f32)> = indexed.into_iter().take(5).collect();
-                info!(
-                    "  decode step {}: token={}, top5={:?}",
-                    step, next_token, top5
-                );
+            // Repetition penalty with token history
+            for &prev_tok in &generated_tokens {
+                let idx = prev_tok as usize;
+                if idx < logits_vec.len() {
+                    if logits_vec[idx] > 0.0 {
+                        logits_vec[idx] /= ICL_REPETITION_PENALTY;
+                    } else {
+                        logits_vec[idx] *= ICL_REPETITION_PENALTY;
+                    }
+                }
             }
+            let next_token = sample_token(
+                &logits_vec,
+                tts_temperature(),
+                TOP_K,
+                ICL_REPETITION_PENALTY,
+            );
+
+            generated_tokens.push(next_token);
 
             if next_token == codec_eos {
-                info!("TTS: codec EOS at step {}", step);
+                info!("TTS voice clone: codec EOS at step {}", step);
                 break;
             }
 
@@ -1022,9 +1043,17 @@ impl TtsModelExecutor {
                 info!("  step {} codec_ids: {:?}", step, all_ids);
             }
 
-            // Add tts_pad to codec embedding (dual-stream sum)
-            combined_embed = (combined_embed + &tts_pad_embed)
-                .map_err(|e| FerrumError::model(format!("add tts_pad: {e}")))?;
+            // Add trailing text or tts_pad (matching reference streaming mode)
+            if step < trailing_text_len {
+                let trail = icl_trailing
+                    .narrow(1, step, 1)
+                    .map_err(|e| FerrumError::model(format!("trailing narrow: {e}")))?;
+                combined_embed = (combined_embed + trail)
+                    .map_err(|e| FerrumError::model(format!("add trailing: {e}")))?;
+            } else {
+                combined_embed = (combined_embed + &tts_pad_embed)
+                    .map_err(|e| FerrumError::model(format!("add tts_pad: {e}")))?;
+            }
 
             hidden = self.talker.forward_step(&combined_embed)?;
             current_logits = self.talker.logits(&hidden)?;
