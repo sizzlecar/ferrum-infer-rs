@@ -53,6 +53,12 @@ ferrum serve --model qwen3:0.6b --port 8000
 |------|-------|------|----------|
 | **Whisper** | 支持 | — | whisper-tiny, whisper-base, whisper-small, whisper-medium, whisper-large-v3, **whisper-turbo**（推荐） |
 
+### 文字转语音（Qwen3-TTS）
+
+| 架构 | Metal | CPU | 声音克隆 | 示例模型 |
+|------|-------|-----|---------|----------|
+| **Qwen3-TTS** | 支持 | 支持 | 支持（ICL） | Qwen3-TTS-12Hz-0.6B-Base |
+
 ### 向量化（文本 + 图片）
 
 | 架构 | 模态 | 向量维度 | 示例模型 |
@@ -70,6 +76,12 @@ ferrum run llama3.2:3b
 # 语音转文字（支持 WAV/M4A/MP3/FLAC，自动 ffmpeg 转码）
 ferrum transcribe whisper-turbo 录音.m4a -l zh
 ferrum transcribe whisper-turbo meeting.wav -l en
+
+# 文字转语音
+ferrum tts qwen3-tts "你好欢迎使用语音合成系统" -o output.wav
+
+# 声音克隆（ICL 模式，5 秒参考音频即可克隆任何声音）
+ferrum tts qwen3-tts "你好" --ref-audio ref.wav --ref-text "参考文本" -o clone.wav
 
 # Whisper API 服务（OpenAI 兼容）
 ferrum serve whisper-turbo
@@ -96,6 +108,7 @@ curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to
 | `ferrum list` | 查看已缓存模型 |
 | `ferrum bench <model>` | 性能基准测试 |
 | `ferrum transcribe <model> <audio>` | 语音转文字（Whisper，支持 WAV/M4A/MP3） |
+| `ferrum tts <model> <text>` | 文字转语音（Qwen3-TTS，`--ref-audio` 声音克隆） |
 | `ferrum embed <model>` | 生成向量（BERT/CLIP/SigLIP，文本 + 图片） |
 
 ## API 接口
@@ -157,6 +170,15 @@ curl http://localhost:8000/health
 
 > 自研 Whisper 前向推理 + rustfft STFT，mel 精度与 Python whisper 完全一致。完整解码管线：带时间戳的顺序解码、温度回退、压缩率检测。
 
+### Qwen3-TTS（Apple Silicon Metal）
+
+| 文本 | 音频时长 | 耗时 | 实时率 |
+|------|---------|------|--------|
+| 29 字中文 | 4.6s | **11.3s** | **2.8 倍实时** |
+| 声音克隆（ICL，5s 参考音频） | 5.3s | 13.1s | 2.5 倍实时 |
+
+> 全 Metal fused transformer 管线：自研 GEMM（64×32 simdgroup tiles）、fused residual+norm、flash attention + layer_scale。完整 Mimi vocoder（8 层 pre-transformer）。Apple Silicon 统一内存零拷贝。
+
 ### 核心优化
 
 - **自定义 CUDA decode runner**：绕过 candle 的 decode 热路径（Qwen3 + LLaMA）
@@ -167,6 +189,8 @@ curl http://localhost:8000/health
 - **自定义 CUDA 内核**：fused RmsNorm、SiLU×mul、RoPE、decode attention（统一 stream 零同步）
 - **Flash Decoding**：长上下文 split-K（KV > 256 时自动启用）
 - **Batch decode**：batched cuBLAS GEMM + batched attention 支持并发请求
+- **Metal TTS 管线**：全 Metal fused transformer，talker（28 层）+ SubTalker（5 层）+ vocoder（8 层），缓存 GPU buffer，fused residual+norm 内核，layer_scale 支持
+- **TTS 声音克隆**：ICL 提示 + 说话人编码器（ECAPA-TDNN）+ 语音分词器（Mimi RVQ）
 - **Paged KV attention**：GPU block pool + block-table 间接寻址
 - **双缓冲 residual**：跨层 norm 融合（-108 次 kernel launch）
 
@@ -184,6 +208,7 @@ curl http://localhost:8000/health
 - 张量并行（多 GPU NCCL，自动检测 GPU 数量）
 - CLIP/Chinese-CLIP/SigLIP 向量化（文本 + 图片，`/v1/embeddings` API）
 - Whisper 语音识别（Metal 加速，`/v1/audio/transcriptions` API）
+- Qwen3-TTS 语音合成（Metal 加速，ICL 声音克隆）
 - 多格式音频支持（WAV/M4A/MP3/FLAC，自动 ffmpeg 转码）
 - Top-k / Top-p / Temperature / 重复惩罚采样
 
