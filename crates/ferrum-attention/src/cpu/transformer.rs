@@ -31,9 +31,18 @@ pub fn cpu_layer_forward(
     let k = matmul_at_bt(&ln_out, &w.k_proj_w, tokens, nkv * hd, h);
     let v = matmul_at_bt(&ln_out, &w.v_proj_w, tokens, nkv * hd, h);
 
-    // 3. Transpose + QK norm + RoPE
-    let mut q_r = transpose_and_norm(&q, tokens, nh, hd, &w.q_norm_w, eps);
-    let mut k_r = transpose_and_norm(&k, tokens, nkv, hd, &w.k_norm_w, eps);
+    // 3. Transpose + optional QK norm + RoPE
+    // Empty norm weights = skip QK-norm (vocoder transformer has no QK-norm)
+    let mut q_r = if w.q_norm_w.is_empty() {
+        transpose_no_norm(&q, tokens, nh, hd)
+    } else {
+        transpose_and_norm(&q, tokens, nh, hd, &w.q_norm_w, eps)
+    };
+    let mut k_r = if w.k_norm_w.is_empty() {
+        transpose_no_norm(&k, tokens, nkv, hd)
+    } else {
+        transpose_and_norm(&k, tokens, nkv, hd, &w.k_norm_w, eps)
+    };
     let v_r = transpose_no_norm(&v, tokens, nkv, hd);
 
     apply_rope(&mut q_r, nh, tokens, hd, cos, sin, pos_offset);

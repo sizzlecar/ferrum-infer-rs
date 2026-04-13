@@ -564,8 +564,8 @@ impl VocoderPreTransformer {
                 k_proj_w: get_w(&av.pp("k_proj"), (nh * hd, h).into(), "weight")?,
                 v_proj_w: get_w(&av.pp("v_proj"), (nh * hd, h).into(), "weight")?,
                 o_proj_w: get_w(&av.pp("o_proj"), (h, nh * hd).into(), "weight")?,
-                q_norm_w: vec![1.0f32; hd], // vocoder has no QK-norm, use identity
-                k_norm_w: vec![1.0f32; hd],
+                q_norm_w: vec![], // empty = skip QK-norm (vocoder has none)
+                k_norm_w: vec![], // empty = skip QK-norm
                 post_ln_w: get_w(&lv.pp("post_attention_layernorm"), h.into(), "weight")?,
                 gate_proj_w: get_w(&mv.pp("gate_proj"), (cfg.intermediate_size, h).into(), "weight")?,
                 up_proj_w: get_w(&mv.pp("up_proj"), (cfg.intermediate_size, h).into(), "weight")?,

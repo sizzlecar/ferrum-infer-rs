@@ -132,14 +132,16 @@ impl FusedTransformer {
 
         // Backend selection:
         //   FERRUM_FUSED_CPU=1  → force CPU
+        //   FERRUM_FUSED_CPU=1  → force CPU
         //   FERRUM_FUSED_METAL=1 → force Metal
-        //   otherwise → auto: CPU for hidden≤2048 (Metal sync overhead > compute benefit)
+        //   otherwise → auto: Metal for large models (28-layer talker), CPU for small (SubTalker/vocoder)
         let use_cpu = if std::env::var("FERRUM_FUSED_CPU").as_deref() == Ok("1") {
             true
         } else if std::env::var("FERRUM_FUSED_METAL").as_deref() == Ok("1") {
             false
         } else {
-            cfg.hidden_size <= 2048
+            // Metal for talker (28) + vocoder (8), CPU for SubTalker (5) only
+            cfg.num_layers < 10 // Talker(28)=Metal, SubTalker(5)+Vocoder(8)=CPU
         };
 
         #[cfg(feature = "metal")]
@@ -153,12 +155,21 @@ impl FusedTransformer {
                         k_proj_w: pipes.buffer_from_data(&lw.k_proj_w),
                         v_proj_w: pipes.buffer_from_data(&lw.v_proj_w),
                         o_proj_w: pipes.buffer_from_data(&lw.o_proj_w),
-                        q_norm_w: pipes.buffer_from_data(&lw.q_norm_w),
-                        k_norm_w: pipes.buffer_from_data(&lw.k_norm_w),
+                        q_norm_w: if lw.q_norm_w.is_empty() {
+                            pipes.buffer_from_data(&[1.0f32]) // dummy, won't be used
+                        } else {
+                            pipes.buffer_from_data(&lw.q_norm_w)
+                        },
+                        k_norm_w: if lw.k_norm_w.is_empty() {
+                            pipes.buffer_from_data(&[1.0f32])
+                        } else {
+                            pipes.buffer_from_data(&lw.k_norm_w)
+                        },
                         post_ln_w: pipes.buffer_from_data(&lw.post_ln_w),
                         gate_proj_w: pipes.buffer_from_data(&lw.gate_proj_w),
                         up_proj_w: pipes.buffer_from_data(&lw.up_proj_w),
                         down_proj_w: pipes.buffer_from_data(&lw.down_proj_w),
+                        has_qk_norm: !lw.q_norm_w.is_empty(),
                     }
                 }).collect();
                 let kv_max_len = cfg.max_position_embeddings.min(4096);

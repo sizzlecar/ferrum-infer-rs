@@ -11,12 +11,14 @@ pub struct MetalLayerWeights {
     pub k_proj_w: Buffer,
     pub v_proj_w: Buffer,
     pub o_proj_w: Buffer,
-    pub q_norm_w: Buffer,  // on GPU for fused kernel
+    pub q_norm_w: Buffer,
     pub k_norm_w: Buffer,
     pub post_ln_w: Buffer,
     pub gate_proj_w: Buffer,
     pub up_proj_w: Buffer,
     pub down_proj_w: Buffer,
+    /// False = skip QK-norm in qk_norm_rope kernel (vocoder has no QK-norm)
+    pub has_qk_norm: bool,
 }
 
 pub struct MetalTransformerConfig {
@@ -135,13 +137,15 @@ pub fn metal_layer_forward_v2(
     // Encoder 3: QK-norm + RoPE + transpose (3 independent dispatches)
     {
         let enc = cmd.new_compute_command_encoder();
+        // Q/K: mode 1 (norm+RoPE) if has_qk_norm, mode 2 (RoPE only) if not
+        let qk_mode: i32 = if w.has_qk_norm { 1 } else { 2 };
         pipes.qk_norm_rope(enc, &s.q_buf, &w.q_norm_w, cos_buf, sin_buf, &s.q_ready,
-            tokens, nh, hd, pos_offset, cfg.rms_norm_eps, true);
+            tokens, nh, hd, pos_offset, cfg.rms_norm_eps, qk_mode);
         pipes.qk_norm_rope(enc, &s.k_buf, &w.k_norm_w, cos_buf, sin_buf, &s.k_ready,
-            tokens, nkv, hd, pos_offset, cfg.rms_norm_eps, true);
-        // V: transpose only (no norm, no RoPE)
+            tokens, nkv, hd, pos_offset, cfg.rms_norm_eps, qk_mode);
+        // V: mode 0 (transpose only, no norm, no RoPE)
         pipes.qk_norm_rope(enc, &s.v_buf, &w.k_norm_w, cos_buf, sin_buf, &s.v_ready,
-            tokens, nkv, hd, pos_offset, cfg.rms_norm_eps, false);
+            tokens, nkv, hd, pos_offset, cfg.rms_norm_eps, 0); // mode 0: transpose only
         enc.end_encoding();
     }
 

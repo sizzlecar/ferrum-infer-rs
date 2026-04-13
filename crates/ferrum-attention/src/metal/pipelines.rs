@@ -20,6 +20,7 @@ impl MetalPipelines {
         let ops_src = include_str!("shaders/transformer_ops.metal");
         let gemm_src = include_str!("shaders/gemm_f32.metal");
         let nr_src = include_str!("shaders/norm_rope.metal");
+        let sm_src = include_str!("shaders/softmax.metal");
 
         let fa_lib = device.new_library_with_source(fa_src, &opts)
             .expect("failed to compile flash_attn.metal");
@@ -29,6 +30,8 @@ impl MetalPipelines {
             .expect("failed to compile gemm_f32.metal");
         let nr_lib = device.new_library_with_source(nr_src, &opts)
             .expect("failed to compile norm_rope.metal");
+        let sm_lib = device.new_library_with_source(sm_src, &opts)
+            .expect("failed to compile softmax.metal");
 
         let mut pipelines = HashMap::new();
         for (lib, names) in [
@@ -36,6 +39,7 @@ impl MetalPipelines {
             (&ops_lib, &["rms_norm_f32", "silu_mul_f32", "add_f32", "gemm_f32"][..]),
             (&gemm_lib, &["gemm_f32_v2"][..]),
             (&nr_lib, &["qk_norm_rope_transpose_f32", "transpose_out_f32", "kv_cache_append_f32"][..]),
+            (&sm_lib, &["softmax_last_dim_f32", "softmax_last_dim_f32_out"][..]),
         ] {
             for name in names {
                 let func = lib.get_function(name, None)
@@ -233,14 +237,15 @@ impl MetalPipelines {
     /// QK-norm + RoPE + transpose (fused). Set apply_norm=false for V (transpose only).
     pub fn qk_norm_rope(&self, enc: &ComputeCommandEncoderRef,
         input: &Buffer, weight: &Buffer, cos: &Buffer, sin: &Buffer, output: &Buffer,
-        tokens: usize, heads: usize, head_dim: usize, pos_offset: usize, eps: f32, apply_norm: bool)
+        tokens: usize, heads: usize, head_dim: usize, pos_offset: usize, eps: f32, norm_mode: i32)
+        // norm_mode: 0=transpose only (V), 1=norm+RoPE (Q/K with QK-norm), 2=RoPE only (Q/K without QK-norm)
     {
         #[repr(C)]
         struct P { tokens: i32, heads: i32, head_dim: i32, half_dim: i32, pos_offset: i32, eps: f32, apply_norm: i32 }
         let params = P {
             tokens: tokens as i32, heads: heads as i32, head_dim: head_dim as i32,
             half_dim: (head_dim / 2) as i32, pos_offset: pos_offset as i32,
-            eps, apply_norm: if apply_norm { 1 } else { 0 },
+            eps, apply_norm: norm_mode,
         };
         let params_buf = self.device.new_buffer_with_data(
             &params as *const _ as *const c_void, std::mem::size_of::<P>() as u64,
@@ -296,6 +301,22 @@ impl MetalPipelines {
         let n = heads * new_len * head_dim;
         let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Softmax last dim (in-place): data[rows, cols] → softmax over cols
+    pub fn softmax_last_dim_inplace(&self, enc: &ComputeCommandEncoderRef, data: &Buffer, rows: usize, cols: usize) {
+        #[repr(C)]
+        struct P { rows: i32, cols: i32 }
+        let params = P { rows: rows as i32, cols: cols as i32 };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 8, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("softmax_last_dim_f32"));
+        enc.set_buffer(0, Some(data), 0);
+        enc.set_buffer(1, Some(&params_buf), 0);
+        enc.set_threadgroup_memory_length(0, 128);
+        let grid = MTLSize::new(rows as u64, 1, 1);
+        let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
 
