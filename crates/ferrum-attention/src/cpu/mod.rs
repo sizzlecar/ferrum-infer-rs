@@ -9,11 +9,20 @@ use crate::AttentionParams;
 #[cfg(target_os = "macos")]
 extern "C" {
     fn cblas_sgemm(
-        order: i32, transa: i32, transb: i32,
-        m: i32, n: i32, k: i32,
-        alpha: f32, a: *const f32, lda: i32,
-        b: *const f32, ldb: i32,
-        beta: f32, c: *mut f32, ldc: i32,
+        order: i32,
+        transa: i32,
+        transb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
     );
 }
 
@@ -22,11 +31,20 @@ extern "C" {
 fn gemm_at_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     unsafe {
         cblas_sgemm(
-            101, 111, 112, // RowMajor, NoTrans, Trans
-            m as i32, n as i32, k as i32,
-            1.0, a.as_ptr(), k as i32,
-            b.as_ptr(), k as i32,
-            0.0, c.as_mut_ptr(), n as i32,
+            101,
+            111,
+            112, // RowMajor, NoTrans, Trans
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            k as i32,
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
         );
     }
 }
@@ -114,16 +132,23 @@ fn gemm_tb_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize)
         // cblas_sgemm(ColMajor=102, Trans=112, NoTrans=111, M=sk, N=sq, K=d,
         //             alpha, K, kStride=d, Q, qStride=d, beta, C, ldC=sk)
         cblas_sgemm(
-            102, 112, 111,  // ColMajor, Trans, NoTrans
-            m as i32, n as i32, k as i32,
+            102,
+            112,
+            111, // ColMajor, Trans, NoTrans
+            m as i32,
+            n as i32,
+            k as i32,
             1.0,
-            a.as_ptr(), k as i32,  // K[sk, d] stored row-major, col-major lda = d? No...
+            a.as_ptr(),
+            k as i32, // K[sk, d] stored row-major, col-major lda = d? No...
             // Actually in ColMajor: A has dimensions [lda, *], stored column-by-column
             // K is stored row-major as [sk, d]. In col-major terms, it's a [d, sk] matrix with lda = sk? No.
             // This is getting confusing. Let me just use a simple loop.
-            b.as_ptr(), k as i32,
+            b.as_ptr(),
+            k as i32,
             0.0,
-            c.as_mut_ptr(), m as i32,
+            c.as_mut_ptr(),
+            m as i32,
         );
     }
 }
@@ -151,11 +176,20 @@ fn gemm_nt_nt_colmajor(_a: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: us
 pub fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     unsafe {
         cblas_sgemm(
-            101, 111, 111, // RowMajor, NoTrans, NoTrans
-            m as i32, n as i32, k as i32,
-            1.0, a.as_ptr(), k as i32,
-            b.as_ptr(), n as i32,
-            0.0, c.as_mut_ptr(), n as i32,
+            101,
+            111,
+            111, // RowMajor, NoTrans, NoTrans
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            n as i32,
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
         );
     }
 }
@@ -181,7 +215,11 @@ pub fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usi
 pub fn softmax_inplace(scores: &mut [f32], m: usize, n: usize, causal: bool, pos_offset: usize) {
     for i in 0..m {
         let row = &mut scores[i * n..(i + 1) * n];
-        let attend_len = if causal { (pos_offset + i + 1).min(n) } else { n };
+        let attend_len = if causal {
+            (pos_offset + i + 1).min(n)
+        } else {
+            n
+        };
 
         // Mask future positions
         for j in attend_len..n {
@@ -191,7 +229,9 @@ pub fn softmax_inplace(scores: &mut [f32], m: usize, n: usize, causal: bool, pos
         // Max
         let mut max_val = f32::NEG_INFINITY;
         for j in 0..attend_len {
-            if row[j] > max_val { max_val = row[j]; }
+            if row[j] > max_val {
+                max_val = row[j];
+            }
         }
 
         // Exp + sum in f32 (matching PyTorch)
@@ -212,10 +252,7 @@ pub fn softmax_inplace(scores: &mut [f32], m: usize, n: usize, causal: bool, pos
 
 // ── Main entry point ────────────────────────────────────────────────────
 
-pub fn fused_attention(
-    q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
-    p: &AttentionParams,
-) {
+pub fn fused_attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], p: &AttentionParams) {
     let nh = p.num_heads;
     let nkv = p.num_kv_heads;
     let n_rep = nh / nkv;
@@ -240,7 +277,9 @@ pub fn fused_attention(
             // scores[sq, sk] = Q[sq, d] @ K[sk, d]^T * scale
             let mut scores = vec![0.0f32; sq * sk];
             gemm_at_bt(q_slice, k_slice, &mut scores, sq, sk, d);
-            for s in scores.iter_mut() { *s *= scale; }
+            for s in scores.iter_mut() {
+                *s *= scale;
+            }
 
             // Fused softmax with causal mask
             softmax_inplace(&mut scores, sq, sk, p.causal, p.pos_offset);
@@ -259,15 +298,20 @@ mod tests {
     #[test]
     fn test_cpu_attention_causal() {
         // 1 batch, 1 head, 2 tokens, dim=4
-        let q = vec![1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0];
-        let k = vec![1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0];
-        let v = vec![1.0, 2.0, 3.0, 4.0,  5.0, 6.0, 7.0, 8.0];
+        let q = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let k = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let v = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let mut out = vec![0.0f32; 8];
 
         let params = AttentionParams {
-            batch: 1, num_heads: 1, num_kv_heads: 1,
-            q_len: 2, kv_len: 2, head_dim: 4,
-            causal: true, pos_offset: 0,
+            batch: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            q_len: 2,
+            kv_len: 2,
+            head_dim: 4,
+            causal: true,
+            pos_offset: 0,
         };
 
         fused_attention(&q, &k, &v, &mut out, &params);
@@ -283,21 +327,31 @@ mod tests {
         let w0 = e0 / (e0 + 1.0);
         let w1 = 1.0 / (e0 + 1.0);
         let expected = w0 * 1.0 + w1 * 5.0;
-        assert!((out[4] - expected).abs() < 1e-3, "out[4]={} expected={}", out[4], expected);
+        assert!(
+            (out[4] - expected).abs() < 1e-3,
+            "out[4]={} expected={}",
+            out[4],
+            expected
+        );
     }
 
     #[test]
     fn test_cpu_attention_gqa() {
         // 1 batch, 2 Q heads, 1 KV head, 1 token, dim=2
-        let q = vec![1.0, 0.0,  0.0, 1.0]; // 2 heads
+        let q = vec![1.0, 0.0, 0.0, 1.0]; // 2 heads
         let k = vec![1.0, 0.0]; // 1 head
         let v = vec![3.0, 7.0]; // 1 head
         let mut out = vec![0.0f32; 4];
 
         let params = AttentionParams {
-            batch: 1, num_heads: 2, num_kv_heads: 1,
-            q_len: 1, kv_len: 1, head_dim: 2,
-            causal: false, pos_offset: 0,
+            batch: 1,
+            num_heads: 2,
+            num_kv_heads: 1,
+            q_len: 1,
+            kv_len: 1,
+            head_dim: 2,
+            causal: false,
+            pos_offset: 0,
         };
 
         fused_attention(&q, &k, &v, &mut out, &params);

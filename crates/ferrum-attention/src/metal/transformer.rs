@@ -1,9 +1,9 @@
 //! All-Metal transformer layer — single command buffer, zero CPU-GPU sync.
 //! GEMM via simdgroup_multiply_accumulate (64x32 tiles), all ops on GPU.
 
-use metal::*;
 use super::pipelines::MetalPipelines;
 use crate::AttentionParams;
+use metal::*;
 
 pub struct MetalLayerWeights {
     pub input_ln_w: Buffer,
@@ -35,8 +35,8 @@ pub struct MetalTransformerConfig {
 
 /// GPU-resident KV cache with pre-allocated buffers.
 pub struct MetalKvCache {
-    pub k_buf: Buffer,   // [nkv, max_len, hd]
-    pub v_buf: Buffer,   // [nkv, max_len, hd]
+    pub k_buf: Buffer, // [nkv, max_len, hd]
+    pub v_buf: Buffer, // [nkv, max_len, hd]
     pub len: usize,
     pub max_len: usize,
 }
@@ -51,7 +51,9 @@ impl MetalKvCache {
             max_len,
         }
     }
-    pub fn reset(&mut self) { self.len = 0; }
+    pub fn reset(&mut self) {
+        self.len = 0;
+    }
 }
 
 /// Pre-allocated scratch buffers for one layer forward (reused across layers).
@@ -76,7 +78,15 @@ pub struct LayerScratch {
 }
 
 impl LayerScratch {
-    pub fn new(pipes: &MetalPipelines, tokens: usize, h: usize, im: usize, nh: usize, nkv: usize, hd: usize) -> Self {
+    pub fn new(
+        pipes: &MetalPipelines,
+        tokens: usize,
+        h: usize,
+        im: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+    ) -> Self {
         Self {
             ln_out: pipes.buffer_empty(tokens * h),
             q_buf: pipes.buffer_empty(tokens * nh * hd),
@@ -124,7 +134,15 @@ pub fn metal_layer_forward_v2(
     // Encoder 1: RMSNorm
     {
         let enc = cmd.new_compute_command_encoder();
-        pipes.rms_norm_enc(enc, input, &w.input_ln_w, &s.ln_out, tokens, h, cfg.rms_norm_eps);
+        pipes.rms_norm_enc(
+            enc,
+            input,
+            &w.input_ln_w,
+            &s.ln_out,
+            tokens,
+            h,
+            cfg.rms_norm_eps,
+        );
         enc.end_encoding();
     }
 
@@ -142,23 +160,75 @@ pub fn metal_layer_forward_v2(
         let enc = cmd.new_compute_command_encoder();
         // Q/K: mode 1 (norm+RoPE) if has_qk_norm, mode 2 (RoPE only) if not
         let qk_mode: i32 = if w.has_qk_norm { 1 } else { 2 };
-        pipes.qk_norm_rope(enc, &s.q_buf, &w.q_norm_w, cos_buf, sin_buf, &s.q_ready,
-            tokens, nh, hd, pos_offset, cfg.rms_norm_eps, qk_mode);
-        pipes.qk_norm_rope(enc, &s.k_buf, &w.k_norm_w, cos_buf, sin_buf, &s.k_ready,
-            tokens, nkv, hd, pos_offset, cfg.rms_norm_eps, qk_mode);
+        pipes.qk_norm_rope(
+            enc,
+            &s.q_buf,
+            &w.q_norm_w,
+            cos_buf,
+            sin_buf,
+            &s.q_ready,
+            tokens,
+            nh,
+            hd,
+            pos_offset,
+            cfg.rms_norm_eps,
+            qk_mode,
+        );
+        pipes.qk_norm_rope(
+            enc,
+            &s.k_buf,
+            &w.k_norm_w,
+            cos_buf,
+            sin_buf,
+            &s.k_ready,
+            tokens,
+            nkv,
+            hd,
+            pos_offset,
+            cfg.rms_norm_eps,
+            qk_mode,
+        );
         // V: mode 0 (transpose only, no norm, no RoPE)
-        pipes.qk_norm_rope(enc, &s.v_buf, &w.k_norm_w, cos_buf, sin_buf, &s.v_ready,
-            tokens, nkv, hd, pos_offset, cfg.rms_norm_eps, 0); // mode 0: transpose only
+        pipes.qk_norm_rope(
+            enc,
+            &s.v_buf,
+            &w.k_norm_w,
+            cos_buf,
+            sin_buf,
+            &s.v_ready,
+            tokens,
+            nkv,
+            hd,
+            pos_offset,
+            cfg.rms_norm_eps,
+            0,
+        ); // mode 0: transpose only
         enc.end_encoding();
     }
 
     // Encoder 4: KV cache append
     {
         let enc = cmd.new_compute_command_encoder();
-        pipes.kv_cache_append(enc, &s.k_ready, &kv_cache.k_buf,
-            nkv, hd, kv_cache.len, tokens, kv_cache.max_len);
-        pipes.kv_cache_append(enc, &s.v_ready, &kv_cache.v_buf,
-            nkv, hd, kv_cache.len, tokens, kv_cache.max_len);
+        pipes.kv_cache_append(
+            enc,
+            &s.k_ready,
+            &kv_cache.k_buf,
+            nkv,
+            hd,
+            kv_cache.len,
+            tokens,
+            kv_cache.max_len,
+        );
+        pipes.kv_cache_append(
+            enc,
+            &s.v_ready,
+            &kv_cache.v_buf,
+            nkv,
+            hd,
+            kv_cache.len,
+            tokens,
+            kv_cache.max_len,
+        );
         enc.end_encoding();
     }
     let kv_len = kv_cache.len + tokens;
@@ -167,13 +237,25 @@ pub fn metal_layer_forward_v2(
     // Encoder 5: Flash attention (GQA handled internally)
     {
         let params = AttentionParams {
-            batch: 1, num_heads: nh, num_kv_heads: nkv,
-            q_len: tokens, kv_len, head_dim: hd,
-            causal: tokens > 1, pos_offset,
+            batch: 1,
+            num_heads: nh,
+            num_kv_heads: nkv,
+            q_len: tokens,
+            kv_len,
+            head_dim: hd,
+            causal: tokens > 1,
+            pos_offset,
         };
         // flash_attn creates its own encoder; kv_seq_stride=max_len for GPU cache
-        pipes.flash_attn_v2(cmd, &s.q_ready, &kv_cache.k_buf, &kv_cache.v_buf, &s.attn_out,
-            &params, kv_cache.max_len);
+        pipes.flash_attn_v2(
+            cmd,
+            &s.q_ready,
+            &kv_cache.k_buf,
+            &kv_cache.v_buf,
+            &s.attn_out,
+            &params,
+            kv_cache.max_len,
+        );
     }
 
     // Encoder 6: Untranspose
@@ -193,10 +275,19 @@ pub fn metal_layer_forward_v2(
     // Encoder 8: Fused attn_scale + residual + post-norm (1 dispatch instead of 3)
     {
         let enc = cmd.new_compute_command_encoder();
-        pipes.fused_residual_norm_enc(enc,
-            input, &s.o_out, w.attn_scale.as_ref(), &w.post_ln_w,
-            &s.hidden, &s.post_ln,
-            tokens, h, cfg.rms_norm_eps, h);
+        pipes.fused_residual_norm_enc(
+            enc,
+            input,
+            &s.o_out,
+            w.attn_scale.as_ref(),
+            &w.post_ln_w,
+            &s.hidden,
+            &s.post_ln,
+            tokens,
+            h,
+            cfg.rms_norm_eps,
+            h,
+        );
         enc.end_encoding();
     }
 

@@ -1,14 +1,20 @@
 //! Tests for Metal flash attention kernel.
 //! Compares Metal output against CPU reference.
 
-use ferrum_attention::{AttentionParams, attention_cpu};
+use ferrum_attention::{attention_cpu, AttentionParams};
 
 #[cfg(target_os = "macos")]
 use ferrum_attention::metal;
 
 #[cfg(target_os = "macos")]
 fn assert_close(a: &[f32], b: &[f32], atol: f32, label: &str) {
-    assert_eq!(a.len(), b.len(), "{label}: length mismatch {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{label}: length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
     let mut max_diff = 0.0f32;
     let mut max_idx = 0;
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
@@ -21,7 +27,8 @@ fn assert_close(a: &[f32], b: &[f32], atol: f32, label: &str) {
     assert!(
         max_diff < atol,
         "{label}: max diff {max_diff} at idx {max_idx} (a={}, b={}), atol={atol}",
-        a[max_idx], b[max_idx]
+        a[max_idx],
+        b[max_idx]
     );
 }
 
@@ -36,13 +43,22 @@ fn test_metal_flash_attn_causal_small() {
 
     // Random-ish Q, K, V
     let q: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.1).sin() * 0.5)).collect();
-    let k: Vec<f32> = (0..sk * d).map(|i| ((i as f32 * 0.07 + 1.0).cos() * 0.5)).collect();
-    let v: Vec<f32> = (0..sk * d).map(|i| ((i as f32 * 0.13 + 2.0).sin() * 0.3)).collect();
+    let k: Vec<f32> = (0..sk * d)
+        .map(|i| ((i as f32 * 0.07 + 1.0).cos() * 0.5))
+        .collect();
+    let v: Vec<f32> = (0..sk * d)
+        .map(|i| ((i as f32 * 0.13 + 2.0).sin() * 0.3))
+        .collect();
 
     let params = AttentionParams {
-        batch: 1, num_heads: 1, num_kv_heads: 1,
-        q_len: sq, kv_len: sk, head_dim: d,
-        causal: true, pos_offset: 0,
+        batch: 1,
+        num_heads: 1,
+        num_kv_heads: 1,
+        q_len: sq,
+        kv_len: sk,
+        head_dim: d,
+        causal: true,
+        pos_offset: 0,
     };
 
     let mut out_cpu = vec![0.0f32; n];
@@ -65,14 +81,25 @@ fn test_metal_flash_attn_prefill_73() {
     let sk = 73;
     let d = 128;
 
-    let q: Vec<f32> = (0..b * nh * sq * d).map(|i| ((i as f32 * 0.01).sin() * 0.1)).collect();
-    let k: Vec<f32> = (0..b * nkv * sk * d).map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.1)).collect();
-    let v: Vec<f32> = (0..b * nkv * sk * d).map(|i| ((i as f32 * 0.013 + 2.0).sin() * 0.1)).collect();
+    let q: Vec<f32> = (0..b * nh * sq * d)
+        .map(|i| ((i as f32 * 0.01).sin() * 0.1))
+        .collect();
+    let k: Vec<f32> = (0..b * nkv * sk * d)
+        .map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.1))
+        .collect();
+    let v: Vec<f32> = (0..b * nkv * sk * d)
+        .map(|i| ((i as f32 * 0.013 + 2.0).sin() * 0.1))
+        .collect();
 
     let params = AttentionParams {
-        batch: b, num_heads: nh, num_kv_heads: nkv,
-        q_len: sq, kv_len: sk, head_dim: d,
-        causal: true, pos_offset: 0,
+        batch: b,
+        num_heads: nh,
+        num_kv_heads: nkv,
+        q_len: sq,
+        kv_len: sk,
+        head_dim: d,
+        causal: true,
+        pos_offset: 0,
     };
 
     let mut out_cpu = vec![0.0f32; b * nh * sq * d];
@@ -96,14 +123,25 @@ fn test_metal_flash_attn_decode() {
     let sk = 74;
     let d = 128;
 
-    let q: Vec<f32> = (0..b * nh * sq * d).map(|i| ((i as f32 * 0.02).sin() * 0.2)).collect();
-    let k: Vec<f32> = (0..b * nkv * sk * d).map(|i| ((i as f32 * 0.005).cos() * 0.2)).collect();
-    let v: Vec<f32> = (0..b * nkv * sk * d).map(|i| ((i as f32 * 0.011 + 3.0).sin() * 0.2)).collect();
+    let q: Vec<f32> = (0..b * nh * sq * d)
+        .map(|i| ((i as f32 * 0.02).sin() * 0.2))
+        .collect();
+    let k: Vec<f32> = (0..b * nkv * sk * d)
+        .map(|i| ((i as f32 * 0.005).cos() * 0.2))
+        .collect();
+    let v: Vec<f32> = (0..b * nkv * sk * d)
+        .map(|i| ((i as f32 * 0.011 + 3.0).sin() * 0.2))
+        .collect();
 
     let params = AttentionParams {
-        batch: b, num_heads: nh, num_kv_heads: nkv,
-        q_len: sq, kv_len: sk, head_dim: d,
-        causal: false, pos_offset: 73,
+        batch: b,
+        num_heads: nh,
+        num_kv_heads: nkv,
+        q_len: sq,
+        kv_len: sk,
+        head_dim: d,
+        causal: false,
+        pos_offset: 73,
     };
 
     let mut out_cpu = vec![0.0f32; b * nh * sq * d];
@@ -130,9 +168,14 @@ fn bench_metal_flash_attn_prefill() {
     let v: Vec<f32> = vec![0.1; b * nkv * sq * d];
 
     let params = AttentionParams {
-        batch: b, num_heads: nh, num_kv_heads: nkv,
-        q_len: sq, kv_len: sq, head_dim: d,
-        causal: true, pos_offset: 0,
+        batch: b,
+        num_heads: nh,
+        num_kv_heads: nkv,
+        q_len: sq,
+        kv_len: sq,
+        head_dim: d,
+        causal: true,
+        pos_offset: 0,
     };
 
     // Warmup

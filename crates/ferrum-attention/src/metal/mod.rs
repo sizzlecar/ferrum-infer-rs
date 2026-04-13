@@ -7,7 +7,7 @@ pub mod pipelines;
 pub mod transformer;
 
 use crate::AttentionParams;
-use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLSize, MTLResourceOptions};
+use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -36,11 +36,14 @@ fn get_or_init_device(device: &Device) -> &'static MetalFlashAttn {
     INSTANCE.get_or_init(|| {
         let queue = device.new_command_queue();
         let shader_src = include_str!("shaders/flash_attn.metal");
-        let library = device.new_library_with_source(shader_src, &CompileOptions::new())
+        let library = device
+            .new_library_with_source(shader_src, &CompileOptions::new())
             .expect("failed to compile flash_attn.metal");
-        let func = library.get_function("flash_attn_f32", None)
+        let func = library
+            .get_function("flash_attn_f32", None)
             .expect("flash_attn_f32 not found");
-        let pipeline = device.new_compute_pipeline_state_with_function(&func)
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&func)
             .expect("failed to create pipeline");
         MetalFlashAttn {
             device: device.clone(),
@@ -108,10 +111,7 @@ pub fn fused_attention_metal_buffers(
 
 /// Convenience: run attention from f32 slices (copies to/from GPU).
 /// For integration testing. Production code should use fused_attention_metal_buffers.
-pub fn fused_attention(
-    q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
-    p: &AttentionParams,
-) {
+pub fn fused_attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], p: &AttentionParams) {
     let device = Device::system_default().expect("no Metal device");
     let ma = get_or_init_device(&device);
 
@@ -126,7 +126,10 @@ pub fn fused_attention(
     let q_buf = mk_buf(q);
     let k_buf = mk_buf(k);
     let v_buf = mk_buf(v);
-    let o_buf = ma.device.new_buffer((out.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let o_buf = ma.device.new_buffer(
+        (out.len() * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
 
     fused_attention_metal_buffers(&device, &q_buf, &k_buf, &v_buf, &o_buf, p);
 

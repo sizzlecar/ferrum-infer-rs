@@ -21,18 +21,12 @@ pub struct AttentionParams {
 }
 
 /// Run fused attention on CPU.
-pub fn attention_cpu(
-    q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
-    params: &AttentionParams,
-) {
+pub fn attention_cpu(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], params: &AttentionParams) {
     cpu::fused_attention(q, k, v, out, params);
 }
 
 /// Run fused attention on best available backend.
-pub fn attention(
-    q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
-    params: &AttentionParams,
-) {
+pub fn attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], params: &AttentionParams) {
     #[cfg(feature = "metal")]
     {
         if metal::is_available() {
@@ -130,7 +124,9 @@ impl FusedTransformer {
         }
 
         let n = layers.len();
-        let cpu_kv = (0..n).map(|_| cpu::transformer::CpuKvCache::new()).collect();
+        let cpu_kv = (0..n)
+            .map(|_| cpu::transformer::CpuKvCache::new())
+            .collect();
 
         // Backend selection:
         //   FERRUM_FUSED_CPU=1  → force CPU
@@ -152,36 +148,52 @@ impl FusedTransformer {
         let metal_state = {
             if let Some(device) = ::metal::Device::system_default() {
                 let pipes = metal::pipelines::MetalPipelines::new(&device);
-                let weights: Vec<_> = layers.iter().map(|lw| {
-                    metal::transformer::MetalLayerWeights {
-                        input_ln_w: pipes.buffer_from_data(&lw.input_ln_w),
-                        q_proj_w: pipes.buffer_from_data(&lw.q_proj_w),
-                        k_proj_w: pipes.buffer_from_data(&lw.k_proj_w),
-                        v_proj_w: pipes.buffer_from_data(&lw.v_proj_w),
-                        o_proj_w: pipes.buffer_from_data(&lw.o_proj_w),
-                        q_norm_w: if lw.q_norm_w.is_empty() {
-                            pipes.buffer_from_data(&[1.0f32]) // dummy, won't be used
-                        } else {
-                            pipes.buffer_from_data(&lw.q_norm_w)
-                        },
-                        k_norm_w: if lw.k_norm_w.is_empty() {
-                            pipes.buffer_from_data(&[1.0f32])
-                        } else {
-                            pipes.buffer_from_data(&lw.k_norm_w)
-                        },
-                        post_ln_w: pipes.buffer_from_data(&lw.post_ln_w),
-                        gate_proj_w: pipes.buffer_from_data(&lw.gate_proj_w),
-                        up_proj_w: pipes.buffer_from_data(&lw.up_proj_w),
-                        down_proj_w: pipes.buffer_from_data(&lw.down_proj_w),
-                        has_qk_norm: !lw.q_norm_w.is_empty(),
-                        attn_scale: lw.attn_layer_scale.as_ref().map(|s| pipes.buffer_from_data(s)),
-                        mlp_scale: lw.mlp_layer_scale.as_ref().map(|s| pipes.buffer_from_data(s)),
-                    }
-                }).collect();
+                let weights: Vec<_> = layers
+                    .iter()
+                    .map(|lw| {
+                        metal::transformer::MetalLayerWeights {
+                            input_ln_w: pipes.buffer_from_data(&lw.input_ln_w),
+                            q_proj_w: pipes.buffer_from_data(&lw.q_proj_w),
+                            k_proj_w: pipes.buffer_from_data(&lw.k_proj_w),
+                            v_proj_w: pipes.buffer_from_data(&lw.v_proj_w),
+                            o_proj_w: pipes.buffer_from_data(&lw.o_proj_w),
+                            q_norm_w: if lw.q_norm_w.is_empty() {
+                                pipes.buffer_from_data(&[1.0f32]) // dummy, won't be used
+                            } else {
+                                pipes.buffer_from_data(&lw.q_norm_w)
+                            },
+                            k_norm_w: if lw.k_norm_w.is_empty() {
+                                pipes.buffer_from_data(&[1.0f32])
+                            } else {
+                                pipes.buffer_from_data(&lw.k_norm_w)
+                            },
+                            post_ln_w: pipes.buffer_from_data(&lw.post_ln_w),
+                            gate_proj_w: pipes.buffer_from_data(&lw.gate_proj_w),
+                            up_proj_w: pipes.buffer_from_data(&lw.up_proj_w),
+                            down_proj_w: pipes.buffer_from_data(&lw.down_proj_w),
+                            has_qk_norm: !lw.q_norm_w.is_empty(),
+                            attn_scale: lw
+                                .attn_layer_scale
+                                .as_ref()
+                                .map(|s| pipes.buffer_from_data(s)),
+                            mlp_scale: lw
+                                .mlp_layer_scale
+                                .as_ref()
+                                .map(|s| pipes.buffer_from_data(s)),
+                        }
+                    })
+                    .collect();
                 let kv_max_len = cfg.max_position_embeddings.min(4096);
-                let kv = (0..n).map(|_| {
-                    metal::transformer::MetalKvCache::new(&pipes, cfg.num_kv_heads, cfg.head_dim, kv_max_len)
-                }).collect();
+                let kv = (0..n)
+                    .map(|_| {
+                        metal::transformer::MetalKvCache::new(
+                            &pipes,
+                            cfg.num_kv_heads,
+                            cfg.head_dim,
+                            kv_max_len,
+                        )
+                    })
+                    .collect();
                 let metal_cfg = metal::transformer::MetalTransformerConfig {
                     hidden_size: cfg.hidden_size,
                     intermediate_size: cfg.intermediate_size,
@@ -193,17 +205,31 @@ impl FusedTransformer {
                 let cos_buf = pipes.buffer_from_data(&cos);
                 let sin_buf = pipes.buffer_from_data(&sin);
                 Some(MetalTransformerState {
-                    pipes, weights, kv, cos_buf, sin_buf, metal_cfg,
-                    scratch: None, max_scratch_tokens: 0,
-                    input_buf: None, input_buf_size: 0,
+                    pipes,
+                    weights,
+                    kv,
+                    cos_buf,
+                    sin_buf,
+                    metal_cfg,
+                    scratch: None,
+                    max_scratch_tokens: 0,
+                    input_buf: None,
+                    input_buf_size: 0,
                 })
             } else {
                 None
             }
         };
 
-        let backend = if use_cpu { "CPU (Accelerate)" } else { "Metal+Accelerate" };
-        eprintln!("[fused-transformer] backend={backend}, hidden={}, layers={n}", cfg.hidden_size);
+        let backend = if use_cpu {
+            "CPU (Accelerate)"
+        } else {
+            "Metal+Accelerate"
+        };
+        eprintln!(
+            "[fused-transformer] backend={backend}, hidden={}, layers={n}",
+            cfg.hidden_size
+        );
 
         FusedTransformer {
             cfg,
@@ -226,65 +252,105 @@ impl FusedTransformer {
 
         #[cfg(feature = "metal")]
         if !self.use_cpu {
-        if let Some(ref mut ms) = self.metal_state {
-            // Allocate/resize scratch buffers if needed
-            if ms.scratch.is_none() || ms.max_scratch_tokens < tokens {
-                ms.scratch = Some(metal::transformer::LayerScratch::new(
-                    &ms.pipes, tokens, h, ms.metal_cfg.intermediate_size,
-                    ms.metal_cfg.num_heads, ms.metal_cfg.num_kv_heads, ms.metal_cfg.head_dim,
-                ));
-                ms.max_scratch_tokens = tokens;
-            }
-            let scratch = ms.scratch.as_ref().unwrap();
+            if let Some(ref mut ms) = self.metal_state {
+                // Allocate/resize scratch buffers if needed
+                if ms.scratch.is_none() || ms.max_scratch_tokens < tokens {
+                    ms.scratch = Some(metal::transformer::LayerScratch::new(
+                        &ms.pipes,
+                        tokens,
+                        h,
+                        ms.metal_cfg.intermediate_size,
+                        ms.metal_cfg.num_heads,
+                        ms.metal_cfg.num_kv_heads,
+                        ms.metal_cfg.head_dim,
+                    ));
+                    ms.max_scratch_tokens = tokens;
+                }
+                let scratch = ms.scratch.as_ref().unwrap();
 
-            // Reuse or allocate input buffer (shared memory = zero-copy write on Apple Silicon)
-            let needed = tokens * h;
-            if ms.input_buf.is_none() || ms.input_buf_size < needed {
-                ms.input_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h))); // preallocate for up to 128 tokens
-                ms.input_buf_size = needed.max(128 * h);
-            }
-            let input_buf = ms.input_buf.as_ref().unwrap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(input.as_ptr(), input_buf.contents() as *mut f32, needed);
-            }
+                // Reuse or allocate input buffer (shared memory = zero-copy write on Apple Silicon)
+                let needed = tokens * h;
+                if ms.input_buf.is_none() || ms.input_buf_size < needed {
+                    ms.input_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h))); // preallocate for up to 128 tokens
+                    ms.input_buf_size = needed.max(128 * h);
+                }
+                let input_buf = ms.input_buf.as_ref().unwrap();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        input.as_ptr(),
+                        input_buf.contents() as *mut f32,
+                        needed,
+                    );
+                }
 
-            let cmd = ms.pipes.queue.new_command_buffer();
+                let cmd = ms.pipes.queue.new_command_buffer();
 
-            // Layer 0: input from input_buf
-            metal::transformer::metal_layer_forward_v2(
-                cmd, &ms.pipes, &input_buf, tokens, &ms.weights[0], &ms.metal_cfg,
-                &mut ms.kv[0], pos_offset, &ms.cos_buf, &ms.sin_buf, scratch,
-            );
-
-            // Layers 1..N: input from scratch.output (ping-pong via copy)
-            for li in 1..ms.weights.len() {
-                // Copy scratch.output to input_buf for next layer
-                let enc = cmd.new_blit_command_encoder();
-                enc.copy_from_buffer(&scratch.output, 0, &input_buf, 0, (tokens * h * 4) as u64);
-                enc.end_encoding();
-
+                // Layer 0: input from input_buf
                 metal::transformer::metal_layer_forward_v2(
-                    cmd, &ms.pipes, &input_buf, tokens, &ms.weights[li], &ms.metal_cfg,
-                    &mut ms.kv[li], pos_offset, &ms.cos_buf, &ms.sin_buf, scratch,
+                    cmd,
+                    &ms.pipes,
+                    &input_buf,
+                    tokens,
+                    &ms.weights[0],
+                    &ms.metal_cfg,
+                    &mut ms.kv[0],
+                    pos_offset,
+                    &ms.cos_buf,
+                    &ms.sin_buf,
+                    scratch,
                 );
+
+                // Layers 1..N: input from scratch.output (ping-pong via copy)
+                for li in 1..ms.weights.len() {
+                    // Copy scratch.output to input_buf for next layer
+                    let enc = cmd.new_blit_command_encoder();
+                    enc.copy_from_buffer(
+                        &scratch.output,
+                        0,
+                        &input_buf,
+                        0,
+                        (tokens * h * 4) as u64,
+                    );
+                    enc.end_encoding();
+
+                    metal::transformer::metal_layer_forward_v2(
+                        cmd,
+                        &ms.pipes,
+                        &input_buf,
+                        tokens,
+                        &ms.weights[li],
+                        &ms.metal_cfg,
+                        &mut ms.kv[li],
+                        pos_offset,
+                        &ms.cos_buf,
+                        &ms.sin_buf,
+                        scratch,
+                    );
+                }
+
+                // Single commit+wait for all layers
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                let hidden =
+                    metal::pipelines::MetalPipelines::read_buffer(&scratch.output, tokens * h);
+                self.tokens_generated += tokens;
+                return self.final_rms_norm(&hidden, tokens);
             }
-
-            // Single commit+wait for all layers
-            cmd.commit();
-            cmd.wait_until_completed();
-
-            let hidden = metal::pipelines::MetalPipelines::read_buffer(&scratch.output, tokens * h);
-            self.tokens_generated += tokens;
-            return self.final_rms_norm(&hidden, tokens);
-        }
         } // !self.use_cpu
 
         // CPU path (Accelerate sgemm + SIMD element-wise)
         let mut hidden = input.to_vec();
         for li in 0..self.cpu_layers.len() {
             hidden = cpu::transformer::cpu_layer_forward(
-                &hidden, tokens, &self.cpu_layers[li], &self.cfg,
-                &self.cos, &self.sin, &mut self.cpu_kv[li], pos_offset,
+                &hidden,
+                tokens,
+                &self.cpu_layers[li],
+                &self.cfg,
+                &self.cos,
+                &self.sin,
+                &mut self.cpu_kv[li],
+                pos_offset,
             );
         }
         self.tokens_generated += tokens;
@@ -303,20 +369,33 @@ impl FusedTransformer {
             #[cfg(feature = "metal")]
             {
                 extern "C" {
-                    fn vDSP_dotpr(a: *const f32, a_stride: i32, b: *const f32, b_stride: i32, result: *mut f32, n: u64);
+                    fn vDSP_dotpr(
+                        a: *const f32,
+                        a_stride: i32,
+                        b: *const f32,
+                        b_stride: i32,
+                        result: *mut f32,
+                        n: u64,
+                    );
                 }
                 let mut dot = 0.0f32;
-                unsafe { vDSP_dotpr(row.as_ptr(), 1, row.as_ptr(), 1, &mut dot, h as u64); }
+                unsafe {
+                    vDSP_dotpr(row.as_ptr(), 1, row.as_ptr(), 1, &mut dot, h as u64);
+                }
                 sum_sq = dot;
             }
             #[cfg(not(feature = "metal"))]
             {
                 let mut v = 0.0f32;
-                for &val in row { v += val * val; }
+                for &val in row {
+                    v += val * val;
+                }
                 sum_sq = v;
             }
             let inv = 1.0f32 / (sum_sq / h as f32 + eps).sqrt();
-            for i in 0..h { o[i] = row[i] * inv * self.norm_w[i]; }
+            for i in 0..h {
+                o[i] = row[i] * inv * self.norm_w[i];
+            }
         }
         out
     }
