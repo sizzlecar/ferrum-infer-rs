@@ -96,12 +96,18 @@ impl TtsModelExecutor {
         let sub_talker = SubTalker::load(&config, talker_vb.clone(), device.clone())?;
 
         // Load Speaker Encoder (for voice cloning, base models only)
-        let speaker_encoder = SpeakerEncoder::load(talker_vb.pp("speaker_encoder"))
-            .map_err(|e| {
-                tracing::warn!("Speaker encoder not available: {e}");
-                e
-            })
-            .ok();
+        let spk_enc_dim = config_json
+            .get("speaker_encoder_config")
+            .and_then(|c| c.get("enc_dim"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1024) as usize;
+        let speaker_encoder =
+            SpeakerEncoder::load_with_dim(talker_vb.pp("speaker_encoder"), spk_enc_dim)
+                .map_err(|e| {
+                    tracing::warn!("Speaker encoder not available: {e}");
+                    e
+                })
+                .ok();
 
         // Load Vocoder weights from speech_tokenizer/model.safetensors
         let vocoder_dir = dir.join("speech_tokenizer");
@@ -628,7 +634,7 @@ impl TtsModelExecutor {
             "Step 2 (speaker embed): {:.1}ms",
             t0.elapsed().as_secs_f64() * 1000.0
         );
-        // spk_embed shape: [1024] -> reshape to [1, 1, 1024]
+        // spk_embed shape: [enc_dim] -> reshape to [1, 1, hidden_size]
         let spk_embed = spk_embed
             .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("spk unsqueeze(0): {e}")))?
@@ -871,7 +877,7 @@ impl TtsModelExecutor {
             let n_pad = codec_icl_len - text_len;
             let text_padded = if n_pad > 0 {
                 let pad_block = tts_pad_embed
-                    .expand((1, n_pad, 1024))
+                    .expand((1, n_pad, self.config.hidden_size))
                     .map_err(|e| FerrumError::model(format!("pad expand: {e}")))?;
                 Tensor::cat(&[&text_embed_with_eos, &pad_block], 1)
                     .map_err(|e| FerrumError::model(format!("text_padded cat: {e}")))?

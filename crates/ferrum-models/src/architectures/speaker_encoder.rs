@@ -374,7 +374,7 @@ pub struct SpeakerEncoder {
 impl SpeakerEncoder {
     /// Load speaker encoder weights from VarBuilder.
     /// Expects the VarBuilder to be scoped to the `speaker_encoder` prefix.
-    pub fn load(vb: VarBuilder) -> Result<Self> {
+    pub fn load_with_dim(vb: VarBuilder, enc_dim: usize) -> Result<Self> {
         info!("Loading ECAPA-TDNN speaker encoder");
 
         // blocks.0: TDNN(128→512, k=5, dilation=1)
@@ -405,11 +405,14 @@ impl SpeakerEncoder {
         let asp = AttentiveStatisticsPooling::load(1536, 128, vb.pp("asp"))
             .map_err(|e| FerrumError::model(format!("speaker_encoder asp: {e}")))?;
 
-        // FC: Conv1d(3072→1024, k=1) with reflect padding
-        let fc = ReflectConv1d::load(3072, 1024, 1, 1, 1, vb.pp("fc"))
+        // FC: Conv1d(3072→enc_dim, k=1) — enc_dim is 1024 for 0.6B, 2048 for 1.7B
+        let fc = ReflectConv1d::load(3072, enc_dim, 1, 1, 1, vb.pp("fc"))
             .map_err(|e| FerrumError::model(format!("speaker_encoder fc: {e}")))?;
 
-        info!("Speaker encoder loaded (ECAPA-TDNN, 1024-dim output)");
+        info!(
+            "Speaker encoder loaded (ECAPA-TDNN, {}-dim output)",
+            enc_dim
+        );
         Ok(Self {
             block0,
             se_blocks,
