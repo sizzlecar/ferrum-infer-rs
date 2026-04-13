@@ -539,11 +539,15 @@ impl VocoderPreTransformer {
 
         // Extract projection weights to raw f32
         let to_vec = |t: &Tensor| -> candle_core::Result<Vec<f32>> {
-            t.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()
+            t.to_device(&candle_core::Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()
         };
-        let get_w = |pp: &VarBuilder, shape: candle_core::Shape, name: &str| -> candle_core::Result<Vec<f32>> {
-            to_vec(&pp.get(shape, name)?)
-        };
+        let get_w = |pp: &VarBuilder,
+                     shape: candle_core::Shape,
+                     name: &str|
+         -> candle_core::Result<Vec<f32>> { to_vec(&pp.get(shape, name)?) };
 
         let input_proj_w = get_w(&vb.pp("input_proj"), (h, lat).into(), "weight")?;
         let input_proj_b = get_w(&vb.pp("input_proj"), h.into(), "bias")?;
@@ -567,9 +571,21 @@ impl VocoderPreTransformer {
                 q_norm_w: vec![], // empty = skip QK-norm (vocoder has none)
                 k_norm_w: vec![], // empty = skip QK-norm
                 post_ln_w: get_w(&lv.pp("post_attention_layernorm"), h.into(), "weight")?,
-                gate_proj_w: get_w(&mv.pp("gate_proj"), (cfg.intermediate_size, h).into(), "weight")?,
-                up_proj_w: get_w(&mv.pp("up_proj"), (cfg.intermediate_size, h).into(), "weight")?,
-                down_proj_w: get_w(&mv.pp("down_proj"), (h, cfg.intermediate_size).into(), "weight")?,
+                gate_proj_w: get_w(
+                    &mv.pp("gate_proj"),
+                    (cfg.intermediate_size, h).into(),
+                    "weight",
+                )?,
+                up_proj_w: get_w(
+                    &mv.pp("up_proj"),
+                    (cfg.intermediate_size, h).into(),
+                    "weight",
+                )?,
+                down_proj_w: get_w(
+                    &mv.pp("down_proj"),
+                    (h, cfg.intermediate_size).into(),
+                    "weight",
+                )?,
                 attn_layer_scale: Some(attn_scale),
                 mlp_layer_scale: Some(mlp_scale),
             });
@@ -592,7 +608,15 @@ impl VocoderPreTransformer {
             norm_w,
         );
 
-        Ok(Self { input_proj_w, input_proj_b, output_proj_w, output_proj_b, fused, hidden: h, latent: lat })
+        Ok(Self {
+            input_proj_w,
+            input_proj_b,
+            output_proj_w,
+            output_proj_b,
+            fused,
+            hidden: h,
+            latent: lat,
+        })
     }
 
     fn reset(&mut self) {
@@ -606,28 +630,58 @@ impl VocoderPreTransformer {
         let lat = self.latent;
 
         // Extract to raw f32
-        let x_data: Vec<f32> = x.to_device(&candle_core::Device::Cpu)?
-            .to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let x_data: Vec<f32> = x
+            .to_device(&candle_core::Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
 
         // Input projection: [T, 1024] @ [512, 1024]^T + bias → [T, 512]
         let mut proj = vec![0.0f32; seq_len * h];
         #[cfg(target_os = "macos")]
         {
             extern "C" {
-                fn cblas_sgemm(order: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32,
-                    alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32,
-                    beta: f32, c: *mut f32, ldc: i32);
+                fn cblas_sgemm(
+                    order: i32,
+                    ta: i32,
+                    tb: i32,
+                    m: i32,
+                    n: i32,
+                    k: i32,
+                    alpha: f32,
+                    a: *const f32,
+                    lda: i32,
+                    b: *const f32,
+                    ldb: i32,
+                    beta: f32,
+                    c: *mut f32,
+                    ldc: i32,
+                );
             }
             unsafe {
-                cblas_sgemm(101, 111, 112, seq_len as i32, h as i32, lat as i32,
-                    1.0, x_data.as_ptr(), lat as i32,
-                    self.input_proj_w.as_ptr(), lat as i32,
-                    0.0, proj.as_mut_ptr(), h as i32);
+                cblas_sgemm(
+                    101,
+                    111,
+                    112,
+                    seq_len as i32,
+                    h as i32,
+                    lat as i32,
+                    1.0,
+                    x_data.as_ptr(),
+                    lat as i32,
+                    self.input_proj_w.as_ptr(),
+                    lat as i32,
+                    0.0,
+                    proj.as_mut_ptr(),
+                    h as i32,
+                );
             }
         }
         // Add bias
         for t in 0..seq_len {
-            for j in 0..h { proj[t * h + j] += self.input_proj_b[j]; }
+            for j in 0..h {
+                proj[t * h + j] += self.input_proj_b[j];
+            }
         }
 
         // FusedTransformer: 8 layers
@@ -638,17 +692,44 @@ impl VocoderPreTransformer {
         #[cfg(target_os = "macos")]
         unsafe {
             extern "C" {
-                fn cblas_sgemm(order: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32,
-                    alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32,
-                    beta: f32, c: *mut f32, ldc: i32);
+                fn cblas_sgemm(
+                    order: i32,
+                    ta: i32,
+                    tb: i32,
+                    m: i32,
+                    n: i32,
+                    k: i32,
+                    alpha: f32,
+                    a: *const f32,
+                    lda: i32,
+                    b: *const f32,
+                    ldb: i32,
+                    beta: f32,
+                    c: *mut f32,
+                    ldc: i32,
+                );
             }
-            cblas_sgemm(101, 111, 112, seq_len as i32, lat as i32, h as i32,
-                1.0, transformed.as_ptr(), h as i32,
-                self.output_proj_w.as_ptr(), h as i32,
-                0.0, out.as_mut_ptr(), lat as i32);
+            cblas_sgemm(
+                101,
+                111,
+                112,
+                seq_len as i32,
+                lat as i32,
+                h as i32,
+                1.0,
+                transformed.as_ptr(),
+                h as i32,
+                self.output_proj_w.as_ptr(),
+                h as i32,
+                0.0,
+                out.as_mut_ptr(),
+                lat as i32,
+            );
         }
         for t in 0..seq_len {
-            for j in 0..lat { out[t * lat + j] += self.output_proj_b[j]; }
+            for j in 0..lat {
+                out[t * lat + j] += self.output_proj_b[j];
+            }
         }
 
         Tensor::from_vec(out, (1, seq_len, lat), x.device())
@@ -691,7 +772,10 @@ impl Qwen3TTSVocoder {
 
         let pre_transformer = VocoderPreTransformer::load(cfg, decoder_vb.pp("pre_transformer"))
             .map_err(|e| FerrumError::model(format!("pre_transformer: {e}")))?;
-        info!("Vocoder pre_transformer loaded: {} layers, hidden={}", cfg.num_hidden_layers, cfg.hidden_size);
+        info!(
+            "Vocoder pre_transformer loaded: {} layers, hidden={}",
+            cfg.num_hidden_layers, cfg.hidden_size
+        );
 
         // Upsampling stages (before decoder)
         let mut upsample_blocks = Vec::new();
@@ -794,7 +878,8 @@ impl Qwen3TTSVocoder {
             .map_err(|e| FerrumError::model(format!("transpose: {e}")))?; // [B, T, 1024]
         let hidden = {
             self.pre_transformer.reset(); // Clear KV cache + position (vocoder is non-autoregressive)
-            self.pre_transformer.forward(&hidden)
+            self.pre_transformer
+                .forward(&hidden)
                 .map_err(|e| FerrumError::model(format!("pre_transformer: {e}")))?
         }; // [B, T, 1024]
         let hidden = hidden

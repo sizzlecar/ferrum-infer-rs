@@ -225,19 +225,30 @@ impl TtsModelExecutor {
 
         // Role prefix: text_projection([<|im_start|>, assistant, \n])
         // These are fixed special token IDs from the tokenizer
-        let im_start_id = 151644u32;  // <|im_start|>
-        let assistant_id = 77091u32;  // "assistant"
-        let newline_id = 198u32;      // "\n"
+        let im_start_id = 151644u32; // <|im_start|>
+        let assistant_id = 77091u32; // "assistant"
+        let newline_id = 198u32; // "\n"
         let role_prefix_ids = [im_start_id, assistant_id, newline_id];
 
-        info!("TTS: role_prefix={} content={} tokens", role_prefix_ids.len(), content_ids.len());
+        info!(
+            "TTS: role_prefix={} content={} tokens",
+            role_prefix_ids.len(),
+            content_ids.len()
+        );
 
         // Role prefix embedding (text_projection)
         let role_embed = embed_text_ids(&role_prefix_ids)?;
 
         // Codec prefix: [think, think_bos, lang, think_eos, speaker, pad]
-        let resolved_lang = if language == "auto" { "chinese" } else { language };
-        let language_id = self.config.codec_language_id.get(&resolved_lang.to_lowercase());
+        let resolved_lang = if language == "auto" {
+            "chinese"
+        } else {
+            language
+        };
+        let language_id = self
+            .config
+            .codec_language_id
+            .get(&resolved_lang.to_lowercase());
         let codec_prefix_ids = if let Some(&lang_id) = language_id {
             vec![
                 self.config.codec_think_id,
@@ -254,7 +265,11 @@ impl TtsModelExecutor {
         };
         // Codec sequence: [think, think_bos, lang, think_eos, SPEAKER, pad, bos]
         // Speaker: use Vivian (3065) for Chinese, Ryan (3061) for English
-        let speaker_token = if resolved_lang == "chinese" { 3065u32 } else { 3061u32 };
+        let speaker_token = if resolved_lang == "chinese" {
+            3065u32
+        } else {
+            3061u32
+        };
         let codec_full = {
             let mut v = codec_prefix_ids.clone();
             v.push(speaker_token);
@@ -281,7 +296,7 @@ impl TtsModelExecutor {
         // codec_full has [think, think_bos, lang, think_eos, speaker, pad, bos] = 7 tokens
         // tts_prefix: [pad*5, bos] overlaid on codec[0:6] (first 6, excluding last bos)
         // Then: first_text + codec_bos (last token) summed
-        let n_prefix = n_codec - 1;  // 6: everything except codec_bos
+        let n_prefix = n_codec - 1; // 6: everything except codec_bos
         let codec_prefix_part = codec_embed
             .narrow(1, 0, n_prefix)
             .map_err(|e| FerrumError::model(format!("codec narrow: {e}")))?;
@@ -315,11 +330,23 @@ impl TtsModelExecutor {
         let plen = prefill_embeds.dim(1).unwrap_or(0);
         info!("TTS: prefill_len = {}", plen);
         // Dump prefill input for comparison with reference
-        if let Ok(v) = prefill_embeds.narrow(0,0,1).and_then(|t| t.narrow(1,0,1)).and_then(|t| t.narrow(2,0,5)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()) {
+        if let Ok(v) = prefill_embeds
+            .narrow(0, 0, 1)
+            .and_then(|t| t.narrow(1, 0, 1))
+            .and_then(|t| t.narrow(2, 0, 5))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+        {
             info!("  prefill_input pos0[:5] = {:?}", v);
         }
         if plen > 0 {
-            if let Ok(v) = prefill_embeds.narrow(0,0,1).and_then(|t| t.narrow(1,plen-1,1)).and_then(|t| t.narrow(2,0,5)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>()) {
+            if let Ok(v) = prefill_embeds
+                .narrow(0, 0, 1)
+                .and_then(|t| t.narrow(1, plen - 1, 1))
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+            {
                 info!("  prefill_input pos-1[:5] = {:?}", v);
             }
         }
@@ -378,14 +405,21 @@ impl TtsModelExecutor {
                     }
                 }
             }
-            let next_token = sample_token(&logits_vec, tts_temperature(), TOP_K, REPETITION_PENALTY);
+            let next_token =
+                sample_token(&logits_vec, tts_temperature(), TOP_K, REPETITION_PENALTY);
 
             if step < 10 {
                 // Find argmax (greedy token)
-                let argmax_tok = logits_vec.iter().enumerate()
+                let argmax_tok = logits_vec
+                    .iter()
+                    .enumerate()
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, v)| (i, *v)).unwrap_or((0, 0.0));
-                info!("TOKEN step={} sampled={} argmax=({}, {:.2})", step, next_token, argmax_tok.0, argmax_tok.1);
+                    .map(|(i, v)| (i, *v))
+                    .unwrap_or((0, 0.0));
+                info!(
+                    "TOKEN step={} sampled={} argmax=({}, {:.2})",
+                    step, next_token, argmax_tok.0, argmax_tok.1
+                );
             }
 
             generated_tokens.push(next_token);
@@ -410,11 +444,17 @@ impl TtsModelExecutor {
 
             // SubTalker: predict remaining codec tokens 1..num_code_groups-1
             let st_t0 = std::time::Instant::now();
-            let extra_codes =
-                self.sub_talker
-                    .predict(&last_hidden, &first_codec_embed, st_temperature(), TOP_K)?;
+            let extra_codes = self.sub_talker.predict(
+                &last_hidden,
+                &first_codec_embed,
+                st_temperature(),
+                TOP_K,
+            )?;
             if step == 0 {
-                info!("  SubTalker: {:.1}ms", st_t0.elapsed().as_secs_f64() * 1000.0);
+                info!(
+                    "  SubTalker: {:.1}ms",
+                    st_t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             let mut frame_codes = vec![next_token];
@@ -436,7 +476,11 @@ impl TtsModelExecutor {
             }
 
             if step == 0 {
-                if let Ok(v) = combined_embed.flatten_all().and_then(|t| t.narrow(0,0,5)).and_then(|t| t.to_vec1::<f32>()) {
+                if let Ok(v) = combined_embed
+                    .flatten_all()
+                    .and_then(|t| t.narrow(0, 0, 5))
+                    .and_then(|t| t.to_vec1::<f32>())
+                {
                     info!("STEP0 codec_sum[:5] = {:?} (before trailing)", v);
                 }
             }
@@ -457,10 +501,18 @@ impl TtsModelExecutor {
 
             // Debug: dump step 0 components
             if step == 0 {
-                if let Ok(v) = first_codec_embed.flatten_all().and_then(|t| t.narrow(0,0,5)).and_then(|t| t.to_vec1::<f32>()) {
+                if let Ok(v) = first_codec_embed
+                    .flatten_all()
+                    .and_then(|t| t.narrow(0, 0, 5))
+                    .and_then(|t| t.to_vec1::<f32>())
+                {
                     info!("STEP0 semantic[:5] = {:?}", v);
                 }
-                if let Ok(v) = combined_embed.flatten_all().and_then(|t| t.narrow(0,0,5)).and_then(|t| t.to_vec1::<f32>()) {
+                if let Ok(v) = combined_embed
+                    .flatten_all()
+                    .and_then(|t| t.narrow(0, 0, 5))
+                    .and_then(|t| t.to_vec1::<f32>())
+                {
                     info!("STEP0 combined[:5] = {:?}", v);
                 }
             }
@@ -469,7 +521,10 @@ impl TtsModelExecutor {
             hidden = self.talker.forward_step(&combined_embed)?;
             current_logits = self.talker.logits(&hidden)?;
             if step == 0 {
-                info!("  Talker step: {:.1}ms", tk_t0.elapsed().as_secs_f64() * 1000.0);
+                info!(
+                    "  Talker step: {:.1}ms",
+                    tk_t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
         }
 
@@ -576,7 +631,10 @@ impl TtsModelExecutor {
             .unsqueeze(0)
             .map_err(|e| FerrumError::model(format!("spk unsqueeze(0) 2: {e}")))?;
 
-        info!("Step 2 (speaker embed): {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        info!(
+            "Step 2 (speaker embed): {:.1}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
         let t1 = std::time::Instant::now();
         // Step 3: Encode reference audio to codec tokens (ICL)
         let speech_enc = self
@@ -587,12 +645,16 @@ impl TtsModelExecutor {
         let ref_codes = if let Ok(path) = std::env::var("FERRUM_REF_CODES") {
             let data = std::fs::read(&path)
                 .map_err(|e| FerrumError::model(format!("read ref codes: {e}")))?;
-            let u32s: Vec<u32> = data.chunks(4)
+            let u32s: Vec<u32> = data
+                .chunks(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             let ncb = self.config.num_code_groups;
             let nframes = u32s.len() / ncb;
-            info!("Loaded pre-computed ref codes: {} frames from {}", nframes, path);
+            info!(
+                "Loaded pre-computed ref codes: {} frames from {}",
+                nframes, path
+            );
             u32s.chunks(ncb).map(|c| c.to_vec()).collect()
         } else {
             speech_enc.encode(&ref_pcm)?
@@ -607,7 +669,10 @@ impl TtsModelExecutor {
             info!("  rust codec frame {}: {:?}", i, &ref_codes[i]);
         }
 
-        info!("Step 3 (speech tokenizer): {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
+        info!(
+            "Step 3 (speech tokenizer): {:.1}ms",
+            t1.elapsed().as_secs_f64() * 1000.0
+        );
         let t2 = std::time::Instant::now();
         // Step 4: Tokenize target text with chat template
         let chat_text = format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n");
@@ -674,7 +739,10 @@ impl TtsModelExecutor {
         } else {
             language
         };
-        let language_id = self.config.codec_language_id.get(&resolved_lang.to_lowercase());
+        let language_id = self
+            .config
+            .codec_language_id
+            .get(&resolved_lang.to_lowercase());
 
         // Codec prefix: [think, think_bos, lang, think_eos] or [nothink, think_bos, think_eos]
         let codec_prefix_ids = if let Some(&lang_id) = language_id {
@@ -830,17 +898,27 @@ impl TtsModelExecutor {
             }
         }
 
-        info!("Steps 4-5 (tokenize+prompt): {:.1}ms", t2.elapsed().as_secs_f64() * 1000.0);
+        info!(
+            "Steps 4-5 (tokenize+prompt): {:.1}ms",
+            t2.elapsed().as_secs_f64() * 1000.0
+        );
         let t3 = std::time::Instant::now();
         // Step 6: Prefill and decode
         let mut hidden = self.talker.forward_step(&talker_input)?;
-        info!("Prefill ({} tokens, {} layers): {:.1}ms", prefill_len, self.config.num_hidden_layers, t3.elapsed().as_secs_f64() * 1000.0);
+        info!(
+            "Prefill ({} tokens, {} layers): {:.1}ms",
+            prefill_len,
+            self.config.num_hidden_layers,
+            t3.elapsed().as_secs_f64() * 1000.0
+        );
         // Debug: dump prefill output at last position
-        if let Ok(vals) = hidden.narrow(0, 0, 1)
+        if let Ok(vals) = hidden
+            .narrow(0, 0, 1)
             .and_then(|t| t.narrow(1, prefill_len - 1, 1))
             .and_then(|t| t.narrow(2, 0, 10))
             .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<f32>()) {
+            .and_then(|t| t.to_vec1::<f32>())
+        {
             info!("  prefill hidden[-1,:10] = {:?}", vals);
             info!("  Python reference:        [9.320, 3.522, -4.352, 0.385, 3.274, 4.379, 1.663, 2.466, 2.021, -3.127]");
         }
@@ -869,14 +947,19 @@ impl TtsModelExecutor {
                     logits_vec[i] = f32::NEG_INFINITY;
                 }
             }
-            let next_token = sample_token(&logits_vec, tts_temperature(), TOP_K, REPETITION_PENALTY);
+            let next_token =
+                sample_token(&logits_vec, tts_temperature(), TOP_K, REPETITION_PENALTY);
 
             if step < 3 {
                 // Dump top-5 logits for comparison
-                let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+                let mut indexed: Vec<(usize, f32)> =
+                    logits_vec.iter().copied().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let top5: Vec<(usize, f32)> = indexed.into_iter().take(5).collect();
-                info!("  decode step {}: token={}, top5={:?}", step, next_token, top5);
+                info!(
+                    "  decode step {}: token={}, top5={:?}",
+                    step, next_token, top5
+                );
             }
 
             if next_token == codec_eos {
@@ -892,11 +975,13 @@ impl TtsModelExecutor {
                 .map_err(|e| FerrumError::model(format!("last_hidden: {e}")))?;
 
             if step < 2 {
-                if let Ok(vals) = last_hidden.narrow(0, 0, 1)
+                if let Ok(vals) = last_hidden
+                    .narrow(0, 0, 1)
                     .and_then(|t| t.narrow(1, 0, 1))
                     .and_then(|t| t.narrow(2, 0, 5))
                     .and_then(|t| t.flatten_all())
-                    .and_then(|t| t.to_vec1::<f32>()) {
+                    .and_then(|t| t.to_vec1::<f32>())
+                {
                     info!("  step {} past_hidden first 5: {:?}", step, vals);
                 }
             }
@@ -907,9 +992,12 @@ impl TtsModelExecutor {
                 .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?;
             let first_codec_embed = self.talker.embed_codec(&token_tensor)?;
 
-            let extra_codes =
-                self.sub_talker
-                    .predict(&last_hidden, &first_codec_embed, st_temperature(), TOP_K)?;
+            let extra_codes = self.sub_talker.predict(
+                &last_hidden,
+                &first_codec_embed,
+                st_temperature(),
+                TOP_K,
+            )?;
 
             let mut frame_codes = vec![next_token];
             frame_codes.extend_from_slice(&extra_codes);
@@ -1142,7 +1230,9 @@ pub fn sample_token(
         sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         let threshold = sorted[top_k - 1];
         for v in &mut filtered {
-            if *v < threshold { *v = f32::NEG_INFINITY; }
+            if *v < threshold {
+                *v = f32::NEG_INFINITY;
+            }
         }
     }
 
@@ -1150,11 +1240,18 @@ pub fn sample_token(
     const TOP_P: f32 = 0.9;
     {
         let mut indices: Vec<usize> = (0..vocab).collect();
-        indices.sort_unstable_by(|&a, &b| filtered[b].partial_cmp(&filtered[a]).unwrap_or(std::cmp::Ordering::Equal));
+        indices.sort_unstable_by(|&a, &b| {
+            filtered[b]
+                .partial_cmp(&filtered[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Softmax over sorted values for cumulative prob
         let max_val = filtered[indices[0]];
-        let exp_sorted: Vec<f32> = indices.iter().map(|&i| (filtered[i] - max_val).exp()).collect();
+        let exp_sorted: Vec<f32> = indices
+            .iter()
+            .map(|&i| (filtered[i] - max_val).exp())
+            .collect();
         let sum: f32 = exp_sorted.iter().sum();
         let probs_sorted: Vec<f32> = exp_sorted.iter().map(|e| e / sum).collect();
 

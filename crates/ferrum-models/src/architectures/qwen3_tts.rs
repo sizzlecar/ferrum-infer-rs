@@ -211,11 +211,17 @@ impl RotaryEmbedding {
     ) -> candle_core::Result<(Tensor, Tensor)> {
         // Match reference project: narrow + manual rotation (not rope_slow)
         let (_, _, seq_len, d) = q.dims4()?;
-        let cos = self.cos.narrow(0, offset, seq_len)?
-            .unsqueeze(0)?.unsqueeze(0)?
+        let cos = self
+            .cos
+            .narrow(0, offset, seq_len)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
             .to_dtype(q.dtype())?;
-        let sin = self.sin.narrow(0, offset, seq_len)?
-            .unsqueeze(0)?.unsqueeze(0)?
+        let sin = self
+            .sin
+            .narrow(0, offset, seq_len)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
             .to_dtype(q.dtype())?;
 
         fn rope_rotate(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
@@ -224,10 +230,13 @@ impl RotaryEmbedding {
             let x2 = x.narrow(candle_core::D::Minus1, d / 2, d / 2)?;
             let cos = cos.broadcast_as(x1.shape())?;
             let sin = sin.broadcast_as(x1.shape())?;
-            Tensor::cat(&[
-                &(x1.mul(&cos)? - x2.mul(&sin)?)?,
-                &(x2.mul(&cos)? + x1.mul(&sin)?)?,
-            ], candle_core::D::Minus1)
+            Tensor::cat(
+                &[
+                    &(x1.mul(&cos)? - x2.mul(&sin)?)?,
+                    &(x2.mul(&cos)? + x1.mul(&sin)?)?,
+                ],
+                candle_core::D::Minus1,
+            )
         }
 
         let q_embed = rope_rotate(q, &cos, &sin)?;
@@ -256,7 +265,8 @@ impl Module for ManualRmsNorm {
         // NOT x / sqrt(mean(x²) + eps) — eps placement matters!
         let x_f32 = x.to_dtype(DType::F32)?;
         let hidden_size = x_f32.dim(candle_core::D::Minus1)?;
-        let norm_x = (x_f32.sqr()?.sum_keepdim(candle_core::D::Minus1)? / hidden_size as f64)?.sqrt()?;
+        let norm_x =
+            (x_f32.sqr()?.sum_keepdim(candle_core::D::Minus1)? / hidden_size as f64)?.sqrt()?;
         let normed = x_f32.broadcast_div(&(norm_x + self.eps)?)?;
         let normed = normed.to_dtype(x.dtype())?;
         normed.broadcast_mul(&self.weight)
@@ -390,13 +400,19 @@ impl Attention {
         let kv_len = k.dim(2)?;
         let n_rep = self.num_heads / self.num_kv_heads;
         let k = if n_rep > 1 {
-            k.unsqueeze(2)?.expand((b, self.num_kv_heads, n_rep, kv_len, hd))?
+            k.unsqueeze(2)?
+                .expand((b, self.num_kv_heads, n_rep, kv_len, hd))?
                 .reshape((b, self.num_heads, kv_len, hd))?
-        } else { k };
+        } else {
+            k
+        };
         let v = if n_rep > 1 {
-            v.unsqueeze(2)?.expand((b, self.num_kv_heads, n_rep, kv_len, hd))?
+            v.unsqueeze(2)?
+                .expand((b, self.num_kv_heads, n_rep, kv_len, hd))?
                 .reshape((b, self.num_heads, kv_len, hd))?
-        } else { v };
+        } else {
+            v
+        };
 
         // Standard attention using candle ops (matching reference project)
         let scale = (hd as f64).powf(-0.5);
@@ -426,7 +442,9 @@ impl Attention {
         };
         let out = attn_weights.matmul(&v)?;
 
-        let out = out.transpose(1, 2)?.reshape((b, seq_len, self.num_heads * hd))?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, seq_len, self.num_heads * hd))?;
         out.apply(&self.o_proj)
     }
 
@@ -474,14 +492,16 @@ impl TransformerLayer {
 
         // Debug: dump layernorm output for layer 0 comparison
         if pos_offset == 0 && x.dim(1).unwrap_or(0) > 1 {
-            if let Ok(vals) = x.narrow(0, 0, 1)
+            if let Ok(vals) = x
+                .narrow(0, 0, 1)
                 .and_then(|t| {
                     let sl = t.dim(1).unwrap_or(1);
                     t.narrow(1, sl - 1, 1)
                 })
                 .and_then(|t| t.narrow(2, 0, 5))
                 .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_vec1::<f32>()) {
+                .and_then(|t| t.to_vec1::<f32>())
+            {
                 tracing::info!("  layernorm pos -1 first 5: {:?}", vals);
             }
         }
@@ -585,10 +605,15 @@ impl Qwen3TTSTalker {
 
         // Build fused transformer (Metal or CPU, bypasses candle for precision)
         let to_cpu_vec = |t: &Tensor| -> candle_core::Result<Vec<f32>> {
-            t.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()
+            t.to_device(&candle_core::Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()
         };
         let get_w = |vb: &VarBuilder, shape: candle_core::Shape, name: &str| -> Result<Vec<f32>> {
-            let t = vb.get(shape, name).map_err(|e| FerrumError::model(format!("w {name}: {e}")))?;
+            let t = vb
+                .get(shape, name)
+                .map_err(|e| FerrumError::model(format!("w {name}: {e}")))?;
             to_cpu_vec(&t).map_err(|e| FerrumError::model(format!("vec {name}: {e}")))
         };
 
@@ -599,22 +624,54 @@ impl Qwen3TTSTalker {
             let mv = lv.pp("mlp");
             fused_layers.push(ferrum_attention::LayerWeights {
                 input_ln_w: get_w(&lv.pp("input_layernorm"), cfg.hidden_size.into(), "weight")?,
-                q_proj_w: get_w(&av.pp("q_proj"), (cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size).into(), "weight")?,
-                k_proj_w: get_w(&av.pp("k_proj"), (cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size).into(), "weight")?,
-                v_proj_w: get_w(&av.pp("v_proj"), (cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size).into(), "weight")?,
-                o_proj_w: get_w(&av.pp("o_proj"), (cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim).into(), "weight")?,
+                q_proj_w: get_w(
+                    &av.pp("q_proj"),
+                    (cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size).into(),
+                    "weight",
+                )?,
+                k_proj_w: get_w(
+                    &av.pp("k_proj"),
+                    (cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size).into(),
+                    "weight",
+                )?,
+                v_proj_w: get_w(
+                    &av.pp("v_proj"),
+                    (cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size).into(),
+                    "weight",
+                )?,
+                o_proj_w: get_w(
+                    &av.pp("o_proj"),
+                    (cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim).into(),
+                    "weight",
+                )?,
                 q_norm_w: get_w(&av.pp("q_norm"), cfg.head_dim.into(), "weight")?,
                 k_norm_w: get_w(&av.pp("k_norm"), cfg.head_dim.into(), "weight")?,
-                post_ln_w: get_w(&lv.pp("post_attention_layernorm"), cfg.hidden_size.into(), "weight")?,
-                gate_proj_w: get_w(&mv.pp("gate_proj"), (cfg.intermediate_size, cfg.hidden_size).into(), "weight")?,
-                up_proj_w: get_w(&mv.pp("up_proj"), (cfg.intermediate_size, cfg.hidden_size).into(), "weight")?,
-                down_proj_w: get_w(&mv.pp("down_proj"), (cfg.hidden_size, cfg.intermediate_size).into(), "weight")?,
+                post_ln_w: get_w(
+                    &lv.pp("post_attention_layernorm"),
+                    cfg.hidden_size.into(),
+                    "weight",
+                )?,
+                gate_proj_w: get_w(
+                    &mv.pp("gate_proj"),
+                    (cfg.intermediate_size, cfg.hidden_size).into(),
+                    "weight",
+                )?,
+                up_proj_w: get_w(
+                    &mv.pp("up_proj"),
+                    (cfg.intermediate_size, cfg.hidden_size).into(),
+                    "weight",
+                )?,
+                down_proj_w: get_w(
+                    &mv.pp("down_proj"),
+                    (cfg.hidden_size, cfg.intermediate_size).into(),
+                    "weight",
+                )?,
                 attn_layer_scale: None,
                 mlp_layer_scale: None,
             });
         }
-        let norm_w = to_cpu_vec(&norm.weight)
-            .map_err(|e| FerrumError::model(format!("norm_w: {e}")))?;
+        let norm_w =
+            to_cpu_vec(&norm.weight).map_err(|e| FerrumError::model(format!("norm_w: {e}")))?;
 
         let fused = ferrum_attention::FusedTransformer::new(
             ferrum_attention::TransformerConfig {
@@ -676,7 +733,8 @@ impl Qwen3TTSTalker {
         if use_candle {
             // Candle path: use candle's layer.forward() with fused attention
             let pos_offset = self.tokens_generated;
-            let seq_len = input_embeds.dim(1)
+            let seq_len = input_embeds
+                .dim(1)
                 .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
             let mut hidden = input_embeds.clone();
             for (li, layer) in self.layers.iter_mut().enumerate() {
@@ -691,7 +749,8 @@ impl Qwen3TTSTalker {
             Ok(hidden)
         } else {
             // Fused path: bypasses candle for Metal/CPU custom ops
-            let seq_len = input_embeds.dim(1)
+            let seq_len = input_embeds
+                .dim(1)
                 .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
             let h = self.config.hidden_size;
 
@@ -749,8 +808,8 @@ pub struct SubTalker {
     /// Per-codebook prediction heads: lm_head[i] maps hidden → logits for codebook i+1
     lm_heads: Vec<Linear>,
     /// Cached raw weights for zero-overhead predict loop
-    lm_raw: Vec<Vec<f32>>,    // [n_extra][vocab * hidden]
-    emb_raw: Vec<Vec<f32>>,   // [n_extra][vocab * emb_dim]
+    lm_raw: Vec<Vec<f32>>, // [n_extra][vocab * hidden]
+    emb_raw: Vec<Vec<f32>>, // [n_extra][vocab * emb_dim]
     vocab_size: usize,
     emb_dim: usize,
     /// Projection from talker hidden to subtalker hidden (if sizes differ)
@@ -838,10 +897,15 @@ impl SubTalker {
 
         // Build fused transformer for SubTalker (bypasses candle)
         let to_cpu_vec = |t: &Tensor| -> candle_core::Result<Vec<f32>> {
-            t.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()
+            t.to_device(&candle_core::Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()
         };
         let get_w = |vb: &VarBuilder, shape: candle_core::Shape, name: &str| -> Result<Vec<f32>> {
-            let t = vb.get(shape, name).map_err(|e| FerrumError::model(format!("st w {name}: {e}")))?;
+            let t = vb
+                .get(shape, name)
+                .map_err(|e| FerrumError::model(format!("st w {name}: {e}")))?;
             to_cpu_vec(&t).map_err(|e| FerrumError::model(format!("st vec {name}: {e}")))
         };
 
@@ -872,8 +936,8 @@ impl SubTalker {
                 mlp_layer_scale: None,
             });
         }
-        let st_norm_w = to_cpu_vec(&norm.weight)
-            .map_err(|e| FerrumError::model(format!("st norm_w: {e}")))?;
+        let st_norm_w =
+            to_cpu_vec(&norm.weight).map_err(|e| FerrumError::model(format!("st norm_w: {e}")))?;
 
         let fused = ferrum_attention::FusedTransformer::new(
             ferrum_attention::TransformerConfig {
@@ -900,14 +964,26 @@ impl SubTalker {
         );
 
         // Pre-extract raw weights for zero-overhead predict loop
-        let lm_raw: Vec<Vec<f32>> = lm_heads.iter().map(|lm| {
-            lm.weight().flatten_all().unwrap().to_vec1::<f32>().unwrap()
-        }).collect();
-        let emb_raw: Vec<Vec<f32>> = codec_embeddings.iter().map(|e| {
-            e.embeddings().flatten_all().unwrap().to_vec1::<f32>().unwrap()
-        }).collect();
+        let lm_raw: Vec<Vec<f32>> = lm_heads
+            .iter()
+            .map(|lm| lm.weight().flatten_all().unwrap().to_vec1::<f32>().unwrap())
+            .collect();
+        let emb_raw: Vec<Vec<f32>> = codec_embeddings
+            .iter()
+            .map(|e| {
+                e.embeddings()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect();
         let vocab_size = cfg.code_predictor_vocab_size;
-        let emb_dim = if !emb_raw.is_empty() { emb_raw[0].len() / vocab_size } else { st_h };
+        let emb_dim = if !emb_raw.is_empty() {
+            emb_raw[0].len() / vocab_size
+        } else {
+            st_h
+        };
 
         Ok(Self {
             layers,
@@ -940,10 +1016,12 @@ impl SubTalker {
         let n_extra = self.num_code_groups - 1;
 
         // Extract input to raw f32: [hidden(h), embed(h)] = 2*h floats
-        let th: Vec<f32> = talker_hidden.flatten_all()
+        let th: Vec<f32> = talker_hidden
+            .flatten_all()
             .and_then(|t| t.to_vec1())
             .map_err(|e| FerrumError::model(format!("th: {e}")))?;
-        let fe: Vec<f32> = first_codec_embed.flatten_all()
+        let fe: Vec<f32> = first_codec_embed
+            .flatten_all()
             .and_then(|t| t.to_vec1())
             .map_err(|e| FerrumError::model(format!("fe: {e}")))?;
         let mut input_data = Vec::with_capacity(2 * h);
@@ -961,9 +1039,22 @@ impl SubTalker {
 
         #[cfg(target_os = "macos")]
         extern "C" {
-            fn cblas_sgemm(order: i32, ta: i32, tb: i32, m: i32, n: i32, k: i32,
-                alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32,
-                beta: f32, c: *mut f32, ldc: i32);
+            fn cblas_sgemm(
+                order: i32,
+                ta: i32,
+                tb: i32,
+                m: i32,
+                n: i32,
+                k: i32,
+                alpha: f32,
+                a: *const f32,
+                lda: i32,
+                b: *const f32,
+                ldb: i32,
+                beta: f32,
+                c: *mut f32,
+                ldc: i32,
+            );
         }
 
         let mut predicted_tokens = Vec::with_capacity(n_extra);
@@ -973,19 +1064,34 @@ impl SubTalker {
             // lm_head matmul: logits = last_hidden @ lm_weights[i]^T
             #[cfg(target_os = "macos")]
             unsafe {
-                cblas_sgemm(101, 111, 112, 1, vocab as i32, h as i32,
-                    1.0, last_hidden.as_ptr(), h as i32,
-                    self.lm_raw[i].as_ptr(), h as i32,
-                    0.0, logits_buf.as_mut_ptr(), vocab as i32);
+                cblas_sgemm(
+                    101,
+                    111,
+                    112,
+                    1,
+                    vocab as i32,
+                    h as i32,
+                    1.0,
+                    last_hidden.as_ptr(),
+                    h as i32,
+                    self.lm_raw[i].as_ptr(),
+                    h as i32,
+                    0.0,
+                    logits_buf.as_mut_ptr(),
+                    vocab as i32,
+                );
             }
             #[cfg(not(target_os = "macos"))]
             for j in 0..vocab {
                 let mut s = 0.0f32;
-                for k in 0..h { s += last_hidden[k] * self.lm_raw[i][j * h + k]; }
+                for k in 0..h {
+                    s += last_hidden[k] * self.lm_raw[i][j * h + k];
+                }
                 logits_buf[j] = s;
             }
 
-            let token = crate::executor::tts_executor::sample_token(&logits_buf, temperature, top_k, 1.0);
+            let token =
+                crate::executor::tts_executor::sample_token(&logits_buf, temperature, top_k, 1.0);
             predicted_tokens.push(token);
 
             if i < n_extra - 1 {
@@ -1014,17 +1120,20 @@ impl SubTalker {
     }
 
     fn forward_layers(&mut self, input: &Tensor) -> Result<Tensor> {
-        let seq_len = input.dim(1)
+        let seq_len = input
+            .dim(1)
             .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
         let h = self.fused_hidden_size;
 
         // Fast path: if already on CPU f32, avoid extra copies
         let input_data = if input.device().is_cpu() && input.dtype() == DType::F32 {
-            input.flatten_all()
+            input
+                .flatten_all()
                 .and_then(|t| t.to_vec1())
                 .map_err(|e| FerrumError::model(format!("st extract: {e}")))?
         } else {
-            input.to_device(&candle_core::Device::Cpu)
+            input
+                .to_device(&candle_core::Device::Cpu)
                 .and_then(|t| t.to_dtype(DType::F32))
                 .and_then(|t| t.flatten_all())
                 .and_then(|t| t.to_vec1())

@@ -138,11 +138,10 @@ impl CausalConv {
         // Match Python MimiConv1d: add extra right padding for strided convs
         // to ensure output = ceil(n_frames) instead of floor.
         let length = x.dim(2)?;
-        let n_frames_f = (length + self.pad_left - self.kernel_size) as f64
-            / self.stride as f64 + 1.0;
+        let n_frames_f =
+            (length + self.pad_left - self.kernel_size) as f64 / self.stride as f64 + 1.0;
         let n_frames_ceil = n_frames_f.ceil() as usize;
-        let ideal_length =
-            (n_frames_ceil - 1) * self.stride + self.kernel_size - self.pad_left;
+        let ideal_length = (n_frames_ceil - 1) * self.stride + self.kernel_size - self.pad_left;
         let extra_right = ideal_length.saturating_sub(length);
         let x = x.pad_with_zeros(2, self.pad_left, extra_right)?;
         self.conv.forward(&x)
@@ -322,13 +321,17 @@ impl EncoderConvStack {
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h)?;
             if i <= 3 || i >= 13 {
-                let vals: Vec<f32> = h.narrow(0, 0, 1)?
+                let vals: Vec<f32> = h
+                    .narrow(0, 0, 1)?
                     .narrow(1, 0, 1)?
                     .narrow(2, 0, 5.min(h.dim(2)?))?
-                    .flatten_all()?.to_vec1()?;
+                    .flatten_all()?
+                    .to_vec1()?;
                 tracing::info!(
                     "  conv layer {}: shape={:?}, first 5: {:?}",
-                    i, h.dims(), vals
+                    i,
+                    h.dims(),
+                    vals
                 );
             }
         }
@@ -678,11 +681,13 @@ impl ResidualVQ {
                 if let Ok(idx) = indices.flatten_all().and_then(|t| t.to_vec1::<u32>()) {
                     info!("  RVQ layer {}: frame 0 idx={}", li, idx[0]);
                 }
-                if let Ok(r) = residual.narrow(0, 0, 1)
+                if let Ok(r) = residual
+                    .narrow(0, 0, 1)
                     .and_then(|t| t.narrow(1, 0, 1))
                     .and_then(|t| t.narrow(2, 0, 5))
                     .and_then(|t| t.flatten_all())
-                    .and_then(|t| t.to_vec1::<f32>()) {
+                    .and_then(|t| t.to_vec1::<f32>())
+                {
                     info!("  RVQ layer {} residual first 5: {:?}", li, r);
                 }
             }
@@ -787,11 +792,13 @@ impl SplitQuantizer {
         let aco_proj = self.acoustic_input_proj.forward(hidden)?; // same hidden!
 
         // Debug: dump acoustic input proj frame 0
-        if let Ok(vals) = aco_proj.narrow(0, 0, 1)
+        if let Ok(vals) = aco_proj
+            .narrow(0, 0, 1)
             .and_then(|t| t.narrow(2, 0, 1))
             .and_then(|t| t.narrow(1, 0, 10))
             .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<f32>()) {
+            .and_then(|t| t.to_vec1::<f32>())
+        {
             info!("Acoustic input proj frame 0 first 10: {:?}", vals);
         }
 
@@ -908,10 +915,7 @@ impl SpeechTokenizerEncoder {
             .dim(2)
             .map_err(|e| FerrumError::model(format!("conv output dim: {e}")))?;
 
-        info!(
-            "Conv encoder output: T={} frames",
-            t_conv,
-        );
+        info!("Conv encoder output: T={} frames", t_conv,);
 
         // Pipeline matches Python MimiModel._encode_frame:
         // 1. Conv encoder (already done above)
