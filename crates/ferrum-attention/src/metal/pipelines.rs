@@ -36,7 +36,7 @@ impl MetalPipelines {
         let mut pipelines = HashMap::new();
         for (lib, names) in [
             (&fa_lib, &["flash_attn_f32"][..]),
-            (&ops_lib, &["rms_norm_f32", "silu_mul_f32", "add_f32", "mul_scale_f32", "gemm_f32"][..]),
+            (&ops_lib, &["rms_norm_f32", "silu_mul_f32", "add_f32", "mul_scale_f32", "fused_scale_add_f32", "fused_residual_norm_f32", "gemm_f32"][..]),
             (&gemm_lib, &["gemm_f32_v2"][..]),
             (&nr_lib, &["qk_norm_rope_transpose_f32", "transpose_out_f32", "kv_cache_append_f32"][..]),
             (&sm_lib, &["softmax_last_dim_f32", "softmax_last_dim_f32_out"][..]),
@@ -334,6 +334,57 @@ impl MetalPipelines {
         enc.set_buffer(3, Some(&params_buf), 0);
         let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Fused scale-add: out = a + b * scale (replaces mul_scale + add)
+    pub fn fused_scale_add_enc(&self, enc: &ComputeCommandEncoderRef,
+        a: &Buffer, b: &Buffer, scale: &Buffer, output: &Buffer, n: usize, scale_len: usize)
+    {
+        #[repr(C)]
+        struct P { n: i32, scale_len: i32 }
+        let params = P { n: n as i32, scale_len: scale_len as i32 };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 8, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("fused_scale_add_f32"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(scale), 0);
+        enc.set_buffer(3, Some(output), 0);
+        enc.set_buffer(4, Some(&params_buf), 0);
+        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Fused residual-add + RMSNorm: out_res = a + b*scale, out_norm = rms_norm(out_res)*weight
+    pub fn fused_residual_norm_enc(&self, enc: &ComputeCommandEncoderRef,
+        a: &Buffer, b: &Buffer, scale: Option<&Buffer>, weight: &Buffer,
+        out_res: &Buffer, out_norm: &Buffer,
+        tokens: usize, dim: usize, eps: f32, scale_len: usize)
+    {
+        #[repr(C)]
+        struct P { tokens: i32, dim: i32, eps: f32, has_scale: i32, scale_len: i32 }
+        let dummy_buf = self.device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let params = P {
+            tokens: tokens as i32, dim: dim as i32, eps,
+            has_scale: if scale.is_some() { 1 } else { 0 },
+            scale_len: scale_len as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, std::mem::size_of::<P>() as u64,
+            MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("fused_residual_norm_f32"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(scale.unwrap_or(&dummy_buf)), 0);
+        enc.set_buffer(3, Some(weight), 0);
+        enc.set_buffer(4, Some(out_res), 0);
+        enc.set_buffer(5, Some(out_norm), 0);
+        enc.set_buffer(6, Some(&params_buf), 0);
+        enc.set_threadgroup_memory_length(0, 128);
+        let grid = MTLSize::new(tokens as u64, 1, 1);
+        let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
 

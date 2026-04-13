@@ -93,11 +93,10 @@ kernel void add_f32(
 
 // ── Element-wise Multiply (broadcast scale) ─────────────────────────────
 // out[i] = a[i] * scale[i % scale_len]
-// Used for layer_scale: out = attn_out * scale_vector
 
 struct MulScaleParams {
-    int n;          // total elements in a
-    int scale_len;  // length of scale vector (broadcasted)
+    int n;
+    int scale_len;
 };
 
 kernel void mul_scale_f32(
@@ -109,6 +108,74 @@ kernel void mul_scale_f32(
 {
     if (tid >= uint(p.n)) return;
     output[tid] = a[tid] * scale[tid % p.scale_len];
+}
+
+// ── Fused Scale-Add: out = a + b * scale ────────────────────────────────
+// Single kernel replaces mul_scale + add (saves 1 dispatch + 1 encoder barrier)
+
+kernel void fused_scale_add_f32(
+    device const float* a       [[buffer(0)]],   // residual
+    device const float* b       [[buffer(1)]],   // attn/mlp output
+    device const float* scale   [[buffer(2)]],   // layer_scale vector
+    device       float* output  [[buffer(3)]],
+    constant MulScaleParams& p  [[buffer(4)]],   // reuse params struct
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(p.n)) return;
+    output[tid] = a[tid] + b[tid] * scale[tid % p.scale_len];
+}
+
+// ── Fused Residual-Add + RMSNorm ────────────────────────────────────────
+// out_residual = a + b  (or a + b * scale if scale != NULL)
+// out_norm = rms_norm(out_residual) * weight
+// Saves 2 dispatches + 1 encoder barrier
+
+struct FusedResNormParams {
+    int tokens;
+    int dim;
+    float eps;
+    int has_scale;   // 0 = no scale, 1 = apply scale to b before add
+    int scale_len;
+};
+
+kernel void fused_residual_norm_f32(
+    device const float* a       [[buffer(0)]],   // residual input
+    device const float* b       [[buffer(1)]],   // attn/mlp output
+    device const float* scale   [[buffer(2)]],   // layer_scale (or dummy if has_scale=0)
+    device const float* weight  [[buffer(3)]],   // norm weight
+    device       float* out_res [[buffer(4)]],   // residual output (a + b*scale)
+    device       float* out_norm[[buffer(5)]],   // normalized output
+    constant FusedResNormParams& p [[buffer(6)]],
+    uint  tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    threadgroup float* shmem [[threadgroup(0)]])
+{
+    const int row = tgpig;
+    if (row >= p.tokens) return;
+
+    device const float* a_row = a + row * p.dim;
+    device const float* b_row = b + row * p.dim;
+    device float* res_row = out_res + row * p.dim;
+    device float* norm_row = out_norm + row * p.dim;
+
+    // Step 1: Residual add (with optional scale)
+    float sum_sq = 0.0f;
+    for (int i = tiisg; i < p.dim; i += 32) {
+        float bv = b_row[i];
+        if (p.has_scale) bv *= scale[i % p.scale_len];
+        float r = a_row[i] + bv;
+        res_row[i] = r;
+        sum_sq += r * r;
+    }
+
+    // Step 2: RMSNorm reduction
+    sum_sq = simd_sum(sum_sq);
+    float inv = 1.0f / sqrt(sum_sq / float(p.dim) + p.eps);
+
+    // Step 3: Apply norm + weight
+    for (int i = tiisg; i < p.dim; i += 32) {
+        norm_row[i] = res_row[i] * inv * weight[i];
+    }
 }
 
 // ── GEMM: C = A @ B^T ──────────────────────────────────────────────────

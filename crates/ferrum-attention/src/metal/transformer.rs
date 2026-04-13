@@ -190,25 +190,13 @@ pub fn metal_layer_forward_v2(
         enc.end_encoding();
     }
 
-    // Encoder 8: Optional attn layer_scale + Residual add
+    // Encoder 8: Fused attn_scale + residual + post-norm (1 dispatch instead of 3)
     {
         let enc = cmd.new_compute_command_encoder();
-        if let Some(ref scale) = w.attn_scale {
-            // scaled = o_out * attn_scale, then hidden = input + scaled
-            pipes.mul_scale_enc(enc, &s.o_out, scale, &s.mlp_out, tokens * h, h); // reuse mlp_out as temp
-            enc.end_encoding();
-            let enc = cmd.new_compute_command_encoder();
-            pipes.add_enc(enc, input, &s.mlp_out, &s.hidden, tokens * h);
-        } else {
-            pipes.add_enc(enc, input, &s.o_out, &s.hidden, tokens * h);
-        }
-        enc.end_encoding();
-    }
-
-    // Encoder 9: Post-attention RMSNorm
-    {
-        let enc = cmd.new_compute_command_encoder();
-        pipes.rms_norm_enc(enc, &s.hidden, &w.post_ln_w, &s.post_ln, tokens, h, cfg.rms_norm_eps);
+        pipes.fused_residual_norm_enc(enc,
+            input, &s.o_out, w.attn_scale.as_ref(), &w.post_ln_w,
+            &s.hidden, &s.post_ln,
+            tokens, h, cfg.rms_norm_eps, h);
         enc.end_encoding();
     }
 
@@ -234,14 +222,11 @@ pub fn metal_layer_forward_v2(
         enc.end_encoding();
     }
 
-    // Encoder 13: Optional mlp layer_scale + Final residual add
+    // Encoder 13: Fused mlp_scale + final residual (1 dispatch instead of 2-3)
     {
         let enc = cmd.new_compute_command_encoder();
         if let Some(ref scale) = w.mlp_scale {
-            pipes.mul_scale_enc(enc, &s.mlp_out, scale, &s.o_out, tokens * h, h); // reuse o_out as temp
-            enc.end_encoding();
-            let enc = cmd.new_compute_command_encoder();
-            pipes.add_enc(enc, &s.hidden, &s.o_out, &s.output, tokens * h);
+            pipes.fused_scale_add_enc(enc, &s.hidden, &s.mlp_out, scale, &s.output, tokens * h, h);
         } else {
             pipes.add_enc(enc, &s.hidden, &s.mlp_out, &s.output, tokens * h);
         }
