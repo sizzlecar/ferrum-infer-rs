@@ -107,6 +107,8 @@ struct MetalTransformerState {
     metal_cfg: metal::transformer::MetalTransformerConfig,
     scratch: Option<metal::transformer::LayerScratch>,
     max_scratch_tokens: usize,
+    input_buf: Option<::metal::Buffer>,
+    input_buf_size: usize,
 }
 
 impl FusedTransformer {
@@ -141,7 +143,9 @@ impl FusedTransformer {
             false
         } else {
             // Metal for talker (28) + vocoder (8), CPU for SubTalker (5) only
-            false // All Metal (vocoder reset + QK-norm skip fixed)
+            // All Metal: total pipeline is faster even though SubTalker per-step is slower,
+            // because GPU pipeline amortizes overhead across the full decode loop.
+            false
         };
 
         #[cfg(feature = "metal")]
@@ -191,6 +195,7 @@ impl FusedTransformer {
                 Some(MetalTransformerState {
                     pipes, weights, kv, cos_buf, sin_buf, metal_cfg,
                     scratch: None, max_scratch_tokens: 0,
+                    input_buf: None, input_buf_size: 0,
                 })
             } else {
                 None
@@ -232,9 +237,18 @@ impl FusedTransformer {
             }
             let scratch = ms.scratch.as_ref().unwrap();
 
-            // Single command buffer for ALL layers
+            // Reuse or allocate input buffer (shared memory = zero-copy write on Apple Silicon)
+            let needed = tokens * h;
+            if ms.input_buf.is_none() || ms.input_buf_size < needed {
+                ms.input_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h))); // preallocate for up to 128 tokens
+                ms.input_buf_size = needed.max(128 * h);
+            }
+            let input_buf = ms.input_buf.as_ref().unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(input.as_ptr(), input_buf.contents() as *mut f32, needed);
+            }
+
             let cmd = ms.pipes.queue.new_command_buffer();
-            let input_buf = ms.pipes.buffer_from_data(input);
 
             // Layer 0: input from input_buf
             metal::transformer::metal_layer_forward_v2(
