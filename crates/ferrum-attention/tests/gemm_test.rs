@@ -1,6 +1,6 @@
 //! Test Metal GEMM v2 kernel against Accelerate cblas_sgemm reference.
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 mod gemm_tests {
     use ferrum_attention::metal::pipelines::MetalPipelines;
     use metal::Device;

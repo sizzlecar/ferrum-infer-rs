@@ -1,6 +1,6 @@
 //! Test the all-Metal transformer layer.
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_transformer_tests {
     use ferrum_attention::metal::pipelines::MetalPipelines;
     use ferrum_attention::metal::transformer::*;

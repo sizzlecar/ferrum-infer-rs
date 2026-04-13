@@ -3,10 +3,10 @@
 
 use ferrum_attention::{attention_cpu, AttentionParams};
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use ferrum_attention::metal;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn assert_close(a: &[f32], b: &[f32], atol: f32, label: &str) {
     assert_eq!(
         a.len(),
@@ -33,7 +33,7 @@ fn assert_close(a: &[f32], b: &[f32], atol: f32, label: &str) {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn test_metal_flash_attn_causal_small() {
     // 1 batch, 1 head, 4 tokens, dim=64
     let sq = 4;
@@ -71,7 +71,7 @@ fn test_metal_flash_attn_causal_small() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn test_metal_flash_attn_prefill_73() {
     // Matches TTS prefill: 1 batch, 16 heads, 73 tokens, head_dim=128
     let b = 1;
@@ -113,7 +113,7 @@ fn test_metal_flash_attn_prefill_73() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn test_metal_flash_attn_decode() {
     // Decode step: 1 query token, 74 KV tokens
     let b = 1;
@@ -154,7 +154,7 @@ fn test_metal_flash_attn_decode() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn bench_metal_flash_attn_prefill() {
     // Benchmark: 73 tokens, 16 heads, 128 dim
     let b = 1;
