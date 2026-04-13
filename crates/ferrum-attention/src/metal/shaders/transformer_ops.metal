@@ -91,6 +91,26 @@ kernel void add_f32(
     output[tid] = a[tid] + b[tid];
 }
 
+// ── Element-wise Multiply (broadcast scale) ─────────────────────────────
+// out[i] = a[i] * scale[i % scale_len]
+// Used for layer_scale: out = attn_out * scale_vector
+
+struct MulScaleParams {
+    int n;          // total elements in a
+    int scale_len;  // length of scale vector (broadcasted)
+};
+
+kernel void mul_scale_f32(
+    device const float* a       [[buffer(0)]],
+    device const float* scale   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant MulScaleParams& p  [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(p.n)) return;
+    output[tid] = a[tid] * scale[tid % p.scale_len];
+}
+
 // ── GEMM: C = A @ B^T ──────────────────────────────────────────────────
 // A: [M, K], B: [N, K] (row-major), C: [M, N]
 // Uses simdgroup_matrix for 8x8 tiles.

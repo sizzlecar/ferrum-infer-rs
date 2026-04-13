@@ -36,7 +36,7 @@ impl MetalPipelines {
         let mut pipelines = HashMap::new();
         for (lib, names) in [
             (&fa_lib, &["flash_attn_f32"][..]),
-            (&ops_lib, &["rms_norm_f32", "silu_mul_f32", "add_f32", "gemm_f32"][..]),
+            (&ops_lib, &["rms_norm_f32", "silu_mul_f32", "add_f32", "mul_scale_f32", "gemm_f32"][..]),
             (&gemm_lib, &["gemm_f32_v2"][..]),
             (&nr_lib, &["qk_norm_rope_transpose_f32", "transpose_out_f32", "kv_cache_append_f32"][..]),
             (&sm_lib, &["softmax_last_dim_f32", "softmax_last_dim_f32_out"][..]),
@@ -317,6 +317,23 @@ impl MetalPipelines {
         enc.set_threadgroup_memory_length(0, 128);
         let grid = MTLSize::new(rows as u64, 1, 1);
         let tg = MTLSize::new(32, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Element-wise multiply with broadcast scale: out[i] = a[i] * scale[i % scale_len]
+    pub fn mul_scale_enc(&self, enc: &ComputeCommandEncoderRef, a: &Buffer, scale: &Buffer, output: &Buffer, n: usize, scale_len: usize) {
+        #[repr(C)]
+        struct P { n: i32, scale_len: i32 }
+        let params = P { n: n as i32, scale_len: scale_len as i32 };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void, 8, MTLResourceOptions::StorageModeShared);
+        enc.set_compute_pipeline_state(self.pipeline("mul_scale_f32"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(scale), 0);
+        enc.set_buffer(2, Some(output), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
 

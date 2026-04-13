@@ -141,7 +141,7 @@ impl FusedTransformer {
             false
         } else {
             // Metal for talker (28) + vocoder (8), CPU for SubTalker (5) only
-            cfg.num_layers < 10 // Talker(28)=Metal, SubTalker(5)+Vocoder(8)=CPU
+            false // All Metal (vocoder reset + QK-norm skip fixed)
         };
 
         #[cfg(feature = "metal")]
@@ -170,6 +170,8 @@ impl FusedTransformer {
                         up_proj_w: pipes.buffer_from_data(&lw.up_proj_w),
                         down_proj_w: pipes.buffer_from_data(&lw.down_proj_w),
                         has_qk_norm: !lw.q_norm_w.is_empty(),
+                        attn_scale: lw.attn_layer_scale.as_ref().map(|s| pipes.buffer_from_data(s)),
+                        mlp_scale: lw.mlp_layer_scale.as_ref().map(|s| pipes.buffer_from_data(s)),
                     }
                 }).collect();
                 let kv_max_len = cfg.max_position_embeddings.min(4096);

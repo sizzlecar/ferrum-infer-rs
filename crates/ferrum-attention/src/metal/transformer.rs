@@ -19,6 +19,9 @@ pub struct MetalLayerWeights {
     pub down_proj_w: Buffer,
     /// False = skip QK-norm in qk_norm_rope kernel (vocoder has no QK-norm)
     pub has_qk_norm: bool,
+    /// Optional layer_scale buffers (vocoder transformer uses these)
+    pub attn_scale: Option<Buffer>,
+    pub mlp_scale: Option<Buffer>,
 }
 
 pub struct MetalTransformerConfig {
@@ -187,10 +190,18 @@ pub fn metal_layer_forward_v2(
         enc.end_encoding();
     }
 
-    // Encoder 8: Residual add
+    // Encoder 8: Optional attn layer_scale + Residual add
     {
         let enc = cmd.new_compute_command_encoder();
-        pipes.add_enc(enc, input, &s.o_out, &s.hidden, tokens * h);
+        if let Some(ref scale) = w.attn_scale {
+            // scaled = o_out * attn_scale, then hidden = input + scaled
+            pipes.mul_scale_enc(enc, &s.o_out, scale, &s.mlp_out, tokens * h, h); // reuse mlp_out as temp
+            enc.end_encoding();
+            let enc = cmd.new_compute_command_encoder();
+            pipes.add_enc(enc, input, &s.mlp_out, &s.hidden, tokens * h);
+        } else {
+            pipes.add_enc(enc, input, &s.o_out, &s.hidden, tokens * h);
+        }
         enc.end_encoding();
     }
 
@@ -223,10 +234,17 @@ pub fn metal_layer_forward_v2(
         enc.end_encoding();
     }
 
-    // Encoder 13: Final residual add
+    // Encoder 13: Optional mlp layer_scale + Final residual add
     {
         let enc = cmd.new_compute_command_encoder();
-        pipes.add_enc(enc, &s.hidden, &s.mlp_out, &s.output, tokens * h);
+        if let Some(ref scale) = w.mlp_scale {
+            pipes.mul_scale_enc(enc, &s.mlp_out, scale, &s.o_out, tokens * h, h); // reuse o_out as temp
+            enc.end_encoding();
+            let enc = cmd.new_compute_command_encoder();
+            pipes.add_enc(enc, &s.hidden, &s.o_out, &s.output, tokens * h);
+        } else {
+            pipes.add_enc(enc, &s.hidden, &s.mlp_out, &s.output, tokens * h);
+        }
         enc.end_encoding();
     }
     // Output is in s.output. Caller reads it after commit+wait.

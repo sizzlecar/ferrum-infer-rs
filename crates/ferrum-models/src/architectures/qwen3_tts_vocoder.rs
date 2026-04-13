@@ -595,6 +595,10 @@ impl VocoderPreTransformer {
         Ok(Self { input_proj_w, input_proj_b, output_proj_w, output_proj_b, fused, hidden: h, latent: lat })
     }
 
+    fn reset(&mut self) {
+        self.fused.reset();
+    }
+
     /// Forward: [B, T, latent_dim] → [B, T, latent_dim]. All on CPU/Metal via FusedTransformer.
     fn forward(&mut self, x: &Tensor) -> candle_core::Result<Tensor> {
         let seq_len = x.dim(1)?;
@@ -788,8 +792,11 @@ impl Qwen3TTSVocoder {
         let hidden = hidden
             .transpose(1, 2)
             .map_err(|e| FerrumError::model(format!("transpose: {e}")))?; // [B, T, 1024]
-        let hidden = self.pre_transformer.forward(&hidden)
-            .map_err(|e| FerrumError::model(format!("pre_transformer: {e}")))?; // [B, T, 1024]
+        let hidden = {
+            self.pre_transformer.reset(); // Clear KV cache + position (vocoder is non-autoregressive)
+            self.pre_transformer.forward(&hidden)
+                .map_err(|e| FerrumError::model(format!("pre_transformer: {e}")))?
+        }; // [B, T, 1024]
         let hidden = hidden
             .transpose(1, 2)
             .map_err(|e| FerrumError::model(format!("transpose back: {e}")))?; // [B, 1024, T]
