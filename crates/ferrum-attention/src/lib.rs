@@ -226,8 +226,15 @@ impl FusedTransformer {
         } else {
             "Metal+Accelerate"
         };
-        eprintln!(
-            "[fused-transformer] backend={backend}, hidden={}, layers={n}",
+        // Log backend selection (visible with RUST_LOG=info)
+        #[cfg(feature = "metal")]
+        tracing::info!(
+            "FusedTransformer: backend={backend}, hidden={}, layers={n}",
+            cfg.hidden_size
+        );
+        #[cfg(not(feature = "metal"))]
+        tracing::info!(
+            "FusedTransformer: backend=CPU, hidden={}, layers={n}",
             cfg.hidden_size
         );
 

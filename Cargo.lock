@@ -1234,6 +1234,7 @@ dependencies = [
  "metal 0.31.0",
  "objc2",
  "objc2-foundation",
+ "tracing",
 ]
 
 [[package]]

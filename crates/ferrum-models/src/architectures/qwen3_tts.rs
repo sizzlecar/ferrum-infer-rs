@@ -1146,17 +1146,6 @@ impl SubTalker {
         Ok(predicted_tokens)
     }
 
-    // Keep old predict signature for compatibility (unused placeholder)
-    fn _predict_candle(
-        &mut self,
-        talker_hidden: &Tensor,
-        first_codec_embed: &Tensor,
-        temperature: f32,
-        top_k: usize,
-    ) -> Result<Vec<u32>> {
-        unreachable!()
-    }
-
     fn forward_layers(&mut self, input: &Tensor) -> Result<Tensor> {
         let seq_len = input
             .dim(1)

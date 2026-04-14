@@ -670,8 +670,8 @@ impl TtsModelExecutor {
                 .collect();
             let ncb = self.config.num_code_groups;
             let nframes = u32s.len() / ncb;
-            eprintln!(
-                "[voice-clone] loaded pre-computed ref codes: {} frames from {}",
+            info!(
+                "Loaded pre-computed ref codes: {} frames from {}",
                 nframes, path
             );
             u32s.chunks(ncb).map(|c| c.to_vec()).collect()
@@ -929,16 +929,7 @@ impl TtsModelExecutor {
             .map_err(|e| FerrumError::model(format!("narrow last: {e}")))?;
         if let Ok(v) = last_hidden.flatten_all().and_then(|t| t.to_vec1::<f32>()) {}
         let current_logits = self.talker.logits(&last_hidden)?;
-        {
-            let lv: Vec<f32> = current_logits
-                .flatten_all()
-                .and_then(|t| t.to_vec1())
-                .unwrap_or_default();
-            eprintln!(
-                "[VC-INITIAL] logits [1146]={:.4}, [1912]={:.4}, [433]={:.4}",
-                lv[1146], lv[1912], lv[433]
-            );
-        }
+        {}
 
         // Decode loop
         let mut all_codec_tokens: Vec<Vec<u32>> = Vec::new();
@@ -958,15 +949,6 @@ impl TtsModelExecutor {
 
         for step in 0..max_icl_tokens {
             let mut logits_vec = logits_to_vec(&current_logits)?;
-            if step == 0 {
-                eprintln!(
-                    "[VC-RAW] logits_vec.len()={}, [1146]={:.4}, [1912]={:.4}, [433]={:.4}",
-                    logits_vec.len(),
-                    logits_vec[1146],
-                    logits_vec[1912],
-                    logits_vec[433]
-                );
-            }
             // Suppress special tokens [vocab-1024, vocab) except EOS
             for i in suppress_start..suppress_end.min(logits_vec.len()) {
                 if i as u32 != codec_eos {
@@ -989,12 +971,6 @@ impl TtsModelExecutor {
                         logits_vec[idx] *= ICL_REPETITION_PENALTY;
                     }
                 }
-            }
-            if step < 2 {
-                let mut t5: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
-                t5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                t5.truncate(5);
-                eprintln!("[VC-LOGITS step={}] top5={:?}", step, t5);
             }
             let next_token = sample_token(
                 &logits_vec,
@@ -1041,18 +1017,6 @@ impl TtsModelExecutor {
                 .narrow(1, cur_hidden_len - 1, 1)
                 .map_err(|e| FerrumError::model(format!("last_hidden: {e}")))?;
 
-            if step < 2 {
-                if let Ok(vals) = last_hidden
-                    .narrow(0, 0, 1)
-                    .and_then(|t| t.narrow(1, 0, 1))
-                    .and_then(|t| t.narrow(2, 0, 5))
-                    .and_then(|t| t.flatten_all())
-                    .and_then(|t| t.to_vec1::<f32>())
-                {
-                    info!("  step {} past_hidden first 5: {:?}", step, vals);
-                }
-            }
-
             let token_tensor = Tensor::new(&[next_token], &device)
                 .map_err(|e| FerrumError::model(format!("token tensor: {e}")))?
                 .unsqueeze(0)
@@ -1081,12 +1045,6 @@ impl TtsModelExecutor {
                     .map_err(|e| FerrumError::model(format!("sub_embed: {e}")))?;
                 combined_embed = (combined_embed + sub_embed)
                     .map_err(|e| FerrumError::model(format!("add embed: {e}")))?;
-            }
-
-            if step < 3 {
-                let mut all_ids = vec![next_token];
-                all_ids.extend_from_slice(&extra_codes);
-                info!("  step {} codec_ids: {:?}", step, all_ids);
             }
 
             // Add trailing text or tts_pad (matching reference streaming mode)
@@ -1353,28 +1311,7 @@ pub fn sample_token(
     let sum: f32 = exps.iter().sum();
     let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
 
-    // 5. Multinomial sample: cumsum and compare with random
-    // Debug: count how many tokens survived top_k + top_p
-    static SAMPLE_CALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let call = SAMPLE_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if call < 3 {
-        let n_active = probs.iter().filter(|&&p| p > 0.0).count();
-        let top3: Vec<(usize, f32)> = {
-            let mut indexed: Vec<(usize, f32)> = probs
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(_, p)| *p > 0.0)
-                .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            indexed.truncate(3);
-            indexed
-        };
-        eprintln!(
-            "[SAMPLE#{}] n_active={}, top3_probs={:?}",
-            call, n_active, top3
-        );
-    }
+    // 5. Multinomial sample
     let r = rand_f32();
     let mut cumulative = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {

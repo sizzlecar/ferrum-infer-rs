@@ -9,6 +9,8 @@ default = []
 metal = ["dep:metal", "dep:objc2", "dep:objc2-foundation"]
 
 [dependencies]
+tracing = "0.1"
+
 # Metal (macOS only)
 metal = { version = "0.31", optional = true }
 objc2 = { version = "0.6", optional = true }
