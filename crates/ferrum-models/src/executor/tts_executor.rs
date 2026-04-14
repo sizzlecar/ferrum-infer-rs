@@ -612,7 +612,18 @@ impl TtsModelExecutor {
         let device = self.talker.device().clone();
 
         // Step 1: Load and process reference audio at 24kHz
-        let ref_pcm = crate::audio_processor::load_audio_at_rate(ref_audio_path, 24000)?;
+        let ref_pcm = if let Ok(path) = std::env::var("FERRUM_REF_PCM") {
+            let data = std::fs::read(&path)
+                .map_err(|e| FerrumError::model(format!("read ref pcm: {e}")))?;
+            let pcm: Vec<f32> = data
+                .chunks(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            info!("Loaded ref PCM override: {} samples", pcm.len());
+            pcm
+        } else {
+            crate::audio_processor::load_audio_at_rate(ref_audio_path, 24000)?
+        };
         info!(
             "TTS voice clone: loaded ref audio {} samples ({:.2}s)",
             ref_pcm.len(),
@@ -627,6 +638,8 @@ impl TtsModelExecutor {
             .ok_or_else(|| FerrumError::model("speaker encoder not loaded"))?;
         let mel = mel_spectrogram_speaker_encoder(&ref_pcm);
         let n_mel_frames = mel.len() / 128;
+        // mel_spectrogram_speaker_encoder returns [T, 128] row-major
+        // forward() internally transposes [1, T, 128] → [1, 128, T]
         let mel_tensor = Tensor::from_vec(mel, (1, n_mel_frames, 128), &device)
             .map_err(|e| FerrumError::model(format!("mel tensor: {e}")))?;
         let spk_embed = speaker_encoder.forward(&mel_tensor)?;
@@ -801,10 +814,13 @@ impl TtsModelExecutor {
         let text_codec_prefix = (&text_prefix + &codec_prefix_part)
             .map_err(|e| FerrumError::model(format!("text+codec prefix sum: {e}")))?;
 
-        let mut talker_input = Tensor::cat(&[&role_embed, &text_codec_prefix], 1)
-            .map_err(|e| FerrumError::model(format!("talker_input cat: {e}")))?;
+        // ICL mode: prefill is 9 positions (no first_text+codec_bos)
+        let prefill_embed = Tensor::cat(&[&role_embed, &text_codec_prefix], 1)
+            .map_err(|e| FerrumError::model(format!("prefill cat: {e}")))?;
 
-        // ICL prompt: [ref_text, target_text, tts_eos] + [codec_bos, ref_codec]
+        let t3 = std::time::Instant::now();
+
+        // Step 6b: Build ICL block — [ref_text, target_text, tts_eos] + [codec_bos, ref_codec]
         // Streaming mode: element-wise sum, trailing = text beyond codec length
         let all_text_ids: Vec<u32> = ref_text_ids
             .iter()
@@ -857,23 +873,19 @@ impl TtsModelExecutor {
             .dim(1)
             .map_err(|e| FerrumError::model(format!("codec_icl_len dim: {e}")))?;
 
-        // Merge text and codec (element-wise sum, handling different lengths)
-        let trailing_text: Option<Tensor>;
+        // Build ICL embed: element-wise sum of text and codec (streaming mode)
+        let icl_trailing: Tensor;
+        let icl_embed: Tensor;
         if text_len > codec_icl_len {
-            // text is longer: sum first codec_len positions, trailing text is separate
             let text_part = text_embed_with_eos
                 .narrow(1, 0, codec_icl_len)
                 .map_err(|e| FerrumError::model(format!("text_part narrow: {e}")))?;
-            let summed = (&text_part + &icl_codec)
+            icl_embed = (&text_part + &icl_codec)
                 .map_err(|e| FerrumError::model(format!("text+codec sum: {e}")))?;
-            let trailing = text_embed_with_eos
+            icl_trailing = text_embed_with_eos
                 .narrow(1, codec_icl_len, text_len - codec_icl_len)
                 .map_err(|e| FerrumError::model(format!("trailing narrow: {e}")))?;
-            talker_input = Tensor::cat(&[&talker_input, &summed], 1)
-                .map_err(|e| FerrumError::model(format!("talker+summed cat: {e}")))?;
-            trailing_text = Some(trailing);
         } else {
-            // codec is longer or equal: pad text with tts_pad via expand (single op)
             let n_pad = codec_icl_len - text_len;
             let text_padded = if n_pad > 0 {
                 let pad_block = tts_pad_embed
@@ -884,59 +896,31 @@ impl TtsModelExecutor {
             } else {
                 text_embed_with_eos.clone()
             };
-            let summed = (&text_padded + &icl_codec)
+            icl_embed = (&text_padded + &icl_codec)
                 .map_err(|e| FerrumError::model(format!("padded+codec sum: {e}")))?;
-            talker_input = Tensor::cat(&[&talker_input, &summed], 1)
-                .map_err(|e| FerrumError::model(format!("talker+summed cat: {e}")))?;
-            trailing_text = None;
+            icl_trailing = tts_pad_embed.clone();
         }
-
-        // Trailing text for decode: text positions beyond codec (if text > codec)
-        // Otherwise trailing is just tts_pad (matching reference project streaming mode)
-        let icl_trailing = if let Some(trailing) = &trailing_text {
-            trailing.clone()
-        } else {
-            tts_pad_embed.clone()
-        };
         let trailing_text_len = icl_trailing
             .dim(1)
             .map_err(|e| FerrumError::model(format!("trailing dim: {e}")))?;
 
-        let prefill_len = talker_input
+        // Debug: dump values for comparison with reference project
+        // Step 6c: Run prefill then ICL block as SEPARATE forward passes
+        let _prefill_out = self.talker.forward_step(&prefill_embed)?;
+        let t_icl = std::time::Instant::now();
+        let icl_hidden = self.talker.forward_step(&icl_embed)?;
+        let icl_len = icl_hidden
             .dim(1)
-            .map_err(|e| FerrumError::model(format!("prefill dim: {e}")))?;
+            .map_err(|e| FerrumError::model(format!("icl_hidden dim: {e}")))?;
         info!(
-            "ICL prompt: prefill={}, icl={}, trailing={}, {:.1}ms",
-            prefill_len,
-            codec_icl_len.min(text_len),
-            trailing_text_len,
-            t_merge.elapsed().as_secs_f64() * 1000.0
+            "ICL block: {:.1}ms ({} tokens), trailing={}",
+            t_icl.elapsed().as_secs_f64() * 1000.0,
+            icl_len,
+            trailing_text_len
         );
 
-        info!(
-            "Steps 4-5 (tokenize+prompt): {:.1}ms",
-            t2.elapsed().as_secs_f64() * 1000.0
-        );
-        let t3 = std::time::Instant::now();
-        // Step 6: Prefill and decode
-        let mut hidden = self.talker.forward_step(&talker_input)?;
-        info!(
-            "Prefill: {:.1}ms ({} tokens × {} layers)",
-            t3.elapsed().as_secs_f64() * 1000.0,
-            prefill_len,
-            self.config.num_hidden_layers,
-        );
-        // Debug: dump prefill output at last position
-        if let Ok(vals) = hidden
-            .narrow(0, 0, 1)
-            .and_then(|t| t.narrow(1, prefill_len - 1, 1))
-            .and_then(|t| t.narrow(2, 0, 10))
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<f32>())
-        {
-            info!("  prefill hidden[-1,:10] = {:?}", vals);
-            info!("  Python reference:        [9.320, 3.522, -4.352, 0.385, 3.274, 4.379, 1.663, 2.466, 2.021, -3.127]");
-        }
+        // Use ICL hidden output for logits and decode
+        let mut hidden = icl_hidden;
         let hidden_len = hidden
             .dim(1)
             .map_err(|e| FerrumError::model(format!("hidden dim: {e}")))?;

@@ -1015,6 +1015,22 @@ impl SubTalker {
         let h = self.fused_hidden_size;
         let n_extra = self.num_code_groups - 1;
 
+        // Project from talker hidden to CP hidden if dimensions differ (1.7B: 2048→1024)
+        let talker_hidden = if let Some(ref proj) = self.projection {
+            talker_hidden
+                .apply(proj)
+                .map_err(|e| FerrumError::model(format!("predict proj hidden: {e}")))?
+        } else {
+            talker_hidden.clone()
+        };
+        let first_codec_embed = if let Some(ref proj) = self.projection {
+            first_codec_embed
+                .apply(proj)
+                .map_err(|e| FerrumError::model(format!("predict proj embed: {e}")))?
+        } else {
+            first_codec_embed.clone()
+        };
+
         // Extract input to raw f32: [hidden(h), embed(h)] = 2*h floats
         let th: Vec<f32> = talker_hidden
             .flatten_all()

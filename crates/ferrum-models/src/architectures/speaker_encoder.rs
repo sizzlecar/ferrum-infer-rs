@@ -175,8 +175,12 @@ impl Res2NetBlock {
 
         for i in 1..self.scale {
             let chunk_i = x.narrow(1, i * self.chunk_size, self.chunk_size)?;
-            // chunk[i>0] gets chunk[i] + output[i-1] as input
-            let input_i = (chunk_i + outputs.last().unwrap())?;
+            // First block (i=1) processes chunk directly; subsequent blocks add previous output
+            let input_i = if i == 1 {
+                chunk_i
+            } else {
+                (chunk_i + outputs.last().unwrap())?
+            };
             let out_i = self.blocks[i - 1].forward(&input_i)?;
             outputs.push(out_i);
         }
@@ -282,7 +286,7 @@ impl SERes2NetBlock {
         let out = self.res2net_block.forward(&out)?;
         let out = self.tdnn2.forward(&out)?;
         let out = self.se_block.forward(&out)?;
-        (out + residual)?.relu()
+        out + residual
     }
 }
 
@@ -314,7 +318,7 @@ impl AttentiveStatisticsPooling {
         let mean = x.mean_keepdim(2)?; // [B, C, 1]
         let diff = x.broadcast_sub(&mean)?;
         let var = diff.sqr()?.mean_keepdim(2)?;
-        let std = (var + 1e-9)?.sqrt()?; // [B, C, 1]
+        let std = (var + 1e-5)?.sqrt()?; // [B, C, 1]
 
         // Expand mean/std to match time dim
         let mean_exp = mean.expand(x.dims())?; // [B, C, T]
@@ -337,7 +341,7 @@ impl AttentiveStatisticsPooling {
 
         let w_diff = x.broadcast_sub(&w_mean)?;
         let w_var = (w_diff.sqr()? * &attn)?.sum_keepdim(2)?;
-        let w_std = (w_var + 1e-9)?.sqrt()?; // [B, C, 1]
+        let w_std = (w_var + 1e-5)?.sqrt()?; // [B, C, 1]
 
         // Concat mean + std → [B, C*2, 1]
         Tensor::cat(&[&w_mean, &w_std], 1)
@@ -430,6 +434,7 @@ impl SpeakerEncoder {
         // Transpose [1, T, 128] → [1, 128, T] for Conv1d processing
         let x = mel
             .transpose(1, 2)
+            .and_then(|t| t.contiguous())
             .map_err(|e| FerrumError::model(format!("speaker_encoder transpose: {e}")))?;
 
         // blocks[0]: initial TDNN
