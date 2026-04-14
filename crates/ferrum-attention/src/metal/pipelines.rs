@@ -114,6 +114,11 @@ impl MetalPipelines {
         unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
     }
 
+    pub fn read_buffer_u32(buf: &Buffer, len: usize) -> Vec<u32> {
+        let ptr = buf.contents() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
+    }
+
     /// Run GEMM: C[M,N] = A[M,K] @ B[N,K]^T
     /// Uses Accelerate cblas_sgemm on shared Metal buffers (zero-copy on Apple Silicon).
     pub fn gemm(

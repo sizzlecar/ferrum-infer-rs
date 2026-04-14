@@ -488,6 +488,183 @@ impl FusedTransformer {
         Some((result, tokens * h))
     }
 
+    /// Forward + lm_head + argmax in one GPU pass. Returns (token_index, hidden_buffer).
+    /// Eliminates CPU roundtrip for SubTalker's inner loop.
+    /// lm_weights: [vocab, hidden] row-major on GPU.
+    #[cfg(feature = "metal")]
+    pub fn forward_and_argmax(
+        &mut self,
+        input_buf: &::metal::Buffer,
+        tokens: usize,
+        lm_weights_buf: &::metal::Buffer,
+        vocab_size: usize,
+    ) -> Option<(u32, ::metal::Buffer)> {
+        let h = self.cfg.hidden_size;
+
+        // Forward through transformer layers + norm
+        let hidden_buf = self.forward_gpu_buffer(input_buf, tokens)?;
+
+        let ms = self.metal_state.as_ref()?;
+
+        // lm_head GEMM: [1, hidden] × [vocab, hidden]^T = [1, vocab]
+        let logits_buf = ms.pipes.buffer_empty(vocab_size);
+        let cmd = ms.pipes.queue.new_command_buffer();
+        {
+            let enc = cmd.new_compute_command_encoder();
+            ms.pipes.gemm_v2(
+                enc,
+                &hidden_buf,
+                lm_weights_buf,
+                &logits_buf,
+                1,
+                vocab_size,
+                h,
+            );
+            enc.end_encoding();
+        }
+
+        // Argmax on GPU
+        let result_buf = ms.pipes.buffer_empty(1); // 1 u32
+        {
+            let enc = cmd.new_compute_command_encoder();
+            #[repr(C)]
+            struct ArgmaxParams {
+                n: i32,
+            }
+            let params = ArgmaxParams {
+                n: vocab_size as i32,
+            };
+            let params_buf = ms.pipes.device.new_buffer_with_data(
+                &params as *const _ as *const std::ffi::c_void,
+                4,
+                ::metal::MTLResourceOptions::StorageModeShared,
+            );
+            enc.set_compute_pipeline_state(ms.pipes.pipeline("argmax_f32"));
+            enc.set_buffer(0, Some(&logits_buf), 0);
+            enc.set_buffer(1, Some(&result_buf), 0);
+            enc.set_buffer(2, Some(&params_buf), 0);
+            let tg = ::metal::MTLSize::new(256, 1, 1);
+            let grid = ::metal::MTLSize::new(1, 1, 1);
+            enc.dispatch_thread_groups(grid, tg);
+            enc.end_encoding();
+        }
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // Read single u32 token from GPU
+        let token = metal::pipelines::MetalPipelines::read_buffer_u32(&result_buf, 1)[0];
+
+        Some((token, hidden_buf))
+    }
+
+    /// Forward on GPU from a Metal Buffer input. Zero CPU transfer.
+    /// Returns normed hidden as Metal Buffer.
+    #[cfg(feature = "metal")]
+    pub fn forward_gpu_buffer(
+        &mut self,
+        input_buf: &::metal::Buffer,
+        tokens: usize,
+    ) -> Option<::metal::Buffer> {
+        let pos_offset = self.tokens_generated;
+        let h = self.cfg.hidden_size;
+        if self.use_cpu {
+            return None;
+        }
+        let ms = self.metal_state.as_mut()?;
+
+        if ms.scratch.is_none() || ms.max_scratch_tokens < tokens {
+            ms.scratch = Some(metal::transformer::LayerScratch::new(
+                &ms.pipes,
+                tokens,
+                h,
+                ms.metal_cfg.intermediate_size,
+                ms.metal_cfg.num_heads,
+                ms.metal_cfg.num_kv_heads,
+                ms.metal_cfg.head_dim,
+            ));
+            ms.max_scratch_tokens = tokens;
+        }
+        let scratch = ms.scratch.as_ref().unwrap();
+
+        let cmd = ms.pipes.queue.new_command_buffer();
+
+        // All transformer layers (input from caller's buffer)
+        metal::transformer::metal_layer_forward_v2(
+            cmd,
+            &ms.pipes,
+            input_buf,
+            tokens,
+            &ms.weights[0],
+            &ms.metal_cfg,
+            &mut ms.kv[0],
+            pos_offset,
+            &ms.cos_buf,
+            &ms.sin_buf,
+            scratch,
+        );
+        // Use ms.input_buf as intermediate for layers 1..N
+        let needed = tokens * h;
+        if ms.input_buf.is_none() || ms.input_buf_size < needed {
+            ms.input_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h)));
+            ms.input_buf_size = needed.max(128 * h);
+        }
+        let int_buf = ms.input_buf.as_ref().unwrap();
+
+        for li in 1..ms.weights.len() {
+            let enc = cmd.new_blit_command_encoder();
+            enc.copy_from_buffer(&scratch.output, 0, int_buf, 0, (tokens * h * 4) as u64);
+            enc.end_encoding();
+            metal::transformer::metal_layer_forward_v2(
+                cmd,
+                &ms.pipes,
+                int_buf,
+                tokens,
+                &ms.weights[li],
+                &ms.metal_cfg,
+                &mut ms.kv[li],
+                pos_offset,
+                &ms.cos_buf,
+                &ms.sin_buf,
+                scratch,
+            );
+        }
+
+        // Final RMSNorm on GPU
+        if ms.norm_out_buf.is_none() {
+            ms.norm_out_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h)));
+        }
+        let norm_out = ms.norm_out_buf.as_ref().unwrap();
+        {
+            let enc = cmd.new_compute_command_encoder();
+            ms.pipes.rms_norm_enc(
+                enc,
+                &scratch.output,
+                &ms.norm_w_buf,
+                norm_out,
+                tokens,
+                h,
+                self.cfg.rms_norm_eps as f32,
+            );
+            enc.end_encoding();
+        }
+
+        cmd.commit();
+        cmd.wait_until_completed();
+        self.tokens_generated += tokens;
+
+        // Return copy of norm output
+        let result = ms.pipes.buffer_empty(tokens * h);
+        let cmd2 = ms.pipes.queue.new_command_buffer();
+        let enc = cmd2.new_blit_command_encoder();
+        enc.copy_from_buffer(norm_out, 0, &result, 0, (tokens * h * 4) as u64);
+        enc.end_encoding();
+        cmd2.commit();
+        cmd2.wait_until_completed();
+
+        Some(result)
+    }
+
     /// Forward on GPU with GPU-side norm, returns Vec<f32>.
     /// Avoids CPU-side RMSNorm but still transfers output to CPU.
     #[cfg(feature = "metal")]
