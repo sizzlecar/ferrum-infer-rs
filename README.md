@@ -47,6 +47,18 @@ Any Hugging Face model using a supported architecture works out of the box:
 | **Qwen3** | Yes | Yes | Yes | Qwen3-0.6B ~ 4B |
 | **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
 
+### Speech-to-Text (Whisper ASR)
+
+| Architecture | Metal | CUDA | Example Models |
+|-------------|-------|------|----------------|
+| **Whisper** | Yes | — | whisper-tiny, whisper-base, whisper-small, whisper-medium, whisper-large-v3, **whisper-turbo** (recommended) |
+
+### Text-to-Speech (Qwen3-TTS)
+
+| Architecture | Metal | CPU | Voice Clone | Example Models |
+|-------------|-------|-----|-------------|----------------|
+| **Qwen3-TTS** | Yes | Yes | Yes (ICL) | Qwen3-TTS-12Hz-0.6B-Base |
+
 ### Embeddings (text + image)
 
 | Architecture | Modality | Embedding Dim | Example Models |
@@ -60,6 +72,21 @@ Any Hugging Face model using a supported architecture works out of the box:
 # Text generation
 ferrum run Qwen/Qwen3-4B
 ferrum run llama3.2:3b
+
+# Speech-to-Text (supports WAV/M4A/MP3/FLAC — auto ffmpeg conversion)
+ferrum transcribe whisper-turbo recording.m4a -l zh
+ferrum transcribe whisper-turbo meeting.wav -l en
+
+# Text-to-Speech
+ferrum tts qwen3-tts "Hello, welcome to Ferrum TTS" -o output.wav
+ferrum tts qwen3-tts "你好欢迎使用语音合成系统" -o output.wav
+
+# Voice clone (ICL mode — clone any voice from 5s reference audio)
+ferrum tts qwen3-tts "你好" --ref-audio ref.wav --ref-text "参考文本" -o clone.wav
+
+# Whisper API server (OpenAI-compatible)
+ferrum serve whisper-turbo
+curl localhost:8000/v1/audio/transcriptions -F "file=@audio.wav" -F "language=zh"
 
 # Embeddings (text + image)
 ferrum embed OFA-Sys/chinese-clip-vit-base-patch16 --text "sunset at the beach"
@@ -81,6 +108,8 @@ curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to
 | `ferrum pull <model>` | Download model from Hugging Face |
 | `ferrum list` | Show cached models |
 | `ferrum bench <model>` | Performance benchmark |
+| `ferrum transcribe <model> <audio>` | Speech-to-text (Whisper, supports WAV/M4A/MP3) |
+| `ferrum tts <model> <text>` | Text-to-speech (Qwen3-TTS, voice clone with `--ref-audio`) |
 | `ferrum embed <model>` | Generate embeddings (BERT/CLIP/SigLIP, text + image) |
 
 ## API Endpoints
@@ -90,6 +119,14 @@ curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"Hello"}]}'
+
+# Audio transcription (OpenAI-compatible, multipart form)
+curl http://localhost:8000/v1/audio/transcriptions \
+  -F "file=@audio.wav" -F "language=zh"
+
+# Embeddings
+curl http://localhost:8000/v1/embeddings \
+  -d '{"model":"clip","input":"hello"}'
 
 # List models
 curl http://localhost:8000/v1/models
@@ -125,6 +162,24 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 
 > TP decode uses persistent per-rank threads with NCCL all-reduce. Current bottleneck is PCIe interconnect latency (~0.44ms × 72 NCCL calls/step). TP is most beneficial for models that don't fit on a single GPU, or with NVLink interconnect.
 
+### Whisper ASR (Apple Silicon Metal)
+
+| Model | 5-min audio | Realtime factor |
+|-------|------------|-----------------|
+| whisper-large-v3-turbo | **~72s** | **4.2x realtime** |
+| whisper-tiny | ~20s | 15x realtime |
+
+> Custom Whisper forward pass with rustfft STFT. Full decode pipeline: timestamp-based sequential decode, temperature fallback, compression ratio check. Mel precision matches Python whisper exactly.
+
+### Qwen3-TTS (Apple Silicon Metal)
+
+| Text | Audio | Time | RTF |
+|------|-------|------|-----|
+| 29 chars Chinese | 4.6s | **11.3s** | **2.8x realtime** |
+| Voice clone (ICL, 5s ref) | 5.3s | 13.1s | 2.5x realtime |
+
+> All-Metal fused transformer pipeline: custom GEMM (64×32 simdgroup tiles), fused residual+norm, flash attention with layer_scale. Full Mimi-based vocoder with 8-layer pre-transformer. Zero-copy on Apple Silicon unified memory.
+
 ### Key Optimizations
 
 - **Custom CUDA decode runner**: bypasses candle for the decode hot path (Qwen3 + LLaMA)
@@ -135,6 +190,8 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 - **Custom CUDA kernels**: fused RmsNorm, SiLU×mul, RoPE, decode attention (all on single stream)
 - **Flash Decoding**: split-K for long-context decode (auto at KV > 256)
 - **Batch decode**: batched cuBLAS GEMM + batched attention for concurrent requests
+- **Metal TTS pipeline**: all-Metal fused transformer for talker (28 layers) + SubTalker (5 layers) + vocoder (8 layers), cached GPU buffers, fused residual+norm kernel, layer_scale support
+- **TTS voice clone**: ICL prompting with speaker encoder (ECAPA-TDNN) + speech tokenizer (Mimi RVQ)
 - **Paged KV attention**: GPU block pool with block-table indirection
 - **Double-buffered residual**: cross-layer norm fusion (-108 kernel launches)
 
@@ -151,6 +208,8 @@ What works:
 - Continuous batching with batch decode
 - Tensor parallelism (multi-GPU NCCL, auto-detects GPU count)
 - CLIP/Chinese-CLIP/SigLIP embeddings (text + image, `/v1/embeddings` API)
+- Whisper ASR (speech-to-text, Metal accelerated, `/v1/audio/transcriptions` API)
+- Multi-format audio support (WAV/M4A/MP3/FLAC via ffmpeg)
 - Top-k/top-p/temperature/repetition-penalty sampling
 
 ## Roadmap
@@ -192,7 +251,7 @@ crates/
 ├── ferrum-interfaces     # Core trait contracts (ComputeBackend, KernelOps, ModelExecutor)
 ├── ferrum-runtime        # Backend implementations (Candle, CPU)
 ├── ferrum-engine         # Metal kernels, model orchestration
-├── ferrum-models         # Model architectures (LLaMA, Qwen2, Qwen3, BERT)
+├── ferrum-models         # Model architectures (LLaMA, Qwen2, Qwen3, BERT, Whisper)
 ├── ferrum-cuda-kernels   # Custom CUDA kernels + decode runner
 ├── ferrum-tokenizer      # Tokenization
 ├── ferrum-sampler        # Sampling strategies

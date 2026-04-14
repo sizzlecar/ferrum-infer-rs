@@ -7,3 +7,5 @@ pub mod pull;
 pub mod run;
 pub mod serve;
 pub mod stop;
+pub mod transcribe;
+pub mod tts;
