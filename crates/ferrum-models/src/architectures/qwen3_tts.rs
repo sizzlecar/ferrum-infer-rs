@@ -1015,34 +1015,22 @@ impl SubTalker {
         let h = self.fused_hidden_size;
         let n_extra = self.num_code_groups - 1;
 
-        // Project from talker hidden to CP hidden if dimensions differ (1.7B: 2048→1024)
-        let talker_hidden = if let Some(ref proj) = self.projection {
-            talker_hidden
+        // Concat [talker_hidden, first_codec_embed] then project (matching reference)
+        let combined = Tensor::cat(&[talker_hidden, first_codec_embed], 1)
+            .map_err(|e| FerrumError::model(format!("predict cat: {e}")))?;
+        let combined = if let Some(ref proj) = self.projection {
+            combined
                 .apply(proj)
-                .map_err(|e| FerrumError::model(format!("predict proj hidden: {e}")))?
+                .map_err(|e| FerrumError::model(format!("predict proj: {e}")))?
         } else {
-            talker_hidden.clone()
-        };
-        let first_codec_embed = if let Some(ref proj) = self.projection {
-            first_codec_embed
-                .apply(proj)
-                .map_err(|e| FerrumError::model(format!("predict proj embed: {e}")))?
-        } else {
-            first_codec_embed.clone()
+            combined
         };
 
-        // Extract input to raw f32: [hidden(h), embed(h)] = 2*h floats
-        let th: Vec<f32> = talker_hidden
+        // Extract to raw f32: [2*h] floats
+        let input_data: Vec<f32> = combined
             .flatten_all()
             .and_then(|t| t.to_vec1())
-            .map_err(|e| FerrumError::model(format!("th: {e}")))?;
-        let fe: Vec<f32> = first_codec_embed
-            .flatten_all()
-            .and_then(|t| t.to_vec1())
-            .map_err(|e| FerrumError::model(format!("fe: {e}")))?;
-        let mut input_data = Vec::with_capacity(2 * h);
-        input_data.extend_from_slice(&th);
-        input_data.extend_from_slice(&fe);
+            .map_err(|e| FerrumError::model(format!("input extract: {e}")))?;
 
         // Prefill (2 tokens through fused transformer)
         let output = self.fused.forward(&input_data, 2);
@@ -1115,8 +1103,42 @@ impl SubTalker {
                 let t = token as usize;
                 let embed = &self.emb_raw[i][t * emb_dim..(t + 1) * emb_dim];
 
+                // Project if needed (1.7B: embed is 2048, CP hidden is 1024)
+                let embed = if let Some(ref proj) = self.projection {
+                    // Move proj weights to CPU for raw f32 path
+                    let w = proj
+                        .weight()
+                        .to_device(&candle_core::Device::Cpu)
+                        .and_then(|w| w.to_vec2::<f32>())
+                        .map_err(|e| FerrumError::model(format!("proj weight: {e}")))?;
+                    let b = proj
+                        .bias()
+                        .map(|b| {
+                            b.to_device(&candle_core::Device::Cpu)
+                                .and_then(|b| b.to_vec1::<f32>())
+                                .ok()
+                        })
+                        .flatten();
+                    // Manual matmul: out[j] = sum_k(embed[k] * w[j][k]) + bias[j]
+                    let out_dim = w.len();
+                    let mut projected = vec![0.0f32; out_dim];
+                    for j in 0..out_dim {
+                        let mut s = 0.0f32;
+                        for k in 0..emb_dim {
+                            s += embed[k] * w[j][k];
+                        }
+                        if let Some(ref bias) = b {
+                            s += bias[j];
+                        }
+                        projected[j] = s;
+                    }
+                    projected
+                } else {
+                    embed.to_vec()
+                };
+
                 // Forward through fused transformer (1 token)
-                let output = self.fused.forward(embed, 1);
+                let output = self.fused.forward(&embed, 1);
                 last_hidden = output;
             }
         }

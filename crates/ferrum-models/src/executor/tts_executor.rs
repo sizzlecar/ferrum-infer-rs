@@ -924,11 +924,22 @@ impl TtsModelExecutor {
         let hidden_len = hidden
             .dim(1)
             .map_err(|e| FerrumError::model(format!("hidden dim: {e}")))?;
-        let current_logits = self.talker.logits(
-            &hidden
-                .narrow(1, hidden_len - 1, 1)
-                .map_err(|e| FerrumError::model(format!("narrow last: {e}")))?,
-        )?;
+        let last_hidden = hidden
+            .narrow(1, hidden_len - 1, 1)
+            .map_err(|e| FerrumError::model(format!("narrow last: {e}")))?;
+        if let Ok(v) = last_hidden.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+            eprintln!("[US] ICL last_hidden[:10]= {:?}", &v[..10.min(v.len())]);
+        }
+        let current_logits = self.talker.logits(&last_hidden)?;
+        if let Ok(lv) = current_logits
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+        {
+            let mut top5: Vec<(usize, f32)> = lv.iter().copied().enumerate().collect();
+            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            top5.truncate(5);
+            eprintln!("[US] initial logits top5={:?}, vocab={}", top5, lv.len());
+        }
 
         // Decode loop
         let mut all_codec_tokens: Vec<Vec<u32>> = Vec::new();
