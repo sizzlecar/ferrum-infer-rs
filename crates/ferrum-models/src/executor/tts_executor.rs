@@ -946,8 +946,9 @@ impl TtsModelExecutor {
         let suppress_start = self.config.vocab_size.saturating_sub(1024);
         let suppress_end = self.config.vocab_size;
 
-        // ICL mode: stronger repetition penalty + max_tokens limit (matching reference)
-        const ICL_REPETITION_PENALTY: f32 = 1.5;
+        // ICL mode: match official Qwen3-TTS parameters (rep_penalty=1.05, top_p=1.0)
+        // + repetition detection for early stop
+        const ICL_REPETITION_PENALTY: f32 = 1.05;
         const ICL_FRAMES_PER_TOKEN: usize = 6;
         const ICL_MIN_FRAMES: usize = 75;
         let max_icl_tokens = ICL_MIN_FRAMES.max(text_content_ids.len() * ICL_FRAMES_PER_TOKEN);
@@ -984,6 +985,30 @@ impl TtsModelExecutor {
             if next_token == codec_eos {
                 info!("TTS voice clone: codec EOS at step {}", step);
                 break;
+            }
+
+            // Repetition detection: check for repeating patterns of length 1-4
+            if generated_tokens.len() >= 6 {
+                let n = generated_tokens.len();
+                let mut is_repeat = false;
+                for pat_len in 1..=4 {
+                    if n >= pat_len * 3 {
+                        let a = &generated_tokens[n - pat_len * 3..n - pat_len * 2];
+                        let b = &generated_tokens[n - pat_len * 2..n - pat_len];
+                        let c = &generated_tokens[n - pat_len..n];
+                        if a == b && b == c {
+                            is_repeat = true;
+                            break;
+                        }
+                    }
+                }
+                if is_repeat {
+                    info!(
+                        "TTS voice clone: repetition detected at step {}, stopping",
+                        step
+                    );
+                    break;
+                }
             }
 
             let cur_hidden_len = hidden
