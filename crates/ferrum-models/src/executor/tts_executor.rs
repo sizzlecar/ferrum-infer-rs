@@ -1034,7 +1034,7 @@ impl TtsModelExecutor {
             frame_codes.extend_from_slice(&extra_codes);
             all_codec_tokens.push(frame_codes);
 
-            // Sum all codebook embeddings
+            // Sum all codebook embeddings on GPU
             let mut combined_embed = first_codec_embed.clone();
             for (i, &code) in extra_codes.iter().enumerate() {
                 let code_t = Tensor::new(&[code], &device)

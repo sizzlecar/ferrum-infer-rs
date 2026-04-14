@@ -809,9 +809,9 @@ pub struct SubTalker {
     lm_heads: Vec<Linear>,
     /// Cached raw weights for zero-overhead predict loop
     lm_raw: Vec<Vec<f32>>, // [n_extra][vocab * hidden]
-    emb_raw: Vec<Vec<f32>>, // [n_extra][vocab * emb_dim]
+    pub(crate) emb_raw: Vec<Vec<f32>>, // [n_extra][vocab * emb_dim]
     vocab_size: usize,
-    emb_dim: usize,
+    pub(crate) emb_dim: usize,
     /// Projection from talker hidden to subtalker hidden (if sizes differ)
     projection: Option<Linear>,
     /// Cached projection weights for fast CPU matmul (avoids GPU→CPU transfer per step)
