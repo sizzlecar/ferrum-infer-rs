@@ -837,30 +837,54 @@ impl SplitQuantizer {
 /// Pipeline: CausalConv stack (960x downsample) → Transformer (8 layers)
 /// → Split RVQ quantizer → [T, 16] token indices.
 pub struct SpeechTokenizerEncoder {
-    conv_stack: EncoderConvStack,
-    transformer: EncoderTransformer,
-    downsample: CausalConv, // CausalConv1d(512→512, k=4, stride=2)
-    quantizer: SplitQuantizer,
+    conv_stack: candle_transformers::models::mimi::seanet::SeaNetEncoder,
+    transformer:
+        parking_lot::Mutex<candle_transformers::models::mimi::transformer::ProjectedTransformer>,
+    downsample: candle_transformers::models::mimi::conv::ConvDownsample1d,
+    quantizer: candle_transformers::models::mimi::quantization::SplitResidualVectorQuantizer,
     device: CandleDevice,
 }
 
 impl SpeechTokenizerEncoder {
     /// Load weights from VarBuilder with `encoder.` prefix.
     pub fn load(vb: VarBuilder, device: CandleDevice) -> Result<Self> {
-        // Weight paths: encoder.encoder.layers.*, encoder.encoder_transformer.*, encoder.quantizer.*
-        // vb already has prefix "encoder." from the caller.
+        let mimi_cfg = candle_transformers::models::mimi::Config::v0_1(Some(NUM_OUTPUT_CODEBOOKS));
 
-        let conv_stack = EncoderConvStack::load(vb.pp("encoder"))
-            .map_err(|e| FerrumError::model(format!("encoder conv stack: {e}")))?;
-
-        let transformer = EncoderTransformer::load(&device, vb.pp("encoder_transformer"))
+        let conv_stack = candle_transformers::models::mimi::seanet::SeaNetEncoder::new(
+            &mimi_cfg.seanet,
+            vb.pp("encoder"),
+        )
+        .map_err(|e| FerrumError::model(format!("encoder conv stack: {e}")))?;
+        let transformer =
+            candle_transformers::models::mimi::transformer::ProjectedTransformer::new(
+                mimi_cfg.seanet.dimension,
+                &[mimi_cfg.seanet.dimension],
+                &mimi_cfg.transformer,
+                vb.pp("encoder_transformer"),
+            )
             .map_err(|e| FerrumError::model(format!("encoder transformer: {e}")))?;
+        let transformer = parking_lot::Mutex::new(transformer);
 
-        // Downsample: CausalConv1d(512→512, k=4, stride=2) between transformer and RVQ
-        let downsample = CausalConv::load(512, 512, 4, 2, 1, vb.pp("downsample"))
-            .map_err(|e| FerrumError::model(format!("encoder downsample: {e}")))?;
+        let downsample_stride = 2usize;
+        let downsample = candle_transformers::models::mimi::conv::ConvDownsample1d::new(
+            downsample_stride,
+            mimi_cfg.seanet.dimension,
+            true, // causal
+            true, // learnt
+            vb.pp("downsample"),
+        )
+        .map_err(|e| FerrumError::model(format!("encoder downsample: {e}")))?;
 
-        let quantizer = SplitQuantizer::load(vb.pp("quantizer"))
+        // Use candle's SplitResidualVectorQuantizer (matches reference project exactly)
+        let quantizer =
+            candle_transformers::models::mimi::quantization::SplitResidualVectorQuantizer::new(
+                CODEBOOK_DIM,           // 256
+                Some(HIDDEN_SIZE),      // 512
+                Some(HIDDEN_SIZE),      // 512
+                NUM_OUTPUT_CODEBOOKS,   // 16
+                SEMANTIC_CODEBOOK_SIZE, // 2048
+                vb.pp("quantizer"),
+            )
             .map_err(|e| FerrumError::model(format!("encoder quantizer: {e}")))?;
 
         info!(
@@ -904,36 +928,21 @@ impl SpeechTokenizerEncoder {
             .to_dtype(DType::F32)
             .map_err(|e| FerrumError::model(format!("input dtype: {e}")))?;
 
-        // Conv encoder: [1, 1, N] → [1, 512, T']
-        // Causal padding doubles the effective length, so T' ≈ N/960 * 2
-        let conv_out = self
-            .conv_stack
-            .forward(&input)
+        // Conv encoder: [1, 1, N] → [1, 512, T'] via candle SeaNetEncoder
+        let conv_out = input
+            .apply(&self.conv_stack)
             .map_err(|e| FerrumError::model(format!("conv encoder: {e}")))?;
 
-        let t_conv = conv_out
-            .dim(2)
-            .map_err(|e| FerrumError::model(format!("conv output dim: {e}")))?;
-
-        info!("Conv encoder output: T={} frames", t_conv,);
-
-        // Pipeline matches Python MimiModel._encode_frame:
-        // 1. Conv encoder (already done above)
-        // 2. Transformer on full conv output
-        // 3. Downsample (2x, CausalConv k=4 s=2)
-        // 4. Quantize
-        // No manual trimming needed — downsample handles the 960x → 1920x transition.
-
-        // Transformer: [1, 512, T] → [1, 512, T]
-        let hidden = self
-            .transformer
+        // Transformer: [1, 512, T] → [1, 512, T] via candle Mimi transformer
+        let mut transformer = self.transformer.lock();
+        let hidden = transformer
             .forward(&conv_out)
             .map_err(|e| FerrumError::model(format!("encoder transformer: {e}")))?;
+        let hidden = &hidden[0]; // ProjectedTransformer returns Vec<Tensor>
 
         // Downsample: [1, 512, T] → [1, 512, T/2]
-        let hidden = self
-            .downsample
-            .forward(&hidden)
+        let hidden = hidden
+            .apply(&self.downsample)
             .map_err(|e| FerrumError::model(format!("encoder downsample: {e}")))?;
 
         let t_ds = hidden
@@ -941,18 +950,37 @@ impl SpeechTokenizerEncoder {
             .map_err(|e| FerrumError::model(format!("downsample dim: {e}")))?;
         info!("After downsample: T={}", t_ds);
 
-        // Quantize: [1, 512, T/2] → [T/2, 16]
-        let tokens = self
+        // Quantize: [1, 512, T/2] → codes [1, 16, T/2] via candle SplitRVQ
+        let codes = self
             .quantizer
-            .quantize(&hidden)
-            .map_err(|e| FerrumError::model(format!("quantizer: {e}")))?;
+            .encode(&hidden)
+            .map_err(|e| FerrumError::model(format!("quantizer encode: {e}")))?;
 
-        info!(
-            "SpeechTokenizerEncoder: {} frames, {} codebooks per frame",
-            tokens.len(),
-            tokens.first().map_or(0, |r| r.len()),
-        );
+        // Convert [1, 16, T] → Vec<Vec<u32>> as [T, 16]
+        let codes = codes
+            .squeeze(0)
+            .map_err(|e| FerrumError::model(format!("squeeze: {e}")))?
+            .transpose(0, 1)
+            .map_err(|e| FerrumError::model(format!("transpose: {e}")))?
+            .to_dtype(DType::U32)
+            .map_err(|e| FerrumError::model(format!("to_u32: {e}")))?;
 
-        Ok(tokens)
+        let t = codes
+            .dim(0)
+            .map_err(|e| FerrumError::model(format!("codes dim: {e}")))?;
+        let k = codes
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("codes dim1: {e}")))?;
+        info!("SpeechTokenizerEncoder: {} frames, {} codebooks", t, k);
+
+        let mut result = Vec::with_capacity(t);
+        for ti in 0..t {
+            let row: Vec<u32> = codes
+                .i(ti)
+                .and_then(|r| r.to_vec1())
+                .map_err(|e| FerrumError::model(format!("codes row: {e}")))?;
+            result.push(row);
+        }
+        Ok(result)
     }
 }
