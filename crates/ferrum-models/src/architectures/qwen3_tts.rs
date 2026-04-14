@@ -814,6 +814,10 @@ pub struct SubTalker {
     emb_dim: usize,
     /// Projection from talker hidden to subtalker hidden (if sizes differ)
     projection: Option<Linear>,
+    /// Cached projection weights for fast CPU matmul (avoids GPU→CPU transfer per step)
+    proj_w_raw: Option<Vec<f32>>, // [out_dim, in_dim] row-major
+    proj_b_raw: Option<Vec<f32>>, // [out_dim]
+    proj_out_dim: usize,
     num_code_groups: usize,
     tokens_generated: usize,
     /// Fused transformer (bypasses candle for precision)
@@ -985,6 +989,28 @@ impl SubTalker {
             st_h
         };
 
+        // Cache projection weights for fast CPU matmul
+        let (proj_w_raw, proj_b_raw, proj_out_dim) = if let Some(ref proj) = projection {
+            let w: Vec<f32> = proj
+                .weight()
+                .to_device(&candle_core::Device::Cpu)
+                .and_then(|w| w.flatten_all())
+                .and_then(|w| w.to_vec1())
+                .unwrap_or_default();
+            let out_dim = proj.weight().dim(0).unwrap_or(st_h);
+            let b: Option<Vec<f32>> = proj
+                .bias()
+                .map(|b| {
+                    b.to_device(&candle_core::Device::Cpu)
+                        .and_then(|b| b.to_vec1())
+                        .ok()
+                })
+                .flatten();
+            (Some(w), b, out_dim)
+        } else {
+            (None, None, 0)
+        };
+
         Ok(Self {
             layers,
             norm,
@@ -995,6 +1021,9 @@ impl SubTalker {
             vocab_size,
             emb_dim,
             projection,
+            proj_w_raw,
+            proj_b_raw,
+            proj_out_dim,
             num_code_groups: cfg.num_code_groups,
             tokens_generated: 0,
             fused,
@@ -1103,34 +1132,57 @@ impl SubTalker {
                 let t = token as usize;
                 let embed = &self.emb_raw[i][t * emb_dim..(t + 1) * emb_dim];
 
-                // Project if needed (1.7B: embed is 2048, CP hidden is 1024)
-                let embed = if let Some(ref proj) = self.projection {
-                    // Move proj weights to CPU for raw f32 path
-                    let w = proj
-                        .weight()
-                        .to_device(&candle_core::Device::Cpu)
-                        .and_then(|w| w.to_vec2::<f32>())
-                        .map_err(|e| FerrumError::model(format!("proj weight: {e}")))?;
-                    let b = proj
-                        .bias()
-                        .map(|b| {
-                            b.to_device(&candle_core::Device::Cpu)
-                                .and_then(|b| b.to_vec1::<f32>())
-                                .ok()
-                        })
-                        .flatten();
-                    // Manual matmul: out[j] = sum_k(embed[k] * w[j][k]) + bias[j]
-                    let out_dim = w.len();
-                    let mut projected = vec![0.0f32; out_dim];
-                    for j in 0..out_dim {
+                // Project if needed (1.7B: 2048→1024) using cached weights + cblas
+                let embed = if let Some(ref w) = self.proj_w_raw {
+                    let od = self.proj_out_dim;
+                    let mut projected = vec![0.0f32; od];
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        // cblas_sgemv: y = alpha * A * x + beta * y
+                        // A=[od, emb_dim] row-major, x=[emb_dim], y=[od]
+                        extern "C" {
+                            fn cblas_sgemv(
+                                order: i32,
+                                trans: i32,
+                                m: i32,
+                                n: i32,
+                                alpha: f32,
+                                a: *const f32,
+                                lda: i32,
+                                x: *const f32,
+                                incx: i32,
+                                beta: f32,
+                                y: *mut f32,
+                                incy: i32,
+                            );
+                        }
+                        cblas_sgemv(
+                            101,
+                            111,
+                            od as i32,
+                            emb_dim as i32,
+                            1.0,
+                            w.as_ptr(),
+                            emb_dim as i32,
+                            embed.as_ptr(),
+                            1,
+                            0.0,
+                            projected.as_mut_ptr(),
+                            1,
+                        );
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    for j in 0..od {
                         let mut s = 0.0f32;
                         for k in 0..emb_dim {
-                            s += embed[k] * w[j][k];
-                        }
-                        if let Some(ref bias) = b {
-                            s += bias[j];
+                            s += embed[k] * w[j * emb_dim + k];
                         }
                         projected[j] = s;
+                    }
+                    if let Some(ref b) = self.proj_b_raw {
+                        for j in 0..od {
+                            projected[j] += b[j];
+                        }
                     }
                     projected
                 } else {
