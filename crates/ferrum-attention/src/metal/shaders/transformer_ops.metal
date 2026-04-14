@@ -247,3 +247,87 @@ kernel void gemm_f32(
         }
     }
 }
+
+// ── Argmax ─────────────────────────────────────────────────────────────
+// Find index of maximum value in a float array.
+// Input: data[n], Output: result[0] = argmax index (as uint32)
+// Uses simd reduction for parallel max-finding.
+
+struct ArgmaxParams {
+    int n;
+};
+
+kernel void argmax_f32(
+    device const float* data   [[buffer(0)]],
+    device uint*        result [[buffer(1)]],
+    constant ArgmaxParams& p  [[buffer(2)]],
+    uint tid                   [[thread_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]]
+) {
+    // Each thread finds local max
+    float local_max = -INFINITY;
+    int   local_idx = 0;
+    for (int i = tid; i < p.n; i += tg_size) {
+        float v = data[i];
+        if (v > local_max) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+
+    // Simd reduction to find global max
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_max = simd_shuffle_down(local_max, offset);
+        int   other_idx = simd_shuffle_down(local_idx, offset);
+        if (other_max > local_max) {
+            local_max = other_max;
+            local_idx = other_idx;
+        }
+    }
+
+    // Threadgroup reduction (first thread of each simdgroup)
+    threadgroup float tg_max[32];
+    threadgroup int   tg_idx[32];
+    int simd_id = tid / 32;
+    int lane = tid % 32;
+    if (lane == 0) {
+        tg_max[simd_id] = local_max;
+        tg_idx[simd_id] = local_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Final reduction by thread 0
+    if (tid == 0) {
+        float best = tg_max[0];
+        int   best_idx = tg_idx[0];
+        int n_simd = (tg_size + 31) / 32;
+        for (int s = 1; s < n_simd; s++) {
+            if (tg_max[s] > best) {
+                best = tg_max[s];
+                best_idx = tg_idx[s];
+            }
+        }
+        result[0] = (uint)best_idx;
+    }
+}
+
+// ── Embedding Lookup ───────────────────────────────────────────────────
+// output[i] = table[index * dim + i]
+// table: [vocab_size, dim], index: scalar, output: [dim]
+
+struct EmbedParams {
+    int dim;
+};
+
+kernel void embedding_lookup_f32(
+    device const float* table  [[buffer(0)]],
+    device const uint*  index  [[buffer(1)]],
+    device float*       output [[buffer(2)]],
+    constant EmbedParams& p    [[buffer(3)]],
+    uint tid                   [[thread_position_in_grid]]
+) {
+    if ((int)tid < p.dim) {
+        uint idx = index[0];
+        output[tid] = table[idx * p.dim + tid];
+    }
+}
