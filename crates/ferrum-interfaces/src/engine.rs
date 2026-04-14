@@ -68,6 +68,25 @@ pub trait InferenceEngine: Send + Sync {
             "This engine does not support audio transcription",
         ))
     }
+
+    /// Synthesize speech → PCM audio chunks (streaming).
+    /// Returns Vec of (chunk_index, PCM f32 samples).
+    /// Default: not supported.
+    async fn synthesize_speech(
+        &self,
+        _text: &str,
+        _language: Option<&str>,
+        _chunk_frames: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        Err(ferrum_types::FerrumError::model(
+            "This engine does not support speech synthesis",
+        ))
+    }
+
+    /// Get TTS sample rate (default 24000).
+    fn tts_sample_rate(&self) -> u32 {
+        24000
+    }
 }
 
 /// Advanced engine capabilities

@@ -123,6 +123,19 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 ),
             )
         }
+        ferrum_models::Architecture::Qwen3TTS => {
+            println!("{}", "Initializing Qwen3-TTS engine...".dimmed());
+            let candle_device = to_candle_device(&device);
+            let executor = ferrum_models::TtsModelExecutor::from_path(
+                &source.local_path.to_string_lossy(),
+                candle_device,
+                candle_core::DType::F32,
+            )?;
+            Arc::new(ferrum_engine::tts_engine::TtsEngine::new(
+                executor,
+                ferrum_types::ModelId(model_id.clone()),
+            ))
+        }
         _ => {
             println!(
                 "{}",
@@ -157,6 +170,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     println!("Endpoints:");
     println!("  POST /v1/chat/completions      - OpenAI-compatible chat");
     println!("  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)");
+    println!("  POST /v1/audio/speech          - Text-to-speech (TTS)");
     println!("  POST /v1/embeddings            - Text/image embeddings");
     println!("  GET  /v1/models                - List models");
     println!("  GET  /health                   - Health check");
@@ -224,6 +238,8 @@ fn resolve_model_alias(name: &str) -> String {
         "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
             "openai/whisper-large-v3-turbo".to_string()
         }
+        "qwen3-tts" | "tts" | "tts:0.6b" => "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string(),
+        "tts:1.7b" | "qwen3-tts:1.7b" => "Qwen/Qwen3-TTS-12Hz-1.7B-Base".to_string(),
         _ => name.to_string(),
     }
 }
