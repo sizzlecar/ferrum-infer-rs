@@ -1094,8 +1094,8 @@ impl SubTalker {
                 logits_buf[j] = s;
             }
 
-            let token =
-                crate::executor::tts_executor::sample_token(&logits_buf, temperature, top_k, 1.0);
+            // SubTalker: argmax (greedy) — matching reference project
+            let token = crate::executor::tts_executor::sample_token(&logits_buf, 0.0, top_k, 1.0);
             predicted_tokens.push(token);
 
             if i < n_extra - 1 {

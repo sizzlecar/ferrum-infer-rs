@@ -69,6 +69,8 @@ base64 = "0.22"
 hound = "3.5"
 flate2 = "1"
 rustfft = "6"
+rubato = "2.0.0"
+audioadapter-buffers = "3.0.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

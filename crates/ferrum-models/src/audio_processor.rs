@@ -264,24 +264,51 @@ fn convert_with_ffmpeg_at_rate(input_path: &str, target_rate: u32) -> Result<Vec
 // ── Resampler ───────────────────────────────────────────────────────────
 
 pub(crate) fn resample(input: &[f32], from_rate: f64, to_rate: f64) -> Vec<f32> {
-    let ratio = from_rate / to_rate;
-    let output_len = (input.len() as f64 / ratio) as usize;
-    let mut output = Vec::with_capacity(output_len);
+    use rubato::{
+        audioadapter::Adapter, Async, FixedAsync, Resampler as RubatoResampler,
+        SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    };
 
-    for i in 0..output_len {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos as usize;
-        let frac = (src_pos - idx as f64) as f32;
+    let ratio = to_rate / from_rate;
+    let chunk_size = 1024;
 
-        let sample = if idx + 1 < input.len() {
-            input[idx] * (1.0 - frac) + input[idx + 1] * frac
-        } else if idx < input.len() {
-            input[idx]
+    let params = SincInterpolationParameters {
+        sinc_len: 128,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 128,
+        window: WindowFunction::BlackmanHarris2,
+    };
+
+    let mut resampler =
+        Async::<f32>::new_sinc(ratio, 1.0, &params, chunk_size, 1, FixedAsync::Input)
+            .expect("resample init");
+
+    let mut output = Vec::new();
+    let mut pos = 0;
+    while pos < input.len() {
+        let end = (pos + chunk_size).min(input.len());
+        let chunk = &input[pos..end];
+        let data: Vec<f32> = if chunk.len() < chunk_size {
+            let mut p = chunk.to_vec();
+            p.resize(chunk_size, 0.0);
+            p
         } else {
-            0.0
+            chunk.to_vec()
         };
-        output.push(sample);
-    }
 
+        let input_vecs = vec![data];
+        let input_adapter =
+            audioadapter_buffers::direct::SequentialSliceOfVecs::new(&input_vecs, 1, chunk_size)
+                .expect("input adapter");
+        let result = resampler
+            .process(&input_adapter, 0, None)
+            .expect("resample");
+        let frames = result.frames();
+        for i in 0..frames {
+            output.push(result.read_sample(0, i).unwrap_or(0.0));
+        }
+        pos += chunk_size;
+    }
     output
 }

@@ -929,13 +929,15 @@ impl TtsModelExecutor {
             .map_err(|e| FerrumError::model(format!("narrow last: {e}")))?;
         if let Ok(v) = last_hidden.flatten_all().and_then(|t| t.to_vec1::<f32>()) {}
         let current_logits = self.talker.logits(&last_hidden)?;
-        if let Ok(lv) = current_logits
-            .flatten_all()
-            .and_then(|t| t.to_vec1::<f32>())
         {
-            let mut top5: Vec<(usize, f32)> = lv.iter().copied().enumerate().collect();
-            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            top5.truncate(5);
+            let lv: Vec<f32> = current_logits
+                .flatten_all()
+                .and_then(|t| t.to_vec1())
+                .unwrap_or_default();
+            eprintln!(
+                "[VC-INITIAL] logits [1146]={:.4}, [1912]={:.4}, [433]={:.4}",
+                lv[1146], lv[1912], lv[433]
+            );
         }
 
         // Decode loop
@@ -946,9 +948,9 @@ impl TtsModelExecutor {
         let suppress_start = self.config.vocab_size.saturating_sub(1024);
         let suppress_end = self.config.vocab_size;
 
-        // ICL mode: match official Qwen3-TTS parameters (rep_penalty=1.05, top_p=1.0)
+        // ICL mode: stronger repetition penalty (matching reference Rust project)
         // + repetition detection for early stop
-        const ICL_REPETITION_PENALTY: f32 = 1.05;
+        const ICL_REPETITION_PENALTY: f32 = 1.5;
         const ICL_FRAMES_PER_TOKEN: usize = 6;
         const ICL_MIN_FRAMES: usize = 75;
         let max_icl_tokens = ICL_MIN_FRAMES.max(text_content_ids.len() * ICL_FRAMES_PER_TOKEN);
@@ -956,10 +958,25 @@ impl TtsModelExecutor {
 
         for step in 0..max_icl_tokens {
             let mut logits_vec = logits_to_vec(&current_logits)?;
-            // Suppress special tokens
+            if step == 0 {
+                eprintln!(
+                    "[VC-RAW] logits_vec.len()={}, [1146]={:.4}, [1912]={:.4}, [433]={:.4}",
+                    logits_vec.len(),
+                    logits_vec[1146],
+                    logits_vec[1912],
+                    logits_vec[433]
+                );
+            }
+            // Suppress special tokens [vocab-1024, vocab) except EOS
             for i in suppress_start..suppress_end.min(logits_vec.len()) {
                 if i as u32 != codec_eos {
                     logits_vec[i] = f32::NEG_INFINITY;
+                }
+            }
+            // min_new_tokens=2: suppress EOS for first 2 steps
+            if step < 2 {
+                if let Some(v) = logits_vec.get_mut(codec_eos as usize) {
+                    *v = f32::NEG_INFINITY;
                 }
             }
             // Repetition penalty with token history
@@ -972,6 +989,12 @@ impl TtsModelExecutor {
                         logits_vec[idx] *= ICL_REPETITION_PENALTY;
                     }
                 }
+            }
+            if step < 2 {
+                let mut t5: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+                t5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                t5.truncate(5);
+                eprintln!("[VC-LOGITS step={}] top5={:?}", step, t5);
             }
             let next_token = sample_token(
                 &logits_vec,
@@ -1331,6 +1354,27 @@ pub fn sample_token(
     let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
 
     // 5. Multinomial sample: cumsum and compare with random
+    // Debug: count how many tokens survived top_k + top_p
+    static SAMPLE_CALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = SAMPLE_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if call < 3 {
+        let n_active = probs.iter().filter(|&&p| p > 0.0).count();
+        let top3: Vec<(usize, f32)> = {
+            let mut indexed: Vec<(usize, f32)> = probs
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, p)| *p > 0.0)
+                .collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed.truncate(3);
+            indexed
+        };
+        eprintln!(
+            "[SAMPLE#{}] n_active={}, top3_probs={:?}",
+            call, n_active, top3
+        );
+    }
     let r = rand_f32();
     let mut cumulative = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
@@ -1362,7 +1406,6 @@ fn rand_f32() -> f32 {
         .subsec_nanos() as u64;
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    // LCG matching reference: seed + count * LCG constants
     let state = seed
         .wrapping_add(count)
         .wrapping_mul(1103515245)
