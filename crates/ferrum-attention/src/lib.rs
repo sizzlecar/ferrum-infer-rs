@@ -103,6 +103,10 @@ struct MetalTransformerState {
     max_scratch_tokens: usize,
     input_buf: Option<::metal::Buffer>,
     input_buf_size: usize,
+    /// GPU-resident final norm weight for forward_gpu
+    norm_w_buf: ::metal::Buffer,
+    /// Reusable output buffer for forward_gpu (avoids alloc per call)
+    norm_out_buf: Option<::metal::Buffer>,
 }
 
 impl FusedTransformer {
@@ -204,6 +208,7 @@ impl FusedTransformer {
                 };
                 let cos_buf = pipes.buffer_from_data(&cos);
                 let sin_buf = pipes.buffer_from_data(&sin);
+                let norm_w_buf = pipes.buffer_from_data(&norm_w);
                 Some(MetalTransformerState {
                     pipes,
                     weights,
@@ -215,6 +220,8 @@ impl FusedTransformer {
                     max_scratch_tokens: 0,
                     input_buf: None,
                     input_buf_size: 0,
+                    norm_w_buf,
+                    norm_out_buf: None,
                 })
             } else {
                 None
@@ -362,6 +369,135 @@ impl FusedTransformer {
         }
         self.tokens_generated += tokens;
         self.final_rms_norm(&hidden, tokens)
+    }
+
+    /// Forward on GPU, returning Metal Buffer directly (zero CPU transfer).
+    /// Input: raw f32 slice (will be copied to GPU once).
+    /// Output: Metal Buffer containing normed hidden [tokens, hidden].
+    /// Falls back to CPU path if Metal not available.
+    #[cfg(feature = "metal")]
+    pub fn forward_gpu(
+        &mut self,
+        input: &[f32],
+        tokens: usize,
+    ) -> Option<(::metal::Buffer, usize)> {
+        let pos_offset = self.tokens_generated;
+        let h = self.cfg.hidden_size;
+
+        if self.use_cpu {
+            return None;
+        }
+
+        let ms = self.metal_state.as_mut()?;
+
+        // Allocate scratch
+        if ms.scratch.is_none() || ms.max_scratch_tokens < tokens {
+            ms.scratch = Some(metal::transformer::LayerScratch::new(
+                &ms.pipes,
+                tokens,
+                h,
+                ms.metal_cfg.intermediate_size,
+                ms.metal_cfg.num_heads,
+                ms.metal_cfg.num_kv_heads,
+                ms.metal_cfg.head_dim,
+            ));
+            ms.max_scratch_tokens = tokens;
+        }
+        let scratch = ms.scratch.as_ref().unwrap();
+
+        // Input buffer
+        let needed = tokens * h;
+        if ms.input_buf.is_none() || ms.input_buf_size < needed {
+            ms.input_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h)));
+            ms.input_buf_size = needed.max(128 * h);
+        }
+        let input_buf = ms.input_buf.as_ref().unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr(), input_buf.contents() as *mut f32, needed);
+        }
+
+        let cmd = ms.pipes.queue.new_command_buffer();
+
+        // All transformer layers
+        metal::transformer::metal_layer_forward_v2(
+            cmd,
+            &ms.pipes,
+            input_buf,
+            tokens,
+            &ms.weights[0],
+            &ms.metal_cfg,
+            &mut ms.kv[0],
+            pos_offset,
+            &ms.cos_buf,
+            &ms.sin_buf,
+            scratch,
+        );
+        for li in 1..ms.weights.len() {
+            let enc = cmd.new_blit_command_encoder();
+            enc.copy_from_buffer(&scratch.output, 0, input_buf, 0, (tokens * h * 4) as u64);
+            enc.end_encoding();
+            metal::transformer::metal_layer_forward_v2(
+                cmd,
+                &ms.pipes,
+                input_buf,
+                tokens,
+                &ms.weights[li],
+                &ms.metal_cfg,
+                &mut ms.kv[li],
+                pos_offset,
+                &ms.cos_buf,
+                &ms.sin_buf,
+                scratch,
+            );
+        }
+
+        // Final RMSNorm on GPU
+        if ms.norm_out_buf.is_none() {
+            ms.norm_out_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h)));
+        }
+        let norm_out = ms.norm_out_buf.as_ref().unwrap();
+        {
+            let enc = cmd.new_compute_command_encoder();
+            ms.pipes.rms_norm_enc(
+                enc,
+                &scratch.output,
+                &ms.norm_w_buf,
+                norm_out,
+                tokens,
+                h,
+                self.cfg.rms_norm_eps as f32,
+            );
+            enc.end_encoding();
+        }
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.tokens_generated += tokens;
+
+        // Return buffer with normed hidden (stays on GPU)
+        let result = ms.pipes.buffer_empty(tokens * h);
+        // Copy norm_out to result (so caller owns it)
+        let cmd2 = ms.pipes.queue.new_command_buffer();
+        let enc = cmd2.new_blit_command_encoder();
+        enc.copy_from_buffer(norm_out, 0, &result, 0, (tokens * h * 4) as u64);
+        enc.end_encoding();
+        cmd2.commit();
+        cmd2.wait_until_completed();
+
+        Some((result, tokens * h))
+    }
+
+    /// Forward on GPU with GPU-side norm, returns Vec<f32>.
+    /// Avoids CPU-side RMSNorm but still transfers output to CPU.
+    #[cfg(feature = "metal")]
+    pub fn forward_gpu_to_vec(&mut self, input: &[f32], tokens: usize) -> Option<Vec<f32>> {
+        let h = self.cfg.hidden_size;
+        let (buf, _) = self.forward_gpu(input, tokens)?;
+        Some(metal::pipelines::MetalPipelines::read_buffer(
+            &buf,
+            tokens * h,
+        ))
     }
 
     fn final_rms_norm(&self, hidden: &[f32], tokens: usize) -> Vec<f32> {

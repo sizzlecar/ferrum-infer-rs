@@ -748,12 +748,13 @@ impl Qwen3TTSTalker {
             self.tokens_generated += seq_len;
             Ok(hidden)
         } else {
-            // Fused path: bypasses candle for Metal/CPU custom ops
+            // Fused path: Metal GPU or CPU custom ops
             let seq_len = input_embeds
                 .dim(1)
                 .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
             let h = self.config.hidden_size;
 
+            // Extract input to CPU (needed for both GPU and CPU paths)
             let input_data: Vec<f32> = input_embeds
                 .to_device(&candle_core::Device::Cpu)
                 .and_then(|t| t.to_dtype(DType::F32))
@@ -761,6 +762,16 @@ impl Qwen3TTSTalker {
                 .and_then(|t| t.to_vec1())
                 .map_err(|e| FerrumError::model(format!("input extract: {e}")))?;
 
+            // Try GPU path with GPU-side norm (avoids CPU norm overhead)
+            #[cfg(feature = "metal")]
+            if let Some(data) = self.fused.forward_gpu_to_vec(&input_data, seq_len) {
+                self.tokens_generated += seq_len;
+                return Tensor::from_vec(data, (1, seq_len, h), &candle_core::Device::Cpu)
+                    .and_then(|t| t.to_device(&self.device))
+                    .map_err(|e| FerrumError::model(format!("output tensor: {e}")));
+            }
+
+            // CPU fallback
             let output = self.fused.forward(&input_data, seq_len);
             self.tokens_generated += seq_len;
 
