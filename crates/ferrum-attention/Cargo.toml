@@ -1,8 +1,10 @@
 [package]
 name = "ferrum-attention"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
+license = "MIT"
 description = "Fused flash attention for Metal and CPU — production-grade, framework-independent"
+repository = "https://github.com/sizzlecar/ferrum-infer-rs"
 
 [features]
 default = []

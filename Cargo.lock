@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-attention"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "metal 0.31.0",
  "objc2",
