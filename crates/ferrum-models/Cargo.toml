@@ -36,7 +36,7 @@ candle-flash-attn = { workspace = true, optional = true }
 safetensors = { workspace = true }
 
 # Fused attention
-ferrum-attention = { path = "../ferrum-attention" }
+ferrum-attention = { path = "../ferrum-attention", version = "0.6.0" }
 
 # Custom CUDA kernels
 ferrum-cuda-kernels = { workspace = true, optional = true }
