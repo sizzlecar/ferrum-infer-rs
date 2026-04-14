@@ -8,6 +8,12 @@ pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
 
+/// Opaque GPU buffer type (Metal Buffer when available, placeholder otherwise).
+#[cfg(feature = "metal")]
+pub type GpuBuffer = ::metal::Buffer;
+#[cfg(not(feature = "metal"))]
+pub type GpuBuffer = Vec<f32>; // fallback: CPU storage
+
 /// Attention configuration.
 pub struct AttentionParams {
     pub batch: usize,
@@ -488,74 +494,151 @@ impl FusedTransformer {
         Some((result, tokens * h))
     }
 
-    /// Forward + lm_head + argmax in one GPU pass. Returns (token_index, hidden_buffer).
-    /// Eliminates CPU roundtrip for SubTalker's inner loop.
-    /// lm_weights: [vocab, hidden] row-major on GPU.
+    /// Forward + lm_head + argmax in ONE command buffer, ZERO extra allocs.
+    /// Returns (token_index, norm_hidden as Vec<f32>).
+    /// Pre-allocated buffers reused across calls.
     #[cfg(feature = "metal")]
     pub fn forward_and_argmax(
         &mut self,
-        input_buf: &::metal::Buffer,
+        input_buf: &GpuBuffer,
         tokens: usize,
-        lm_weights_buf: &::metal::Buffer,
+        lm_weights_buf: &GpuBuffer,
         vocab_size: usize,
-    ) -> Option<(u32, ::metal::Buffer)> {
+    ) -> Option<(u32, Vec<f32>)> {
+        let pos_offset = self.tokens_generated;
         let h = self.cfg.hidden_size;
+        if self.use_cpu {
+            return None;
+        }
 
-        // Forward through transformer layers + norm
-        let hidden_buf = self.forward_gpu_buffer(input_buf, tokens)?;
+        let ms = self.metal_state.as_mut()?;
 
-        let ms = self.metal_state.as_ref()?;
+        // Ensure scratch allocated
+        if ms.scratch.is_none() || ms.max_scratch_tokens < tokens {
+            ms.scratch = Some(metal::transformer::LayerScratch::new(
+                &ms.pipes,
+                tokens,
+                h,
+                ms.metal_cfg.intermediate_size,
+                ms.metal_cfg.num_heads,
+                ms.metal_cfg.num_kv_heads,
+                ms.metal_cfg.head_dim,
+            ));
+            ms.max_scratch_tokens = tokens;
+        }
+        let scratch = ms.scratch.as_ref().unwrap();
+        let needed = tokens * h;
+        if ms.input_buf.is_none() || ms.input_buf_size < needed {
+            ms.input_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h)));
+            ms.input_buf_size = needed.max(128 * h);
+        }
+        let int_buf = ms.input_buf.as_ref().unwrap();
+        if ms.norm_out_buf.is_none() {
+            ms.norm_out_buf = Some(ms.pipes.buffer_empty(needed.max(128 * h)));
+        }
+        let norm_out = ms.norm_out_buf.as_ref().unwrap();
 
-        // lm_head GEMM: [1, hidden] × [vocab, hidden]^T = [1, vocab]
-        let logits_buf = ms.pipes.buffer_empty(vocab_size);
+        // === SINGLE command buffer: layers + norm + lm_head + argmax ===
         let cmd = ms.pipes.queue.new_command_buffer();
+
+        metal::transformer::metal_layer_forward_v2(
+            cmd,
+            &ms.pipes,
+            input_buf,
+            tokens,
+            &ms.weights[0],
+            &ms.metal_cfg,
+            &mut ms.kv[0],
+            pos_offset,
+            &ms.cos_buf,
+            &ms.sin_buf,
+            scratch,
+        );
+        for li in 1..ms.weights.len() {
+            let enc = cmd.new_blit_command_encoder();
+            enc.copy_from_buffer(&scratch.output, 0, int_buf, 0, (needed * 4) as u64);
+            enc.end_encoding();
+            metal::transformer::metal_layer_forward_v2(
+                cmd,
+                &ms.pipes,
+                int_buf,
+                tokens,
+                &ms.weights[li],
+                &ms.metal_cfg,
+                &mut ms.kv[li],
+                pos_offset,
+                &ms.cos_buf,
+                &ms.sin_buf,
+                scratch,
+            );
+        }
+
+        // RMSNorm
         {
             let enc = cmd.new_compute_command_encoder();
-            ms.pipes.gemm_v2(
+            ms.pipes.rms_norm_enc(
                 enc,
-                &hidden_buf,
-                lm_weights_buf,
-                &logits_buf,
-                1,
-                vocab_size,
+                &scratch.output,
+                &ms.norm_w_buf,
+                norm_out,
+                tokens,
                 h,
+                self.cfg.rms_norm_eps as f32,
             );
             enc.end_encoding();
         }
 
-        // Argmax on GPU
-        let result_buf = ms.pipes.buffer_empty(1); // 1 u32
+        // lm_head GEMM (reuse int_buf as logits since it's ≥ vocab_size for small models)
+        // For safety, use a dedicated buffer only if needed
+        let logits_buf = if ms.input_buf_size >= vocab_size {
+            // Can't reuse int_buf — it might be read by norm. Use scratch.ln_out as temp.
+            &scratch.gate_buf // gate_buf is large enough (intermediate_size ≥ vocab_size)
+        } else {
+            &scratch.gate_buf
+        };
+        {
+            let enc = cmd.new_compute_command_encoder();
+            ms.pipes
+                .gemm_v2(enc, norm_out, lm_weights_buf, logits_buf, 1, vocab_size, h);
+            enc.end_encoding();
+        }
+
+        // Argmax (reuse scratch.up_buf for result — just need 1 u32 = 4 bytes)
+        let result_ptr = scratch.up_buf.contents() as *mut u32;
         {
             let enc = cmd.new_compute_command_encoder();
             #[repr(C)]
-            struct ArgmaxParams {
+            struct P {
                 n: i32,
             }
-            let params = ArgmaxParams {
+            let p = P {
                 n: vocab_size as i32,
             };
-            let params_buf = ms.pipes.device.new_buffer_with_data(
-                &params as *const _ as *const std::ffi::c_void,
+            let p_buf = ms.pipes.device.new_buffer_with_data(
+                &p as *const _ as *const std::ffi::c_void,
                 4,
                 ::metal::MTLResourceOptions::StorageModeShared,
             );
             enc.set_compute_pipeline_state(ms.pipes.pipeline("argmax_f32"));
-            enc.set_buffer(0, Some(&logits_buf), 0);
-            enc.set_buffer(1, Some(&result_buf), 0);
-            enc.set_buffer(2, Some(&params_buf), 0);
-            let tg = ::metal::MTLSize::new(256, 1, 1);
-            let grid = ::metal::MTLSize::new(1, 1, 1);
-            enc.dispatch_thread_groups(grid, tg);
+            enc.set_buffer(0, Some(logits_buf), 0);
+            enc.set_buffer(1, Some(&scratch.up_buf), 0);
+            enc.set_buffer(2, Some(&p_buf), 0);
+            enc.dispatch_thread_groups(
+                ::metal::MTLSize::new(1, 1, 1),
+                ::metal::MTLSize::new(256, 1, 1),
+            );
             enc.end_encoding();
         }
 
         cmd.commit();
         cmd.wait_until_completed();
+        self.tokens_generated += tokens;
 
-        // Read single u32 token from GPU
-        let token = metal::pipelines::MetalPipelines::read_buffer_u32(&result_buf, 1)[0];
+        // Read results from shared memory (zero-copy on Apple Silicon)
+        let token = unsafe { *result_ptr };
+        let hidden_vec = metal::pipelines::MetalPipelines::read_buffer(norm_out, needed);
 
-        Some((token, hidden_buf))
+        Some((token, hidden_vec))
     }
 
     /// Forward on GPU from a Metal Buffer input. Zero CPU transfer.
@@ -718,6 +801,21 @@ impl FusedTransformer {
             }
         }
         out
+    }
+
+    /// Create a Metal buffer from f32 data (shared memory, zero-copy on Apple Silicon).
+    /// Returns None if Metal not available.
+    /// Create a GPU buffer from f32 data. Returns None if Metal not available.
+    pub fn create_gpu_buffer(&self, data: &[f32]) -> Option<GpuBuffer> {
+        #[cfg(feature = "metal")]
+        {
+            let ms = self.metal_state.as_ref()?;
+            Some(ms.pipes.buffer_from_data(data))
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            Some(data.to_vec())
+        }
     }
 
     pub fn reset(&mut self) {

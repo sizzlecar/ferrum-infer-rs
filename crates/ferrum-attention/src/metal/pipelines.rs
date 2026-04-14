@@ -51,6 +51,8 @@ impl MetalPipelines {
                     "fused_scale_add_f32",
                     "fused_residual_norm_f32",
                     "gemm_f32",
+                    "argmax_f32",
+                    "embedding_lookup_f32",
                 ][..],
             ),
             (&gemm_lib, &["gemm_f32_v2"][..]),

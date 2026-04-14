@@ -1105,7 +1105,7 @@ impl SubTalker {
         let mut logits_buf = vec![0.0f32; vocab];
 
         for i in 0..n_extra {
-            // lm_head matmul: logits = last_hidden @ lm_weights[i]^T
+            // lm_head: logits = last_hidden @ lm_weights[i]^T
             #[cfg(target_os = "macos")]
             unsafe {
                 cblas_sgemm(
@@ -1134,7 +1134,6 @@ impl SubTalker {
                 logits_buf[j] = s;
             }
 
-            // SubTalker: argmax (greedy) — matching reference project
             let token = crate::executor::tts_executor::sample_token(&logits_buf, 0.0, top_k, 1.0);
             predicted_tokens.push(token);
 
@@ -1201,8 +1200,19 @@ impl SubTalker {
                 };
 
                 // Forward through fused transformer (1 token)
-                let output = self.fused.forward(&embed, 1);
-                last_hidden = output;
+                // Use GPU path with GPU-side norm if available
+                #[cfg(feature = "metal")]
+                {
+                    if let Some(output) = self.fused.forward_gpu_to_vec(&embed, 1) {
+                        last_hidden = output;
+                    } else {
+                        last_hidden = self.fused.forward(&embed, 1);
+                    }
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    last_hidden = self.fused.forward(&embed, 1);
+                }
             }
         }
 
