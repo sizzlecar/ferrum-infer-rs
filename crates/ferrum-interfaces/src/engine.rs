@@ -54,6 +54,20 @@ pub trait InferenceEngine: Send + Sync {
     fn embedding_dim(&self) -> usize {
         0
     }
+
+    /// Transcribe audio file → text. Default: not supported.
+    async fn transcribe_file(&self, _path: &str, _language: Option<&str>) -> Result<String> {
+        Err(ferrum_types::FerrumError::model(
+            "This engine does not support audio transcription",
+        ))
+    }
+
+    /// Transcribe audio bytes (WAV) → text. Default: not supported.
+    async fn transcribe_bytes(&self, _data: &[u8], _language: Option<&str>) -> Result<String> {
+        Err(ferrum_types::FerrumError::model(
+            "This engine does not support audio transcription",
+        ))
+    }
 }
 
 /// Advanced engine capabilities

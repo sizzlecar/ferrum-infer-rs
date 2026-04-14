@@ -70,6 +70,7 @@ impl AxumServer {
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/embeddings", post(embeddings_handler))
+            .route("/v1/audio/transcriptions", post(transcriptions_handler))
             .route("/v1/models", get(models_handler))
             // Health & observability
             .route("/health", get(health_handler))
@@ -470,6 +471,51 @@ async fn embeddings_handler(
     };
 
     Ok(Json(response).into_response())
+}
+
+/// Audio transcription handler (OpenAI-compatible multipart form).
+async fn transcriptions_handler(
+    State(state): State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> std::result::Result<Response, ServerError> {
+    let span = span!(Level::INFO, "transcription");
+    let _enter = span.enter();
+
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut language: Option<String> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ServerError::BadRequest(format!("multipart: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" => {
+                file_data = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| ServerError::BadRequest(format!("read file: {e}")))?
+                        .to_vec(),
+                );
+            }
+            "language" => {
+                language = field.text().await.ok().filter(|s| !s.is_empty());
+            }
+            _ => {} // ignore model, response_format, etc. for now
+        }
+    }
+
+    let data = file_data.ok_or_else(|| ServerError::BadRequest("missing 'file' field".into()))?;
+
+    let text = state
+        .engine
+        .transcribe_bytes(&data, language.as_deref())
+        .await
+        .map_err(|e| ServerError::InternalError(format!("transcribe: {e}")))?;
+
+    Ok(Json(TranscriptionResponse { text }).into_response())
 }
 
 async fn models_handler(

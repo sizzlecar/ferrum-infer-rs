@@ -35,6 +35,9 @@ candle-transformers = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 safetensors = { workspace = true }
 
+# Fused attention
+ferrum-attention = { path = "../ferrum-attention" }
+
 # Custom CUDA kernels
 ferrum-cuda-kernels = { workspace = true, optional = true }
 half = { workspace = true }
@@ -63,6 +66,11 @@ pathdiff = "0.2"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 base64 = "0.22"
+hound = "3.5"
+flate2 = "1"
+rustfft = "6"
+rubato = "2.0.0"
+audioadapter-buffers = "3.0.0"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -74,6 +82,8 @@ default = []
 # Enable runtime integration for weight loading
 runtime = ["dep:ferrum-runtime"]
 # Enable CUDA FlashAttention-2 and fused custom kernels
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+metal = ["ferrum-attention/metal"]
 cuda = ["dep:candle-flash-attn", "candle-nn/cuda", "dep:ferrum-cuda-kernels", "ferrum-cuda-kernels?/cuda"]
 marlin = ["cuda"]  # kept for backward compat, cuda already enables marlin
 tensor-parallel = ["cuda"]  # backward compat alias

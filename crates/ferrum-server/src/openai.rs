@@ -297,6 +297,14 @@ pub struct EmbeddingUsage {
     pub total_tokens: u32,
 }
 
+// ======================== Audio Transcription API ========================
+
+/// Transcription response (OpenAI-compatible)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionResponse {
+    pub text: String,
+}
+
 // ======================== Error types ========================
 
 /// OpenAI API error

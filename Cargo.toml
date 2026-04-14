@@ -14,6 +14,9 @@ members = [
     # CUDA kernel crate
     "crates/ferrum-cuda-kernels",
 
+    # Attention kernel crate
+    "crates/ferrum-attention",
+
     # Existing crates (to be refactored)
     "crates/ferrum-engine",
     "crates/ferrum-models",

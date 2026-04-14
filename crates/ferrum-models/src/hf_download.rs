@@ -95,21 +95,34 @@ impl HfDownloader {
         // Get file list from HuggingFace API
         let files = self.list_files(model_id, revision).await?;
 
-        // Determine which files to download (only files, not directories)
+        // Determine which files to download (only files, not directories).
+        // Download all model-related files: weights (.safetensors, .pt, .bin, .onnx),
+        // configs (.json, .yaml), tokenizers, and other assets.
         let files_to_download: Vec<_> = files
             .iter()
             .filter(|f| {
                 if f.file_type.as_deref() == Some("directory") {
                     return false;
                 }
-                REQUIRED_FILES.contains(&f.path.as_str())
-                    || MODEL_FILES
-                        .iter()
-                        .any(|m| f.path.starts_with(m) || f.path == *m)
-                    || TOKENIZER_FILES.contains(&f.path.as_str())
-                    || f.path == "generation_config.json"
-                    || f.path == "special_tokens_map.json"
-                    || f.path.ends_with(".safetensors")
+                let path = f.path.as_str();
+                // Skip large non-essential files
+                if path.ends_with(".md") || path.starts_with(".git") {
+                    return false;
+                }
+                // Include all model weight formats
+                path.ends_with(".safetensors")
+                    || path.ends_with(".pt")
+                    || path.ends_with(".bin")
+                    || path.ends_with(".onnx")
+                    // Config and tokenizer files
+                    || path.ends_with(".json")
+                    || path.ends_with(".yaml")
+                    || path.ends_with(".yml")
+                    || path.ends_with(".model")  // sentencepiece tokenizer
+                    || path.ends_with(".txt")    // vocab.txt
+                    // Image/audio assets (small)
+                    || path.ends_with(".png")
+                    || path.ends_with(".wav")
             })
             .collect();
 
@@ -197,35 +210,55 @@ impl HfDownloader {
         Ok(snapshot_dir)
     }
 
-    /// List files in a HuggingFace repository
+    /// List files in a HuggingFace repository (recursively traverses subdirectories).
     async fn list_files(&self, model_id: &str, revision: &str) -> Result<Vec<HfFileInfo>> {
-        let url = format!("{}/api/models/{}/tree/{}", HF_API_URL, model_id, revision);
+        let mut all_files = Vec::new();
+        let mut dirs_to_visit = vec![String::new()]; // start with root
 
-        let mut request = self.client.get(&url);
-        if let Some(token) = &self.token {
-            request = request.header("Authorization", format!("Bearer {}", token));
+        while let Some(dir) = dirs_to_visit.pop() {
+            let url = if dir.is_empty() {
+                format!("{}/api/models/{}/tree/{}", HF_API_URL, model_id, revision)
+            } else {
+                format!(
+                    "{}/api/models/{}/tree/{}/{}",
+                    HF_API_URL, model_id, revision, dir
+                )
+            };
+
+            let mut request = self.client.get(&url);
+            if let Some(token) = &self.token {
+                request = request.header("Authorization", format!("Bearer {}", token));
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| FerrumError::model(format!("Failed to list files: {}", e)))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(FerrumError::model(format!(
+                    "API error ({}): {}",
+                    status, text
+                )));
+            }
+
+            let entries: Vec<HfFileInfo> = response
+                .json()
+                .await
+                .map_err(|e| FerrumError::model(format!("Failed to parse file list: {}", e)))?;
+
+            for entry in entries {
+                if entry.file_type.as_deref() == Some("directory") {
+                    dirs_to_visit.push(entry.path.clone());
+                } else {
+                    all_files.push(entry);
+                }
+            }
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| FerrumError::model(format!("Failed to list files: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(FerrumError::model(format!(
-                "API error ({}): {}",
-                status, text
-            )));
-        }
-
-        let files: Vec<HfFileInfo> = response
-            .json()
-            .await
-            .map_err(|e| FerrumError::model(format!("Failed to parse file list: {}", e)))?;
-
-        Ok(files)
+        Ok(all_files)
     }
 
     /// Get the commit SHA for a revision

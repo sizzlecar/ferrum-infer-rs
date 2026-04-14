@@ -1143,6 +1143,15 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 )?;
                 Ok(Arc::new(executor))
             }
+            ferrum_models::Architecture::Whisper => {
+                info!("Using Whisper executor for ASR");
+                let executor = ferrum_models::WhisperModelExecutor::from_path(
+                    &model_path,
+                    candle_device.clone(),
+                    dtype,
+                )?;
+                Ok(Arc::new(executor))
+            }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
