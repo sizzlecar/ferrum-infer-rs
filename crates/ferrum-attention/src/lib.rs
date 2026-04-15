@@ -257,7 +257,12 @@ impl FusedTransformer {
             "FusedTransformer: backend={backend}, hidden={}, layers={n}",
             cfg.hidden_size
         );
-        #[cfg(not(feature = "metal"))]
+        #[cfg(all(not(feature = "metal"), feature = "cuda"))]
+        tracing::info!(
+            "FusedTransformer: backend=CUDA, hidden={}, layers={n}",
+            cfg.hidden_size
+        );
+        #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
         tracing::info!(
             "FusedTransformer: backend=CPU, hidden={}, layers={n}",
             cfg.hidden_size
@@ -817,14 +822,20 @@ impl FusedTransformer {
 
     /// Create a Metal buffer from f32 data (shared memory, zero-copy on Apple Silicon).
     /// Returns None if Metal not available.
-    /// Create a GPU buffer from f32 data. Returns None if Metal not available.
+    /// Create a GPU buffer from f32 data. Returns None if GPU not available.
     pub fn create_gpu_buffer(&self, data: &[f32]) -> Option<GpuBuffer> {
         #[cfg(feature = "metal")]
         {
             let ms = self.metal_state.as_ref()?;
-            Some(ms.pipes.buffer_from_data(data))
+            return Some(ms.pipes.buffer_from_data(data));
         }
-        #[cfg(not(feature = "metal"))]
+        #[cfg(feature = "cuda")]
+        {
+            // TODO: allocate CudaSlice and copy data
+            let _ = data;
+            return None;
+        }
+        #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
         {
             Some(data.to_vec())
         }
