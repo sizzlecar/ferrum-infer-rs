@@ -67,11 +67,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check CUDA compilation
+        env:
+          CUDA_COMPUTE_CAP: "80"
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo check --workspace --features cuda
 
       - name: Build CUDA kernels (PTX)
+        env:
+          CUDA_COMPUTE_CAP: "80"
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo build -p ferrum-cuda-kernels --features cuda
