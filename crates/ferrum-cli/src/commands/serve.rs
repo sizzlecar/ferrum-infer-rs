@@ -33,6 +33,10 @@ pub struct ServeCommand {
     /// Port to listen on
     #[arg(short, long)]
     pub port: Option<u16>,
+
+    /// Number of TTS concurrent slots (default: 2)
+    #[arg(long, default_value = "2")]
+    pub tts_slots: usize,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -41,6 +45,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         model_option,
         host,
         port,
+        tts_slots,
     } = cmd;
 
     // Print banner
@@ -124,15 +129,31 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             )
         }
         ferrum_models::Architecture::Qwen3TTS => {
-            println!("{}", "Initializing Qwen3-TTS engine...".dimmed());
-            let candle_device = to_candle_device(&device);
-            let executor = ferrum_models::TtsModelExecutor::from_path(
-                &source.local_path.to_string_lossy(),
-                candle_device,
-                candle_core::DType::F32,
-            )?;
-            Arc::new(ferrum_engine::tts_engine::TtsEngine::new(
-                executor,
+            let n_slots = tts_slots.max(1);
+            println!(
+                "{} ({} slot{})",
+                "Initializing Qwen3-TTS engine...".dimmed(),
+                n_slots,
+                if n_slots > 1 { "s" } else { "" }
+            );
+            let model_path = source.local_path.to_string_lossy().to_string();
+            let mut executors = Vec::with_capacity(n_slots);
+            for i in 0..n_slots {
+                let candle_device = to_candle_device(&device);
+                let executor = ferrum_models::TtsModelExecutor::from_path(
+                    &model_path,
+                    candle_device,
+                    candle_core::DType::F32,
+                )?;
+                if i == 0 {
+                    println!("  Slot 0 loaded");
+                } else {
+                    println!("  Slot {} loaded", i);
+                }
+                executors.push(executor);
+            }
+            Arc::new(ferrum_engine::tts_engine::TtsEngine::new_multi(
+                executors,
                 ferrum_types::ModelId(model_id.clone()),
             ))
         }
