@@ -50,3 +50,28 @@ jobs:
         run: |
           cargo build -p ferrum-cli --bin ferrum
           cargo test -p ferrum-cli --test cli_e2e
+
+  cuda-check:
+    name: CUDA Compile Check
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.0-devel-ubuntu22.04
+    steps:
+      - name: Install deps
+        run: |
+          apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check CUDA compilation
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo check --workspace --features cuda
+
+      - name: Build CUDA kernels (PTX)
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build -p ferrum-cuda-kernels --features cuda
