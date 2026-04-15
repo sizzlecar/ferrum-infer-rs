@@ -1,4 +1,4 @@
-//! ferrum-attention: Fused flash attention and transformer for Metal and CPU.
+//! ferrum-attention: Fused flash attention and transformer for Metal, CUDA, and CPU.
 //!
 //! Single-kernel attention (QK^T + softmax + attn@V) with no intermediate buffer
 //! materialization. Full transformer layer with all ops fused on GPU.
@@ -8,11 +8,16 @@ pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
 
-/// Opaque GPU buffer type (Metal Buffer when available, placeholder otherwise).
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
+/// Opaque GPU buffer type.
 #[cfg(feature = "metal")]
 pub type GpuBuffer = ::metal::Buffer;
-#[cfg(not(feature = "metal"))]
-pub type GpuBuffer = Vec<f32>; // fallback: CPU storage
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+pub type GpuBuffer = cudarc::driver::CudaSlice<f32>;
+#[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
+pub type GpuBuffer = Vec<f32>;
 
 /// Attention configuration.
 pub struct AttentionParams {
@@ -33,6 +38,13 @@ pub fn attention_cpu(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], params: &
 
 /// Run fused attention on best available backend.
 pub fn attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], params: &AttentionParams) {
+    #[cfg(feature = "cuda")]
+    {
+        if cuda::is_available() {
+            cuda::fused_attention(q, k, v, out, params);
+            return;
+        }
+    }
     #[cfg(feature = "metal")]
     {
         if metal::is_available() {

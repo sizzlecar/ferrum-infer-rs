@@ -31,6 +31,9 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/paged_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/dequant_int4.cu");
     println!("cargo:rerun-if-changed=kernels/batched_decode_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/softmax.cu");
+    println!("cargo:rerun-if-changed=kernels/embedding_lookup.cu");
+    println!("cargo:rerun-if-changed=kernels/flash_attn_full.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -52,6 +55,9 @@ fn main() {
             "kernels/paged_decode_attention.cu",
             "kernels/dequant_int4.cu",
             "kernels/batched_decode_attention.cu",
+            "kernels/softmax.cu",
+            "kernels/embedding_lookup.cu",
+            "kernels/flash_attn_full.cu",
         ])
         .out_dir(out_dir)
         .arg("--expt-relaxed-constexpr")
