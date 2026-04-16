@@ -60,7 +60,6 @@ pub mod continuous_engine;
 pub mod embedding_engine;
 pub mod engine;
 pub mod factory;
-pub mod kernels;
 pub mod parallel;
 pub mod pipeline;
 pub mod registry;
@@ -108,14 +107,6 @@ pub use registry::{
     GreedySamplerFactory, HuggingFaceTokenizerFactory, MultinomialSamplerFactory,
     PagedKvCacheFactory, PrioritySchedulerFactory, StubExecutorFactory, StubTokenizer,
     StubTokenizerFactory,
-};
-
-// Re-exports of kernels
-pub use kernels::{
-    create_attention_op, global_kernel_registry, AttentionConfig, AttentionKernel, AttentionOp,
-    AttentionOutput, AttentionType, CpuAttentionOp, DecodeAttentionInput, FusedOpType, FusedOps,
-    FusedOpsConfig, FusedRopeAttention, KernelInfo, KernelRegistry, PerformanceHint,
-    PrefillAttentionInput, RopeCache,
 };
 
 // Re-exports of parallel module

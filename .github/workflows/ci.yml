@@ -58,6 +58,12 @@ jobs:
       # ── Integration Tests ─────────────────────────────
       # These test subsystems without downloading models
 
+      - name: "Test: Backend CPU (GEMM, norm, RoPE, attention, SiLU)"
+        run: cargo test -p ferrum-kernels --test backend_cpu_test
+
+      - name: "Test: ModelRunner CPU (prefill, decode, GQA, determinism)"
+        run: cargo test -p ferrum-kernels --test runner_cpu_test
+
       - name: "Test: FusedTransformer CPU (forward, reset, attention)"
         run: cargo test -p ferrum-attention --test cpu_transformer_test
 
