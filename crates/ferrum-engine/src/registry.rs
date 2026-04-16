@@ -1058,48 +1058,17 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 Ok(Arc::new(executor))
             }
             ferrum_models::Architecture::Qwen3 => {
-                // Opt-in: FERRUM_USE_RUNNER=1 uses the new unified ModelRunner path
-                // (Backend trait + layer_forward). Default: legacy Candle path.
-                if std::env::var("FERRUM_USE_RUNNER").as_deref() == Ok("1") {
-                    info!("Loading Qwen3 via ModelRunner (FERRUM_USE_RUNNER=1)");
-                    let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
-                    let vb = loader.load_varbuilder(&candle_device, dtype)?;
-
-                    let transformer_cfg = ferrum_models::model_config::qwen3_config(&model_def);
-                    let weights = ferrum_models::model_config::weight_loader::load_model_weights(
-                        &vb,
-                        &transformer_cfg,
-                    )?;
-                    let runner =
-                        ferrum_kernels::backend::runner::ModelRunner::new(transformer_cfg, weights);
-                    let model_info =
-                        model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                    let executor = ferrum_models::GenericModelExecutor::new(runner, model_info);
-                    return Ok(Arc::new(executor));
-                }
-
-                info!("Loading Qwen3 model weights...");
+                info!("Loading Qwen3 via ModelRunner");
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();
 
-                // Qwen3 + TP: use Llama wrapper (same safetensors layout + has_qk_norm)
+                // TP: fallback to legacy Candle path (NCCL multi-GPU)
                 let tp_size: usize = std::env::var("FERRUM_TP")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| {
-                        #[cfg(feature = "cuda")]
-                        {
-                            candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
-                                .map(|n| n as usize)
-                                .unwrap_or(1)
-                        }
-                        #[cfg(not(feature = "cuda"))]
-                        {
-                            0
-                        }
-                    });
+                    .unwrap_or(0);
                 if tp_size > 1 {
-                    info!("Qwen3 TP={tp_size}: using Llama wrapper for tensor parallel");
+                    info!("Qwen3 TP={tp_size}: falling back to Candle executor");
                     let vb = loader.load_varbuilder(&candle_device, dtype)?;
                     let mut llama_model = ferrum_models::LlamaModelWrapper::from_varbuilder(
                         vb,
@@ -1110,38 +1079,81 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     llama_model.set_model_dir(model_dir_path);
                     let model_info =
                         model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                    let executor = ferrum_models::CandleModelExecutor::new(llama_model, model_info);
-                    return Ok(Arc::new(executor));
+                    return Ok(Arc::new(ferrum_models::CandleModelExecutor::new(
+                        llama_model,
+                        model_info,
+                    )));
                 }
 
-                // Auto-detect GPTQ: dequantize INT4→FP16 for candle prefill
+                // GPTQ: fallback to legacy path (quantized weight handling)
                 let qconfig =
                     ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
                         .unwrap_or(None);
+                if qconfig.is_some() {
+                    info!("GPTQ detected: falling back to Candle executor");
+                    let vb = loader.load_varbuilder_gptq(
+                        qconfig.as_ref().unwrap(),
+                        &candle_device,
+                        dtype,
+                    )?;
+                    let mut qwen3_model = ferrum_models::Qwen3ModelWrapper::from_varbuilder(
+                        vb,
+                        &model_def,
+                        candle_device.clone(),
+                        dtype,
+                    )?;
+                    qwen3_model.set_model_dir(model_dir_path);
+                    let model_info =
+                        model_def.to_model_info(config.engine_config.model.model_id.to_string());
+                    return Ok(Arc::new(ferrum_models::Qwen3ModelExecutor::new(
+                        qwen3_model,
+                        model_info,
+                    )));
+                }
 
-                let vb = if let Some(ref qc) = qconfig {
-                    info!(
-                        "GPTQ model detected ({}bit, gs={}), dequantizing for prefill...",
-                        qc.bits, qc.group_size
-                    );
-                    loader.load_varbuilder_gptq(qc, &candle_device, dtype)?
-                } else {
-                    loader.load_varbuilder(&candle_device, dtype)?
-                };
-
-                let mut qwen3_model = ferrum_models::Qwen3ModelWrapper::from_varbuilder(
-                    vb,
-                    &model_def,
-                    candle_device.clone(),
-                    dtype,
+                // Default: new ModelRunner path
+                let vb = loader.load_varbuilder(&candle_device, dtype)?;
+                let transformer_cfg = ferrum_models::model_config::qwen3_config(&model_def);
+                let weights = ferrum_models::model_config::weight_loader::load_model_weights(
+                    &vb,
+                    &transformer_cfg,
                 )?;
-                qwen3_model.set_model_dir(model_dir_path);
+
+                let runner: Box<dyn ferrum_kernels::backend::RunnerInterface> = {
+                    #[cfg(feature = "metal")]
+                    if matches!(&config.device, Device::Metal) {
+                        info!("  Backend: Metal");
+                        let metal_weights =
+                            ferrum_kernels::backend::runner::convert_weights_to_metal(&weights);
+                        Box::new(ferrum_kernels::backend::runner::ModelRunner::<
+                            ferrum_kernels::backend::metal::MetalBackend,
+                        >::new(
+                            transformer_cfg.clone(), metal_weights
+                        ))
+                    } else {
+                        info!("  Backend: CPU");
+                        Box::new(ferrum_kernels::backend::runner::ModelRunner::<
+                            ferrum_kernels::backend::cpu::CpuBackend,
+                        >::new(
+                            transformer_cfg.clone(), weights
+                        ))
+                    }
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        info!("  Backend: CPU");
+                        Box::new(ferrum_kernels::backend::runner::ModelRunner::<
+                            ferrum_kernels::backend::cpu::CpuBackend,
+                        >::new(
+                            transformer_cfg.clone(), weights
+                        ))
+                    }
+                };
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                let executor = ferrum_models::Qwen3ModelExecutor::new(qwen3_model, model_info);
-
-                Ok(Arc::new(executor))
+                Ok(Arc::new(ferrum_models::GenericModelExecutor::new(
+                    runner, model_info,
+                )))
             }
             ferrum_models::Architecture::Bert => {
                 info!("Using BERT executor for embeddings");

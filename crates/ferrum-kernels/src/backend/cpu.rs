@@ -1,10 +1,9 @@
 //! CPU backend using Accelerate (macOS) / portable fallback (Linux).
+//! Context = () — all ops execute immediately, no batching needed.
 
 use super::{AttnConfig, Backend};
 
 pub struct CpuBackend;
-
-// ── BLAS bindings (macOS Accelerate) ──────────────────────────────────
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -36,8 +35,13 @@ extern "C" {
 
 impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
+    type Context = ();
+
+    fn new_context() -> Self::Context {}
+    fn sync(_ctx: &mut Self::Context) {}
 
     fn gemm(
+        _ctx: &mut Self::Context,
         a: &Self::Buffer,
         b: &Self::Buffer,
         out: &mut Self::Buffer,
@@ -45,17 +49,15 @@ impl Backend for CpuBackend {
         n: usize,
         k: usize,
     ) {
-        // C[m,n] = A[m,k] @ B[n,k]^T (B stored as [n, k])
         debug_assert!(a.len() >= m * k, "gemm: a too small");
         debug_assert!(b.len() >= n * k, "gemm: b too small");
         debug_assert!(out.len() >= m * n, "gemm: out too small");
-
         #[cfg(target_os = "macos")]
         unsafe {
             cblas_sgemm(
                 101,
                 111,
-                112, // RowMajor, NoTrans, Trans
+                112,
                 m as i32,
                 n as i32,
                 k as i32,
@@ -69,7 +71,6 @@ impl Backend for CpuBackend {
                 n as i32,
             );
         }
-
         #[cfg(not(target_os = "macos"))]
         {
             for i in 0..m {
@@ -85,6 +86,7 @@ impl Backend for CpuBackend {
     }
 
     fn rms_norm(
+        _ctx: &mut Self::Context,
         x: &Self::Buffer,
         w: &Self::Buffer,
         eps: f32,
@@ -104,6 +106,7 @@ impl Backend for CpuBackend {
     }
 
     fn fused_add_rms_norm(
+        _ctx: &mut Self::Context,
         residual: &mut Self::Buffer,
         x: &Self::Buffer,
         w: &Self::Buffer,
@@ -114,11 +117,9 @@ impl Backend for CpuBackend {
     ) {
         for t in 0..tokens {
             let off = t * dim;
-            // residual += x
             for i in 0..dim {
                 residual[off + i] += x[off + i];
             }
-            // rms norm on updated residual
             let row = &residual[off..off + dim];
             let o = &mut out[off..off + dim];
             let sum_sq = dot_product(row, row);
@@ -130,6 +131,7 @@ impl Backend for CpuBackend {
     }
 
     fn rope(
+        _ctx: &mut Self::Context,
         q: &mut Self::Buffer,
         k: &mut Self::Buffer,
         cos: &Self::Buffer,
@@ -146,6 +148,7 @@ impl Backend for CpuBackend {
     }
 
     fn decode_attention(
+        _ctx: &mut Self::Context,
         q: &Self::Buffer,
         k_cache: &Self::Buffer,
         v_cache: &Self::Buffer,
@@ -153,11 +156,11 @@ impl Backend for CpuBackend {
         kv_len: usize,
         cfg: &AttnConfig,
     ) {
-        // Single-token attention: q [num_heads, head_dim] × k_cache [num_kv_heads, kv_len, head_dim]
         cpu_attention(q, k_cache, v_cache, out, 1, 1, kv_len, false, 0, cfg);
     }
 
     fn flash_attention(
+        _ctx: &mut Self::Context,
         q: &Self::Buffer,
         k: &Self::Buffer,
         v: &Self::Buffer,
@@ -173,45 +176,197 @@ impl Backend for CpuBackend {
         );
     }
 
-    fn silu_mul(gate: &Self::Buffer, up: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
+    fn silu_mul(
+        _ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
         for i in 0..len {
             let g = gate[i];
-            let s = g / (1.0 + (-g).exp());
-            out[i] = s * up[i];
+            out[i] = (g / (1.0 + (-g).exp())) * up[i];
         }
     }
 
-    fn add(a: &Self::Buffer, b: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
+    fn add(
+        _ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        b: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
         for i in 0..len {
             out[i] = a[i] + b[i];
         }
     }
 
-    fn copy(src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
+    fn copy(_ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
         dst[..len].copy_from_slice(&src[..len]);
     }
 
-    fn embedding_lookup(table: &Self::Buffer, ids: &[u32], out: &mut Self::Buffer, dim: usize) {
+    fn embedding_lookup(
+        _ctx: &mut Self::Context,
+        table: &Self::Buffer,
+        ids: &[u32],
+        out: &mut Self::Buffer,
+        dim: usize,
+    ) {
         for (i, &id) in ids.iter().enumerate() {
             let src = id as usize * dim;
             out[i * dim..(i + 1) * dim].copy_from_slice(&table[src..src + dim]);
         }
     }
 
+    fn split_qkv(
+        _ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q: &mut Self::Buffer,
+        k: &mut Self::Buffer,
+        v: &mut Self::Buffer,
+        tokens: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) {
+        let qkv_dim = q_dim + 2 * kv_dim;
+        for t in 0..tokens {
+            let base = t * qkv_dim;
+            q[t * q_dim..(t + 1) * q_dim].copy_from_slice(&qkv[base..base + q_dim]);
+            k[t * kv_dim..(t + 1) * kv_dim]
+                .copy_from_slice(&qkv[base + q_dim..base + q_dim + kv_dim]);
+            v[t * kv_dim..(t + 1) * kv_dim]
+                .copy_from_slice(&qkv[base + q_dim + kv_dim..base + qkv_dim]);
+        }
+    }
+
+    fn fused_silu_mul_split(
+        _ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        for t in 0..tokens {
+            for i in 0..im {
+                let g = gate_up[t * 2 * im + i];
+                let u = gate_up[t * 2 * im + im + i];
+                out[t * im + i] = (g / (1.0 + (-g).exp())) * u;
+            }
+        }
+    }
+
+    fn qk_norm(
+        _ctx: &mut Self::Context,
+        data: &mut Self::Buffer,
+        w: &Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) {
+        for t in 0..tokens {
+            for h in 0..heads {
+                let off = (t * heads + h) * head_dim;
+                let mut sum_sq = 0.0f32;
+                for i in 0..head_dim {
+                    sum_sq += data[off + i] * data[off + i];
+                }
+                let inv = 1.0 / (sum_sq / head_dim as f32 + eps).sqrt();
+                for i in 0..head_dim {
+                    data[off + i] = data[off + i] * inv * w[i];
+                }
+            }
+        }
+    }
+
+    fn kv_cache_append(
+        _ctx: &mut Self::Context,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        cache_len: usize,
+        new_k: &Self::Buffer,
+        new_v: &Self::Buffer,
+        new_tokens: usize,
+        nkv: usize,
+        hd: usize,
+    ) -> (Self::Buffer, Self::Buffer) {
+        let new_len = cache_len + new_tokens;
+        let mut fk = vec![0.0f32; nkv * new_len * hd];
+        let mut fv = vec![0.0f32; nkv * new_len * hd];
+        for h in 0..nkv {
+            if cache_len > 0 {
+                fk[h * new_len * hd..h * new_len * hd + cache_len * hd]
+                    .copy_from_slice(&cache_k[h * cache_len * hd..(h + 1) * cache_len * hd]);
+                fv[h * new_len * hd..h * new_len * hd + cache_len * hd]
+                    .copy_from_slice(&cache_v[h * cache_len * hd..(h + 1) * cache_len * hd]);
+            }
+            for t in 0..new_tokens {
+                let src = t * nkv * hd + h * hd;
+                let dst = h * new_len * hd + (cache_len + t) * hd;
+                fk[dst..dst + hd].copy_from_slice(&new_k[src..src + hd]);
+                fv[dst..dst + hd].copy_from_slice(&new_v[src..src + hd]);
+            }
+        }
+        (fk, fv)
+    }
+
+    fn transpose_token_to_head(
+        _ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+    ) {
+        for t in 0..tokens {
+            for h in 0..heads {
+                let s = (t * heads + h) * dim;
+                let d = (h * tokens + t) * dim;
+                dst[d..d + dim].copy_from_slice(&src[s..s + dim]);
+            }
+        }
+    }
+
+    fn transpose_head_to_token(
+        _ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+    ) {
+        for h in 0..heads {
+            for t in 0..tokens {
+                let s = (h * tokens + t) * dim;
+                let d = (t * heads + h) * dim;
+                dst[d..d + dim].copy_from_slice(&src[s..s + dim]);
+            }
+        }
+    }
+
+    fn add_inplace(
+        _ctx: &mut Self::Context,
+        residual: &mut Self::Buffer,
+        x: &Self::Buffer,
+        len: usize,
+    ) {
+        for i in 0..len {
+            residual[i] += x[i];
+        }
+    }
+
     fn alloc(len: usize) -> Self::Buffer {
         vec![0.0f32; len]
     }
-
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
         buf[..len].to_vec()
     }
-
     fn from_slice(data: &[f32]) -> Self::Buffer {
         data.to_vec()
     }
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_os = "macos")]
@@ -224,11 +379,7 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut sum = 0.0f32;
-        for i in 0..a.len() {
-            sum += a[i] * b[i];
-        }
-        sum
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
     }
 }
 
@@ -242,7 +393,6 @@ fn apply_rope_impl(
     sin: &[f32],
     positions: &[u32],
 ) {
-    // data layout: [tokens, heads, head_dim]
     for t in 0..tokens {
         let pos = positions[t] as usize;
         for h in 0..heads {
@@ -259,14 +409,6 @@ fn apply_rope_impl(
     }
 }
 
-/// CPU attention supporting both prefill (q_len > 1) and decode (q_len == 1).
-/// Handles GQA (num_heads != num_kv_heads).
-///
-/// Layout:
-///   Q: [batch, num_heads, q_len, head_dim]
-///   K: [batch, num_kv_heads, kv_len, head_dim]
-///   V: [batch, num_kv_heads, kv_len, head_dim]
-///   out: [batch, num_heads, q_len, head_dim]
 fn cpu_attention(
     q: &[f32],
     k: &[f32],
@@ -288,35 +430,28 @@ fn cpu_attention(
     for b in 0..batch {
         for h in 0..nh {
             let kv_h = h / n_rep;
-
             let q_off = (b * nh + h) * q_len * d;
             let k_off = (b * nkv + kv_h) * kv_len * d;
             let v_off = (b * nkv + kv_h) * kv_len * d;
             let o_off = (b * nh + h) * q_len * d;
 
             for qi in 0..q_len {
-                // Compute scores: Q[qi] · K[ki] for all ki
                 let attend_len = if causal {
                     (pos_offset + qi + 1).min(kv_len)
                 } else {
                     kv_len
                 };
-
-                // Online softmax + weighted V accumulation
                 let mut max_score = f32::NEG_INFINITY;
                 let mut sum_exp = 0.0f32;
                 let mut acc = vec![0.0f32; d];
 
                 for ki in 0..attend_len {
-                    // dot(q[qi], k[ki])
                     let mut dot = 0.0f32;
                     for di in 0..d {
                         dot += q[q_off + qi * d + di] * k[k_off + ki * d + di];
                     }
                     let score = dot * scale;
-
                     if score > max_score {
-                        // Rescale existing accumulator
                         let correction = (max_score - score).exp();
                         for di in 0..d {
                             acc[di] *= correction;
@@ -331,7 +466,6 @@ fn cpu_attention(
                     }
                 }
 
-                // Normalize
                 if sum_exp > 0.0 {
                     let inv = 1.0 / sum_exp;
                     for di in 0..d {

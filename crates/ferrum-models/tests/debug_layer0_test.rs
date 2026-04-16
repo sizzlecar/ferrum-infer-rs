@@ -86,6 +86,7 @@ fn debug_embedding_and_norm() {
     // Runner RMS norm
     let mut runner_normed = vec![0.0f32; h];
     ferrum_kernels::backend::cpu::CpuBackend::rms_norm(
+        &mut (),
         &runner_embed.to_vec(),
         &weights.layers[0].input_ln_w,
         cfg.rms_norm_eps,
@@ -141,6 +142,7 @@ fn debug_embedding_and_norm() {
     let qkv_dim = q_dim + 2 * kv_dim;
     let mut qkv_out = vec![0.0f32; qkv_dim];
     ferrum_kernels::backend::cpu::CpuBackend::gemm(
+        &mut (),
         &runner_normed,
         &weights.layers[0].qkv_proj_w,
         &mut qkv_out,

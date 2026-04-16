@@ -1,28 +1,19 @@
-//! Metal backend using ferrum-attention's MetalPipelines.
-//!
-//! Buffer type: `metal::Buffer` (shared memory = zero-copy on Apple Silicon).
-//! GEMM uses cblas_sgemm on shared buffer contents (no GPU dispatch needed).
-//! Other ops use Metal compute shaders via MetalPipelines.
+//! Metal backend — pipelined command buffer.
+//! Metal ops encode into shared cmd buffer. CPU ops trigger sync first.
 
 use super::{AttnConfig, Backend};
 use ferrum_attention::metal::pipelines::MetalPipelines;
 use ferrum_attention::AttentionParams;
-use metal::{Device, MTLResourceOptions};
-use std::ffi::c_void;
+use metal::Device;
 use std::sync::OnceLock;
 
-/// Lazily initialized Metal state (device + compiled pipelines).
 struct MetalState {
     pipes: MetalPipelines,
 }
-
 static METAL_STATE: OnceLock<MetalState> = OnceLock::new();
-
-fn get_state() -> &'static MetalState {
-    METAL_STATE.get_or_init(|| {
-        let device = Device::system_default().expect("no Metal device");
-        let pipes = MetalPipelines::new(&device);
-        MetalState { pipes }
+fn st() -> &'static MetalState {
+    METAL_STATE.get_or_init(|| MetalState {
+        pipes: MetalPipelines::new(&Device::system_default().unwrap()),
     })
 }
 
@@ -48,10 +39,42 @@ extern "C" {
     );
 }
 
+pub struct MetalContext {
+    cmd: metal::CommandBuffer,
+    dirty: bool, // true if cmd has pending GPU work
+}
+
+impl MetalContext {
+    /// Ensure all pending GPU work is complete before CPU reads buffer contents.
+    fn ensure_synced(&mut self) {
+        if self.dirty {
+            self.cmd.commit();
+            self.cmd.wait_until_completed();
+            self.cmd = st().pipes.queue.new_command_buffer().to_owned();
+            self.dirty = false;
+        }
+    }
+}
+
 impl Backend for MetalBackend {
     type Buffer = metal::Buffer;
+    type Context = MetalContext;
+
+    fn new_context() -> Self::Context {
+        MetalContext {
+            cmd: st().pipes.queue.new_command_buffer().to_owned(),
+            dirty: false,
+        }
+    }
+
+    fn sync(ctx: &mut Self::Context) {
+        ctx.ensure_synced();
+    }
+
+    // ── GPU ops: encode into cmd buffer ──────────────────────────────────
 
     fn gemm(
+        ctx: &mut Self::Context,
         a: &Self::Buffer,
         b: &Self::Buffer,
         out: &mut Self::Buffer,
@@ -59,12 +82,13 @@ impl Backend for MetalBackend {
         n: usize,
         k: usize,
     ) {
-        // Apple Silicon shared memory: cblas directly on buffer contents (zero-copy)
+        // cblas on shared memory — sync pending GPU ops first
+        ctx.ensure_synced();
         unsafe {
             cblas_sgemm(
                 101,
                 111,
-                112, // RowMajor, NoTrans, Trans
+                112,
                 m as i32,
                 n as i32,
                 k as i32,
@@ -81,21 +105,20 @@ impl Backend for MetalBackend {
     }
 
     fn rms_norm(
+        ctx: &mut Self::Context,
         x: &Self::Buffer,
         w: &Self::Buffer,
         eps: f32,
         out: &mut Self::Buffer,
         tokens: usize,
-        _dim: usize,
+        dim: usize,
     ) {
-        let st = get_state();
-        let cmd = st.pipes.queue.new_command_buffer();
-        st.pipes.rms_norm(cmd, x, w, out, tokens, _dim, eps);
-        cmd.commit();
-        cmd.wait_until_completed();
+        st().pipes.rms_norm(&ctx.cmd, x, w, out, tokens, dim, eps);
+        ctx.dirty = true;
     }
 
     fn fused_add_rms_norm(
+        ctx: &mut Self::Context,
         residual: &mut Self::Buffer,
         x: &Self::Buffer,
         w: &Self::Buffer,
@@ -104,86 +127,39 @@ impl Backend for MetalBackend {
         tokens: usize,
         dim: usize,
     ) {
-        let st = get_state();
-        let cmd = st.pipes.queue.new_command_buffer();
-        // Use fused_residual_norm: residual = residual + x, out = rms_norm(residual) * w
-        let enc = cmd.new_compute_command_encoder();
-        st.pipes.fused_residual_norm_enc(
-            enc, residual, x, None, // no layer_scale
-            w, residual, // out_res = updated residual (in-place)
-            out,      // out_norm
-            tokens, dim, eps, 0, // scale_len unused
+        let enc = ctx.cmd.new_compute_command_encoder();
+        st().pipes.fused_residual_norm_enc(
+            enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
         );
         enc.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
-    }
-
-    fn rope(
-        q: &mut Self::Buffer,
-        k: &mut Self::Buffer,
-        cos: &Self::Buffer,
-        sin: &Self::Buffer,
-        positions: &[u32],
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    ) {
-        // Metal RoPE is fused into qk_norm_rope_transpose, which expects a different layout.
-        // For now, fall back to CPU RoPE on shared buffer contents (zero-copy).
-        let tokens = positions.len();
-        let half = head_dim / 2;
-        let cos_vec = Self::to_vec(cos, cos.length() as usize / 4);
-        let sin_vec = Self::to_vec(sin, sin.length() as usize / 4);
-
-        unsafe {
-            let q_ptr = q.contents() as *mut f32;
-            let q_slice = std::slice::from_raw_parts_mut(q_ptr, tokens * num_heads * head_dim);
-            apply_rope_cpu(
-                q_slice, tokens, num_heads, head_dim, half, &cos_vec, &sin_vec, positions,
-            );
-
-            let k_ptr = k.contents() as *mut f32;
-            let k_slice = std::slice::from_raw_parts_mut(k_ptr, tokens * num_kv_heads * head_dim);
-            apply_rope_cpu(
-                k_slice,
-                tokens,
-                num_kv_heads,
-                head_dim,
-                half,
-                &cos_vec,
-                &sin_vec,
-                positions,
-            );
-        }
+        ctx.dirty = true;
     }
 
     fn decode_attention(
+        ctx: &mut Self::Context,
         q: &Self::Buffer,
-        k_cache: &Self::Buffer,
-        v_cache: &Self::Buffer,
+        kc: &Self::Buffer,
+        vc: &Self::Buffer,
         out: &mut Self::Buffer,
         kv_len: usize,
         cfg: &AttnConfig,
     ) {
-        let st = get_state();
-        let params = AttentionParams {
+        let p = AttentionParams {
             batch: 1,
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             q_len: 1,
             kv_len,
             head_dim: cfg.head_dim,
-            causal: false, // decode: single token, no mask needed
+            causal: false,
             pos_offset: 0,
         };
-        let cmd = st.pipes.queue.new_command_buffer();
-        st.pipes.flash_attn(cmd, q, k_cache, v_cache, out, &params);
-        cmd.commit();
-        cmd.wait_until_completed();
+        st().pipes.flash_attn_v2(&ctx.cmd, q, kc, vc, out, &p, 0);
+        ctx.dirty = true;
     }
 
     fn flash_attention(
+        ctx: &mut Self::Context,
         q: &Self::Buffer,
         k: &Self::Buffer,
         v: &Self::Buffer,
@@ -194,8 +170,7 @@ impl Backend for MetalBackend {
         pos_offset: usize,
         cfg: &AttnConfig,
     ) {
-        let st = get_state();
-        let params = AttentionParams {
+        let p = AttentionParams {
             batch,
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
@@ -205,89 +180,313 @@ impl Backend for MetalBackend {
             causal: cfg.causal,
             pos_offset,
         };
-        let cmd = st.pipes.queue.new_command_buffer();
-        st.pipes.flash_attn(cmd, q, k, v, out, &params);
-        cmd.commit();
-        cmd.wait_until_completed();
+        st().pipes.flash_attn_v2(&ctx.cmd, q, k, v, out, &p, 0);
+        ctx.dirty = true;
     }
 
-    fn silu_mul(gate: &Self::Buffer, up: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
-        let st = get_state();
-        let cmd = st.pipes.queue.new_command_buffer();
-        st.pipes.silu_mul(cmd, gate, up, out, len);
-        cmd.commit();
-        cmd.wait_until_completed();
+    fn silu_mul(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
+        let enc = ctx.cmd.new_compute_command_encoder();
+        st().pipes.silu_mul_enc(enc, gate, up, out, len);
+        enc.end_encoding();
+        ctx.dirty = true;
     }
 
-    fn add(a: &Self::Buffer, b: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
-        let st = get_state();
-        let cmd = st.pipes.queue.new_command_buffer();
-        st.pipes.add(cmd, a, b, out, len);
-        cmd.commit();
-        cmd.wait_until_completed();
+    fn add(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        b: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
+        let enc = ctx.cmd.new_compute_command_encoder();
+        st().pipes.add_enc(enc, a, b, out, len);
+        enc.end_encoding();
+        ctx.dirty = true;
     }
 
-    fn copy(src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
-        let bytes = len * 4;
+    fn copy(_ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.contents() as *const u8,
                 dst.contents() as *mut u8,
-                bytes,
+                len * 4,
             );
         }
     }
 
-    fn embedding_lookup(table: &Self::Buffer, ids: &[u32], out: &mut Self::Buffer, dim: usize) {
-        // CPU gather on shared memory (zero-copy)
-        let tbl = unsafe {
-            std::slice::from_raw_parts(table.contents() as *const f32, table.length() as usize / 4)
-        };
-        let o =
-            unsafe { std::slice::from_raw_parts_mut(out.contents() as *mut f32, ids.len() * dim) };
-        for (i, &id) in ids.iter().enumerate() {
-            let src = id as usize * dim;
-            o[i * dim..(i + 1) * dim].copy_from_slice(&tbl[src..src + dim]);
+    fn embedding_lookup(
+        _ctx: &mut Self::Context,
+        table: &Self::Buffer,
+        ids: &[u32],
+        out: &mut Self::Buffer,
+        dim: usize,
+    ) {
+        unsafe {
+            let t = std::slice::from_raw_parts(
+                table.contents() as *const f32,
+                table.length() as usize / 4,
+            );
+            let o = std::slice::from_raw_parts_mut(out.contents() as *mut f32, ids.len() * dim);
+            for (i, &id) in ids.iter().enumerate() {
+                let s = id as usize * dim;
+                o[i * dim..(i + 1) * dim].copy_from_slice(&t[s..s + dim]);
+            }
+        }
+    }
+
+    // ── CPU ops on shared memory: sync first ─────────────────────────────
+
+    fn split_qkv(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q: &mut Self::Buffer,
+        k: &mut Self::Buffer,
+        v: &mut Self::Buffer,
+        tokens: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) {
+        ctx.ensure_synced();
+        let qd = q_dim + 2 * kv_dim;
+        unsafe {
+            let s = std::slice::from_raw_parts(qkv.contents() as *const f32, tokens * qd);
+            let qo = std::slice::from_raw_parts_mut(q.contents() as *mut f32, tokens * q_dim);
+            let ko = std::slice::from_raw_parts_mut(k.contents() as *mut f32, tokens * kv_dim);
+            let vo = std::slice::from_raw_parts_mut(v.contents() as *mut f32, tokens * kv_dim);
+            for t in 0..tokens {
+                let b = t * qd;
+                qo[t * q_dim..(t + 1) * q_dim].copy_from_slice(&s[b..b + q_dim]);
+                ko[t * kv_dim..(t + 1) * kv_dim].copy_from_slice(&s[b + q_dim..b + q_dim + kv_dim]);
+                vo[t * kv_dim..(t + 1) * kv_dim].copy_from_slice(&s[b + q_dim + kv_dim..b + qd]);
+            }
+        }
+    }
+
+    fn fused_silu_mul_split(
+        ctx: &mut Self::Context,
+        gu: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        ctx.ensure_synced();
+        unsafe {
+            let s = std::slice::from_raw_parts(gu.contents() as *const f32, tokens * 2 * im);
+            let d = std::slice::from_raw_parts_mut(out.contents() as *mut f32, tokens * im);
+            for t in 0..tokens {
+                for i in 0..im {
+                    let g = s[t * 2 * im + i];
+                    let u = s[t * 2 * im + im + i];
+                    d[t * im + i] = (g / (1.0 + (-g).exp())) * u;
+                }
+            }
+        }
+    }
+
+    fn qk_norm(
+        ctx: &mut Self::Context,
+        data: &mut Self::Buffer,
+        w: &Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        hd: usize,
+        eps: f32,
+    ) {
+        // No sync needed — called right after split_qkv which already synced
+        unsafe {
+            let d =
+                std::slice::from_raw_parts_mut(data.contents() as *mut f32, tokens * heads * hd);
+            let wv = std::slice::from_raw_parts(w.contents() as *const f32, hd);
+            for t in 0..tokens {
+                for h in 0..heads {
+                    let o = (t * heads + h) * hd;
+                    let mut ss = 0.0f32;
+                    for i in 0..hd {
+                        ss += d[o + i] * d[o + i];
+                    }
+                    let inv = 1.0 / (ss / hd as f32 + eps).sqrt();
+                    for i in 0..hd {
+                        d[o + i] *= inv * wv[i];
+                    }
+                }
+            }
+        }
+    }
+
+    fn rope(
+        ctx: &mut Self::Context,
+        q: &mut Self::Buffer,
+        k: &mut Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        positions: &[u32],
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+    ) {
+        // No sync needed — called after qk_norm which runs after split_qkv sync
+        let tokens = positions.len();
+        let half = hd / 2;
+        let cv = Self::to_vec(cos, cos.length() as usize / 4);
+        let sv = Self::to_vec(sin, sin.length() as usize / 4);
+        unsafe {
+            rope_cpu(
+                std::slice::from_raw_parts_mut(q.contents() as *mut f32, tokens * nh * hd),
+                tokens,
+                nh,
+                hd,
+                half,
+                &cv,
+                &sv,
+                positions,
+            );
+            rope_cpu(
+                std::slice::from_raw_parts_mut(k.contents() as *mut f32, tokens * nkv * hd),
+                tokens,
+                nkv,
+                hd,
+                half,
+                &cv,
+                &sv,
+                positions,
+            );
+        }
+    }
+
+    fn kv_cache_append(
+        ctx: &mut Self::Context,
+        ck: &mut Self::Buffer,
+        cv: &mut Self::Buffer,
+        cl: usize,
+        nk: &Self::Buffer,
+        nv: &Self::Buffer,
+        nt: usize,
+        nkv: usize,
+        hd: usize,
+    ) -> (Self::Buffer, Self::Buffer) {
+        // No sync needed — called after rope, data already on CPU
+        let nl = cl + nt;
+        let fk = st().pipes.buffer_empty(nkv * nl * hd);
+        let fv = st().pipes.buffer_empty(nkv * nl * hd);
+        unsafe {
+            let ok = std::slice::from_raw_parts(ck.contents() as *const f32, nkv * cl * hd);
+            let ov = std::slice::from_raw_parts(cv.contents() as *const f32, nkv * cl * hd);
+            let nkd = std::slice::from_raw_parts(nk.contents() as *const f32, nt * nkv * hd);
+            let nvd = std::slice::from_raw_parts(nv.contents() as *const f32, nt * nkv * hd);
+            let fko = std::slice::from_raw_parts_mut(fk.contents() as *mut f32, nkv * nl * hd);
+            let fvo = std::slice::from_raw_parts_mut(fv.contents() as *mut f32, nkv * nl * hd);
+            for h in 0..nkv {
+                if cl > 0 {
+                    fko[h * nl * hd..h * nl * hd + cl * hd]
+                        .copy_from_slice(&ok[h * cl * hd..(h + 1) * cl * hd]);
+                    fvo[h * nl * hd..h * nl * hd + cl * hd]
+                        .copy_from_slice(&ov[h * cl * hd..(h + 1) * cl * hd]);
+                }
+                for t in 0..nt {
+                    let s = t * nkv * hd + h * hd;
+                    let d = h * nl * hd + (cl + t) * hd;
+                    fko[d..d + hd].copy_from_slice(&nkd[s..s + hd]);
+                    fvo[d..d + hd].copy_from_slice(&nvd[s..s + hd]);
+                }
+            }
+        }
+        (fk, fv)
+    }
+
+    fn transpose_token_to_head(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+    ) {
+        // Sync if dirty (prefill path: src was written by split_qkv after sync, so not dirty)
+        ctx.ensure_synced();
+        unsafe {
+            let s = std::slice::from_raw_parts(src.contents() as *const f32, tokens * heads * dim);
+            let d =
+                std::slice::from_raw_parts_mut(dst.contents() as *mut f32, heads * tokens * dim);
+            for t in 0..tokens {
+                for h in 0..heads {
+                    d[(h * tokens + t) * dim..(h * tokens + t) * dim + dim]
+                        .copy_from_slice(&s[(t * heads + h) * dim..(t * heads + h) * dim + dim]);
+                }
+            }
+        }
+    }
+
+    fn transpose_head_to_token(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+    ) {
+        ctx.ensure_synced();
+        unsafe {
+            let s = std::slice::from_raw_parts(src.contents() as *const f32, heads * tokens * dim);
+            let d =
+                std::slice::from_raw_parts_mut(dst.contents() as *mut f32, tokens * heads * dim);
+            for h in 0..heads {
+                for t in 0..tokens {
+                    d[(t * heads + h) * dim..(t * heads + h) * dim + dim]
+                        .copy_from_slice(&s[(h * tokens + t) * dim..(h * tokens + t) * dim + dim]);
+                }
+            }
+        }
+    }
+
+    fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
+        ctx.ensure_synced();
+        unsafe {
+            let rv = std::slice::from_raw_parts_mut(r.contents() as *mut f32, len);
+            let xv = std::slice::from_raw_parts(x.contents() as *const f32, len);
+            for i in 0..len {
+                rv[i] += xv[i];
+            }
         }
     }
 
     fn alloc(len: usize) -> Self::Buffer {
-        let st = get_state();
-        st.pipes.buffer_empty(len)
+        st().pipes.buffer_empty(len)
     }
-
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
         MetalPipelines::read_buffer(buf, len)
     }
-
     fn from_slice(data: &[f32]) -> Self::Buffer {
-        let st = get_state();
-        st.pipes.buffer_from_data(data)
+        st().pipes.buffer_from_data(data)
     }
 }
 
-// CPU RoPE fallback on shared memory contents
-fn apply_rope_cpu(
+fn rope_cpu(
     data: &mut [f32],
     tokens: usize,
     heads: usize,
-    head_dim: usize,
+    hd: usize,
     half: usize,
     cos: &[f32],
     sin: &[f32],
-    positions: &[u32],
+    pos: &[u32],
 ) {
     for t in 0..tokens {
-        let pos = positions[t] as usize;
+        let p = pos[t] as usize;
         for h in 0..heads {
-            let base = t * heads * head_dim + h * head_dim;
+            let b = t * heads * hd + h * hd;
             for i in 0..half {
-                let c = cos[pos * half + i];
-                let s = sin[pos * half + i];
-                let x0 = data[base + i];
-                let x1 = data[base + half + i];
-                data[base + i] = x0 * c - x1 * s;
-                data[base + half + i] = x1 * c + x0 * s;
+                let c = cos[p * half + i];
+                let s = sin[p * half + i];
+                let x0 = data[b + i];
+                let x1 = data[b + half + i];
+                data[b + i] = x0 * c - x1 * s;
+                data[b + half + i] = x1 * c + x0 * s;
             }
         }
     }

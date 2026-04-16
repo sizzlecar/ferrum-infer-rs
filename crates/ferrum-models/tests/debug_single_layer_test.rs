@@ -87,7 +87,7 @@ fn trace_layer0_step_by_step() {
     // Step 1: RMS norm
     let input_ln_vec: Vec<f32> = input_ln_w.to_vec1().unwrap();
     let mut norm_out = vec![0.0f32; h];
-    CpuBackend::rms_norm(&embed_vec, &input_ln_vec, eps, &mut norm_out, 1, h);
+    CpuBackend::rms_norm(&mut (), &embed_vec, &input_ln_vec, eps, &mut norm_out, 1, h);
 
     // Step 2: Q, K, V projections (separate, like Candle)
     let normed_t = Tensor::new(&norm_out[..], &Device::Cpu)
@@ -167,7 +167,15 @@ fn trace_layer0_step_by_step() {
 
     // Q: [nh, hd], K: [nkv, 1, hd] → reshape for cpu_attention [1, nh, 1, hd]
     let mut attn_out = vec![0.0f32; q_dim];
-    CpuBackend::decode_attention(&cq_normed, &ck_normed, &cv, &mut attn_out, 1, &attn_cfg);
+    CpuBackend::decode_attention(
+        &mut (),
+        &cq_normed,
+        &ck_normed,
+        &cv,
+        &mut attn_out,
+        1,
+        &attn_cfg,
+    );
     eprintln!("Attn out[0..8]: {:?}", &attn_out[..8]);
     // With 1 KV token, attention output should be just V (broadcast to all Q heads)
     eprintln!("V[0..8] (expected for 1-token attention): {:?}", &cv[..8]);
@@ -215,7 +223,7 @@ fn trace_layer0_step_by_step() {
 
     // Post-attn norm
     let mut post_norm = vec![0.0f32; h];
-    CpuBackend::rms_norm(&residual, &post_ln_vec, eps, &mut post_norm, 1, h);
+    CpuBackend::rms_norm(&mut (), &residual, &post_ln_vec, eps, &mut post_norm, 1, h);
 
     // MLP
     let gate_w = vb
@@ -283,7 +291,7 @@ fn trace_layer0_step_by_step() {
         .unwrap();
     let fnw: Vec<f32> = final_norm_w.to_vec1().unwrap();
     let mut final_normed = vec![0.0f32; h];
-    CpuBackend::rms_norm(&final_residual, &fnw, eps, &mut final_normed, 1, h);
+    CpuBackend::rms_norm(&mut (), &final_residual, &fnw, eps, &mut final_normed, 1, h);
 
     // LM head
     let lm_head = vb

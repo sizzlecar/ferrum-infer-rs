@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 
 use super::layer_forward::layer_forward;
-use super::{Backend, KvCache, LayerScratch, ModelWeights, RopeConfig, TransformerConfig};
+use super::{
+    Backend, KvCache, LayerScratch, LayerWeights, ModelWeights, RopeConfig, TransformerConfig,
+};
 
 /// Pre-allocated scratch buffers sized for max batch/tokens.
 struct RunnerBuffers<B: Backend> {
@@ -115,17 +117,22 @@ impl<B: Backend> ModelRunner<B> {
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
+        let mut ctx = B::new_context();
 
-        // Embedding lookup
-        B::embedding_lookup(&self.weights.embed, tokens, &mut self.buffers.residual, h);
+        B::embedding_lookup(
+            &mut ctx,
+            &self.weights.embed,
+            tokens,
+            &mut self.buffers.residual,
+            h,
+        );
 
-        // Positions: [0, 1, 2, ..., seq_len-1]
         let positions: Vec<u32> = (0..seq_len as u32).collect();
 
-        // N × layer_forward
         let kv_caches = self.kv_caches.get_mut(cache_id).unwrap();
         for li in 0..self.cfg.num_layers {
             layer_forward::<B>(
+                &mut ctx,
                 &self.cfg,
                 &self.weights.layers[li],
                 &mut kv_caches[li],
@@ -138,8 +145,8 @@ impl<B: Backend> ModelRunner<B> {
             );
         }
 
-        // Final RMS norm
         B::rms_norm(
+            &mut ctx,
             &self.buffers.residual,
             &self.weights.final_norm_w,
             self.cfg.rms_norm_eps,
@@ -148,12 +155,14 @@ impl<B: Backend> ModelRunner<B> {
             h,
         );
 
-        // LM head: take last token only → [1, hidden] @ [vocab, hidden]^T → [1, vocab]
-        // Extract last token's hidden state
+        // Sync before reading results back to CPU
+        B::sync(&mut ctx);
+
         let all_hidden = B::to_vec(&self.buffers.norm_out, seq_len * h);
         let last_hidden = B::from_slice(&all_hidden[(seq_len - 1) * h..seq_len * h]);
         let mut logits_buf = B::alloc(vocab);
         B::gemm(
+            &mut ctx,
             &last_hidden,
             &self.weights.lm_head_w,
             &mut logits_buf,
@@ -161,6 +170,7 @@ impl<B: Backend> ModelRunner<B> {
             vocab,
             h,
         );
+        B::sync(&mut ctx);
 
         B::to_vec(&logits_buf, vocab)
     }
@@ -174,16 +184,22 @@ impl<B: Backend> ModelRunner<B> {
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
+        let mut ctx = B::new_context();
 
-        // Embedding lookup (1 token)
-        B::embedding_lookup(&self.weights.embed, &[token], &mut self.buffers.residual, h);
+        B::embedding_lookup(
+            &mut ctx,
+            &self.weights.embed,
+            &[token],
+            &mut self.buffers.residual,
+            h,
+        );
 
         let positions = [pos];
 
-        // N × layer_forward
         let kv_caches = self.kv_caches.get_mut(cache_id).unwrap();
         for li in 0..self.cfg.num_layers {
             layer_forward::<B>(
+                &mut ctx,
                 &self.cfg,
                 &self.weights.layers[li],
                 &mut kv_caches[li],
@@ -196,8 +212,8 @@ impl<B: Backend> ModelRunner<B> {
             );
         }
 
-        // Final norm + LM head
         B::rms_norm(
+            &mut ctx,
             &self.buffers.residual,
             &self.weights.final_norm_w,
             self.cfg.rms_norm_eps,
@@ -206,6 +222,7 @@ impl<B: Backend> ModelRunner<B> {
             h,
         );
         B::gemm(
+            &mut ctx,
             &self.buffers.norm_out,
             &self.weights.lm_head_w,
             &mut self.buffers.logits,
@@ -213,6 +230,7 @@ impl<B: Backend> ModelRunner<B> {
             vocab,
             h,
         );
+        B::sync(&mut ctx);
 
         B::to_vec(&self.buffers.logits, vocab)
     }
@@ -234,6 +252,33 @@ impl<B: Backend> ModelRunner<B> {
 }
 
 // ── RoPE table ───────────────────────────────────────────────────────────
+
+/// Convert CPU weights to Metal weights (f32 Vec → Metal shared buffer).
+#[cfg(feature = "metal")]
+pub fn convert_weights_to_metal(
+    cpu: &ModelWeights<super::cpu::CpuBackend>,
+) -> ModelWeights<super::metal::MetalBackend> {
+    use super::metal::MetalBackend;
+    ModelWeights {
+        embed: MetalBackend::from_slice(&cpu.embed),
+        layers: cpu
+            .layers
+            .iter()
+            .map(|l| LayerWeights {
+                input_ln_w: MetalBackend::from_slice(&l.input_ln_w),
+                qkv_proj_w: MetalBackend::from_slice(&l.qkv_proj_w),
+                o_proj_w: MetalBackend::from_slice(&l.o_proj_w),
+                post_ln_w: MetalBackend::from_slice(&l.post_ln_w),
+                gate_up_proj_w: MetalBackend::from_slice(&l.gate_up_proj_w),
+                down_proj_w: MetalBackend::from_slice(&l.down_proj_w),
+                q_norm_w: l.q_norm_w.as_ref().map(|w| MetalBackend::from_slice(w)),
+                k_norm_w: l.k_norm_w.as_ref().map(|w| MetalBackend::from_slice(w)),
+            })
+            .collect(),
+        final_norm_w: MetalBackend::from_slice(&cpu.final_norm_w),
+        lm_head_w: MetalBackend::from_slice(&cpu.lm_head_w),
+    }
+}
 
 fn alloc_buffers<B: Backend>(
     tokens: usize,

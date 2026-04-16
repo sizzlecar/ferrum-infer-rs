@@ -46,12 +46,14 @@ fn test_metal_gemm_vs_cpu() {
     let b_data = pseudo_random(2, n * k);
 
     let mut cpu_out = CpuBackend::alloc(m * n);
-    CpuBackend::gemm(&a_data, &b_data, &mut cpu_out, m, n, k);
+    CpuBackend::gemm(&mut (), &a_data, &b_data, &mut cpu_out, m, n, k);
 
     let a_metal = MetalBackend::from_slice(&a_data);
     let b_metal = MetalBackend::from_slice(&b_data);
     let mut metal_out = MetalBackend::alloc(m * n);
-    MetalBackend::gemm(&a_metal, &b_metal, &mut metal_out, m, n, k);
+    let mut mctx = MetalBackend::new_context();
+    MetalBackend::gemm(&mut mctx, &a_metal, &b_metal, &mut metal_out, m, n, k);
+    MetalBackend::sync(&mut mctx);
 
     let metal_vec = MetalBackend::to_vec(&metal_out, m * n);
     assert_close(&cpu_out, &metal_vec, 1e-4, "gemm");
@@ -68,12 +70,22 @@ fn test_metal_rms_norm_vs_cpu() {
     let eps = 1e-5;
 
     let mut cpu_out = CpuBackend::alloc(tokens * dim);
-    CpuBackend::rms_norm(&x_data, &w_data, eps, &mut cpu_out, tokens, dim);
+    CpuBackend::rms_norm(&mut (), &x_data, &w_data, eps, &mut cpu_out, tokens, dim);
 
     let x_metal = MetalBackend::from_slice(&x_data);
     let w_metal = MetalBackend::from_slice(&w_data);
     let mut metal_out = MetalBackend::alloc(tokens * dim);
-    MetalBackend::rms_norm(&x_metal, &w_metal, eps, &mut metal_out, tokens, dim);
+    let mut mctx = MetalBackend::new_context();
+    MetalBackend::rms_norm(
+        &mut mctx,
+        &x_metal,
+        &w_metal,
+        eps,
+        &mut metal_out,
+        tokens,
+        dim,
+    );
+    MetalBackend::sync(&mut mctx);
 
     let metal_vec = MetalBackend::to_vec(&metal_out, tokens * dim);
     assert_close(&cpu_out, &metal_vec, 1e-4, "rms_norm");
@@ -88,12 +100,14 @@ fn test_metal_silu_mul_vs_cpu() {
     let up_data = pseudo_random(21, len);
 
     let mut cpu_out = CpuBackend::alloc(len);
-    CpuBackend::silu_mul(&gate_data, &up_data, &mut cpu_out, len);
+    CpuBackend::silu_mul(&mut (), &gate_data, &up_data, &mut cpu_out, len);
 
     let gate_metal = MetalBackend::from_slice(&gate_data);
     let up_metal = MetalBackend::from_slice(&up_data);
     let mut metal_out = MetalBackend::alloc(len);
-    MetalBackend::silu_mul(&gate_metal, &up_metal, &mut metal_out, len);
+    let mut mctx = MetalBackend::new_context();
+    MetalBackend::silu_mul(&mut mctx, &gate_metal, &up_metal, &mut metal_out, len);
+    MetalBackend::sync(&mut mctx);
 
     let metal_vec = MetalBackend::to_vec(&metal_out, len);
     assert_close(&cpu_out, &metal_vec, 1e-5, "silu_mul");
@@ -108,12 +122,14 @@ fn test_metal_add_vs_cpu() {
     let b_data = pseudo_random(31, len);
 
     let mut cpu_out = CpuBackend::alloc(len);
-    CpuBackend::add(&a_data, &b_data, &mut cpu_out, len);
+    CpuBackend::add(&mut (), &a_data, &b_data, &mut cpu_out, len);
 
     let a_metal = MetalBackend::from_slice(&a_data);
     let b_metal = MetalBackend::from_slice(&b_data);
     let mut metal_out = MetalBackend::alloc(len);
-    MetalBackend::add(&a_metal, &b_metal, &mut metal_out, len);
+    let mut mctx = MetalBackend::new_context();
+    MetalBackend::add(&mut mctx, &a_metal, &b_metal, &mut metal_out, len);
+    MetalBackend::sync(&mut mctx);
 
     let metal_vec = MetalBackend::to_vec(&metal_out, len);
     assert_close(&cpu_out, &metal_vec, 1e-6, "add");
@@ -146,6 +162,7 @@ fn test_metal_flash_attention_vs_cpu() {
 
     let mut cpu_out = CpuBackend::alloc(size);
     CpuBackend::flash_attention(
+        &mut (),
         &q_data,
         &k_data,
         &v_data,
@@ -162,6 +179,7 @@ fn test_metal_flash_attention_vs_cpu() {
     let v_metal = MetalBackend::from_slice(&v_data);
     let mut metal_out = MetalBackend::alloc(size);
     MetalBackend::flash_attention(
+        &mut MetalBackend::new_context(),
         &q_metal,
         &k_metal,
         &v_metal,
@@ -201,13 +219,29 @@ fn test_metal_decode_attention_vs_cpu() {
     };
 
     let mut cpu_out = CpuBackend::alloc(nh * hd);
-    CpuBackend::decode_attention(&q_data, &k_data, &v_data, &mut cpu_out, kv_len, &cfg);
+    CpuBackend::decode_attention(
+        &mut (),
+        &q_data,
+        &k_data,
+        &v_data,
+        &mut cpu_out,
+        kv_len,
+        &cfg,
+    );
 
     let q_metal = MetalBackend::from_slice(&q_data);
     let k_metal = MetalBackend::from_slice(&k_data);
     let v_metal = MetalBackend::from_slice(&v_data);
     let mut metal_out = MetalBackend::alloc(nh * hd);
-    MetalBackend::decode_attention(&q_metal, &k_metal, &v_metal, &mut metal_out, kv_len, &cfg);
+    MetalBackend::decode_attention(
+        &mut MetalBackend::new_context(),
+        &q_metal,
+        &k_metal,
+        &v_metal,
+        &mut metal_out,
+        kv_len,
+        &cfg,
+    );
 
     let metal_vec = MetalBackend::to_vec(&metal_out, nh * hd);
     assert_close(&cpu_out, &metal_vec, 1e-3, "decode_attention");
@@ -223,11 +257,17 @@ fn test_metal_embedding_vs_cpu() {
     let ids = vec![3u32, 7, 1, 0];
 
     let mut cpu_out = CpuBackend::alloc(ids.len() * dim);
-    CpuBackend::embedding_lookup(&table_data, &ids, &mut cpu_out, dim);
+    CpuBackend::embedding_lookup(&mut (), &table_data, &ids, &mut cpu_out, dim);
 
     let table_metal = MetalBackend::from_slice(&table_data);
     let mut metal_out = MetalBackend::alloc(ids.len() * dim);
-    MetalBackend::embedding_lookup(&table_metal, &ids, &mut metal_out, dim);
+    MetalBackend::embedding_lookup(
+        &mut MetalBackend::new_context(),
+        &table_metal,
+        &ids,
+        &mut metal_out,
+        dim,
+    );
 
     let metal_vec = MetalBackend::to_vec(&metal_out, ids.len() * dim);
     assert_close(&cpu_out, &metal_vec, 0.0, "embedding");

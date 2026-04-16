@@ -52,7 +52,7 @@ fn test_gemm_identity() {
         0.0, 0.0, 1.0, // row 2
     ];
     let mut out = vec![0.0f32; 6];
-    CpuBackend::gemm(&a, &b, &mut out, 2, 3, 3);
+    CpuBackend::gemm(&mut (), &a, &b, &mut out, 2, 3, 3);
     assert_close(&out, &a, 1e-6, "gemm identity");
 }
 
@@ -62,7 +62,7 @@ fn test_gemm_small() {
     let a = vec![1.0, 2.0];
     let b = vec![3.0, 4.0];
     let mut out = vec![0.0f32; 1];
-    CpuBackend::gemm(&a, &b, &mut out, 1, 1, 2);
+    CpuBackend::gemm(&mut (), &a, &b, &mut out, 1, 1, 2);
     assert_close(&out, &[11.0], 1e-5, "gemm small");
 }
 
@@ -72,7 +72,7 @@ fn test_gemm_rectangular() {
     let a = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // 2x3
     let b = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // 2x3
     let mut out = vec![0.0f32; 4];
-    CpuBackend::gemm(&a, &b, &mut out, 2, 2, 3);
+    CpuBackend::gemm(&mut (), &a, &b, &mut out, 2, 2, 3);
     // C = [[1,0],[0,1]]
     assert_close(&out, &[1.0, 0.0, 0.0, 1.0], 1e-6, "gemm rectangular");
 }
@@ -86,7 +86,7 @@ fn test_rms_norm_ones() {
     let x = vec![1.0; 4];
     let w = vec![1.0; 4];
     let mut out = vec![0.0f32; 4];
-    CpuBackend::rms_norm(&x, &w, 0.0, &mut out, 1, 4);
+    CpuBackend::rms_norm(&mut (), &x, &w, 0.0, &mut out, 1, 4);
     assert_close(&out, &[1.0, 1.0, 1.0, 1.0], 1e-6, "rms_norm ones");
 }
 
@@ -97,7 +97,7 @@ fn test_rms_norm_scale() {
     let x = vec![2.0, 2.0];
     let w = vec![0.5, 0.5];
     let mut out = vec![0.0f32; 2];
-    CpuBackend::rms_norm(&x, &w, 0.0, &mut out, 1, 2);
+    CpuBackend::rms_norm(&mut (), &x, &w, 0.0, &mut out, 1, 2);
     assert_close(&out, &[0.5, 0.5], 1e-5, "rms_norm scale");
 }
 
@@ -106,7 +106,7 @@ fn test_rms_norm_multi_token() {
     let x = vec![1.0, 0.0, 0.0, 1.0]; // 2 tokens, dim=2
     let w = vec![1.0, 1.0];
     let mut out = vec![0.0f32; 4];
-    CpuBackend::rms_norm(&x, &w, 1e-6, &mut out, 2, 2);
+    CpuBackend::rms_norm(&mut (), &x, &w, 1e-6, &mut out, 2, 2);
     // Each token normalized independently
     // Token 0: x=[1,0], sum_sq=1, mean_sq=0.5, rms=sqrt(0.5+eps), inv=1/rms
     // Token 1: x=[0,1], same
@@ -122,7 +122,7 @@ fn test_fused_add_rms_norm() {
     let x = vec![1.0, 1.0, 1.0, 1.0];
     let w = vec![1.0; 4];
     let mut out = vec![0.0f32; 4];
-    CpuBackend::fused_add_rms_norm(&mut residual, &x, &w, 0.0, &mut out, 1, 4);
+    CpuBackend::fused_add_rms_norm(&mut (), &mut residual, &x, &w, 0.0, &mut out, 1, 4);
     // residual = [2,2,2,2], rms = 2, out = [2/2, ...] = [1,1,1,1]
     assert_close(&residual, &[2.0; 4], 1e-6, "fused residual");
     assert_close(&out, &[1.0; 4], 1e-6, "fused norm out");
@@ -140,7 +140,17 @@ fn test_rope_position_zero() {
     let mut q = vec![1.0, 2.0, 3.0, 4.0]; // 1 token, 1 head, dim=4
     let mut k = vec![5.0, 6.0, 7.0, 8.0];
     let positions = vec![0u32];
-    CpuBackend::rope(&mut q, &mut k, &cos, &sin, &positions, 1, 1, head_dim);
+    CpuBackend::rope(
+        &mut (),
+        &mut q,
+        &mut k,
+        &cos,
+        &sin,
+        &positions,
+        1,
+        1,
+        head_dim,
+    );
     assert_close(&q, &[1.0, 2.0, 3.0, 4.0], 1e-6, "rope q pos0");
     assert_close(&k, &[5.0, 6.0, 7.0, 8.0], 1e-6, "rope k pos0");
 }
@@ -156,7 +166,7 @@ fn test_rope_rotation() {
     let mut q = vec![1.0, 0.0]; // 1 token, 1 head, dim=2
     let mut k = vec![0.0; 2];
     let positions = vec![1u32];
-    CpuBackend::rope(&mut q, &mut k, &cos, &sin, &positions, 1, 1, 2);
+    CpuBackend::rope(&mut (), &mut q, &mut k, &cos, &sin, &positions, 1, 1, 2);
     // q[0] = 1*cos - 0*sin = cos, q[1] = 0*cos + 1*sin = sin
     assert_close(&q, &[c, s], 1e-5, "rope rotation");
 }
@@ -168,7 +178,7 @@ fn test_silu_mul() {
     let gate = vec![0.0, 1.0, -1.0, 2.0];
     let up = vec![1.0, 1.0, 1.0, 1.0];
     let mut out = vec![0.0f32; 4];
-    CpuBackend::silu_mul(&gate, &up, &mut out, 4);
+    CpuBackend::silu_mul(&mut (), &gate, &up, &mut out, 4);
 
     // silu(0) = 0, silu(1) = 1/(1+e^-1) ≈ 0.7311, silu(-1) = -1/(1+e^1) ≈ -0.2689
     assert!((out[0]).abs() < 1e-6, "silu(0)={}", out[0]);
@@ -192,7 +202,7 @@ fn test_decode_attention_single_kv() {
         causal: false,
         scale: 1.0 / (2.0f32).sqrt(),
     };
-    CpuBackend::decode_attention(&q, &k, &v, &mut out, 1, &cfg);
+    CpuBackend::decode_attention(&mut (), &q, &k, &v, &mut out, 1, &cfg);
     assert_close(&out, &[3.0, 7.0], 1e-5, "decode attn single kv");
 }
 
@@ -210,7 +220,7 @@ fn test_decode_attention_gqa() {
         causal: false,
         scale: 1.0 / (2.0f32).sqrt(),
     };
-    CpuBackend::decode_attention(&q, &k, &v, &mut out, 1, &cfg);
+    CpuBackend::decode_attention(&mut (), &q, &k, &v, &mut out, 1, &cfg);
     // Both Q heads attend to the single KV → both get V
     assert_close(&out, &[3.0, 7.0, 3.0, 7.0], 1e-5, "decode attn gqa");
 }
@@ -231,7 +241,7 @@ fn test_flash_attention_causal() {
         causal: true,
         scale: 1.0 / 2.0, // 1/sqrt(4)
     };
-    CpuBackend::flash_attention(&q, &k, &v, &mut out, 1, 2, 2, 0, &cfg);
+    CpuBackend::flash_attention(&mut (), &q, &k, &v, &mut out, 1, 2, 2, 0, &cfg);
 
     // Token 0 only attends to token 0 → copies V[0]
     assert_close(&out[0..4], &[1.0, 2.0, 3.0, 4.0], 1e-4, "flash causal t0");
@@ -262,7 +272,7 @@ fn test_embedding_lookup() {
     ];
     let ids = vec![2u32, 0, 1];
     let mut out = vec![0.0f32; 6];
-    CpuBackend::embedding_lookup(&table, &ids, &mut out, 2);
+    CpuBackend::embedding_lookup(&mut (), &table, &ids, &mut out, 2);
     assert_close(&out, &[0.5, 0.6, 0.1, 0.2, 0.3, 0.4], 1e-6, "embedding");
 }
 
@@ -273,7 +283,7 @@ fn test_add() {
     let a = vec![1.0, 2.0, 3.0];
     let b = vec![4.0, 5.0, 6.0];
     let mut out = vec![0.0f32; 3];
-    CpuBackend::add(&a, &b, &mut out, 3);
+    CpuBackend::add(&mut (), &a, &b, &mut out, 3);
     assert_close(&out, &[5.0, 7.0, 9.0], 1e-6, "add");
 }
 
@@ -315,7 +325,7 @@ fn test_mini_layer_forward() {
 
     // 1. RMS Norm
     let mut norm_out = CpuBackend::alloc(h);
-    CpuBackend::rms_norm(&residual, &input_ln_w, eps, &mut norm_out, 1, h);
+    CpuBackend::rms_norm(&mut (), &residual, &input_ln_w, eps, &mut norm_out, 1, h);
     assert!(
         is_finite_nonzero(&norm_out),
         "norm_out should be finite nonzero"
@@ -326,7 +336,7 @@ fn test_mini_layer_forward() {
     let kv_dim = nkv * hd;
     let qkv_dim = q_dim + 2 * kv_dim;
     let mut qkv_out = CpuBackend::alloc(qkv_dim);
-    CpuBackend::gemm(&norm_out, &qkv_w, &mut qkv_out, 1, qkv_dim, h);
+    CpuBackend::gemm(&mut (), &norm_out, &qkv_w, &mut qkv_out, 1, qkv_dim, h);
     assert!(is_finite_nonzero(&qkv_out), "qkv should be finite nonzero");
 
     // 3. Split Q, K, V
@@ -343,7 +353,7 @@ fn test_mini_layer_forward() {
         causal: false,
         scale: 1.0 / (hd as f32).sqrt(),
     };
-    CpuBackend::decode_attention(&q, &k, &v, &mut attn_out, 1, &cfg);
+    CpuBackend::decode_attention(&mut (), &q, &k, &v, &mut attn_out, 1, &cfg);
     assert!(
         is_finite_nonzero(&attn_out),
         "attn_out should be finite nonzero"
@@ -351,29 +361,46 @@ fn test_mini_layer_forward() {
 
     // 5. O projection
     let mut o_out = CpuBackend::alloc(h);
-    CpuBackend::gemm(&attn_out, &o_proj_w, &mut o_out, 1, h, q_dim);
+    CpuBackend::gemm(&mut (), &attn_out, &o_proj_w, &mut o_out, 1, h, q_dim);
 
     // 6. Fused add + norm (residual += o_out, then norm)
     let mut post_norm = CpuBackend::alloc(h);
-    CpuBackend::fused_add_rms_norm(&mut residual, &o_out, &post_ln_w, eps, &mut post_norm, 1, h);
+    CpuBackend::fused_add_rms_norm(
+        &mut (),
+        &mut residual,
+        &o_out,
+        &post_ln_w,
+        eps,
+        &mut post_norm,
+        1,
+        h,
+    );
 
     // 7. MLP: gate_up projection
     let mut gate_up_out = CpuBackend::alloc(2 * im);
-    CpuBackend::gemm(&post_norm, &gate_up_w, &mut gate_up_out, 1, 2 * im, h);
+    CpuBackend::gemm(
+        &mut (),
+        &post_norm,
+        &gate_up_w,
+        &mut gate_up_out,
+        1,
+        2 * im,
+        h,
+    );
     let gate = gate_up_out[..im].to_vec();
     let up = gate_up_out[im..].to_vec();
 
     // 8. SiLU + mul
     let mut silu_out = CpuBackend::alloc(im);
-    CpuBackend::silu_mul(&gate, &up, &mut silu_out, im);
+    CpuBackend::silu_mul(&mut (), &gate, &up, &mut silu_out, im);
 
     // 9. Down projection
     let mut mlp_out = CpuBackend::alloc(h);
-    CpuBackend::gemm(&silu_out, &down_w, &mut mlp_out, 1, h, im);
+    CpuBackend::gemm(&mut (), &silu_out, &down_w, &mut mlp_out, 1, h, im);
 
     // 10. Final residual add
     let mut final_out = CpuBackend::alloc(h);
-    CpuBackend::add(&residual, &mlp_out, &mut final_out, h);
+    CpuBackend::add(&mut (), &residual, &mlp_out, &mut final_out, h);
     assert!(
         is_finite_nonzero(&final_out),
         "layer output should be finite nonzero"
@@ -400,7 +427,7 @@ fn test_deterministic() {
     let w = pseudo_random(100, 64);
     let mut out1 = CpuBackend::alloc(64);
     let mut out2 = CpuBackend::alloc(64);
-    CpuBackend::rms_norm(&x, &w, 1e-5, &mut out1, 1, 64);
-    CpuBackend::rms_norm(&x, &w, 1e-5, &mut out2, 1, 64);
+    CpuBackend::rms_norm(&mut (), &x, &w, 1e-5, &mut out1, 1, 64);
+    CpuBackend::rms_norm(&mut (), &x, &w, 1e-5, &mut out2, 1, 64);
     assert_close(&out1, &out2, 0.0, "determinism: rms_norm");
 }

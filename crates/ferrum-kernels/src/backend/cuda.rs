@@ -26,8 +26,18 @@ pub struct CudaBackend;
 
 impl Backend for CudaBackend {
     type Buffer = CudaSlice<f16>;
+    type Context = CudaState;
+
+    fn new_context() -> Self::Context {
+        todo!("CudaBackend::new_context — init device + stream")
+    }
+
+    fn sync(ctx: &mut Self::Context) {
+        todo!("CudaBackend::sync — stream.synchronize()")
+    }
 
     fn gemm(
+        ctx: &mut Self::Context,
         a: &Self::Buffer,
         b: &Self::Buffer,
         out: &mut Self::Buffer,
@@ -41,6 +51,7 @@ impl Backend for CudaBackend {
     }
 
     fn rms_norm(
+        ctx: &mut Self::Context,
         x: &Self::Buffer,
         w: &Self::Buffer,
         eps: f32,
@@ -53,6 +64,7 @@ impl Backend for CudaBackend {
     }
 
     fn fused_add_rms_norm(
+        ctx: &mut Self::Context,
         residual: &mut Self::Buffer,
         x: &Self::Buffer,
         w: &Self::Buffer,
@@ -66,6 +78,7 @@ impl Backend for CudaBackend {
     }
 
     fn rope(
+        ctx: &mut Self::Context,
         q: &mut Self::Buffer,
         k: &mut Self::Buffer,
         cos: &Self::Buffer,
@@ -81,6 +94,7 @@ impl Backend for CudaBackend {
     }
 
     fn decode_attention(
+        ctx: &mut Self::Context,
         q: &Self::Buffer,
         k_cache: &Self::Buffer,
         v_cache: &Self::Buffer,
@@ -95,6 +109,7 @@ impl Backend for CudaBackend {
     }
 
     fn flash_attention(
+        ctx: &mut Self::Context,
         q: &Self::Buffer,
         k: &Self::Buffer,
         v: &Self::Buffer,
@@ -109,24 +124,111 @@ impl Backend for CudaBackend {
         todo!("CudaBackend::flash_attention — needs flash_attn_full F16")
     }
 
-    fn silu_mul(gate: &Self::Buffer, up: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
+    fn silu_mul(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
         // TODO: launch fused_silu_mul_f16 kernel
         todo!("CudaBackend::silu_mul")
     }
 
-    fn add(a: &Self::Buffer, b: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
+    fn add(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        b: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
         // TODO: launch residual_add_f16 kernel
         todo!("CudaBackend::add")
     }
 
-    fn copy(src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
+    fn copy(ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
         // TODO: cudarc stream.memcpy_dtod
         todo!("CudaBackend::copy")
     }
 
-    fn embedding_lookup(table: &Self::Buffer, ids: &[u32], out: &mut Self::Buffer, dim: usize) {
+    fn embedding_lookup(
+        ctx: &mut Self::Context,
+        table: &Self::Buffer,
+        ids: &[u32],
+        out: &mut Self::Buffer,
+        dim: usize,
+    ) {
         // TODO: launch embedding_lookup_f16 kernel (already exists in .cu)
         todo!("CudaBackend::embedding_lookup")
+    }
+
+    fn split_qkv(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q: &mut Self::Buffer,
+        k: &mut Self::Buffer,
+        v: &mut Self::Buffer,
+        tokens: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) {
+        todo!()
+    }
+    fn fused_silu_mul_split(
+        ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        todo!()
+    }
+    fn qk_norm(
+        ctx: &mut Self::Context,
+        data: &mut Self::Buffer,
+        w: &Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) {
+        todo!()
+    }
+    fn kv_cache_append(
+        ctx: &mut Self::Context,
+        ck: &mut Self::Buffer,
+        cv: &mut Self::Buffer,
+        cl: usize,
+        nk: &Self::Buffer,
+        nv: &Self::Buffer,
+        nt: usize,
+        nkv: usize,
+        hd: usize,
+    ) -> (Self::Buffer, Self::Buffer) {
+        todo!()
+    }
+    fn transpose_token_to_head(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        t: usize,
+        h: usize,
+        d: usize,
+    ) {
+        todo!()
+    }
+    fn transpose_head_to_token(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        t: usize,
+        h: usize,
+        d: usize,
+    ) {
+        todo!()
+    }
+    fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
+        todo!()
     }
 
     fn alloc(len: usize) -> Self::Buffer {

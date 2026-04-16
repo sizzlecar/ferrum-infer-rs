@@ -3,11 +3,8 @@
 /// Configuration for RoPE (rotary position embeddings).
 #[derive(Clone, Debug)]
 pub struct RopeConfig {
-    /// Base frequency (default 1_000_000 for Qwen3, 10_000 for LLaMA).
     pub theta: f64,
-    /// Head dimension (full, not half).
     pub head_dim: usize,
-    /// Max sequence length for precomputed cos/sin tables.
     pub max_seq_len: usize,
 }
 
@@ -17,9 +14,7 @@ pub struct AttnConfig {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
-    /// Whether to apply causal mask.
     pub causal: bool,
-    /// Softmax scale factor (typically 1/sqrt(head_dim)).
     pub scale: f32,
 }
 
@@ -36,41 +31,31 @@ pub struct TransformerConfig {
     pub max_seq_len: usize,
     pub rms_norm_eps: f32,
     pub rope: RopeConfig,
-    /// Whether the model uses QK-norm (e.g., Qwen3 does, LLaMA doesn't).
     pub has_qk_norm: bool,
-    /// Attention type.
     pub attn_type: AttnType,
-    /// MLP type.
     pub mlp_type: MlpType,
 }
 
-/// Attention variant.
 #[derive(Clone, Debug)]
 pub enum AttnType {
-    /// Standard grouped-query attention.
     Gqa,
-    /// Sliding window attention (Mistral).
     SlidingWindow { window: usize },
 }
 
-/// MLP variant.
 #[derive(Clone, Debug)]
 pub enum MlpType {
-    /// SwiGLU (gate + up projections, SiLU activation, down projection).
     SwiGlu,
-    /// Mixture of Experts (future: DeepSeek-V3).
     Moe { num_experts: usize, top_k: usize },
 }
 
 /// Per-layer weights stored in backend-native buffers.
 pub struct LayerWeights<B: Backend> {
     pub input_ln_w: B::Buffer,
-    pub qkv_proj_w: B::Buffer, // fused [q_dim + 2*kv_dim, hidden]
+    pub qkv_proj_w: B::Buffer,
     pub o_proj_w: B::Buffer,
     pub post_ln_w: B::Buffer,
-    pub gate_up_proj_w: B::Buffer, // fused [2*intermediate, hidden]
+    pub gate_up_proj_w: B::Buffer,
     pub down_proj_w: B::Buffer,
-    // Optional QK-norm weights (Qwen3)
     pub q_norm_w: Option<B::Buffer>,
     pub k_norm_w: Option<B::Buffer>,
 }
@@ -93,15 +78,13 @@ pub struct LayerScratch<B: Backend> {
 pub struct KvCache<B: Backend> {
     pub k: B::Buffer,
     pub v: B::Buffer,
-    /// Current number of tokens stored in cache.
     pub len: usize,
-    /// Max tokens this cache can hold before reallocation.
     pub capacity: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
 }
 
-/// Full model weights (embedding + layers + final norm + lm_head).
+/// Full model weights.
 pub struct ModelWeights<B: Backend> {
     pub embed: B::Buffer,
     pub layers: Vec<LayerWeights<B>>,
@@ -109,26 +92,35 @@ pub struct ModelWeights<B: Backend> {
     pub lm_head_w: B::Buffer,
 }
 
-/// The core abstraction: all operations needed for a transformer forward pass.
+/// The core abstraction over CUDA / Metal / CPU.
 ///
-/// Each method takes explicit dimensions — no shape metadata baked into buffers.
-/// Buffers are raw contiguous memory; layout is row-major unless noted otherwise.
+/// Key design: operations take a `&mut Self::Context` which accumulates work.
+///   - **CPU**: Context is `()` — ops execute immediately.
+///   - **Metal**: Context is a `CommandBuffer` — ops encode into it, flushed on `sync()`.
+///   - **CUDA**: Context is a `CudaStream` — ops launch on the stream, synced on `sync()`.
+///
+/// `layer_forward` passes the context through all ops in a layer.
+/// `ModelRunner` calls `sync()` only when it needs results (e.g., reading logits).
 pub trait Backend: Send + Sync + 'static {
-    /// The native buffer type for this backend.
-    ///   - CUDA: `CudaSlice<f16>`
-    ///   - Metal: `metal::Buffer`
-    ///   - CPU: `Vec<f32>`
     type Buffer: Send + Sync;
+
+    /// Execution context that accumulates GPU work.
+    ///   - CPU: `()` (no-op, ops execute inline)
+    ///   - Metal: wraps a CommandBuffer
+    ///   - CUDA: wraps a CudaStream
+    type Context;
+
+    /// Create a new execution context (begin accumulating work).
+    fn new_context() -> Self::Context;
+
+    /// Flush accumulated work and wait for completion.
+    /// CPU: no-op. Metal: commit + waitUntilCompleted. CUDA: stream sync.
+    fn sync(ctx: &mut Self::Context);
 
     // ── GEMM ────────────────────────────────────────────────────────────
 
-    /// C[m, n] = A[m, k] @ B[n, k]^T  (row-major, B transposed)
-    ///
-    /// This is the standard weight-projection GEMM:
-    ///   - A = activations [tokens, hidden]
-    ///   - B = weights [out_dim, hidden] (stored transposed)
-    ///   - C = output [tokens, out_dim]
     fn gemm(
+        ctx: &mut Self::Context,
         a: &Self::Buffer,
         b: &Self::Buffer,
         out: &mut Self::Buffer,
@@ -139,10 +131,8 @@ pub trait Backend: Send + Sync + 'static {
 
     // ── Norms ───────────────────────────────────────────────────────────
 
-    /// RMS norm: out[i] = x[i] * w[i % dim] / sqrt(mean(x^2) + eps)
-    ///
-    /// x, out: [tokens * dim], w: [dim]
     fn rms_norm(
+        ctx: &mut Self::Context,
         x: &Self::Buffer,
         w: &Self::Buffer,
         eps: f32,
@@ -151,12 +141,8 @@ pub trait Backend: Send + Sync + 'static {
         dim: usize,
     );
 
-    /// Fused residual add + RMS norm:
-    ///   residual[i] += x[i]
-    ///   out[i] = residual[i] * w[i % dim] / sqrt(mean(residual^2) + eps)
-    ///
-    /// residual, x, out: [tokens * dim], w: [dim]
     fn fused_add_rms_norm(
+        ctx: &mut Self::Context,
         residual: &mut Self::Buffer,
         x: &Self::Buffer,
         w: &Self::Buffer,
@@ -168,12 +154,8 @@ pub trait Backend: Send + Sync + 'static {
 
     // ── Positional encoding ─────────────────────────────────────────────
 
-    /// Apply rotary position embeddings to Q and K in-place.
-    ///
-    /// q: [tokens, num_heads, head_dim], k: [tokens, num_kv_heads, head_dim]
-    /// cos, sin: precomputed tables [max_seq, head_dim/2]
-    /// positions: [tokens] position index for each token
     fn rope(
+        ctx: &mut Self::Context,
         q: &mut Self::Buffer,
         k: &mut Self::Buffer,
         cos: &Self::Buffer,
@@ -186,12 +168,8 @@ pub trait Backend: Send + Sync + 'static {
 
     // ── Attention ───────────────────────────────────────────────────────
 
-    /// Single-query decode attention: Q[1, num_heads, head_dim] attends to
-    /// full KV cache [kv_len, num_kv_heads, head_dim].
-    ///
-    /// Optimized for decode (M=1): warp-cooperative dot product, no
-    /// intermediate score matrix materialization.
     fn decode_attention(
+        ctx: &mut Self::Context,
         q: &Self::Buffer,
         k_cache: &Self::Buffer,
         v_cache: &Self::Buffer,
@@ -200,13 +178,8 @@ pub trait Backend: Send + Sync + 'static {
         cfg: &AttnConfig,
     );
 
-    /// Full-sequence flash attention for prefill.
-    ///
-    /// Q: [batch, num_heads, q_len, head_dim]
-    /// K: [batch, num_kv_heads, kv_len, head_dim]
-    /// V: [batch, num_kv_heads, kv_len, head_dim]
-    /// out: [batch, num_heads, q_len, head_dim]
     fn flash_attention(
+        ctx: &mut Self::Context,
         q: &Self::Buffer,
         k: &Self::Buffer,
         v: &Self::Buffer,
@@ -220,34 +193,121 @@ pub trait Backend: Send + Sync + 'static {
 
     // ── Activations ─────────────────────────────────────────────────────
 
-    /// Fused SiLU(gate) * up: out[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i]
-    ///
-    /// gate, up, out: [tokens * intermediate_size]
-    fn silu_mul(gate: &Self::Buffer, up: &Self::Buffer, out: &mut Self::Buffer, len: usize);
+    fn silu_mul(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    );
 
     // ── Element-wise ────────────────────────────────────────────────────
 
-    /// out[i] = a[i] + b[i]
-    fn add(a: &Self::Buffer, b: &Self::Buffer, out: &mut Self::Buffer, len: usize);
+    fn add(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        b: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    );
 
-    /// Copy src into dst.
-    fn copy(src: &Self::Buffer, dst: &mut Self::Buffer, len: usize);
+    fn copy(ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize);
 
     // ── Embedding ───────────────────────────────────────────────────────
 
-    /// Gather embedding vectors: out[i] = table[ids[i]]
-    ///
-    /// table: [vocab_size, dim], ids: token ids, out: [tokens * dim]
-    fn embedding_lookup(table: &Self::Buffer, ids: &[u32], out: &mut Self::Buffer, dim: usize);
+    fn embedding_lookup(
+        ctx: &mut Self::Context,
+        table: &Self::Buffer,
+        ids: &[u32],
+        out: &mut Self::Buffer,
+        dim: usize,
+    );
 
-    // ── Buffer management ───────────────────────────────────────────────
+    // ── Transformer-specific fused ops ─────────────────────────────────
+    // These avoid CPU round-trips for data layout transformations.
 
-    /// Allocate a zero-initialized buffer of `len` elements.
+    /// Split fused QKV [tokens, q_dim+2*kv_dim] into separate Q, K, V buffers.
+    /// Q: [tokens, q_dim], K: [tokens, kv_dim], V: [tokens, kv_dim]
+    fn split_qkv(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q: &mut Self::Buffer,
+        k: &mut Self::Buffer,
+        v: &mut Self::Buffer,
+        tokens: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    );
+
+    /// Split fused gate_up [tokens, 2*im] into gate [tokens, im] and up [tokens, im],
+    /// then compute SiLU(gate) * up → out [tokens, im].
+    fn fused_silu_mul_split(
+        ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+    );
+
+    /// Per-head RMS norm in-place (QK-norm for Qwen3).
+    /// data: [tokens, heads, head_dim], w: [head_dim]
+    fn qk_norm(
+        ctx: &mut Self::Context,
+        data: &mut Self::Buffer,
+        w: &Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+    );
+
+    /// Append new K/V to cache. Transposes from token-major to head-major.
+    /// new_k/v: [tokens, nkv, hd] (token-major)
+    /// cache k/v: [nkv, kv_len, hd] (head-major)
+    fn kv_cache_append(
+        ctx: &mut Self::Context,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        cache_len: usize,
+        new_k: &Self::Buffer,
+        new_v: &Self::Buffer,
+        new_tokens: usize,
+        nkv: usize,
+        hd: usize,
+    ) -> (Self::Buffer, Self::Buffer);
+    // Returns new cache buffers with appended data. Cache len updated by caller.
+
+    /// Transpose [tokens, heads, dim] → [heads, tokens, dim]
+    fn transpose_token_to_head(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+    );
+
+    /// Transpose [heads, tokens, dim] → [tokens, heads, dim]
+    fn transpose_head_to_token(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+    );
+
+    /// residual[i] += x[i] (in-place)
+    fn add_inplace(
+        ctx: &mut Self::Context,
+        residual: &mut Self::Buffer,
+        x: &Self::Buffer,
+        len: usize,
+    );
+
+    // ── Buffer management (context-free) ────────────────────────────────
+
     fn alloc(len: usize) -> Self::Buffer;
-
-    /// Read buffer contents back to CPU as f32 vec.
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
-
-    /// Create a buffer from existing f32 data (upload to device if GPU).
     fn from_slice(data: &[f32]) -> Self::Buffer;
 }

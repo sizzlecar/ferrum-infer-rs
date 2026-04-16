@@ -1,22 +1,13 @@
 //! Generic transformer layer forward — one function, all backends.
 //!
-//! This is the core compute loop shared by prefill and decode.
-//! The only branch is attention dispatch (decode_attention vs flash_attention).
+//! All data manipulation (split, transpose, cache append) goes through Backend
+//! methods — no CPU round-trips via to_vec/from_slice.
 
 use super::{AttnConfig, Backend, KvCache, LayerScratch, LayerWeights, TransformerConfig};
 
 /// Forward one transformer layer.
-///
-/// **Data layout:**
-///   - `residual`: `[tokens, hidden_size]` — updated in-place (residual connections)
-///   - `LayerWeights`: fused QKV `[q_dim + 2*kv_dim, hidden]`, fused gate_up `[2*inter, hidden]`
-///   - KV cache: `[num_kv_heads, kv_len, head_dim]`
-///
-/// **Flow:**
-///   1. RMS Norm → 2. QKV GEMM → 3. (optional QK norm) → 4. RoPE →
-///   5. KV cache append → 6. Attention → 7. O-proj GEMM → 8. Residual + Norm →
-///   9. Gate/Up GEMM → 10. SiLU*mul → 11. Down GEMM → 12. Residual add
 pub fn layer_forward<B: Backend>(
+    ctx: &mut B::Context,
     cfg: &TransformerConfig,
     weights: &LayerWeights<B>,
     kv: &mut KvCache<B>,
@@ -39,6 +30,7 @@ pub fn layer_forward<B: Backend>(
 
     // 1. Input RMS Norm
     B::rms_norm(
+        ctx,
         residual,
         &weights.input_ln_w,
         eps,
@@ -47,8 +39,9 @@ pub fn layer_forward<B: Backend>(
         h,
     );
 
-    // 2. Fused QKV projection: [tokens, hidden] @ [q_dim+2*kv_dim, hidden]^T
+    // 2. Fused QKV projection
     B::gemm(
+        ctx,
         &scratch.norm_out,
         &weights.qkv_proj_w,
         &mut scratch.qkv_out,
@@ -57,18 +50,9 @@ pub fn layer_forward<B: Backend>(
         h,
     );
 
-    // 3. Split Q, K, V and optionally apply QK norm
-    //    QKV layout: [tokens, q_dim + kv_dim + kv_dim]
-    //    After split, we need to work with:
-    //      Q: [tokens, num_heads, head_dim] (= [tokens, q_dim])
-    //      K: [tokens, num_kv_heads, head_dim] (= [tokens, kv_dim])
-    //      V: [tokens, num_kv_heads, head_dim] (= [tokens, kv_dim])
-    //
-    //    For QK norm + RoPE + KV cache append, we reuse scratch buffers.
-    //    The split is implicit via offset arithmetic in the backend.
-
-    // 4. Split QKV into dedicated buffers, then apply RoPE
-    split_qkv_all::<B>(
+    // 3. Split QKV into separate buffers (Backend method, no CPU round-trip)
+    B::split_qkv(
+        ctx,
         &scratch.qkv_out,
         &mut scratch.q_buf,
         &mut scratch.k_buf,
@@ -78,21 +62,19 @@ pub fn layer_forward<B: Backend>(
         kv_dim,
     );
 
-    // 3b. Optional QK norm (Qwen3 has this, LLaMA doesn't)
+    // 4. Optional QK norm
     if cfg.has_qk_norm {
-        if let Some(ref q_norm_w) = weights.q_norm_w {
-            // QK norm: per-head RMS norm on Q and K
-            // Q: [tokens, num_heads, head_dim] → norm each [head_dim] vector
-            // K: [tokens, num_kv_heads, head_dim] → norm each [head_dim] vector
-            qk_norm_inplace::<B>(&mut scratch.q_buf, q_norm_w, tokens, nh, hd, eps);
+        if let Some(ref w) = weights.q_norm_w {
+            B::qk_norm(ctx, &mut scratch.q_buf, w, tokens, nh, hd, eps);
         }
-        if let Some(ref k_norm_w) = weights.k_norm_w {
-            qk_norm_inplace::<B>(&mut scratch.k_buf, k_norm_w, tokens, nkv, hd, eps);
+        if let Some(ref w) = weights.k_norm_w {
+            B::qk_norm(ctx, &mut scratch.k_buf, w, tokens, nkv, hd, eps);
         }
     }
 
-    // Apply RoPE to Q and K
+    // 5. RoPE
     B::rope(
+        ctx,
         &mut scratch.q_buf,
         &mut scratch.k_buf,
         cos,
@@ -103,11 +85,24 @@ pub fn layer_forward<B: Backend>(
         hd,
     );
 
-    // 5. KV cache append
-    kv_cache_append::<B>(kv, &scratch.k_buf, &scratch.v_buf, tokens, nkv, hd);
+    // 6. KV cache append (Backend method handles transpose)
+    let (new_cache_k, new_cache_v) = B::kv_cache_append(
+        ctx,
+        &mut kv.k,
+        &mut kv.v,
+        kv.len,
+        &scratch.k_buf,
+        &scratch.v_buf,
+        tokens,
+        nkv,
+        hd,
+    );
+    kv.k = new_cache_k;
+    kv.v = new_cache_v;
+    kv.len += tokens;
     let kv_len = kv.len;
 
-    // 6. Attention
+    // 7. Attention
     let attn_cfg = AttnConfig {
         num_heads: nh,
         num_kv_heads: nkv,
@@ -117,8 +112,8 @@ pub fn layer_forward<B: Backend>(
     };
 
     if tokens == 1 {
-        // Decode: single-query attention against full KV cache
         B::decode_attention(
+            ctx,
             &scratch.q_buf,
             &kv.k,
             &kv.v,
@@ -127,29 +122,30 @@ pub fn layer_forward<B: Backend>(
             &attn_cfg,
         );
     } else {
-        // Prefill: full-sequence flash attention
-        // Q is [tokens, nh, hd] (token-major) but attention expects [1, nh, tokens, hd] (head-major)
-        // K/V from cache are already [nkv, kv_len, hd] (head-major)
-        // Transpose Q: [tokens, nh, hd] → [nh, tokens, hd]
-        let q_transposed = transpose_token_to_head::<B>(&scratch.q_buf, tokens, nh, hd);
+        // Prefill: transpose Q to head-major for flash attention
+        B::transpose_token_to_head(ctx, &scratch.q_buf, &mut scratch.o_proj_out, tokens, nh, hd);
         B::flash_attention(
-            &q_transposed,
+            ctx,
+            &scratch.o_proj_out, // Q in head-major
             &kv.k,
             &kv.v,
-            &mut scratch.attn_out, // output: [1, nh, tokens, hd] = [nh, tokens, hd]
-            1,                     // batch=1
-            tokens,                // q_len
-            kv_len,                // kv_len
+            &mut scratch.attn_out,
+            1,
+            tokens,
+            kv_len,
             positions[0] as usize,
             &attn_cfg,
         );
-        // Transpose attention output back: [nh, tokens, hd] → [tokens, nh, hd]
-        let attn_back = transpose_head_to_token::<B>(&scratch.attn_out, tokens, nh, hd);
-        B::copy(&attn_back, &mut scratch.attn_out, tokens * q_dim);
+        // Transpose output back to token-major
+        // attn_out is [nh, tokens, hd], need [tokens, nh, hd]
+        let mut temp = B::alloc(tokens * q_dim);
+        B::transpose_head_to_token(ctx, &scratch.attn_out, &mut temp, tokens, nh, hd);
+        B::copy(ctx, &temp, &mut scratch.attn_out, tokens * q_dim);
     }
 
-    // 7. O-projection: [tokens, q_dim] @ [hidden, q_dim]^T → [tokens, hidden]
+    // 8. O-projection
     B::gemm(
+        ctx,
         &scratch.attn_out,
         &weights.o_proj_w,
         &mut scratch.o_proj_out,
@@ -158,9 +154,9 @@ pub fn layer_forward<B: Backend>(
         q_dim,
     );
 
-    // 8. Fused residual add + post-attention RMS norm
-    //    residual += o_proj_out, then norm(residual) → norm_out
+    // 9. Fused residual add + post-attention RMS norm
     B::fused_add_rms_norm(
+        ctx,
         residual,
         &scratch.o_proj_out,
         &weights.post_ln_w,
@@ -170,8 +166,9 @@ pub fn layer_forward<B: Backend>(
         h,
     );
 
-    // 9. Fused gate+up projection: [tokens, hidden] @ [2*inter, hidden]^T → [tokens, 2*inter]
+    // 10. Fused gate+up projection
     B::gemm(
+        ctx,
         &scratch.norm_out,
         &weights.gate_up_proj_w,
         &mut scratch.gate_up_out,
@@ -180,16 +177,12 @@ pub fn layer_forward<B: Backend>(
         h,
     );
 
-    // 10. SiLU(gate) * up
-    //     gate_up_out layout: [tokens, 2*inter] → gate = [tokens, inter], up = [tokens, inter]
-    //     Split is implicit: gate = gate_up_out[..tokens*im], up = gate_up_out[tokens*im..]
-    //     But they're interleaved per token: [gate_0 | up_0 | gate_1 | up_1 | ...]
-    //     Actually with fused weight [gate_w; up_w], output is [tokens, 2*im] where
-    //     each row is [gate_out(im) | up_out(im)].
-    silu_mul_split::<B>(&scratch.gate_up_out, &mut scratch.silu_out, tokens, im);
+    // 11. SiLU(gate) * up (Backend method, no CPU split)
+    B::fused_silu_mul_split(ctx, &scratch.gate_up_out, &mut scratch.silu_out, tokens, im);
 
-    // 11. Down projection: [tokens, inter] @ [hidden, inter]^T → [tokens, hidden]
+    // 12. Down projection
     B::gemm(
+        ctx,
         &scratch.silu_out,
         &weights.down_proj_w,
         &mut scratch.mlp_out,
@@ -198,196 +191,6 @@ pub fn layer_forward<B: Backend>(
         im,
     );
 
-    // 12. Final residual add: residual += mlp_out
-    //     (Next layer will do its own norm at step 1)
-    add_inplace::<B>(residual, &scratch.mlp_out, tokens * h);
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-/// Split fused QKV output into separate Q, K, V buffers.
-///
-/// QKV layout per token: [Q(q_dim) | K(kv_dim) | V(kv_dim)]
-/// Output: Q [tokens, q_dim], K [tokens, kv_dim], V [tokens, kv_dim]
-fn split_qkv_all<B: Backend>(
-    qkv: &B::Buffer,
-    q_out: &mut B::Buffer,
-    k_out: &mut B::Buffer,
-    v_out: &mut B::Buffer,
-    tokens: usize,
-    q_dim: usize,
-    kv_dim: usize,
-) {
-    let qkv_dim = q_dim + 2 * kv_dim;
-    let qkv_vec = B::to_vec(qkv, tokens * qkv_dim);
-    let mut q_vec = vec![0.0f32; tokens * q_dim];
-    let mut k_vec = vec![0.0f32; tokens * kv_dim];
-    let mut v_vec = vec![0.0f32; tokens * kv_dim];
-    for t in 0..tokens {
-        let base = t * qkv_dim;
-        q_vec[t * q_dim..(t + 1) * q_dim].copy_from_slice(&qkv_vec[base..base + q_dim]);
-        k_vec[t * kv_dim..(t + 1) * kv_dim]
-            .copy_from_slice(&qkv_vec[base + q_dim..base + q_dim + kv_dim]);
-        v_vec[t * kv_dim..(t + 1) * kv_dim]
-            .copy_from_slice(&qkv_vec[base + q_dim + kv_dim..base + qkv_dim]);
-    }
-    // Write into existing buffers (preserve allocation size)
-    let q_buf = B::from_slice(&q_vec);
-    let k_buf = B::from_slice(&k_vec);
-    let v_buf = B::from_slice(&v_vec);
-    B::copy(&q_buf, q_out, tokens * q_dim);
-    B::copy(&k_buf, k_out, tokens * kv_dim);
-    B::copy(&v_buf, v_out, tokens * kv_dim);
-}
-
-/// Append new K, V tokens to the KV cache.
-///
-/// KV cache layout: `[num_kv_heads, kv_len, head_dim]` (contiguous per head).
-/// New K/V: `[tokens, num_kv_heads, head_dim]` (token-major from QKV projection).
-///
-/// We need to transpose new data to head-major and append to each head's sequence.
-fn kv_cache_append<B: Backend>(
-    kv: &mut KvCache<B>,
-    new_k: &B::Buffer,
-    new_v: &B::Buffer,
-    new_tokens: usize,
-    nkv: usize,
-    hd: usize,
-) {
-    let old_len = kv.len;
-    let new_len = old_len + new_tokens;
-
-    // Read existing cache and new data
-    let old_k = B::to_vec(&kv.k, nkv * old_len * hd);
-    let old_v = B::to_vec(&kv.v, nkv * old_len * hd);
-    let nk = B::to_vec(new_k, new_tokens * nkv * hd);
-    let nv = B::to_vec(new_v, new_tokens * nkv * hd);
-
-    // Build new cache: [nkv, new_len, hd]
-    let mut full_k = vec![0.0f32; nkv * new_len * hd];
-    let mut full_v = vec![0.0f32; nkv * new_len * hd];
-
-    for h in 0..nkv {
-        // Copy old cache for this head
-        if old_len > 0 {
-            let dst_off = h * new_len * hd;
-            let src_off = h * old_len * hd;
-            full_k[dst_off..dst_off + old_len * hd]
-                .copy_from_slice(&old_k[src_off..src_off + old_len * hd]);
-            full_v[dst_off..dst_off + old_len * hd]
-                .copy_from_slice(&old_v[src_off..src_off + old_len * hd]);
-        }
-        // Append new tokens (transpose from token-major to head-major)
-        for t in 0..new_tokens {
-            let src = t * nkv * hd + h * hd;
-            let dst = h * new_len * hd + (old_len + t) * hd;
-            full_k[dst..dst + hd].copy_from_slice(&nk[src..src + hd]);
-            full_v[dst..dst + hd].copy_from_slice(&nv[src..src + hd]);
-        }
-    }
-
-    kv.k = B::from_slice(&full_k);
-    kv.v = B::from_slice(&full_v);
-    kv.len = new_len;
-}
-
-/// SiLU(gate) * up from fused [tokens, 2*inter] output.
-///
-/// Input layout per token: [gate(inter) | up(inter)]
-fn silu_mul_split<B: Backend>(gate_up: &B::Buffer, out: &mut B::Buffer, tokens: usize, im: usize) {
-    let data = B::to_vec(gate_up, tokens * 2 * im);
-    let mut gate = vec![0.0f32; tokens * im];
-    let mut up = vec![0.0f32; tokens * im];
-    for t in 0..tokens {
-        gate[t * im..(t + 1) * im].copy_from_slice(&data[t * 2 * im..t * 2 * im + im]);
-        up[t * im..(t + 1) * im].copy_from_slice(&data[t * 2 * im + im..(t + 1) * 2 * im]);
-    }
-    let gate_buf = B::from_slice(&gate);
-    let up_buf = B::from_slice(&up);
-    B::silu_mul(&gate_buf, &up_buf, out, tokens * im);
-}
-
-/// Transpose [tokens, heads, dim] → [heads, tokens, dim]
-fn transpose_token_to_head<B: Backend>(
-    buf: &B::Buffer,
-    tokens: usize,
-    heads: usize,
-    dim: usize,
-) -> B::Buffer {
-    let data = B::to_vec(buf, tokens * heads * dim);
-    let mut out = vec![0.0f32; heads * tokens * dim];
-    for t in 0..tokens {
-        for h in 0..heads {
-            let src = (t * heads + h) * dim;
-            let dst = (h * tokens + t) * dim;
-            out[dst..dst + dim].copy_from_slice(&data[src..src + dim]);
-        }
-    }
-    B::from_slice(&out)
-}
-
-/// Transpose [heads, tokens, dim] → [tokens, heads, dim]
-fn transpose_head_to_token<B: Backend>(
-    buf: &B::Buffer,
-    tokens: usize,
-    heads: usize,
-    dim: usize,
-) -> B::Buffer {
-    let data = B::to_vec(buf, heads * tokens * dim);
-    let mut out = vec![0.0f32; tokens * heads * dim];
-    for h in 0..heads {
-        for t in 0..tokens {
-            let src = (h * tokens + t) * dim;
-            let dst = (t * heads + h) * dim;
-            out[dst..dst + dim].copy_from_slice(&data[src..src + dim]);
-        }
-    }
-    B::from_slice(&out)
-}
-
-/// Per-head RMS norm in-place (QK-norm for Qwen3).
-///
-/// data: [tokens, heads, head_dim] — each [head_dim] vector is independently normalized.
-/// w: [head_dim] — shared across heads and tokens.
-fn qk_norm_inplace<B: Backend>(
-    data: &mut B::Buffer,
-    w: &B::Buffer,
-    tokens: usize,
-    heads: usize,
-    hd: usize,
-    eps: f32,
-) {
-    // Read data, apply per-head RMS norm, write back
-    let mut v = B::to_vec(data, tokens * heads * hd);
-    let wv = B::to_vec(w, hd);
-
-    for t in 0..tokens {
-        for h in 0..heads {
-            let off = (t * heads + h) * hd;
-            let slice = &mut v[off..off + hd];
-
-            // RMS norm: x / sqrt(mean(x^2) + eps) * w
-            let mut sum_sq = 0.0f32;
-            for i in 0..hd {
-                sum_sq += slice[i] * slice[i];
-            }
-            let inv = 1.0f32 / (sum_sq / hd as f32 + eps).sqrt();
-            for i in 0..hd {
-                slice[i] = slice[i] * inv * wv[i];
-            }
-        }
-    }
-
-    *data = B::from_slice(&v);
-}
-
-/// residual += x (in-place)
-fn add_inplace<B: Backend>(residual: &mut B::Buffer, x: &B::Buffer, len: usize) {
-    let r = B::to_vec(residual, len);
-    let xv = B::to_vec(x, len);
-    let mut result = vec![0.0f32; len];
-    for i in 0..len {
-        result[i] = r[i] + xv[i];
-    }
-    *residual = B::from_slice(&result);
+    // 13. Residual add (in-place)
+    B::add_inplace(ctx, residual, &scratch.mlp_out, tokens * h);
 }

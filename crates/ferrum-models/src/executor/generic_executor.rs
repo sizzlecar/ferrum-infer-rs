@@ -16,21 +16,19 @@ use ferrum_interfaces::{
     },
     ModelExecutor,
 };
-use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kernels::backend::runner::ModelRunner;
+use ferrum_kernels::backend::RunnerInterface;
 use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
 
 use super::common::{self, GenericKvCacheHandle};
-use crate::tensor_wrapper::CandleTensorWrapper;
 
 pub struct GenericModelExecutor {
-    runner: Mutex<ModelRunner<CpuBackend>>,
+    runner: Mutex<Box<dyn RunnerInterface>>,
     info: ModelInfo,
     next_cache_id: AtomicU64,
 }
 
 impl GenericModelExecutor {
-    pub fn new(runner: ModelRunner<CpuBackend>, info: ModelInfo) -> Self {
+    pub fn new(runner: Box<dyn RunnerInterface>, info: ModelInfo) -> Self {
         Self {
             runner: Mutex::new(runner),
             info,
