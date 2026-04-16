@@ -78,6 +78,19 @@ pub fn layer_forward<B: Backend>(
         kv_dim,
     );
 
+    // 3b. Optional QK norm (Qwen3 has this, LLaMA doesn't)
+    if cfg.has_qk_norm {
+        if let Some(ref q_norm_w) = weights.q_norm_w {
+            // QK norm: per-head RMS norm on Q and K
+            // Q: [tokens, num_heads, head_dim] → norm each [head_dim] vector
+            // K: [tokens, num_kv_heads, head_dim] → norm each [head_dim] vector
+            qk_norm_inplace::<B>(&mut scratch.q_buf, q_norm_w, tokens, nh, hd, eps);
+        }
+        if let Some(ref k_norm_w) = weights.k_norm_w {
+            qk_norm_inplace::<B>(&mut scratch.k_buf, k_norm_w, tokens, nkv, hd, eps);
+        }
+    }
+
     // Apply RoPE to Q and K
     B::rope(
         &mut scratch.q_buf,
@@ -115,17 +128,24 @@ pub fn layer_forward<B: Backend>(
         );
     } else {
         // Prefill: full-sequence flash attention
+        // Q is [tokens, nh, hd] (token-major) but attention expects [1, nh, tokens, hd] (head-major)
+        // K/V from cache are already [nkv, kv_len, hd] (head-major)
+        // Transpose Q: [tokens, nh, hd] → [nh, tokens, hd]
+        let q_transposed = transpose_token_to_head::<B>(&scratch.q_buf, tokens, nh, hd);
         B::flash_attention(
-            &scratch.q_buf,
+            &q_transposed,
             &kv.k,
             &kv.v,
-            &mut scratch.attn_out,
-            1,      // batch=1
-            tokens, // q_len
-            kv_len, // kv_len
+            &mut scratch.attn_out, // output: [1, nh, tokens, hd] = [nh, tokens, hd]
+            1,                     // batch=1
+            tokens,                // q_len
+            kv_len,                // kv_len
             positions[0] as usize,
             &attn_cfg,
         );
+        // Transpose attention output back: [nh, tokens, hd] → [tokens, nh, hd]
+        let attn_back = transpose_head_to_token::<B>(&scratch.attn_out, tokens, nh, hd);
+        B::copy(&attn_back, &mut scratch.attn_out, tokens * q_dim);
     }
 
     // 7. O-projection: [tokens, q_dim] @ [hidden, q_dim]^T → [tokens, hidden]
@@ -285,6 +305,80 @@ fn silu_mul_split<B: Backend>(gate_up: &B::Buffer, out: &mut B::Buffer, tokens: 
     let gate_buf = B::from_slice(&gate);
     let up_buf = B::from_slice(&up);
     B::silu_mul(&gate_buf, &up_buf, out, tokens * im);
+}
+
+/// Transpose [tokens, heads, dim] → [heads, tokens, dim]
+fn transpose_token_to_head<B: Backend>(
+    buf: &B::Buffer,
+    tokens: usize,
+    heads: usize,
+    dim: usize,
+) -> B::Buffer {
+    let data = B::to_vec(buf, tokens * heads * dim);
+    let mut out = vec![0.0f32; heads * tokens * dim];
+    for t in 0..tokens {
+        for h in 0..heads {
+            let src = (t * heads + h) * dim;
+            let dst = (h * tokens + t) * dim;
+            out[dst..dst + dim].copy_from_slice(&data[src..src + dim]);
+        }
+    }
+    B::from_slice(&out)
+}
+
+/// Transpose [heads, tokens, dim] → [tokens, heads, dim]
+fn transpose_head_to_token<B: Backend>(
+    buf: &B::Buffer,
+    tokens: usize,
+    heads: usize,
+    dim: usize,
+) -> B::Buffer {
+    let data = B::to_vec(buf, heads * tokens * dim);
+    let mut out = vec![0.0f32; tokens * heads * dim];
+    for h in 0..heads {
+        for t in 0..tokens {
+            let src = (h * tokens + t) * dim;
+            let dst = (t * heads + h) * dim;
+            out[dst..dst + dim].copy_from_slice(&data[src..src + dim]);
+        }
+    }
+    B::from_slice(&out)
+}
+
+/// Per-head RMS norm in-place (QK-norm for Qwen3).
+///
+/// data: [tokens, heads, head_dim] — each [head_dim] vector is independently normalized.
+/// w: [head_dim] — shared across heads and tokens.
+fn qk_norm_inplace<B: Backend>(
+    data: &mut B::Buffer,
+    w: &B::Buffer,
+    tokens: usize,
+    heads: usize,
+    hd: usize,
+    eps: f32,
+) {
+    // Read data, apply per-head RMS norm, write back
+    let mut v = B::to_vec(data, tokens * heads * hd);
+    let wv = B::to_vec(w, hd);
+
+    for t in 0..tokens {
+        for h in 0..heads {
+            let off = (t * heads + h) * hd;
+            let slice = &mut v[off..off + hd];
+
+            // RMS norm: x / sqrt(mean(x^2) + eps) * w
+            let mut sum_sq = 0.0f32;
+            for i in 0..hd {
+                sum_sq += slice[i] * slice[i];
+            }
+            let inv = 1.0f32 / (sum_sq / hd as f32 + eps).sqrt();
+            for i in 0..hd {
+                slice[i] = slice[i] * inv * wv[i];
+            }
+        }
+    }
+
+    *data = B::from_slice(&v);
 }
 
 /// residual += x (in-place)

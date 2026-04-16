@@ -6,7 +6,12 @@ use crate::definition::ModelDefinition;
 
 pub fn llama_config(def: &ModelDefinition) -> TransformerConfig {
     let num_kv_heads = def.num_key_value_heads.unwrap_or(def.num_attention_heads);
-    let head_dim = def.hidden_size / def.num_attention_heads;
+    let head_dim = def
+        .extra_params
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(def.hidden_size / def.num_attention_heads);
 
     TransformerConfig {
         num_layers: def.num_hidden_layers,
