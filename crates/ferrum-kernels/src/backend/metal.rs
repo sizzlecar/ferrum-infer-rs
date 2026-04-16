@@ -39,21 +39,16 @@ extern "C" {
     );
 }
 
-pub struct MetalContext {
-    cmd: metal::CommandBuffer,
-    dirty: bool, // true if cmd has pending GPU work
-}
+/// Metal context — no persistent command buffer (to_owned() is unsafe with autoreleased objects).
+/// Each GPU op creates its own command buffer. Pipeline batching will use a different approach.
+pub struct MetalContext;
 
-impl MetalContext {
-    /// Ensure all pending GPU work is complete before CPU reads buffer contents.
-    fn ensure_synced(&mut self) {
-        if self.dirty {
-            self.cmd.commit();
-            self.cmd.wait_until_completed();
-            self.cmd = st().pipes.queue.new_command_buffer().to_owned();
-            self.dirty = false;
-        }
-    }
+/// Run GPU work in a fresh command buffer, commit and wait.
+fn run(f: impl FnOnce(&metal::CommandBufferRef)) {
+    let cmd = st().pipes.queue.new_command_buffer();
+    f(cmd);
+    cmd.commit();
+    cmd.wait_until_completed();
 }
 
 impl Backend for MetalBackend {
@@ -61,20 +56,14 @@ impl Backend for MetalBackend {
     type Context = MetalContext;
 
     fn new_context() -> Self::Context {
-        MetalContext {
-            cmd: st().pipes.queue.new_command_buffer().to_owned(),
-            dirty: false,
-        }
+        MetalContext
     }
-
-    fn sync(ctx: &mut Self::Context) {
-        ctx.ensure_synced();
-    }
+    fn sync(_ctx: &mut Self::Context) {}
 
     // ── GPU ops: encode into cmd buffer ──────────────────────────────────
 
     fn gemm(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         a: &Self::Buffer,
         b: &Self::Buffer,
         out: &mut Self::Buffer,
@@ -82,8 +71,7 @@ impl Backend for MetalBackend {
         n: usize,
         k: usize,
     ) {
-        // cblas on shared memory — sync pending GPU ops first
-        ctx.ensure_synced();
+        // cblas on shared memory (Accelerate) — Metal gemm_v2 has resource issues with 28-layer models
         unsafe {
             cblas_sgemm(
                 101,
@@ -105,7 +93,7 @@ impl Backend for MetalBackend {
     }
 
     fn rms_norm(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         x: &Self::Buffer,
         w: &Self::Buffer,
         eps: f32,
@@ -113,12 +101,11 @@ impl Backend for MetalBackend {
         tokens: usize,
         dim: usize,
     ) {
-        st().pipes.rms_norm(&ctx.cmd, x, w, out, tokens, dim, eps);
-        ctx.dirty = true;
+        run(|cmd| st().pipes.rms_norm(cmd, x, w, out, tokens, dim, eps));
     }
 
     fn fused_add_rms_norm(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         residual: &mut Self::Buffer,
         x: &Self::Buffer,
         w: &Self::Buffer,
@@ -127,16 +114,17 @@ impl Backend for MetalBackend {
         tokens: usize,
         dim: usize,
     ) {
-        let enc = ctx.cmd.new_compute_command_encoder();
-        st().pipes.fused_residual_norm_enc(
-            enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
-        );
-        enc.end_encoding();
-        ctx.dirty = true;
+        run(|cmd| {
+            let enc = cmd.new_compute_command_encoder();
+            st().pipes.fused_residual_norm_enc(
+                enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
+            );
+            enc.end_encoding();
+        });
     }
 
     fn decode_attention(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         q: &Self::Buffer,
         kc: &Self::Buffer,
         vc: &Self::Buffer,
@@ -154,12 +142,11 @@ impl Backend for MetalBackend {
             causal: false,
             pos_offset: 0,
         };
-        st().pipes.flash_attn_v2(&ctx.cmd, q, kc, vc, out, &p, 0);
-        ctx.dirty = true;
+        run(|cmd| st().pipes.flash_attn(cmd, q, kc, vc, out, &p));
     }
 
     fn flash_attention(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         q: &Self::Buffer,
         k: &Self::Buffer,
         v: &Self::Buffer,
@@ -180,34 +167,27 @@ impl Backend for MetalBackend {
             causal: cfg.causal,
             pos_offset,
         };
-        st().pipes.flash_attn_v2(&ctx.cmd, q, k, v, out, &p, 0);
-        ctx.dirty = true;
+        run(|cmd| st().pipes.flash_attn(cmd, q, k, v, out, &p));
     }
 
     fn silu_mul(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         gate: &Self::Buffer,
         up: &Self::Buffer,
         out: &mut Self::Buffer,
         len: usize,
     ) {
-        let enc = ctx.cmd.new_compute_command_encoder();
-        st().pipes.silu_mul_enc(enc, gate, up, out, len);
-        enc.end_encoding();
-        ctx.dirty = true;
+        run(|cmd| st().pipes.silu_mul(cmd, gate, up, out, len));
     }
 
     fn add(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         a: &Self::Buffer,
         b: &Self::Buffer,
         out: &mut Self::Buffer,
         len: usize,
     ) {
-        let enc = ctx.cmd.new_compute_command_encoder();
-        st().pipes.add_enc(enc, a, b, out, len);
-        enc.end_encoding();
-        ctx.dirty = true;
+        run(|cmd| st().pipes.add(cmd, a, b, out, len));
     }
 
     fn copy(_ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
@@ -252,7 +232,6 @@ impl Backend for MetalBackend {
         q_dim: usize,
         kv_dim: usize,
     ) {
-        ctx.ensure_synced();
         let qd = q_dim + 2 * kv_dim;
         unsafe {
             let s = std::slice::from_raw_parts(qkv.contents() as *const f32, tokens * qd);
@@ -275,7 +254,6 @@ impl Backend for MetalBackend {
         tokens: usize,
         im: usize,
     ) {
-        ctx.ensure_synced();
         unsafe {
             let s = std::slice::from_raw_parts(gu.contents() as *const f32, tokens * 2 * im);
             let d = std::slice::from_raw_parts_mut(out.contents() as *mut f32, tokens * im);
@@ -408,7 +386,7 @@ impl Backend for MetalBackend {
         dim: usize,
     ) {
         // Sync if dirty (prefill path: src was written by split_qkv after sync, so not dirty)
-        ctx.ensure_synced();
+
         unsafe {
             let s = std::slice::from_raw_parts(src.contents() as *const f32, tokens * heads * dim);
             let d =
@@ -430,7 +408,6 @@ impl Backend for MetalBackend {
         heads: usize,
         dim: usize,
     ) {
-        ctx.ensure_synced();
         unsafe {
             let s = std::slice::from_raw_parts(src.contents() as *const f32, heads * tokens * dim);
             let d =
@@ -445,7 +422,6 @@ impl Backend for MetalBackend {
     }
 
     fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
-        ctx.ensure_synced();
         unsafe {
             let rv = std::slice::from_raw_parts_mut(r.contents() as *mut f32, len);
             let xv = std::slice::from_raw_parts(x.contents() as *const f32, len);
