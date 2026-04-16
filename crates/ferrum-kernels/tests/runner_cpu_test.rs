@@ -100,8 +100,14 @@ fn test_decode_single_token() {
     let mut runner = create_runner();
     let logits = runner.decode("seq-0", 1, 0);
     assert_eq!(logits.len(), 32, "logits should be vocab_size");
-    assert!(logits.iter().all(|x| x.is_finite()), "logits should be finite");
-    assert!(logits.iter().any(|x| *x != 0.0), "logits should be non-zero");
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "logits should be finite"
+    );
+    assert!(
+        logits.iter().any(|x| *x != 0.0),
+        "logits should be non-zero"
+    );
 }
 
 #[test]
@@ -114,12 +120,23 @@ fn test_decode_multiple_tokens_sequential() {
     // All should produce valid logits
     for (i, logits) in [&logits0, &logits1, &logits2].iter().enumerate() {
         assert_eq!(logits.len(), 32, "step {i}: wrong logits length");
-        assert!(logits.iter().all(|x| x.is_finite()), "step {i}: non-finite logits");
+        assert!(
+            logits.iter().all(|x| x.is_finite()),
+            "step {i}: non-finite logits"
+        );
     }
 
     // Each step should produce different logits (different token + KV context)
-    let diff01: f32 = logits0.iter().zip(&logits1).map(|(a, b)| (a - b).abs()).sum();
-    let diff12: f32 = logits1.iter().zip(&logits2).map(|(a, b)| (a - b).abs()).sum();
+    let diff01: f32 = logits0
+        .iter()
+        .zip(&logits1)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    let diff12: f32 = logits1
+        .iter()
+        .zip(&logits2)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
     assert!(diff01 > 0.01, "step 0 vs 1 should differ, diff={diff01}");
     assert!(diff12 > 0.01, "step 1 vs 2 should differ, diff={diff12}");
 }
@@ -130,8 +147,14 @@ fn test_prefill() {
     let logits = runner.prefill("seq-0", &[1, 2, 3, 4, 5]);
 
     assert_eq!(logits.len(), 32, "logits should be vocab_size");
-    assert!(logits.iter().all(|x| x.is_finite()), "logits should be finite");
-    assert!(logits.iter().any(|x| *x != 0.0), "logits should be non-zero");
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "logits should be finite"
+    );
+    assert!(
+        logits.iter().any(|x| *x != 0.0),
+        "logits should be non-zero"
+    );
 }
 
 #[test]
@@ -170,10 +193,7 @@ fn test_deterministic() {
         .zip(&logits2)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(
-        max_diff < 1e-6,
-        "determinism: max diff = {max_diff}"
-    );
+    assert!(max_diff < 1e-6, "determinism: max diff = {max_diff}");
 }
 
 #[test]
@@ -192,7 +212,10 @@ fn test_reset_reproduces() {
         .zip(&logits2)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(max_diff < 1e-6, "reset should reproduce, max diff = {max_diff}");
+    assert!(
+        max_diff < 1e-6,
+        "reset should reproduce, max diff = {max_diff}"
+    );
 }
 
 #[test]
@@ -216,8 +239,15 @@ fn test_multiple_sequences_independent() {
     let logits_b = runner.decode("seq-b", 2, 0);
 
     // They should produce different results (different input tokens)
-    let diff: f32 = logits_a.iter().zip(&logits_b).map(|(a, b)| (a - b).abs()).sum();
-    assert!(diff > 1e-6, "different tokens should produce different logits, diff={diff}");
+    let diff: f32 = logits_a
+        .iter()
+        .zip(&logits_b)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        diff > 1e-6,
+        "different tokens should produce different logits, diff={diff}"
+    );
 }
 
 #[test]
@@ -272,6 +302,12 @@ fn test_gqa_config() {
     let mut runner = ModelRunner::<CpuBackend>::new(cfg, weights);
     let logits = runner.decode("s", 3, 0);
     assert_eq!(logits.len(), 16);
-    assert!(logits.iter().all(|x| x.is_finite()), "GQA logits should be finite");
-    assert!(logits.iter().any(|x| *x != 0.0), "GQA logits should be non-zero");
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "GQA logits should be finite"
+    );
+    assert!(
+        logits.iter().any(|x| *x != 0.0),
+        "GQA logits should be non-zero"
+    );
 }

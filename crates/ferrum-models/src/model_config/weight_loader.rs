@@ -37,17 +37,18 @@ pub fn load_model_weights(
         let input_ln_w = get_f32(vb, &format!("{prefix}.input_layernorm.weight"))?;
 
         // QKV projection: try fused first, then separate
-        let qkv_proj_w = if let Ok(fused) = get_f32(vb, &format!("{prefix}.self_attn.qkv_proj.weight")) {
-            fused
-        } else {
-            // Separate Q, K, V → fuse into [q_dim + 2*kv_dim, hidden]
-            let q = get_tensor(vb, &format!("{prefix}.self_attn.q_proj.weight"))?;
-            let k = get_tensor(vb, &format!("{prefix}.self_attn.k_proj.weight"))?;
-            let v = get_tensor(vb, &format!("{prefix}.self_attn.v_proj.weight"))?;
-            let fused = Tensor::cat(&[&q, &k, &v], 0)
-                .map_err(|e| FerrumError::model(format!("QKV cat: {e}")))?;
-            tensor_to_f32(&fused)?
-        };
+        let qkv_proj_w =
+            if let Ok(fused) = get_f32(vb, &format!("{prefix}.self_attn.qkv_proj.weight")) {
+                fused
+            } else {
+                // Separate Q, K, V → fuse into [q_dim + 2*kv_dim, hidden]
+                let q = get_tensor(vb, &format!("{prefix}.self_attn.q_proj.weight"))?;
+                let k = get_tensor(vb, &format!("{prefix}.self_attn.k_proj.weight"))?;
+                let v = get_tensor(vb, &format!("{prefix}.self_attn.v_proj.weight"))?;
+                let fused = Tensor::cat(&[&q, &k, &v], 0)
+                    .map_err(|e| FerrumError::model(format!("QKV cat: {e}")))?;
+                tensor_to_f32(&fused)?
+            };
 
         // O projection
         let o_proj_w = get_f32(vb, &format!("{prefix}.self_attn.o_proj.weight"))?;
@@ -90,8 +91,7 @@ pub fn load_model_weights(
     let final_norm_w = get_f32(vb, "model.norm.weight")?;
 
     // LM head: try dedicated lm_head, fallback to tied embed
-    let lm_head_w = get_f32(vb, "lm_head.weight")
-        .unwrap_or_else(|_| embed.clone());
+    let lm_head_w = get_f32(vb, "lm_head.weight").unwrap_or_else(|_| embed.clone());
 
     Ok(ModelWeights {
         embed: CpuBackend::from_slice(&embed),
@@ -107,7 +107,8 @@ fn get_tensor(vb: &VarBuilder, name: &str) -> Result<Tensor> {
     vb.get_with_hints(&[], name, candle_nn::Init::Const(0.0))
         .or_else(|_| {
             // VarBuilder sometimes needs shape hints — try without
-            vb.pp("").get_with_hints(&[], name, candle_nn::Init::Const(0.0))
+            vb.pp("")
+                .get_with_hints(&[], name, candle_nn::Init::Const(0.0))
         })
         .map_err(|e| FerrumError::model(format!("weight '{name}': {e}")))
 }
@@ -118,9 +119,11 @@ fn get_f32(vb: &VarBuilder, name: &str) -> Result<Vec<f32>> {
 }
 
 fn tensor_to_f32(t: &Tensor) -> Result<Vec<f32>> {
-    let t = t.to_dtype(DType::F32)
+    let t = t
+        .to_dtype(DType::F32)
         .map_err(|e| FerrumError::model(format!("to_f32: {e}")))?;
-    let t = t.flatten_all()
+    let t = t
+        .flatten_all()
         .map_err(|e| FerrumError::model(format!("flatten: {e}")))?;
     t.to_vec1::<f32>()
         .map_err(|e| FerrumError::model(format!("to_vec: {e}")))

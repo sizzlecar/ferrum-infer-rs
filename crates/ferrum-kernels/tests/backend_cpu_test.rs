@@ -9,7 +9,13 @@ use ferrum_kernels::backend::{AttnConfig, Backend};
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn assert_close(a: &[f32], b: &[f32], atol: f32, msg: &str) {
-    assert_eq!(a.len(), b.len(), "{msg}: length mismatch {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{msg}: length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
         assert!(
             (x - y).abs() <= atol,
@@ -232,9 +238,16 @@ fn test_flash_attention_causal() {
 
     // Token 1 attends to both: scores = [0, 0.5] * scale = [0, 0.25]
     // softmax([0, 0.5]) = online softmax result
-    assert!(is_finite_nonzero(&out[4..8]), "flash causal t1 should be non-zero");
+    assert!(
+        is_finite_nonzero(&out[4..8]),
+        "flash causal t1 should be non-zero"
+    );
     // Weighted average of V[0] and V[1], skewed toward V[1]
-    assert!(out[4] > 1.0 && out[4] < 5.0, "flash causal t1[0]={}", out[4]);
+    assert!(
+        out[4] > 1.0 && out[4] < 5.0,
+        "flash causal t1[0]={}",
+        out[4]
+    );
 }
 
 // ── Embedding Lookup ─────────────────────────────────────────────────────
@@ -250,12 +263,7 @@ fn test_embedding_lookup() {
     let ids = vec![2u32, 0, 1];
     let mut out = vec![0.0f32; 6];
     CpuBackend::embedding_lookup(&table, &ids, &mut out, 2);
-    assert_close(
-        &out,
-        &[0.5, 0.6, 0.1, 0.2, 0.3, 0.4],
-        1e-6,
-        "embedding",
-    );
+    assert_close(&out, &[0.5, 0.6, 0.1, 0.2, 0.3, 0.4], 1e-6, "embedding");
 }
 
 // ── Add ──────────────────────────────────────────────────────────────────
@@ -308,7 +316,10 @@ fn test_mini_layer_forward() {
     // 1. RMS Norm
     let mut norm_out = CpuBackend::alloc(h);
     CpuBackend::rms_norm(&residual, &input_ln_w, eps, &mut norm_out, 1, h);
-    assert!(is_finite_nonzero(&norm_out), "norm_out should be finite nonzero");
+    assert!(
+        is_finite_nonzero(&norm_out),
+        "norm_out should be finite nonzero"
+    );
 
     // 2. QKV projection
     let q_dim = nh * hd;
@@ -333,7 +344,10 @@ fn test_mini_layer_forward() {
         scale: 1.0 / (hd as f32).sqrt(),
     };
     CpuBackend::decode_attention(&q, &k, &v, &mut attn_out, 1, &cfg);
-    assert!(is_finite_nonzero(&attn_out), "attn_out should be finite nonzero");
+    assert!(
+        is_finite_nonzero(&attn_out),
+        "attn_out should be finite nonzero"
+    );
 
     // 5. O projection
     let mut o_out = CpuBackend::alloc(h);
@@ -360,11 +374,21 @@ fn test_mini_layer_forward() {
     // 10. Final residual add
     let mut final_out = CpuBackend::alloc(h);
     CpuBackend::add(&residual, &mlp_out, &mut final_out, h);
-    assert!(is_finite_nonzero(&final_out), "layer output should be finite nonzero");
+    assert!(
+        is_finite_nonzero(&final_out),
+        "layer output should be finite nonzero"
+    );
 
     // Verify output differs from input (something computed)
-    let diff: f32 = input.iter().zip(&final_out).map(|(a, b)| (a - b).abs()).sum();
-    assert!(diff > 0.01, "layer output should differ from input, diff={diff}");
+    let diff: f32 = input
+        .iter()
+        .zip(&final_out)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        diff > 0.01,
+        "layer output should differ from input, diff={diff}"
+    );
 }
 
 // ── Determinism ──────────────────────────────────────────────────────────

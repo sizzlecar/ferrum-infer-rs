@@ -53,13 +53,20 @@ impl Backend for CpuBackend {
         #[cfg(target_os = "macos")]
         unsafe {
             cblas_sgemm(
-                101, 111, 112, // RowMajor, NoTrans, Trans
-                m as i32, n as i32, k as i32,
+                101,
+                111,
+                112, // RowMajor, NoTrans, Trans
+                m as i32,
+                n as i32,
+                k as i32,
                 1.0,
-                a.as_ptr(), k as i32,
-                b.as_ptr(), k as i32,
+                a.as_ptr(),
+                k as i32,
+                b.as_ptr(),
+                k as i32,
                 0.0,
-                out.as_mut_ptr(), n as i32,
+                out.as_mut_ptr(),
+                n as i32,
             );
         }
 
@@ -161,15 +168,12 @@ impl Backend for CpuBackend {
         pos_offset: usize,
         cfg: &AttnConfig,
     ) {
-        cpu_attention(q, k, v, out, batch, q_len, kv_len, cfg.causal, pos_offset, cfg);
+        cpu_attention(
+            q, k, v, out, batch, q_len, kv_len, cfg.causal, pos_offset, cfg,
+        );
     }
 
-    fn silu_mul(
-        gate: &Self::Buffer,
-        up: &Self::Buffer,
-        out: &mut Self::Buffer,
-        len: usize,
-    ) {
+    fn silu_mul(gate: &Self::Buffer, up: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
         for i in 0..len {
             let g = gate[i];
             let s = g / (1.0 + (-g).exp());
@@ -187,12 +191,7 @@ impl Backend for CpuBackend {
         dst[..len].copy_from_slice(&src[..len]);
     }
 
-    fn embedding_lookup(
-        table: &Self::Buffer,
-        ids: &[u32],
-        out: &mut Self::Buffer,
-        dim: usize,
-    ) {
+    fn embedding_lookup(table: &Self::Buffer, ids: &[u32], out: &mut Self::Buffer, dim: usize) {
         for (i, &id) in ids.iter().enumerate() {
             let src = id as usize * dim;
             out[i * dim..(i + 1) * dim].copy_from_slice(&table[src..src + dim]);

@@ -117,12 +117,7 @@ impl<B: Backend> ModelRunner<B> {
         let vocab = self.cfg.vocab_size;
 
         // Embedding lookup
-        B::embedding_lookup(
-            &self.weights.embed,
-            tokens,
-            &mut self.buffers.residual,
-            h,
-        );
+        B::embedding_lookup(&self.weights.embed, tokens, &mut self.buffers.residual, h);
 
         // Positions: [0, 1, 2, ..., seq_len-1]
         let positions: Vec<u32> = (0..seq_len as u32).collect();
@@ -158,7 +153,14 @@ impl<B: Backend> ModelRunner<B> {
         let all_hidden = B::to_vec(&self.buffers.norm_out, seq_len * h);
         let last_hidden = B::from_slice(&all_hidden[(seq_len - 1) * h..seq_len * h]);
         let mut logits_buf = B::alloc(vocab);
-        B::gemm(&last_hidden, &self.weights.lm_head_w, &mut logits_buf, 1, vocab, h);
+        B::gemm(
+            &last_hidden,
+            &self.weights.lm_head_w,
+            &mut logits_buf,
+            1,
+            vocab,
+            h,
+        );
 
         B::to_vec(&logits_buf, vocab)
     }
@@ -174,12 +176,7 @@ impl<B: Backend> ModelRunner<B> {
         let vocab = self.cfg.vocab_size;
 
         // Embedding lookup (1 token)
-        B::embedding_lookup(
-            &self.weights.embed,
-            &[token],
-            &mut self.buffers.residual,
-            h,
-        );
+        B::embedding_lookup(&self.weights.embed, &[token], &mut self.buffers.residual, h);
 
         let positions = [pos];
 

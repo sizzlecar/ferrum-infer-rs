@@ -65,7 +65,7 @@ pub enum MlpType {
 /// Per-layer weights stored in backend-native buffers.
 pub struct LayerWeights<B: Backend> {
     pub input_ln_w: B::Buffer,
-    pub qkv_proj_w: B::Buffer,    // fused [q_dim + 2*kv_dim, hidden]
+    pub qkv_proj_w: B::Buffer, // fused [q_dim + 2*kv_dim, hidden]
     pub o_proj_w: B::Buffer,
     pub post_ln_w: B::Buffer,
     pub gate_up_proj_w: B::Buffer, // fused [2*intermediate, hidden]
@@ -223,12 +223,7 @@ pub trait Backend: Send + Sync + 'static {
     /// Fused SiLU(gate) * up: out[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i]
     ///
     /// gate, up, out: [tokens * intermediate_size]
-    fn silu_mul(
-        gate: &Self::Buffer,
-        up: &Self::Buffer,
-        out: &mut Self::Buffer,
-        len: usize,
-    );
+    fn silu_mul(gate: &Self::Buffer, up: &Self::Buffer, out: &mut Self::Buffer, len: usize);
 
     // ── Element-wise ────────────────────────────────────────────────────
 
@@ -243,12 +238,7 @@ pub trait Backend: Send + Sync + 'static {
     /// Gather embedding vectors: out[i] = table[ids[i]]
     ///
     /// table: [vocab_size, dim], ids: token ids, out: [tokens * dim]
-    fn embedding_lookup(
-        table: &Self::Buffer,
-        ids: &[u32],
-        out: &mut Self::Buffer,
-        dim: usize,
-    );
+    fn embedding_lookup(table: &Self::Buffer, ids: &[u32], out: &mut Self::Buffer, dim: usize);
 
     // ── Buffer management ───────────────────────────────────────────────
 

@@ -865,13 +865,9 @@ impl Qwen3ModelWrapper {
     /// The runner bypasses candle for the decode hot path, using cuBLAS + custom
     /// CUDA kernels with pre-allocated buffers.
     #[cfg(feature = "cuda")]
-    pub fn create_decode_runner(
-        &self,
-    ) -> Result<ferrum_kernels::cuda_decode::CudaDecodeRunner> {
+    pub fn create_decode_runner(&self) -> Result<ferrum_kernels::cuda_decode::CudaDecodeRunner> {
         use ferrum_kernels::decode_buffers::ModelDims;
-        use ferrum_kernels::weight_store::{
-            GpuWeight, LayerWeights, LinearWeight, Qwen3Weights,
-        };
+        use ferrum_kernels::weight_store::{GpuWeight, LayerWeights, LinearWeight, Qwen3Weights};
 
         let model = self.model.lock();
         let cfg = &self.config;
@@ -1098,13 +1094,8 @@ impl Qwen3ModelWrapper {
         rs.synchronize()
             .map_err(|e| FerrumError::model(format!("stream sync after weight copy: {e}")))?;
 
-        ferrum_kernels::cuda_decode::CudaDecodeRunner::new(
-            weights,
-            dims,
-            cuda_device.clone(),
-            rs,
-        )
-        .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
+        ferrum_kernels::cuda_decode::CudaDecodeRunner::new(weights, dims, cuda_device.clone(), rs)
+            .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
     }
 }
 

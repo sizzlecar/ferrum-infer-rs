@@ -2,18 +2,18 @@
 //!
 //! Adding a new model = adding one function here (~10 lines).
 
-mod qwen3;
 mod llama;
 mod mistral;
+mod qwen3;
 pub mod weight_loader;
 
-use ferrum_kernels::backend::TransformerConfig;
 use crate::definition::ModelDefinition;
 use crate::registry::Architecture;
+use ferrum_kernels::backend::TransformerConfig;
 
-pub use qwen3::qwen3_config;
 pub use llama::llama_config;
 pub use mistral::mistral_config;
+pub use qwen3::qwen3_config;
 
 /// Convert a ModelDefinition into a TransformerConfig for the ModelRunner.
 ///

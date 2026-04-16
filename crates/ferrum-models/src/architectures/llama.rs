@@ -535,9 +535,7 @@ impl LlamaModelWrapper {
 
     /// Create CUDA decode runner by extracting weights directly from the model.
     #[cfg(feature = "cuda")]
-    pub fn create_decode_runner(
-        &self,
-    ) -> Result<ferrum_kernels::cuda_decode::CudaDecodeRunner> {
+    pub fn create_decode_runner(&self) -> Result<ferrum_kernels::cuda_decode::CudaDecodeRunner> {
         use ferrum_kernels::decode_buffers::ModelDims;
         use ferrum_kernels::weight_store::{
             GpuWeight, LayerWeights, LinearWeight, TransformerGpuWeights,
@@ -647,12 +645,7 @@ impl LlamaModelWrapper {
         rs.synchronize()
             .map_err(|e| FerrumError::model(format!("sync: {e}")))?;
 
-        ferrum_kernels::cuda_decode::CudaDecodeRunner::new(
-            weights,
-            dims,
-            cuda_device.clone(),
-            rs,
-        )
-        .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
+        ferrum_kernels::cuda_decode::CudaDecodeRunner::new(weights, dims, cuda_device.clone(), rs)
+            .map_err(|e| FerrumError::model(format!("CudaDecodeRunner: {e}")))
     }
 }

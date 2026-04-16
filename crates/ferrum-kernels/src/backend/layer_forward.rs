@@ -38,7 +38,14 @@ pub fn layer_forward<B: Backend>(
     let qkv_dim = q_dim + 2 * kv_dim;
 
     // 1. Input RMS Norm
-    B::rms_norm(residual, &weights.input_ln_w, eps, &mut scratch.norm_out, tokens, h);
+    B::rms_norm(
+        residual,
+        &weights.input_ln_w,
+        eps,
+        &mut scratch.norm_out,
+        tokens,
+        h,
+    );
 
     // 2. Fused QKV projection: [tokens, hidden] @ [q_dim+2*kv_dim, hidden]^T
     B::gemm(
@@ -113,9 +120,9 @@ pub fn layer_forward<B: Backend>(
             &kv.k,
             &kv.v,
             &mut scratch.attn_out,
-            1,       // batch=1
-            tokens,  // q_len
-            kv_len,  // kv_len
+            1,      // batch=1
+            tokens, // q_len
+            kv_len, // kv_len
             positions[0] as usize,
             &attn_cfg,
         );
@@ -159,12 +166,7 @@ pub fn layer_forward<B: Backend>(
     //     But they're interleaved per token: [gate_0 | up_0 | gate_1 | up_1 | ...]
     //     Actually with fused weight [gate_w; up_w], output is [tokens, 2*im] where
     //     each row is [gate_out(im) | up_out(im)].
-    silu_mul_split::<B>(
-        &scratch.gate_up_out,
-        &mut scratch.silu_out,
-        tokens,
-        im,
-    );
+    silu_mul_split::<B>(&scratch.gate_up_out, &mut scratch.silu_out, tokens, im);
 
     // 11. Down projection: [tokens, inter] @ [hidden, inter]^T → [tokens, hidden]
     B::gemm(
@@ -203,8 +205,7 @@ fn split_qkv_all<B: Backend>(
     let mut v_vec = vec![0.0f32; tokens * kv_dim];
     for t in 0..tokens {
         let base = t * qkv_dim;
-        q_vec[t * q_dim..(t + 1) * q_dim]
-            .copy_from_slice(&qkv_vec[base..base + q_dim]);
+        q_vec[t * q_dim..(t + 1) * q_dim].copy_from_slice(&qkv_vec[base..base + q_dim]);
         k_vec[t * kv_dim..(t + 1) * kv_dim]
             .copy_from_slice(&qkv_vec[base + q_dim..base + q_dim + kv_dim]);
         v_vec[t * kv_dim..(t + 1) * kv_dim]
@@ -273,12 +274,7 @@ fn kv_cache_append<B: Backend>(
 /// SiLU(gate) * up from fused [tokens, 2*inter] output.
 ///
 /// Input layout per token: [gate(inter) | up(inter)]
-fn silu_mul_split<B: Backend>(
-    gate_up: &B::Buffer,
-    out: &mut B::Buffer,
-    tokens: usize,
-    im: usize,
-) {
+fn silu_mul_split<B: Backend>(gate_up: &B::Buffer, out: &mut B::Buffer, tokens: usize, im: usize) {
     let data = B::to_vec(gate_up, tokens * 2 * im);
     let mut gate = vec![0.0f32; tokens * im];
     let mut up = vec![0.0f32; tokens * im];
