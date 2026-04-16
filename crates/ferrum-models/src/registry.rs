@@ -28,6 +28,7 @@ pub enum Architecture {
     Bert,
     Clip,
     Whisper,
+    Qwen3TTS,
     Unknown,
 }
 
@@ -47,6 +48,7 @@ impl Architecture {
             "chinese_clip" | "chineseclipmodel" => Architecture::Clip,
             "siglip" | "siglipmodel" => Architecture::Clip,
             "whisper" | "whisperforconditionalgeneration" => Architecture::Whisper,
+            "qwen3_tts" | "qwen3ttsforconditionalgeneration" => Architecture::Qwen3TTS,
             _ => Architecture::Unknown,
         }
     }

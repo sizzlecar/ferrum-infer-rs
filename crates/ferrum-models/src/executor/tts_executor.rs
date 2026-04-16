@@ -586,6 +586,266 @@ impl TtsModelExecutor {
         Ok(samples)
     }
 
+    /// Decode a chunk of codec frames to audio samples.
+    /// frames: Vec<Vec<u32>> where each inner Vec has num_code_groups elements.
+    fn decode_frames(&mut self, frames: &[Vec<u32>], device: &CandleDevice) -> Result<Vec<f32>> {
+        let num_frames = frames.len();
+        if num_frames == 0 {
+            return Ok(vec![]);
+        }
+        let num_groups = self.config.num_code_groups;
+        let codebook_size = 2048u32;
+
+        let mut flat_codes: Vec<u32> = vec![0; num_groups * num_frames];
+        for (t, frame) in frames.iter().enumerate() {
+            for (g, &code) in frame.iter().take(num_groups).enumerate() {
+                flat_codes[g * num_frames + t] = if code >= codebook_size { 0 } else { code };
+            }
+        }
+
+        let codes_tensor = Tensor::new(&flat_codes[..], device)
+            .map_err(|e| FerrumError::model(format!("codes tensor: {e}")))?
+            .reshape((1, num_groups, num_frames))
+            .map_err(|e| FerrumError::model(format!("reshape codes: {e}")))?;
+
+        let waveform = self.vocoder.decode(&codes_tensor)?;
+        waveform
+            .squeeze(0)
+            .and_then(|t| t.squeeze(0))
+            .and_then(|t| t.to_vec1())
+            .map_err(|e| FerrumError::model(format!("waveform extract: {e}")))
+    }
+
+    /// Streaming TTS: calls `on_chunk` with each audio chunk as soon as it's ready.
+    ///
+    /// Each chunk is `chunk_frames` codec frames decoded to audio (~800ms at default 10 frames).
+    /// First chunk arrives after `chunk_frames` decode steps (~2-3s for 0.6B).
+    pub fn synthesize_streaming<F: FnMut(usize, &[f32])>(
+        &mut self,
+        text: &str,
+        language: &str,
+        chunk_frames: usize,
+        mut on_chunk: F,
+    ) -> Result<Vec<Vec<f32>>> {
+        // Reuse existing synthesize setup (prefill + trailing text)
+        // but yield audio in chunks instead of all at once
+        self.talker.reset();
+        let device = self.talker.device().clone();
+
+        let encoding = self
+            .text_tokenizer
+            .encode(text, false)
+            .map_err(|e| FerrumError::model(format!("tokenize: {e}")))?;
+        let content_ids: Vec<u32> = encoding.get_ids().to_vec();
+        if content_ids.is_empty() {
+            return Err(FerrumError::model("empty text after tokenization"));
+        }
+
+        let codec_eos = self.config.codec_eos_token_id;
+        let tts_pad = self.config.tts_pad_token_id;
+        let tts_bos = self.config.tts_bos_token_id;
+        let tts_eos = self.config.tts_eos_token_id;
+
+        // Build embeddings (same as synthesize)
+        let embed_text_ids = |ids: &[u32]| -> Result<Tensor> {
+            let t = Tensor::new(ids, &device)
+                .map_err(|e| FerrumError::model(format!("text tensor: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("text unsqueeze: {e}")))?;
+            self.talker.embed_text(&t)
+        };
+        let embed_codec_ids = |ids: &[u32]| -> Result<Tensor> {
+            let t = Tensor::new(ids, &device)
+                .map_err(|e| FerrumError::model(format!("codec tensor: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("codec unsqueeze: {e}")))?;
+            self.talker.embed_codec(&t)
+        };
+
+        // Codec/text prefix (same as synthesize)
+        let resolved_lang = if language.eq_ignore_ascii_case("auto") {
+            "chinese"
+        } else {
+            language
+        };
+        let language_id = self
+            .config
+            .codec_language_id
+            .get(&resolved_lang.to_lowercase());
+        let codec_prefix_ids = if let Some(&lang_id) = language_id {
+            vec![
+                self.config.codec_think_id,
+                self.config.codec_think_bos_id,
+                lang_id,
+                self.config.codec_think_eos_id,
+            ]
+        } else {
+            vec![
+                self.config.codec_nothink_id,
+                self.config.codec_think_bos_id,
+                self.config.codec_think_eos_id,
+            ]
+        };
+        let speaker_token = if resolved_lang == "chinese" {
+            3065u32
+        } else {
+            3061u32
+        };
+        let mut codec_ids = codec_prefix_ids;
+        codec_ids.push(speaker_token);
+        codec_ids.push(self.config.codec_pad_id);
+        codec_ids.push(self.config.codec_bos_id);
+        let codec_embed = embed_codec_ids(&codec_ids)?;
+        let n_codec = codec_embed
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+        let n_prefix = n_codec - 1;
+        let codec_prefix_part = codec_embed
+            .narrow(1, 0, n_prefix)
+            .map_err(|e| FerrumError::model(format!("narrow: {e}")))?;
+
+        let mut tts_text_prefix_ids = vec![tts_pad; n_prefix - 1];
+        tts_text_prefix_ids.push(tts_bos);
+        let tts_text_embed = embed_text_ids(&tts_text_prefix_ids)?;
+        let codec_hidden = (&tts_text_embed + &codec_prefix_part)
+            .map_err(|e| FerrumError::model(format!("sum: {e}")))?;
+        let codec_bos_embed = codec_embed
+            .narrow(1, n_prefix, 1)
+            .map_err(|e| FerrumError::model(format!("bos: {e}")))?;
+
+        let role_ids: &[u32] = &[151644, 77091, 198]; // im_start, assistant, \n
+        let role_embed = embed_text_ids(role_ids)?;
+
+        let first_text_combined = if !content_ids.is_empty() {
+            let first_text_embed = embed_text_ids(&content_ids[..1])?;
+            (&first_text_embed + &codec_bos_embed)
+                .map_err(|e| FerrumError::model(format!("first: {e}")))?
+        } else {
+            codec_bos_embed.clone()
+        };
+
+        let prefill_embeds = Tensor::cat(&[&role_embed, &codec_hidden, &first_text_combined], 1)
+            .map_err(|e| FerrumError::model(format!("prefill cat: {e}")))?;
+
+        // Trailing text
+        let trailing_text_embeds = if content_ids.len() > 1 {
+            let remaining = embed_text_ids(&content_ids[1..])?;
+            let eos = embed_text_ids(&[tts_eos])?;
+            Tensor::cat(&[&remaining, &eos], 1)
+                .map_err(|e| FerrumError::model(format!("trailing: {e}")))?
+        } else {
+            embed_text_ids(&[tts_eos])?
+        };
+        let trailing_text_len = trailing_text_embeds
+            .dim(1)
+            .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+        let tts_pad_embed = embed_text_ids(&[tts_pad])?;
+
+        // Prefill
+        let mut hidden = self.talker.forward_step(&prefill_embeds)?;
+        let mut current_logits = self.talker.logits(
+            &hidden
+                .narrow(1, hidden.dim(1).unwrap() - 1, 1)
+                .map_err(|e| FerrumError::model(format!("narrow: {e}")))?,
+        )?;
+
+        // Streaming decode loop
+        let suppress_start = self.config.vocab_size.saturating_sub(1024);
+        let suppress_end = self.config.vocab_size;
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut frame_buffer: Vec<Vec<u32>> = Vec::new();
+        let mut audio_chunks: Vec<Vec<f32>> = Vec::new();
+
+        for step in 0..MAX_CODEC_TOKENS {
+            let mut logits_vec = logits_to_vec(&current_logits)?;
+            for i in suppress_start..suppress_end.min(logits_vec.len()) {
+                if i as u32 != codec_eos {
+                    logits_vec[i] = f32::NEG_INFINITY;
+                }
+            }
+            for &prev_tok in &generated_tokens {
+                let idx = prev_tok as usize;
+                if idx < logits_vec.len() {
+                    if logits_vec[idx] > 0.0 {
+                        logits_vec[idx] /= REPETITION_PENALTY;
+                    } else {
+                        logits_vec[idx] *= REPETITION_PENALTY;
+                    }
+                }
+            }
+            let next_token =
+                sample_token(&logits_vec, tts_temperature(), TOP_K, REPETITION_PENALTY);
+            generated_tokens.push(next_token);
+
+            if next_token == codec_eos {
+                info!("TTS streaming: EOS at step {}", step);
+                break;
+            }
+
+            let last_hidden = hidden
+                .narrow(1, hidden.dim(1).unwrap() - 1, 1)
+                .map_err(|e| FerrumError::model(format!("narrow: {e}")))?;
+            let token_tensor = Tensor::new(&[next_token], &device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| FerrumError::model(format!("tok: {e}")))?;
+            let first_codec_embed = self.talker.embed_codec(&token_tensor)?;
+
+            let extra_codes = self.sub_talker.predict(
+                &last_hidden,
+                &first_codec_embed,
+                st_temperature(),
+                TOP_K,
+            )?;
+
+            let mut frame = vec![next_token];
+            frame.extend_from_slice(&extra_codes);
+            frame_buffer.push(frame);
+
+            // Emit chunk when buffer is full
+            if frame_buffer.len() >= chunk_frames {
+                let chunk_audio = self.decode_frames(&frame_buffer, &device)?;
+                on_chunk(audio_chunks.len(), &chunk_audio);
+                audio_chunks.push(chunk_audio);
+                frame_buffer.clear();
+            }
+
+            // Build combined embed for next step
+            let mut combined_embed = first_codec_embed.clone();
+            for (i, &code) in extra_codes.iter().enumerate() {
+                let code_t = Tensor::new(&[code], &device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| FerrumError::model(format!("code_t: {e}")))?;
+                let sub_embed = code_t
+                    .apply(&self.sub_talker.codec_embeddings[i])
+                    .map_err(|e| FerrumError::model(format!("sub: {e}")))?;
+                combined_embed = (combined_embed + sub_embed)
+                    .map_err(|e| FerrumError::model(format!("add: {e}")))?;
+            }
+            if step < trailing_text_len {
+                let trail = trailing_text_embeds
+                    .narrow(1, step, 1)
+                    .map_err(|e| FerrumError::model(format!("trail: {e}")))?;
+                combined_embed = (combined_embed + trail)
+                    .map_err(|e| FerrumError::model(format!("add trail: {e}")))?;
+            } else {
+                combined_embed = (combined_embed + &tts_pad_embed)
+                    .map_err(|e| FerrumError::model(format!("pad: {e}")))?;
+            }
+
+            hidden = self.talker.forward_step(&combined_embed)?;
+            current_logits = self.talker.logits(&hidden)?;
+        }
+
+        // Flush remaining frames
+        if !frame_buffer.is_empty() {
+            let chunk_audio = self.decode_frames(&frame_buffer, &device)?;
+            on_chunk(audio_chunks.len(), &chunk_audio);
+            audio_chunks.push(chunk_audio);
+        }
+
+        Ok(audio_chunks)
+    }
+
     /// Get the output sample rate.
     pub fn sample_rate(&self) -> usize {
         SAMPLE_RATE

@@ -377,3 +377,43 @@ impl SseEvent {
         result
     }
 }
+
+/// TTS speech request (OpenAI compatible /v1/audio/speech)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechRequest {
+    /// Model name (e.g., "qwen3-tts", "tts-1")
+    #[serde(default = "default_tts_model")]
+    pub model: String,
+
+    /// Text to synthesize
+    pub input: String,
+
+    /// Voice preset (ignored for now — uses default speaker)
+    #[serde(default = "default_voice")]
+    pub voice: String,
+
+    /// Response format: "wav", "pcm" (default: "wav")
+    #[serde(default = "default_audio_format")]
+    pub response_format: String,
+
+    /// Language hint: "auto", "chinese", "english"
+    #[serde(default = "default_language")]
+    pub language: String,
+
+    /// Enable streaming (chunked transfer)
+    #[serde(default)]
+    pub stream: bool,
+}
+
+fn default_tts_model() -> String {
+    "qwen3-tts".to_string()
+}
+fn default_voice() -> String {
+    "default".to_string()
+}
+fn default_audio_format() -> String {
+    "wav".to_string()
+}
+fn default_language() -> String {
+    "auto".to_string()
+}

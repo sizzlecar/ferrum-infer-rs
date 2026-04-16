@@ -71,6 +71,7 @@ impl AxumServer {
             .route("/v1/completions", post(completions_handler))
             .route("/v1/embeddings", post(embeddings_handler))
             .route("/v1/audio/transcriptions", post(transcriptions_handler))
+            .route("/v1/audio/speech", post(speech_handler))
             .route("/v1/models", get(models_handler))
             // Health & observability
             .route("/health", get(health_handler))
@@ -516,6 +517,111 @@ async fn transcriptions_handler(
         .map_err(|e| ServerError::InternalError(format!("transcribe: {e}")))?;
 
     Ok(Json(TranscriptionResponse { text }).into_response())
+}
+
+/// TTS speech synthesis handler (OpenAI-compatible /v1/audio/speech)
+async fn speech_handler(
+    State(state): State<AppState>,
+    Json(request): Json<SpeechRequest>,
+) -> std::result::Result<Response, ServerError> {
+    let span = span!(Level::INFO, "speech");
+    let _guard = span.enter();
+
+    let language = if request.language.is_empty() || request.language == "auto" {
+        None
+    } else {
+        Some(request.language.as_str())
+    };
+
+    let chunk_frames = 10usize;
+    let sample_rate = state.engine.tts_sample_rate();
+
+    if request.stream {
+        // Streaming: chunked transfer encoding with WAV audio
+        let (tx, rx) =
+            mpsc::unbounded_channel::<std::result::Result<axum::body::Bytes, std::io::Error>>();
+
+        let engine = state.engine.clone();
+        let text = request.input.clone();
+        let lang = request.language.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let lang_opt = if lang.is_empty() || lang == "auto" {
+                None
+            } else {
+                Some(lang.as_str())
+            };
+            let rt = tokio::runtime::Handle::current();
+
+            match rt.block_on(engine.synthesize_speech(&text, lang_opt, chunk_frames)) {
+                Ok(chunks) => {
+                    for chunk in &chunks {
+                        let wav_bytes = pcm_to_wav_bytes(chunk, sample_rate);
+                        let _ = tx.send(Ok(axum::body::Bytes::from(wav_bytes)));
+                    }
+                }
+                Err(e) => {
+                    error!("TTS error: {e}");
+                }
+            }
+        });
+
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        let body = axum::body::Body::from_stream(stream);
+        Ok(Response::builder()
+            .status(200)
+            .header("content-type", "audio/wav")
+            .header("transfer-encoding", "chunked")
+            .body(body)
+            .unwrap())
+    } else {
+        // Non-streaming: return complete WAV
+        let chunks = state
+            .engine
+            .synthesize_speech(&request.input, language, chunk_frames)
+            .await
+            .map_err(|e| ServerError::InternalError(format!("TTS: {e}")))?;
+
+        let all_samples: Vec<f32> = chunks.into_iter().flatten().collect();
+        let wav_bytes = pcm_to_wav_bytes(&all_samples, sample_rate);
+
+        Ok(Response::builder()
+            .status(200)
+            .header("content-type", "audio/wav")
+            .header("content-length", wav_bytes.len().to_string())
+            .body(axum::body::Body::from(wav_bytes))
+            .unwrap())
+    }
+}
+
+/// Convert PCM f32 samples to WAV bytes (16-bit, mono).
+fn pcm_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    let num_samples = samples.len();
+    let data_size = num_samples * 2; // 16-bit = 2 bytes per sample
+    let file_size = 44 + data_size;
+
+    let mut buf = Vec::with_capacity(file_size);
+    // RIFF header
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&((file_size - 8) as u32).to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    // fmt chunk
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&1u16.to_le_bytes()); // mono
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+                                                 // data chunk
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&(data_size as u32).to_le_bytes());
+    for &s in samples {
+        let i16_val = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        buf.extend_from_slice(&i16_val.to_le_bytes());
+    }
+    buf
 }
 
 async fn models_handler(

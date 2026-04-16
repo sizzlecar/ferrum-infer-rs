@@ -33,6 +33,10 @@ pub struct ServeCommand {
     /// Port to listen on
     #[arg(short, long)]
     pub port: Option<u16>,
+
+    /// Number of TTS concurrent slots (default: 2)
+    #[arg(long, default_value = "2")]
+    pub tts_slots: usize,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -41,6 +45,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         model_option,
         host,
         port,
+        tts_slots,
     } = cmd;
 
     // Print banner
@@ -123,6 +128,35 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 ),
             )
         }
+        ferrum_models::Architecture::Qwen3TTS => {
+            let n_slots = tts_slots.max(1);
+            println!(
+                "{} ({} slot{})",
+                "Initializing Qwen3-TTS engine...".dimmed(),
+                n_slots,
+                if n_slots > 1 { "s" } else { "" }
+            );
+            let model_path = source.local_path.to_string_lossy().to_string();
+            let mut executors = Vec::with_capacity(n_slots);
+            for i in 0..n_slots {
+                let candle_device = to_candle_device(&device);
+                let executor = ferrum_models::TtsModelExecutor::from_path(
+                    &model_path,
+                    candle_device,
+                    candle_core::DType::F32,
+                )?;
+                if i == 0 {
+                    println!("  Slot 0 loaded");
+                } else {
+                    println!("  Slot {} loaded", i);
+                }
+                executors.push(executor);
+            }
+            Arc::new(ferrum_engine::tts_engine::TtsEngine::new_multi(
+                executors,
+                ferrum_types::ModelId(model_id.clone()),
+            ))
+        }
         _ => {
             println!(
                 "{}",
@@ -157,6 +191,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     println!("Endpoints:");
     println!("  POST /v1/chat/completions      - OpenAI-compatible chat");
     println!("  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)");
+    println!("  POST /v1/audio/speech          - Text-to-speech (TTS)");
     println!("  POST /v1/embeddings            - Text/image embeddings");
     println!("  GET  /v1/models                - List models");
     println!("  GET  /health                   - Health check");
@@ -224,6 +259,8 @@ fn resolve_model_alias(name: &str) -> String {
         "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
             "openai/whisper-large-v3-turbo".to_string()
         }
+        "qwen3-tts" | "tts" | "tts:0.6b" => "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string(),
+        "tts:1.7b" | "qwen3-tts:1.7b" => "Qwen/Qwen3-TTS-12Hz-1.7B-Base".to_string(),
         _ => name.to_string(),
     }
 }
