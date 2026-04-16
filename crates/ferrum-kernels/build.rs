@@ -40,6 +40,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/softmax.cu");
     println!("cargo:rerun-if-changed=kernels/embedding_lookup.cu");
     println!("cargo:rerun-if-changed=kernels/flash_attn_full.cu");
+    println!("cargo:rerun-if-changed=kernels/batched_flash_decode_attention.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -64,6 +65,7 @@ fn main() {
             "kernels/softmax.cu",
             "kernels/embedding_lookup.cu",
             "kernels/flash_attn_full.cu",
+            "kernels/batched_flash_decode_attention.cu",
         ])
         .out_dir(out_dir)
         .arg("-Ikernels") // for common.cuh

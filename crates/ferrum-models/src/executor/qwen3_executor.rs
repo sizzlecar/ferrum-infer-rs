@@ -439,10 +439,8 @@ impl ModelExecutor for Qwen3ModelExecutor {
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
         use ferrum_kernels::cuda_decode::BatchDecodeRequest;
 
-        // Fallback to per-request when: batch=1, no CUDA runner, or paged KV
-        // (batch_decode_step doesn't support paged KV yet)
-        let paged_kv = std::env::var("FERRUM_PAGED_KV").map_or(false, |v| v == "1");
-        if inputs.len() <= 1 || !self.ensure_cuda_runner() || paged_kv {
+        // Fallback to per-request when: batch=1 or no CUDA runner
+        if inputs.len() <= 1 || !self.ensure_cuda_runner() {
             let mut outputs = Vec::with_capacity(inputs.len());
             for input in inputs {
                 outputs.push(self.decode(input).await?);

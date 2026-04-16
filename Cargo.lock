@@ -1362,8 +1362,10 @@ dependencies = [
  "bindgen_cuda",
  "candle-core",
  "cudarc 0.19.4",
+ "ferrum-attention",
  "ferrum-types",
  "half",
+ "metal 0.31.0",
  "tracing",
 ]
 
