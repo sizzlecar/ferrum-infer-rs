@@ -1,5 +1,8 @@
-//! Metal backend — pipelined command buffer.
-//! Metal ops encode into shared cmd buffer. CPU ops trigger sync first.
+//! Metal backend — per-op command buffer (correct, not yet pipelined).
+//!
+//! Each Metal shader dispatch gets its own cmd buffer + commit + wait.
+//! CPU ops on shared memory work without sync (results already committed).
+//! Pipeline optimization: TODO move to FusedTransformer-style batched encoding.
 
 use super::{AttnConfig, Backend};
 use ferrum_attention::metal::pipelines::MetalPipelines;
@@ -18,6 +21,7 @@ fn st() -> &'static MetalState {
 }
 
 pub struct MetalBackend;
+pub struct MetalContext;
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -39,11 +43,6 @@ extern "C" {
     );
 }
 
-/// Metal context — no persistent command buffer (to_owned() is unsafe with autoreleased objects).
-/// Each GPU op creates its own command buffer. Pipeline batching will use a different approach.
-pub struct MetalContext;
-
-/// Run GPU work in a fresh command buffer, commit and wait.
 fn run(f: impl FnOnce(&metal::CommandBufferRef)) {
     let cmd = st().pipes.queue.new_command_buffer();
     f(cmd);
@@ -60,8 +59,6 @@ impl Backend for MetalBackend {
     }
     fn sync(_ctx: &mut Self::Context) {}
 
-    // ── GPU ops: encode into cmd buffer ──────────────────────────────────
-
     fn gemm(
         _ctx: &mut Self::Context,
         a: &Self::Buffer,
@@ -71,7 +68,6 @@ impl Backend for MetalBackend {
         n: usize,
         k: usize,
     ) {
-        // cblas on shared memory (Accelerate) — Metal gemm_v2 has resource issues with 28-layer models
         unsafe {
             cblas_sgemm(
                 101,
@@ -220,10 +216,8 @@ impl Backend for MetalBackend {
         }
     }
 
-    // ── CPU ops on shared memory: sync first ─────────────────────────────
-
     fn split_qkv(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         qkv: &Self::Buffer,
         q: &mut Self::Buffer,
         k: &mut Self::Buffer,
@@ -248,7 +242,7 @@ impl Backend for MetalBackend {
     }
 
     fn fused_silu_mul_split(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         gu: &Self::Buffer,
         out: &mut Self::Buffer,
         tokens: usize,
@@ -268,7 +262,7 @@ impl Backend for MetalBackend {
     }
 
     fn qk_norm(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         data: &mut Self::Buffer,
         w: &Self::Buffer,
         tokens: usize,
@@ -276,7 +270,6 @@ impl Backend for MetalBackend {
         hd: usize,
         eps: f32,
     ) {
-        // No sync needed — called right after split_qkv which already synced
         unsafe {
             let d =
                 std::slice::from_raw_parts_mut(data.contents() as *mut f32, tokens * heads * hd);
@@ -298,7 +291,7 @@ impl Backend for MetalBackend {
     }
 
     fn rope(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         q: &mut Self::Buffer,
         k: &mut Self::Buffer,
         cos: &Self::Buffer,
@@ -308,7 +301,6 @@ impl Backend for MetalBackend {
         nkv: usize,
         hd: usize,
     ) {
-        // No sync needed — called after qk_norm which runs after split_qkv sync
         let tokens = positions.len();
         let half = hd / 2;
         let cv = Self::to_vec(cos, cos.length() as usize / 4);
@@ -338,7 +330,7 @@ impl Backend for MetalBackend {
     }
 
     fn kv_cache_append(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         ck: &mut Self::Buffer,
         cv: &mut Self::Buffer,
         cl: usize,
@@ -348,7 +340,6 @@ impl Backend for MetalBackend {
         nkv: usize,
         hd: usize,
     ) -> (Self::Buffer, Self::Buffer) {
-        // No sync needed — called after rope, data already on CPU
         let nl = cl + nt;
         let fk = st().pipes.buffer_empty(nkv * nl * hd);
         let fv = st().pipes.buffer_empty(nkv * nl * hd);
@@ -378,15 +369,13 @@ impl Backend for MetalBackend {
     }
 
     fn transpose_token_to_head(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         src: &Self::Buffer,
         dst: &mut Self::Buffer,
         tokens: usize,
         heads: usize,
         dim: usize,
     ) {
-        // Sync if dirty (prefill path: src was written by split_qkv after sync, so not dirty)
-
         unsafe {
             let s = std::slice::from_raw_parts(src.contents() as *const f32, tokens * heads * dim);
             let d =
@@ -401,7 +390,7 @@ impl Backend for MetalBackend {
     }
 
     fn transpose_head_to_token(
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
         src: &Self::Buffer,
         dst: &mut Self::Buffer,
         tokens: usize,
@@ -421,7 +410,7 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
+    fn add_inplace(_ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
         unsafe {
             let rv = std::slice::from_raw_parts_mut(r.contents() as *mut f32, len);
             let xv = std::slice::from_raw_parts(x.contents() as *const f32, len);
