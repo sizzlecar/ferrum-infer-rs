@@ -1304,6 +1304,7 @@ dependencies = [
  "chrono",
  "criterion",
  "ferrum-interfaces",
+ "ferrum-kernels",
  "ferrum-kv",
  "ferrum-models",
  "ferrum-runtime",

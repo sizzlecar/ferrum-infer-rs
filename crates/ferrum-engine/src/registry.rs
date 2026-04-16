@@ -1058,6 +1058,26 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 Ok(Arc::new(executor))
             }
             ferrum_models::Architecture::Qwen3 => {
+                // Opt-in: FERRUM_USE_RUNNER=1 uses the new unified ModelRunner path
+                // (Backend trait + layer_forward). Default: legacy Candle path.
+                if std::env::var("FERRUM_USE_RUNNER").as_deref() == Ok("1") {
+                    info!("Loading Qwen3 via ModelRunner (FERRUM_USE_RUNNER=1)");
+                    let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
+                    let vb = loader.load_varbuilder(&CandleDevice::Cpu, DType::F32)?;
+
+                    let transformer_cfg = ferrum_models::model_config::qwen3_config(&model_def);
+                    let weights = ferrum_models::model_config::weight_loader::load_model_weights(
+                        &vb,
+                        &transformer_cfg,
+                    )?;
+                    let runner =
+                        ferrum_kernels::backend::runner::ModelRunner::new(transformer_cfg, weights);
+                    let model_info =
+                        model_def.to_model_info(config.engine_config.model.model_id.to_string());
+                    let executor = ferrum_models::GenericModelExecutor::new(runner, model_info);
+                    return Ok(Arc::new(executor));
+                }
+
                 info!("Loading Qwen3 model weights...");
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();
