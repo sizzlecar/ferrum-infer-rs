@@ -9,6 +9,7 @@ pub mod audio_processor;
 pub mod builder;
 pub mod definition;
 pub mod executor;
+pub mod model_config;
 pub mod hf_download;
 pub mod image_processor;
 pub mod loader;
@@ -26,8 +27,9 @@ pub use architectures::{
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    BertModelExecutor, CandleModelExecutor, ClipModelExecutor, Qwen2ModelExecutor,
-    Qwen3ModelExecutor, StubModelExecutor, TtsModelExecutor, WhisperModelExecutor,
+    BertModelExecutor, CandleModelExecutor, ClipModelExecutor, GenericModelExecutor,
+    Qwen2ModelExecutor, Qwen3ModelExecutor, StubModelExecutor, TtsModelExecutor,
+    WhisperModelExecutor,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;
