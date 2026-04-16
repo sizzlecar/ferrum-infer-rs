@@ -1290,18 +1290,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrum-cuda-kernels"
-version = "0.6.0"
-dependencies = [
- "bindgen_cuda",
- "candle-core",
- "cudarc 0.19.4",
- "ferrum-types",
- "half",
- "tracing",
-]
-
-[[package]]
 name = "ferrum-engine"
 version = "0.6.0"
 dependencies = [
@@ -1368,6 +1356,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-kernels"
+version = "0.6.0"
+dependencies = [
+ "bindgen_cuda",
+ "candle-core",
+ "cudarc 0.19.4",
+ "ferrum-types",
+ "half",
+ "tracing",
+]
+
+[[package]]
 name = "ferrum-kv"
 version = "0.6.0"
 dependencies = [
@@ -1404,8 +1404,8 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "ferrum-attention",
- "ferrum-cuda-kernels",
  "ferrum-interfaces",
+ "ferrum-kernels",
  "ferrum-runtime",
  "ferrum-testkit",
  "ferrum-types",

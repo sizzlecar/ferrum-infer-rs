@@ -36,9 +36,9 @@ pub struct CandleModelExecutor {
     states: Mutex<HashMap<String, LlamaCacheState>>,
     next_cache_id: AtomicU64,
     #[cfg(feature = "cuda")]
-    cuda_runner: Mutex<Option<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner>>,
+    cuda_runner: Mutex<Option<ferrum_kernels::cuda_decode::CudaDecodeRunner>>,
     #[cfg(feature = "cuda")]
-    tp_group: Mutex<Option<ferrum_cuda_kernels::tp_decode::TpDecodeGroup>>,
+    tp_group: Mutex<Option<ferrum_kernels::tp_decode::TpDecodeGroup>>,
 }
 
 impl CandleModelExecutor {
@@ -154,7 +154,7 @@ impl CandleModelExecutor {
         // to fix candle VarBuilder producing different BF16→F16 conversions
         // when loaded independently on different GPUs.
         type RankResult = candle_core::Result<(
-            ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner,
+            ferrum_kernels::cuda_decode::CudaDecodeRunner,
             std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
         )>;
 
@@ -178,7 +178,7 @@ impl CandleModelExecutor {
 
                 let cuda_dev = device.as_cuda_device()?.clone();
 
-                let runner = ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
+                let runner = ferrum_kernels::cuda_decode::CudaDecodeRunner::new(
                     weights,
                     dims,
                     cuda_dev,
@@ -231,7 +231,7 @@ impl CandleModelExecutor {
             .collect();
 
         // Init NCCL using ncclCommInitAll (single thread, no deadlock)
-        let nccl_ranks = match ferrum_cuda_kernels::nccl_comm::NcclRank::init_all(nccl_streams) {
+        let nccl_ranks = match ferrum_kernels::nccl_comm::NcclRank::init_all(nccl_streams) {
             Ok(ranks) => ranks,
             Err(e) => {
                 tracing::warn!("NCCL init_all failed: {e}");
@@ -239,7 +239,7 @@ impl CandleModelExecutor {
             }
         };
 
-        match ferrum_cuda_kernels::tp_decode::TpDecodeGroup::new(runners, nccl_ranks) {
+        match ferrum_kernels::tp_decode::TpDecodeGroup::new(runners, nccl_ranks) {
             Ok(group) => {
                 info!("Tensor parallel group initialized: {tp} GPUs");
                 *self.tp_group.lock() = Some(group);
@@ -462,7 +462,7 @@ impl ModelExecutor for CandleModelExecutor {
                                 let num_kv_heads = self.model.config().num_key_value_heads;
                                 let heads_per_rank = num_kv_heads / tp;
 
-                                use ferrum_cuda_kernels::tp_decode::KvSource;
+                                use ferrum_kernels::tp_decode::KvSource;
 
                                 let mut per_rank_kv: Vec<Vec<(KvSource, KvSource)>> =
                                     (0..tp).map(|_| Vec::new()).collect();

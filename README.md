@@ -252,7 +252,7 @@ crates/
 ├── ferrum-runtime        # Backend implementations (Candle, CPU)
 ├── ferrum-engine         # Metal kernels, model orchestration
 ├── ferrum-models         # Model architectures (LLaMA, Qwen2, Qwen3, BERT, Whisper)
-├── ferrum-cuda-kernels   # Custom CUDA kernels + decode runner
+├── ferrum-kernels   # Custom CUDA kernels + decode runner
 ├── ferrum-tokenizer      # Tokenization
 ├── ferrum-sampler        # Sampling strategies
 ├── ferrum-scheduler      # Request scheduling

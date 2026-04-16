@@ -82,7 +82,7 @@ fn fused_add_rms_norm_compat(
 
     let dims = input.dims();
     match dims.len() {
-        2 => ferrum_cuda_kernels::fused_add_rms_norm(input, residual, weight, eps),
+        2 => ferrum_kernels::fused_add_rms_norm(input, residual, weight, eps),
         3 => {
             let batch_size = dims[0];
             let seq_len = dims[1];
@@ -93,7 +93,7 @@ fn fused_add_rms_norm_compat(
             let input_2d = input.reshape(flat_shape)?;
             let residual_2d = residual.reshape(flat_shape)?;
             let (normalized, residual_updated) =
-                ferrum_cuda_kernels::fused_add_rms_norm(&input_2d, &residual_2d, weight, eps)?;
+                ferrum_kernels::fused_add_rms_norm(&input_2d, &residual_2d, weight, eps)?;
 
             Ok((
                 normalized.reshape(view_shape)?,
@@ -234,7 +234,7 @@ impl Module for MLP {
         let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
         // Fused SiLU+mul: 2 kernel launches → 1, reads gate+up once instead of twice
         #[cfg(feature = "cuda")]
-        let hidden = ferrum_cuda_kernels::fused_silu_mul(&gate.contiguous()?, &up.contiguous()?)?;
+        let hidden = ferrum_kernels::fused_silu_mul(&gate.contiguous()?, &up.contiguous()?)?;
         #[cfg(not(feature = "cuda"))]
         let hidden = (gate.apply(&self.act_fn)? * up)?;
         hidden.apply(&self.down_proj)
@@ -867,9 +867,9 @@ impl Qwen3ModelWrapper {
     #[cfg(feature = "cuda")]
     pub fn create_decode_runner(
         &self,
-    ) -> Result<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner> {
-        use ferrum_cuda_kernels::decode_buffers::ModelDims;
-        use ferrum_cuda_kernels::weight_store::{
+    ) -> Result<ferrum_kernels::cuda_decode::CudaDecodeRunner> {
+        use ferrum_kernels::decode_buffers::ModelDims;
+        use ferrum_kernels::weight_store::{
             GpuWeight, LayerWeights, LinearWeight, Qwen3Weights,
         };
 
@@ -935,19 +935,19 @@ impl Qwen3ModelWrapper {
             gptq: Option<&std::collections::HashMap<String, crate::loader::GptqLayerWeights>>,
             stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
         ) -> std::result::Result<LinearWeight, FerrumError> {
-            use ferrum_cuda_kernels::weight_store::GpuQuantWeight;
+            use ferrum_kernels::weight_store::GpuQuantWeight;
 
             if let Some(gptq_map) = gptq {
                 if let Some(gw) = gptq_map.get(prefix) {
                     // Try Marlin (fused, 3.9x) if dimensions are compatible
-                    let use_marlin = ferrum_cuda_kernels::marlin::is_available()
+                    let use_marlin = ferrum_kernels::marlin::is_available()
                         && gw.k % 128 == 0
                         && gw.n % 256 == 0
                         && (gw.group_size == 128 || gw.group_size == gw.k)
                         && std::env::var("FERRUM_NO_MARLIN").is_err();
 
                     if use_marlin {
-                        use ferrum_cuda_kernels::marlin::{
+                        use ferrum_kernels::marlin::{
                             repack_gptq_to_marlin, repack_scales_to_marlin, MarlinWeight,
                         };
                         let marlin_qw = repack_gptq_to_marlin(&gw.qweight, gw.k, gw.n);
@@ -1098,7 +1098,7 @@ impl Qwen3ModelWrapper {
         rs.synchronize()
             .map_err(|e| FerrumError::model(format!("stream sync after weight copy: {e}")))?;
 
-        ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner::new(
+        ferrum_kernels::cuda_decode::CudaDecodeRunner::new(
             weights,
             dims,
             cuda_device.clone(),

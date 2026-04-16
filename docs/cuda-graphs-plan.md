@@ -76,7 +76,7 @@ cudaGraphExecUpdate(graphExec, graph, &resultInfo)  // 更新图参数
 ```
 
 **实现路径：**
-1. 新建 `crates/ferrum-cuda-kernels/src/cuda_graph.rs`
+1. 新建 `crates/ferrum-kernels/src/cuda_graph.rs`
 2. 通过 `cuda-sys` crate 或手写 FFI 绑定获取 CUDA Runtime 函数
 3. 获取 candle CUDA stream：`tensor.device().as_cuda_device()` → 内部 cudarc stream
 4. 在 stream 上 capture decode forward pass
@@ -114,14 +114,14 @@ cargo doc -p cudarc --all-features 2>&1 | grep -i graph
 find ~/.cargo/registry/src -path "*/cudarc-0.19*" -name "*.rs" | xargs grep -l "graph\|Graph"
 ```
 
-如果 cudarc 0.19 有 graph 模块，在 `ferrum-cuda-kernels/Cargo.toml` 启用：
+如果 cudarc 0.19 有 graph 模块，在 `ferrum-kernels/Cargo.toml` 启用：
 ```toml
 cudarc = { version = "0.19", features = ["driver", "graph"] }  # 假设 feature 名
 ```
 
 ### Step 2: Graph Manager 结构
 
-新建文件：`crates/ferrum-cuda-kernels/src/cuda_graph.rs`
+新建文件：`crates/ferrum-kernels/src/cuda_graph.rs`
 
 ```rust
 pub struct CudaGraphManager {
@@ -316,7 +316,7 @@ RoPE 需要当前 position 来查 cos/sin 表。在 Graph 中：
 ### 新建依赖
 
 ```toml
-# ferrum-cuda-kernels/Cargo.toml
+# ferrum-kernels/Cargo.toml
 [dependencies]
 cuda-sys = "0.3"  # 或手写 FFI bindings
 ```
@@ -324,7 +324,7 @@ cuda-sys = "0.3"  # 或手写 FFI bindings
 ### FFI Bindings
 
 ```rust
-// crates/ferrum-cuda-kernels/src/cuda_graph_ffi.rs
+// crates/ferrum-kernels/src/cuda_graph_ffi.rs
 
 extern "C" {
     fn cudaStreamBeginCapture(
@@ -442,32 +442,32 @@ let out = fused_silu_mul(&gate, &up)?;
 
 | 文件 | 说明 |
 |---|---|
-| `crates/ferrum-cuda-kernels/src/cuda_graph.rs` | CUDA Graph manager |
-| `crates/ferrum-cuda-kernels/src/cuda_graph_ffi.rs` | (方案B) FFI bindings |
+| `crates/ferrum-kernels/src/cuda_graph.rs` | CUDA Graph manager |
+| `crates/ferrum-kernels/src/cuda_graph_ffi.rs` | (方案B) FFI bindings |
 
 ### 方案 A/B 需要修改的文件
 
 | 文件 | 修改内容 |
 |---|---|
-| `crates/ferrum-cuda-kernels/Cargo.toml` | 启用 cudarc graph feature 或添加 cuda-sys |
-| `crates/ferrum-cuda-kernels/src/lib.rs` | 导出 cuda_graph 模块 |
+| `crates/ferrum-kernels/Cargo.toml` | 启用 cudarc graph feature 或添加 cuda-sys |
+| `crates/ferrum-kernels/src/lib.rs` | 导出 cuda_graph 模块 |
 | `crates/ferrum-models/src/architectures/qwen3.rs` | ModelForCausalLM 集成 graph capture/replay |
 | `crates/ferrum-models/src/architectures/qwen3.rs` | Attention: graph 模式下用 full KV buffer + mask |
-| `crates/ferrum-models/Cargo.toml` | 添加 ferrum-cuda-kernels 依赖(如果还没有) |
+| `crates/ferrum-models/Cargo.toml` | 添加 ferrum-kernels 依赖(如果还没有) |
 
 ### 方案 C 需要创建的文件
 
 | 文件 | 说明 |
 |---|---|
-| `crates/ferrum-cuda-kernels/kernels/fused_qk_norm_rope.cu` | CUDA kernel 源码 |
-| `crates/ferrum-cuda-kernels/src/fused_qk_norm_rope.rs` | Rust wrapper |
+| `crates/ferrum-kernels/kernels/fused_qk_norm_rope.cu` | CUDA kernel 源码 |
+| `crates/ferrum-kernels/src/fused_qk_norm_rope.rs` | Rust wrapper |
 
 ### 方案 C 需要修改的文件
 
 | 文件 | 修改内容 |
 |---|---|
-| `crates/ferrum-cuda-kernels/build.rs` | 编译新 kernel |
-| `crates/ferrum-cuda-kernels/src/lib.rs` | 导出新模块 |
+| `crates/ferrum-kernels/build.rs` | 编译新 kernel |
+| `crates/ferrum-kernels/src/lib.rs` | 导出新模块 |
 | `crates/ferrum-models/src/architectures/qwen3.rs` | Attention 层使用 fused kernel |
 
 ## 预期收益

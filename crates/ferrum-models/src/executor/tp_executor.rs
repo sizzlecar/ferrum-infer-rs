@@ -33,7 +33,7 @@ use crate::tensor_wrapper::CandleTensorWrapper;
 use parking_lot::Mutex;
 
 #[cfg(feature = "cuda")]
-use ferrum_cuda_kernels::tp_decode::TpDecodeGroup;
+use ferrum_kernels::tp_decode::TpDecodeGroup;
 
 #[cfg(feature = "cuda")]
 struct TpCacheState {

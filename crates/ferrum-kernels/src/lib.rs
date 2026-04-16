@@ -1,10 +1,10 @@
-//! Ferrum custom CUDA kernels for high-performance inference.
+//! Ferrum unified compute kernels for high-performance inference.
 //!
-//! This crate provides fused CUDA kernels that bypass candle's per-op dispatch,
-//! reducing kernel launch overhead and memory bandwidth usage.
-//!
+//! Provides the `Backend` trait and implementations for CUDA, Metal, and CPU.
 //! On CUDA builds, kernels are compiled to PTX during `cargo build` and loaded
 //! on demand at runtime.
+
+pub mod backend;
 
 #[cfg(feature = "cuda")]
 mod ptx {

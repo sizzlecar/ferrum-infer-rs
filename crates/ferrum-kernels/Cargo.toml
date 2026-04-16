@@ -1,10 +1,10 @@
 [package]
-name = "ferrum-cuda-kernels"
+name = "ferrum-kernels"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Custom CUDA kernels and decode runner for Ferrum inference"
+description = "Unified compute kernels (CUDA/Metal/CPU) and model runner for Ferrum inference"
 readme = "../../README.md"
 
 [dependencies]
@@ -20,5 +20,6 @@ bindgen_cuda = "0.1.6"
 [features]
 default = []
 cuda = ["candle-core/cuda", "dep:cudarc", "marlin", "cudarc?/nccl"]
+metal = []  # Metal backend (macOS)
 marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)
 tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL

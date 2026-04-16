@@ -44,7 +44,7 @@ pub struct Qwen3ModelExecutor {
     next_cache_id: AtomicU64,
     /// CUDA decode runner (created lazily on first CUDA decode call).
     #[cfg(feature = "cuda")]
-    cuda_runner: Mutex<Option<ferrum_cuda_kernels::cuda_decode::CudaDecodeRunner>>,
+    cuda_runner: Mutex<Option<ferrum_kernels::cuda_decode::CudaDecodeRunner>>,
     /// Whether CUDA runner initialization has been attempted (avoid retrying on failure).
     #[cfg(feature = "cuda")]
     cuda_runner_init_attempted: std::sync::atomic::AtomicBool,
@@ -437,7 +437,7 @@ impl ModelExecutor for Qwen3ModelExecutor {
 
     #[cfg(feature = "cuda")]
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
-        use ferrum_cuda_kernels::cuda_decode::BatchDecodeRequest;
+        use ferrum_kernels::cuda_decode::BatchDecodeRequest;
 
         // Fallback to per-request when: batch=1, no CUDA runner, or paged KV
         // (batch_decode_step doesn't support paged KV yet)

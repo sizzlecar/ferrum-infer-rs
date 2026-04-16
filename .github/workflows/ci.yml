@@ -165,4 +165,4 @@ jobs:
           CUDA_COMPUTE_CAP: "80"
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          cargo build -p ferrum-cuda-kernels --features cuda
+          cargo build -p ferrum-kernels --features cuda

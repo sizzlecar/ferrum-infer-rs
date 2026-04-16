@@ -1,7 +1,7 @@
 //! CUDA backend for FusedTransformer.
 //!
 //! Parallel implementation to `metal/` — uses cuBLAS for GEMM and custom
-//! CUDA kernels (from ferrum-cuda-kernels) for element-wise ops.
+//! CUDA kernels (from ferrum-kernels) for element-wise ops.
 
 pub mod transformer;
 

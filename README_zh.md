@@ -252,7 +252,7 @@ crates/
 ├── ferrum-runtime        # 后端实现（Candle, CPU）
 ├── ferrum-engine         # Metal 内核、模型编排
 ├── ferrum-models         # 模型架构（LLaMA, Qwen2, Qwen3, BERT, Whisper）
-├── ferrum-cuda-kernels   # 自定义 CUDA 内核 + decode runner
+├── ferrum-kernels   # 自定义 CUDA 内核 + decode runner
 ├── ferrum-tokenizer      # 分词器
 ├── ferrum-sampler        # 采样策略
 ├── ferrum-scheduler      # 请求调度

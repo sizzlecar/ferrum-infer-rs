@@ -19,7 +19,7 @@ COPY . .
 RUN cargo check --workspace --features cuda 2>&1 | tail -20
 
 # Also verify the CUDA kernels compile to PTX
-RUN cargo build -p ferrum-cuda-kernels --features cuda 2>&1 | tail -10
+RUN cargo build -p ferrum-kernels --features cuda 2>&1 | tail -10
 
 # If we get here, everything compiles
 RUN echo "CUDA compilation check PASSED"

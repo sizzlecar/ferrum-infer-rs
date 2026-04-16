@@ -21,6 +21,11 @@ fn cuda_root_from_env() -> Option<PathBuf> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Link Accelerate framework on macOS (provides cblas_sgemm, vDSP_*)
+    if env::consts::OS == "macos" {
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+    }
     println!("cargo:rerun-if-changed=kernels/fused_add_rms_norm.cu");
     println!("cargo:rerun-if-changed=kernels/fused_silu_mul.cu");
     println!("cargo:rerun-if-changed=kernels/rms_norm.cu");

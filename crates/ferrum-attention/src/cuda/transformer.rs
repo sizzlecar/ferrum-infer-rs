@@ -124,12 +124,12 @@ pub struct CudaTransformerState {
 
 // TODO: Implement cuda_layer_forward() using:
 // - cuBLAS sgemm for Q/K/V/O/gate/up/down projections
-// - ferrum-cuda-kernels rms_norm_f32 for layer norms
-// - ferrum-cuda-kernels rope_f32 for RoPE
-// - ferrum-cuda-kernels fused_silu_mul_f32 for SiLU gate
-// - ferrum-cuda-kernels residual_add_f32 for residual connections
-// - ferrum-cuda-kernels flash_attn_full_f32 for attention
-// - ferrum-cuda-kernels softmax_f32 (used internally by attention)
+// - ferrum-kernels rms_norm_f32 for layer norms
+// - ferrum-kernels rope_f32 for RoPE
+// - ferrum-kernels fused_silu_mul_f32 for SiLU gate
+// - ferrum-kernels residual_add_f32 for residual connections
+// - ferrum-kernels flash_attn_full_f32 for attention
+// - ferrum-kernels softmax_f32 (used internally by attention)
 //
 // All ops on a single CUDA stream. KV cache append is a device-to-device copy.
 // Output written to scratch.output. Caller reads after all layers.

@@ -13,7 +13,7 @@ use candle_core::{DType, Device as CandleDevice, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::VarBuilder;
 #[cfg(feature = "cuda")]
-use ferrum_cuda_kernels::{
+use ferrum_kernels::{
     decode_buffers::ModelDims,
     weight_store::{GpuWeight, LayerWeights, LinearWeight, TransformerGpuWeights},
 };

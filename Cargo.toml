@@ -11,10 +11,10 @@ members = [
     "crates/ferrum-sampler",
     "crates/ferrum-kv",
     
-    # CUDA kernel crate
-    "crates/ferrum-cuda-kernels",
+    # Unified compute kernels (CUDA/Metal/CPU)
+    "crates/ferrum-kernels",
 
-    # Attention kernel crate
+    # Attention kernel crate (to be merged into ferrum-kernels)
     "crates/ferrum-attention",
 
     # Existing crates (to be refactored)
@@ -138,8 +138,8 @@ ferrum-tokenizer = { path = "crates/ferrum-tokenizer", version = "0.6.0" }
 ferrum-sampler = { path = "crates/ferrum-sampler", version = "0.6.0" }
 ferrum-kv = { path = "crates/ferrum-kv", version = "0.6.0" }
 
-# CUDA kernel crate
-ferrum-cuda-kernels = { path = "crates/ferrum-cuda-kernels", version = "0.6.0" }
+# Unified compute kernels (CUDA/Metal/CPU)
+ferrum-kernels = { path = "crates/ferrum-kernels", version = "0.6.0" }
 
 # Internal crates - Existing crates (to be refactored)
 ferrum-engine = { path = "crates/ferrum-engine", version = "0.6.0" }
