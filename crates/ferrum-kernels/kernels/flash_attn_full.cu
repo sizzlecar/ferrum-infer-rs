@@ -12,6 +12,7 @@
 // Block: 1 threadgroup per (batch, head, q_tile).
 // Each block computes attention for TILE_Q query positions.
 
+#include "common.cuh"
 #include <cstdint>
 #include <cfloat>
 
@@ -126,5 +127,94 @@ extern "C" __global__ void flash_attn_full_f32(
     float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 0.0f;
     for (int d = 0; d < hd; d++) {
         o_ptr[d] = acc[d] * inv_l;
+    }
+}
+
+// ── F16 variant for CUDA decode path ─────────────────────────────────────
+
+extern "C" __global__ void flash_attn_full_f16(
+    const __half* __restrict__ Q,   // [B, NH, SQ, HD]
+    const __half* __restrict__ K,   // [B, NKV, SK, HD]
+    const __half* __restrict__ V,   // [B, NKV, SK, HD]
+    __half* __restrict__ O,         // [B, NH, SQ, HD]
+    FlashAttnParams params
+) {
+    int b = blockIdx.z;
+    int h = blockIdx.y;
+    int q_tile_start = blockIdx.x * TILE_Q;
+
+    int nh = params.num_heads;
+    int nkv = params.num_kv_heads;
+    int sq = params.q_len;
+    int sk = params.kv_len;
+    int hd = params.head_dim;
+    int kv_stride = params.kv_seq_stride;
+
+    int kv_h = h / (nh / nkv);
+    float scale = rsqrtf((float)hd);
+
+    int q_local = threadIdx.x % TILE_Q;
+    int q_pos = q_tile_start + q_local;
+    if (q_pos >= sq) return;
+
+    const __half* q_ptr = Q + ((b * nh + h) * sq + q_pos) * hd;
+    __half* o_ptr = O + ((b * nh + h) * sq + q_pos) * hd;
+
+    float m_prev = -FLT_MAX;
+    float l_prev = 0.0f;
+    float acc[128];
+    for (int d = 0; d < hd; d++) acc[d] = 0.0f;
+
+    for (int kv_start = 0; kv_start < sk; kv_start += TILE_KV) {
+        float scores[TILE_KV];
+        for (int kv_local = 0; kv_local < TILE_KV; kv_local++) {
+            int kv_pos = kv_start + kv_local;
+            if (kv_pos >= sk) {
+                scores[kv_local] = -FLT_MAX;
+                continue;
+            }
+            if (params.causal && kv_pos > params.pos_offset + q_pos) {
+                scores[kv_local] = -FLT_MAX;
+                continue;
+            }
+
+            const __half* k_ptr = K + ((b * nkv + kv_h) * kv_stride + kv_pos) * hd;
+            float dot = 0.0f;
+            for (int d = 0; d < hd; d++) {
+                dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
+            }
+            scores[kv_local] = dot * scale;
+        }
+
+        float m_new = m_prev;
+        for (int j = 0; j < TILE_KV; j++) {
+            m_new = fmaxf(m_new, scores[j]);
+        }
+
+        float correction = expf(m_prev - m_new);
+        l_prev *= correction;
+        for (int d = 0; d < hd; d++) {
+            acc[d] *= correction;
+        }
+
+        for (int kv_local = 0; kv_local < TILE_KV; kv_local++) {
+            int kv_pos = kv_start + kv_local;
+            if (kv_pos >= sk) continue;
+
+            float w = expf(scores[kv_local] - m_new);
+            l_prev += w;
+
+            const __half* v_ptr = V + ((b * nkv + kv_h) * kv_stride + kv_pos) * hd;
+            for (int d = 0; d < hd; d++) {
+                acc[d] += w * __half2float(v_ptr[d]);
+            }
+        }
+
+        m_prev = m_new;
+    }
+
+    float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 0.0f;
+    for (int d = 0; d < hd; d++) {
+        o_ptr[d] = __float2half(acc[d] * inv_l);
     }
 }

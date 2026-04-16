@@ -16,6 +16,5 @@ pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
 
-// CUDA backend will be added when we refactor CudaDecodeRunner (Phase 2).
-// #[cfg(feature = "cuda")]
-// pub mod cuda;
+#[cfg(feature = "cuda")]
+pub mod cuda;
