@@ -39,6 +39,14 @@ pub struct TtsCommand {
     /// Reference audio transcript (required for ICL voice cloning)
     #[arg(long)]
     pub ref_text: Option<String>,
+
+    /// Enable streaming mode (generate audio in chunks)
+    #[arg(long)]
+    pub streaming: bool,
+
+    /// Frames per streaming chunk (default: 10, ~800ms per chunk)
+    #[arg(long, default_value = "10")]
+    pub chunk_frames: usize,
 }
 
 pub async fn execute(cmd: TtsCommand, config: CliConfig) -> Result<()> {
@@ -115,32 +123,70 @@ pub async fn execute(cmd: TtsCommand, config: CliConfig) -> Result<()> {
     );
 
     let start = std::time::Instant::now();
-    let samples = if let Some(ref_audio) = &cmd.ref_audio {
-        let ref_text = cmd.ref_text.as_deref().ok_or_else(|| {
-            ferrum_types::FerrumError::model("--ref-text required for voice cloning")
-        })?;
-        eprintln!("{} {}", "Ref audio:".dimmed(), ref_audio.cyan());
-        executor.synthesize_voice_clone(&cmd.text, &cmd.language, ref_audio, ref_text)?
-    } else {
-        executor.synthesize(&cmd.text, &cmd.language)?
-    };
-    let elapsed = start.elapsed();
-
     let sample_rate = executor.sample_rate();
-    let duration_secs = samples.len() as f64 / sample_rate as f64;
 
-    // Save as WAV
-    let output_path = &cmd.output;
-    save_wav(output_path, &samples, sample_rate as u32)?;
+    if cmd.streaming && cmd.ref_audio.is_none() {
+        // Streaming mode: generate and save chunks incrementally
+        eprintln!("{}", "Streaming mode enabled".yellow());
+        let mut all_samples = Vec::new();
+        let sr = sample_rate;
+        let t0 = start;
+        let chunks = executor.synthesize_streaming(
+            &cmd.text,
+            &cmd.language,
+            cmd.chunk_frames,
+            |idx, chunk| {
+                let chunk_dur = chunk.len() as f64 / sr as f64;
+                eprintln!(
+                    "  {} chunk {} — {:.2}s audio (at {:.1}s)",
+                    "▶".green(),
+                    idx,
+                    chunk_dur,
+                    t0.elapsed().as_secs_f64(),
+                );
+            },
+        )?;
+        let elapsed = start.elapsed();
+        for chunk in &chunks {
+            all_samples.extend_from_slice(chunk);
+        }
 
-    eprintln!("\n{} {}", "Output:".dimmed(), output_path.green());
-    eprintln!(
-        "{} {:.2}s audio, {:.2}s elapsed (RTF={:.2}x)",
-        "Stats:".dimmed(),
-        duration_secs,
-        elapsed.as_secs_f64(),
-        elapsed.as_secs_f64() / duration_secs.max(0.001),
-    );
+        let duration_secs = all_samples.len() as f64 / sample_rate as f64;
+        save_wav(&cmd.output, &all_samples, sample_rate as u32)?;
+
+        eprintln!("\n{} {}", "Output:".dimmed(), cmd.output.green());
+        eprintln!(
+            "{} {:.2}s audio, {:.2}s elapsed (RTF={:.2}x), {} chunks",
+            "Stats:".dimmed(),
+            duration_secs,
+            elapsed.as_secs_f64(),
+            elapsed.as_secs_f64() / duration_secs.max(0.001),
+            chunks.len(),
+        );
+    } else {
+        // Batch mode
+        let samples = if let Some(ref_audio) = &cmd.ref_audio {
+            let ref_text = cmd.ref_text.as_deref().ok_or_else(|| {
+                ferrum_types::FerrumError::model("--ref-text required for voice cloning")
+            })?;
+            eprintln!("{} {}", "Ref audio:".dimmed(), ref_audio.cyan());
+            executor.synthesize_voice_clone(&cmd.text, &cmd.language, ref_audio, ref_text)?
+        } else {
+            executor.synthesize(&cmd.text, &cmd.language)?
+        };
+        let elapsed = start.elapsed();
+        let duration_secs = samples.len() as f64 / sample_rate as f64;
+        save_wav(&cmd.output, &samples, sample_rate as u32)?;
+
+        eprintln!("\n{} {}", "Output:".dimmed(), cmd.output.green());
+        eprintln!(
+            "{} {:.2}s audio, {:.2}s elapsed (RTF={:.2}x)",
+            "Stats:".dimmed(),
+            duration_secs,
+            elapsed.as_secs_f64(),
+            elapsed.as_secs_f64() / duration_secs.max(0.001),
+        );
+    }
 
     Ok(())
 }

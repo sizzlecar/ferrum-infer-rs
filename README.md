@@ -84,6 +84,13 @@ ferrum tts qwen3-tts "你好欢迎使用语音合成系统" -o output.wav
 # Voice clone (ICL mode — clone any voice from 5s reference audio)
 ferrum tts qwen3-tts "你好" --ref-audio ref.wav --ref-text "参考文本" -o clone.wav
 
+# Streaming TTS (first audio chunk in ~2.5s)
+ferrum tts qwen3-tts "你好世界" --streaming -o output.wav
+
+# TTS API server (OpenAI-compatible)
+ferrum serve qwen3-tts
+curl localhost:8000/v1/audio/speech -d '{"input":"你好","language":"chinese"}' -o speech.wav
+
 # Whisper API server (OpenAI-compatible)
 ferrum serve whisper-turbo
 curl localhost:8000/v1/audio/transcriptions -F "file=@audio.wav" -F "language=zh"
@@ -123,6 +130,11 @@ curl http://localhost:8000/v1/chat/completions \
 # Audio transcription (OpenAI-compatible, multipart form)
 curl http://localhost:8000/v1/audio/transcriptions \
   -F "file=@audio.wav" -F "language=zh"
+
+# Text-to-speech (OpenAI-compatible)
+curl http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"Hello world","language":"english"}' -o speech.wav
 
 # Embeddings
 curl http://localhost:8000/v1/embeddings \
@@ -173,10 +185,10 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 
 ### Qwen3-TTS (Apple Silicon Metal)
 
-| Text | Audio | Time | RTF |
-|------|-------|------|-----|
-| 29 chars Chinese | 4.6s | **11.3s** | **2.8x realtime** |
-| Voice clone (ICL, 5s ref) | 5.3s | 13.1s | 2.5x realtime |
+| Model | Text | Audio | Time | RTF | First chunk |
+|-------|------|-------|------|-----|-------------|
+| 0.6B | 29 chars Chinese | 4.6s | **11.3s** | **2.8x** | ~2.5s (streaming) |
+| 1.7B | Voice clone (ICL) | 5.8s | **25s** | **4.4x** | ~5s (streaming) |
 
 > All-Metal fused transformer pipeline: custom GEMM (64×32 simdgroup tiles), fused residual+norm, flash attention with layer_scale. Full Mimi-based vocoder with 8-layer pre-transformer. Zero-copy on Apple Silicon unified memory.
 
@@ -190,8 +202,10 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 - **Custom CUDA kernels**: fused RmsNorm, SiLU×mul, RoPE, decode attention (all on single stream)
 - **Flash Decoding**: split-K for long-context decode (auto at KV > 256)
 - **Batch decode**: batched cuBLAS GEMM + batched attention for concurrent requests
-- **Metal TTS pipeline**: all-Metal fused transformer for talker (28 layers) + SubTalker (5 layers) + vocoder (8 layers), cached GPU buffers, fused residual+norm kernel, layer_scale support
-- **TTS voice clone**: ICL prompting with speaker encoder (ECAPA-TDNN) + speech tokenizer (Mimi RVQ)
+- **Metal TTS pipeline**: all-Metal fused transformer for talker (28 layers) + SubTalker (5 layers) + vocoder (8 layers), GPU-side RMSNorm, cached projection weights
+- **TTS streaming**: chunk-by-chunk audio generation (~800ms chunks), first audio in ~2.5s
+- **TTS voice clone**: ICL prompting with speaker encoder (ECAPA-TDNN) + speech tokenizer (Mimi RVQ), sinc resampling
+- **TTS HTTP API**: OpenAI-compatible `/v1/audio/speech` with streaming support
 - **Paged KV attention**: GPU block pool with block-table indirection
 - **Double-buffered residual**: cross-layer norm fusion (-108 kernel launches)
 
