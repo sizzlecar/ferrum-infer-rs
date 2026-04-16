@@ -1063,7 +1063,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 if std::env::var("FERRUM_USE_RUNNER").as_deref() == Ok("1") {
                     info!("Loading Qwen3 via ModelRunner (FERRUM_USE_RUNNER=1)");
                     let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
-                    let vb = loader.load_varbuilder(&CandleDevice::Cpu, DType::F32)?;
+                    let vb = loader.load_varbuilder(&candle_device, dtype)?;
 
                     let transformer_cfg = ferrum_models::model_config::qwen3_config(&model_def);
                     let weights = ferrum_models::model_config::weight_loader::load_model_weights(
