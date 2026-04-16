@@ -5,29 +5,7 @@
 //
 // Reference: vLLM csrc/layernorm_kernels.cu (Apache 2.0)
 
-#include <cuda_fp16.h>
-
-// Warp-level reduction for sum
-__inline__ __device__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
-// Block-level reduction for sum using shared memory
-__inline__ __device__ float block_reduce_sum(float val) {
-    __shared__ float shared[32]; // Max 32 warps per block
-    int lane = threadIdx.x & 31;
-    int wid = threadIdx.x >> 5;
-    val = warp_reduce_sum(val);
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-    val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0f;
-    if (wid == 0) val = warp_reduce_sum(val);
-    return val;
-}
+#include "common.cuh"
 
 // Fused: residual_out = input + residual; output = rms_norm(residual_out, weight, eps)
 // All in FP16, internal computation in FP32.

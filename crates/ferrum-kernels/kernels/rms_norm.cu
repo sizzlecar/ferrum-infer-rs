@@ -6,27 +6,7 @@
 // Supports both flat [num_tokens, hidden_size] and per-head [num_heads, head_dim]
 // layouts — the kernel just sees num_rows × row_size.
 
-#include <cuda_fp16.h>
-
-__inline__ __device__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
-__inline__ __device__ float block_reduce_sum(float val) {
-    __shared__ float shared[32];
-    int lane = threadIdx.x & 31;
-    int wid = threadIdx.x >> 5;
-    val = warp_reduce_sum(val);
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-    val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0f;
-    if (wid == 0) val = warp_reduce_sum(val);
-    return val;
-}
+#include "common.cuh"
 
 // Grid:  (num_rows,)   — one block per row
 // Block: (min(row_size, 1024),)

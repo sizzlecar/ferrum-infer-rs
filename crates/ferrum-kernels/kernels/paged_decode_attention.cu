@@ -18,46 +18,9 @@
 // Block: (256,)
 // Shared: valid_kv_len * sizeof(float) for attention scores
 
-#include <cuda_fp16.h>
+#include "common.cuh"
 
 #define WARP_SIZE 32
-
-__inline__ __device__ float warp_reduce_sum_pa(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
-__inline__ __device__ float block_reduce_max_pa(float val) {
-    __shared__ float shared[32];
-    int lane = threadIdx.x & 31;
-    int wid = threadIdx.x >> 5;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-    val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : -1e20f;
-    if (wid == 0) {
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
-
-__inline__ __device__ float block_reduce_sum_pa(float val) {
-    __shared__ float shared[32];
-    int lane = threadIdx.x & 31;
-    int wid = threadIdx.x >> 5;
-    val = warp_reduce_sum_pa(val);
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-    val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0f;
-    if (wid == 0) val = warp_reduce_sum_pa(val);
-    return val;
-}
 
 // Translate a logical KV position to a global memory pointer in the block pool.
 __inline__ __device__ const __half* paged_kv_ptr(
@@ -129,7 +92,7 @@ extern "C" __global__ void paged_decode_attention_f16(
             if (i < elems_per_thread && d < head_dim)
                 dot += q_reg[i] * __half2float(k_row[d]);
         }
-        float score = warp_reduce_sum_pa(dot) * scale;
+        float score = warp_reduce_sum(dot) * scale;
         if (lane_id == 0)
             s_scores[kv_pos] = score;
     }
@@ -141,7 +104,7 @@ extern "C" __global__ void paged_decode_attention_f16(
         thread_max = fmaxf(thread_max, s_scores[i]);
 
     __shared__ float s_global_max;
-    float bmax = block_reduce_max_pa(thread_max);
+    float bmax = block_reduce_max(thread_max);
     if (threadIdx.x == 0) s_global_max = bmax;
     __syncthreads();
     float global_max = s_global_max;
@@ -155,7 +118,7 @@ extern "C" __global__ void paged_decode_attention_f16(
     __syncthreads();
 
     __shared__ float s_global_sum;
-    float bsum = block_reduce_sum_pa(thread_sum);
+    float bsum = block_reduce_sum(thread_sum);
     if (threadIdx.x == 0) s_global_sum = bsum;
     __syncthreads();
     float inv_sum = 1.0f / s_global_sum;
@@ -250,7 +213,7 @@ extern "C" __global__ void paged_flash_decode_attn_f16(
             if (i < elems_per_thread && d < head_dim)
                 dot += q_reg[i] * __half2float(k_row[d]);
         }
-        float score = warp_reduce_sum_pa(dot) * scale;
+        float score = warp_reduce_sum(dot) * scale;
         if (lane_id == 0)
             smem[pos] = score;
     }
@@ -260,7 +223,7 @@ extern "C" __global__ void paged_flash_decode_attn_f16(
     float thread_max = -1e20f;
     for (int i = threadIdx.x; i < my_len; i += blockDim.x)
         thread_max = fmaxf(thread_max, smem[i]);
-    float local_max = block_reduce_max_pa(thread_max);
+    float local_max = block_reduce_max(thread_max);
     __shared__ float s_max;
     if (threadIdx.x == 0) s_max = local_max;
     __syncthreads();
@@ -273,7 +236,7 @@ extern "C" __global__ void paged_flash_decode_attn_f16(
         thread_sum += v;
     }
     __syncthreads();
-    float local_sum = block_reduce_sum_pa(thread_sum);
+    float local_sum = block_reduce_sum(thread_sum);
     __shared__ float s_sum;
     if (threadIdx.x == 0) s_sum = local_sum;
     __syncthreads();

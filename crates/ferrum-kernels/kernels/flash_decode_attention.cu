@@ -17,49 +17,10 @@
 // Reference: Flash-Decoding (Stanford CRFM, 2023)
 // K/V cache layout: [seq_len, num_kv_heads, head_dim]
 
-#include <cuda_fp16.h>
+#include "common.cuh"
 
 #define WARP_SIZE 32
 #define MAX_SPLITS 32
-
-// ====================== Warp/Block Reductions ======================
-
-__inline__ __device__ float warp_reduce_sum_fd(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
-__inline__ __device__ float block_reduce_max_fd(float val) {
-    __shared__ float shared[32];
-    int lane = threadIdx.x & 31;
-    int wid = threadIdx.x >> 5;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-    val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : -1e20f;
-    if (wid == 0) {
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
-
-__inline__ __device__ float block_reduce_sum_fd(float val) {
-    __shared__ float shared[32];
-    int lane = threadIdx.x & 31;
-    int wid = threadIdx.x >> 5;
-    val = warp_reduce_sum_fd(val);
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-    val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0f;
-    if (wid == 0) val = warp_reduce_sum_fd(val);
-    return val;
-}
 
 // ====================== Phase 1: Split-K Attention ======================
 //
@@ -137,7 +98,7 @@ extern "C" __global__ void flash_decode_attn_f16(
             if (i < elems_per_thread && d < head_dim)
                 dot += q_reg[i] * __half2float(k_row[d]);
         }
-        float score = warp_reduce_sum_fd(dot) * scale;
+        float score = warp_reduce_sum(dot) * scale;
         if (lane_id == 0)
             smem[pos] = score;
     }
@@ -147,7 +108,7 @@ extern "C" __global__ void flash_decode_attn_f16(
     float thread_max = -1e20f;
     for (int i = threadIdx.x; i < my_len; i += blockDim.x)
         thread_max = fmaxf(thread_max, smem[i]);
-    float local_max = block_reduce_max_fd(thread_max);
+    float local_max = block_reduce_max(thread_max);
 
     __shared__ float s_max;
     if (threadIdx.x == 0) s_max = local_max;
@@ -162,7 +123,7 @@ extern "C" __global__ void flash_decode_attn_f16(
     }
     __syncthreads();
 
-    float local_sum = block_reduce_sum_fd(thread_sum);
+    float local_sum = block_reduce_sum(thread_sum);
     __shared__ float s_sum;
     if (threadIdx.x == 0) s_sum = local_sum;
     __syncthreads();

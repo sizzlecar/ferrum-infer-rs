@@ -2,21 +2,8 @@
 // Used by TTS flash attention and speaker encoder.
 // Grid: one block per row. Block: 256 threads.
 
-#include <cstdint>
+#include "common.cuh"
 #include <cfloat>
-
-// Warp-level reduction
-__device__ float warp_reduce_max(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    return val;
-}
-
-__device__ float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
 
 extern "C" __global__ void softmax_f32(
     const float* __restrict__ input,
