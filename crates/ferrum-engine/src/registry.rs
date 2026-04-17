@@ -967,7 +967,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             // Only the config constructor differs.
             arch @ (ferrum_models::Architecture::Llama
             | ferrum_models::Architecture::Qwen2
-            | ferrum_models::Architecture::Qwen3) => {
+            | ferrum_models::Architecture::Qwen3
+            | ferrum_models::Architecture::Mistral) => {
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();
 
@@ -1002,6 +1003,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     ferrum_models::Architecture::Qwen2 => {
                         info!("Loading Qwen2 via LlamaFamilyModel");
                         ferrum_models::models::LlamaFamilyConfig::qwen2_from_def(&model_def)
+                    }
+                    ferrum_models::Architecture::Mistral => {
+                        info!("Loading Mistral via LlamaFamilyModel (sliding_window from config)");
+                        ferrum_models::models::LlamaFamilyConfig::mistral_from_def(&model_def)
                     }
                     _ => {
                         info!("Loading Llama via LlamaFamilyModel");

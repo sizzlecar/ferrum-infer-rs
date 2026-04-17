@@ -190,6 +190,7 @@ impl Backend for MetalBackend {
             head_dim: cfg.head_dim,
             causal: cfg.causal,
             pos_offset,
+            sliding_window: cfg.sliding_window,
         };
         let cmd = ctx.cmd();
         st().pipes

@@ -418,16 +418,21 @@ fn cpu_attention(
             let o_off = (b * nh + h) * q_len * d;
 
             for qi in 0..q_len {
-                let attend_len = if causal {
+                let attend_end = if causal {
                     (pos_offset + qi + 1).min(kv_len)
                 } else {
                     kv_len
+                };
+                let attend_start = if causal && cfg.sliding_window > 0 {
+                    attend_end.saturating_sub(cfg.sliding_window)
+                } else {
+                    0
                 };
                 let mut max_score = f32::NEG_INFINITY;
                 let mut sum_exp = 0.0f32;
                 let mut acc = vec![0.0f32; d];
 
-                for ki in 0..attend_len {
+                for ki in attend_start..attend_end {
                     let mut dot = 0.0f32;
                     for di in 0..d {
                         dot += q[q_off + qi * d + di] * k[k_off + ki * d + di];

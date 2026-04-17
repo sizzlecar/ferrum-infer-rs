@@ -20,6 +20,7 @@ pub type GpuBuffer = cudarc::driver::CudaSlice<f32>;
 pub type GpuBuffer = Vec<f32>;
 
 /// Attention configuration.
+#[derive(Clone, Debug, Default)]
 pub struct AttentionParams {
     pub batch: usize,
     pub num_heads: usize,
@@ -29,6 +30,9 @@ pub struct AttentionParams {
     pub head_dim: usize,
     pub causal: bool,
     pub pos_offset: usize,
+    /// Sliding-window size. `0` = full causal (default). Mistral v0.1 and
+    /// Gemma use 4096; later Mistral versions set this to 0 to disable.
+    pub sliding_window: usize,
 }
 
 /// Run fused attention on CPU.

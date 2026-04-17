@@ -41,6 +41,9 @@ pub struct LlamaFamilyConfig {
     /// Whether the checkpoint has `q_norm` / `k_norm` per layer. All known
     /// Qwen3 checkpoints do; some derivatives may strip them.
     pub has_qk_norm: bool,
+    /// Sliding-window attention size. `0` disables (full causal).
+    /// Mistral v0.1 sets 4096; Mistral v0.2+ removed the limitation (0).
+    pub sliding_window: usize,
 }
 
 impl LlamaFamilyConfig {
@@ -66,6 +69,14 @@ impl LlamaFamilyConfig {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(def.hidden_size / def.num_attention_heads);
+        // Mistral / Gemma: "sliding_window" may be null (v0.2+) or a positive
+        // integer (v0.1). Non-null value passes through; missing/null → 0.
+        let sliding_window = def
+            .extra_params
+            .get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(0);
 
         LlamaFamilyConfigBase {
             hidden_size: def.hidden_size,
@@ -78,12 +89,11 @@ impl LlamaFamilyConfig {
             max_seq_len: def.max_position_embeddings,
             rms_norm_eps: def.norm_eps as f32,
             rope_theta_opt: def.rope_theta,
+            sliding_window,
         }
     }
 
-    /// Qwen3: QK-norm on, rope_theta default 1e6.
-    pub fn qwen3_from_def(def: &crate::definition::ModelDefinition) -> Self {
-        let b = Self::from_def_base(def);
+    fn from_base(b: LlamaFamilyConfigBase, rope_default: f64, has_qk_norm: bool) -> Self {
         Self {
             hidden_size: b.hidden_size,
             intermediate_size: b.intermediate_size,
@@ -94,47 +104,34 @@ impl LlamaFamilyConfig {
             vocab_size: b.vocab_size,
             max_seq_len: b.max_seq_len,
             rms_norm_eps: b.rms_norm_eps,
-            rope_theta: b.rope_theta_opt.unwrap_or(1_000_000.0),
-            has_qk_norm: true,
+            rope_theta: b.rope_theta_opt.unwrap_or(rope_default),
+            has_qk_norm,
+            sliding_window: b.sliding_window,
         }
+    }
+
+    /// Qwen3: QK-norm on, rope_theta default 1e6.
+    pub fn qwen3_from_def(def: &crate::definition::ModelDefinition) -> Self {
+        Self::from_base(Self::from_def_base(def), 1_000_000.0, true)
     }
 
     /// Llama / Llama-2 / Llama-3: no QK-norm; rope_theta varies by version
     /// (10k for Llama-2, 500k for Llama-3.1+) — use the checkpoint value or
     /// fall back to the most common modern value.
     pub fn llama_from_def(def: &crate::definition::ModelDefinition) -> Self {
-        let b = Self::from_def_base(def);
-        Self {
-            hidden_size: b.hidden_size,
-            intermediate_size: b.intermediate_size,
-            num_heads: b.num_heads,
-            num_kv_heads: b.num_kv_heads,
-            head_dim: b.head_dim,
-            num_layers: b.num_layers,
-            vocab_size: b.vocab_size,
-            max_seq_len: b.max_seq_len,
-            rms_norm_eps: b.rms_norm_eps,
-            rope_theta: b.rope_theta_opt.unwrap_or(500_000.0),
-            has_qk_norm: false,
-        }
+        Self::from_base(Self::from_def_base(def), 500_000.0, false)
     }
 
     /// Qwen2 / Qwen2.5: structurally Llama; no QK-norm; rope_theta default 1e6.
     pub fn qwen2_from_def(def: &crate::definition::ModelDefinition) -> Self {
-        let b = Self::from_def_base(def);
-        Self {
-            hidden_size: b.hidden_size,
-            intermediate_size: b.intermediate_size,
-            num_heads: b.num_heads,
-            num_kv_heads: b.num_kv_heads,
-            head_dim: b.head_dim,
-            num_layers: b.num_layers,
-            vocab_size: b.vocab_size,
-            max_seq_len: b.max_seq_len,
-            rms_norm_eps: b.rms_norm_eps,
-            rope_theta: b.rope_theta_opt.unwrap_or(1_000_000.0),
-            has_qk_norm: false,
-        }
+        Self::from_base(Self::from_def_base(def), 1_000_000.0, false)
+    }
+
+    /// Mistral: no QK-norm; `rope_theta` commonly 10_000 (v0.1 / v0.2).
+    /// Picks up `sliding_window` from the checkpoint's config.json
+    /// (Mistral v0.1: 4096; Mistral v0.2+: 0 / null).
+    pub fn mistral_from_def(def: &crate::definition::ModelDefinition) -> Self {
+        Self::from_base(Self::from_def_base(def), 10_000.0, false)
     }
 }
 
@@ -149,6 +146,7 @@ struct LlamaFamilyConfigBase {
     max_seq_len: usize,
     rms_norm_eps: f32,
     rope_theta_opt: Option<f64>,
+    sliding_window: usize,
 }
 
 /// Per-layer weights. `Box<dyn Linear<B>>` means each projection can be
@@ -494,14 +492,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let kv_len = cache.len;
         let kv_stride = cache.capacity;
 
-        // 6. Flash attention over strided cache
+        // 6. Flash attention over strided cache.
+        //    `causal` is always true for decoder-only LLMs — every query must
+        //    mask out future tokens. (The `tokens > 1` heuristic from the old
+        //    path only worked because single-token decode trivially "attends"
+        //    to one position.) Sliding-window models (Mistral v0.1) narrow
+        //    the lower bound via `sliding_window`.
         let attn_cfg = ferrum_kernels::backend::AttnConfig {
             num_heads: nh,
             num_kv_heads: nkv,
             head_dim: hd,
-            causal: tokens > 1,
+            causal: true,
             scale: 1.0 / (hd as f32).sqrt(),
             kv_seq_stride: kv_stride,
+            sliding_window: cfg.sliding_window,
         };
         B::flash_attention(
             ctx,

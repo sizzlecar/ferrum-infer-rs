@@ -61,6 +61,11 @@ pub struct AttnConfig {
     /// Set to `cache_capacity` when flashing against a pre-allocated cache
     /// that only has `kv_len` valid slots out of `cache_capacity`.
     pub kv_seq_stride: usize,
+    /// Sliding-window attention size (Mistral v0.1, Gemma).
+    /// `0` = disabled (full causal attention).
+    /// `w > 0` = each query position attends to the previous `w` KV positions
+    ///            (still bounded by `causal` + `pos_offset + qi + 1` as the upper end).
+    pub sliding_window: usize,
 }
 
 impl Default for AttnConfig {
@@ -72,6 +77,7 @@ impl Default for AttnConfig {
             causal: false,
             scale: 1.0,
             kv_seq_stride: 0,
+            sliding_window: 0,
         }
     }
 }

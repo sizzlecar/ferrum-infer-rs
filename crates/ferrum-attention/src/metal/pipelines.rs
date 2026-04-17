@@ -750,6 +750,7 @@ impl MetalPipelines {
             causal: i32,
             pos_offset: i32,
             kv_seq_stride: i32,
+            sliding_window: i32,
         }
         let p = P {
             batch: params.batch as i32,
@@ -762,6 +763,7 @@ impl MetalPipelines {
             causal: if params.causal { 1 } else { 0 },
             pos_offset: params.pos_offset as i32,
             kv_seq_stride: kv_seq_stride as i32,
+            sliding_window: params.sliding_window as i32,
         };
         let params_buf = self.device.new_buffer_with_data(
             &p as *const _ as *const c_void,

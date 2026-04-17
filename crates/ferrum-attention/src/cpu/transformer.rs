@@ -73,6 +73,7 @@ pub fn cpu_layer_forward(
         head_dim: hd,
         causal: tokens > 1,
         pos_offset,
+        sliding_window: 0,
     };
     let mut attn_out = vec![0.0f32; nh * tokens * hd];
     super::fused_attention(&q_r, &full_k, &full_v, &mut attn_out, &params);
