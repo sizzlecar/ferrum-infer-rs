@@ -1864,46 +1864,27 @@ impl CudaDecodeRunner {
                     .memcpy_htod(&kv_lens_host, &mut self.buffers.batched_kv_lens)
                     .map_err(|e| candle_core::Error::Msg(format!("kv_lens: {e}")))?;
 
-                let num_splits = Self::compute_num_splits(max_kv);
-
-                if num_splits <= 1 {
-                    // Short enough for basic batched attention
-                    Self::launch_batched_decode_attention(
-                        &self.device,
-                        &self.stream,
-                        &self.buffers.q_rotated,
-                        &self.buffers.batched_k_ptrs,
-                        &self.buffers.batched_v_ptrs,
-                        &self.buffers.batched_kv_lens,
-                        &mut self.buffers.attn_out,
-                        batch,
-                        nq,
-                        nkv,
-                        hd,
-                        max_kv,
-                        scale,
-                    )?;
-                } else {
-                    // Batched flash decode: grid = (nq, num_splits, batch)
-                    Self::launch_batched_flash_decode_attention(
-                        &self.device,
-                        &self.stream,
-                        &self.buffers.q_rotated,
-                        &self.buffers.batched_k_ptrs,
-                        &self.buffers.batched_v_ptrs,
-                        &self.buffers.batched_kv_lens,
-                        &mut self.buffers.flash_partial_out,
-                        &mut self.buffers.flash_partial_m,
-                        &mut self.buffers.flash_partial_l,
-                        &mut self.buffers.attn_out,
-                        batch,
-                        nq,
-                        nkv,
-                        hd,
-                        scale,
-                        num_splits,
-                    )?;
-                }
+                // Batched flash decode was planned but `launch_batched_flash_decode_attention`
+                // was never wired (kernel exists in batched_flash_decode_attention.cu but no
+                // Rust launcher). CudaDecodeRunner is being retired in Phase E — not worth
+                // finishing the flash path here. Force non-flash batched attention for all
+                // kv lengths.
+                let _num_splits = Self::compute_num_splits(max_kv);
+                Self::launch_batched_decode_attention(
+                    &self.device,
+                    &self.stream,
+                    &self.buffers.q_rotated,
+                    &self.buffers.batched_k_ptrs,
+                    &self.buffers.batched_v_ptrs,
+                    &self.buffers.batched_kv_lens,
+                    &mut self.buffers.attn_out,
+                    batch,
+                    nq,
+                    nkv,
+                    hd,
+                    max_kv,
+                    scale,
+                )?;
             }
 
             // ---- Batched O proj + post-attn residual/norm + MLP + layer exit ----
