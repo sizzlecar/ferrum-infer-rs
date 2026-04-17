@@ -167,6 +167,35 @@ pub trait Backend: Send + Sync + Sized + 'static {
         cfg: &AttnConfig,
     );
 
+    /// Multi-Head Latent Attention — DeepSeek V2 / V3's compressed-KV
+    /// attention variant. Extension point only; no backend implements it
+    /// yet. DeepSeek V3 landing in Phase D/E will fill this in.
+    ///
+    /// `q`: full Q `[batch, num_heads, q_len, head_dim]`
+    /// `kv_compressed`: latent KV `[batch, kv_len, kv_lora_rank]`
+    /// `kv_rope`: per-position rope-applied key heads `[batch, kv_len, qk_rope_head_dim]`
+    /// `out`: `[batch, num_heads, q_len, head_dim]`
+    #[allow(clippy::too_many_arguments)]
+    fn mla_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _kv_compressed: &Self::Buffer,
+        _kv_rope: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _batch: usize,
+        _q_len: usize,
+        _kv_len: usize,
+        _pos_offset: usize,
+        _cfg: &AttnConfig,
+        _kv_lora_rank: usize,
+        _qk_rope_head_dim: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "mla_attention not implemented for this backend; required by \
+             DeepSeek V2/V3 (Phase D/E)",
+        ))
+    }
+
     // ── Element-wise ────────────────────────────────────────────────────
     //
     // Models use `add_inplace` for residual updates and `copy_slice` for the
