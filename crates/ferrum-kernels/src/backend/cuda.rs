@@ -186,6 +186,38 @@ impl Backend for CudaBackend {
         todo!("CudaBackend::add_inplace")
     }
 
+    fn add_bias(
+        _ctx: &mut Self::Context,
+        _data: &mut Self::Buffer,
+        _bias: &Self::Buffer,
+        _rows: usize,
+        _cols: usize,
+    ) {
+        todo!("CudaBackend::add_bias")
+    }
+
+    fn layer_norm(
+        _ctx: &mut Self::Context,
+        _x: &Self::Buffer,
+        _gamma: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _eps: f32,
+        _out: &mut Self::Buffer,
+        _tokens: usize,
+        _dim: usize,
+    ) {
+        todo!("CudaBackend::layer_norm")
+    }
+
+    fn gelu(
+        _ctx: &mut Self::Context,
+        _x: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _len: usize,
+    ) {
+        todo!("CudaBackend::gelu")
+    }
+
     fn alloc(_len: usize) -> Self::Buffer {
         todo!("CudaBackend::alloc — CudaDevice::alloc_zeros")
     }

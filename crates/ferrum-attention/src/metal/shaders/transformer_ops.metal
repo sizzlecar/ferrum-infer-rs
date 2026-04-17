@@ -370,6 +370,97 @@ kernel void split_qkv_f32(
     }
 }
 
+// ── LayerNorm (mean + variance) ─────────────────────────────────────────
+// Distinct from RMSNorm — Bert / Clip / Whisper use full LayerNorm.
+//   out[r, c] = ((x[r, c] - mean) / sqrt(var + eps)) * gamma[c] + beta[c]
+
+struct LayerNormParams {
+    int dim;
+    float eps;
+};
+
+kernel void layer_norm_f32(
+    device const float* input   [[buffer(0)]],
+    device const float* gamma   [[buffer(1)]],
+    device const float* beta    [[buffer(2)]],
+    device       float* output  [[buffer(3)]],
+    constant LayerNormParams& p [[buffer(4)]],
+    uint  tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const int row = (int)tgpig;
+    device const float* x = input  + row * p.dim;
+    device       float* y = output + row * p.dim;
+
+    // Pass 1: mean.
+    float sum = 0.0f;
+    for (int i = tiisg; i < p.dim; i += 32) {
+        sum += x[i];
+    }
+    sum = simd_sum(sum);
+    float mean = sum / float(p.dim);
+
+    // Pass 2: variance.
+    float var_sum = 0.0f;
+    for (int i = tiisg; i < p.dim; i += 32) {
+        float d = x[i] - mean;
+        var_sum += d * d;
+    }
+    var_sum = simd_sum(var_sum);
+    float inv = 1.0f / sqrt(var_sum / float(p.dim) + p.eps);
+
+    // Pass 3: write.
+    for (int i = tiisg; i < p.dim; i += 32) {
+        y[i] = (x[i] - mean) * inv * gamma[i] + beta[i];
+    }
+}
+
+// ── GELU (erf-based, PyTorch default) ───────────────────────────────────
+// Approximate erf via Abramowitz & Stegun 7.1.26 — accurate to ~1.5e-7.
+
+struct GeluParams {
+    int n;
+};
+
+static inline float erf_approx(float x) {
+    const float sign = (x < 0.0f) ? -1.0f : 1.0f;
+    x = fabs(x);
+    const float t = 1.0f / (1.0f + 0.3275911f * x);
+    const float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t
+                            - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+    return sign * y;
+}
+
+kernel void gelu_f32(
+    device const float* input   [[buffer(0)]],
+    device       float* output  [[buffer(1)]],
+    constant GeluParams& p      [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if ((int)tid >= p.n) return;
+    const float x = input[tid];
+    output[tid] = 0.5f * x * (1.0f + erf_approx(x * M_SQRT1_2_F));
+}
+
+// ── Broadcast bias add: data[r, c] += bias[c] ───────────────────────────
+
+struct AddBiasParams {
+    int rows;
+    int cols;
+};
+
+kernel void add_bias_f32(
+    device       float* data    [[buffer(0)]],
+    device const float* bias    [[buffer(1)]],
+    constant AddBiasParams& p   [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    const int total = p.rows * p.cols;
+    if ((int)tid >= total) return;
+    const int c = (int)tid % p.cols;
+    data[tid] += bias[c];
+}
+
 // ── GEMV: m=1 GEMM specialization ───────────────────────────────────────
 // C[1, N] = A[1, K] @ B[N, K]^T
 // One threadgroup (1 simdgroup = 32 threads) per output column.

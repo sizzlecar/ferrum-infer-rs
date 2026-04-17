@@ -334,6 +334,40 @@ pub trait Backend: Send + Sync + Sized + 'static {
         len: usize,
     );
 
+    /// Broadcast bias add: `data[r, c] += bias[c]` for every row.
+    /// Required by Bert / Clip / Whisper whose linear projections carry a bias.
+    fn add_bias(
+        ctx: &mut Self::Context,
+        data: &mut Self::Buffer,
+        bias: &Self::Buffer,
+        rows: usize,
+        cols: usize,
+    );
+
+    /// Full LayerNorm (mean + variance normalisation + affine), distinct from
+    /// the `rms_norm` used by Llama-family decoders.
+    ///   `out[r, c] = ((x[r, c] - mean) / sqrt(var + eps)) * gamma[c] + beta[c]`
+    /// Where `mean` and `var` are reduced over the last dim (cols).
+    #[allow(clippy::too_many_arguments)]
+    fn layer_norm(
+        ctx: &mut Self::Context,
+        x: &Self::Buffer,
+        gamma: &Self::Buffer,
+        beta: &Self::Buffer,
+        eps: f32,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    );
+
+    /// Element-wise GELU activation (erf-based, matches PyTorch default).
+    fn gelu(
+        ctx: &mut Self::Context,
+        x: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    );
+
     // ── Buffer management (context-free) ────────────────────────────────
 
     fn alloc(len: usize) -> Self::Buffer;

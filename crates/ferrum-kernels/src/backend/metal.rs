@@ -360,6 +360,43 @@ impl Backend for MetalBackend {
         enc.end_encoding();
     }
 
+    fn add_bias(
+        ctx: &mut Self::Context,
+        data: &mut Self::Buffer,
+        bias: &Self::Buffer,
+        rows: usize,
+        cols: usize,
+    ) {
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.add_bias_enc(enc, data, bias, rows, cols);
+        enc.end_encoding();
+    }
+
+    fn layer_norm(
+        ctx: &mut Self::Context,
+        x: &Self::Buffer,
+        gamma: &Self::Buffer,
+        beta: &Self::Buffer,
+        eps: f32,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes
+            .layer_norm_enc(enc, x, gamma, beta, out, tokens, dim, eps);
+        enc.end_encoding();
+    }
+
+    fn gelu(ctx: &mut Self::Context, x: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.gelu_enc(enc, x, out, len);
+        enc.end_encoding();
+    }
+
     fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
         // Fused in-place add via add_enc with output == residual input.
         // Metal's `add_f32` kernel reads a[tid] + b[tid] -> out[tid]; using the

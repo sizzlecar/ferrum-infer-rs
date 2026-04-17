@@ -328,6 +328,65 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn add_bias(
+        _ctx: &mut Self::Context,
+        data: &mut Self::Buffer,
+        bias: &Self::Buffer,
+        rows: usize,
+        cols: usize,
+    ) {
+        debug_assert_eq!(bias.len(), cols);
+        for r in 0..rows {
+            let off = r * cols;
+            for c in 0..cols {
+                data[off + c] += bias[c];
+            }
+        }
+    }
+
+    fn layer_norm(
+        _ctx: &mut Self::Context,
+        x: &Self::Buffer,
+        gamma: &Self::Buffer,
+        beta: &Self::Buffer,
+        eps: f32,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        debug_assert_eq!(gamma.len(), dim);
+        debug_assert_eq!(beta.len(), dim);
+        for t in 0..tokens {
+            let off = t * dim;
+            // Compute mean + variance over `dim` in f64 for stability.
+            let mut mean = 0.0f64;
+            for i in 0..dim {
+                mean += x[off + i] as f64;
+            }
+            mean /= dim as f64;
+            let mut var = 0.0f64;
+            for i in 0..dim {
+                let d = x[off + i] as f64 - mean;
+                var += d * d;
+            }
+            var /= dim as f64;
+            let inv = 1.0f32 / ((var as f32) + eps).sqrt();
+            let mean_f32 = mean as f32;
+            for i in 0..dim {
+                out[off + i] = (x[off + i] - mean_f32) * inv * gamma[i] + beta[i];
+            }
+        }
+    }
+
+    fn gelu(_ctx: &mut Self::Context, x: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
+        // Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2))).
+        // Uses f64 for erf accuracy (matches torch.nn.functional.gelu default).
+        for i in 0..len {
+            let xi = x[i];
+            out[i] = 0.5 * xi * (1.0 + libm_erf(xi / std::f32::consts::SQRT_2));
+        }
+    }
+
     fn alloc(len: usize) -> Self::Buffer {
         vec![0.0f32; len]
     }
@@ -462,4 +521,18 @@ fn cpu_attention(
             }
         }
     }
+}
+
+/// Minimal error-function approximation (Abramowitz & Stegun 7.1.26),
+/// max error ~1.5e-7 which is comfortably below f32 round-off noise.
+fn libm_erf(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    sign * y
 }
