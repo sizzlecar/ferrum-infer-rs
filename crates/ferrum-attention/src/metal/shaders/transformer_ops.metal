@@ -331,3 +331,97 @@ kernel void embedding_lookup_f32(
         output[tid] = table[idx * p.dim + tid];
     }
 }
+
+// ── Split fused QKV ────────────────────────────────────────────────────
+// Input:  qkv [tokens, q_dim + 2*kv_dim] (row-major, Q|K|V interleaved per row)
+// Output: q [tokens, q_dim], k [tokens, kv_dim], v [tokens, kv_dim]
+// One thread per output element (dispatch q_dim + 2*kv_dim × tokens threads, one thread per element).
+
+struct SplitQkvParams {
+    int tokens;
+    int q_dim;
+    int kv_dim;
+};
+
+kernel void split_qkv_f32(
+    device const float* qkv     [[buffer(0)]],
+    device       float* q       [[buffer(1)]],
+    device       float* k       [[buffer(2)]],
+    device       float* v       [[buffer(3)]],
+    constant SplitQkvParams& p  [[buffer(4)]],
+    uint tid                    [[thread_position_in_grid]])
+{
+    const int qd  = p.q_dim;
+    const int kd  = p.kv_dim;
+    const int row_stride = qd + 2 * kd;
+    const int total = p.tokens * row_stride;
+    if ((int)tid >= total) return;
+
+    const int t = (int)tid / row_stride;
+    const int c = (int)tid % row_stride;
+    const float val = qkv[(int)tid];
+
+    if (c < qd) {
+        q[t * qd + c] = val;
+    } else if (c < qd + kd) {
+        k[t * kd + (c - qd)] = val;
+    } else {
+        v[t * kd + (c - qd - kd)] = val;
+    }
+}
+
+// ── GEMV: m=1 GEMM specialization ───────────────────────────────────────
+// C[1, N] = A[1, K] @ B[N, K]^T
+// One threadgroup per output column, 32 threads per threadgroup (1 simdgroup).
+// K-dimension reduction via simd_sum. Much better occupancy than gemm_v2 for m=1
+// (which wastes 63/64 of tile compute at m=1).
+
+kernel void gemv_f32(
+    device const float* A       [[buffer(0)]],   // [1, K]
+    device const float* B       [[buffer(1)]],   // [N, K]
+    device       float* C       [[buffer(2)]],   // [1, N]
+    constant GemmParams& p      [[buffer(3)]],
+    uint  tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const int nj = (int)tgpig;
+    if (nj >= p.N) return;
+
+    device const float* b_row = B + nj * p.K;
+
+    // Each thread computes K/32 partial products; simd_sum reduces.
+    float acc = 0.0f;
+    for (int k = (int)tiisg; k < p.K; k += 32) {
+        acc += A[k] * b_row[k];
+    }
+    acc = simd_sum(acc);
+
+    if (tiisg == 0) {
+        C[nj] = acc;
+    }
+}
+
+// ── Fused SiLU × Up with gate_up split ──────────────────────────────────
+// Input:  gate_up [tokens, 2*im]   (gate = first im, up = second im per row)
+// Output: out     [tokens, im]     out[t, i] = silu(gate[t, i]) * up[t, i]
+
+struct SiluMulSplitParams {
+    int tokens;
+    int im;
+};
+
+kernel void silu_mul_split_f32(
+    device const float* gate_up    [[buffer(0)]],
+    device       float* out        [[buffer(1)]],
+    constant SiluMulSplitParams& p [[buffer(2)]],
+    uint tid                       [[thread_position_in_grid]])
+{
+    const int total = p.tokens * p.im;
+    if ((int)tid >= total) return;
+    const int t = (int)tid / p.im;
+    const int i = (int)tid % p.im;
+    const float g = gate_up[t * 2 * p.im + i];
+    const float u = gate_up[t * 2 * p.im + p.im + i];
+    const float silu = g / (1.0f + exp(-g));
+    out[(int)tid] = silu * u;
+}

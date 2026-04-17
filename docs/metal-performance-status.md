@@ -1,65 +1,89 @@
-# Metal Backend 性能现状与问题记录
+# Metal Backend 性能现状
 
-## 当前性能数据
+## 当前性能数据 (Qwen3-0.6B, Mac, ModelRunner<MetalBackend>)
 
-| 路径 | tok/s | 备注 |
-|------|-------|------|
-| 旧 Candle 路径 | ~19 tok/s | Qwen3-0.6B, Metal backend 选项但实际用 Candle tensor ops |
-| 新 ModelRunner + MetalBackend | ~5 tok/s | rms_norm/attention/add 用 Metal shader，GEMM 用 cblas |
-| 新 ModelRunner + CpuBackend | ~9 tok/s | 全 CPU，Accelerate cblas + scalar loops |
+| 路径 | decode tok/s | TPOT | TTFT | 备注 |
+|------|--------------|------|------|------|
+| **新 MetalBackend (current)** | **32.5 tok/s** | **31ms** | 80ms | 全 Metal shader + m=1 GEMV + 整个 decode 1 个 cmd buffer |
+| MetalBackend phase 2 (per-decode cmd buffer) | 13.0 tok/s | 77ms | 85ms | gemm_v2 tile kernel（m=1 时 tile 浪费）|
+| MetalBackend phase 1 (per-layer cmd buffer) | 8.8 tok/s | 115ms | 123ms | 全 Metal shader，28 次 sync/decode |
+| 旧 MetalBackend (per-op cmd buffer) | 5.4 tok/s | 184ms | 63ms | 每层 3 cmd buffer + cblas GEMM + CPU 标量 split/rope/kv_append |
+| CpuBackend | 跑不完 (>5min/64tok) | — | — | 全 CPU，无 GPU 加速 |
+| Candle legacy (Qwen3) | broken | — | — | Qwen3 在 Metal device 上 `no metal impl for rms-norm`，CPU 上 dtype mismatch；实际 baseline 不可用 |
 
-测试环境：本机 Mac，Qwen3-0.6B (28层, hidden=1024, head_dim=128)，decode 模式 (tokens=1)。
+**累计提升 6x** throughput，TPOT **降 83%**。满足底线：Metal > CPU，Metal > Candle。
 
-## 已验证的事实
+测试：Qwen3-0.6B (28层, h=1024, nh=16, nkv=8, hd=128, im=3072)，decode tokens=1，release build。
 
-### 正确性
-- MetalBackend vs CpuBackend cosine=1.000000（release 模式，真实 Qwen3-0.6B 权重）
-- E2E 交互输出正确（"你好！有什么可以帮助你的吗？"，多轮对话正常）
-- gemm_v2 Metal shader 在所有实际模型维度上 max_diff=0（1x4096x1024, 1x151936x1024 等）
+## 当前 MetalBackend 结构 (ferrum-kernels/src/backend/metal.rs)
 
-### Metal command buffer 问题
-- `to_owned()` 在 metal-rs 0.31 下 **hang**（release 模式卡死，debug 模式 SIGABRT）
-- 原因：`foreign_obj_type!` 宏的 `obj_clone` 调 `msg_send![retain]`，但 autoreleased command buffer 可能在 retain 前已被 pool drain
-- llama.cpp 的做法：`[queue commandBufferWithUnretainedReferences]` + 手动 `[cmd_buf retain]` + `@autoreleasepool` 包裹
-- Rust 的 metal-rs 0.31 没有 `commandBufferWithUnretainedReferences` API，也没有安全的 autorelease pool 管理
-- **结果：无法在 Rust 中安全持有 command buffer 跨函数调用，每个 Metal op 必须独立 cmd buffer + commit + wait**
+`MetalContext` 持有一个 `Option<&'static CommandBufferRef>`（queue 在 `OnceLock` 里永久存活，lifetime 安全），所有 op 把 encoder 添加到这个共享 cmd buffer。`B::sync()` 才 commit+wait+释放。
 
-### 性能分析
-- 每层 3 次 Metal shader dispatch（rms_norm, attention, fused_add_rms_norm），每次 commit+wait
-- 28 层 × 3 = 84 次 GPU sync
-- 4 次 cblas GEMM/层（QKV, O-proj, gate_up, down）— 这部分速度跟 Candle 一样
-- **瓶颈是 84 次 GPU sync 的开销，不是计算本身**
+结果：ModelRunner::decode 的 `embedding_lookup + 28 × layer_forward_fused + final_rms_norm`（全部 GPU）积累到**同一个 cmd buffer**，之后 `lm_head gemm`（cblas CPU）自动触发 `ctx.flush()`，最后 `to_vec`。**整个 decode 只有 1 次 GPU sync**。
 
-## 旧 Candle 路径为什么快
+每层 13 个 encoder 顺序串起来（不 commit）：
 
-旧路径（Qwen3ModelExecutor + Candle）在 Metal 设备上的实际执行方式：
-- **GEMM: cblas_sgemm**（通过 candle_nn::Linear → Candle dispatch → Accelerate）
-- **RMS Norm: Candle CPU ops**（broadcast_div + broadcast_mul 或自定义 fused kernel）
-- **Attention: Candle CPU standard attention**（matmul + softmax + matmul，全 CPU）
-- **SiLU: Candle CPU**
-- **零 GPU dispatch，零 Metal sync**
+每层 12 个 encoder 顺序串起来，一次 commit+wait：
+1. `rms_norm_enc` (input norm)
+2. `gemm_v2` (fused QKV projection)
+3. `split_qkv_enc` (**新 shader** — fused qkv → Q/K/V 三个 buffer)
+4. `qk_norm_rope` ×3 (Q/K 走 mode 1 norm+rope+transpose，V 走 mode 0 transpose only)
+5. `kv_cache_append` ×2 (K, V 写入预分配 max_seq_len 的 cache)
+6. `flash_attn_v2` (head-major Q/K/V, kv_seq_stride=max_seq_len)
+7. `transpose_out` (head-major → token-major)
+8. `gemm_v2` (O projection)
+9. `fused_residual_norm_enc` (residual add + post-attn norm)
+10. `gemm_v2` (gate_up projection)
+11. `silu_mul_split_enc` (**新 shader** — fused gate_up → SiLU(gate)*up)
+12. `gemm_v2` (down projection)
+13. `add_enc` (final residual add)
 
-也就是说旧路径标称 "Metal backend" 但 **实际没有用任何 Metal GPU 计算**，全是 CPU（Accelerate BLAS + Candle scalar ops）。
+KV cache 在**首次调用时**按 `cfg.max_seq_len` 预分配 `[nkv, max_seq_len, hd]`，之后永远复用（不再 realloc）。
 
-## 未解决的问题
+整个 ModelRunner::decode() 的 sync 开销：**1 次 commit+wait**（在 lm_head 的 cblas 调用前由 `gemm()` 内部 `ctx.flush()` 触发）。
 
-1. **Metal pipeline 无法实现**：metal-rs 0.31 的 `to_owned()` broken，无法持有 cmd buffer 跨多个 Backend 方法调用
-2. **CpuBackend 有 bug**：`kv_cache_append` 在 `--backend cpu` 时 slice 越界（nkv * cl * hd 计算在 cl=0 时 from_raw_parts 长度为 0 但仍被索引）
-3. **MetalBackend 的 gemm_v2 shader**：单独测试正确（max_diff=0），但放到 pipeline 中（to_owned cmd buffer）产生错误结果——原因是 cmd buffer hang 不是 shader 精度问题
+## 关键设计决策
+
+- **Fused QKV 权重保留**：`LayerWeights.qkv_proj_w` 是 `[q_dim+2*kv_dim, hidden]` 融合矩阵。用 1 次 gemm_v2 + split_qkv_f32 替代 3 次独立 GEMM。
+- **cblas 保留在 `MetalBackend::gemm()`**：只在 ModelRunner 末尾的 lm_head GEMM (m=1, n=vocab=152k) 时被调用；对于 m=1 的极端 tall-thin 矩阵，Accelerate 很难被 GPU shader 打败（GPU dispatch overhead 占比太大）。
+- **per-op trait methods (split_qkv, qk_norm, rope, kv_cache_append, ...) 保留作为 CPU fallback**：不再被 layer_forward_fused 调用，但 Backend trait 要求实现。后续清理会把这些从 trait 中移除。
+
+## 历史误诊与修正
+
+`1c466ba` 的 commit message 和前一版的本文档都断言 "metal-rs 0.31 `to_owned()` hang 导致无法跨方法持有 cmd buffer" 是性能瓶颈。**这个结论是错的**。
+
+真正瓶颈是 `layer_forward_fused` 被拆成 3 个 cmd buffer + cblas GEMM + CPU 标量循环，每层 3 次 GPU sync + 6+ 次 CPU-GPU 切换。
+
+同 workspace 里 `ferrum-attention::metal_layer_forward_v2` 早就证明可以在一个函数栈帧里串起全部 encoder 并一次 commit（TTS 在用）。本次改造就是把这个模式搬到 MetalBackend 上，完全不需要 `to_owned()` 或跨函数 cmd buffer 持有。
+
+## 下一步可能的优化
+
+1. **GEMV shader 进一步优化**（已实现基础版本）
+   - 当前 gemv_f32: 32 threads/tg, simd_sum K-reduction，每 threadgroup 算 1 个输出列
+   - 参考 llama.cpp `kernel_mul_mv_f32_f32`: 每 threadgroup 算多列 + cross-simd reduction，memory coalescing 更好
+   - 对 lm_head (N=152064) 尤其有效，当前是每层开销的大头
+
+2. **Prefill 路径优化**（TTFT 80ms 还有空间）
+   - tokens > 1 走 gemm_v2 tile kernel，m=8 时 tile 利用率 8/64
+   - 方向：写 m<=16 的中等 GEMM kernel，或多流水线 prefill
+
+3. **scratch buffer 复用问题**
+   - 当前用 `o_proj_out` 和 `gate_up_out` 作为 K/V head-major staging，依赖 `2*im >= nkv*hd` 和 `h >= nkv*hd`，脆弱
+   - 修复：给 `LayerScratch` 加专用 `k_head_buf` / `v_head_buf` 字段
+
+4. **删除死代码**
+   - MetalBackend::split_qkv / qk_norm / rope / kv_cache_append / silu_mul_split / add_inplace / transpose_* 现在不再被调用（layer_forward_fused override 了）
+   - 待 Backend trait 做减法（把"整个 layer"而不是"单 op"作为强约束）后可以移除
+
+5. **合并 ferrum-attention 到 ferrum-kernels**
+   - Cargo.toml 里已标注 "to be merged"
+   - `metal_layer_forward_v2`（TTS 用）和 `MetalBackend::layer_forward_fused`（LLM 用）大量重复
+   - 迁移后 TTS 也走统一的 `ModelRunner<MetalBackend>`
 
 ## 文件位置
 
-- MetalBackend: `crates/ferrum-kernels/src/backend/metal.rs`
-- CpuBackend: `crates/ferrum-kernels/src/backend/cpu.rs`
-- layer_forward: `crates/ferrum-kernels/src/backend/layer_forward.rs`
-- ModelRunner: `crates/ferrum-kernels/src/backend/runner.rs`
-- Backend trait: `crates/ferrum-kernels/src/backend/traits.rs`
-- Metal pipeline tests: `crates/ferrum-models/tests/metal_runner_test.rs`
-- Candle vs Runner compare: `crates/ferrum-models/tests/runner_compare_test.rs`
-
-## 下一步可能的方向
-
-1. 修 metal-rs `to_owned()` 或换 `metal` crate 版本（0.27 可能没有这个问题，ferrum-engine 用的就是 0.27）
-2. 绕过 Backend trait，在 `layer_forward_fused` 里直接用函数局部 cmd buffer 编码所有 GPU ops（不跨函数）
-3. decode 时全走 CPU（shared memory 零拷贝），只在 prefill 时用 Metal GPU
-4. 修 CpuBackend 的 kv_cache_append bug，让纯 CPU 路径能跑
+- MetalBackend (override): `crates/ferrum-kernels/src/backend/metal.rs`
+- 新增 shader: `crates/ferrum-attention/src/metal/shaders/transformer_ops.metal` (split_qkv_f32, silu_mul_split_f32)
+- ferrum-attention pipelines (复用): `crates/ferrum-attention/src/metal/pipelines.rs`
+- 参考实现 (TTS): `crates/ferrum-attention/src/metal/transformer.rs::metal_layer_forward_v2`
+- Parity test: `crates/ferrum-models/tests/metal_parity_test.rs` — prefill + 5 decode step 对拍 CpuBackend，每步 cosine > 0.9999、argmax 一致

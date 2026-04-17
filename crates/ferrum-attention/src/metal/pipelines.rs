@@ -53,6 +53,9 @@ impl MetalPipelines {
                     "gemm_f32",
                     "argmax_f32",
                     "embedding_lookup_f32",
+                    "split_qkv_f32",
+                    "silu_mul_split_f32",
+                    "gemv_f32",
                 ][..],
             ),
             (&gemm_lib, &["gemm_f32_v2"][..]),
@@ -363,6 +366,43 @@ impl MetalPipelines {
     }
 
     // ── New all-Metal dispatch methods (encoder-based, no commit) ──────
+
+    /// GEMV: m=1 specialization. C[1, N] = A[1, K] @ B[N, K]^T.
+    /// One threadgroup per output column, 32 threads; K-reduction via simd_sum.
+    pub fn gemv_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        a: &Buffer,
+        b: &Buffer,
+        c: &Buffer,
+        n: usize,
+        k: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            m: i32,
+            n: i32,
+            k: i32,
+        }
+        let params = P {
+            m: 1,
+            n: n as i32,
+            k: k as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void,
+            12,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("gemv_f32"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(c), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let tg = MTLSize::new(32, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
 
     /// GEMM v2: C[M,N] = A[M,K] @ B[N,K]^T — all on Metal, 64x32 tiles
     pub fn gemm_v2(
@@ -757,5 +797,78 @@ impl MetalPipelines {
         params: &crate::AttentionParams,
     ) {
         self.flash_attn_v2(cmd, q, k, v, o, params, 0);
+    }
+
+    /// Split fused QKV: qkv [tokens, q_dim + 2*kv_dim] → q, k, v separate buffers.
+    pub fn split_qkv_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        qkv: &Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        tokens: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            tokens: i32,
+            q_dim: i32,
+            kv_dim: i32,
+        }
+        let p = P {
+            tokens: tokens as i32,
+            q_dim: q_dim as i32,
+            kv_dim: kv_dim as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &p as *const _ as *const c_void,
+            12,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("split_qkv_f32"));
+        enc.set_buffer(0, Some(qkv), 0);
+        enc.set_buffer(1, Some(q), 0);
+        enc.set_buffer(2, Some(k), 0);
+        enc.set_buffer(3, Some(v), 0);
+        enc.set_buffer(4, Some(&params_buf), 0);
+        let total = tokens * (q_dim + 2 * kv_dim);
+        let grid = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// SiLU(gate) * up with fused gate_up split: gate_up [tokens, 2*im] → out [tokens, im].
+    pub fn silu_mul_split_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        gate_up: &Buffer,
+        out: &Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            tokens: i32,
+            im: i32,
+        }
+        let p = P {
+            tokens: tokens as i32,
+            im: im as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &p as *const _ as *const c_void,
+            8,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("silu_mul_split_f32"));
+        enc.set_buffer(0, Some(gate_up), 0);
+        enc.set_buffer(1, Some(out), 0);
+        enc.set_buffer(2, Some(&params_buf), 0);
+        let total = tokens * im;
+        let grid = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
     }
 }

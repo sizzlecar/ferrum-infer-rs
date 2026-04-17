@@ -6,7 +6,7 @@
 use super::{AttnConfig, Backend};
 use ferrum_attention::metal::pipelines::MetalPipelines;
 use ferrum_attention::AttentionParams;
-use metal::{CommandBufferRef, Device};
+use metal::Device;
 use std::sync::OnceLock;
 
 struct MetalState {
@@ -41,9 +41,43 @@ extern "C" {
     );
 }
 
-/// Metal context — empty marker. Command buffers are function-local (not stored).
-pub struct MetalContext;
+/// Metal context — accumulates GPU work in a single command buffer across
+/// multiple Backend method calls. `sync()` commits and creates a fresh one on demand.
+///
+/// The `&'static CommandBufferRef` lifetime is safe because the command queue lives in
+/// a `OnceLock` (see [`st`]) for the program's lifetime; autoreleased command buffers
+/// are retained for the duration of the queue.
+pub struct MetalContext {
+    cmd: Option<&'static metal::CommandBufferRef>,
+}
 
+impl MetalContext {
+    /// Return the current in-flight command buffer, creating one on first use.
+    fn cmd(&mut self) -> &'static metal::CommandBufferRef {
+        match self.cmd {
+            Some(c) => c,
+            None => {
+                let c = st().pipes.queue.new_command_buffer();
+                // Erase the queue's lifetime; the queue is static (OnceLock) so this is safe.
+                let c_static: &'static metal::CommandBufferRef =
+                    unsafe { std::mem::transmute::<&metal::CommandBufferRef, _>(c) };
+                self.cmd = Some(c_static);
+                c_static
+            }
+        }
+    }
+
+    /// Commit pending work and wait for completion.
+    fn flush(&mut self) {
+        if let Some(cmd) = self.cmd.take() {
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+    }
+}
+
+/// One-shot helper: open a cmd buffer, encode, commit+wait.
+/// Used only when ctx-driven batching is not needed (tests, isolated ops).
 fn run(f: impl FnOnce(&metal::CommandBufferRef)) {
     let cmd = st().pipes.queue.new_command_buffer();
     f(cmd);
@@ -56,12 +90,14 @@ impl Backend for MetalBackend {
     type Context = MetalContext;
 
     fn new_context() -> Self::Context {
-        MetalContext
+        MetalContext { cmd: None }
     }
-    fn sync(_ctx: &mut Self::Context) {}
+    fn sync(ctx: &mut Self::Context) {
+        ctx.flush();
+    }
 
     fn gemm(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         a: &Self::Buffer,
         b: &Self::Buffer,
         out: &mut Self::Buffer,
@@ -69,28 +105,39 @@ impl Backend for MetalBackend {
         n: usize,
         k: usize,
     ) {
-        unsafe {
-            cblas_sgemm(
-                101,
-                111,
-                112,
-                m as i32,
-                n as i32,
-                k as i32,
-                1.0,
-                a.contents() as *const f32,
-                k as i32,
-                b.contents() as *const f32,
-                k as i32,
-                0.0,
-                out.contents() as *mut f32,
-                n as i32,
-            );
+        if m == 1 {
+            // GPU GEMV: one threadgroup per output col, K-reduction via simd_sum.
+            // Great occupancy for lm_head (N = vocab = 152k for Qwen3).
+            let cmd = ctx.cmd();
+            let enc = cmd.new_compute_command_encoder();
+            st().pipes.gemv_enc(enc, a, b, out, n, k);
+            enc.end_encoding();
+        } else {
+            // Multi-row: Accelerate cblas on shared memory. Needs flush first.
+            ctx.flush();
+            unsafe {
+                cblas_sgemm(
+                    101,
+                    111,
+                    112,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    1.0,
+                    a.contents() as *const f32,
+                    k as i32,
+                    b.contents() as *const f32,
+                    k as i32,
+                    0.0,
+                    out.contents() as *mut f32,
+                    n as i32,
+                );
+            }
         }
     }
 
     fn rms_norm(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         x: &Self::Buffer,
         w: &Self::Buffer,
         eps: f32,
@@ -98,11 +145,14 @@ impl Backend for MetalBackend {
         tokens: usize,
         dim: usize,
     ) {
-        run(|cmd| st().pipes.rms_norm(cmd, x, w, out, tokens, dim, eps));
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.rms_norm_enc(enc, x, w, out, tokens, dim, eps);
+        enc.end_encoding();
     }
 
     fn fused_add_rms_norm(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         residual: &mut Self::Buffer,
         x: &Self::Buffer,
         w: &Self::Buffer,
@@ -111,17 +161,16 @@ impl Backend for MetalBackend {
         tokens: usize,
         dim: usize,
     ) {
-        run(|cmd| {
-            let enc = cmd.new_compute_command_encoder();
-            st().pipes.fused_residual_norm_enc(
-                enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
-            );
-            enc.end_encoding();
-        });
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.fused_residual_norm_enc(
+            enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
+        );
+        enc.end_encoding();
     }
 
     fn decode_attention(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         q: &Self::Buffer,
         kc: &Self::Buffer,
         vc: &Self::Buffer,
@@ -139,11 +188,12 @@ impl Backend for MetalBackend {
             causal: false,
             pos_offset: 0,
         };
-        run(|cmd| st().pipes.flash_attn(cmd, q, kc, vc, out, &p));
+        let cmd = ctx.cmd();
+        st().pipes.flash_attn(cmd, q, kc, vc, out, &p);
     }
 
     fn flash_attention(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         q: &Self::Buffer,
         k: &Self::Buffer,
         v: &Self::Buffer,
@@ -164,30 +214,39 @@ impl Backend for MetalBackend {
             causal: cfg.causal,
             pos_offset,
         };
-        run(|cmd| st().pipes.flash_attn(cmd, q, k, v, out, &p));
+        let cmd = ctx.cmd();
+        st().pipes.flash_attn(cmd, q, k, v, out, &p);
     }
 
     fn silu_mul(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         gate: &Self::Buffer,
         up: &Self::Buffer,
         out: &mut Self::Buffer,
         len: usize,
     ) {
-        run(|cmd| st().pipes.silu_mul(cmd, gate, up, out, len));
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.silu_mul_enc(enc, gate, up, out, len);
+        enc.end_encoding();
     }
 
     fn add(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         a: &Self::Buffer,
         b: &Self::Buffer,
         out: &mut Self::Buffer,
         len: usize,
     ) {
-        run(|cmd| st().pipes.add(cmd, a, b, out, len));
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.add_enc(enc, a, b, out, len);
+        enc.end_encoding();
     }
 
-    fn copy(_ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
+    fn copy(ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
+        // CPU memcpy on shared buffers; must flush pending GPU writes first.
+        ctx.flush();
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.contents() as *const u8,
@@ -198,12 +257,14 @@ impl Backend for MetalBackend {
     }
 
     fn embedding_lookup(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         table: &Self::Buffer,
         ids: &[u32],
         out: &mut Self::Buffer,
         dim: usize,
     ) {
+        // CPU table lookup writing to shared buffer; must flush any readers of `out`.
+        ctx.flush();
         unsafe {
             let t = std::slice::from_raw_parts(
                 table.contents() as *const f32,
@@ -424,7 +485,7 @@ impl Backend for MetalBackend {
     }
 
     fn layer_forward_fused(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         cfg: &super::TransformerConfig,
         weights: &super::LayerWeights<Self>,
         kv: &mut super::KvCache<Self>,
@@ -435,6 +496,16 @@ impl Backend for MetalBackend {
         sin: &Self::Buffer,
         tokens: usize,
     ) {
+        // All-Metal layer forward. Encoders are appended to the caller's command buffer
+        // (via `ctx.cmd()`), so an entire forward pass — embedding + N × layer_forward
+        // + final norm + lm_head — can be bundled into a single commit+wait.
+        //
+        // Pipeline: rms_norm → qkv GEMM → split → qk_norm+RoPE+transpose → kv_append
+        //           → flash_attn → untranspose → o_proj GEMM → fused residual+post_norm
+        //           → gate_up GEMM → silu_mul_split → down GEMM → residual add
+        //
+        // KV buffers are pre-allocated to cfg.max_seq_len on first call and reused thereafter.
+
         let h = cfg.hidden_size;
         let nh = cfg.num_heads;
         let nkv = cfg.num_kv_heads;
@@ -444,230 +515,293 @@ impl Backend for MetalBackend {
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
         let qkv_dim = q_dim + 2 * kv_dim;
-        let s = st();
-        let mut mc = MetalContext;
 
-        // --- CMD 1: rms_norm ---
-        let cmd = s.pipes.queue.new_command_buffer();
-        s.pipes.rms_norm(
-            cmd,
-            residual,
-            &weights.input_ln_w,
-            &scratch.norm_out,
-            tokens,
-            h,
-            eps,
-        );
-        cmd.commit();
-        cmd.wait_until_completed();
+        let pipes = &st().pipes;
 
-        // --- GEMM (cblas): QKV ---
-        unsafe {
-            cblas_sgemm(
-                101,
-                111,
-                112,
-                tokens as i32,
-                qkv_dim as i32,
-                h as i32,
-                1.0,
-                scratch.norm_out.contents() as *const f32,
-                h as i32,
-                weights.qkv_proj_w.contents() as *const f32,
-                h as i32,
-                0.0,
-                scratch.qkv_out.contents() as *mut f32,
-                qkv_dim as i32,
-            );
+        // Ensure KV cache is pre-allocated to max_seq_len.
+        // First call: kv.capacity == 0 — alloc full-size buffers.
+        let max_len = cfg.max_seq_len;
+        if kv.capacity == 0 {
+            kv.k = pipes.buffer_empty(nkv * max_len * hd);
+            kv.v = pipes.buffer_empty(nkv * max_len * hd);
+            kv.capacity = max_len;
         }
-
-        // --- CPU: split, qk_norm, rope, kv_append ---
-        Self::split_qkv(
-            &mut mc,
-            &scratch.qkv_out,
-            &mut scratch.q_buf,
-            &mut scratch.k_buf,
-            &mut scratch.v_buf,
-            tokens,
-            q_dim,
-            kv_dim,
-        );
-        if cfg.has_qk_norm {
-            if let Some(ref w) = weights.q_norm_w {
-                Self::qk_norm(&mut mc, &mut scratch.q_buf, w, tokens, nh, hd, eps);
-            }
-            if let Some(ref w) = weights.k_norm_w {
-                Self::qk_norm(&mut mc, &mut scratch.k_buf, w, tokens, nkv, hd, eps);
-            }
-        }
-        Self::rope(
-            &mut mc,
-            &mut scratch.q_buf,
-            &mut scratch.k_buf,
-            cos,
-            sin,
-            positions,
-            nh,
-            nkv,
-            hd,
-        );
-        let (nk, nv) = Self::kv_cache_append(
-            &mut mc,
-            &mut kv.k,
-            &mut kv.v,
+        debug_assert!(
+            kv.len + tokens <= kv.capacity,
+            "kv overflow: len={}, new={}, cap={}",
             kv.len,
-            &scratch.k_buf,
-            &scratch.v_buf,
             tokens,
-            nkv,
-            hd,
+            kv.capacity
         );
-        kv.k = nk;
-        kv.v = nv;
-        kv.len += tokens;
 
-        // --- CMD 2: attention ---
-        let cmd = s.pipes.queue.new_command_buffer();
-        if tokens == 1 {
-            let p = AttentionParams {
-                batch: 1,
-                num_heads: nh,
-                num_kv_heads: nkv,
-                q_len: 1,
-                kv_len: kv.len,
-                head_dim: hd,
-                causal: false,
-                pos_offset: 0,
-            };
-            s.pipes
-                .flash_attn(cmd, &scratch.q_buf, &kv.k, &kv.v, &scratch.attn_out, &p);
-        } else {
-            Self::transpose_token_to_head(
-                &mut mc,
+        let cmd = ctx.cmd();
+
+        // GEMM dispatcher: m=1 (decode) uses gemv; m>1 (prefill) uses tiled gemm_v2.
+        // Closure lets us pick implementation once at layer entry.
+        let gemm = |enc: &metal::ComputeCommandEncoderRef,
+                    a: &metal::Buffer,
+                    b: &metal::Buffer,
+                    c: &metal::Buffer,
+                    m: usize,
+                    n: usize,
+                    k: usize| {
+            if m == 1 {
+                pipes.gemv_enc(enc, a, b, c, n, k);
+            } else {
+                pipes.gemm_v2(enc, a, b, c, m, n, k);
+            }
+        };
+
+        // 1. Input RMSNorm: residual -> norm_out
+        {
+            let enc = cmd.new_compute_command_encoder();
+            pipes.rms_norm_enc(
+                enc,
+                residual,
+                &weights.input_ln_w,
+                &scratch.norm_out,
+                tokens,
+                h,
+                eps,
+            );
+            enc.end_encoding();
+        }
+
+        // 2. Fused QKV GEMM: norm_out [tokens,h] @ qkv_proj_w [qkv_dim,h] -> qkv_out [tokens, qkv_dim]
+        {
+            let enc = cmd.new_compute_command_encoder();
+            gemm(
+                enc,
+                &scratch.norm_out,
+                &weights.qkv_proj_w,
+                &scratch.qkv_out,
+                tokens,
+                qkv_dim,
+                h,
+            );
+            enc.end_encoding();
+        }
+
+        // 3. Split fused qkv -> q, k, v
+        {
+            let enc = cmd.new_compute_command_encoder();
+            pipes.split_qkv_enc(
+                enc,
+                &scratch.qkv_out,
                 &scratch.q_buf,
-                &mut scratch.o_proj_out,
+                &scratch.k_buf,
+                &scratch.v_buf,
+                tokens,
+                q_dim,
+                kv_dim,
+            );
+            enc.end_encoding();
+        }
+
+        // 4. QK-norm + RoPE + transpose-to-head-major (fused kernel).
+        //    Output goes into attn_out (Q) / o_proj_out (K) / gate_up_out (V) as temp staging.
+        //    We need [heads, tokens, hd] layout for flash_attn.
+        //    Modes: 1 = norm + RoPE (Qwen3 has QK-norm), 2 = RoPE only, 0 = transpose only (for V).
+        let pos_offset = positions[0] as usize;
+        let q_mode: i32 = if cfg.has_qk_norm { 1 } else { 2 };
+        let (q_norm_w, k_norm_w) = (
+            weights.q_norm_w.as_ref(),
+            weights.k_norm_w.as_ref(),
+        );
+        // Dummy weight buffer for mode-2 paths (kernel requires a buffer even when unused).
+        // Reuse input_ln_w — not read when mode != 1.
+        let dummy = &weights.input_ln_w;
+        let q_norm_buf = q_norm_w.unwrap_or(dummy);
+        let k_norm_buf = k_norm_w.unwrap_or(dummy);
+
+        // Stage Q in attn_out (size tokens*q_dim). For tokens==1 the flash_attn expects
+        // Q in token-major shape [batch, q_len, nh, hd] which for q_len=1 is just [nh*hd]; transpose is trivial.
+        // We always output head-major to be consistent with flash_attn_v2 kv_seq_stride=max_len.
+        {
+            let enc = cmd.new_compute_command_encoder();
+            pipes.qk_norm_rope(
+                enc,
+                &scratch.q_buf,
+                q_norm_buf,
+                cos,
+                sin,
+                &scratch.attn_out, // head-major Q
                 tokens,
                 nh,
                 hd,
+                pos_offset,
+                eps,
+                q_mode,
             );
-            let p = AttentionParams {
+            pipes.qk_norm_rope(
+                enc,
+                &scratch.k_buf,
+                k_norm_buf,
+                cos,
+                sin,
+                &scratch.o_proj_out, // head-major K (staged)
+                tokens,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                q_mode,
+            );
+            pipes.qk_norm_rope(
+                enc,
+                &scratch.v_buf,
+                k_norm_buf, // unused in mode 0
+                cos,
+                sin,
+                &scratch.gate_up_out, // head-major V (staged; large enough: 2*im >= nkv*hd for small models)
+                tokens,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                0, // transpose only
+            );
+            enc.end_encoding();
+        }
+
+        // 5. Append K/V into pre-allocated cache at position kv.len
+        {
+            let enc = cmd.new_compute_command_encoder();
+            pipes.kv_cache_append(
+                enc,
+                &scratch.o_proj_out, // staged head-major K
+                &kv.k,
+                nkv,
+                hd,
+                kv.len,
+                tokens,
+                kv.capacity,
+            );
+            pipes.kv_cache_append(
+                enc,
+                &scratch.gate_up_out, // staged head-major V
+                &kv.v,
+                nkv,
+                hd,
+                kv.len,
+                tokens,
+                kv.capacity,
+            );
+            enc.end_encoding();
+        }
+        let kv_len = kv.len + tokens;
+        kv.len = kv_len;
+
+        // 6. Flash attention with strided KV (kv_seq_stride = max_len so cache reads skip unused slots)
+        {
+            let params = AttentionParams {
                 batch: 1,
                 num_heads: nh,
                 num_kv_heads: nkv,
                 q_len: tokens,
-                kv_len: kv.len,
+                kv_len,
                 head_dim: hd,
-                causal: true,
-                pos_offset: positions[0] as usize,
+                causal: tokens > 1,
+                pos_offset,
             };
-            s.pipes.flash_attn(
+            pipes.flash_attn_v2(
                 cmd,
-                &scratch.o_proj_out,
+                &scratch.attn_out, // head-major Q
                 &kv.k,
                 &kv.v,
+                &scratch.q_buf, // reuse q_buf for head-major attn output
+                &params,
+                kv.capacity,
+            );
+        }
+
+        // 7. Untranspose: [nh, tokens, hd] -> [tokens, nh, hd]
+        {
+            let enc = cmd.new_compute_command_encoder();
+            pipes.transpose_out(enc, &scratch.q_buf, &scratch.attn_out, tokens, nh, hd);
+            enc.end_encoding();
+        }
+
+        // 8. O-projection GEMM: attn_out [tokens, q_dim] @ o_proj_w [h, q_dim] -> o_proj_out [tokens, h]
+        {
+            let enc = cmd.new_compute_command_encoder();
+            gemm(
+                enc,
                 &scratch.attn_out,
-                &p,
+                &weights.o_proj_w,
+                &scratch.o_proj_out,
+                tokens,
+                h,
+                q_dim,
             );
-        }
-        cmd.commit();
-        cmd.wait_until_completed();
-        if tokens > 1 {
-            let mut temp = Self::alloc(tokens * q_dim);
-            Self::transpose_head_to_token(&mut mc, &scratch.attn_out, &mut temp, tokens, nh, hd);
-            Self::copy(&mut mc, &temp, &mut scratch.attn_out, tokens * q_dim);
+            enc.end_encoding();
         }
 
-        // --- GEMM (cblas): O-proj ---
-        unsafe {
-            cblas_sgemm(
-                101,
-                111,
-                112,
-                tokens as i32,
-                h as i32,
-                q_dim as i32,
-                1.0,
-                scratch.attn_out.contents() as *const f32,
-                q_dim as i32,
-                weights.o_proj_w.contents() as *const f32,
-                q_dim as i32,
-                0.0,
-                scratch.o_proj_out.contents() as *mut f32,
-                h as i32,
+        // 9. Fused residual add + post-attention RMSNorm (overwrites residual with new value, norm into norm_out)
+        {
+            let enc = cmd.new_compute_command_encoder();
+            pipes.fused_residual_norm_enc(
+                enc,
+                residual,
+                &scratch.o_proj_out,
+                None,
+                &weights.post_ln_w,
+                residual,
+                &scratch.norm_out,
+                tokens,
+                h,
+                eps,
+                0,
             );
+            enc.end_encoding();
         }
 
-        // --- CMD 3: fused_add_rms_norm ---
-        let cmd = s.pipes.queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
-        s.pipes.fused_residual_norm_enc(
-            enc,
-            residual,
-            &scratch.o_proj_out,
-            None,
-            &weights.post_ln_w,
-            residual,
-            &scratch.norm_out,
-            tokens,
-            h,
-            eps,
-            0,
-        );
-        enc.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
-
-        // --- GEMM (cblas): gate_up ---
-        unsafe {
-            cblas_sgemm(
-                101,
-                111,
-                112,
-                tokens as i32,
-                (2 * im) as i32,
-                h as i32,
-                1.0,
-                scratch.norm_out.contents() as *const f32,
-                h as i32,
-                weights.gate_up_proj_w.contents() as *const f32,
-                h as i32,
-                0.0,
-                scratch.gate_up_out.contents() as *mut f32,
-                (2 * im) as i32,
+        // 10. Gate+Up GEMM (fused): norm_out @ gate_up_proj_w -> gate_up_out [tokens, 2*im]
+        {
+            let enc = cmd.new_compute_command_encoder();
+            gemm(
+                enc,
+                &scratch.norm_out,
+                &weights.gate_up_proj_w,
+                &scratch.gate_up_out,
+                tokens,
+                2 * im,
+                h,
             );
+            enc.end_encoding();
         }
 
-        // --- CPU: silu_mul_split ---
-        Self::fused_silu_mul_split(
-            &mut mc,
-            &scratch.gate_up_out,
-            &mut scratch.silu_out,
-            tokens,
-            im,
-        );
+        // 11. SiLU(gate) * up, split from fused gate_up
+        {
+            let enc = cmd.new_compute_command_encoder();
+            pipes.silu_mul_split_enc(enc, &scratch.gate_up_out, &scratch.silu_out, tokens, im);
+            enc.end_encoding();
+        }
 
-        // --- GEMM (cblas): down ---
-        unsafe {
-            cblas_sgemm(
-                101,
-                111,
-                112,
-                tokens as i32,
-                h as i32,
-                im as i32,
-                1.0,
-                scratch.silu_out.contents() as *const f32,
-                im as i32,
-                weights.down_proj_w.contents() as *const f32,
-                im as i32,
-                0.0,
-                scratch.mlp_out.contents() as *mut f32,
-                h as i32,
+        // 12. Down GEMM: silu_out [tokens, im] @ down_proj_w [h, im] -> mlp_out [tokens, h]
+        {
+            let enc = cmd.new_compute_command_encoder();
+            gemm(
+                enc,
+                &scratch.silu_out,
+                &weights.down_proj_w,
+                &scratch.mlp_out,
+                tokens,
+                h,
+                im,
             );
+            enc.end_encoding();
         }
 
-        // --- CPU: add_inplace ---
-        Self::add_inplace(&mut mc, residual, &scratch.mlp_out, tokens * h);
+        // 13. Final residual add: residual += mlp_out (in-place via add_enc into residual)
+        {
+            let enc = cmd.new_compute_command_encoder();
+            pipes.add_enc(enc, residual, &scratch.mlp_out, residual, tokens * h);
+            enc.end_encoding();
+        }
+
+        // No commit here — caller (ModelRunner / B::sync) is responsible for flushing
+        // the accumulated command buffer after all layers + final norm + lm_head GEMM.
     }
 
     fn alloc(len: usize) -> Self::Buffer {
