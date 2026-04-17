@@ -199,6 +199,13 @@ impl Backend for CudaBackend {
 
     fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
         use cudarc::driver::sys::CUstreamCaptureMode;
+        // Disable cudarc's per-slice event tracking during capture —
+        // without this, CUDA_ERROR_STREAM_CAPTURE_ISOLATION fires because
+        // weight buffers carry event handles from pre-capture htod calls.
+        // Matches what the old CudaDecodeRunner does around graph capture.
+        unsafe {
+            ctx.ctx.disable_event_tracking();
+        }
         ctx.stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| FerrumError::unsupported(format!("begin_capture: {e}")))?;
@@ -215,7 +222,15 @@ impl Backend for CudaBackend {
         let graph_opt = ctx
             .stream
             .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-            .map_err(|e| FerrumError::unsupported(format!("end_capture: {e}")))?;
+            .map_err(|e| {
+                // Re-enable event tracking even on error to avoid permanent disable.
+                unsafe { ctx.ctx.enable_event_tracking() };
+                FerrumError::unsupported(format!("end_capture: {e}"))
+            })?;
+        // Re-enable event tracking for subsequent non-captured work.
+        unsafe {
+            ctx.ctx.enable_event_tracking();
+        }
         match graph_opt {
             Some(g) => {
                 install_decode_graph(g);
