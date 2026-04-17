@@ -83,11 +83,22 @@ run_logged "nvcc --version | tail -3"
 record ""
 
 # Compute capability — Marlin (GPTQ) needs SM >= 8.0.
-CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"
-if [ -n "$CC" ]; then
-    export CUDA_COMPUTE_CAP="$CC"
-    record "CUDA_COMPUTE_CAP = ${CC}"
+#
+# Clamp to the highest arch nvcc actually supports (newer GPUs like Blackwell
+# SM 12.0 need nvcc 12.8+; on older nvcc the PTX JIT handles forward-compat
+# at runtime). Don't just propagate raw `nvidia-smi` output — nvcc 12.6 will
+# reject `compute_cap=120` with "nvcc cannot target gpu arch 120".
+CC_RAW="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"
+NVCC_MAX_CAP="$(nvcc --list-gpu-arch 2>/dev/null | grep -oE 'compute_[0-9]+' | grep -oE '[0-9]+$' | sort -n | tail -1)"
+: "${NVCC_MAX_CAP:=90}"
+if [ -n "$CC_RAW" ] && [ "$CC_RAW" -le "$NVCC_MAX_CAP" ]; then
+    export CUDA_COMPUTE_CAP="$CC_RAW"
+else
+    export CUDA_COMPUTE_CAP="$NVCC_MAX_CAP"
 fi
+record "GPU compute_cap = ${CC_RAW:-unknown}"
+record "nvcc max cap    = ${NVCC_MAX_CAP}"
+record "CUDA_COMPUTE_CAP = ${CUDA_COMPUTE_CAP} (PTX JIT bridges any gap on newer GPUs)"
 
 # ────────────────────────────────────────────────────────────────────────
 # 1. System deps
