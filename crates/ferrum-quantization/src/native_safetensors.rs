@@ -182,6 +182,27 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
         if self.has(&qw_key) {
             return self.load_gptq_linear(name);
         }
+        // GPTQ fusion shims: synthesise qkv_proj / gate_up_proj from split
+        // components — same pattern as Dense but concatenating the GPTQ
+        // tensors (qweight/scales/qzeros) along the N dim.
+        if name.ends_with("qkv_proj") {
+            let prefix = &name[..name.len() - "qkv_proj".len()];
+            let parts = [
+                format!("{prefix}q_proj"),
+                format!("{prefix}k_proj"),
+                format!("{prefix}v_proj"),
+            ];
+            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                return self.load_gptq_linear_fused(&parts);
+            }
+        }
+        if name.ends_with("gate_up_proj") {
+            let prefix = &name[..name.len() - "gate_up_proj".len()];
+            let parts = [format!("{prefix}gate_proj"), format!("{prefix}up_proj")];
+            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                return self.load_gptq_linear_fused(&parts);
+            }
+        }
 
         // Direct fused `<name>.weight` next.
         let direct = format!("{name}.weight");
@@ -284,6 +305,112 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             &qweight,
             &scales_f32,
             &qzeros,
+            g_idx.as_deref(),
+            qcfg.bits,
+            qcfg.group_size,
+            in_features,
+            out_features,
+        )?;
+        Ok(Box::new(linear))
+    }
+
+    /// Fuse multiple GPTQ projections by concatenating qweight/scales/qzeros
+    /// along the output (N) dim. Matches the Dense fusion shim used for
+    /// non-quantized models: q_proj + k_proj + v_proj → qkv_proj.
+    ///
+    /// All parts must share:
+    /// - in_features (K)
+    /// - bits, group_size
+    /// - qzeros N-packing (which the GPTQ format always honours: qzeros[-1]
+    ///   = N/8, concat along that axis works)
+    ///
+    /// g_idx: only present when desc_act=true. When present, all parts
+    /// share it (same K rows, same activation permutation).
+    fn load_gptq_linear_fused(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
+        let qcfg = self.quant_config.as_ref().ok_or_else(|| {
+            FerrumError::model("GPTQ fusion requires quantize_config.json".to_string())
+        })?;
+        if qcfg.method != QuantMethod::Gptq {
+            return Err(FerrumError::model(format!(
+                "GPTQ fusion but quant_method={:?}",
+                qcfg.method
+            )));
+        }
+
+        let mut qw_acc: Vec<i32> = Vec::new();
+        let mut sc_acc: Vec<f32> = Vec::new();
+        let mut qz_acc: Vec<i32> = Vec::new();
+        let mut qw_rows = 0usize;
+        let mut sc_rows = 0usize;
+        let mut qz_rows = 0usize;
+        let mut total_n = 0usize;
+        let mut total_n_scales = 0usize;
+        let mut total_n_zeros = 0usize;
+        let mut g_idx: Option<Vec<i32>> = None;
+        // Segments: (qw_slice, sc_slice, qz_slice) per part, needed for N-major layout concat
+        let mut qw_parts: Vec<(Vec<i32>, usize, usize)> = Vec::new(); // (data, rows, cols)
+        let mut sc_parts: Vec<(Vec<f32>, usize, usize)> = Vec::new();
+        let mut qz_parts: Vec<(Vec<i32>, usize, usize)> = Vec::new();
+
+        for p in parts {
+            let (qw, qw_sh) = self.read_i32(&format!("{p}.qweight"))?;
+            let (sc, sc_sh) = self.read_f32(&format!("{p}.scales"))?;
+            let (qz, qz_sh) = self.read_i32(&format!("{p}.qzeros"))?;
+            if qw_sh.len() != 2 || sc_sh.len() != 2 || qz_sh.len() != 2 {
+                return Err(FerrumError::model(format!(
+                    "GPTQ fusion '{p}': expected 2D tensors, got qw {qw_sh:?} sc {sc_sh:?} qz {qz_sh:?}"
+                )));
+            }
+            if qw_rows == 0 {
+                qw_rows = qw_sh[0];
+                sc_rows = sc_sh[0];
+                qz_rows = qz_sh[0];
+            } else if qw_sh[0] != qw_rows || sc_sh[0] != sc_rows || qz_sh[0] != qz_rows {
+                return Err(FerrumError::model(format!(
+                    "GPTQ fusion row mismatch on '{p}'"
+                )));
+            }
+            total_n += qw_sh[1];
+            total_n_scales += sc_sh[1];
+            total_n_zeros += qz_sh[1];
+            qw_parts.push((qw, qw_sh[0], qw_sh[1]));
+            sc_parts.push((sc, sc_sh[0], sc_sh[1]));
+            qz_parts.push((qz, qz_sh[0], qz_sh[1]));
+
+            // g_idx optional; if first part has it, use that
+            if g_idx.is_none() {
+                if self.has(&format!("{p}.g_idx")) {
+                    g_idx = Some(self.read_i32(&format!("{p}.g_idx"))?.0);
+                }
+            }
+        }
+
+        // Interleave row-major concatenation: for each row, write all parts' cols.
+        qw_acc.reserve(qw_rows * total_n);
+        for r in 0..qw_rows {
+            for (part, _rows, cols) in &qw_parts {
+                qw_acc.extend_from_slice(&part[r * cols..r * cols + cols]);
+            }
+        }
+        sc_acc.reserve(sc_rows * total_n_scales);
+        for r in 0..sc_rows {
+            for (part, _rows, cols) in &sc_parts {
+                sc_acc.extend_from_slice(&part[r * cols..r * cols + cols]);
+            }
+        }
+        qz_acc.reserve(qz_rows * total_n_zeros);
+        for r in 0..qz_rows {
+            for (part, _rows, cols) in &qz_parts {
+                qz_acc.extend_from_slice(&part[r * cols..r * cols + cols]);
+            }
+        }
+
+        let in_features = qw_rows * 8;
+        let out_features = total_n;
+        let linear = GptqLinear::<B>::from_raw(
+            &qw_acc,
+            &sc_acc,
+            &qz_acc,
             g_idx.as_deref(),
             qcfg.bits,
             qcfg.group_size,
