@@ -106,9 +106,13 @@ record "CUDA_COMPUTE_CAP = ${CUDA_COMPUTE_CAP} (PTX JIT bridges any gap on newer
 section "1. System deps (build-essential, libssl, ffmpeg, python3)"
 if command -v apt-get >/dev/null 2>&1; then
     record 'Installing / verifying via apt-get...'
+    # libnccl-dev: cudarc's `nccl` feature links -lnccl at build time.
+    # Without this apt step, the release link step fails even though CUDA
+    # compiles cleanly.
     run_logged "sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends \
         build-essential pkg-config libssl-dev git curl \
-        python3 python3-pip ffmpeg libsndfile1 2>&1 | tail -3" || \
+        python3 python3-pip ffmpeg libsndfile1 \
+        libnccl2 libnccl-dev 2>&1 | tail -3" || \
         record 'apt-get hit an issue — retry manually if next steps fail'
 else
     record 'Non-Debian host — ensure build-essential, libssl-dev, pkg-config, python3 are installed manually.'
