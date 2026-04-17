@@ -23,7 +23,7 @@
 
 use super::{AttnConfig, Backend, QuantKind, QuantWeights, ReduceOp};
 use crate::ptx;
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::cublas::CudaBlas;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
     PushKernelArg,
@@ -233,20 +233,47 @@ impl Backend for CudaBackend {
         n: usize,
         k: usize,
     ) {
-        use cudarc::cublas::sys::cublasOperation_t;
-        let cfg = GemmConfig {
-            transa: cublasOperation_t::CUBLAS_OP_T,
-            transb: cublasOperation_t::CUBLAS_OP_N,
-            m: n as i32,
-            n: m as i32,
-            k: k as i32,
-            alpha: f16::ONE,
-            lda: k as i32,
-            ldb: k as i32,
-            beta: f16::ZERO,
-            ldc: n as i32,
-        };
-        unsafe { ctx.blas.gemm(cfg, b, a, out) }.expect("gemm (cuBLAS hgemm)");
+        // Call `cublasGemmEx` directly with:
+        //   compute_type = CUBLAS_COMPUTE_32F_FAST_16F (fp32 accum via fp16 tensor cores)
+        //   algo         = CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        // cudarc's safe `blas.gemm` hardcodes COMPUTE_32F + GEMM_DEFAULT, which
+        // returns CUBLAS_STATUS_INTERNAL_ERROR on Blackwell (SM 12.0) cuBLAS 12.8
+        // for standard hgemm. The tensor-op variant uses the fp16 tensor-core
+        // path that Blackwell actually has working kernels for.
+        use cudarc::cublas::result::gemm_ex;
+        use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType_t};
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let (a_ptr, _rec_a) = b.device_ptr(&ctx.stream); // cuBLAS arg "A" = weight = our `b`
+        let (b_ptr, _rec_b) = a.device_ptr(&ctx.stream); // cuBLAS arg "B" = input = our `a`
+        let (c_ptr, _rec_c) = out.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            gemm_ex(
+                *ctx.blas.handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                (&alpha) as *const f32 as *const _,
+                a_ptr as *const _,
+                cudaDataType_t::CUDA_R_16F,
+                k as i32,
+                b_ptr as *const _,
+                cudaDataType_t::CUDA_R_16F,
+                k as i32,
+                (&beta) as *const f32 as *const _,
+                c_ptr as *mut _,
+                cudaDataType_t::CUDA_R_16F,
+                n as i32,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        }
+        .expect("gemm (cublasGemmEx, compute=32F_FAST_16F, algo=TENSOR_OP)");
     }
 
     // ── Attention ───────────────────────────────────────────────────────
