@@ -211,6 +211,62 @@ fn def_to_qwen3_cfg(def: &ferrum_models::definition::ModelDefinition) -> Qwen3Co
     }
 }
 
+/// Qwen3Model<CpuBackend> vs Qwen3Model<MetalBackend> on the same weights.
+///
+/// This is the post-Phase-B regression guard for the Model-as-Code path:
+/// if either backend's Qwen3Model-facing Backend methods (qk_norm_rope,
+/// kv_cache_append_head_major, etc.) diverge, this catches it immediately.
+#[test]
+#[ignore]
+fn qwen3model_cpu_vs_metal() {
+    let mp = qwen3_path().expect("Qwen3-0.6B not in HF cache");
+    let def = load_model_def(&mp);
+    let qcfg = def_to_qwen3_cfg(&def);
+
+    let loader = ferrum_models::SafeTensorsLoader::new(mp.to_str().unwrap());
+    let vb = loader
+        .load_varbuilder(&candle_core::Device::Cpu, candle_core::DType::F32)
+        .unwrap();
+
+    let cpu_loader = CandleShimLoader::<CpuBackend>::new(&vb);
+    let mut cpu_model = Qwen3Model::<CpuBackend>::new(qcfg.clone(), &cpu_loader).unwrap();
+    let mtl_loader = CandleShimLoader::<MetalBackend>::new(&vb);
+    let mut mtl_model = Qwen3Model::<MetalBackend>::new(qcfg, &mtl_loader).unwrap();
+
+    let prompt: Vec<u32> = vec![872, 111, 248, 104715, 0, 56568, 53481, 5048];
+    eprintln!("\n=== Prefill {} tokens ===", prompt.len());
+
+    let c_logits = cpu_model.prefill("t", &prompt);
+    let m_logits = mtl_model.prefill("t", &prompt);
+    let (ca, ma) = (argmax(&c_logits), argmax(&m_logits));
+    let cos = cosine(&c_logits, &m_logits);
+    let mad = max_abs_diff(&c_logits, &m_logits);
+    eprintln!(
+        "prefill  CPU argmax={ca} ({:.4})  Metal argmax={ma} ({:.4})  cos={cos:.6}  max_diff={mad:.4}",
+        c_logits[ca], m_logits[ma]
+    );
+    assert_eq!(ca, ma, "prefill argmax mismatch");
+    assert!(cos > 0.9999, "prefill cosine too low: {cos}");
+
+    let mut pos = prompt.len() as u32;
+    let mut tok = ca as u32;
+    for step in 0..5 {
+        let c = cpu_model.decode("t", tok, pos);
+        let m = mtl_model.decode("t", tok, pos);
+        let (ca, ma) = (argmax(&c), argmax(&m));
+        let cos = cosine(&c, &m);
+        let mad = max_abs_diff(&c, &m);
+        eprintln!(
+            "decode {step} pos={pos} tok={tok}  CPU argmax={ca}  Metal argmax={ma}  cos={cos:.6}  max_diff={mad:.4}",
+        );
+        assert_eq!(ca, ma, "decode step {step} argmax mismatch");
+        assert!(cos > 0.9999, "decode step {step} cosine too low: {cos}");
+        tok = ca as u32;
+        pos += 1;
+    }
+    eprintln!("✅ Qwen3Model Cpu↔Metal parity pass");
+}
+
 #[test]
 #[ignore]
 fn qwen3model_vs_modelrunner_prefill_decode() {
