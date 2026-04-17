@@ -278,7 +278,11 @@ impl Backend for MetalBackend {
         }
     }
 
-    // ── CPU ops on shared memory: flush GPU first ────────────────────────
+    // ── Metal shader dispatches, no ctx flush ────────────────────────────
+    // These were CPU scalar loops on shared memory in the layer_forward_fused
+    // era (where the override bypassed the trait). Now that models call them
+    // directly they must encode into ctx.cmd() like every other GPU op so the
+    // single-command-buffer batching stays intact.
 
     fn split_qkv(
         ctx: &mut Self::Context,
@@ -290,19 +294,11 @@ impl Backend for MetalBackend {
         q_dim: usize,
         kv_dim: usize,
     ) {
-        let qd = q_dim + 2 * kv_dim;
-        unsafe {
-            let s = std::slice::from_raw_parts(qkv.contents() as *const f32, tokens * qd);
-            let qo = std::slice::from_raw_parts_mut(q.contents() as *mut f32, tokens * q_dim);
-            let ko = std::slice::from_raw_parts_mut(k.contents() as *mut f32, tokens * kv_dim);
-            let vo = std::slice::from_raw_parts_mut(v.contents() as *mut f32, tokens * kv_dim);
-            for t in 0..tokens {
-                let b = t * qd;
-                qo[t * q_dim..(t + 1) * q_dim].copy_from_slice(&s[b..b + q_dim]);
-                ko[t * kv_dim..(t + 1) * kv_dim].copy_from_slice(&s[b + q_dim..b + q_dim + kv_dim]);
-                vo[t * kv_dim..(t + 1) * kv_dim].copy_from_slice(&s[b + q_dim + kv_dim..b + qd]);
-            }
-        }
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes
+            .split_qkv_enc(enc, qkv, q, k, v, tokens, q_dim, kv_dim);
+        enc.end_encoding();
     }
 
     fn fused_silu_mul_split(
@@ -312,17 +308,10 @@ impl Backend for MetalBackend {
         tokens: usize,
         im: usize,
     ) {
-        unsafe {
-            let s = std::slice::from_raw_parts(gu.contents() as *const f32, tokens * 2 * im);
-            let d = std::slice::from_raw_parts_mut(out.contents() as *mut f32, tokens * im);
-            for t in 0..tokens {
-                for i in 0..im {
-                    let g = s[t * 2 * im + i];
-                    let u = s[t * 2 * im + im + i];
-                    d[t * im + i] = (g / (1.0 + (-g).exp())) * u;
-                }
-            }
-        }
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.silu_mul_split_enc(enc, gu, out, tokens, im);
+        enc.end_encoding();
     }
 
     fn qk_norm(
@@ -475,13 +464,14 @@ impl Backend for MetalBackend {
     }
 
     fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
-        unsafe {
-            let rv = std::slice::from_raw_parts_mut(r.contents() as *mut f32, len);
-            let xv = std::slice::from_raw_parts(x.contents() as *const f32, len);
-            for i in 0..len {
-                rv[i] += xv[i];
-            }
-        }
+        // Fused in-place add via add_enc with output == residual input.
+        // Metal's `add_f32` kernel reads a[tid] + b[tid] -> out[tid]; using the
+        // same buffer for a and out is well-defined because each thread handles
+        // exactly one element with no cross-thread dependency.
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.add_enc(enc, r, x, r, len);
+        enc.end_encoding();
     }
 
     fn layer_forward_fused(
