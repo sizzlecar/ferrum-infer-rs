@@ -9,6 +9,7 @@ pub mod audio_processor;
 pub mod builder;
 pub mod common;
 pub mod definition;
+pub mod models;
 pub mod executor;
 pub mod hf_download;
 pub mod image_processor;

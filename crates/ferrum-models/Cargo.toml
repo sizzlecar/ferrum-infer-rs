@@ -40,6 +40,7 @@ ferrum-attention = { path = "../ferrum-attention", version = "0.6.0" }
 
 # Unified compute kernels (CUDA/Metal/CPU) — always needed for TransformerConfig/Backend types
 ferrum-kernels = { workspace = true }
+ferrum-quantization = { workspace = true }
 half = { workspace = true }
 
 # Error handling
