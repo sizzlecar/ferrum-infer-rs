@@ -108,21 +108,18 @@ impl Backend for CudaBackend {
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     fn new_context() -> Self::Context {
-        let ordinal = std::env::var("FERRUM_CUDA_DEVICE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let ctx = CudaContext::new(ordinal).unwrap_or_else(|e| {
-            panic!("CudaBackend::new_context: failed to init context {ordinal}: {e}")
-        });
-        let stream = ctx
-            .new_stream()
-            .unwrap_or_else(|e| panic!("CudaBackend::new_context: failed to create stream: {e}"));
+        // Reuse the process-global stream populated by `default_stream()`.
+        // Model constructors call `B::from_slice` thousands of times to
+        // upload weights BEFORE the engine ever calls `new_context()`, so
+        // `default_stream()` has already lazily spun up a stream. Reusing
+        // it here keeps allocations + ops on the SAME stream — no
+        // cross-stream synchronization needed.
+        let stream = default_stream();
+        let ctx = stream.context().clone();
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .unwrap_or_else(|e| panic!("CudaBackend::new_context: CudaBlas::new: {e}")),
         );
-        install_thread_stream(stream.clone());
         Self::Context {
             ctx,
             stream,
@@ -843,19 +840,51 @@ fn stream_slot() -> &'static std::sync::RwLock<Option<Arc<CudaStream>>> {
     GLOBAL_STREAM.get_or_init(|| std::sync::RwLock::new(None))
 }
 
-fn with_stream<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
-    let guard = stream_slot().read().expect("GLOBAL_STREAM poisoned");
-    let stream = guard
+/// Return the global stream, lazily creating it if neither `new_context`
+/// nor `install_thread_stream` has populated it yet.
+///
+/// This is needed because `LlamaFamilyModel::new()` (and other model
+/// constructors) call `B::from_slice` on thousands of weights before
+/// any engine code creates a `Context`. We can't easily force ordering
+/// through trait signatures, so the first `from_slice` lazily spins up
+/// a default context (ordinal from `FERRUM_CUDA_DEVICE` env, else 0)
+/// and a dedicated stream. Subsequent `new_context()` calls reuse this
+/// same stream — no divergence.
+fn default_stream() -> Arc<CudaStream> {
+    if let Some(s) = stream_slot()
+        .read()
+        .expect("GLOBAL_STREAM poisoned")
         .as_ref()
-        .cloned()
-        .expect("CudaBackend: GLOBAL_STREAM not set — call new_context() first");
-    drop(guard);
+    {
+        return s.clone();
+    }
+    let mut w = stream_slot().write().expect("GLOBAL_STREAM poisoned");
+    if w.is_none() {
+        let ordinal = std::env::var("FERRUM_CUDA_DEVICE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let ctx = CudaContext::new(ordinal).unwrap_or_else(|e| {
+            panic!("CudaBackend: failed to init default context {ordinal}: {e}")
+        });
+        let stream = ctx
+            .new_stream()
+            .unwrap_or_else(|e| panic!("CudaBackend: failed to create default stream: {e}"));
+        *w = Some(stream);
+    }
+    w.as_ref().cloned().expect("just inserted")
+}
+
+fn with_stream<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
+    let stream = default_stream();
     f(&stream)
 }
 
 /// Install a stream as the global default for context-free ops.
-/// Called automatically by `new_context`; override manually from worker
-/// threads that need to pin a different stream.
+/// `new_context` calls this to make its freshly-created stream the
+/// process default — subsequent `alloc`/`from_slice`/`to_vec` calls
+/// route through it. If `default_stream` already lazily created a
+/// stream, this replaces it.
 pub fn install_thread_stream(stream: Arc<CudaStream>) {
     *stream_slot().write().expect("GLOBAL_STREAM poisoned") = Some(stream);
 }
