@@ -315,7 +315,7 @@ impl Backend for MetalBackend {
     }
 
     fn qk_norm(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         data: &mut Self::Buffer,
         w: &Self::Buffer,
         tokens: usize,
@@ -323,24 +323,39 @@ impl Backend for MetalBackend {
         hd: usize,
         eps: f32,
     ) {
-        unsafe {
-            let d =
-                std::slice::from_raw_parts_mut(data.contents() as *mut f32, tokens * heads * hd);
-            let wv = std::slice::from_raw_parts(w.contents() as *const f32, hd);
-            for t in 0..tokens {
-                for h in 0..heads {
-                    let o = (t * heads + h) * hd;
-                    let mut ss = 0.0f32;
-                    for i in 0..hd {
-                        ss += d[o + i] * d[o + i];
-                    }
-                    let inv = 1.0 / (ss / hd as f32 + eps).sqrt();
-                    for i in 0..hd {
-                        d[o + i] *= inv * wv[i];
-                    }
-                }
-            }
-        }
+        // Per-head RMS norm in-place: reshape [tokens, heads, hd] as
+        // `tokens * heads` independent rows of length `hd`. The rms_norm_f32
+        // shader does exactly one normalized row per threadgroup, so this is
+        // the same kernel, just with a larger row count.
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes
+            .rms_norm_enc(enc, data, w, data, tokens * heads, hd, eps);
+        enc.end_encoding();
+    }
+
+    fn qk_norm_rope(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        mode: i32,
+    ) {
+        // Fused norm (optional) + RoPE (optional) + transpose, all in one
+        // Metal dispatch. See ferrum_attention::metal::shaders::norm_rope.
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.qk_norm_rope(
+            enc, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps, mode,
+        );
+        enc.end_encoding();
     }
 
     fn rope(
@@ -443,24 +458,19 @@ impl Backend for MetalBackend {
     }
 
     fn transpose_head_to_token(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         src: &Self::Buffer,
         dst: &mut Self::Buffer,
         tokens: usize,
         heads: usize,
         dim: usize,
     ) {
-        unsafe {
-            let s = std::slice::from_raw_parts(src.contents() as *const f32, heads * tokens * dim);
-            let d =
-                std::slice::from_raw_parts_mut(dst.contents() as *mut f32, tokens * heads * dim);
-            for h in 0..heads {
-                for t in 0..tokens {
-                    d[(t * heads + h) * dim..(t * heads + h) * dim + dim]
-                        .copy_from_slice(&s[(h * tokens + t) * dim..(h * tokens + t) * dim + dim]);
-                }
-            }
-        }
+        // [heads, tokens, dim] → [tokens, heads, dim] via dedicated Metal shader.
+        // Called after flash_attention to return Q in row-major layout for O-proj.
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.transpose_out(enc, src, dst, tokens, heads, dim);
+        enc.end_encoding();
     }
 
     fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {

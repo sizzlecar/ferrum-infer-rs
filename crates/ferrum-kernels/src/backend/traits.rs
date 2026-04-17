@@ -309,6 +309,39 @@ pub trait Backend: Send + Sync + Sized + 'static {
         eps: f32,
     );
 
+    /// Fused QK-norm + RoPE + transpose-to-head-major.
+    ///
+    /// `mode` selects the operation:
+    ///   0 = transpose only (typical for V, which needs no norm and no RoPE)
+    ///   1 = per-head RMS norm + RoPE + transpose  (Q/K with QK-norm, Qwen3)
+    ///   2 = RoPE + transpose                       (Q/K without QK-norm, Llama/Mistral)
+    ///
+    /// input:   `[tokens, heads, head_dim]`  (token-major, output of split_qkv)
+    /// output:  `[heads, tokens, head_dim]`  (head-major, ready for flash_attn / kv_cache_append)
+    ///
+    /// `pos_offset` is the position of token 0 (decode uses current seq len;
+    /// prefill uses 0). Within the batch, positions are taken as `pos_offset + i`.
+    ///
+    /// This is the primary attention-input preparation op. Backends that have a
+    /// fused kernel (Metal's `qk_norm_rope_transpose_f32`) will be dramatically
+    /// faster than composing norm + rope + transpose separately; the CPU
+    /// fallback lowers to the individual ops.
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        mode: i32,
+    );
+
     /// Append new K/V to cache. Transposes from token-major to head-major.
     /// new_k/v: [tokens, nkv, hd] (token-major)
     /// cache k/v: [nkv, kv_len, hd] (head-major)

@@ -279,6 +279,69 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn qk_norm_rope(
+        _ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        mode: i32,
+    ) {
+        let half = head_dim / 2;
+        let cos_len = cos.len();
+        let sin_len = sin.len();
+        debug_assert_eq!(cos_len, sin_len);
+
+        for t in 0..tokens {
+            let pos = pos_offset + t;
+            for h in 0..heads {
+                // input row: [t, h, :]  stride = heads * head_dim
+                let src_off = (t * heads + h) * head_dim;
+                // output row: [h, t, :]  stride = tokens * head_dim
+                let dst_off = (h * tokens + t) * head_dim;
+
+                // Mode 0: plain transpose.
+                if mode == 0 {
+                    for i in 0..head_dim {
+                        output[dst_off + i] = input[src_off + i];
+                    }
+                    continue;
+                }
+
+                // Optional RMS norm (mode 1 only).
+                let scale = if mode == 1 {
+                    let mut sum_sq = 0.0f32;
+                    for i in 0..head_dim {
+                        sum_sq += input[src_off + i] * input[src_off + i];
+                    }
+                    1.0f32 / (sum_sq / head_dim as f32 + eps).sqrt()
+                } else {
+                    1.0
+                };
+
+                // Apply (norm?) + RoPE to halves, write to head-major output.
+                for i in 0..half {
+                    let (x0_raw, x1_raw) = (input[src_off + i], input[src_off + i + half]);
+                    let (x0, x1) = if mode == 1 {
+                        (x0_raw * scale * norm_w[i], x1_raw * scale * norm_w[i + half])
+                    } else {
+                        (x0_raw, x1_raw)
+                    };
+                    let c = cos[pos * half + i];
+                    let s = sin[pos * half + i];
+                    output[dst_off + i] = x0 * c - x1 * s;
+                    output[dst_off + i + half] = x1 * c + x0 * s;
+                }
+            }
+        }
+    }
+
     fn kv_cache_append(
         _ctx: &mut Self::Context,
         cache_k: &mut Self::Buffer,
