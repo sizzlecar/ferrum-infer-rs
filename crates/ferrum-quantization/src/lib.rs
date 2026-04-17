@@ -18,11 +18,13 @@
 
 pub mod dense;
 pub mod factory;
+pub mod gptq;
 pub mod loader;
 pub mod traits;
 
 pub use dense::DenseLinear;
 pub use factory::DefaultLinearFactory;
+pub use gptq::GptqLinear;
 pub use loader::WeightLoader;
 pub use traits::{Linear, LinearFactory};
 
