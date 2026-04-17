@@ -233,6 +233,11 @@ impl Backend for CudaBackend {
         n: usize,
         k: usize,
     ) {
+        // DEBUG: re-check for prior-kernel faults
+        ctx.stream
+            .synchronize()
+            .expect("pre-gemm sync failed — prior kernel faulted");
+
         use cudarc::cublas::result::gemm_ex;
         use cudarc::cublas::sys::{
             cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType_t,
