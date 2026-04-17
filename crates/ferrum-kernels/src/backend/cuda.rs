@@ -52,18 +52,7 @@ pub struct CudaState {
     /// of the cheap perf wins for decode-heavy workloads.
     _blas_workspace: CudaSlice<u8>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
-
-    // ── Device-side dynamic decode state (for CUDA graph capture) ──
-    // Kernels that depend on per-step values (token id, position,
-    // valid-kv-len) have `_dyn` variants reading these device slots.
-    // When `use_dev_state = true`, the `_dyn` kernels are launched; the
-    // captured graph sees stable pointer args and the scalar values get
-    // updated via memcpy_htod_async before each graph replay.
-    pub token_buf: CudaSlice<u32>,
-    pub pos_buf: CudaSlice<i32>, // pos_offset == cache_len for decode
-    pub kv_buf: CudaSlice<i32>,  // valid_kv_len == pos + 1
     pub use_dev_state: bool,
-
     /// True between begin_graph_capture and end_graph_capture.
     pub capture_in_flight: bool,
 }
@@ -157,13 +146,10 @@ impl Backend for CudaBackend {
                 panic!("cublasSetWorkspace_v2 failed: {:?}", status);
             }
         }
-        // Per-step dynamic state (for graph replay).
-        let token_buf = unsafe { stream.alloc::<u32>(1) }
-            .expect("CudaBackend::new_context: token_buf alloc");
-        let pos_buf = unsafe { stream.alloc::<i32>(1) }
-            .expect("CudaBackend::new_context: pos_buf alloc");
-        let kv_buf = unsafe { stream.alloc::<i32>(1) }
-            .expect("CudaBackend::new_context: kv_buf alloc");
+        // Ensure process-global decode state buffers exist.
+        // Allocated once per process; shared across all ctx instances so
+        // captured graphs reference stable device pointers.
+        ensure_decode_state_bufs(&stream);
 
         Self::Context {
             ctx,
@@ -171,9 +157,6 @@ impl Backend for CudaBackend {
             blas,
             _blas_workspace: blas_workspace,
             modules: HashMap::new(),
-            token_buf,
-            pos_buf,
-            kv_buf,
             use_dev_state: false,
             capture_in_flight: false,
         }
@@ -182,14 +165,19 @@ impl Backend for CudaBackend {
     fn set_decode_state(ctx: &mut Self::Context, token: u32, step: u32) {
         let valid_kv = (step as i32) + 1;
         let step_i = step as i32;
-        ctx.stream
-            .memcpy_htod(&[token], &mut ctx.token_buf)
+        let stream = ctx.stream.clone();
+        let mut w = decode_state_slot()
+            .write()
+            .expect("DECODE_STATE poisoned");
+        let bufs = w.as_mut().expect("DecodeStateBufs not initialised");
+        stream
+            .memcpy_htod(&[token], &mut bufs.token)
             .expect("token_buf memcpy");
-        ctx.stream
-            .memcpy_htod(&[step_i], &mut ctx.pos_buf)
+        stream
+            .memcpy_htod(&[step_i], &mut bufs.pos)
             .expect("pos_buf memcpy");
-        ctx.stream
-            .memcpy_htod(&[valid_kv], &mut ctx.kv_buf)
+        stream
+            .memcpy_htod(&[valid_kv], &mut bufs.kv)
             .expect("kv_buf memcpy");
     }
 
@@ -448,6 +436,12 @@ impl Backend for CudaBackend {
             let scale = cfg.scale;
             let shared_mem = (kv_len as u32) * 4;
             let stream = ctx.stream.clone();
+            // Hold read-guard on global state bufs for the builder's lifetime.
+            let dec_guard = if use_dyn {
+                Some(decode_state_slot().read().expect("DECODE_STATE poisoned"))
+            } else {
+                None
+            };
             let mut bld = stream.launch_builder(&func);
             bld.arg(q);
             bld.arg(k);
@@ -458,7 +452,8 @@ impl Backend for CudaBackend {
             bld.arg(&hd);
             bld.arg(&capacity);
             if use_dyn {
-                bld.arg(&ctx.kv_buf);
+                let bufs = dec_guard.as_ref().unwrap().as_ref().unwrap();
+                bld.arg(&bufs.kv);
             } else {
                 bld.arg(&valid_kv_scalar);
             }
@@ -471,6 +466,7 @@ impl Backend for CudaBackend {
                 })
             }
             .expect("decode_attention_head_major launch");
+            drop(dec_guard);
             return;
         }
         let func = ctx.func(
@@ -552,9 +548,11 @@ impl Backend for CudaBackend {
                 "embedding_lookup_f16_dyn",
             );
             let stream = ctx.stream.clone();
+            let dec_guard = decode_state_slot().read().expect("DECODE_STATE poisoned");
+            let bufs = dec_guard.as_ref().expect("DecodeStateBufs");
             let mut b = stream.launch_builder(&func);
             b.arg(table);
-            b.arg(&ctx.token_buf);
+            b.arg(&bufs.token);
             b.arg(out);
             b.arg(&dim_i32);
             unsafe {
@@ -565,6 +563,7 @@ impl Backend for CudaBackend {
                 })
             }
             .expect("embedding_lookup_dyn launch");
+            drop(dec_guard);
             return;
         }
 
@@ -691,6 +690,11 @@ impl Backend for CudaBackend {
         let head_dim_i32 = head_dim as i32;
         let pos_offset_i32 = pos_offset as i32;
         let stream = ctx.stream.clone();
+        let dec_guard = if use_dyn {
+            Some(decode_state_slot().read().expect("DECODE_STATE poisoned"))
+        } else {
+            None
+        };
         let mut b = stream.launch_builder(&func);
         b.arg(input);
         b.arg(norm_w);
@@ -701,7 +705,8 @@ impl Backend for CudaBackend {
         b.arg(&heads_i32);
         b.arg(&head_dim_i32);
         if use_dyn {
-            b.arg(&ctx.pos_buf);
+            let bufs = dec_guard.as_ref().unwrap().as_ref().unwrap();
+            b.arg(&bufs.pos);
         } else {
             b.arg(&pos_offset_i32);
         }
@@ -715,6 +720,7 @@ impl Backend for CudaBackend {
             })
         }
         .expect("qk_norm_rope launch");
+        drop(dec_guard);
     }
 
     fn kv_cache_append_head_major(
@@ -752,6 +758,11 @@ impl Backend for CudaBackend {
             shared_mem_bytes: 0,
         };
         let stream = ctx.stream.clone();
+        let dec_guard = if use_dyn {
+            Some(decode_state_slot().read().expect("DECODE_STATE poisoned"))
+        } else {
+            None
+        };
 
         // K half.
         {
@@ -761,7 +772,8 @@ impl Backend for CudaBackend {
             b.arg(&nkv_i32);
             b.arg(&hd_i32);
             if use_dyn {
-                b.arg(&ctx.pos_buf);
+                let bufs = dec_guard.as_ref().unwrap().as_ref().unwrap();
+                b.arg(&bufs.pos);
             } else {
                 b.arg(&cache_len_i32);
             }
@@ -777,7 +789,8 @@ impl Backend for CudaBackend {
             b.arg(&nkv_i32);
             b.arg(&hd_i32);
             if use_dyn {
-                b.arg(&ctx.pos_buf);
+                let bufs = dec_guard.as_ref().unwrap().as_ref().unwrap();
+                b.arg(&bufs.pos);
             } else {
                 b.arg(&cache_len_i32);
             }
@@ -785,6 +798,7 @@ impl Backend for CudaBackend {
             b.arg(&cap_i32);
             unsafe { b.launch(cfg) }.expect("kv_cache_append V launch");
         }
+        drop(dec_guard);
     }
 
     fn transpose_head_to_token(
@@ -1130,4 +1144,48 @@ fn with_decode_graph<R>(
 /// change (e.g. scratch resize, model reload). Next decode will re-capture.
 pub fn invalidate_decode_graph() {
     *graph_slot().write().expect("DECODE_GRAPH poisoned") = None;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Process-global decode state buffers (token_id, pos, kv_len)
+// ────────────────────────────────────────────────────────────────────────
+//
+// Must be global (not per-ctx): captured graph holds pointers to these
+// buffers. If ctx is recreated per decode step (which it is), per-ctx
+// bufs would be freed between capture and replay → dangling pointer →
+// CUDA_ERROR_INVALID_VALUE on next sync.
+
+pub struct DecodeStateBufs {
+    pub token: CudaSlice<u32>,
+    pub pos: CudaSlice<i32>,
+    pub kv: CudaSlice<i32>,
+}
+unsafe impl Send for DecodeStateBufs {}
+unsafe impl Sync for DecodeStateBufs {}
+
+static DECODE_STATE: std::sync::OnceLock<std::sync::RwLock<Option<DecodeStateBufs>>> =
+    std::sync::OnceLock::new();
+
+fn decode_state_slot() -> &'static std::sync::RwLock<Option<DecodeStateBufs>> {
+    DECODE_STATE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn ensure_decode_state_bufs(stream: &Arc<CudaStream>) {
+    let guard = decode_state_slot().read().expect("DECODE_STATE poisoned");
+    if guard.is_some() {
+        return;
+    }
+    drop(guard);
+    let mut w = decode_state_slot().write().expect("DECODE_STATE poisoned");
+    if w.is_none() {
+        let token = unsafe { stream.alloc::<u32>(1) }.expect("token_buf alloc");
+        let pos = unsafe { stream.alloc::<i32>(1) }.expect("pos_buf alloc");
+        let kv = unsafe { stream.alloc::<i32>(1) }.expect("kv_buf alloc");
+        *w = Some(DecodeStateBufs { token, pos, kv });
+    }
+}
+
+fn with_decode_state<R>(f: impl FnOnce(&DecodeStateBufs) -> R) -> R {
+    let guard = decode_state_slot().read().expect("DECODE_STATE poisoned");
+    f(guard.as_ref().expect("DecodeStateBufs not initialised"))
 }
