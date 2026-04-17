@@ -78,18 +78,28 @@ pub struct Qwen3Scratch<B: Backend> {
     pub residual: B::Buffer,
     pub norm_out: B::Buffer,
     pub qkv_out: B::Buffer,
+    /// Token-major Q/K/V right after `split_qkv`. Stride: heads * hd per row.
     pub q_buf: B::Buffer,
     pub k_buf: B::Buffer,
     pub v_buf: B::Buffer,
-    pub attn_head_major: B::Buffer, // [nh, tokens, hd] flash_attn output
-    pub attn_flat: B::Buffer,       // [tokens, nh, hd]
-    pub k_head_major: B::Buffer,    // staging for kv_cache_append
+    /// Head-major Q produced by `qk_norm_rope` — fed into `flash_attention`.
+    pub q_head_major: B::Buffer,
+    /// Head-major K/V staging — produced by `qk_norm_rope`, consumed by
+    /// `kv_cache_append_head_major` (no reuse after append).
+    pub k_head_major: B::Buffer,
     pub v_head_major: B::Buffer,
+    /// Head-major attention output from `flash_attention`.
+    pub attn_head_major_out: B::Buffer,
+    /// Token-major attention output after `transpose_head_to_token`.
+    pub attn_flat: B::Buffer,
     pub o_proj_out: B::Buffer,
     pub gate_up_out: B::Buffer,
     pub silu_out: B::Buffer,
     pub mlp_out: B::Buffer,
+    /// Final-norm output over the last `tokens` positions (shape `[tokens, h]`).
     pub final_norm_out: B::Buffer,
+    /// lm_head output (`[1, vocab]` for decode, `[1, vocab]` for prefill's
+    /// last-token logits).
     pub logits: B::Buffer,
     /// The max tokens-per-step this scratch has been sized for.
     pub max_tokens: usize,
@@ -110,16 +120,17 @@ impl<B: Backend> Qwen3Scratch<B> {
             q_buf: B::alloc(t * q_dim),
             k_buf: B::alloc(t * kv_dim),
             v_buf: B::alloc(t * kv_dim),
-            attn_head_major: B::alloc(cfg.num_heads * t * cfg.head_dim),
-            attn_flat: B::alloc(t * q_dim),
+            q_head_major: B::alloc(cfg.num_heads * t * cfg.head_dim),
             k_head_major: B::alloc(cfg.num_kv_heads * t * cfg.head_dim),
             v_head_major: B::alloc(cfg.num_kv_heads * t * cfg.head_dim),
+            attn_head_major_out: B::alloc(cfg.num_heads * t * cfg.head_dim),
+            attn_flat: B::alloc(t * q_dim),
             o_proj_out: B::alloc(t * h),
             gate_up_out: B::alloc(t * 2 * im),
             silu_out: B::alloc(t * im),
             mlp_out: B::alloc(t * h),
             final_norm_out: B::alloc(t * h),
-            logits: B::alloc(t * cfg.vocab_size),
+            logits: B::alloc(cfg.vocab_size),
             max_tokens: t,
         }
     }
@@ -228,26 +239,236 @@ impl<B: Backend> Qwen3Model<B> {
         }
     }
 
-    /// Ensure per-layer KV caches exist for `cache_id`. Allocation itself is
-    /// deferred to the first `layer_forward` (backends pre-allocate
-    /// `max_seq_len` slots on first append).
+    /// Ensure per-layer KV caches exist for `cache_id`, pre-allocated to
+    /// `max_seq_len` slots per head. Enables the in-place
+    /// `kv_cache_append_head_major` path — no realloc per layer.
     pub(crate) fn ensure_kv(&mut self, cache_id: &str) {
         if self.kv_caches.contains_key(cache_id) {
             return;
         }
         let nkv = self.cfg.num_kv_heads;
         let hd = self.cfg.head_dim;
+        let max = self.cfg.max_seq_len;
         let caches = (0..self.cfg.num_layers)
             .map(|_| KvCache {
-                k: B::alloc(0),
-                v: B::alloc(0),
+                k: B::alloc(nkv * max * hd),
+                v: B::alloc(nkv * max * hd),
                 len: 0,
-                capacity: 0,
+                capacity: max,
                 num_kv_heads: nkv,
                 head_dim: hd,
             })
             .collect();
         self.kv_caches.insert(cache_id.to_string(), caches);
+    }
+
+    /// Run one transformer layer. Mutates `residual` in place.
+    ///
+    /// `pos_offset` is the absolute position of token 0 in this batch
+    /// (decode: `pos`; prefill: 0). `tokens` is the batch size.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_layer(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        cache_id: &str,
+        residual: &mut B::Buffer,
+        pos_offset: usize,
+        tokens: usize,
+    ) {
+        let layer = &self.layers[li];
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let nh = cfg.num_heads;
+        let nkv = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let im = cfg.intermediate_size;
+        let eps = cfg.rms_norm_eps;
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+
+        // 1. Input RMSNorm
+        B::rms_norm(
+            ctx,
+            residual,
+            &layer.input_ln_w,
+            eps,
+            &mut self.scratch.norm_out,
+            tokens,
+            h,
+        );
+
+        // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
+        layer
+            .qkv_proj
+            .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, tokens);
+
+        // 3. Split fused QKV → token-major Q/K/V
+        B::split_qkv(
+            ctx,
+            &self.scratch.qkv_out,
+            &mut self.scratch.q_buf,
+            &mut self.scratch.k_buf,
+            &mut self.scratch.v_buf,
+            tokens,
+            q_dim,
+            kv_dim,
+        );
+
+        // 4. Fused QK-norm + RoPE + transpose to head-major
+        //    Qwen3: mode=1 (norm + rope). Non-QK-norm variants: mode=2 (rope only).
+        //    V always uses mode=0 (transpose only).
+        let qk_mode: i32 = if cfg.has_qk_norm { 1 } else { 2 };
+        let dummy = &layer.input_ln_w;
+        let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy);
+        let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy);
+
+        B::qk_norm_rope(
+            ctx,
+            &self.scratch.q_buf,
+            q_norm_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.q_head_major,
+            tokens,
+            nh,
+            hd,
+            pos_offset,
+            eps,
+            qk_mode,
+        );
+        B::qk_norm_rope(
+            ctx,
+            &self.scratch.k_buf,
+            k_norm_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.k_head_major,
+            tokens,
+            nkv,
+            hd,
+            pos_offset,
+            eps,
+            qk_mode,
+        );
+        B::qk_norm_rope(
+            ctx,
+            &self.scratch.v_buf,
+            dummy, // unused in mode 0
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.v_head_major,
+            tokens,
+            nkv,
+            hd,
+            pos_offset,
+            eps,
+            0, // transpose only
+        );
+
+        // 5. Append K/V to pre-allocated head-major cache
+        let caches = self
+            .kv_caches
+            .get_mut(cache_id)
+            .expect("ensure_kv must be called before forward_layer");
+        let cache = &mut caches[li];
+        B::kv_cache_append_head_major(
+            ctx,
+            &mut cache.k,
+            &mut cache.v,
+            cache.len,
+            cache.capacity,
+            &self.scratch.k_head_major,
+            &self.scratch.v_head_major,
+            tokens,
+            nkv,
+            hd,
+        );
+        cache.len += tokens;
+        let kv_len = cache.len;
+        let kv_stride = cache.capacity;
+
+        // 6. Flash attention over strided cache
+        let attn_cfg = ferrum_kernels::backend::AttnConfig {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            causal: tokens > 1,
+            scale: 1.0 / (hd as f32).sqrt(),
+            kv_seq_stride: kv_stride,
+        };
+        B::flash_attention(
+            ctx,
+            &self.scratch.q_head_major,
+            &cache.k,
+            &cache.v,
+            &mut self.scratch.attn_head_major_out,
+            1,
+            tokens,
+            kv_len,
+            pos_offset,
+            &attn_cfg,
+        );
+
+        // 7. Untranspose head-major → token-major for O-proj input
+        B::transpose_head_to_token(
+            ctx,
+            &self.scratch.attn_head_major_out,
+            &mut self.scratch.attn_flat,
+            tokens,
+            nh,
+            hd,
+        );
+
+        // 8. O projection
+        layer.o_proj.forward(
+            ctx,
+            &self.scratch.attn_flat,
+            &mut self.scratch.o_proj_out,
+            tokens,
+        );
+
+        // 9. Fused residual-add + post-attention RMSNorm.
+        //    Writes the new residual back into `residual` and the normed
+        //    value into `norm_out`.
+        B::fused_add_rms_norm(
+            ctx,
+            residual,
+            &self.scratch.o_proj_out,
+            &layer.post_ln_w,
+            eps,
+            &mut self.scratch.norm_out,
+            tokens,
+            h,
+        );
+
+        // 10. Fused gate+up projection
+        layer.gate_up_proj.forward(
+            ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.gate_up_out,
+            tokens,
+        );
+
+        // 11. SwiGLU: silu(gate) * up
+        B::fused_silu_mul_split(
+            ctx,
+            &self.scratch.gate_up_out,
+            &mut self.scratch.silu_out,
+            tokens,
+            im,
+        );
+
+        // 12. Down projection
+        layer.down_proj.forward(
+            ctx,
+            &self.scratch.silu_out,
+            &mut self.scratch.mlp_out,
+            tokens,
+        );
+
+        // 13. Final residual add
+        B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
     }
 }
 
