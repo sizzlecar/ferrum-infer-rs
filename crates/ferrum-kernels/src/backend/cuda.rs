@@ -178,9 +178,6 @@ impl Backend for CudaBackend {
             })
         }
         .expect("rms_norm launch");
-        ctx.stream
-            .synchronize()
-            .expect("DEBUG: rms_norm kernel faulted");
     }
 
     fn fused_add_rms_norm(
@@ -236,14 +233,6 @@ impl Backend for CudaBackend {
         n: usize,
         k: usize,
     ) {
-        // DEBUG: sync + check for sticky CUDA error before gemm.
-        // If a prior kernel (embedding_lookup / rms_norm / etc) faulted
-        // silently, cuBLAS inherits the error state and returns
-        // CUBLAS_STATUS_INTERNAL_ERROR regardless of correctness.
-        ctx.stream
-            .synchronize()
-            .expect("pre-gemm stream sync failed — a prior kernel launch errored");
-
         use cudarc::cublas::result::gemm_ex;
         use cudarc::cublas::sys::{
             cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType_t,
@@ -446,9 +435,6 @@ impl Backend for CudaBackend {
             })
         }
         .expect("embedding_lookup launch");
-        ctx.stream
-            .synchronize()
-            .expect("DEBUG: embedding_lookup kernel faulted");
     }
 
     // ── Transformer-specific fused ops ──────────────────────────────────

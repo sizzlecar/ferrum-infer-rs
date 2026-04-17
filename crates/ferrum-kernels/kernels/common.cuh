@@ -22,7 +22,11 @@ __inline__ __device__ float warp_reduce_max(float val) {
 // ── Block-level reductions (up to 256 threads = 8 warps) ───────────────
 
 __inline__ __device__ float block_reduce_sum(float val) {
-    __shared__ float shared[8];
+    // Sized for up to 32 warps = 1024 threads (max CUDA block size).
+    // Was `shared[8]` — caused OOB write for blocks > 256 threads, which
+    // silently corrupted shared memory on older GPUs but trips
+    // CUDA_ERROR_ILLEGAL_ADDRESS on Blackwell's stricter memory model.
+    __shared__ float shared[32];
     int lane = threadIdx.x % 32;
     int wid  = threadIdx.x / 32;
     val = warp_reduce_sum(val);
@@ -34,7 +38,11 @@ __inline__ __device__ float block_reduce_sum(float val) {
 }
 
 __inline__ __device__ float block_reduce_max(float val) {
-    __shared__ float shared[8];
+    // Sized for up to 32 warps = 1024 threads (max CUDA block size).
+    // Was `shared[8]` — caused OOB write for blocks > 256 threads, which
+    // silently corrupted shared memory on older GPUs but trips
+    // CUDA_ERROR_ILLEGAL_ADDRESS on Blackwell's stricter memory model.
+    __shared__ float shared[32];
     int lane = threadIdx.x % 32;
     int wid  = threadIdx.x / 32;
     val = warp_reduce_max(val);
