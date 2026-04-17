@@ -1,18 +1,34 @@
 # Architecture v2 RFC — Extensibility + Performance
 
+## 0. 实施状态 (自最近一次更新)
+
+**Phase A-D.4 已落地。** Qwen3-0.6B Metal decode 34.4 tok/s，cos=1.000000。
+
+| Phase | 状态 | 要点 |
+|-------|:----:|------|
+| A (骨架) | ✅ | `ferrum-quantization` crate; `Linear<B>` / `WeightLoader<B>`; Backend trait 加量化 / TP / MLA stubs |
+| B (Qwen3 Model-as-Code) | ✅ | `Qwen3Model<B>` 端到端；`ModelRunner` 删除；Backend trait 瘦身 |
+| C (Llama family 统一) | ✅ | `LlamaFamilyModel<B>` 覆盖 Llama / Qwen2 / Qwen3 / Mistral；删除 `CandleModelExecutor` 等 |
+| D.1 (GptqLinear 结构) | ✅ | 结构已就位；真实 kernel 等 Phase E |
+| D.2 (MLA / Multimodal / Encoder trait) | ✅ | 扩展 trait 定义完整，用户选择不实装 |
+| D.3 (Mistral sliding window) | ✅ | `AttnConfig.sliding_window` + flash_attn shader 支持 |
+| D.4 (Native safetensors loader) | ✅ | `NativeSafetensorsLoader<B>`, LLM 路径完全脱离 candle |
+| D.5 (Bert / Clip / Whisper 迁 M-as-C) | ⏳ | 未做 |
+| D.6 (TTS 迁 Backend trait) | ⏳ | 未做 |
+| E (CUDA runtime + NCCL TP + GPTQ kernel) | ⏳ | 需要 GPU 机器 |
+
+**candle 依赖现状**：
+- **LLM 路径**：0 candle
+- Bert / Clip / Whisper / Qwen3-TTS executors：仍依赖（D.5 / D.6 目标）
+
 ## 1. 背景与目标
 
-### 当前阶段的成果
-- Qwen3 `ModelRunner<CpuBackend | MetalBackend>` 可用，Metal decode 33 tok/s（从 5.4 的 6x）
-- Parity test 保证正确性
-- 单 cmd buffer 模式（MetalContext）已验证
-
-### 当前阶段的问题
-1. `TransformerConfig` 是 "decoder-only + GQA + SwiGlu + 可选 QK-norm" 专用，塞 MoE / MLA / multimodal 只能靠膨胀 enum
-2. `layer_forward_fused` 假设"标准 transformer layer"结构，无法覆盖 MoE / MLA / cross-attention
-3. `LayerWeights<B>` 硬编码 dense f32 buffer，GPTQ/AWQ/GGUF 塞不进去
-4. Backend trait 里混了 transformer-specific 方法（split_qkv / qk_norm / rope / kv_cache_append / transpose 等），MetalBackend 用 override 绕开后多数变成死代码
-5. 非 LLM（Whisper/Bert/CLIP/TTS）绕过 registry
+### 启动时的问题（作为历史记录；多数已解决）
+1. `TransformerConfig` 是 "decoder-only + GQA + SwiGlu + 可选 QK-norm" 专用，塞 MoE / MLA / multimodal 只能靠膨胀 enum → ✅ 已删除，替换为每模型的 `Qwen3Config` / `LlamaFamilyConfig` 等
+2. `layer_forward_fused` 假设"标准 transformer layer"结构，无法覆盖 MoE / MLA / cross-attention → ✅ 已删除
+3. `LayerWeights<B>` 硬编码 dense f32 buffer → ✅ 替换为 `Box<dyn Linear<B>>`（Dense / Gptq / 未来 AWQ / GGUF）
+4. Backend trait 里混了 transformer-specific 方法 → ✅ 瘦身完成
+5. 非 LLM（Whisper/Bert/CLIP/TTS）绕过 registry → ⏳ 部分解决（它们仍通过 CLI 直调 executor；家族 trait 已就位，D.5 迁移）
 
 ### 本 RFC 的目标（P0 优先级）
 1. **性能第一**：热路径最小开销。Context 批处理保持现有 single-cmd-buffer 模式。量化 GEMM 用 fused kernel，不展中间 fp16 buffer
