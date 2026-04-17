@@ -295,16 +295,52 @@ impl Backend for CudaBackend {
         pos_offset: usize,
         cfg: &AttnConfig,
     ) {
-        // Unified path: `flash_attn_full_f16` handles any q_len including 1.
+        // Dispatch by q_len:
+        //   q_len == 1  → `decode_attention_head_major_f16` — single-block
+        //                 warp-cooperative for head-major cache (fast decode).
+        //   q_len >  1  → `flash_attn_full_f16` — tiled prefill (TILE_Q=32).
         //
-        // Earlier this had a q_len==1 fast path through `decode_attention_f16`,
-        // but that kernel expects SEQ-MAJOR cache layout `[seq, nkv, hd]`
-        // (candle's original) whereas our `kv_cache_append_head_major`
-        // produces HEAD-MAJOR `[nkv, seq, hd]`. Routing decode through
-        // flash_attn_full gives correct layout at the cost of a small amount
-        // of per-token overhead (tile-loop sets up for TILE_Q=32 even when
-        // q_len=1). Perf optimisation: port `decode_attention` to head-major
-        // in a followup, or add a dedicated single-token head-major kernel.
+        // Both kernels read the cache as HEAD-MAJOR `[nkv, capacity, hd]`
+        // matching `kv_cache_append_head_major_f16`'s write layout.
+        if q_len == 1 {
+            let func = ctx.func(
+                "decode_attention_hm",
+                ptx::DECODE_ATTENTION_HM,
+                "decode_attention_head_major_f16",
+            );
+            let num_q = cfg.num_heads as i32;
+            let num_kv = cfg.num_kv_heads as i32;
+            let hd = cfg.head_dim as i32;
+            let capacity = if cfg.kv_seq_stride > 0 {
+                cfg.kv_seq_stride as i32
+            } else {
+                kv_len as i32
+            };
+            let valid_kv = kv_len as i32;
+            let scale = cfg.scale;
+            let shared_mem = (kv_len as u32) * 4; // one f32 per KV position
+            let stream = ctx.stream.clone();
+            let mut bld = stream.launch_builder(&func);
+            bld.arg(q);
+            bld.arg(k);
+            bld.arg(v);
+            bld.arg(out);
+            bld.arg(&num_q);
+            bld.arg(&num_kv);
+            bld.arg(&hd);
+            bld.arg(&capacity);
+            bld.arg(&valid_kv);
+            bld.arg(&scale);
+            unsafe {
+                bld.launch(LaunchConfig {
+                    grid_dim: (cfg.num_heads as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: shared_mem,
+                })
+            }
+            .expect("decode_attention_head_major launch");
+            return;
+        }
         let func = ctx.func(
             "flash_attn_full",
             ptx::FLASH_ATTN_FULL,

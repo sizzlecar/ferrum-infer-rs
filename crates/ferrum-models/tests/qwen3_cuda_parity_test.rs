@@ -122,17 +122,22 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
     }
 }
 
-fn qwen3_path() -> Option<std::path::PathBuf> {
+fn model_path(hf_id: &str) -> Option<std::path::PathBuf> {
     // Honour HF_HOME (vast.ai etc often remap it to /workspace or similar) +
     // fallback to the standard ~/.cache/huggingface location.
     let base = std::env::var_os("HF_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|d| d.join(".cache/huggingface")))?;
-    let p = base.join("hub/models--Qwen--Qwen3-0.6B/snapshots");
+    let dir_name = format!("models--{}", hf_id.replace('/', "--"));
+    let p = base.join("hub").join(dir_name).join("snapshots");
     std::fs::read_dir(&p).ok()?.find_map(|e| {
         let e = e.ok()?;
         e.path().join("config.json").exists().then(|| e.path())
     })
+}
+
+fn qwen3_path() -> Option<std::path::PathBuf> {
+    model_path("Qwen/Qwen3-0.6B")
 }
 
 fn load_model_def(mp: &std::path::Path) -> ferrum_models::definition::ModelDefinition {
@@ -237,4 +242,132 @@ fn qwen3model_cpu_vs_cuda() {
         pos += 1;
     }
     eprintln!("✅ LlamaFamilyModel Cpu↔Cuda parity pass");
+}
+
+/// Same parity check on Qwen3-4B. Bigger model stresses more kernel paths
+/// (larger hidden_size, different rope dims, more layers).
+///
+/// Run: cargo test -p ferrum-models --features cuda --release \
+///          --test qwen3_cuda_parity_test qwen3_4b -- --ignored --nocapture
+#[test]
+#[ignore]
+fn qwen3_4b_cpu_vs_cuda() {
+    let Some(mp) = model_path("Qwen/Qwen3-4B") else {
+        eprintln!("SKIP: Qwen3-4B not in HF cache — run `ferrum pull qwen3:4b` first");
+        return;
+    };
+    let def = load_model_def(&mp);
+    let qcfg = LlamaFamilyConfig::qwen3_from_def(&def);
+
+    let loader = ferrum_models::SafeTensorsLoader::new(mp.to_str().unwrap());
+    let vb = loader
+        .load_varbuilder(&candle_core::Device::Cpu, candle_core::DType::F32)
+        .unwrap();
+
+    let cpu_loader = CandleShimLoader::<CpuBackend>::new(&vb);
+    let mut cpu_model = LlamaFamilyModel::<CpuBackend>::new(qcfg.clone(), &cpu_loader).unwrap();
+    let cuda_loader = CandleShimLoader::<CudaBackend>::new(&vb);
+    let mut cuda_model = LlamaFamilyModel::<CudaBackend>::new(qcfg, &cuda_loader).unwrap();
+
+    let prompt: Vec<u32> = vec![872, 111, 248, 104715, 0, 56568, 53481, 5048];
+    eprintln!("\n=== Qwen3-4B Prefill {} tokens ===", prompt.len());
+
+    let c = cpu_model.prefill("t", &prompt);
+    let u = cuda_model.prefill("t", &prompt);
+    let (ca, ua) = (argmax(&c), argmax(&u));
+    let cos = cosine(&c, &u);
+    let mad = max_abs_diff(&c, &u);
+    eprintln!(
+        "prefill  CPU argmax={ca} ({:.4})  CUDA argmax={ua} ({:.4})  cos={cos:.6}  max_diff={mad:.4}",
+        c[ca], u[ua]
+    );
+    assert_eq!(ca, ua, "4B prefill argmax mismatch");
+    assert!(cos > 0.999, "4B prefill cosine too low: {cos}");
+
+    let mut pos = prompt.len() as u32;
+    let mut tok = ca as u32;
+    for step in 0..5 {
+        let c = cpu_model.decode("t", tok, pos);
+        let u = cuda_model.decode("t", tok, pos);
+        let (ca, ua) = (argmax(&c), argmax(&u));
+        let cos = cosine(&c, &u);
+        let mad = max_abs_diff(&c, &u);
+        eprintln!(
+            "decode {step} pos={pos} tok={tok}  CPU argmax={ca}  CUDA argmax={ua}  cos={cos:.6}  max_diff={mad:.4}",
+        );
+        assert_eq!(ca, ua, "4B decode step {step} argmax mismatch");
+        assert!(cos > 0.999, "4B decode step {step} cosine too low: {cos}");
+        tok = ca as u32;
+        pos += 1;
+    }
+    eprintln!("✅ Qwen3-4B Cpu↔Cuda parity pass");
+}
+
+/// End-to-end text correctness: generate N tokens greedily on both
+/// CPU and CUDA with the SAME chat-formatted prompt, decode to string,
+/// assert the two strings are identical.
+///
+/// This catches bugs that argmax-parity doesn't: tokenizer glitches,
+/// seq-len boundary issues, wrong KV append offsets after decode N+1,
+/// RoPE pos drift, etc.
+///
+/// Uses the tokenizer from the same HF snapshot as the model.
+#[test]
+#[ignore]
+fn qwen3_generate_text_cpu_vs_cuda() {
+    use tokenizers::Tokenizer;
+
+    let mp = qwen3_path().expect("Qwen3-0.6B not in HF cache");
+    let def = load_model_def(&mp);
+    let qcfg = LlamaFamilyConfig::qwen3_from_def(&def);
+
+    let tok_path = mp.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tok_path).expect("tokenizer.json");
+
+    let loader = ferrum_models::SafeTensorsLoader::new(mp.to_str().unwrap());
+    let vb = loader
+        .load_varbuilder(&candle_core::Device::Cpu, candle_core::DType::F32)
+        .unwrap();
+    let cpu_loader = CandleShimLoader::<CpuBackend>::new(&vb);
+    let mut cpu_model = LlamaFamilyModel::<CpuBackend>::new(qcfg.clone(), &cpu_loader).unwrap();
+    let cuda_loader = CandleShimLoader::<CudaBackend>::new(&vb);
+    let mut cuda_model = LlamaFamilyModel::<CudaBackend>::new(qcfg, &cuda_loader).unwrap();
+
+    let prompt_text = "The capital of France is";
+    let enc = tokenizer.encode(prompt_text, false).expect("encode");
+    let prompt: Vec<u32> = enc.get_ids().to_vec();
+    eprintln!("\n=== Text generation: '{}' ({} tokens) ===", prompt_text, prompt.len());
+
+    const N_STEPS: usize = 20;
+
+    let mut cpu_out: Vec<u32> = Vec::with_capacity(N_STEPS);
+    let mut cuda_out: Vec<u32> = Vec::with_capacity(N_STEPS);
+
+    let first_c = argmax(&cpu_model.prefill("c", &prompt)) as u32;
+    let first_u = argmax(&cuda_model.prefill("u", &prompt)) as u32;
+    cpu_out.push(first_c);
+    cuda_out.push(first_u);
+
+    let mut pos = prompt.len() as u32;
+    let (mut tc, mut tu) = (first_c, first_u);
+    for _ in 1..N_STEPS {
+        tc = argmax(&cpu_model.decode("c", tc, pos)) as u32;
+        tu = argmax(&cuda_model.decode("u", tu, pos)) as u32;
+        cpu_out.push(tc);
+        cuda_out.push(tu);
+        pos += 1;
+    }
+
+    let cpu_text = tokenizer.decode(&cpu_out, true).expect("decode cpu");
+    let cuda_text = tokenizer.decode(&cuda_out, true).expect("decode cuda");
+    eprintln!("CPU  → '{}'", cpu_text);
+    eprintln!("CUDA → '{}'", cuda_text);
+    eprintln!("CPU  ids: {:?}", cpu_out);
+    eprintln!("CUDA ids: {:?}", cuda_out);
+
+    assert_eq!(
+        cpu_out, cuda_out,
+        "generated token sequence diverged — text mismatch"
+    );
+    eprintln!("✅ End-to-end text parity: {N_STEPS} tokens identical");
 }
