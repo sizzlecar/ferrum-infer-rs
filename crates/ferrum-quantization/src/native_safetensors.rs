@@ -24,8 +24,9 @@ use half::{bf16, f16};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
-use crate::config::QuantConfig;
+use crate::config::{QuantConfig, QuantMethod};
 use crate::dense::DenseLinear;
+use crate::gptq::GptqLinear;
 use crate::loader::WeightLoader;
 use crate::traits::Linear;
 
@@ -140,6 +141,30 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         Ok((data, shape))
     }
 
+    /// Read a tensor as i32 (for GPTQ qweight / qzeros / g_idx).
+    fn read_i32(&self, name: &str) -> Result<(Vec<i32>, Vec<usize>)> {
+        let shard_idx = *self
+            .index
+            .get(name)
+            .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in index")))?;
+        let view = self.shards[shard_idx].get(name)?;
+        let shape = view.shape().to_vec();
+        if view.dtype() != Dtype::I32 {
+            return Err(FerrumError::model(format!(
+                "'{name}': expected I32, got {:?}",
+                view.dtype()
+            )));
+        }
+        let bytes = view.data();
+        debug_assert_eq!(bytes.len() % 4, 0);
+        let mut out = vec![0i32; bytes.len() / 4];
+        out.as_mut_slice()
+            .iter_mut()
+            .zip(bytes.chunks_exact(4))
+            .for_each(|(d, chunk)| *d = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        Ok((out, shape))
+    }
+
     fn has(&self, name: &str) -> bool {
         self.index.contains_key(name)
     }
@@ -152,7 +177,13 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
     }
 
     fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
-        // Direct fused `<name>.weight` first.
+        // GPTQ first: `<name>.qweight` + `<name>.scales` + `<name>.qzeros`.
+        let qw_key = format!("{name}.qweight");
+        if self.has(&qw_key) {
+            return self.load_gptq_linear(name);
+        }
+
+        // Direct fused `<name>.weight` next.
         let direct = format!("{name}.weight");
         if self.has(&direct) {
             let (data, shape) = self.read_f32(&direct)?;
@@ -207,6 +238,61 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
 }
 
 impl<B: Backend> NativeSafetensorsLoader<B> {
+    /// Load a GPTQ-packed linear projection: reads `<name>.qweight`,
+    /// `<name>.scales`, `<name>.qzeros`, optionally `<name>.g_idx`, and
+    /// hands the raw host-side tensors to `Backend::load_gptq` which
+    /// repacks + uploads per its own strategy.
+    fn load_gptq_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
+        let qcfg = self.quant_config.as_ref().ok_or_else(|| {
+            FerrumError::model(format!(
+                "'{name}.qweight' present but no quantize_config.json — \
+                 can't determine bits/group_size"
+            ))
+        })?;
+        if qcfg.method != QuantMethod::Gptq {
+            return Err(FerrumError::model(format!(
+                "'{name}.qweight' present but quant_method={:?} (expected GPTQ)",
+                qcfg.method
+            )));
+        }
+
+        let (qweight, qw_shape) = self.read_i32(&format!("{name}.qweight"))?;
+        let (scales_f32, sc_shape) = self.read_f32(&format!("{name}.scales"))?;
+        let (qzeros, _qz_shape) = self.read_i32(&format!("{name}.qzeros"))?;
+        let g_idx = if self.has(&format!("{name}.g_idx")) {
+            Some(self.read_i32(&format!("{name}.g_idx"))?.0)
+        } else {
+            None
+        };
+
+        // Shape inference: qweight is [K/8, N]; scales is [K/group, N].
+        // → K = qw_shape[0] * 8, N = qw_shape[1].
+        if qw_shape.len() != 2 {
+            return Err(FerrumError::model(format!(
+                "'{name}.qweight' expected 2D, got {qw_shape:?}"
+            )));
+        }
+        let in_features = qw_shape[0] * 8;
+        let out_features = qw_shape[1];
+        if sc_shape.len() != 2 || sc_shape[1] != out_features {
+            return Err(FerrumError::model(format!(
+                "'{name}.scales' {sc_shape:?} incompatible with qweight {qw_shape:?}"
+            )));
+        }
+
+        let linear = GptqLinear::<B>::from_raw(
+            &qweight,
+            &scales_f32,
+            &qzeros,
+            g_idx.as_deref(),
+            qcfg.bits,
+            qcfg.group_size,
+            in_features,
+            out_features,
+        )?;
+        Ok(Box::new(linear))
+    }
+
     /// Read each name, assert shape width matches, concatenate along dim 0.
     fn cat_rows(&self, names: &[String]) -> Result<(usize, usize, Vec<f32>)> {
         let mut total_rows = 0usize;
