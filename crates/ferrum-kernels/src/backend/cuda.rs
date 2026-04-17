@@ -408,6 +408,16 @@ impl Backend for CudaBackend {
                 "decode_attention_head_major_f16"
             };
             let func = ctx.func("decode_attention_hm", ptx::DECODE_ATTENTION_HM, func_name);
+            // Opt the kernel into Blackwell's full per-SM dynamic shared
+            // memory (up to 228 KB). The default cap is 48 KB which is
+            // smaller than the `capacity * 4` bytes we bake into the
+            // captured graph for long max_seq_len models (Qwen3 = 160 KB).
+            // Without this, graph launch fails with CUDA_ERROR_INVALID_VALUE.
+            const MAX_DYN_SMEM: i32 = 192 * 1024;
+            let _ = func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                MAX_DYN_SMEM,
+            );
             let num_q = cfg.num_heads as i32;
             let num_kv = cfg.num_kv_heads as i32;
             let hd = cfg.head_dim as i32;
