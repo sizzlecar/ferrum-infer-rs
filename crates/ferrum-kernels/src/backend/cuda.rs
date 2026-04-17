@@ -46,11 +46,11 @@ use std::sync::Arc;
 pub struct CudaState {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
+    /// Shared cuBLAS handle (process-global, initialised once). Graph
+    /// capture records pointers to the cuBLAS workspace; a per-ctx
+    /// workspace would dangle after ctx drop → CUDA_ERROR_INVALID_VALUE
+    /// at next sync. Share the handle so the workspace outlives captures.
     pub blas: Arc<CudaBlas>,
-    /// Pre-allocated cuBLAS workspace (32 MB) — held so cuBLAS doesn't
-    /// malloc per-GEMM. The old CudaDecodeRunner had this and it's one
-    /// of the cheap perf wins for decode-heavy workloads.
-    _blas_workspace: CudaSlice<u8>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
     pub use_dev_state: bool,
     /// True between begin_graph_capture and end_graph_capture.
@@ -123,39 +123,17 @@ impl Backend for CudaBackend {
         // cross-stream synchronization needed.
         let stream = default_stream();
         let ctx = stream.context().clone();
-        let blas = Arc::new(
-            CudaBlas::new(stream.clone())
-                .unwrap_or_else(|e| panic!("CudaBackend::new_context: CudaBlas::new: {e}")),
-        );
-        // Pre-allocate a 32 MB cuBLAS workspace and pin it to the handle.
-        // Without this, cuBLAS internally mallocs a workspace per call on
-        // some algorithms (visible as ~1-2ms overhead per GEMM on Blackwell).
-        const BLAS_WS_BYTES: usize = 32 * 1024 * 1024;
-        let blas_workspace = unsafe { stream.alloc::<u8>(BLAS_WS_BYTES) }
-            .expect("CudaBackend::new_context: cuBLAS workspace alloc");
-        unsafe {
-            use cudarc::cublas::sys;
-            use cudarc::driver::DevicePtr;
-            let (ws_ptr, _guard) = blas_workspace.device_ptr(&stream);
-            let status = sys::cublasSetWorkspace_v2(
-                *blas.handle(),
-                ws_ptr as *mut _,
-                BLAS_WS_BYTES,
-            );
-            if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                panic!("cublasSetWorkspace_v2 failed: {:?}", status);
-            }
-        }
+        // Process-global blas handle + workspace. Critical for graph capture:
+        // the captured kernel args include the workspace pointer, which must
+        // outlive the ctx that owned it at capture time.
+        let blas = ensure_blas_handle(&stream);
         // Ensure process-global decode state buffers exist.
-        // Allocated once per process; shared across all ctx instances so
-        // captured graphs reference stable device pointers.
         ensure_decode_state_bufs(&stream);
 
         Self::Context {
             ctx,
             stream,
             blas,
-            _blas_workspace: blas_workspace,
             modules: HashMap::new(),
             use_dev_state: false,
             capture_in_flight: false,
@@ -1188,4 +1166,50 @@ fn ensure_decode_state_bufs(stream: &Arc<CudaStream>) {
 fn with_decode_state<R>(f: impl FnOnce(&DecodeStateBufs) -> R) -> R {
     let guard = decode_state_slot().read().expect("DECODE_STATE poisoned");
     f(guard.as_ref().expect("DecodeStateBufs not initialised"))
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Process-global cuBLAS handle + 32MB workspace
+// ────────────────────────────────────────────────────────────────────────
+//
+// Must be process-global (not per-ctx): graph capture records the workspace
+// device pointer as a kernel arg. Per-ctx workspace would be freed when ctx
+// drops → dangling pointer on replay → CUDA_ERROR_INVALID_VALUE.
+
+struct BlasSlot {
+    blas: Arc<CudaBlas>,
+    _workspace: CudaSlice<u8>,
+}
+unsafe impl Send for BlasSlot {}
+unsafe impl Sync for BlasSlot {}
+
+static BLAS_HANDLE: std::sync::OnceLock<std::sync::RwLock<Option<BlasSlot>>> =
+    std::sync::OnceLock::new();
+
+fn blas_slot() -> &'static std::sync::RwLock<Option<BlasSlot>> {
+    BLAS_HANDLE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
+    if let Some(slot) = blas_slot().read().expect("BLAS poisoned").as_ref() {
+        return slot.blas.clone();
+    }
+    let mut w = blas_slot().write().expect("BLAS poisoned");
+    if w.is_none() {
+        const WS_BYTES: usize = 32 * 1024 * 1024;
+        let blas = Arc::new(CudaBlas::new(stream.clone()).expect("CudaBlas::new"));
+        let workspace = unsafe { stream.alloc::<u8>(WS_BYTES) }.expect("blas ws alloc");
+        unsafe {
+            use cudarc::cublas::sys;
+            use cudarc::driver::DevicePtr;
+            let (ws_ptr, _g) = workspace.device_ptr(stream);
+            let st = sys::cublasSetWorkspace_v2(*blas.handle(), ws_ptr as *mut _, WS_BYTES);
+            assert_eq!(st, sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS, "set workspace");
+        }
+        *w = Some(BlasSlot {
+            blas,
+            _workspace: workspace,
+        });
+    }
+    w.as_ref().unwrap().blas.clone()
 }
