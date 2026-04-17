@@ -1119,35 +1119,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     &transformer_cfg,
                 )?;
 
-                let runner: Box<dyn ferrum_kernels::backend::RunnerInterface> = {
-                    #[cfg(feature = "metal")]
-                    if matches!(&config.device, Device::Metal) {
-                        info!("  Backend: Metal");
-                        let metal_weights =
-                            ferrum_kernels::backend::runner::convert_weights_to_metal(&weights);
-                        Box::new(ferrum_kernels::backend::runner::ModelRunner::<
-                            ferrum_kernels::backend::metal::MetalBackend,
-                        >::new(
-                            transformer_cfg.clone(), metal_weights
-                        ))
-                    } else {
-                        info!("  Backend: CPU");
-                        Box::new(ferrum_kernels::backend::runner::ModelRunner::<
-                            ferrum_kernels::backend::cpu::CpuBackend,
-                        >::new(
-                            transformer_cfg.clone(), weights
-                        ))
-                    }
-                    #[cfg(not(feature = "metal"))]
-                    {
-                        info!("  Backend: CPU");
-                        Box::new(ferrum_kernels::backend::runner::ModelRunner::<
-                            ferrum_kernels::backend::cpu::CpuBackend,
-                        >::new(
-                            transformer_cfg.clone(), weights
-                        ))
-                    }
-                };
+                let runner: Box<dyn ferrum_kernels::backend::RunnerInterface> =
+                    build_runner_for_device(&config.device, transformer_cfg.clone(), weights)?;
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
@@ -1206,6 +1179,68 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 "fp32".to_string(),
             ],
         }
+    }
+}
+
+// ============================================================================
+// Backend selection helper for ModelRunner
+// ============================================================================
+
+/// Build a `ModelRunner` boxed as `RunnerInterface` for the requested device.
+///
+/// Keeps device→backend mapping in one place so CLI `--backend cuda` doesn't
+/// silently fall through to CPU. Returns a clear error when a device is selected
+/// but the corresponding backend is not yet implemented in this build.
+fn build_runner_for_device(
+    device: &Device,
+    cfg: ferrum_kernels::backend::TransformerConfig,
+    weights: ferrum_kernels::backend::ModelWeights<ferrum_kernels::backend::cpu::CpuBackend>,
+) -> Result<Box<dyn ferrum_kernels::backend::RunnerInterface>> {
+    match device {
+        Device::CPU => {
+            info!("  Backend: CPU (Accelerate on macOS)");
+            Ok(Box::new(ferrum_kernels::backend::runner::ModelRunner::<
+                ferrum_kernels::backend::cpu::CpuBackend,
+            >::new(cfg, weights)))
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        Device::Metal => {
+            #[cfg(feature = "metal")]
+            {
+                info!("  Backend: Metal (GPU)");
+                let metal_weights =
+                    ferrum_kernels::backend::runner::convert_weights_to_metal(&weights);
+                Ok(Box::new(ferrum_kernels::backend::runner::ModelRunner::<
+                    ferrum_kernels::backend::metal::MetalBackend,
+                >::new(cfg, metal_weights)))
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                let _ = (cfg, weights);
+                Err(FerrumError::device(
+                    "Metal device requested but ferrum-kernels was built without \
+                     the 'metal' feature",
+                ))
+            }
+        }
+
+        Device::CUDA(idx) => {
+            // CudaBackend is a work-in-progress: the trait struct compiles but most
+            // methods are not implemented. Rather than silently falling back to CPU
+            // (which would be indistinguishable from correct behaviour at startup),
+            // we return a precise error so the user can pick a supported path.
+            let _ = (cfg, weights);
+            Err(FerrumError::device(format!(
+                "CUDA device {idx} requested, but CudaBackend for ModelRunner is not \
+                 yet implemented in this build. CPU and Metal are the only verified \
+                 targets today. See docs/metal-performance-status.md for status."
+            )))
+        }
+
+        other => Err(FerrumError::device(format!(
+            "Unsupported device {other:?} for ModelRunner"
+        ))),
     }
 }
 
