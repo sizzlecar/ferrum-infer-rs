@@ -1409,6 +1409,7 @@ dependencies = [
  "ferrum-attention",
  "ferrum-interfaces",
  "ferrum-kernels",
+ "ferrum-quantization",
  "ferrum-runtime",
  "ferrum-testkit",
  "ferrum-types",
@@ -1438,6 +1439,16 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ferrum-quantization"
+version = "0.6.0"
+dependencies = [
+ "ferrum-kernels",
+ "ferrum-types",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

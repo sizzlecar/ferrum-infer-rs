@@ -8,11 +8,6 @@
 mod traits;
 pub use traits::*;
 
-pub mod layer_forward;
-pub mod runner;
-pub mod runner_trait;
-pub use runner_trait::RunnerInterface;
-
 pub mod cpu;
 
 #[cfg(feature = "metal")]

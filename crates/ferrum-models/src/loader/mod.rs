@@ -2,7 +2,6 @@
 
 pub mod candle_weight_loader;
 pub mod gptq_loader;
-pub mod runner_weights;
 pub mod safetensors_loader;
 pub mod tp_weight_loader;
 

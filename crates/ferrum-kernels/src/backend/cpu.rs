@@ -130,35 +130,6 @@ impl Backend for CpuBackend {
         }
     }
 
-    fn rope(
-        _ctx: &mut Self::Context,
-        q: &mut Self::Buffer,
-        k: &mut Self::Buffer,
-        cos: &Self::Buffer,
-        sin: &Self::Buffer,
-        positions: &[u32],
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    ) {
-        let half = head_dim / 2;
-        let tokens = positions.len();
-        apply_rope_impl(q, tokens, num_heads, head_dim, half, cos, sin, positions);
-        apply_rope_impl(k, tokens, num_kv_heads, head_dim, half, cos, sin, positions);
-    }
-
-    fn decode_attention(
-        _ctx: &mut Self::Context,
-        q: &Self::Buffer,
-        k_cache: &Self::Buffer,
-        v_cache: &Self::Buffer,
-        out: &mut Self::Buffer,
-        kv_len: usize,
-        cfg: &AttnConfig,
-    ) {
-        cpu_attention(q, k_cache, v_cache, out, 1, 1, kv_len, false, 0, cfg);
-    }
-
     fn flash_attention(
         _ctx: &mut Self::Context,
         q: &Self::Buffer,
@@ -174,35 +145,6 @@ impl Backend for CpuBackend {
         cpu_attention(
             q, k, v, out, batch, q_len, kv_len, cfg.causal, pos_offset, cfg,
         );
-    }
-
-    fn silu_mul(
-        _ctx: &mut Self::Context,
-        gate: &Self::Buffer,
-        up: &Self::Buffer,
-        out: &mut Self::Buffer,
-        len: usize,
-    ) {
-        for i in 0..len {
-            let g = gate[i];
-            out[i] = (g / (1.0 + (-g).exp())) * up[i];
-        }
-    }
-
-    fn add(
-        _ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        b: &Self::Buffer,
-        out: &mut Self::Buffer,
-        len: usize,
-    ) {
-        for i in 0..len {
-            out[i] = a[i] + b[i];
-        }
-    }
-
-    fn copy(_ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize) {
-        dst[..len].copy_from_slice(&src[..len]);
     }
 
     fn copy_slice(
@@ -263,30 +205,6 @@ impl Backend for CpuBackend {
                 let g = gate_up[t * 2 * im + i];
                 let u = gate_up[t * 2 * im + im + i];
                 out[t * im + i] = (g / (1.0 + (-g).exp())) * u;
-            }
-        }
-    }
-
-    fn qk_norm(
-        _ctx: &mut Self::Context,
-        data: &mut Self::Buffer,
-        w: &Self::Buffer,
-        tokens: usize,
-        heads: usize,
-        head_dim: usize,
-        eps: f32,
-    ) {
-        for t in 0..tokens {
-            for h in 0..heads {
-                let off = (t * heads + h) * head_dim;
-                let mut sum_sq = 0.0f32;
-                for i in 0..head_dim {
-                    sum_sq += data[off + i] * data[off + i];
-                }
-                let inv = 1.0 / (sum_sq / head_dim as f32 + eps).sqrt();
-                for i in 0..head_dim {
-                    data[off + i] = data[off + i] * inv * w[i];
-                }
             }
         }
     }
@@ -379,54 +297,6 @@ impl Backend for CpuBackend {
                 .copy_from_slice(&new_k_head_major[src_base..src_base + new_tokens * hd]);
             cache_v[dst_base..dst_base + new_tokens * hd]
                 .copy_from_slice(&new_v_head_major[src_base..src_base + new_tokens * hd]);
-        }
-    }
-
-    fn kv_cache_append(
-        _ctx: &mut Self::Context,
-        cache_k: &mut Self::Buffer,
-        cache_v: &mut Self::Buffer,
-        cache_len: usize,
-        new_k: &Self::Buffer,
-        new_v: &Self::Buffer,
-        new_tokens: usize,
-        nkv: usize,
-        hd: usize,
-    ) -> (Self::Buffer, Self::Buffer) {
-        let new_len = cache_len + new_tokens;
-        let mut fk = vec![0.0f32; nkv * new_len * hd];
-        let mut fv = vec![0.0f32; nkv * new_len * hd];
-        for h in 0..nkv {
-            if cache_len > 0 {
-                fk[h * new_len * hd..h * new_len * hd + cache_len * hd]
-                    .copy_from_slice(&cache_k[h * cache_len * hd..(h + 1) * cache_len * hd]);
-                fv[h * new_len * hd..h * new_len * hd + cache_len * hd]
-                    .copy_from_slice(&cache_v[h * cache_len * hd..(h + 1) * cache_len * hd]);
-            }
-            for t in 0..new_tokens {
-                let src = t * nkv * hd + h * hd;
-                let dst = h * new_len * hd + (cache_len + t) * hd;
-                fk[dst..dst + hd].copy_from_slice(&new_k[src..src + hd]);
-                fv[dst..dst + hd].copy_from_slice(&new_v[src..src + hd]);
-            }
-        }
-        (fk, fv)
-    }
-
-    fn transpose_token_to_head(
-        _ctx: &mut Self::Context,
-        src: &Self::Buffer,
-        dst: &mut Self::Buffer,
-        tokens: usize,
-        heads: usize,
-        dim: usize,
-    ) {
-        for t in 0..tokens {
-            for h in 0..heads {
-                let s = (t * heads + h) * dim;
-                let d = (h * tokens + t) * dim;
-                dst[d..d + dim].copy_from_slice(&src[s..s + dim]);
-            }
         }
     }
 

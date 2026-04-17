@@ -48,14 +48,6 @@ pub enum ReduceOp {
 }
 
 
-/// Configuration for RoPE (rotary position embeddings).
-#[derive(Clone, Debug)]
-pub struct RopeConfig {
-    pub theta: f64,
-    pub head_dim: usize,
-    pub max_seq_len: usize,
-}
-
 /// Configuration for attention dispatch.
 #[derive(Clone, Debug)]
 pub struct AttnConfig {
@@ -84,63 +76,13 @@ impl Default for AttnConfig {
     }
 }
 
-/// Transformer model configuration (architecture-level).
-#[derive(Clone, Debug)]
-pub struct TransformerConfig {
-    pub num_layers: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_heads: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
-    pub vocab_size: usize,
-    pub max_seq_len: usize,
-    pub rms_norm_eps: f32,
-    pub rope: RopeConfig,
-    pub has_qk_norm: bool,
-    pub attn_type: AttnType,
-    pub mlp_type: MlpType,
-}
+// Note: `TransformerConfig` / `AttnType` / `MlpType` / `RopeConfig` used to
+// live here when `ModelRunner` needed a generic model config. They're now
+// per-model (e.g. `Qwen3Config` in `ferrum-models::models::qwen3`) so each
+// model can carry exactly the architecture parameters it cares about.
+// Backend trait stays model-agnostic.
 
-#[derive(Clone, Debug)]
-pub enum AttnType {
-    Gqa,
-    SlidingWindow { window: usize },
-}
-
-#[derive(Clone, Debug)]
-pub enum MlpType {
-    SwiGlu,
-    Moe { num_experts: usize, top_k: usize },
-}
-
-/// Per-layer weights stored in backend-native buffers.
-pub struct LayerWeights<B: Backend> {
-    pub input_ln_w: B::Buffer,
-    pub qkv_proj_w: B::Buffer,
-    pub o_proj_w: B::Buffer,
-    pub post_ln_w: B::Buffer,
-    pub gate_up_proj_w: B::Buffer,
-    pub down_proj_w: B::Buffer,
-    pub q_norm_w: Option<B::Buffer>,
-    pub k_norm_w: Option<B::Buffer>,
-}
-
-/// Pre-allocated scratch buffers for one layer forward pass.
-pub struct LayerScratch<B: Backend> {
-    pub norm_out: B::Buffer,
-    pub qkv_out: B::Buffer,
-    pub q_buf: B::Buffer,
-    pub k_buf: B::Buffer,
-    pub v_buf: B::Buffer,
-    pub attn_out: B::Buffer,
-    pub o_proj_out: B::Buffer,
-    pub gate_up_out: B::Buffer,
-    pub silu_out: B::Buffer,
-    pub mlp_out: B::Buffer,
-}
-
-/// Per-layer KV cache.
+/// Per-layer KV cache. Each model owns its own `Vec<KvCache<B>>` per sequence.
 pub struct KvCache<B: Backend> {
     pub k: B::Buffer,
     pub v: B::Buffer,
@@ -148,14 +90,6 @@ pub struct KvCache<B: Backend> {
     pub capacity: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
-}
-
-/// Full model weights.
-pub struct ModelWeights<B: Backend> {
-    pub embed: B::Buffer,
-    pub layers: Vec<LayerWeights<B>>,
-    pub final_norm_w: B::Buffer,
-    pub lm_head_w: B::Buffer,
 }
 
 /// The core abstraction over CUDA / Metal / CPU.
@@ -218,31 +152,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         dim: usize,
     );
 
-    // ── Positional encoding ─────────────────────────────────────────────
-
-    fn rope(
-        ctx: &mut Self::Context,
-        q: &mut Self::Buffer,
-        k: &mut Self::Buffer,
-        cos: &Self::Buffer,
-        sin: &Self::Buffer,
-        positions: &[u32],
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    );
-
     // ── Attention ───────────────────────────────────────────────────────
-
-    fn decode_attention(
-        ctx: &mut Self::Context,
-        q: &Self::Buffer,
-        k_cache: &Self::Buffer,
-        v_cache: &Self::Buffer,
-        out: &mut Self::Buffer,
-        kv_len: usize,
-        cfg: &AttnConfig,
-    );
 
     fn flash_attention(
         ctx: &mut Self::Context,
@@ -257,27 +167,12 @@ pub trait Backend: Send + Sync + Sized + 'static {
         cfg: &AttnConfig,
     );
 
-    // ── Activations ─────────────────────────────────────────────────────
-
-    fn silu_mul(
-        ctx: &mut Self::Context,
-        gate: &Self::Buffer,
-        up: &Self::Buffer,
-        out: &mut Self::Buffer,
-        len: usize,
-    );
-
     // ── Element-wise ────────────────────────────────────────────────────
-
-    fn add(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        b: &Self::Buffer,
-        out: &mut Self::Buffer,
-        len: usize,
-    );
-
-    fn copy(ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize);
+    //
+    // Models use `add_inplace` for residual updates and `copy_slice` for the
+    // row-extraction step in prefill. Offset-free copy / non-inplace add are
+    // not needed by the current Model-as-Code path; they can return later if
+    // a model actually requires them.
 
     /// Copy `len` floats from `src[src_offset..]` to `dst[dst_offset..]`.
     ///
@@ -330,18 +225,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         im: usize,
     );
 
-    /// Per-head RMS norm in-place (QK-norm for Qwen3).
-    /// data: [tokens, heads, head_dim], w: [head_dim]
-    fn qk_norm(
-        ctx: &mut Self::Context,
-        data: &mut Self::Buffer,
-        w: &Self::Buffer,
-        tokens: usize,
-        heads: usize,
-        head_dim: usize,
-        eps: f32,
-    );
-
     /// Fused QK-norm + RoPE + transpose-to-head-major.
     ///
     /// `mode` selects the operation:
@@ -375,28 +258,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
-    /// (Legacy) Append new K/V to cache. Accepts token-major input and
-    /// allocates fresh cache buffers sized for `cache_len + new_tokens`.
-    /// Used by the generic `layer_forward` path (CpuBackend default impl).
-    ///
-    /// `new_k/v`: `[tokens, nkv, hd]` (token-major)
-    /// `cache k/v`: `[nkv, cache_len, hd]` (head-major)
-    /// Returns fresh `(cache_k, cache_v)` with appended data; caller updates
-    /// `kv.len` on its side. Realloc-per-call makes this O(cache_len) per
-    /// layer and is going away once Model-as-Code models use the pre-allocated
-    /// `kv_cache_append_head_major` path below.
-    fn kv_cache_append(
-        ctx: &mut Self::Context,
-        cache_k: &mut Self::Buffer,
-        cache_v: &mut Self::Buffer,
-        cache_len: usize,
-        new_k: &Self::Buffer,
-        new_v: &Self::Buffer,
-        new_tokens: usize,
-        nkv: usize,
-        hd: usize,
-    ) -> (Self::Buffer, Self::Buffer);
-
     /// Append new K/V into a pre-allocated head-major cache buffer.
     ///
     /// `cache_k` / `cache_v`: `[nkv, capacity, hd]` (head-major, pre-allocated)
@@ -419,17 +280,8 @@ pub trait Backend: Send + Sync + Sized + 'static {
         hd: usize,
     );
 
-    /// Transpose [tokens, heads, dim] → [heads, tokens, dim]
-    fn transpose_token_to_head(
-        ctx: &mut Self::Context,
-        src: &Self::Buffer,
-        dst: &mut Self::Buffer,
-        tokens: usize,
-        heads: usize,
-        dim: usize,
-    );
-
-    /// Transpose [heads, tokens, dim] → [tokens, heads, dim]
+    /// Transpose [heads, tokens, dim] → [tokens, heads, dim].
+    /// Called after `flash_attention` to restore token-major layout for O-proj.
     fn transpose_head_to_token(
         ctx: &mut Self::Context,
         src: &Self::Buffer,
@@ -446,29 +298,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         x: &Self::Buffer,
         len: usize,
     );
-
-    // ── Fused layer forward ────────────────────────────────────────────
-    //
-    // Optional: execute entire transformer layer as a single GPU batch.
-    // Metal/CUDA can override to pipeline all ops in one command buffer.
-    // Default: delegates to generic layer_forward (per-op dispatch).
-
-    fn layer_forward_fused(
-        ctx: &mut Self::Context,
-        cfg: &TransformerConfig,
-        weights: &super::LayerWeights<Self>,
-        kv: &mut super::KvCache<Self>,
-        scratch: &mut super::LayerScratch<Self>,
-        residual: &mut Self::Buffer,
-        positions: &[u32],
-        cos: &Self::Buffer,
-        sin: &Self::Buffer,
-        tokens: usize,
-    ) {
-        super::layer_forward::layer_forward::<Self>(
-            ctx, cfg, weights, kv, scratch, residual, positions, cos, sin, tokens,
-        );
-    }
 
     // ── Buffer management (context-free) ────────────────────────────────
 

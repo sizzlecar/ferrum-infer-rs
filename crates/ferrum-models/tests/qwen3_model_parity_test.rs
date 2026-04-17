@@ -1,8 +1,7 @@
-//! Qwen3Model (Model-as-Code) vs ModelRunner parity on real Qwen3-0.6B weights.
+//! Qwen3Model self-parity — Cpu↔Metal on real Qwen3-0.6B weights.
 //!
-//! Verifies Phase B4: the new `Qwen3Model<B>` gives identical logits to the
-//! existing `ModelRunner<B>` path for prefill + multi-step decode, on both
-//! CpuBackend and MetalBackend.
+//! Verifies that both backend specialisations of Qwen3Model produce identical
+//! logits for prefill + multi-step decode on the Model-as-Code path.
 //!
 //! Run: cargo test -p ferrum-models --features metal --release \
 //!          --test qwen3_model_parity_test -- --ignored --nocapture
@@ -11,7 +10,6 @@
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kernels::backend::metal::MetalBackend;
-use ferrum_kernels::backend::runner::{convert_weights_to_metal, ModelRunner};
 use ferrum_models::common::DecoderOnlyLLM;
 use ferrum_models::models::qwen3::{Qwen3Config, Qwen3Model};
 use ferrum_quantization::{DenseLinear, Linear, WeightLoader};
@@ -265,62 +263,4 @@ fn qwen3model_cpu_vs_metal() {
         pos += 1;
     }
     eprintln!("✅ Qwen3Model Cpu↔Metal parity pass");
-}
-
-#[test]
-#[ignore]
-fn qwen3model_vs_modelrunner_prefill_decode() {
-    let mp = qwen3_path().expect("Qwen3-0.6B not in HF cache");
-    let def = load_model_def(&mp);
-    let qcfg = def_to_qwen3_cfg(&def);
-
-    let loader = ferrum_models::SafeTensorsLoader::new(mp.to_str().unwrap());
-    let vb = loader
-        .load_varbuilder(&candle_core::Device::Cpu, candle_core::DType::F32)
-        .unwrap();
-
-    // Legacy path: ModelRunner<MetalBackend>
-    let runner_cfg = ferrum_models::model_config::qwen3_config(&def);
-    let cpu_w =
-        ferrum_models::model_config::weight_loader::load_model_weights(&vb, &runner_cfg).unwrap();
-    let metal_w = convert_weights_to_metal(&cpu_w);
-    let mut runner = ModelRunner::<MetalBackend>::new(runner_cfg, metal_w);
-
-    // New path: Qwen3Model<MetalBackend>
-    let shim = CandleShimLoader::<MetalBackend>::new(&vb);
-    let mut model = Qwen3Model::<MetalBackend>::new(qcfg, &shim).unwrap();
-
-    let prompt: Vec<u32> = vec![872, 111, 248, 104715, 0, 56568, 53481, 5048];
-    eprintln!("\n=== Prefill {} tokens ===", prompt.len());
-
-    let r_logits = runner.prefill("t", &prompt);
-    let m_logits = model.prefill("t", &prompt);
-    let (ra, ma) = (argmax(&r_logits), argmax(&m_logits));
-    let cos = cosine(&r_logits, &m_logits);
-    let mad = max_abs_diff(&r_logits, &m_logits);
-    eprintln!(
-        "prefill  Runner argmax={ra} ({:.4})  Model argmax={ma} ({:.4})  cos={cos:.6}  max_diff={mad:.4}",
-        r_logits[ra], m_logits[ma]
-    );
-    assert_eq!(ra, ma, "prefill argmax mismatch");
-    assert!(cos > 0.9999, "prefill cosine too low: {cos}");
-
-    // 5 decode steps chained on runner's argmax.
-    let mut pos = prompt.len() as u32;
-    let mut tok = ra as u32;
-    for step in 0..5 {
-        let r = runner.decode("t", tok, pos);
-        let m = model.decode("t", tok, pos);
-        let (ra, ma) = (argmax(&r), argmax(&m));
-        let cos = cosine(&r, &m);
-        let mad = max_abs_diff(&r, &m);
-        eprintln!(
-            "decode {step} pos={pos} tok={tok}  Runner argmax={ra}  Model argmax={ma}  cos={cos:.6}  max_diff={mad:.4}",
-        );
-        assert_eq!(ra, ma, "decode step {step} argmax mismatch");
-        assert!(cos > 0.9999, "decode step {step} cosine too low: {cos}");
-        tok = ra as u32;
-        pos += 1;
-    }
-    eprintln!("✅ Qwen3Model vs ModelRunner parity pass");
 }

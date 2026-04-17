@@ -15,7 +15,6 @@ pub mod hf_download;
 pub mod image_processor;
 pub mod loader;
 pub mod mel;
-pub mod model_config;
 pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;
@@ -30,9 +29,8 @@ pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    BertModelExecutor, CandleModelExecutor, ClipModelExecutor, GenericModelExecutor, LlmExecutor,
-    Qwen2ModelExecutor, Qwen3ModelExecutor, StubModelExecutor, TtsModelExecutor,
-    WhisperModelExecutor,
+    BertModelExecutor, CandleModelExecutor, ClipModelExecutor, LlmExecutor, Qwen2ModelExecutor,
+    Qwen3ModelExecutor, StubModelExecutor, TtsModelExecutor, WhisperModelExecutor,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;
