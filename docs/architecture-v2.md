@@ -21,10 +21,17 @@
 4. **近期目标**：MoE（Mixtral, DeepSeek-MoE）、MLA（DeepSeek-V2/V3）、多模态（Qwen-VL, LLaVA）
 
 ### 非目标（本期不做）
-- Tensor Parallel（多 GPU 分片）—— 之后单独 RFC
 - Pipeline Parallel
 - Speculative Decoding
 - Long-context extrapolation（RoPE scaling 以外的）
+
+### 架构预留但实现推后
+- **Tensor Parallel**：Backend trait 在本期就加 collective ops stub
+  (`world_size` / `rank` / `all_reduce_sum` / `all_gather` / `broadcast`)，
+  default impl 全是 no-op（单卡行为）。Linear trait 后续加
+  `ColumnParallelLinear` / `RowParallelLinear` 变种。模型在 attention/MLP
+  出口调 `B::all_reduce_sum`，单卡时是 no-op。真实 NCCL runtime 等
+  CudaBackend + GPU 机器再做。这样**以后加 TP 不改 Backend 实现**。
 
 ---
 
@@ -151,6 +158,15 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn gemm_awq(ctx, a, qweight, scales, zeros, out,
                 m, n, k, bits, group_size) -> Result<()>;
     fn gemm_gguf(ctx, a, qweight, out, m, n, k, quant_type) -> Result<()>;
+
+    // ── TP collective ops (default = single-rank no-op) ──
+    // Kept here (not a separate trait) so model code can call B::all_reduce
+    // unconditionally; single-GPU backends return immediately.
+    fn world_size(ctx: &Self::Context) -> usize { 1 }
+    fn rank(ctx: &Self::Context) -> usize { 0 }
+    fn all_reduce_sum(ctx, buf, len, dtype) { /* no-op */ }
+    fn all_gather(ctx, local, global, local_len, world_size, dtype) { /* no-op */ }
+    fn broadcast(ctx, buf, len, src_rank, dtype) { /* no-op */ }
 }
 ```
 
@@ -235,6 +251,30 @@ pub struct GgufLinear<B: Backend> {
     in_f: usize, out_f: usize,
 }
 ```
+
+### 5.3.1 Tensor-Parallel 变种（预留，未来实现）
+
+TP 通过两个 "包装型" Linear 实现，与量化正交：
+
+```rust
+// Column parallel: W [out, in] split along out dim.
+// Each rank holds W_local [out / tp_size, in]. Output is local partial.
+// Upstream will typically AllGather or be consumed by a RowParallel next.
+pub struct ColumnParallelLinear<B: Backend, L: Linear<B>> {
+    local: L,            // e.g. DenseLinear or GptqLinear holding local shard
+    gather_output: bool, // if true, AllGather at end of forward
+}
+
+// Row parallel: W [out, in] split along in dim.
+// Each rank holds W_local [out, in / tp_size]. Output is partial sum; we
+// AllReduce(sum) at end to materialise full output.
+pub struct RowParallelLinear<B: Backend, L: Linear<B>> {
+    local: L,
+}
+```
+
+TP × quantization 组合（GPTQ + ColumnParallel 是 production 常见搭配）通过
+泛型内层 `L: Linear<B>` 自然支持 —— 不需要为每种组合写新的类型。
 
 ### 5.3 GEMM 内核策略（重点）
 
@@ -679,7 +719,9 @@ Metal 的 single-cmd-buffer 模式继续保留。Backend::Context 持有 GPU 命
 
 ## 15. 本 RFC 不包括
 
-- TP / PP / 多 GPU
+- **TP runtime**：架构预留 collective ops stub（§4.1 末尾），但 CUDA NCCL
+  实现和 rank-aware executor 推迟到 Phase D/E
+- Pipeline Parallel / 多机
 - Speculative decoding
 - Structured output（已在 engine 层做）
 - Prefix caching（已在 engine 层做）

@@ -1,5 +1,53 @@
 //! Core Backend trait — the single abstraction over CUDA / Metal / CPU.
 
+use ferrum_types::{FerrumError, Result};
+
+/// Quantization flavour discriminator for `Backend::gemm_quant`.
+///
+/// Distinct schemes need distinct kernels. Carried as a parameter so the
+/// Backend trait does not explode with one method per quantization type.
+#[derive(Clone, Debug)]
+pub enum QuantKind {
+    /// GPTQ: group-wise int4/int8 with scales + zeros (asymmetric) + optional g_idx.
+    Gptq { bits: u32, group_size: usize, desc_act: bool },
+    /// AWQ: activation-aware int4 with scales + zeros, different packing from GPTQ.
+    Awq { bits: u32, group_size: usize },
+    /// GGUF: one of k-quants / legacy quants, fully specified by the inner type.
+    Gguf { quant_type: GgufQuantType },
+}
+
+/// GGUF quantization sub-type (expand as kernels are added).
+#[derive(Clone, Copy, Debug)]
+pub enum GgufQuantType {
+    Q4_0,
+    Q4_1,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8_0,
+}
+
+/// Packed quantized weight buffers passed to `Backend::gemm_quant`.
+///
+/// Not every field is used by every `QuantKind` — e.g. GGUF packs scales
+/// inside `qweight`, so `scales` / `zeros` may be dummies. The Backend
+/// implementation is expected to validate the shape for the kind it handles.
+pub struct QuantWeights<'a, B: Backend> {
+    pub qweight: &'a B::Buffer,
+    pub scales: Option<&'a B::Buffer>,
+    pub zeros: Option<&'a B::Buffer>,
+    pub g_idx: Option<&'a B::Buffer>,
+}
+
+/// Collective-op reduction kind for TP all_reduce.
+#[derive(Clone, Copy, Debug)]
+pub enum ReduceOp {
+    Sum,
+    Max,
+    Min,
+}
+
+
 /// Configuration for RoPE (rotary position embeddings).
 #[derive(Clone, Debug)]
 pub struct RopeConfig {
@@ -333,4 +381,68 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn alloc(len: usize) -> Self::Buffer;
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
     fn from_slice(data: &[f32]) -> Self::Buffer;
+
+    // ── Quantized GEMM (Phase A3 stubs) ─────────────────────────────────
+    //
+    // Backends override the kinds they actually support (e.g. Metal will
+    // implement Gptq first; CUDA will implement Gptq + Awq via Marlin).
+    // Default impl returns an `unsupported` error so missing kernels surface
+    // as clean runtime errors instead of silent wrong output.
+
+    /// GEMM with packed-quantized B matrix. `m`/`n`/`k` describe the dense
+    /// equivalent (`[m,n] = [m,k] @ [k,n]^T`).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_quant(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weights: &QuantWeights<'_, Self>,
+        _out: &mut Self::Buffer,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        kind: &QuantKind,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(format!(
+            "gemm_quant({kind:?}) not implemented for this backend"
+        )))
+    }
+
+    // ── TP collective ops (Phase A3 stubs) ──────────────────────────────
+    //
+    // Default impl is single-rank no-op: `world_size = 1`, `rank = 0`, and
+    // the collective ops are identity. Multi-GPU backends (future
+    // CudaBackend + NCCL) override these. Model code can call
+    // `B::all_reduce_sum(...)` unconditionally; single-GPU paths pay zero.
+
+    fn world_size(_ctx: &Self::Context) -> usize {
+        1
+    }
+    fn rank(_ctx: &Self::Context) -> usize {
+        0
+    }
+    fn all_reduce(
+        _ctx: &mut Self::Context,
+        _buf: &mut Self::Buffer,
+        _len: usize,
+        _op: ReduceOp,
+    ) {
+        // single-rank: no-op
+    }
+    fn all_gather(
+        _ctx: &mut Self::Context,
+        _local: &Self::Buffer,
+        _global: &mut Self::Buffer,
+        _local_len: usize,
+    ) {
+        // single-rank: no-op (caller is expected to handle the degenerate
+        // case or arrange for `local == global`)
+    }
+    fn broadcast(
+        _ctx: &mut Self::Context,
+        _buf: &mut Self::Buffer,
+        _len: usize,
+        _src_rank: usize,
+    ) {
+        // single-rank: no-op
+    }
 }
