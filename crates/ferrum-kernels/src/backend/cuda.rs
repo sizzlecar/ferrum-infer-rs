@@ -178,6 +178,9 @@ impl Backend for CudaBackend {
             })
         }
         .expect("rms_norm launch");
+        ctx.stream
+            .synchronize()
+            .expect("DEBUG: rms_norm kernel faulted");
     }
 
     fn fused_add_rms_norm(
@@ -443,6 +446,9 @@ impl Backend for CudaBackend {
             })
         }
         .expect("embedding_lookup launch");
+        ctx.stream
+            .synchronize()
+            .expect("DEBUG: embedding_lookup kernel faulted");
     }
 
     // ── Transformer-specific fused ops ──────────────────────────────────
