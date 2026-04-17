@@ -111,6 +111,7 @@ pub struct CudaBackend;
 impl Backend for CudaBackend {
     type Buffer = CudaSlice<f16>;
     type Context = CudaState;
+    type GptqStore = crate::marlin::MarlinWeight;
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -413,11 +414,6 @@ impl Backend for CudaBackend {
             // smaller than the `capacity * 4` bytes we bake into the
             // captured graph for long max_seq_len models (Qwen3 = 160 KB).
             // Without this, graph launch fails with CUDA_ERROR_INVALID_VALUE.
-            const MAX_DYN_SMEM: i32 = 192 * 1024;
-            let _ = func.set_attribute(
-                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                MAX_DYN_SMEM,
-            );
             let num_q = cfg.num_heads as i32;
             let num_kv = cfg.num_kv_heads as i32;
             let hd = cfg.head_dim as i32;
@@ -428,11 +424,16 @@ impl Backend for CudaBackend {
             };
             let valid_kv_scalar = kv_len as i32;
             let scale = cfg.scale;
-            // Size shared memory for the MAX possible kv_len (cache capacity),
-            // not current kv_len. Otherwise a captured graph bakes in a small
-            // shared_mem_bytes and later replays with larger kv_len trigger
-            // shared-memory OOB → CUDA_ERROR_INVALID_VALUE on next sync.
-            let shared_mem = (capacity as u32) * 4;
+            // Shared-memory sizing (graph-safe):
+            // - Kernel writes `s_scores[0..valid_kv_len]` per step. valid_kv_len
+            //   grows over time; captured graph has a fixed shared_mem_bytes.
+            // - Must bake in a size that covers max expected kv_len during
+            //   decode.  48 KB (12288 positions) is the default limit without
+            //   `cudaFuncSetAttribute` opt-in — plenty for most practical
+            //   decode lengths. Longer sequences opt into bigger limits.
+            const DECODE_MAX_KV_POS_DEFAULT: usize = 12288; // 48 KB
+            let max_kv_pos = capacity.min(DECODE_MAX_KV_POS_DEFAULT as i32) as u32;
+            let shared_mem = max_kv_pos * 4;
             let stream = ctx.stream.clone();
             // Hold read-guard on global state bufs for the builder's lifetime.
             let dec_guard = if use_dyn {
@@ -958,11 +959,86 @@ impl Backend for CudaBackend {
         kind: &QuantKind,
     ) -> Result<()> {
         Err(FerrumError::unsupported(format!(
-            "CudaBackend::gemm_quant({kind:?}) not yet wired — Marlin \
-             kernel requires mixed-dtype QuantWeights buffers, pending \
-             Phase E-GPTQ refactor (see crates/ferrum-kernels/src/backend/cuda.rs \
-             module docs)"
+            "CudaBackend::gemm_quant({kind:?}) deprecated — use gemm_gptq + GptqStore"
         )))
+    }
+
+    // ── GPTQ (Marlin INT4) ──────────────────────────────────────────────
+
+    fn load_gptq(
+        qweight: &[i32],
+        scales: &[f32],
+        _qzeros: &[i32],
+        _g_idx: Option<&[i32]>,
+        bits: u32,
+        group_size: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Self::GptqStore> {
+        if bits != 4 {
+            return Err(FerrumError::unsupported(format!(
+                "CUDA Marlin GPTQ: only bits=4 supported (got {bits})"
+            )));
+        }
+        // Repack on CPU, then upload. Matches IST-DASLab/marlin Layer.pack().
+        let marlin_qweight_i32 = crate::marlin::repack_gptq_to_marlin(qweight, k, n);
+        // Scales arrive as f32 but Marlin expects f16. Convert + permute.
+        let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
+        let marlin_scales_f16 =
+            crate::marlin::repack_scales_to_marlin(&scales_f16, k, n, group_size);
+
+        // Upload on the global stream (same one inference uses).
+        let stream = default_stream();
+        let qweight_dev = stream
+            .clone_htod(&marlin_qweight_i32)
+            .map_err(|e| FerrumError::model(format!("qweight htod: {e}")))?;
+        let scales_dev = stream
+            .clone_htod(&marlin_scales_f16)
+            .map_err(|e| FerrumError::model(format!("scales htod: {e}")))?;
+
+        // Workspace: Marlin uses int32 atomic locks, [N/128 * max_par] zeroed.
+        // max_par hardcoded to 16 per kernel launch; allocate + zero here.
+        let max_par = 16usize;
+        let ws_len = (n / 128).max(1) * max_par;
+        let workspace_dev = stream
+            .alloc_zeros::<i32>(ws_len)
+            .map_err(|e| FerrumError::model(format!("ws alloc: {e}")))?;
+
+        Ok(crate::marlin::MarlinWeight {
+            qweight: qweight_dev,
+            scales: scales_dev,
+            workspace: workspace_dev,
+            k,
+            n,
+            group_size: group_size as i32,
+        })
+    }
+
+    #[cfg(feature = "marlin")]
+    fn gemm_gptq(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::GptqStore,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        // Delegate to the existing marlin_gemm wrapper. Takes care of
+        // workspace reset + kernel launch.
+        crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
+            .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+    }
+
+    #[cfg(not(feature = "marlin"))]
+    fn gemm_gptq(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::GptqStore,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "cargo feature `marlin` disabled — GPTQ not available",
+        ))
     }
 
     // ── TP collectives ──────────────────────────────────────────────────

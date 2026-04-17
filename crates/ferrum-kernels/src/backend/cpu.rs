@@ -2,6 +2,7 @@
 //! Context = () — all ops execute immediately, no batching needed.
 
 use super::{AttnConfig, Backend};
+use ferrum_types::{FerrumError, Result};
 
 pub struct CpuBackend;
 
@@ -33,12 +34,79 @@ extern "C" {
     );
 }
 
+/// CPU-side GPTQ store — dequantized f32 weights in row-major [n, k] layout.
+/// Trades memory for simplicity: repack once at load, then run normal GEMM.
+pub struct CpuGptqStore {
+    pub weight_f32: Vec<f32>, // [n, k] row-major
+    pub k: usize,
+    pub n: usize,
+}
+
 impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
     type Context = ();
+    type GptqStore = CpuGptqStore;
 
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
+
+    fn load_gptq(
+        qweight: &[i32],
+        scales: &[f32],
+        qzeros: &[i32],
+        _g_idx: Option<&[i32]>,
+        bits: u32,
+        group_size: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Self::GptqStore> {
+        if bits != 4 {
+            return Err(FerrumError::unsupported(format!(
+                "CPU GPTQ: only bits=4 supported (got {bits})"
+            )));
+        }
+        let num_groups = k / group_size;
+        // Unpack GPTQ [K/8, N] i32 → int4 values, dequantize per-group:
+        //   w_f16 = (q - zero) * scale
+        // Write to [n, k] row-major (matches DenseLinear convention).
+        let mut w = vec![0.0f32; n * k];
+        let packed_rows = k / 8;
+        for pr in 0..packed_rows {
+            for col in 0..n {
+                let packed = qweight[pr * n + col] as u32;
+                for bi in 0..8 {
+                    let ki = pr * 8 + bi;
+                    let q = ((packed >> (bi * 4)) & 0xF) as i32;
+                    let grp = ki / group_size;
+                    let scale = scales[grp * n + col];
+                    // qzeros [num_groups, N/8] i32 packs 8 zero-values per int32
+                    let z_packed = qzeros[grp * (n / 8) + (col / 8)] as u32;
+                    let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
+                    let val = (q - zero) as f32 * scale;
+                    w[col * k + ki] = val;
+                }
+            }
+        }
+        let _ = num_groups; // informational only
+        Ok(CpuGptqStore {
+            weight_f32: w,
+            k,
+            n,
+        })
+    }
+
+    fn gemm_gptq(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::GptqStore,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        // Just run normal GEMM with dequantized weights.
+        // out[m, n] = a[m, k] @ w[n, k]^T — same contract as B::gemm.
+        Self::gemm(ctx, a, &weight.weight_f32, out, m, weight.n, weight.k);
+        Ok(())
+    }
 
     fn gemm(
         _ctx: &mut Self::Context,

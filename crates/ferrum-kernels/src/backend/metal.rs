@@ -88,6 +88,7 @@ fn run(f: impl FnOnce(&metal::CommandBufferRef)) {
 impl Backend for MetalBackend {
     type Buffer = metal::Buffer;
     type Context = MetalContext;
+    type GptqStore = (); // Metal GPTQ not yet wired; load_gptq/gemm_gptq return unsupported
 
     fn new_context() -> Self::Context {
         MetalContext { cmd: None }

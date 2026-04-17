@@ -119,6 +119,16 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ///   - CUDA: wraps a CudaStream
     type Context;
 
+    /// Opaque per-backend GPTQ weight representation.
+    ///   - CPU: dequantized f32 weights (run as regular GEMM)
+    ///   - Metal: `()` — unsupported; `gemm_gptq` errors
+    ///   - CUDA: `MarlinWeight` — pre-repacked tiles + permuted scales
+    ///
+    /// Each backend repacks raw GPTQ tensors (qweight/scales/qzeros, all
+    /// i32/f16) into its preferred format at model load time, so inference
+    /// doesn't pay the repack cost per forward pass.
+    type GptqStore: Send + Sync;
+
     /// Create a new execution context (begin accumulating work).
     fn new_context() -> Self::Context;
 
@@ -168,6 +178,49 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// is cached; caller should run eager.
     fn replay_last_graph(_ctx: &mut Self::Context) -> Result<bool> {
         Ok(false)
+    }
+
+    // ── GPTQ (INT4 quantization) ────────────────────────────────────────
+    //
+    // Two-step: load (once per weight) → gemm (per forward). The store
+    // holds whatever backend-specific format is fastest; caller code
+    // (GptqLinear) is dtype-agnostic.
+
+    /// Repack raw GPTQ tensors into the backend's preferred format.
+    /// Called once per layer at model load time.
+    ///
+    /// Inputs are host-side slices (CPU memory) — the loader reads from
+    /// safetensors and hands them off; each backend uploads + repacks
+    /// per its own strategy. `bits` is typically 4; `group_size` is
+    /// typically 128.
+    #[allow(clippy::too_many_arguments)]
+    fn load_gptq(
+        _qweight: &[i32],
+        _scales: &[f32],
+        _qzeros: &[i32],
+        _g_idx: Option<&[i32]>,
+        _bits: u32,
+        _group_size: usize,
+        _k: usize,
+        _n: usize,
+    ) -> Result<Self::GptqStore> {
+        Err(FerrumError::unsupported(
+            "load_gptq not implemented for this backend",
+        ))
+    }
+
+    /// GEMM with pre-loaded GPTQ weights.
+    /// `out[m, n] = a[m, k] @ dequant(weight)^T`
+    fn gemm_gptq(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::GptqStore,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_gptq not implemented for this backend",
+        ))
     }
 
     // ── GEMM ────────────────────────────────────────────────────────────
