@@ -109,6 +109,7 @@ pub fn layer_forward<B: Backend>(
         head_dim: hd,
         causal: true,
         scale: 1.0 / (hd as f32).sqrt(),
+        kv_seq_stride: 0, // legacy contiguous cache (grows per layer)
     };
 
     if tokens == 1 {

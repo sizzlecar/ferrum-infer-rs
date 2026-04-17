@@ -517,13 +517,22 @@ fn cpu_attention(
     let d = cfg.head_dim;
     let n_rep = nh / nkv;
     let scale = cfg.scale;
+    // Per-head KV stride: 0 (the default) means contiguous (legacy
+    // `kv_cache_append` path reallocates each layer). A non-zero value means
+    // the cache is pre-allocated to `kv_seq_stride` rows per head but only
+    // the first `kv_len` are valid — we skip the rest via `attend_len`.
+    let kv_stride = if cfg.kv_seq_stride > 0 {
+        cfg.kv_seq_stride
+    } else {
+        kv_len
+    };
 
     for b in 0..batch {
         for h in 0..nh {
             let kv_h = h / n_rep;
             let q_off = (b * nh + h) * q_len * d;
-            let k_off = (b * nkv + kv_h) * kv_len * d;
-            let v_off = (b * nkv + kv_h) * kv_len * d;
+            let k_off = (b * nkv + kv_h) * kv_stride * d;
+            let v_off = (b * nkv + kv_h) * kv_stride * d;
             let o_off = (b * nh + h) * q_len * d;
 
             for qi in 0..q_len {

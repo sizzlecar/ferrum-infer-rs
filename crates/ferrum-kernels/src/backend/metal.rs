@@ -189,7 +189,8 @@ impl Backend for MetalBackend {
             pos_offset: 0,
         };
         let cmd = ctx.cmd();
-        st().pipes.flash_attn(cmd, q, kc, vc, out, &p);
+        st().pipes
+            .flash_attn_v2(cmd, q, kc, vc, out, &p, cfg.kv_seq_stride);
     }
 
     fn flash_attention(
@@ -215,7 +216,8 @@ impl Backend for MetalBackend {
             pos_offset,
         };
         let cmd = ctx.cmd();
-        st().pipes.flash_attn(cmd, q, k, v, out, &p);
+        st().pipes
+            .flash_attn_v2(cmd, q, k, v, out, &p, cfg.kv_seq_stride);
     }
 
     fn silu_mul(

@@ -64,6 +64,24 @@ pub struct AttnConfig {
     pub head_dim: usize,
     pub causal: bool,
     pub scale: f32,
+    /// Stride (in rows) between head blocks in the KV buffer.
+    /// `0` means contiguous (use `kv_len`, legacy behaviour).
+    /// Set to `cache_capacity` when flashing against a pre-allocated cache
+    /// that only has `kv_len` valid slots out of `cache_capacity`.
+    pub kv_seq_stride: usize,
+}
+
+impl Default for AttnConfig {
+    fn default() -> Self {
+        Self {
+            num_heads: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            causal: false,
+            scale: 1.0,
+            kv_seq_stride: 0,
+        }
+    }
 }
 
 /// Transformer model configuration (architecture-level).
