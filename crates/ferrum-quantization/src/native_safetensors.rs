@@ -487,13 +487,56 @@ fn dtype_to_f32(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {
 }
 
 fn load_quantize_config(dir: &Path) -> Result<Option<QuantConfig>> {
+    // AutoGPTQ / gptq-for-llama format: separate quantize_config.json.
     let p = dir.join("quantize_config.json");
-    if !p.exists() {
-        return Ok(None);
+    if p.exists() {
+        let data = std::fs::read_to_string(&p)
+            .map_err(|e| FerrumError::io(format!("read {p:?}: {e}")))?;
+        let qc: QuantConfig = serde_json::from_str(&data)
+            .map_err(|e| FerrumError::serialization(format!("parse quantize_config.json: {e}")))?;
+        return Ok(Some(qc));
     }
-    let data =
-        std::fs::read_to_string(&p).map_err(|e| FerrumError::io(format!("read {p:?}: {e}")))?;
-    let qc: QuantConfig = serde_json::from_str(&data)
-        .map_err(|e| FerrumError::serialization(format!("parse quantize_config.json: {e}")))?;
-    Ok(Some(qc))
+    // Qwen GPTQ / transformers-style: embedded in config.json under
+    // "quantization_config": { "quant_method": "gptq", "bits": 4, ... }.
+    let cfg = dir.join("config.json");
+    if cfg.exists() {
+        let data = std::fs::read_to_string(&cfg)
+            .map_err(|e| FerrumError::io(format!("read {cfg:?}: {e}")))?;
+        let root: serde_json::Value = serde_json::from_str(&data)
+            .map_err(|e| FerrumError::serialization(format!("parse config.json: {e}")))?;
+        if let Some(qc_val) = root.get("quantization_config") {
+            // The embedded block has "quant_method" (not "method"); remap.
+            let method = qc_val
+                .get("quant_method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
+            let method = match method.to_lowercase().as_str() {
+                "gptq" => QuantMethod::Gptq,
+                "awq" => QuantMethod::Awq,
+                "gguf" => QuantMethod::Gguf,
+                _ => QuantMethod::None,
+            };
+            let bits = qc_val.get("bits").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let group_size = qc_val
+                .get("group_size")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(128)
+                .max(0) as usize;
+            let desc_act = qc_val
+                .get("desc_act")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let sym = qc_val.get("sym").and_then(|v| v.as_bool()).unwrap_or(false);
+            if method != QuantMethod::None {
+                return Ok(Some(QuantConfig {
+                    method,
+                    bits,
+                    group_size,
+                    desc_act,
+                    sym,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
