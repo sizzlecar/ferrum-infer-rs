@@ -178,9 +178,6 @@ impl Backend for CudaBackend {
             })
         }
         .expect("rms_norm launch");
-        ctx.stream
-            .synchronize()
-            .expect("DEBUG: rms_norm kernel still faulting after common.cuh fix");
     }
 
     fn fused_add_rms_norm(
@@ -236,11 +233,6 @@ impl Backend for CudaBackend {
         n: usize,
         k: usize,
     ) {
-        // DEBUG: re-check for prior-kernel faults
-        ctx.stream
-            .synchronize()
-            .expect("pre-gemm sync failed — prior kernel faulted");
-
         use cudarc::cublas::result::gemm_ex;
         use cudarc::cublas::sys::{
             cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType_t,
@@ -303,52 +295,16 @@ impl Backend for CudaBackend {
         pos_offset: usize,
         cfg: &AttnConfig,
     ) {
-        if q_len == 1 {
-            // Single-token decode path.
-            // Kernel signature (decode_attention_f16):
-            //   q, k_cache, v_cache, out,
-            //   num_q_heads, num_kv_heads, head_dim,
-            //   max_kv_len, valid_kv_len, scale
-            let func = ctx.func(
-                "decode_attention",
-                ptx::DECODE_ATTENTION,
-                "decode_attention_f16",
-            );
-            let num_q = cfg.num_heads as i32;
-            let num_kv = cfg.num_kv_heads as i32;
-            let hd = cfg.head_dim as i32;
-            let max_kv = if cfg.kv_seq_stride > 0 {
-                cfg.kv_seq_stride as i32
-            } else {
-                kv_len as i32
-            };
-            let valid_kv = kv_len as i32;
-            let scale = cfg.scale;
-            let shared_mem = (kv_len as u32) * 4; // one f32 per KV position
-            let stream = ctx.stream.clone();
-            let mut b = stream.launch_builder(&func);
-            b.arg(q);
-            b.arg(k);
-            b.arg(v);
-            b.arg(out);
-            b.arg(&num_q);
-            b.arg(&num_kv);
-            b.arg(&hd);
-            b.arg(&max_kv);
-            b.arg(&valid_kv);
-            b.arg(&scale);
-            unsafe {
-                b.launch(LaunchConfig {
-                    grid_dim: (cfg.num_heads as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: shared_mem,
-                })
-            }
-            .expect("decode_attention launch");
-            return;
-        }
-
-        // Prefill / multi-token path: flash_attn_full_f16.
+        // Unified path: `flash_attn_full_f16` handles any q_len including 1.
+        //
+        // Earlier this had a q_len==1 fast path through `decode_attention_f16`,
+        // but that kernel expects SEQ-MAJOR cache layout `[seq, nkv, hd]`
+        // (candle's original) whereas our `kv_cache_append_head_major`
+        // produces HEAD-MAJOR `[nkv, seq, hd]`. Routing decode through
+        // flash_attn_full gives correct layout at the cost of a small amount
+        // of per-token overhead (tile-loop sets up for TILE_Q=32 even when
+        // q_len=1). Perf optimisation: port `decode_attention` to head-major
+        // in a followup, or add a dedicated single-token head-major kernel.
         let func = ctx.func(
             "flash_attn_full",
             ptx::FLASH_ATTN_FULL,
@@ -443,9 +399,6 @@ impl Backend for CudaBackend {
             })
         }
         .expect("embedding_lookup launch");
-        ctx.stream
-            .synchronize()
-            .expect("DEBUG: embedding_lookup kernel faulted");
     }
 
     // ── Transformer-specific fused ops ──────────────────────────────────
