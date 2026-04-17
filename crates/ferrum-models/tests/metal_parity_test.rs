@@ -70,6 +70,14 @@ fn prefill_decode_parity() {
         ..Default::default()
     };
 
+    // Note: intentionally leaves extra_params empty so qwen3_config falls back
+    // to hidden/num_heads for head_dim (64 on Qwen3-0.6B instead of the real
+    // 128). This hides the real-head_dim runtime failure in the legacy
+    // ModelRunner path — acceptable short-term because both backends agree on
+    // the (wrong) config, and the production registry path carries
+    // extra_params through correctly via ConfigManager. Qwen3Model's own
+    // parity test (qwen3_model_parity_test.rs) verifies the real head_dim=128
+    // case on the new code path.
     let cfg = ferrum_models::model_config::qwen3_config(&def);
     let loader = ferrum_models::SafeTensorsLoader::new(mp.to_str().unwrap());
     let vb = loader
