@@ -428,12 +428,27 @@ impl Backend for CudaBackend {
             // - Kernel writes `s_scores[0..valid_kv_len]` per step. valid_kv_len
             //   grows over time; captured graph has a fixed shared_mem_bytes.
             // - Must bake in a size that covers max expected kv_len during
-            //   decode.  48 KB (12288 positions) is the default limit without
-            //   `cudaFuncSetAttribute` opt-in — plenty for most practical
-            //   decode lengths. Longer sequences opt into bigger limits.
-            const DECODE_MAX_KV_POS_DEFAULT: usize = 12288; // 48 KB
-            let max_kv_pos = capacity.min(DECODE_MAX_KV_POS_DEFAULT as i32) as u32;
+            //   decode. Kernel also uses ~8 bytes of static shared mem
+            //   (s_block_max / s_block_sum), so we can't claim the full 48 KB
+            //   default limit. 32 KB = 8192 positions is a safe default with
+            //   no cudaFuncSetAttribute opt-in needed; longer sequences can
+            //   raise via FERRUM_CUDA_MAX_KV env (bumps dynamic shared beyond
+            //   48 KB via CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES).
+            const DECODE_MAX_KV_POS_DEFAULT: usize = 8192; // 32 KB
+            let env_cap = std::env::var("FERRUM_CUDA_MAX_KV")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DECODE_MAX_KV_POS_DEFAULT);
+            let max_kv_pos = capacity.min(env_cap as i32) as u32;
             let shared_mem = max_kv_pos * 4;
+            // If user bumped the cap beyond 48 KB default, opt into the
+            // higher limit on Blackwell (up to 228 KB).
+            if shared_mem > 48 * 1024 {
+                let _ = func.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem as i32,
+                );
+            }
             let stream = ctx.stream.clone();
             // Hold read-guard on global state bufs for the builder's lifetime.
             let dec_guard = if use_dyn {
