@@ -47,6 +47,10 @@ pub struct CudaState {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     pub blas: Arc<CudaBlas>,
+    /// Pre-allocated cuBLAS workspace (32 MB) — held so cuBLAS doesn't
+    /// malloc per-GEMM. The old CudaDecodeRunner had this and it's one
+    /// of the cheap perf wins for decode-heavy workloads.
+    _blas_workspace: CudaSlice<u8>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
 }
 
@@ -120,10 +124,30 @@ impl Backend for CudaBackend {
             CudaBlas::new(stream.clone())
                 .unwrap_or_else(|e| panic!("CudaBackend::new_context: CudaBlas::new: {e}")),
         );
+        // Pre-allocate a 32 MB cuBLAS workspace and pin it to the handle.
+        // Without this, cuBLAS internally mallocs a workspace per call on
+        // some algorithms (visible as ~1-2ms overhead per GEMM on Blackwell).
+        const BLAS_WS_BYTES: usize = 32 * 1024 * 1024;
+        let blas_workspace = unsafe { stream.alloc::<u8>(BLAS_WS_BYTES) }
+            .expect("CudaBackend::new_context: cuBLAS workspace alloc");
+        unsafe {
+            use cudarc::cublas::sys;
+            use cudarc::driver::DevicePtrMut;
+            let (ws_ptr, _guard) = (&blas_workspace).device_ptr(&stream);
+            let status = sys::cublasSetWorkspace_v2(
+                *blas.handle(),
+                ws_ptr as *mut _,
+                BLAS_WS_BYTES,
+            );
+            if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                panic!("cublasSetWorkspace_v2 failed: {:?}", status);
+            }
+        }
         Self::Context {
             ctx,
             stream,
             blas,
+            _blas_workspace: blas_workspace,
             modules: HashMap::new(),
         }
     }
