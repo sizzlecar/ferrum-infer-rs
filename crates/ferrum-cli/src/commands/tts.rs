@@ -274,7 +274,27 @@ fn select_candle_device(backend: &str) -> CandleDevice {
                 CandleDevice::Cpu
             }
         }
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                return CandleDevice::new_cuda(0).unwrap_or_else(|e| {
+                    eprintln!("CUDA unavailable ({e}), falling back to CPU");
+                    CandleDevice::Cpu
+                });
+            }
+            #[allow(unreachable_code)]
+            {
+                eprintln!("CUDA feature not compiled, falling back to CPU");
+                CandleDevice::Cpu
+            }
+        }
         "auto" | _ => {
+            #[cfg(feature = "cuda")]
+            {
+                if let Ok(d) = CandleDevice::new_cuda(0) {
+                    return d;
+                }
+            }
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
                 return CandleDevice::new_metal(0).unwrap_or(CandleDevice::Cpu);
