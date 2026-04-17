@@ -167,8 +167,12 @@ record ""
 # 5. cargo check --features cuda
 # ────────────────────────────────────────────────────────────────────────
 section "5. cargo check --features cuda"
+# Target ferrum-cli specifically, not the whole workspace — `--workspace
+# --features cuda` activates every workspace member's cuda feature, which
+# includes ferrum-attention's dead-stub cuda feature (pinned on cudarc 0.12,
+# max CUDA 12.6). Scoping to ferrum-cli pulls only the live CUDA deps.
 record '```'
-if run_logged "cargo check --workspace --features cuda 2>&1 | tail -10"; then
+if run_logged "cargo check --features cuda -p ferrum-cli 2>&1 | tail -10"; then
     record "✅ type check passed"
 else
     record "❌ type check failed"
