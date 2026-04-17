@@ -233,15 +233,18 @@ impl Backend for CudaBackend {
         n: usize,
         k: usize,
     ) {
-        // Call `cublasGemmEx` directly with:
-        //   compute_type = CUBLAS_COMPUTE_32F_FAST_16F (fp32 accum via fp16 tensor cores)
-        //   algo         = CUBLAS_GEMM_DEFAULT_TENSOR_OP
-        // cudarc's safe `blas.gemm` hardcodes COMPUTE_32F + GEMM_DEFAULT, which
-        // returns CUBLAS_STATUS_INTERNAL_ERROR on Blackwell (SM 12.0) cuBLAS 12.8
-        // for standard hgemm. The tensor-op variant uses the fp16 tensor-core
-        // path that Blackwell actually has working kernels for.
+        // DEBUG: sync + check for sticky CUDA error before gemm.
+        // If a prior kernel (embedding_lookup / rms_norm / etc) faulted
+        // silently, cuBLAS inherits the error state and returns
+        // CUBLAS_STATUS_INTERNAL_ERROR regardless of correctness.
+        ctx.stream
+            .synchronize()
+            .expect("pre-gemm stream sync failed — a prior kernel launch errored");
+
         use cudarc::cublas::result::gemm_ex;
-        use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType_t};
+        use cudarc::cublas::sys::{
+            cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType_t,
+        };
         use cudarc::driver::{DevicePtr, DevicePtrMut};
 
         let alpha: f32 = 1.0;
