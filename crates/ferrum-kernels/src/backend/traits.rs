@@ -126,6 +126,50 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// CPU: no-op. Metal: commit + waitUntilCompleted. CUDA: stream sync.
     fn sync(ctx: &mut Self::Context);
 
+    // ── Graph capture / replay (CUDA only) ──────────────────────────────
+    //
+    // Decode-loop optimization: eliminate per-kernel launch overhead by
+    // capturing the full step as a CUDA graph and replaying. CPU/Metal
+    // have no equivalent — defaults return `unsupported`.
+    //
+    // Flow per decode step:
+    //   1. Caller: `set_decode_state(ctx, token, step)` — memcpy to dev bufs
+    //   2. Try `replay_last_graph(ctx)`:
+    //        - Ok(true):  graph replayed, skip eager forward
+    //        - Ok(false): no captured graph yet, run eager
+    //        - Err(_):    not supported, run eager
+    //   3. If running eager and in capture window:
+    //      - `set_dev_state_mode(ctx, true)` so kernels use _dyn variants
+    //      - `begin_graph_capture(ctx)`
+    //      - run forward
+    //      - `end_graph_capture(ctx)` — stores graph on ctx internally
+    //      - `set_dev_state_mode(ctx, false)` — restore scalar kernels
+
+    /// Update per-step dynamic state (token id, step/pos). Fast (3x memcpy).
+    fn set_decode_state(_ctx: &mut Self::Context, _token: u32, _step: u32) {}
+
+    /// Toggle between scalar-arg kernels (normal) and `_dyn` kernels that
+    /// read their dynamic scalar args from device memory (graph-friendly).
+    fn set_dev_state_mode(_ctx: &mut Self::Context, _enable: bool) {}
+
+    /// Begin stream capture. Subsequent kernel launches are recorded into
+    /// a pending graph instead of executing eagerly.
+    fn begin_graph_capture(_ctx: &mut Self::Context) -> Result<()> {
+        Err(FerrumError::unsupported("graph capture not supported"))
+    }
+
+    /// End stream capture and install the captured graph as this context's
+    /// "last graph" for future `replay_last_graph` calls.
+    fn end_graph_capture(_ctx: &mut Self::Context) -> Result<()> {
+        Err(FerrumError::unsupported("graph capture not supported"))
+    }
+
+    /// Replay the last captured graph. Returns `Ok(false)` if no graph
+    /// is cached; caller should run eager.
+    fn replay_last_graph(_ctx: &mut Self::Context) -> Result<bool> {
+        Ok(false)
+    }
+
     // ── GEMM ────────────────────────────────────────────────────────────
 
     fn gemm(

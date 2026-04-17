@@ -36,6 +36,23 @@ extern "C" __global__ void embedding_lookup_f16(
     output[b * dim + i] = table[idx * dim + i];
 }
 
+// Device-state variant: token id read from a single device slot.
+// Enables CUDA graph capture — the captured graph's scalar args are frozen,
+// so dynamic values (token id that changes every decode step) must live in
+// device memory and be updated via memcpy_htod_async before each replay.
+// Grid: (ceil(dim/256), 1, 1). Batch hardcoded to 1 (decode path).
+extern "C" __global__ void embedding_lookup_f16_dyn(
+    const __half* __restrict__ table,        // [vocab, dim]
+    const uint32_t* __restrict__ token_ptr,  // [1]
+    __half* __restrict__ output,             // [dim]
+    int dim
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+    uint32_t idx = token_ptr[0];
+    output[i] = table[(int)idx * dim + i];
+}
+
 // Argmax: find index of maximum value in array.
 // Single block, uses warp reduction.
 // output[0] = argmax(input[0..n])

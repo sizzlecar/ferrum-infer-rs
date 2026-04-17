@@ -52,6 +52,20 @@ pub struct CudaState {
     /// of the cheap perf wins for decode-heavy workloads.
     _blas_workspace: CudaSlice<u8>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
+
+    // ── Device-side dynamic decode state (for CUDA graph capture) ──
+    // Kernels that depend on per-step values (token id, position,
+    // valid-kv-len) have `_dyn` variants reading these device slots.
+    // When `use_dev_state = true`, the `_dyn` kernels are launched; the
+    // captured graph sees stable pointer args and the scalar values get
+    // updated via memcpy_htod_async before each graph replay.
+    pub token_buf: CudaSlice<u32>,
+    pub pos_buf: CudaSlice<i32>, // pos_offset == cache_len for decode
+    pub kv_buf: CudaSlice<i32>,  // valid_kv_len == pos + 1
+    pub use_dev_state: bool,
+
+    /// True between begin_graph_capture and end_graph_capture.
+    pub capture_in_flight: bool,
 }
 
 impl CudaState {
@@ -143,13 +157,86 @@ impl Backend for CudaBackend {
                 panic!("cublasSetWorkspace_v2 failed: {:?}", status);
             }
         }
+        // Per-step dynamic state (for graph replay).
+        let token_buf = unsafe { stream.alloc::<u32>(1) }
+            .expect("CudaBackend::new_context: token_buf alloc");
+        let pos_buf = unsafe { stream.alloc::<i32>(1) }
+            .expect("CudaBackend::new_context: pos_buf alloc");
+        let kv_buf = unsafe { stream.alloc::<i32>(1) }
+            .expect("CudaBackend::new_context: kv_buf alloc");
+
         Self::Context {
             ctx,
             stream,
             blas,
             _blas_workspace: blas_workspace,
             modules: HashMap::new(),
+            token_buf,
+            pos_buf,
+            kv_buf,
+            use_dev_state: false,
+            capture_in_flight: false,
         }
+    }
+
+    fn set_decode_state(ctx: &mut Self::Context, token: u32, step: u32) {
+        let valid_kv = (step as i32) + 1;
+        let step_i = step as i32;
+        ctx.stream
+            .memcpy_htod(&[token], &mut ctx.token_buf)
+            .expect("token_buf memcpy");
+        ctx.stream
+            .memcpy_htod(&[step_i], &mut ctx.pos_buf)
+            .expect("pos_buf memcpy");
+        ctx.stream
+            .memcpy_htod(&[valid_kv], &mut ctx.kv_buf)
+            .expect("kv_buf memcpy");
+    }
+
+    fn set_dev_state_mode(ctx: &mut Self::Context, enable: bool) {
+        ctx.use_dev_state = enable;
+    }
+
+    fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
+        use cudarc::driver::sys::CUstreamCaptureMode;
+        ctx.stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .map_err(|e| FerrumError::unsupported(format!("begin_capture: {e}")))?;
+        ctx.capture_in_flight = true;
+        Ok(())
+    }
+
+    fn end_graph_capture(ctx: &mut Self::Context) -> Result<()> {
+        use cudarc::driver::sys::CUgraphInstantiate_flags;
+        if !ctx.capture_in_flight {
+            return Err(FerrumError::unsupported("end_capture without begin"));
+        }
+        ctx.capture_in_flight = false;
+        let graph_opt = ctx
+            .stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|e| FerrumError::unsupported(format!("end_capture: {e}")))?;
+        match graph_opt {
+            Some(g) => {
+                install_decode_graph(g);
+                Ok(())
+            }
+            None => Err(FerrumError::unsupported(
+                "end_capture returned None (empty graph?)",
+            )),
+        }
+    }
+
+    fn replay_last_graph(_ctx: &mut Self::Context) -> Result<bool> {
+        with_decode_graph(|g_opt| {
+            if let Some(g) = g_opt {
+                g.launch()
+                    .map_err(|e| FerrumError::unsupported(format!("graph.launch: {e}")))?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
     }
 
     fn sync(ctx: &mut Self::Context) {
@@ -327,11 +414,13 @@ impl Backend for CudaBackend {
         // Both kernels read the cache as HEAD-MAJOR `[nkv, capacity, hd]`
         // matching `kv_cache_append_head_major_f16`'s write layout.
         if q_len == 1 {
-            let func = ctx.func(
-                "decode_attention_hm",
-                ptx::DECODE_ATTENTION_HM,
-                "decode_attention_head_major_f16",
-            );
+            let use_dyn = ctx.use_dev_state;
+            let func_name = if use_dyn {
+                "decode_attention_head_major_f16_dyn"
+            } else {
+                "decode_attention_head_major_f16"
+            };
+            let func = ctx.func("decode_attention_hm", ptx::DECODE_ATTENTION_HM, func_name);
             let num_q = cfg.num_heads as i32;
             let num_kv = cfg.num_kv_heads as i32;
             let hd = cfg.head_dim as i32;
@@ -340,9 +429,9 @@ impl Backend for CudaBackend {
             } else {
                 kv_len as i32
             };
-            let valid_kv = kv_len as i32;
+            let valid_kv_scalar = kv_len as i32;
             let scale = cfg.scale;
-            let shared_mem = (kv_len as u32) * 4; // one f32 per KV position
+            let shared_mem = (kv_len as u32) * 4;
             let stream = ctx.stream.clone();
             let mut bld = stream.launch_builder(&func);
             bld.arg(q);
@@ -353,7 +442,11 @@ impl Backend for CudaBackend {
             bld.arg(&num_kv);
             bld.arg(&hd);
             bld.arg(&capacity);
-            bld.arg(&valid_kv);
+            if use_dyn {
+                bld.arg(&ctx.kv_buf);
+            } else {
+                bld.arg(&valid_kv_scalar);
+            }
             bld.arg(&scale);
             unsafe {
                 bld.launch(LaunchConfig {
@@ -430,8 +523,37 @@ impl Backend for CudaBackend {
         out: &mut Self::Buffer,
         dim: usize,
     ) {
+        let dim_i32 = dim as i32;
+        let block = 256u32;
+        let grid_x = ((dim as u32) + block - 1) / block;
+
+        if ctx.use_dev_state {
+            // Graph-friendly: read token id from device state buffer.
+            // Limited to batch=1 (decode path). Prefill uses the scalar path.
+            debug_assert!(ids.len() == 1, "dev_state embedding requires batch=1");
+            let func = ctx.func(
+                "embedding_lookup",
+                ptx::EMBEDDING_LOOKUP,
+                "embedding_lookup_f16_dyn",
+            );
+            let stream = ctx.stream.clone();
+            let mut b = stream.launch_builder(&func);
+            b.arg(table);
+            b.arg(&ctx.token_buf);
+            b.arg(out);
+            b.arg(&dim_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .expect("embedding_lookup_dyn launch");
+            return;
+        }
+
         let batch = ids.len();
-        // Upload ids to device (small, at most a few dozen elements).
         let stream = ctx.stream.clone();
         let ids_dev = stream.clone_htod(ids).expect("embedding_lookup ids htod");
 
@@ -441,9 +563,6 @@ impl Backend for CudaBackend {
             "embedding_lookup_f16",
         );
         let batch_i32 = batch as i32;
-        let dim_i32 = dim as i32;
-        let block = 256u32;
-        let grid_x = ((dim as u32) + block - 1) / block;
         let stream = ctx.stream.clone();
         let mut b = stream.launch_builder(&func);
         b.arg(table);
@@ -545,11 +664,13 @@ impl Backend for CudaBackend {
         eps: f32,
         mode: i32,
     ) {
-        let func = ctx.func(
-            "qk_norm_rope",
-            ptx::QK_NORM_ROPE,
-            "qk_norm_rope_transpose_f16",
-        );
+        let use_dyn = ctx.use_dev_state && tokens == 1;
+        let fn_name = if use_dyn {
+            "qk_norm_rope_transpose_f16_dyn"
+        } else {
+            "qk_norm_rope_transpose_f16"
+        };
+        let func = ctx.func("qk_norm_rope", ptx::QK_NORM_ROPE, fn_name);
         let tokens_i32 = tokens as i32;
         let heads_i32 = heads as i32;
         let head_dim_i32 = head_dim as i32;
@@ -564,7 +685,11 @@ impl Backend for CudaBackend {
         b.arg(&tokens_i32);
         b.arg(&heads_i32);
         b.arg(&head_dim_i32);
-        b.arg(&pos_offset_i32);
+        if use_dyn {
+            b.arg(&ctx.pos_buf);
+        } else {
+            b.arg(&pos_offset_i32);
+        }
         b.arg(&eps);
         b.arg(&mode);
         unsafe {
@@ -591,11 +716,13 @@ impl Backend for CudaBackend {
     ) {
         debug_assert!(cache_len + new_tokens <= cache_capacity);
 
-        let func = ctx.func(
-            "kv_cache_append",
-            ptx::KV_CACHE_APPEND,
-            "kv_cache_append_head_major_f16",
-        );
+        let use_dyn = ctx.use_dev_state && new_tokens == 1;
+        let fn_name = if use_dyn {
+            "kv_cache_append_head_major_f16_dyn"
+        } else {
+            "kv_cache_append_head_major_f16"
+        };
+        let func = ctx.func("kv_cache_append", ptx::KV_CACHE_APPEND, fn_name);
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
         let cache_len_i32 = cache_len as i32;
@@ -618,7 +745,11 @@ impl Backend for CudaBackend {
             b.arg(new_k_head_major);
             b.arg(&nkv_i32);
             b.arg(&hd_i32);
-            b.arg(&cache_len_i32);
+            if use_dyn {
+                b.arg(&ctx.pos_buf);
+            } else {
+                b.arg(&cache_len_i32);
+            }
             b.arg(&new_tokens_i32);
             b.arg(&cap_i32);
             unsafe { b.launch(cfg) }.expect("kv_cache_append K launch");
@@ -630,7 +761,11 @@ impl Backend for CudaBackend {
             b.arg(new_v_head_major);
             b.arg(&nkv_i32);
             b.arg(&hd_i32);
-            b.arg(&cache_len_i32);
+            if use_dyn {
+                b.arg(&ctx.pos_buf);
+            } else {
+                b.arg(&cache_len_i32);
+            }
             b.arg(&new_tokens_i32);
             b.arg(&cap_i32);
             unsafe { b.launch(cfg) }.expect("kv_cache_append V launch");
@@ -933,4 +1068,51 @@ fn with_stream<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
 /// stream, this replaces it.
 pub fn install_thread_stream(stream: Arc<CudaStream>) {
     *stream_slot().write().expect("GLOBAL_STREAM poisoned") = Some(stream);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Process-global decode graph slot
+// ────────────────────────────────────────────────────────────────────────
+//
+// Stored here (not on `CudaState`) because:
+//   - Backend::Context isn't Send+Sync for all backends (Metal holds a
+//     raw CommandBufferRef) — the model struct gets Send issues if ctx
+//     is stored on it.
+//   - Only CUDA uses graph capture, so global-per-process is fine.
+//   - Kernel arg pointers captured in the graph reference model-owned
+//     scratch buffers; the model outlives any graph, so no dangling refs.
+//
+// `CudaGraph` isn't automatically `Send+Sync` in cudarc's public API —
+// we wrap in our own marker struct with `unsafe impl`. The stream itself
+// is single-threaded per model (engine serialises via Mutex), so graph
+// launch from the same thread is safe.
+
+struct GraphSlot(cudarc::driver::CudaGraph);
+// SAFETY: graph launch is serialised through the model's stream, which
+// is accessed from one thread at a time (engine Mutex-wraps the model).
+unsafe impl Send for GraphSlot {}
+unsafe impl Sync for GraphSlot {}
+
+static DECODE_GRAPH: std::sync::OnceLock<std::sync::RwLock<Option<GraphSlot>>> =
+    std::sync::OnceLock::new();
+
+fn graph_slot() -> &'static std::sync::RwLock<Option<GraphSlot>> {
+    DECODE_GRAPH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn install_decode_graph(g: cudarc::driver::CudaGraph) {
+    *graph_slot().write().expect("DECODE_GRAPH poisoned") = Some(GraphSlot(g));
+}
+
+fn with_decode_graph<R>(
+    f: impl FnOnce(Option<&cudarc::driver::CudaGraph>) -> Result<R>,
+) -> Result<R> {
+    let guard = graph_slot().read().expect("DECODE_GRAPH poisoned");
+    f(guard.as_ref().map(|s| &s.0))
+}
+
+/// Evict the cached graph — call this when model weights/scratch pointers
+/// change (e.g. scratch resize, model reload). Next decode will re-capture.
+pub fn invalidate_decode_graph() {
+    *graph_slot().write().expect("DECODE_GRAPH poisoned") = None;
 }

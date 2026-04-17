@@ -257,6 +257,14 @@ pub struct LlamaFamilyModel<B: Backend> {
 
     /// Per-sequence KV caches, one `Vec<KvCache<B>>` of length `num_layers`.
     pub kv_caches: HashMap<String, Vec<KvCache<B>>>,
+
+    // ── Graph capture state (CUDA only; harmless no-op on other backends) ──
+    /// Count of eager decode steps run so far. After `GRAPH_WARMUP`, the
+    /// next step captures the decode flow as a graph.
+    graph_warmup: usize,
+    /// True if capture was attempted but failed (e.g. backend doesn't
+    /// support graph capture). Stops further attempts, falls back to eager.
+    graph_capture_failed: bool,
 }
 
 impl<B: Backend> LlamaFamilyModel<B> {
@@ -349,6 +357,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
             rope,
             scratch,
             kv_caches: HashMap::new(),
+            graph_warmup: 0,
+            graph_capture_failed: false,
         })
     }
 
@@ -667,8 +677,42 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
+
+        // Context creation is cheap (CUDA reuses the process-global stream).
+        // The captured graph lives in a process-global slot, not on ctx.
         let mut ctx = B::new_context();
 
+        // Always refresh device-side dynamic state (token/pos/kv_len).
+        // Cheap (3x 4-byte memcpy_htod_async); required before both eager
+        // capture-step and graph replay.
+        B::set_decode_state(&mut ctx, token, pos);
+
+        // Fast path: graph replay (if available).
+        match B::replay_last_graph(&mut ctx) {
+            Ok(true) => {
+                B::sync(&mut ctx);
+                return B::to_vec(&self.scratch.logits, vocab);
+            }
+            Ok(false) => { /* no graph yet, fall through to eager */ }
+            Err(_) => { /* backend error or unsupported, eager */ }
+        }
+
+        // Decide whether to capture this step.
+        // Warmup for a few steps so cuBLAS picks algorithms, JIT settles, etc.
+        const GRAPH_WARMUP: usize = 3;
+        let should_capture = !self.graph_capture_failed
+            && self.graph_warmup >= GRAPH_WARMUP
+            && std::env::var("FERRUM_CUDA_NO_GRAPH").is_err();
+
+        if should_capture {
+            B::set_dev_state_mode(&mut ctx, true);
+            if B::begin_graph_capture(&mut ctx).is_err() {
+                self.graph_capture_failed = true;
+                B::set_dev_state_mode(&mut ctx, false);
+            }
+        }
+
+        // Eager forward (records into graph if capture is active).
         let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(0));
         B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
 
@@ -676,7 +720,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
         }
 
-        // Final RMSNorm directly on residual (1 row — decode).
         B::rms_norm(
             &mut ctx,
             &residual,
@@ -694,8 +737,16 @@ impl<B: Backend> LlamaFamilyModel<B> {
             1,
         );
 
-        B::sync(&mut ctx);
+        if should_capture && !self.graph_capture_failed {
+            if B::end_graph_capture(&mut ctx).is_err() {
+                self.graph_capture_failed = true;
+            }
+            B::set_dev_state_mode(&mut ctx, false);
+        } else {
+            self.graph_warmup += 1;
+        }
 
+        B::sync(&mut ctx);
         self.scratch.residual = residual;
 
         B::to_vec(&self.scratch.logits, vocab)
