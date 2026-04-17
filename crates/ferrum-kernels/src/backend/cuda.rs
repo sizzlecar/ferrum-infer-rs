@@ -122,7 +122,7 @@ impl Backend for CudaBackend {
             CudaBlas::new(stream.clone())
                 .unwrap_or_else(|e| panic!("CudaBackend::new_context: CudaBlas::new: {e}")),
         );
-        GLOBAL_STREAM.with(|slot| *slot.borrow_mut() = Some(stream.clone()));
+        install_thread_stream(stream.clone());
         Self::Context {
             ctx,
             stream,
