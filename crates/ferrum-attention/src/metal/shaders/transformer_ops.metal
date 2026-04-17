@@ -372,9 +372,12 @@ kernel void split_qkv_f32(
 
 // ── GEMV: m=1 GEMM specialization ───────────────────────────────────────
 // C[1, N] = A[1, K] @ B[N, K]^T
-// One threadgroup per output column, 32 threads per threadgroup (1 simdgroup).
-// K-dimension reduction via simd_sum. Much better occupancy than gemm_v2 for m=1
-// (which wastes 63/64 of tile compute at m=1).
+// One threadgroup (1 simdgroup = 32 threads) per output column.
+// K-dim reduction via simd_sum.
+//
+// Note: tried tile_n=4 (A-vector reuse across 4 cols), turned out slower on
+// Qwen3-0.6B (30.2 vs 32.5 tok/s). Bottleneck is not A-side DRAM traffic,
+// it's B-side reads (vocab×hidden for lm_head dwarfs everything else).
 
 kernel void gemv_f32(
     device const float* A       [[buffer(0)]],   // [1, K]
@@ -388,11 +391,25 @@ kernel void gemv_f32(
     if (nj >= p.N) return;
 
     device const float* b_row = B + nj * p.K;
+    const int K = p.K;
 
-    // Each thread computes K/32 partial products; simd_sum reduces.
     float acc = 0.0f;
-    for (int k = (int)tiisg; k < p.K; k += 32) {
-        acc += A[k] * b_row[k];
+
+    // Vectorized float4 path when K is aligned and large enough.
+    // Each thread consumes 4 floats per step = 128-bit load, 4 FMAs.
+    if ((K & 3) == 0) {
+        device const float4* a4 = (device const float4*)A;
+        device const float4* b4 = (device const float4*)b_row;
+        const int K4 = K >> 2;
+        for (int k4 = (int)tiisg; k4 < K4; k4 += 32) {
+            float4 a = a4[k4];
+            float4 b = b4[k4];
+            acc += dot(a, b);
+        }
+    } else {
+        for (int k = (int)tiisg; k < K; k += 32) {
+            acc += A[k] * b_row[k];
+        }
     }
     acc = simd_sum(acc);
 
