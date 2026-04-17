@@ -552,9 +552,23 @@ impl Backend for MetalBackend {
             }
         };
 
-        // 1. Input RMSNorm: residual -> norm_out
+        // ── Prelude encoder: rms_norm → QKV gemm → split → qk_norm_rope × 3 → kv_append × 2 ──
+        // Metal guarantees commands in a single compute encoder are ordered and sees
+        // writes from earlier dispatches when later dispatches read the same resource,
+        // so merging saves ~11 encoder end/create pairs per layer vs one-encoder-per-op.
+        let pos_offset = positions[0] as usize;
+        let q_mode: i32 = if cfg.has_qk_norm { 1 } else { 2 };
+        let (q_norm_w, k_norm_w) =
+            (weights.q_norm_w.as_ref(), weights.k_norm_w.as_ref());
+        // Dummy weight buffer for mode-0/2 paths (kernel requires a buffer even when unused).
+        let dummy = &weights.input_ln_w;
+        let q_norm_buf = q_norm_w.unwrap_or(dummy);
+        let k_norm_buf = k_norm_w.unwrap_or(dummy);
+
         {
             let enc = cmd.new_compute_command_encoder();
+
+            // 1. Input RMSNorm
             pipes.rms_norm_enc(
                 enc,
                 residual,
@@ -564,12 +578,8 @@ impl Backend for MetalBackend {
                 h,
                 eps,
             );
-            enc.end_encoding();
-        }
 
-        // 2. Fused QKV GEMM: norm_out [tokens,h] @ qkv_proj_w [qkv_dim,h] -> qkv_out [tokens, qkv_dim]
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 2. Fused QKV GEMM
             gemm(
                 enc,
                 &scratch.norm_out,
@@ -579,12 +589,8 @@ impl Backend for MetalBackend {
                 qkv_dim,
                 h,
             );
-            enc.end_encoding();
-        }
 
-        // 3. Split fused qkv -> q, k, v
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 3. Split fused qkv → q, k, v (token-major)
             pipes.split_qkv_enc(
                 enc,
                 &scratch.qkv_out,
@@ -595,37 +601,16 @@ impl Backend for MetalBackend {
                 q_dim,
                 kv_dim,
             );
-            enc.end_encoding();
-        }
 
-        // 4. QK-norm + RoPE + transpose-to-head-major (fused kernel).
-        //    Output goes into attn_out (Q) / o_proj_out (K) / gate_up_out (V) as temp staging.
-        //    We need [heads, tokens, hd] layout for flash_attn.
-        //    Modes: 1 = norm + RoPE (Qwen3 has QK-norm), 2 = RoPE only, 0 = transpose only (for V).
-        let pos_offset = positions[0] as usize;
-        let q_mode: i32 = if cfg.has_qk_norm { 1 } else { 2 };
-        let (q_norm_w, k_norm_w) = (
-            weights.q_norm_w.as_ref(),
-            weights.k_norm_w.as_ref(),
-        );
-        // Dummy weight buffer for mode-2 paths (kernel requires a buffer even when unused).
-        // Reuse input_ln_w — not read when mode != 1.
-        let dummy = &weights.input_ln_w;
-        let q_norm_buf = q_norm_w.unwrap_or(dummy);
-        let k_norm_buf = k_norm_w.unwrap_or(dummy);
-
-        // Stage Q in attn_out (size tokens*q_dim). For tokens==1 the flash_attn expects
-        // Q in token-major shape [batch, q_len, nh, hd] which for q_len=1 is just [nh*hd]; transpose is trivial.
-        // We always output head-major to be consistent with flash_attn_v2 kv_seq_stride=max_len.
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 4. QK-norm + RoPE + transpose to head-major.
+            //    Q → attn_out; K → o_proj_out (staging); V → gate_up_out (staging).
             pipes.qk_norm_rope(
                 enc,
                 &scratch.q_buf,
                 q_norm_buf,
                 cos,
                 sin,
-                &scratch.attn_out, // head-major Q
+                &scratch.attn_out,
                 tokens,
                 nh,
                 hd,
@@ -639,7 +624,7 @@ impl Backend for MetalBackend {
                 k_norm_buf,
                 cos,
                 sin,
-                &scratch.o_proj_out, // head-major K (staged)
+                &scratch.o_proj_out,
                 tokens,
                 nkv,
                 hd,
@@ -650,26 +635,22 @@ impl Backend for MetalBackend {
             pipes.qk_norm_rope(
                 enc,
                 &scratch.v_buf,
-                k_norm_buf, // unused in mode 0
+                k_norm_buf,
                 cos,
                 sin,
-                &scratch.gate_up_out, // head-major V (staged; large enough: 2*im >= nkv*hd for small models)
+                &scratch.gate_up_out,
                 tokens,
                 nkv,
                 hd,
                 pos_offset,
                 eps,
-                0, // transpose only
+                0,
             );
-            enc.end_encoding();
-        }
 
-        // 5. Append K/V into pre-allocated cache at position kv.len
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 5. Append K/V into pre-allocated cache
             pipes.kv_cache_append(
                 enc,
-                &scratch.o_proj_out, // staged head-major K
+                &scratch.o_proj_out,
                 &kv.k,
                 nkv,
                 hd,
@@ -679,7 +660,7 @@ impl Backend for MetalBackend {
             );
             pipes.kv_cache_append(
                 enc,
-                &scratch.gate_up_out, // staged head-major V
+                &scratch.gate_up_out,
                 &kv.v,
                 nkv,
                 hd,
@@ -687,6 +668,7 @@ impl Backend for MetalBackend {
                 tokens,
                 kv.capacity,
             );
+
             enc.end_encoding();
         }
         let kv_len = kv.len + tokens;
@@ -715,16 +697,15 @@ impl Backend for MetalBackend {
             );
         }
 
-        // 7. Untranspose: [nh, tokens, hd] -> [tokens, nh, hd]
+        // ── Postlude encoder: transpose → O-proj → residual+norm → gate_up → silu → down → add ──
+        // Again a single encoder per Metal's in-order guarantee.
         {
             let enc = cmd.new_compute_command_encoder();
-            pipes.transpose_out(enc, &scratch.q_buf, &scratch.attn_out, tokens, nh, hd);
-            enc.end_encoding();
-        }
 
-        // 8. O-projection GEMM: attn_out [tokens, q_dim] @ o_proj_w [h, q_dim] -> o_proj_out [tokens, h]
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 7. Untranspose: [nh, tokens, hd] → [tokens, nh, hd]
+            pipes.transpose_out(enc, &scratch.q_buf, &scratch.attn_out, tokens, nh, hd);
+
+            // 8. O-projection GEMM
             gemm(
                 enc,
                 &scratch.attn_out,
@@ -734,12 +715,8 @@ impl Backend for MetalBackend {
                 h,
                 q_dim,
             );
-            enc.end_encoding();
-        }
 
-        // 9. Fused residual add + post-attention RMSNorm (overwrites residual with new value, norm into norm_out)
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 9. Fused residual + post-attention RMSNorm
             pipes.fused_residual_norm_enc(
                 enc,
                 residual,
@@ -753,12 +730,8 @@ impl Backend for MetalBackend {
                 eps,
                 0,
             );
-            enc.end_encoding();
-        }
 
-        // 10. Gate+Up GEMM (fused): norm_out @ gate_up_proj_w -> gate_up_out [tokens, 2*im]
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 10. Gate+Up GEMM (fused)
             gemm(
                 enc,
                 &scratch.norm_out,
@@ -768,19 +741,11 @@ impl Backend for MetalBackend {
                 2 * im,
                 h,
             );
-            enc.end_encoding();
-        }
 
-        // 11. SiLU(gate) * up, split from fused gate_up
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 11. SiLU(gate) * up
             pipes.silu_mul_split_enc(enc, &scratch.gate_up_out, &scratch.silu_out, tokens, im);
-            enc.end_encoding();
-        }
 
-        // 12. Down GEMM: silu_out [tokens, im] @ down_proj_w [h, im] -> mlp_out [tokens, h]
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 12. Down GEMM
             gemm(
                 enc,
                 &scratch.silu_out,
@@ -790,13 +755,10 @@ impl Backend for MetalBackend {
                 h,
                 im,
             );
-            enc.end_encoding();
-        }
 
-        // 13. Final residual add: residual += mlp_out (in-place via add_enc into residual)
-        {
-            let enc = cmd.new_compute_command_encoder();
+            // 13. Final residual add
             pipes.add_enc(enc, residual, &scratch.mlp_out, residual, tokens * h);
+
             enc.end_encoding();
         }
 
