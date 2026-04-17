@@ -331,11 +331,16 @@ impl Backend for CudaBackend {
         };
         use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
+        // cuBLAS is set to CUBLAS_POINTER_MODE_DEVICE (see ensure_blas_handle)
+        // so alpha/beta are read from device memory. Using the process-global
+        // alpha_f32/beta_f32 slices keeps pointers stable for graph capture.
         let (a_ptr, _rec_a) = b.device_ptr(&ctx.stream); // cuBLAS arg "A" = weight = our `b`
         let (b_ptr, _rec_b) = a.device_ptr(&ctx.stream); // cuBLAS arg "B" = input = our `a`
         let (c_ptr, _rec_c) = out.device_ptr_mut(&ctx.stream);
+        let blas_guard = blas_slot().read().expect("BLAS poisoned");
+        let slot = blas_guard.as_ref().expect("BLAS not init");
+        let (alpha_ptr, _ga) = slot.alpha_f32.device_ptr(&ctx.stream);
+        let (beta_ptr, _gb) = slot.beta_f32.device_ptr(&ctx.stream);
 
         unsafe {
             gemm_ex(
@@ -345,14 +350,14 @@ impl Backend for CudaBackend {
                 n as i32,
                 m as i32,
                 k as i32,
-                (&alpha) as *const f32 as *const _,
+                alpha_ptr as *const _,
                 a_ptr as *const _,
                 cudaDataType_t::CUDA_R_16F,
                 k as i32,
                 b_ptr as *const _,
                 cudaDataType_t::CUDA_R_16F,
                 k as i32,
-                (&beta) as *const f32 as *const _,
+                beta_ptr as *const _,
                 c_ptr as *mut _,
                 cudaDataType_t::CUDA_R_16F,
                 n as i32,
@@ -361,6 +366,7 @@ impl Backend for CudaBackend {
             )
         }
         .expect("gemm (cublasGemmEx, compute=32F_FAST_16F, algo=TENSOR_OP)");
+        drop(blas_guard);
     }
 
     // ── Attention ───────────────────────────────────────────────────────
@@ -1179,6 +1185,11 @@ fn with_decode_state<R>(f: impl FnOnce(&DecodeStateBufs) -> R) -> R {
 struct BlasSlot {
     blas: Arc<CudaBlas>,
     _workspace: CudaSlice<u8>,
+    // Device-resident alpha/beta for f16/f32 GEMMs. cuBLAS captures the
+    // scalar-copy of alpha/beta into the graph; host pointers would
+    // dangle on replay (stack-local). Device pointers persist.
+    pub alpha_f32: CudaSlice<f32>, // [1.0]
+    pub beta_f32: CudaSlice<f32>,  // [0.0]
 }
 unsafe impl Send for BlasSlot {}
 unsafe impl Sync for BlasSlot {}
@@ -1199,17 +1210,37 @@ fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
         const WS_BYTES: usize = 32 * 1024 * 1024;
         let blas = Arc::new(CudaBlas::new(stream.clone()).expect("CudaBlas::new"));
         let workspace = unsafe { stream.alloc::<u8>(WS_BYTES) }.expect("blas ws alloc");
+        let alpha_f32 = stream.clone_htod(&[1.0f32]).expect("alpha htod");
+        let beta_f32 = stream.clone_htod(&[0.0f32]).expect("beta htod");
         unsafe {
             use cudarc::cublas::sys;
             use cudarc::driver::DevicePtr;
             let (ws_ptr, _g) = workspace.device_ptr(stream);
             let st = sys::cublasSetWorkspace_v2(*blas.handle(), ws_ptr as *mut _, WS_BYTES);
             assert_eq!(st, sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS, "set workspace");
+            // Switch to device-pointer mode so alpha/beta pass cleanly through
+            // graph capture. cuBLAS is HOST mode by default; in HOST mode it
+            // internally memcpies the scalar from host, and that memcpy lands
+            // in the captured graph with a stack-local pointer → UB at replay.
+            let st = sys::cublasSetPointerMode_v2(
+                *blas.handle(),
+                sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
+            );
+            assert_eq!(st, sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS, "set pointer mode");
         }
         *w = Some(BlasSlot {
             blas,
             _workspace: workspace,
+            alpha_f32,
+            beta_f32,
         });
     }
     w.as_ref().unwrap().blas.clone()
+}
+
+/// Access the process-global alpha/beta device scalars for cuBLAS.
+fn with_blas_scalars<R>(f: impl FnOnce(&CudaSlice<f32>, &CudaSlice<f32>) -> R) -> R {
+    let g = blas_slot().read().expect("BLAS poisoned");
+    let s = g.as_ref().expect("BLAS not init");
+    f(&s.alpha_f32, &s.beta_f32)
 }
