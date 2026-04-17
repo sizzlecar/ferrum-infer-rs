@@ -983,15 +983,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                          architecture-v2 migration (Phase D/E).",
                     ));
                 }
-                let qconfig =
-                    ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
-                        .unwrap_or(None);
-                if qconfig.is_some() {
-                    return Err(FerrumError::unsupported(
-                        "GPTQ path temporarily unsupported during \
-                         architecture-v2 migration; GptqLinear lands in Phase D",
-                    ));
-                }
+                // NOTE: GPTQ is now wired through NativeSafetensorsLoader's
+                // load_linear path (Phase E-GPTQ). The loader auto-detects
+                // `<name>.qweight` tensors and constructs GptqLinear via
+                // Backend::load_gptq; no legacy opt-out here.
+                let _ = ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path);
 
                 // Per-architecture config constructor picks has_qk_norm +
                 // rope_theta defaults. Everything else is the same forward code.
