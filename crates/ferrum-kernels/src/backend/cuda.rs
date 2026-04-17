@@ -366,7 +366,7 @@ impl Backend for CudaBackend {
             )
         }
         .expect("gemm (cublasGemmEx, compute=32F_FAST_16F, algo=TENSOR_OP)");
-        drop(blas_guard);
+        // blas_guard dropped at scope end — `_ga`/`_gb` borrow from it.
     }
 
     // ── Attention ───────────────────────────────────────────────────────
