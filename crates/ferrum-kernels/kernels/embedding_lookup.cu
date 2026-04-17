@@ -3,11 +3,28 @@
 // Supports batch: output[b * dim + i] = table[indices[b] * dim + i]
 
 #include <cstdint>
+#include <cuda_fp16.h>
 
 extern "C" __global__ void embedding_lookup_f32(
     const float* __restrict__ table,   // [vocab_size, dim]
     const uint32_t* __restrict__ indices, // [batch]
     float* __restrict__ output,        // [batch, dim]
+    int batch,
+    int dim
+) {
+    int b = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch || i >= dim) return;
+
+    uint32_t idx = indices[b];
+    output[b * dim + i] = table[idx * dim + i];
+}
+
+// f16 variant used by the LLM hot path (Qwen3 / Llama etc run in fp16).
+extern "C" __global__ void embedding_lookup_f16(
+    const __half* __restrict__ table,     // [vocab_size, dim]
+    const uint32_t* __restrict__ indices, // [batch]
+    __half* __restrict__ output,          // [batch, dim]
     int batch,
     int dim
 ) {

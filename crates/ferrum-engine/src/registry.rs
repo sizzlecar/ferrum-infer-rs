@@ -1048,10 +1048,23 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                         }
                     }
                     Device::CUDA(_) => {
-                        return Err(FerrumError::device(
-                            "CUDA backend for LlamaFamilyModel not yet implemented; \
-                             it lands in Phase E on a real GPU",
-                        ));
+                        #[cfg(feature = "cuda")]
+                        {
+                            info!("  Backend: CUDA");
+                            let weight_loader =
+                                ferrum_quantization::NativeSafetensorsLoader::<
+                                    ferrum_kernels::backend::cuda::CudaBackend,
+                                >::open(&model_path)?;
+                            Box::new(ferrum_models::models::LlamaFamilyModel::<
+                                ferrum_kernels::backend::cuda::CudaBackend,
+                            >::new(qcfg, &weight_loader)?)
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            return Err(FerrumError::device(
+                                "CUDA requested but 'cuda' feature not enabled",
+                            ));
+                        }
                     }
                     other => {
                         return Err(FerrumError::device(format!(

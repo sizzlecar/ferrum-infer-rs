@@ -41,6 +41,13 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/embedding_lookup.cu");
     println!("cargo:rerun-if-changed=kernels/flash_attn_full.cu");
     println!("cargo:rerun-if-changed=kernels/batched_flash_decode_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/qk_norm_rope.cu");
+    println!("cargo:rerun-if-changed=kernels/transpose.cu");
+    println!("cargo:rerun-if-changed=kernels/kv_cache_append.cu");
+    println!("cargo:rerun-if-changed=kernels/split_qkv.cu");
+    println!("cargo:rerun-if-changed=kernels/add_bias.cu");
+    println!("cargo:rerun-if-changed=kernels/layer_norm.cu");
+    println!("cargo:rerun-if-changed=kernels/gelu.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -66,6 +73,13 @@ fn main() {
             "kernels/embedding_lookup.cu",
             "kernels/flash_attn_full.cu",
             "kernels/batched_flash_decode_attention.cu",
+            "kernels/qk_norm_rope.cu",
+            "kernels/transpose.cu",
+            "kernels/kv_cache_append.cu",
+            "kernels/split_qkv.cu",
+            "kernels/add_bias.cu",
+            "kernels/layer_norm.cu",
+            "kernels/gelu.cu",
         ])
         .out_dir(out_dir)
         .arg("-Ikernels") // for common.cuh

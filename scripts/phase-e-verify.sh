@@ -77,11 +77,11 @@ record ""
 # ── 4. Parity test: CudaBackend vs CpuBackend on LlamaFamilyModel ───────
 section "3. Parity (CudaBackend ↔ CpuBackend, same weights)"
 record ""
-record 'Runs `llama_family_parity_test::cpu_vs_cuda` on Qwen3-0.6B. Any'
-record 'logit mismatch dumps a diff of the first disagreeing layer.'
+record 'Runs `qwen3_cuda_parity_test::qwen3model_cpu_vs_cuda` on Qwen3-0.6B.'
+record 'Fails loudly on the first argmax/cosine mismatch (per-step diff printed).'
 record ""
 record '```'
-if run_logged "cargo test -p ferrum-models --features cuda --release --test llama_family_parity_test -- --ignored --nocapture 2>&1 | tail -20"; then
+if run_logged "cargo test -p ferrum-models --features cuda --release --test qwen3_cuda_parity_test -- --ignored --nocapture 2>&1 | tail -20"; then
     record ""
     record "✅ parity passed"
 else

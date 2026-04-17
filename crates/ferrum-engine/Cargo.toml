@@ -85,6 +85,8 @@ cuda = [
     "candle-nn/cuda",
     "dep:candle-flash-attn",
     "ferrum-models/cuda",
+    "ferrum-kernels/cuda",
+    "ferrum-quantization/cuda",
 ]
 marlin = ["cuda"]  # kept for backward compat, cuda already enables marlin
 tensor-parallel = ["cuda"]  # backward compat alias

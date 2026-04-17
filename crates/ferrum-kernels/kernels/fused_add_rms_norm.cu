@@ -57,6 +57,49 @@ extern "C" __global__ void fused_add_rms_norm_f16(
     }
 }
 
+// In-place variant: residual is both input and output.
+// Semantically identical to fused_add_rms_norm_f16 with residual == residual_out.
+// Exists because cudarc's safe `launch_builder.arg(...)` won't let us alias
+// the same CudaSlice as both read-only and mutable in one call (Rust borrow rules).
+//
+// residual (in/out): [num_tokens, hidden_size] fp16
+//   - on entry:  residual value from previous layer
+//   - on exit:   residual + input  (so the caller sees the updated residual)
+extern "C" __global__ void fused_add_rms_norm_inplace_f16(
+    const __half* __restrict__ input,
+    __half* __restrict__ residual,
+    const __half* __restrict__ weight,
+    __half* __restrict__ output,
+    const int hidden_size,
+    const float eps
+) {
+    const int token_idx = blockIdx.x;
+    const int offset = token_idx * hidden_size;
+
+    float variance = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float x = __half2float(input[offset + i]);
+        float r = __half2float(residual[offset + i]);
+        float sum = x + r;
+        residual[offset + i] = __float2half(sum);
+        variance += sum * sum;
+    }
+
+    variance = block_reduce_sum(variance);
+    __shared__ float s_inv_rms;
+    if (threadIdx.x == 0) {
+        s_inv_rms = rsqrtf(variance / (float)hidden_size + eps);
+    }
+    __syncthreads();
+    float inv_rms = s_inv_rms;
+
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float val = __half2float(residual[offset + i]);
+        float w = __half2float(weight[i]);
+        output[offset + i] = __float2half(val * inv_rms * w);
+    }
+}
+
 // FP32 version
 extern "C" __global__ void fused_add_rms_norm_f32(
     const float* __restrict__ input,
