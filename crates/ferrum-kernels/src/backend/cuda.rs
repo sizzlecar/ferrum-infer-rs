@@ -418,7 +418,11 @@ impl Backend for CudaBackend {
             };
             let valid_kv_scalar = kv_len as i32;
             let scale = cfg.scale;
-            let shared_mem = (kv_len as u32) * 4;
+            // Size shared memory for the MAX possible kv_len (cache capacity),
+            // not current kv_len. Otherwise a captured graph bakes in a small
+            // shared_mem_bytes and later replays with larger kv_len trigger
+            // shared-memory OOB → CUDA_ERROR_INVALID_VALUE on next sync.
+            let shared_mem = (capacity as u32) * 4;
             let stream = ctx.stream.clone();
             // Hold read-guard on global state bufs for the builder's lifetime.
             let dec_guard = if use_dyn {

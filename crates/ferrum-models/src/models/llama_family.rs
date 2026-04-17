@@ -698,15 +698,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
 
         // Decide whether to capture this step.
-        // Opt-in via FERRUM_CUDA_GRAPH=1 — graph capture still hits
-        // CUDA_ERROR_INVALID_VALUE on Blackwell+CUDA12.8 despite
-        // globalising cuBLAS workspace, setting pointer-mode DEVICE, and
-        // disabling event tracking. Root cause still under investigation;
-        // eager path is the default until resolved.
+        // Warmup first so cuBLAS picks algorithms, JIT settles, etc.
+        // Override with FERRUM_CUDA_NO_GRAPH=1 to disable capture.
         const GRAPH_WARMUP: usize = 3;
         let should_capture = !self.graph_capture_failed
             && self.graph_warmup >= GRAPH_WARMUP
-            && std::env::var("FERRUM_CUDA_GRAPH").ok().as_deref() == Some("1");
+            && std::env::var("FERRUM_CUDA_NO_GRAPH").is_err();
 
         if should_capture {
             B::set_dev_state_mode(&mut ctx, true);
