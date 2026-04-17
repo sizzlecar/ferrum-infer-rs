@@ -31,7 +31,6 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 use ferrum_types::{FerrumError, Result};
 use half::f16;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -822,34 +821,41 @@ impl Backend for CudaBackend {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Thread-local stream for context-free ops
+// Process-global stream for context-free ops
 // ────────────────────────────────────────────────────────────────────────
 //
 // `alloc` / `from_slice` / `to_vec` inherit a no-context signature from
 // the Backend trait. cudarc 0.19 hangs all memory APIs off `CudaStream`,
-// so we stash an Arc<CudaStream> in thread-local state populated by
-// `new_context` and read by the context-free ops.
+// so we stash an Arc<CudaStream> in a process-global slot populated by
+// `new_context`.
+//
+// Must be process-global (not thread-local): the engine's executor is
+// created on one thread (where `new_context` runs) and ops may fire on
+// other threads (tokio worker pool, Rayon parallel loops, etc.). A
+// thread-local would panic on every worker. cudarc's `stream.alloc()`
+// internally calls `ctx.bind_to_thread()` on whichever thread it's
+// invoked from, so sharing one stream across threads is safe.
 
-thread_local! {
-    static GLOBAL_STREAM: RefCell<Option<Arc<CudaStream>>> = const { RefCell::new(None) };
+static GLOBAL_STREAM: std::sync::OnceLock<std::sync::RwLock<Option<Arc<CudaStream>>>> =
+    std::sync::OnceLock::new();
+
+fn stream_slot() -> &'static std::sync::RwLock<Option<Arc<CudaStream>>> {
+    GLOBAL_STREAM.get_or_init(|| std::sync::RwLock::new(None))
 }
 
 fn with_stream<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
-    GLOBAL_STREAM.with(|slot| {
-        let stream =
-            slot.borrow().as_ref().cloned().expect(
-                "CudaBackend: GLOBAL_STREAM not set — call new_context() on this thread first",
-            );
-        f(&stream)
-    })
+    let guard = stream_slot().read().expect("GLOBAL_STREAM poisoned");
+    let stream = guard
+        .as_ref()
+        .cloned()
+        .expect("CudaBackend: GLOBAL_STREAM not set — call new_context() first");
+    drop(guard);
+    f(&stream)
 }
 
-/// Install a stream as the current thread's default for context-free
-/// ops. Called automatically by `new_context`; override manually if a
-/// worker thread issues allocations without having created its own
-/// context (e.g. TP rank-1+ workers sharing the rank-0 stream).
+/// Install a stream as the global default for context-free ops.
+/// Called automatically by `new_context`; override manually from worker
+/// threads that need to pin a different stream.
 pub fn install_thread_stream(stream: Arc<CudaStream>) {
-    GLOBAL_STREAM.with(|slot| {
-        *slot.borrow_mut() = Some(stream);
-    });
+    *stream_slot().write().expect("GLOBAL_STREAM poisoned") = Some(stream);
 }

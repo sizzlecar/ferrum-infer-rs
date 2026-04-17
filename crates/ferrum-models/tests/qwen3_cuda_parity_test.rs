@@ -123,7 +123,12 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
 }
 
 fn qwen3_path() -> Option<std::path::PathBuf> {
-    let p = dirs::home_dir()?.join(".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots");
+    // Honour HF_HOME (vast.ai etc often remap it to /workspace or similar) +
+    // fallback to the standard ~/.cache/huggingface location.
+    let base = std::env::var_os("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|d| d.join(".cache/huggingface")))?;
+    let p = base.join("hub/models--Qwen--Qwen3-0.6B/snapshots");
     std::fs::read_dir(&p).ok()?.find_map(|e| {
         let e = e.ok()?;
         e.path().join("config.json").exists().then(|| e.path())

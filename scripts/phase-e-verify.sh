@@ -148,7 +148,8 @@ record ""
 # 4. Download model weights
 # ────────────────────────────────────────────────────────────────────────
 section "4. Weights: ${HF_MODEL_ID}"
-HF_CACHE="${HOME}/.cache/huggingface/hub/models--${HF_MODEL_ID//\//--}"
+HF_CACHE_BASE="${HF_HOME:-${HOME}/.cache/huggingface}"
+HF_CACHE="${HF_CACHE_BASE}/hub/models--${HF_MODEL_ID//\//--}"
 if [ -d "$HF_CACHE/snapshots" ] && find "$HF_CACHE/snapshots" -name "*.safetensors" -print -quit | grep -q .; then
     record "✅ already cached: ${HF_CACHE}"
 else
