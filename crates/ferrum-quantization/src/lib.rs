@@ -17,9 +17,13 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod dense;
+pub mod factory;
+pub mod loader;
 pub mod traits;
 
 pub use dense::DenseLinear;
+pub use factory::DefaultLinearFactory;
+pub use loader::WeightLoader;
 pub use traits::{Linear, LinearFactory};
 
 // Quant config types — populated from safetensors metadata or GGUF header.
