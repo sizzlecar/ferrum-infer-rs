@@ -7,6 +7,7 @@
 pub mod architectures;
 pub mod audio_processor;
 pub mod builder;
+pub mod common;
 pub mod definition;
 pub mod executor;
 pub mod hf_download;
@@ -24,6 +25,7 @@ pub use architectures::{
     BertModelWrapper, ClipModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper,
     WhisperModelWrapper,
 };
+pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
