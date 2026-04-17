@@ -245,7 +245,7 @@ pub fn metal_layer_forward_v2(
             head_dim: hd,
             causal: tokens > 1,
             pos_offset,
-        sliding_window: 0,
+            sliding_window: 0,
         };
         // flash_attn creates its own encoder; kv_seq_stride=max_len for GPU cache
         pipes.flash_attn_v2(

@@ -85,13 +85,7 @@ impl<B: Backend> Linear<B> for DenseLinear<B> {
         self.out_features
     }
 
-    fn forward(
-        &self,
-        ctx: &mut B::Context,
-        input: &B::Buffer,
-        out: &mut B::Buffer,
-        m: usize,
-    ) {
+    fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
         B::gemm(
             ctx,
             input,

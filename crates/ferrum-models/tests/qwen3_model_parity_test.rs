@@ -25,7 +25,10 @@ struct CandleShimLoader<'a, B: ferrum_kernels::backend::Backend> {
 
 impl<'a, B: ferrum_kernels::backend::Backend> CandleShimLoader<'a, B> {
     fn new(vb: &'a candle_nn::VarBuilder<'a>) -> Self {
-        Self { vb, _m: std::marker::PhantomData }
+        Self {
+            vb,
+            _m: std::marker::PhantomData,
+        }
     }
 
     fn load_f32_rows(&self, name: &str) -> Result<Vec<f32>> {

@@ -278,8 +278,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
             let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
             let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
             let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-            let post_ln_w = loader
-                .load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let post_ln_w =
+                loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
             let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
             let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
 
@@ -403,9 +403,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
 
         // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
-        layer
-            .qkv_proj
-            .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, tokens);
+        layer.qkv_proj.forward(
+            ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.qkv_out,
+            tokens,
+        );
 
         // 3. Split fused QKV → token-major Q/K/V
         B::split_qkv(

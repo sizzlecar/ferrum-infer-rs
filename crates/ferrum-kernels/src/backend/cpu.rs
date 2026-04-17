@@ -155,8 +155,7 @@ impl Backend for CpuBackend {
         dst_offset: usize,
         len: usize,
     ) {
-        dst[dst_offset..dst_offset + len]
-            .copy_from_slice(&src[src_offset..src_offset + len]);
+        dst[dst_offset..dst_offset + len].copy_from_slice(&src[src_offset..src_offset + len]);
     }
 
     fn embedding_lookup(
@@ -259,7 +258,10 @@ impl Backend for CpuBackend {
                 for i in 0..half {
                     let (x0_raw, x1_raw) = (input[src_off + i], input[src_off + i + half]);
                     let (x0, x1) = if mode == 1 {
-                        (x0_raw * scale * norm_w[i], x1_raw * scale * norm_w[i + half])
+                        (
+                            x0_raw * scale * norm_w[i],
+                            x1_raw * scale * norm_w[i + half],
+                        )
                     } else {
                         (x0_raw, x1_raw)
                     };

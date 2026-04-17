@@ -418,4 +418,3 @@ impl Backend for MetalBackend {
         st().pipes.buffer_from_data(data)
     }
 }
-

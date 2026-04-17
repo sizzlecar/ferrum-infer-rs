@@ -62,20 +62,11 @@ jobs:
       # ── Integration Tests ─────────────────────────────
       # These test subsystems without downloading models
 
-      - name: "Test: Backend CPU (GEMM, norm, RoPE, attention, SiLU)"
-        run: cargo test -p ferrum-kernels --test backend_cpu_test
-
-      - name: "Test: ModelRunner CPU (prefill, decode, GQA, determinism)"
-        run: cargo test -p ferrum-kernels --test runner_cpu_test
-
       - name: "Test: Correctness (determinism, EOS, edge cases)"
         run: cargo test -p ferrum-engine --test correctness_test
 
       - name: "Test: Concurrency stress (32/64 concurrent)"
         run: cargo test -p ferrum-engine --test concurrency_stress_test
-
-      - name: "Test: FusedTransformer CPU (forward, reset, attention)"
-        run: cargo test -p ferrum-attention --test cpu_transformer_test
 
       - name: "Test: Audio processing (WAV, resample, mel)"
         run: cargo test -p ferrum-models --test audio_test

@@ -69,13 +69,7 @@ impl<B: Backend> Linear<B> for GptqLinear<B> {
         self.out_features
     }
 
-    fn forward(
-        &self,
-        ctx: &mut B::Context,
-        input: &B::Buffer,
-        out: &mut B::Buffer,
-        m: usize,
-    ) {
+    fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
         let weights = QuantWeights::<B> {
             qweight: &self.qweight,
             scales: Some(&self.scales),

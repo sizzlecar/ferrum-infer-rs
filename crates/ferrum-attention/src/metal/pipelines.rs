@@ -882,13 +882,7 @@ impl MetalPipelines {
     }
 
     /// Element-wise GELU (erf-based, matches torch default).
-    pub fn gelu_enc(
-        &self,
-        enc: &ComputeCommandEncoderRef,
-        x: &Buffer,
-        out: &Buffer,
-        len: usize,
-    ) {
+    pub fn gelu_enc(&self, enc: &ComputeCommandEncoderRef, x: &Buffer, out: &Buffer, len: usize) {
         #[repr(C)]
         struct P {
             n: i32,

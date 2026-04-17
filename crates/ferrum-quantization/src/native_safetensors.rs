@@ -40,8 +40,7 @@ struct Shard {
 
 impl Shard {
     fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)
-            .map_err(|e| FerrumError::io(format!("open {path:?}: {e}")))?;
+        let file = File::open(path).map_err(|e| FerrumError::io(format!("open {path:?}: {e}")))?;
         let mmap = unsafe {
             Mmap::map(&file).map_err(|e| FerrumError::io(format!("mmap {path:?}: {e}")))?
         };
@@ -279,8 +278,8 @@ fn load_quantize_config(dir: &Path) -> Result<Option<QuantConfig>> {
     if !p.exists() {
         return Ok(None);
     }
-    let data = std::fs::read_to_string(&p)
-        .map_err(|e| FerrumError::io(format!("read {p:?}: {e}")))?;
+    let data =
+        std::fs::read_to_string(&p).map_err(|e| FerrumError::io(format!("read {p:?}: {e}")))?;
     let qc: QuantConfig = serde_json::from_str(&data)
         .map_err(|e| FerrumError::serialization(format!("parse quantize_config.json: {e}")))?;
     Ok(Some(qc))

@@ -25,11 +25,5 @@ pub trait Linear<B: Backend>: Send + Sync {
 
     /// Append GEMM work onto `ctx`. Caller flushes the context when results
     /// must be materialised.
-    fn forward(
-        &self,
-        ctx: &mut B::Context,
-        input: &B::Buffer,
-        out: &mut B::Buffer,
-        m: usize,
-    );
+    fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize);
 }

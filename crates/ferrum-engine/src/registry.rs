@@ -1051,10 +1051,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                         #[cfg(feature = "cuda")]
                         {
                             info!("  Backend: CUDA");
-                            let weight_loader =
-                                ferrum_quantization::NativeSafetensorsLoader::<
-                                    ferrum_kernels::backend::cuda::CudaBackend,
-                                >::open(&model_path)?;
+                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
+                                ferrum_kernels::backend::cuda::CudaBackend,
+                            >::open(&model_path)?;
                             Box::new(ferrum_models::models::LlamaFamilyModel::<
                                 ferrum_kernels::backend::cuda::CudaBackend,
                             >::new(qcfg, &weight_loader)?)

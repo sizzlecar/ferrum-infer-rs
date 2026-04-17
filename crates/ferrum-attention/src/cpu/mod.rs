@@ -312,6 +312,7 @@ mod tests {
             head_dim: 4,
             causal: true,
             pos_offset: 0,
+            sliding_window: 0,
         };
 
         fused_attention(&q, &k, &v, &mut out, &params);
@@ -352,6 +353,7 @@ mod tests {
             head_dim: 2,
             causal: false,
             pos_offset: 0,
+            sliding_window: 0,
         };
 
         fused_attention(&q, &k, &v, &mut out, &params);

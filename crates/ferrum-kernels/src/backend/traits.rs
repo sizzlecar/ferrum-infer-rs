@@ -9,7 +9,11 @@ use ferrum_types::{FerrumError, Result};
 #[derive(Clone, Debug)]
 pub enum QuantKind {
     /// GPTQ: group-wise int4/int8 with scales + zeros (asymmetric) + optional g_idx.
-    Gptq { bits: u32, group_size: usize, desc_act: bool },
+    Gptq {
+        bits: u32,
+        group_size: usize,
+        desc_act: bool,
+    },
     /// AWQ: activation-aware int4 with scales + zeros, different packing from GPTQ.
     Awq { bits: u32, group_size: usize },
     /// GGUF: one of k-quants / legacy quants, fully specified by the inner type.
@@ -46,7 +50,6 @@ pub enum ReduceOp {
     Max,
     Min,
 }
-
 
 /// Configuration for attention dispatch.
 #[derive(Clone, Debug)]
@@ -361,12 +364,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
     );
 
     /// Element-wise GELU activation (erf-based, matches PyTorch default).
-    fn gelu(
-        ctx: &mut Self::Context,
-        x: &Self::Buffer,
-        out: &mut Self::Buffer,
-        len: usize,
-    );
+    fn gelu(ctx: &mut Self::Context, x: &Self::Buffer, out: &mut Self::Buffer, len: usize);
 
     // ── Buffer management (context-free) ────────────────────────────────
 
@@ -412,12 +410,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn rank(_ctx: &Self::Context) -> usize {
         0
     }
-    fn all_reduce(
-        _ctx: &mut Self::Context,
-        _buf: &mut Self::Buffer,
-        _len: usize,
-        _op: ReduceOp,
-    ) {
+    fn all_reduce(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _op: ReduceOp) {
         // single-rank: no-op
     }
     fn all_gather(
@@ -429,12 +422,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         // single-rank: no-op (caller is expected to handle the degenerate
         // case or arrange for `local == global`)
     }
-    fn broadcast(
-        _ctx: &mut Self::Context,
-        _buf: &mut Self::Buffer,
-        _len: usize,
-        _src_rank: usize,
-    ) {
+    fn broadcast(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _src_rank: usize) {
         // single-rank: no-op
     }
 }

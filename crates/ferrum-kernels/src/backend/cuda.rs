@@ -116,9 +116,9 @@ impl Backend for CudaBackend {
         let ctx = CudaContext::new(ordinal).unwrap_or_else(|e| {
             panic!("CudaBackend::new_context: failed to init context {ordinal}: {e}")
         });
-        let stream = ctx.new_stream().unwrap_or_else(|e| {
-            panic!("CudaBackend::new_context: failed to create stream: {e}")
-        });
+        let stream = ctx
+            .new_stream()
+            .unwrap_or_else(|e| panic!("CudaBackend::new_context: failed to create stream: {e}"));
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .unwrap_or_else(|e| panic!("CudaBackend::new_context: CudaBlas::new: {e}")),
@@ -603,11 +603,7 @@ impl Backend for CudaBackend {
         heads: usize,
         dim: usize,
     ) {
-        let func = ctx.func(
-            "transpose",
-            ptx::TRANSPOSE,
-            "transpose_head_to_token_f16",
-        );
+        let func = ctx.func("transpose", ptx::TRANSPOSE, "transpose_head_to_token_f16");
         let tokens_i32 = tokens as i32;
         let heads_i32 = heads as i32;
         let dim_i32 = dim as i32;
@@ -720,12 +716,7 @@ impl Backend for CudaBackend {
         .expect("layer_norm launch");
     }
 
-    fn gelu(
-        ctx: &mut Self::Context,
-        x: &Self::Buffer,
-        out: &mut Self::Buffer,
-        len: usize,
-    ) {
+    fn gelu(ctx: &mut Self::Context, x: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
         let func = ctx.func("gelu", ptx::GELU, "gelu_f16");
         let n_i32 = len as i32;
         let block = 256u32;
@@ -793,12 +784,7 @@ impl Backend for CudaBackend {
             .unwrap_or(0)
     }
 
-    fn all_reduce(
-        ctx: &mut Self::Context,
-        buf: &mut Self::Buffer,
-        len: usize,
-        op: ReduceOp,
-    ) {
+    fn all_reduce(ctx: &mut Self::Context, buf: &mut Self::Buffer, len: usize, op: ReduceOp) {
         // Only Sum is supported for now (the NCCL wrapper is sum-only).
         if !matches!(op, ReduceOp::Sum) {
             tracing::warn!(
@@ -830,12 +816,7 @@ impl Backend for CudaBackend {
         // Phase E-TP: no NCCL wrapper for all_gather yet.
     }
 
-    fn broadcast(
-        _ctx: &mut Self::Context,
-        _buf: &mut Self::Buffer,
-        _len: usize,
-        _src_rank: usize,
-    ) {
+    fn broadcast(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _src_rank: usize) {
         // Phase E-TP: no NCCL wrapper for broadcast yet.
     }
 }
@@ -855,11 +836,8 @@ thread_local! {
 
 fn with_stream<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
     GLOBAL_STREAM.with(|slot| {
-        let stream = slot
-            .borrow()
-            .as_ref()
-            .cloned()
-            .expect(
+        let stream =
+            slot.borrow().as_ref().cloned().expect(
                 "CudaBackend: GLOBAL_STREAM not set — call new_context() on this thread first",
             );
         f(&stream)
