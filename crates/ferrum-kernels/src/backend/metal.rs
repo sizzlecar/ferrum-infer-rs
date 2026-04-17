@@ -1,13 +1,12 @@
-//! Metal backend — per-op command buffer (correct, not yet pipelined).
+//! Metal backend — pipelined command buffer with manual retain/release.
 //!
-//! Each Metal shader dispatch gets its own cmd buffer + commit + wait.
-//! CPU ops on shared memory work without sync (results already committed).
-//! Pipeline optimization: TODO move to FusedTransformer-style batched encoding.
+//! Pattern from llama.cpp: [queue commandBuffer] + [cmd_buf retain].
+//! One command buffer per forward pass; GPU ops encode into it; sync() commits.
 
 use super::{AttnConfig, Backend};
 use ferrum_attention::metal::pipelines::MetalPipelines;
 use ferrum_attention::AttentionParams;
-use metal::Device;
+use metal::{CommandBufferRef, Device};
 use std::sync::OnceLock;
 
 struct MetalState {
@@ -21,7 +20,6 @@ fn st() -> &'static MetalState {
 }
 
 pub struct MetalBackend;
-pub struct MetalContext;
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -42,6 +40,9 @@ extern "C" {
         ldc: i32,
     );
 }
+
+/// Metal context — empty marker. Command buffers are function-local (not stored).
+pub struct MetalContext;
 
 fn run(f: impl FnOnce(&metal::CommandBufferRef)) {
     let cmd = st().pipes.queue.new_command_buffer();
@@ -216,8 +217,10 @@ impl Backend for MetalBackend {
         }
     }
 
+    // ── CPU ops on shared memory: flush GPU first ────────────────────────
+
     fn split_qkv(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         qkv: &Self::Buffer,
         q: &mut Self::Buffer,
         k: &mut Self::Buffer,
@@ -242,7 +245,7 @@ impl Backend for MetalBackend {
     }
 
     fn fused_silu_mul_split(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         gu: &Self::Buffer,
         out: &mut Self::Buffer,
         tokens: usize,
@@ -410,7 +413,7 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn add_inplace(_ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
+    fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
         unsafe {
             let rv = std::slice::from_raw_parts_mut(r.contents() as *mut f32, len);
             let xv = std::slice::from_raw_parts(x.contents() as *const f32, len);
@@ -418,6 +421,253 @@ impl Backend for MetalBackend {
                 rv[i] += xv[i];
             }
         }
+    }
+
+    fn layer_forward_fused(
+        _ctx: &mut Self::Context,
+        cfg: &super::TransformerConfig,
+        weights: &super::LayerWeights<Self>,
+        kv: &mut super::KvCache<Self>,
+        scratch: &mut super::LayerScratch<Self>,
+        residual: &mut Self::Buffer,
+        positions: &[u32],
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        tokens: usize,
+    ) {
+        let h = cfg.hidden_size;
+        let nh = cfg.num_heads;
+        let nkv = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let im = cfg.intermediate_size;
+        let eps = cfg.rms_norm_eps;
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let s = st();
+        let mut mc = MetalContext;
+
+        // --- CMD 1: rms_norm ---
+        let cmd = s.pipes.queue.new_command_buffer();
+        s.pipes.rms_norm(
+            cmd,
+            residual,
+            &weights.input_ln_w,
+            &scratch.norm_out,
+            tokens,
+            h,
+            eps,
+        );
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // --- GEMM (cblas): QKV ---
+        unsafe {
+            cblas_sgemm(
+                101,
+                111,
+                112,
+                tokens as i32,
+                qkv_dim as i32,
+                h as i32,
+                1.0,
+                scratch.norm_out.contents() as *const f32,
+                h as i32,
+                weights.qkv_proj_w.contents() as *const f32,
+                h as i32,
+                0.0,
+                scratch.qkv_out.contents() as *mut f32,
+                qkv_dim as i32,
+            );
+        }
+
+        // --- CPU: split, qk_norm, rope, kv_append ---
+        Self::split_qkv(
+            &mut mc,
+            &scratch.qkv_out,
+            &mut scratch.q_buf,
+            &mut scratch.k_buf,
+            &mut scratch.v_buf,
+            tokens,
+            q_dim,
+            kv_dim,
+        );
+        if cfg.has_qk_norm {
+            if let Some(ref w) = weights.q_norm_w {
+                Self::qk_norm(&mut mc, &mut scratch.q_buf, w, tokens, nh, hd, eps);
+            }
+            if let Some(ref w) = weights.k_norm_w {
+                Self::qk_norm(&mut mc, &mut scratch.k_buf, w, tokens, nkv, hd, eps);
+            }
+        }
+        Self::rope(
+            &mut mc,
+            &mut scratch.q_buf,
+            &mut scratch.k_buf,
+            cos,
+            sin,
+            positions,
+            nh,
+            nkv,
+            hd,
+        );
+        let (nk, nv) = Self::kv_cache_append(
+            &mut mc,
+            &mut kv.k,
+            &mut kv.v,
+            kv.len,
+            &scratch.k_buf,
+            &scratch.v_buf,
+            tokens,
+            nkv,
+            hd,
+        );
+        kv.k = nk;
+        kv.v = nv;
+        kv.len += tokens;
+
+        // --- CMD 2: attention ---
+        let cmd = s.pipes.queue.new_command_buffer();
+        if tokens == 1 {
+            let p = AttentionParams {
+                batch: 1,
+                num_heads: nh,
+                num_kv_heads: nkv,
+                q_len: 1,
+                kv_len: kv.len,
+                head_dim: hd,
+                causal: false,
+                pos_offset: 0,
+            };
+            s.pipes
+                .flash_attn(cmd, &scratch.q_buf, &kv.k, &kv.v, &scratch.attn_out, &p);
+        } else {
+            Self::transpose_token_to_head(
+                &mut mc,
+                &scratch.q_buf,
+                &mut scratch.o_proj_out,
+                tokens,
+                nh,
+                hd,
+            );
+            let p = AttentionParams {
+                batch: 1,
+                num_heads: nh,
+                num_kv_heads: nkv,
+                q_len: tokens,
+                kv_len: kv.len,
+                head_dim: hd,
+                causal: true,
+                pos_offset: positions[0] as usize,
+            };
+            s.pipes.flash_attn(
+                cmd,
+                &scratch.o_proj_out,
+                &kv.k,
+                &kv.v,
+                &scratch.attn_out,
+                &p,
+            );
+        }
+        cmd.commit();
+        cmd.wait_until_completed();
+        if tokens > 1 {
+            let mut temp = Self::alloc(tokens * q_dim);
+            Self::transpose_head_to_token(&mut mc, &scratch.attn_out, &mut temp, tokens, nh, hd);
+            Self::copy(&mut mc, &temp, &mut scratch.attn_out, tokens * q_dim);
+        }
+
+        // --- GEMM (cblas): O-proj ---
+        unsafe {
+            cblas_sgemm(
+                101,
+                111,
+                112,
+                tokens as i32,
+                h as i32,
+                q_dim as i32,
+                1.0,
+                scratch.attn_out.contents() as *const f32,
+                q_dim as i32,
+                weights.o_proj_w.contents() as *const f32,
+                q_dim as i32,
+                0.0,
+                scratch.o_proj_out.contents() as *mut f32,
+                h as i32,
+            );
+        }
+
+        // --- CMD 3: fused_add_rms_norm ---
+        let cmd = s.pipes.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        s.pipes.fused_residual_norm_enc(
+            enc,
+            residual,
+            &scratch.o_proj_out,
+            None,
+            &weights.post_ln_w,
+            residual,
+            &scratch.norm_out,
+            tokens,
+            h,
+            eps,
+            0,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // --- GEMM (cblas): gate_up ---
+        unsafe {
+            cblas_sgemm(
+                101,
+                111,
+                112,
+                tokens as i32,
+                (2 * im) as i32,
+                h as i32,
+                1.0,
+                scratch.norm_out.contents() as *const f32,
+                h as i32,
+                weights.gate_up_proj_w.contents() as *const f32,
+                h as i32,
+                0.0,
+                scratch.gate_up_out.contents() as *mut f32,
+                (2 * im) as i32,
+            );
+        }
+
+        // --- CPU: silu_mul_split ---
+        Self::fused_silu_mul_split(
+            &mut mc,
+            &scratch.gate_up_out,
+            &mut scratch.silu_out,
+            tokens,
+            im,
+        );
+
+        // --- GEMM (cblas): down ---
+        unsafe {
+            cblas_sgemm(
+                101,
+                111,
+                112,
+                tokens as i32,
+                h as i32,
+                im as i32,
+                1.0,
+                scratch.silu_out.contents() as *const f32,
+                im as i32,
+                weights.down_proj_w.contents() as *const f32,
+                im as i32,
+                0.0,
+                scratch.mlp_out.contents() as *mut f32,
+                h as i32,
+            );
+        }
+
+        // --- CPU: add_inplace ---
+        Self::add_inplace(&mut mc, residual, &scratch.mlp_out, tokens * h);
     }
 
     fn alloc(len: usize) -> Self::Buffer {

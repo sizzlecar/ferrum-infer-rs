@@ -101,7 +101,7 @@ pub struct ModelWeights<B: Backend> {
 ///
 /// `layer_forward` passes the context through all ops in a layer.
 /// `ModelRunner` calls `sync()` only when it needs results (e.g., reading logits).
-pub trait Backend: Send + Sync + 'static {
+pub trait Backend: Send + Sync + Sized + 'static {
     type Buffer: Send + Sync;
 
     /// Execution context that accumulates GPU work.
@@ -304,6 +304,29 @@ pub trait Backend: Send + Sync + 'static {
         x: &Self::Buffer,
         len: usize,
     );
+
+    // ── Fused layer forward ────────────────────────────────────────────
+    //
+    // Optional: execute entire transformer layer as a single GPU batch.
+    // Metal/CUDA can override to pipeline all ops in one command buffer.
+    // Default: delegates to generic layer_forward (per-op dispatch).
+
+    fn layer_forward_fused(
+        ctx: &mut Self::Context,
+        cfg: &TransformerConfig,
+        weights: &super::LayerWeights<Self>,
+        kv: &mut super::KvCache<Self>,
+        scratch: &mut super::LayerScratch<Self>,
+        residual: &mut Self::Buffer,
+        positions: &[u32],
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        tokens: usize,
+    ) {
+        super::layer_forward::layer_forward::<Self>(
+            ctx, cfg, weights, kv, scratch, residual, positions, cos, sin, tokens,
+        );
+    }
 
     // ── Buffer management (context-free) ────────────────────────────────
 

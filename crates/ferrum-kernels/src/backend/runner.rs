@@ -131,7 +131,7 @@ impl<B: Backend> ModelRunner<B> {
 
         let kv_caches = self.kv_caches.get_mut(cache_id).unwrap();
         for li in 0..self.cfg.num_layers {
-            layer_forward::<B>(
+            B::layer_forward_fused(
                 &mut ctx,
                 &self.cfg,
                 &self.weights.layers[li],
@@ -198,7 +198,7 @@ impl<B: Backend> ModelRunner<B> {
 
         let kv_caches = self.kv_caches.get_mut(cache_id).unwrap();
         for li in 0..self.cfg.num_layers {
-            layer_forward::<B>(
+            B::layer_forward_fused(
                 &mut ctx,
                 &self.cfg,
                 &self.weights.layers[li],
