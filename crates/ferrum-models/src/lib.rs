@@ -30,7 +30,7 @@ pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    BertModelExecutor, CandleModelExecutor, ClipModelExecutor, GenericModelExecutor,
+    BertModelExecutor, CandleModelExecutor, ClipModelExecutor, GenericModelExecutor, LlmExecutor,
     Qwen2ModelExecutor, Qwen3ModelExecutor, StubModelExecutor, TtsModelExecutor,
     WhisperModelExecutor,
 };

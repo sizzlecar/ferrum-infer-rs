@@ -47,6 +47,34 @@ impl Qwen3Config {
             max_seq_len: self.max_seq_len,
         }
     }
+
+    /// Build from a parsed `ModelDefinition`. Reads the explicit `head_dim`
+    /// from `extra_params["head_dim"]` if present (Qwen3 sets this to 128 on
+    /// the 0.6B / 1.7B / 4B checkpoints even though hidden/num_heads=64),
+    /// falling back to `hidden_size / num_attention_heads`.
+    pub fn from_definition(def: &crate::definition::ModelDefinition) -> Self {
+        let num_kv_heads = def.num_key_value_heads.unwrap_or(def.num_attention_heads);
+        let head_dim = def
+            .extra_params
+            .get("head_dim")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(def.hidden_size / def.num_attention_heads);
+
+        Self {
+            hidden_size: def.hidden_size,
+            intermediate_size: def.intermediate_size,
+            num_heads: def.num_attention_heads,
+            num_kv_heads,
+            head_dim,
+            num_layers: def.num_hidden_layers,
+            vocab_size: def.vocab_size,
+            max_seq_len: def.max_position_embeddings,
+            rms_norm_eps: def.norm_eps as f32,
+            rope_theta: def.rope_theta.unwrap_or(1_000_000.0),
+            has_qk_norm: true,
+        }
+    }
 }
 
 /// Per-layer weights. `Box<dyn Linear<B>>` means each projection can be

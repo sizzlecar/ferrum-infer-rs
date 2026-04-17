@@ -1111,7 +1111,74 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     )));
                 }
 
-                // Default: new ModelRunner path
+                // FERRUM_QWEN3_MODEL=1 → new Model-as-Code path (Qwen3Model<B> + LlmExecutor).
+                // Default remains the legacy ModelRunner path during Phase B/C
+                // until the new path is benched and verified on production workloads.
+                let use_new_model = std::env::var("FERRUM_QWEN3_MODEL")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+
+                if use_new_model {
+                    info!("Qwen3: using new Qwen3Model path (Model-as-Code + Linear trait)");
+                    let qcfg = ferrum_models::models::qwen3::Qwen3Config::from_definition(
+                        &model_def,
+                    );
+                    let vb = loader.load_varbuilder(&candle_device, dtype)?;
+                    let model_info =
+                        model_def.to_model_info(config.engine_config.model.model_id.to_string());
+
+                    // `CandleVarBuilderLoader<B>` is generic over Backend — construct a
+                    // fresh one per branch so it matches the Qwen3Model<B> instance.
+                    let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> =
+                        match &config.device {
+                            Device::CPU => {
+                                info!("  Backend: CPU");
+                                let weight_loader = ferrum_models::loader::CandleVarBuilderLoader::<
+                                    ferrum_kernels::backend::cpu::CpuBackend,
+                                >::new(vb);
+                                Box::new(ferrum_models::models::qwen3::Qwen3Model::<
+                                    ferrum_kernels::backend::cpu::CpuBackend,
+                                >::new(qcfg, &weight_loader)?)
+                            }
+                            #[cfg(any(target_os = "macos", target_os = "ios"))]
+                            Device::Metal => {
+                                #[cfg(feature = "metal")]
+                                {
+                                    info!("  Backend: Metal");
+                                    let weight_loader =
+                                        ferrum_models::loader::CandleVarBuilderLoader::<
+                                            ferrum_kernels::backend::metal::MetalBackend,
+                                        >::new(vb);
+                                    Box::new(ferrum_models::models::qwen3::Qwen3Model::<
+                                        ferrum_kernels::backend::metal::MetalBackend,
+                                    >::new(
+                                        qcfg, &weight_loader
+                                    )?)
+                                }
+                                #[cfg(not(feature = "metal"))]
+                                {
+                                    return Err(FerrumError::device(
+                                        "Metal requested but 'metal' feature not enabled",
+                                    ));
+                                }
+                            }
+                            Device::CUDA(_) => {
+                                return Err(FerrumError::device(
+                                    "CUDA backend for Qwen3Model not yet implemented; \
+                                     unset FERRUM_QWEN3_MODEL to use legacy path",
+                                ));
+                            }
+                            other => {
+                                return Err(FerrumError::device(format!(
+                                    "Qwen3Model does not support device {other:?}"
+                                )));
+                            }
+                        };
+
+                    return Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)));
+                }
+
+                // Default: legacy ModelRunner path
                 let vb = loader.load_varbuilder(&candle_device, dtype)?;
                 let transformer_cfg = ferrum_models::model_config::qwen3_config(&model_def);
                 let weights = ferrum_models::model_config::weight_loader::load_model_weights(
