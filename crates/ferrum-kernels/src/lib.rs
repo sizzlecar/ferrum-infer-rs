@@ -6,6 +6,9 @@
 
 pub mod backend;
 
+pub mod linear;
+pub use linear::Linear;
+
 #[cfg(feature = "cuda")]
 mod ptx {
     include!(concat!(env!("OUT_DIR"), "/ptx.rs"));

@@ -1,31 +1,13 @@
-//! Core `Linear` trait.
+//! Re-export of `Linear` trait (canonical home: ferrum-kernels) plus
+//! `LinearFactory` for weight-loader-side Linear construction.
 //!
-//! A `Linear<B>` is a single matrix-vector / matrix-matrix projection.
-//! Implementations carry whatever weight representation they need (dense
-//! f32/f16 buffer, GPTQ packed int4 + scales + zeros, etc.) and dispatch
-//! to the appropriate `Backend` op in `forward`.
+//! The trait itself lives in `ferrum-kernels::linear` so that Backend-level
+//! helpers (`layer_forward_fused`) can reference it without ferrum-kernels
+//! depending on this crate (which would be circular).
 
 use ferrum_kernels::backend::Backend;
 
-/// A weight-bearing linear projection.
-///
-/// `forward` computes `out[m, out_features] = input[m, in_features] @ W^T`.
-/// The implementation is responsible for calling the right `Backend` op
-/// (e.g. `B::gemm` for dense, `B::gemm_gptq` for GPTQ).
-pub trait Linear<B: Backend>: Send + Sync {
-    fn in_features(&self) -> usize;
-    fn out_features(&self) -> usize;
-
-    /// Append GEMM work onto `ctx`. Caller is responsible for eventually
-    /// flushing the context.
-    fn forward(
-        &self,
-        ctx: &mut B::Context,
-        input: &B::Buffer,
-        out: &mut B::Buffer,
-        m: usize,
-    );
-}
+pub use ferrum_kernels::Linear;
 
 /// Factory for constructing `Linear<B>` from raw loaded tensors.
 ///
