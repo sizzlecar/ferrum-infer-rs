@@ -310,16 +310,32 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let final_norm_w = loader.load_tensor("model.norm.weight")?;
 
         // LM head: either dedicated `lm_head.weight` or tied to embedding.
+        // Many models (Qwen3-4B, Llama-3.2-1B, some Qwen2.5) use TIED
+        // embeddings — lm_head shares weights with model.embed_tokens. When
+        // no dedicated lm_head tensor exists, re-load the embed tensor as a
+        // DenseLinear. This duplicates the buffer (memory cost = vocab*h*2
+        // bytes, e.g. ~770MB for Qwen3-4B) but keeps the Linear trait's
+        // owned-weights invariant. Sharing via Arc is a future optimisation.
         let lm_head = if loader.has_tensor("lm_head.weight") {
             loader.load_linear("lm_head")?
         } else {
-            // Tied embedding: use a DenseLinear over the embedding buffer.
-            // TODO(B3): we need a way to share the embed buffer with a Linear.
-            // For now, require dedicated lm_head; tied-embed support lands with
-            // the first model that actually requires it.
-            return Err(ferrum_types::FerrumError::model(
-                "lm_head.weight not found and tied-embedding Linear not yet supported",
-            ));
+            tracing::info!(
+                "LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head"
+            );
+            let as_linear = loader.load_linear("model.embed_tokens")?;
+            // Sanity check: shape must be [vocab, hidden].
+            if as_linear.out_features() != cfg.vocab_size
+                || as_linear.in_features() != cfg.hidden_size
+            {
+                return Err(ferrum_types::FerrumError::model(format!(
+                    "tied embed shape mismatch: got [{}, {}], expected [{}, {}]",
+                    as_linear.out_features(),
+                    as_linear.in_features(),
+                    cfg.vocab_size,
+                    cfg.hidden_size
+                )));
+            }
+            as_linear
         };
 
         let runtime_cfg = cfg.to_runtime();
