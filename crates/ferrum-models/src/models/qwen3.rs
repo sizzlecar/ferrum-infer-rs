@@ -15,7 +15,7 @@ use ferrum_kernels::backend::{Backend, KvCache};
 use ferrum_quantization::{Linear, WeightLoader};
 use ferrum_types::Result;
 
-use crate::common::LlmRuntimeConfig;
+use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 
 /// Full Qwen3 architecture config (everything the model code needs, not just
 /// the engine-facing subset in `LlmRuntimeConfig`).
@@ -96,10 +96,13 @@ pub struct Qwen3Scratch<B: Backend> {
     pub gate_up_out: B::Buffer,
     pub silu_out: B::Buffer,
     pub mlp_out: B::Buffer,
-    /// Final-norm output over the last `tokens` positions (shape `[tokens, h]`).
-    pub final_norm_out: B::Buffer,
-    /// lm_head output (`[1, vocab]` for decode, `[1, vocab]` for prefill's
-    /// last-token logits).
+    /// Last token's hidden state (`[h]`). For prefill this is populated via
+    /// `copy_slice(residual, (seq_len-1)*h, ..)`; for decode `residual` already
+    /// holds only 1 row so `last_hidden` is unused on that path.
+    pub last_hidden: B::Buffer,
+    /// Final-norm output for the last token (`[h]`).
+    pub last_normed: B::Buffer,
+    /// lm_head logits (`[vocab]`).
     pub logits: B::Buffer,
     /// The max tokens-per-step this scratch has been sized for.
     pub max_tokens: usize,
@@ -129,7 +132,8 @@ impl<B: Backend> Qwen3Scratch<B> {
             gate_up_out: B::alloc(t * 2 * im),
             silu_out: B::alloc(t * im),
             mlp_out: B::alloc(t * h),
-            final_norm_out: B::alloc(t * h),
+            last_hidden: B::alloc(h),
+            last_normed: B::alloc(h),
             logits: B::alloc(cfg.vocab_size),
             max_tokens: t,
         }
@@ -469,6 +473,129 @@ impl<B: Backend> Qwen3Model<B> {
 
         // 13. Final residual add
         B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
+    }
+
+    /// Prefill: process `tokens` prompt tokens in a single batch, return
+    /// `[vocab_size]` logits for the last position.
+    pub fn prefill_internal(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        let seq_len = tokens.len();
+        assert!(seq_len > 0, "prefill called with empty token list");
+        self.ensure_scratch(seq_len);
+        self.ensure_kv(cache_id);
+
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        let mut ctx = B::new_context();
+
+        // Move `residual` out of `scratch` to work around the borrow checker:
+        // `forward_layer` re-borrows `&mut self` to reach `self.layers` /
+        // `self.kv_caches`, which would conflict with an outstanding
+        // `&mut self.scratch.residual`. Swap it back at the end.
+        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(0));
+        B::embedding_lookup(&mut ctx, &self.embed, tokens, &mut residual, h);
+
+        for li in 0..self.cfg.num_layers {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
+        }
+
+        // Take the last token's hidden state: residual[(seq_len-1)*h .. seq_len*h]
+        B::copy_slice(
+            &mut ctx,
+            &residual,
+            (seq_len - 1) * h,
+            &mut self.scratch.last_hidden,
+            0,
+            h,
+        );
+
+        // Final RMSNorm on the last hidden.
+        B::rms_norm(
+            &mut ctx,
+            &self.scratch.last_hidden,
+            &self.final_norm_w,
+            self.cfg.rms_norm_eps,
+            &mut self.scratch.last_normed,
+            1,
+            h,
+        );
+
+        // LM head (m=1 — triggers GEMV on MetalBackend).
+        self.lm_head.forward(
+            &mut ctx,
+            &self.scratch.last_normed,
+            &mut self.scratch.logits,
+            1,
+        );
+
+        B::sync(&mut ctx);
+
+        // Restore residual into scratch for reuse on the next call.
+        self.scratch.residual = residual;
+
+        B::to_vec(&self.scratch.logits, vocab)
+    }
+
+    /// Decode: process 1 token at position `pos`, return `[vocab_size]` logits.
+    pub fn decode_internal(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
+        self.ensure_scratch(1);
+        self.ensure_kv(cache_id);
+
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        let mut ctx = B::new_context();
+
+        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(0));
+        B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
+
+        for li in 0..self.cfg.num_layers {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
+        }
+
+        // Final RMSNorm directly on residual (1 row — decode).
+        B::rms_norm(
+            &mut ctx,
+            &residual,
+            &self.final_norm_w,
+            self.cfg.rms_norm_eps,
+            &mut self.scratch.last_normed,
+            1,
+            h,
+        );
+
+        self.lm_head.forward(
+            &mut ctx,
+            &self.scratch.last_normed,
+            &mut self.scratch.logits,
+            1,
+        );
+
+        B::sync(&mut ctx);
+
+        self.scratch.residual = residual;
+
+        B::to_vec(&self.scratch.logits, vocab)
+    }
+}
+
+impl<B: Backend> DecoderOnlyLLM for Qwen3Model<B> {
+    fn config(&self) -> &LlmRuntimeConfig {
+        &self.runtime_cfg
+    }
+
+    fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        self.prefill_internal(cache_id, tokens)
+    }
+
+    fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
+        self.decode_internal(cache_id, token, pos)
+    }
+
+    fn release(&mut self, cache_id: &str) {
+        self.kv_caches.remove(cache_id);
+    }
+
+    fn reset(&mut self) {
+        self.kv_caches.clear();
     }
 }
 

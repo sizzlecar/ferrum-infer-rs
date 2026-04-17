@@ -279,6 +279,21 @@ pub trait Backend: Send + Sync + Sized + 'static {
 
     fn copy(ctx: &mut Self::Context, src: &Self::Buffer, dst: &mut Self::Buffer, len: usize);
 
+    /// Copy `len` floats from `src[src_offset..]` to `dst[dst_offset..]`.
+    ///
+    /// Needed for Qwen3Model::prefill to pluck the last token's hidden state
+    /// out of `residual[seq_len, h]` without round-tripping through host RAM.
+    /// `Backend::copy` is the offset-free variant; `copy_slice` additionally
+    /// supports non-zero source and destination offsets.
+    fn copy_slice(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        src_offset: usize,
+        dst: &mut Self::Buffer,
+        dst_offset: usize,
+        len: usize,
+    );
+
     // ── Embedding ───────────────────────────────────────────────────────
 
     fn embedding_lookup(

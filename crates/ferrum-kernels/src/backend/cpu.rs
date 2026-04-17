@@ -205,6 +205,18 @@ impl Backend for CpuBackend {
         dst[..len].copy_from_slice(&src[..len]);
     }
 
+    fn copy_slice(
+        _ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        src_offset: usize,
+        dst: &mut Self::Buffer,
+        dst_offset: usize,
+        len: usize,
+    ) {
+        dst[dst_offset..dst_offset + len]
+            .copy_from_slice(&src[src_offset..src_offset + len]);
+    }
+
     fn embedding_lookup(
         _ctx: &mut Self::Context,
         table: &Self::Buffer,

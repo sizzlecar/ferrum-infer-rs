@@ -258,6 +258,28 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn copy_slice(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        src_offset: usize,
+        dst: &mut Self::Buffer,
+        dst_offset: usize,
+        len: usize,
+    ) {
+        // Blit encoder stays in the same command buffer as neighbouring
+        // compute encoders, keeping the single-command-buffer invariant.
+        let cmd = ctx.cmd();
+        let blit = cmd.new_blit_command_encoder();
+        blit.copy_from_buffer(
+            src,
+            (src_offset * 4) as u64,
+            dst,
+            (dst_offset * 4) as u64,
+            (len * 4) as u64,
+        );
+        blit.end_encoding();
+    }
+
     fn embedding_lookup(
         ctx: &mut Self::Context,
         table: &Self::Buffer,
