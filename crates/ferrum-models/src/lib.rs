@@ -21,16 +21,13 @@ pub mod tensor_wrapper;
 pub mod tokenizer;
 pub mod weights;
 
-pub use architectures::{
-    BertModelWrapper, ClipModelWrapper, LlamaModelWrapper, Qwen2ModelWrapper, Qwen3ModelWrapper,
-    WhisperModelWrapper,
-};
+pub use architectures::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    BertModelExecutor, CandleModelExecutor, ClipModelExecutor, LlmExecutor, Qwen2ModelExecutor,
-    Qwen3ModelExecutor, StubModelExecutor, TtsModelExecutor, WhisperModelExecutor,
+    BertModelExecutor, ClipModelExecutor, LlmExecutor, StubModelExecutor, TtsModelExecutor,
+    WhisperModelExecutor,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;

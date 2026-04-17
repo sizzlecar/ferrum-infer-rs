@@ -1,13 +1,20 @@
-//! Qwen3 model as explicit code (Phase B2: structure + weight loading).
+//! Llama-family decoder model as explicit code.
 //!
-//! Phase B3 will add `forward_layer`, B4 adds `prefill`/`decode` + KV cache,
-//! B5 adds `impl DecoderOnlyLLM`.
+//! Covers all "standard Llama-style GQA + SwiGLU + RoPE" decoders:
+//!   - Llama / Llama-2 / Llama-3  (no QK-norm)
+//!   - Qwen2 / Qwen2.5            (no QK-norm, structurally Llama)
+//!   - Qwen3                      (QK-norm per head, larger rope_theta)
+//!   - Mistral                    (sliding-window attention — not yet
+//!                                 supported on the forward path; will
+//!                                 require an `AttnConfig.sliding_window`
+//!                                 field + shader support in Phase D)
 //!
-//! Architecture notes (Qwen3 0.6B / 1.7B / 4B):
-//!   - GQA (num_heads > num_kv_heads), QK-norm (RMS per head) unique to Qwen3
-//!   - Fused QKV projection in safetensors (`qkv_proj`)
-//!   - Fused gate+up MLP (`gate_up_proj`)
-//!   - RoPE with large theta (typically 1e6 for 32k context)
+//! Variant differences are controlled by `LlamaFamilyConfig::has_qk_norm`
+//! and RoPE theta. Weight loading accepts both fused (`qkv_proj`,
+//! `gate_up_proj`) and split (`q_proj`+`k_proj`+`v_proj`,
+//! `gate_proj`+`up_proj`) projection layouts — the loader (e.g.
+//! `CandleVarBuilderLoader`) fuses split weights on load so model code
+//! sees a uniform `qkv_proj` / `gate_up_proj` Linear.
 
 use std::collections::HashMap;
 
@@ -20,7 +27,7 @@ use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 /// Full Qwen3 architecture config (everything the model code needs, not just
 /// the engine-facing subset in `LlmRuntimeConfig`).
 #[derive(Clone, Debug)]
-pub struct Qwen3Config {
+pub struct LlamaFamilyConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub num_heads: usize,
@@ -36,7 +43,7 @@ pub struct Qwen3Config {
     pub has_qk_norm: bool,
 }
 
-impl Qwen3Config {
+impl LlamaFamilyConfig {
     pub fn to_runtime(&self) -> LlmRuntimeConfig {
         LlmRuntimeConfig {
             hidden_size: self.hidden_size,
@@ -48,11 +55,10 @@ impl Qwen3Config {
         }
     }
 
-    /// Build from a parsed `ModelDefinition`. Reads the explicit `head_dim`
-    /// from `extra_params["head_dim"]` if present (Qwen3 sets this to 128 on
-    /// the 0.6B / 1.7B / 4B checkpoints even though hidden/num_heads=64),
-    /// falling back to `hidden_size / num_attention_heads`.
-    pub fn from_definition(def: &crate::definition::ModelDefinition) -> Self {
+    /// Build config from a `ModelDefinition`, shared field extraction.
+    /// Variant-specific constructors below set `has_qk_norm` and fall back
+    /// to different `rope_theta` defaults when the checkpoint doesn't set one.
+    fn from_def_base(def: &crate::definition::ModelDefinition) -> LlamaFamilyConfigBase {
         let num_kv_heads = def.num_key_value_heads.unwrap_or(def.num_attention_heads);
         let head_dim = def
             .extra_params
@@ -61,7 +67,7 @@ impl Qwen3Config {
             .map(|v| v as usize)
             .unwrap_or(def.hidden_size / def.num_attention_heads);
 
-        Self {
+        LlamaFamilyConfigBase {
             hidden_size: def.hidden_size,
             intermediate_size: def.intermediate_size,
             num_heads: def.num_attention_heads,
@@ -71,15 +77,83 @@ impl Qwen3Config {
             vocab_size: def.vocab_size,
             max_seq_len: def.max_position_embeddings,
             rms_norm_eps: def.norm_eps as f32,
-            rope_theta: def.rope_theta.unwrap_or(1_000_000.0),
+            rope_theta_opt: def.rope_theta,
+        }
+    }
+
+    /// Qwen3: QK-norm on, rope_theta default 1e6.
+    pub fn qwen3_from_def(def: &crate::definition::ModelDefinition) -> Self {
+        let b = Self::from_def_base(def);
+        Self {
+            hidden_size: b.hidden_size,
+            intermediate_size: b.intermediate_size,
+            num_heads: b.num_heads,
+            num_kv_heads: b.num_kv_heads,
+            head_dim: b.head_dim,
+            num_layers: b.num_layers,
+            vocab_size: b.vocab_size,
+            max_seq_len: b.max_seq_len,
+            rms_norm_eps: b.rms_norm_eps,
+            rope_theta: b.rope_theta_opt.unwrap_or(1_000_000.0),
             has_qk_norm: true,
+        }
+    }
+
+    /// Llama / Llama-2 / Llama-3: no QK-norm; rope_theta varies by version
+    /// (10k for Llama-2, 500k for Llama-3.1+) — use the checkpoint value or
+    /// fall back to the most common modern value.
+    pub fn llama_from_def(def: &crate::definition::ModelDefinition) -> Self {
+        let b = Self::from_def_base(def);
+        Self {
+            hidden_size: b.hidden_size,
+            intermediate_size: b.intermediate_size,
+            num_heads: b.num_heads,
+            num_kv_heads: b.num_kv_heads,
+            head_dim: b.head_dim,
+            num_layers: b.num_layers,
+            vocab_size: b.vocab_size,
+            max_seq_len: b.max_seq_len,
+            rms_norm_eps: b.rms_norm_eps,
+            rope_theta: b.rope_theta_opt.unwrap_or(500_000.0),
+            has_qk_norm: false,
+        }
+    }
+
+    /// Qwen2 / Qwen2.5: structurally Llama; no QK-norm; rope_theta default 1e6.
+    pub fn qwen2_from_def(def: &crate::definition::ModelDefinition) -> Self {
+        let b = Self::from_def_base(def);
+        Self {
+            hidden_size: b.hidden_size,
+            intermediate_size: b.intermediate_size,
+            num_heads: b.num_heads,
+            num_kv_heads: b.num_kv_heads,
+            head_dim: b.head_dim,
+            num_layers: b.num_layers,
+            vocab_size: b.vocab_size,
+            max_seq_len: b.max_seq_len,
+            rms_norm_eps: b.rms_norm_eps,
+            rope_theta: b.rope_theta_opt.unwrap_or(1_000_000.0),
+            has_qk_norm: false,
         }
     }
 }
 
+struct LlamaFamilyConfigBase {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+    vocab_size: usize,
+    max_seq_len: usize,
+    rms_norm_eps: f32,
+    rope_theta_opt: Option<f64>,
+}
+
 /// Per-layer weights. `Box<dyn Linear<B>>` means each projection can be
 /// Dense / GPTQ / AWQ / GGUF without the surrounding code caring.
-pub struct Qwen3Layer<B: Backend> {
+pub struct LlamaFamilyLayer<B: Backend> {
     pub input_ln_w: B::Buffer,
     pub qkv_proj: Box<dyn Linear<B>>,
     /// QK-norm weight per head: `[head_dim]`. Optional for non-Qwen3 derivatives.
@@ -102,7 +176,7 @@ pub struct RopeCache<B: Backend> {
 ///
 /// Sized lazily on first use so tiny decode steps don't pay for prefill-sized
 /// buffers. Grows monotonically when a larger prefill arrives.
-pub struct Qwen3Scratch<B: Backend> {
+pub struct LlamaFamilyScratch<B: Backend> {
     pub residual: B::Buffer,
     pub norm_out: B::Buffer,
     pub qkv_out: B::Buffer,
@@ -136,8 +210,8 @@ pub struct Qwen3Scratch<B: Backend> {
     pub max_tokens: usize,
 }
 
-impl<B: Backend> Qwen3Scratch<B> {
-    fn alloc(cfg: &Qwen3Config, max_tokens: usize) -> Self {
+impl<B: Backend> LlamaFamilyScratch<B> {
+    fn alloc(cfg: &LlamaFamilyConfig, max_tokens: usize) -> Self {
         let h = cfg.hidden_size;
         let im = cfg.intermediate_size;
         let q_dim = cfg.num_heads * cfg.head_dim;
@@ -171,30 +245,30 @@ impl<B: Backend> Qwen3Scratch<B> {
 /// Qwen3 model — decoder-only LLM, one per (backend, weights) combination.
 ///
 /// Holds all parameters, scratch space, RoPE cache, and per-sequence KV caches.
-pub struct Qwen3Model<B: Backend> {
-    pub cfg: Qwen3Config,
+pub struct LlamaFamilyModel<B: Backend> {
+    pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
     pub embed: B::Buffer,
-    pub layers: Vec<Qwen3Layer<B>>,
+    pub layers: Vec<LlamaFamilyLayer<B>>,
     pub final_norm_w: B::Buffer,
     pub lm_head: Box<dyn Linear<B>>,
 
     pub rope: RopeCache<B>,
-    pub scratch: Qwen3Scratch<B>,
+    pub scratch: LlamaFamilyScratch<B>,
 
     /// Per-sequence KV caches, one `Vec<KvCache<B>>` of length `num_layers`.
     pub kv_caches: HashMap<String, Vec<KvCache<B>>>,
 }
 
-impl<B: Backend> Qwen3Model<B> {
+impl<B: Backend> LlamaFamilyModel<B> {
     /// Build a Qwen3 model from weights provided by the loader.
     ///
     /// The loader decides per-projection whether to instantiate DenseLinear,
     /// GptqLinear, etc. — this code doesn't care.
-    pub fn new(cfg: Qwen3Config, loader: &dyn WeightLoader<B>) -> Result<Self> {
+    pub fn new(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
         let rope = build_rope_cache::<B>(&cfg);
-        let scratch = Qwen3Scratch::alloc(&cfg, 1); // decode-sized; prefill resizes
+        let scratch = LlamaFamilyScratch::alloc(&cfg, 1); // decode-sized; prefill resizes
 
         // Embedding: plain tensor (no projection math, just lookup).
         let embed = loader.load_tensor("model.embed_tokens.weight")?;
@@ -223,7 +297,7 @@ impl<B: Backend> Qwen3Model<B> {
                 (None, None)
             };
 
-            layers.push(Qwen3Layer {
+            layers.push(LlamaFamilyLayer {
                 input_ln_w,
                 qkv_proj,
                 q_norm_w,
@@ -267,7 +341,7 @@ impl<B: Backend> Qwen3Model<B> {
     /// Grow scratch buffers if `tokens` exceeds the current sizing.
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
         if self.scratch.max_tokens < tokens {
-            self.scratch = Qwen3Scratch::alloc(&self.cfg, tokens);
+            self.scratch = LlamaFamilyScratch::alloc(&self.cfg, tokens);
         }
     }
 
@@ -605,7 +679,7 @@ impl<B: Backend> Qwen3Model<B> {
     }
 }
 
-impl<B: Backend> DecoderOnlyLLM for Qwen3Model<B> {
+impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -627,7 +701,7 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3Model<B> {
     }
 }
 
-fn build_rope_cache<B: Backend>(cfg: &Qwen3Config) -> RopeCache<B> {
+fn build_rope_cache<B: Backend>(cfg: &LlamaFamilyConfig) -> RopeCache<B> {
     let hd = cfg.head_dim;
     let half = hd / 2;
     let max = cfg.max_seq_len;
