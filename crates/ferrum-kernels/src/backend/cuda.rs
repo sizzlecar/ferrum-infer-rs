@@ -132,8 +132,8 @@ impl Backend for CudaBackend {
             .expect("CudaBackend::new_context: cuBLAS workspace alloc");
         unsafe {
             use cudarc::cublas::sys;
-            use cudarc::driver::DevicePtrMut;
-            let (ws_ptr, _guard) = (&blas_workspace).device_ptr(&stream);
+            use cudarc::driver::DevicePtr;
+            let (ws_ptr, _guard) = blas_workspace.device_ptr(&stream);
             let status = sys::cublasSetWorkspace_v2(
                 *blas.handle(),
                 ws_ptr as *mut _,
