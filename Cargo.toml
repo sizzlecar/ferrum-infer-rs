@@ -17,6 +17,9 @@ members = [
     # Attention kernel crate (to be merged into ferrum-kernels)
     "crates/ferrum-attention",
 
+    # Weight-format abstraction (Dense / GPTQ / AWQ / GGUF)
+    "crates/ferrum-quantization",
+
     # Existing crates (to be refactored)
     "crates/ferrum-engine",
     "crates/ferrum-models",
@@ -140,6 +143,9 @@ ferrum-kv = { path = "crates/ferrum-kv", version = "0.6.0" }
 
 # Unified compute kernels (CUDA/Metal/CPU)
 ferrum-kernels = { path = "crates/ferrum-kernels", version = "0.6.0" }
+
+# Weight-format abstraction (Dense / GPTQ / AWQ / GGUF)
+ferrum-quantization = { path = "crates/ferrum-quantization", version = "0.6.0" }
 
 # Internal crates - Existing crates (to be refactored)
 ferrum-engine = { path = "crates/ferrum-engine", version = "0.6.0" }
