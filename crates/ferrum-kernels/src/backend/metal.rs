@@ -397,6 +397,49 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn kv_cache_append_head_major(
+        ctx: &mut Self::Context,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        cache_len: usize,
+        cache_capacity: usize,
+        new_k_head_major: &Self::Buffer,
+        new_v_head_major: &Self::Buffer,
+        new_tokens: usize,
+        nkv: usize,
+        hd: usize,
+    ) {
+        // Pre-allocated head-major append: data already laid out as
+        // [nkv, new_tokens, hd] (e.g. produced by qk_norm_rope). Writes into
+        // cache slot [nkv, cache_len .. cache_len+new_tokens, hd].
+        //
+        // No allocation; no transpose; one compute encoder on ctx.cmd().
+        debug_assert!(cache_len + new_tokens <= cache_capacity);
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        st().pipes.kv_cache_append(
+            enc,
+            new_k_head_major,
+            cache_k,
+            nkv,
+            hd,
+            cache_len,
+            new_tokens,
+            cache_capacity,
+        );
+        st().pipes.kv_cache_append(
+            enc,
+            new_v_head_major,
+            cache_v,
+            nkv,
+            hd,
+            cache_len,
+            new_tokens,
+            cache_capacity,
+        );
+        enc.end_encoding();
+    }
+
     fn kv_cache_append(
         _ctx: &mut Self::Context,
         ck: &mut Self::Buffer,

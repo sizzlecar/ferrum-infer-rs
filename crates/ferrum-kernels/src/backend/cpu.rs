@@ -342,6 +342,34 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn kv_cache_append_head_major(
+        _ctx: &mut Self::Context,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        cache_len: usize,
+        cache_capacity: usize,
+        new_k_head_major: &Self::Buffer,
+        new_v_head_major: &Self::Buffer,
+        new_tokens: usize,
+        nkv: usize,
+        hd: usize,
+    ) {
+        debug_assert!(cache_len + new_tokens <= cache_capacity);
+        debug_assert_eq!(cache_k.len(), nkv * cache_capacity * hd);
+        debug_assert_eq!(cache_v.len(), nkv * cache_capacity * hd);
+        debug_assert_eq!(new_k_head_major.len(), nkv * new_tokens * hd);
+        debug_assert_eq!(new_v_head_major.len(), nkv * new_tokens * hd);
+
+        for h in 0..nkv {
+            let dst_base = h * cache_capacity * hd + cache_len * hd;
+            let src_base = h * new_tokens * hd;
+            cache_k[dst_base..dst_base + new_tokens * hd]
+                .copy_from_slice(&new_k_head_major[src_base..src_base + new_tokens * hd]);
+            cache_v[dst_base..dst_base + new_tokens * hd]
+                .copy_from_slice(&new_v_head_major[src_base..src_base + new_tokens * hd]);
+        }
+    }
+
     fn kv_cache_append(
         _ctx: &mut Self::Context,
         cache_k: &mut Self::Buffer,

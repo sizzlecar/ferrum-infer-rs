@@ -342,9 +342,16 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
-    /// Append new K/V to cache. Transposes from token-major to head-major.
-    /// new_k/v: [tokens, nkv, hd] (token-major)
-    /// cache k/v: [nkv, kv_len, hd] (head-major)
+    /// (Legacy) Append new K/V to cache. Accepts token-major input and
+    /// allocates fresh cache buffers sized for `cache_len + new_tokens`.
+    /// Used by the generic `layer_forward` path (CpuBackend default impl).
+    ///
+    /// `new_k/v`: `[tokens, nkv, hd]` (token-major)
+    /// `cache k/v`: `[nkv, cache_len, hd]` (head-major)
+    /// Returns fresh `(cache_k, cache_v)` with appended data; caller updates
+    /// `kv.len` on its side. Realloc-per-call makes this O(cache_len) per
+    /// layer and is going away once Model-as-Code models use the pre-allocated
+    /// `kv_cache_append_head_major` path below.
     fn kv_cache_append(
         ctx: &mut Self::Context,
         cache_k: &mut Self::Buffer,
@@ -356,7 +363,28 @@ pub trait Backend: Send + Sync + Sized + 'static {
         nkv: usize,
         hd: usize,
     ) -> (Self::Buffer, Self::Buffer);
-    // Returns new cache buffers with appended data. Cache len updated by caller.
+
+    /// Append new K/V into a pre-allocated head-major cache buffer.
+    ///
+    /// `cache_k` / `cache_v`: `[nkv, capacity, hd]` (head-major, pre-allocated)
+    /// `new_k_head_major` / `new_v_head_major`: `[nkv, new_tokens, hd]`
+    ///   — produced directly by `qk_norm_rope`, no extra transpose needed.
+    ///
+    /// In-place append at slot `[nkv, cache_len..cache_len+new_tokens, hd]`.
+    /// Caller owns `cache_len` bookkeeping.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_cache_append_head_major(
+        ctx: &mut Self::Context,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        cache_len: usize,
+        cache_capacity: usize,
+        new_k_head_major: &Self::Buffer,
+        new_v_head_major: &Self::Buffer,
+        new_tokens: usize,
+        nkv: usize,
+        hd: usize,
+    );
 
     /// Transpose [tokens, heads, dim] → [heads, tokens, dim]
     fn transpose_token_to_head(
