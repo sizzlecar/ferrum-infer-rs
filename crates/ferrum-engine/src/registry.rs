@@ -1014,16 +1014,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     }
                 };
 
-                let vb = loader.load_varbuilder(&candle_device, dtype)?;
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
 
+                // Native safetensors loader, no candle on the LLM hot path.
                 let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match &config.device {
                     Device::CPU => {
                         info!("  Backend: CPU");
-                        let weight_loader = ferrum_models::loader::CandleVarBuilderLoader::<
+                        let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
                             ferrum_kernels::backend::cpu::CpuBackend,
-                        >::new(vb);
+                        >::open(&model_path)?;
                         Box::new(ferrum_models::models::LlamaFamilyModel::<
                             ferrum_kernels::backend::cpu::CpuBackend,
                         >::new(qcfg, &weight_loader)?)
@@ -1033,9 +1033,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                         #[cfg(feature = "metal")]
                         {
                             info!("  Backend: Metal");
-                            let weight_loader = ferrum_models::loader::CandleVarBuilderLoader::<
+                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
                                 ferrum_kernels::backend::metal::MetalBackend,
-                            >::new(vb);
+                            >::open(&model_path)?;
                             Box::new(ferrum_models::models::LlamaFamilyModel::<
                                 ferrum_kernels::backend::metal::MetalBackend,
                             >::new(qcfg, &weight_loader)?)

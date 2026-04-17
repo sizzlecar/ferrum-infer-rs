@@ -20,12 +20,14 @@ pub mod dense;
 pub mod factory;
 pub mod gptq;
 pub mod loader;
+pub mod native_safetensors;
 pub mod traits;
 
 pub use dense::DenseLinear;
 pub use factory::DefaultLinearFactory;
 pub use gptq::GptqLinear;
 pub use loader::WeightLoader;
+pub use native_safetensors::NativeSafetensorsLoader;
 pub use traits::{Linear, LinearFactory};
 
 // Quant config types — populated from safetensors metadata or GGUF header.

@@ -19,6 +19,7 @@ ferrum-tokenizer = { workspace = true }
 ferrum-sampler = { workspace = true }
 ferrum-kv = { workspace = true }
 ferrum-kernels = { workspace = true }
+ferrum-quantization = { workspace = true }
 ferrum-models = { workspace = true }
 
 # Async

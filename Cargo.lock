@@ -1307,6 +1307,7 @@ dependencies = [
  "ferrum-kernels",
  "ferrum-kv",
  "ferrum-models",
+ "ferrum-quantization",
  "ferrum-runtime",
  "ferrum-sampler",
  "ferrum-scheduler",
@@ -1447,7 +1448,11 @@ version = "0.6.0"
 dependencies = [
  "ferrum-kernels",
  "ferrum-types",
+ "half",
+ "memmap2",
+ "safetensors 0.4.5",
  "serde",
+ "serde_json",
  "tracing",
 ]
 
