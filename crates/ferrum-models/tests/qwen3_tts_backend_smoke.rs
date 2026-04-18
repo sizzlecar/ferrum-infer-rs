@@ -57,6 +57,73 @@ fn load_talker_config(model_dir: &PathBuf) -> TalkerConfig {
     TalkerConfig::from_json(&v).expect("TalkerConfig::from_json")
 }
 
+/// Shared flow for both CPU and CUDA tests: load weights, run prefill +
+/// 4 decode steps, then exercise SubTalker.predict_greedy. Returns
+/// `(first_5_codec_tokens, subtalker_tokens)` for caller to compare
+/// across backends.
+fn run_full_chain<B: ferrum_kernels::backend::Backend>(
+    dir: &PathBuf,
+    cfg: &TalkerConfig,
+    tag: &str,
+) -> (Vec<u32>, Vec<u32>) {
+    let loader: NativeSafetensorsLoader<B> =
+        NativeSafetensorsLoader::open(dir).expect("NativeSafetensorsLoader::open");
+
+    let mut talker =
+        Qwen3TtsTalker::<B>::new(cfg.clone(), &loader).expect("Qwen3TtsTalker::new");
+    let mut sub =
+        Qwen3TtsSubTalker::<B>::new(cfg.clone(), &loader).expect("SubTalker::new");
+
+    let text_tok = |id: u32| (id, true);
+    let codec_tok = |id: u32| (id, false);
+    let prompt = vec![
+        text_tok(9707),
+        text_tok(11),
+        text_tok(1879),
+        codec_tok(cfg.codec_bos_id),
+        codec_tok(0),
+    ];
+
+    let logits = talker.prefill(tag, &prompt);
+    assert_eq!(logits.len(), cfg.vocab_size);
+    let (first, val) = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap();
+    assert!(val.is_finite());
+    eprintln!("{tag} prefill ok: top={first} val={val:.4}");
+
+    let mut codec_tokens = vec![first as u32];
+    let mut last = first as u32;
+    for step in 0..4 {
+        let logits = talker.decode_codec(tag, last);
+        let (top, val) = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        assert!(val.is_finite());
+        eprintln!("  {tag} decode step={step} top={top} val={val:.4}");
+        codec_tokens.push(top as u32);
+        last = top as u32;
+    }
+
+    // SubTalker predict: takes talker's post-norm hidden + first codec
+    // token's embedding. Returns num_code_groups - 1 codec tokens.
+    let talker_hidden = talker.last_hidden_normed(tag);
+    let first_embed = talker.codec_embed_lookup(codec_tokens[0]);
+    let sub_tokens = sub.predict_greedy(&format!("{tag}-sub"), &talker_hidden, &first_embed);
+    eprintln!(
+        "{tag} subtalker predicted {} tokens; first 5: {:?}",
+        sub_tokens.len(),
+        &sub_tokens[..sub_tokens.len().min(5)]
+    );
+    assert_eq!(sub_tokens.len(), cfg.num_code_groups - 1, "sub token count");
+
+    (codec_tokens, sub_tokens)
+}
+
 #[test]
 #[ignore = "requires Qwen3-TTS weights cached under $HF_HOME"]
 fn cpu_smoke() {
@@ -81,54 +148,9 @@ fn cpu_smoke() {
         cfg.vocab_size,
     );
 
-    let loader: NativeSafetensorsLoader<CpuBackend> =
-        NativeSafetensorsLoader::open(&dir).expect("NativeSafetensorsLoader::open");
-
-    let mut talker = Qwen3TtsTalker::<CpuBackend>::new(cfg.clone(), &loader)
-        .expect("Qwen3TtsTalker::new");
-    let _sub =
-        Qwen3TtsSubTalker::<CpuBackend>::new(cfg.clone(), &loader).expect("SubTalker::new");
-
-    // Minimal prefill: 3 text tokens + 2 codec tokens. The actual chat
-    // formatting is elsewhere; this test only proves the LM path works.
-    let text_tok = |id: u32| (id, true);
-    let codec_tok = |id: u32| (id, false);
-    let prompt = vec![
-        text_tok(9707), // "Hello" in Qwen BPE (stable enough for a smoke test)
-        text_tok(11),
-        text_tok(1879),
-        codec_tok(cfg.codec_bos_id),
-        codec_tok(0),
-    ];
-
-    let logits = talker.prefill("smoke", &prompt);
-    assert_eq!(logits.len(), cfg.vocab_size, "logits shape");
-
-    let (top, val) = logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap();
-    assert!(val.is_finite(), "logits contain NaN/Inf");
-    eprintln!(
-        "prefill ok: top={top} val={val:.4} codec_vocab={}",
-        cfg.vocab_size
-    );
-
-    // A handful of decode steps.
-    let mut last = top as u32;
-    for step in 0..4 {
-        let logits = talker.decode_codec("smoke", last);
-        assert_eq!(logits.len(), cfg.vocab_size);
-        let (top, val) = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap();
-        assert!(val.is_finite());
-        eprintln!("  decode step={step} top={top} val={val:.4}");
-        last = top as u32;
-    }
+    let (codec_tokens, sub_tokens) = run_full_chain::<CpuBackend>(&dir, &cfg, "CPU");
+    assert!(!codec_tokens.is_empty());
+    assert!(!sub_tokens.is_empty());
 }
 
 #[cfg(feature = "cuda")]
@@ -149,46 +171,7 @@ fn cuda_smoke() {
     eprintln!("TTS model dir: {dir:?}");
 
     let cfg = load_talker_config(&dir);
-
-    let loader: NativeSafetensorsLoader<CudaBackend> =
-        NativeSafetensorsLoader::open(&dir).expect("NativeSafetensorsLoader::open");
-
-    let mut talker = Qwen3TtsTalker::<CudaBackend>::new(cfg.clone(), &loader)
-        .expect("Qwen3TtsTalker::new on CUDA");
-    let _sub = Qwen3TtsSubTalker::<CudaBackend>::new(cfg.clone(), &loader)
-        .expect("SubTalker::new on CUDA");
-
-    let text_tok = |id: u32| (id, true);
-    let codec_tok = |id: u32| (id, false);
-    let prompt = vec![
-        text_tok(9707),
-        text_tok(11),
-        text_tok(1879),
-        codec_tok(cfg.codec_bos_id),
-        codec_tok(0),
-    ];
-
-    let logits = talker.prefill("cuda_smoke", &prompt);
-    assert_eq!(logits.len(), cfg.vocab_size);
-
-    let (top, val) = logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap();
-    assert!(val.is_finite(), "CUDA logits contain NaN/Inf");
-    eprintln!("CUDA prefill ok: top={top} val={val:.4}");
-
-    let mut last = top as u32;
-    for step in 0..4 {
-        let logits = talker.decode_codec("cuda_smoke", last);
-        let (top, val) = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap();
-        assert!(val.is_finite());
-        eprintln!("  CUDA decode step={step} top={top} val={val:.4}");
-        last = top as u32;
-    }
+    let (codec_tokens, sub_tokens) = run_full_chain::<CudaBackend>(&dir, &cfg, "CUDA");
+    assert!(!codec_tokens.is_empty());
+    assert!(!sub_tokens.is_empty());
 }
