@@ -276,39 +276,10 @@ impl Backend for CudaBackend {
     }
 
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
-        use cudarc::driver::DevicePtr;
         with_stream(|stream| {
-            // Ensure context is bound to this thread BEFORE any CUDA calls —
-            // graph replay on Blackwell leaves the calling thread without
-            // a primary context bound in some cases, which then breaks
-            // cuStreamSynchronize with CUDA_ERROR_INVALID_VALUE.
-            stream
-                .context()
-                .bind_to_thread()
-                .expect("bind ctx before dtoh");
-            // Full device sync (not just stream) — ensures graph execution
-            // is fully complete regardless of which stream it ran on.
-            unsafe {
-                use cudarc::driver::sys;
-                let st = sys::cuCtxSynchronize();
-                assert_eq!(
-                    st,
-                    sys::CUresult::CUDA_SUCCESS,
-                    "cuCtxSynchronize failed: {st:?}"
-                );
-            }
             let mut host = vec![f16::ZERO; len];
-            let (src_ptr, _g) = buf.device_ptr(stream);
-            unsafe {
-                use cudarc::driver::sys;
-                let bytes = len * std::mem::size_of::<f16>();
-                let st = sys::cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, src_ptr, bytes);
-                assert_eq!(
-                    st,
-                    sys::CUresult::CUDA_SUCCESS,
-                    "cuMemcpyDtoH_v2 failed: {st:?}"
-                );
-            }
+            stream.memcpy_dtoh(buf, &mut host).expect("cuda dtoh");
+            stream.synchronize().expect("cuda dtoh sync");
             host.into_iter().map(|x| x.to_f32()).collect()
         })
     }
