@@ -554,6 +554,11 @@ pub struct Qwen3TTSTalker {
     device: CandleDevice,
     tokens_generated: usize,
     fused: ferrum_attention::FusedTransformer,
+    /// Optional Backend<B> transformer stack. When set, `forward_step`
+    /// routes through this instead of `fused`. Used on Linux + CUDA where
+    /// `fused` would silently fall back to a broken naive-fp64 CPU matmul.
+    /// See `architectures::qwen3_tts_backbone`.
+    backend_override: Option<Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>>,
 }
 
 impl Qwen3TTSTalker {
@@ -705,7 +710,22 @@ impl Qwen3TTSTalker {
             device,
             tokens_generated: 0,
             fused,
+            backend_override: None,
         })
+    }
+
+    /// Install a Backend<B>-backed transformer to bypass `fused`. Used by
+    /// the executor on CUDA where `fused`'s fallback is broken.
+    pub fn set_backend_override(
+        &mut self,
+        backend: Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>,
+    ) {
+        self.backend_override = Some(backend);
+        self.tokens_generated = 0;
+    }
+
+    pub fn has_backend_override(&self) -> bool {
+        self.backend_override.is_some()
     }
 
     /// Embed text token IDs through text_embedding + text_projection.
@@ -729,6 +749,28 @@ impl Qwen3TTSTalker {
     /// set FERRUM_USE_CANDLE=1 to use candle's native ops (for precision testing).
     pub fn forward_step(&mut self, input_embeds: &Tensor) -> Result<Tensor> {
         let use_candle = std::env::var("FERRUM_USE_CANDLE").as_deref() == Ok("1");
+
+        // If a Backend<B> override is installed, use it. Returns post-norm
+        // hidden so semantics match `fused.forward`.
+        if let Some(ref mut backend) = self.backend_override {
+            let seq_len = input_embeds
+                .dim(1)
+                .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+            let h = self.config.hidden_size;
+            let input_data: Vec<f32> = input_embeds
+                .to_device(&candle_core::Device::Cpu)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1())
+                .map_err(|e| FerrumError::model(format!("input extract: {e}")))?;
+
+            let output = backend.forward(&input_data, seq_len);
+            self.tokens_generated += seq_len;
+
+            return Tensor::from_vec(output, (1, seq_len, h), &candle_core::Device::Cpu)
+                .and_then(|t| t.to_device(&self.device))
+                .map_err(|e| FerrumError::model(format!("output tensor: {e}")));
+        }
 
         if use_candle {
             // Candle path: use candle's layer.forward() with fused attention
@@ -791,6 +833,9 @@ impl Qwen3TTSTalker {
     pub fn reset(&mut self) {
         self.tokens_generated = 0;
         self.fused.reset();
+        if let Some(ref mut backend) = self.backend_override {
+            backend.reset();
+        }
         for layer in &mut self.layers {
             layer.reset_cache();
         }
@@ -834,6 +879,9 @@ pub struct SubTalker {
     /// Fused transformer (bypasses candle for precision)
     fused: ferrum_attention::FusedTransformer,
     fused_hidden_size: usize,
+    /// Optional Backend<B> transformer stack that supersedes `fused` on
+    /// CUDA. Same motivation as `Qwen3TTSTalker::backend_override`.
+    backend_override: Option<Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>>,
 }
 
 impl SubTalker {
@@ -1039,7 +1087,23 @@ impl SubTalker {
             tokens_generated: 0,
             fused,
             fused_hidden_size: st_h,
+            backend_override: None,
         })
+    }
+
+    /// Install a Backend<B>-backed transformer for this SubTalker. Used
+    /// on CUDA where the legacy fused path would route to broken Linux
+    /// fp64 naive matmul. Mirrors `Qwen3TTSTalker::set_backend_override`.
+    pub fn set_backend_override(
+        &mut self,
+        backend: Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>,
+    ) {
+        self.backend_override = Some(backend);
+        self.tokens_generated = 0;
+    }
+
+    pub fn has_backend_override(&self) -> bool {
+        self.backend_override.is_some()
     }
 
     /// Predict codec tokens 1..num_code_groups-1 given talker hidden state and first codec token.
@@ -1072,8 +1136,12 @@ impl SubTalker {
             .and_then(|t| t.to_vec1())
             .map_err(|e| FerrumError::model(format!("input extract: {e}")))?;
 
-        // Prefill (2 tokens through fused transformer)
-        let output = self.fused.forward(&input_data, 2);
+        // Prefill (2 tokens through fused transformer or Backend<B> override)
+        let output = if let Some(ref mut backend) = self.backend_override {
+            backend.forward(&input_data, 2)
+        } else {
+            self.fused.forward(&input_data, 2)
+        };
         // Last position = output[h..2h]
         let mut last_hidden = output[h..2 * h].to_vec();
 
@@ -1199,19 +1267,24 @@ impl SubTalker {
                     embed.to_vec()
                 };
 
-                // Forward through fused transformer (1 token)
-                // Use GPU path with GPU-side norm if available
-                #[cfg(feature = "metal")]
-                {
-                    if let Some(output) = self.fused.forward_gpu_to_vec(&embed, 1) {
-                        last_hidden = output;
-                    } else {
+                // Forward through Backend<B> override if installed, else
+                // fused transformer (1 token). Metal GPU path shortcut still
+                // applies on the fused fallback.
+                if let Some(ref mut backend) = self.backend_override {
+                    last_hidden = backend.forward(&embed, 1);
+                } else {
+                    #[cfg(feature = "metal")]
+                    {
+                        if let Some(output) = self.fused.forward_gpu_to_vec(&embed, 1) {
+                            last_hidden = output;
+                        } else {
+                            last_hidden = self.fused.forward(&embed, 1);
+                        }
+                    }
+                    #[cfg(not(feature = "metal"))]
+                    {
                         last_hidden = self.fused.forward(&embed, 1);
                     }
-                }
-                #[cfg(not(feature = "metal"))]
-                {
-                    last_hidden = self.fused.forward(&embed, 1);
                 }
             }
         }
@@ -1240,7 +1313,11 @@ impl SubTalker {
                 .map_err(|e| FerrumError::model(format!("st extract: {e}")))?
         };
 
-        let output = self.fused.forward(&input_data, seq_len);
+        let output = if let Some(ref mut backend) = self.backend_override {
+            backend.forward(&input_data, seq_len)
+        } else {
+            self.fused.forward(&input_data, seq_len)
+        };
 
         Tensor::from_vec(output, (1, seq_len, h), &candle_core::Device::Cpu)
             .map_err(|e| FerrumError::model(format!("st output: {e}")))
@@ -1249,6 +1326,9 @@ impl SubTalker {
     pub fn reset(&mut self) {
         self.tokens_generated = 0;
         self.fused.reset();
+        if let Some(ref mut backend) = self.backend_override {
+            backend.reset();
+        }
         for layer in &mut self.layers {
             layer.reset_cache();
         }

@@ -8,6 +8,7 @@
 pub mod bert;
 pub mod clip;
 pub mod qwen3_tts;
+pub mod qwen3_tts_backbone;
 pub mod qwen3_tts_backend;
 pub mod qwen3_tts_vocoder;
 pub mod speaker_encoder;

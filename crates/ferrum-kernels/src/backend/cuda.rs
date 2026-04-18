@@ -1237,10 +1237,6 @@ fn default_stream() -> Arc<CudaStream> {
         unsafe {
             ctx.disable_event_tracking();
         }
-        eprintln!(
-            "[CUDA] default_stream: ctx created, event_tracking disabled (now={})",
-            ctx.is_event_tracking()
-        );
         let stream = ctx
             .new_stream()
             .unwrap_or_else(|e| panic!("CudaBackend: failed to create default stream: {e}"));

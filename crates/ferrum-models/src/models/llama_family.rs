@@ -1021,15 +1021,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
     /// Variant of `prefill_from_embeds` that applies `final_norm` to every
     /// position and returns the whole `[seq_len * hidden_size]` vector.
+    /// Accepts `pos_offset` so callers can continue an existing sequence
+    /// (e.g. Qwen3-TTS voice-clone: one prefill for the role prefix, a
+    /// follow-up prefill for the reference-audio ICL block, then
+    /// autoregressive decoding — all against the same KV cache).
     ///
-    /// Used by TTS (Qwen3-TTS Talker) where `forward_step` in the candle-
-    /// based wrapper is expected to return **post-norm all-positions** hidden
-    /// state so `codec_head` can be applied on candle side.
+    /// Used by TTS where `forward_step` in the candle-based wrapper is
+    /// expected to return **post-norm all-positions** hidden state so
+    /// `codec_head` can be applied on candle side.
     pub fn prefill_all_post_norm(
         &mut self,
         cache_id: &str,
         embeds: &[f32],
         seq_len: usize,
+        pos_offset: usize,
     ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(
@@ -1055,7 +1060,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
 
         for li in 0..self.cfg.num_layers {
-            self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
         // Apply final_norm over all seq_len positions → scratch.norm_out.
