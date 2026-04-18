@@ -175,7 +175,11 @@ pub struct RopeCache<B: Backend> {
 /// Sized lazily on first use so tiny decode steps don't pay for prefill-sized
 /// buffers. Grows monotonically when a larger prefill arrives.
 pub struct LlamaFamilyScratch<B: Backend> {
-    pub residual: B::Buffer,
+    /// Residual stream — wrapped in Option so decode_internal can
+    /// `.take()` it (no alloc-placeholder needed for mem::replace, avoiding
+    /// a transient CudaSlice drop that corrupts the stream pool state after
+    /// graph capture on Blackwell).
+    pub residual: Option<B::Buffer>,
     pub norm_out: B::Buffer,
     pub qkv_out: B::Buffer,
     /// Token-major Q/K/V right after `split_qkv`. Stride: heads * hd per row.
@@ -217,7 +221,7 @@ impl<B: Backend> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let t = max_tokens;
         Self {
-            residual: B::alloc(t * h),
+            residual: Some(B::alloc(t * h)),
             norm_out: B::alloc(t * h),
             qkv_out: B::alloc(t * qkv_dim),
             q_buf: B::alloc(t * q_dim),
@@ -642,12 +646,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // Move `residual` out of `scratch` to work around the borrow checker:
         // `forward_layer` re-borrows `&mut self` to reach `self.layers` /
         // `self.kv_caches`, which would conflict with an outstanding
-        // `&mut self.scratch.residual`. Swap it back at the end.
-        // mem::replace needs a placeholder. B::alloc(0) was our choice but
-        // cuMemAllocFromPoolAsync(stream, 0) can return CUDA_ERROR_INVALID_VALUE
-        // on Blackwell after graph replay corrupts the pool state. Size-1 is
-        // always valid and costs 2 bytes of transient VRAM per decode step.
-        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(1));
+        // `&mut self.scratch.residual`. Use Option::take to move it out
+        // (no placeholder alloc → no transient cuMemFreeAsync that could
+        // corrupt stream pool state after graph ops on Blackwell).
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing");
         B::embedding_lookup(&mut ctx, &self.embed, tokens, &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
@@ -686,7 +692,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // to_vec() syncs internally before dtoh — no explicit B::sync needed.
 
         // Restore residual into scratch for reuse on the next call.
-        self.scratch.residual = residual;
+        self.scratch.residual = Some(residual);
 
         B::to_vec(&self.scratch.logits, vocab)
     }
@@ -747,7 +753,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // cuMemAllocFromPoolAsync(stream, 0) can return CUDA_ERROR_INVALID_VALUE
         // on Blackwell after graph replay corrupts the pool state. Size-1 is
         // always valid and costs 2 bytes of transient VRAM per decode step.
-        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(1));
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing");
         B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
@@ -781,7 +791,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
 
         // to_vec() syncs internally before dtoh — no explicit B::sync needed.
-        self.scratch.residual = residual;
+        self.scratch.residual = Some(residual);
 
         B::to_vec(&self.scratch.logits, vocab)
     }
