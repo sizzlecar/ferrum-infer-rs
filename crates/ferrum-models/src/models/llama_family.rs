@@ -284,10 +284,14 @@ pub struct LlamaFamilyModel<B: Backend> {
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
-    pub embed: B::Buffer,
+    /// Token embedding table. `None` for backbone-only models (e.g. the
+    /// Qwen3-TTS Talker, which embeds inputs externally and feeds via
+    /// `prefill_from_embeds`).
+    pub embed: Option<B::Buffer>,
     pub layers: Vec<LlamaFamilyLayer<B>>,
     pub final_norm_w: B::Buffer,
-    pub lm_head: Box<dyn Linear<B>>,
+    /// LM output head. `None` for backbone-only models.
+    pub lm_head: Option<Box<dyn Linear<B>>>,
 
     pub rope: RopeCache<B>,
     pub scratch: LlamaFamilyScratch<B>,
@@ -392,10 +396,82 @@ impl<B: Backend> LlamaFamilyModel<B> {
         Ok(Self {
             cfg,
             runtime_cfg,
-            embed,
+            embed: Some(embed),
             layers,
             final_norm_w,
-            lm_head,
+            lm_head: Some(lm_head),
+            rope,
+            scratch,
+            kv_caches: HashMap::new(),
+            kv_free_pool: Vec::new(),
+            graph_warmup: 0,
+            graph_capture_failed: false,
+        })
+    }
+
+    /// Build a backbone-only Qwen3 transformer stack (no embed, no lm_head).
+    ///
+    /// Intended for composing the transformer inside a larger model where
+    /// embedding and output-head logic differs from the standard LLM path —
+    /// e.g. Qwen3-TTS Talker uses dual text/codec embeddings with a projection
+    /// MLP, and a codec_head output. The caller drives forward via
+    /// `prefill_from_embeds` / `decode_from_embed`.
+    ///
+    /// Loader must provide: per-layer weights under `model.layers.{i}.*` and
+    /// the final `model.norm.weight`. `model.embed_tokens` and `lm_head`
+    /// are NOT read.
+    pub fn new_backbone_only(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+    ) -> Result<Self> {
+        let rope = build_rope_cache::<B>(&cfg);
+        let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
+
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for li in 0..cfg.num_layers {
+            let prefix = format!("model.layers.{li}");
+            let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
+            let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
+            let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
+            let post_ln_w =
+                loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
+            let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
+
+            let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
+                let q = loader
+                    .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
+                    .ok();
+                let k = loader
+                    .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
+                    .ok();
+                (q, k)
+            } else {
+                (None, None)
+            };
+
+            layers.push(LlamaFamilyLayer {
+                input_ln_w,
+                qkv_proj,
+                q_norm_w,
+                k_norm_w,
+                o_proj,
+                post_ln_w,
+                gate_up_proj,
+                down_proj,
+            });
+        }
+
+        let final_norm_w = loader.load_tensor("model.norm.weight")?;
+
+        let runtime_cfg = cfg.to_runtime();
+        Ok(Self {
+            cfg,
+            runtime_cfg,
+            embed: None,
+            layers,
+            final_norm_w,
+            lm_head: None,
             rope,
             scratch,
             kv_caches: HashMap::new(),
@@ -687,7 +763,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .residual
             .take()
             .expect("scratch residual missing (previous call didn't restore)");
-        B::embedding_lookup(&mut ctx, &self.embed, tokens, &mut residual, h);
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("prefill_internal called on backbone-only model (no embed)");
+        B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
@@ -715,7 +795,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
 
         // LM head (m=1 — triggers GEMV on MetalBackend).
-        self.lm_head.forward(
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .expect("prefill_internal called on backbone-only model (no lm_head)");
+        lm_head.forward(
             &mut ctx,
             &self.scratch.last_normed,
             &mut self.scratch.logits,
@@ -793,7 +877,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .residual
             .take()
             .expect("scratch residual missing (previous call didn't restore)");
-        B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("decode_internal called on backbone-only model (no embed)");
+        B::embedding_lookup(&mut ctx, embed, &[token], &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
@@ -809,7 +897,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             h,
         );
 
-        self.lm_head.forward(
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .expect("decode_internal called on backbone-only model (no lm_head)");
+        lm_head.forward(
             &mut ctx,
             &self.scratch.last_normed,
             &mut self.scratch.logits,
@@ -964,7 +1056,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .residual
             .take()
             .expect("scratch residual missing (previous call didn't restore)");
-        B::embedding_lookup(&mut ctx, &self.embed, &tokens, &mut residual, h);
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("decode_batch_internal called on backbone-only model (no embed)");
+        B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
 
         // 1..num_layers: batched forward for each layer
         for li in 0..self.cfg.num_layers {
@@ -983,7 +1079,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
 
         // LM head with m=M → batch_logits [M, vocab]
-        self.lm_head.forward(
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .expect("decode_batch_internal called on backbone-only model (no lm_head)");
+        lm_head.forward(
             &mut ctx,
             &self.scratch.norm_out,
             &mut self.scratch.batch_logits,
