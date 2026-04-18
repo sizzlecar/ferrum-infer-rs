@@ -662,7 +662,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             1,
         );
 
-        B::sync(&mut ctx);
+        // to_vec() syncs internally before dtoh — no explicit B::sync needed.
 
         // Restore residual into scratch for reuse on the next call.
         self.scratch.residual = residual;
@@ -748,7 +748,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             self.graph_warmup += 1;
         }
 
-        B::sync(&mut ctx);
+        // to_vec() syncs internally before dtoh — no explicit B::sync needed.
         self.scratch.residual = residual;
 
         B::to_vec(&self.scratch.logits, vocab)
