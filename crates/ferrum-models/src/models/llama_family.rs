@@ -718,6 +718,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // Fast path: graph replay (if available).
             match B::replay_last_graph(&mut ctx) {
                 Ok(true) => {
+                    // Force a sync point after graph.launch before dtoh. Without
+                    // this, the graph kernels are still in-flight and dtoh's
+                    // own synchronize hits an undefined stream state on
+                    // Blackwell, returning CUDA_ERROR_INVALID_VALUE.
+                    B::sync(&mut ctx);
                     return B::to_vec(&self.scratch.logits, vocab);
                 }
                 Ok(false) => { /* no graph yet, fall through to eager */ }
