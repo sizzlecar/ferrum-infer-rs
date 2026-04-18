@@ -19,6 +19,7 @@ use ferrum_types::Result;
 
 pub struct GptqLinear<B: Backend> {
     store: B::GptqStore,
+    bias: Option<B::Buffer>,
     in_features: usize,
     out_features: usize,
 }
@@ -54,6 +55,7 @@ impl<B: Backend> GptqLinear<B> {
         )?;
         Ok(Self {
             store,
+            bias: None,
             in_features,
             out_features,
         })
@@ -63,9 +65,22 @@ impl<B: Backend> GptqLinear<B> {
     pub fn from_store(store: B::GptqStore, in_features: usize, out_features: usize) -> Self {
         Self {
             store,
+            bias: None,
             in_features,
             out_features,
         }
+    }
+
+    /// Attach a bias vector (`[out_features]` f32 on host, uploaded to backend).
+    /// Qwen2.5 / Llama-with-bias variants require this.
+    pub fn with_bias(mut self, bias: &[f32]) -> Self {
+        debug_assert_eq!(
+            bias.len(),
+            self.out_features,
+            "GptqLinear bias length mismatch"
+        );
+        self.bias = Some(B::from_slice(bias));
+        self
     }
 
     pub fn store(&self) -> &B::GptqStore {
@@ -85,5 +100,8 @@ impl<B: Backend> Linear<B> for GptqLinear<B> {
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
         B::gemm_gptq(ctx, input, &self.store, out, m)
             .unwrap_or_else(|e| panic!("GPTQ forward failed: {e}"));
+        if let Some(bias) = &self.bias {
+            B::add_bias(ctx, out, bias, m, self.out_features);
+        }
     }
 }
