@@ -181,6 +181,7 @@ impl Backend for CudaBackend {
 
     fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
         use cudarc::driver::sys::CUstreamCaptureMode;
+        println!("[GRAPH] begin_capture");
         // Event tracking already disabled globally in new_context; begin
         // capture directly in relaxed mode.
         ctx.stream
@@ -207,12 +208,14 @@ impl Backend for CudaBackend {
             .stream
             .end_capture(flags)
             .map_err(|e| FerrumError::unsupported(format!("end_capture: {e}")))?;
+        println!("[GRAPH] end_capture -> is_some={}", graph_opt.is_some());
         match graph_opt {
             Some(g) => {
                 // Pre-upload the graph's resources so the first replay
                 // doesn't pay setup overhead + any latent init errors.
                 g.upload()
                     .map_err(|e| FerrumError::unsupported(format!("graph.upload: {e}")))?;
+                println!("[GRAPH] upload ok");
                 install_decode_graph(g);
                 Ok(())
             }
@@ -234,7 +237,7 @@ impl Backend for CudaBackend {
                 unsafe {
                     let mut cur: sys::CUcontext = std::ptr::null_mut();
                     let st = sys::cuCtxGetCurrent(&mut cur);
-                    eprintln!("[GRAPH] pre-launch cuCtxGetCurrent: st={st:?} cur={cur:?}");
+                    println!("[GRAPH] pre-launch cuCtxGetCurrent: st={st:?} cur={cur:?}");
                 }
                 g.launch()
                     .map_err(|e| FerrumError::unsupported(format!("graph.launch: {e}")))?;
@@ -242,7 +245,7 @@ impl Backend for CudaBackend {
                 unsafe {
                     let mut cur: sys::CUcontext = std::ptr::null_mut();
                     let st = sys::cuCtxGetCurrent(&mut cur);
-                    eprintln!("[GRAPH] post-launch cuCtxGetCurrent: st={st:?} cur={cur:?}");
+                    println!("[GRAPH] post-launch cuCtxGetCurrent: st={st:?} cur={cur:?}");
                 }
                 Ok(true)
             } else {
