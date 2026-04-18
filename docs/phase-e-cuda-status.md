@@ -73,8 +73,19 @@ but not unblocked this session).
 Saturates past concurrency=4 — true batched decode (one GEMM with
 m=batch, per-item attention) would push further. Currently the
 `LlmExecutor::batch_decode` override acquires the model mutex once
-per batch but loops sequentially inside the lock; single-item forward
-pass per decode step is the throughput ceiling.
+per batch and dispatches to `DecoderOnlyLLM::decode_batch` whose
+default impl loops `decode` sequentially.
+
+Plumbing in place for future `decode_batch` overrides; the kernel
+work to actually batch (GEMM m=M, per-item KV append+attention loop)
+requires either:
+- Buffer-offset-aware kernel variants (new `_at` trait methods for
+  qk_norm_rope / kv_cache_append / decode_attention with offsets)
+- OR per-token `pos[]` array parameter in qk_norm_rope
+- Plus per-item scratch or slicing support in the Backend's Buffer type
+
+Not tractable from an SSH-only debug session — needs kernel iteration
+on-box with nvcc. Tracked as follow-up.
 
 ## ⚠️ Graph capture — experimental
 
