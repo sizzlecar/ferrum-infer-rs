@@ -178,6 +178,24 @@ pub struct LlamaFamilyScratch<B: Backend> {
     pub residual: B::Buffer,
     pub norm_out: B::Buffer,
     pub qkv_out: B::Buffer,
+    // ── Per-item scratch for batched decode path ──────────────────────
+    // decode_batch_internal runs tokens=M batched ops for the GEMM-heavy
+    // half (norm, qkv_proj, split_qkv, o_proj, post_norm, gate_up, silu,
+    // down, residual_add) but must loop per-item for rope + KV append +
+    // attention (each item has its own KV cache at a different kv_len).
+    // These single-item buffers hold item i's slice during that loop.
+    /// Item-scope q_buf slice, sized `q_dim`.
+    pub q_single: B::Buffer,
+    pub k_single: B::Buffer,
+    pub v_single: B::Buffer,
+    pub q_head_major_single: B::Buffer,
+    pub k_head_major_single: B::Buffer,
+    pub v_head_major_single: B::Buffer,
+    pub attn_head_major_single: B::Buffer,
+    pub attn_flat_single: B::Buffer,
+    /// Batched logits output, sized `max_tokens * vocab_size`. Used only
+    /// in decode_batch; prefill/single-decode use the regular `logits`.
+    pub batch_logits: B::Buffer,
     /// Token-major Q/K/V right after `split_qkv`. Stride: heads * hd per row.
     pub q_buf: B::Buffer,
     pub k_buf: B::Buffer,
@@ -235,6 +253,15 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             last_hidden: B::alloc(h),
             last_normed: B::alloc(h),
             logits: B::alloc(cfg.vocab_size),
+            q_single: B::alloc(q_dim),
+            k_single: B::alloc(kv_dim),
+            v_single: B::alloc(kv_dim),
+            q_head_major_single: B::alloc(q_dim),
+            k_head_major_single: B::alloc(kv_dim),
+            v_head_major_single: B::alloc(kv_dim),
+            attn_head_major_single: B::alloc(q_dim),
+            attn_flat_single: B::alloc(q_dim),
+            batch_logits: B::alloc(t * cfg.vocab_size),
             max_tokens: t,
         }
     }
@@ -791,6 +818,306 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
         B::to_vec(&self.scratch.logits, vocab)
     }
+
+    /// Batched decode: process M concurrent requests at potentially different
+    /// positions in one forward pass. GEMM-heavy ops (qkv_proj, o_proj,
+    /// gate_up, down) run with m=M for natural batching; rope + KV append +
+    /// attention loop per-item (each has its own KV cache at a different
+    /// kv_len, and potentially different pos).
+    ///
+    /// Returns M logit vectors in the same order as `batch`.
+    pub fn decode_batch_internal(
+        &mut self,
+        batch: &[(String, u32, u32)],
+    ) -> Vec<Vec<f32>> {
+        let m = batch.len();
+        if m == 0 {
+            return Vec::new();
+        }
+        if m == 1 {
+            let (cid, tok, pos) = &batch[0];
+            return vec![self.decode_internal(cid, *tok, *pos)];
+        }
+
+        // Ensure all caches exist and scratch is sized for M tokens.
+        for (cid, _, _) in batch {
+            self.ensure_kv(cid);
+        }
+        self.ensure_scratch(m);
+
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        let mut ctx = B::new_context();
+
+        // 0. Embed all M tokens into residual [M, H]
+        let tokens: Vec<u32> = batch.iter().map(|(_, t, _)| *t).collect();
+        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(1));
+        B::embedding_lookup(&mut ctx, &self.embed, &tokens, &mut residual, h);
+
+        // 1..num_layers: batched forward for each layer
+        for li in 0..self.cfg.num_layers {
+            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+        }
+
+        // Final RMSNorm on [M, H] → norm_out [M, H]
+        B::rms_norm(
+            &mut ctx,
+            &residual,
+            &self.final_norm_w,
+            self.cfg.rms_norm_eps,
+            &mut self.scratch.norm_out,
+            m,
+            h,
+        );
+
+        // LM head with m=M → batch_logits [M, vocab]
+        self.lm_head.forward(
+            &mut ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.batch_logits,
+            m,
+        );
+
+        // Sync before to_vec (Metal: no internal sync on buffer read).
+        B::sync(&mut ctx);
+        self.scratch.residual = residual;
+
+        // Extract M logit vectors from the flat buffer.
+        let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+        (0..m)
+            .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
+            .collect()
+    }
+
+    /// One transformer layer over M items, GEMMs batched + per-item attention.
+    fn forward_layer_batched_decode(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        batch: &[(String, u32, u32)],
+        residual: &mut B::Buffer,
+        m: usize,
+    ) {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let nh = cfg.num_heads;
+        let nkv = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let im = cfg.intermediate_size;
+        let eps = cfg.rms_norm_eps;
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+
+        let layer = &self.layers[li];
+        let qk_mode: i32 = if cfg.has_qk_norm { 1 } else { 2 };
+        let dummy_w = &layer.input_ln_w;
+        let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
+        let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
+
+        // 1. rms_norm [M, H]  → norm_out
+        B::rms_norm(
+            ctx,
+            residual,
+            &layer.input_ln_w,
+            eps,
+            &mut self.scratch.norm_out,
+            m,
+            h,
+        );
+
+        // 2. qkv_proj (GEMM m=M): norm_out [M, H] → qkv_out [M, QKV]
+        layer
+            .qkv_proj
+            .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
+
+        // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
+        B::split_qkv(
+            ctx,
+            &self.scratch.qkv_out,
+            &mut self.scratch.q_buf,
+            &mut self.scratch.k_buf,
+            &mut self.scratch.v_buf,
+            m,
+            q_dim,
+            kv_dim,
+        );
+
+        // 4-6. Per-item loop for rope + kv_append + attention.
+        //      Each item has its own cache_id + pos + kv_len.
+        for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
+            let pos_i = *pos as usize;
+
+            // Extract item i's Q/K/V from batched buffers.
+            B::copy_slice(
+                ctx,
+                &self.scratch.q_buf,
+                i * q_dim,
+                &mut self.scratch.q_single,
+                0,
+                q_dim,
+            );
+            B::copy_slice(
+                ctx,
+                &self.scratch.k_buf,
+                i * kv_dim,
+                &mut self.scratch.k_single,
+                0,
+                kv_dim,
+            );
+            B::copy_slice(
+                ctx,
+                &self.scratch.v_buf,
+                i * kv_dim,
+                &mut self.scratch.v_single,
+                0,
+                kv_dim,
+            );
+
+            // qk_norm_rope with tokens=1, per-item pos.
+            B::qk_norm_rope(
+                ctx,
+                &self.scratch.q_single,
+                q_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.q_head_major_single,
+                1,
+                nh,
+                hd,
+                pos_i,
+                eps,
+                qk_mode,
+            );
+            B::qk_norm_rope(
+                ctx,
+                &self.scratch.k_single,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.k_head_major_single,
+                1,
+                nkv,
+                hd,
+                pos_i,
+                eps,
+                qk_mode,
+            );
+            B::qk_norm_rope(
+                ctx,
+                &self.scratch.v_single,
+                dummy_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.v_head_major_single,
+                1,
+                nkv,
+                hd,
+                pos_i,
+                eps,
+                0,
+            );
+
+            // KV append + attention for item i's cache.
+            let caches = self
+                .kv_caches
+                .get_mut(cache_id)
+                .expect("ensure_kv must be called before forward_layer_batched");
+            let cache = &mut caches[li];
+            B::kv_cache_append_head_major(
+                ctx,
+                &mut cache.k,
+                &mut cache.v,
+                cache.len,
+                cache.capacity,
+                &self.scratch.k_head_major_single,
+                &self.scratch.v_head_major_single,
+                1,
+                nkv,
+                hd,
+            );
+            cache.len += 1;
+            let kv_len = cache.len;
+            let kv_stride = cache.capacity;
+
+            let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                num_heads: nh,
+                num_kv_heads: nkv,
+                head_dim: hd,
+                causal: true,
+                scale: 1.0 / (hd as f32).sqrt(),
+                kv_seq_stride: kv_stride,
+                sliding_window: cfg.sliding_window,
+            };
+            B::flash_attention(
+                ctx,
+                &self.scratch.q_head_major_single,
+                &cache.k,
+                &cache.v,
+                &mut self.scratch.attn_head_major_single,
+                1,
+                1,
+                kv_len,
+                pos_i,
+                &attn_cfg,
+            );
+
+            // Untranspose head-major → token-major (tokens=1 → just contiguous).
+            B::transpose_head_to_token(
+                ctx,
+                &self.scratch.attn_head_major_single,
+                &mut self.scratch.attn_flat_single,
+                1,
+                nh,
+                hd,
+            );
+
+            // Inject item i's attn output into batched attn_flat [M, Q].
+            B::copy_slice(
+                ctx,
+                &self.scratch.attn_flat_single,
+                0,
+                &mut self.scratch.attn_flat,
+                i * q_dim,
+                q_dim,
+            );
+        }
+
+        // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
+        layer
+            .o_proj
+            .forward(ctx, &self.scratch.attn_flat, &mut self.scratch.o_proj_out, m);
+
+        // 8. Fused residual add + post-attention RMSNorm.
+        B::fused_add_rms_norm(
+            ctx,
+            residual,
+            &self.scratch.o_proj_out,
+            &layer.post_ln_w,
+            eps,
+            &mut self.scratch.norm_out,
+            m,
+            h,
+        );
+
+        // 9. gate_up_proj (GEMM m=M)
+        layer.gate_up_proj.forward(
+            ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.gate_up_out,
+            m,
+        );
+
+        // 10. SwiGLU
+        B::fused_silu_mul_split(ctx, &self.scratch.gate_up_out, &mut self.scratch.silu_out, m, im);
+
+        // 11. down_proj (GEMM m=M)
+        layer
+            .down_proj
+            .forward(ctx, &self.scratch.silu_out, &mut self.scratch.mlp_out, m);
+
+        // 12. Residual add
+        B::add_inplace(ctx, residual, &self.scratch.mlp_out, m * h);
+    }
 }
 
 impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
@@ -804,6 +1131,10 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
 
     fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
         self.decode_internal(cache_id, token, pos)
+    }
+
+    fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        self.decode_batch_internal(batch)
     }
 
     fn release(&mut self, cache_id: &str) {
