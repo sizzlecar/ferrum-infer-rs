@@ -205,7 +205,7 @@ impl Backend for CudaBackend {
             .bind_to_thread()
             .map_err(|e| FerrumError::unsupported(format!("bind pre-end: {e}")))?;
 
-        let cu_stream = ctx.stream.cu_stream;
+        let cu_stream = ctx.stream.cu_stream();
         let mut cu_graph: sys::CUgraph = std::ptr::null_mut();
         let st1 = unsafe { sys::cuStreamEndCapture(cu_stream, &mut cu_graph) };
         println!("[GRAPH] cuStreamEndCapture: st={st1:?} graph={cu_graph:?}");
@@ -270,7 +270,7 @@ impl Backend for CudaBackend {
 
     fn replay_last_graph(ctx: &mut Self::Context) -> Result<bool> {
         use cudarc::driver::sys;
-        let cu_stream = ctx.stream.cu_stream;
+        let cu_stream = ctx.stream.cu_stream();
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
