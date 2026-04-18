@@ -175,13 +175,14 @@ impl Backend for CudaBackend {
 
     fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
         use cudarc::driver::sys::CUstreamCaptureMode;
-        eprintln!(
-            "[GRAPH] begin_capture: event_tracking={}, is_primary={}",
-            ctx.ctx.is_event_tracking(),
-            ctx.ctx.is_primary()
-        );
-        // Event tracking already disabled globally in new_context; begin
-        // capture directly in relaxed mode.
+        // Event tracking already disabled globally in default_stream; begin
+        // capture directly in relaxed mode. Bare-Rust cudarc reproducer
+        // confirms this configuration works on Blackwell + CUDA 13
+        // (`cudarc_graph_no_event_tracking` test). The full ferrum bench
+        // path still SIGSEGVs though — remaining delta is likely one of
+        // PTX module load timing, cuBLAS workspace interaction, or a
+        // specific kernel's use of constant memory that doesn't survive
+        // capture. See `docs/phase-e-cuda-status.md` graph section.
         ctx.stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| FerrumError::unsupported(format!("begin_capture: {e}")))?;
