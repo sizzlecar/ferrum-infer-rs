@@ -179,3 +179,79 @@ fn cuda_smoke() {
     assert!(!codec_tokens.is_empty());
     assert!(!sub_tokens.is_empty());
 }
+
+/// Long-decode variant — run 50 decode steps from a fresh prefill, dump
+/// argmax codec tokens to `/tmp/tts_smoke_<backend>.tokens`. Diffing the
+/// CPU and CUDA outputs pinpoints the first step where precision drift
+/// flips a codec selection (if it happens at all).
+fn run_long_decode<B: ferrum_kernels::backend::Backend>(
+    dir: &PathBuf,
+    cfg: &TalkerConfig,
+    tag: &str,
+    n_decode: usize,
+) -> Vec<u32> {
+    let loader: NativeSafetensorsLoader<B> =
+        NativeSafetensorsLoader::open(dir).expect("NativeSafetensorsLoader::open");
+    let mut talker =
+        Qwen3TtsTalker::<B>::new(cfg.clone(), &loader).expect("Qwen3TtsTalker::new");
+
+    let text_tok = |id: u32| (id, true);
+    let codec_tok = |id: u32| (id, false);
+    let prompt = vec![
+        text_tok(9707),
+        text_tok(11),
+        text_tok(1879),
+        codec_tok(cfg.codec_bos_id),
+        codec_tok(0),
+    ];
+    let logits = talker.prefill(&format!("{tag}-long"), &prompt);
+    let mut last = argmax_u32(&logits);
+    let mut out = vec![last];
+    for _ in 0..n_decode {
+        let logits = talker.decode_codec(&format!("{tag}-long"), last);
+        last = argmax_u32(&logits);
+        out.push(last);
+    }
+
+    let path = format!("/tmp/tts_smoke_{}.tokens", tag.to_lowercase());
+    let as_str: Vec<String> = out.iter().map(|t| t.to_string()).collect();
+    std::fs::write(&path, as_str.join("\n")).expect("write tokens file");
+    eprintln!("{tag} long-decode dumped to {path} ({} tokens)", out.len());
+    out
+}
+
+fn argmax_u32(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Qwen3-TTS weights cached under $HF_HOME"]
+fn cpu_long_decode() {
+    let dir = match resolve_tts_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    let cfg = load_talker_config(&dir);
+    let tokens = run_long_decode::<CpuBackend>(&dir, &cfg, "CPU", 50);
+    assert_eq!(tokens.len(), 51);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CUDA + Qwen3-TTS weights"]
+fn cuda_long_decode() {
+    use ferrum_kernels::backend::cuda::CudaBackend;
+    let dir = match resolve_tts_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    let cfg = load_talker_config(&dir);
+    let tokens = run_long_decode::<CudaBackend>(&dir, &cfg, "CUDA", 50);
+    assert_eq!(tokens.len(), 51);
+}
