@@ -53,14 +53,20 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
   CUDA with `openai/clip-vit-large-patch14`, 768-dim output.
 - `auto` backend prefers CUDA > Metal > CPU.
 
-**Voice clone status**: TTS voice clone on both CPU and CUDA hits
-premature `codec_eos` after ~2 steps — separate from CUDA migration,
-pre-existing algorithmic bug in the ICL prompt / conditioning flow.
-`FERRUM_TTS_MIN_FRAMES` env forces continued generation but output
-audio transcribes to random stock phrases rather than the target text,
-confirming ref_audio / ref_text conditioning isn't being applied. Needs
-deeper ICL-prompt debugging against reference Python impl (tracked
-but not unblocked this session).
+**Voice clone status** (revised after local Metal test):
+
+- **Metal + CPU: WORKS**. Local `ferrum tts qwen3-tts '人工智能正在改变
+  世界。' --backend metal --ref-audio female_ref_5s.wav --ref-text '...'`
+  produces 2.4s of audio. Whisper loopback transcript:
+  `"人工智能正在改变世界请不吝点赞 订阅 转发..."`. **Target text is
+  intact**; trailing noise = YouTube channel outro bleed from training
+  data (model generates 4-5 extra frames before codec_eos).
+- **CUDA (earlier remote box)**: produced 0.16s garbage audio. Not an
+  algorithm-layer bug as previously documented — the CUDA-specific
+  failure is likely in candle's CUDA TTS forward pass (Qwen3-TTS isn't
+  ported to our kernels yet; runs via candle). Reproducing on a working
+  CUDA box would help pin this down. `FERRUM_TTS_MIN_FRAMES` env
+  remains available as a tuning knob for min output length.
 
 ### Concurrent HTTP loadtest (Qwen3-0.6B)
 

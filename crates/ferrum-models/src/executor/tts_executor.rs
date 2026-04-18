@@ -940,7 +940,7 @@ impl TtsModelExecutor {
         let suppress_end = self.config.vocab_size;
 
         // ICL mode: stronger repetition penalty (matching reference Rust project)
-        // + repetition detection for early stop
+        // + repetition detection for early stop.
         const ICL_REPETITION_PENALTY: f32 = 1.5;
         const ICL_FRAMES_PER_TOKEN: usize = 6;
         const ICL_MIN_FRAMES: usize = 75;
