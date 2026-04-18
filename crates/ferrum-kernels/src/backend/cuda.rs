@@ -192,60 +192,92 @@ impl Backend for CudaBackend {
     }
 
     fn end_graph_capture(ctx: &mut Self::Context) -> Result<()> {
-        use cudarc::driver::sys::CUgraphInstantiate_flags;
+        use cudarc::driver::sys;
         if !ctx.capture_in_flight {
             return Err(FerrumError::unsupported("end_capture without begin"));
         }
         ctx.capture_in_flight = false;
-        // Default flags = 0 (no special behavior). cudarc's enum has no zero
-        // variant — transmute a dummy variant to the primitive type; the FFI
-        // only uses the u32 value (cast to u64 inside cudarc). The
-        // AUTO_FREE_ON_LAUNCH flag we used earlier was auto-freeing the
-        // model's KV cache alloc pool → new-request alloc() broke mid-bench.
-        let flags: CUgraphInstantiate_flags =
-            unsafe { std::mem::transmute::<u32, CUgraphInstantiate_flags>(0u32) };
-        let graph_opt = ctx
-            .stream
-            .end_capture(flags)
-            .map_err(|e| FerrumError::unsupported(format!("end_capture: {e}")))?;
-        println!("[GRAPH] end_capture -> is_some={}", graph_opt.is_some());
-        match graph_opt {
-            Some(g) => {
-                // NOTE: previously called g.upload() here to pre-stage graph
-                // resources. On Blackwell + CUDA 13 + cudarc 0.19 this leaves
-                // the calling thread without a valid current context
-                // (subsequent cuCtxSetCurrent returns INVALID_VALUE). Skip
-                // the upload — first launch will do on-demand setup.
-                install_decode_graph(g);
-                Ok(())
-            }
-            None => Err(FerrumError::unsupported(
-                "end_capture returned None (empty graph?)",
-            )),
+
+        // Bypass cudarc's end_capture — it does cuStreamEndCapture +
+        // cuGraphInstantiateWithFlags in one call, and one of those corrupts
+        // the context on Blackwell. Call them separately so we can see which.
+        ctx.ctx
+            .bind_to_thread()
+            .map_err(|e| FerrumError::unsupported(format!("bind pre-end: {e}")))?;
+
+        let cu_stream = ctx.stream.cu_stream;
+        let mut cu_graph: sys::CUgraph = std::ptr::null_mut();
+        let st1 = unsafe { sys::cuStreamEndCapture(cu_stream, &mut cu_graph) };
+        println!("[GRAPH] cuStreamEndCapture: st={st1:?} graph={cu_graph:?}");
+        if st1 != sys::CUresult::CUDA_SUCCESS {
+            return Err(FerrumError::unsupported(format!(
+                "cuStreamEndCapture failed: {st1:?}"
+            )));
         }
+        if cu_graph.is_null() {
+            return Err(FerrumError::unsupported(
+                "cuStreamEndCapture returned null graph",
+            ));
+        }
+
+        // Check context BEFORE instantiate
+        unsafe {
+            let mut cur: sys::CUcontext = std::ptr::null_mut();
+            let st = sys::cuCtxGetCurrent(&mut cur);
+            println!("[GRAPH] pre-instantiate ctx: st={st:?} cur={cur:?}");
+        }
+
+        // Use simpler cuGraphInstantiate_v2 instead of cuGraphInstantiateWithFlags
+        // (v2 is the older API without flags; on some Blackwell driver builds
+        // the WithFlags variant is the one that corrupts context).
+        let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
+        let st2 = unsafe {
+            sys::cuGraphInstantiateWithFlags(
+                &mut cu_graph_exec,
+                cu_graph,
+                0u64, // no flags
+            )
+        };
+        println!("[GRAPH] cuGraphInstantiate: st={st2:?} exec={cu_graph_exec:?}");
+
+        // Check context AFTER instantiate
+        unsafe {
+            let mut cur: sys::CUcontext = std::ptr::null_mut();
+            let st = sys::cuCtxGetCurrent(&mut cur);
+            println!("[GRAPH] post-instantiate ctx: st={st:?} cur={cur:?}");
+        }
+
+        if st2 != sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                sys::cuGraphDestroy(cu_graph);
+            }
+            return Err(FerrumError::unsupported(format!(
+                "cuGraphInstantiate failed: {st2:?}"
+            )));
+        }
+
+        // Wrap back into cudarc's CudaGraph so we can use .launch() etc.
+        // Unsafe but matches cudarc's internal struct layout (pub fields).
+        // Actually cudarc's CudaGraph has private fields — we can't construct
+        // it directly. Instead, store cu_graph_exec in our own slot.
+        install_decode_graph_raw(cu_graph, cu_graph_exec, ctx.stream.clone());
+        Ok(())
     }
 
     fn reset_graph(_ctx: &mut Self::Context) {
         invalidate_decode_graph();
     }
 
-    fn replay_last_graph(_ctx: &mut Self::Context) -> Result<bool> {
+    fn replay_last_graph(ctx: &mut Self::Context) -> Result<bool> {
         use cudarc::driver::sys;
+        let cu_stream = ctx.stream.cu_stream;
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
-                // DIAG: print current context BEFORE launch
-                unsafe {
-                    let mut cur: sys::CUcontext = std::ptr::null_mut();
-                    let st = sys::cuCtxGetCurrent(&mut cur);
-                    println!("[GRAPH] pre-launch cuCtxGetCurrent: st={st:?} cur={cur:?}");
-                }
-                g.launch()
-                    .map_err(|e| FerrumError::unsupported(format!("graph.launch: {e}")))?;
-                // DIAG: print current context AFTER launch
-                unsafe {
-                    let mut cur: sys::CUcontext = std::ptr::null_mut();
-                    let st = sys::cuCtxGetCurrent(&mut cur);
-                    println!("[GRAPH] post-launch cuCtxGetCurrent: st={st:?} cur={cur:?}");
+                let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
+                if st != sys::CUresult::CUDA_SUCCESS {
+                    return Err(FerrumError::unsupported(format!(
+                        "cuGraphLaunch: {st:?}"
+                    )));
                 }
                 Ok(true)
             } else {
@@ -1267,28 +1299,60 @@ pub fn install_thread_stream(stream: Arc<CudaStream>) {
 // is single-threaded per model (engine serialises via Mutex), so graph
 // launch from the same thread is safe.
 
-struct GraphSlot(cudarc::driver::CudaGraph);
+/// Raw graph slot holding cuGraph + cuGraphExec pointers directly, bypassing
+/// cudarc's CudaGraph wrapper. The wrapper's `end_capture` does
+/// cuStreamEndCapture + cuGraphInstantiateWithFlags in one non-overridable
+/// call, and one of those corrupts the context on Blackwell; bypassing lets
+/// us split the FFI calls and choose which instantiate variant to use.
+struct GraphSlotRaw {
+    cu_graph: cudarc::driver::sys::CUgraph,
+    cu_graph_exec: cudarc::driver::sys::CUgraphExec,
+    // Keep the stream Arc alive so its underlying cu_stream stays valid.
+    _stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
+
+impl Drop for GraphSlotRaw {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.cu_graph_exec.is_null() {
+                cudarc::driver::sys::cuGraphExecDestroy(self.cu_graph_exec);
+            }
+            if !self.cu_graph.is_null() {
+                cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
+            }
+        }
+    }
+}
+
 // SAFETY: graph launch is serialised through the model's stream, which
 // is accessed from one thread at a time (engine Mutex-wraps the model).
-unsafe impl Send for GraphSlot {}
-unsafe impl Sync for GraphSlot {}
+unsafe impl Send for GraphSlotRaw {}
+unsafe impl Sync for GraphSlotRaw {}
 
-static DECODE_GRAPH: std::sync::OnceLock<std::sync::RwLock<Option<GraphSlot>>> =
+static DECODE_GRAPH: std::sync::OnceLock<std::sync::RwLock<Option<GraphSlotRaw>>> =
     std::sync::OnceLock::new();
 
-fn graph_slot() -> &'static std::sync::RwLock<Option<GraphSlot>> {
+fn graph_slot() -> &'static std::sync::RwLock<Option<GraphSlotRaw>> {
     DECODE_GRAPH.get_or_init(|| std::sync::RwLock::new(None))
 }
 
-fn install_decode_graph(g: cudarc::driver::CudaGraph) {
-    *graph_slot().write().expect("DECODE_GRAPH poisoned") = Some(GraphSlot(g));
+fn install_decode_graph_raw(
+    cu_graph: cudarc::driver::sys::CUgraph,
+    cu_graph_exec: cudarc::driver::sys::CUgraphExec,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+) {
+    *graph_slot().write().expect("DECODE_GRAPH poisoned") = Some(GraphSlotRaw {
+        cu_graph,
+        cu_graph_exec,
+        _stream: stream,
+    });
 }
 
 fn with_decode_graph<R>(
-    f: impl FnOnce(Option<&cudarc::driver::CudaGraph>) -> Result<R>,
+    f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>,
 ) -> Result<R> {
     let guard = graph_slot().read().expect("DECODE_GRAPH poisoned");
-    f(guard.as_ref().map(|s| &s.0))
+    f(guard.as_ref())
 }
 
 /// Evict the cached graph — call this when model weights/scratch pointers
