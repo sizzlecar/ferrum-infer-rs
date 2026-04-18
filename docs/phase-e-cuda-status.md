@@ -72,12 +72,26 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
   FusedTransformer path with a `LlamaFamilyModel<B>`-backed
   transformer stack that uses ferrum-kernels' production CUDA/Metal
   kernels. Loaded via `NativeSafetensorsLoader` + `PrefixedLoader`
-  ("talker." prefix). **Validated on Blackwell + CUDA 13**: first
-  5 codec tokens match CPU bit-for-bit (argmax identical, logits
-  within f16 precision ~0.007). Commits `b5931d1` (Talker) +
-  `8a9c99f` (SubTalker). Executor integration pending — current
-  `TtsModelExecutor` still uses the legacy candle/FusedTransformer
-  path by default.
+  ("talker." prefix). `Qwen3TTSTalker::backend_override` added; the
+  `TtsModelExecutor` installs `TalkerBackboneBackend<CudaBackend>`
+  for Talker + SubTalker automatically when device is CUDA. Commits
+  `b5931d1`, `8a9c99f`, `7e80f7d`.
+- **Runtime impact**: CUDA voice-clone RTF drops from **45x → 1.12x**
+  (40× speedup). Audio length becomes reasonable (10s vs 5.9s
+  of outro garbage). Multi-stage prefill (role prefix → ICL block
+  → decode) is verified correct via trace.
+- **Remaining gap — f16 precision drift**: CPU↔CUDA codec tokens
+  match bit-for-bit for **steps 0-39**, then diverge at **step 40**
+  (CPU=984 vs CUDA=1720). Over the ~120 decode steps in a typical
+  voice-clone, steps 40+ drift into training-data attractors (outro
+  phrases like "Thank you", "感谢观看"). Confirmed via
+  `cuda_long_decode` / `cpu_long_decode` in
+  `qwen3_tts_backend_smoke.rs` — dumps argmax tokens for side-by-side
+  diff. Root cause: our `Backend<CudaBackend>` stores intermediate
+  activations in f16; 28 layers × 40 steps accumulated enough
+  rounding error to flip a codec selection. Fix options: (a) add
+  f32 activation mode to `CudaBackend` scratch buffers, or (b) keep
+  f16 and tolerate drift for short prompts.
 
 ### Concurrent HTTP loadtest (Qwen3-0.6B)
 
