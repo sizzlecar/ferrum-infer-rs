@@ -175,6 +175,11 @@ impl Backend for CudaBackend {
 
     fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
         use cudarc::driver::sys::CUstreamCaptureMode;
+        eprintln!(
+            "[GRAPH] begin_capture: event_tracking={}, is_primary={}",
+            ctx.ctx.is_event_tracking(),
+            ctx.ctx.is_primary()
+        );
         // Event tracking already disabled globally in new_context; begin
         // capture directly in relaxed mode.
         ctx.stream
