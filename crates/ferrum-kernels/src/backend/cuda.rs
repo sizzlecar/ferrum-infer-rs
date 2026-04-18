@@ -170,7 +170,13 @@ impl Backend for CudaBackend {
     }
 
     fn set_dev_state_mode(ctx: &mut Self::Context, enable: bool) {
-        ctx.use_dev_state = enable;
+        // Temporarily disabled: the _dyn kernel variants may be causing
+        // device-side faults on Blackwell that leave the context in error
+        // state post-replay. Force eager kernels (with scalar args baked
+        // into the capture) to isolate whether the crash is in the
+        // graph machinery or the _dyn kernels.
+        let _ = (ctx, enable);
+        // ctx.use_dev_state = enable;
     }
 
     fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
