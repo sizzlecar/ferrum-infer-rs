@@ -175,6 +175,7 @@ impl Backend for CudaBackend {
 
     fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
         use cudarc::driver::sys::CUstreamCaptureMode;
+        eprintln!("[GRAPH] begin_capture");
         // Event tracking already disabled globally in new_context; begin
         // capture directly in relaxed mode.
         ctx.stream
@@ -216,6 +217,7 @@ impl Backend for CudaBackend {
         // (v2 is the older API without flags; on some Blackwell driver builds
         // the WithFlags variant is the one that corrupts context).
         let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
+        eprintln!("[GRAPH] instantiate start");
         let st2 = unsafe {
             sys::cuGraphInstantiateWithFlags(
                 &mut cu_graph_exec,
@@ -223,6 +225,7 @@ impl Backend for CudaBackend {
                 0u64, // no flags
             )
         };
+        eprintln!("[GRAPH] instantiate done st={st2:?} exec={cu_graph_exec:p}");
         if st2 != sys::CUresult::CUDA_SUCCESS {
             unsafe {
                 sys::cuGraphDestroy(cu_graph);
@@ -249,11 +252,26 @@ impl Backend for CudaBackend {
         let cu_stream = ctx.stream.cu_stream();
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
+                eprintln!("[GRAPH] pre-launch exec={:p}", g.cu_graph_exec);
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
+                eprintln!("[GRAPH] post-launch st={st:?}");
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!(
                         "cuGraphLaunch: {st:?}"
                     )));
+                }
+                // Sync the stream so the launched graph work completes
+                // before the caller does a dtoh. Some Blackwell driver
+                // configurations reject the subsequent dtoh-async if the
+                // launched work hasn't drained.
+                unsafe {
+                    let sst = sys::cuStreamSynchronize(cu_stream);
+                    eprintln!("[GRAPH] post-sync st={sst:?}");
+                    if sst != sys::CUresult::CUDA_SUCCESS {
+                        return Err(FerrumError::unsupported(format!(
+                            "post-launch cuStreamSynchronize: {sst:?}"
+                        )));
+                    }
                 }
                 Ok(true)
             } else {
