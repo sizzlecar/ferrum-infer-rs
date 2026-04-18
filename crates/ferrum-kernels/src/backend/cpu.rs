@@ -117,9 +117,21 @@ impl Backend for CpuBackend {
         n: usize,
         k: usize,
     ) {
-        debug_assert!(a.len() >= m * k, "gemm: a too small");
-        debug_assert!(b.len() >= n * k, "gemm: b too small");
-        debug_assert!(out.len() >= m * n, "gemm: out too small");
+        assert!(
+            a.len() >= m * k,
+            "gemm: a too small len={} m={m} k={k}",
+            a.len()
+        );
+        assert!(
+            b.len() >= n * k,
+            "gemm: b too small len={} n={n} k={k}",
+            b.len()
+        );
+        assert!(
+            out.len() >= m * n,
+            "gemm: out too small len={} m={m} n={n}",
+            out.len()
+        );
         #[cfg(target_os = "macos")]
         unsafe {
             cblas_sgemm(
