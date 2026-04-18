@@ -82,7 +82,13 @@ impl<B: Backend> TalkerBackboneBackend<B> {
             intermediate_size: cp_h * 3,
             num_heads: cfg.code_predictor_num_heads,
             num_kv_heads: cfg.code_predictor_num_kv_heads,
-            head_dim: cp_h / cfg.code_predictor_num_heads.max(1),
+            // head_dim is explicit in code_predictor_config, NOT hidden/num_heads.
+            // Qwen3-TTS: hidden=1024, num_heads=16, head_dim=128 → q_dim=2048,
+            // kv_dim=1024 (GQA). The old `cp_h/num_heads=64` undersized scratch
+            // by half; cuBLAS GEMM wrote 2*4096 floats into a 2*2048-sized
+            // qkv_out, corrupting adjacent CUDA memory and causing NaN cascades
+            // in SubTalker layer 2+ on the 2nd predict() invocation.
+            head_dim: cfg.code_predictor_head_dim,
             num_layers: cfg.code_predictor_num_layers,
             vocab_size: cfg.code_predictor_vocab_size,
             max_seq_len: cfg.max_position_embeddings,

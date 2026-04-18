@@ -46,7 +46,8 @@ pub struct TalkerConfig {
     pub code_predictor_hidden_size: usize,  // 1024
     pub code_predictor_num_layers: usize,   // typically 4
     pub code_predictor_num_heads: usize,    // 16
-    pub code_predictor_num_kv_heads: usize, // 2
+    pub code_predictor_num_kv_heads: usize, // 8
+    pub code_predictor_head_dim: usize,     // 128 (explicit — not hidden/num_heads)
     /// Speaker ID mapping (speaker_name → token_id)
     pub spk_id: HashMap<String, Vec<u32>>,
     /// Language ID mapping (language_name → token_id)
@@ -168,6 +169,13 @@ impl TalkerConfig {
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize)
                     .unwrap_or(8)
+            },
+            code_predictor_head_dim: {
+                let cp = tc.get("code_predictor_config");
+                cp.and_then(|c| c.get("head_dim"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(128)
             },
             spk_id,
             codec_language_id,
