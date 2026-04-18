@@ -133,6 +133,29 @@ impl ClipModelWrapper {
             Self::new_chinese(vb, &config, device, dtype)
         } else {
             let mut config = ClipConfig::vit_base_patch32();
+            // Override from config.json — supports base/large/any variant that
+            // differs from vit_base_patch32 defaults (e.g. clip-vit-large-patch14
+            // has embed_dim=768 / 24 layers / 16 heads, not 512 / 12 / 8).
+            if let Some(tc) = raw.get("text_config") {
+                if let Some(v) = tc.get("hidden_size").and_then(|v| v.as_u64()) {
+                    config.text_config.embed_dim = v as usize;
+                }
+                if let Some(v) = tc.get("intermediate_size").and_then(|v| v.as_u64()) {
+                    config.text_config.intermediate_size = v as usize;
+                }
+                if let Some(v) = tc.get("num_hidden_layers").and_then(|v| v.as_u64()) {
+                    config.text_config.num_hidden_layers = v as usize;
+                }
+                if let Some(v) = tc.get("num_attention_heads").and_then(|v| v.as_u64()) {
+                    config.text_config.num_attention_heads = v as usize;
+                }
+                if let Some(v) = tc.get("vocab_size").and_then(|v| v.as_u64()) {
+                    config.text_config.vocab_size = v as usize;
+                }
+                if let Some(v) = tc.get("max_position_embeddings").and_then(|v| v.as_u64()) {
+                    config.text_config.max_position_embeddings = v as usize;
+                }
+            }
             if let Some(vc) = raw.get("vision_config") {
                 if let Some(v) = vc.get("image_size").and_then(|v| v.as_u64()) {
                     config.vision_config.image_size = v as usize;
@@ -140,6 +163,21 @@ impl ClipModelWrapper {
                 }
                 if let Some(v) = vc.get("projection_dim").and_then(|v| v.as_u64()) {
                     config.vision_config.projection_dim = v as usize;
+                }
+                if let Some(v) = vc.get("hidden_size").and_then(|v| v.as_u64()) {
+                    config.vision_config.embed_dim = v as usize;
+                }
+                if let Some(v) = vc.get("intermediate_size").and_then(|v| v.as_u64()) {
+                    config.vision_config.intermediate_size = v as usize;
+                }
+                if let Some(v) = vc.get("num_hidden_layers").and_then(|v| v.as_u64()) {
+                    config.vision_config.num_hidden_layers = v as usize;
+                }
+                if let Some(v) = vc.get("num_attention_heads").and_then(|v| v.as_u64()) {
+                    config.vision_config.num_attention_heads = v as usize;
+                }
+                if let Some(v) = vc.get("patch_size").and_then(|v| v.as_u64()) {
+                    config.vision_config.patch_size = v as usize;
                 }
             }
             Self::new_openai(vb, &config, device, dtype)
