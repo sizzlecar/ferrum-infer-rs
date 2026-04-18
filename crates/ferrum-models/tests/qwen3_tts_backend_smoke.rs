@@ -125,11 +125,9 @@ fn run_full_chain<B: ferrum_kernels::backend::Backend>(
 }
 
 // On macOS the CpuBackend GEMM routes through Accelerate cblas_sgemm;
-// on Linux it falls back to a naive triple-loop in `cpu.rs::gemm` that
-// seems to have a subtle bounds issue that predates this PR. Gate the
-// CPU smoke to macOS until that's tracked down — CUDA parity (the real
-// validation) is covered by `cuda_smoke`.
-#[cfg(target_os = "macos")]
+// on Linux it falls back to a naive triple-loop in `cpu.rs::gemm`.
+// Both paths are exercised; Linux surfacing any shape mismatches via
+// `assert!` that the macOS path would paper over.
 #[test]
 #[ignore = "requires Qwen3-TTS weights cached under $HF_HOME"]
 fn cpu_smoke() {
