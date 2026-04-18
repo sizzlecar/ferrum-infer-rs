@@ -98,51 +98,60 @@ Implementation (`decode_batch_internal`):
 GPTQ concurrent improves more (+50%) because Marlin kernel has larger
 fixed overhead that GEMM batching amortises.
 
-## ⚠️ Graph capture — experimental
+## ⛔ Graph capture — blocked by driver bug (Blackwell + CUDA 13)
 
-Infrastructure landed but replay triggers `CUDA_ERROR_INVALID_VALUE`
-on Blackwell + CUDA 12.8 in a way I couldn't fully diagnose on the
-rented session. Root-cause suspicions (each of which has fixes landed):
+**Final diagnosis**: `cuGraphLaunch` segfaults inside `libcuda.so` on
+RTX PRO 6000 Blackwell + CUDA 13 driver. Verified via `gdb --batch`
+run on the rented box:
 
-1. **Shared memory OOB** — kernel's `extern __shared__` sized per
-   current kv_len; captured graph bakes in smaller size than later
-   replays need. **Fixed**: cap dynamic shared at 32 KB (8192 positions);
-   `FERRUM_CUDA_MAX_KV` env to raise (auto opts into >48KB via
-   cuFuncSetAttribute).
+```
+Thread 31 "tokio-runtime-w" received signal SIGSEGV, Segmentation fault.
+#0  0x00007efdab0919ad in ?? () from /usr/lib/x86_64-linux-gnu/libcuda.so.1
+#3  0x00007efdab1a0a30 in cuGraphLaunch () from /usr/lib/x86_64-linux-gnu/libcuda.so.1
+```
+
+Stack frame in libcuda.so → NVIDIA driver bug, not our code. No
+in-tree fix possible. Infrastructure kept in place so future driver
+releases can be retested without re-doing the plumbing.
+
+### Our-side fixes that DID land (kept for future retry)
+
+All these were real bugs, just shadowed by the driver SIGSEGV:
+
+1. **Shared memory OOB** — `extern __shared__` sized per current
+   kv_len; captured graph bakes in smaller size than later replays
+   need. **Fixed**: cap dynamic shared at 32 KB; `FERRUM_CUDA_MAX_KV`
+   env to raise (auto opts into >48KB via `cuFuncSetAttribute`).
 2. **Per-ctx resource lifetime** — captured graph held pointers to
    workspace/alpha/beta/decode-state buffers that were freed when the
    capturing ctx dropped. **Fixed**: moved cuBLAS handle + workspace +
-   decode-state buffers (token/pos/kv) + captured graph to
-   process-global `OnceLock<RwLock<...>>` slots.
-3. **cuBLAS host-pointer alpha/beta** — HOST pointer mode causes
-   cuBLAS to queue a memcpy with stack-local scalar pointer that goes
-   stale at replay. **Fixed**: `cublasSetPointerMode(DEVICE)` +
-   process-global `alpha_f32/beta_f32: CudaSlice<f32>` holding 1.0/0.0.
-4. **Event tracking cross-stream deps** — cudarc's auto event
-   recording fails capture with `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`.
-   **Fixed**: `ctx.disable_event_tracking()` around capture.
-5. **Graph upload timing** — first replay may trigger JIT setup that
-   fails under the current stream state. **Fixed**: call `graph.upload()`
-   immediately after `end_capture`.
+   decode-state buffers + captured graph to process-global
+   `OnceLock<RwLock<...>>` slots.
+3. **cuBLAS host-pointer alpha/beta** — HOST pointer mode queues
+   memcpy with stack-local scalar pointer, stale at replay. **Fixed**:
+   `cublasSetPointerMode(DEVICE)` + process-global
+   `alpha_f32/beta_f32: CudaSlice<f32>` holding 1.0/0.0.
+4. **Event tracking cross-stream deps** — cudarc auto event recording
+   fails capture with `STREAM_CAPTURE_ISOLATION`. **Fixed**: disable
+   event tracking globally in `new_context`.
+5. **Graph upload timing** — first replay triggers JIT. **Fixed**:
+   `graph.upload()` immediately after `end_capture`.
+6. **Placeholder-alloc drop** — `mem::replace(&mut scratch.residual,
+   B::alloc(1))` dropped a stream-ordered alloc after graph capture,
+   corrupting pool state. **Fixed**: `scratch.residual:
+   Option<Buffer>` + `.take()`.
+7. **cudarc `end_capture` non-zero default flag** — split into raw
+   FFI `cuStreamEndCapture` + `cuGraphInstantiateWithFlags(flags=0)`.
+8. **Graph ref lifetime across requests** — `cuGraphExec` held
+   memory-pool refs. **Fixed**: `Drop for GraphSlotRaw` calls
+   `cuCtxSynchronize` + `cuGraphExecDestroy` + `cuGraphDestroy`;
+   `release` invokes `sync → reset_graph → sync` before cache return.
+9. **Thread binding** — `cuGraphLaunch` from un-bound tokio worker
+   hung silently. **Fixed**: `ctx.bind_to_thread()` pre-launch.
 
-**Current state of graph with `FERRUM_CUDA_GRAPH=1`:**
-
-Root causes found across two boxes (CUDA 12.8 + 13.0, both Blackwell):
-
-1. **Placeholder-alloc drop corruption**: `mem::replace(&mut scratch.residual, B::alloc(1))` dropped a stream-ordered alloc after graph capture, corrupting pool state so `bind_to_thread` / `sync` / `dtoh` all returned INVALID_VALUE. **Fixed**: `scratch.residual: Option<Buffer>` + `.take()` — no placeholder.
-2. **cudarc's end_capture packaged cuStreamEndCapture + cuGraphInstantiateWithFlags as one call with non-zero default flag**. Traced showed context ptr was fine after both; fix was not actually in this layer but the diagnostic was useful. **Now**: raw FFI split with flags=0 explicitly.
-3. **Graph ref lifetime across requests**: captured graph's cuGraphExec held memory-pool references that prevented new-request allocs. **Fixed**: `Drop for GraphSlotRaw` calls `cuCtxSynchronize` + `cuGraphExecDestroy` + `cuGraphDestroy`; `LlamaFamilyModel::release` invokes `sync → reset_graph → sync` before returning cache to pool.
-
-**With all fixes**: within-request replay confirmed working (observed 10+ replays succeed). **But**: flaky — same binary sometimes hangs at first `cuGraphLaunch`, sometimes replays cleanly for entire request. No consistent repro from SSH-only debug. Blackwell Server Edition + driver + cudarc 0.19 has some additional interaction needs cuda-gdb on-box to pin down.
-
-Default: eager. `FERRUM_CUDA_GRAPH=1` for research only. Infrastructure fully in place so follow-up with cuda-gdb can focus on the remaining flakiness without redoing the plumbing.
-
-Default: eager (no graph). Set `FERRUM_CUDA_GRAPH=1` for the single-
-request case. Production fix requires either per-graph memory pools
-or graph-less KV cache reuse.
-
-**Impact**: 4B runs at 82 tok/s (92% of the 88.8 baseline). The
-~7 tok/s gap is what graph capture is expected to recover.
+Default: eager. `FERRUM_CUDA_GRAPH=1` now errors out with the driver
+trace. Impact: 4B runs at 82 tok/s (~92% of 88.8 baseline); the
+~7 tok/s gap is what graph would recover if/when the driver is fixed.
 
 ### Kernel infrastructure for graph capture (retained)
 
