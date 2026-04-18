@@ -955,8 +955,14 @@ impl TtsModelExecutor {
                     logits_vec[i] = f32::NEG_INFINITY;
                 }
             }
-            // min_new_tokens=2: suppress EOS for first 2 steps
-            if step < 2 {
+            // min_new_tokens: suppress EOS until we've generated a minimum
+            // number of frames. Reference Python uses sentence-length heuristic.
+            // FERRUM_TTS_MIN_FRAMES env lets us tune without rebuilding.
+            let min_frames: usize = std::env::var("FERRUM_TTS_MIN_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| text_content_ids.len() * ICL_FRAMES_PER_TOKEN);
+            if step < min_frames {
                 if let Some(v) = logits_vec.get_mut(codec_eos as usize) {
                     *v = f32::NEG_INFINITY;
                 }
