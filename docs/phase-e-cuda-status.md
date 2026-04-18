@@ -123,21 +123,65 @@ Implementation (`decode_batch_internal`):
 GPTQ concurrent improves more (+50%) because Marlin kernel has larger
 fixed overhead that GEMM batching amortises.
 
-## ⛔ Graph capture — blocked by driver bug (Blackwell + CUDA 13)
+## ⛔ Graph capture — Rust-side trigger not pinned (2026-04-19)
 
-**Final diagnosis**: `cuGraphLaunch` segfaults inside `libcuda.so` on
-RTX PRO 6000 Blackwell + CUDA 13 driver. Verified via `gdb --batch`
-run on the rented box:
+Earlier diagnosis said "libcuda.so driver bug". Further investigation
+ruled that out:
 
-```
-Thread 31 "tokio-runtime-w" received signal SIGSEGV, Segmentation fault.
-#0  0x00007efdab0919ad in ?? () from /usr/lib/x86_64-linux-gnu/libcuda.so.1
-#3  0x00007efdab1a0a30 in cuGraphLaunch () from /usr/lib/x86_64-linux-gnu/libcuda.so.1
-```
+- `scripts/graph_repro{,_v2..v5}.cu` — five bare-C++ reproducers
+  covering runtime API, `cuCtxCreate_v4`, memory pool, cross-thread
+  capture+replay, cuBLAS sgemm inside capture. **All pass** with 6
+  `cuGraphLaunch` replays on Blackwell + CUDA 13.
+- `crates/ferrum-kernels/tests/cudarc_graph_repro.rs`:
+  - `cudarc_graph_default_pool` — fails at `begin_capture` with
+    `STREAM_CAPTURE_ISOLATION` (because cudarc's default event
+    tracking injects cross-stream deps during warm-up allocs).
+  - `cudarc_graph_no_event_tracking` — **passes** all 6 replays.
+  - `cudarc_graph_with_many_allocs` — 200 pre-existing bufs + event
+    tracking off — **passes** all 6 replays.
 
-Stack frame in libcuda.so → NVIDIA driver bug, not our code. No
-in-tree fix possible. Infrastructure kept in place so future driver
-releases can be retested without re-doing the plumbing.
+So cudarc + CUDA 13 graph **works** on this box. The ferrum bench
+path still SIGSEGVs though, even with event tracking verified off
+(`is_event_tracking()=false` logged at `begin_capture`). The
+remaining trigger is ferrum-kernels-specific state that the
+minimal repros don't exercise. Most likely suspects:
+
+- **cuBLAS workspace reuse across capture + replay** — we share a
+  process-global 32 MB workspace, cuBLAS may record it into the
+  graph in a way the `_v2` reproducer doesn't stress.
+- **Multiple PTX modules** — ferrum loads ~20 distinct kernel PTX
+  blobs. Graph capture may be sensitive to module lifetime or JIT
+  state across them.
+- **`set_decode_state` memcpy_htod pre-launch** — we do 3 small
+  htods to device state buffers right before `cuGraphLaunch`.
+  Nothing in the repros does this pattern.
+
+**Our-side fixes already landed**:
+
+1. Shared-memory OOB — dynamic shared capped at 32 KB, `cuFuncSet
+   Attribute` for >48 KB cases.
+2. Per-ctx resource lifetime — cuBLAS handle, workspace, alpha/beta,
+   decode-state buffers, captured graph all moved to process-global
+   `OnceLock<RwLock<...>>`.
+3. cuBLAS host-pointer alpha/beta → DEVICE pointer mode +
+   process-global `CudaSlice<f32>` scalars.
+4. Event tracking disabled in `default_stream` **before any buffer
+   is allocated** (previously only in `new_context` — too late).
+5. Graph upload after `end_capture` to skip lazy JIT.
+6. `scratch.residual: Option<Buffer>` + `.take()` — no placeholder
+   `B::alloc(1)` leaks.
+7. Raw FFI `cuStreamEndCapture` + `cuGraphInstantiateWithFlags(0)`
+   (cudarc default flag didn't agree with this driver).
+8. `Drop for GraphSlotRaw` → `cuCtxSynchronize` + proper destruction.
+9. `ctx.bind_to_thread()` pre-`cuGraphLaunch` so tokio-worker switch
+   doesn't hit un-bound ctx.
+10. Skip candle's `Device::new_cuda(0)` probe in `bench.rs` when
+    `FERRUM_CUDA_GRAPH=1` (candle instantiates another
+    `CudaContext` with default event tracking).
+
+**Default**: eager (graph disabled). `FERRUM_CUDA_GRAPH=1` still
+crashes in `ferrum` binary. Infrastructure kept in place for
+follow-up work to isolate the remaining trigger.
 
 ### Our-side fixes that DID land (kept for future retry)
 
