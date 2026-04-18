@@ -816,16 +816,23 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     }
 
     fn release(&mut self, cache_id: &str) {
+        // Sync + drop graph BEFORE touching cache buffers. The graph was
+        // actively running replays up to this point; destroying the graph
+        // while the allocator pool still has in-flight references from the
+        // graph's kernels corrupts stream state. Sync first to drain, then
+        // destroy graph, then sync again to ensure cleanup completes.
+        let mut ctx = B::new_context();
+        B::sync(&mut ctx);
+        B::reset_graph(&mut ctx);
+        B::sync(&mut ctx);
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
+
         // Return the cache's buffers to the free pool instead of dropping.
-        // This keeps device pointers stable across requests so a captured
-        // decode graph remains valid. Graph-free path still works — the
-        // pool is append-only; unused slots just sit idle.
+        // Pointers stay stable for the next request's captured graph.
         if let Some(caches) = self.kv_caches.remove(cache_id) {
             self.kv_free_pool.push(caches);
         }
-        // Graph replay only works if the NEXT request draws the SAME pool
-        // slot (LIFO pop gives us that for single-request sequential) so
-        // we DON'T invalidate the graph here.
     }
 
     fn reset(&mut self) {
