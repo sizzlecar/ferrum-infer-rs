@@ -200,6 +200,10 @@ impl Backend for CudaBackend {
         }
         match graph_opt {
             Some(g) => {
+                // Pre-upload the graph's resources so the first replay
+                // doesn't pay setup overhead + any latent init errors.
+                g.upload()
+                    .map_err(|e| FerrumError::unsupported(format!("graph.upload: {e}")))?;
                 install_decode_graph(g);
                 Ok(())
             }
