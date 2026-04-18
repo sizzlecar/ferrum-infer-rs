@@ -70,28 +70,33 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
 
 ### Concurrent HTTP loadtest (Qwen3-0.6B)
 
+**After batched decode impl** (LlamaFamilyModel::decode_batch_internal):
+
 | Concurrency | Throughput | p50 latency | p99 latency |
 |-------------|-----------|-------------|-------------|
-| 1           | 215 tok/s |  250ms      |  483ms      |
-| 4           | 242 tok/s | 1020ms      | 1189ms      |
-| 8           | 244 tok/s | 2034ms      | 2337ms      |
+| 1           | 175 tok/s |  283ms      |  528ms      |
+| 4           | **314 tok/s** |  699ms | 1065ms      |
+| 8           | **344 tok/s** | 1220ms | 2169ms     |
 
-Saturates past concurrency=4 — true batched decode (one GEMM with
-m=batch, per-item attention) would push further. Currently the
-`LlmExecutor::batch_decode` override acquires the model mutex once
-per batch and dispatches to `DecoderOnlyLLM::decode_batch` whose
-default impl loops `decode` sequentially.
+**Before** batched decode (sequential loop inside Mutex): conc=8
+saturated at 244 tok/s. Now scales to 344 (+41%).
 
-Plumbing in place for future `decode_batch` overrides; the kernel
-work to actually batch (GEMM m=M, per-item KV append+attention loop)
-requires either:
-- Buffer-offset-aware kernel variants (new `_at` trait methods for
-  qk_norm_rope / kv_cache_append / decode_attention with offsets)
-- OR per-token `pos[]` array parameter in qk_norm_rope
-- Plus per-item scratch or slicing support in the Backend's Buffer type
+Implementation (`decode_batch_internal`):
+- GEMM-heavy ops run with m=M: qkv_proj, o_proj, gate_up_proj,
+  down_proj. Natural batching → significant win on cuBLAS GEMM fixed
+  overhead.
+- rms_norm, split_qkv, fused_silu_mul, residual_add: all take
+  `tokens` parameter, run with tokens=M.
+- Per-item attention loop: qk_norm_rope + kv_cache_append +
+  flash_attention called M times with tokens=1. copy_slice extracts
+  each item's Q/K/V from the M-batched q_buf/k_buf/v_buf into single-
+  item scratch (q_single, etc), runs attention, copies result back
+  into attn_flat.
+- Final norm + lm_head run with m=M into `batch_logits` buffer
+  (sized max_tokens * vocab); to_vec slices out M * vocab floats.
 
-Not tractable from an SSH-only debug session — needs kernel iteration
-on-box with nvcc. Tracked as follow-up.
+GPTQ concurrent improves more (+50%) because Marlin kernel has larger
+fixed overhead that GEMM batching amortises.
 
 ## ⚠️ Graph capture — experimental
 
