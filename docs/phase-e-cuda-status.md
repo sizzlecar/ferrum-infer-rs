@@ -77,9 +77,24 @@ rented session. Root-cause suspicions (each of which has fixes landed):
    fails under the current stream state. **Fixed**: call `graph.upload()`
    immediately after `end_capture`.
 
-Despite all fixes landing, some graph replay still errors. Current
-default: eager (no graph). Set `FERRUM_CUDA_GRAPH=1` to opt in for
-debugging.
+**Current state of graph with `FERRUM_CUDA_GRAPH=1`:**
+
+- ✅ Single-request capture + replay works: warmup (14-16 replays) runs
+  clean, all kernels record into graph, replay reuses them.
+- ❌ Multi-request breaks: on the 2nd request, `stream.alloc()` for the
+  new KV cache fails with CUDA_ERROR_INVALID_VALUE. Even with
+  sync→reset_graph→sync before the cache free, the stream allocator
+  pool ends up in a bad state the next alloc can't recover from.
+
+The fundamental issue: captured graphs hold raw device pointers into
+the request's KV cache. Freeing that cache while the stream's
+allocator still has outstanding graph-bound reservations corrupts
+the pool. vLLM avoids this with a process-global paged KV pool that
+never gets freed between requests.
+
+Default: eager (no graph). Set `FERRUM_CUDA_GRAPH=1` for the single-
+request case. Production fix requires either per-graph memory pools
+or graph-less KV cache reuse.
 
 **Impact**: 4B runs at 82 tok/s (92% of the 88.8 baseline). The
 ~7 tok/s gap is what graph capture is expected to recover.
