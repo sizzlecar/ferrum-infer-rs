@@ -190,9 +190,16 @@ impl Backend for CudaBackend {
             return Err(FerrumError::unsupported("end_capture without begin"));
         }
         ctx.capture_in_flight = false;
+        // Default flags = 0 (no special behavior). cudarc's enum has no zero
+        // variant — transmute a dummy variant to the primitive type; the FFI
+        // only uses the u32 value (cast to u64 inside cudarc). The
+        // AUTO_FREE_ON_LAUNCH flag we used earlier was auto-freeing the
+        // model's KV cache alloc pool → new-request alloc() broke mid-bench.
+        let flags: CUgraphInstantiate_flags =
+            unsafe { std::mem::transmute::<u32, CUgraphInstantiate_flags>(0u32) };
         let graph_opt = ctx
             .stream
-            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .end_capture(flags)
             .map_err(|e| FerrumError::unsupported(format!("end_capture: {e}")))?;
         match graph_opt {
             Some(g) => {
