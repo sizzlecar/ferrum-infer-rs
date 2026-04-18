@@ -257,6 +257,11 @@ pub struct LlamaFamilyModel<B: Backend> {
 
     /// Per-sequence KV caches, one `Vec<KvCache<B>>` of length `num_layers`.
     pub kv_caches: HashMap<String, Vec<KvCache<B>>>,
+    /// Free pool of pre-allocated KV cache slots. Released caches return
+    /// here instead of being dropped, so their device pointers stay valid
+    /// across requests — critical for graph capture (pointers baked into
+    /// the captured graph would otherwise dangle).
+    kv_free_pool: Vec<Vec<KvCache<B>>>,
 
     // ── Graph capture state (CUDA only; harmless no-op on other backends) ──
     /// Count of eager decode steps run so far. After `GRAPH_WARMUP`, the
@@ -357,6 +362,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             rope,
             scratch,
             kv_caches: HashMap::new(),
+            kv_free_pool: Vec::new(),
             graph_warmup: 0,
             graph_capture_failed: false,
         })
@@ -379,16 +385,27 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let nkv = self.cfg.num_kv_heads;
         let hd = self.cfg.head_dim;
         let max = self.cfg.max_seq_len;
-        let caches = (0..self.cfg.num_layers)
-            .map(|_| KvCache {
-                k: B::alloc(nkv * max * hd),
-                v: B::alloc(nkv * max * hd),
-                len: 0,
-                capacity: max,
-                num_kv_heads: nkv,
-                head_dim: hd,
-            })
-            .collect();
+
+        // Try pool first — reused buffers have stable device pointers,
+        // so a captured decode graph can be replayed for this request too.
+        let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
+            (0..self.cfg.num_layers)
+                .map(|_| KvCache {
+                    k: B::alloc(nkv * max * hd),
+                    v: B::alloc(nkv * max * hd),
+                    len: 0,
+                    capacity: max,
+                    num_kv_heads: nkv,
+                    head_dim: hd,
+                })
+                .collect()
+        });
+        // Reset logical length; buffers stay. No need to zero the memory —
+        // the kv_cache_append writes new K/V in place, and attention only
+        // reads up to `cache_len`.
+        for c in caches.iter_mut() {
+            c.len = 0;
+        }
         self.kv_caches.insert(cache_id.to_string(), caches);
     }
 
@@ -771,20 +788,20 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     }
 
     fn release(&mut self, cache_id: &str) {
-        // Drop the captured graph BEFORE the KV cache: the graph holds raw
-        // device pointers into that cache, and a pending graph launch on
-        // the stream would prevent the cache's cuMemFreeAsync from
-        // completing cleanly. Sync + reset_graph + sync orders the ops.
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        B::reset_graph(&mut ctx);
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.kv_caches.remove(cache_id);
+        // Return the cache's buffers to the free pool instead of dropping.
+        // This keeps device pointers stable across requests so a captured
+        // decode graph remains valid. Graph-free path still works — the
+        // pool is append-only; unused slots just sit idle.
+        if let Some(caches) = self.kv_caches.remove(cache_id) {
+            self.kv_free_pool.push(caches);
+        }
+        // Graph replay only works if the NEXT request draws the SAME pool
+        // slot (LIFO pop gives us that for single-request sequential) so
+        // we DON'T invalidate the graph here.
     }
 
     fn reset(&mut self) {
+        // Hard reset: drop all caches AND the pool, invalidate graph.
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
         B::reset_graph(&mut ctx);
@@ -792,6 +809,7 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
         self.kv_caches.clear();
+        self.kv_free_pool.clear();
     }
 }
 
