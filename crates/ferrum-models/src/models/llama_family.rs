@@ -319,6 +319,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
     /// The loader decides per-projection whether to instantiate DenseLinear,
     /// GptqLinear, etc. — this code doesn't care.
     pub fn new(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
+        // Invalidate any graph from a previously-loaded model. The captured
+        // graph references the old model's scratch buffers; a fresh model
+        // gets fresh scratch, so reusing the graph would read/write freed
+        // pointers. Matters for test suites where multiple models coexist.
+        {
+            let mut ctx = B::new_context();
+            B::reset_graph(&mut ctx);
+        }
         let rope = build_rope_cache::<B>(&cfg);
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1); // decode-sized; prefill resizes
 
@@ -424,6 +432,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         cfg: LlamaFamilyConfig,
         loader: &dyn WeightLoader<B>,
     ) -> Result<Self> {
+        // See `new` — invalidate stale graph referring to prior model's scratch.
+        {
+            let mut ctx = B::new_context();
+            B::reset_graph(&mut ctx);
+        }
         let rope = build_rope_cache::<B>(&cfg);
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
 
@@ -484,7 +497,17 @@ impl<B: Backend> LlamaFamilyModel<B> {
     /// Grow scratch buffers if `tokens` exceeds the current sizing.
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
         if self.scratch.max_tokens < tokens {
+            // Any captured decode graph holds pointers to the old scratch
+            // buffers; those are about to be freed. Invalidate first so the
+            // next decode falls back to eager + re-captures with fresh ptrs.
+            // Critical for multi-turn chat (turn N+1's prefill may grow scratch).
+            {
+                let mut ctx = B::new_context();
+                B::reset_graph(&mut ctx);
+            }
             self.scratch = LlamaFamilyScratch::alloc(&self.cfg, tokens);
+            self.graph_warmup = 0;
+            self.graph_capture_failed = false;
         }
     }
 
@@ -911,6 +934,16 @@ impl<B: Backend> LlamaFamilyModel<B> {
         if should_capture && !self.graph_capture_failed {
             if B::end_graph_capture(&mut ctx).is_err() {
                 self.graph_capture_failed = true;
+            } else {
+                // Stream capture mode RECORDS ops into the graph without
+                // executing them. scratch.logits still holds the previous
+                // step's value. Replay the just-captured graph once to
+                // actually execute and produce this step's logits. Without
+                // this, the capture step's to_vec returns stale logits,
+                // yielding a 1-token offset in the generated sequence.
+                if B::replay_last_graph(&mut ctx).is_err() {
+                    self.graph_capture_failed = true;
+                }
             }
             B::set_dev_state_mode(&mut ctx, false);
         } else {

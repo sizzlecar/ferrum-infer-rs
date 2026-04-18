@@ -218,16 +218,14 @@ impl Backend for CudaBackend {
             ));
         }
 
-        // Use simpler cuGraphInstantiate_v2 instead of cuGraphInstantiateWithFlags
-        // (v2 is the older API without flags; on some Blackwell driver builds
-        // the WithFlags variant is the one that corrupts context).
+        // Use AUTO_FREE_ON_LAUNCH (value 1). Paired with cuGraphUpload
+        // below; flags=0 + no upload was producing SIGSEGV inside libcuda
+        // at cuGraphLaunch on Blackwell + CUDA 13. Matches what cudarc's
+        // default end_capture uses in the passing repro tests.
+        let flags = sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64;
         let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
         let st2 = unsafe {
-            sys::cuGraphInstantiateWithFlags(
-                &mut cu_graph_exec,
-                cu_graph,
-                0u64, // no flags
-            )
+            sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, flags)
         };
         if st2 != sys::CUresult::CUDA_SUCCESS {
             unsafe {
@@ -235,6 +233,21 @@ impl Backend for CudaBackend {
             }
             return Err(FerrumError::unsupported(format!(
                 "cuGraphInstantiate failed: {st2:?}"
+            )));
+        }
+
+        // Upload graph to GPU before first launch. Without this, the first
+        // cuGraphLaunch does lazy JIT + resource upload while the stream
+        // still has pending ops — libcuda dereferences not-yet-uploaded
+        // graph state and SIGSEGVs on Blackwell + CUDA 13.
+        let st3 = unsafe { sys::cuGraphUpload(cu_graph_exec, cu_stream) };
+        if st3 != sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                sys::cuGraphExecDestroy(cu_graph_exec);
+                sys::cuGraphDestroy(cu_graph);
+            }
+            return Err(FerrumError::unsupported(format!(
+                "cuGraphUpload failed: {st3:?}"
             )));
         }
 
@@ -262,11 +275,6 @@ impl Backend for CudaBackend {
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
-                // NOTE: on Blackwell + CUDA 13 driver, cuGraphLaunch crashes
-                // inside libcuda.so with SIGSEGV (verified via gdb:
-                // stack frame #3 = cuGraphLaunch from libcuda.so, #0 =
-                // arbitrary addr inside it). Driver-side bug, not our code.
-                // Kept the raw FFI path for future driver versions to retry.
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!(
