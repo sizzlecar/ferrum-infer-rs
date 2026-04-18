@@ -278,7 +278,12 @@ impl Backend for CudaBackend {
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
         with_stream(|stream| {
             let mut host = vec![f16::ZERO; len];
-            stream.memcpy_dtoh(buf, &mut host).expect("cuda dtoh");
+            // cudarc asserts host.len() >= buf.len() — but we may want a
+            // PARTIAL read (len < buf capacity), e.g. reading only 4 rows
+            // out of a batch_logits buffer sized for max_batch. Slice the
+            // device buffer so its reported length matches `len`.
+            let view = buf.slice(0..len);
+            stream.memcpy_dtoh(&view, &mut host).expect("cuda dtoh");
             stream.synchronize().expect("cuda dtoh sync");
             host.into_iter().map(|x| x.to_f32()).collect()
         })
