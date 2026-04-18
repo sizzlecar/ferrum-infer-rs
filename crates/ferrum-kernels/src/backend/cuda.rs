@@ -267,7 +267,12 @@ impl Backend for CudaBackend {
         let cu_stream = ctx.stream.cu_stream();
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
+                eprintln!(
+                    "[GRAPH] pre-launch exec={:?} stream={:?}",
+                    g.cu_graph_exec, cu_stream
+                );
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
+                eprintln!("[GRAPH] post-launch st={st:?}");
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!(
                         "cuGraphLaunch: {st:?}"
