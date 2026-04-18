@@ -770,10 +770,21 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
 
     fn release(&mut self, cache_id: &str) {
         self.kv_caches.remove(cache_id);
+        // Captured decode graph holds raw pointers into this request's KV
+        // cache + scratch; dropping the cache invalidates those pointers.
+        // Force a re-capture on the next request.
+        let mut ctx = B::new_context();
+        B::reset_graph(&mut ctx);
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
     }
 
     fn reset(&mut self) {
         self.kv_caches.clear();
+        let mut ctx = B::new_context();
+        B::reset_graph(&mut ctx);
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
     }
 }
 

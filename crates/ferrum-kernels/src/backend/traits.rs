@@ -180,6 +180,11 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Ok(false)
     }
 
+    /// Drop the cached decode graph — required when the KV cache it
+    /// was captured against is about to be freed (e.g. request release),
+    /// since the graph holds raw device pointers into that cache.
+    fn reset_graph(_ctx: &mut Self::Context) {}
+
     // ── GPTQ (INT4 quantization) ────────────────────────────────────────
     //
     // Two-step: load (once per weight) → gemm (per forward). The store

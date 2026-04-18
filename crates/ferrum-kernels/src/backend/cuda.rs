@@ -216,6 +216,10 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn reset_graph(_ctx: &mut Self::Context) {
+        invalidate_decode_graph();
+    }
+
     fn replay_last_graph(_ctx: &mut Self::Context) -> Result<bool> {
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
