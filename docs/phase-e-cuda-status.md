@@ -60,13 +60,24 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
   produces 2.4s audio (RTF 3x). Whisper loopback:
   `"人工智能正在改变世界请不吝点赞 订阅 转发..."` — **target text
   intact**, trailing = training-data YouTube outro bleed.
-- **CUDA: BROKEN**. Same input on CUDA 13 + Blackwell produces 5.92s
-  audio at RTF **45x** (15× slower than Metal). Whisper transcribes:
-  `"感谢观看我是超"` — pure YouTube outro, target text absent.
-  Isolated to CUDA path since Metal with identical code works. TTS
-  runs via candle-transformers (not our Backend kernels), so this is
-  a candle CUDA-specific issue — not fixable at our layer without
-  Model-as-Code port of Qwen3-TTS.
+- **CUDA voice clone via existing candle path**: broken, produces
+  YouTube-outro garbage at RTF 45x. Root cause found (not candle's
+  fault): `ferrum-attention::FusedTransformer` CUDA module was a
+  stub; on Linux w/ CUDA feature but no Metal, forward silently fell
+  back to `cpu/transformer.rs` which uses **naive fp64 O(n³) matmul**
+  (Accelerate is macOS-only). Over 20 decoder layers × 128 decode
+  steps the rounding diverges from training numerics enough to pick
+  wrong codec tokens → untrained-distribution output.
+- **Phase F fix — `Qwen3TtsTalker<B>` Model-as-Code**: replaces the
+  FusedTransformer path with a `LlamaFamilyModel<B>`-backed
+  transformer stack that uses ferrum-kernels' production CUDA/Metal
+  kernels. Loaded via `NativeSafetensorsLoader` + `PrefixedLoader`
+  ("talker." prefix). **Validated on Blackwell + CUDA 13**: first
+  5 codec tokens match CPU bit-for-bit (argmax identical, logits
+  within f16 precision ~0.007). Commits `b5931d1` (Talker) +
+  `8a9c99f` (SubTalker). Executor integration pending — current
+  `TtsModelExecutor` still uses the legacy candle/FusedTransformer
+  path by default.
 
 ### Concurrent HTTP loadtest (Qwen3-0.6B)
 
