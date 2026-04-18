@@ -129,6 +129,65 @@ impl ModelExecutor for LlmExecutor {
         Ok(DecodeOutput::new(logits_ref, kv_handle))
     }
 
+    /// Override default fallback to acquire the model lock ONCE for the whole
+    /// batch, avoiding N round-trips through parking_lot. Does not yet do
+    /// true attention batching (each cache has its own kv_len), but removes
+    /// mutex churn that was serialising concurrent requests at async level.
+    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Pre-extract all per-input metadata OUTSIDE the lock — this is pure
+        // borrow/downcast work that doesn't touch the model.
+        struct Prep {
+            cache_id: String,
+            token: u32,
+            seq_len: u32,
+            handle: Arc<GenericKvCacheHandle>,
+        }
+        let mut prepped: Vec<Prep> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let input_handle = input
+                .kv_cache
+                .as_any()
+                .downcast_ref::<GenericKvCacheHandle>()
+                .ok_or_else(|| FerrumError::model("Invalid KV cache handle type"))?;
+            use ferrum_interfaces::KvCacheHandle;
+            let seq_len = input_handle.block_table().sequence_length as u32;
+            let tokens = common::tensor_to_tokens(&input.input_ids)?;
+            if tokens.is_empty() {
+                return Err(FerrumError::model("Decode input is empty"));
+            }
+            prepped.push(Prep {
+                cache_id: input_handle.request_cache_id().to_string(),
+                token: tokens[0],
+                seq_len,
+                handle: Arc::new(input_handle.with_sequence_length((seq_len + 1) as usize)),
+            });
+        }
+
+        // One lock for the whole batch.
+        let all_logits: Vec<Vec<f32>> = {
+            let mut model = self.model.lock();
+            prepped
+                .iter()
+                .map(|p| model.decode(&p.cache_id, p.token, p.seq_len))
+                .collect()
+        };
+
+        let mut outputs = Vec::with_capacity(prepped.len());
+        for (p, logits) in prepped.into_iter().zip(all_logits.into_iter()) {
+            debug!("LlmExecutor batch_decode: token={}, pos={}", p.token, p.seq_len);
+            let logits_tensor = candle_core::Tensor::new(&logits[..], &candle_core::Device::Cpu)
+                .map_err(|e| FerrumError::model(format!("logits tensor: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?;
+            let logits_ref = common::wrap_tensor(logits_tensor);
+            outputs.push(DecodeOutput::new(logits_ref, p.handle));
+        }
+        Ok(outputs)
+    }
+
     fn release_cache(&self, cache_id: &str) {
         self.model.lock().release(cache_id);
     }
