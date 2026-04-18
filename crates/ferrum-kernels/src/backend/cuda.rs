@@ -1312,14 +1312,18 @@ struct GraphSlotRaw {
 
 impl Drop for GraphSlotRaw {
     fn drop(&mut self) {
-        unsafe {
-            if !self.cu_graph_exec.is_null() {
-                cudarc::driver::sys::cuGraphExecDestroy(self.cu_graph_exec);
-            }
-            if !self.cu_graph.is_null() {
-                cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
-            }
-        }
+        // DEBUG: cuGraphExecDestroy may corrupt stream allocator pool on
+        // Blackwell if called while any kernel args still reference
+        // pool-allocated memory. Skip destroy for now — graphs leak but
+        // the process dies anyway when the model drops.
+        // unsafe {
+        //     if !self.cu_graph_exec.is_null() {
+        //         cudarc::driver::sys::cuGraphExecDestroy(self.cu_graph_exec);
+        //     }
+        //     if !self.cu_graph.is_null() {
+        //         cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
+        //     }
+        // }
     }
 }
 
