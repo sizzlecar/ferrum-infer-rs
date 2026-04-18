@@ -698,12 +698,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
 
         // Decide whether to capture this step.
+        // Graph capture is opt-in via FERRUM_CUDA_GRAPH=1 — replay is currently
+        // unreliable on Blackwell + CUDA 12.8 (see docs/phase-e-cuda-status.md).
         // Warmup first so cuBLAS picks algorithms, JIT settles, etc.
-        // Override with FERRUM_CUDA_NO_GRAPH=1 to disable capture.
         const GRAPH_WARMUP: usize = 3;
         let should_capture = !self.graph_capture_failed
             && self.graph_warmup >= GRAPH_WARMUP
-            && std::env::var("FERRUM_CUDA_NO_GRAPH").is_err();
+            && std::env::var("FERRUM_CUDA_GRAPH").is_ok();
 
         if should_capture {
             B::set_dev_state_mode(&mut ctx, true);

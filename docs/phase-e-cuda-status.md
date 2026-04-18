@@ -72,8 +72,8 @@ rented session. Root-cause suspicions (each of which has fixes landed):
    immediately after `end_capture`.
 
 Despite all fixes landing, some graph replay still errors. Current
-default: `FERRUM_CUDA_NO_GRAPH=1` is the implicit default unless
-overriden. Set `FERRUM_CUDA_GRAPH=1` to opt in for debugging.
+default: eager (no graph). Set `FERRUM_CUDA_GRAPH=1` to opt in for
+debugging.
 
 **Impact**: 4B runs at 82 tok/s (92% of the 88.8 baseline). The
 ~7 tok/s gap is what graph capture is expected to recover.
