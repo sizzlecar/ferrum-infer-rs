@@ -769,22 +769,27 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     }
 
     fn release(&mut self, cache_id: &str) {
-        self.kv_caches.remove(cache_id);
-        // Captured decode graph holds raw pointers into this request's KV
-        // cache + scratch; dropping the cache invalidates those pointers.
-        // Force a re-capture on the next request.
+        // Drop the captured graph BEFORE the KV cache: the graph holds raw
+        // device pointers into that cache, and a pending graph launch on
+        // the stream would prevent the cache's cuMemFreeAsync from
+        // completing cleanly. Sync + reset_graph + sync orders the ops.
         let mut ctx = B::new_context();
+        B::sync(&mut ctx);
         B::reset_graph(&mut ctx);
+        B::sync(&mut ctx);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
+        self.kv_caches.remove(cache_id);
     }
 
     fn reset(&mut self) {
-        self.kv_caches.clear();
         let mut ctx = B::new_context();
+        B::sync(&mut ctx);
         B::reset_graph(&mut ctx);
+        B::sync(&mut ctx);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
+        self.kv_caches.clear();
     }
 }
 
