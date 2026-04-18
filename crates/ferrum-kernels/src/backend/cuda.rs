@@ -211,11 +211,11 @@ impl Backend for CudaBackend {
         println!("[GRAPH] end_capture -> is_some={}", graph_opt.is_some());
         match graph_opt {
             Some(g) => {
-                // Pre-upload the graph's resources so the first replay
-                // doesn't pay setup overhead + any latent init errors.
-                g.upload()
-                    .map_err(|e| FerrumError::unsupported(format!("graph.upload: {e}")))?;
-                println!("[GRAPH] upload ok");
+                // NOTE: previously called g.upload() here to pre-stage graph
+                // resources. On Blackwell + CUDA 13 + cudarc 0.19 this leaves
+                // the calling thread without a valid current context
+                // (subsequent cuCtxSetCurrent returns INVALID_VALUE). Skip
+                // the upload — first launch will do on-demand setup.
                 install_decode_graph(g);
                 Ok(())
             }
