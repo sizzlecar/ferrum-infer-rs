@@ -248,14 +248,25 @@ impl Backend for CudaBackend {
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
         use cudarc::driver::DevicePtr;
         with_stream(|stream| {
-            // Sync the stream first so all pending work (including graph
-            // replay) is drained. Then use the SYNCHRONOUS cuMemcpyDtoH_v2
-            // directly rather than stream-ordered memcpy_dtoh_async — the
-            // async variant was returning CUDA_ERROR_INVALID_VALUE after
-            // graph replay on Blackwell, apparently because of stream state
-            // left behind by graph.launch that the async memcpy path
-            // validates. The synchronous variant bypasses stream validation.
-            stream.synchronize().expect("cuda pre-dtoh sync");
+            // Ensure context is bound to this thread BEFORE any CUDA calls —
+            // graph replay on Blackwell leaves the calling thread without
+            // a primary context bound in some cases, which then breaks
+            // cuStreamSynchronize with CUDA_ERROR_INVALID_VALUE.
+            stream
+                .context()
+                .bind_to_thread()
+                .expect("bind ctx before dtoh");
+            // Full device sync (not just stream) — ensures graph execution
+            // is fully complete regardless of which stream it ran on.
+            unsafe {
+                use cudarc::driver::sys;
+                let st = sys::cuCtxSynchronize();
+                assert_eq!(
+                    st,
+                    sys::CUresult::CUDA_SUCCESS,
+                    "cuCtxSynchronize failed: {st:?}"
+                );
+            }
             let mut host = vec![f16::ZERO; len];
             let (src_ptr, _g) = buf.device_ptr(stream);
             unsafe {
