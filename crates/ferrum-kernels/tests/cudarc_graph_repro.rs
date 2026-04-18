@@ -182,3 +182,143 @@ fn cudarc_graph_with_many_allocs() {
     }
     eprintln!("[cudarc-repro-heavy] SUCCESS (200 bufs + graph)");
 }
+
+/// Mirrors ferrum's path even more closely — adds:
+/// - cuBLAS handle + 32 MB workspace + DEVICE pointer mode + sgemm inside capture
+/// - multiple different PTX modules loaded dynamically
+/// - set_decode_state-style memcpy_htod BEFORE graph launch
+///
+/// This is the final "if this passes, the trigger is in our kernel
+/// dispatch / stream semantics / something we haven't imagined"
+/// sanity check for cudarc.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cudarc_graph_like_ferrum() {
+    use cudarc::cublas::{sys as blas_sys, CudaBlas};
+
+    const ANOTHER_PTX: &str = r#"
+extern "C" __global__ void square(float* buf, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) buf[i] = buf[i] * buf[i];
+}
+"#;
+
+    eprintln!("[cudarc-ferrum-like] init");
+    let ctx = CudaContext::new(0).expect("CudaContext::new");
+    unsafe {
+        ctx.disable_event_tracking();
+    }
+    let stream = ctx.new_stream().expect("new_stream");
+
+    // Load TWO PTX modules — mirrors ferrum's multi-kernel setup.
+    let touch_ptx = compile_ptx(TOUCH_PTX).expect("compile touch");
+    let touch_mod = ctx.load_module(touch_ptx).expect("load touch");
+    let touch_fn = touch_mod.load_function("touch").expect("touch fn");
+    let square_ptx = compile_ptx(ANOTHER_PTX).expect("compile square");
+    let square_mod = ctx.load_module(square_ptx).expect("load square");
+    let square_fn = square_mod.load_function("square").expect("square fn");
+
+    // cuBLAS handle + workspace + DEVICE pointer mode (matches our config).
+    let blas = CudaBlas::new(stream.clone()).expect("CudaBlas::new");
+    let alpha_f32 = stream.memcpy_stod(&[1.0f32]).expect("alpha");
+    let beta_f32 = stream.memcpy_stod(&[0.0f32]).expect("beta");
+    unsafe {
+        blas_sys::cublasSetPointerMode_v2(
+            blas.handle().clone(),
+            blas_sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
+        );
+    }
+
+    // GEMM buffers.
+    let m = 1;
+    let n = 1024;
+    let k = 1024;
+    let d_a = stream.alloc_zeros::<f32>(m * k).expect("a");
+    let d_b = stream.alloc_zeros::<f32>(k * n).expect("b");
+    let mut d_c = stream.alloc_zeros::<f32>(m * n).expect("c");
+
+    // Decode-state mimic: three tiny buffers we'll memcpy_htod into pre-replay.
+    let mut state_token = stream.alloc_zeros::<u32>(1).expect("token");
+    let mut state_pos = stream.alloc_zeros::<i32>(1).expect("pos");
+    let mut state_kv = stream.alloc_zeros::<i32>(1).expect("kv");
+    stream.synchronize().expect("sync");
+
+    // Scratch for kernel launches.
+    let scratch_n = 4096;
+    let mut scratch = stream.alloc_zeros::<f32>(scratch_n).expect("scratch");
+    let n_i32 = scratch_n as i32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (((scratch_n + 127) / 128) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Warm-up outside capture.
+    let mut b = stream.launch_builder(&touch_fn);
+    b.arg(&mut scratch).arg(&n_i32);
+    unsafe { b.launch(cfg).expect("warmup touch") };
+    stream.synchronize().expect("sync");
+
+    eprintln!("[cudarc-ferrum-like] begin capture");
+    stream
+        .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        .expect("begin_capture");
+
+    // Inside capture: mix kernels, modules, cuBLAS — like a real decode step.
+    for _ in 0..3 {
+        let mut b = stream.launch_builder(&touch_fn);
+        b.arg(&mut scratch).arg(&n_i32);
+        unsafe { b.launch(cfg).expect("cap touch") };
+        let mut b = stream.launch_builder(&square_fn);
+        b.arg(&mut scratch).arg(&n_i32);
+        unsafe { b.launch(cfg).expect("cap square") };
+        // cuBLAS sgemm (DEVICE alpha/beta)
+        unsafe {
+            blas_sys::cublasSgemm_v2(
+                blas.handle().clone(),
+                blas_sys::cublasOperation_t::CUBLAS_OP_N,
+                blas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                alpha_f32.device_ptr(&stream).0 as *const f32,
+                d_b.device_ptr(&stream).0 as *const f32,
+                n as i32,
+                d_a.device_ptr(&stream).0 as *const f32,
+                k as i32,
+                beta_f32.device_ptr(&stream).0 as *const f32,
+                d_c.device_ptr_mut(&stream).0 as *mut f32,
+                n as i32,
+            );
+        }
+    }
+
+    let graph = stream
+        .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+        .expect("end_capture")
+        .expect("non-null");
+    graph.upload().expect("upload");
+    stream.synchronize().expect("sync");
+
+    for i in 0..6 {
+        // set_decode_state-style pre-launch htod
+        stream
+            .memcpy_htod(&[i as u32], &mut state_token)
+            .expect("htod token");
+        stream
+            .memcpy_htod(&[i as i32], &mut state_pos)
+            .expect("htod pos");
+        stream
+            .memcpy_htod(&[(i + 1) as i32], &mut state_kv)
+            .expect("htod kv");
+
+        eprintln!("[cudarc-ferrum-like] cuGraphLaunch #{}", i + 1);
+        let st = unsafe { sys::cuGraphLaunch(graph.cu_graph_exec(), stream.cu_stream()) };
+        assert_eq!(st, sys::CUresult::CUDA_SUCCESS, "cuGraphLaunch: {st:?}");
+        stream.synchronize().expect("sync");
+    }
+    eprintln!(
+        "[cudarc-ferrum-like] SUCCESS — cuBLAS + multi-module + htod pre-launch"
+    );
+}
