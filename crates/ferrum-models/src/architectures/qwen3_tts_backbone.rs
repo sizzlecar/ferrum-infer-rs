@@ -117,6 +117,12 @@ impl<B: Backend> TalkerBackboneForward for TalkerBackboneBackend<B> {
         // backbone method based on seq_len, but both respect `self.pos` so
         // a multi-stage prefill (role prefix then ICL block then decode)
         // keeps the KV cache and positions aligned.
+        tracing::debug!(
+            "TalkerBackboneBackend::forward cache={} seq_len={} pos_offset={}",
+            self.cache_id,
+            seq_len,
+            self.pos
+        );
         let out = if seq_len == 1 {
             self.backbone
                 .decode_post_norm_from_embed(&self.cache_id, input_f32, self.pos as u32)
