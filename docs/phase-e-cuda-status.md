@@ -10,7 +10,13 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
 |-------|------|-------|--------|-------|
 | Qwen3-0.6B FP16 | eager | ~108 | ✅ cos=0.999998 | matches CPU argmax + text |
 | Qwen3-4B FP16 | eager | ~82 | ✅ cos=1.000000 | tied-emb wired |
-| Qwen2.5-3B-GPTQ-Int4 | Marlin | ~106 | — | native `.qweight` loader, repack at load |
+| Qwen2.5-3B-GPTQ-Int4 | Marlin | ~107.5 | ✅ text | bias-on-attn projections now wired |
+
+**Smoke tests:**
+- `ferrum run qwen2.5:3b-gptq --backend cuda` → coherent Chinese + English answers.
+- `ferrum transcribe whisper-turbo *.wav --backend cuda` → correct transcript.
+- `ferrum tts qwen3-tts "..." --backend cuda -o out.wav` → runs, produces audio
+  (output quality is a pre-existing voice-clone issue, not a CUDA issue).
 
 - **Parity test**: `crates/ferrum-models/tests/qwen3_cuda_parity_test.rs`
   - `qwen3model_cpu_vs_cuda` — 0.6B, prefill + 5 decode, argmax + cosine ≥ 0.999
