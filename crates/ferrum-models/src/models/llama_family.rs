@@ -175,7 +175,17 @@ pub struct RopeCache<B: Backend> {
 /// Sized lazily on first use so tiny decode steps don't pay for prefill-sized
 /// buffers. Grows monotonically when a larger prefill arrives.
 pub struct LlamaFamilyScratch<B: Backend> {
-    pub residual: B::Buffer,
+    /// Residual stream — wrapped in Option so decode_internal can
+    /// `.take()` it without needing an alloc placeholder.
+    ///
+    /// Why this matters for graph capture: the old pattern was
+    /// `mem::replace(&mut scratch.residual, B::alloc(1))` which creates a
+    /// 1-element buffer at every decode step. When graph capture is on,
+    /// that alloc-during-capture + drop-after-capture pair surfaces as
+    /// cuMemFreeAsync(INVALID_VALUE) because the free tries to release a
+    /// pointer the captured graph may still reference. Option::take leaves
+    /// None and moves the real buffer into a local — no spurious alloc.
+    pub residual: Option<B::Buffer>,
     pub norm_out: B::Buffer,
     pub qkv_out: B::Buffer,
     // ── Per-item scratch for batched decode path ──────────────────────
@@ -235,7 +245,7 @@ impl<B: Backend> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let t = max_tokens;
         Self {
-            residual: B::alloc(t * h),
+            residual: Some(B::alloc(t * h)),
             norm_out: B::alloc(t * h),
             qkv_out: B::alloc(t * qkv_dim),
             q_buf: B::alloc(t * q_dim),
@@ -672,7 +682,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // `&mut self.scratch.residual`. Use Option::take to move it out
         // (no placeholder alloc → no transient cuMemFreeAsync that could
         // corrupt stream pool state after graph ops on Blackwell).
-        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(1));
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
         B::embedding_lookup(&mut ctx, &self.embed, tokens, &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
@@ -717,7 +731,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         B::sync(&mut ctx);
 
         // Restore residual into scratch for reuse on the next call.
-        self.scratch.residual = residual;
+        self.scratch.residual = Some(residual);
 
         B::to_vec(&self.scratch.logits, vocab)
     }
@@ -774,7 +788,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // cuMemAllocFromPoolAsync(stream, 0) can return CUDA_ERROR_INVALID_VALUE
         // on Blackwell after graph replay corrupts the pool state. Size-1 is
         // always valid and costs 2 bytes of transient VRAM per decode step.
-        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(1));
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
         B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
@@ -814,7 +832,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // the call redundant there (~50µs/step cost), but correctness on
         // Metal requires the explicit flush here.
         B::sync(&mut ctx);
-        self.scratch.residual = residual;
+        self.scratch.residual = Some(residual);
 
         B::to_vec(&self.scratch.logits, vocab)
     }
@@ -851,7 +869,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
         // 0. Embed all M tokens into residual [M, H]
         let tokens: Vec<u32> = batch.iter().map(|(_, t, _)| *t).collect();
-        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(1));
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
         B::embedding_lookup(&mut ctx, &self.embed, &tokens, &mut residual, h);
 
         // 1..num_layers: batched forward for each layer
@@ -880,7 +902,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
         // Sync before to_vec (Metal: no internal sync on buffer read).
         B::sync(&mut ctx);
-        self.scratch.residual = residual;
+        self.scratch.residual = Some(residual);
 
         // Extract M logit vectors from the flat buffer.
         let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
