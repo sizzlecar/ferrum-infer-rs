@@ -15,7 +15,7 @@
 #![cfg(feature = "cuda")]
 
 use cudarc::driver::sys::{self, CUgraphInstantiate_flags, CUstreamCaptureMode};
-use cudarc::driver::{CudaContext, PushKernelArg};
+use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 
 // A trivial kernel — matches our touch_kernel from the C++ repros.
@@ -225,7 +225,7 @@ extern "C" __global__ void square(float* buf, int n) {
     let beta_f32 = stream.memcpy_stod(&[0.0f32]).expect("beta");
     unsafe {
         blas_sys::cublasSetPointerMode_v2(
-            blas.handle().clone(),
+            *blas.handle(),
             blas_sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
         );
     }
@@ -275,20 +275,25 @@ extern "C" __global__ void square(float* buf, int n) {
         unsafe { b.launch(cfg).expect("cap square") };
         // cuBLAS sgemm (DEVICE alpha/beta)
         unsafe {
+            let (a_ptr, _ga) = alpha_f32.device_ptr(&stream);
+            let (b_ptr, _gb) = beta_f32.device_ptr(&stream);
+            let (da_ptr, _gda) = d_a.device_ptr(&stream);
+            let (db_ptr, _gdb) = d_b.device_ptr(&stream);
+            let (dc_ptr, _gdc) = d_c.device_ptr_mut(&stream);
             blas_sys::cublasSgemm_v2(
-                blas.handle().clone(),
+                *blas.handle(),
                 blas_sys::cublasOperation_t::CUBLAS_OP_N,
                 blas_sys::cublasOperation_t::CUBLAS_OP_N,
                 n as i32,
                 m as i32,
                 k as i32,
-                alpha_f32.device_ptr(&stream).0 as *const f32,
-                d_b.device_ptr(&stream).0 as *const f32,
+                a_ptr as *const f32,
+                db_ptr as *const f32,
                 n as i32,
-                d_a.device_ptr(&stream).0 as *const f32,
+                da_ptr as *const f32,
                 k as i32,
-                beta_f32.device_ptr(&stream).0 as *const f32,
-                d_c.device_ptr_mut(&stream).0 as *mut f32,
+                b_ptr as *const f32,
+                dc_ptr as *mut f32,
                 n as i32,
             );
         }
