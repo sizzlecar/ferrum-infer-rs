@@ -116,24 +116,15 @@ rented session. Root-cause suspicions (each of which has fixes landed):
 
 **Current state of graph with `FERRUM_CUDA_GRAPH=1`:**
 
-- ✅ Single-request warmup decodes 3-4 steps clean (no replay).
-- ❌ First replay step: `stream.memcpy_dtoh(&scratch.logits, ...)`
-  returns CUDA_ERROR_INVALID_VALUE. Explicit `B::sync` before dtoh
-  doesn't help; compute-sanitizer only fingers a cuStreamWaitEvent
-  error that re-appears on every replay. Cause is apparently deeper
-  than my 8+ attempted fixes.
-- Added: KV cache pool (`kv_free_pool`) so release() doesn't free
-  buffers → captured graph pointers don't dangle across requests.
-  Needed for any multi-request graph support but not sufficient.
+Root causes found across two boxes (CUDA 12.8 + 13.0, both Blackwell):
 
-Hypothesis: Blackwell + cudarc 0.17 + CUDA 12.8 combination has a
-subtle interaction between stream-ordered allocator and graph replay
-that none of the expected fixes unblock. Investigation needs
-cuda-gdb on-box, not reachable via SSH-only.
+1. **Placeholder-alloc drop corruption**: `mem::replace(&mut scratch.residual, B::alloc(1))` dropped a stream-ordered alloc after graph capture, corrupting pool state so `bind_to_thread` / `sync` / `dtoh` all returned INVALID_VALUE. **Fixed**: `scratch.residual: Option<Buffer>` + `.take()` — no placeholder.
+2. **cudarc's end_capture packaged cuStreamEndCapture + cuGraphInstantiateWithFlags as one call with non-zero default flag**. Traced showed context ptr was fine after both; fix was not actually in this layer but the diagnostic was useful. **Now**: raw FFI split with flags=0 explicitly.
+3. **Graph ref lifetime across requests**: captured graph's cuGraphExec held memory-pool references that prevented new-request allocs. **Fixed**: `Drop for GraphSlotRaw` calls `cuCtxSynchronize` + `cuGraphExecDestroy` + `cuGraphDestroy`; `LlamaFamilyModel::release` invokes `sync → reset_graph → sync` before returning cache to pool.
 
-Default: eager. `FERRUM_CUDA_GRAPH=1` still panics — leaving the
-infrastructure in place for a future fix attempt with a different
-driver/cudarc combo.
+**With all fixes**: within-request replay confirmed working (observed 10+ replays succeed). **But**: flaky — same binary sometimes hangs at first `cuGraphLaunch`, sometimes replays cleanly for entire request. No consistent repro from SSH-only debug. Blackwell Server Edition + driver + cudarc 0.19 has some additional interaction needs cuda-gdb on-box to pin down.
+
+Default: eager. `FERRUM_CUDA_GRAPH=1` for research only. Infrastructure fully in place so follow-up with cuda-gdb can focus on the remaining flakiness without redoing the plumbing.
 
 Default: eager (no graph). Set `FERRUM_CUDA_GRAPH=1` for the single-
 request case. Production fix requires either per-graph memory pools
