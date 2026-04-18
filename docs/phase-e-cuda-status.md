@@ -8,9 +8,9 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
 
 | Model | Path | tok/s | Parity | Notes |
 |-------|------|-------|--------|-------|
-| Qwen3-0.6B FP16 | eager | ~108 | ✅ cos=0.999998 | matches CPU argmax + text |
-| Qwen3-4B FP16 | eager | ~82 | ✅ cos=1.000000 | tied-emb wired |
-| Qwen2.5-3B-GPTQ-Int4 | Marlin | ~107.5 | ✅ text | bias-on-attn projections now wired |
+| Qwen3-0.6B FP16 | eager | ~141 | ✅ cos=0.999998 | matches CPU argmax + text |
+| Qwen3-4B FP16 | eager | ~81 | ✅ cos=1.000000 | tied-emb wired; 91% of 88.8 target |
+| Qwen2.5-3B-GPTQ-Int4 | Marlin | ~106.5 | ✅ text | bias-on-attn projections wired; 95% of 112.4 target |
 
 **Smoke tests:**
 - `ferrum run qwen2.5:3b-gptq --backend cuda` → coherent Chinese + English answers.
