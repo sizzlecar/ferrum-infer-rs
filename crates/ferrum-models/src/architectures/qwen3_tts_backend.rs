@@ -274,4 +274,221 @@ impl<B: Backend> Qwen3TtsTalker<B> {
         let _ = cache_id; // cache_id not used yet; reserved for per-session variants
         B::to_vec(&normed, h)
     }
+
+    /// Access the codec embedding buffer for external use (e.g. SubTalker
+    /// needs the first codec token's embedding as its starting input).
+    pub fn codec_embed_lookup(&self, token: u32) -> Vec<f32> {
+        let mut ctx = B::new_context();
+        let h = self.cfg.hidden_size;
+        let mut out = B::alloc(h);
+        B::embedding_lookup(
+            &mut ctx,
+            &self.codec_embedding,
+            &[token],
+            &mut out,
+            h,
+        );
+        B::sync(&mut ctx);
+        B::to_vec(&out, h)
+    }
+}
+
+// ── SubTalker (Code Predictor) ──────────────────────────────────────────
+//
+// Smaller transformer (4-5 layers) that predicts codec tokens 1..N-1 given
+// the Talker's post-norm hidden state and the first codec token's
+// embedding. Has per-codebook embedding tables and per-codebook output
+// heads (N-1 of each).
+
+pub struct Qwen3TtsSubTalker<B: Backend> {
+    pub cfg: TalkerConfig,
+
+    /// Backbone — 4-5 layer Qwen3 with `code_predictor_*` dims.
+    pub backbone: LlamaFamilyModel<B>,
+
+    /// Projection from Talker's `hidden_size` to SubTalker's
+    /// `code_predictor_hidden_size`. `None` if sizes match.
+    pub projection: Option<Box<dyn Linear<B>>>,
+
+    /// Per-codebook embedding tables: `codec_embeddings[i]` is
+    /// `[code_predictor_vocab_size * hidden_size]` for i in 0..num_code_groups-1.
+    pub codec_embeddings: Vec<B::Buffer>,
+
+    /// Per-codebook output heads: `lm_heads[i]` is
+    /// `code_predictor_hidden_size -> code_predictor_vocab_size`.
+    pub lm_heads: Vec<Box<dyn Linear<B>>>,
+}
+
+impl<B: Backend> Qwen3TtsSubTalker<B> {
+    pub fn new(cfg: TalkerConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
+        let cp_h = cfg.code_predictor_hidden_size;
+        let cp_im = cp_h * 3; // ~3072 for 1024 hidden; matches existing impl
+
+        // Backbone config: same pattern as Qwen3 but smaller dims.
+        let backbone_cfg = LlamaFamilyConfig {
+            hidden_size: cp_h,
+            intermediate_size: cp_im,
+            num_heads: cfg.code_predictor_num_heads,
+            num_kv_heads: cfg.code_predictor_num_kv_heads,
+            head_dim: cp_h / cfg.code_predictor_num_heads,
+            num_layers: cfg.code_predictor_num_layers,
+            vocab_size: cfg.code_predictor_vocab_size,
+            max_seq_len: cfg.max_position_embeddings,
+            rms_norm_eps: cfg.rms_norm_eps as f32,
+            rope_theta: cfg.rope_theta,
+            has_qk_norm: true,
+            sliding_window: 0,
+        };
+
+        let cp_loader = PrefixedLoader::new(loader, "talker.code_predictor.");
+        let backbone = LlamaFamilyModel::<B>::new_backbone_only(backbone_cfg, &cp_loader)?;
+
+        // Optional projection talker.code_predictor.small_to_mtp_projection.
+        let projection = if cfg.hidden_size != cp_h {
+            Some(loader.load_linear("talker.code_predictor.small_to_mtp_projection")?)
+        } else {
+            None
+        };
+
+        // Per-codebook embeddings + heads (num_code_groups - 1).
+        let n_extra = cfg.num_code_groups - 1;
+        let mut codec_embeddings = Vec::with_capacity(n_extra);
+        for i in 0..n_extra {
+            let name = format!(
+                "talker.code_predictor.model.codec_embedding.{i}.weight"
+            );
+            codec_embeddings.push(loader.load_tensor(&name)?);
+        }
+        let mut lm_heads = Vec::with_capacity(n_extra);
+        for i in 0..n_extra {
+            let name = format!("talker.code_predictor.lm_head.{i}");
+            lm_heads.push(loader.load_linear(&name)?);
+        }
+
+        Ok(Self {
+            cfg,
+            backbone,
+            projection,
+            codec_embeddings,
+            lm_heads,
+        })
+    }
+
+    /// Predict codec tokens 1..num_code_groups-1 given Talker's post-norm
+    /// hidden state `[hidden_size]` and the first codec token's embedding
+    /// `[hidden_size]`. Returns `num_code_groups - 1` token IDs.
+    ///
+    /// Sampling uses greedy argmax; caller can wrap for top-k / temperature
+    /// sampling by decoding logits.
+    pub fn predict_greedy(
+        &mut self,
+        cache_id: &str,
+        talker_hidden: &[f32],
+        first_codec_embed: &[f32],
+    ) -> Vec<u32> {
+        let h_talker = self.cfg.hidden_size;
+        let cp_h = self.cfg.code_predictor_hidden_size;
+        let n_extra = self.cfg.num_code_groups - 1;
+
+        debug_assert_eq!(talker_hidden.len(), h_talker);
+        debug_assert_eq!(first_codec_embed.len(), h_talker);
+
+        // Fresh KV cache per predict call.
+        self.backbone.kv_caches.remove(cache_id);
+
+        // 1. Concat [talker_hidden | first_codec_embed] → [2, h_talker].
+        let mut combined = Vec::with_capacity(2 * h_talker);
+        combined.extend_from_slice(talker_hidden);
+        combined.extend_from_slice(first_codec_embed);
+
+        // 2. Optional projection h_talker → cp_h (per token).
+        let projected: Vec<f32> = if let Some(ref proj) = self.projection {
+            let mut ctx = B::new_context();
+            let in_buf = B::from_slice(&combined);
+            let mut out = B::alloc(2 * cp_h);
+            proj.forward(&mut ctx, &in_buf, &mut out, 2);
+            B::sync(&mut ctx);
+            B::to_vec(&out, 2 * cp_h)
+        } else {
+            combined
+        };
+
+        // 3. Prefill through SubTalker backbone (2 tokens → pre-norm last).
+        let _ = self
+            .backbone
+            .prefill_from_embeds(cache_id, &projected, 2);
+
+        // 4. Autoregressive loop: for each codebook i, apply lm_heads[i] on
+        // the current post-norm hidden, greedy sample, embed via
+        // codec_embeddings[i], decode next step.
+        let mut pos: u32 = 2;
+        let mut predicted = Vec::with_capacity(n_extra);
+        let vocab = self.cfg.code_predictor_vocab_size;
+
+        for i in 0..n_extra {
+            // Get post-norm last hidden via backbone.final_norm_w.
+            let mut ctx = B::new_context();
+            let mut normed = B::alloc(cp_h);
+            B::rms_norm(
+                &mut ctx,
+                &self.backbone.scratch.last_hidden,
+                &self.backbone.final_norm_w,
+                self.cfg.rms_norm_eps as f32,
+                &mut normed,
+                1,
+                cp_h,
+            );
+            let mut logits = B::alloc(vocab);
+            self.lm_heads[i].forward(&mut ctx, &normed, &mut logits, 1);
+            B::sync(&mut ctx);
+            let logits_host = B::to_vec(&logits, vocab);
+
+            // Greedy argmax.
+            let token = logits_host
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0);
+            predicted.push(token);
+
+            // If this is the last codebook, no need to decode next step.
+            if i == n_extra - 1 {
+                break;
+            }
+
+            // Embed via codec_embeddings[i] (dim = h_talker).
+            let mut ctx2 = B::new_context();
+            let mut emb = B::alloc(h_talker);
+            B::embedding_lookup(
+                &mut ctx2,
+                &self.codec_embeddings[i],
+                &[token],
+                &mut emb,
+                h_talker,
+            );
+            B::sync(&mut ctx2);
+            let emb_host = B::to_vec(&emb, h_talker);
+
+            // Project h_talker → cp_h if needed.
+            let next_embed: Vec<f32> = if let Some(ref proj) = self.projection {
+                let mut ctx3 = B::new_context();
+                let in_buf = B::from_slice(&emb_host);
+                let mut out = B::alloc(cp_h);
+                proj.forward(&mut ctx3, &in_buf, &mut out, 1);
+                B::sync(&mut ctx3);
+                B::to_vec(&out, cp_h)
+            } else {
+                emb_host
+            };
+
+            // Decode one step → advances scratch.last_hidden.
+            let _ = self
+                .backbone
+                .decode_from_embed(cache_id, &next_embed, pos);
+            pos += 1;
+        }
+
+        predicted
+    }
 }
