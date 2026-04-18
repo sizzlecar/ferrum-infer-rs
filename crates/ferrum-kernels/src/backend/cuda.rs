@@ -131,6 +131,15 @@ impl Backend for CudaBackend {
         // Ensure process-global decode state buffers exist.
         ensure_decode_state_bufs(&stream);
 
+        // Disable cudarc's per-slice event tracking globally. We run everything
+        // on one stream → CUDA stream semantics handle ordering natively.
+        // Critical for graph capture: without this, the post-capture `to_vec`
+        // dtoh sync hits cuStreamWaitEvent on events that were recorded during
+        // pre-capture weight htods and are stale after replay.
+        unsafe {
+            ctx.disable_event_tracking();
+        }
+
         Self::Context {
             ctx,
             stream,
@@ -166,13 +175,8 @@ impl Backend for CudaBackend {
 
     fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
         use cudarc::driver::sys::CUstreamCaptureMode;
-        // Disable cudarc's per-slice event tracking during capture —
-        // without this, CUDA_ERROR_STREAM_CAPTURE_ISOLATION fires because
-        // weight buffers carry event handles from pre-capture htod calls.
-        // Matches what the old CudaDecodeRunner does around graph capture.
-        unsafe {
-            ctx.ctx.disable_event_tracking();
-        }
+        // Event tracking already disabled globally in new_context; begin
+        // capture directly in relaxed mode.
         ctx.stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| FerrumError::unsupported(format!("begin_capture: {e}")))?;
@@ -189,15 +193,7 @@ impl Backend for CudaBackend {
         let graph_opt = ctx
             .stream
             .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-            .map_err(|e| {
-                // Re-enable event tracking even on error to avoid permanent disable.
-                unsafe { ctx.ctx.enable_event_tracking() };
-                FerrumError::unsupported(format!("end_capture: {e}"))
-            })?;
-        // Re-enable event tracking for subsequent non-captured work.
-        unsafe {
-            ctx.ctx.enable_event_tracking();
-        }
+            .map_err(|e| FerrumError::unsupported(format!("end_capture: {e}")))?;
         match graph_opt {
             Some(g) => {
                 // Pre-upload the graph's resources so the first replay
