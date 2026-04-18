@@ -166,13 +166,17 @@ impl ModelExecutor for LlmExecutor {
             });
         }
 
-        // One lock for the whole batch.
+        // One lock for the whole batch, dispatch to model's decode_batch —
+        // which implementations may fuse into a single forward pass (GEMMs
+        // with m=batch, per-item attention) for true concurrency speedup.
+        // Trait default falls back to sequential decode per item.
         let all_logits: Vec<Vec<f32>> = {
             let mut model = self.model.lock();
-            prepped
+            let tuples: Vec<(String, u32, u32)> = prepped
                 .iter()
-                .map(|p| model.decode(&p.cache_id, p.token, p.seq_len))
-                .collect()
+                .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
+                .collect();
+            model.decode_batch(&tuples)
         };
 
         let mut outputs = Vec::with_capacity(prepped.len());

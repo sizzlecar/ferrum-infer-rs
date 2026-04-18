@@ -47,6 +47,21 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Returns `[vocab_size]` logits for the next step.
     fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32>;
 
+    /// Decode multiple concurrent requests in a single forward pass.
+    ///
+    /// Each entry is `(cache_id, token, pos)` — per-request state. Returns
+    /// one `[vocab_size]` logits vec per request in the SAME order.
+    ///
+    /// Default implementation loops `decode` sequentially. Backends that
+    /// implement true batched decode (one GEMM with m=batch, per-item
+    /// attention loop) override for concurrency speedup.
+    fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        batch
+            .iter()
+            .map(|(cid, tok, p)| self.decode(cid, *tok, *p))
+            .collect()
+    }
+
     /// Release the KV cache for a completed sequence.
     fn release(&mut self, cache_id: &str);
 
