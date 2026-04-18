@@ -131,11 +131,10 @@ int main() {
 
     fprintf(stderr, "[repro] all replays succeeded — graph works on this box\n");
 
-    // Cleanup.
+    // Cleanup. Skip cuCtxDestroy — runtime API owns the primary ctx.
     CHECK(cuGraphExecDestroy(graph_exec));
     CHECK(cuGraphDestroy(graph));
     CHECK(cuMemFree((CUdeviceptr)dev_buf));
     CHECK(cuStreamDestroy(stream));
-    CHECK(cuCtxDestroy(ctx));
     return 0;
 }
