@@ -1224,6 +1224,19 @@ fn default_stream() -> Arc<CudaStream> {
         let ctx = CudaContext::new(ordinal).unwrap_or_else(|e| {
             panic!("CudaBackend: failed to init default context {ordinal}: {e}")
         });
+        // Disable cudarc event tracking BEFORE any buffer is allocated on
+        // this context. Previously we only disabled in `new_context`, which
+        // runs after model construction — meaning every weight buffer had a
+        // dependency event recorded from its htod. During graph capture the
+        // captured launches picked up those event dependencies, and on
+        // replay cuGraphLaunch dereferenced a stale event pointer → SIGSEGV
+        // inside libcuda.so. Flipping this here means all weight loads go
+        // in cleanly, and the graph captured later sees no stray event
+        // dependencies. Bare C++ reproducers (scripts/graph_repro{,_v2}.cu)
+        // work because they never enable event tracking in the first place.
+        unsafe {
+            ctx.disable_event_tracking();
+        }
         let stream = ctx
             .new_stream()
             .unwrap_or_else(|e| panic!("CudaBackend: failed to create default stream: {e}"));
