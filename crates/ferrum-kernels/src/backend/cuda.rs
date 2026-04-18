@@ -175,7 +175,6 @@ impl Backend for CudaBackend {
 
     fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
         use cudarc::driver::sys::CUstreamCaptureMode;
-        println!("[GRAPH] begin_capture");
         // Event tracking already disabled globally in new_context; begin
         // capture directly in relaxed mode.
         ctx.stream
@@ -202,7 +201,6 @@ impl Backend for CudaBackend {
         let cu_stream = ctx.stream.cu_stream();
         let mut cu_graph: sys::CUgraph = std::ptr::null_mut();
         let st1 = unsafe { sys::cuStreamEndCapture(cu_stream, &mut cu_graph) };
-        println!("[GRAPH] cuStreamEndCapture: st={st1:?} graph={cu_graph:?}");
         if st1 != sys::CUresult::CUDA_SUCCESS {
             return Err(FerrumError::unsupported(format!(
                 "cuStreamEndCapture failed: {st1:?}"
@@ -212,13 +210,6 @@ impl Backend for CudaBackend {
             return Err(FerrumError::unsupported(
                 "cuStreamEndCapture returned null graph",
             ));
-        }
-
-        // Check context BEFORE instantiate
-        unsafe {
-            let mut cur: sys::CUcontext = std::ptr::null_mut();
-            let st = sys::cuCtxGetCurrent(&mut cur);
-            println!("[GRAPH] pre-instantiate ctx: st={st:?} cur={cur:?}");
         }
 
         // Use simpler cuGraphInstantiate_v2 instead of cuGraphInstantiateWithFlags
@@ -232,15 +223,6 @@ impl Backend for CudaBackend {
                 0u64, // no flags
             )
         };
-        println!("[GRAPH] cuGraphInstantiate: st={st2:?} exec={cu_graph_exec:?}");
-
-        // Check context AFTER instantiate
-        unsafe {
-            let mut cur: sys::CUcontext = std::ptr::null_mut();
-            let st = sys::cuCtxGetCurrent(&mut cur);
-            println!("[GRAPH] post-instantiate ctx: st={st:?} cur={cur:?}");
-        }
-
         if st2 != sys::CUresult::CUDA_SUCCESS {
             unsafe {
                 sys::cuGraphDestroy(cu_graph);
@@ -267,12 +249,7 @@ impl Backend for CudaBackend {
         let cu_stream = ctx.stream.cu_stream();
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
-                eprintln!(
-                    "[GRAPH] pre-launch exec={:?} stream={:?}",
-                    g.cu_graph_exec, cu_stream
-                );
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
-                eprintln!("[GRAPH] post-launch st={st:?}");
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!(
                         "cuGraphLaunch: {st:?}"

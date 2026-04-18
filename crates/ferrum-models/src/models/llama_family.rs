@@ -722,22 +722,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
             B::set_decode_state(&mut ctx, token, pos);
 
             // Fast path: graph replay (if available).
-            eprintln!("[MODEL] pre-replay pos={pos} token={token}");
             match B::replay_last_graph(&mut ctx) {
                 Ok(true) => {
-                    eprintln!("[MODEL] replay ok, pre-sync");
                     B::sync(&mut ctx);
-                    eprintln!("[MODEL] post-sync, calling to_vec");
-                    let out = B::to_vec(&self.scratch.logits, vocab);
-                    eprintln!("[MODEL] to_vec done, len={}", out.len());
-                    return out;
+                    return B::to_vec(&self.scratch.logits, vocab);
                 }
-                Ok(false) => {
-                    eprintln!("[MODEL] no graph yet, eager");
-                }
-                Err(e) => {
-                    eprintln!("[MODEL] replay err: {e:?}");
-                }
+                Ok(false) => { /* no graph yet, fall through to eager */ }
+                Err(_) => { /* backend error or unsupported, eager */ }
             }
         }
 
