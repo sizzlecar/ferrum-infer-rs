@@ -66,11 +66,17 @@ int main() {
     CHECK(cuInit(0));
     CUdevice dev;
     CHECK(cuDeviceGet(&dev, 0));
+    // CUDA 13 changed the `cuCtxCreate` default to `_v4` which wants a
+    // params struct. Skip it and use the Runtime API instead — this
+    // materialises the primary context on the device and is equivalent
+    // to what cudarc does by default in ferrum-kernels.
+    CHECK_RT(cudaSetDevice(0));
     CUcontext ctx;
-    // cuCtxCreate in CUDA 13 resolves to cuCtxCreate_v4 which takes extra
-    // args; use _v2 explicitly to keep the signature stable across SDK
-    // versions (our Rust uses v2 via cudarc 0.19 too).
-    CHECK(cuCtxCreate_v2(&ctx, 0, dev));
+    CHECK(cuCtxGetCurrent(&ctx));
+    if (!ctx) {
+        fprintf(stderr, "cuCtxGetCurrent returned null — runtime did not bind a ctx\n");
+        return 1;
+    }
 
     // Equivalent of cudarc's default stream + our context.
     CUstream stream;
