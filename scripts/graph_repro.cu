@@ -67,7 +67,10 @@ int main() {
     CUdevice dev;
     CHECK(cuDeviceGet(&dev, 0));
     CUcontext ctx;
-    CHECK(cuCtxCreate(&ctx, 0, dev));
+    // cuCtxCreate in CUDA 13 resolves to cuCtxCreate_v4 which takes extra
+    // args; use _v2 explicitly to keep the signature stable across SDK
+    // versions (our Rust uses v2 via cudarc 0.19 too).
+    CHECK(cuCtxCreate_v2(&ctx, 0, dev));
 
     // Equivalent of cudarc's default stream + our context.
     CUstream stream;
