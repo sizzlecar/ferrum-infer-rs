@@ -682,29 +682,31 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // The captured graph lives in a process-global slot, not on ctx.
         let mut ctx = B::new_context();
 
-        // Always refresh device-side dynamic state (token/pos/kv_len).
-        // Cheap (3x 4-byte memcpy_htod_async); required before both eager
-        // capture-step and graph replay.
-        B::set_decode_state(&mut ctx, token, pos);
+        // Graph capture is opt-in via FERRUM_CUDA_GRAPH=1. Replay is currently
+        // single-request-only on Blackwell + CUDA 12.8 (see
+        // docs/phase-e-cuda-status.md). In pure eager mode, we skip the
+        // per-step device-state memcpy_htod trio entirely.
+        const GRAPH_WARMUP: usize = 3;
+        let graph_enabled = std::env::var("FERRUM_CUDA_GRAPH").is_ok();
 
-        // Fast path: graph replay (if available).
-        match B::replay_last_graph(&mut ctx) {
-            Ok(true) => {
-                B::sync(&mut ctx);
-                return B::to_vec(&self.scratch.logits, vocab);
+        if graph_enabled {
+            // Refresh device-side dynamic state (token/pos/kv_len) before
+            // replay — captured graph reads these from device buffers.
+            B::set_decode_state(&mut ctx, token, pos);
+
+            // Fast path: graph replay (if available).
+            match B::replay_last_graph(&mut ctx) {
+                Ok(true) => {
+                    return B::to_vec(&self.scratch.logits, vocab);
+                }
+                Ok(false) => { /* no graph yet, fall through to eager */ }
+                Err(_) => { /* backend error or unsupported, eager */ }
             }
-            Ok(false) => { /* no graph yet, fall through to eager */ }
-            Err(_) => { /* backend error or unsupported, eager */ }
         }
 
-        // Decide whether to capture this step.
-        // Graph capture is opt-in via FERRUM_CUDA_GRAPH=1 — replay is currently
-        // unreliable on Blackwell + CUDA 12.8 (see docs/phase-e-cuda-status.md).
-        // Warmup first so cuBLAS picks algorithms, JIT settles, etc.
-        const GRAPH_WARMUP: usize = 3;
-        let should_capture = !self.graph_capture_failed
-            && self.graph_warmup >= GRAPH_WARMUP
-            && std::env::var("FERRUM_CUDA_GRAPH").is_ok();
+        let should_capture = graph_enabled
+            && !self.graph_capture_failed
+            && self.graph_warmup >= GRAPH_WARMUP;
 
         if should_capture {
             B::set_dev_state_mode(&mut ctx, true);
