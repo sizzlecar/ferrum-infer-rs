@@ -168,7 +168,7 @@ fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedMode
     None
 }
 
-fn select_candle_device(backend: &str) -> CandleDevice {
+pub fn select_candle_device(backend: &str) -> CandleDevice {
     match backend.to_lowercase().as_str() {
         "cpu" => CandleDevice::Cpu,
         "metal" => {
