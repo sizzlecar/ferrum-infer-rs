@@ -2,6 +2,10 @@
 
 Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
 
+> **Latest session (2026-04-19)**: see [cuda-tts-graph-session-2026-04-19.md](cuda-tts-graph-session-2026-04-19.md)
+> for the current state of CUDA TTS and graph — TTS integration done (RTF 45× → 1.12×) but content drifts
+> beyond step 40 due to f16; graph trigger confirmed ferrum-kernels-specific after ruling out driver + cudarc.
+
 ## ✅ Working end-to-end
 
 ### LLM inference (LlamaFamilyModel<CudaBackend>)
