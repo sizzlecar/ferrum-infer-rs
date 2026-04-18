@@ -575,7 +575,12 @@ impl Backend for CudaBackend {
                 kv_len as i32
             },
         };
-        const TILE_Q: usize = 32; // must match kernel TILE_Q
+        // Must match `#define TILE_Q 16` in kernels/flash_attn_full.cu.
+        // Was 32 — produced grid with too few blocks for q_len > 16, so
+        // the last q-tile never launched and its attention output stayed
+        // uninitialized. Observed as garbage first token ("emas") on any
+        // prefill longer than 16 tokens (multi-turn chat, long prompts).
+        const TILE_Q: usize = 16;
         let num_q_tiles = (q_len + TILE_Q - 1) / TILE_Q;
         let stream = ctx.stream.clone();
         let mut b = stream.launch_builder(&func);
