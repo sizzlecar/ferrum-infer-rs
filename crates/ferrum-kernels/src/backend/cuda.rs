@@ -227,10 +227,23 @@ impl Backend for CudaBackend {
     }
 
     fn replay_last_graph(_ctx: &mut Self::Context) -> Result<bool> {
+        use cudarc::driver::sys;
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
+                // DIAG: print current context BEFORE launch
+                unsafe {
+                    let mut cur: sys::CUcontext = std::ptr::null_mut();
+                    let st = sys::cuCtxGetCurrent(&mut cur);
+                    eprintln!("[GRAPH] pre-launch cuCtxGetCurrent: st={st:?} cur={cur:?}");
+                }
                 g.launch()
                     .map_err(|e| FerrumError::unsupported(format!("graph.launch: {e}")))?;
+                // DIAG: print current context AFTER launch
+                unsafe {
+                    let mut cur: sys::CUcontext = std::ptr::null_mut();
+                    let st = sys::cuCtxGetCurrent(&mut cur);
+                    eprintln!("[GRAPH] post-launch cuCtxGetCurrent: st={st:?} cur={cur:?}");
+                }
                 Ok(true)
             } else {
                 Ok(false)
