@@ -837,6 +837,96 @@ impl<B: Backend> LlamaFamilyModel<B> {
         B::to_vec(&self.scratch.logits, vocab)
     }
 
+    /// Prefill with pre-computed embeddings instead of token IDs.
+    ///
+    /// Used by models that embed inputs outside the LLM (e.g. Qwen3-TTS
+    /// mixes text-embedding + codec-embedding before feeding the LM).
+    /// Skips `final_norm` + `lm_head`; returns the last position's pre-norm
+    /// hidden state. Caller applies its own output head.
+    ///
+    /// `embeds` is row-major `[seq_len * hidden_size]`, f32.
+    pub fn prefill_from_embeds(
+        &mut self,
+        cache_id: &str,
+        embeds: &[f32],
+        seq_len: usize,
+    ) -> Vec<f32> {
+        let h = self.cfg.hidden_size;
+        assert_eq!(
+            embeds.len(),
+            seq_len * h,
+            "embeds length {} != seq_len * hidden_size {}",
+            embeds.len(),
+            seq_len * h
+        );
+        assert!(seq_len > 0, "prefill_from_embeds called with zero length");
+
+        self.ensure_scratch(seq_len);
+        self.ensure_kv(cache_id);
+
+        let mut ctx = B::new_context();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+
+        // Upload embeds → residual[0 .. seq_len*h].
+        let embed_buf = B::from_slice(embeds);
+        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
+
+        for li in 0..self.cfg.num_layers {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
+        }
+
+        B::copy_slice(
+            &mut ctx,
+            &residual,
+            (seq_len - 1) * h,
+            &mut self.scratch.last_hidden,
+            0,
+            h,
+        );
+        B::sync(&mut ctx);
+        self.scratch.residual = Some(residual);
+        B::to_vec(&self.scratch.last_hidden, h)
+    }
+
+    /// Decode with a single pre-computed embedding (shape `[hidden]`).
+    /// Returns the pre-norm hidden state for the position `pos`. Caller
+    /// applies final norm + its own output head.
+    pub fn decode_from_embed(
+        &mut self,
+        cache_id: &str,
+        embed: &[f32],
+        pos: u32,
+    ) -> Vec<f32> {
+        let h = self.cfg.hidden_size;
+        assert_eq!(embed.len(), h, "embed length {} != hidden_size {}", embed.len(), h);
+
+        self.ensure_scratch(1);
+        self.ensure_kv(cache_id);
+
+        let mut ctx = B::new_context();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+
+        let embed_buf = B::from_slice(embed);
+        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
+
+        for li in 0..self.cfg.num_layers {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
+        }
+
+        B::copy_slice(&mut ctx, &residual, 0, &mut self.scratch.last_hidden, 0, h);
+        B::sync(&mut ctx);
+        self.scratch.residual = Some(residual);
+        B::to_vec(&self.scratch.last_hidden, h)
+    }
+
     /// Batched decode: process M concurrent requests at potentially different
     /// positions in one forward pass. GEMM-heavy ops (qkv_proj, o_proj,
     /// gate_up, down) run with m=M for natural batching; rope + KV append +
