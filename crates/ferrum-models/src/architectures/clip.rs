@@ -136,6 +136,13 @@ impl ClipModelWrapper {
             // Override from config.json — supports base/large/any variant that
             // differs from vit_base_patch32 defaults (e.g. clip-vit-large-patch14
             // has embed_dim=768 / 24 layers / 16 heads, not 512 / 12 / 8).
+
+            // Top-level projection_dim (shared across text/vision in HF config).
+            if let Some(v) = raw.get("projection_dim").and_then(|v| v.as_u64()) {
+                config.text_config.projection_dim = v as usize;
+                config.vision_config.projection_dim = v as usize;
+            }
+
             if let Some(tc) = raw.get("text_config") {
                 if let Some(v) = tc.get("hidden_size").and_then(|v| v.as_u64()) {
                     config.text_config.embed_dim = v as usize;
@@ -154,6 +161,9 @@ impl ClipModelWrapper {
                 }
                 if let Some(v) = tc.get("max_position_embeddings").and_then(|v| v.as_u64()) {
                     config.text_config.max_position_embeddings = v as usize;
+                }
+                if let Some(v) = tc.get("projection_dim").and_then(|v| v.as_u64()) {
+                    config.text_config.projection_dim = v as usize;
                 }
             }
             if let Some(vc) = raw.get("vision_config") {
