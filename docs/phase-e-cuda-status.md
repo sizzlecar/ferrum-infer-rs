@@ -42,13 +42,35 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
   - Parses `quantization_config` either as a standalone `quantize_config.json`
     or embedded in `config.json` (Qwen-GPTQ, transformers-style).
 
-### ASR (Whisper) + TTS (Qwen3-TTS)
+### ASR (Whisper) + TTS (Qwen3-TTS) + CLIP
 
 - CLI `select_candle_device` extended to handle `--backend cuda` —
   routes to `CandleDevice::new_cuda(0)`, falls back to CPU with message.
-- Both commands run on CUDA via the existing candle-based executor
-  (no Model-as-Code port yet — that's Phase D.5e / D.6 proper).
+- Whisper / TTS / embed commands all run on CUDA via candle.
 - `auto` backend prefers CUDA > Metal > CPU.
+
+**Voice clone status**: TTS voice clone on both CPU and CUDA hits
+premature `codec_eos` after ~2 steps — separate from CUDA migration,
+pre-existing algorithmic bug in the ICL prompt / conditioning flow.
+`FERRUM_TTS_MIN_FRAMES` env forces continued generation but output
+audio transcribes to random stock phrases rather than the target text,
+confirming ref_audio / ref_text conditioning isn't being applied. Needs
+deeper ICL-prompt debugging against reference Python impl (tracked
+but not unblocked this session).
+
+### Concurrent HTTP loadtest (Qwen3-0.6B)
+
+| Concurrency | Throughput | p50 latency | p99 latency |
+|-------------|-----------|-------------|-------------|
+| 1           | 215 tok/s |  250ms      |  483ms      |
+| 4           | 242 tok/s | 1020ms      | 1189ms      |
+| 8           | 244 tok/s | 2034ms      | 2337ms      |
+
+Saturates past concurrency=4 — true batched decode (one GEMM with
+m=batch, per-item attention) would push further. Currently the
+`LlmExecutor::batch_decode` override acquires the model mutex once
+per batch but loops sequentially inside the lock; single-item forward
+pass per decode step is the throughput ceiling.
 
 ## ⚠️ Graph capture — experimental
 
@@ -79,18 +101,24 @@ rented session. Root-cause suspicions (each of which has fixes landed):
 
 **Current state of graph with `FERRUM_CUDA_GRAPH=1`:**
 
-- ✅ Single-request capture + replay works: warmup (14-16 replays) runs
-  clean, all kernels record into graph, replay reuses them.
-- ❌ Multi-request breaks: on the 2nd request, `stream.alloc()` for the
-  new KV cache fails with CUDA_ERROR_INVALID_VALUE. Even with
-  sync→reset_graph→sync before the cache free, the stream allocator
-  pool ends up in a bad state the next alloc can't recover from.
+- ✅ Single-request warmup decodes 3-4 steps clean (no replay).
+- ❌ First replay step: `stream.memcpy_dtoh(&scratch.logits, ...)`
+  returns CUDA_ERROR_INVALID_VALUE. Explicit `B::sync` before dtoh
+  doesn't help; compute-sanitizer only fingers a cuStreamWaitEvent
+  error that re-appears on every replay. Cause is apparently deeper
+  than my 8+ attempted fixes.
+- Added: KV cache pool (`kv_free_pool`) so release() doesn't free
+  buffers → captured graph pointers don't dangle across requests.
+  Needed for any multi-request graph support but not sufficient.
 
-The fundamental issue: captured graphs hold raw device pointers into
-the request's KV cache. Freeing that cache while the stream's
-allocator still has outstanding graph-bound reservations corrupts
-the pool. vLLM avoids this with a process-global paged KV pool that
-never gets freed between requests.
+Hypothesis: Blackwell + cudarc 0.17 + CUDA 12.8 combination has a
+subtle interaction between stream-ordered allocator and graph replay
+that none of the expected fixes unblock. Investigation needs
+cuda-gdb on-box, not reachable via SSH-only.
+
+Default: eager. `FERRUM_CUDA_GRAPH=1` still panics — leaving the
+infrastructure in place for a future fix attempt with a different
+driver/cudarc combo.
 
 Default: eager (no graph). Set `FERRUM_CUDA_GRAPH=1` for the single-
 request case. Production fix requires either per-graph memory pools
