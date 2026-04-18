@@ -750,28 +750,6 @@ impl Qwen3TTSTalker {
     pub fn forward_step(&mut self, input_embeds: &Tensor) -> Result<Tensor> {
         let use_candle = std::env::var("FERRUM_USE_CANDLE").as_deref() == Ok("1");
 
-        // FERRUM_USE_CANDLE takes precedence over backend_override — lets
-        // users fall back to candle's f32 tensor path when Backend<B>'s
-        // f16 precision causes codec-selection drift (Qwen3-TTS is
-        // f16-sensitive after ~40 decode steps).
-        if use_candle {
-            let pos_offset = self.tokens_generated;
-            let seq_len = input_embeds
-                .dim(1)
-                .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
-            let mut hidden = input_embeds.clone();
-            for (li, layer) in self.layers.iter_mut().enumerate() {
-                hidden = layer
-                    .forward(&hidden, pos_offset)
-                    .map_err(|e| FerrumError::model(format!("layer {li}: {e}")))?;
-            }
-            hidden = hidden
-                .apply(&self.norm)
-                .map_err(|e| FerrumError::model(format!("norm: {e}")))?;
-            self.tokens_generated += seq_len;
-            return Ok(hidden);
-        }
-
         // If a Backend<B> override is installed, use it. Returns post-norm
         // hidden so semantics match `fused.forward`.
         if let Some(ref mut backend) = self.backend_override {
@@ -794,9 +772,26 @@ impl Qwen3TTSTalker {
                 .map_err(|e| FerrumError::model(format!("output tensor: {e}")));
         }
 
+        if use_candle {
+            let pos_offset = self.tokens_generated;
+            let seq_len = input_embeds
+                .dim(1)
+                .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
+            let mut hidden = input_embeds.clone();
+            for (li, layer) in self.layers.iter_mut().enumerate() {
+                hidden = layer
+                    .forward(&hidden, pos_offset)
+                    .map_err(|e| FerrumError::model(format!("layer {li}: {e}")))?;
+            }
+            hidden = hidden
+                .apply(&self.norm)
+                .map_err(|e| FerrumError::model(format!("norm: {e}")))?;
+            self.tokens_generated += seq_len;
+            return Ok(hidden);
+        }
+
         {
-            // Fused path: Metal GPU or CPU custom ops. (The candle and
-            // backend_override paths return early above.)
+            // Fused path: Metal GPU or CPU custom ops.
             let seq_len = input_embeds
                 .dim(1)
                 .map_err(|e| FerrumError::model(format!("dim: {e}")))?;
