@@ -643,7 +643,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // `forward_layer` re-borrows `&mut self` to reach `self.layers` /
         // `self.kv_caches`, which would conflict with an outstanding
         // `&mut self.scratch.residual`. Swap it back at the end.
-        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(0));
+        // mem::replace needs a placeholder. B::alloc(0) was our choice but
+        // cuMemAllocFromPoolAsync(stream, 0) can return CUDA_ERROR_INVALID_VALUE
+        // on Blackwell after graph replay corrupts the pool state. Size-1 is
+        // always valid and costs 2 bytes of transient VRAM per decode step.
+        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(1));
         B::embedding_lookup(&mut ctx, &self.embed, tokens, &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
@@ -734,7 +738,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
 
         // Eager forward (records into graph if capture is active).
-        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(0));
+        // mem::replace needs a placeholder. B::alloc(0) was our choice but
+        // cuMemAllocFromPoolAsync(stream, 0) can return CUDA_ERROR_INVALID_VALUE
+        // on Blackwell after graph replay corrupts the pool state. Size-1 is
+        // always valid and costs 2 bytes of transient VRAM per decode step.
+        let mut residual = std::mem::replace(&mut self.scratch.residual, B::alloc(1));
         B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
