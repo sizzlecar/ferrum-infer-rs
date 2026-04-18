@@ -108,3 +108,77 @@ fn cudarc_graph_default_pool() {
 fn cudarc_graph_no_event_tracking() {
     run_graph_repro(true);
 }
+
+/// Mirrors ferrum's load pattern: allocate LOTS of buffers (like weights)
+/// then try graph capture + replay. If this fails where the simpler test
+/// passes, allocation count or memory pool state is the trigger.
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cudarc_graph_with_many_allocs() {
+    eprintln!("[cudarc-repro-heavy] init");
+    let ctx = CudaContext::new(0).expect("CudaContext::new");
+    unsafe {
+        ctx.disable_event_tracking();
+    }
+    let stream = ctx.new_stream().expect("new_stream");
+
+    let ptx = compile_ptx(TOUCH_PTX).expect("compile_ptx");
+    let module = ctx.load_module(ptx).expect("load_module");
+    let touch = module.load_function("touch").expect("load_function");
+
+    // Allocate ~200 buffers (each f32 weights-sized) to mimic model load.
+    let mut weight_bufs = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let buf = stream
+            .alloc_zeros::<f32>(1024 * 1024) // 4 MB each
+            .expect("weight alloc");
+        weight_bufs.push(buf);
+    }
+    eprintln!(
+        "[cudarc-repro-heavy] {} weight bufs allocated",
+        weight_bufs.len()
+    );
+
+    // Scratch buffer for graph work.
+    let n: usize = 4096;
+    let mut scratch = stream.alloc_zeros::<f32>(n).expect("scratch");
+    stream.synchronize().expect("sync");
+
+    let n_i32 = n as i32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (((n + 127) / 128) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Warm up.
+    let mut builder = stream.launch_builder(&touch);
+    builder.arg(&mut scratch).arg(&n_i32);
+    unsafe { builder.launch(cfg).expect("warmup launch") };
+    stream.synchronize().expect("sync");
+
+    eprintln!("[cudarc-repro-heavy] begin capture");
+    stream
+        .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        .expect("begin_capture");
+
+    for _ in 0..8 {
+        let mut builder = stream.launch_builder(&touch);
+        builder.arg(&mut scratch).arg(&n_i32);
+        unsafe { builder.launch(cfg).expect("captured launch") };
+    }
+    let graph = stream
+        .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+        .expect("end_capture")
+        .expect("non-null graph");
+    graph.upload().expect("upload");
+    stream.synchronize().expect("sync");
+
+    for i in 0..6 {
+        eprintln!("[cudarc-repro-heavy] cuGraphLaunch #{}", i + 1);
+        let st = unsafe { sys::cuGraphLaunch(graph.cu_graph_exec(), stream.cu_stream()) };
+        assert_eq!(st, sys::CUresult::CUDA_SUCCESS, "cuGraphLaunch: {st:?}");
+        stream.synchronize().expect("sync");
+    }
+    eprintln!("[cudarc-repro-heavy] SUCCESS (200 bufs + graph)");
+}
