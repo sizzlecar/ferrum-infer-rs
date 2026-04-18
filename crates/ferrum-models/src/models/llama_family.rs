@@ -722,17 +722,22 @@ impl<B: Backend> LlamaFamilyModel<B> {
             B::set_decode_state(&mut ctx, token, pos);
 
             // Fast path: graph replay (if available).
+            eprintln!("[MODEL] pre-replay pos={pos} token={token}");
             match B::replay_last_graph(&mut ctx) {
                 Ok(true) => {
-                    // Force a sync point after graph.launch before dtoh. Without
-                    // this, the graph kernels are still in-flight and dtoh's
-                    // own synchronize hits an undefined stream state on
-                    // Blackwell, returning CUDA_ERROR_INVALID_VALUE.
+                    eprintln!("[MODEL] replay ok, pre-sync");
                     B::sync(&mut ctx);
-                    return B::to_vec(&self.scratch.logits, vocab);
+                    eprintln!("[MODEL] post-sync, calling to_vec");
+                    let out = B::to_vec(&self.scratch.logits, vocab);
+                    eprintln!("[MODEL] to_vec done, len={}", out.len());
+                    return out;
                 }
-                Ok(false) => { /* no graph yet, fall through to eager */ }
-                Err(_) => { /* backend error or unsupported, eager */ }
+                Ok(false) => {
+                    eprintln!("[MODEL] no graph yet, eager");
+                }
+                Err(e) => {
+                    eprintln!("[MODEL] replay err: {e:?}");
+                }
             }
         }
 
