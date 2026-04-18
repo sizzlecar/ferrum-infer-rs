@@ -37,3 +37,44 @@ pub trait WeightLoader<B: Backend>: Send + Sync {
     /// `None` means the source is dense.
     fn quant_config(&self) -> Option<&QuantConfig>;
 }
+
+/// Adapter that prepends a fixed prefix to every tensor name before
+/// delegating to an underlying loader.
+///
+/// Use case: a single safetensors file contains a sub-model (e.g.
+/// Qwen3-TTS stores the Talker LM under `talker.model.*`) and we want
+/// to reuse a backbone loader like `LlamaFamilyModel::new` that
+/// expects bare `model.*` names. Wrapping with
+/// `PrefixedLoader { inner, prefix: "talker." }` lets the backbone
+/// code stay prefix-agnostic.
+pub struct PrefixedLoader<'a, B: Backend> {
+    inner: &'a dyn WeightLoader<B>,
+    prefix: String,
+}
+
+impl<'a, B: Backend> PrefixedLoader<'a, B> {
+    pub fn new(inner: &'a dyn WeightLoader<B>, prefix: impl Into<String>) -> Self {
+        Self {
+            inner,
+            prefix: prefix.into(),
+        }
+    }
+}
+
+impl<'a, B: Backend> WeightLoader<B> for PrefixedLoader<'a, B> {
+    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
+        self.inner.load_tensor(&format!("{}{}", self.prefix, name))
+    }
+
+    fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
+        self.inner.load_linear(&format!("{}{}", self.prefix, name))
+    }
+
+    fn has_tensor(&self, name: &str) -> bool {
+        self.inner.has_tensor(&format!("{}{}", self.prefix, name))
+    }
+
+    fn quant_config(&self) -> Option<&QuantConfig> {
+        self.inner.quant_config()
+    }
+}
