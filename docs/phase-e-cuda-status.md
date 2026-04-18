@@ -53,20 +53,20 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
   CUDA with `openai/clip-vit-large-patch14`, 768-dim output.
 - `auto` backend prefers CUDA > Metal > CPU.
 
-**Voice clone status** (revised after local Metal test):
+**Voice clone status** (two tests, two outcomes):
 
-- **Metal + CPU: WORKS**. Local `ferrum tts qwen3-tts '人工智能正在改变
+- **Metal + CPU: WORKS**. `ferrum tts qwen3-tts '人工智能正在改变
   世界。' --backend metal --ref-audio female_ref_5s.wav --ref-text '...'`
-  produces 2.4s of audio. Whisper loopback transcript:
-  `"人工智能正在改变世界请不吝点赞 订阅 转发..."`. **Target text is
-  intact**; trailing noise = YouTube channel outro bleed from training
-  data (model generates 4-5 extra frames before codec_eos).
-- **CUDA (earlier remote box)**: produced 0.16s garbage audio. Not an
-  algorithm-layer bug as previously documented — the CUDA-specific
-  failure is likely in candle's CUDA TTS forward pass (Qwen3-TTS isn't
-  ported to our kernels yet; runs via candle). Reproducing on a working
-  CUDA box would help pin this down. `FERRUM_TTS_MIN_FRAMES` env
-  remains available as a tuning knob for min output length.
+  produces 2.4s audio (RTF 3x). Whisper loopback:
+  `"人工智能正在改变世界请不吝点赞 订阅 转发..."` — **target text
+  intact**, trailing = training-data YouTube outro bleed.
+- **CUDA: BROKEN**. Same input on CUDA 13 + Blackwell produces 5.92s
+  audio at RTF **45x** (15× slower than Metal). Whisper transcribes:
+  `"感谢观看我是超"` — pure YouTube outro, target text absent.
+  Isolated to CUDA path since Metal with identical code works. TTS
+  runs via candle-transformers (not our Backend kernels), so this is
+  a candle CUDA-specific issue — not fixable at our layer without
+  Model-as-Code port of Qwen3-TTS.
 
 ### Concurrent HTTP loadtest (Qwen3-0.6B)
 
