@@ -47,6 +47,10 @@ Runtime-validated on RTX PRO 6000 Blackwell (SM 12.0, CUDA 12.8).
 - CLI `select_candle_device` extended to handle `--backend cuda` —
   routes to `CandleDevice::new_cuda(0)`, falls back to CPU with message.
 - Whisper / TTS / embed commands all run on CUDA via candle.
+- CLIP: `from_config_json` now reads hidden_size / layers / heads /
+  projection_dim from config.json (was hardcoded to base defaults,
+  broke on large variants). Verified text + image embedding work on
+  CUDA with `openai/clip-vit-large-patch14`, 768-dim output.
 - `auto` backend prefers CUDA > Metal > CPU.
 
 **Voice clone status**: TTS voice clone on both CPU and CUDA hits
