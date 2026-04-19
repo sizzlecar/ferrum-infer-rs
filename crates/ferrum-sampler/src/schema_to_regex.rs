@@ -30,13 +30,18 @@ use serde_json::Value;
 /// Compile a JSON Schema (serialised as a JSON string) into a regex
 /// pattern suitable for feeding into `RegexGuidedProcessor`.
 ///
-/// The returned pattern is anchored internally by the processor (which
-/// wraps it with `^(?:...)\z`), so we emit a plain inner pattern here.
+/// The returned pattern:
+///   * has a leading `\s*` so BPE tokenisers that prepend a space
+///     to the first generated token (Qwen3, Llama-3) still transition
+///     cleanly — without it the DFA would die at the very first step.
+///   * is anchored to end internally by the processor (which wraps
+///     with `^(?:...)\z`).
 pub fn schema_to_regex(schema_json: &str) -> Result<String> {
     let schema: Value = serde_json::from_str(schema_json).map_err(|e| {
         FerrumError::invalid_request(format!("response_format.schema is not valid JSON: {e}"))
     })?;
-    translate(&schema)
+    let inner = translate(&schema)?;
+    Ok(format!(r"\s*{inner}\s*"))
 }
 
 fn translate(node: &Value) -> Result<String> {

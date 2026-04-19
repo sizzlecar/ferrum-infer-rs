@@ -92,18 +92,24 @@ impl RegexGuidedProcessor {
             .start_state(&StartConfig::new().anchored(Anchored::Yes))
             .map_err(|e| FerrumError::invalid_request(format!("regex start state: {e}")))?;
 
-        // Decode every token in the vocab once. If a token has no text
-        // representation (common for byte-level BPE control tokens), treat
-        // it as empty bytes so the DFA walk trivially accepts it — the EOS
-        // check below covers the termination case.
+        // Decode every token in the vocab once. We try `token_text` first
+        // (cheap, zero-copy for tokenizers that implement it), then fall
+        // back to `decode([id])` — the byte-level-BPE tokenisers that ship
+        // with Qwen/Llama return `None` from `token_text`, so without this
+        // fallback every token would have empty bytes and the DFA mask
+        // would reject everything (force-EOS spam).
         let vocab_size = tokenizer.vocab_size();
         let mut token_bytes = Vec::with_capacity(vocab_size);
         for i in 0..vocab_size {
             let id = TokenId::new(i as u32);
-            let bytes = tokenizer
-                .token_text(id)
-                .map(|s| s.as_bytes().to_vec())
-                .unwrap_or_default();
+            let bytes = if let Some(s) = tokenizer.token_text(id) {
+                s.as_bytes().to_vec()
+            } else {
+                tokenizer
+                    .decode(&[id], false)
+                    .map(|s| s.into_bytes())
+                    .unwrap_or_default()
+            };
             token_bytes.push(bytes);
         }
 
