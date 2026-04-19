@@ -386,18 +386,29 @@ impl EngineInner {
         };
 
         // ── Check prefix cache ──────────────────────────────────────────
-        // On an exact match we can skip the executor prefill entirely:
-        // clone the cached KV handle and reuse the stored logits.
-        // NOTE: Skip prefix cache when CUDA decode runner is active — the runner
-        // needs its own KV cache from a real prefill (candle KV export).
-        // Prefix cache clones share the original candle KV which gets released
-        // on completion, causing "No candle KV cache to export" on later requests.
-        let skip_prefix_cache = cfg!(feature = "cuda")
-            && std::env::var("FERRUM_DISABLE_CUDA_RUNNER").map_or(true, |v| v != "1");
+        // Exact-match only: on hit, skip executor prefill entirely by cloning
+        // the cached KV handle and sampling from the stored last-token logits.
+        // Partial matches (stored prefix is a proper prefix of input) fall
+        // through to full prefill — supporting them needs incremental prefill
+        // on top of a cloned KV, not yet exposed by the executor contract.
+        //
+        // CUDA default: OFF. Historical candle CUDA decode runner released
+        // the KV on completion, invalidating clones ("No candle KV cache to
+        // export"). The Phase E Model-as-Code CUDA path may be safe, but
+        // end-to-end engine + prefix-cache is not yet validated on GPU.
+        // Toggle via env `FERRUM_PREFIX_CACHE=1` to opt in on CUDA; CPU/Metal
+        // defaults ON (validated).
+        let skip_prefix_cache = if cfg!(feature = "cuda") {
+            std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1")
+        } else {
+            std::env::var("FERRUM_PREFIX_CACHE").map_or(false, |v| v == "0")
+        };
         if !skip_prefix_cache {
-            if let Some((_prefix_id, cached_kv, cached_logits)) =
-                self.prefix_cache.find_prefix(&input_tokens_clone)
-            {
+            let hit = self
+                .prefix_cache
+                .find_prefix(&input_tokens_clone)
+                .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens_clone.len());
+            if let Some((_prefix_id, cached_kv, cached_logits)) = hit {
                 debug!(
                     "Prefix cache hit for {}: reusing {} cached tokens",
                     request_id, num_tokens,
@@ -867,6 +878,17 @@ impl ContinuousBatchEngine {
                 prefix_cache_hits: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Hit count since engine construction (prefix cache). Exposed for
+    /// tests + /metrics endpoint; monotonic, Relaxed-ordered.
+    pub fn prefix_cache_hits(&self) -> u64 {
+        self.inner.prefix_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of prefix cache stats (hits/misses/evictions/active entries).
+    pub fn prefix_cache_stats(&self) -> ferrum_kv::cache::prefix::PrefixCacheStats {
+        self.inner.prefix_cache.stats()
     }
 
     /// Start a background iteration loop.  Returns a `JoinHandle` that
