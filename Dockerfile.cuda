@@ -44,11 +44,13 @@ RUN cargo build --release --features cuda -p ferrum-cli --bin ferrum
 FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+# libnccl2 ships in the nvidia/cuda 12.6 runtime base; adding it from the
+# Ubuntu repo triggers "held packages changed" because it wants to upgrade
+# gcc-12-base/libgcc-s1/libstdc++6 that the CUDA image has apt-mark'd.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
         ffmpeg \
-        libnccl2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/ferrum /usr/local/bin/ferrum
