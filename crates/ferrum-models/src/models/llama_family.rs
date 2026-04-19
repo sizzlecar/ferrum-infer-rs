@@ -762,11 +762,25 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
     /// Prefill: process `tokens` prompt tokens in a single batch, return
     /// `[vocab_size]` logits for the last position.
+    ///
+    /// Supports incremental prefill: if the KV cache for `cache_id` already
+    /// contains earlier tokens, the new chunk's positions are computed as
+    /// `[kv_len, kv_len + tokens.len())` so RoPE and causal masking stay
+    /// aligned. Used by the engine's chunked-prefill path.
     pub fn prefill_internal(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         let seq_len = tokens.len();
         assert!(seq_len > 0, "prefill called with empty token list");
         self.ensure_scratch(seq_len);
         self.ensure_kv(cache_id);
+
+        // Starting position for this chunk — 0 for a fresh prefill, kv_len
+        // for the second+ chunk of a split prefill.
+        let pos_offset = self
+            .kv_caches
+            .get(cache_id)
+            .and_then(|layers| layers.first())
+            .map(|c| c.len)
+            .unwrap_or(0);
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
@@ -790,7 +804,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
 
         for li in 0..self.cfg.num_layers {
-            self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
         // Take the last token's hidden state: residual[(seq_len-1)*h .. seq_len*h]

@@ -62,7 +62,19 @@ impl ModelExecutor for LlmExecutor {
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
         debug!("LlmExecutor prefill: {} tokens", tokens.len());
 
-        let cache_id = self.gen_cache_id();
+        // Reuse an existing cache_id when the caller supplies a KV handle
+        // (chunked prefill) — fresh id only on the very first call for a
+        // request. Without this, every chunk would create a new KV cache
+        // at position 0 and subsequent chunks wouldn't see prior tokens.
+        let cache_id = input
+            .kv_cache
+            .as_ref()
+            .and_then(|h| {
+                h.as_any()
+                    .downcast_ref::<GenericKvCacheHandle>()
+                    .map(|g| g.request_cache_id().to_string())
+            })
+            .unwrap_or_else(|| self.gen_cache_id());
 
         let logits = {
             let mut model = self.model.lock();
