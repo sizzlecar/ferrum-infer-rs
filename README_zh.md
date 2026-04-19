@@ -35,6 +35,10 @@ docker run --rm -p 8000:8000 --gpus all \
 
 Tag 说明：`latest`（= CUDA）、`cuda`、`cpu`、`cuda-0.7.0`、`cpu-0.7.0` 等
 
+> **Mac / Metal 用户**：Metal 无法在 Docker 容器内使用（macOS Metal 设备
+> 不暴露给 Docker 底层的 Linux VM）。请用 `cargo install ferrum-cli`
+> 安装 —— macOS 构建会自动启用 Metal。
+
 ### crates.io
 
 ```bash

@@ -35,6 +35,10 @@ docker run --rm -p 8000:8000 --gpus all \
 
 Tags: `latest` (= CUDA), `cuda`, `cpu`, `cuda-0.7.0`, `cpu-0.7.0`, ...
 
+> **Mac / Metal users**: Metal can't run inside Docker containers (macOS
+> Metal device isn't exposed to the Linux VM Docker runs on). Install via
+> `cargo install ferrum-cli` — the macOS build auto-selects Metal.
+
 ### crates.io
 
 ```bash
