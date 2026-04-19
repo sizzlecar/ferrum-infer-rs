@@ -1,7 +1,8 @@
 //! Audio preprocessing for Whisper ASR.
 //!
 //! Load audio files → decode → resample to 16kHz mono → f32 PCM samples.
-//! Supports WAV natively; M4A/MP3/FLAC/OGG via ffmpeg auto-conversion.
+//! Pure-Rust pipeline via `symphonia` — no ffmpeg runtime dependency.
+//! Supports WAV / MP3 / FLAC / M4A (AAC) / OGG (Vorbis).
 
 use ferrum_types::{FerrumError, Result};
 use std::path::Path;
@@ -10,61 +11,38 @@ use std::path::Path;
 pub const CHUNK_SAMPLES: usize = 16000 * 30;
 
 /// Load audio file and return 16kHz mono f32 PCM samples.
-///
-/// If the file is not WAV, tries ffmpeg conversion automatically.
 pub fn load_audio(path: &str) -> Result<Vec<f32>> {
-    let p = Path::new(path);
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    // WAV: direct load
-    if ext == "wav" {
-        return load_wav_file(path);
-    }
-
-    // Non-WAV: convert via ffmpeg
-    convert_with_ffmpeg(path)
+    load_audio_at_rate(path, 16000)
 }
 
 /// Load audio file and return mono f32 PCM samples at a configurable sample rate.
 ///
-/// Similar to `load_audio` but resamples to `target_rate` instead of 16kHz.
+/// Accepts WAV / MP3 / FLAC / M4A (AAC) / OGG (Vorbis). Non-mono sources are
+/// downmixed by averaging channels; sample rate is converted via sinc resampling.
 /// Useful for TTS speaker encoder which expects 24kHz input.
 pub fn load_audio_at_rate(path: &str, target_rate: u32) -> Result<Vec<f32>> {
-    let p = Path::new(path);
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let file = std::fs::File::open(path)
+        .map_err(|e| FerrumError::model(format!("open audio {path}: {e}")))?;
+    let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
 
-    // WAV: decode then resample to target_rate
-    if ext == "wav" {
-        return load_wav_file_at_rate(path, target_rate);
+    // Hint the decoder with the file extension — purely an optimisation; the
+    // probe still content-sniffs if the hint is absent or wrong.
+    let mut hint = symphonia::core::probe::Hint::new();
+    if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(&ext.to_lowercase());
     }
 
-    // Non-WAV: convert via ffmpeg to target_rate
-    convert_with_ffmpeg_at_rate(path, target_rate)
+    decode_with_symphonia(mss, &hint, target_rate)
 }
 
-/// Load audio from raw bytes.
-/// Tries WAV first; if that fails and bytes look non-WAV, tries ffmpeg.
+/// Load audio from raw bytes (used by the HTTP multipart endpoint).
+///
+/// Content-sniffs the format; supports the same codec set as `load_audio`.
 pub fn load_audio_bytes(data: &[u8]) -> Result<Vec<f32>> {
-    // Try WAV first
-    match load_wav_bytes(data) {
-        Ok(pcm) => return Ok(pcm),
-        Err(_) => {}
-    }
-
-    // Fallback: write to temp file and convert via ffmpeg
-    let tmp = std::env::temp_dir().join("ferrum_audio_tmp");
-    std::fs::write(&tmp, data).map_err(|e| FerrumError::model(format!("write temp audio: {e}")))?;
-    let result = convert_with_ffmpeg(tmp.to_str().unwrap_or(""));
-    let _ = std::fs::remove_file(&tmp);
-    result
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let mss = symphonia::core::io::MediaSourceStream::new(Box::new(cursor), Default::default());
+    let hint = symphonia::core::probe::Hint::new();
+    decode_with_symphonia(mss, &hint, 16000)
 }
 
 /// Split PCM samples into 30-second chunks for Whisper processing.
@@ -75,189 +53,130 @@ pub fn chunk_pcm(pcm: &[f32]) -> Vec<&[f32]> {
     pcm.chunks(CHUNK_SAMPLES).collect()
 }
 
-// ── WAV loading ─────────────────────────────────────────────────────────
+// ── symphonia-based decoding ────────────────────────────────────────────
 
-fn load_wav_file(path: &str) -> Result<Vec<f32>> {
-    let reader = hound::WavReader::open(path)
-        .map_err(|e| FerrumError::model(format!("open audio {path}: {e}")))?;
-    decode_wav(reader)
-}
-
-fn load_wav_bytes(data: &[u8]) -> Result<Vec<f32>> {
-    let cursor = std::io::Cursor::new(data);
-    let reader =
-        hound::WavReader::new(cursor).map_err(|e| FerrumError::model(format!("decode: {e}")))?;
-    decode_wav(reader)
-}
-
-fn decode_wav<R: std::io::Read>(reader: hound::WavReader<R>) -> Result<Vec<f32>> {
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate as f64;
-    let channels = spec.channels as usize;
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .into_samples::<f32>()
-            .filter_map(|s| s.ok())
-            .collect(),
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1u32 << (bits - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max_val)
-                .collect()
-        }
-    };
-
-    // Mix to mono
-    let mono: Vec<f32> = if channels == 1 {
-        samples
-    } else {
-        samples
-            .chunks(channels)
-            .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
-
-    // Resample to 16kHz if needed
-    if (sample_rate - 16000.0).abs() < 1.0 {
-        Ok(mono)
-    } else {
-        Ok(resample(&mono, sample_rate, 16000.0))
-    }
-}
-
-// ── ffmpeg conversion ───────────────────────────────────────────────────
-
-fn convert_with_ffmpeg(input_path: &str) -> Result<Vec<f32>> {
-    let output = std::env::temp_dir().join("ferrum_ffmpeg_out.wav");
-    let output_str = output.to_string_lossy().to_string();
-
-    let status = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            input_path,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-sample_fmt",
-            "s16",
-            "-f",
-            "wav",
-            &output_str,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            let result = load_wav_file(&output_str);
-            let _ = std::fs::remove_file(&output);
-            result
-        }
-        Ok(s) => Err(FerrumError::model(format!(
-            "ffmpeg exited with code {}. Is the audio file valid?",
-            s.code().unwrap_or(-1)
-        ))),
-        Err(_) => Err(FerrumError::model(
-            "ffmpeg not found. Install ffmpeg to process non-WAV audio (brew install ffmpeg)",
-        )),
-    }
-}
-
-// ── WAV loading at configurable rate ─────────────────────────────────────
-
-fn load_wav_file_at_rate(path: &str, target_rate: u32) -> Result<Vec<f32>> {
-    let reader = hound::WavReader::open(path)
-        .map_err(|e| FerrumError::model(format!("open audio {path}: {e}")))?;
-    decode_wav_at_rate(reader, target_rate)
-}
-
-fn decode_wav_at_rate<R: std::io::Read>(
-    reader: hound::WavReader<R>,
+fn decode_with_symphonia(
+    mss: symphonia::core::io::MediaSourceStream,
+    hint: &symphonia::core::probe::Hint,
     target_rate: u32,
 ) -> Result<Vec<f32>> {
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate as f64;
-    let channels = spec.channels as usize;
+    use symphonia::core::audio::{AudioBufferRef, Signal};
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error as SymError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::meta::MetadataOptions;
 
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .into_samples::<f32>()
-            .filter_map(|s| s.ok())
-            .collect(),
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1u32 << (bits - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max_val)
-                .collect()
+    let fmt_opts: FormatOptions = Default::default();
+    let meta_opts: MetadataOptions = Default::default();
+    let probed = symphonia::default::get_probe()
+        .format(hint, mss, &fmt_opts, &meta_opts)
+        .map_err(|e| FerrumError::model(format!("probe audio: {e}")))?;
+
+    let mut format = probed.format;
+
+    // First audio track wins. Whisper-friendly files are mono or stereo; we
+    // downmix to mono below.
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or_else(|| FerrumError::model("no audio track in file"))?;
+    let track_id = track.id;
+
+    let source_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| FerrumError::model("audio track missing sample rate"))?;
+    let channels = track
+        .codec_params
+        .channels
+        .map(|c| c.count())
+        .unwrap_or(1)
+        .max(1);
+
+    let dec_opts: DecoderOptions = Default::default();
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &dec_opts)
+        .map_err(|e| FerrumError::model(format!("decoder init: {e}")))?;
+
+    // Accumulate interleaved f32 samples across all decoded packets, then
+    // downmix + resample once at the end. Cheaper in wall time than per-packet
+    // resampling for short files and simpler to reason about.
+    let mut interleaved: Vec<f32> = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(SymError::ResetRequired) => break,
+            Err(e) => return Err(FerrumError::model(format!("next_packet: {e}"))),
+        };
+        if packet.track_id() != track_id {
+            continue;
         }
-    };
 
-    // Mix to mono
+        match decoder.decode(&packet) {
+            Ok(decoded) => append_interleaved_f32(&decoded, &mut interleaved, channels),
+            Err(SymError::DecodeError(_)) => continue, // skip corrupt packet
+            Err(SymError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(FerrumError::model(format!("decode: {e}"))),
+        }
+    }
+
+    // Downmix to mono (average channels)
     let mono: Vec<f32> = if channels == 1 {
-        samples
+        interleaved
     } else {
-        samples
+        interleaved
             .chunks(channels)
-            .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
+            .map(|c| c.iter().sum::<f32>() / channels as f32)
             .collect()
     };
 
     // Resample to target_rate if needed
-    let target = target_rate as f64;
-    if (sample_rate - target).abs() < 1.0 {
+    if source_rate == target_rate {
         Ok(mono)
     } else {
-        Ok(resample(&mono, sample_rate, target))
+        Ok(resample(&mono, source_rate as f64, target_rate as f64))
     }
 }
 
-fn convert_with_ffmpeg_at_rate(input_path: &str, target_rate: u32) -> Result<Vec<f32>> {
-    let output = std::env::temp_dir().join("ferrum_ffmpeg_out_rate.wav");
-    let output_str = output.to_string_lossy().to_string();
-    let rate_str = target_rate.to_string();
+/// Convert any symphonia AudioBufferRef variant into interleaved f32 samples
+/// and append to `out`. Handles U8 / S16 / S24 / S32 / F32 / F64 — which
+/// covers every codec we compile in.
+fn append_interleaved_f32(
+    buf: &symphonia::core::audio::AudioBufferRef<'_>,
+    out: &mut Vec<f32>,
+    channels: usize,
+) {
+    use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
+    use symphonia::core::conv::IntoSample;
 
-    let status = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            input_path,
-            "-ar",
-            &rate_str,
-            "-ac",
-            "1",
-            "-sample_fmt",
-            "s16",
-            "-f",
-            "wav",
-            &output_str,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            let result = load_wav_file_at_rate(&output_str, target_rate);
-            let _ = std::fs::remove_file(&output);
-            result
+    fn push_interleaved<S>(buf: &AudioBuffer<S>, out: &mut Vec<f32>, channels: usize)
+    where
+        S: symphonia::core::sample::Sample + IntoSample<f32> + Copy,
+    {
+        let frames = buf.frames();
+        out.reserve(frames * channels);
+        for frame in 0..frames {
+            for ch in 0..channels {
+                let s: S = buf.chan(ch)[frame];
+                out.push(s.into_sample());
+            }
         }
-        Ok(s) => Err(FerrumError::model(format!(
-            "ffmpeg exited with code {}. Is the audio file valid?",
-            s.code().unwrap_or(-1)
-        ))),
-        Err(_) => Err(FerrumError::model(
-            "ffmpeg not found. Install ffmpeg to process non-WAV audio (brew install ffmpeg)",
-        )),
+    }
+
+    match buf {
+        AudioBufferRef::U8(b) => push_interleaved(b, out, channels),
+        AudioBufferRef::S16(b) => push_interleaved(b, out, channels),
+        AudioBufferRef::S24(b) => push_interleaved(b, out, channels),
+        AudioBufferRef::S32(b) => push_interleaved(b, out, channels),
+        AudioBufferRef::F32(b) => push_interleaved(b, out, channels),
+        AudioBufferRef::F64(b) => push_interleaved(b, out, channels),
+        _ => {
+            // U16, S8 etc. not exposed by the codecs we compile in; silently
+            // skip rather than add dead conversion code.
+        }
     }
 }
 
