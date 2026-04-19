@@ -9,7 +9,7 @@ readme = "../../README.md"
 
 [dependencies]
 ferrum-types = { workspace = true }
-ferrum-kernels = { path = "../ferrum-kernels" }
+ferrum-kernels = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
