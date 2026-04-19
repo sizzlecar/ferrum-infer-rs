@@ -57,6 +57,9 @@ pub struct SequenceState {
     pub json_processor: Option<Arc<JsonModeProcessor>>,
     /// Regex-guided hard-mask processor (active when response_format is Regex).
     pub regex_processor: Option<Arc<ferrum_sampler::guided::RegexGuidedProcessor>>,
+    /// Draft-model KV cache (only populated when engine has speculative
+    /// decoding enabled). Allocated + prefilled lazily on the first decode.
+    pub draft_kv_cache: Option<Arc<dyn KvCacheHandle>>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Model executor's KV cache key for this sequence (for cleanup on completion).
@@ -113,6 +116,7 @@ impl SequenceState {
             preemption_count: 0,
             json_processor,
             regex_processor,
+            draft_kv_cache: None,
             token_frequencies: HashMap::new(),
             model_cache_id: None,
         }
@@ -198,6 +202,11 @@ struct EngineInner {
     sampler: Arc<dyn Sampler + Send + Sync>,
     kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+    /// Optional draft executor for speculative decoding. When set alongside
+    /// `spec_config`, `run_single_decode` routes through `SpeculativeRunner`.
+    draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
+    /// Speculative decoding parameters (N, temperature). `None` = disabled.
+    spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
     tensor_factory: Arc<dyn TensorFactory>,
     sequences: RwLock<HashMap<RequestId, SequenceState>>,
     is_running: AtomicBool,
@@ -724,6 +733,13 @@ impl EngineInner {
     // ── decode step ────────────────────────────────────────────────────
 
     async fn run_decode_step(&self, request_id: &RequestId) -> Result<()> {
+        // Speculative decoding path: when both a draft executor and
+        // config are set, delegate to the runner and push the accepted
+        // tokens onto the sequence in one shot.
+        if self.draft_executor.is_some() && self.spec_config.is_some() {
+            return self.run_decode_step_speculative(request_id).await;
+        }
+
         let decode_input = {
             let sequences = self.sequences.read();
             let seq = sequences
@@ -793,6 +809,187 @@ impl EngineInner {
             };
             self.complete_request(request_id, finish_reason).await?;
         }
+
+        Ok(())
+    }
+
+    /// Speculative-decoding variant of `run_decode_step`. Lazily prefills
+    /// the draft model's KV cache on first call (same prompt as target).
+    /// Then each iteration produces 1..=N+1 tokens via `SpeculativeRunner`.
+    async fn run_decode_step_speculative(&self, request_id: &RequestId) -> Result<()> {
+        use ferrum_interfaces::model_executor::PrefillInput;
+
+        let (draft_exec, cfg) = match (&self.draft_executor, &self.spec_config) {
+            (Some(d), Some(c)) => (d.clone(), c.clone()),
+            _ => unreachable!("speculative gate checked in run_decode_step"),
+        };
+
+        // ── 1. Ensure draft KV is prefilled once with the full prompt ────
+        let draft_kv_ready = {
+            let sequences = self.sequences.read();
+            sequences
+                .get(request_id)
+                .and_then(|s| s.draft_kv_cache.clone())
+        };
+        let draft_kv = if let Some(kv) = draft_kv_ready {
+            kv
+        } else {
+            // First spec iteration — prefill the draft on the prompt.
+            let (prompt_u32s, last_gen_token) = {
+                let sequences = self.sequences.read();
+                let seq = sequences
+                    .get(request_id)
+                    .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+                let full_prompt: Vec<u32> = seq.input_tokens.iter().map(|t| t.get()).collect();
+                let last = seq
+                    .generated_tokens
+                    .last()
+                    .copied()
+                    .unwrap_or(TokenId::new(0));
+                (full_prompt, last)
+            };
+            // Allocate a fresh KV handle for the draft from the same pool.
+            let model_info = draft_exec.info();
+            let alloc_request = AllocationRequest {
+                request_id: request_id.clone(),
+                initial_tokens: prompt_u32s.len(),
+                max_sequence_length: model_info.max_sequence_length,
+                num_layers: model_info.num_layers,
+                num_heads: model_info.num_kv_heads,
+                head_dim: model_info.hidden_size / model_info.num_heads.max(1),
+                device: self.config.backend.device.clone(),
+                dtype: model_info.dtype,
+                priority: Priority::Normal,
+            };
+            let draft_kv_handle = self.kv_cache.allocate(&alloc_request).await?;
+            let prompt_tensor = self.tokens_to_tensor(&prompt_u32s)?;
+            let pfx = PrefillInput::new(prompt_tensor).with_kv_cache(draft_kv_handle);
+            let pfx_out = draft_exec.prefill(&pfx).await?;
+            // Feed the already-sampled target token into the draft so it
+            // starts aligned with the target's next-token position.
+            let feed_tensor = self.tokens_to_tensor(&[last_gen_token.get()])?;
+            let feed_in = ferrum_interfaces::model_executor::DecodeInput::new(
+                feed_tensor,
+                pfx_out.kv_cache.clone(),
+            );
+            let feed_out = draft_exec.decode(&feed_in).await?;
+            let kv = feed_out.kv_cache.clone();
+            {
+                let mut sequences = self.sequences.write();
+                if let Some(s) = sequences.get_mut(request_id) {
+                    s.draft_kv_cache = Some(kv.clone());
+                }
+            }
+            kv
+        };
+
+        // ── 2. Pull current state + run one spec step ────────────────────
+        let (target_kv, last_token) = {
+            let sequences = self.sequences.read();
+            let seq = sequences
+                .get(request_id)
+                .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+            let kv = seq
+                .kv_cache
+                .as_ref()
+                .ok_or_else(|| FerrumError::internal("No target KV"))?
+                .clone();
+            let last = seq
+                .generated_tokens
+                .last()
+                .copied()
+                .unwrap_or(TokenId::new(0));
+            (kv, last)
+        };
+
+        let runner = crate::speculative::SpeculativeRunner {
+            draft: draft_exec.as_ref(),
+            target: self.model_executor.as_ref(),
+            tensor_factory: self.tensor_factory.clone(),
+            cfg,
+        };
+
+        // Snapshot the RNG out of the sequence so the async step can borrow
+        // the mutable RNG; reinstall on the way back.
+        let mut rng_seed = {
+            let sequences = self.sequences.read();
+            let seed = sequences
+                .get(request_id)
+                .and_then(|s| s.sampling_params.seed)
+                .unwrap_or(42);
+            // Mix in iteration count for non-deterministic draws across
+            // speculative rounds that share the same seed.
+            seed.wrapping_add(self.iteration_count.load(Ordering::Relaxed))
+        };
+        let mut rng = rand::rngs::StdRng::from_seed({
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&rng_seed.to_le_bytes());
+            rng_seed = rng_seed.wrapping_add(1);
+            seed
+        });
+
+        let outcome = runner
+            .step(last_token, draft_kv.clone(), target_kv, &mut rng)
+            .await?;
+
+        // ── 3. Install accepted tokens; check stop after each ───────────
+        let mut last_emitted = last_token;
+        for &tok in &outcome.tokens {
+            {
+                let mut sequences = self.sequences.write();
+                if let Some(seq) = sequences.get_mut(request_id) {
+                    seq.generated_tokens.push(tok);
+                    seq.tokens_this_iteration += 1;
+                }
+            }
+            last_emitted = tok;
+            self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+            counter!("ferrum.engine.decode_tokens_total").increment(1);
+
+            self.send_stream_update(request_id, tok).await;
+
+            let should_stop = {
+                let sequences = self.sequences.read();
+                sequences.get(request_id).map_or(true, |s| {
+                    s.should_stop(self.model_executor.info().vocab_size)
+                })
+            };
+            if should_stop {
+                let finish_reason = {
+                    let sequences = self.sequences.read();
+                    match sequences.get(request_id) {
+                        Some(seq)
+                            if seq.generated_tokens.len() >= seq.sampling_params.max_tokens =>
+                        {
+                            FinishReason::Length
+                        }
+                        Some(_) => FinishReason::EOS,
+                        None => FinishReason::Error,
+                    }
+                };
+                self.complete_request(request_id, finish_reason).await?;
+                return Ok(());
+            }
+        }
+
+        // ── 4. Persist updated KV handles ───────────────────────────────
+        {
+            let mut sequences = self.sequences.write();
+            if let Some(seq) = sequences.get_mut(request_id) {
+                seq.kv_cache = Some(outcome.target_kv);
+                seq.draft_kv_cache = Some(outcome.draft_kv);
+            }
+        }
+        let _ = last_emitted;
+        let generated_count = {
+            let sequences = self.sequences.read();
+            sequences
+                .get(request_id)
+                .map(|s| s.generated_tokens.len())
+                .unwrap_or(0)
+        };
+        self.scheduler
+            .update_decode_progress(request_id, generated_count);
 
         Ok(())
     }
@@ -931,7 +1128,37 @@ impl ContinuousBatchEngine {
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
         tensor_factory: Arc<dyn TensorFactory>,
     ) -> Self {
-        info!("Creating ContinuousBatchEngine");
+        Self::new_with_speculation(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            kv_cache,
+            model_executor,
+            tensor_factory,
+            None,
+            None,
+        )
+    }
+
+    /// Build an engine with optional speculative decoding. Pass both the
+    /// draft executor AND the config together — either both or neither.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_speculation(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+        draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
+        spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
+    ) -> Self {
+        info!(
+            "Creating ContinuousBatchEngine (speculative_decoding={})",
+            draft_executor.is_some() && spec_config.is_some()
+        );
 
         Self {
             inner: Arc::new(EngineInner {
@@ -941,6 +1168,8 @@ impl ContinuousBatchEngine {
                 sampler,
                 kv_cache,
                 model_executor,
+                draft_executor,
+                spec_config,
                 tensor_factory,
                 sequences: RwLock::new(HashMap::new()),
                 is_running: AtomicBool::new(false),

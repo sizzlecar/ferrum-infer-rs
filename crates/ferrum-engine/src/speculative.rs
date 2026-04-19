@@ -279,7 +279,7 @@ impl<'a> SpeculativeRunner<'a> {
         last_token: TokenId,
         draft_kv: Arc<dyn KvCacheHandle>,
         target_kv: Arc<dyn KvCacheHandle>,
-        rng: &mut dyn RngCore,
+        rng: &mut (dyn RngCore + Send),
     ) -> Result<SpeculativeStepOutcome> {
         let n = self.cfg.num_speculative_tokens.max(1);
 
