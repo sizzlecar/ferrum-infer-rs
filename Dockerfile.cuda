@@ -20,8 +20,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl build-essential pkg-config libssl-dev git \
     && rm -rf /var/lib/apt/lists/*
 
+# Rust 1.88+ needed: transitive deps (moxcms, audioadapter-sample) require
+# edition 2024, which stabilized in 1.85.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-        sh -s -- -y --default-toolchain 1.82.0
+        sh -s -- -y --default-toolchain 1.88.0
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /build

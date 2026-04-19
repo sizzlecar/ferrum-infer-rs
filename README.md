@@ -20,6 +20,37 @@ cargo build --release -p ferrum-cli --bin ferrum
 CUDA_HOME=/usr/local/cuda cargo build --release --features cuda -p ferrum-cli --bin ferrum
 ```
 
+### Docker (CPU)
+
+A prebuilt CPU image is published to GHCR on each tagged release (`:cpu`,
+`:cpu-<version>`). Runs on any x86_64 Linux host — no Rust toolchain needed.
+
+```bash
+# Pull the latest CPU image (available after the next tagged release)
+docker pull ghcr.io/sizzlecar/ferrum-infer-rs:cpu
+
+# Serve a model on port 8000 (HF cache mounted so weights persist across runs)
+docker run --rm -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
+  serve --model qwen3:0.6b --port 8000
+
+# Gated models: pass HF_TOKEN
+docker run --rm -e HF_TOKEN=$HF_TOKEN \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
+  pull meta-llama/Llama-3.2-1B-Instruct
+```
+
+To build the image yourself:
+
+```bash
+docker build -t ferrum:cpu .
+```
+
+CUDA and Metal images are on the roadmap — for now run Metal natively on
+macOS, CUDA natively on Linux.
+
 ## Quick Start
 
 For gated models (e.g. Llama 3.2), set your Hugging Face token first:
