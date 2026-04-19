@@ -1,52 +1,179 @@
 name: CI
 
 on:
+  # Only run on direct pushes to main (release commits, hotfixes).
+  # PR branches already get covered by the pull_request trigger — running
+  # both here doubles CI minutes for every PR commit.
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      build_ptx:
+        description: 'Also compile CUDA kernels to PTX (~40min)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  checks:
-    name: Minimal Checks
+  # ── CPU (Linux) ──────────────────────────────────────────────────────
+  # Core quality gate: format, lint, unit tests, integration tests
+  cpu:
+    name: CPU (Linux)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config build-essential
+          sudo apt-get install -y libssl-dev pkg-config build-essential ffmpeg
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo dependencies
-        uses: actions/cache@v3
+      - uses: actions/cache@v3
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cpu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cpu-
 
-      - name: Check formatting
+      - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Compile (workspace, all targets)
         run: cargo check --workspace --all-targets
 
-      - name: Clippy (advisory)
+      - name: Clippy
         run: cargo clippy --workspace --all-targets -- -A warnings
         continue-on-error: true
 
-      - name: CLI E2E smoke tests
+      # ── Unit Tests ────────────────────────────────────
+      - name: Unit tests (all crates)
+        run: cargo test --workspace
+
+      # ── Integration Tests ─────────────────────────────
+      # These test subsystems without downloading models
+
+      - name: "Test: Correctness (determinism, EOS, edge cases)"
+        run: cargo test -p ferrum-engine --test correctness_test
+
+      - name: "Test: Concurrency stress (32/64 concurrent)"
+        run: cargo test -p ferrum-engine --test concurrency_stress_test
+
+      - name: "Test: Audio processing (WAV, resample, mel)"
+        run: cargo test -p ferrum-models --test audio_test
+
+      - name: "Test: Type system (errors, configs, sampling)"
+        run: cargo test -p ferrum-types
+
+      - name: "Test: Interfaces (engine traits, sampler)"
+        run: cargo test -p ferrum-interfaces
+
+      - name: "Test: Scheduler (batch planning)"
+        run: cargo test -p ferrum-scheduler
+
+      - name: "Test: KV cache (paged lifecycle)"
+        run: cargo test -p ferrum-kv
+
+      - name: "Test: Sampler (top-k, top-p, temperature)"
+        run: cargo test -p ferrum-sampler
+
+      # ── CLI E2E ───────────────────────────────────────
+      - name: "Test: CLI build + smoke test"
         run: |
           cargo build -p ferrum-cli --bin ferrum
           cargo test -p ferrum-cli --test cli_e2e
+          # Verify help works
+          ./target/debug/ferrum --help
+          ./target/debug/ferrum tts --help
+          ./target/debug/ferrum transcribe --help
+          ./target/debug/ferrum serve --help
+
+  # ── Metal (macOS) ────────────────────────────────────────────────────
+  # Verifies Metal shader compilation + Metal-gated code paths
+  metal:
+    name: Metal (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-metal-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-metal-
+
+      - name: Compile with Metal (all targets)
+        run: cargo check --workspace --all-targets --features metal
+
+      - name: Build CLI (Metal, release)
+        run: cargo build --release -p ferrum-cli --features metal
+
+      - name: Unit tests (with Metal feature)
+        run: cargo test --workspace --features metal
+
+      - name: "Test: Metal GEMM (vs cblas reference)"
+        run: cargo test -p ferrum-attention --test gemm_test --features metal
+        continue-on-error: true  # needs Metal GPU, may skip in CI VM
+
+      - name: "Test: Metal flash attention"
+        run: cargo test -p ferrum-attention --test metal_test --features metal
+        continue-on-error: true
+
+      - name: "Test: Metal transformer layer"
+        run: cargo test -p ferrum-attention --test transformer_test --features metal
+        continue-on-error: true
+
+      - name: "Test: CLI help (Metal build)"
+        run: |
+          ./target/release/ferrum --help
+          ./target/release/ferrum tts --help
+
+  # ── CUDA (Linux + CUDA toolkit) ─────────────────────────────────────
+  # Type-checks CUDA code paths. PTX build optional (slow).
+  cuda:
+    name: CUDA (Linux)
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.0-devel-ubuntu22.04
+    steps:
+      - name: Install deps
+        run: |
+          apt-get update
+          apt-get install -y curl build-essential pkg-config libssl-dev git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Type check (--features cuda)
+        env:
+          CUDA_COMPUTE_CAP: "80"
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo check --workspace --features cuda
+
+      - name: Build CUDA kernels (PTX)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.build_ptx == 'true'
+        env:
+          CUDA_COMPUTE_CAP: "80"
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build -p ferrum-kernels --features cuda

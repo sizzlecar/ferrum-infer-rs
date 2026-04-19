@@ -15,6 +15,9 @@ cargo install ferrum-cli
 
 # 或从源码编译
 cargo build --release -p ferrum-cli --bin ferrum
+
+# CUDA（Linux + NVIDIA）
+CUDA_HOME=/usr/local/cuda cargo build --release --features cuda -p ferrum-cli --bin ferrum
 ```
 
 ## 快速开始
@@ -152,11 +155,14 @@ curl http://localhost:8000/health
 
 ### Qwen3-4B
 
-| 模式 | FP16 | INT4 (GPTQ + Marlin) |
-|------|------|----------------------|
-| 单请求 decode | 88.1 tok/s | **130.4 tok/s (+48%)** |
-| 4 并发 (batch decode) | 109.4 tok/s | **124.2 tok/s** |
-| 显存占用 | ~8 GB | **~2.5 GB (-69%)** |
+| 模式 | FP16（eager） | FP16 + CUDA 图 | INT4 (GPTQ + Marlin) |
+|------|--------------|----------------|----------------------|
+| 单请求 decode | 70.3 tok/s | **82.9 tok/s (+18%)** | **130.4 tok/s** |
+| 4 并发 (batch decode) | 109.4 tok/s | — | **124.2 tok/s** |
+| TPOT (p50) | 14.2 ms | **12.1 ms** | — |
+| 显存占用 | ~8 GB | — | **~2.5 GB (-69%)** |
+
+> CUDA graph 模式 warmup 3 步后自动启用，消除 per-step kernel 启动开销。已在 Blackwell + CUDA 13 路径上加固（见 [docs/phase-e-cuda-status.md](docs/phase-e-cuda-status.md)）。
 
 ### TinyLlama-1.1B（Llama 架构）
 
@@ -266,7 +272,7 @@ crates/
 ├── ferrum-runtime        # 后端实现（Candle, CPU）
 ├── ferrum-engine         # Metal 内核、模型编排
 ├── ferrum-models         # 模型架构（LLaMA, Qwen2, Qwen3, BERT, Whisper）
-├── ferrum-cuda-kernels   # 自定义 CUDA 内核 + decode runner
+├── ferrum-kernels   # 自定义 CUDA 内核 + decode runner
 ├── ferrum-tokenizer      # 分词器
 ├── ferrum-sampler        # 采样策略
 ├── ferrum-scheduler      # 请求调度

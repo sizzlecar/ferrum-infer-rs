@@ -1,6 +1,6 @@
 [package]
 name = "ferrum-attention"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 description = "Fused flash attention for Metal and CPU — production-grade, framework-independent"
@@ -9,6 +9,7 @@ repository = "https://github.com/sizzlecar/ferrum-infer-rs"
 [features]
 default = []
 metal = ["dep:metal", "dep:objc2", "dep:objc2-foundation"]
+cuda = ["dep:cudarc", "dep:half"]
 
 [dependencies]
 tracing = "0.1"
@@ -17,3 +18,7 @@ tracing = "0.1"
 metal = { version = "0.31", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", features = ["NSString"], optional = true }
+
+# CUDA (NVIDIA only)
+cudarc = { version = "0.12", features = ["driver", "cublas", "cuda-version-from-build-system"], optional = true }
+half = { version = "2.4", optional = true }

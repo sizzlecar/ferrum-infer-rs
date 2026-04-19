@@ -1,4 +1,4 @@
-//! ferrum-attention: Fused flash attention and transformer for Metal and CPU.
+//! ferrum-attention: Fused flash attention and transformer for Metal, CUDA, and CPU.
 //!
 //! Single-kernel attention (QK^T + softmax + attn@V) with no intermediate buffer
 //! materialization. Full transformer layer with all ops fused on GPU.
@@ -8,13 +8,19 @@ pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
 
-/// Opaque GPU buffer type (Metal Buffer when available, placeholder otherwise).
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
+/// Opaque GPU buffer type.
 #[cfg(feature = "metal")]
 pub type GpuBuffer = ::metal::Buffer;
-#[cfg(not(feature = "metal"))]
-pub type GpuBuffer = Vec<f32>; // fallback: CPU storage
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+pub type GpuBuffer = cudarc::driver::CudaSlice<f32>;
+#[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
+pub type GpuBuffer = Vec<f32>;
 
 /// Attention configuration.
+#[derive(Clone, Debug, Default)]
 pub struct AttentionParams {
     pub batch: usize,
     pub num_heads: usize,
@@ -24,6 +30,9 @@ pub struct AttentionParams {
     pub head_dim: usize,
     pub causal: bool,
     pub pos_offset: usize,
+    /// Sliding-window size. `0` = full causal (default). Mistral v0.1 and
+    /// Gemma use 4096; later Mistral versions set this to 0 to disable.
+    pub sliding_window: usize,
 }
 
 /// Run fused attention on CPU.
@@ -33,6 +42,13 @@ pub fn attention_cpu(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], params: &
 
 /// Run fused attention on best available backend.
 pub fn attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], params: &AttentionParams) {
+    #[cfg(feature = "cuda")]
+    {
+        if cuda::is_available() {
+            cuda::fused_attention(q, k, v, out, params);
+            return;
+        }
+    }
     #[cfg(feature = "metal")]
     {
         if metal::is_available() {
@@ -245,7 +261,12 @@ impl FusedTransformer {
             "FusedTransformer: backend={backend}, hidden={}, layers={n}",
             cfg.hidden_size
         );
-        #[cfg(not(feature = "metal"))]
+        #[cfg(all(not(feature = "metal"), feature = "cuda"))]
+        tracing::info!(
+            "FusedTransformer: backend=CUDA, hidden={}, layers={n}",
+            cfg.hidden_size
+        );
+        #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
         tracing::info!(
             "FusedTransformer: backend=CPU, hidden={}, layers={n}",
             cfg.hidden_size
@@ -805,14 +826,20 @@ impl FusedTransformer {
 
     /// Create a Metal buffer from f32 data (shared memory, zero-copy on Apple Silicon).
     /// Returns None if Metal not available.
-    /// Create a GPU buffer from f32 data. Returns None if Metal not available.
+    /// Create a GPU buffer from f32 data. Returns None if GPU not available.
     pub fn create_gpu_buffer(&self, data: &[f32]) -> Option<GpuBuffer> {
         #[cfg(feature = "metal")]
         {
             let ms = self.metal_state.as_ref()?;
-            Some(ms.pipes.buffer_from_data(data))
+            return Some(ms.pipes.buffer_from_data(data));
         }
-        #[cfg(not(feature = "metal"))]
+        #[cfg(feature = "cuda")]
+        {
+            // TODO: allocate CudaSlice and copy data
+            let _ = data;
+            return None;
+        }
+        #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
         {
             Some(data.to_vec())
         }

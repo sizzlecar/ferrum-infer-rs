@@ -147,77 +147,10 @@ fn bench_scheduling_overhead(c: &mut Criterion) {
     group.finish();
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Attention kernel micro-benchmarks
-// ────────────────────────────────────────────────────────────────────────────
-
-fn bench_cpu_attention(c: &mut Criterion) {
-    use ferrum_engine::kernels::ops::{
-        AttentionOp, CpuAttentionOp, DecodeAttentionInput, PrefillAttentionInput,
-    };
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    let mut group = c.benchmark_group("cpu_attention");
-    group.measurement_time(Duration::from_secs(5));
-
-    let op = CpuAttentionOp::new();
-
-    // Prefill at various sequence lengths
-    for seq_len in [16, 64, 256, 512] {
-        let num_heads = 8;
-        let num_kv_heads = 4;
-        let head_dim = 64;
-
-        let query = vec![0.1f32; seq_len * num_heads * head_dim];
-        let key = vec![0.1f32; seq_len * num_kv_heads * head_dim];
-        let value = vec![0.1f32; seq_len * num_kv_heads * head_dim];
-
-        let input = PrefillAttentionInput {
-            query: query.clone(),
-            key: key.clone(),
-            value: value.clone(),
-            seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            causal: true,
-        };
-
-        group.throughput(Throughput::Elements(seq_len as u64));
-        group.bench_with_input(BenchmarkId::new("prefill", seq_len), &input, |b, input| {
-            b.iter(|| rt.block_on(op.prefill(input)))
-        });
-    }
-
-    // Decode at various KV cache lengths
-    for kv_len in [16, 64, 256, 1024] {
-        let num_heads = 8;
-        let num_kv_heads = 4;
-        let head_dim = 64;
-
-        let input = DecodeAttentionInput {
-            query: vec![0.1f32; num_heads * head_dim],
-            cached_keys: vec![0.1f32; kv_len * num_kv_heads * head_dim],
-            cached_values: vec![0.1f32; kv_len * num_kv_heads * head_dim],
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            kv_len,
-        };
-
-        group.bench_with_input(BenchmarkId::new("decode", kv_len), &input, |b, input| {
-            b.iter(|| rt.block_on(op.decode(input)))
-        });
-    }
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_single_request,
     bench_concurrent_throughput,
     bench_scheduling_overhead,
-    bench_cpu_attention,
 );
 criterion_main!(benches);

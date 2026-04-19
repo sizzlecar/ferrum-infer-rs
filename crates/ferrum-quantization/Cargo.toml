@@ -1,0 +1,23 @@
+[package]
+name = "ferrum-quantization"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Weight-format abstraction (Dense / GPTQ / AWQ / GGUF) for Ferrum models"
+readme = "../../README.md"
+
+[dependencies]
+ferrum-types = { workspace = true }
+ferrum-kernels = { path = "../ferrum-kernels" }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+memmap2 = "0.9"
+half = { workspace = true }
+
+[features]
+default = []
+metal = ["ferrum-kernels/metal"]
+cuda = ["ferrum-kernels/cuda"]

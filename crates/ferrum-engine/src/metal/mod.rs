@@ -16,15 +16,9 @@ mod context;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 mod error;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub mod metal_executor;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_kernel_ops;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub mod metal_llama;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_model;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub mod metal_qwen2;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod quantization;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -41,15 +35,9 @@ pub use context::MetalContext;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use error::MetalError;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub use metal_executor::*;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_kernel_ops::MetalKernelOps;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub use metal_llama::*;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_model::*;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub use metal_qwen2::*;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use quantization::*;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]

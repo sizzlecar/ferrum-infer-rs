@@ -909,6 +909,15 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
+dependencies = [
+ "libloading 0.8.9",
+]
+
+[[package]]
+name = "cudarc"
 version = "0.17.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf99ab37ee7072d64d906aa2dada9a3422f1d975cdf8c8055a573bc84897ed8"
@@ -1229,8 +1238,10 @@ dependencies = [
 
 [[package]]
 name = "ferrum-attention"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
+ "cudarc 0.12.1",
+ "half",
  "metal 0.31.0",
  "objc2",
  "objc2-foundation",
@@ -1239,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1279,20 +1290,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrum-cuda-kernels"
-version = "0.6.0"
-dependencies = [
- "bindgen_cuda",
- "candle-core",
- "cudarc 0.19.4",
- "ferrum-types",
- "half",
- "tracing",
-]
-
-[[package]]
 name = "ferrum-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1305,8 +1304,10 @@ dependencies = [
  "chrono",
  "criterion",
  "ferrum-interfaces",
+ "ferrum-kernels",
  "ferrum-kv",
  "ferrum-models",
+ "ferrum-quantization",
  "ferrum-runtime",
  "ferrum-sampler",
  "ferrum-scheduler",
@@ -1341,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-interfaces"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1357,8 +1358,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-kernels"
+version = "0.7.0"
+dependencies = [
+ "bindgen_cuda",
+ "candle-core",
+ "cudarc 0.19.4",
+ "ferrum-attention",
+ "ferrum-types",
+ "half",
+ "metal 0.31.0",
+ "tracing",
+]
+
+[[package]]
 name = "ferrum-kv"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1379,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-models"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1393,8 +1408,9 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "ferrum-attention",
- "ferrum-cuda-kernels",
  "ferrum-interfaces",
+ "ferrum-kernels",
+ "ferrum-quantization",
  "ferrum-runtime",
  "ferrum-testkit",
  "ferrum-types",
@@ -1427,8 +1443,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-quantization"
+version = "0.7.0"
+dependencies = [
+ "ferrum-kernels",
+ "ferrum-types",
+ "half",
+ "memmap2",
+ "safetensors 0.4.5",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "ferrum-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1459,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-sampler"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1479,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-scheduler"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1507,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1542,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1551,13 +1581,15 @@ dependencies = [
  "ferrum-types",
  "parking_lot",
  "rand 0.9.2",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "ferrum-tokenizer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1582,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-types"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "rand 0.9.2",

@@ -59,7 +59,7 @@ FERRUM_PAGED_KV=1 FERRUM_KV_BLOCKS=128 cargo run -p ferrum-cli --features cuda -
 1. **Foundation (no GPU deps):** `ferrum-types` (shared types, errors), `ferrum-interfaces` (trait contracts: ComputeBackend, ModelExecutor, Scheduler, KvCacheManager, Sampler, Tokenizer)
 2. **Core logic (hardware-agnostic):** `ferrum-scheduler` (continuous batching, priority), `ferrum-sampler` (top-k/p, temperature), `ferrum-tokenizer` (HF wrapper), `ferrum-kv` (paged KV cache, block allocation), `ferrum-runtime` (backend abstraction)
 3. **Application:** `ferrum-engine` (orchestration, ContinuousBatchEngine), `ferrum-models` (Qwen3/Qwen2/LLaMA/BERT architectures + weight loading), `ferrum-server` (Axum HTTP, OpenAI-compatible API), `ferrum-cli` (binary entry point)
-4. **Accelerators (feature-gated):** `ferrum-cuda-kernels` (CudaDecodeRunner with custom CUDA kernels — PTX precompiled at build time)
+4. **Accelerators (feature-gated):** `ferrum-kernels` (CudaDecodeRunner with custom CUDA kernels — PTX precompiled at build time)
 5. **Testing:** `ferrum-testkit` (mocks for all trait contracts — enables GPU-free testing)
 
 **Key design rules:**
@@ -76,7 +76,7 @@ FERRUM_PAGED_KV=1 FERRUM_KV_BLOCKS=128 cargo run -p ferrum-cli --features cuda -
 
 ## CUDA Decode Runner
 
-Candle handles weight loading and prefill (FlashAttention-2). Decode is fully controlled by `CudaDecodeRunner` in `ferrum-cuda-kernels`:
+Candle handles weight loading and prefill (FlashAttention-2). Decode is fully controlled by `CudaDecodeRunner` in `ferrum-kernels`:
 
 **Custom CUDA kernels** (PTX compiled at build time):
 - `rms_norm.cu`, `fused_add_rms_norm.cu` — layer normalization
@@ -96,7 +96,7 @@ Candle handles weight loading and prefill (FlashAttention-2). Decode is fully co
 ## Build Scripts
 
 - **`ferrum-engine/build.rs`**: Compiles Metal shaders (.metal → .air → .metallib) on macOS via `xcrun`. Generates empty stub on non-Apple platforms.
-- **`ferrum-cuda-kernels/build.rs`**: Compiles CUDA .cu files to PTX using `bindgen_cuda`. Requires CUDA_HOME env var. Generates `ptx.rs` in OUT_DIR.
+- **`ferrum-kernels/build.rs`**: Compiles CUDA .cu files to PTX using `bindgen_cuda`. Requires CUDA_HOME env var. Generates `ptx.rs` in OUT_DIR.
 
 ## Model Support
 

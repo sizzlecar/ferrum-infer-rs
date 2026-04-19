@@ -59,6 +59,7 @@ fn test_metal_flash_attn_causal_small() {
         head_dim: d,
         causal: true,
         pos_offset: 0,
+        sliding_window: 0,
     };
 
     let mut out_cpu = vec![0.0f32; n];
@@ -100,6 +101,7 @@ fn test_metal_flash_attn_prefill_73() {
         head_dim: d,
         causal: true,
         pos_offset: 0,
+        sliding_window: 0,
     };
 
     let mut out_cpu = vec![0.0f32; b * nh * sq * d];
@@ -142,6 +144,7 @@ fn test_metal_flash_attn_decode() {
         head_dim: d,
         causal: false,
         pos_offset: 73,
+        sliding_window: 0,
     };
 
     let mut out_cpu = vec![0.0f32; b * nh * sq * d];
@@ -176,6 +179,7 @@ fn bench_metal_flash_attn_prefill() {
         head_dim: d,
         causal: true,
         pos_offset: 0,
+        sliding_window: 0,
     };
 
     // Warmup

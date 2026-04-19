@@ -53,6 +53,12 @@ impl MetalPipelines {
                     "gemm_f32",
                     "argmax_f32",
                     "embedding_lookup_f32",
+                    "split_qkv_f32",
+                    "silu_mul_split_f32",
+                    "gemv_f32",
+                    "layer_norm_f32",
+                    "gelu_f32",
+                    "add_bias_f32",
                 ][..],
             ),
             (&gemm_lib, &["gemm_f32_v2"][..]),
@@ -363,6 +369,43 @@ impl MetalPipelines {
     }
 
     // ── New all-Metal dispatch methods (encoder-based, no commit) ──────
+
+    /// GEMV: m=1 specialization. C[1, N] = A[1, K] @ B[N, K]^T.
+    /// One threadgroup per output column, 32 threads; K-reduction via simd_sum.
+    pub fn gemv_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        a: &Buffer,
+        b: &Buffer,
+        c: &Buffer,
+        n: usize,
+        k: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            m: i32,
+            n: i32,
+            k: i32,
+        }
+        let params = P {
+            m: 1,
+            n: n as i32,
+            k: k as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void,
+            12,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("gemv_f32"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(c), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let tg = MTLSize::new(32, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
 
     /// GEMM v2: C[M,N] = A[M,K] @ B[N,K]^T — all on Metal, 64x32 tiles
     pub fn gemm_v2(
@@ -710,6 +753,7 @@ impl MetalPipelines {
             causal: i32,
             pos_offset: i32,
             kv_seq_stride: i32,
+            sliding_window: i32,
         }
         let p = P {
             batch: params.batch as i32,
@@ -722,6 +766,7 @@ impl MetalPipelines {
             causal: if params.causal { 1 } else { 0 },
             pos_offset: params.pos_offset as i32,
             kv_seq_stride: kv_seq_stride as i32,
+            sliding_window: params.sliding_window as i32,
         };
         let params_buf = self.device.new_buffer_with_data(
             &p as *const _ as *const c_void,
@@ -757,5 +802,169 @@ impl MetalPipelines {
         params: &crate::AttentionParams,
     ) {
         self.flash_attn_v2(cmd, q, k, v, o, params, 0);
+    }
+
+    /// Split fused QKV: qkv [tokens, q_dim + 2*kv_dim] → q, k, v separate buffers.
+    pub fn split_qkv_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        qkv: &Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        tokens: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            tokens: i32,
+            q_dim: i32,
+            kv_dim: i32,
+        }
+        let p = P {
+            tokens: tokens as i32,
+            q_dim: q_dim as i32,
+            kv_dim: kv_dim as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &p as *const _ as *const c_void,
+            12,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("split_qkv_f32"));
+        enc.set_buffer(0, Some(qkv), 0);
+        enc.set_buffer(1, Some(q), 0);
+        enc.set_buffer(2, Some(k), 0);
+        enc.set_buffer(3, Some(v), 0);
+        enc.set_buffer(4, Some(&params_buf), 0);
+        let total = tokens * (q_dim + 2 * kv_dim);
+        let grid = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// LayerNorm with learnable gamma/beta.
+    pub fn layer_norm_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        gamma: &Buffer,
+        beta: &Buffer,
+        out: &Buffer,
+        tokens: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        #[repr(C)]
+        struct P {
+            dim: i32,
+            eps: f32,
+        }
+        let p = P {
+            dim: dim as i32,
+            eps,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &p as *const _ as *const c_void,
+            8,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("layer_norm_f32"));
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(gamma), 0);
+        enc.set_buffer(2, Some(beta), 0);
+        enc.set_buffer(3, Some(out), 0);
+        enc.set_buffer(4, Some(&params_buf), 0);
+        let grid = MTLSize::new(tokens as u64, 1, 1);
+        let tg = MTLSize::new(32, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Element-wise GELU (erf-based, matches torch default).
+    pub fn gelu_enc(&self, enc: &ComputeCommandEncoderRef, x: &Buffer, out: &Buffer, len: usize) {
+        #[repr(C)]
+        struct P {
+            n: i32,
+        }
+        let p = P { n: len as i32 };
+        let params_buf = self.device.new_buffer_with_data(
+            &p as *const _ as *const c_void,
+            4,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("gelu_f32"));
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(out), 0);
+        enc.set_buffer(2, Some(&params_buf), 0);
+        let grid = MTLSize::new(((len + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Broadcast bias add: data[r, c] += bias[c].
+    pub fn add_bias_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        data: &Buffer,
+        bias: &Buffer,
+        rows: usize,
+        cols: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            rows: i32,
+            cols: i32,
+        }
+        let p = P {
+            rows: rows as i32,
+            cols: cols as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &p as *const _ as *const c_void,
+            8,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("add_bias_f32"));
+        enc.set_buffer(0, Some(data), 0);
+        enc.set_buffer(1, Some(bias), 0);
+        enc.set_buffer(2, Some(&params_buf), 0);
+        let total = rows * cols;
+        let grid = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// SiLU(gate) * up with fused gate_up split: gate_up [tokens, 2*im] → out [tokens, im].
+    pub fn silu_mul_split_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        gate_up: &Buffer,
+        out: &Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            tokens: i32,
+            im: i32,
+        }
+        let p = P {
+            tokens: tokens as i32,
+            im: im as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &p as *const _ as *const c_void,
+            8,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("silu_mul_split_f32"));
+        enc.set_buffer(0, Some(gate_up), 0);
+        enc.set_buffer(1, Some(out), 0);
+        enc.set_buffer(2, Some(&params_buf), 0);
+        let total = tokens * im;
+        let grid = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
     }
 }

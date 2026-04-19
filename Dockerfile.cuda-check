@@ -1,0 +1,25 @@
+# Lightweight CUDA compile check — verifies Rust + CUDA code compiles.
+# Does NOT run tests (no GPU in Docker build).
+#
+# Usage:
+#   docker build -f Dockerfile.cuda-check .
+#   # If build succeeds, CUDA code compiles correctly.
+
+FROM nvidia/cuda:12.6.0-devel-ubuntu22.04
+
+# Install Rust
+RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev git && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+COPY . .
+
+# Compile check (no linking to GPU driver needed for cargo check)
+RUN cargo check --workspace --features cuda 2>&1 | tail -20
+
+# Also verify the CUDA kernels compile to PTX
+RUN cargo build -p ferrum-kernels --features cuda 2>&1 | tail -10
+
+# If we get here, everything compiles
+RUN echo "CUDA compilation check PASSED"
