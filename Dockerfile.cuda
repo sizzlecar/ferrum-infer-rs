@@ -16,7 +16,11 @@
 FROM nvidia/cuda:12.6.0-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
+# --allow-change-held-packages needed because libnccl-dev's transitive deps
+# (gcc-12-base / libgcc-s1 / libstdc++6) may bump held CUDA-base packages
+# when the nvidia apt repo publishes newer NCCL builds.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        --allow-change-held-packages \
         curl build-essential pkg-config libssl-dev git \
         libnccl2 libnccl-dev \
     && rm -rf /var/lib/apt/lists/*
