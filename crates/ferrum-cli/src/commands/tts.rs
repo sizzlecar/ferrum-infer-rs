@@ -5,7 +5,7 @@ use candle_core::{DType, Device as CandleDevice};
 use clap::Args;
 use colored::Colorize;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
-use ferrum_models::{ConfigManager, HfDownloader};
+use ferrum_models::HfDownloader;
 use ferrum_types::Result;
 use std::path::PathBuf;
 

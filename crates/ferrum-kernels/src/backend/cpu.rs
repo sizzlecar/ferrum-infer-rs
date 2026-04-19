@@ -497,6 +497,7 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+#[allow(dead_code)]
 fn apply_rope_impl(
     data: &mut [f32],
     tokens: usize,

@@ -911,7 +911,7 @@ impl EngineInner {
 
         // Snapshot the RNG out of the sequence so the async step can borrow
         // the mutable RNG; reinstall on the way back.
-        let mut rng_seed = {
+        let rng_seed = {
             let sequences = self.sequences.read();
             let seed = sequences
                 .get(request_id)
@@ -924,7 +924,6 @@ impl EngineInner {
         let mut rng = rand::rngs::StdRng::from_seed({
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&rng_seed.to_le_bytes());
-            rng_seed = rng_seed.wrapping_add(1);
             seed
         });
 

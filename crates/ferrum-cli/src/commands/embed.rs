@@ -1,7 +1,6 @@
 //! Embed command - Generate embeddings using BERT models
 
 use crate::config::CliConfig;
-use candle_core::Device as CandleDevice;
 use clap::Args;
 use colored::Colorize;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};

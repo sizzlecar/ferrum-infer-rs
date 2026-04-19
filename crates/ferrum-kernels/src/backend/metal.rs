@@ -78,6 +78,7 @@ impl MetalContext {
 
 /// One-shot helper: open a cmd buffer, encode, commit+wait.
 /// Used only when ctx-driven batching is not needed (tests, isolated ops).
+#[allow(dead_code)]
 fn run(f: impl FnOnce(&metal::CommandBufferRef)) {
     let cmd = st().pipes.queue.new_command_buffer();
     f(cmd);

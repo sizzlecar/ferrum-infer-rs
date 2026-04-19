@@ -1,6 +1,8 @@
 //! Tests for Metal flash attention kernel.
 //! Compares Metal output against CPU reference.
 
+#![allow(unused_parens)]
+
 use ferrum_attention::{attention_cpu, AttentionParams};
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
