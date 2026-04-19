@@ -18,6 +18,7 @@ FROM nvidia/cuda:12.6.0-devel-ubuntu22.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl build-essential pkg-config libssl-dev git \
+        libnccl2 libnccl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust 1.88+ needed: transitive deps (moxcms, audioadapter-sample) require
@@ -47,6 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
         ffmpeg \
+        libnccl2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/ferrum /usr/local/bin/ferrum
