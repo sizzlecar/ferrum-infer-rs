@@ -161,7 +161,9 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         out.as_mut_slice()
             .iter_mut()
             .zip(bytes.chunks_exact(4))
-            .for_each(|(d, chunk)| *d = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            .for_each(|(d, chunk)| {
+                *d = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+            });
         Ok((out, shape))
     }
 
@@ -527,8 +529,8 @@ fn load_quantize_config(dir: &Path) -> Result<Option<QuantConfig>> {
     // AutoGPTQ / gptq-for-llama format: separate quantize_config.json.
     let p = dir.join("quantize_config.json");
     if p.exists() {
-        let data = std::fs::read_to_string(&p)
-            .map_err(|e| FerrumError::io(format!("read {p:?}: {e}")))?;
+        let data =
+            std::fs::read_to_string(&p).map_err(|e| FerrumError::io(format!("read {p:?}: {e}")))?;
         let qc: QuantConfig = serde_json::from_str(&data)
             .map_err(|e| FerrumError::serialization(format!("parse quantize_config.json: {e}")))?;
         return Ok(Some(qc));

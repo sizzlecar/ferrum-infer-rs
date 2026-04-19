@@ -38,8 +38,7 @@ fn install_cuda_backend_overrides(
     sub_talker: &mut SubTalker,
 ) -> Result<()> {
     use ferrum_kernels::backend::cuda::CudaBackend;
-    let loader: NativeSafetensorsLoader<CudaBackend> =
-        NativeSafetensorsLoader::open(model_dir)?;
+    let loader: NativeSafetensorsLoader<CudaBackend> = NativeSafetensorsLoader::open(model_dir)?;
     let talker_bb = TalkerBackboneBackend::<CudaBackend>::new(cfg, &loader)?;
     talker.set_backend_override(Box::new(talker_bb));
     let sub_bb = TalkerBackboneBackend::<CudaBackend>::new_code_predictor(cfg, &loader)?;

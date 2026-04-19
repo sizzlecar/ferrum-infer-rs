@@ -336,7 +336,11 @@ fn qwen3_generate_text_cpu_vs_cuda() {
     let prompt_text = "The capital of France is";
     let enc = tokenizer.encode(prompt_text, false).expect("encode");
     let prompt: Vec<u32> = enc.get_ids().to_vec();
-    eprintln!("\n=== Text generation: '{}' ({} tokens) ===", prompt_text, prompt.len());
+    eprintln!(
+        "\n=== Text generation: '{}' ({} tokens) ===",
+        prompt_text,
+        prompt.len()
+    );
 
     const N_STEPS: usize = 20;
 

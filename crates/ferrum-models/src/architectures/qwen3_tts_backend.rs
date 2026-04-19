@@ -171,13 +171,7 @@ impl<B: Backend> Qwen3TtsTalker<B> {
         let hidden = self.cfg.hidden_size;
         let mut ctx = B::new_context();
         let mut out = B::alloc(hidden);
-        B::embedding_lookup(
-            &mut ctx,
-            &self.codec_embedding,
-            &[token],
-            &mut out,
-            hidden,
-        );
+        B::embedding_lookup(&mut ctx, &self.codec_embedding, &[token], &mut out, hidden);
         B::sync(&mut ctx);
         B::to_vec(&out, hidden)
     }
@@ -188,11 +182,7 @@ impl<B: Backend> Qwen3TtsTalker<B> {
     ///
     /// Returns `[vocab_size]` logits for the last position, ready for
     /// sampling the first codec token.
-    pub fn prefill(
-        &mut self,
-        cache_id: &str,
-        tokens: &[(u32, bool)],
-    ) -> Vec<f32> {
+    pub fn prefill(&mut self, cache_id: &str, tokens: &[(u32, bool)]) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         let seq_len = tokens.len();
 
@@ -281,13 +271,7 @@ impl<B: Backend> Qwen3TtsTalker<B> {
         let mut ctx = B::new_context();
         let h = self.cfg.hidden_size;
         let mut out = B::alloc(h);
-        B::embedding_lookup(
-            &mut ctx,
-            &self.codec_embedding,
-            &[token],
-            &mut out,
-            h,
-        );
+        B::embedding_lookup(&mut ctx, &self.codec_embedding, &[token], &mut out, h);
         B::sync(&mut ctx);
         B::to_vec(&out, h)
     }
@@ -354,9 +338,7 @@ impl<B: Backend> Qwen3TtsSubTalker<B> {
         let n_extra = cfg.num_code_groups - 1;
         let mut codec_embeddings = Vec::with_capacity(n_extra);
         for i in 0..n_extra {
-            let name = format!(
-                "talker.code_predictor.model.codec_embedding.{i}.weight"
-            );
+            let name = format!("talker.code_predictor.model.codec_embedding.{i}.weight");
             codec_embeddings.push(loader.load_tensor(&name)?);
         }
         let mut lm_heads = Vec::with_capacity(n_extra);
@@ -414,9 +396,7 @@ impl<B: Backend> Qwen3TtsSubTalker<B> {
         };
 
         // 3. Prefill through SubTalker backbone (2 tokens → pre-norm last).
-        let _ = self
-            .backbone
-            .prefill_from_embeds(cache_id, &projected, 2);
+        let _ = self.backbone.prefill_from_embeds(cache_id, &projected, 2);
 
         // 4. Autoregressive loop: for each codebook i, apply lm_heads[i] on
         // the current post-norm hidden, greedy sample, embed via
@@ -483,9 +463,7 @@ impl<B: Backend> Qwen3TtsSubTalker<B> {
             };
 
             // Decode one step → advances scratch.last_hidden.
-            let _ = self
-                .backbone
-                .decode_from_embed(cache_id, &next_embed, pos);
+            let _ = self.backbone.decode_from_embed(cache_id, &next_embed, pos);
             pos += 1;
         }
 

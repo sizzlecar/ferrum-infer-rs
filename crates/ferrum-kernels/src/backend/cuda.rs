@@ -154,9 +154,7 @@ impl Backend for CudaBackend {
         let valid_kv = (step as i32) + 1;
         let step_i = step as i32;
         let stream = ctx.stream.clone();
-        let mut w = decode_state_slot()
-            .write()
-            .expect("DECODE_STATE poisoned");
+        let mut w = decode_state_slot().write().expect("DECODE_STATE poisoned");
         let bufs = w.as_mut().expect("DecodeStateBufs not initialised");
         stream
             .memcpy_htod(&[token], &mut bufs.token)
@@ -222,11 +220,10 @@ impl Backend for CudaBackend {
         // below; flags=0 + no upload was producing SIGSEGV inside libcuda
         // at cuGraphLaunch on Blackwell + CUDA 13. Matches what cudarc's
         // default end_capture uses in the passing repro tests.
-        let flags = sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64;
+        let flags =
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64;
         let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
-        let st2 = unsafe {
-            sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, flags)
-        };
+        let st2 = unsafe { sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, flags) };
         if st2 != sys::CUresult::CUDA_SUCCESS {
             unsafe {
                 sys::cuGraphDestroy(cu_graph);
@@ -277,9 +274,7 @@ impl Backend for CudaBackend {
             if let Some(g) = g_opt {
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
                 if st != sys::CUresult::CUDA_SUCCESS {
-                    return Err(FerrumError::unsupported(format!(
-                        "cuGraphLaunch: {st:?}"
-                    )));
+                    return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
                 }
                 Ok(true)
             } else {
@@ -1350,9 +1345,7 @@ fn install_decode_graph_raw(
     });
 }
 
-fn with_decode_graph<R>(
-    f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>,
-) -> Result<R> {
+fn with_decode_graph<R>(f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>) -> Result<R> {
     let guard = graph_slot().read().expect("DECODE_GRAPH poisoned");
     f(guard.as_ref())
 }
@@ -1450,7 +1443,11 @@ fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
             use cudarc::driver::DevicePtr;
             let (ws_ptr, _g) = workspace.device_ptr(stream);
             let st = sys::cublasSetWorkspace_v2(*blas.handle(), ws_ptr as *mut _, WS_BYTES);
-            assert_eq!(st, sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS, "set workspace");
+            assert_eq!(
+                st,
+                sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                "set workspace"
+            );
             // Switch to device-pointer mode so alpha/beta pass cleanly through
             // graph capture. cuBLAS is HOST mode by default; in HOST mode it
             // internally memcpies the scalar from host, and that memcpy lands
@@ -1459,7 +1456,11 @@ fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
                 *blas.handle(),
                 sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
             );
-            assert_eq!(st, sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS, "set pointer mode");
+            assert_eq!(
+                st,
+                sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                "set pointer mode"
+            );
         }
         *w = Some(BlasSlot {
             blas,

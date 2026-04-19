@@ -1,7 +1,11 @@
 name: CI
 
 on:
+  # Only run on direct pushes to main (release commits, hotfixes).
+  # PR branches already get covered by the pull_request trigger — running
+  # both here doubles CI minutes for every PR commit.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:

@@ -20,9 +20,7 @@
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_models::architectures::qwen3_tts::TalkerConfig;
-use ferrum_models::architectures::qwen3_tts_backend::{
-    Qwen3TtsSubTalker, Qwen3TtsTalker,
-};
+use ferrum_models::architectures::qwen3_tts_backend::{Qwen3TtsSubTalker, Qwen3TtsTalker};
 use ferrum_quantization::NativeSafetensorsLoader;
 use std::path::PathBuf;
 
@@ -50,10 +48,8 @@ fn resolve_tts_dir() -> Option<PathBuf> {
 
 fn load_talker_config(model_dir: &PathBuf) -> TalkerConfig {
     let cfg_path = model_dir.join("config.json");
-    let data =
-        std::fs::read_to_string(&cfg_path).expect("read config.json");
-    let v: serde_json::Value =
-        serde_json::from_str(&data).expect("parse config.json");
+    let data = std::fs::read_to_string(&cfg_path).expect("read config.json");
+    let v: serde_json::Value = serde_json::from_str(&data).expect("parse config.json");
     TalkerConfig::from_json(&v).expect("TalkerConfig::from_json")
 }
 
@@ -69,10 +65,8 @@ fn run_full_chain<B: ferrum_kernels::backend::Backend>(
     let loader: NativeSafetensorsLoader<B> =
         NativeSafetensorsLoader::open(dir).expect("NativeSafetensorsLoader::open");
 
-    let mut talker =
-        Qwen3TtsTalker::<B>::new(cfg.clone(), &loader).expect("Qwen3TtsTalker::new");
-    let mut sub =
-        Qwen3TtsSubTalker::<B>::new(cfg.clone(), &loader).expect("SubTalker::new");
+    let mut talker = Qwen3TtsTalker::<B>::new(cfg.clone(), &loader).expect("Qwen3TtsTalker::new");
+    let mut sub = Qwen3TtsSubTalker::<B>::new(cfg.clone(), &loader).expect("SubTalker::new");
 
     let text_tok = |id: u32| (id, true);
     let codec_tok = |id: u32| (id, false);
@@ -192,8 +186,7 @@ fn run_long_decode<B: ferrum_kernels::backend::Backend>(
 ) -> Vec<u32> {
     let loader: NativeSafetensorsLoader<B> =
         NativeSafetensorsLoader::open(dir).expect("NativeSafetensorsLoader::open");
-    let mut talker =
-        Qwen3TtsTalker::<B>::new(cfg.clone(), &loader).expect("Qwen3TtsTalker::new");
+    let mut talker = Qwen3TtsTalker::<B>::new(cfg.clone(), &loader).expect("Qwen3TtsTalker::new");
 
     let text_tok = |id: u32| (id, true);
     let codec_tok = |id: u32| (id, false);

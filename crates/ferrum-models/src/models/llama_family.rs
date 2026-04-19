@@ -428,10 +428,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
     /// Loader must provide: per-layer weights under `model.layers.{i}.*` and
     /// the final `model.norm.weight`. `model.embed_tokens` and `lm_head`
     /// are NOT read.
-    pub fn new_backbone_only(
-        cfg: LlamaFamilyConfig,
-        loader: &dyn WeightLoader<B>,
-    ) -> Result<Self> {
+    pub fn new_backbone_only(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
         // See `new` — invalidate stale graph referring to prior model's scratch.
         {
             let mut ctx = B::new_context();
@@ -878,9 +875,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
-        let should_capture = graph_enabled
-            && !self.graph_capture_failed
-            && self.graph_warmup >= GRAPH_WARMUP;
+        let should_capture =
+            graph_enabled && !self.graph_capture_failed && self.graph_warmup >= GRAPH_WARMUP;
 
         if should_capture {
             B::set_dev_state_mode(&mut ctx, true);
@@ -1020,14 +1016,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
     /// Decode with a single pre-computed embedding (shape `[hidden]`).
     /// Returns the pre-norm hidden state for the position `pos`. Caller
     /// applies final norm + its own output head.
-    pub fn decode_from_embed(
-        &mut self,
-        cache_id: &str,
-        embed: &[f32],
-        pos: u32,
-    ) -> Vec<f32> {
+    pub fn decode_from_embed(&mut self, cache_id: &str, embed: &[f32], pos: u32) -> Vec<f32> {
         let h = self.cfg.hidden_size;
-        assert_eq!(embed.len(), h, "embed length {} != hidden_size {}", embed.len(), h);
+        assert_eq!(
+            embed.len(),
+            h,
+            "embed length {} != hidden_size {}",
+            embed.len(),
+            h
+        );
 
         self.ensure_scratch(1);
         self.ensure_kv(cache_id);
@@ -1161,10 +1158,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
     /// kv_len, and potentially different pos).
     ///
     /// Returns M logit vectors in the same order as `batch`.
-    pub fn decode_batch_internal(
-        &mut self,
-        batch: &[(String, u32, u32)],
-    ) -> Vec<Vec<f32>> {
+    pub fn decode_batch_internal(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
         let m = batch.len();
         if m == 0 {
             return Vec::new();
@@ -1430,9 +1424,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
 
         // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
-        layer
-            .o_proj
-            .forward(ctx, &self.scratch.attn_flat, &mut self.scratch.o_proj_out, m);
+        layer.o_proj.forward(
+            ctx,
+            &self.scratch.attn_flat,
+            &mut self.scratch.o_proj_out,
+            m,
+        );
 
         // 8. Fused residual add + post-attention RMSNorm.
         B::fused_add_rms_norm(
@@ -1455,7 +1452,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
 
         // 10. SwiGLU
-        B::fused_silu_mul_split(ctx, &self.scratch.gate_up_out, &mut self.scratch.silu_out, m, im);
+        B::fused_silu_mul_split(
+            ctx,
+            &self.scratch.gate_up_out,
+            &mut self.scratch.silu_out,
+            m,
+            im,
+        );
 
         // 11. down_proj (GEMM m=M)
         layer

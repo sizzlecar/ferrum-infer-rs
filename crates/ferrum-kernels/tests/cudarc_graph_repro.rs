@@ -27,9 +27,7 @@ extern "C" __global__ void touch(float* buf, int n) {
 "#;
 
 fn run_graph_repro(disable_event_tracking: bool) {
-    eprintln!(
-        "[cudarc-repro] disable_event_tracking={disable_event_tracking}"
-    );
+    eprintln!("[cudarc-repro] disable_event_tracking={disable_event_tracking}");
     let ctx = CudaContext::new(0).expect("CudaContext::new");
     if disable_event_tracking {
         unsafe {
@@ -92,9 +90,7 @@ fn run_graph_repro(disable_event_tracking: bool) {
         );
         stream.synchronize().expect("sync after graph launch");
     }
-    eprintln!(
-        "[cudarc-repro] SUCCESS (disable_event_tracking={disable_event_tracking})"
-    );
+    eprintln!("[cudarc-repro] SUCCESS (disable_event_tracking={disable_event_tracking})");
 }
 
 #[test]
@@ -323,7 +319,5 @@ extern "C" __global__ void square(float* buf, int n) {
         assert_eq!(st, sys::CUresult::CUDA_SUCCESS, "cuGraphLaunch: {st:?}");
         stream.synchronize().expect("sync");
     }
-    eprintln!(
-        "[cudarc-ferrum-like] SUCCESS — cuBLAS + multi-module + htod pre-launch"
-    );
+    eprintln!("[cudarc-ferrum-like] SUCCESS — cuBLAS + multi-module + htod pre-launch");
 }

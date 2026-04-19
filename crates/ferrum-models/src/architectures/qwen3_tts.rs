@@ -566,7 +566,8 @@ pub struct Qwen3TTSTalker {
     /// routes through this instead of `fused`. Used on Linux + CUDA where
     /// `fused` would silently fall back to a broken naive-fp64 CPU matmul.
     /// See `architectures::qwen3_tts_backbone`.
-    backend_override: Option<Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>>,
+    backend_override:
+        Option<Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>>,
 }
 
 impl Qwen3TTSTalker {
@@ -890,7 +891,8 @@ pub struct SubTalker {
     fused_hidden_size: usize,
     /// Optional Backend<B> transformer stack that supersedes `fused` on
     /// CUDA. Same motivation as `Qwen3TTSTalker::backend_override`.
-    backend_override: Option<Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>>,
+    backend_override:
+        Option<Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>>,
 }
 
 impl SubTalker {

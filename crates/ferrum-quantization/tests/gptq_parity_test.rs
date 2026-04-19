@@ -12,14 +12,16 @@
 //! (repack + upload + marlin_gemm) produces numerically-equivalent
 //! output to the CPU dequant-then-GEMM path.
 
-use ferrum_kernels::backend::Backend;
 use ferrum_kernels::backend::cpu::CpuBackend;
+use ferrum_kernels::backend::Backend;
 use ferrum_kernels::Linear;
 use ferrum_quantization::GptqLinear;
 
 /// Tiny deterministic PRNG so we don't need rand crate.
 fn rnd_u32(state: &mut u64) -> u32 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (*state >> 33) as u32
 }
 
@@ -33,9 +35,9 @@ struct SyntheticGptq {
     n: usize,
     bits: u32,
     group_size: usize,
-    qweight: Vec<i32>,   // [K/8, N]
-    scales: Vec<f32>,    // [K/group, N]
-    qzeros: Vec<i32>,    // [K/group, N/8]
+    qweight: Vec<i32>, // [K/8, N]
+    scales: Vec<f32>,  // [K/group, N]
+    qzeros: Vec<i32>,  // [K/group, N/8]
 }
 
 fn make_synthetic(k: usize, n: usize, group_size: usize, seed: u64) -> SyntheticGptq {
@@ -61,7 +63,15 @@ fn make_synthetic(k: usize, n: usize, group_size: usize, seed: u64) -> Synthetic
         }
         *qz = word as i32;
     }
-    SyntheticGptq { k, n, bits: 4, group_size, qweight, scales, qzeros }
+    SyntheticGptq {
+        k,
+        n,
+        bits: 4,
+        group_size,
+        qweight,
+        scales,
+        qzeros,
+    }
 }
 
 /// CPU-side self-check: feed the GPTQ tensors through CpuBackend's
@@ -75,8 +85,14 @@ fn cpu_selfcheck() {
     let syn = make_synthetic(k, n, gs, 0xDEADBEEF);
 
     let linear = GptqLinear::<CpuBackend>::from_raw(
-        &syn.qweight, &syn.scales, &syn.qzeros,
-        None, syn.bits, syn.group_size, syn.k, syn.n,
+        &syn.qweight,
+        &syn.scales,
+        &syn.qzeros,
+        None,
+        syn.bits,
+        syn.group_size,
+        syn.k,
+        syn.n,
     )
     .expect("CPU load_gptq");
 
@@ -91,7 +107,11 @@ fn cpu_selfcheck() {
     let mut out_ref = vec![0.0f32; m * n];
     <CpuBackend as Backend>::gemm(&mut ctx, &input, &ref_w, &mut out_ref, m, n, k);
 
-    let max_diff = out_linear.iter().zip(&out_ref).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let max_diff = out_linear
+        .iter()
+        .zip(&out_ref)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     assert!(max_diff < 1e-3, "CPU GPTQ selfcheck drift: {max_diff}");
 }
 
@@ -134,21 +154,36 @@ fn cuda_vs_cpu() {
 
     // CPU reference (fp32).
     let cpu_linear = GptqLinear::<CpuBackend>::from_raw(
-        &syn.qweight, &syn.scales, &syn.qzeros,
-        None, syn.bits, syn.group_size, syn.k, syn.n,
+        &syn.qweight,
+        &syn.scales,
+        &syn.qzeros,
+        None,
+        syn.bits,
+        syn.group_size,
+        syn.k,
+        syn.n,
     )
     .expect("CPU load_gptq");
 
     // CUDA Marlin path.
     let cuda_linear = GptqLinear::<CudaBackend>::from_raw(
-        &syn.qweight, &syn.scales, &syn.qzeros,
-        None, syn.bits, syn.group_size, syn.k, syn.n,
+        &syn.qweight,
+        &syn.scales,
+        &syn.qzeros,
+        None,
+        syn.bits,
+        syn.group_size,
+        syn.k,
+        syn.n,
     )
     .expect("CUDA load_gptq (Marlin repack + upload)");
 
     let m = 2;
     let input_f32: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.003).cos()).collect();
-    let input_f16: Vec<f32> = input_f32.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
+    let input_f16: Vec<f32> = input_f32
+        .iter()
+        .map(|&x| f16::from_f32(x).to_f32())
+        .collect();
 
     // CPU out
     let mut cpu_out = vec![0.0f32; m * n];
@@ -169,10 +204,13 @@ fn cuda_vs_cpu() {
         .zip(&cuda_out)
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
-    let rel_err = max_diff / cpu_out.iter().map(|x| x.abs()).fold(0f32, f32::max).max(1e-6);
-    eprintln!(
-        "CUDA↔CPU GPTQ: max|diff|={max_diff:.4}, rel={rel_err:.4}"
-    );
+    let rel_err = max_diff
+        / cpu_out
+            .iter()
+            .map(|x| x.abs())
+            .fold(0f32, f32::max)
+            .max(1e-6);
+    eprintln!("CUDA↔CPU GPTQ: max|diff|={max_diff:.4}, rel={rel_err:.4}");
     // fp16 GEMM typical relative error < 1% over small dims.
     assert!(
         rel_err < 0.05,

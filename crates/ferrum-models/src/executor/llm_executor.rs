@@ -181,7 +181,10 @@ impl ModelExecutor for LlmExecutor {
 
         let mut outputs = Vec::with_capacity(prepped.len());
         for (p, logits) in prepped.into_iter().zip(all_logits.into_iter()) {
-            debug!("LlmExecutor batch_decode: token={}, pos={}", p.token, p.seq_len);
+            debug!(
+                "LlmExecutor batch_decode: token={}, pos={}",
+                p.token, p.seq_len
+            );
             let logits_tensor = candle_core::Tensor::new(&logits[..], &candle_core::Device::Cpu)
                 .map_err(|e| FerrumError::model(format!("logits tensor: {e}")))?
                 .unsqueeze(0)

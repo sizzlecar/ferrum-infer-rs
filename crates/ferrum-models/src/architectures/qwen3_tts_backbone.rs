@@ -72,10 +72,7 @@ impl<B: Backend> TalkerBackboneBackend<B> {
 
     /// SubTalker variant — expects weights under `talker.code_predictor.` and
     /// smaller dims (`code_predictor_*`).
-    pub fn new_code_predictor(
-        cfg: &TalkerConfig,
-        loader: &dyn WeightLoader<B>,
-    ) -> Result<Self> {
+    pub fn new_code_predictor(cfg: &TalkerConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
         let cp_h = cfg.code_predictor_hidden_size;
         let backbone_cfg = LlamaFamilyConfig {
             hidden_size: cp_h,
