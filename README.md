@@ -9,12 +9,41 @@ A Rust-native LLM inference engine. Load models from Hugging Face, chat locally 
 
 ## Install
 
-```bash
-# From crates.io
-cargo install ferrum-cli
+### Docker (recommended — no Rust toolchain needed)
 
-# Or build from source
+```bash
+# CPU image (works everywhere)
+docker build -t ferrum:cpu .
+docker run --rm -it \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ferrum:cpu run qwen3:0.6b
+
+# CUDA image (NVIDIA Container Toolkit required)
+docker build -f Dockerfile.cuda -t ferrum:cuda .
+docker run --rm -it --gpus all \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ferrum:cuda run qwen3:4b --backend cuda
+
+# HTTP server (port 8000)
+docker run --rm -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ferrum:cpu serve --model qwen3:0.6b
+```
+
+### crates.io
+
+```bash
+cargo install ferrum-cli
+```
+
+### From source
+
+```bash
+# CPU / Metal (macOS auto-selects Metal)
 cargo build --release -p ferrum-cli --bin ferrum
+
+# CUDA (Linux + NVIDIA)
+CUDA_HOME=/usr/local/cuda cargo build --release --features cuda -p ferrum-cli --bin ferrum
 ```
 
 ## Quick Start
@@ -141,11 +170,14 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 
 ### Qwen3-4B
 
-| Mode | FP16 | INT4 (GPTQ + Marlin) |
-|------|------|----------------------|
-| Single request decode | 88.1 tok/s | **130.4 tok/s (+48%)** |
-| 4 concurrent (batch) | 109.4 tok/s | **124.2 tok/s** |
-| VRAM | ~8 GB | **~2.5 GB (-69%)** |
+| Mode | FP16 (eager) | FP16 + CUDA graph | INT4 (GPTQ + Marlin) |
+|------|--------------|-------------------|----------------------|
+| Single request decode | 70.3 tok/s | **82.9 tok/s (+18%)** | **130.4 tok/s** |
+| 4 concurrent (batch) | 109.4 tok/s | — | **124.2 tok/s** |
+| TPOT (p50) | 14.2 ms | **12.1 ms** | — |
+| VRAM | ~8 GB | — | **~2.5 GB (-69%)** |
+
+> CUDA graph replay is automatic after 3-step warmup; eliminates per-step launch overhead and sits on the Blackwell + CUDA 13 path we hardened in this cycle (see [docs/phase-e-cuda-status.md](docs/phase-e-cuda-status.md)).
 
 ### TinyLlama-1.1B (Llama architecture)
 

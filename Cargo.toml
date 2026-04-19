@@ -31,7 +31,7 @@ resolver = "2"
 
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Ferrum Team"]
 license = "MIT"
@@ -131,28 +131,28 @@ candle-flash-attn = "0.9.2"
 candle-metal-kernels = "0.9.2"
 
 # Internal crates - New refactored crates
-ferrum-types = { path = "crates/ferrum-types", version = "0.6.0" }
-ferrum-interfaces = { path = "crates/ferrum-interfaces", version = "0.6.0" }
+ferrum-types = { path = "crates/ferrum-types", version = "0.7.0" }
+ferrum-interfaces = { path = "crates/ferrum-interfaces", version = "0.7.0" }
 
 # Internal crates - Implementation crates
-ferrum-runtime = { path = "crates/ferrum-runtime", version = "0.6.0" }
-ferrum-scheduler = { path = "crates/ferrum-scheduler", version = "0.6.0" }
-ferrum-tokenizer = { path = "crates/ferrum-tokenizer", version = "0.6.0" }
-ferrum-sampler = { path = "crates/ferrum-sampler", version = "0.6.0" }
-ferrum-kv = { path = "crates/ferrum-kv", version = "0.6.0" }
+ferrum-runtime = { path = "crates/ferrum-runtime", version = "0.7.0" }
+ferrum-scheduler = { path = "crates/ferrum-scheduler", version = "0.7.0" }
+ferrum-tokenizer = { path = "crates/ferrum-tokenizer", version = "0.7.0" }
+ferrum-sampler = { path = "crates/ferrum-sampler", version = "0.7.0" }
+ferrum-kv = { path = "crates/ferrum-kv", version = "0.7.0" }
 
 # Unified compute kernels (CUDA/Metal/CPU)
-ferrum-kernels = { path = "crates/ferrum-kernels", version = "0.6.0" }
+ferrum-kernels = { path = "crates/ferrum-kernels", version = "0.7.0" }
 
 # Weight-format abstraction (Dense / GPTQ / AWQ / GGUF)
-ferrum-quantization = { path = "crates/ferrum-quantization", version = "0.6.0" }
+ferrum-quantization = { path = "crates/ferrum-quantization", version = "0.7.0" }
 
 # Internal crates - Existing crates (to be refactored)
-ferrum-engine = { path = "crates/ferrum-engine", version = "0.6.0" }
-ferrum-models = { path = "crates/ferrum-models", version = "0.6.0" }
-ferrum-server = { path = "crates/ferrum-server", version = "0.6.0" }
-ferrum-cli = { path = "crates/ferrum-cli", version = "0.6.0" }
-ferrum-testkit = { path = "crates/ferrum-testkit", version = "0.6.0" }
+ferrum-engine = { path = "crates/ferrum-engine", version = "0.7.0" }
+ferrum-models = { path = "crates/ferrum-models", version = "0.7.0" }
+ferrum-server = { path = "crates/ferrum-server", version = "0.7.0" }
+ferrum-cli = { path = "crates/ferrum-cli", version = "0.7.0" }
+ferrum-testkit = { path = "crates/ferrum-testkit", version = "0.7.0" }
 
 
 [profile.release]

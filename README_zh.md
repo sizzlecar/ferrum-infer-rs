@@ -9,12 +9,41 @@
 
 ## 安装
 
-```bash
-# 从 crates.io 安装
-cargo install ferrum-cli
+### Docker（推荐，无需 Rust 工具链）
 
-# 或从源码编译
+```bash
+# CPU 镜像（通用）
+docker build -t ferrum:cpu .
+docker run --rm -it \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ferrum:cpu run qwen3:0.6b
+
+# CUDA 镜像（需 NVIDIA Container Toolkit）
+docker build -f Dockerfile.cuda -t ferrum:cuda .
+docker run --rm -it --gpus all \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ferrum:cuda run qwen3:4b --backend cuda
+
+# HTTP 服务（端口 8000）
+docker run --rm -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ferrum:cpu serve --model qwen3:0.6b
+```
+
+### crates.io
+
+```bash
+cargo install ferrum-cli
+```
+
+### 从源码
+
+```bash
+# CPU / Metal（macOS 自动选 Metal）
 cargo build --release -p ferrum-cli --bin ferrum
+
+# CUDA（Linux + NVIDIA）
+CUDA_HOME=/usr/local/cuda cargo build --release --features cuda -p ferrum-cli --bin ferrum
 ```
 
 ## 快速开始
@@ -140,11 +169,14 @@ curl http://localhost:8000/health
 
 ### Qwen3-4B
 
-| 模式 | FP16 | INT4 (GPTQ + Marlin) |
-|------|------|----------------------|
-| 单请求 decode | 88.1 tok/s | **130.4 tok/s (+48%)** |
-| 4 并发 (batch decode) | 109.4 tok/s | **124.2 tok/s** |
-| 显存占用 | ~8 GB | **~2.5 GB (-69%)** |
+| 模式 | FP16（eager） | FP16 + CUDA 图 | INT4 (GPTQ + Marlin) |
+|------|--------------|----------------|----------------------|
+| 单请求 decode | 70.3 tok/s | **82.9 tok/s (+18%)** | **130.4 tok/s** |
+| 4 并发 (batch decode) | 109.4 tok/s | — | **124.2 tok/s** |
+| TPOT (p50) | 14.2 ms | **12.1 ms** | — |
+| 显存占用 | ~8 GB | — | **~2.5 GB (-69%)** |
+
+> CUDA graph 模式 warmup 3 步后自动启用，消除 per-step kernel 启动开销。已在 Blackwell + CUDA 13 路径上加固（见 [docs/phase-e-cuda-status.md](docs/phase-e-cuda-status.md)）。
 
 ### TinyLlama-1.1B（Llama 架构）
 

@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-attention"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cudarc 0.12.1",
  "half",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-interfaces"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-kernels"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bindgen_cuda",
  "candle-core",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-kv"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-models"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-quantization"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ferrum-kernels",
  "ferrum-types",
@@ -1458,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-sampler"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-scheduler"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-tokenizer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-types"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "rand 0.9.2",
