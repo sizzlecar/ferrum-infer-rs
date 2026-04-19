@@ -16,8 +16,14 @@
 //! separate layer and explicitly out of scope for this file — wiring it is
 //! the follow-up once the algorithm is locked down.
 
+use ferrum_interfaces::{
+    model_executor::{DecodeInput, DecodeOutput},
+    tensor::TensorFactory,
+    KvCacheHandle, ModelExecutor,
+};
 use ferrum_types::{Result, TokenId};
 use rand::RngCore;
+use std::sync::Arc;
 
 /// Softmax a logit vector, in-place modifications avoided — returns new Vec.
 /// `temperature == 0.0` collapses to one-hot at argmax (as elsewhere in the
@@ -212,9 +218,158 @@ pub fn verify_speculation(spec: Speculation<'_>, rng: &mut dyn RngCore) -> Resul
     })
 }
 
+/// Configuration for speculative decoding.
+#[derive(Debug, Clone)]
+pub struct SpeculativeDecodingConfig {
+    /// Draft model produces this many tokens per target forward pass.
+    /// Typical range: 3-7. Paper used 4-5. Larger N amortises target cost
+    /// more aggressively but raises the probability of early rejection.
+    pub num_speculative_tokens: usize,
+    /// Temperature applied during accept/reject. Matches the sampling
+    /// temperature to keep the target-draft ratio calibrated.
+    pub temperature: f32,
+}
+
+impl Default for SpeculativeDecodingConfig {
+    fn default() -> Self {
+        Self {
+            num_speculative_tokens: 4,
+            temperature: 1.0,
+        }
+    }
+}
+
+/// Drives one round of speculative decoding against a (draft, target) pair
+/// of `ModelExecutor`s. Owns neither executor — the engine keeps them and
+/// hands references per call.
+///
+/// Usage per decode iteration:
+///   - Caller hands the runner the last sampled token for this request,
+///     plus the draft & target KV cache handles.
+///   - `step()` runs N draft decodes, N+1 target decodes (sequentially for
+///     now — performance gain lands once the executors grow multi-position
+///     decode support), then applies `verify_speculation`.
+///   - Returns the list of newly accepted tokens plus the updated KV
+///     handles for draft and target (caller installs them on the sequence
+///     state for the next iteration).
+pub struct SpeculativeRunner<'a> {
+    pub draft: &'a dyn ModelExecutor,
+    pub target: &'a dyn ModelExecutor,
+    pub tensor_factory: Arc<dyn TensorFactory>,
+    pub cfg: SpeculativeDecodingConfig,
+}
+
+/// Result of a single `SpeculativeRunner::step`.
+pub struct SpeculativeStepOutcome {
+    pub tokens: Vec<TokenId>,
+    pub draft_kv: Arc<dyn KvCacheHandle>,
+    pub target_kv: Arc<dyn KvCacheHandle>,
+    /// True when a draft was rejected (caller may want to roll target KV
+    /// back to `rejected_at` to stay token-aligned with the draft model).
+    pub rejected: bool,
+    pub rejected_at: usize,
+}
+
+impl<'a> SpeculativeRunner<'a> {
+    /// Run one draft+verify cycle. `last_token` is the token that was sampled
+    /// from the previous iteration (or the end of prefill) — it's the
+    /// starting point both executors advance from.
+    pub async fn step(
+        &self,
+        last_token: TokenId,
+        draft_kv: Arc<dyn KvCacheHandle>,
+        target_kv: Arc<dyn KvCacheHandle>,
+        rng: &mut dyn RngCore,
+    ) -> Result<SpeculativeStepOutcome> {
+        let n = self.cfg.num_speculative_tokens.max(1);
+
+        // ── Draft: N sequential decodes, one token at a time ─────────────
+        let mut draft_tokens: Vec<TokenId> = Vec::with_capacity(n);
+        let mut draft_logits: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut draft_kv_cur = draft_kv;
+        let mut draft_prev_token = last_token;
+        for _ in 0..n {
+            let input_tensor = tokens_to_tensor(&self.tensor_factory, &[draft_prev_token.get()])?;
+            let input = DecodeInput::new(input_tensor, draft_kv_cur.clone());
+            let output = self.draft.decode(&input).await?;
+            let logits = output.logits.to_vec_f32()?;
+            let next_token = argmax_token(&logits);
+            draft_tokens.push(next_token);
+            draft_logits.push(logits);
+            draft_kv_cur = output.kv_cache.clone();
+            draft_prev_token = next_token;
+        }
+
+        // ── Target: N+1 sequential decodes (sequentially for now; batched
+        // multi-position decode is the follow-up for the real speedup) ────
+        let mut target_logits: Vec<Vec<f32>> = Vec::with_capacity(n + 1);
+        let mut target_kv_cur = target_kv;
+        let mut target_prev_token = last_token;
+        for i in 0..=n {
+            let input_tensor =
+                tokens_to_tensor(&self.tensor_factory, &[target_prev_token.get()])?;
+            let input = DecodeInput::new(input_tensor, target_kv_cur.clone());
+            let output: DecodeOutput = self.target.decode(&input).await?;
+            let logits = output.logits.to_vec_f32()?;
+            target_logits.push(logits);
+            target_kv_cur = output.kv_cache.clone();
+            if i < n {
+                // Feed the next draft token into the target — standard
+                // speculative-decoding pattern: the target attends to
+                // prompt + drafts so far, producing logits for "what
+                // comes after draft[i]".
+                target_prev_token = draft_tokens[i];
+            }
+        }
+
+        let spec = Speculation {
+            draft_tokens: &draft_tokens,
+            draft_logits: &draft_logits,
+            target_logits: &target_logits,
+            temperature: self.cfg.temperature,
+        };
+        let outcome = verify_speculation(spec, rng)?;
+        let rejected = outcome.rejected_at < n;
+        Ok(SpeculativeStepOutcome {
+            tokens: outcome.tokens,
+            draft_kv: draft_kv_cur,
+            target_kv: target_kv_cur,
+            rejected,
+            rejected_at: outcome.rejected_at,
+        })
+    }
+}
+
+fn tokens_to_tensor(
+    factory: &Arc<dyn TensorFactory>,
+    token_ids: &[u32],
+) -> Result<ferrum_interfaces::tensor::TensorRef> {
+    use ferrum_types::{DataType, Device};
+    let f32_data: Vec<f32> = token_ids.iter().map(|&v| v as f32).collect();
+    let len = f32_data.len();
+    factory.from_slice(&f32_data, &[1, len], DataType::FP32, Device::CPU)
+}
+
+fn argmax_token(logits: &[f32]) -> TokenId {
+    let (idx, _) = logits
+        .iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+            if v > bv {
+                (i, v)
+            } else {
+                (bi, bv)
+            }
+        });
+    TokenId::new(idx as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_interfaces::KvCacheHandle;
+    use ferrum_testkit::{ConfigurableModelExecutor, MockKvCacheHandle, MockTensorFactory};
+    use ferrum_types::RequestId;
     use rand::{rngs::StdRng, SeedableRng};
 
     /// Build a logit vector biased toward `favored` with `strength` over a
@@ -387,6 +542,95 @@ mod tests {
         assert_eq!(
             out.tokens,
             vec![TokenId::new(2), TokenId::new(5), TokenId::new(13)]
+        );
+    }
+
+    // ── SpeculativeRunner integration tests (mock executors) ─────────
+
+    fn mock_kv(num_layers: usize) -> Arc<dyn KvCacheHandle> {
+        Arc::new(MockKvCacheHandle::new(RequestId::new(), num_layers, 0))
+    }
+
+    /// Draft and target both use the same executor logic (matching logits)
+    /// → every draft should be accepted and a bonus token should follow.
+    #[tokio::test]
+    async fn runner_full_accept_when_models_agree() {
+        let vocab = 64;
+        let draft: Arc<ConfigurableModelExecutor> =
+            Arc::new(ConfigurableModelExecutor::with_token_sequence(
+                vocab,
+                vec![13, 13, 13, 13, 13],
+            ));
+        let target: Arc<ConfigurableModelExecutor> =
+            Arc::new(ConfigurableModelExecutor::with_token_sequence(
+                vocab,
+                vec![13, 13, 13, 13, 13],
+            ));
+        let tf: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+        let runner = SpeculativeRunner {
+            draft: draft.as_ref(),
+            target: target.as_ref(),
+            tensor_factory: tf,
+            cfg: SpeculativeDecodingConfig {
+                num_speculative_tokens: 3,
+                temperature: 1.0,
+            },
+        };
+        let mut rng = StdRng::seed_from_u64(0);
+        let out = runner
+            .step(TokenId::new(5), mock_kv(12), mock_kv(12), &mut rng)
+            .await
+            .expect("step");
+
+        assert!(!out.rejected, "agreeing models should not reject");
+        assert_eq!(out.rejected_at, 3);
+        assert_eq!(out.tokens.len(), 4, "3 drafts + 1 bonus");
+        for &t in &out.tokens {
+            assert_eq!(
+                t.get(),
+                13,
+                "agreeing models should all emit the biased token 13"
+            );
+        }
+    }
+
+    /// Draft biases token A, target biases token B → first draft rejected
+    /// → step returns 1 replacement token (target's preferred). Remaining
+    /// draft positions don't contribute.
+    #[tokio::test]
+    async fn runner_rejects_when_models_disagree() {
+        let vocab = 64;
+        let draft = Arc::new(ConfigurableModelExecutor::with_token_sequence(
+            vocab,
+            vec![7, 7, 7],
+        ));
+        let target = Arc::new(ConfigurableModelExecutor::with_token_sequence(
+            vocab,
+            vec![21, 21, 21, 21],
+        ));
+        let tf: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+        let runner = SpeculativeRunner {
+            draft: draft.as_ref(),
+            target: target.as_ref(),
+            tensor_factory: tf,
+            cfg: SpeculativeDecodingConfig {
+                num_speculative_tokens: 3,
+                temperature: 1.0,
+            },
+        };
+        let mut rng = StdRng::seed_from_u64(1);
+        let out = runner
+            .step(TokenId::new(0), mock_kv(12), mock_kv(12), &mut rng)
+            .await
+            .expect("step");
+
+        assert!(out.rejected);
+        assert_eq!(out.rejected_at, 0, "first draft should be rejected");
+        assert_eq!(out.tokens.len(), 1);
+        assert_eq!(
+            out.tokens[0].get(),
+            21,
+            "residual should sample target's preferred token"
         );
     }
 
