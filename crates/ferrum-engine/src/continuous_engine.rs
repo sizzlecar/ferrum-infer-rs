@@ -502,11 +502,6 @@ impl EngineInner {
         } // skip_prefix_cache
 
         // ── Cache miss (or prefix cache skipped) — full prefill ─────────
-        let input_tensor = {
-            let token_u32s: Vec<u32> = input_tokens_clone.iter().map(|t| t.get()).collect();
-            self.tokens_to_tensor(&token_u32s)?
-        };
-
         let model_info = self.model_executor.info();
         let alloc_request = AllocationRequest {
             request_id: request_id.clone(),
@@ -536,9 +531,50 @@ impl EngineInner {
             }
         };
 
-        let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
-            .with_kv_cache(kv_handle);
-        let prefill_output = self.model_executor.prefill(&prefill_input).await?;
+        // Opt-in chunked prefill: `FERRUM_CHUNKED_PREFILL=<chunk_size>` splits
+        // the prompt into sequential chunks and runs `prefill` per chunk.
+        // Reduces peak activation memory for long prompts; also informs the
+        // scheduler so its metrics reflect actual progress. True cross-
+        // iteration interleaving with decode is a follow-up refactor.
+        let chunk_size = std::env::var("FERRUM_CHUNKED_PREFILL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0 && n < num_tokens);
+
+        let prefill_output = if let Some(csz) = chunk_size {
+            let mut current_kv = kv_handle;
+            let mut final_output: Option<ferrum_interfaces::model_executor::PrefillOutput> = None;
+            let mut processed = 0usize;
+            while processed < num_tokens {
+                let end = (processed + csz).min(num_tokens);
+                let chunk_ids: Vec<u32> = input_tokens_clone[processed..end]
+                    .iter()
+                    .map(|t| t.get())
+                    .collect();
+                let chunk_tensor = self.tokens_to_tensor(&chunk_ids)?;
+                let input = ferrum_interfaces::model_executor::PrefillInput::new(chunk_tensor)
+                    .with_kv_cache(current_kv.clone());
+                let out = self.model_executor.prefill(&input).await?;
+                current_kv = out.kv_cache.clone();
+
+                self.scheduler
+                    .mark_prefill_chunk_processed(request_id, num_tokens, end - processed);
+
+                processed = end;
+                if processed >= num_tokens {
+                    final_output = Some(out);
+                }
+            }
+            final_output.expect("at least one chunk must run")
+        } else {
+            let input_tensor = {
+                let token_u32s: Vec<u32> = input_tokens_clone.iter().map(|t| t.get()).collect();
+                self.tokens_to_tensor(&token_u32s)?
+            };
+            let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
+                .with_kv_cache(kv_handle);
+            self.model_executor.prefill(&prefill_input).await?
+        };
 
         let last_logits = prefill_output.last_token_logits()?;
         let logits_vec = last_logits.to_vec_f32()?;
