@@ -9,26 +9,31 @@
 
 ## 安装
 
-### Docker（推荐，无需 Rust 工具链）
+### Docker（推荐，无需工具链、无需编译）
+
+GitHub Container Registry 预构建镜像：
 
 ```bash
-# CPU 镜像（通用）
-docker build -t ferrum:cpu .
-docker run --rm -it \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ferrum:cpu run qwen3:0.6b
-
-# CUDA 镜像（需 NVIDIA Container Toolkit）
-docker build -f Dockerfile.cuda -t ferrum:cuda .
+# GPU 主机（需 NVIDIA + Container Toolkit）
 docker run --rm -it --gpus all \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ferrum:cuda run qwen3:4b --backend cuda
+  ghcr.io/sizzlecar/ferrum-infer-rs:latest \
+  run qwen3:4b --backend cuda
 
-# HTTP 服务（端口 8000）
-docker run --rm -p 8000:8000 \
+# 纯 CPU 主机
+docker run --rm -it \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ferrum:cpu serve --model qwen3:0.6b
+  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
+  run qwen3:0.6b
+
+# HTTP 服务（OpenAI 兼容）
+docker run --rm -p 8000:8000 --gpus all \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/sizzlecar/ferrum-infer-rs:latest \
+  serve --model qwen3:4b --backend cuda
 ```
+
+Tag 说明：`latest`（= CUDA）、`cuda`、`cpu`、`cuda-0.7.0`、`cpu-0.7.0` 等
 
 ### crates.io
 

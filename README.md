@@ -9,26 +9,31 @@ A Rust-native LLM inference engine. Load models from Hugging Face, chat locally 
 
 ## Install
 
-### Docker (recommended — no Rust toolchain needed)
+### Docker (recommended — no toolchain, no build)
+
+Pre-built images on GitHub Container Registry:
 
 ```bash
-# CPU image (works everywhere)
-docker build -t ferrum:cpu .
-docker run --rm -it \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ferrum:cpu run qwen3:0.6b
-
-# CUDA image (NVIDIA Container Toolkit required)
-docker build -f Dockerfile.cuda -t ferrum:cuda .
+# GPU host (NVIDIA + Container Toolkit)
 docker run --rm -it --gpus all \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ferrum:cuda run qwen3:4b --backend cuda
+  ghcr.io/sizzlecar/ferrum-infer-rs:latest \
+  run qwen3:4b --backend cuda
 
-# HTTP server (port 8000)
-docker run --rm -p 8000:8000 \
+# CPU-only host
+docker run --rm -it \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ferrum:cpu serve --model qwen3:0.6b
+  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
+  run qwen3:0.6b
+
+# HTTP server (OpenAI-compatible)
+docker run --rm -p 8000:8000 --gpus all \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/sizzlecar/ferrum-infer-rs:latest \
+  serve --model qwen3:4b --backend cuda
 ```
+
+Tags: `latest` (= CUDA), `cuda`, `cpu`, `cuda-0.7.0`, `cpu-0.7.0`, ...
 
 ### crates.io
 
