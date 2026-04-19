@@ -1,0 +1,52 @@
+# CUDA runtime Ferrum image for NVIDIA GPU hosts.
+#
+# Build (can build on any machine with Docker + buildx; no GPU needed for build):
+#   docker build -f Dockerfile.cuda -t ferrum:cuda .
+#
+# Run (requires NVIDIA Container Toolkit on host):
+#   docker run --rm -it --gpus all \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     ferrum:cuda run qwen3:4b --backend cuda
+#
+#   docker run --rm -p 8000:8000 --gpus all \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     ferrum:cuda serve --model qwen3:4b --backend cuda --port 8000
+
+# ── Build stage ──────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.6.0-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl build-essential pkg-config libssl-dev git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain 1.82.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY crates ./crates
+
+ENV CUDA_HOME=/usr/local/cuda
+RUN cargo build --release --features cuda -p ferrum-cli --bin ferrum
+
+# ── Runtime stage ────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/ferrum /usr/local/bin/ferrum
+
+ENV HF_HOME=/root/.cache/huggingface
+VOLUME ["/root/.cache/huggingface"]
+
+EXPOSE 8000
+
+ENTRYPOINT ["ferrum"]
+CMD ["--help"]

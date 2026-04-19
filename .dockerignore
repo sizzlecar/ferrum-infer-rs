@@ -1,0 +1,20 @@
+target
+.git
+.github
+docs
+scripts
+tests/data
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.png
+*.jpg
+*.pdf
+.vscode
+.idea
+__pycache__
+*.pyc
+# But keep Dockerfiles + configs
+!Dockerfile*
+!.dockerignore

@@ -962,166 +962,113 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
         // Create model based on architecture
         info!("Building model...");
         match model_def.architecture {
-            ferrum_models::Architecture::Llama => {
-                // Use Metal LLaMA executor for Metal device
-                #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-                if matches!(&config.device, Device::Metal) {
-                    info!("Using Metal-accelerated LLaMA executor with custom RMS Norm kernel");
-                    let executor = crate::metal::MetalLlamaExecutor::from_path(
-                        &model_path,
-                        &model_def,
-                        candle_device.clone(),
-                        dtype,
-                    )
-                    .await?;
-                    return Ok(Arc::new(executor));
-                }
-
-                // Load weights (non-Metal path)
-                info!("Loading model weights...");
-                let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
-
-                let model_dir_path: std::path::PathBuf = model_path.clone().into();
-                let qconfig =
-                    ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
-                        .unwrap_or(None);
-                let vb = if let Some(ref qc) = qconfig {
-                    info!(
-                        "GPTQ Llama detected ({}bit, gs={}), dequantizing...",
-                        qc.bits, qc.group_size
-                    );
-                    loader.load_varbuilder_gptq(qc, &candle_device, dtype)?
-                } else {
-                    loader.load_varbuilder(&candle_device, dtype)?
-                };
-
-                // Standard Candle executor for CPU/CUDA
-                let mut llama_model = ferrum_models::LlamaModelWrapper::from_varbuilder(
-                    vb,
-                    &model_def,
-                    candle_device.clone(),
-                    dtype,
-                )?;
-                llama_model.set_model_dir(model_dir_path);
-
-                let model_info =
-                    model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                let executor = ferrum_models::CandleModelExecutor::new(llama_model, model_info);
-
-                Ok(Arc::new(executor))
-            }
-            ferrum_models::Architecture::Qwen2 => {
-                // Use Metal Qwen2 executor for Metal device
-                #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-                if matches!(&config.device, Device::Metal) {
-                    info!("Using Metal-accelerated Qwen2 executor");
-                    let executor = crate::metal::MetalQwen2Executor::from_path(
-                        &model_path,
-                        &model_def,
-                        candle_device.clone(),
-                        dtype,
-                    )
-                    .await?;
-                    return Ok(Arc::new(executor));
-                }
-
-                // Load weights (non-Metal path)
-                info!("Loading model weights...");
-                let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
-
-                // Auto-detect GPTQ
-                let model_dir_path: std::path::PathBuf = model_path.clone().into();
-                let qconfig =
-                    ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
-                        .unwrap_or(None);
-                let vb = if let Some(ref qc) = qconfig {
-                    info!(
-                        "GPTQ Qwen2 detected ({}bit, gs={}), dequantizing for prefill...",
-                        qc.bits, qc.group_size
-                    );
-                    loader.load_varbuilder_gptq(qc, &candle_device, dtype)?
-                } else {
-                    loader.load_varbuilder(&candle_device, dtype)?
-                };
-
-                let qwen2_model = ferrum_models::Qwen2ModelWrapper::from_varbuilder(
-                    vb,
-                    &model_def,
-                    candle_device.clone(),
-                    dtype,
-                )?;
-
-                let model_info =
-                    model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                let executor = ferrum_models::Qwen2ModelExecutor::new(qwen2_model, model_info);
-
-                Ok(Arc::new(executor))
-            }
-            ferrum_models::Architecture::Qwen3 => {
-                info!("Loading Qwen3 model weights...");
+            // All Llama-family decoders (Llama / Llama-2 / Llama-3 / Qwen2 /
+            // Qwen2.5 / Qwen3) share `LlamaFamilyModel<B>` + `LlmExecutor`.
+            // Only the config constructor differs.
+            arch @ (ferrum_models::Architecture::Llama
+            | ferrum_models::Architecture::Qwen2
+            | ferrum_models::Architecture::Qwen3
+            | ferrum_models::Architecture::Mistral) => {
                 let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();
 
-                // Qwen3 + TP: use Llama wrapper (same safetensors layout + has_qk_norm)
+                // TP and GPTQ still pending on the new path (Phase D/E).
                 let tp_size: usize = std::env::var("FERRUM_TP")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| {
-                        #[cfg(feature = "cuda")]
-                        {
-                            candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
-                                .map(|n| n as usize)
-                                .unwrap_or(1)
-                        }
-                        #[cfg(not(feature = "cuda"))]
-                        {
-                            0
-                        }
-                    });
+                    .unwrap_or(0);
                 if tp_size > 1 {
-                    info!("Qwen3 TP={tp_size}: using Llama wrapper for tensor parallel");
-                    let vb = loader.load_varbuilder(&candle_device, dtype)?;
-                    let mut llama_model = ferrum_models::LlamaModelWrapper::from_varbuilder(
-                        vb,
-                        &model_def,
-                        candle_device.clone(),
-                        dtype,
-                    )?;
-                    llama_model.set_model_dir(model_dir_path);
-                    let model_info =
-                        model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                    let executor = ferrum_models::CandleModelExecutor::new(llama_model, model_info);
-                    return Ok(Arc::new(executor));
+                    return Err(FerrumError::unsupported(
+                        "FERRUM_TP>1 temporarily unsupported during \
+                         architecture-v2 migration (Phase D/E).",
+                    ));
                 }
+                // NOTE: GPTQ is now wired through NativeSafetensorsLoader's
+                // load_linear path (Phase E-GPTQ). The loader auto-detects
+                // `<name>.qweight` tensors and constructs GptqLinear via
+                // Backend::load_gptq; no legacy opt-out here.
+                let _ = ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path);
 
-                // Auto-detect GPTQ: dequantize INT4→FP16 for candle prefill
-                let qconfig =
-                    ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path)
-                        .unwrap_or(None);
-
-                let vb = if let Some(ref qc) = qconfig {
-                    info!(
-                        "GPTQ model detected ({}bit, gs={}), dequantizing for prefill...",
-                        qc.bits, qc.group_size
-                    );
-                    loader.load_varbuilder_gptq(qc, &candle_device, dtype)?
-                } else {
-                    loader.load_varbuilder(&candle_device, dtype)?
+                // Per-architecture config constructor picks has_qk_norm +
+                // rope_theta defaults. Everything else is the same forward code.
+                let qcfg = match arch {
+                    ferrum_models::Architecture::Qwen3 => {
+                        info!("Loading Qwen3 via LlamaFamilyModel (QK-norm on)");
+                        ferrum_models::models::LlamaFamilyConfig::qwen3_from_def(&model_def)
+                    }
+                    ferrum_models::Architecture::Qwen2 => {
+                        info!("Loading Qwen2 via LlamaFamilyModel");
+                        ferrum_models::models::LlamaFamilyConfig::qwen2_from_def(&model_def)
+                    }
+                    ferrum_models::Architecture::Mistral => {
+                        info!("Loading Mistral via LlamaFamilyModel (sliding_window from config)");
+                        ferrum_models::models::LlamaFamilyConfig::mistral_from_def(&model_def)
+                    }
+                    _ => {
+                        info!("Loading Llama via LlamaFamilyModel");
+                        ferrum_models::models::LlamaFamilyConfig::llama_from_def(&model_def)
+                    }
                 };
-
-                let mut qwen3_model = ferrum_models::Qwen3ModelWrapper::from_varbuilder(
-                    vb,
-                    &model_def,
-                    candle_device.clone(),
-                    dtype,
-                )?;
-                qwen3_model.set_model_dir(model_dir_path);
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                let executor = ferrum_models::Qwen3ModelExecutor::new(qwen3_model, model_info);
 
-                Ok(Arc::new(executor))
+                // Native safetensors loader, no candle on the LLM hot path.
+                let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match &config.device {
+                    Device::CPU => {
+                        info!("  Backend: CPU");
+                        let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
+                            ferrum_kernels::backend::cpu::CpuBackend,
+                        >::open(&model_path)?;
+                        Box::new(ferrum_models::models::LlamaFamilyModel::<
+                            ferrum_kernels::backend::cpu::CpuBackend,
+                        >::new(qcfg, &weight_loader)?)
+                    }
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    Device::Metal => {
+                        #[cfg(feature = "metal")]
+                        {
+                            info!("  Backend: Metal");
+                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
+                                ferrum_kernels::backend::metal::MetalBackend,
+                            >::open(&model_path)?;
+                            Box::new(ferrum_models::models::LlamaFamilyModel::<
+                                ferrum_kernels::backend::metal::MetalBackend,
+                            >::new(qcfg, &weight_loader)?)
+                        }
+                        #[cfg(not(feature = "metal"))]
+                        {
+                            return Err(FerrumError::device(
+                                "Metal requested but 'metal' feature not enabled",
+                            ));
+                        }
+                    }
+                    Device::CUDA(_) => {
+                        #[cfg(feature = "cuda")]
+                        {
+                            info!("  Backend: CUDA");
+                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
+                                ferrum_kernels::backend::cuda::CudaBackend,
+                            >::open(&model_path)?;
+                            Box::new(ferrum_models::models::LlamaFamilyModel::<
+                                ferrum_kernels::backend::cuda::CudaBackend,
+                            >::new(qcfg, &weight_loader)?)
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            return Err(FerrumError::device(
+                                "CUDA requested but 'cuda' feature not enabled",
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(FerrumError::device(format!(
+                            "LlamaFamilyModel does not support device {other:?}"
+                        )));
+                    }
+                };
+
+                Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)))
             }
             ferrum_models::Architecture::Bert => {
                 info!("Using BERT executor for embeddings");

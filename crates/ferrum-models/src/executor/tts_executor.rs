@@ -21,9 +21,30 @@ use tracing::info;
 
 use super::common;
 use crate::architectures::qwen3_tts::{Qwen3TTSTalker, SubTalker, TalkerConfig};
+use crate::architectures::qwen3_tts_backbone::TalkerBackboneBackend;
 use crate::architectures::qwen3_tts_vocoder::{Qwen3TTSVocoder, VocoderConfig};
 use crate::architectures::speaker_encoder::{mel_spectrogram_speaker_encoder, SpeakerEncoder};
 use crate::architectures::speech_tokenizer_encoder::SpeechTokenizerEncoder;
+use ferrum_quantization::NativeSafetensorsLoader;
+
+/// Install `Qwen3TtsTalker`/`SubTalker` Backend<CudaBackend> overrides so
+/// the transformer stack runs via ferrum-kernels cuBLAS + CUDA kernels
+/// instead of the broken fused-on-Linux CPU fallback.
+#[cfg(feature = "cuda")]
+fn install_cuda_backend_overrides(
+    cfg: &TalkerConfig,
+    model_dir: &std::path::Path,
+    talker: &mut Qwen3TTSTalker,
+    sub_talker: &mut SubTalker,
+) -> Result<()> {
+    use ferrum_kernels::backend::cuda::CudaBackend;
+    let loader: NativeSafetensorsLoader<CudaBackend> = NativeSafetensorsLoader::open(model_dir)?;
+    let talker_bb = TalkerBackboneBackend::<CudaBackend>::new(cfg, &loader)?;
+    talker.set_backend_override(Box::new(talker_bb));
+    let sub_bb = TalkerBackboneBackend::<CudaBackend>::new_code_predictor(cfg, &loader)?;
+    sub_talker.set_backend_override(Box::new(sub_bb));
+    Ok(())
+}
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -90,10 +111,10 @@ impl TtsModelExecutor {
             VarBuilder::from_mmaped_safetensors(&talker_weights, dtype, &device)
                 .map_err(|e| FerrumError::model(format!("load talker weights: {e}")))?
         };
-        let talker = Qwen3TTSTalker::load(&config, talker_vb.clone(), device.clone())?;
+        let mut talker = Qwen3TTSTalker::load(&config, talker_vb.clone(), device.clone())?;
 
         // Load SubTalker (code predictor) from same weights file
-        let sub_talker = SubTalker::load(&config, talker_vb.clone(), device.clone())?;
+        let mut sub_talker = SubTalker::load(&config, talker_vb.clone(), device.clone())?;
 
         // Load Speaker Encoder (for voice cloning, base models only)
         let spk_enc_dim = config_json
@@ -136,6 +157,31 @@ impl TtsModelExecutor {
         } else {
             None
         };
+
+        // Install a Backend<B>-backed transformer for the Talker/SubTalker
+        // when running on CUDA. The legacy `ferrum_attention::FusedTransformer`
+        // CUDA module is a stub and its Linux CPU fallback uses naive fp64
+        // matmul — the CUDA-only voice-clone regression traces back to that
+        // path accumulating precision drift through the 20-layer decoder.
+        // Routing through LlamaFamilyModel<CudaBackend> gives us cuBLAS +
+        // ferrum-kernels for the transformer stack while keeping candle
+        // embeddings / projection / codec_head unchanged.
+        #[cfg(feature = "cuda")]
+        if matches!(&device, CandleDevice::Cuda(_)) {
+            match install_cuda_backend_overrides(&config, dir, &mut talker, &mut sub_talker) {
+                Ok(()) => {
+                    tracing::info!(
+                        "TtsModelExecutor: Backend<CudaBackend> installed for Talker + SubTalker"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "TtsModelExecutor: Backend<CudaBackend> install failed ({e}); \
+                         falling back to candle/fused path (CUDA voice-clone may produce garbage)"
+                    );
+                }
+            }
+        }
 
         let info = ModelInfo {
             model_id: ferrum_types::ModelId(model_path.to_string()),
@@ -1200,7 +1246,7 @@ impl TtsModelExecutor {
         let suppress_end = self.config.vocab_size;
 
         // ICL mode: stronger repetition penalty (matching reference Rust project)
-        // + repetition detection for early stop
+        // + repetition detection for early stop.
         const ICL_REPETITION_PENALTY: f32 = 1.5;
         const ICL_FRAMES_PER_TOKEN: usize = 6;
         const ICL_MIN_FRAMES: usize = 75;
@@ -1215,8 +1261,14 @@ impl TtsModelExecutor {
                     logits_vec[i] = f32::NEG_INFINITY;
                 }
             }
-            // min_new_tokens=2: suppress EOS for first 2 steps
-            if step < 2 {
+            // min_new_tokens: suppress EOS until we've generated a minimum
+            // number of frames. Reference Python uses sentence-length heuristic.
+            // FERRUM_TTS_MIN_FRAMES env lets us tune without rebuilding.
+            let min_frames: usize = std::env::var("FERRUM_TTS_MIN_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| text_content_ids.len() * ICL_FRAMES_PER_TOKEN);
+            if step < min_frames {
                 if let Some(v) = logits_vec.get_mut(codec_eos as usize) {
                     *v = f32::NEG_INFINITY;
                 }

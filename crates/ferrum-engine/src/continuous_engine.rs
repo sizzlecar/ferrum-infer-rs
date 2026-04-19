@@ -271,11 +271,6 @@ impl EngineInner {
         }
 
         // Decode continuing requests (batch when possible)
-        eprintln!(
-            "[ENGINE] decode: prefill={} decode={}",
-            prefill_ids.len(),
-            decode_ids.len()
-        );
         if decode_ids.len() > 1 {
             if let Err(e) = self.run_batch_decode(&decode_ids).await {
                 warn!("Batch decode failed, falling back to per-request: {}", e);
@@ -619,7 +614,6 @@ impl EngineInner {
                 })
             };
             if should_stop {
-                eprintln!("[ENGINE] should_stop=true for {rid} in batch_decode");
                 let finish_reason = {
                     let sequences = self.sequences.read();
                     match sequences.get(rid) {
@@ -699,7 +693,6 @@ impl EngineInner {
         };
 
         if should_stop {
-            eprintln!("[ENGINE] should_stop=true for {request_id} in decode_step");
             let finish_reason = {
                 let sequences = self.sequences.read();
                 match sequences.get(request_id) {
@@ -781,17 +774,13 @@ impl EngineInner {
                     cache_id,
                 )
             } else {
-                eprintln!("[RELEASE] complete_request: seq already gone for {request_id}");
                 return Ok(());
             }
         };
 
         // Release model executor's KV cache for this sequence (frees GPU memory).
         if let Some(ref cache_id) = model_cache_id {
-            eprintln!("[RELEASE] complete_request: cache={cache_id} req={request_id}");
             self.model_executor.release_cache(cache_id);
-        } else {
-            eprintln!("[RELEASE] complete_request: NO cache_id for req={request_id}");
         }
 
         if has_kv_cache {

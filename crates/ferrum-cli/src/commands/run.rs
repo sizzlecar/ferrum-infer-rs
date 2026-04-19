@@ -261,6 +261,9 @@ pub fn resolve_model_alias(name: &str) -> String {
         "qwen3:0.6b" => "Qwen/Qwen3-0.6B".to_string(),
         "qwen3:1.7b" => "Qwen/Qwen3-1.7B".to_string(),
         "qwen3:4b" => "Qwen/Qwen3-4B".to_string(),
+        "qwen2.5:3b-gptq" | "qwen2.5-3b-instruct-gptq-int4" => {
+            "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4".to_string()
+        }
         "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
         "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
         "whisper-tiny" | "whisper:tiny" => "openai/whisper-tiny".to_string(),

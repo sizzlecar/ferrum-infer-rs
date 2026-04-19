@@ -33,6 +33,10 @@ pub struct EmbedCommand {
     /// Normalize embeddings to unit length
     #[arg(short, long, default_value = "true")]
     pub normalize: bool,
+
+    /// Backend: auto, cpu, cuda, metal (default: auto)
+    #[arg(short, long, default_value = "auto")]
+    pub backend: String,
 }
 
 pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
@@ -75,13 +79,13 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
     };
 
     let model_path = source.local_path.to_string_lossy().to_string();
-    eprintln!("{}", "Using CPU backend".dimmed());
 
     // Load model definition to detect architecture
     let mut config_manager = ConfigManager::new();
     let model_def = config_manager.load_from_path(&source.local_path).await?;
 
-    let device = CandleDevice::Cpu;
+    let device = crate::commands::transcribe::select_candle_device(&cmd.backend);
+    eprintln!("{} {:?}", "Device:".dimmed(), &device);
     let is_clip = model_def.architecture == ferrum_models::Architecture::Clip;
 
     let mut all_embeddings: Vec<(String, Vec<f32>)> = Vec::new();

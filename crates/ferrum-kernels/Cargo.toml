@@ -1,0 +1,27 @@
+[package]
+name = "ferrum-kernels"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Unified compute kernels (CUDA/Metal/CPU) and model runner for Ferrum inference"
+readme = "../../README.md"
+
+[dependencies]
+ferrum-types = { workspace = true }
+candle-core = { workspace = true }
+half = { workspace = true }
+tracing = { workspace = true }
+cudarc = { version = "0.19", default-features = false, features = ["driver", "cublas", "f16", "nvrtc"], optional = true }
+metal = { version = "0.31", optional = true }
+ferrum-attention = { path = "../ferrum-attention", version = "0.7.0", optional = true }
+
+[build-dependencies]
+bindgen_cuda = "0.1.6"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "dep:cudarc", "marlin", "cudarc?/nccl"]
+metal = ["dep:metal", "dep:ferrum-attention", "ferrum-attention/metal"]  # Metal backend (macOS)
+marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)
+tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL

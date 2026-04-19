@@ -85,19 +85,28 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let device = super::run::select_device(&cmd.backend);
     eprintln!("{} {:?}", "Device:".dimmed(), device);
 
-    // Show GPU info
+    // Show GPU info — skip candle's probe when FERRUM_CUDA_GRAPH=1 is set.
+    // `candle_core::Device::new_cuda` creates a candle-owned CudaContext
+    // with event tracking enabled by default; even though allocations on
+    // it are separate from ours, its presence corrupts graph capture /
+    // replay on Blackwell + CUDA 13 (we verified a bare Rust+cudarc
+    // reproducer fails identically when event tracking is left on).
+    // The probe is purely cosmetic; dropping it in graph mode is safe.
     #[cfg(feature = "cuda")]
     {
-        if let Ok(d) = candle_core::Device::new_cuda(0) {
-            if let Ok(cd) = d.as_cuda_device() {
-                let name = cd.cuda_stream().context().name().unwrap_or_default();
-                eprintln!("GPU 0: {name}");
+        let graph_mode = std::env::var("FERRUM_CUDA_GRAPH").is_ok();
+        if !graph_mode {
+            if let Ok(d) = candle_core::Device::new_cuda(0) {
+                if let Ok(cd) = d.as_cuda_device() {
+                    let name = cd.cuda_stream().context().name().unwrap_or_default();
+                    eprintln!("GPU 0: {name}");
+                }
             }
-        }
-        if let Ok(d) = candle_core::Device::new_cuda(1) {
-            if let Ok(cd) = d.as_cuda_device() {
-                let name = cd.cuda_stream().context().name().unwrap_or_default();
-                eprintln!("GPU 1: {name}");
+            if let Ok(d) = candle_core::Device::new_cuda(1) {
+                if let Ok(cd) = d.as_cuda_device() {
+                    let name = cd.cuda_stream().context().name().unwrap_or_default();
+                    eprintln!("GPU 1: {name}");
+                }
             }
         }
         #[cfg(feature = "cuda")]

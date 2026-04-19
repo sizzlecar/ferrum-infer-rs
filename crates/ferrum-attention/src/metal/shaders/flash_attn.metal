@@ -27,6 +27,7 @@ struct FlashAttnParams {
     int causal;       // 0 or 1
     int pos_offset;
     int kv_seq_stride; // seq dimension stride for K/V (= kv_len for contiguous, = max_len for paged cache)
+    int sliding_window; // 0 = full causal, >0 = attend only to last `w` KV positions (Mistral v0.1, Gemma)
 };
 
 // Block size for KV processing — process this many KV positions per iteration
@@ -50,8 +51,12 @@ kernel void flash_attn_f32(
     const int d     = p.head_dim;
     const int sk    = p.kv_len;
 
-    // Causal: how many KV positions can we attend to?
-    const int attend_len = p.causal ? min(p.pos_offset + qi + 1, sk) : sk;
+    // Causal upper bound and optional sliding-window lower bound.
+    const int attend_end = p.causal ? min(p.pos_offset + qi + 1, sk) : sk;
+    const int attend_start = (p.causal && p.sliding_window > 0)
+        ? max(0, attend_end - p.sliding_window)
+        : 0;
+    const int attend_len = attend_end;
 
     // Pointers
     device const float* q_row = Q + ((bi * p.num_heads + hi) * p.q_len + qi) * d;
@@ -72,8 +77,9 @@ kernel void flash_attn_f32(
     // Local output accumulator
     float acc[4] = {0, 0, 0, 0}; // supports up to head_dim=128 (4 per thread)
 
-    // Process KV in blocks
-    for (int kv_start = 0; kv_start < attend_len; kv_start += BLOCK_KV) {
+    // Process KV in blocks, starting at `attend_start` so sliding-window
+    // positions that are too old don't contribute.
+    for (int kv_start = attend_start; kv_start < attend_len; kv_start += BLOCK_KV) {
         int kv_end = min(kv_start + BLOCK_KV, attend_len);
 
         for (int ki = kv_start; ki < kv_end; ++ki) {

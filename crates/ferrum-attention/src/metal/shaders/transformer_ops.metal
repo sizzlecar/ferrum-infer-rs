@@ -331,3 +331,205 @@ kernel void embedding_lookup_f32(
         output[tid] = table[idx * p.dim + tid];
     }
 }
+
+// ── Split fused QKV ────────────────────────────────────────────────────
+// Input:  qkv [tokens, q_dim + 2*kv_dim] (row-major, Q|K|V interleaved per row)
+// Output: q [tokens, q_dim], k [tokens, kv_dim], v [tokens, kv_dim]
+// One thread per output element (dispatch q_dim + 2*kv_dim × tokens threads, one thread per element).
+
+struct SplitQkvParams {
+    int tokens;
+    int q_dim;
+    int kv_dim;
+};
+
+kernel void split_qkv_f32(
+    device const float* qkv     [[buffer(0)]],
+    device       float* q       [[buffer(1)]],
+    device       float* k       [[buffer(2)]],
+    device       float* v       [[buffer(3)]],
+    constant SplitQkvParams& p  [[buffer(4)]],
+    uint tid                    [[thread_position_in_grid]])
+{
+    const int qd  = p.q_dim;
+    const int kd  = p.kv_dim;
+    const int row_stride = qd + 2 * kd;
+    const int total = p.tokens * row_stride;
+    if ((int)tid >= total) return;
+
+    const int t = (int)tid / row_stride;
+    const int c = (int)tid % row_stride;
+    const float val = qkv[(int)tid];
+
+    if (c < qd) {
+        q[t * qd + c] = val;
+    } else if (c < qd + kd) {
+        k[t * kd + (c - qd)] = val;
+    } else {
+        v[t * kd + (c - qd - kd)] = val;
+    }
+}
+
+// ── LayerNorm (mean + variance) ─────────────────────────────────────────
+// Distinct from RMSNorm — Bert / Clip / Whisper use full LayerNorm.
+//   out[r, c] = ((x[r, c] - mean) / sqrt(var + eps)) * gamma[c] + beta[c]
+
+struct LayerNormParams {
+    int dim;
+    float eps;
+};
+
+kernel void layer_norm_f32(
+    device const float* input   [[buffer(0)]],
+    device const float* gamma   [[buffer(1)]],
+    device const float* beta    [[buffer(2)]],
+    device       float* output  [[buffer(3)]],
+    constant LayerNormParams& p [[buffer(4)]],
+    uint  tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const int row = (int)tgpig;
+    device const float* x = input  + row * p.dim;
+    device       float* y = output + row * p.dim;
+
+    // Pass 1: mean.
+    float sum = 0.0f;
+    for (int i = tiisg; i < p.dim; i += 32) {
+        sum += x[i];
+    }
+    sum = simd_sum(sum);
+    float mean = sum / float(p.dim);
+
+    // Pass 2: variance.
+    float var_sum = 0.0f;
+    for (int i = tiisg; i < p.dim; i += 32) {
+        float d = x[i] - mean;
+        var_sum += d * d;
+    }
+    var_sum = simd_sum(var_sum);
+    float inv = 1.0f / sqrt(var_sum / float(p.dim) + p.eps);
+
+    // Pass 3: write.
+    for (int i = tiisg; i < p.dim; i += 32) {
+        y[i] = (x[i] - mean) * inv * gamma[i] + beta[i];
+    }
+}
+
+// ── GELU (erf-based, PyTorch default) ───────────────────────────────────
+// Approximate erf via Abramowitz & Stegun 7.1.26 — accurate to ~1.5e-7.
+
+struct GeluParams {
+    int n;
+};
+
+static inline float erf_approx(float x) {
+    const float sign = (x < 0.0f) ? -1.0f : 1.0f;
+    x = fabs(x);
+    const float t = 1.0f / (1.0f + 0.3275911f * x);
+    const float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t
+                            - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+    return sign * y;
+}
+
+kernel void gelu_f32(
+    device const float* input   [[buffer(0)]],
+    device       float* output  [[buffer(1)]],
+    constant GeluParams& p      [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if ((int)tid >= p.n) return;
+    const float x = input[tid];
+    output[tid] = 0.5f * x * (1.0f + erf_approx(x * M_SQRT1_2_F));
+}
+
+// ── Broadcast bias add: data[r, c] += bias[c] ───────────────────────────
+
+struct AddBiasParams {
+    int rows;
+    int cols;
+};
+
+kernel void add_bias_f32(
+    device       float* data    [[buffer(0)]],
+    device const float* bias    [[buffer(1)]],
+    constant AddBiasParams& p   [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    const int total = p.rows * p.cols;
+    if ((int)tid >= total) return;
+    const int c = (int)tid % p.cols;
+    data[tid] += bias[c];
+}
+
+// ── GEMV: m=1 GEMM specialization ───────────────────────────────────────
+// C[1, N] = A[1, K] @ B[N, K]^T
+// One threadgroup (1 simdgroup = 32 threads) per output column.
+// K-dim reduction via simd_sum.
+//
+// Note: tried tile_n=4 (A-vector reuse across 4 cols), turned out slower on
+// Qwen3-0.6B (30.2 vs 32.5 tok/s). Bottleneck is not A-side DRAM traffic,
+// it's B-side reads (vocab×hidden for lm_head dwarfs everything else).
+
+kernel void gemv_f32(
+    device const float* A       [[buffer(0)]],   // [1, K]
+    device const float* B       [[buffer(1)]],   // [N, K]
+    device       float* C       [[buffer(2)]],   // [1, N]
+    constant GemmParams& p      [[buffer(3)]],
+    uint  tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const int nj = (int)tgpig;
+    if (nj >= p.N) return;
+
+    device const float* b_row = B + nj * p.K;
+    const int K = p.K;
+
+    float acc = 0.0f;
+
+    // Vectorized float4 path when K is aligned and large enough.
+    // Each thread consumes 4 floats per step = 128-bit load, 4 FMAs.
+    if ((K & 3) == 0) {
+        device const float4* a4 = (device const float4*)A;
+        device const float4* b4 = (device const float4*)b_row;
+        const int K4 = K >> 2;
+        for (int k4 = (int)tiisg; k4 < K4; k4 += 32) {
+            float4 a = a4[k4];
+            float4 b = b4[k4];
+            acc += dot(a, b);
+        }
+    } else {
+        for (int k = (int)tiisg; k < K; k += 32) {
+            acc += A[k] * b_row[k];
+        }
+    }
+    acc = simd_sum(acc);
+
+    if (tiisg == 0) {
+        C[nj] = acc;
+    }
+}
+
+// ── Fused SiLU × Up with gate_up split ──────────────────────────────────
+// Input:  gate_up [tokens, 2*im]   (gate = first im, up = second im per row)
+// Output: out     [tokens, im]     out[t, i] = silu(gate[t, i]) * up[t, i]
+
+struct SiluMulSplitParams {
+    int tokens;
+    int im;
+};
+
+kernel void silu_mul_split_f32(
+    device const float* gate_up    [[buffer(0)]],
+    device       float* out        [[buffer(1)]],
+    constant SiluMulSplitParams& p [[buffer(2)]],
+    uint tid                       [[thread_position_in_grid]])
+{
+    const int total = p.tokens * p.im;
+    if ((int)tid >= total) return;
+    const int t = (int)tid / p.im;
+    const int i = (int)tid % p.im;
+    const float g = gate_up[t * 2 * p.im + i];
+    const float u = gate_up[t * 2 * p.im + p.im + i];
+    const float silu = g / (1.0f + exp(-g));
+    out[(int)tid] = silu * u;
+}

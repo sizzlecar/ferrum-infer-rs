@@ -33,3 +33,6 @@ IMPLEMENTATION_SUMMARY.md
 QUICKSTART.md
 docs/registry_pattern_explanation.md
 .env.local
+
+# Claude Code local settings
+.claude/

@@ -15,6 +15,9 @@ cargo install ferrum-cli
 
 # Or build from source
 cargo build --release -p ferrum-cli --bin ferrum
+
+# CUDA (Linux + NVIDIA)
+CUDA_HOME=/usr/local/cuda cargo build --release --features cuda -p ferrum-cli --bin ferrum
 ```
 
 ## Quick Start
@@ -153,11 +156,14 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 
 ### Qwen3-4B
 
-| Mode | FP16 | INT4 (GPTQ + Marlin) |
-|------|------|----------------------|
-| Single request decode | 88.1 tok/s | **130.4 tok/s (+48%)** |
-| 4 concurrent (batch) | 109.4 tok/s | **124.2 tok/s** |
-| VRAM | ~8 GB | **~2.5 GB (-69%)** |
+| Mode | FP16 (eager) | FP16 + CUDA graph | INT4 (GPTQ + Marlin) |
+|------|--------------|-------------------|----------------------|
+| Single request decode | 70.3 tok/s | **82.9 tok/s (+18%)** | **130.4 tok/s** |
+| 4 concurrent (batch) | 109.4 tok/s | — | **124.2 tok/s** |
+| TPOT (p50) | 14.2 ms | **12.1 ms** | — |
+| VRAM | ~8 GB | — | **~2.5 GB (-69%)** |
+
+> CUDA graph replay is automatic after 3-step warmup; eliminates per-step launch overhead and sits on the Blackwell + CUDA 13 path we hardened in this cycle (see [docs/phase-e-cuda-status.md](docs/phase-e-cuda-status.md)).
 
 ### TinyLlama-1.1B (Llama architecture)
 
@@ -266,7 +272,7 @@ crates/
 ├── ferrum-runtime        # Backend implementations (Candle, CPU)
 ├── ferrum-engine         # Metal kernels, model orchestration
 ├── ferrum-models         # Model architectures (LLaMA, Qwen2, Qwen3, BERT, Whisper)
-├── ferrum-cuda-kernels   # Custom CUDA kernels + decode runner
+├── ferrum-kernels   # Custom CUDA kernels + decode runner
 ├── ferrum-tokenizer      # Tokenization
 ├── ferrum-sampler        # Sampling strategies
 ├── ferrum-scheduler      # Request scheduling

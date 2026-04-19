@@ -1,0 +1,66 @@
+# CUDA dev image for Phase E runtime verification.
+#
+# Build locally (no GPU needed; nvcc + rustc only):
+#   docker build -f Dockerfile.cuda-dev -t ferrum-cuda-dev .
+#
+# Run on GPU host:
+#   docker run --rm --gpus all -it \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     -v $(pwd):/workspace \
+#     ferrum-cuda-dev \
+#     bash scripts/phase-e-verify.sh qwen3:0.6b
+#
+# Layout: deps baked in, workspace mounted so iterations don't re-download.
+
+FROM nvidia/cuda:12.6.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+        curl build-essential pkg-config libssl-dev git \
+        # Python for reference generation scripts
+        python3 python3-pip \
+        # Audio I/O for whisper/tts tests (even though CUDA path is LLM-only initially)
+        ffmpeg libsndfile1 \
+        # useful diagnostics
+        htop nvtop time \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Pre-warm cargo deps. Copy only manifest + lockfile so dep fetch is cacheable.
+WORKDIR /pre-deps
+COPY Cargo.toml Cargo.lock ./
+# Copy every crate's Cargo.toml so the workspace resolves.
+COPY crates/ferrum-attention/Cargo.toml crates/ferrum-attention/
+COPY crates/ferrum-cli/Cargo.toml crates/ferrum-cli/
+COPY crates/ferrum-engine/Cargo.toml crates/ferrum-engine/
+COPY crates/ferrum-interfaces/Cargo.toml crates/ferrum-interfaces/
+COPY crates/ferrum-kernels/Cargo.toml crates/ferrum-kernels/
+COPY crates/ferrum-kv/Cargo.toml crates/ferrum-kv/
+COPY crates/ferrum-models/Cargo.toml crates/ferrum-models/
+COPY crates/ferrum-quantization/Cargo.toml crates/ferrum-quantization/
+COPY crates/ferrum-runtime/Cargo.toml crates/ferrum-runtime/
+COPY crates/ferrum-sampler/Cargo.toml crates/ferrum-sampler/
+COPY crates/ferrum-scheduler/Cargo.toml crates/ferrum-scheduler/
+COPY crates/ferrum-server/Cargo.toml crates/ferrum-server/
+COPY crates/ferrum-testkit/Cargo.toml crates/ferrum-testkit/
+COPY crates/ferrum-tokenizer/Cargo.toml crates/ferrum-tokenizer/
+COPY crates/ferrum-types/Cargo.toml crates/ferrum-types/
+
+# Stub lib.rs files so cargo fetch can resolve the workspace.
+RUN for d in crates/*/; do mkdir -p $d/src && touch $d/src/lib.rs; done
+RUN cargo fetch --locked || true
+
+# Python deps for reference generation.
+RUN pip3 install --no-cache-dir \
+        torch==2.4.1 \
+        transformers==4.44.2 \
+        safetensors==0.4.5 \
+        numpy==1.26.4 \
+        soundfile==0.12.1
+
+WORKDIR /workspace
+CMD ["bash"]
