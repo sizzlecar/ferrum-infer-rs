@@ -9,46 +9,11 @@
 
 ## 安装
 
-### Docker（推荐，无需工具链、无需编译）
-
-GitHub Container Registry 预构建镜像：
-
 ```bash
-# GPU 主机（需 NVIDIA + Container Toolkit）
-docker run --rm -it --gpus all \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:latest \
-  run qwen3:4b --backend cuda
-
-# 纯 CPU 主机
-docker run --rm -it \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
-  run qwen3:0.6b
-
-# HTTP 服务（OpenAI 兼容）
-docker run --rm -p 8000:8000 --gpus all \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:latest \
-  serve --model qwen3:4b --backend cuda
-```
-
-Tag 说明：`latest`（= CUDA）、`cuda`、`cpu`、`cuda-0.7.0`、`cpu-0.7.0` 等
-
-> **Mac / Metal 用户**：Metal 无法在 Docker 容器内使用（macOS Metal 设备
-> 不暴露给 Docker 底层的 Linux VM）。请用 `cargo install ferrum-cli`
-> 安装 —— macOS 构建会自动启用 Metal。
-
-### crates.io
-
-```bash
+# 从 crates.io 安装
 cargo install ferrum-cli
-```
 
-### 从源码
-
-```bash
-# CPU / Metal（macOS 自动选 Metal）
+# 或从源码编译
 cargo build --release -p ferrum-cli --bin ferrum
 
 # CUDA（Linux + NVIDIA）

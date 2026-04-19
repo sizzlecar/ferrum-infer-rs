@@ -9,46 +9,11 @@ A Rust-native LLM inference engine. Load models from Hugging Face, chat locally 
 
 ## Install
 
-### Docker (recommended — no toolchain, no build)
-
-Pre-built images on GitHub Container Registry:
-
 ```bash
-# GPU host (NVIDIA + Container Toolkit)
-docker run --rm -it --gpus all \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:latest \
-  run qwen3:4b --backend cuda
-
-# CPU-only host
-docker run --rm -it \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
-  run qwen3:0.6b
-
-# HTTP server (OpenAI-compatible)
-docker run --rm -p 8000:8000 --gpus all \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:latest \
-  serve --model qwen3:4b --backend cuda
-```
-
-Tags: `latest` (= CUDA), `cuda`, `cpu`, `cuda-0.7.0`, `cpu-0.7.0`, ...
-
-> **Mac / Metal users**: Metal can't run inside Docker containers (macOS
-> Metal device isn't exposed to the Linux VM Docker runs on). Install via
-> `cargo install ferrum-cli` — the macOS build auto-selects Metal.
-
-### crates.io
-
-```bash
+# From crates.io
 cargo install ferrum-cli
-```
 
-### From source
-
-```bash
-# CPU / Metal (macOS auto-selects Metal)
+# Or build from source
 cargo build --release -p ferrum-cli --bin ferrum
 
 # CUDA (Linux + NVIDIA)
