@@ -31,6 +31,12 @@ COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY crates ./crates
 
 ENV CUDA_HOME=/usr/local/cuda
+# GitHub runners have no GPU, so bindgen_cuda's `nvidia-smi` probe panics.
+# Pin the build-time compute cap; nvcc still emits PTX so newer GPUs
+# (Ada sm_89, Hopper sm_90, Blackwell sm_100/sm_120) JIT-compile at load.
+# sm_86 covers Ampere RTX 30xx / A5000 / A40 natively and is the broadest
+# backwards-compatible SASS target (vLLM uses a similar approach).
+ENV CUDA_COMPUTE_CAP=86
 RUN cargo build --release --features cuda -p ferrum-cli --bin ferrum
 
 # ── Runtime stage ────────────────────────────────────────────────────────
