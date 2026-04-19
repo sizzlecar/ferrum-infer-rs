@@ -151,12 +151,7 @@ impl RegexGuidedProcessor {
         let pos = *self.state.lock();
         if pos.dead {
             // Give up and force EOS — no other token can recover.
-            if let Some(eos) = self.eos_token {
-                let eos_idx = eos.get() as usize;
-                for (i, l) in logits.iter_mut().enumerate() {
-                    *l = if i == eos_idx { 0.0 } else { f32::NEG_INFINITY };
-                }
-            }
+            self.force_eos(logits);
             return;
         }
 
@@ -166,6 +161,7 @@ impl RegexGuidedProcessor {
         // cached per-state transition table would amortise further, but this
         // keeps the hot path allocation-free for now.
         let vocab = logits.len().min(self.token_bytes.len());
+        let mut any_allowed = false;
         for idx in 0..vocab {
             let is_eos = self.eos_token.map_or(false, |e| e.get() as usize == idx);
             let bytes = &self.token_bytes[idx];
@@ -181,8 +177,27 @@ impl RegexGuidedProcessor {
                 self.advance(pos.state, bytes).is_some()
             };
 
-            if !allowed {
+            if allowed {
+                any_allowed = true;
+            } else {
                 logits[idx] = f32::NEG_INFINITY;
+            }
+        }
+
+        // No token in the vocab can extend the current match. Rather than
+        // hand the sampler a row of -inf (which produces NaN softmax and a
+        // junk argmax) terminate cleanly by forcing EOS. Happens when the
+        // tokenizer's BPE merges span byte boundaries the schema rejects.
+        if !any_allowed {
+            self.force_eos(logits);
+        }
+    }
+
+    fn force_eos(&self, logits: &mut [f32]) {
+        if let Some(eos) = self.eos_token {
+            let eos_idx = eos.get() as usize;
+            for (i, l) in logits.iter_mut().enumerate() {
+                *l = if i == eos_idx { 0.0 } else { f32::NEG_INFINITY };
             }
         }
     }

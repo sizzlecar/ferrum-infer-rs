@@ -39,13 +39,15 @@ pub struct SamplingParams {
     pub response_format: ResponseFormat,
 }
 
-/// Response format for structured output.
+/// Response format for structured output. Mirrors OpenAI's
+/// `response_format` API — no proprietary extensions.
 ///
-/// Controls how the model output is constrained:
 /// - `Text`: no constraint (default)
-/// - `JsonObject`: output must be valid JSON
-/// - `JsonSchema`: output must conform to a JSON schema
-/// - `Regex`: output must match the given regex pattern (DFA-guided)
+/// - `JsonObject`: output must be a valid JSON object (matches OpenAI's
+///   `{"type": "json_object"}`)
+/// - `JsonSchema(schema)`: output must conform to the given JSON Schema
+///   (matches OpenAI's `{"type": "json_schema", "json_schema": {...}}`).
+///   Internally compiled to a regex FSM for per-token hard masking.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "schema")]
 pub enum ResponseFormat {
@@ -55,10 +57,6 @@ pub enum ResponseFormat {
     JsonObject,
     /// Output must conform to the given JSON schema (as a JSON string).
     JsonSchema(String),
-    /// Output must match this regex pattern. Enforced per-token via a DFA
-    /// built at request admission. Unlike `JsonObject` (soft bias), this is
-    /// a hard mask — invalid tokens are set to -inf before sampling.
-    Regex(String),
 }
 
 impl Default for ResponseFormat {

@@ -87,12 +87,30 @@ impl SequenceState {
             _ => None,
         };
         let regex_processor = match (&request.sampling_params.response_format, &tokenizer) {
-            (ResponseFormat::Regex(pattern), Some(tok)) => {
-                let eos = tok.special_tokens().eos_token;
-                match ferrum_sampler::guided::RegexGuidedProcessor::new(pattern, tok.clone(), eos) {
-                    Ok(p) => Some(Arc::new(p)),
+            (ResponseFormat::JsonSchema(schema), Some(tok)) => {
+                // OpenAI-style structured output: compile the JSON Schema
+                // to a regex then drive the DFA-guided processor with it.
+                match ferrum_sampler::schema_to_regex::schema_to_regex(schema) {
+                    Ok(pattern) => {
+                        let eos = tok.special_tokens().eos_token;
+                        match ferrum_sampler::guided::RegexGuidedProcessor::new(
+                            &pattern,
+                            tok.clone(),
+                            eos,
+                        ) {
+                            Ok(p) => Some(Arc::new(p)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "json_schema guided decode disabled (regex build): {e}"
+                                );
+                                None
+                            }
+                        }
+                    }
                     Err(e) => {
-                        tracing::warn!("regex guided decode disabled: {e}");
+                        tracing::warn!(
+                            "json_schema guided decode disabled (schema translation): {e}"
+                        );
                         None
                     }
                 }

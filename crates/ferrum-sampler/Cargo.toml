@@ -42,3 +42,6 @@ regex-automata = { version = "0.4", default-features = false, features = ["std",
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Tests only — easy full-match regex semantics for validating our
+# schema-to-regex translator. Production uses regex-automata directly.
+regex-lite = "0.1"
