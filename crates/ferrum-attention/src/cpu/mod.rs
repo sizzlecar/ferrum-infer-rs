@@ -211,24 +211,41 @@ pub fn gemm_at_b(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usi
 
 /// In-place softmax on rows of scores[m, n], with causal mask.
 /// For causal: row i can attend to columns 0..=pos_offset+i.
+/// When `sliding_window > 0`, the lower bound is raised to `attend_end - sliding_window`,
+/// matching Mistral v0.1 / Gemma local-attention semantics.
 /// All f32, matching PyTorch's CPU softmax behavior.
-pub fn softmax_inplace(scores: &mut [f32], m: usize, n: usize, causal: bool, pos_offset: usize) {
+pub fn softmax_inplace(
+    scores: &mut [f32],
+    m: usize,
+    n: usize,
+    causal: bool,
+    pos_offset: usize,
+    sliding_window: usize,
+) {
     for i in 0..m {
         let row = &mut scores[i * n..(i + 1) * n];
-        let attend_len = if causal {
+        let attend_end = if causal {
             (pos_offset + i + 1).min(n)
         } else {
             n
         };
+        let attend_start = if causal && sliding_window > 0 {
+            attend_end.saturating_sub(sliding_window)
+        } else {
+            0
+        };
 
-        // Mask future positions
-        for j in attend_len..n {
+        // Mask positions outside the [attend_start, attend_end) window.
+        for j in 0..attend_start {
+            row[j] = f32::NEG_INFINITY;
+        }
+        for j in attend_end..n {
             row[j] = f32::NEG_INFINITY;
         }
 
-        // Max
+        // Max over the active window only.
         let mut max_val = f32::NEG_INFINITY;
-        for j in 0..attend_len {
+        for j in attend_start..attend_end {
             if row[j] > max_val {
                 max_val = row[j];
             }
@@ -281,8 +298,8 @@ pub fn fused_attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], p: &Att
                 *s *= scale;
             }
 
-            // Fused softmax with causal mask
-            softmax_inplace(&mut scores, sq, sk, p.causal, p.pos_offset);
+            // Fused softmax with causal mask (+ optional sliding-window lower bound)
+            softmax_inplace(&mut scores, sq, sk, p.causal, p.pos_offset, p.sliding_window);
 
             // out[sq, d] = scores[sq, sk] @ V[sk, d]
             let o_slice = &mut out[o_off..o_off + sq * d];
@@ -364,5 +381,47 @@ mod tests {
         assert!((out[1] - 7.0).abs() < 1e-4);
         assert!((out[2] - 3.0).abs() < 1e-4);
         assert!((out[3] - 7.0).abs() < 1e-4);
+    }
+
+    /// Sliding window = 1 means each query sees only its own KV position —
+    /// output must equal V[i] for query i (softmax of single element = 1.0).
+    #[test]
+    fn test_cpu_attention_sliding_window_equals_self() {
+        // 1 batch, 1 head, 4 tokens, dim=2. Pick K = one-hots, V = [row index, row index + 10]
+        // so V[i] is trivially identifiable.
+        let q = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5];
+        let k = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5];
+        let v = vec![0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0];
+        let mut out = vec![0.0f32; 8];
+
+        let params = AttentionParams {
+            batch: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            q_len: 4,
+            kv_len: 4,
+            head_dim: 2,
+            causal: true,
+            pos_offset: 0,
+            sliding_window: 1,
+        };
+
+        fused_attention(&q, &k, &v, &mut out, &params);
+
+        // Each row attends only to itself → out[i] == v[i].
+        for i in 0..4 {
+            assert!(
+                (out[i * 2] - v[i * 2]).abs() < 1e-4,
+                "row {i}: expected {}, got {}",
+                v[i * 2],
+                out[i * 2]
+            );
+            assert!(
+                (out[i * 2 + 1] - v[i * 2 + 1]).abs() < 1e-4,
+                "row {i}: expected {}, got {}",
+                v[i * 2 + 1],
+                out[i * 2 + 1]
+            );
+        }
     }
 }
