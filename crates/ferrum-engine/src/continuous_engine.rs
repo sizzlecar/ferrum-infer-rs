@@ -55,6 +55,8 @@ pub struct SequenceState {
     pub preemption_count: usize,
     /// JSON mode logits processor (active when response_format is JsonObject).
     pub json_processor: Option<Arc<JsonModeProcessor>>,
+    /// Regex-guided hard-mask processor (active when response_format is Regex).
+    pub regex_processor: Option<Arc<ferrum_sampler::guided::RegexGuidedProcessor>>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Model executor's KV cache key for this sequence (for cleanup on completion).
@@ -63,10 +65,35 @@ pub struct SequenceState {
 
 impl SequenceState {
     pub fn new(request: InferenceRequest, input_tokens: Vec<TokenId>) -> Self {
+        Self::new_with_tokenizer(request, input_tokens, None)
+    }
+
+    /// Build sequence state, optionally wiring a tokenizer for guided-decoding
+    /// processors (`ResponseFormat::Regex` needs vocab access to compile a
+    /// token-level mask). Falling back to `None` preserves the old behaviour
+    /// for call sites that don't have a tokenizer to hand (smoke tests).
+    pub fn new_with_tokenizer(
+        request: InferenceRequest,
+        input_tokens: Vec<TokenId>,
+        tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
+    ) -> Self {
         use ferrum_types::ResponseFormat;
         let seed = request.sampling_params.seed.unwrap_or(42);
         let json_processor = match &request.sampling_params.response_format {
             ResponseFormat::JsonObject => Some(Arc::new(JsonModeProcessor::new())),
+            _ => None,
+        };
+        let regex_processor = match (&request.sampling_params.response_format, &tokenizer) {
+            (ResponseFormat::Regex(pattern), Some(tok)) => {
+                let eos = tok.special_tokens().eos_token;
+                match ferrum_sampler::guided::RegexGuidedProcessor::new(pattern, tok.clone(), eos) {
+                    Ok(p) => Some(Arc::new(p)),
+                    Err(e) => {
+                        tracing::warn!("regex guided decode disabled: {e}");
+                        None
+                    }
+                }
+            }
             _ => None,
         };
         Self {
@@ -85,6 +112,7 @@ impl SequenceState {
             tokens_this_iteration: 0,
             preemption_count: 0,
             json_processor,
+            regex_processor,
             token_frequencies: HashMap::new(),
             model_cache_id: None,
         }
@@ -106,9 +134,18 @@ impl SequenceState {
         false
     }
 
-    /// Sample next token with full processor chain (temperature, top-k/p, repetition penalty, JSON mode).
+    /// Sample next token with full processor chain (temperature, top-k/p,
+    /// repetition penalty, JSON mode, regex-guided mask).
     pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
         use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
+
+        // Regex-guided mask runs FIRST: it's a hard constraint (sets invalid
+        // tokens to -inf). Subsequent temperature / top-k / top-p stay
+        // correct because -inf tokens can't make it through any softmax.
+        if let Some(ref rp) = self.regex_processor {
+            rp.advance_with_tokens_public(&self.generated_tokens);
+            rp.mask_logits(logits);
+        }
 
         // Apply JSON mode biases before the standard processor chain
         if let Some(ref jp) = self.json_processor {
@@ -251,7 +288,11 @@ impl EngineInner {
                         .tokenizer
                         .encode(&scheduled_req.request.prompt, true)
                         .unwrap_or_else(|_| vec![TokenId::new(0)]);
-                    SequenceState::new(scheduled_req.request.clone(), input_tokens)
+                    SequenceState::new_with_tokenizer(
+                        scheduled_req.request.clone(),
+                        input_tokens,
+                        Some(self.tokenizer.clone()),
+                    )
                 });
 
                 if !seq.prefill_complete {
@@ -930,7 +971,11 @@ impl InferenceEngine for ContinuousBatchEngine {
         // Create sequence state with oneshot channel
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let mut seq_state = SequenceState::new(request, input_tokens);
+        let mut seq_state = SequenceState::new_with_tokenizer(
+            request,
+            input_tokens,
+            Some(self.inner.tokenizer.clone()),
+        );
         seq_state.response_sender = Some(resp_tx);
         self.inner
             .sequences
@@ -975,7 +1020,11 @@ impl InferenceEngine for ContinuousBatchEngine {
 
         // Create sequence state with stream sender
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
-        let mut seq_state = SequenceState::new(request, input_tokens);
+        let mut seq_state = SequenceState::new_with_tokenizer(
+            request,
+            input_tokens,
+            Some(self.inner.tokenizer.clone()),
+        );
         seq_state.stream_sender = Some(tx);
         self.inner
             .sequences

@@ -45,6 +45,7 @@ pub struct SamplingParams {
 /// - `Text`: no constraint (default)
 /// - `JsonObject`: output must be valid JSON
 /// - `JsonSchema`: output must conform to a JSON schema
+/// - `Regex`: output must match the given regex pattern (DFA-guided)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "schema")]
 pub enum ResponseFormat {
@@ -54,6 +55,10 @@ pub enum ResponseFormat {
     JsonObject,
     /// Output must conform to the given JSON schema (as a JSON string).
     JsonSchema(String),
+    /// Output must match this regex pattern. Enforced per-token via a DFA
+    /// built at request admission. Unlike `JsonObject` (soft bias), this is
+    /// a hard mask — invalid tokens are set to -inf before sampling.
+    Regex(String),
 }
 
 impl Default for ResponseFormat {
