@@ -306,27 +306,37 @@ impl<'a> SpeculativeRunner<'a> {
             draft_prev_token = next_token;
         }
 
-        // ── Target: N+1 sequential decodes (sequentially for now; batched
-        // multi-position decode is the follow-up for the real speedup) ────
-        let mut target_logits: Vec<Vec<f32>> = Vec::with_capacity(n + 1);
-        let mut target_kv_cur = target_kv;
-        let mut target_prev_token = last_token;
-        for i in 0..=n {
-            let input_tensor =
-                tokens_to_tensor(&self.tensor_factory, &[target_prev_token.get()])?;
-            let input = DecodeInput::new(input_tensor, target_kv_cur.clone());
-            let output: DecodeOutput = self.target.decode(&input).await?;
-            let logits = output.logits.to_vec_f32()?;
-            target_logits.push(logits);
-            target_kv_cur = output.kv_cache.clone();
-            if i < n {
-                // Feed the next draft token into the target — standard
-                // speculative-decoding pattern: the target attends to
-                // prompt + drafts so far, producing logits for "what
-                // comes after draft[i]".
-                target_prev_token = draft_tokens[i];
-            }
+        // ── Target: ONE multi-position forward over N+1 tokens ──────────
+        // Feeds [last_token, draft_0, ..., draft_{N-1}] into a single
+        // forward pass and gets N+1 logit rows back — one per position.
+        // Dramatically cheaper than N+1 sequential decodes because the
+        // weight matrices are read from HBM exactly once instead of N+1
+        // times (the decode hot path is memory-bound).
+        let mut verify_tokens = Vec::with_capacity(n + 1);
+        verify_tokens.push(last_token);
+        for i in 0..n {
+            verify_tokens.push(draft_tokens[i]);
         }
+        let mut verify_inputs = Vec::with_capacity(verify_tokens.len());
+        let mut kv_for_verify = target_kv.clone();
+        for tok in &verify_tokens {
+            let input_tensor = tokens_to_tensor(&self.tensor_factory, &[tok.get()])?;
+            verify_inputs.push(DecodeInput::new(input_tensor, kv_for_verify.clone()));
+            // Subsequent inputs share the same handle; `forward_verify` only
+            // reads cache_id + starting seq from the first one.
+            kv_for_verify = kv_for_verify.clone();
+        }
+        let verify_outputs: Vec<DecodeOutput> =
+            self.target.forward_verify(&verify_inputs).await?;
+        assert_eq!(verify_outputs.len(), n + 1);
+        let mut target_logits: Vec<Vec<f32>> = Vec::with_capacity(n + 1);
+        for out in &verify_outputs {
+            target_logits.push(out.logits.to_vec_f32()?);
+        }
+        let target_kv_cur = verify_outputs
+            .last()
+            .map(|o| o.kv_cache.clone())
+            .unwrap_or(target_kv);
 
         let spec = Speculation {
             draft_tokens: &draft_tokens,

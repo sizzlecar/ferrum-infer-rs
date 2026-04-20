@@ -213,6 +213,23 @@ pub trait ModelExecutor: Send + Sync {
         Ok(())
     }
 
+    /// Multi-position decode-verify: one forward over `N+1` tokens,
+    /// producing one logits row per position. Used by speculative
+    /// decoding's target path so we don't pay N+1 sequential forwards.
+    ///
+    /// Default falls back to N+1 sequential `decode()` calls — correct
+    /// but slow; real LLM executors override.
+    ///
+    /// Returns a `Vec<DecodeOutput>` of length `inputs.len()` with the
+    /// final KV handle attached to the last element.
+    async fn forward_verify(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        let mut out = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            out.push(self.decode(input).await?);
+        }
+        Ok(out)
+    }
+
     /// Get executor capabilities
     fn capabilities(&self) -> ExecutorCapabilities;
 

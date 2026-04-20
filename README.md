@@ -259,7 +259,7 @@ What works:
 - Continuous batching with batch decode
 - Chunked prefill (`FERRUM_CHUNKED_PREFILL=<size>`) — split long prompts
 - Prefix cache for repeated prompts (safe exact-match gate)
-- Speculative decoding scaffolding (see known limitations below)
+- Speculative decoding (`--spec-draft <MODEL>`) — DeepMind accept/reject
 - Structured output — OpenAI-compatible `response_format: json_object` +
   `json_schema` with DFA-guided hard token masking
 - Tensor parallelism (multi-GPU NCCL, auto-detects GPU count)
@@ -268,31 +268,8 @@ What works:
 - Multi-format audio support (WAV/MP3/FLAC/M4A/OGG) via pure-Rust `symphonia`
 - Top-k/top-p/temperature/repetition-penalty sampling
 
-### Speculative decoding — known limitations
-
-The `--spec-draft <MODEL>` flag wires the full DeepMind accept/reject
-algorithm (incl. partial-reject KV rollback) through the main engine, so
-output is **mathematically equivalent** to decoding with the target alone.
-The current integration is **correctness-ready, not throughput-ready**:
-
-- Target decode in the spec path runs **sequentially N+1 times** per iter
-  (no multi-position decode yet). On Metal fp32 with a 7B target this
-  makes asymmetric setups (e.g. Qwen2.5-7B + 0.5B draft) *slower* than
-  baseline, not faster.
-- Real ≥2× speedup needs either (a) multi-position decode in the model
-  executor — producing N+1 logits from one forward — or (b) running the
-  target on CUDA fp16 where each decode is cheap enough to tolerate the
-  sequential repeat. Both are tracked in the roadmap.
-
-Use it today for: correctness experiments, validating draft-model
-acceptance rates, or any scenario where you *want* per-token equivalence
-to target-alone output. Don't use it for throughput on Metal fp32.
-
 ## Roadmap
 
-- **Multi-position decode** — one target forward → N+1 logits; unlocks
-  real speculative-decoding throughput (see [Speculative decoding
-  limitations](#speculative-decoding--known-limitations))
 - **More model architectures** — Phi, DeepSeek, Gemma
 - **Qwen2 CUDA runner** — same pattern as LLaMA
 - **FP8 / Marlin INT4 on more architectures**

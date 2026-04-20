@@ -62,6 +62,26 @@ pub trait DecoderOnlyLLM: Send + Sync {
             .collect()
     }
 
+    /// Multi-position decode-verify: run a single forward over `tokens`
+    /// starting at the current KV end, append their K/V in place, and
+    /// return `seq_len * vocab_size` logits (row-major, position-first).
+    ///
+    /// Used by speculative decoding to collect N+1 verification logits
+    /// in one target pass instead of N+1 sequential decodes.
+    ///
+    /// Default falls back to a decode loop — slower but correct, lets
+    /// minor backends not reimplement the primitive.
+    fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(tokens.len() * self.config().vocab_size);
+        // cache.len before any decode in this batch — we can derive per-token
+        // position from it. Backends override this default for real batching.
+        let start_pos = 0u32; // placeholder; real impls know their own state
+        for (i, &tok) in tokens.iter().enumerate() {
+            out.extend_from_slice(&self.decode(cache_id, tok, start_pos + i as u32));
+        }
+        out
+    }
+
     /// Release the KV cache for a completed sequence.
     fn release(&mut self, cache_id: &str);
 

@@ -760,6 +760,81 @@ impl<B: Backend> LlamaFamilyModel<B> {
         B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
     }
 
+    /// Multi-position decode-verify: run one forward pass over `tokens`
+    /// starting at the cache's current end position, write their K/V
+    /// into the KV cache, and return logits for ALL `tokens.len()`
+    /// positions as a flat `Vec<f32>` of length `seq_len * vocab_size`.
+    ///
+    /// Used by speculative decoding: target receives
+    /// `[last_token, draft_0, ..., draft_{N-1}]` (N+1 inputs) and produces
+    /// N+1 logit rows in a single forward instead of N+1 sequential
+    /// decode() calls. Positions are implicit — the model looks up
+    /// `pos_offset = cache.len` the same way prefill_internal does, so
+    /// chunked prefill semantics carry over for free.
+    pub fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        let seq_len = tokens.len();
+        assert!(seq_len > 0, "forward_verify called with empty tokens");
+        self.ensure_scratch(seq_len);
+        self.ensure_kv(cache_id);
+
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+
+        let pos_offset = self
+            .kv_caches
+            .get(cache_id)
+            .and_then(|layers| layers.first())
+            .map(|c| c.len)
+            .unwrap_or(0);
+
+        let mut ctx = B::new_context();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("forward_verify called on backbone-only model (no embed)");
+        B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
+
+        for li in 0..self.cfg.num_layers {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+        }
+
+        // RMSNorm on ALL seq_len positions (prefill_internal only norms
+        // the last one; verify needs the full grid).
+        B::rms_norm(
+            &mut ctx,
+            &residual,
+            &self.final_norm_w,
+            self.cfg.rms_norm_eps,
+            &mut self.scratch.norm_out,
+            seq_len,
+            h,
+        );
+
+        // LM head applied to all positions → `seq_len * vocab` logits.
+        // Reuses the existing `batch_logits` scratch (sized max_tokens *
+        // vocab) so no extra allocation.
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .expect("forward_verify called on backbone-only model (no lm_head)");
+        lm_head.forward(
+            &mut ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.batch_logits,
+            seq_len,
+        );
+
+        B::sync(&mut ctx);
+        self.scratch.residual = Some(residual);
+        B::to_vec(&self.scratch.batch_logits, seq_len * vocab)
+    }
+
     /// Prefill: process `tokens` prompt tokens in a single batch, return
     /// `[vocab_size]` logits for the last position.
     ///
@@ -1499,6 +1574,11 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
 
     fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
         self.decode_batch_internal(batch)
+    }
+
+    fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        // Delegate to the inherent implementation on LlamaFamilyModel.
+        LlamaFamilyModel::<B>::forward_verify(self, cache_id, tokens)
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
