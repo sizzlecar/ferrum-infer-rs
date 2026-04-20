@@ -13,5 +13,8 @@ pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
 
+#[cfg(feature = "metal")]
+pub mod metal_f16;
+
 #[cfg(feature = "cuda")]
 pub mod cuda;
