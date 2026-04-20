@@ -60,20 +60,21 @@ impl ModelExecutor for LlmExecutor {
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
-        debug!("LlmExecutor prefill: {} tokens", tokens.len());
 
         // Reuse an existing cache_id when the caller supplies a KV handle
         // (chunked prefill) — fresh id only on the very first call for a
         // request. Without this, every chunk would create a new KV cache
         // at position 0 and subsequent chunks wouldn't see prior tokens.
-        let cache_id = input
+        let supplied_handle_id = input
             .kv_cache
             .as_ref()
             .and_then(|h| {
                 h.as_any()
                     .downcast_ref::<GenericKvCacheHandle>()
                     .map(|g| g.request_cache_id().to_string())
-            })
+            });
+        let cache_id = supplied_handle_id
+            .clone()
             .unwrap_or_else(|| self.gen_cache_id());
 
         let logits = {
@@ -91,14 +92,28 @@ impl ModelExecutor for LlmExecutor {
         let logits_ref = common::wrap_tensor(logits_tensor);
 
         let cfg = self.model.lock().config().clone();
-        // num_kv_heads for KV cache sizing; GenericKvCacheHandle's third arg
-        // is head count which here is the KV-head count.
+        // Sequence-length tracking across chunks: if the caller supplied a
+        // GenericKvCacheHandle (chunked prefill continuation), add this
+        // chunk's tokens to the prior length. Otherwise this is a fresh
+        // prefill so seq_len == this call's token count. Without this the
+        // handle would claim only the last chunk's length, misleading
+        // decode() into rewriting the KV at an earlier position.
+        let seq_len = input
+            .kv_cache
+            .as_ref()
+            .and_then(|h| h.as_any().downcast_ref::<GenericKvCacheHandle>())
+            .map(|g| {
+                use ferrum_interfaces::KvCacheHandle;
+                g.block_table().sequence_length + tokens.len()
+            })
+            .unwrap_or(tokens.len());
+
         let kv_handle = Arc::new(GenericKvCacheHandle::new(
             cfg.num_layers,
             cfg.num_kv_heads,
             cfg.head_dim,
             candle_core::Device::Cpu,
-            tokens.len(),
+            seq_len,
             cache_id,
         ));
 

@@ -248,3 +248,52 @@ fn qwen3model_cpu_vs_metal() {
     }
     eprintln!("✅ LlamaFamilyModel Cpu↔Metal parity pass");
 }
+
+/// Chunked vs non-chunked prefill parity on Metal. If the incremental
+/// prefill path (`pos_offset` + cache_id reuse) is correct, splitting a
+/// prompt across two `prefill()` calls must yield bit-identical logits
+/// to one-shot prefill over the same prompt.
+#[test]
+#[ignore]
+fn qwen3model_chunked_vs_oneshot_prefill_metal() {
+    let mp = qwen3_path().expect("Qwen3-0.6B not in HF cache");
+    let def = load_model_def(&mp);
+    let qcfg = def_to_qwen3_cfg(&def);
+
+    let loader = ferrum_models::SafeTensorsLoader::new(mp.to_str().unwrap());
+    let vb = loader
+        .load_varbuilder(&candle_core::Device::Cpu, candle_core::DType::F32)
+        .unwrap();
+
+    let mtl_loader = CandleShimLoader::<MetalBackend>::new(&vb);
+    let mut model = LlamaFamilyModel::<MetalBackend>::new(qcfg, &mtl_loader).unwrap();
+
+    // Exact token stream from the failing server case ("Say hello in five
+    // words only." through Qwen3 chat template). Split 8 + 1.
+    let prompt: Vec<u32> = vec![872, 25, 24917, 23811, 304, 4236, 4244, 1172, 13];
+    let split = 8;
+
+    let baseline = model.prefill("oneshot", &prompt);
+
+    // Fresh cache_id for chunked run to ensure no leakage. First chunk's
+    // logits are discarded — we care about the final position only.
+    let _ = model.prefill("chunked", &prompt[..split]);
+    let chunked_final = model.prefill("chunked", &prompt[split..]);
+
+    let cos = cosine(&baseline, &chunked_final);
+    let mad = max_abs_diff(&baseline, &chunked_final);
+    let (ba, ca) = (argmax(&baseline), argmax(&chunked_final));
+    eprintln!(
+        "one-shot argmax={ba} ({:.4})  chunked argmax={ca} ({:.4})  cos={cos:.6}  max_diff={mad:.4}",
+        baseline[ba], chunked_final[ca]
+    );
+    assert_eq!(
+        ba, ca,
+        "chunked prefill argmax must match one-shot baseline"
+    );
+    assert!(
+        cos > 0.9999,
+        "chunked prefill logits diverge from baseline: cos={cos}"
+    );
+    eprintln!("✅ chunked prefill parity pass");
+}
