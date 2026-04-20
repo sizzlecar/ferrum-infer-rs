@@ -1028,13 +1028,31 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     Device::Metal => {
                         #[cfg(feature = "metal")]
                         {
-                            info!("  Backend: Metal");
-                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
-                                ferrum_kernels::backend::metal::MetalBackend,
-                            >::open(&model_path)?;
-                            Box::new(ferrum_models::models::LlamaFamilyModel::<
-                                ferrum_kernels::backend::metal::MetalBackend,
-                            >::new(qcfg, &weight_loader)?)
+                            // FERRUM_METAL_DTYPE=f16 switches to the fp16-weight
+                            // backend. Halves weight RAM; recommended for 4B+
+                            // models on 16 GB Macs where the f32 path swaps.
+                            let use_f16 = std::env::var("FERRUM_METAL_DTYPE")
+                                .map(|v| v.eq_ignore_ascii_case("f16"))
+                                .unwrap_or(false);
+                            if use_f16 {
+                                info!("  Backend: Metal (fp16 weights)");
+                                let weight_loader =
+                                    ferrum_quantization::NativeSafetensorsLoader::<
+                                        ferrum_kernels::backend::metal_f16::MetalF16Backend,
+                                    >::open(&model_path)?;
+                                Box::new(ferrum_models::models::LlamaFamilyModel::<
+                                    ferrum_kernels::backend::metal_f16::MetalF16Backend,
+                                >::new(qcfg, &weight_loader)?)
+                            } else {
+                                info!("  Backend: Metal (f32)");
+                                let weight_loader =
+                                    ferrum_quantization::NativeSafetensorsLoader::<
+                                        ferrum_kernels::backend::metal::MetalBackend,
+                                    >::open(&model_path)?;
+                                Box::new(ferrum_models::models::LlamaFamilyModel::<
+                                    ferrum_kernels::backend::metal::MetalBackend,
+                                >::new(qcfg, &weight_loader)?)
+                            }
                         }
                         #[cfg(not(feature = "metal"))]
                         {
