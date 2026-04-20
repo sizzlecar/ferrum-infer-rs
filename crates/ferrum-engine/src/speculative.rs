@@ -268,6 +268,12 @@ pub struct SpeculativeStepOutcome {
     /// back to `rejected_at` to stay token-aligned with the draft model).
     pub rejected: bool,
     pub rejected_at: usize,
+    /// Draft KV is `N` writes; target KV is `N+1` writes. In the full-accept
+    /// case the draft is exactly one position behind target. Caller
+    /// catches up by feeding this token (the final draft input to target,
+    /// i.e. `draft_tokens[N-1]`) into the draft executor once. `None` on
+    /// rejection (caller handles rollback separately).
+    pub draft_catchup_token: Option<TokenId>,
 }
 
 impl<'a> SpeculativeRunner<'a> {
@@ -330,12 +336,20 @@ impl<'a> SpeculativeRunner<'a> {
         };
         let outcome = verify_speculation(spec, rng)?;
         let rejected = outcome.rejected_at < n;
+        // For full-accept, the token needed to realign draft with target is
+        // the last draft input consumed by target: draft_tokens[N-1].
+        let draft_catchup_token = if !rejected {
+            draft_tokens.last().copied()
+        } else {
+            None
+        };
         Ok(SpeculativeStepOutcome {
             tokens: outcome.tokens,
             draft_kv: draft_kv_cur,
             target_kv: target_kv_cur,
             rejected,
             rejected_at: outcome.rejected_at,
+            draft_catchup_token,
         })
     }
 }

@@ -837,9 +837,26 @@ impl EngineInner {
     async fn run_decode_step_speculative(&self, request_id: &RequestId) -> Result<()> {
         use ferrum_interfaces::model_executor::PrefillInput;
 
-        let (draft_exec, cfg) = match (&self.draft_executor, &self.spec_config) {
+        let (draft_exec, cfg_base) = match (&self.draft_executor, &self.spec_config) {
             (Some(d), Some(c)) => (d.clone(), c.clone()),
             _ => unreachable!("speculative gate checked in run_decode_step"),
+        };
+
+        // Use the caller's sampling temperature for accept/reject, not the
+        // engine-default from spec_config. Otherwise a greedy request
+        // (temperature=0) runs through a T=1 verifier and ULP-level fp32
+        // noise between draft/target causes stochastic rejections → KV
+        // misalignment → output drift.
+        let per_request_temperature = {
+            let sequences = self.sequences.read();
+            sequences
+                .get(request_id)
+                .map(|s| s.sampling_params.temperature)
+                .unwrap_or(cfg_base.temperature)
+        };
+        let cfg = crate::speculative::SpeculativeDecodingConfig {
+            num_speculative_tokens: cfg_base.num_speculative_tokens,
+            temperature: per_request_temperature,
         };
 
         // ── 1. Ensure draft KV is prefilled once with the full prompt ────
@@ -852,21 +869,18 @@ impl EngineInner {
         let draft_kv = if let Some(kv) = draft_kv_ready {
             kv
         } else {
-            // First spec iteration — prefill the draft on the prompt.
-            let (prompt_u32s, last_gen_token) = {
+            // First spec iteration — prefill the draft on the prompt only.
+            // The already-sampled `last_token` is passed into the runner in
+            // step() below (as `last_token`) — the runner's first draft
+            // decode consumes it, writing KV at position prompt_len exactly
+            // as target's decode path does. DO NOT pre-consume it here.
+            let prompt_u32s = {
                 let sequences = self.sequences.read();
                 let seq = sequences
                     .get(request_id)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                let full_prompt: Vec<u32> = seq.input_tokens.iter().map(|t| t.get()).collect();
-                let last = seq
-                    .generated_tokens
-                    .last()
-                    .copied()
-                    .unwrap_or(TokenId::new(0));
-                (full_prompt, last)
+                seq.input_tokens.iter().map(|t| t.get()).collect::<Vec<_>>()
             };
-            // Allocate a fresh KV handle for the draft from the same pool.
             let model_info = draft_exec.info();
             let alloc_request = AllocationRequest {
                 request_id: request_id.clone(),
@@ -883,15 +897,7 @@ impl EngineInner {
             let prompt_tensor = self.tokens_to_tensor(&prompt_u32s)?;
             let pfx = PrefillInput::new(prompt_tensor).with_kv_cache(draft_kv_handle);
             let pfx_out = draft_exec.prefill(&pfx).await?;
-            // Feed the already-sampled target token into the draft so it
-            // starts aligned with the target's next-token position.
-            let feed_tensor = self.tokens_to_tensor(&[last_gen_token.get()])?;
-            let feed_in = ferrum_interfaces::model_executor::DecodeInput::new(
-                feed_tensor,
-                pfx_out.kv_cache.clone(),
-            );
-            let feed_out = draft_exec.decode(&feed_in).await?;
-            let kv = feed_out.kv_cache.clone();
+            let kv = pfx_out.kv_cache.clone();
             {
                 let mut sequences = self.sequences.write();
                 if let Some(s) = sequences.get_mut(request_id) {
@@ -949,6 +955,34 @@ impl EngineInner {
             .step(last_token, draft_kv.clone(), target_kv, &mut rng)
             .await?;
 
+        // KV-cache catch-up for draft. Runner does N draft decodes, N+1
+        // target decodes. After a full-accept step, target's KV has N+1
+        // new positions filled but draft only N — draft lags target by
+        // one (the bonus token never made it into draft's KV). Feed it in
+        // now so the next iter's draft decodes land at the right offsets.
+        //
+        // On partial rejection, draft over-consumed (N decodes vs k+1 < N+1
+        // emitted). Proper handling needs KV truncation to `kv_len_entry
+        // + k + 1` on BOTH draft and target — a model-level method we
+        // don't yet expose. For the degenerate `draft == target` case
+        // (always full-accept) that path isn't exercised; heterogeneous
+        // draft/target is flagged here with a one-time warning.
+        let draft_kv_aligned = if let Some(catchup) = outcome.draft_catchup_token {
+            let tensor = self.tokens_to_tensor(&[catchup.get()])?;
+            let input = ferrum_interfaces::model_executor::DecodeInput::new(
+                tensor,
+                outcome.draft_kv.clone(),
+            );
+            let feed_out = draft_exec.decode(&input).await?;
+            feed_out.kv_cache.clone()
+        } else {
+            tracing::warn!(
+                "speculative decode: draft/target partial reject without KV \
+                 rollback — output may drift; KV truncation support TODO"
+            );
+            outcome.draft_kv.clone()
+        };
+
         // ── 3. Install accepted tokens; check stop after each ───────────
         let mut last_emitted = last_token;
         for &tok in &outcome.tokens {
@@ -994,7 +1028,7 @@ impl EngineInner {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(request_id) {
                 seq.kv_cache = Some(outcome.target_kv);
-                seq.draft_kv_cache = Some(outcome.draft_kv);
+                seq.draft_kv_cache = Some(draft_kv_aligned);
             }
         }
         let _ = last_emitted;
