@@ -1001,9 +1001,15 @@ impl EngineInner {
             let feed_out = draft_exec.decode(&input).await?;
             (feed_out.kv_cache.clone(), outcome.target_kv.clone())
         } else {
-            // Partial reject path. outcome.rejected_at ∈ [0, N-1]. Accepted
-            // draft count = rejected_at. Keep entry_seq + rejected_at + 1
-            // positions (prior last_token + k accepted drafts).
+            // Partial reject path. k = rejected_at accepted drafts + 1
+            // replacement → emitted.len() = k+1. Target wrote positions
+            // [entry..entry+N], draft wrote [entry..entry+N-1] during the
+            // runner step; only the first k writes are valid. Truncate
+            // BOTH caches back to entry+k+1 (keep last_token + k accepted
+            // drafts). Do NOT feed replacement here — the next iter's
+            // runner will consume replacement as its new last_token and
+            // write it at the correct position automatically, mirroring
+            // how target self-corrects on the bonus token in full-accept.
             let k = outcome.rejected_at;
             let kept_target = entry_target_seq + k + 1;
             let kept_draft = entry_draft_seq + k + 1;
@@ -1015,25 +1021,9 @@ impl EngineInner {
                 .truncate_kv(&outcome.target_kv, kept_target)
                 .await?;
 
-            // Rebuild handles with corrected seq_len so the next decode()
-            // call writes at the right position.
             let truncated_draft = self.make_kv_handle_with_seq(&outcome.draft_kv, kept_draft);
             let truncated_target = self.make_kv_handle_with_seq(&outcome.target_kv, kept_target);
-
-            // Feed the replacement into both to fill position `kept_*`.
-            let replacement = *outcome.tokens.last().expect("rejection emits ≥1 token");
-            let tensor = self.tokens_to_tensor(&[replacement.get()])?;
-            let draft_in = ferrum_interfaces::model_executor::DecodeInput::new(
-                tensor.clone(),
-                truncated_draft,
-            );
-            let target_in = ferrum_interfaces::model_executor::DecodeInput::new(
-                tensor,
-                truncated_target,
-            );
-            let draft_out = draft_exec.decode(&draft_in).await?;
-            let target_out = self.model_executor.decode(&target_in).await?;
-            (draft_out.kv_cache.clone(), target_out.kv_cache.clone())
+            (truncated_draft, truncated_target)
         };
 
         // ── 3. Install accepted tokens; check stop after each ───────────
