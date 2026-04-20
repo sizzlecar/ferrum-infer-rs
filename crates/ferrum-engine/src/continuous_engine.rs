@@ -253,6 +253,25 @@ impl EngineInner {
             .from_slice(&f32_data, &[1, len], DataType::FP32, Device::CPU)
     }
 
+    /// Rebuild a KvCacheHandle with a corrected sequence_length. Used by
+    /// speculative-decode rollback — covers the `GenericKvCacheHandle`
+    /// that our LLM executors return; for any other handle type we just
+    /// return the original clone (stub / mock executors don't care).
+    fn make_kv_handle_with_seq(
+        &self,
+        h: &std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle>,
+        new_seq: usize,
+    ) -> std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle> {
+        if let Some(g) = h
+            .as_any()
+            .downcast_ref::<ferrum_models::executor::common::GenericKvCacheHandle>()
+        {
+            std::sync::Arc::new(g.with_sequence_length(new_seq))
+        } else {
+            h.clone()
+        }
+    }
+
     // ── iteration loop ─────────────────────────────────────────────────
 
     /// Drive iterations until the given request is removed from `sequences`.
@@ -951,36 +970,70 @@ impl EngineInner {
             seed
         });
 
+        // Capture entry seq_len so we can compute the correct rollback
+        // length on partial rejection below.
+        let entry_target_seq = target_kv.block_table().sequence_length;
+        let entry_draft_seq = draft_kv.block_table().sequence_length;
+
         let outcome = runner
             .step(last_token, draft_kv.clone(), target_kv, &mut rng)
             .await?;
 
-        // KV-cache catch-up for draft. Runner does N draft decodes, N+1
-        // target decodes. After a full-accept step, target's KV has N+1
-        // new positions filled but draft only N — draft lags target by
-        // one (the bonus token never made it into draft's KV). Feed it in
-        // now so the next iter's draft decodes land at the right offsets.
+        // KV-cache reconciliation post-step.
         //
-        // On partial rejection, draft over-consumed (N decodes vs k+1 < N+1
-        // emitted). Proper handling needs KV truncation to `kv_len_entry
-        // + k + 1` on BOTH draft and target — a model-level method we
-        // don't yet expose. For the degenerate `draft == target` case
-        // (always full-accept) that path isn't exercised; heterogeneous
-        // draft/target is flagged here with a one-time warning.
-        let draft_kv_aligned = if let Some(catchup) = outcome.draft_catchup_token {
+        //   full accept: target wrote N+1 new positions, draft only N.
+        //     Draft lags by one. Feed `draft_catchup_token`
+        //     (= draft_tokens[N-1]) into draft so it catches up.
+        //
+        //   partial reject at k < N: target wrote N+1 positions including
+        //     `N-k` that were conditioned on rejected drafts. Truncate
+        //     BOTH to entry_seq + k + 1 (keep last_token + k accepted
+        //     drafts), then feed the replacement token so both advance
+        //     to entry_seq + k + 2 in lockstep.
+        let (draft_kv_aligned, target_kv_aligned) = if let Some(catchup) =
+            outcome.draft_catchup_token
+        {
             let tensor = self.tokens_to_tensor(&[catchup.get()])?;
             let input = ferrum_interfaces::model_executor::DecodeInput::new(
                 tensor,
                 outcome.draft_kv.clone(),
             );
             let feed_out = draft_exec.decode(&input).await?;
-            feed_out.kv_cache.clone()
+            (feed_out.kv_cache.clone(), outcome.target_kv.clone())
         } else {
-            tracing::warn!(
-                "speculative decode: draft/target partial reject without KV \
-                 rollback — output may drift; KV truncation support TODO"
+            // Partial reject path. outcome.rejected_at ∈ [0, N-1]. Accepted
+            // draft count = rejected_at. Keep entry_seq + rejected_at + 1
+            // positions (prior last_token + k accepted drafts).
+            let k = outcome.rejected_at;
+            let kept_target = entry_target_seq + k + 1;
+            let kept_draft = entry_draft_seq + k + 1;
+
+            draft_exec
+                .truncate_kv(&outcome.draft_kv, kept_draft)
+                .await?;
+            self.model_executor
+                .truncate_kv(&outcome.target_kv, kept_target)
+                .await?;
+
+            // Rebuild handles with corrected seq_len so the next decode()
+            // call writes at the right position.
+            let truncated_draft = self.make_kv_handle_with_seq(&outcome.draft_kv, kept_draft);
+            let truncated_target = self.make_kv_handle_with_seq(&outcome.target_kv, kept_target);
+
+            // Feed the replacement into both to fill position `kept_*`.
+            let replacement = *outcome.tokens.last().expect("rejection emits ≥1 token");
+            let tensor = self.tokens_to_tensor(&[replacement.get()])?;
+            let draft_in = ferrum_interfaces::model_executor::DecodeInput::new(
+                tensor.clone(),
+                truncated_draft,
             );
-            outcome.draft_kv.clone()
+            let target_in = ferrum_interfaces::model_executor::DecodeInput::new(
+                tensor,
+                truncated_target,
+            );
+            let draft_out = draft_exec.decode(&draft_in).await?;
+            let target_out = self.model_executor.decode(&target_in).await?;
+            (draft_out.kv_cache.clone(), target_out.kv_cache.clone())
         };
 
         // ── 3. Install accepted tokens; check stop after each ───────────
@@ -1027,7 +1080,7 @@ impl EngineInner {
         {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(request_id) {
-                seq.kv_cache = Some(outcome.target_kv);
+                seq.kv_cache = Some(target_kv_aligned);
                 seq.draft_kv_cache = Some(draft_kv_aligned);
             }
         }

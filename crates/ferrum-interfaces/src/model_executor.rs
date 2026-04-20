@@ -200,6 +200,19 @@ pub trait ModelExecutor: Send + Sync {
         ))
     }
 
+    /// Roll the KV cache for this executor's sequence back to `new_len`.
+    /// Used by speculative decoding on partial rejection so the next
+    /// iteration sees a KV prefix that matches the accepted token stream.
+    /// Default: Ok(()) — executors that don't cache per-sequence state
+    /// (stub, mock) are inherently tolerant; real LLM executors override.
+    async fn truncate_kv(
+        &self,
+        _kv_cache: &std::sync::Arc<dyn crate::KvCacheHandle>,
+        _new_len: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Get executor capabilities
     fn capabilities(&self) -> ExecutorCapabilities;
 

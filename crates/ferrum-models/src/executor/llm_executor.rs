@@ -50,6 +50,14 @@ impl LlmExecutor {
             self.next_cache_id.fetch_add(1, Ordering::Relaxed)
         )
     }
+
+    /// Roll the KV cache for `cache_id` back to `new_len` positions.
+    /// Used by speculative decoding on partial rejection. The caller must
+    /// supply a `GenericKvCacheHandle` whose seq_len is also updated.
+    pub fn truncate_kv_for_cache_id(&self, cache_id: &str, new_len: usize) {
+        let mut model = self.model.lock();
+        model.truncate_kv(cache_id, new_len);
+    }
 }
 
 #[async_trait::async_trait]
@@ -118,6 +126,18 @@ impl ModelExecutor for LlmExecutor {
         ));
 
         Ok(PrefillOutput::new(logits_ref, kv_handle))
+    }
+
+    async fn truncate_kv(
+        &self,
+        kv_cache: &Arc<dyn ferrum_interfaces::KvCacheHandle>,
+        new_len: usize,
+    ) -> Result<()> {
+        if let Some(g) = kv_cache.as_any().downcast_ref::<GenericKvCacheHandle>() {
+            let cache_id = g.request_cache_id();
+            self.model.lock().truncate_kv(cache_id, new_len);
+        }
+        Ok(())
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {

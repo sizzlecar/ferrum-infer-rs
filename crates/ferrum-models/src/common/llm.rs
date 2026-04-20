@@ -65,6 +65,17 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Release the KV cache for a completed sequence.
     fn release(&mut self, cache_id: &str);
 
+    /// Truncate the KV cache for `cache_id` back to `new_len` positions.
+    /// Used by speculative decoding on rejection — roll draft/target KV
+    /// back to the last accepted position before the next iteration.
+    ///
+    /// Default implementation is a panic so backends that don't support
+    /// rollback fail loudly; implementations override this.
+    fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
+        let _ = (cache_id, new_len);
+        panic!("truncate_kv not implemented for this DecoderOnlyLLM");
+    }
+
     /// Drop all cached state (useful for tests and hot-reload).
     fn reset(&mut self) {}
 }

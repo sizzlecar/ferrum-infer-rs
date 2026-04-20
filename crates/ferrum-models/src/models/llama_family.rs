@@ -1501,6 +1501,21 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         self.decode_batch_internal(batch)
     }
 
+    fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
+        if let Some(caches) = self.kv_caches.get_mut(cache_id) {
+            for c in caches.iter_mut() {
+                if new_len < c.len {
+                    c.len = new_len;
+                }
+            }
+        }
+        // Captured graph expects a specific cache layout; roll it back too.
+        let mut ctx = B::new_context();
+        B::reset_graph(&mut ctx);
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
+    }
+
     fn release(&mut self, cache_id: &str) {
         // Sync + drop graph BEFORE touching cache buffers. The graph was
         // actively running replays up to this point; destroying the graph
