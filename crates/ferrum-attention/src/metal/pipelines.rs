@@ -19,6 +19,7 @@ impl MetalPipelines {
         let fa_src = include_str!("shaders/flash_attn.metal");
         let ops_src = include_str!("shaders/transformer_ops.metal");
         let gemm_src = include_str!("shaders/gemm_f32.metal");
+        let gemm_f16w_src = include_str!("shaders/gemm_f16w.metal");
         let nr_src = include_str!("shaders/norm_rope.metal");
         let sm_src = include_str!("shaders/softmax.metal");
 
@@ -31,6 +32,9 @@ impl MetalPipelines {
         let gemm_lib = device
             .new_library_with_source(gemm_src, &opts)
             .expect("failed to compile gemm_f32.metal");
+        let gemm_f16w_lib = device
+            .new_library_with_source(gemm_f16w_src, &opts)
+            .expect("failed to compile gemm_f16w.metal");
         let nr_lib = device
             .new_library_with_source(nr_src, &opts)
             .expect("failed to compile norm_rope.metal");
@@ -62,6 +66,10 @@ impl MetalPipelines {
                 ][..],
             ),
             (&gemm_lib, &["gemm_f32_v2"][..]),
+            (
+                &gemm_f16w_lib,
+                &["gemm_f32a_f16w_v2", "gemv_f32a_f16w"][..],
+            ),
             (
                 &nr_lib,
                 &[
@@ -442,6 +450,82 @@ impl MetalPipelines {
         enc.set_threadgroup_memory_length(0, 12288);
         let grid = MTLSize::new(((n + 31) / 32) as u64, ((m + 63) / 64) as u64, 1);
         let tg = MTLSize::new(128, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// GEMM with f16 weights: C[M,N] f32 = A[M,K] f32 @ B[N,K]^T f16.
+    /// Same tile shape as `gemm_v2`; B is read as half and upcast on load.
+    pub fn gemm_v2_f16w(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        a: &Buffer,
+        b_f16: &Buffer,
+        c: &Buffer,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            m: i32,
+            n: i32,
+            k: i32,
+        }
+        let params = P {
+            m: m as i32,
+            n: n as i32,
+            k: k as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void,
+            12,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("gemm_f32a_f16w_v2"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b_f16), 0);
+        enc.set_buffer(2, Some(c), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_threadgroup_memory_length(0, 12288);
+        let grid = MTLSize::new(((n + 31) / 32) as u64, ((m + 63) / 64) as u64, 1);
+        let tg = MTLSize::new(128, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// GEMV with f16 weights: C[1,N] f32 = A[1,K] f32 @ B[N,K]^T f16.
+    /// Used for decode (m=1) against the large weight matrices.
+    pub fn gemv_enc_f16w(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        a: &Buffer,
+        b_f16: &Buffer,
+        c: &Buffer,
+        n: usize,
+        k: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            m: i32,
+            n: i32,
+            k: i32,
+        }
+        let params = P {
+            m: 1,
+            n: n as i32,
+            k: k as i32,
+        };
+        let params_buf = self.device.new_buffer_with_data(
+            &params as *const _ as *const c_void,
+            12,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(self.pipeline("gemv_f32a_f16w"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b_f16), 0);
+        enc.set_buffer(2, Some(c), 0);
+        enc.set_buffer(3, Some(&params_buf), 0);
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
 

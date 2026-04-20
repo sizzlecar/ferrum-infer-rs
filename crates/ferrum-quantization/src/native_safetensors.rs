@@ -18,11 +18,23 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, SrcDtype};
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
+
+/// Map a safetensors Dtype to ferrum's SrcDtype.
+fn map_src_dtype(dtype: Dtype) -> Result<SrcDtype> {
+    match dtype {
+        Dtype::F32 => Ok(SrcDtype::F32),
+        Dtype::F16 => Ok(SrcDtype::F16),
+        Dtype::BF16 => Ok(SrcDtype::BF16),
+        other => Err(FerrumError::model(format!(
+            "dtype {other:?} not supported; Dense path expects F32/F16/BF16"
+        ))),
+    }
+}
 
 use crate::config::{QuantConfig, QuantMethod};
 use crate::dense::DenseLinear;
@@ -141,6 +153,57 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         Ok((data, shape))
     }
 
+    /// Read the raw on-disk byte slice plus dtype and shape. Zero-copy into
+    /// the mmap — used to hand weights straight to `B::from_weight_bytes` so
+    /// a fp16-preferring backend can skip the transient f32 Vec.
+    fn read_bytes_typed(&self, name: &str) -> Result<(&[u8], SrcDtype, Vec<usize>)> {
+        let shard_idx = *self
+            .index
+            .get(name)
+            .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in index")))?;
+        let view = self.shards[shard_idx].get(name)?;
+        let shape = view.shape().to_vec();
+        let dtype = map_src_dtype(view.dtype())?;
+        Ok((view.data(), dtype, shape))
+    }
+
+    /// Concatenate several tensors along dim 0 at the byte level. All parts
+    /// must share the same dtype and trailing-dim width. Returns the fused
+    /// raw bytes + common dtype + `(total_rows, cols)` shape.
+    fn cat_rows_bytes(&self, names: &[String]) -> Result<(Vec<u8>, SrcDtype, (usize, usize))> {
+        let mut total_rows = 0usize;
+        let mut cols = 0usize;
+        let mut dtype: Option<SrcDtype> = None;
+        let mut bytes: Vec<u8> = Vec::new();
+        for n in names {
+            let (raw, d, shape) = self.read_bytes_typed(n)?;
+            if shape.len() != 2 {
+                return Err(FerrumError::model(format!(
+                    "cat_rows_bytes: '{n}' is {shape:?}, need 2D"
+                )));
+            }
+            match dtype {
+                Some(prev) if prev != d => {
+                    return Err(FerrumError::model(format!(
+                        "cat_rows_bytes: dtype mismatch on '{n}'"
+                    )))
+                }
+                _ => dtype = Some(d),
+            }
+            if cols == 0 {
+                cols = shape[1];
+            } else if cols != shape[1] {
+                return Err(FerrumError::model(format!(
+                    "cat_rows_bytes: col mismatch {cols} vs {}",
+                    shape[1]
+                )));
+            }
+            total_rows += shape[0];
+            bytes.extend_from_slice(raw);
+        }
+        Ok((bytes, dtype.expect("at least one part"), (total_rows, cols)))
+    }
+
     /// Read a tensor as i32 (for GPTQ qweight / qzeros / g_idx).
     fn read_i32(&self, name: &str) -> Result<(Vec<i32>, Vec<usize>)> {
         let shard_idx = *self
@@ -206,22 +269,26 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
             }
         }
 
-        // Direct fused `<name>.weight` next.
+        // Direct fused `<name>.weight` next. Load straight from raw bytes
+        // so fp16-preferring backends can skip the f32 Vec intermediate.
         let direct = format!("{name}.weight");
         if self.has(&direct) {
-            let (data, shape) = self.read_f32(&direct)?;
+            let (raw, src_dtype, shape) = self.read_bytes_typed(&direct)?;
             if shape.len() != 2 {
                 return Err(FerrumError::model(format!(
                     "linear '{name}': expected 2D weight, got {shape:?}"
                 )));
             }
-            return Ok(Box::new(DenseLinear::<B>::from_rows(
-                &data, shape[0], shape[1],
+            let weight = B::from_weight_bytes(raw, src_dtype);
+            return Ok(Box::new(DenseLinear::<B>::from_buffer(
+                weight, shape[0], shape[1],
             )));
         }
 
         // Llama-family fusion shims: synthesise qkv_proj / gate_up_proj from
-        // split q_proj+k_proj+v_proj / gate_proj+up_proj if present.
+        // split q_proj+k_proj+v_proj / gate_proj+up_proj if present. The cat
+        // happens at the byte level so fused-weight memory is the same size
+        // as the per-part weights — no expansion to f32.
         if name.ends_with("qkv_proj") {
             let prefix = &name[..name.len() - "qkv_proj".len()];
             let parts = [
@@ -230,8 +297,9 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
                 format!("{prefix}v_proj.weight"),
             ];
             if parts.iter().all(|p| self.has(p)) {
-                let (rows, cols, data) = self.cat_rows(&parts)?;
-                return Ok(Box::new(DenseLinear::<B>::from_rows(&data, rows, cols)));
+                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                let weight = B::from_weight_bytes(&bytes, dtype);
+                return Ok(Box::new(DenseLinear::<B>::from_buffer(weight, rows, cols)));
             }
         }
         if name.ends_with("gate_up_proj") {
@@ -241,8 +309,9 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
                 format!("{prefix}up_proj.weight"),
             ];
             if parts.iter().all(|p| self.has(p)) {
-                let (rows, cols, data) = self.cat_rows(&parts)?;
-                return Ok(Box::new(DenseLinear::<B>::from_rows(&data, rows, cols)));
+                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                let weight = B::from_weight_bytes(&bytes, dtype);
+                return Ok(Box::new(DenseLinear::<B>::from_buffer(weight, rows, cols)));
             }
         }
 
