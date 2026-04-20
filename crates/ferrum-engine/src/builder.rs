@@ -393,7 +393,42 @@ impl EngineBuilder {
                     config.backend.device.clone(),
                 ));
 
-            let engine = crate::ContinuousBatchEngine::new(
+            // Opt-in speculative decoding: set FERRUM_SPEC_DRAFT=<model_path>
+            // (absolute path to a HF snapshot dir) to load a second smaller
+            // model as the draft. The draft must use the same tokenizer +
+            // vocab as the target (same family e.g. Qwen3).
+            let (draft_executor, spec_config) = match std::env::var("FERRUM_SPEC_DRAFT").ok() {
+                Some(draft_path) if !draft_path.is_empty() => {
+                    info!("Speculative decoding: loading draft model from {draft_path}");
+                    let n = std::env::var("FERRUM_SPEC_N")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(4);
+                    let mut draft_cfg = component_config.clone();
+                    draft_cfg.component_options.insert(
+                        "model_path".to_string(),
+                        serde_json::Value::String(draft_path.clone()),
+                    );
+                    match registry.create_executor(&executor_name, &draft_cfg).await {
+                        Ok(draft) => (
+                            Some(draft),
+                            Some(crate::speculative::SpeculativeDecodingConfig {
+                                num_speculative_tokens: n,
+                                temperature: 1.0,
+                            }),
+                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Speculative decoding disabled — draft load failed: {e}"
+                            );
+                            (None, None)
+                        }
+                    }
+                }
+                _ => (None, None),
+            };
+
+            let engine = crate::ContinuousBatchEngine::new_with_speculation(
                 config,
                 cb_scheduler,
                 tokenizer,
@@ -401,6 +436,8 @@ impl EngineBuilder {
                 kv_cache,
                 executor,
                 tensor_factory,
+                draft_executor,
+                spec_config,
             );
             Ok(Box::new(engine))
         } else {

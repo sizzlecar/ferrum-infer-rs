@@ -37,6 +37,17 @@ pub struct ServeCommand {
     /// Number of TTS concurrent slots (default: 2)
     #[arg(long, default_value = "2")]
     pub tts_slots: usize,
+
+    /// Speculative decoding: draft model id (same family as target).
+    /// Example: `--spec-draft qwen3:0.6b` when serving `qwen3:4b`.
+    /// The draft model must share the tokenizer + vocabulary.
+    #[arg(long, value_name = "MODEL")]
+    pub spec_draft: Option<String>,
+
+    /// Number of speculative tokens per draft forward pass (default: 4).
+    /// Only active when --spec-draft is set.
+    #[arg(long, default_value = "4")]
+    pub spec_tokens: usize,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -46,6 +57,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         host,
         port,
         tts_slots,
+        spec_draft,
+        spec_tokens,
     } = cmd;
 
     // Print banner
@@ -86,6 +99,33 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         "FERRUM_MODEL_PATH",
         source.local_path.to_string_lossy().to_string(),
     );
+
+    // Speculative decoding draft model: resolve + set FERRUM_SPEC_DRAFT so
+    // the engine builder picks it up. Validates that the draft model is
+    // actually cached before the target load kicks in.
+    if let Some(ref draft_name) = spec_draft {
+        let draft_id = resolve_model_alias(draft_name);
+        println!("{} {}", "Draft model:".dimmed(), draft_id.cyan());
+        let draft_source = find_cached_model(&cache_dir, &draft_id).ok_or_else(|| {
+            eprintln!(
+                "{} Draft model '{}' not in HF cache. Run: ferrum pull {}",
+                "Error:".red().bold(),
+                draft_id,
+                draft_name
+            );
+            ferrum_types::FerrumError::model("Draft model not found")
+        })?;
+        std::env::set_var(
+            "FERRUM_SPEC_DRAFT",
+            draft_source.local_path.to_string_lossy().to_string(),
+        );
+        std::env::set_var("FERRUM_SPEC_N", spec_tokens.to_string());
+        println!(
+            "{} {} tokens / verify pass",
+            "Speculative decoding:".dimmed(),
+            spec_tokens
+        );
+    }
 
     // Select device
     let device = select_device();
