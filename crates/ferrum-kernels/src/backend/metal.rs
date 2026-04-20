@@ -21,26 +21,6 @@ fn st() -> &'static MetalState {
 
 pub struct MetalBackend;
 
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn cblas_sgemm(
-        order: i32,
-        ta: i32,
-        tb: i32,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        a: *const f32,
-        lda: i32,
-        b: *const f32,
-        ldb: i32,
-        beta: f32,
-        c: *mut f32,
-        ldc: i32,
-    );
-}
-
 /// Metal context — accumulates GPU work in a single command buffer across
 /// multiple Backend method calls. `sync()` commits and creates a fresh one on demand.
 ///
@@ -106,35 +86,20 @@ impl Backend for MetalBackend {
         n: usize,
         k: usize,
     ) {
+        let cmd = ctx.cmd();
+        let enc = cmd.new_compute_command_encoder();
         if m == 1 {
-            // GPU GEMV: one threadgroup per output col, K-reduction via simd_sum.
+            // GEMV: one threadgroup per output col, K-reduction via simd_sum.
             // Great occupancy for lm_head (N = vocab = 152k for Qwen3).
-            let cmd = ctx.cmd();
-            let enc = cmd.new_compute_command_encoder();
             st().pipes.gemv_enc(enc, a, b, out, n, k);
-            enc.end_encoding();
         } else {
-            // Multi-row: Accelerate cblas on shared memory. Needs flush first.
-            ctx.flush();
-            unsafe {
-                cblas_sgemm(
-                    101,
-                    111,
-                    112,
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    1.0,
-                    a.contents() as *const f32,
-                    k as i32,
-                    b.contents() as *const f32,
-                    k as i32,
-                    0.0,
-                    out.contents() as *mut f32,
-                    n as i32,
-                );
-            }
+            // GPU GEMM (simdgroup matrix, 64x32 tiles). Replaces earlier
+            // `cblas_sgemm` fallback: on M1 with 4B-param models the CPU
+            // GEMM path competed with decode threads and thrashed shared-
+            // memory bandwidth. gemm_f32_v2 runs fully on the GPU.
+            st().pipes.gemm_v2(enc, a, b, out, m, n, k);
         }
+        enc.end_encoding();
     }
 
     fn rms_norm(
