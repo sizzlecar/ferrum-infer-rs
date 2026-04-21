@@ -306,21 +306,38 @@ impl Backend for MetalF16Backend {
         out: &mut Self::Buffer,
         dim: usize,
     ) {
-        // Embedding table currently stays f32 on this backend; fp16 embedding
-        // lookup would require a separate shader. Falls through to the same
-        // path as MetalBackend.
-        let table = table.expect_f32("embedding_lookup table");
+        // CPU-side gather (ids.len() is small — one per batch item), writing
+        // into the shared-memory output buffer. Must flush any pending GPU
+        // work that might read `out` before this write.
         let out = out.expect_f32_mut("embedding_lookup out");
         ctx.flush();
         unsafe {
-            let t = std::slice::from_raw_parts(
-                table.contents() as *const f32,
-                table.length() as usize / 4,
-            );
             let o = std::slice::from_raw_parts_mut(out.contents() as *mut f32, ids.len() * dim);
-            for (i, &id) in ids.iter().enumerate() {
-                let s = id as usize * dim;
-                o[i * dim..(i + 1) * dim].copy_from_slice(&t[s..s + dim]);
+            match table {
+                F16Buffer::F32 { raw: table, .. } => {
+                    let t = std::slice::from_raw_parts(
+                        table.contents() as *const f32,
+                        table.length() as usize / 4,
+                    );
+                    for (i, &id) in ids.iter().enumerate() {
+                        let s = id as usize * dim;
+                        o[i * dim..(i + 1) * dim].copy_from_slice(&t[s..s + dim]);
+                    }
+                }
+                F16Buffer::F16 { raw: table, .. } => {
+                    // Upcast fp16 → f32 row by row. Loop is cheap: dim ≤
+                    // few thousand, called once per token.
+                    let t = std::slice::from_raw_parts(
+                        table.contents() as *const f16,
+                        table.length() as usize / 2,
+                    );
+                    for (i, &id) in ids.iter().enumerate() {
+                        let s = id as usize * dim;
+                        for j in 0..dim {
+                            o[i * dim + j] = t[s + j].to_f32();
+                        }
+                    }
+                }
             }
         }
     }
@@ -534,22 +551,33 @@ impl Backend for MetalF16Backend {
     }
 
     fn from_weight_bytes(raw: &[u8], src_dtype: SrcDtype) -> Self::Buffer {
+        // Size-threshold dispatch: the tiny tensors (norm weights, QK-norm
+        // weights, biases) only save kilobytes if put in f16 but would force
+        // every shader that reads them to pick a dtype. Keep them f32.
+        //
+        // 1M elements × 4 bytes = 4 MB as f32, 2 MB as f16 — anything
+        // smaller isn't worth the complexity. Embed table and projection
+        // weights are all > 1M elements, so they take the f16 path.
+        let n = raw.len() / src_dtype.bytes_per_elem();
+        if n < F16_MIN_ELEMS {
+            return F16Buffer::F32 {
+                raw: buffer_from_f32(&src_dtype.to_f32_vec(raw)),
+                n,
+            };
+        }
+
         // Materialise the weight directly into a half-precision Metal buffer.
         // This is the whole point of MetalF16Backend — avoids the 2× host
         // RAM spike the default impl incurs.
         match src_dtype {
-            SrcDtype::F16 => {
-                let n = raw.len() / 2;
-                F16Buffer::F16 {
-                    raw: buffer_from_f16_bytes(raw),
-                    n,
-                }
-            }
+            SrcDtype::F16 => F16Buffer::F16 {
+                raw: buffer_from_f16_bytes(raw),
+                n,
+            },
             SrcDtype::BF16 => {
                 // bf16 → f16: go via f32. Loses a tiny bit of magnitude
                 // range (bf16's broader exponent is the only thing we can't
                 // keep) but gains mantissa precision.
-                let n = raw.len() / 2;
                 let mut f16_bytes = vec![0u8; n * 2];
                 for i in 0..n {
                     let v = bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
@@ -564,7 +592,6 @@ impl Backend for MetalF16Backend {
             }
             SrcDtype::F32 => {
                 // Source is f32 → downcast. Halves storage.
-                let n = raw.len() / 4;
                 let mut f16_bytes = vec![0u8; n * 2];
                 for i in 0..n {
                     let bytes = [
@@ -586,6 +613,11 @@ impl Backend for MetalF16Backend {
         }
     }
 }
+
+/// Element-count threshold above which `from_weight_bytes` stores as f16.
+/// 1 M elems = 4 MB as f32 / 2 MB as f16 — anything smaller (norm weights,
+/// small biases) stays f32 to avoid feeding f16 into shaders that expect f32.
+const F16_MIN_ELEMS: usize = 1_048_576;
 
 // Silence unused-var complaints for helpers that will land with GPTQ later.
 #[allow(dead_code)]

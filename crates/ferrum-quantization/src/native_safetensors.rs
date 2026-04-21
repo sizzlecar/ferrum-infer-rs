@@ -237,8 +237,12 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
 
 impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
     fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
-        let (data, _) = self.read_f32(name)?;
-        Ok(B::from_slice(&data))
+        // Route through `from_weight_bytes` so fp16-preferring backends can
+        // materialise big tensors (embed table) directly as half-precision
+        // without the transient f32 Vec. Tiny tensors (norm weights) still
+        // end up as f32 because backends size-threshold inside the override.
+        let (raw, src_dtype, _) = self.read_bytes_typed(name)?;
+        Ok(B::from_weight_bytes(raw, src_dtype))
     }
 
     fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {

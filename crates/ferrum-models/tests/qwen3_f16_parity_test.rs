@@ -86,18 +86,20 @@ fn qwen3model_cpu_vs_metalf16() {
     let mut cpu_model = LlamaFamilyModel::<CpuBackend>::new(qcfg.clone(), &cpu_loader).unwrap();
     drop(cpu_loader);
 
-    // Probe: verify `from_weight_bytes` actually stored as f16 by feeding
-    // a dummy bf16 byte slice and checking the resulting buffer variant.
+    // Probe the size-threshold dispatch:
+    //   - tiny (< 1 M elems) → stays F32 so norm/bias shaders still see f32
+    //   - big  (≥ 1 M elems) → promoted to F16 for memory savings
     {
         use ferrum_kernels::backend::{Backend, SrcDtype};
-        let bf16_bytes = vec![0u8; 8]; // 4 bf16 elements
-        let probe = MetalF16Backend::from_weight_bytes(&bf16_bytes, SrcDtype::BF16);
-        assert!(
-            probe.is_f16(),
-            "MetalF16Backend.from_weight_bytes(BF16) must store as F16"
+        let small = MetalF16Backend::from_weight_bytes(&vec![0u8; 8], SrcDtype::BF16);
+        assert!(!small.is_f16(), "tiny probe should stay F32 (under threshold)");
+        let big_bytes = vec![0u8; 2 * 1_048_576 * 2]; // 2 M bf16 elements
+        let big = MetalF16Backend::from_weight_bytes(&big_bytes, SrcDtype::BF16);
+        assert!(big.is_f16(), "big probe should promote to F16");
+        eprintln!(
+            "✔ size-threshold dispatch: tiny→F32, big→F16 (big.is_f16={})",
+            big.is_f16()
         );
-        assert_eq!(probe.len(), 4, "probe element count");
-        eprintln!("✔ from_weight_bytes BF16 → F16 storage confirmed (4-elem probe, is_f16={})", probe.is_f16());
     }
 
     let f16_loader = NativeSafetensorsLoader::<MetalF16Backend>::open(&mp).unwrap();
