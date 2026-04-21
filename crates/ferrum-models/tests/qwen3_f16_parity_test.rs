@@ -1,8 +1,9 @@
-//! `LlamaFamilyModel<MetalF16Backend>` correctness vs CPU/f32 baseline.
+//! `LlamaFamilyModel<MetalBackend>` correctness with fp16 weight storage.
 //!
-//! Uses the real `NativeSafetensorsLoader` so weights actually flow through
-//! `Backend::from_weight_bytes` — the whole point of MetalF16Backend is that
-//! path stores weights directly as fp16 without a transient f32 Vec.
+//! Uses the real `NativeSafetensorsLoader` so weights flow through
+//! `Backend::from_weight_bytes`. With `FERRUM_METAL_DTYPE=f16` big tensors
+//! (embed table, linear projections, lm_head) materialise as half-precision;
+//! tiny tensors (norm weights) stay f32 via the size threshold.
 //!
 //! Tolerance is looser than `qwen3_model_parity_test` because f16 storage
 //! sacrifices ~13 bits of weight mantissa. Argmax must still agree for a
@@ -14,7 +15,7 @@
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kernels::backend::metal_f16::MetalF16Backend;
+use ferrum_kernels::backend::metal::MetalBackend;
 use ferrum_models::common::DecoderOnlyLLM;
 use ferrum_models::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
 use ferrum_quantization::NativeSafetensorsLoader;
@@ -77,7 +78,12 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 #[ignore]
-fn qwen3model_cpu_vs_metalf16() {
+fn qwen3model_cpu_vs_metal_f16() {
+    // Force the fp16 weight path. `prefer_f16_weights()` caches on first
+    // read, so setting this before any Metal buffer is allocated binds
+    // the policy for the whole run.
+    std::env::set_var("FERRUM_METAL_DTYPE", "f16");
+
     let mp = qwen3_path().expect("Qwen3-0.6B not in HF cache");
     let def = load_model_def(&mp);
     let qcfg = LlamaFamilyConfig::qwen3_from_def(&def);
@@ -86,60 +92,62 @@ fn qwen3model_cpu_vs_metalf16() {
     let mut cpu_model = LlamaFamilyModel::<CpuBackend>::new(qcfg.clone(), &cpu_loader).unwrap();
     drop(cpu_loader);
 
-    // Probe the size-threshold dispatch:
-    //   - tiny (< 1 M elems) → stays F32 so norm/bias shaders still see f32
-    //   - big  (≥ 1 M elems) → promoted to F16 for memory savings
+    // Probe the size-threshold dispatch inside the unified MetalBackend:
+    //   tiny (< 1 M elems) stays F32 so f32-only shaders still see f32
+    //   big  (≥ 1 M elems) promotes to F16 for memory savings
     {
         use ferrum_kernels::backend::{Backend, SrcDtype};
-        let small = MetalF16Backend::from_weight_bytes(&vec![0u8; 8], SrcDtype::BF16);
-        assert!(!small.is_f16(), "tiny probe should stay F32 (under threshold)");
+        let small = MetalBackend::from_weight_bytes(&vec![0u8; 8], SrcDtype::BF16);
+        assert!(
+            !small.is_f16(),
+            "tiny probe should stay F32 (under threshold)"
+        );
         let big_bytes = vec![0u8; 2 * 1_048_576 * 2]; // 2 M bf16 elements
-        let big = MetalF16Backend::from_weight_bytes(&big_bytes, SrcDtype::BF16);
+        let big = MetalBackend::from_weight_bytes(&big_bytes, SrcDtype::BF16);
         assert!(big.is_f16(), "big probe should promote to F16");
         eprintln!(
-            "✔ size-threshold dispatch: tiny→F32, big→F16 (big.is_f16={})",
+            "✔ MetalBackend dtype dispatch: tiny→F32, big→F16 (big.is_f16={})",
             big.is_f16()
         );
     }
 
-    let f16_loader = NativeSafetensorsLoader::<MetalF16Backend>::open(&mp).unwrap();
-    let mut f16_model =
-        LlamaFamilyModel::<MetalF16Backend>::new(qcfg, &f16_loader).unwrap();
-    drop(f16_loader);
+    let mtl_loader = NativeSafetensorsLoader::<MetalBackend>::open(&mp).unwrap();
+    let mut mtl_model = LlamaFamilyModel::<MetalBackend>::new(qcfg, &mtl_loader).unwrap();
+    drop(mtl_loader);
 
     let prompt: Vec<u32> = vec![872, 111, 248, 104715, 0, 56568, 53481, 5048];
     eprintln!("\n=== Prefill {} tokens ===", prompt.len());
 
     let c_logits = cpu_model.prefill("t", &prompt);
-    let m_logits = f16_model.prefill("t", &prompt);
+    let m_logits = mtl_model.prefill("t", &prompt);
     let (ca, ma) = (argmax(&c_logits), argmax(&m_logits));
     let cos = cosine(&c_logits, &m_logits);
     let mad = max_abs_diff(&c_logits, &m_logits);
     eprintln!(
-        "prefill  CPU argmax={ca} ({:.4})  F16 argmax={ma} ({:.4})  cos={cos:.6}  max_diff={mad:.4}",
+        "prefill  CPU argmax={ca} ({:.4})  Metal-F16 argmax={ma} ({:.4})  cos={cos:.6}  max_diff={mad:.4}",
         c_logits[ca], m_logits[ma]
     );
     assert_eq!(ca, ma, "prefill argmax mismatch");
-    assert!(
-        cos > 0.995,
-        "prefill cosine too low (f16 tol): {cos}"
-    );
+    assert!(cos > 0.995, "prefill cosine too low (f16 tol): {cos}");
 
     let mut pos = prompt.len() as u32;
     let mut tok = ca as u32;
     for step in 0..5 {
         let c = cpu_model.decode("t", tok, pos);
-        let m = f16_model.decode("t", tok, pos);
+        let m = mtl_model.decode("t", tok, pos);
         let (ca, ma) = (argmax(&c), argmax(&m));
         let cos = cosine(&c, &m);
         let mad = max_abs_diff(&c, &m);
         eprintln!(
-            "decode {step} pos={pos} tok={tok}  CPU argmax={ca}  F16 argmax={ma}  cos={cos:.6}  max_diff={mad:.4}",
+            "decode {step} pos={pos} tok={tok}  CPU argmax={ca}  Metal-F16 argmax={ma}  cos={cos:.6}  max_diff={mad:.4}",
         );
         assert_eq!(ca, ma, "decode step {step} argmax mismatch");
-        assert!(cos > 0.99, "decode step {step} cosine too low (f16 tol): {cos}");
+        assert!(
+            cos > 0.99,
+            "decode step {step} cosine too low (f16 tol): {cos}"
+        );
         tok = ca as u32;
         pos += 1;
     }
-    eprintln!("✅ LlamaFamilyModel CpuF32 ↔ MetalF16 parity pass");
+    eprintln!("✅ LlamaFamilyModel Cpu ↔ Metal-F16 parity pass");
 }

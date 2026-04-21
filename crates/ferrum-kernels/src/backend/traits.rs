@@ -535,9 +535,9 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// letting the backend pick its preferred storage dtype.
     ///
     /// Default impl upcasts bf16/f16 to f32 via an intermediate Vec, matching
-    /// pre-existing loader behaviour. A fp16-preferring backend
-    /// (e.g. `MetalF16Backend`) overrides this to go straight from raw bytes
-    /// into a half-precision buffer, avoiding the transient 2× RAM spike.
+    /// pre-existing loader behaviour. Backends override this to go straight
+    /// from raw bytes into a native half-precision buffer (e.g. Metal with
+    /// `FERRUM_METAL_DTYPE=f16`), avoiding the transient 2× RAM spike.
     fn from_weight_bytes(raw: &[u8], src_dtype: SrcDtype) -> Self::Buffer {
         let data = src_dtype.to_f32_vec(raw);
         Self::from_slice(&data)
