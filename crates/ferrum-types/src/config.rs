@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
 /// Engine configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EngineConfig {
     pub model: EngineModelConfig,
     pub scheduler: SchedulerConfig,
@@ -15,21 +15,6 @@ pub struct EngineConfig {
     pub memory: MemoryConfig,
     pub batching: BatchConfig,
     pub monitoring: MonitoringConfig,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            model: EngineModelConfig::default(),
-            scheduler: SchedulerConfig::default(),
-            sampling: SamplingConfig::default(),
-            backend: BackendConfig::default(),
-            kv_cache: KvCacheConfig::default(),
-            memory: MemoryConfig::default(),
-            batching: BatchConfig::default(),
-            monitoring: MonitoringConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,21 +344,11 @@ impl Default for SecurityConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SamplingConfig {
     pub default_params: SamplingParams,
     pub presets: SamplingPresets,
     pub enable_custom_processors: bool,
-}
-
-impl Default for SamplingConfig {
-    fn default() -> Self {
-        Self {
-            default_params: SamplingParams::default(),
-            presets: SamplingPresets::default(),
-            enable_custom_processors: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

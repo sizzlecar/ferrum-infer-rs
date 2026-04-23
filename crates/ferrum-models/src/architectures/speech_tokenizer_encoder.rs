@@ -8,7 +8,7 @@
 //!
 //! Loaded from speech_tokenizer/model.safetensors.
 
-use candle_core::{DType, Device as CandleDevice, IndexOp, Module, Tensor};
+use candle_core::{DType, Device as CandleDevice, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use ferrum_types::{FerrumError, Result};
 use tracing::info;

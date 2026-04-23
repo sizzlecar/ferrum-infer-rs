@@ -5,7 +5,6 @@
 //! a DecodeBackend to execute the decode hot path.
 
 use crate::tensor::TensorRef;
-use crate::transformer::TransformerWeights;
 use ferrum_types::Result;
 
 /// Decode-phase execution backend.

@@ -969,7 +969,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             | ferrum_models::Architecture::Qwen2
             | ferrum_models::Architecture::Qwen3
             | ferrum_models::Architecture::Mistral) => {
-                let loader = ferrum_models::SafeTensorsLoader::new(&model_path);
+                let _loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();
 
                 // TP and GPTQ still pending on the new path (Phase D/E).
@@ -1028,7 +1028,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     Device::Metal => {
                         #[cfg(feature = "metal")]
                         {
-                            info!("  Backend: Metal");
+                            // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
+                            // inside MetalBackend. Halves big-tensor RAM;
+                            // recommended for 4B+ models on 16 GB Macs.
+                            let dtype_hint = std::env::var("FERRUM_METAL_DTYPE")
+                                .unwrap_or_else(|_| "f32".to_string());
+                            info!("  Backend: Metal (weights {})", dtype_hint);
                             let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
                                 ferrum_kernels::backend::metal::MetalBackend,
                             >::open(&model_path)?;

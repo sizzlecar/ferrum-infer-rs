@@ -1,6 +1,63 @@
 //! Core Backend trait — the single abstraction over CUDA / Metal / CPU.
 
 use ferrum_types::{FerrumError, Result};
+use half::{bf16, f16};
+
+/// Source dtype for a weight tensor read straight from safetensors mmap.
+///
+/// Passed to `Backend::from_weight_bytes` so each backend can choose whether
+/// to upcast to its compute dtype or store as-is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SrcDtype {
+    F32,
+    F16,
+    BF16,
+}
+
+impl SrcDtype {
+    /// Number of bytes per element in the raw on-disk representation.
+    pub const fn bytes_per_elem(self) -> usize {
+        match self {
+            SrcDtype::F32 => 4,
+            SrcDtype::F16 | SrcDtype::BF16 => 2,
+        }
+    }
+
+    /// Materialise the raw byte slice into a `Vec<f32>`. Used by the default
+    /// `Backend::from_weight_bytes` impl; fp16-preferring backends bypass it.
+    pub fn to_f32_vec(self, raw: &[u8]) -> Vec<f32> {
+        match self {
+            SrcDtype::F32 => {
+                debug_assert_eq!(raw.len() % 4, 0);
+                let n = raw.len() / 4;
+                let mut out = vec![0f32; n];
+                for i in 0..n {
+                    let b = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]];
+                    out[i] = f32::from_le_bytes(b);
+                }
+                out
+            }
+            SrcDtype::F16 => {
+                debug_assert_eq!(raw.len() % 2, 0);
+                let n = raw.len() / 2;
+                let mut out = vec![0f32; n];
+                for i in 0..n {
+                    out[i] = f16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
+                }
+                out
+            }
+            SrcDtype::BF16 => {
+                debug_assert_eq!(raw.len() % 2, 0);
+                let n = raw.len() / 2;
+                let mut out = vec![0f32; n];
+                for i in 0..n {
+                    out[i] = bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
+                }
+                out
+            }
+        }
+    }
+}
 
 /// Quantization flavour discriminator for `Backend::gemm_quant`.
 ///
@@ -473,6 +530,18 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn alloc(len: usize) -> Self::Buffer;
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
     fn from_slice(data: &[f32]) -> Self::Buffer;
+
+    /// Load a weight tensor straight from its on-disk byte representation,
+    /// letting the backend pick its preferred storage dtype.
+    ///
+    /// Default impl upcasts bf16/f16 to f32 via an intermediate Vec, matching
+    /// pre-existing loader behaviour. Backends override this to go straight
+    /// from raw bytes into a native half-precision buffer (e.g. Metal with
+    /// `FERRUM_METAL_DTYPE=f16`), avoiding the transient 2× RAM spike.
+    fn from_weight_bytes(raw: &[u8], src_dtype: SrcDtype) -> Self::Buffer {
+        let data = src_dtype.to_f32_vec(raw);
+        Self::from_slice(&data)
+    }
 
     // ── Quantized GEMM (Phase A3 stubs) ─────────────────────────────────
     //

@@ -569,7 +569,7 @@ impl InferenceEngine for DefaultInferenceEngine {
 
                 // 3. Decode loop - stream each token
                 let mut generated_tokens = Vec::new();
-                let mut all_tokens: Vec<TokenId> = input_tokens.iter().copied().collect();
+                let mut all_tokens: Vec<TokenId> = input_tokens.to_vec();
                 let mut model_kv_cache = prefill_output.kv_cache.clone();
                 last_cache_id = model_kv_cache.cache_id();
                 let mut rng = create_rng(&sampling_params);
@@ -656,12 +656,9 @@ impl InferenceEngine for DefaultInferenceEngine {
 
             kv_guard.deallocate_now("stream-infer").await;
 
-            match &generation_result {
-                Ok(_) => {
-                    // Release model executor's KV cache (frees CUDA runner paged blocks)
-                    model_executor.release_cache(&last_cache_id);
-                }
-                Err(_) => {}
+            if generation_result.is_ok() {
+                // Release model executor's KV cache (frees CUDA runner paged blocks)
+                model_executor.release_cache(&last_cache_id);
             }
 
             match generation_result {
@@ -691,7 +688,6 @@ impl InferenceEngine for DefaultInferenceEngine {
                             "Streaming consumer disconnected before final chunk for request {}",
                             request_id
                         );
-                        return;
                     }
                 }
                 Err(e) => {

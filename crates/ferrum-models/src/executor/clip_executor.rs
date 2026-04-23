@@ -11,8 +11,8 @@ use candle_core::{DType, Device as CandleDevice, Tensor};
 use candle_nn::VarBuilder;
 use ferrum_interfaces::{
     model_executor::{
-        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
-        ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
+        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
+        MemoryRequirements, PrefillInput, PrefillOutput,
     },
     BlockTable, CacheHandleStats, KvCacheHandle, ModelExecutor, TensorRef,
 };

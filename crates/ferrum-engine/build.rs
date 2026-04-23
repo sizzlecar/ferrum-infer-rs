@@ -111,13 +111,13 @@ fn compile_metal_files(metal_files: &[PathBuf], output_path: &Path, include_dir:
         air_files.push(air_file.clone());
 
         let mut cmd = Command::new("xcrun");
-        cmd.args(&["-sdk", "macosx", "metal"])
+        cmd.args(["-sdk", "macosx", "metal"])
             .arg(metal_opt)
             .arg("-std=metal3.1")
             .arg("-mmacosx-version-min=14.0")
-            .args(&["-I", include_dir.to_str().unwrap()])
-            .args(&["-c", metal_file.to_str().unwrap()])
-            .args(&["-o", air_file.to_str().unwrap()]);
+            .args(["-I", include_dir.to_str().unwrap()])
+            .args(["-c", metal_file.to_str().unwrap()])
+            .args(["-o", air_file.to_str().unwrap()]);
 
         println!(
             "cargo:info=Compiling Metal shader: {}",
@@ -138,11 +138,11 @@ fn compile_metal_files(metal_files: &[PathBuf], output_path: &Path, include_dir:
 
     // Link .air files into .metallib
     let mut lib_cmd = Command::new("xcrun");
-    lib_cmd.args(&["-sdk", "macosx", "metallib"]);
+    lib_cmd.args(["-sdk", "macosx", "metallib"]);
     for air_file in &air_files {
         lib_cmd.arg(air_file);
     }
-    lib_cmd.args(&["-o", output_path.to_str().unwrap()]);
+    lib_cmd.args(["-o", output_path.to_str().unwrap()]);
 
     println!(
         "cargo:info=Linking Metal library: {}",

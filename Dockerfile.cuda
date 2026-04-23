@@ -16,12 +16,19 @@
 FROM nvidia/cuda:12.6.0-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
+# --allow-change-held-packages needed because libnccl-dev's transitive deps
+# (gcc-12-base / libgcc-s1 / libstdc++6) may bump held CUDA-base packages
+# when the nvidia apt repo publishes newer NCCL builds.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        --allow-change-held-packages \
         curl build-essential pkg-config libssl-dev git \
+        libnccl2 libnccl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Rust 1.88+ needed: transitive deps (moxcms, audioadapter-sample) require
+# edition 2024, which stabilized in 1.85.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-        sh -s -- -y --default-toolchain 1.82.0
+        sh -s -- -y --default-toolchain 1.88.0
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /build
@@ -29,16 +36,24 @@ COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY crates ./crates
 
 ENV CUDA_HOME=/usr/local/cuda
+# GitHub runners have no GPU, so bindgen_cuda's `nvidia-smi` probe panics.
+# Pin the build-time compute cap; nvcc still emits PTX so newer GPUs
+# (Ada sm_89, Hopper sm_90, Blackwell sm_100/sm_120) JIT-compile at load.
+# sm_86 covers Ampere RTX 30xx / A5000 / A40 natively and is the broadest
+# backwards-compatible SASS target (vLLM uses a similar approach).
+ENV CUDA_COMPUTE_CAP=86
 RUN cargo build --release --features cuda -p ferrum-cli --bin ferrum
 
 # ── Runtime stage ────────────────────────────────────────────────────────
 FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+# libnccl2 ships in the nvidia/cuda 12.6 runtime base. ffmpeg intentionally
+# omitted — LLM inference focus; Whisper users should pre-convert audio
+# to 16kHz WAV or mount ffmpeg in.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
-        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/ferrum /usr/local/bin/ferrum
