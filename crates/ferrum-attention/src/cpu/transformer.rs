@@ -1,4 +1,9 @@
 //! CPU transformer layer using Accelerate sgemm.
+//!
+//! Same platform-split story as `super::mod`: the Accelerate extern block and
+//! its Linux fallback are mutually exclusive per build.
+
+#![allow(dead_code)]
 
 use crate::{AttentionParams, LayerWeights, TransformerConfig};
 
@@ -142,7 +147,6 @@ extern "C" {
         n: u64,
     );
     /// vDSP vector-scalar multiply
-    #[allow(dead_code)]
     fn vDSP_vsmul(
         a: *const f32,
         a_stride: i32,
@@ -317,7 +321,6 @@ fn apply_rope(
     }
 }
 
-#[allow(dead_code)]
 fn repeat_kv(kv: &[f32], nkv: usize, n_rep: usize, seq: usize, hd: usize) -> Vec<f32> {
     if n_rep == 1 {
         return kv.to_vec();
