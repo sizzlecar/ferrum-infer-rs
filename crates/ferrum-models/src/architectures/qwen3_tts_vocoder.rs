@@ -5,7 +5,7 @@
 //!
 //! Loaded from speech_tokenizer/model.safetensors.
 
-#![allow(dead_code, unused_imports, unused_parens)]
+#![allow(dead_code, unused_imports, unused_parens, unused_variables)]
 
 use candle_core::{DType, Device as CandleDevice, IndexOp, Module, Tensor, D};
 use candle_nn::{
