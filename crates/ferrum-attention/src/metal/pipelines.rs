@@ -66,10 +66,7 @@ impl MetalPipelines {
                 ][..],
             ),
             (&gemm_lib, &["gemm_f32_v2"][..]),
-            (
-                &gemm_f16w_lib,
-                &["gemm_f32a_f16w_v2", "gemv_f32a_f16w"][..],
-            ),
+            (&gemm_f16w_lib, &["gemm_f32a_f16w_v2", "gemv_f32a_f16w"][..]),
             (
                 &nr_lib,
                 &[

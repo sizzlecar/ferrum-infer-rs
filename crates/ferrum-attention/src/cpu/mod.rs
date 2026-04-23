@@ -299,7 +299,14 @@ pub fn fused_attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], p: &Att
             }
 
             // Fused softmax with causal mask (+ optional sliding-window lower bound)
-            softmax_inplace(&mut scores, sq, sk, p.causal, p.pos_offset, p.sliding_window);
+            softmax_inplace(
+                &mut scores,
+                sq,
+                sk,
+                p.causal,
+                p.pos_offset,
+                p.sliding_window,
+            );
 
             // out[sq, d] = scores[sq, sk] @ V[sk, d]
             let o_slice = &mut out[o_off..o_off + sq * d];

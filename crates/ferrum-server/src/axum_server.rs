@@ -788,8 +788,7 @@ fn apply_chat_template(messages: &[ChatMessage], model_id: &str) -> String {
                 role, msg.content
             ));
         }
-        prompt
-            .push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
         prompt
     } else {
         // TinyLlama / generic chat format. Promote the first system message
@@ -843,10 +842,7 @@ mod chat_template_tests {
 
     #[test]
     fn qwen2_renders_chatml_without_think() {
-        let out = apply_chat_template(
-            &[msg(MessageRole::User, "Hi")],
-            "Qwen/Qwen2.5-7B-Instruct",
-        );
+        let out = apply_chat_template(&[msg(MessageRole::User, "Hi")], "Qwen/Qwen2.5-7B-Instruct");
         assert!(out.ends_with("<|im_start|>assistant\n"));
         assert!(!out.contains("<think>"));
     }
