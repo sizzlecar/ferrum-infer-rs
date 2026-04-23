@@ -190,7 +190,7 @@ impl PagedKvCacheHandle {
 
     /// Get required number of blocks for token count
     pub fn required_blocks(&self, num_tokens: usize) -> usize {
-        (num_tokens + self.block_size - 1) / self.block_size
+        num_tokens.div_ceil(self.block_size)
     }
 
     /// Increment reference count (for COW)
@@ -904,8 +904,7 @@ impl KvCacheManager for PagedKvCacheManager {
     }
 
     fn can_allocate(&self, request: &AllocationRequest) -> bool {
-        let required_blocks =
-            (request.initial_tokens + self.config.block_size - 1) / self.config.block_size;
+        let required_blocks = request.initial_tokens.div_ceil(self.config.block_size);
         let gpu_stats = self.gpu_pool.stats();
 
         gpu_stats.free_blocks >= required_blocks

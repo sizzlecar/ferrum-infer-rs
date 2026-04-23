@@ -8,6 +8,12 @@ pub struct CpuKvCache {
     pub len: usize,
 }
 
+impl Default for CpuKvCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CpuKvCache {
     pub fn new() -> Self {
         Self {
@@ -88,7 +94,7 @@ pub fn cpu_layer_forward(
     } else {
         o_out
     };
-    let mut hidden = add_vecs(input, &o_scaled);
+    let hidden = add_vecs(input, &o_scaled);
 
     // 8. Post LayerNorm + MLP
     let post_ln = rms_norm(&hidden, &w.post_ln_w, tokens, h, eps);
@@ -136,6 +142,7 @@ extern "C" {
         n: u64,
     );
     /// vDSP vector-scalar multiply
+    #[allow(dead_code)]
     fn vDSP_vsmul(
         a: *const f32,
         a_stride: i32,
@@ -310,6 +317,7 @@ fn apply_rope(
     }
 }
 
+#[allow(dead_code)]
 fn repeat_kv(kv: &[f32], nkv: usize, n_rep: usize, seq: usize, hd: usize) -> Vec<f32> {
     if n_rep == 1 {
         return kv.to_vec();

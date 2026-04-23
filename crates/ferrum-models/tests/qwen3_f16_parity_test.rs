@@ -97,7 +97,7 @@ fn qwen3model_cpu_vs_metal_f16() {
     //   big  (≥ 1 M elems) promotes to F16 for memory savings
     {
         use ferrum_kernels::backend::{Backend, SrcDtype};
-        let small = MetalBackend::from_weight_bytes(&vec![0u8; 8], SrcDtype::BF16);
+        let small = MetalBackend::from_weight_bytes(&[0u8; 8], SrcDtype::BF16);
         assert!(
             !small.is_f16(),
             "tiny probe should stay F32 (under threshold)"

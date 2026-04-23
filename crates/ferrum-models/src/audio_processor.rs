@@ -60,7 +60,6 @@ fn decode_with_symphonia(
     hint: &symphonia::core::probe::Hint,
     target_rate: u32,
 ) -> Result<Vec<f32>> {
-    use symphonia::core::audio::{AudioBufferRef, Signal};
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error as SymError;
     use symphonia::core::formats::FormatOptions;

@@ -4,6 +4,8 @@
 //! SuppressTokens, ApplyTimestampRules), temperature fallback, compression ratio
 //! check, seek-based segmentation.
 
+#![allow(dead_code, unused_variables)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

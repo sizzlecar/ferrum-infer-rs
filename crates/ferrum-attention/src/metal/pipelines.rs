@@ -242,7 +242,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(up), 0);
         enc.set_buffer(2, Some(output), 0);
         enc.set_buffer(3, Some(&params_buf), 0);
-        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -271,7 +271,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(b), 0);
         enc.set_buffer(2, Some(output), 0);
         enc.set_buffer(3, Some(&params_buf), 0);
-        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -342,7 +342,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(up), 0);
         enc.set_buffer(2, Some(output), 0);
         enc.set_buffer(3, Some(&params_buf), 0);
-        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
@@ -367,7 +367,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(b), 0);
         enc.set_buffer(2, Some(output), 0);
         enc.set_buffer(3, Some(&params_buf), 0);
-        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
@@ -445,7 +445,7 @@ impl MetalPipelines {
         enc.set_buffer(2, Some(c), 0);
         enc.set_buffer(3, Some(&params_buf), 0);
         enc.set_threadgroup_memory_length(0, 12288);
-        let grid = MTLSize::new(((n + 31) / 32) as u64, ((m + 63) / 64) as u64, 1);
+        let grid = MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1);
         let tg = MTLSize::new(128, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -484,7 +484,7 @@ impl MetalPipelines {
         enc.set_buffer(2, Some(c), 0);
         enc.set_buffer(3, Some(&params_buf), 0);
         enc.set_threadgroup_memory_length(0, 12288);
-        let grid = MTLSize::new(((n + 31) / 32) as u64, ((m + 63) / 64) as u64, 1);
+        let grid = MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1);
         let tg = MTLSize::new(128, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -611,7 +611,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(output), 0);
         enc.set_buffer(2, Some(&params_buf), 0);
         let n = tokens * heads * head_dim;
-        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -653,7 +653,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(cache), 0);
         enc.set_buffer(2, Some(&params_buf), 0);
         let n = heads * new_len * head_dim;
-        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -718,7 +718,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(scale), 0);
         enc.set_buffer(2, Some(output), 0);
         enc.set_buffer(3, Some(&params_buf), 0);
-        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -754,7 +754,7 @@ impl MetalPipelines {
         enc.set_buffer(2, Some(scale), 0);
         enc.set_buffer(3, Some(output), 0);
         enc.set_buffer(4, Some(&params_buf), 0);
-        let grid = MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -920,7 +920,7 @@ impl MetalPipelines {
         enc.set_buffer(3, Some(v), 0);
         enc.set_buffer(4, Some(&params_buf), 0);
         let total = tokens * (q_dim + 2 * kv_dim);
-        let grid = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(total.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -978,7 +978,7 @@ impl MetalPipelines {
         enc.set_buffer(0, Some(x), 0);
         enc.set_buffer(1, Some(out), 0);
         enc.set_buffer(2, Some(&params_buf), 0);
-        let grid = MTLSize::new(((len + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(len.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -1011,7 +1011,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(bias), 0);
         enc.set_buffer(2, Some(&params_buf), 0);
         let total = rows * cols;
-        let grid = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(total.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
@@ -1044,7 +1044,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(out), 0);
         enc.set_buffer(2, Some(&params_buf), 0);
         let total = tokens * im;
-        let grid = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        let grid = MTLSize::new(total.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }

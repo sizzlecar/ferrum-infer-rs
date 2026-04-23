@@ -509,7 +509,7 @@ impl WhisperModelWrapper {
     /// Pads or truncates PCM to exactly 30 seconds (N_SAMPLES = 480000).
     pub fn pcm_to_mel_tensor(&self, pcm: &[f32]) -> Result<Tensor> {
         let n_samples = whisper::N_SAMPLES;
-        let mut samples = if pcm.len() >= n_samples {
+        let samples = if pcm.len() >= n_samples {
             pcm[..n_samples].to_vec()
         } else {
             let mut buf = pcm.to_vec();

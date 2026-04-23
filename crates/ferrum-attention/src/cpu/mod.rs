@@ -66,6 +66,7 @@ fn gemm_at_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize)
 /// C[m,n] = A^T[m,k] @ B[k,n]  where A is stored as [k,m] (Trans-A, NoTrans-B)
 /// Matches PyTorch SDPA's QK^T GEMM: scores[kv,q] = K[kv,d]^? @ Q[q,d]^?
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn gemm_tb_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     // A stored as [k, m] row-major, we want A^T = [m, k]
     // B stored as [k, n] row-major... wait, Q is [sq, d] and we want Q columns
@@ -167,6 +168,7 @@ fn gemm_tb_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize)
     }
 }
 
+#[allow(dead_code)]
 fn gemm_nt_nt_colmajor(_a: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: usize, _k: usize) {
     // placeholder - not used, V matmul done with simple loop
 }

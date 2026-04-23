@@ -401,7 +401,7 @@ impl EngineInner {
         let skip_prefix_cache = if cfg!(feature = "cuda") {
             std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1")
         } else {
-            std::env::var("FERRUM_PREFIX_CACHE").map_or(false, |v| v == "0")
+            std::env::var("FERRUM_PREFIX_CACHE").is_ok_and(|v| v == "0")
         };
         if !skip_prefix_cache {
             let hit = self
@@ -448,9 +448,9 @@ impl EngineInner {
 
                 let should_stop = {
                     let sequences = self.sequences.read();
-                    sequences.get(request_id).map_or(true, |s| {
-                        s.should_stop(self.model_executor.info().vocab_size)
-                    })
+                    sequences
+                        .get(request_id)
+                        .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
                 };
                 if should_stop {
                     self.complete_request(request_id, FinishReason::EOS).await?;
@@ -544,9 +544,9 @@ impl EngineInner {
 
         let should_stop = {
             let sequences = self.sequences.read();
-            sequences.get(request_id).map_or(true, |s| {
-                s.should_stop(self.model_executor.info().vocab_size)
-            })
+            sequences
+                .get(request_id)
+                .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
         };
         if should_stop {
             self.complete_request(request_id, FinishReason::EOS).await?;
@@ -620,9 +620,9 @@ impl EngineInner {
 
             let should_stop = {
                 let sequences = self.sequences.read();
-                sequences.get(rid).map_or(true, |s| {
-                    s.should_stop(self.model_executor.info().vocab_size)
-                })
+                sequences
+                    .get(rid)
+                    .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
             };
             if should_stop {
                 let finish_reason = {
@@ -698,9 +698,9 @@ impl EngineInner {
 
         let should_stop = {
             let sequences = self.sequences.read();
-            sequences.get(request_id).map_or(true, |s| {
-                s.should_stop(self.model_executor.info().vocab_size)
-            })
+            sequences
+                .get(request_id)
+                .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
         };
 
         if should_stop {

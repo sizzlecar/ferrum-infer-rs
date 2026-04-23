@@ -254,8 +254,7 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
         // GPTQ fusion shims: synthesise qkv_proj / gate_up_proj from split
         // components — same pattern as Dense but concatenating the GPTQ
         // tensors (qweight/scales/qzeros) along the N dim.
-        if name.ends_with("qkv_proj") {
-            let prefix = &name[..name.len() - "qkv_proj".len()];
+        if let Some(prefix) = name.strip_suffix("qkv_proj") {
             let parts = [
                 format!("{prefix}q_proj"),
                 format!("{prefix}k_proj"),
@@ -265,8 +264,7 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
                 return self.load_gptq_linear_fused(&parts);
             }
         }
-        if name.ends_with("gate_up_proj") {
-            let prefix = &name[..name.len() - "gate_up_proj".len()];
+        if let Some(prefix) = name.strip_suffix("gate_up_proj") {
             let parts = [format!("{prefix}gate_proj"), format!("{prefix}up_proj")];
             if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
                 return self.load_gptq_linear_fused(&parts);
@@ -293,8 +291,7 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
         // split q_proj+k_proj+v_proj / gate_proj+up_proj if present. The cat
         // happens at the byte level so fused-weight memory is the same size
         // as the per-part weights — no expansion to f32.
-        if name.ends_with("qkv_proj") {
-            let prefix = &name[..name.len() - "qkv_proj".len()];
+        if let Some(prefix) = name.strip_suffix("qkv_proj") {
             let parts = [
                 format!("{prefix}q_proj.weight"),
                 format!("{prefix}k_proj.weight"),
@@ -306,8 +303,7 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
                 return Ok(Box::new(DenseLinear::<B>::from_buffer(weight, rows, cols)));
             }
         }
-        if name.ends_with("gate_up_proj") {
-            let prefix = &name[..name.len() - "gate_up_proj".len()];
+        if let Some(prefix) = name.strip_suffix("gate_up_proj") {
             let parts = [
                 format!("{prefix}gate_proj.weight"),
                 format!("{prefix}up_proj.weight"),
@@ -465,10 +461,8 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             qz_parts.push((qz, qz_sh[0], qz_sh[1]));
 
             // g_idx optional; if first part has it, use that
-            if g_idx.is_none() {
-                if self.has(&format!("{p}.g_idx")) {
-                    g_idx = Some(self.read_i32(&format!("{p}.g_idx"))?.0);
-                }
+            if g_idx.is_none() && self.has(&format!("{p}.g_idx")) {
+                g_idx = Some(self.read_i32(&format!("{p}.g_idx"))?.0);
             }
         }
 
@@ -533,6 +527,9 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
     }
 
     /// Read each name, assert shape width matches, concatenate along dim 0.
+    /// Kept for diagnostic / fallback paths; DenseLinear fusion prefers the
+    /// byte-level `cat_rows_bytes` above.
+    #[allow(dead_code)]
     fn cat_rows(&self, names: &[String]) -> Result<(usize, usize, Vec<f32>)> {
         let mut total_rows = 0usize;
         let mut cols = 0usize;

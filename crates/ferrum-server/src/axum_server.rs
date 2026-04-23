@@ -264,7 +264,7 @@ async fn handle_chat_completions_stream(
                                             .map(finish_reason_to_string),
                                     }],
                                     usage: Some(Usage {
-                                        prompt_tokens: prompt_tokens,
+                                        prompt_tokens,
                                         completion_tokens: token_count,
                                         total_tokens: prompt_tokens + token_count,
                                     }),
@@ -281,7 +281,7 @@ async fn handle_chat_completions_stream(
                         Err(e) => {
                             error!("Stream generation error: {}", e);
                             let _ = tx.send(Ok(
-                                Event::default().data(&format!("{{\"error\": \"{}\"}}", e))
+                                Event::default().data(format!("{{\"error\": \"{}\"}}", e))
                             ));
                             break;
                         }
@@ -291,7 +291,7 @@ async fn handle_chat_completions_stream(
             Err(e) => {
                 error!("Failed to start streaming: {}", e);
                 let _ = tx.send(Ok(
-                    Event::default().data(&format!("{{\"error\": \"{}\"}}", e))
+                    Event::default().data(format!("{{\"error\": \"{}\"}}", e))
                 ));
             }
         }
@@ -330,7 +330,7 @@ async fn handle_chat_completions_sync(
                     finish_reason: Some(finish_reason_to_string(&output.finish_reason)),
                 }],
                 usage: Some(Usage {
-                    prompt_tokens: prompt_tokens,
+                    prompt_tokens,
                     completion_tokens: output.tokens.len() as u32,
                     total_tokens: prompt_tokens + output.tokens.len() as u32,
                 }),
@@ -814,6 +814,18 @@ fn apply_chat_template(messages: &[ChatMessage], model_id: &str) -> String {
     }
 }
 
+/// Convert FinishReason to OpenAI API string
+fn finish_reason_to_string(reason: &FinishReason) -> String {
+    match reason {
+        FinishReason::Length => "length".to_string(),
+        FinishReason::Stop => "stop".to_string(),
+        FinishReason::EOS => "stop".to_string(),
+        FinishReason::Cancelled => "cancelled".to_string(),
+        FinishReason::Error => "error".to_string(),
+        FinishReason::ContentFilter => "content_filter".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod chat_template_tests {
     use super::*;
@@ -884,17 +896,5 @@ mod chat_template_tests {
         assert!(out.contains("<|system|>"));
         assert!(out.contains("<|user|>\nhi</s>"));
         assert!(out.ends_with("<|assistant|>\n"));
-    }
-}
-
-/// Convert FinishReason to OpenAI API string
-fn finish_reason_to_string(reason: &FinishReason) -> String {
-    match reason {
-        FinishReason::Length => "length".to_string(),
-        FinishReason::Stop => "stop".to_string(),
-        FinishReason::EOS => "stop".to_string(),
-        FinishReason::Cancelled => "cancelled".to_string(),
-        FinishReason::Error => "error".to_string(),
-        FinishReason::ContentFilter => "content_filter".to_string(),
     }
 }

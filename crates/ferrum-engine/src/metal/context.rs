@@ -19,8 +19,7 @@ pub struct MetalContext {
 impl MetalContext {
     /// Create a new Metal context with the default system device
     pub fn new() -> Result<Self, FerrumError> {
-        let device =
-            MTLDevice::system_default().ok_or_else(|| MetalError::device_not_available())?;
+        let device = MTLDevice::system_default().ok_or_else(MetalError::device_not_available)?;
 
         debug!("Creating Metal context with device: {}", device.name());
 
