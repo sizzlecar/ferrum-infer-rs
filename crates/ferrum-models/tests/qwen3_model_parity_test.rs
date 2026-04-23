@@ -95,8 +95,7 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
 
         // Fallback: Qwen3 0.6B (and Llama family) checkpoints store projections
         // split as q/k/v and gate/up — fuse them by concatenating on dim 0.
-        if name.ends_with("qkv_proj") {
-            let prefix = &name[..name.len() - "qkv_proj".len()];
+        if let Some(prefix) = name.strip_suffix("qkv_proj") {
             let keys = vec![
                 format!("{prefix}q_proj.weight"),
                 format!("{prefix}k_proj.weight"),
@@ -106,8 +105,7 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
                 return Ok(Box::new(DenseLinear::<B>::from_rows(&data, r, c)));
             }
         }
-        if name.ends_with("gate_up_proj") {
-            let prefix = &name[..name.len() - "gate_up_proj".len()];
+        if let Some(prefix) = name.strip_suffix("gate_up_proj") {
             let keys = vec![
                 format!("{prefix}gate_proj.weight"),
                 format!("{prefix}up_proj.weight"),

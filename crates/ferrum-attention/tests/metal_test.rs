@@ -1,10 +1,8 @@
 //! Tests for Metal flash attention kernel.
 //! Compares Metal output against CPU reference.
 
-use ferrum_attention::{attention_cpu, AttentionParams};
-
 #[cfg(all(target_os = "macos", feature = "metal"))]
-use ferrum_attention::metal;
+use ferrum_attention::{attention_cpu, metal, AttentionParams};
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn assert_close(a: &[f32], b: &[f32], atol: f32, label: &str) {
@@ -42,12 +40,12 @@ fn test_metal_flash_attn_causal_small() {
     let n = sq * d;
 
     // Random-ish Q, K, V
-    let q: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.1).sin() * 0.5)).collect();
+    let q: Vec<f32> = (0..n).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
     let k: Vec<f32> = (0..sk * d)
-        .map(|i| ((i as f32 * 0.07 + 1.0).cos() * 0.5))
+        .map(|i| (i as f32 * 0.07 + 1.0).cos() * 0.5)
         .collect();
     let v: Vec<f32> = (0..sk * d)
-        .map(|i| ((i as f32 * 0.13 + 2.0).sin() * 0.3))
+        .map(|i| (i as f32 * 0.13 + 2.0).sin() * 0.3)
         .collect();
 
     let params = AttentionParams {
@@ -83,13 +81,13 @@ fn test_metal_flash_attn_prefill_73() {
     let d = 128;
 
     let q: Vec<f32> = (0..b * nh * sq * d)
-        .map(|i| ((i as f32 * 0.01).sin() * 0.1))
+        .map(|i| (i as f32 * 0.01).sin() * 0.1)
         .collect();
     let k: Vec<f32> = (0..b * nkv * sk * d)
-        .map(|i| ((i as f32 * 0.007 + 1.0).cos() * 0.1))
+        .map(|i| (i as f32 * 0.007 + 1.0).cos() * 0.1)
         .collect();
     let v: Vec<f32> = (0..b * nkv * sk * d)
-        .map(|i| ((i as f32 * 0.013 + 2.0).sin() * 0.1))
+        .map(|i| (i as f32 * 0.013 + 2.0).sin() * 0.1)
         .collect();
 
     let params = AttentionParams {
@@ -126,13 +124,13 @@ fn test_metal_flash_attn_decode() {
     let d = 128;
 
     let q: Vec<f32> = (0..b * nh * sq * d)
-        .map(|i| ((i as f32 * 0.02).sin() * 0.2))
+        .map(|i| (i as f32 * 0.02).sin() * 0.2)
         .collect();
     let k: Vec<f32> = (0..b * nkv * sk * d)
-        .map(|i| ((i as f32 * 0.005).cos() * 0.2))
+        .map(|i| (i as f32 * 0.005).cos() * 0.2)
         .collect();
     let v: Vec<f32> = (0..b * nkv * sk * d)
-        .map(|i| ((i as f32 * 0.011 + 3.0).sin() * 0.2))
+        .map(|i| (i as f32 * 0.011 + 3.0).sin() * 0.2)
         .collect();
 
     let params = AttentionParams {
@@ -154,6 +152,95 @@ fn test_metal_flash_attn_decode() {
     metal::fused_attention(&q, &k, &v, &mut out_metal, &params);
 
     assert_close(&out_cpu, &out_metal, 1e-4, "decode");
+}
+
+/// Sliding-window parity: Mistral v0.1 / Gemma local-attention semantics.
+/// CPU softmax must mask positions outside `[attend_end - sliding_window, attend_end)`
+/// exactly the same way the Metal flash_attn shader does.
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn test_metal_flash_attn_sliding_window_prefill() {
+    // 1 batch, 4 heads, 16 query tokens, 16 KV tokens, head_dim=64.
+    // Sliding window = 4 means row i attends only to columns [max(0, i-3), i].
+    let b = 1;
+    let nh = 4;
+    let nkv = 2;
+    let sq = 16;
+    let sk = 16;
+    let d = 64;
+
+    let q: Vec<f32> = (0..b * nh * sq * d)
+        .map(|i| (i as f32 * 0.017).sin() * 0.2)
+        .collect();
+    let k: Vec<f32> = (0..b * nkv * sk * d)
+        .map(|i| (i as f32 * 0.011 + 1.0).cos() * 0.2)
+        .collect();
+    let v: Vec<f32> = (0..b * nkv * sk * d)
+        .map(|i| (i as f32 * 0.019 + 2.0).sin() * 0.2)
+        .collect();
+
+    let params = AttentionParams {
+        batch: b,
+        num_heads: nh,
+        num_kv_heads: nkv,
+        q_len: sq,
+        kv_len: sk,
+        head_dim: d,
+        causal: true,
+        pos_offset: 0,
+        sliding_window: 4,
+    };
+
+    let mut out_cpu = vec![0.0f32; b * nh * sq * d];
+    attention_cpu(&q, &k, &v, &mut out_cpu, &params);
+
+    let mut out_metal = vec![0.0f32; b * nh * sq * d];
+    metal::fused_attention(&q, &k, &v, &mut out_metal, &params);
+
+    assert_close(&out_cpu, &out_metal, 1e-4, "sliding_window_prefill");
+}
+
+/// Sliding-window decode-step parity (q_len=1 with pos_offset, mimicking generation).
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn test_metal_flash_attn_sliding_window_decode() {
+    let b = 1;
+    let nh = 4;
+    let nkv = 2;
+    let sq = 1;
+    let sk = 20;
+    let d = 64;
+
+    let q: Vec<f32> = (0..b * nh * sq * d)
+        .map(|i| (i as f32 * 0.023).cos() * 0.3)
+        .collect();
+    let k: Vec<f32> = (0..b * nkv * sk * d)
+        .map(|i| (i as f32 * 0.013).sin() * 0.3)
+        .collect();
+    let v: Vec<f32> = (0..b * nkv * sk * d)
+        .map(|i| (i as f32 * 0.031 + 1.5).cos() * 0.3)
+        .collect();
+
+    // pos_offset=19 (we're decoding token 20), sliding_window=8 so we attend to last 8 KV.
+    let params = AttentionParams {
+        batch: b,
+        num_heads: nh,
+        num_kv_heads: nkv,
+        q_len: sq,
+        kv_len: sk,
+        head_dim: d,
+        causal: true,
+        pos_offset: 19,
+        sliding_window: 8,
+    };
+
+    let mut out_cpu = vec![0.0f32; b * nh * sq * d];
+    attention_cpu(&q, &k, &v, &mut out_cpu, &params);
+
+    let mut out_metal = vec![0.0f32; b * nh * sq * d];
+    metal::fused_attention(&q, &k, &v, &mut out_metal, &params);
+
+    assert_close(&out_cpu, &out_metal, 1e-4, "sliding_window_decode");
 }
 
 #[test]

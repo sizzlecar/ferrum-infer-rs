@@ -300,7 +300,7 @@ impl Default for GlobalMemoryStatsRegistry {
 /// Global instance of memory stats registry
 use once_cell::sync::Lazy;
 static GLOBAL_MEMORY_STATS: Lazy<GlobalMemoryStatsRegistry> =
-    Lazy::new(|| GlobalMemoryStatsRegistry::new());
+    Lazy::new(GlobalMemoryStatsRegistry::new);
 
 /// Get global memory stats registry
 pub fn global_memory_stats() -> &'static GlobalMemoryStatsRegistry {

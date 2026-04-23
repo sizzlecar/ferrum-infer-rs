@@ -548,18 +548,13 @@ pub struct PerformanceTrends {
 }
 
 /// Trend direction enum
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TrendDirection {
     Improving,
+    #[default]
     Stable,
     Degrading,
     Volatile,
-}
-
-impl Default for TrendDirection {
-    fn default() -> Self {
-        TrendDirection::Stable
-    }
 }
 
 /// System information snapshot

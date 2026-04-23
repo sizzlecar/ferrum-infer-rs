@@ -86,7 +86,7 @@ mod gemm_tests {
         enc.set_buffer(3, Some(&params_buf), 0);
         enc.set_threadgroup_memory_length(0, 12288);
 
-        let grid = metal::MTLSize::new(((n + 31) / 32) as u64, ((m + 63) / 64) as u64, 1);
+        let grid = metal::MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1);
         let tg = metal::MTLSize::new(128, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();

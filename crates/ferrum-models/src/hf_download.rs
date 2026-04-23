@@ -6,6 +6,8 @@
 //! - Progress bar with speed display
 //! - HuggingFace token authentication
 
+#![allow(dead_code)]
+
 use ferrum_types::{FerrumError, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;

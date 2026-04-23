@@ -21,7 +21,7 @@ impl DefaultKvCacheHandle {
         block_table.sequence_length = num_tokens;
 
         Self {
-            cache_id: format!("cache_{}", request_id.to_string()),
+            cache_id: format!("cache_{}", request_id),
             block_table,
             device: Device::CPU,
             num_layers: 32, // Default placeholder

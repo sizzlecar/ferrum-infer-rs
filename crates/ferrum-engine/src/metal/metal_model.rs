@@ -53,7 +53,7 @@ impl Default for QuantizedWeightsCache {
 /// Check if a layer should use Metal acceleration based on dimensions
 pub fn should_accelerate_layer(layer_name: &str, nrows: usize, ncols: usize) -> bool {
     // Only accelerate large enough matrices and certain layer types
-    if ncols % QK4_0 != 0 {
+    if !ncols.is_multiple_of(QK4_0) {
         return false;
     }
 

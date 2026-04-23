@@ -6,9 +6,10 @@ use ferrum_types::Device;
 use serde::{Deserialize, Serialize};
 
 /// Type of parallelism strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ParallelismType {
     /// No parallelism (single GPU)
+    #[default]
     None,
     /// Tensor parallelism: split tensors across GPUs
     Tensor,
@@ -18,12 +19,6 @@ pub enum ParallelismType {
     Data,
     /// Hybrid: combination of tensor and pipeline parallelism
     Hybrid,
-}
-
-impl Default for ParallelismType {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Parallel execution configuration

@@ -325,21 +325,12 @@ pub enum Activation {
 }
 
 /// Attention configuration for model architecture
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AttentionConfig {
     /// Whether attention uses bias
     pub attention_bias: bool,
     /// Sliding window size (None for full attention)
     pub sliding_window: Option<usize>,
-}
-
-impl Default for AttentionConfig {
-    fn default() -> Self {
-        Self {
-            attention_bias: false,
-            sliding_window: None,
-        }
-    }
 }
 
 /// Model loading source specification

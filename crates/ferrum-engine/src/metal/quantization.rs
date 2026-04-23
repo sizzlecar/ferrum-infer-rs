@@ -46,7 +46,7 @@ pub fn quantize_q4_0_block(src: &[f32]) -> Q4_0Block {
 
     // Quantize to 4-bit values and pack into bytes
     for i in 0..16 {
-        let x0 = src[i * 2 + 0] * id;
+        let x0 = src[i * 2] * id;
         let x1 = src[i * 2 + 1] * id;
 
         // Map to [0, 15] range (add 8 to shift from [-8, 7] to [0, 15])
@@ -124,7 +124,7 @@ pub fn dequantize_q4_0_block(block: &Q4_0Block) -> Vec<f32> {
         let q1 = ((packed >> 4) & 0x0F) as f32;
 
         // Dequantize to f32: map [0, 15] back to original range
-        result[i * 2 + 0] = (q0 - 8.0) * block.d;
+        result[i * 2] = (q0 - 8.0) * block.d;
         result[i * 2 + 1] = (q1 - 8.0) * block.d;
     }
 

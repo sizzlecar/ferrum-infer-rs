@@ -742,7 +742,7 @@ mod tests {
 
         let batch = batch.unwrap();
         assert!(batch.requests.len() <= 3);
-        assert!(batch.requests.len() > 0);
+        assert!(!batch.requests.is_empty());
     }
 
     #[tokio::test]

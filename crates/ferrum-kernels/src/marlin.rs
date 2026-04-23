@@ -271,7 +271,7 @@ fn build_marlin_perm() -> Vec<usize> {
         let col = i / 4;
         let mut perm1 = Vec::with_capacity(8);
 
-        for block in 0..2 {
+        for _block in 0..2 {
             for &row_off in &[0, 1, 8, 9] {
                 let row = 2 * (i % 4) + row_off / 8 * 8 + row_off % 8;
                 // Actually, the original Python is:

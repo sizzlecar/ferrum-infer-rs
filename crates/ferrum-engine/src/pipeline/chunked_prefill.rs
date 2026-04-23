@@ -64,7 +64,7 @@ impl ChunkedPrefillState {
         let total_chunks = if tokens.len() <= config.min_sequence_for_chunking {
             1
         } else {
-            (tokens.len() + chunk_size - 1) / chunk_size
+            tokens.len().div_ceil(chunk_size)
         };
 
         Self {

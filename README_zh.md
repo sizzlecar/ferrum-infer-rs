@@ -20,6 +20,37 @@ cargo build --release -p ferrum-cli --bin ferrum
 CUDA_HOME=/usr/local/cuda cargo build --release --features cuda -p ferrum-cli --bin ferrum
 ```
 
+### Docker (CPU)
+
+每次打 tag 发布时会推送 CPU 镜像到 GHCR（`:cpu`、`:cpu-<version>`）。任意
+x86_64 Linux 主机即可运行，无需预装 Rust 工具链。
+
+```bash
+# 拉取最新 CPU 镜像（下一个 tag 发布后可用）
+docker pull ghcr.io/sizzlecar/ferrum-infer-rs:cpu
+
+# 启动 HTTP 服务（挂载 HF 缓存，权重在容器间持久化）
+docker run --rm -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
+  serve --model qwen3:0.6b --port 8000
+
+# 受限模型：通过环境变量传入 HF_TOKEN
+docker run --rm -e HF_TOKEN=$HF_TOKEN \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
+  pull meta-llama/Llama-3.2-1B-Instruct
+```
+
+也可以自己构建：
+
+```bash
+docker build -t ferrum:cpu .
+```
+
+CUDA 和 Metal 镜像尚未发布 —— 目前 macOS 请本地编译 Metal 版本，
+Linux + NVIDIA 请本地编译 CUDA 版本。
+
 ## 快速开始
 
 访问受限模型（如 Llama 3.2）需先设置 Hugging Face token：

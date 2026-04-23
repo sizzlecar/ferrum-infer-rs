@@ -20,7 +20,9 @@
 #     ferrum:cpu pull meta-llama/Llama-3.2-1B-Instruct
 
 # ── Build stage ──────────────────────────────────────────────────────────
-FROM rust:1.82-bookworm AS builder
+# Rust 1.88+ needed: transitive deps (moxcms, audioadapter-sample) require
+# edition 2024, which stabilized in 1.85.
+FROM rust:1.88-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev \
@@ -35,10 +37,13 @@ RUN cargo build --release -p ferrum-cli --bin ferrum
 # ── Runtime stage ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
+# ffmpeg intentionally omitted — this is an LLM inference image, not an
+# ASR utility. Whisper transcribe still works if audio is already 16kHz
+# WAV; for MP3/M4A/FLAC either pre-convert with `ffmpeg -i in.mp3 -ar 16000
+# out.wav` or mount ffmpeg into the container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
-        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/ferrum /usr/local/bin/ferrum

@@ -40,7 +40,7 @@ impl BlockTable {
 
     /// Get required number of blocks for sequence length
     pub fn blocks_needed_for_length(length: usize, block_size: usize) -> usize {
-        (length + block_size - 1) / block_size // Ceiling division
+        length.div_ceil(block_size) // Ceiling division
     }
 
     /// Check if can accommodate more tokens without new blocks

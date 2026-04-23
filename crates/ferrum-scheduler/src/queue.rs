@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_priority_distribution_from_requests() {
-        let requests = vec![
+        let requests = [
             create_test_request(1, Priority::Critical),
             create_test_request(2, Priority::Critical),
             create_test_request(3, Priority::High),

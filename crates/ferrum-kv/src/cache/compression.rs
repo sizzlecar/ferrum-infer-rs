@@ -34,7 +34,7 @@ pub struct CompressedData {
 }
 
 /// Compression parameters
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompressionParams {
     /// Quantization bits (for quantization-based compression)
     pub quantization_bits: Option<u8>,
@@ -42,16 +42,6 @@ pub struct CompressionParams {
     pub block_size: Option<usize>,
     /// Custom parameters
     pub custom: std::collections::HashMap<String, String>,
-}
-
-impl Default for CompressionParams {
-    fn default() -> Self {
-        Self {
-            quantization_bits: None,
-            block_size: None,
-            custom: std::collections::HashMap::new(),
-        }
-    }
 }
 
 /// No-op compression (passthrough)
@@ -111,7 +101,7 @@ impl CompressionStrategy for Int4Compression {
             DataType::FP16 | DataType::FP32 => {
                 // Simplified INT4 quantization
                 // In practice, this would involve proper float->int4 quantization
-                let compressed_size = (data.len() + 1) / 2; // 4 bits per element
+                let compressed_size = data.len().div_ceil(2); // 4 bits per element
                 let mut compressed = vec![0u8; compressed_size];
 
                 // Placeholder compression (just truncate for demo)

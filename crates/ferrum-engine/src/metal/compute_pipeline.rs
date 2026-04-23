@@ -69,7 +69,7 @@ impl Q4_0MatvecPipeline {
         ncols: usize,
     ) -> Result<Vec<f32>, FerrumError> {
         // Validate input dimensions
-        if ncols % QK4_0 != 0 {
+        if !ncols.is_multiple_of(QK4_0) {
             return Err(MetalError::invalid_argument(format!(
                 "ncols ({}) must be divisible by QK4_0 ({})",
                 ncols, QK4_0
@@ -333,7 +333,7 @@ impl RmsNormPipeline {
         let weight_buffer =
             self.create_buffer_with_data(bytemuck::cast_slice(weight), "RMSNorm Weight")?;
 
-        let output_size = hidden_size * std::mem::size_of::<f32>();
+        let output_size = std::mem::size_of_val(input);
         let output_buffer = self.context.device.new_buffer(
             output_size as u64,
             metal::MTLResourceOptions::StorageModeShared,

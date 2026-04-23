@@ -59,7 +59,7 @@ fn make_synthetic(k: usize, n: usize, group_size: usize, seed: u64) -> Synthetic
         // Choose zero-codes in [0, 16) so each packed int4 is 0..15.
         let mut word: u32 = 0;
         for bi in 0..8 {
-            word |= ((rnd_u32(&mut rs) & 0xF) as u32) << (bi * 4);
+            word |= (rnd_u32(&mut rs) & 0xF) << (bi * 4);
         }
         *qz = word as i32;
     }
@@ -101,11 +101,11 @@ fn cpu_selfcheck() {
     let input: Vec<f32> = (0..2 * k).map(|i| ((i as f32) * 0.001).sin()).collect();
     let m = 2;
     let mut out_linear = vec![0.0f32; m * n];
-    let mut ctx = <CpuBackend as Backend>::new_context();
-    linear.forward(&mut ctx, &input, &mut out_linear, m);
+    <CpuBackend as Backend>::new_context();
+    linear.forward(&mut (), &input, &mut out_linear, m);
 
     let mut out_ref = vec![0.0f32; m * n];
-    <CpuBackend as Backend>::gemm(&mut ctx, &input, &ref_w, &mut out_ref, m, n, k);
+    <CpuBackend as Backend>::gemm(&mut (), &input, &ref_w, &mut out_ref, m, n, k);
 
     let max_diff = out_linear
         .iter()

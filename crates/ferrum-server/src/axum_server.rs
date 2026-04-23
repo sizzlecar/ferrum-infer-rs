@@ -264,7 +264,7 @@ async fn handle_chat_completions_stream(
                                             .map(finish_reason_to_string),
                                     }],
                                     usage: Some(Usage {
-                                        prompt_tokens: prompt_tokens,
+                                        prompt_tokens,
                                         completion_tokens: token_count,
                                         total_tokens: prompt_tokens + token_count,
                                     }),
@@ -281,7 +281,7 @@ async fn handle_chat_completions_stream(
                         Err(e) => {
                             error!("Stream generation error: {}", e);
                             let _ = tx.send(Ok(
-                                Event::default().data(&format!("{{\"error\": \"{}\"}}", e))
+                                Event::default().data(format!("{{\"error\": \"{}\"}}", e))
                             ));
                             break;
                         }
@@ -291,7 +291,7 @@ async fn handle_chat_completions_stream(
             Err(e) => {
                 error!("Failed to start streaming: {}", e);
                 let _ = tx.send(Ok(
-                    Event::default().data(&format!("{{\"error\": \"{}\"}}", e))
+                    Event::default().data(format!("{{\"error\": \"{}\"}}", e))
                 ));
             }
         }
@@ -330,7 +330,7 @@ async fn handle_chat_completions_sync(
                     finish_reason: Some(finish_reason_to_string(&output.finish_reason)),
                 }],
                 usage: Some(Usage {
-                    prompt_tokens: prompt_tokens,
+                    prompt_tokens,
                     completion_tokens: output.tokens.len() as u32,
                     total_tokens: prompt_tokens + output.tokens.len() as u32,
                 }),
@@ -349,13 +349,7 @@ async fn handle_chat_completions_sync(
 fn convert_chat_request(
     request: &ChatCompletionsRequest,
 ) -> ferrum_types::Result<InferenceRequest> {
-    // Combine all messages into a single prompt for MVP
-    let prompt = request
-        .messages
-        .iter()
-        .map(|msg| format!("{}: {}", msg.role.to_string(), msg.content))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let prompt = apply_chat_template(&request.messages, &request.model);
 
     Ok(InferenceRequest {
         id: RequestId(Uuid::new_v4()),
@@ -744,6 +738,82 @@ impl std::fmt::Display for MessageRole {
     }
 }
 
+/// Render OpenAI-style chat messages into the prompt string the model was
+/// trained on. Mirrors the templates `ferrum-cli::commands::run` uses so
+/// `/v1/chat/completions` produces the same behaviour as the interactive CLI.
+///
+/// Detects model family from the request's `model` field:
+///   - qwen (Qwen2 / Qwen2.5 / Qwen3): ChatML with `<|im_start|>` / `<|im_end|>`
+///     (Qwen3 adds the empty `<think></think>` marker to disable reasoning)
+///   - llama 3: `<|start_header_id|>…<|end_header_id|>` + `<|eot_id|>`
+///   - fallback: TinyLlama-style `<|system|>` / `<|user|>` / `<|assistant|>`
+///     with `</s>` separators
+///
+/// All templates end with the assistant header so the first generated token
+/// becomes the reply content (no extra role prefix).
+fn apply_chat_template(messages: &[ChatMessage], model_id: &str) -> String {
+    let model_lower = model_id.to_lowercase();
+
+    if model_lower.contains("qwen") {
+        let mut prompt = String::new();
+        for msg in messages {
+            let role = match msg.role {
+                MessageRole::System => "system",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Function => "function",
+            };
+            prompt.push_str(&format!(
+                "<|im_start|>{}\n{}<|im_end|>\n",
+                role, msg.content
+            ));
+        }
+        prompt.push_str("<|im_start|>assistant\n");
+        if model_lower.contains("qwen3") {
+            // Qwen3: disable thinking mode by inserting an empty think block.
+            prompt.push_str("<think>\n\n</think>\n\n");
+        }
+        prompt
+    } else if model_lower.contains("llama") && model_lower.contains("3") {
+        let mut prompt = String::from("<|begin_of_text|>");
+        for msg in messages {
+            let role = match msg.role {
+                MessageRole::System => "system",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Function => "function",
+            };
+            prompt.push_str(&format!(
+                "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+                role, msg.content
+            ));
+        }
+        prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        prompt
+    } else {
+        // TinyLlama / generic chat format. Promote the first system message
+        // to the top; subsequent ones (rare) are emitted inline.
+        let has_system = messages
+            .iter()
+            .any(|m| matches!(m.role, MessageRole::System));
+        let mut prompt = String::new();
+        if !has_system {
+            prompt.push_str("<|system|>\nYou are a helpful assistant.</s>\n");
+        }
+        for msg in messages {
+            let tag = match msg.role {
+                MessageRole::System => "system",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Function => "assistant",
+            };
+            prompt.push_str(&format!("<|{}|>\n{}</s>\n", tag, msg.content));
+        }
+        prompt.push_str("<|assistant|>\n");
+        prompt
+    }
+}
+
 /// Convert FinishReason to OpenAI API string
 fn finish_reason_to_string(reason: &FinishReason) -> String {
     match reason {
@@ -753,5 +823,78 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
         FinishReason::Cancelled => "cancelled".to_string(),
         FinishReason::Error => "error".to_string(),
         FinishReason::ContentFilter => "content_filter".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod chat_template_tests {
+    use super::*;
+
+    fn msg(role: MessageRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_string(),
+            name: None,
+        }
+    }
+
+    #[test]
+    fn qwen3_renders_chatml_with_think_marker() {
+        let out = apply_chat_template(
+            &[
+                msg(MessageRole::System, "You are helpful."),
+                msg(MessageRole::User, "Hi"),
+            ],
+            "qwen3:0.6b",
+        );
+        assert!(out.contains("<|im_start|>system\nYou are helpful.<|im_end|>"));
+        assert!(out.contains("<|im_start|>user\nHi<|im_end|>"));
+        assert!(out.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn qwen2_renders_chatml_without_think() {
+        let out = apply_chat_template(&[msg(MessageRole::User, "Hi")], "Qwen/Qwen2.5-7B-Instruct");
+        assert!(out.ends_with("<|im_start|>assistant\n"));
+        assert!(!out.contains("<think>"));
+    }
+
+    #[test]
+    fn multi_turn_preserves_order() {
+        let out = apply_chat_template(
+            &[
+                msg(MessageRole::User, "A"),
+                msg(MessageRole::Assistant, "B"),
+                msg(MessageRole::User, "C"),
+            ],
+            "qwen3",
+        );
+        let a_idx = out.find("A").unwrap();
+        let b_idx = out.find("B").unwrap();
+        let c_idx = out.find("C").unwrap();
+        assert!(a_idx < b_idx && b_idx < c_idx);
+    }
+
+    #[test]
+    fn llama3_renders_header_format() {
+        let out = apply_chat_template(
+            &[
+                msg(MessageRole::System, "sys"),
+                msg(MessageRole::User, "hi"),
+            ],
+            "meta-llama/Llama-3.2-1B-Instruct",
+        );
+        assert!(out.starts_with("<|begin_of_text|>"));
+        assert!(out.contains("<|start_header_id|>system<|end_header_id|>\n\nsys<|eot_id|>"));
+        assert!(out.contains("<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"));
+        assert!(out.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn unknown_model_uses_tinyllama_fallback() {
+        let out = apply_chat_template(&[msg(MessageRole::User, "hi")], "mystery-model");
+        assert!(out.contains("<|system|>"));
+        assert!(out.contains("<|user|>\nhi</s>"));
+        assert!(out.ends_with("<|assistant|>\n"));
     }
 }

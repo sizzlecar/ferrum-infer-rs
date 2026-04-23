@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_huggingface_tokenizer_factory_default() {
-        let factory = HuggingFaceTokenizerFactory::default();
+        let factory = HuggingFaceTokenizerFactory;
         let debug_str = format!("{:?}", factory);
         assert!(debug_str.contains("HuggingFaceTokenizerFactory"));
     }
@@ -455,7 +455,7 @@ mod tests {
         let factory = HuggingFaceTokenizerFactory::new();
         let types = factory.supported_types();
 
-        assert!(types.len() >= 1);
+        assert!(!types.is_empty());
         assert!(types.contains(&TokenizerType::BPE));
     }
 

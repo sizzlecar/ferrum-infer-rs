@@ -87,7 +87,7 @@ impl BatchHint {
 }
 
 /// Resource constraints for scheduling
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResourceConstraints {
     /// Maximum GPU memory usage
     pub max_gpu_memory: Option<u64>,
@@ -97,17 +97,6 @@ pub struct ResourceConstraints {
     pub max_compute_units: Option<usize>,
     /// Required device types
     pub required_devices: Vec<ferrum_types::Device>,
-}
-
-impl Default for ResourceConstraints {
-    fn default() -> Self {
-        Self {
-            max_gpu_memory: None,
-            max_cpu_memory: None,
-            max_compute_units: None,
-            required_devices: vec![],
-        }
-    }
 }
 
 /// Batch execution plan
@@ -310,7 +299,7 @@ pub struct SlaRequirements {
 }
 
 /// Resource limits
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResourceLimits {
     /// Maximum total GPU memory
     pub max_gpu_memory: Option<u64>,
@@ -320,17 +309,6 @@ pub struct ResourceLimits {
     pub max_kv_cache_blocks: Option<usize>,
     /// Per-client resource limits
     pub per_client_limits: HashMap<String, ClientResourceLimits>,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            max_gpu_memory: None,
-            max_cpu_memory: None,
-            max_kv_cache_blocks: None,
-            per_client_limits: HashMap::new(),
-        }
-    }
 }
 
 /// Per-client resource limits

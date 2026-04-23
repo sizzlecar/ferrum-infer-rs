@@ -32,7 +32,7 @@ fn make_engine_with_blocks(max_blocks: usize) -> ContinuousBatchEngine {
 }
 
 fn make_request(id: usize, max_tokens: usize) -> InferenceRequest {
-    let mut req = InferenceRequest::new(&format!("Request {id}"), "mock-model");
+    let mut req = InferenceRequest::new(format!("Request {id}"), "mock-model");
     req.sampling_params.max_tokens = max_tokens;
     req.sampling_params.temperature = 0.0;
     req
@@ -75,7 +75,7 @@ async fn concurrent_64_all_complete() {
     for h in handles {
         match h.await.unwrap() {
             Ok(resp) => {
-                assert!(resp.tokens.len() > 0);
+                assert!(!resp.tokens.is_empty());
                 completed += 1;
             }
             Err(e) => {
@@ -106,7 +106,7 @@ async fn concurrent_mixed_lengths() {
 
     for h in handles {
         let resp = h.await.unwrap().unwrap();
-        assert!(resp.tokens.len() > 0);
+        assert!(!resp.tokens.is_empty());
     }
 }
 

@@ -19,7 +19,7 @@
 //! - `mla_attention`: default unsupported error — DeepSeek V2/V3 not a
 //!   Phase E target.
 
-#![allow(unused_variables, dead_code)]
+#![allow(unused_variables, dead_code, unused_imports, unused_mut)]
 
 use super::{AttnConfig, Backend, QuantKind, QuantWeights, ReduceOp};
 use crate::ptx;

@@ -22,6 +22,10 @@ struct FlashAttnParams {
     scale: f32,
     causal: i32,
     pos_offset: i32,
+    /// 0 = contiguous layout (shader falls back to kv_len); >0 = strided paged cache.
+    kv_seq_stride: i32,
+    /// 0 = full causal; >0 = attend only to last `w` KV positions (Mistral v0.1 / Gemma).
+    sliding_window: i32,
 }
 
 struct MetalFlashAttn {
@@ -82,6 +86,8 @@ pub fn fused_attention_metal_buffers(
         scale: 1.0 / (p.head_dim as f32).sqrt(),
         causal: if p.causal { 1 } else { 0 },
         pos_offset: p.pos_offset as i32,
+        kv_seq_stride: 0,
+        sliding_window: p.sliding_window as i32,
     };
 
     let params_buf = ma.device.new_buffer_with_data(

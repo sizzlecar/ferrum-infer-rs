@@ -64,9 +64,8 @@ pub struct MemoryMetrics {
 impl BenchmarkResult {
     /// Write result to JSON file.
     pub fn write_json(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("JSON serialize: {e}"))
-        })?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::other(format!("JSON serialize: {e}")))?;
         std::fs::write(path, json)
     }
 

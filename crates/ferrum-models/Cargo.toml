@@ -67,7 +67,9 @@ pathdiff = "0.2"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 base64 = "0.22"
-hound = "3.5"
+# Pure-Rust audio decoding: replaces ffmpeg shell-out for MP3/FLAC/OGG/M4A
+# (and also handles WAV, superseding `hound`).
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "isomp4", "aac", "flac", "ogg", "vorbis", "wav", "pcm"] }
 flate2 = "1"
 rustfft = "6"
 rubato = "2.0.0"

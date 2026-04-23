@@ -344,7 +344,7 @@ impl ContinuousBatchScheduler {
             }
 
             // Each decode step is 1 token per request
-            if total_tokens + 1 <= hint.max_tokens {
+            if total_tokens < hint.max_tokens {
                 let mut scheduled = req.inner.clone();
                 scheduled.tokens_processed = req.total_tokens();
                 batch_requests.push(scheduled);

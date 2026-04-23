@@ -14,7 +14,7 @@ fn error_constructors_and_classes() {
 
 #[test]
 fn error_conversions() {
-    let io_err: FerrumError = std::io::Error::new(std::io::ErrorKind::Other, "io").into();
+    let io_err: FerrumError = std::io::Error::other("io").into();
     match io_err {
         FerrumError::IO { .. } => {}
         _ => panic!("wrong kind"),

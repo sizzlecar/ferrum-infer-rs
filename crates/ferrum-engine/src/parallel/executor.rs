@@ -321,7 +321,7 @@ impl ParallelStrategySelector {
 
         if total_memory >= model_size_bytes {
             // Tensor parallelism if model can be sharded across available GPUs
-            if num_gpus >= 2 && num_gpus <= 8 {
+            if (2..=8).contains(&num_gpus) {
                 debug!("Using tensor parallelism with {} GPUs", num_gpus);
                 return ParallelConfig::tensor_parallel(devices);
             }

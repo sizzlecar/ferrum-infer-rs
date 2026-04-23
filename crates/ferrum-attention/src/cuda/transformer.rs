@@ -8,7 +8,7 @@
 //! All ops on a single CUDA stream. KV cache managed on GPU.
 
 use cudarc::cublas::CudaBlas;
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice};
 use std::sync::Arc;
 
 /// GPU-resident layer weights.

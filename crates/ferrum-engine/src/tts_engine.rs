@@ -159,7 +159,7 @@ impl InferenceEngine for TtsEngine {
 
         let text = text.to_string();
         let lang = language.unwrap_or("auto").to_string();
-        let active = &self.active_requests;
+        let _active = &self.active_requests;
 
         // Run TTS on blocking thread (model forward is CPU/GPU bound)
         let result = tokio::task::spawn_blocking(move || {
