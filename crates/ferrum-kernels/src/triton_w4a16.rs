@@ -43,6 +43,11 @@ pub const BM: usize = 64;
 pub const BN: usize = 64;
 pub const BK: usize = 32;
 
+/// Precompiled PTX text — re-exported from the embedded `triton_ptx`
+/// module so external callers (tests, custom dispatch) don't have to
+/// reach into a `pub(crate)` symbol.
+pub const W4A16_PTX: &str = w4a16_gptq_f16::PTX;
+
 /// GPTQ weights on GPU in the on-disk layout (no Marlin repack).
 ///
 /// All three tensors live on the same stream as the rest of the runtime
