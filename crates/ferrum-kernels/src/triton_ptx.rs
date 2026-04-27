@@ -120,3 +120,11 @@ pub mod decode_attention_f16_h128 {
     pub const PTX: &str = include_str!("../triton_ptx/decode_attention_f16_h128.ptx");
     pub const META: &str = include_str!("../triton_ptx/decode_attention_f16_h128.json");
 }
+
+// w4a16 GPTQ INT4-weight × FP16-act fused GEMM. Tile <BM=64, BN=64, BK=32>.
+// Drop-in alternative to Marlin's `gemm_gptq` path; gated at load time via
+// FERRUM_TRITON_INT4=1 so the existing Marlin path stays default.
+pub mod w4a16_gptq_f16 {
+    pub const PTX: &str = include_str!("../triton_ptx/w4a16_gptq_f16.ptx");
+    pub const META: &str = include_str!("../triton_ptx/w4a16_gptq_f16.json");
+}

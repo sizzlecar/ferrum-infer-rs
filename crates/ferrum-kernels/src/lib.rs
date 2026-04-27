@@ -83,6 +83,9 @@ mod triton_add_bias;
 #[cfg(all(feature = "cuda", feature = "triton-kernels"))]
 pub use triton_add_bias::add_bias_triton;
 
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub mod triton_w4a16;
+
 #[cfg(feature = "cuda")]
 mod rope;
 #[cfg(feature = "cuda")]
