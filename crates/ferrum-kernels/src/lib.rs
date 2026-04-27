@@ -53,6 +53,11 @@ mod triton_residual_add_inplace;
 #[cfg(all(feature = "cuda", feature = "triton-kernels"))]
 pub use triton_residual_add_inplace::residual_add_inplace_triton;
 
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_fused_silu_mul;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_fused_silu_mul::fused_silu_mul_triton;
+
 #[cfg(feature = "cuda")]
 mod rope;
 #[cfg(feature = "cuda")]
