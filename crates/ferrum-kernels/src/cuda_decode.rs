@@ -2114,26 +2114,89 @@ impl CudaDecodeRunner {
         row_size: usize,
         eps: f32,
     ) -> candle_core::Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        {
+            return Self::launch_rms_norm_triton(
+                device, stream, input, weight, output, row_size, eps,
+            );
+        }
+        #[allow(unreachable_code)]
+        {
+            let num_rows = input.len() / row_size;
+            let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
+            let inp = input.slice(..);
+            let w = weight.slice(..);
+            let rs = row_size as i32;
+            let mut b = stream.launch_builder(&func);
+            b.arg(&inp);
+            b.arg(&w);
+            b.arg(output);
+            b.arg(&rs);
+            b.arg(&eps);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (num_rows as u32, 1, 1),
+                    block_dim: (row_size.min(1024) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("rms_norm: {e}")))
+        }
+    }
+
+    /// Triton-rs PTX path for `launch_rms_norm`. ABI: 6 user args (input,
+    /// weight, output, row_size_i32, inv_n_f32, eps_f32) + 2 implicit scratch
+    /// buffers (Triton 3.6 calling convention).
+    #[cfg(feature = "triton-kernels")]
+    fn launch_rms_norm_triton(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        input: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        row_size: usize,
+        eps: f32,
+    ) -> candle_core::Result<()> {
+        use crate::triton_meta::parse_meta;
+        use crate::triton_ptx::rms_norm_f16;
+        let meta = parse_meta(rms_norm_f16::META)?;
+        let func = device.get_or_load_custom_func(
+            "rms_norm_typed",
+            "triton_rms_norm_f16",
+            rms_norm_f16::PTX,
+        )?;
         let num_rows = input.len() / row_size;
-        let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
+        let inv_n: f32 = 1.0 / row_size as f32;
+        let rs = row_size as i32;
+        let scratch =
+            unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
+                candle_core::Error::Msg(format!("triton rms_norm scratch alloc: {e}"))
+            })?;
+        let prof =
+            unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
+                candle_core::Error::Msg(format!("triton rms_norm profile alloc: {e}"))
+            })?;
         let inp = input.slice(..);
         let w = weight.slice(..);
-        let rs = row_size as i32;
         let mut b = stream.launch_builder(&func);
         b.arg(&inp);
         b.arg(&w);
         b.arg(output);
         b.arg(&rs);
+        b.arg(&inv_n);
         b.arg(&eps);
+        b.arg(&scratch);
+        b.arg(&prof);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (num_rows as u32, 1, 1),
-                block_dim: (row_size.min(1024) as u32, 1, 1),
-                shared_mem_bytes: 0,
+                block_dim: (meta.num_warps * 32, 1, 1),
+                shared_mem_bytes: meta.shared_mem as u32,
             })
         }
         .map(|_| ())
-        .map_err(|e| candle_core::Error::Msg(format!("rms_norm: {e}")))
+        .map_err(|e| candle_core::Error::Msg(format!("triton rms_norm launch: {e}")))
     }
 
     fn launch_rms_norm_view(
@@ -2145,25 +2208,69 @@ impl CudaDecodeRunner {
         row_size: usize,
         eps: f32,
     ) -> candle_core::Result<()> {
-        let num_rows = input.len() / row_size;
-        let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
-        let w = weight.slice(..);
-        let rs = row_size as i32;
-        let mut b = stream.launch_builder(&func);
-        b.arg(input);
-        b.arg(&w);
-        b.arg(output);
-        b.arg(&rs);
-        b.arg(&eps);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (num_rows as u32, 1, 1),
-                block_dim: (row_size.min(1024) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            })
+        #[cfg(feature = "triton-kernels")]
+        {
+            use crate::triton_meta::parse_meta;
+            use crate::triton_ptx::rms_norm_f16;
+            let meta = parse_meta(rms_norm_f16::META)?;
+            let func = device.get_or_load_custom_func(
+                "rms_norm_typed",
+                "triton_rms_norm_f16",
+                rms_norm_f16::PTX,
+            )?;
+            let num_rows = input.len() / row_size;
+            let inv_n: f32 = 1.0 / row_size as f32;
+            let rs = row_size as i32;
+            let scratch =
+                unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("triton rms_norm scratch alloc: {e}"))
+                })?;
+            let prof =
+                unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("triton rms_norm profile alloc: {e}"))
+                })?;
+            let w = weight.slice(..);
+            let mut b = stream.launch_builder(&func);
+            b.arg(input);
+            b.arg(&w);
+            b.arg(output);
+            b.arg(&rs);
+            b.arg(&inv_n);
+            b.arg(&eps);
+            b.arg(&scratch);
+            b.arg(&prof);
+            return unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (num_rows as u32, 1, 1),
+                    block_dim: (meta.num_warps * 32, 1, 1),
+                    shared_mem_bytes: meta.shared_mem as u32,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("triton rms_norm_view: {e}")));
         }
-        .map(|_| ())
-        .map_err(|e| candle_core::Error::Msg(format!("rms_norm: {e}")))
+        #[allow(unreachable_code)]
+        {
+            let num_rows = input.len() / row_size;
+            let func = device.get_or_load_custom_func("rms_norm_f16", "rms_norm", ptx::RMS_NORM)?;
+            let w = weight.slice(..);
+            let rs = row_size as i32;
+            let mut b = stream.launch_builder(&func);
+            b.arg(input);
+            b.arg(&w);
+            b.arg(output);
+            b.arg(&rs);
+            b.arg(&eps);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (num_rows as u32, 1, 1),
+                    block_dim: (row_size.min(1024) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("rms_norm: {e}")))
+        }
     }
 
     /// RMS norm from CudaView input to CudaViewMut output (for batch-offset writes).
@@ -2689,33 +2796,81 @@ impl CudaDecodeRunner {
         h: usize,
         eps: f32,
     ) -> candle_core::Result<()> {
-        let func = device.get_or_load_custom_func(
-            "fused_add_rms_norm_f16",
-            "fused_add_rms_norm",
-            ptx::FUSED_ADD_RMS_NORM,
-        )?;
-        let iv = input.slice(..);
-        let rv = residual.slice(..);
-        let wv = weight.slice(..);
-        let hi = h as i32;
-        let mut b = stream.launch_builder(&func);
-        b.arg(&iv);
-        b.arg(&rv);
-        b.arg(&wv);
-        b.arg(output);
-        b.arg(residual_out);
-        b.arg(&hi);
-        b.arg(&eps);
-        let num_tokens = (input.len() / h) as u32;
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (num_tokens, 1, 1),
-                block_dim: (h.min(1024) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            })
+        #[cfg(feature = "triton-kernels")]
+        {
+            use crate::triton_meta::parse_meta;
+            use crate::triton_ptx::fused_add_rms_norm_f16;
+            let meta = parse_meta(fused_add_rms_norm_f16::META)?;
+            let func = device.get_or_load_custom_func(
+                "fused_add_rms_norm_typed",
+                "triton_fused_add_rms_norm_f16",
+                fused_add_rms_norm_f16::PTX,
+            )?;
+            let num_tokens = (input.len() / h) as u32;
+            let inv_n: f32 = 1.0 / h as f32;
+            let hi = h as i32;
+            let scratch =
+                unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("triton fused_add_rms scratch: {e}"))
+                })?;
+            let prof =
+                unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("triton fused_add_rms profile: {e}"))
+                })?;
+            let iv = input.slice(..);
+            let rv = residual.slice(..);
+            let wv = weight.slice(..);
+            let mut b = stream.launch_builder(&func);
+            b.arg(&iv);
+            b.arg(&rv);
+            b.arg(&wv);
+            b.arg(output);
+            b.arg(residual_out);
+            b.arg(&hi);
+            b.arg(&inv_n);
+            b.arg(&eps);
+            b.arg(&scratch);
+            b.arg(&prof);
+            return unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (num_tokens, 1, 1),
+                    block_dim: (meta.num_warps * 32, 1, 1),
+                    shared_mem_bytes: meta.shared_mem as u32,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("triton fused_add_rms: {e}")));
         }
-        .map(|_| ())
-        .map_err(|e| candle_core::Error::Msg(format!("fused_add_rms: {e}")))
+        #[allow(unreachable_code)]
+        {
+            let func = device.get_or_load_custom_func(
+                "fused_add_rms_norm_f16",
+                "fused_add_rms_norm",
+                ptx::FUSED_ADD_RMS_NORM,
+            )?;
+            let iv = input.slice(..);
+            let rv = residual.slice(..);
+            let wv = weight.slice(..);
+            let hi = h as i32;
+            let mut b = stream.launch_builder(&func);
+            b.arg(&iv);
+            b.arg(&rv);
+            b.arg(&wv);
+            b.arg(output);
+            b.arg(residual_out);
+            b.arg(&hi);
+            b.arg(&eps);
+            let num_tokens = (input.len() / h) as u32;
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (num_tokens, 1, 1),
+                    block_dim: (h.min(1024) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("fused_add_rms: {e}")))
+        }
     }
 
     fn launch_fused_silu_mul(
@@ -2726,26 +2881,68 @@ impl CudaDecodeRunner {
         output: &mut CudaSlice<half::f16>,
         n: usize,
     ) -> candle_core::Result<()> {
-        let func = device.get_or_load_custom_func(
-            "fused_silu_mul_f16",
-            "fused_silu_mul",
-            ptx::FUSED_SILU_MUL,
-        )?;
-        let ni = n as i32;
-        let mut b = stream.launch_builder(&func);
-        b.arg(gate);
-        b.arg(up);
-        b.arg(output);
-        b.arg(&ni);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (((n + 255) / 256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
+        #[cfg(feature = "triton-kernels")]
+        {
+            use crate::triton_meta::parse_meta;
+            use crate::triton_ptx::fused_silu_mul_f16;
+            let meta = parse_meta(fused_silu_mul_f16::META)?;
+            let func = device.get_or_load_custom_func(
+                "fused_silu_mul_typed",
+                "triton_fused_silu_mul_f16",
+                fused_silu_mul_f16::PTX,
+            )?;
+            let ni = n as i32;
+            // Triton DSL kernel uses BLOCK=1024 → grid = ceil(N/1024).
+            let block = 1024usize;
+            let grid = ((n + block - 1) / block) as u32;
+            let scratch =
+                unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("triton silu_mul scratch: {e}"))
+                })?;
+            let prof =
+                unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("triton silu_mul profile: {e}"))
+                })?;
+            let mut b = stream.launch_builder(&func);
+            b.arg(gate);
+            b.arg(up);
+            b.arg(output);
+            b.arg(&ni);
+            b.arg(&scratch);
+            b.arg(&prof);
+            return unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (meta.num_warps * 32, 1, 1),
+                    shared_mem_bytes: meta.shared_mem as u32,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("triton silu_mul: {e}")));
         }
-        .map(|_| ())
-        .map_err(|e| candle_core::Error::Msg(format!("silu_mul: {e}")))
+        #[allow(unreachable_code)]
+        {
+            let func = device.get_or_load_custom_func(
+                "fused_silu_mul_f16",
+                "fused_silu_mul",
+                ptx::FUSED_SILU_MUL,
+            )?;
+            let ni = n as i32;
+            let mut b = stream.launch_builder(&func);
+            b.arg(gate);
+            b.arg(up);
+            b.arg(output);
+            b.arg(&ni);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("silu_mul: {e}")))
+        }
     }
 
     /// Interleaved silu_mul for batched gate+up GEMM output.
@@ -2791,6 +2988,47 @@ impl CudaDecodeRunner {
         output: &mut CudaSlice<half::f16>,
         n: usize,
     ) -> candle_core::Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        {
+            use crate::triton_meta::parse_meta;
+            use crate::triton_ptx::residual_add_f16;
+            let meta = parse_meta(residual_add_f16::META)?;
+            let func = device.get_or_load_custom_func(
+                "residual_add_typed",
+                "triton_residual_add_f16",
+                residual_add_f16::PTX,
+            )?;
+            let ni = n as i32;
+            let block = 1024usize;
+            let grid = ((n + block - 1) / block) as u32;
+            let scratch =
+                unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("triton residual_add scratch: {e}"))
+                })?;
+            let prof =
+                unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("triton residual_add profile: {e}"))
+                })?;
+            let av = a.slice(..);
+            let bv = b_.slice(..);
+            let mut b = stream.launch_builder(&func);
+            b.arg(&av);
+            b.arg(&bv);
+            b.arg(output);
+            b.arg(&ni);
+            b.arg(&scratch);
+            b.arg(&prof);
+            return unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (meta.num_warps * 32, 1, 1),
+                    shared_mem_bytes: meta.shared_mem as u32,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| candle_core::Error::Msg(format!("triton residual_add: {e}")));
+        }
+        #[allow(unreachable_code)]
         let func = device.get_or_load_custom_func(
             "residual_add_f16",
             "residual_add",
