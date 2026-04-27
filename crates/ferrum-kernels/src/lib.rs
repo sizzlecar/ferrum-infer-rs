@@ -78,6 +78,11 @@ mod triton_gelu;
 #[cfg(all(feature = "cuda", feature = "triton-kernels"))]
 pub use triton_gelu::gelu_triton;
 
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_add_bias;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_add_bias::add_bias_triton;
+
 #[cfg(feature = "cuda")]
 mod rope;
 #[cfg(feature = "cuda")]
