@@ -63,6 +63,11 @@ mod triton_fused_add_rms_norm;
 #[cfg(all(feature = "cuda", feature = "triton-kernels"))]
 pub use triton_fused_add_rms_norm::fused_add_rms_norm_triton;
 
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_layer_norm;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_layer_norm::layer_norm_triton;
+
 #[cfg(feature = "cuda")]
 mod rope;
 #[cfg(feature = "cuda")]
