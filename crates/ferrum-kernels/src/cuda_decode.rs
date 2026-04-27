@@ -2358,14 +2358,22 @@ impl CudaDecodeRunner {
         valid_kv: usize,
         scale: f32,
     ) -> candle_core::Result<()> {
-        // Triton path is gated on `triton-kernels` AND a head_dim we have a
-        // PTX for. Today only HEAD_DIM=64 ships (TinyLlama) — fall back to
-        // the .cu kernel for other head dims so larger models still work.
+        // Triton path is gated on `triton-kernels` AND a head_dim we have
+        // a PTX for. We ship HEAD_DIM={64, 128} — covers TinyLlama (64),
+        // Qwen3, Llama-3 (128). Other head dims fall back to .cu.
         #[cfg(feature = "triton-kernels")]
-        if hd == 64 {
-            return Self::launch_decode_attention_triton_h64(
-                device, stream, q, kc, vc, output, nq, nkv, hd, valid_kv, scale,
-            );
+        match hd {
+            64 => {
+                return Self::launch_decode_attention_triton_h64(
+                    device, stream, q, kc, vc, output, nq, nkv, hd, valid_kv, scale,
+                );
+            }
+            128 => {
+                return Self::launch_decode_attention_triton_h128(
+                    device, stream, q, kc, vc, output, nq, nkv, hd, valid_kv, scale,
+                );
+            }
+            _ => {}
         }
         let func = device.get_or_load_custom_func(
             "decode_attention_f16",
@@ -2402,6 +2410,70 @@ impl CudaDecodeRunner {
         }
         .map(|_| ())
         .map_err(|e| candle_core::Error::Msg(format!("attn: {e}")))
+    }
+
+    /// Triton-rs PTX path for `decode_attention` (seq-major, HEAD_DIM=128).
+    /// Same ABI as the h64 variant; just a different precompiled PTX with
+    /// HEAD_DIM=128 baked in (Qwen3 / Llama-3-class models).
+    #[cfg(feature = "triton-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    fn launch_decode_attention_triton_h128(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        q: &CudaSlice<half::f16>,
+        kc: &CudaSlice<half::f16>,
+        vc: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        valid_kv: usize,
+        scale: f32,
+    ) -> candle_core::Result<()> {
+        use crate::triton_meta::parse_meta;
+        use crate::triton_ptx::decode_attention_f16_h128;
+        let meta = parse_meta(decode_attention_f16_h128::META)?;
+        let func = device.get_or_load_custom_func(
+            "decode_attention_typed",
+            "triton_decode_attention_f16_h128",
+            decode_attention_f16_h128::PTX,
+        )?;
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let vki = valid_kv as i32;
+        let scratch =
+            unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
+                candle_core::Error::Msg(format!("triton decode_attn scratch: {e}"))
+            })?;
+        let prof =
+            unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
+                candle_core::Error::Msg(format!("triton decode_attn profile: {e}"))
+            })?;
+        let qv = q.slice(..);
+        let kv = kc.slice(..);
+        let vv = vc.slice(..);
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kv);
+        b.arg(&vv);
+        b.arg(output);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&vki);
+        b.arg(&scale);
+        b.arg(&scratch);
+        b.arg(&prof);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (meta.num_warps * 32, 1, 1),
+                shared_mem_bytes: meta.shared_mem as u32,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("triton decode_attn h128: {e}")))
     }
 
     /// Triton-rs PTX path for `decode_attention` (seq-major, HEAD_DIM=64).
