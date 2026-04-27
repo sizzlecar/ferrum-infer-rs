@@ -73,6 +73,11 @@ mod triton_softmax;
 #[cfg(all(feature = "cuda", feature = "triton-kernels"))]
 pub use triton_softmax::softmax_triton;
 
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_gelu;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_gelu::gelu_triton;
+
 #[cfg(feature = "cuda")]
 mod rope;
 #[cfg(feature = "cuda")]
