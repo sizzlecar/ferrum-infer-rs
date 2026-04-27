@@ -34,6 +34,13 @@ mod rms_norm;
 #[cfg(feature = "cuda")]
 pub use rms_norm::rms_norm;
 
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_ptx;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_rms_norm;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_rms_norm::rms_norm_triton;
+
 #[cfg(feature = "cuda")]
 mod rope;
 #[cfg(feature = "cuda")]
