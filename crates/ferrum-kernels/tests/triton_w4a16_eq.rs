@@ -92,7 +92,8 @@ fn cpu_reference_gemm(
             let pn = n / 8;
             let z_shift = (n % 8) * 4;
             let qz_v = qz[kg * (N / 8) + pn] as u32;
-            let zero = ((qz_v >> z_shift) & 0xF) as i32;
+            // AutoGPTQ stores qzero = actual_zero - 1; recover with +1.
+            let zero = (((qz_v >> z_shift) & 0xF) as i32) + 1;
 
             let scale = scales[kg * N + n].to_f32();
             deq[k * N + n] = (nibble - zero) as f32 * scale;
@@ -249,7 +250,8 @@ fn cpu_reference_gemm_real(
             let pn = n / 8;
             let z_shift = (n % 8) * 4;
             let qz_v = qz[kg * (N2 / 8) + pn] as u32;
-            let zero = ((qz_v >> z_shift) & 0xF) as i32;
+            // AutoGPTQ stores qzero = actual_zero - 1; recover with +1.
+            let zero = (((qz_v >> z_shift) & 0xF) as i32) + 1;
 
             let scale = scales[kg * N2 + n].to_f32();
             deq[k * N2 + n] = (nibble - zero) as f32 * scale;
