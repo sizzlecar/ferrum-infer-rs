@@ -68,6 +68,11 @@ mod triton_layer_norm;
 #[cfg(all(feature = "cuda", feature = "triton-kernels"))]
 pub use triton_layer_norm::layer_norm_triton;
 
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_softmax;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_softmax::softmax_triton;
+
 #[cfg(feature = "cuda")]
 mod rope;
 #[cfg(feature = "cuda")]
