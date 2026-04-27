@@ -107,3 +107,11 @@ pub mod add_bias_f16 {
     pub const PTX: &str = include_str!("../triton_ptx/add_bias_f16.ptx");
     pub const META: &str = include_str!("../triton_ptx/add_bias_f16.json");
 }
+
+// decode_attention seq-major, HEAD_DIM=64 (TinyLlama / 1.1B-class Llamas).
+// HEAD_DIM=128 PTX path is generated separately as decode_attention_f16
+// (same Rust fn name baked into the kernel) for Llama-3 / Qwen sizes.
+pub mod decode_attention_f16_h64 {
+    pub const PTX: &str = include_str!("../triton_ptx/decode_attention_f16_h64.ptx");
+    pub const META: &str = include_str!("../triton_ptx/decode_attention_f16_h64.json");
+}

@@ -2358,6 +2358,15 @@ impl CudaDecodeRunner {
         valid_kv: usize,
         scale: f32,
     ) -> candle_core::Result<()> {
+        // Triton path is gated on `triton-kernels` AND a head_dim we have a
+        // PTX for. Today only HEAD_DIM=64 ships (TinyLlama) — fall back to
+        // the .cu kernel for other head dims so larger models still work.
+        #[cfg(feature = "triton-kernels")]
+        if hd == 64 {
+            return Self::launch_decode_attention_triton_h64(
+                device, stream, q, kc, vc, output, nq, nkv, hd, valid_kv, scale,
+            );
+        }
         let func = device.get_or_load_custom_func(
             "decode_attention_f16",
             "decode_attention",
@@ -2393,6 +2402,72 @@ impl CudaDecodeRunner {
         }
         .map(|_| ())
         .map_err(|e| candle_core::Error::Msg(format!("attn: {e}")))
+    }
+
+    /// Triton-rs PTX path for `decode_attention` (seq-major, HEAD_DIM=64).
+    /// ABI: 9 user args (q, k_cache, v_cache, output, num_q_heads,
+    /// num_kv_heads, head_dim, valid_kv_len, scale) + 2 implicit scratch.
+    /// `max_kv` from the caller is dropped — the triton kernel computes
+    /// the score buffer itself via num_warps shared mem (BLOCK_KV * 4 B).
+    #[cfg(feature = "triton-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    fn launch_decode_attention_triton_h64(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        q: &CudaSlice<half::f16>,
+        kc: &CudaSlice<half::f16>,
+        vc: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        valid_kv: usize,
+        scale: f32,
+    ) -> candle_core::Result<()> {
+        use crate::triton_meta::parse_meta;
+        use crate::triton_ptx::decode_attention_f16_h64;
+        let meta = parse_meta(decode_attention_f16_h64::META)?;
+        let func = device.get_or_load_custom_func(
+            "decode_attention_typed",
+            "triton_decode_attention_f16_h64",
+            decode_attention_f16_h64::PTX,
+        )?;
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let vki = valid_kv as i32;
+        let scratch =
+            unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
+                candle_core::Error::Msg(format!("triton decode_attn scratch: {e}"))
+            })?;
+        let prof =
+            unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
+                candle_core::Error::Msg(format!("triton decode_attn profile: {e}"))
+            })?;
+        let qv = q.slice(..);
+        let kv = kc.slice(..);
+        let vv = vc.slice(..);
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kv);
+        b.arg(&vv);
+        b.arg(output);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&vki);
+        b.arg(&scale);
+        b.arg(&scratch);
+        b.arg(&prof);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (meta.num_warps * 32, 1, 1),
+                shared_mem_bytes: meta.shared_mem as u32,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("triton decode_attn: {e}")))
     }
 
     /// Decode attention accepting CudaView for Q (for batch fallback with sliced Q).
