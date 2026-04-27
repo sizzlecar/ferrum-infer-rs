@@ -17,3 +17,43 @@ pub mod rms_norm_f32 {
     pub const PTX: &str = include_str!("../triton_ptx/rms_norm_f32.ptx");
     pub const META: &str = include_str!("../triton_ptx/rms_norm_f32.json");
 }
+
+pub mod residual_add_f32 {
+    pub const PTX: &str = include_str!("../triton_ptx/residual_add_f32.ptx");
+    pub const META: &str = include_str!("../triton_ptx/residual_add_f32.json");
+}
+
+pub mod residual_add_inplace_f32 {
+    pub const PTX: &str = include_str!("../triton_ptx/residual_add_inplace_f32.ptx");
+    pub const META: &str = include_str!("../triton_ptx/residual_add_inplace_f32.json");
+}
+
+pub mod fused_silu_mul_f32 {
+    pub const PTX: &str = include_str!("../triton_ptx/fused_silu_mul_f32.ptx");
+    pub const META: &str = include_str!("../triton_ptx/fused_silu_mul_f32.json");
+}
+
+pub mod fused_add_rms_norm_f32 {
+    pub const PTX: &str = include_str!("../triton_ptx/fused_add_rms_norm_f32.ptx");
+    pub const META: &str = include_str!("../triton_ptx/fused_add_rms_norm_f32.json");
+}
+
+pub mod layer_norm_f32 {
+    pub const PTX: &str = include_str!("../triton_ptx/layer_norm_f32.ptx");
+    pub const META: &str = include_str!("../triton_ptx/layer_norm_f32.json");
+}
+
+pub mod softmax_f32 {
+    pub const PTX: &str = include_str!("../triton_ptx/softmax_f32.ptx");
+    pub const META: &str = include_str!("../triton_ptx/softmax_f32.json");
+}
+
+pub mod gelu_f32 {
+    pub const PTX: &str = include_str!("../triton_ptx/gelu_f32.ptx");
+    pub const META: &str = include_str!("../triton_ptx/gelu_f32.json");
+}
+
+pub mod add_bias_f32 {
+    pub const PTX: &str = include_str!("../triton_ptx/add_bias_f32.ptx");
+    pub const META: &str = include_str!("../triton_ptx/add_bias_f32.json");
+}
