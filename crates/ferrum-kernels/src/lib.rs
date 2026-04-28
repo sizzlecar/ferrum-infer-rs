@@ -34,6 +34,58 @@ mod rms_norm;
 #[cfg(feature = "cuda")]
 pub use rms_norm::rms_norm;
 
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_ptx;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_meta;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_rms_norm;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_rms_norm::rms_norm_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_residual_add;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_residual_add::residual_add_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_residual_add_inplace;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_residual_add_inplace::residual_add_inplace_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_fused_silu_mul;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_fused_silu_mul::fused_silu_mul_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_fused_add_rms_norm;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_fused_add_rms_norm::fused_add_rms_norm_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_layer_norm;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_layer_norm::layer_norm_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_softmax;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_softmax::softmax_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_gelu;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_gelu::gelu_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+mod triton_add_bias;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use triton_add_bias::add_bias_triton;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub mod triton_w4a16;
+
 #[cfg(feature = "cuda")]
 mod rope;
 #[cfg(feature = "cuda")]
