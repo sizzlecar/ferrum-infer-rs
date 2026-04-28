@@ -29,6 +29,27 @@ use crate::common::DecoderOnlyLLM;
 
 use super::common::{self, GenericKvCacheHandle};
 
+/// Map a `ferrum_types::Device` to the matching `candle_core::Device`.
+/// Used when materialising KV cache handles so downstream readers see
+/// the real backend the model runs on (Metal / CUDA / CPU) rather than
+/// a hard-coded CPU placeholder.
+fn ferrum_device_to_candle(d: &ferrum_types::Device) -> candle_core::Device {
+    match d {
+        ferrum_types::Device::CPU => candle_core::Device::Cpu,
+        #[cfg(feature = "cuda")]
+        ferrum_types::Device::CUDA(i) => {
+            candle_core::Device::new_cuda(*i as usize).unwrap_or(candle_core::Device::Cpu)
+        }
+        #[cfg(not(feature = "cuda"))]
+        ferrum_types::Device::CUDA(_) => candle_core::Device::Cpu,
+        #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
+        ferrum_types::Device::Metal => {
+            candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+        }
+        _ => candle_core::Device::Cpu,
+    }
+}
+
 pub struct LlmExecutor {
     model: Mutex<Box<dyn DecoderOnlyLLM>>,
     info: ModelInfo,
@@ -50,6 +71,14 @@ impl LlmExecutor {
             self.next_cache_id.fetch_add(1, Ordering::Relaxed)
         )
     }
+
+    /// Roll the KV cache for `cache_id` back to `new_len` positions.
+    /// Used by speculative decoding on partial rejection. The caller must
+    /// supply a `GenericKvCacheHandle` whose seq_len is also updated.
+    pub fn truncate_kv_for_cache_id(&self, cache_id: &str, new_len: usize) {
+        let mut model = self.model.lock();
+        model.truncate_kv(cache_id, new_len);
+    }
 }
 
 #[async_trait::async_trait]
@@ -60,9 +89,19 @@ impl ModelExecutor for LlmExecutor {
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
-        debug!("LlmExecutor prefill: {} tokens", tokens.len());
 
-        let cache_id = self.gen_cache_id();
+        // Reuse an existing cache_id when the caller supplies a KV handle
+        // (chunked prefill) — fresh id only on the very first call for a
+        // request. Without this, every chunk would create a new KV cache
+        // at position 0 and subsequent chunks wouldn't see prior tokens.
+        let supplied_handle_id = input.kv_cache.as_ref().and_then(|h| {
+            h.as_any()
+                .downcast_ref::<GenericKvCacheHandle>()
+                .map(|g| g.request_cache_id().to_string())
+        });
+        let cache_id = supplied_handle_id
+            .clone()
+            .unwrap_or_else(|| self.gen_cache_id());
 
         let logits = {
             let mut model = self.model.lock();
@@ -79,18 +118,120 @@ impl ModelExecutor for LlmExecutor {
         let logits_ref = common::wrap_tensor(logits_tensor);
 
         let cfg = self.model.lock().config().clone();
-        // num_kv_heads for KV cache sizing; GenericKvCacheHandle's third arg
-        // is head count which here is the KV-head count.
+        // Sequence-length tracking across chunks: if the caller supplied a
+        // GenericKvCacheHandle (chunked prefill continuation), add this
+        // chunk's tokens to the prior length. Otherwise this is a fresh
+        // prefill so seq_len == this call's token count. Without this the
+        // handle would claim only the last chunk's length, misleading
+        // decode() into rewriting the KV at an earlier position.
+        let seq_len = input
+            .kv_cache
+            .as_ref()
+            .and_then(|h| h.as_any().downcast_ref::<GenericKvCacheHandle>())
+            .map(|g| {
+                use ferrum_interfaces::KvCacheHandle;
+                g.block_table().sequence_length + tokens.len()
+            })
+            .unwrap_or(tokens.len());
+
         let kv_handle = Arc::new(GenericKvCacheHandle::new(
             cfg.num_layers,
             cfg.num_kv_heads,
             cfg.head_dim,
             candle_core::Device::Cpu,
-            tokens.len(),
+            seq_len,
             cache_id,
         ));
 
         Ok(PrefillOutput::new(logits_ref, kv_handle))
+    }
+
+    async fn truncate_kv(
+        &self,
+        kv_cache: &Arc<dyn ferrum_interfaces::KvCacheHandle>,
+        new_len: usize,
+    ) -> Result<()> {
+        if let Some(g) = kv_cache.as_any().downcast_ref::<GenericKvCacheHandle>() {
+            let cache_id = g.request_cache_id();
+            self.model.lock().truncate_kv(cache_id, new_len);
+        }
+        Ok(())
+    }
+
+    async fn forward_verify(
+        &self,
+        inputs: &[ferrum_interfaces::model_executor::DecodeInput],
+    ) -> Result<Vec<ferrum_interfaces::model_executor::DecodeOutput>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // All inputs must share the same KV handle (speculative decoding
+        // contract). Extract cache_id + starting seq_len once.
+        let first_handle = inputs[0].kv_cache.clone();
+        let cache_id = first_handle
+            .as_any()
+            .downcast_ref::<GenericKvCacheHandle>()
+            .ok_or_else(|| {
+                FerrumError::model("forward_verify requires GenericKvCacheHandle input")
+            })?
+            .request_cache_id()
+            .to_string();
+        let start_seq = {
+            use ferrum_interfaces::KvCacheHandle;
+            first_handle.block_table().sequence_length
+        };
+
+        // Collect the N+1 token ids.
+        let mut token_ids: Vec<u32> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let toks = common::tensor_to_tokens(&input.input_ids)?;
+            if toks.is_empty() {
+                return Err(FerrumError::model("forward_verify input token empty"));
+            }
+            token_ids.push(toks[0]);
+        }
+
+        // One model forward for all N+1 positions → flat seq_len*vocab.
+        let flat = {
+            let mut model = self.model.lock();
+            model.forward_verify(&cache_id, &token_ids)
+        };
+
+        let cfg = self.model.lock().config().clone();
+        let vocab = cfg.vocab_size;
+
+        // Record the actual backend device so downstream code that reads
+        // `KvCacheHandle::device()` sees Metal/CUDA/CPU matching the
+        // model's real location. The logits `Tensor` still wraps CPU data
+        // because `B::to_vec` already moved it off-device.
+        let candle_device = ferrum_device_to_candle(&self.info.device);
+
+        // Split the flat logits into per-position tensors, each wrapped
+        // with a handle whose seq_len reflects the positions written so
+        // far. Matches what the spec runner expects from sequential
+        // decode() calls.
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for (i, _) in inputs.iter().enumerate() {
+            let row = &flat[i * vocab..(i + 1) * vocab];
+            let logits_tensor = candle_core::Tensor::new(row, &candle_core::Device::Cpu)
+                .map_err(|e| FerrumError::model(format!("logits tensor: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?;
+            let logits_ref = common::wrap_tensor(logits_tensor);
+            let handle = Arc::new(GenericKvCacheHandle::new(
+                cfg.num_layers,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                candle_device.clone(),
+                start_seq + i + 1,
+                cache_id.clone(),
+            ));
+            outputs.push(ferrum_interfaces::model_executor::DecodeOutput::new(
+                logits_ref, handle,
+            ));
+        }
+        Ok(outputs)
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {

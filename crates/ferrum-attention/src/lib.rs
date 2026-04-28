@@ -3,6 +3,8 @@
 //! Single-kernel attention (QK^T + softmax + attn@V) with no intermediate buffer
 //! materialization. Full transformer layer with all ops fused on GPU.
 
+#![allow(dead_code, unused_imports, unused_variables, unused_mut, unused_parens)]
+
 pub mod cpu;
 
 #[cfg(feature = "metal")]

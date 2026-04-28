@@ -373,6 +373,16 @@ fn convert_chat_request(
                 Some(rf) if rf.format_type == "json_object" => {
                     ferrum_types::ResponseFormat::JsonObject
                 }
+                Some(rf) if rf.format_type == "json_schema" => {
+                    // OpenAI wraps the actual schema one level deeper.
+                    match rf.json_schema.as_ref().map(|js| &js.schema) {
+                        Some(schema) => match serde_json::to_string(schema) {
+                            Ok(s) => ferrum_types::ResponseFormat::JsonSchema(s),
+                            Err(_) => ferrum_types::ResponseFormat::Text,
+                        },
+                        None => ferrum_types::ResponseFormat::JsonObject, // fallback
+                    }
+                }
                 _ => ferrum_types::ResponseFormat::Text,
             },
         },

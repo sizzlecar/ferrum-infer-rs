@@ -363,12 +363,24 @@ impl ContinuousBatchScheduler {
             let prefill_queue = self.prefill_queue.read();
             for req in prefill_queue.iter().take(prefill_remaining) {
                 let prefill_chunk_tokens = if self.cb_config.enable_chunked_prefill {
-                    self.cb_config
-                        .prefill_chunk_size
-                        .min(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
+                    if req.prefill_tokens == 0 {
+                        // Total unknown yet (engine hasn't reported it) —
+                        // reserve one chunk's worth so we don't over-commit.
+                        self.cb_config.prefill_chunk_size
+                    } else {
+                        self.cb_config
+                            .prefill_chunk_size
+                            .min(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
+                    }
                 } else {
                     req.prefill_tokens
                 };
+                // Skip fully-prefilled requests that are still in the queue
+                // (they'll be promoted by mark_prefill_chunk_processed on the
+                // next iteration boundary).
+                if prefill_chunk_tokens == 0 {
+                    continue;
+                }
 
                 if total_tokens + prefill_chunk_tokens <= hint.max_tokens {
                     let mut scheduled = req.inner.clone();
@@ -403,13 +415,20 @@ impl ContinuousBatchScheduler {
             let prefill_queue = self.prefill_queue.read();
             for req in prefill_queue.iter().take(hint.max_batch_size) {
                 let prefill_chunk_tokens = if self.cb_config.enable_chunked_prefill {
-                    self.cb_config
-                        .prefill_chunk_size
-                        .min(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
+                    if req.prefill_tokens == 0 {
+                        self.cb_config.prefill_chunk_size
+                    } else {
+                        self.cb_config
+                            .prefill_chunk_size
+                            .min(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
+                    }
                 } else {
                     // For new requests, prefill_tokens might be 0, use a default
                     req.inner.request.sampling_params.max_tokens.min(512)
                 };
+                if prefill_chunk_tokens == 0 {
+                    continue;
+                }
 
                 if total_tokens + prefill_chunk_tokens <= hint.max_tokens {
                     let mut scheduled = req.inner.clone();
@@ -462,11 +481,51 @@ impl ContinuousBatchScheduler {
         {
             let req = &mut prefill_queue[pos];
             req.prefill_tokens = tokens;
+            req.prefill_chunk_offset = tokens;
+            req.chunked_prefill = false;
         }
         drop(prefill_queue);
 
         // Promote to decode
         self.promote_to_decode(request_id);
+    }
+
+    /// Mark a chunk of prefill as processed. Used by engines that split a
+    /// long prompt across multiple iterations to reduce TTFT under load.
+    ///
+    /// `total_prompt_tokens` should be the full prompt length — pass it
+    /// every call (idempotent: the scheduler uses the last value it sees).
+    /// `chunk_tokens` is how many tokens were processed *this iteration*.
+    ///
+    /// Returns `true` if the request is now fully prefilled and has been
+    /// promoted to the decode queue.
+    pub fn mark_prefill_chunk_processed(
+        &self,
+        request_id: &RequestId,
+        total_prompt_tokens: usize,
+        chunk_tokens: usize,
+    ) -> bool {
+        let mut prefill_queue = self.prefill_queue.write();
+        let mut fully_done = false;
+        if let Some(pos) = prefill_queue
+            .iter()
+            .position(|r| r.inner.request.id == *request_id)
+        {
+            let req = &mut prefill_queue[pos];
+            req.prefill_tokens = total_prompt_tokens;
+            req.chunked_prefill = true;
+            req.prefill_chunk_offset = req
+                .prefill_chunk_offset
+                .saturating_add(chunk_tokens)
+                .min(total_prompt_tokens);
+            fully_done = req.prefill_chunk_offset >= total_prompt_tokens;
+        }
+        drop(prefill_queue);
+
+        if fully_done {
+            self.promote_to_decode(request_id);
+        }
+        fully_done
     }
 
     /// Update decode progress for a request
@@ -902,5 +961,63 @@ mod tests {
         assert_eq!(cb_req.phase, RequestPhase::Waiting);
         assert!(!cb_req.is_active());
         assert!(!cb_req.is_finished());
+    }
+
+    /// Chunked prefill state machine: advance across multiple iterations,
+    /// transition Prefilling → Decoding only on the final chunk.
+    #[tokio::test]
+    async fn chunked_prefill_advances_across_iterations() {
+        let cb_cfg = ContinuousBatchConfig {
+            enable_chunked_prefill: true,
+            prefill_chunk_size: 128,
+            ..ContinuousBatchConfig::default()
+        };
+        let scheduler =
+            ContinuousBatchScheduler::with_cb_config(SchedulerConfig::default(), cb_cfg);
+
+        let request = create_test_request(Priority::Normal);
+        let req_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        // Pull a batch to promote waiting → prefilling
+        let _ = scheduler.next_batch(BatchHint::simple(1024)).await;
+        assert_eq!(scheduler.prefilling_count(), 1);
+        assert_eq!(scheduler.decoding_count(), 0);
+
+        // Engine reports: prompt is 400 tokens, first chunk processed 128.
+        // 128 < 400 → still prefilling, no phase transition.
+        let done = scheduler.mark_prefill_chunk_processed(&req_id, 400, 128);
+        assert!(!done, "first chunk should not finish prefill");
+        assert_eq!(scheduler.prefilling_count(), 1);
+        assert_eq!(scheduler.decoding_count(), 0);
+
+        // Second chunk — 256 of 400.
+        let done = scheduler.mark_prefill_chunk_processed(&req_id, 400, 128);
+        assert!(!done);
+        assert_eq!(scheduler.prefilling_count(), 1);
+        assert_eq!(scheduler.decoding_count(), 0);
+
+        // Final chunk — covers remaining 144 (saturates at 400).
+        let done = scheduler.mark_prefill_chunk_processed(&req_id, 400, 200);
+        assert!(done, "last chunk should complete prefill");
+        assert_eq!(scheduler.prefilling_count(), 0);
+        assert_eq!(scheduler.decoding_count(), 1);
+    }
+
+    /// Legacy one-shot `mark_prefill_complete` still promotes correctly and
+    /// sets offset to total (so the request won't be double-scheduled for
+    /// more prefill if somehow still in the queue).
+    #[tokio::test]
+    async fn mark_prefill_complete_sets_offset_to_total() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request = create_test_request(Priority::Normal);
+        let req_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+        let _ = scheduler.next_batch(BatchHint::simple(1024)).await;
+
+        scheduler.mark_prefill_complete(&req_id, 256);
+
+        assert_eq!(scheduler.prefilling_count(), 0);
+        assert_eq!(scheduler.decoding_count(), 1);
     }
 }

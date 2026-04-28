@@ -23,7 +23,9 @@
 //! let sampler = sampler_from_params(&params);
 //! ```
 
+pub mod guided;
 pub mod json_mode;
+pub mod schema_to_regex;
 
 // Re-export all sampler types from ferrum-interfaces
 pub use ferrum_interfaces::sampler::{

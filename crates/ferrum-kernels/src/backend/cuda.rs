@@ -1121,17 +1121,17 @@ impl Backend for CudaBackend {
             let qzeros_dev = stream
                 .clone_htod(qzeros)
                 .map_err(|e| FerrumError::model(format!("triton qzeros htod: {e}")))?;
-            tracing::info!(
-                "GPTQ load (triton-rs w4a16): K={k}, N={n}, gs={group_size}"
-            );
-            return Ok(GptqStoreCuda::Triton(crate::triton_w4a16::TritonGptqWeight {
-                qweight: qweight_dev,
-                scales: scales_dev,
-                qzeros: qzeros_dev,
-                k,
-                n,
-                group_size: group_size as i32,
-            }));
+            tracing::info!("GPTQ load (triton-rs w4a16): K={k}, N={n}, gs={group_size}");
+            return Ok(GptqStoreCuda::Triton(
+                crate::triton_w4a16::TritonGptqWeight {
+                    qweight: qweight_dev,
+                    scales: scales_dev,
+                    qzeros: qzeros_dev,
+                    k,
+                    n,
+                    group_size: group_size as i32,
+                },
+            ));
         }
 
         // Path A (default): Marlin. Repack on CPU, then upload. Matches
@@ -1190,8 +1190,10 @@ impl Backend for CudaBackend {
         // Branch on store variant (only present when triton-kernels is on).
         #[cfg(feature = "triton-kernels")]
         match weight {
-            GptqStoreCuda::Marlin(mw) => crate::marlin::marlin_gemm(&ctx.stream, a, mw, out, m as i32)
-                .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}"))),
+            GptqStoreCuda::Marlin(mw) => {
+                crate::marlin::marlin_gemm(&ctx.stream, a, mw, out, m as i32)
+                    .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+            }
             GptqStoreCuda::Triton(tw) => {
                 // Pre-load (and cache) the CudaFunction once per CudaState.
                 // Subsequent calls hit the HashMap and skip the PTX parse.
@@ -1201,10 +1203,8 @@ impl Backend for CudaBackend {
                     crate::triton_w4a16::fn_name(),
                 );
                 let stream = ctx.stream.clone();
-                crate::triton_w4a16::launch_w4a16_gptq_triton(
-                    &stream, &func, a, tw, out, m as i32,
-                )
-                .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
+                crate::triton_w4a16::launch_w4a16_gptq_triton(&stream, &func, a, tw, out, m as i32)
+                    .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
             }
         }
         #[cfg(not(feature = "triton-kernels"))]
@@ -1240,10 +1240,8 @@ impl Backend for CudaBackend {
                     crate::triton_w4a16::fn_name(),
                 );
                 let stream = ctx.stream.clone();
-                crate::triton_w4a16::launch_w4a16_gptq_triton(
-                    &stream, &func, a, tw, out, m as i32,
-                )
-                .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
+                crate::triton_w4a16::launch_w4a16_gptq_triton(&stream, &func, a, tw, out, m as i32)
+                    .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
             }
         }
     }

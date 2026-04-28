@@ -246,3 +246,110 @@ fn qwen3model_cpu_vs_metal() {
     }
     eprintln!("✅ LlamaFamilyModel Cpu↔Metal parity pass");
 }
+
+/// Chunked vs non-chunked prefill parity on Metal. If the incremental
+/// prefill path (`pos_offset` + cache_id reuse) is correct, splitting a
+/// prompt across two `prefill()` calls must yield bit-identical logits
+/// to one-shot prefill over the same prompt.
+#[test]
+#[ignore]
+fn qwen3model_chunked_vs_oneshot_prefill_metal() {
+    let mp = qwen3_path().expect("Qwen3-0.6B not in HF cache");
+    let def = load_model_def(&mp);
+    let qcfg = def_to_qwen3_cfg(&def);
+
+    let loader = ferrum_models::SafeTensorsLoader::new(mp.to_str().unwrap());
+    let vb = loader
+        .load_varbuilder(&candle_core::Device::Cpu, candle_core::DType::F32)
+        .unwrap();
+
+    let mtl_loader = CandleShimLoader::<MetalBackend>::new(&vb);
+    let mut model = LlamaFamilyModel::<MetalBackend>::new(qcfg, &mtl_loader).unwrap();
+
+    // Exact token stream from the failing server case ("Say hello in five
+    // words only." through Qwen3 chat template). Split 8 + 1.
+    let prompt: Vec<u32> = vec![872, 25, 24917, 23811, 304, 4236, 4244, 1172, 13];
+    let split = 8;
+
+    let baseline = model.prefill("oneshot", &prompt);
+
+    // Fresh cache_id for chunked run to ensure no leakage. First chunk's
+    // logits are discarded — we care about the final position only.
+    let _ = model.prefill("chunked", &prompt[..split]);
+    let chunked_final = model.prefill("chunked", &prompt[split..]);
+
+    let cos = cosine(&baseline, &chunked_final);
+    let mad = max_abs_diff(&baseline, &chunked_final);
+    let (ba, ca) = (argmax(&baseline), argmax(&chunked_final));
+    eprintln!(
+        "one-shot argmax={ba} ({:.4})  chunked argmax={ca} ({:.4})  cos={cos:.6}  max_diff={mad:.4}",
+        baseline[ba], chunked_final[ca]
+    );
+    assert_eq!(
+        ba, ca,
+        "chunked prefill argmax must match one-shot baseline"
+    );
+    assert!(
+        cos > 0.9999,
+        "chunked prefill logits diverge from baseline: cos={cos}"
+    );
+    eprintln!("✅ chunked prefill parity pass");
+}
+
+/// `forward_verify` on a single token should produce identical logits to
+/// `prefill_internal(token)` — proves multi-position RMSNorm + LM head on
+/// Metal match their single-position counterparts. Catches bugs where
+/// batched GEMM writes logits to the wrong position or RMSNorm doesn't
+/// scale per-row correctly.
+#[test]
+#[ignore]
+fn qwen3model_forward_verify_vs_prefill_metal() {
+    let mp = qwen3_path().expect("Qwen3-0.6B not in HF cache");
+    let def = load_model_def(&mp);
+    let qcfg = def_to_qwen3_cfg(&def);
+    let loader = ferrum_models::SafeTensorsLoader::new(mp.to_str().unwrap());
+    let vb = loader
+        .load_varbuilder(&candle_core::Device::Cpu, candle_core::DType::F32)
+        .unwrap();
+    let mtl_loader = CandleShimLoader::<MetalBackend>::new(&vb);
+    let mut model = LlamaFamilyModel::<MetalBackend>::new(qcfg, &mtl_loader).unwrap();
+
+    // Single token case: fresh prefill produces 1 logits row, forward_verify
+    // produces seq_len=1 rows — should be identical.
+    let tokens: Vec<u32> = vec![872, 25, 24917, 23811]; // short prompt
+    let prefill_out = model.prefill("t-pre", &tokens);
+    let verify_out = model.forward_verify("t-ver", &tokens);
+    // verify_out is seq_len * vocab — take last row to compare against
+    // prefill (which returns the last-position logits).
+    let vocab = prefill_out.len();
+    let verify_last = &verify_out[(tokens.len() - 1) * vocab..tokens.len() * vocab];
+    let cos = cosine(&prefill_out, verify_last);
+    let mad = max_abs_diff(&prefill_out, verify_last);
+    let (a, b) = (argmax(&prefill_out), argmax(verify_last));
+    eprintln!(
+        "prefill_internal argmax={a}  forward_verify(last) argmax={b}  cos={cos:.6}  max_diff={mad:.4}",
+    );
+    assert_eq!(
+        a, b,
+        "last-position argmax must match between prefill and verify"
+    );
+    assert!(cos > 0.9999, "last-position logits diverge: cos={cos}");
+
+    // Also check: forward_verify with 2 tokens — last position should match
+    // what a "normal decode" after the first prefill would give.
+    let next_tok = a as u32;
+    let decode_logits = model.decode("t-pre", next_tok, tokens.len() as u32);
+    let two = {
+        let mut v = tokens.clone();
+        v.push(next_tok);
+        v
+    };
+    let verify2 = model.forward_verify("t-ver2", &two);
+    let verify2_last = &verify2[(two.len() - 1) * vocab..two.len() * vocab];
+    let cos2 = cosine(&decode_logits, verify2_last);
+    let (c, d) = (argmax(&decode_logits), argmax(verify2_last));
+    eprintln!("decode_internal argmax={c}  forward_verify(2-tok, last) argmax={d}  cos={cos2:.6}",);
+    assert_eq!(c, d, "2-token verify last must match decode_internal");
+    assert!(cos2 > 0.999, "2-token verify diverges from decode");
+    eprintln!("✅ forward_verify parity pass");
+}

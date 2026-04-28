@@ -37,5 +37,11 @@ once_cell = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
+# Regex DFA for guided decoding (vocab-aware token masking)
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
+# Tests only — easy full-match regex semantics for validating our
+# schema-to-regex translator. Production uses regex-automata directly.
+regex-lite = "0.1"

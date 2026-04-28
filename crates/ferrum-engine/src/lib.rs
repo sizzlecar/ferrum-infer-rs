@@ -63,6 +63,7 @@ pub mod factory;
 pub mod parallel;
 pub mod pipeline;
 pub mod registry;
+pub mod speculative;
 pub mod transcription_engine;
 pub mod tts_engine;
 

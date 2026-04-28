@@ -24,7 +24,10 @@ fn make_inputs(dev: &Device) -> (Tensor, Tensor) {
     let weights: Vec<f32> = (0..ROW_SIZE).map(|i| 1.0 + (i as f32) * 0.001).collect();
     let input = Tensor::from_vec(total, (ROWS, ROW_SIZE), dev).unwrap();
     let weight = Tensor::from_vec(weights, ROW_SIZE, dev).unwrap();
-    (input.to_dtype(DType::F32).unwrap(), weight.to_dtype(DType::F32).unwrap())
+    (
+        input.to_dtype(DType::F32).unwrap(),
+        weight.to_dtype(DType::F32).unwrap(),
+    )
 }
 
 #[test]

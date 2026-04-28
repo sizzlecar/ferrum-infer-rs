@@ -181,13 +181,11 @@ pub fn launch_w4a16_gptq_triton(
         shared_mem_bytes: lp.shared_mem,
     };
 
-    unsafe { b.launch(cfg) }
-        .map(|_| ())
-        .map_err(|e| {
-            candle_core::Error::Msg(format!(
-                "triton w4a16 launch: {e} (m={m}, n={n}, k={k}, gs={gs})"
-            ))
-        })
+    unsafe { b.launch(cfg) }.map(|_| ()).map_err(|e| {
+        candle_core::Error::Msg(format!(
+            "triton w4a16 launch: {e} (m={m}, n={n}, k={k}, gs={gs})"
+        ))
+    })
 }
 
 /// Helper: kernel function name (matches the `tt.func` name in the MLIR).

@@ -43,11 +43,8 @@ pub fn softmax_triton(input: &Tensor) -> candle_core::Result<Tensor> {
 
     let cuda_dev = input.device().as_cuda_device()?;
     let kernel_name: &'static str = Box::leak(meta.name.into_boxed_str());
-    let func = cuda_dev.get_or_load_custom_func(
-        kernel_name,
-        MODULE_NAME,
-        triton_ptx::softmax_f32::PTX,
-    )?;
+    let func =
+        cuda_dev.get_or_load_custom_func(kernel_name, MODULE_NAME, triton_ptx::softmax_f32::PTX)?;
 
     let grid_size = rows as u32;
     let block_size = (meta.num_warps * 32) as u32;

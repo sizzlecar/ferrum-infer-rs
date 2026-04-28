@@ -39,12 +39,15 @@ pub struct SamplingParams {
     pub response_format: ResponseFormat,
 }
 
-/// Response format for structured output.
+/// Response format for structured output. Mirrors OpenAI's
+/// `response_format` API — no proprietary extensions.
 ///
-/// Controls how the model output is constrained:
 /// - `Text`: no constraint (default)
-/// - `JsonObject`: output must be valid JSON
-/// - `JsonSchema`: output must conform to a JSON schema
+/// - `JsonObject`: output must be a valid JSON object (matches OpenAI's
+///   `{"type": "json_object"}`)
+/// - `JsonSchema(schema)`: output must conform to the given JSON Schema
+///   (matches OpenAI's `{"type": "json_schema", "json_schema": {...}}`).
+///   Internally compiled to a regex FSM for per-token hard masking.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "schema")]
 #[derive(Default)]

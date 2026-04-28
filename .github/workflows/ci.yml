@@ -35,6 +35,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ubuntu-latest ships with ~30 GB of preinstalled SDKs (.NET, Android,
+      # Haskell, etc.) that we don't need. Cargo registry + target dir +
+      # Rust toolchain easily blow past the remaining ~14 GB on big builds —
+      # observed: jobs dying mid-cache-restore with "No space left on device".
+      # Reclaim ~25 GB before any cache step touches the disk.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/share/powershell /usr/share/swift
+          sudo docker system prune -af --volumes 2>/dev/null || true
+          df -h /
+
       - name: Install system deps
         run: |
           sudo apt-get update

@@ -55,7 +55,9 @@ fn build_gptq_tensors() -> (Vec<half::f16>, Vec<i32>, Vec<half::f16>, Vec<i32>) 
         .collect();
 
     // ── Zeros: int4 in [K/G, N], packed [K/G, N/8] along N ──
-    let z_int: Vec<u8> = (0..(K / G) * N).map(|i| ((i * 11 + 5) % 16) as u8).collect();
+    let z_int: Vec<u8> = (0..(K / G) * N)
+        .map(|i| ((i * 11 + 5) % 16) as u8)
+        .collect();
     let mut qz: Vec<i32> = vec![0; (K / G) * (N / 8)];
     for kg in 0..K / G {
         for pn in 0..N / 8 {
@@ -339,8 +341,14 @@ fn triton_w4a16_matches_cpu_reference_qkv_shape() {
         c_ref[argmax].to_f32()
     );
 
-    assert_eq!(nan_count, 0, "kernel produced NaN — bug in dispatch/wiring at scale");
-    assert_eq!(inf_count, 0, "kernel produced Inf — bug in dispatch/wiring at scale");
+    assert_eq!(
+        nan_count, 0,
+        "kernel produced NaN — bug in dispatch/wiring at scale"
+    );
+    assert_eq!(
+        inf_count, 0,
+        "kernel produced Inf — bug in dispatch/wiring at scale"
+    );
 
     // K=2048 f16 mults — accumulated f16 truncation error scales with sqrt(K)
     // for random-sign products. Tolerance 1.0 is loose but catches order-of-

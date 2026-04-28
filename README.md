@@ -250,24 +250,29 @@ Benchmarked on **RTX PRO 6000 (Blackwell)**:
 
 What works:
 - CLI chat, HTTP serving with streaming, benchmarking
-- Qwen3, Qwen2/2.5, LLaMA 3.x, TinyLlama architectures
+- Qwen3, Qwen2/2.5, LLaMA 3.x, Mistral (sliding-window), TinyLlama
 - Custom CUDA decode runner for Qwen3 and LLaMA (2x speedup)
 - Metal GPU acceleration (macOS), CUDA (NVIDIA), CPU
 - INT4 GPTQ quantization with Marlin fused kernel (Blackwell compatible)
 - FlashAttention-2 prefill + custom CUDA decode runner
 - Paged KV cache with block reclamation
 - Continuous batching with batch decode
+- Chunked prefill (`FERRUM_CHUNKED_PREFILL=<size>`) — split long prompts
+- Prefix cache for repeated prompts (safe exact-match gate)
+- Speculative decoding (`--spec-draft <MODEL>`) — DeepMind accept/reject
+- Structured output — OpenAI-compatible `response_format: json_object` +
+  `json_schema` with DFA-guided hard token masking
 - Tensor parallelism (multi-GPU NCCL, auto-detects GPU count)
 - CLIP/Chinese-CLIP/SigLIP embeddings (text + image, `/v1/embeddings` API)
 - Whisper ASR (speech-to-text, Metal accelerated, `/v1/audio/transcriptions` API)
-- Multi-format audio support (WAV/M4A/MP3/FLAC via ffmpeg)
+- Multi-format audio support (WAV/MP3/FLAC/M4A/OGG) via pure-Rust `symphonia`
 - Top-k/top-p/temperature/repetition-penalty sampling
 
 ## Roadmap
 
-- **Speculative decoding** — draft model verification
-- **More model architectures** — Mistral, Phi, DeepSeek, etc.
+- **More model architectures** — Phi, DeepSeek, Gemma
 - **Qwen2 CUDA runner** — same pattern as LLaMA
+- **FP8 / Marlin INT4 on more architectures**
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 

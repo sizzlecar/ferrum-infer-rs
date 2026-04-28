@@ -4,6 +4,18 @@
 //! 提供模型定义解析、构建器与权重加载占位实现，确保上层可以在
 //! 重构阶段编译。
 
+// TTS / Whisper架构里存在大量在不同调用路径下"当下未使用"的字段/方法
+// (e.g. 推理期不走的 layers、只在特定 feature 下用的导入)。抑制到 crate 级，
+// 新写代码的真实警告由 engine / sampler / scheduler 等下游 crate 的 CI 门把守。
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_assignments
+)]
+
 pub mod architectures;
 pub mod audio_processor;
 pub mod builder;
