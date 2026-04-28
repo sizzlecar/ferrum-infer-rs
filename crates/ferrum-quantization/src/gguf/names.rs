@@ -6,9 +6,25 @@
 //! truth for that mapping; both `GgufLoader` and any future tooling go
 //! through `ferrum_to_gguf`.
 //!
-//! Scope (Phase 1C): dense Llama-family models — Qwen3, Qwen2.x, Llama-3.x,
-//! Mistral, TinyLlama. MoE-specific names (`ffn_gate_inp`, `ffn_*_exps`)
-//! land in Phase 2 alongside the MoE runtime.
+//! Scope: dense Llama-family models (Qwen3, Qwen2.x, Llama-3.x, Mistral,
+//! TinyLlama) and Qwen-style MoE families (Qwen3-MoE, Mixtral, DeepSeek-V2 —
+//! they all use the same GGUF layout: per-layer router `ffn_gate_inp` plus
+//! three stacked-expert tensors `ffn_{gate,up,down}_exps` with shape
+//! `[num_experts, ...]`).
+//!
+//! ## ferrum-side naming convention for MoE tensors
+//!
+//! ferrum mirrors GGUF's stacked layout rather than HuggingFace's
+//! `experts.{e}.gate_proj` per-expert layout. Reasons:
+//!   1. The stacked form is what candle's `QMatMul::indexed_moe_forward`
+//!      expects — slicing per-expert is a runtime concern, not a
+//!      storage concern.
+//!   2. Loading per-expert from GGUF would require N reads + concat per
+//!      layer (the dense path's qkv-fusion shim works the other direction
+//!      and only does 3, not N=128).
+//!   3. If a future safetensors-MoE loader needs to consume per-expert
+//!      tensors, it can do its own concat just like the dense Qwen2.5
+//!      path concatenates q/k/v.
 
 /// Translate a ferrum tensor name to its GGUF equivalent.
 ///
@@ -67,10 +83,21 @@ fn map_layer_scoped(rest: &str) -> Option<String> {
         // Qwen3 QK-norm — only present on that family
         "self_attn.q_norm" => "attn_q_norm",
         "self_attn.k_norm" => "attn_k_norm",
-        // MLP projections
+        // Dense MLP projections
         "mlp.gate_proj" => "ffn_gate",
         "mlp.up_proj" => "ffn_up",
         "mlp.down_proj" => "ffn_down",
+        // MoE: router (gating) + stacked expert weights. Shape conventions:
+        //   router:    [hidden_size, num_experts]
+        //   gate_exps: [num_experts, expert_intermediate, hidden_size]
+        //   up_exps:   [num_experts, expert_intermediate, hidden_size]
+        //   down_exps: [num_experts, hidden_size, expert_intermediate]
+        // Loaded as flat fp32 buffers; the MoE runtime slices per-expert
+        // at forward time.
+        "mlp.router" => "ffn_gate_inp",
+        "mlp.gate_exps" => "ffn_gate_exps",
+        "mlp.up_exps" => "ffn_up_exps",
+        "mlp.down_exps" => "ffn_down_exps",
         _ => return None,
     };
 
@@ -195,11 +222,44 @@ mod tests {
     }
 
     #[test]
+    fn maps_moe_router_and_stacked_experts() {
+        // Router (2-D, [hidden, num_experts])
+        assert_eq!(
+            ferrum_to_gguf("model.layers.0.mlp.router.weight"),
+            Some("blk.0.ffn_gate_inp.weight".into())
+        );
+        // Stacked expert weights (3-D, [num_experts, ...])
+        assert_eq!(
+            ferrum_to_gguf("model.layers.0.mlp.gate_exps.weight"),
+            Some("blk.0.ffn_gate_exps.weight".into())
+        );
+        assert_eq!(
+            ferrum_to_gguf("model.layers.27.mlp.up_exps.weight"),
+            Some("blk.27.ffn_up_exps.weight".into())
+        );
+        assert_eq!(
+            ferrum_to_gguf("model.layers.0.mlp.down_exps.weight"),
+            Some("blk.0.ffn_down_exps.weight".into())
+        );
+        // Bare stems (load_linear-style for 2-D router)
+        assert_eq!(
+            ferrum_to_gguf("model.layers.0.mlp.router"),
+            Some("blk.0.ffn_gate_inp".into())
+        );
+    }
+
+    #[test]
     fn rejects_unknown_names() {
         assert_eq!(ferrum_to_gguf("totally_made_up"), None);
         assert_eq!(ferrum_to_gguf("model.layers.0.unknown_part.weight"), None);
         assert_eq!(
             ferrum_to_gguf("model.layers.bad_idx.input_layernorm.weight"),
+            None
+        );
+        // HF-style per-expert names are NOT supported (deliberately —
+        // the loader expects stacked names).
+        assert_eq!(
+            ferrum_to_gguf("model.layers.0.mlp.experts.0.gate_proj.weight"),
             None
         );
     }
