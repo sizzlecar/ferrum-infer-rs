@@ -4,10 +4,11 @@
 //! and load individual tensors as candle `QTensor` (which already handles
 //! dequant for every K-quant variant on CPU / Metal / CUDA).
 //!
-//! Out of scope here (lands in 1C): mapping the GGUF tensor names
-//! (`blk.0.attn_q.weight`) to ferrum's model-config naming and implementing
-//! `WeightLoader`. Phase 1B (this commit) adds `GgufLinear<B>` so model
-//! code can hold a `Box<dyn Linear<B>>` regardless of the source format.
+//! Phase 1A added the `GgufFile` reader. Phase 1B added `GgufLinear<B>`.
+//! Phase 1C (this commit) adds `GgufLoader<B>` — implements `WeightLoader<B>`
+//! against ferrum's HuggingFace-style tensor names by translating to GGUF's
+//! `blk.{i}.attn_q.weight` shorthand and handling `qkv_proj` / `gate_up_proj`
+//! fusion on the fly.
 //!
 //! ## Why wrap candle instead of writing a parser from scratch
 //!
@@ -26,9 +27,13 @@
 
 pub mod file;
 pub mod linear;
+pub mod loader;
+pub mod names;
 
 pub use file::GgufFile;
 pub use linear::{linear_from_qtensor, GgufLinear};
+pub use loader::GgufLoader;
+pub use names::{ferrum_to_gguf, gate_up_split_parts, qkv_split_parts};
 
 // Re-exports — callers can import these from `ferrum_quantization::gguf` rather
 // than reaching into `candle_core::quantized::*` directly. Keeps the dep
