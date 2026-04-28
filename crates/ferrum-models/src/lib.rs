@@ -28,6 +28,7 @@ pub mod image_processor;
 pub mod loader;
 pub mod mel;
 pub mod models;
+pub mod moe_config;
 pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;
