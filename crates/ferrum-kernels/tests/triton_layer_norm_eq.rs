@@ -18,7 +18,14 @@ const ROWS: usize = 32;
 const DIM: usize = 1024;
 const EPS: f32 = 1e-5;
 
-fn cpu_layer_norm(x: &[f32], gamma: &[f32], beta: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f32> {
+fn cpu_layer_norm(
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * dim];
     for r in 0..rows {
         let row = &x[r * dim..(r + 1) * dim];
@@ -37,7 +44,9 @@ fn cpu_layer_norm(x: &[f32], gamma: &[f32], beta: &[f32], rows: usize, dim: usiz
 fn layer_norm_triton_matches_cpu_within_tolerance() {
     let dev = Device::new_cuda(0).expect("CUDA device 0");
 
-    let x_v: Vec<f32> = (0..ROWS * DIM).map(|i| ((i as f32) * 0.0173).sin()).collect();
+    let x_v: Vec<f32> = (0..ROWS * DIM)
+        .map(|i| ((i as f32) * 0.0173).sin())
+        .collect();
     let g_v: Vec<f32> = (0..DIM).map(|i| 1.0 + (i as f32) * 0.001).collect();
     let b_v: Vec<f32> = (0..DIM).map(|i| (i as f32) * -0.0007).collect();
 

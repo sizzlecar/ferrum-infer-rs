@@ -25,7 +25,10 @@ fn make_inputs(dev: &Device) -> (Tensor, Tensor) {
         .collect();
     let a = Tensor::from_vec(a, (ROWS, COLS), dev).unwrap();
     let b = Tensor::from_vec(b, (ROWS, COLS), dev).unwrap();
-    (a.to_dtype(DType::F32).unwrap(), b.to_dtype(DType::F32).unwrap())
+    (
+        a.to_dtype(DType::F32).unwrap(),
+        b.to_dtype(DType::F32).unwrap(),
+    )
 }
 
 #[test]

@@ -29,20 +29,15 @@ pub fn gelu_triton(x: &Tensor) -> candle_core::Result<Tensor> {
     let elem_count = shape.elem_count();
 
     if dtype != DType::F32 {
-        candle_core::bail!(
-            "triton gelu: only F32 currently has a triton-rs port (got {dtype:?})"
-        );
+        candle_core::bail!("triton gelu: only F32 currently has a triton-rs port (got {dtype:?})");
     }
 
     let meta = parse_meta(triton_ptx::gelu_f32::META)?;
 
     let cuda_dev = x.device().as_cuda_device()?;
     let kernel_name: &'static str = Box::leak(meta.name.into_boxed_str());
-    let func = cuda_dev.get_or_load_custom_func(
-        kernel_name,
-        MODULE_NAME,
-        triton_ptx::gelu_f32::PTX,
-    )?;
+    let func =
+        cuda_dev.get_or_load_custom_func(kernel_name, MODULE_NAME, triton_ptx::gelu_f32::PTX)?;
 
     let block_size = (meta.num_warps * 32) as u32;
     let block_elems: u32 = 1024;

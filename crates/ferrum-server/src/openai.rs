@@ -65,11 +65,34 @@ pub struct ChatCompletionsRequest {
 }
 
 /// OpenAI-compatible response format specifier.
+///
+/// Mirrors OpenAI's `response_format` field on `/v1/chat/completions`:
+///   - `{"type": "text"}`         — default, no constraint
+///   - `{"type": "json_object"}`  — output must be valid JSON
+///   - `{"type": "json_schema", "json_schema": {"name":..., "strict":true,
+///      "schema": {...}}}` — output must conform to the inline JSON Schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiResponseFormat {
-    /// Format type: "text" or "json_object"
     #[serde(rename = "type")]
     pub format_type: String,
+    /// Present only when `format_type == "json_schema"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<OpenAiJsonSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiJsonSchema {
+    /// Optional name for the schema (ignored internally, kept for round-trip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The actual JSON Schema. Stored as raw JSON value so callers can pass
+    /// any valid schema object; we re-serialise when forwarding to the
+    /// guided-decoding pipeline.
+    pub schema: serde_json::Value,
+    /// OpenAI's `strict` flag. Currently advisory — we always enforce when
+    /// we can translate the schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Chat message

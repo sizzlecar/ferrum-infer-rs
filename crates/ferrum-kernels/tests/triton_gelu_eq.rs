@@ -47,9 +47,7 @@ fn cpu_gelu(x: &[f32]) -> Vec<f32> {
 fn gelu_triton_matches_cpu_within_tolerance() {
     let dev = Device::new_cuda(0).expect("CUDA device 0");
 
-    let v: Vec<f32> = (0..N)
-        .map(|i| ((i as f32) * 0.0173).sin() * 3.0)
-        .collect();
+    let v: Vec<f32> = (0..N).map(|i| ((i as f32) * 0.0173).sin() * 3.0).collect();
     let x = Tensor::from_vec(v.clone(), N, &dev)
         .unwrap()
         .to_dtype(DType::F32)

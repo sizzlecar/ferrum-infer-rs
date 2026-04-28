@@ -200,6 +200,36 @@ pub trait ModelExecutor: Send + Sync {
         ))
     }
 
+    /// Roll the KV cache for this executor's sequence back to `new_len`.
+    /// Used by speculative decoding on partial rejection so the next
+    /// iteration sees a KV prefix that matches the accepted token stream.
+    /// Default: Ok(()) — executors that don't cache per-sequence state
+    /// (stub, mock) are inherently tolerant; real LLM executors override.
+    async fn truncate_kv(
+        &self,
+        _kv_cache: &std::sync::Arc<dyn crate::KvCacheHandle>,
+        _new_len: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Multi-position decode-verify: one forward over `N+1` tokens,
+    /// producing one logits row per position. Used by speculative
+    /// decoding's target path so we don't pay N+1 sequential forwards.
+    ///
+    /// Default falls back to N+1 sequential `decode()` calls — correct
+    /// but slow; real LLM executors override.
+    ///
+    /// Returns a `Vec<DecodeOutput>` of length `inputs.len()` with the
+    /// final KV handle attached to the last element.
+    async fn forward_verify(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        let mut out = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            out.push(self.decode(input).await?);
+        }
+        Ok(out)
+    }
+
     /// Get executor capabilities
     fn capabilities(&self) -> ExecutorCapabilities;
 

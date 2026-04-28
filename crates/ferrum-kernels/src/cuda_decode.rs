@@ -2169,14 +2169,10 @@ impl CudaDecodeRunner {
         let num_rows = input.len() / row_size;
         let inv_n: f32 = 1.0 / row_size as f32;
         let rs = row_size as i32;
-        let scratch =
-            unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
-                candle_core::Error::Msg(format!("triton rms_norm scratch alloc: {e}"))
-            })?;
-        let prof =
-            unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
-                candle_core::Error::Msg(format!("triton rms_norm profile alloc: {e}"))
-            })?;
+        let scratch = unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }
+            .map_err(|e| candle_core::Error::Msg(format!("triton rms_norm scratch alloc: {e}")))?;
+        let prof = unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }
+            .map_err(|e| candle_core::Error::Msg(format!("triton rms_norm profile alloc: {e}")))?;
         let inp = input.slice(..);
         let w = weight.slice(..);
         let mut b = stream.launch_builder(&func);
@@ -2442,14 +2438,10 @@ impl CudaDecodeRunner {
         let nkvi = nkv as i32;
         let hdi = hd as i32;
         let vki = valid_kv as i32;
-        let scratch =
-            unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
-                candle_core::Error::Msg(format!("triton decode_attn scratch: {e}"))
-            })?;
-        let prof =
-            unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
-                candle_core::Error::Msg(format!("triton decode_attn profile: {e}"))
-            })?;
+        let scratch = unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }
+            .map_err(|e| candle_core::Error::Msg(format!("triton decode_attn scratch: {e}")))?;
+        let prof = unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }
+            .map_err(|e| candle_core::Error::Msg(format!("triton decode_attn profile: {e}")))?;
         let qv = q.slice(..);
         let kv = kc.slice(..);
         let vv = vc.slice(..);
@@ -2508,14 +2500,10 @@ impl CudaDecodeRunner {
         let nkvi = nkv as i32;
         let hdi = hd as i32;
         let vki = valid_kv as i32;
-        let scratch =
-            unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
-                candle_core::Error::Msg(format!("triton decode_attn scratch: {e}"))
-            })?;
-        let prof =
-            unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
-                candle_core::Error::Msg(format!("triton decode_attn profile: {e}"))
-            })?;
+        let scratch = unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }
+            .map_err(|e| candle_core::Error::Msg(format!("triton decode_attn scratch: {e}")))?;
+        let prof = unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }
+            .map_err(|e| candle_core::Error::Msg(format!("triton decode_attn profile: {e}")))?;
         let qv = q.slice(..);
         let kv = kc.slice(..);
         let vv = vc.slice(..);
@@ -3042,14 +3030,10 @@ impl CudaDecodeRunner {
             // Triton DSL kernel uses BLOCK=1024 → grid = ceil(N/1024).
             let block = 1024usize;
             let grid = ((n + block - 1) / block) as u32;
-            let scratch =
-                unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }.map_err(|e| {
-                    candle_core::Error::Msg(format!("triton silu_mul scratch: {e}"))
-                })?;
-            let prof =
-                unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }.map_err(|e| {
-                    candle_core::Error::Msg(format!("triton silu_mul profile: {e}"))
-                })?;
+            let scratch = unsafe { device.alloc::<u8>(meta.global_scratch_size.max(1)) }
+                .map_err(|e| candle_core::Error::Msg(format!("triton silu_mul scratch: {e}")))?;
+            let prof = unsafe { device.alloc::<u8>(meta.profile_scratch_size.max(1)) }
+                .map_err(|e| candle_core::Error::Msg(format!("triton silu_mul profile: {e}")))?;
             let mut b = stream.launch_builder(&func);
             b.arg(gate);
             b.arg(up);

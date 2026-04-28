@@ -25,11 +25,7 @@ const MODULE_NAME: &str = "triton_rms_norm";
 
 /// Triton-compiled RMS normalization. Same semantics as
 /// [`crate::rms_norm`], different code path.
-pub fn rms_norm_triton(
-    input: &Tensor,
-    weight: &Tensor,
-    eps: f32,
-) -> candle_core::Result<Tensor> {
+pub fn rms_norm_triton(input: &Tensor, weight: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
     let dtype = input.dtype();
     let dims = input.dims();
     let row_size = *dims.last().unwrap();

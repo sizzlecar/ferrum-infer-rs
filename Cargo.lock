@@ -1511,6 +1511,8 @@ dependencies = [
  "parking_lot",
  "rand 0.9.2",
  "rand_distr 0.4.3",
+ "regex-automata",
+ "regex-lite",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3936,6 +3938,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
