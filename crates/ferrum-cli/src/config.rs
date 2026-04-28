@@ -9,7 +9,7 @@ use std::path::Path;
 use tokio::fs;
 
 /// CLI configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CliConfig {
     /// Server configuration
     pub server: ServerCliConfig,
@@ -236,18 +236,6 @@ impl CliConfig {
         }
 
         Ok(())
-    }
-}
-
-impl Default for CliConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerCliConfig::default(),
-            models: ModelCliConfig::default(),
-            benchmark: BenchmarkConfig::default(),
-            client: ClientConfig::default(),
-            dev: DevConfig::default(),
-        }
     }
 }
 

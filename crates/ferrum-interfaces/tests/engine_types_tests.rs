@@ -24,5 +24,5 @@ fn engine_status_serde_roundtrip() {
     };
     let s = json::to_string(&st).unwrap();
     let back: EngineStatus = json::from_str(&s).unwrap();
-    assert_eq!(back.is_ready, true);
+    assert!(back.is_ready);
 }

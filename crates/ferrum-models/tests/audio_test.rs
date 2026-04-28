@@ -1,7 +1,6 @@
 //! Audio processing tests — WAV read/write, resample, mel spectrogram.
 //! Runs on CPU, no model needed.
 
-
 /// Generate a sine wave WAV file in memory.
 fn gen_sine_wav(sample_rate: u32, freq: f32, duration_s: f32) -> Vec<u8> {
     let n = (sample_rate as f32 * duration_s) as usize;

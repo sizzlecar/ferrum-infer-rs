@@ -95,8 +95,7 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
 
         // Fallback: Qwen3 0.6B (and Llama family) checkpoints store projections
         // split as q/k/v and gate/up — fuse them by concatenating on dim 0.
-        if name.ends_with("qkv_proj") {
-            let prefix = &name[..name.len() - "qkv_proj".len()];
+        if let Some(prefix) = name.strip_suffix("qkv_proj") {
             let keys = vec![
                 format!("{prefix}q_proj.weight"),
                 format!("{prefix}k_proj.weight"),
@@ -106,8 +105,7 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
                 return Ok(Box::new(DenseLinear::<B>::from_rows(&data, r, c)));
             }
         }
-        if name.ends_with("gate_up_proj") {
-            let prefix = &name[..name.len() - "gate_up_proj".len()];
+        if let Some(prefix) = name.strip_suffix("gate_up_proj") {
             let keys = vec![
                 format!("{prefix}gate_proj.weight"),
                 format!("{prefix}up_proj.weight"),
@@ -331,7 +329,10 @@ fn qwen3model_forward_verify_vs_prefill_metal() {
     eprintln!(
         "prefill_internal argmax={a}  forward_verify(last) argmax={b}  cos={cos:.6}  max_diff={mad:.4}",
     );
-    assert_eq!(a, b, "last-position argmax must match between prefill and verify");
+    assert_eq!(
+        a, b,
+        "last-position argmax must match between prefill and verify"
+    );
     assert!(cos > 0.9999, "last-position logits diverge: cos={cos}");
 
     // Also check: forward_verify with 2 tokens — last position should match
@@ -347,9 +348,7 @@ fn qwen3model_forward_verify_vs_prefill_metal() {
     let verify2_last = &verify2[(two.len() - 1) * vocab..two.len() * vocab];
     let cos2 = cosine(&decode_logits, verify2_last);
     let (c, d) = (argmax(&decode_logits), argmax(verify2_last));
-    eprintln!(
-        "decode_internal argmax={c}  forward_verify(2-tok, last) argmax={d}  cos={cos2:.6}",
-    );
+    eprintln!("decode_internal argmax={c}  forward_verify(2-tok, last) argmax={d}  cos={cos2:.6}",);
     assert_eq!(c, d, "2-token verify last must match decode_internal");
     assert!(cos2 > 0.999, "2-token verify diverges from decode");
     eprintln!("✅ forward_verify parity pass");

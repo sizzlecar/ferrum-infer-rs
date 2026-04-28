@@ -112,6 +112,8 @@ pub struct FusedTransformer {
     tokens_generated: usize,
     /// true = always use CPU path (skips Metal even if available).
     /// Auto-set for small models where Metal sync overhead > compute benefit.
+    /// Only read on Metal-enabled builds.
+    #[allow(dead_code)]
     use_cpu: bool,
 }
 
@@ -252,17 +254,19 @@ impl FusedTransformer {
             }
         };
 
-        let backend = if use_cpu {
-            "CPU (Accelerate)"
-        } else {
-            "Metal+Accelerate"
-        };
         // Log backend selection (visible with RUST_LOG=info)
         #[cfg(feature = "metal")]
-        tracing::info!(
-            "FusedTransformer: backend={backend}, hidden={}, layers={n}",
-            cfg.hidden_size
-        );
+        {
+            let backend = if use_cpu {
+                "CPU (Accelerate)"
+            } else {
+                "Metal+Accelerate"
+            };
+            tracing::info!(
+                "FusedTransformer: backend={backend}, hidden={}, layers={n}",
+                cfg.hidden_size
+            );
+        }
         #[cfg(all(not(feature = "metal"), feature = "cuda"))]
         tracing::info!(
             "FusedTransformer: backend=CUDA, hidden={}, layers={n}",
@@ -291,6 +295,7 @@ impl FusedTransformer {
     /// Forward: input [tokens, hidden] → output [tokens, hidden] (f32 vecs).
     pub fn forward(&mut self, input: &[f32], tokens: usize) -> Vec<f32> {
         let pos_offset = self.tokens_generated;
+        #[cfg(feature = "metal")]
         let h = self.cfg.hidden_size;
 
         #[cfg(feature = "metal")]
@@ -332,7 +337,7 @@ impl FusedTransformer {
                 metal::transformer::metal_layer_forward_v2(
                     cmd,
                     &ms.pipes,
-                    &input_buf,
+                    input_buf,
                     tokens,
                     &ms.weights[0],
                     &ms.metal_cfg,
@@ -347,19 +352,13 @@ impl FusedTransformer {
                 for li in 1..ms.weights.len() {
                     // Copy scratch.output to input_buf for next layer
                     let enc = cmd.new_blit_command_encoder();
-                    enc.copy_from_buffer(
-                        &scratch.output,
-                        0,
-                        &input_buf,
-                        0,
-                        (tokens * h * 4) as u64,
-                    );
+                    enc.copy_from_buffer(&scratch.output, 0, input_buf, 0, (tokens * h * 4) as u64);
                     enc.end_encoding();
 
                     metal::transformer::metal_layer_forward_v2(
                         cmd,
                         &ms.pipes,
-                        &input_buf,
+                        input_buf,
                         tokens,
                         &ms.weights[li],
                         &ms.metal_cfg,
@@ -833,7 +832,7 @@ impl FusedTransformer {
         #[cfg(feature = "metal")]
         {
             let ms = self.metal_state.as_ref()?;
-            return Some(ms.pipes.buffer_from_data(data));
+            Some(ms.pipes.buffer_from_data(data))
         }
         #[cfg(feature = "cuda")]
         {

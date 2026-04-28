@@ -31,16 +31,17 @@ use std::sync::Arc;
 fn softmax(logits: &[f32], temperature: f32) -> Vec<f32> {
     if temperature == 0.0 {
         // Greedy: delta at argmax.
-        let (argmax, _) = logits
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                if v > bv {
-                    (i, v)
-                } else {
-                    (bi, bv)
-                }
-            });
+        let (argmax, _) =
+            logits
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv {
+                        (i, v)
+                    } else {
+                        (bi, bv)
+                    }
+                });
         let mut p = vec![0.0f32; logits.len()];
         p[argmax] = 1.0;
         return p;
@@ -147,7 +148,10 @@ pub struct SpeculationOutcome {
 ///   - If rejected, sample a replacement from the residual `(p_T - p_D)+`.
 ///
 /// If every draft is accepted, sample a bonus token from `target_logits[N]`.
-pub fn verify_speculation(spec: Speculation<'_>, rng: &mut dyn RngCore) -> Result<SpeculationOutcome> {
+pub fn verify_speculation(
+    spec: Speculation<'_>,
+    rng: &mut dyn RngCore,
+) -> Result<SpeculationOutcome> {
     let n = spec.draft_tokens.len();
     assert_eq!(spec.draft_logits.len(), n, "draft_logits count mismatch");
     assert_eq!(
@@ -326,8 +330,7 @@ impl<'a> SpeculativeRunner<'a> {
             // reads cache_id + starting seq from the first one.
             kv_for_verify = kv_for_verify.clone();
         }
-        let verify_outputs: Vec<DecodeOutput> =
-            self.target.forward_verify(&verify_inputs).await?;
+        let verify_outputs: Vec<DecodeOutput> = self.target.forward_verify(&verify_inputs).await?;
         assert_eq!(verify_outputs.len(), n + 1);
         let mut target_logits: Vec<Vec<f32>> = Vec::with_capacity(n + 1);
         for out in &verify_outputs {
@@ -375,16 +378,17 @@ fn tokens_to_tensor(
 }
 
 fn argmax_token(logits: &[f32]) -> TokenId {
-    let (idx, _) = logits
-        .iter()
-        .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-            if v > bv {
-                (i, v)
-            } else {
-                (bi, bv)
-            }
-        });
+    let (idx, _) =
+        logits
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
+            });
     TokenId::new(idx as u32)
 }
 
@@ -437,7 +441,12 @@ mod tests {
         assert_eq!(out.rejected_at, 3, "no rejections → rejected_at == N");
         assert_eq!(
             out.tokens,
-            vec![TokenId::new(3), TokenId::new(7), TokenId::new(11), TokenId::new(19)],
+            vec![
+                TokenId::new(3),
+                TokenId::new(7),
+                TokenId::new(11),
+                TokenId::new(19)
+            ],
             "should accept all three drafts + sample the bonus (token 19)"
         );
     }
@@ -580,16 +589,12 @@ mod tests {
     #[tokio::test]
     async fn runner_full_accept_when_models_agree() {
         let vocab = 64;
-        let draft: Arc<ConfigurableModelExecutor> =
-            Arc::new(ConfigurableModelExecutor::with_token_sequence(
-                vocab,
-                vec![13, 13, 13, 13, 13],
-            ));
-        let target: Arc<ConfigurableModelExecutor> =
-            Arc::new(ConfigurableModelExecutor::with_token_sequence(
-                vocab,
-                vec![13, 13, 13, 13, 13],
-            ));
+        let draft: Arc<ConfigurableModelExecutor> = Arc::new(
+            ConfigurableModelExecutor::with_token_sequence(vocab, vec![13, 13, 13, 13, 13]),
+        );
+        let target: Arc<ConfigurableModelExecutor> = Arc::new(
+            ConfigurableModelExecutor::with_token_sequence(vocab, vec![13, 13, 13, 13, 13]),
+        );
         let tf: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
         let runner = SpeculativeRunner {
             draft: draft.as_ref(),

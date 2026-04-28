@@ -132,7 +132,7 @@ impl PagedAttentionExecutor {
     }
 
     /// Get the paged handle from an Arc<dyn KvCacheHandle>.
-    fn as_paged_handle<'a>(handle: &'a dyn KvCacheHandle) -> Result<&'a PagedKvCacheHandle> {
+    fn as_paged_handle(handle: &dyn KvCacheHandle) -> Result<&PagedKvCacheHandle> {
         handle
             .as_any()
             .downcast_ref::<PagedKvCacheHandle>()
@@ -261,8 +261,7 @@ impl ModelExecutor for PagedAttentionExecutor {
         let position = paged_handle.num_tokens();
 
         // We may need to allocate an additional block
-        let blocks_needed = (position + 1 + self.kv_manager.gpu_pool().block_size() - 1)
-            / self.kv_manager.gpu_pool().block_size();
+        let blocks_needed = (position + 1).div_ceil(self.kv_manager.gpu_pool().block_size());
         let current_blocks = paged_handle.num_blocks();
         if blocks_needed > current_blocks {
             self.kv_manager

@@ -50,19 +50,15 @@ pub struct SamplingParams {
 ///   Internally compiled to a regex FSM for per-token hard masking.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "schema")]
+#[derive(Default)]
 pub enum ResponseFormat {
     /// No constraint — raw text output.
+    #[default]
     Text,
     /// Output must be a valid JSON object.
     JsonObject,
     /// Output must conform to the given JSON schema (as a JSON string).
     JsonSchema(String),
-}
-
-impl Default for ResponseFormat {
-    fn default() -> Self {
-        Self::Text
-    }
 }
 
 impl Default for SamplingParams {
@@ -200,18 +196,15 @@ impl Default for SamplingPresets {
 }
 
 /// Request priority levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
 pub enum Priority {
     Low = 0,
+    #[default]
     Normal = 1,
     High = 2,
     Critical = 3,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
-    }
 }
 
 /// Reason for completion
@@ -232,7 +225,7 @@ pub enum FinishReason {
 }
 
 /// Special tokens configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SpecialTokens {
     /// Beginning of sequence token
     pub bos_token: Option<TokenId>,
@@ -248,18 +241,4 @@ pub struct SpecialTokens {
     pub cls_token: Option<TokenId>,
     /// Mask token
     pub mask_token: Option<TokenId>,
-}
-
-impl Default for SpecialTokens {
-    fn default() -> Self {
-        Self {
-            bos_token: None,
-            eos_token: None,
-            unk_token: None,
-            pad_token: None,
-            sep_token: None,
-            cls_token: None,
-            mask_token: None,
-        }
-    }
 }

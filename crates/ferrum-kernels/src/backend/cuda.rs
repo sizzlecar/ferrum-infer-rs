@@ -19,7 +19,7 @@
 //! - `mla_attention`: default unsupported error — DeepSeek V2/V3 not a
 //!   Phase E target.
 
-#![allow(unused_variables, dead_code)]
+#![allow(unused_variables, dead_code, unused_imports, unused_mut)]
 
 use super::{AttnConfig, Backend, QuantKind, QuantWeights, ReduceOp};
 use crate::ptx;
@@ -103,6 +103,43 @@ struct FlashAttnParams {
 unsafe impl DeviceRepr for FlashAttnParams {}
 
 // ────────────────────────────────────────────────────────────────────────
+// GPTQ store dispatch — Marlin (default) vs Triton-rs (FERRUM_TRITON_INT4=1)
+// ────────────────────────────────────────────────────────────────────────
+
+/// CUDA-side GPTQ weight, pre-loaded for one of two fused INT4×FP16 paths.
+///
+/// Selected once per weight at load time (`load_gptq`) based on the
+/// `FERRUM_TRITON_INT4` env var:
+///   - unset / `0`: build `Marlin` (the existing default — Marlin's tile
+///     repack runs on the CPU; inference uses the hand-tuned CUTLASS
+///     kernel from IST-DASLab/marlin).
+///   - `1`: build `Triton` (port of vLLM's `triton_w4a16_gemm_kernel`,
+///     adapted to ferrum's on-disk GPTQ layout — no host-side repack).
+///
+/// The two stores cannot coexist for the same layer (load-time gating),
+/// so a process-wide A/B comparison runs as two separate `bench`
+/// invocations. This avoids doubling VRAM and keeps the dispatch
+/// branchless on the hot path.
+#[cfg(feature = "triton-kernels")]
+pub enum GptqStoreCuda {
+    Marlin(crate::marlin::MarlinWeight),
+    Triton(crate::triton_w4a16::TritonGptqWeight),
+}
+
+/// When triton-kernels is disabled at compile time the GPTQ store is just
+/// a transparent re-alias of `MarlinWeight`. Keeping this typed alias
+/// (rather than `pub use`) means the trait impl block in `backend::cuda`
+/// can stay shape-identical between the two cfgs.
+#[cfg(not(feature = "triton-kernels"))]
+pub type GptqStoreCuda = crate::marlin::MarlinWeight;
+
+/// Read `FERRUM_TRITON_INT4` once. Returns true iff `=1`. Anything else
+/// (unset, `0`, empty, garbage) → false.
+fn use_triton_int4() -> bool {
+    std::env::var("FERRUM_TRITON_INT4").map_or(false, |v| v == "1")
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Backend impl
 // ────────────────────────────────────────────────────────────────────────
 
@@ -111,7 +148,7 @@ pub struct CudaBackend;
 impl Backend for CudaBackend {
     type Buffer = CudaSlice<f16>;
     type Context = CudaState;
-    type GptqStore = crate::marlin::MarlinWeight;
+    type GptqStore = GptqStoreCuda;
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -1050,12 +1087,12 @@ impl Backend for CudaBackend {
         )))
     }
 
-    // ── GPTQ (Marlin INT4) ──────────────────────────────────────────────
+    // ── GPTQ INT4 dispatch (Marlin default; Triton-rs alt via env) ──────
 
     fn load_gptq(
         qweight: &[i32],
         scales: &[f32],
-        _qzeros: &[i32],
+        qzeros: &[i32],
         _g_idx: Option<&[i32]>,
         bits: u32,
         group_size: usize,
@@ -1064,10 +1101,41 @@ impl Backend for CudaBackend {
     ) -> Result<Self::GptqStore> {
         if bits != 4 {
             return Err(FerrumError::unsupported(format!(
-                "CUDA Marlin GPTQ: only bits=4 supported (got {bits})"
+                "CUDA GPTQ: only bits=4 supported (got {bits})"
             )));
         }
-        // Repack on CPU, then upload. Matches IST-DASLab/marlin Layer.pack().
+
+        // Path B: triton-rs w4a16 GPTQ kernel — operates on the on-disk
+        // GPTQ tensor layout directly. Just upload the three tensors and
+        // tag the store as Triton. No CPU-side repack.
+        #[cfg(feature = "triton-kernels")]
+        if use_triton_int4() {
+            let stream = default_stream();
+            let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
+            let qweight_dev = stream
+                .clone_htod(qweight)
+                .map_err(|e| FerrumError::model(format!("triton qweight htod: {e}")))?;
+            let scales_dev = stream
+                .clone_htod(&scales_f16)
+                .map_err(|e| FerrumError::model(format!("triton scales htod: {e}")))?;
+            let qzeros_dev = stream
+                .clone_htod(qzeros)
+                .map_err(|e| FerrumError::model(format!("triton qzeros htod: {e}")))?;
+            tracing::info!("GPTQ load (triton-rs w4a16): K={k}, N={n}, gs={group_size}");
+            return Ok(GptqStoreCuda::Triton(
+                crate::triton_w4a16::TritonGptqWeight {
+                    qweight: qweight_dev,
+                    scales: scales_dev,
+                    qzeros: qzeros_dev,
+                    k,
+                    n,
+                    group_size: group_size as i32,
+                },
+            ));
+        }
+
+        // Path A (default): Marlin. Repack on CPU, then upload. Matches
+        // IST-DASLab/marlin Layer.pack().
         let marlin_qweight_i32 = crate::marlin::repack_gptq_to_marlin(qweight, k, n);
         // Scales arrive as f32 but Marlin expects f16. Convert + permute.
         let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1091,14 +1159,24 @@ impl Backend for CudaBackend {
             .alloc_zeros::<i32>(ws_len)
             .map_err(|e| FerrumError::model(format!("ws alloc: {e}")))?;
 
-        Ok(crate::marlin::MarlinWeight {
+        let marlin_weight = crate::marlin::MarlinWeight {
             qweight: qweight_dev,
             scales: scales_dev,
             workspace: workspace_dev,
             k,
             n,
             group_size: group_size as i32,
-        })
+        };
+
+        // Wrap in the Marlin variant (or pass through, depending on cfg).
+        #[cfg(feature = "triton-kernels")]
+        {
+            Ok(GptqStoreCuda::Marlin(marlin_weight))
+        }
+        #[cfg(not(feature = "triton-kernels"))]
+        {
+            Ok(marlin_weight)
+        }
     }
 
     #[cfg(feature = "marlin")]
@@ -1109,13 +1187,66 @@ impl Backend for CudaBackend {
         out: &mut Self::Buffer,
         m: usize,
     ) -> Result<()> {
-        // Delegate to the existing marlin_gemm wrapper. Takes care of
-        // workspace reset + kernel launch.
-        crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
-            .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+        // Branch on store variant (only present when triton-kernels is on).
+        #[cfg(feature = "triton-kernels")]
+        match weight {
+            GptqStoreCuda::Marlin(mw) => {
+                crate::marlin::marlin_gemm(&ctx.stream, a, mw, out, m as i32)
+                    .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+            }
+            GptqStoreCuda::Triton(tw) => {
+                // Pre-load (and cache) the CudaFunction once per CudaState.
+                // Subsequent calls hit the HashMap and skip the PTX parse.
+                let func = ctx.func(
+                    "triton_w4a16_gptq",
+                    crate::triton_ptx::w4a16_gptq_f16::PTX,
+                    crate::triton_w4a16::fn_name(),
+                );
+                let stream = ctx.stream.clone();
+                crate::triton_w4a16::launch_w4a16_gptq_triton(&stream, &func, a, tw, out, m as i32)
+                    .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
+            }
+        }
+        #[cfg(not(feature = "triton-kernels"))]
+        {
+            crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
+                .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+        }
     }
 
-    #[cfg(not(feature = "marlin"))]
+    #[cfg(all(not(feature = "marlin"), feature = "triton-kernels"))]
+    fn gemm_gptq(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::GptqStore,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        // Marlin compiled out → only Triton path is callable. The Marlin
+        // variant should never be constructed in this configuration
+        // (load_gptq currently still builds a MarlinWeight even with
+        // triton-kernels — but its `gemm_gptq` would have nothing to call,
+        // so we error explicitly for traceability instead of silently
+        // failing inside the FFI stub).
+        match weight {
+            GptqStoreCuda::Marlin(_) => Err(FerrumError::unsupported(
+                "cargo feature `marlin` disabled — Marlin variant unusable; \
+                 set FERRUM_TRITON_INT4=1 to force the triton path",
+            )),
+            GptqStoreCuda::Triton(tw) => {
+                let func = ctx.func(
+                    "triton_w4a16_gptq",
+                    crate::triton_ptx::w4a16_gptq_f16::PTX,
+                    crate::triton_w4a16::fn_name(),
+                );
+                let stream = ctx.stream.clone();
+                crate::triton_w4a16::launch_w4a16_gptq_triton(&stream, &func, a, tw, out, m as i32)
+                    .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
+            }
+        }
+    }
+
+    #[cfg(all(not(feature = "marlin"), not(feature = "triton-kernels")))]
     fn gemm_gptq(
         _ctx: &mut Self::Context,
         _a: &Self::Buffer,
@@ -1124,7 +1255,8 @@ impl Backend for CudaBackend {
         _m: usize,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
-            "cargo feature `marlin` disabled — GPTQ not available",
+            "cargo features `marlin` and `triton-kernels` both disabled — \
+             GPTQ not available",
         ))
     }
 

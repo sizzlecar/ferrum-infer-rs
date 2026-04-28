@@ -1,0 +1,1 @@
+{"name":"residual_add_f32","num_warps":4,"num_stages":3,"num_ctas":1,"shared_mem":0,"target_arch":"sm_89","global_scratch_size":0,"global_scratch_align":1,"profile_scratch_size":0,"profile_scratch_align":1,"cluster_dims":[1,1,1]}

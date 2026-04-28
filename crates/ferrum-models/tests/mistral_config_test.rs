@@ -82,7 +82,10 @@ fn mistral_v01_sliding_window_propagates() {
     let def = mistral_v01_def();
     let cfg = LlamaFamilyConfig::mistral_from_def(&def);
 
-    assert_eq!(cfg.sliding_window, 4096, "Mistral v0.1 must set window=4096");
+    assert_eq!(
+        cfg.sliding_window, 4096,
+        "Mistral v0.1 must set window=4096"
+    );
     assert!(!cfg.has_qk_norm, "Mistral has no QK-norm");
     assert_eq!(cfg.rope_theta, 10_000.0);
     assert_eq!(cfg.num_heads, 32);
@@ -114,7 +117,10 @@ fn llama_without_sliding_window_is_zero() {
 
     let cfg = LlamaFamilyConfig::llama_from_def(&def);
     assert_eq!(cfg.sliding_window, 0);
-    assert_eq!(cfg.rope_theta, 10_000.0, "explicit rope_theta wins over llama default");
+    assert_eq!(
+        cfg.rope_theta, 10_000.0,
+        "explicit rope_theta wins over llama default"
+    );
 }
 
 /// Regression guard: the runtime subset (`LlmRuntimeConfig`) does NOT carry

@@ -62,7 +62,7 @@ impl TensorParallelConfig {
     /// Calculate shard size for a dimension
     pub fn shard_size(&self, dim_size: usize) -> usize {
         assert!(
-            dim_size % self.world_size == 0,
+            dim_size.is_multiple_of(self.world_size),
             "Dimension {} must be divisible by world size {}",
             dim_size,
             self.world_size
@@ -233,19 +233,19 @@ impl TransformerParallelMapping {
         tp_size: usize,
     ) -> Result<Self> {
         // Validate divisibility
-        if num_heads % tp_size != 0 {
+        if !num_heads.is_multiple_of(tp_size) {
             return Err(FerrumError::config(format!(
                 "num_heads {} must be divisible by tp_size {}",
                 num_heads, tp_size
             )));
         }
-        if num_kv_heads % tp_size != 0 {
+        if !num_kv_heads.is_multiple_of(tp_size) {
             return Err(FerrumError::config(format!(
                 "num_kv_heads {} must be divisible by tp_size {}",
                 num_kv_heads, tp_size
             )));
         }
-        if intermediate_dim % tp_size != 0 {
+        if !intermediate_dim.is_multiple_of(tp_size) {
             return Err(FerrumError::config(format!(
                 "intermediate_dim {} must be divisible by tp_size {}",
                 intermediate_dim, tp_size

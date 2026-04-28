@@ -16,7 +16,10 @@
 //!         -p ferrum-models --test qwen3_tts_backend_smoke \
 //!         -- --ignored --nocapture cpu_smoke
 
-#![allow(clippy::needless_range_loop)]
+// Helper fns (`run_long_decode`, `argmax_u32`) are only called from the
+// macOS-gated and CUDA-feature-gated `#[test]` fns below; Linux CPU CI
+// without either has them sit unused.
+#![allow(clippy::needless_range_loop, dead_code)]
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_models::architectures::qwen3_tts::TalkerConfig;

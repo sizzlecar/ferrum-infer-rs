@@ -1,4 +1,9 @@
 //! CPU transformer layer using Accelerate sgemm.
+//!
+//! Same platform-split story as `super::mod`: the Accelerate extern block and
+//! its Linux fallback are mutually exclusive per build.
+
+#![allow(dead_code)]
 
 use crate::{AttentionParams, LayerWeights, TransformerConfig};
 
@@ -6,6 +11,12 @@ pub struct CpuKvCache {
     pub k: Vec<f32>,
     pub v: Vec<f32>,
     pub len: usize,
+}
+
+impl Default for CpuKvCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CpuKvCache {
@@ -88,7 +99,7 @@ pub fn cpu_layer_forward(
     } else {
         o_out
     };
-    let mut hidden = add_vecs(input, &o_scaled);
+    let hidden = add_vecs(input, &o_scaled);
 
     // 8. Post LayerNorm + MLP
     let post_ln = rms_norm(&hidden, &w.post_ln_w, tokens, h, eps);

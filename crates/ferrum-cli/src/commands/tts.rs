@@ -356,11 +356,8 @@ fn detect_format(path: &PathBuf) -> ModelFormat {
         ModelFormat::SafeTensors
     } else if std::fs::read_dir(path)
         .map(|d| {
-            d.filter_map(|e| e.ok()).any(|e| {
-                e.path()
-                    .extension()
-                    .map_or(false, |ext| ext == "safetensors")
-            })
+            d.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
         })
         .unwrap_or(false)
     {

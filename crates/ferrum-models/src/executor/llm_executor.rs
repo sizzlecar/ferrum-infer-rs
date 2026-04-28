@@ -96,14 +96,11 @@ impl ModelExecutor for LlmExecutor {
         // (chunked prefill) — fresh id only on the very first call for a
         // request. Without this, every chunk would create a new KV cache
         // at position 0 and subsequent chunks wouldn't see prior tokens.
-        let supplied_handle_id = input
-            .kv_cache
-            .as_ref()
-            .and_then(|h| {
-                h.as_any()
-                    .downcast_ref::<GenericKvCacheHandle>()
-                    .map(|g| g.request_cache_id().to_string())
-            });
+        let supplied_handle_id = input.kv_cache.as_ref().and_then(|h| {
+            h.as_any()
+                .downcast_ref::<GenericKvCacheHandle>()
+                .map(|g| g.request_cache_id().to_string())
+        });
         let cache_id = supplied_handle_id
             .clone()
             .unwrap_or_else(|| self.gen_cache_id());
@@ -177,9 +174,9 @@ impl ModelExecutor for LlmExecutor {
         let cache_id = first_handle
             .as_any()
             .downcast_ref::<GenericKvCacheHandle>()
-            .ok_or_else(|| FerrumError::model(
-                "forward_verify requires GenericKvCacheHandle input",
-            ))?
+            .ok_or_else(|| {
+                FerrumError::model("forward_verify requires GenericKvCacheHandle input")
+            })?
             .request_cache_id()
             .to_string();
         let start_seq = {
@@ -232,9 +229,9 @@ impl ModelExecutor for LlmExecutor {
                 start_seq + i + 1,
                 cache_id.clone(),
             ));
-            outputs.push(
-                ferrum_interfaces::model_executor::DecodeOutput::new(logits_ref, handle),
-            );
+            outputs.push(ferrum_interfaces::model_executor::DecodeOutput::new(
+                logits_ref, handle,
+            ));
         }
         Ok(outputs)
     }

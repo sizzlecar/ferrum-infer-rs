@@ -92,9 +92,7 @@ fn array_pattern(node: &Value) -> Result<String> {
         .ok_or_else(|| FerrumError::invalid_request("array schema missing 'items'"))?;
     let item_pat = translate(items_schema)?;
     // `\s*` between tokens so minor whitespace variation doesn't break the match.
-    Ok(format!(
-        r"\[\s*(?:{item_pat}(?:\s*,\s*{item_pat})*)?\s*\]"
-    ))
+    Ok(format!(r"\[\s*(?:{item_pat}(?:\s*,\s*{item_pat})*)?\s*\]"))
 }
 
 fn object_pattern(node: &Value) -> Result<String> {
@@ -126,11 +124,11 @@ fn object_pattern(node: &Value) -> Result<String> {
 
     let mut fields: Vec<String> = Vec::with_capacity(keys.len());
     for key in keys {
-        let sub = props
-            .get(key)
-            .ok_or_else(|| FerrumError::invalid_request(format!(
+        let sub = props.get(key).ok_or_else(|| {
+            FerrumError::invalid_request(format!(
                 "required property '{key}' missing from 'properties'"
-            )))?;
+            ))
+        })?;
         let sub_pat = translate(sub)?;
         let key_literal = regex_escape(&format!("\"{key}\""));
         fields.push(format!(r"\s*{key_literal}\s*:\s*{sub_pat}"));
@@ -146,8 +144,8 @@ fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for ch in s.chars() {
         match ch {
-            '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^'
-            | '$' | '/' => {
+            '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+            | '/' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -207,9 +205,7 @@ mod tests {
 
     #[test]
     fn enum_schema() {
-        let re = compile(
-            &schema_to_regex(r#"{"enum":["red","green","blue"]}"#).unwrap(),
-        );
+        let re = compile(&schema_to_regex(r#"{"enum":["red","green","blue"]}"#).unwrap());
         assert!(re.is_match("\"red\""));
         assert!(re.is_match("\"blue\""));
         assert!(!re.is_match("\"yellow\""));
@@ -217,9 +213,8 @@ mod tests {
 
     #[test]
     fn array_of_integers() {
-        let re = compile(
-            &schema_to_regex(r#"{"type":"array","items":{"type":"integer"}}"#).unwrap(),
-        );
+        let re =
+            compile(&schema_to_regex(r#"{"type":"array","items":{"type":"integer"}}"#).unwrap());
         assert!(re.is_match("[]"));
         assert!(re.is_match("[1]"));
         assert!(re.is_match("[1, 2, 3]"));

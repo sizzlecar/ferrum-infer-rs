@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 /// The quantization scheme in use, if any.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum QuantMethod {
     /// No quantization — dense fp32/fp16/bf16 weights.
+    #[default]
     None,
     /// GPTQ: int4/int8 group-wise with scales + zeros, asymmetric.
     Gptq,
@@ -17,12 +19,6 @@ pub enum QuantMethod {
     Awq,
     /// GGUF: k-quants and legacy quants embedded in a single-file format.
     Gguf,
-}
-
-impl Default for QuantMethod {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Combined quantization config.

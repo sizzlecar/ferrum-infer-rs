@@ -115,7 +115,10 @@ impl RegexGuidedProcessor {
 
         Ok(Self {
             dfa,
-            state: Mutex::new(DfaPosition { state: start, dead: false }),
+            state: Mutex::new(DfaPosition {
+                state: start,
+                dead: false,
+            }),
             token_bytes,
             eos_token,
             consumed: Mutex::new(0),
@@ -128,7 +131,10 @@ impl RegexGuidedProcessor {
             .dfa
             .start_state(&StartConfig::new().anchored(Anchored::Yes))
             .map_err(|e| FerrumError::internal(format!("regex start state: {e}")))?;
-        *self.state.lock() = DfaPosition { state: start, dead: false };
+        *self.state.lock() = DfaPosition {
+            state: start,
+            dead: false,
+        };
         *self.consumed.lock() = 0;
         Ok(())
     }
@@ -332,7 +338,9 @@ mod tests {
             }
         }
         fn token_text(&self, token_id: TokenId) -> Option<&str> {
-            self.byte_strings.get(token_id.get() as usize).map(|s| s.as_str())
+            self.byte_strings
+                .get(token_id.get() as usize)
+                .map(|s| s.as_str())
         }
         fn apply_chat_template(&self, _messages: &[ChatMessage]) -> Result<String> {
             Ok(String::new())
@@ -379,8 +387,14 @@ mod tests {
         p.advance_with_tokens(&[TokenId::new(b'3' as u32)]);
         let mut logits = vec![0.0f32; 257];
         p.mask_logits(&mut logits);
-        assert!(logits[256].is_finite(), "EOS should be allowed after a digit");
-        assert!(logits[b'7' as usize].is_finite(), "another digit still allowed");
+        assert!(
+            logits[256].is_finite(),
+            "EOS should be allowed after a digit"
+        );
+        assert!(
+            logits[b'7' as usize].is_finite(),
+            "another digit still allowed"
+        );
         assert!(logits[b'a' as usize].is_infinite(), "alpha still forbidden");
     }
 

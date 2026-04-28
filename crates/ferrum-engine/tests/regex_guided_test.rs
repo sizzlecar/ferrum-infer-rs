@@ -15,9 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface};
-use ferrum_interfaces::{
-    tokenizer::{ChatMessage, Tokenizer, TokenizerInfo, TokenizerType},
-};
+use ferrum_interfaces::tokenizer::{ChatMessage, Tokenizer, TokenizerInfo, TokenizerType};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     ConfigurableModelExecutor, MockKvCacheManager, MockSampler, MockTensorFactory,
@@ -163,8 +161,7 @@ fn make_request(prompt: &str, schema_json: &str, max_tokens: usize) -> Inference
     let mut req = InferenceRequest::new(prompt, "mock-model");
     req.sampling_params.max_tokens = max_tokens;
     req.sampling_params.temperature = 0.0; // greedy so output is deterministic
-    req.sampling_params.response_format =
-        ResponseFormat::JsonSchema(schema_json.to_string());
+    req.sampling_params.response_format = ResponseFormat::JsonSchema(schema_json.to_string());
     req
 }
 
@@ -186,10 +183,7 @@ async fn integer_schema_forces_digit_tokens() {
     );
 
     // Strip the trailing stop char if present.
-    let trimmed: String = generated
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
+    let trimmed: String = generated.chars().filter(|c| c.is_ascii_digit()).collect();
     assert!(
         trimmed.chars().count() >= 1,
         "expected at least one digit in output, got {generated:?}"

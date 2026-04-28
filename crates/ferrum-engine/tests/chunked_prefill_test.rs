@@ -74,11 +74,10 @@ async fn chunked_matches_baseline() {
     std::env::remove_var("FERRUM_CHUNKED_PREFILL");
 
     let baseline_engine = make_engine();
-    let baseline =
-        baseline_engine
-            .infer(make_request(&make_long_prompt(200), 3))
-            .await
-            .expect("baseline infer");
+    let baseline = baseline_engine
+        .infer(make_request(&make_long_prompt(200), 3))
+        .await
+        .expect("baseline infer");
 
     std::env::set_var("FERRUM_CHUNKED_PREFILL", "64");
     let chunked_engine = make_engine();
@@ -106,11 +105,10 @@ async fn chunked_small_chunk_size() {
     std::env::remove_var("FERRUM_CHUNKED_PREFILL");
 
     let baseline_engine = make_engine();
-    let baseline =
-        baseline_engine
-            .infer(make_request(&make_long_prompt(50), 3))
-            .await
-            .expect("baseline infer");
+    let baseline = baseline_engine
+        .infer(make_request(&make_long_prompt(50), 3))
+        .await
+        .expect("baseline infer");
 
     std::env::set_var("FERRUM_CHUNKED_PREFILL", "4");
     let chunked_engine = make_engine();

@@ -90,6 +90,9 @@ cuda = [
 ]
 marlin = ["cuda"]  # kept for backward compat, cuda already enables marlin
 tensor-parallel = ["cuda"]  # backward compat alias
+# Forward the triton-kernels feature so cuda_decode launches use triton-rs
+# PTX in place of hand-written .cu PTX. Requires `cuda` (always co-enabled).
+triton-kernels = ["cuda", "ferrum-kernels/triton-kernels"]
 metal = ["candle-core/metal", "dep:candle-metal-kernels", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray", "ferrum-models/metal", "ferrum-kernels/metal"]
 
 # Metal dependencies for Apple GPU support (only on macOS/iOS)
