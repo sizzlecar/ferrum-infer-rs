@@ -46,8 +46,6 @@ fn ferrum_device_to_candle(d: &ferrum_types::Device) -> candle_core::Device {
         ferrum_types::Device::Metal => {
             candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
         }
-        #[cfg(not(all(any(target_os = "macos", target_os = "ios"), feature = "metal")))]
-        ferrum_types::Device::Metal => candle_core::Device::Cpu,
         _ => candle_core::Device::Cpu,
     }
 }
