@@ -26,7 +26,7 @@ use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 
 /// Full Qwen3 architecture config (everything the model code needs, not just
 /// the engine-facing subset in `LlmRuntimeConfig`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LlamaFamilyConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
