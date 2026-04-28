@@ -10,12 +10,16 @@ readme = "../../README.md"
 [dependencies]
 ferrum-types = { workspace = true }
 ferrum-kernels = { workspace = true }
+candle-core = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = "0.9"
 half = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8"
 
 [features]
 default = []

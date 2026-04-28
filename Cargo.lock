@@ -1458,6 +1458,7 @@ dependencies = [
 name = "ferrum-quantization"
 version = "0.7.0"
 dependencies = [
+ "candle-core",
  "ferrum-kernels",
  "ferrum-types",
  "half",
@@ -1465,6 +1466,7 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 
