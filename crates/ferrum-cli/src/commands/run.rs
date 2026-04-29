@@ -17,11 +17,13 @@ use uuid::Uuid;
 
 #[derive(Args)]
 pub struct RunCommand {
-    /// Model name (e.g., tinyllama, qwen2.5:7b, or full path)
+    /// Model name (alias like `qwen3:8b`, HF repo id, or path to a `.gguf` file).
+    /// When the argument is a `.gguf` path, ferrum routes to candle-transformers'
+    /// quantized loaders for the M1 Max bench path (Qwen3 / Qwen3-MoE / Llama).
     #[arg(default_value = "tinyllama")]
     pub model: String,
 
-    /// System prompt
+    /// System prompt (interactive chat mode only).
     #[arg(long)]
     pub system: Option<String>,
 
@@ -29,16 +31,68 @@ pub struct RunCommand {
     #[arg(long, default_value = "512")]
     pub max_tokens: u32,
 
-    /// Temperature (0.0-2.0)
+    /// Sampling temperature (0.0–2.0). 0.0 = greedy / argmax (deterministic,
+    /// what you want for benchmarks). >0 = softmax sample with `--top-k`
+    /// and `--top-p` filtering applied.
     #[arg(long, default_value = "0.7")]
     pub temperature: f32,
 
     /// Backend: auto, cpu, metal (default: auto)
     #[arg(long, default_value = "auto")]
     pub backend: String,
+
+    /// One-shot prompt (skip interactive REPL). When supplied, ferrum runs a
+    /// single prefill+decode and exits — useful for benchmarking and shell
+    /// scripting. For `.gguf` paths, omitting this drops into the GGUF REPL.
+    #[arg(long)]
+    pub prompt: Option<String>,
+
+    /// Path to a HuggingFace `tokenizer.json` (only used for `.gguf` paths).
+    /// If omitted, ferrum looks for `<gguf-stem>.tokenizer.json` and then
+    /// `tokenizer.json` next to the `.gguf` file.
+    #[arg(long)]
+    pub tokenizer: Option<PathBuf>,
+
+    /// Bench mode: skip generated text output, print only timing summary.
+    /// Implies one-shot (`--prompt` is required).
+    #[arg(long)]
+    pub bench_mode: bool,
+
+    /// Top-K sampling cutoff (0 disables — keep all). Only the K highest-
+    /// probability tokens compete in the softmax sample. Default 50, a
+    /// conservative value that filters obvious garbage without flattening
+    /// the distribution.
+    #[arg(long, default_value = "50")]
+    pub top_k: usize,
+
+    /// Top-P (nucleus) sampling cutoff (0.0 disables, 1.0 keeps all).
+    /// Smallest set of tokens whose cumulative probability exceeds P
+    /// is kept; the rest are zeroed before sampling. Default 0.95.
+    #[arg(long, default_value = "0.95")]
+    pub top_p: f32,
+
+    /// Repetition penalty applied to logits before sampling. >1 discourages
+    /// repeats, <1 encourages, 1.0 disables. OpenAI uses 1.1 typically.
+    #[arg(long, default_value = "1.0")]
+    pub repeat_penalty: f32,
+
+    /// Number of recent tokens that the repetition penalty considers.
+    /// Smaller = local repeat avoidance only.
+    #[arg(long, default_value = "64")]
+    pub repeat_last_n: usize,
+
+    /// Random seed for sampling (when temperature > 0). Default 42.
+    #[arg(long, default_value = "42")]
+    pub seed: u64,
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    // GGUF fast path — no HF download, no candle weight loader, just hand
+    // the file to candle-transformers' quantized loaders.
+    if looks_like_gguf_path(&cmd.model) {
+        return crate::commands::run_gguf::run_gguf_one_shot(cmd, config).await;
+    }
+
     // Resolve model
     let model_id = resolve_model_alias(&cmd.model);
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
@@ -345,6 +399,17 @@ pub fn detect_format(path: &PathBuf) -> ModelFormat {
     } else {
         ModelFormat::Unknown
     }
+}
+
+/// Treat the model argument as a `.gguf` file path if it ends in `.gguf`
+/// (case-insensitive) and the file actually exists. Anything else falls
+/// through to the alias / HF repo path.
+pub fn looks_like_gguf_path(model: &str) -> bool {
+    let p = PathBuf::from(model);
+    p.extension()
+        .map(|e| e.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
+        && p.is_file()
 }
 
 pub fn select_device(backend: &str) -> ferrum_types::Device {

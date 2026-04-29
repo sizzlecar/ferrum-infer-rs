@@ -32,7 +32,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a model and start interactive chat
+    /// Run a model and start interactive chat. Accepts an alias / HF repo id /
+    /// path to a `.gguf` file — the last routes to candle-transformers'
+    /// quantized loaders for the M1 Max bench path.
     #[command(visible_alias = "r")]
     Run(run::RunCommand),
 
