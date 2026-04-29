@@ -417,6 +417,32 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// GPU-side MoE router: `[batch, num_experts]` logits → `[batch, top_k]`
+    /// expert IDs (i32) + `[batch, top_k]` combine weights (f32).
+    ///
+    /// Replaces the per-layer `B::sync + B::to_vec(router_logits) + host route()`
+    /// round trip. The output buffers stay device-side for downstream
+    /// `gemv_quant_moe_id` / `gemm_quant_moe_id` consumption — no host
+    /// pipeline drain in the inner loop.
+    ///
+    /// `norm_topk_prob`: if true, divide each row's K weights by their
+    /// sum so they total 1.0 (Qwen3-MoE / Mixtral default).
+    #[allow(clippy::too_many_arguments)]
+    fn route_topk_softmax(
+        _ctx: &mut Self::Context,
+        _logits: &Self::Buffer,
+        _out_ids: &mut Self::Buffer,
+        _out_weights: &mut Self::Buffer,
+        _batch: usize,
+        _num_experts: usize,
+        _top_k: usize,
+        _norm_topk_prob: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "route_topk_softmax not implemented for this backend",
+        ))
+    }
+
     /// Stacked SiLU·gate over `[batch * top_k, ffn]` rows (prefill version
     /// of `silu_mul_stacked`).
     fn silu_mul_batched(

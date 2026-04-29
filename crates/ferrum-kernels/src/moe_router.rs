@@ -1,0 +1,200 @@
+//! GPU-side MoE router — softmax + top-K + optional renormalize over
+//! `[batch, num_experts]` router logits, output `[batch, top_k]` ids
+//! and weights. See `moe_router.metal` for the algorithmic notes.
+//!
+//! Eliminates the per-layer `B::sync + B::to_vec + host route()` round
+//! trip used by the previous decode-style stacked dispatch path.
+
+#![cfg(all(target_os = "macos", feature = "metal"))]
+
+use std::ffi::c_void;
+use std::sync::OnceLock;
+
+use metal::{
+    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
+};
+
+const SHADER_SRC: &str = include_str!("moe_router.metal");
+const KERNEL_NAME: &str = "moe_router_topk_softmax_f32";
+
+static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
+
+fn pipeline(device: &Device) -> &'static ComputePipelineState {
+    PIPELINE.get_or_init(|| {
+        let lib = device
+            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+            .expect("compile moe_router.metal");
+        let function = lib
+            .get_function(KERNEL_NAME, None)
+            .expect("find moe_router_topk_softmax_f32");
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .expect("build moe_router_topk_softmax_f32 pipeline")
+    })
+}
+
+/// Dispatch the GPU-side router kernel on an existing compute encoder.
+///
+/// Inputs:
+/// - `logits`: `[batch, num_experts]` f32
+///
+/// Outputs:
+/// - `out_ids`: `[batch, top_k]` i32 (selected expert indices, smaller-
+///   index-wins tie-breaking to match the host `route()` reference)
+/// - `out_weights`: `[batch, top_k]` f32 (post-softmax probabilities,
+///   optionally renormalised so each row sums to 1)
+pub fn dispatch_route_topk_softmax(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    logits: &Buffer,
+    out_ids: &Buffer,
+    out_weights: &Buffer,
+    batch: usize,
+    num_experts: usize,
+    top_k: usize,
+    norm_topk_prob: bool,
+) {
+    debug_assert!(top_k <= num_experts);
+    debug_assert!(top_k > 0);
+
+    #[repr(C)]
+    struct P {
+        num_experts: i32,
+        top_k: i32,
+        norm_topk_prob: i32,
+    }
+    let params = P {
+        num_experts: num_experts as i32,
+        top_k: top_k as i32,
+        norm_topk_prob: if norm_topk_prob { 1 } else { 0 },
+    };
+
+    let pipe = pipeline(device);
+    enc.set_compute_pipeline_state(pipe);
+    enc.set_buffer(0, Some(logits), 0);
+    enc.set_buffer(1, Some(out_ids), 0);
+    enc.set_buffer(2, Some(out_weights), 0);
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<P>() as u64,
+        &params as *const _ as *const c_void,
+    );
+
+    // Threadgroup memory: probs[num_experts] f32 + sel_weights[top_k] f32
+    //                   + sel_idxs[top_k] i32 + renorm_slot[1] f32.
+    let shmem_bytes = (num_experts * 4 + top_k * 4 + top_k * 4 + 4).max(64);
+    enc.set_threadgroup_memory_length(0, shmem_bytes as u64);
+
+    let grid = MTLSize::new(batch as u64, 1, 1);
+    let tg = MTLSize::new(32, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metal::MTLResourceOptions;
+
+    /// Compare GPU router output against a host softmax+top-K reference
+    /// for a small synthetic logits matrix. Catches mass-misordering
+    /// bugs (e.g. using wrong tie-break, off-by-one in masking, weights
+    /// not normalised).
+    #[test]
+    fn router_matches_host_reference() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device — skipping");
+            return;
+        };
+        let queue = device.new_command_queue();
+
+        let batch = 3;
+        let num_experts = 16;
+        let top_k = 4;
+
+        // Build deterministic logits with one clear winner per row.
+        let mut logits: Vec<f32> = Vec::with_capacity(batch * num_experts);
+        for b in 0..batch {
+            for e in 0..num_experts {
+                let v = ((b as f32) * 0.7 + (e as f32) * 0.13).sin() + (e as f32) * 0.05;
+                logits.push(v);
+            }
+        }
+
+        let logits_buf = device.new_buffer_with_data(
+            logits.as_ptr() as *const _,
+            (logits.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let ids_buf = device.new_buffer(
+            (batch * top_k * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let w_buf = device.new_buffer(
+            (batch * top_k * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let cmd = queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        dispatch_route_topk_softmax(
+            &device,
+            enc,
+            &logits_buf,
+            &ids_buf,
+            &w_buf,
+            batch,
+            num_experts,
+            top_k,
+            true,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let gpu_ids: &[i32] =
+            unsafe { std::slice::from_raw_parts(ids_buf.contents() as *const i32, batch * top_k) };
+        let gpu_w: &[f32] =
+            unsafe { std::slice::from_raw_parts(w_buf.contents() as *const f32, batch * top_k) };
+
+        for b in 0..batch {
+            // Host softmax + top-K + renorm reference.
+            let row = &logits[b * num_experts..(b + 1) * num_experts];
+            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|x| (x - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+            // Top-K via partial sort, smaller-index tie-break.
+            let mut indexed: Vec<(usize, f32)> =
+                probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+            indexed.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let topk: Vec<usize> = indexed.iter().take(top_k).map(|(i, _)| *i).collect();
+            let renorm_sum: f32 = topk.iter().map(|&i| probs[i]).sum();
+            let weights_ref: Vec<f32> = topk.iter().map(|&i| probs[i] / renorm_sum).collect();
+
+            for k in 0..top_k {
+                let gpu_id = gpu_ids[b * top_k + k] as usize;
+                let gpu_weight = gpu_w[b * top_k + k];
+                assert_eq!(
+                    gpu_id, topk[k],
+                    "row {} slot {}: gpu id {} != host id {}",
+                    b, k, gpu_id, topk[k]
+                );
+                let diff = (gpu_weight - weights_ref[k]).abs();
+                assert!(
+                    diff < 1e-5,
+                    "row {} slot {}: gpu weight {} vs host {} (diff {})",
+                    b,
+                    k,
+                    gpu_weight,
+                    weights_ref[k],
+                    diff
+                );
+            }
+        }
+    }
+}

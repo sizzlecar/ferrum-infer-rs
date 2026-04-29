@@ -16,6 +16,8 @@ pub mod moe_post_ops;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod moe_post_ops_batched;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod moe_router;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k_gemm;
