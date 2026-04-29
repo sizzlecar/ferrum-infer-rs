@@ -24,6 +24,7 @@ using namespace metal;
 
 #define QK_K       256
 #define QK_NL_Q4_K 16   // 16 dequant tiles per super-block (16 weights/tile)
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
 struct block_q4_K {
     half  d;
@@ -76,18 +77,18 @@ static inline void dequantize_q4_K(
     const float ml = minv * float(sc[1]);
 
     const ushort mask = il < 2 ? 0x0F : 0xF0;
-    for (int i = 0; i < 16; ++i) {
+    FOR_UNROLL (int i = 0; i < 16; ++i) {
         reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
     }
 }
 
-// Tile constants — match llama.cpp's legacy mul_mm path
+// Tile constants — match llama.cpp's legacy mul_mm path.
 constant short NR0 = 64;     // weight rows per threadgroup
 constant short NR1 = 32;     // activation rows per threadgroup
 constant short NK  = 32;     // K-chunk per outer loop iteration
-constant short NL0 = NK / 16;  // = 2: 16-element dequant tiles per K-chunk
-constant short NL1 = NK / 8;   // = 4: 8-element activation loads per K-chunk
-constant short NL_BLOCK_Q4_K = QK_NL_Q4_K; // = 16 (alias for clarity)
+constant short NL0 = NK / 16;  // = 2
+constant short NL1 = NK / 8;   // = 4
+constant short NL_BLOCK_Q4_K = QK_NL_Q4_K; // = 16
 
 kernel void gemm_q4kw_f32a_f32o(
     device const block_q4_K * src0  [[buffer(0)]],   // weights [M, K/256] super-blocks
@@ -140,7 +141,7 @@ kernel void gemm_q4kw_f32a_f32o(
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (short i = 0; i < 16; ++i) {
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
                 const short sx = 2 * il0 + i / 8;
                 const short sy = (short(tiitg) / NL0) / 8;
                 const short lx = (short(tiitg) / NL0) % 8;
@@ -184,20 +185,20 @@ kernel void gemm_q4kw_f32a_f32o(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK / 8; ++ik) {
+        FOR_UNROLL (short ik = 0; ik < NK / 8; ++ik) {
             simdgroup_barrier(mem_flags::mem_none);
 
-            for (short i = 0; i < 4; ++i) {
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
 
-            for (short i = 0; i < 2; ++i) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
 
-            for (short i = 0; i < 8; ++i) {
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
 
