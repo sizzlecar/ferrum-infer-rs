@@ -3,17 +3,17 @@
 ✓ GGUF parsed in 0.02s — arch detected, 32 layers, hidden=4096, kv_heads=8
 → tokenizer: /Users/chejinxuan/ferrum-bench/tokenizers/Meta-Llama-3.1-8B-Instruct.tokenizer.json
 → loading weights into Metal (arch: llama) ...
-✓ model ready in 3.36s
+✓ model ready in 3.45s
 → prompt: 2 tokens
-✓ prefill: 2 tok in 0.191s (10.5 tok/s)
+✓ prefill: 2 tok in 0.193s (10.4 tok/s)
 
 ────────────────────────────────────────────────────────────
 tokens: 2 prompt + 128 generated tok
-time: 0.191s prefill + 4.759s decode
-throughput: 26.7 tok/s (decode only)
-latency: 37.47ms / token
-rep=1 p_n=2 p_s=0.190 d_n=128 d_s=4.852
-rep=2 p_n=2 p_s=0.192 d_n=128 d_s=4.630
-rep=3 p_n=2 p_s=0.195 d_n=128 d_s=4.858
-rep=4 p_n=2 p_s=0.197 d_n=128 d_s=4.883
-rep=5 p_n=2 p_s=0.201 d_n=128 d_s=4.727
+time: 0.193s prefill + 4.745s decode
+throughput: 26.8 tok/s (decode only)
+latency: 37.36ms / token
+rep=1 p_n=2 p_s=0.200 d_n=128 d_s=4.984
+rep=2 p_n=2 p_s=0.196 d_n=128 d_s=4.712
+rep=3 p_n=2 p_s=0.196 d_n=128 d_s=4.639
+rep=4 p_n=2 p_s=0.208 d_n=128 d_s=4.648
+rep=5 p_n=2 p_s=0.197 d_n=128 d_s=4.812

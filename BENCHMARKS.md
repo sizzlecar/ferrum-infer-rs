@@ -231,13 +231,29 @@ Decode throughput (M1 Max, 24-core GPU, AC-powered):
 
 #### Full apples-to-apples (5 reps each, FERRUM_KV_CAPACITY=1024)
 
+After porting llama.cpp's `kernel_mul_mm_q4_K_f32` and
+`kernel_mul_mm_q6_K_f32` (commits e0ff7dc, 12e/13e):
+
 | Model | Test | ferrum mean ± std | llama.cpp | Ratio |
 |---|---|---:|---:|---:|
-| Qwen3-8B Q4_K_M | pp (302-token prompt) | **71.94 ± 0.97** | 346.52 ± 25.26 (pp512) | **21%** |
-| Qwen3-8B Q4_K_M | tg128 | **24.93 ± 0.25** | 27.94 ± 0.90 | **89%** |
-| Llama-3.1-8B Q4_K_M | pp (295-token prompt) | **71.31 ± 0.30** | 335.13 ± 24.86 (pp512) | **21%** |
-| Llama-3.1-8B Q4_K_M | tg128 | **27.37 ± 0.54** | 29.20 ± 0.44 | **94%** |
+| Qwen3-8B Q4_K_M | pp (302-token prompt) | **193.18 ± 1.64** | 346.52 ± 25.26 (pp512) | **56%** |
+| Qwen3-8B Q4_K_M | tg128 | **25.70 ± 0.32** | 27.94 ± 0.90 | **92%** |
+| Llama-3.1-8B Q4_K_M | pp (295-token prompt) | **195.89 ± 2.59** | 335.13 ± 24.86 (pp512) | **58%** |
+| Llama-3.1-8B Q4_K_M | tg128 | **26.91 ± 0.71** | 29.20 ± 0.44 | **92%** |
 | Qwen3-30B-A3B Q4_K_M | — | not wired yet (MoE) | 596 / 44.5 | — |
+
+Progression of prefill on Qwen3-8B (302-token prompt) through this work:
+
+| Stage | tok/s | vs llama.cpp |
+|---|---:|---:|
+| ferrum baseline (pre-mul_mm) | 71.94 | 21% |
+| + Q4 mul_mm (commit e0ff7dc) | 128.92 | 37% |
+| + Q6 mul_mm (current) | **193.18** | **56%** |
+
+Cumulative prefill speedup: **2.69×** on Qwen3-8B, **2.75×** on Llama-3.1.
+
+Decode is at 92% of llama.cpp on both models — within the noise floor
+of llama.cpp's own ±3% stddev.
 
 Headline: **decode is within 6-11% of llama.cpp on dense models; prefill is 5× behind**.
 

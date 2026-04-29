@@ -659,27 +659,23 @@ impl Backend for MetalBackend {
                 );
             }
         } else if is_q6k {
-            // **Q6_K m>1 path**: we don't have a Q6_K dequant kernel
-            // yet, so just call the fused gemv `m` times with stride
-            // offsets. This is a few-call serialised dispatch — fine
-            // for prefill at m=11ish where Q6_K matmuls are a minority
-            // of the work, not great for big batches.
+            // **Q6_K m>1 fused mul_mm path** — ported from llama.cpp's
+            // `kernel_mul_mm_q6_K_f32`. Same 64×32 simdgroup-matmul
+            // tile + inline dequant as the Q4_K version. Replaces the
+            // prior per-row gemv loop which scaled linearly with m
+            // and was the dominant prefill bottleneck on Q4_K_M models
+            // where down_proj / lm_head live as Q6_K.
             let enc = ctx.compute_encoder();
-            for row in 0..m {
-                let a_off = (row * n_cols * 4) as u64;
-                let c_off = (row * n_rows * 4) as u64;
-                crate::q6_k_gemv::dispatch_gemv_q6k_v2_offset(
-                    &st().pipes.device,
-                    enc,
-                    a_buf,
-                    a_off,
-                    blocks,
-                    out_buf,
-                    c_off,
-                    n_rows,
-                    n_cols,
-                );
-            }
+            crate::q6_k_gemm::dispatch_gemm_q6k_on_encoder(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                blocks,
+                out_buf,
+                m,
+                n_rows,
+                n_cols,
+            );
         } else {
             // **Fused mul_mm path** for prefill (m > 1) Q4_K — ported
             // from llama.cpp's `kernel_mul_mm_q4_K_f32`. Inlines Q4_K

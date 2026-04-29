@@ -19,6 +19,8 @@ pub mod q4_k_gemv_v2;
 pub mod q4_k_gemm;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q6_k_gemv;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod q6_k_gemm;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod ptx {

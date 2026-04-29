@@ -1,19 +1,19 @@
 ## llama31_8b / pp512
 → backend: Metal
-✓ GGUF parsed in 0.04s — arch detected, 32 layers, hidden=4096, kv_heads=8
+✓ GGUF parsed in 0.03s — arch detected, 32 layers, hidden=4096, kv_heads=8
 → tokenizer: /Users/chejinxuan/ferrum-bench/tokenizers/Meta-Llama-3.1-8B-Instruct.tokenizer.json
 → loading weights into Metal (arch: llama) ...
-✓ model ready in 10.24s
+✓ model ready in 7.47s
 → prompt: 295 tokens
-✓ prefill: 295 tok in 2.261s (130.5 tok/s)
+✓ prefill: 295 tok in 1.511s (195.2 tok/s)
 
 ────────────────────────────────────────────────────────────
 tokens: 295 prompt + 1 generated tok
-time: 2.261s prefill + 0.000s decode
+time: 1.511s prefill + 0.000s decode
 throughput: 0.0 tok/s (decode only)
 latency: 0.00ms / token
-rep=1 p_n=295 p_s=2.347 d_n=1 d_s=0.000
-rep=2 p_n=295 p_s=2.273 d_n=1 d_s=0.000
-rep=3 p_n=295 p_s=2.264 d_n=1 d_s=0.000
-rep=4 p_n=295 p_s=2.265 d_n=1 d_s=0.000
-rep=5 p_n=295 p_s=2.265 d_n=1 d_s=0.000
+rep=1 p_n=295 p_s=1.533 d_n=1 d_s=0.000
+rep=2 p_n=295 p_s=1.527 d_n=1 d_s=0.000
+rep=3 p_n=295 p_s=1.492 d_n=1 d_s=0.000
+rep=4 p_n=295 p_s=1.480 d_n=1 d_s=0.000
+rep=5 p_n=295 p_s=1.499 d_n=1 d_s=0.000
