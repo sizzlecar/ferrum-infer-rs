@@ -1,8 +1,19 @@
 ## qwen3_30b_a3b / tg128
 → backend: Metal
-Error: Model error: GGUF arch 'qwen3moe' is MoE — use Qwen3MoeConfig::from_gguf or the matching MoE config builder, not LlamaFamilyConfig::from_gguf
-rep=1 p_n= p_s= d_n= d_s=
-rep=2 p_n= p_s= d_n= d_s=
-rep=3 p_n= p_s= d_n= d_s=
-rep=4 p_n= p_s= d_n= d_s=
-rep=5 p_n= p_s= d_n= d_s=
+✓ GGUF parsed in 0.03s — MoE arch detected, 48 layers, hidden=2048, kv_heads=4, experts=128, top_k=8, expert_inter=768
+→ tokenizer: /Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json
+→ loading weights into Metal (arch: qwen3moe) ...
+✓ model ready in 47.92s
+→ prompt: 1 tokens
+✓ prefill: 1 tok in 0.469s (2.1 tok/s)
+
+────────────────────────────────────────────────────────────
+tokens: 1 prompt + 128 generated tok
+time: 0.469s prefill + 14.205s decode
+throughput: 8.9 tok/s (decode only)
+latency: 111.85ms / token
+rep=1 p_n=1 p_s=0.448 d_n=128 d_s=13.066
+rep=2 p_n=1 p_s=0.520 d_n=128 d_s=9.580
+rep=3 p_n=1 p_s=2.328 d_n=128 d_s=10.723
+rep=4 p_n=1 p_s=0.691 d_n=128 d_s=8.129
+rep=5 p_n=1 p_s=0.427 d_n=128 d_s=6.904
