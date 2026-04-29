@@ -458,6 +458,22 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Fused weighted-sum + residual-add: `residual[i] += Σ_k weights[k] · slots[k, i]`.
+    /// Single dispatch replaces the (weighted_sum → moe_out) +
+    /// (add_inplace residual += moe_out) pair on the decode hot path.
+    fn weighted_sum_residual_stacked(
+        _ctx: &mut Self::Context,
+        _slots: &Self::Buffer,
+        _weights: &Self::Buffer,
+        _residual: &mut Self::Buffer,
+        _n_slots: usize,
+        _hidden: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "weighted_sum_residual_stacked not implemented for this backend",
+        ))
+    }
+
     /// Per-batch weighted sum: `out[b, h] = Σ_k weights[b, k] · slots[b, k, h]`.
     /// Single dispatch covers the whole batch (prefill version of
     /// `weighted_sum_stacked` which only handled one token).
