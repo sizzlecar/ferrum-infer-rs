@@ -875,12 +875,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
         } else {
             None
         };
-        layer.o_proj.forward(
-            ctx,
-            attn_token_major,
-            &mut self.scratch.o_proj_out,
-            tokens,
-        );
+        layer
+            .o_proj
+            .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
         if let Some(t0) = _t0 {
             B::sync(ctx);
             MATMUL_TIME_US.fetch_add(

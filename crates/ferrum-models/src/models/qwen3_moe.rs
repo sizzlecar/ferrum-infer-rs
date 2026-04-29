@@ -559,12 +559,9 @@ impl<B: Backend> Qwen3MoeModel<B> {
         };
 
         // 8. O-proj.
-        attn_layer.o_proj.forward(
-            ctx,
-            attn_token_major,
-            &mut self.scratch.o_proj_out,
-            tokens,
-        );
+        attn_layer
+            .o_proj
+            .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
 
         // 9. fused residual-add + post-attention RMSNorm.
         B::fused_add_rms_norm(
