@@ -1084,6 +1084,20 @@ impl Backend for MetalBackend {
         st().pipes.add_enc(enc, r, x, r, len);
     }
 
+    fn scaled_add_inplace(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        src: &Self::Buffer,
+        scale: f32,
+        len: usize,
+    ) {
+        let dst_buf = dst.expect_f32_mut("scaled_add_inplace dst");
+        let src_buf = src.expect_f32("scaled_add_inplace src");
+        let enc = ctx.compute_encoder();
+        st().pipes
+            .scaled_add_inplace_enc(enc, dst_buf, src_buf, scale, len);
+    }
+
     // ── Buffer management ────────────────────────────────────────────
 
     fn alloc(len: usize) -> Self::Buffer {
