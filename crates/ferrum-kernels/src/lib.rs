@@ -16,6 +16,8 @@ pub mod q4_k_gemv;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k_gemv_v2;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod q4_k_gemm;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q6_k_gemv;
 
 #[cfg(feature = "cuda")]

@@ -681,27 +681,26 @@ impl Backend for MetalBackend {
                 );
             }
         } else {
-            // **Dequant→transient→GEMM** path for prefill (m > 1) Q4_K.
-            // Pool the fp16 transient by byte-size so repeated shapes
-            // share one allocation; same encoder for both dispatches
-            // lets the GEMM see dequant's writes without an explicit
-            // fence.
-            let transient_ptr: *const metal::Buffer = ctx.quant_transient(f16_bytes);
-            // SAFETY: transient_ptr points into ctx.quant_transients (a
-            // HashMap we own); the buffer outlives this function and the
-            // cmd buffer we encode into. The raw pointer dance is needed
-            // because the next call takes &mut ctx again for `cmd`.
-            let transient: &metal::Buffer = unsafe { &*transient_ptr };
+            // **Fused mul_mm path** for prefill (m > 1) Q4_K — ported
+            // from llama.cpp's `kernel_mul_mm_q4_K_f32`. Inlines Q4_K
+            // dequant into the threadgroup-memory load and uses
+            // `simdgroup_half8x8` matmul, eliminating both the fp16
+            // transient buffer (~2× memory traffic) and the scalar
+            // gemm_v2_f16w inner loop.
             let enc = ctx.compute_encoder();
-            crate::q4_k::dispatch_dequant_q4_k_on_encoder(
+            crate::q4_k_gemm::dispatch_gemm_q4k_on_encoder(
                 &st().pipes.device,
                 enc,
+                a_buf,
                 blocks,
-                transient,
-                n_blocks,
+                out_buf,
+                m,
+                n_rows,
+                n_cols,
             );
-            st().pipes
-                .gemm_v2_f16w(enc, a_buf, transient, out_buf, m, n_rows, n_cols);
+            // Touch f16_bytes / n_blocks so they don't trigger
+            // unused-warning when the old path is removed.
+            let _ = (f16_bytes, n_blocks);
         }
 
         // Optional per-call timing: commit + wait the cmd buffer right
