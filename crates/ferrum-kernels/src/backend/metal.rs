@@ -741,6 +741,128 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn gemm_quant_moe_id(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        ids: &Self::Buffer,
+        tpe: &Self::Buffer,
+        out: &mut Self::Buffer,
+        ne11: usize,
+        top_k: usize,
+        max_per_expert: usize,
+        batch: usize,
+    ) -> Result<()> {
+        let a_buf = a.expect_f32("gemm_quant_moe_id a");
+        let ids_buf = &ids.raw;
+        let tpe_buf = &tpe.raw;
+        let out_buf = out.expect_f32_mut("gemm_quant_moe_id out");
+        let enc = ctx.compute_encoder();
+        match weight {
+            MetalQuantStore::Q4KExperts {
+                blocks,
+                num_experts,
+                n_rows,
+                n_cols,
+            } => {
+                crate::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    blocks,
+                    a_buf,
+                    ids_buf,
+                    tpe_buf,
+                    out_buf,
+                    *num_experts,
+                    *n_rows,
+                    *n_cols,
+                    ne11,
+                    top_k,
+                    max_per_expert,
+                    batch,
+                );
+                Ok(())
+            }
+            MetalQuantStore::Q6KExperts {
+                blocks,
+                num_experts,
+                n_rows,
+                n_cols,
+            } => {
+                crate::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    blocks,
+                    a_buf,
+                    ids_buf,
+                    tpe_buf,
+                    out_buf,
+                    *num_experts,
+                    *n_rows,
+                    *n_cols,
+                    ne11,
+                    top_k,
+                    max_per_expert,
+                    batch,
+                );
+                Ok(())
+            }
+            _ => Err(FerrumError::model(
+                "gemm_quant_moe_id: weight must be Q4KExperts or Q6KExperts".to_string(),
+            )),
+        }
+    }
+
+    fn silu_mul_batched(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        total_pairs: usize,
+        ffn: usize,
+    ) -> Result<()> {
+        let gate_buf = gate.expect_f32("silu_mul_batched gate");
+        let up_buf = up.expect_f32("silu_mul_batched up");
+        let out_buf = out.expect_f32_mut("silu_mul_batched out");
+        let enc = ctx.compute_encoder();
+        crate::moe_post_ops_batched::dispatch_silu_mul_batched(
+            &st().pipes.device,
+            enc,
+            gate_buf,
+            up_buf,
+            out_buf,
+            total_pairs,
+            ffn,
+        );
+        Ok(())
+    }
+
+    fn weighted_sum_batched(
+        ctx: &mut Self::Context,
+        slots: &Self::Buffer,
+        weights: &Self::Buffer,
+        out: &mut Self::Buffer,
+        batch: usize,
+        top_k: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        let slots_buf = slots.expect_f32("weighted_sum_batched slots");
+        let weights_buf = weights.expect_f32("weighted_sum_batched weights");
+        let out_buf = out.expect_f32_mut("weighted_sum_batched out");
+        let enc = ctx.compute_encoder();
+        crate::moe_post_ops_batched::dispatch_weighted_sum_batched(
+            &st().pipes.device,
+            enc,
+            slots_buf,
+            weights_buf,
+            out_buf,
+            batch,
+            top_k,
+            hidden,
+        );
+        Ok(())
+    }
+
     fn silu_mul_stacked(
         ctx: &mut Self::Context,
         gate: &Self::Buffer,
