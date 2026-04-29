@@ -125,21 +125,88 @@ References:
 
 ### llama.cpp baseline — 2026-04-29 (M1 Max, build 8960)
 
+#### Hardware
+
+| Field | Value |
+|---|---|
+| Machine | Apple M1 Max |
+| CPU | 8 performance + 2 efficiency cores (10 total) |
+| GPU | 24-core (this binning of M1 Max; 32-core also exists) |
+| Memory | 32 GB unified |
+| Power | AC, 100% battery, lid open |
+| Thermal | Cold start at first run; subsequent runs back-to-back |
+
+#### Software
+
+| Field | Value |
+|---|---|
+| OS | macOS 15.1.1 (build 24B91) |
+| llama.cpp | brew bottle `8960`, build commit `19821178b` |
+| ggml | `0.10.0` (libggml-blas, libggml-metal, libggml-cpu-apple_m1) |
+| Metal device | MTL0, MTLGPUFamilyApple7 / Common3 / Metal3 |
+| Working set | `recommendedMaxWorkingSetSize = 22906.50 MB` |
+| Build flags | brew bottle defaults (`GGML_METAL=ON`, BLAS via Accelerate); not built from source |
+
+#### Command
+
+```bash
+llama-bench \
+  -m <model.gguf> \
+  -p 512 -n 128 \
+  -t 8 -ngl 99 -r 5 \
+  -o md
 ```
-Filesystem    GPU   Working set
-M1 Max 32 GB  MTL   ~22.9 GB recommendedMaxWorkingSetSize
-```
+
+  - `-p 512` = prompt-processing test (prefill 512 tokens)
+  - `-n 128` = token-generation test (decode 128 tokens)
+  - `-t 8`   = 8 CPU threads (perf cores only — leave efficiency cores for the OS)
+  - `-ngl 99` = offload all layers to Metal
+  - `-r 5`   = 5 timed reps (one warm-up included by default)
+  - `-o md`  = markdown output (also saved as raw stdout)
+
+#### KV cache + context
+
+  - KV dtype: `fp16` (llama-bench default)
+  - Context size: `4096` (llama-bench default)
+
+#### Models
+
+| Model | HuggingFace source | Size | SHA-256 (truncated) |
+|---|---|---:|---|
+| Qwen3-8B Q4_K_M | `Qwen/Qwen3-8B-GGUF`/`Qwen3-8B-Q4_K_M.gguf` | 4.68 GiB | `d98cdcbd…45785` |
+| Llama-3.1-8B-Instruct Q4_K_M | `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF`/`Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | 4.58 GiB | `7b064f58…3557c` |
+| Qwen3-30B-A3B Q4_K_M | `Qwen/Qwen3-30B-A3B-GGUF`/`Qwen3-30B-A3B-Q4_K_M.gguf` | 17.28 GiB | `0d003f66…aa8f5` |
+
+Full SHA-256 list and raw `llama-bench` stdout/stderr are saved in
+`bench_results/` (`metadata.txt`, `model_sha256.txt`, `llamacpp_*.md`,
+`llamacpp_*.stderr.log`) so the numbers below can be reproduced and
+audited.
+
+#### Results
 
 | Model | Size | Backend | pp512 (prefill tok/s) | tg128 (decode tok/s) |
 |---|---:|---|---:|---:|
-| Qwen3-8B Q4_K_M | 4.68 GiB | BLAS+MTL | **373.51 ± 0.53** | **31.17 ± 1.62** |
-| Llama-3.1-8B-Instruct Q4_K_M | 4.58 GiB | BLAS+MTL | **375.24 ± 1.94** | **29.06 ± 2.43** |
-| Qwen3-30B-A3B Q4_K_M | 17.28 GiB | BLAS+MTL | **598.23 ± 9.95** | **52.68 ± 2.31** |
+| Qwen3-8B Q4_K_M | 4.68 GiB | BLAS+MTL | **346.52 ± 25.26** | **27.94 ± 0.90** |
+| Llama-3.1-8B-Instruct Q4_K_M | 4.58 GiB | BLAS+MTL | **335.13 ± 24.86** | **29.20 ± 0.44** |
+| Qwen3-30B-A3B Q4_K_M | 17.28 GiB | BLAS+MTL | **596.58 ± 3.89** | **44.52 ± 6.80** |
 
-Observation: **Qwen3-30B-A3B MoE decode (52.7 t/s) is faster than dense
-Qwen3-8B (31.2 t/s)** — only 3B active params per token, ferrum needs
-to match this MoE-on-Mac advantage to be competitive on the
-flagship target.
+Observation: **Qwen3-30B-A3B MoE decode (44.5 t/s) is ~1.6× faster
+than dense Qwen3-8B (27.9 t/s)** despite having ~3.7× more total
+parameters — only 3B active params per token. ferrum needs to match
+this MoE-on-Mac advantage to be competitive on the flagship target.
+
+The pp512 stddev for the 8B models (~7%) is higher than the 30B model's
+(~0.7%); this matches the fact that the 8B models share the M1 Max with
+other macOS workloads (Spotlight, mds, etc.), while the 30B model
+saturates the GPU and washes those out. Re-running with the macOS in
+"low-overhead" mode (Spotlight indexing paused, no other apps) is on
+the to-do list.
+
+> Earlier revisions of this document published higher numbers
+> (`373.51 / 31.17 / 375.24 / 29.06 / 598.23 / 52.68`); those came from
+> a single un-saved run and didn't survive re-measurement. The numbers
+> above were captured with the saved `bench_results/llamacpp_*.md`
+> outputs as audit trail.
 
 These are the numbers ferrum is catching up to. ferrum's own runs go
 in the next subsection once Phase 1D is hooked into LlamaFamilyModel
