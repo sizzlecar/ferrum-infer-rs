@@ -304,14 +304,24 @@ impl<B: Backend> WeightLoader<B> for GgufLoader<B> {
                 }
                 let (n_rows, n_cols) = (dims[0], dims[1]);
 
-                if matches!(info.ggml_dtype, candle_core::quantized::GgmlDType::Q4K) {
+                let quant_kind = match info.ggml_dtype {
+                    candle_core::quantized::GgmlDType::Q4K => {
+                        Some(ferrum_kernels::backend::GgufQuantType::Q4K)
+                    }
+                    candle_core::quantized::GgmlDType::Q6K => {
+                        Some(ferrum_kernels::backend::GgufQuantType::Q6K)
+                    }
+                    _ => None,
+                };
+                if let Some(kind) = quant_kind {
                     // Read raw block bytes and hand to QuantLinear.
-                    // Bias on Q4-quantised projections is rare in GGUF
+                    // Bias on quantised projections is rare in GGUF
                     // (Qwen2.5 attention biases land as F32), so we
                     // currently take the bias path only when the bias
                     // tensor is present AND the weight is non-quantised.
-                    // For Q4_K_M weights with bias, fall back to eager
-                    // dequant so Phase 1B's bias support keeps working.
+                    // For quantised weights with bias, fall back to
+                    // eager dequant so Phase 1B's bias support keeps
+                    // working.
                     let has_bias = ferrum_to_gguf(&format!("{name}.bias"))
                         .map(|n| self.gguf.has_tensor(&n))
                         .unwrap_or(false);
@@ -322,7 +332,7 @@ impl<B: Backend> WeightLoader<B> for GgufLoader<B> {
                             .map_err(candle_to_ferrum)?;
                         let bytes = qt.data().map_err(candle_to_ferrum)?;
                         let quant = crate::QuantLinear::<B>::from_gguf_bytes(
-                            ferrum_kernels::backend::GgufQuantType::Q4K,
+                            kind,
                             bytes.as_ref(),
                             n_rows,
                             n_cols,

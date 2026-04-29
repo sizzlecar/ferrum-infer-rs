@@ -297,6 +297,12 @@ pub enum MetalQuantStore {
         n_cols: usize,
         n_blocks: usize,
     },
+    Q6K {
+        blocks: metal::Buffer, // [n_blocks * 210] bytes
+        n_rows: usize,
+        n_cols: usize,
+        n_blocks: usize,
+    },
 }
 
 // SAFETY: metal::Buffer wraps an Objective-C handle. metal-rs marks it
@@ -330,18 +336,18 @@ impl Backend for MetalBackend {
         n_cols: usize,
     ) -> Result<Self::QuantStore> {
         use super::GgufQuantType;
+        const QK_K: usize = 256;
         match kind {
             GgufQuantType::Q4K => {
-                const Q4_K_QK: usize = 256;
-                const Q4_K_BLOCK_BYTES: usize = 144;
+                const BLOCK_BYTES: usize = 144;
                 let total_elems = n_rows * n_cols;
-                if total_elems % Q4_K_QK != 0 {
+                if total_elems % QK_K != 0 {
                     return Err(FerrumError::model(format!(
-                        "load_quant Q4K: elements {total_elems} not multiple of {Q4_K_QK}"
+                        "load_quant Q4K: elements {total_elems} not multiple of {QK_K}"
                     )));
                 }
-                let n_blocks = total_elems / Q4_K_QK;
-                let expected = n_blocks * Q4_K_BLOCK_BYTES;
+                let n_blocks = total_elems / QK_K;
+                let expected = n_blocks * BLOCK_BYTES;
                 if bytes.len() != expected {
                     return Err(FerrumError::model(format!(
                         "load_quant Q4K: bytes {} != expected {} ({n_blocks} blocks)",
@@ -361,6 +367,35 @@ impl Backend for MetalBackend {
                     n_blocks,
                 })
             }
+            GgufQuantType::Q6K => {
+                const BLOCK_BYTES: usize = crate::q6_k_gemv::Q6_K_BLOCK_BYTES; // 210
+                let total_elems = n_rows * n_cols;
+                if total_elems % QK_K != 0 {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q6K: elements {total_elems} not multiple of {QK_K}"
+                    )));
+                }
+                let n_blocks = total_elems / QK_K;
+                let expected = n_blocks * BLOCK_BYTES;
+                if bytes.len() != expected {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q6K: bytes {} != expected {} ({n_blocks} blocks)",
+                        bytes.len(),
+                        expected
+                    )));
+                }
+                let blocks = st().pipes.device.new_buffer_with_data(
+                    bytes.as_ptr() as *const c_void,
+                    bytes.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                Ok(MetalQuantStore::Q6K {
+                    blocks,
+                    n_rows,
+                    n_cols,
+                    n_blocks,
+                })
+            }
             other => Err(FerrumError::unsupported(format!(
                 "Metal load_quant: {other:?} not yet implemented"
             ))),
@@ -374,21 +409,27 @@ impl Backend for MetalBackend {
         out: &mut Self::Buffer,
         m: usize,
     ) -> Result<()> {
-        let MetalQuantStore::Q4K {
-            blocks,
-            n_rows,
-            n_cols,
-            n_blocks,
-        } = weight;
+        // Borrow checker: `cmd` / `compute_encoder` need `&mut ctx` while
+        // we hold a borrow into `weight` for `blocks`. Snapshot the
+        // primitive fields out of `weight` first; `blocks` is a `Buffer`
+        // ref that is independent of ctx.
+        let (blocks, n_rows, n_cols, n_blocks, is_q6k) = match weight {
+            MetalQuantStore::Q4K {
+                blocks,
+                n_rows,
+                n_cols,
+                n_blocks,
+            } => (blocks, *n_rows, *n_cols, *n_blocks, false),
+            MetalQuantStore::Q6K {
+                blocks,
+                n_rows,
+                n_cols,
+                n_blocks,
+            } => (blocks, *n_rows, *n_cols, *n_blocks, true),
+        };
 
-        let total_elems = (*n_rows * *n_cols) as u64;
+        let total_elems = (n_rows * n_cols) as u64;
         let f16_bytes = total_elems * 2;
-        // Snapshot the values we need before the mutable borrow on ctx,
-        // since the borrow checker can't see that `quant_transient` and
-        // `cmd` touch disjoint fields of MetalContext.
-        let n_rows = *n_rows;
-        let n_cols = *n_cols;
-        let n_blocks = *n_blocks;
 
         let _t0 = if debug_per_call_flush() {
             Some(std::time::Instant::now())
@@ -396,32 +437,84 @@ impl Backend for MetalBackend {
             None
         };
 
-        let a_buf = a.expect_f32("gemm_quant Q4K a");
-        let out_buf = out.expect_f32_mut("gemm_quant Q4K out");
+        let a_buf = a.expect_f32("gemm_quant a");
+        let out_buf = out.expect_f32_mut("gemm_quant out");
 
         if m == 1 {
-            // **Fused path** for decode (m=1): one kernel reads the Q4
-            // super-blocks, decodes them inline, and reduces against `A`.
-            // No transient fp16 buffer materialised — saves ~64 MB of
-            // intermediate write+read per 4K×4K matmul, which is a big
-            // chunk of the per-token wall on memory-bandwidth-bound
-            // hardware. Requires `K % 256 == 0` (always holds for Q4_K_M
-            // tensors).
+            // **Fused path** for decode (m=1): one kernel reads the
+            // Q4_K / Q6_K super-blocks, decodes them inline, and reduces
+            // against `A`. No transient fp16 buffer materialised.
+            //
+            // All variants use N_R0=2, N_SG=2 layout from llama.cpp:
+            // 64 threads/threadgroup, 4 output rows/threadgroup. Requires
+            // N divisible by 4. Q6_K has no v1 fallback yet — Qwen3 /
+            // Llama always satisfy the constraint, so we just panic if
+            // not.
             let enc = ctx.compute_encoder();
-            crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
-                &st().pipes.device,
-                enc,
-                a_buf,
-                blocks,
-                out_buf,
-                n_rows,
-                n_cols,
-            );
+            if is_q6k {
+                if n_rows % 4 != 0 {
+                    return Err(FerrumError::model(format!(
+                        "gemm_quant Q6K: n_rows={n_rows} not divisible by 4"
+                    )));
+                }
+                crate::q6_k_gemv::dispatch_gemv_q6k_v2_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    out_buf,
+                    n_rows,
+                    n_cols,
+                );
+            } else if n_rows % 4 == 0 {
+                crate::q4_k_gemv_v2::dispatch_gemv_q4k_v2_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    out_buf,
+                    n_rows,
+                    n_cols,
+                );
+            } else {
+                crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    out_buf,
+                    n_rows,
+                    n_cols,
+                );
+            }
+        } else if is_q6k {
+            // **Q6_K m>1 path**: we don't have a Q6_K dequant kernel
+            // yet, so just call the fused gemv `m` times with stride
+            // offsets. This is a few-call serialised dispatch — fine
+            // for prefill at m=11ish where Q6_K matmuls are a minority
+            // of the work, not great for big batches.
+            let enc = ctx.compute_encoder();
+            for row in 0..m {
+                let a_off = (row * n_cols * 4) as u64;
+                let c_off = (row * n_rows * 4) as u64;
+                crate::q6_k_gemv::dispatch_gemv_q6k_v2_offset(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    a_off,
+                    blocks,
+                    out_buf,
+                    c_off,
+                    n_rows,
+                    n_cols,
+                );
+            }
         } else {
-            // **Dequant→transient→GEMM** path for prefill (m > 1). Pool
-            // the fp16 transient by byte-size so repeated shapes share
-            // one allocation; same encoder for both dispatches lets the
-            // GEMM see dequant's writes without an explicit fence.
+            // **Dequant→transient→GEMM** path for prefill (m > 1) Q4_K.
+            // Pool the fp16 transient by byte-size so repeated shapes
+            // share one allocation; same encoder for both dispatches
+            // lets the GEMM see dequant's writes without an explicit
+            // fence.
             let transient_ptr: *const metal::Buffer = ctx.quant_transient(f16_bytes);
             // SAFETY: transient_ptr points into ctx.quant_transients (a
             // HashMap we own); the buffer outlives this function and the

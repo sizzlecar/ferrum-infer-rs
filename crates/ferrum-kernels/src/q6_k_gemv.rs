@@ -1,19 +1,17 @@
-//! Fused Q4_K_M dequant + GEMV — Metal compute kernel + Rust glue.
+//! Q6_K fused GEMV — adapted from llama.cpp's
+//! `kernel_mul_mv_q6_K_f32_impl`. Same N_R0=2, N_SG=2 threadgroup layout
+//! as `q4_k_gemv_v2`. See `q6_k_gemv.metal` for the kernel.
 //!
-//! Companion to `q4_k.rs` (the standalone dequant kernel). Use this
-//! whenever `m == 1` (decode path): one kernel dispatch reads the Q4
-//! super-blocks, decodes 256 weights per super-block on the fly, and
-//! reduces against `A` — no fp16 transient written or read. Drops
-//! ~64 MB of memory traffic per 4K×4K matmul vs. the dequant→transient→
-//! gemv pipeline.
+//! Q6_K block layout (256 weights / 210 bytes / 6.5 bits/w):
+//!   - `ql[128]`: lower 4 bits of each weight
+//!   - `qh[64]`:  upper 2 bits, 4 weights packed per byte
+//!   - `scales[16]`: 16 sub-block int8 scales
+//!   - `d`:        super-block half-precision scale
 //!
-//! For prefill (`m > 1`) the model still goes through the standalone
-//! dequant + `gemm_v2_f16w` path; a fused gemm is a future optimisation.
-//!
-//! Layout assumptions (must hold; otherwise fall back to dequant path):
-//!   - `K` (in_features) is a multiple of 256 (Q4_K_M super-block size)
-//!   - `W` is row-major over `[N, K/256]` super-blocks (matches what
-//!     `MetalQuantStore::Q4K { blocks, .. }` already stores)
+//! Used for Qwen3-8B Q4_K_M's `attn_v` / `ffn_down` / `output` tensors,
+//! which llama.cpp's quantizer upgrades from Q4_K → Q6_K. Without this
+//! kernel they fall through to the eager-fp32 GgufLinear path, blowing
+//! a 5 GB Q6 footprint up to ~10 GB of fp32 in MTLBuffer.
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
@@ -24,8 +22,12 @@ use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
 };
 
-const SHADER_SRC: &str = include_str!("q4_k_gemv.metal");
-const KERNEL_NAME: &str = "gemv_f32a_q4kw";
+const SHADER_SRC: &str = include_str!("q6_k_gemv.metal");
+const KERNEL_NAME: &str = "gemv_f32a_q6kw_v2";
+
+/// Q6_K super-block size in bytes (matches llama.cpp's `block_q6_K`).
+pub const Q6_K_BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
+pub const Q6_K_BLOCK_ELEMENTS: usize = 256;
 
 static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
 
@@ -33,65 +35,78 @@ fn pipeline(device: &Device) -> &'static ComputePipelineState {
     PIPELINE.get_or_init(|| {
         let lib = device
             .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile q4_k_gemv.metal");
+            .expect("compile q6_k_gemv.metal");
         let function = lib
             .get_function(KERNEL_NAME, None)
-            .expect("find gemv_f32a_q4kw function");
+            .expect("find gemv_f32a_q6kw_v2 function");
         device
             .new_compute_pipeline_state_with_function(&function)
-            .expect("build gemv_f32a_q4kw pipeline")
+            .expect("build gemv_f32a_q6kw_v2 pipeline")
     })
 }
 
-/// Dispatch fused GEMV on an existing compute encoder.
+/// Dispatch the Q6_K fused GEMV on an existing compute encoder.
 ///
-/// Computes `c[n] = a[k] @ w[n, k]^T` where `w` is `block_q4_K[n * (k/256)]`.
-///
-/// Caller is responsible for `enc.end_encoding()` after the dispatch
-/// (or chaining further dispatches).
-pub fn dispatch_gemv_q4k_on_encoder(
+/// `src0`: `block_q6_K[N * (K/256)]` row-major super-blocks
+/// `a`:    `f32[K]` activations (single row)
+/// `c`:    `f32[N]` output (single row)
+pub fn dispatch_gemv_q6k_v2_on_encoder(
     device: &Device,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
-    w: &Buffer,
+    src0: &Buffer,
     c: &Buffer,
     n: usize,
     k: usize,
 ) {
-    debug_assert!(
-        k % 256 == 0,
-        "gemv_q4k requires K divisible by 256 (got K={k})"
-    );
+    dispatch_gemv_q6k_v2_offset(device, enc, a, 0, src0, c, 0, n, k);
+}
+
+/// Same as [`dispatch_gemv_q6k_v2_on_encoder`] but with byte offsets into
+/// `a` and `c`. Used by the m>1 prefill path to batch a multi-row matmul
+/// as a sequence of gemv calls without having to write a separate gemm
+/// kernel just for Q6_K.
+pub fn dispatch_gemv_q6k_v2_offset(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    a_offset_bytes: u64,
+    src0: &Buffer,
+    c: &Buffer,
+    c_offset_bytes: u64,
+    n: usize,
+    k: usize,
+) {
+    debug_assert!(k % 256 == 0, "K must be a multiple of 256 (got {k})");
+
+    let nb01_bytes = (k / 256) * Q6_K_BLOCK_BYTES;
 
     #[repr(C)]
     struct P {
         n: i32,
         k: i32,
+        nb01: i32,
     }
     let params = P {
         n: n as i32,
         k: k as i32,
+        nb01: nb01_bytes as i32,
     };
 
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
-    enc.set_buffer(0, Some(a), 0);
-    enc.set_buffer(1, Some(w), 0);
-    enc.set_buffer(2, Some(c), 0);
-    // setBytes inlines small (<=4KB) params into the encoder argument
-    // table — no MTLBuffer allocation per call. With 145 quant matmuls
-    // per token, this is real money on Apple Silicon (alloc takes ~ms).
+    enc.set_buffer(0, Some(src0), 0);
+    enc.set_buffer(1, Some(a), a_offset_bytes);
+    enc.set_buffer(2, Some(c), c_offset_bytes);
     enc.set_bytes(
         3,
         std::mem::size_of::<P>() as u64,
         &params as *const _ as *const c_void,
     );
 
-    // 1 threadgroup per output column, exactly 1 SIMD group (32 threads)
-    // per threadgroup — the kernel stripes `tiitg` ∈ [0, 32) over K with
-    // step 32 and reduces with `simd_sum`.
-    let grid = MTLSize::new(n as u64, 1, 1);
-    let tg = MTLSize::new(32, 1, 1);
+    const TILE_ROWS: u64 = 4; // N_R0 * N_SG
+    let grid = MTLSize::new((n as u64).div_ceil(TILE_ROWS), 1, 1);
+    let tg = MTLSize::new(32, 2, 1);
     enc.dispatch_thread_groups(grid, tg);
 }
 
@@ -103,31 +118,27 @@ mod tests {
     use candle_core::{Device as CandleDevice, Tensor};
     use metal::MTLResourceOptions;
 
-    /// Compare the fused GEMV against candle's CPU `dequantize → matmul`
-    /// reference within fp16 quantisation tolerance. Tests a 4K×4K shape
-    /// (matches Qwen3-8B o_proj exactly).
+    /// Verify Q6_K GEMV matches candle's CPU reference within fp16
+    /// quantisation tolerance, on a Qwen3-8B `down_proj`-shaped
+    /// 4096×12288 tensor.
     #[test]
-    fn fused_gemv_q4k_matches_cpu_reference_4096x4096() {
+    fn fused_gemv_q6k_matches_cpu_reference() {
         let n: usize = 4096;
-        let k: usize = 4096;
+        let k: usize = 12288;
 
-        // Synthetic weight, sin/cos pattern so quantisation is non-trivial.
         let raw_w: Vec<f32> = (0..n * k)
-            .map(|i| (((i % 313) as f32) * 0.0173).sin() * 0.5
-                + (((i % 251) as f32) * 0.0091).cos() * 0.5)
+            .map(|i| ((((i % 313) as f32) * 0.0173).sin()
+                + (((i % 251) as f32) * 0.0091).cos()) * 0.5)
             .collect();
         let cpu = CandleDevice::Cpu;
         let t_w = Tensor::from_vec(raw_w, (n, k), &cpu).unwrap();
-        let qt_w = QTensor::quantize(&t_w, GgmlDType::Q4K).unwrap();
+        let qt_w = QTensor::quantize(&t_w, GgmlDType::Q6K).unwrap();
         let dense_w = qt_w.dequantize(&cpu).unwrap();
 
         let raw_a: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.0007).sin()).collect();
         let t_a = Tensor::from_vec(raw_a.clone(), (1, k), &cpu).unwrap();
-
-        // Reference: A @ W^T via candle CPU.
         let ref_t = t_a.matmul(&dense_w.transpose(0, 1).unwrap()).unwrap();
         let ref_c: Vec<f32> = ref_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(ref_c.len(), n);
 
         let bytes = qt_w.data().unwrap();
 
@@ -147,14 +158,11 @@ mod tests {
             bytes.len() as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let c_buf = device.new_buffer(
-            (n * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let c_buf = device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemv_q4k_on_encoder(&device, enc, &a_buf, &w_buf, &c_buf, n, k);
+        dispatch_gemv_q6k_v2_on_encoder(&device, enc, &a_buf, &w_buf, &c_buf, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -162,9 +170,6 @@ mod tests {
         let our_ptr = c_buf.contents() as *const f32;
         let our_c: &[f32] = unsafe { std::slice::from_raw_parts(our_ptr, n) };
 
-        // GEMM accumulates K=4096 multiplies — fp16 weight quant adds ~0.1
-        // relative error per element after that many additions. Loose
-        // tolerance: 1e-1 absolute on values typically in [-1, 1].
         let mut max_abs = 0.0_f32;
         let mut mismatches = 0usize;
         for (i, (&our, &refv)) in our_c.iter().zip(ref_c.iter()).enumerate() {
@@ -181,10 +186,10 @@ mod tests {
                 }
             }
         }
-        eprintln!("max_abs={max_abs:.4} mismatches={mismatches}/{n}");
+        eprintln!("q6k max_abs={max_abs:.4} mismatches={mismatches}/{n}");
         assert!(
             mismatches == 0,
-            "{mismatches}/{n} elements outside fp16 tolerance"
+            "q6k: {mismatches}/{n} elements outside fp16 tolerance"
         );
     }
 }
