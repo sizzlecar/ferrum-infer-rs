@@ -813,6 +813,34 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn route_topk_softmax(
+        ctx: &mut Self::Context,
+        logits: &Self::Buffer,
+        out_ids: &mut Self::Buffer,
+        out_weights: &mut Self::Buffer,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+        norm_topk_prob: bool,
+    ) -> Result<()> {
+        let logits_buf = logits.expect_f32("route_topk_softmax logits");
+        let ids_buf = &out_ids.raw;
+        let weights_buf = out_weights.expect_f32_mut("route_topk_softmax out_weights");
+        let enc = ctx.compute_encoder();
+        crate::moe_router::dispatch_route_topk_softmax(
+            &st().pipes.device,
+            enc,
+            logits_buf,
+            ids_buf,
+            weights_buf,
+            batch,
+            num_experts,
+            top_k,
+            norm_topk_prob,
+        );
+        Ok(())
+    }
+
     fn silu_mul_batched(
         ctx: &mut Self::Context,
         gate: &Self::Buffer,
