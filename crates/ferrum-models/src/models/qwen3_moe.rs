@@ -440,7 +440,23 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let dummy = &attn_layer.input_ln_w;
         let q_norm_w = attn_layer.q_norm_w.as_ref().unwrap_or(dummy);
         let k_norm_w = attn_layer.k_norm_w.as_ref().unwrap_or(dummy);
-        let used_fused_qkv = B::split_qkv_norm_rope(
+
+        // 5. Grab the per-layer KV cache up front — the deepest fused
+        //    variant writes K/V straight into it, avoiding a trailing
+        //    `kv_cache_append_head_major` dispatch.
+        let caches = self
+            .kv_caches
+            .get_mut(cache_id)
+            .expect("ensure_kv must be called before forward_layer");
+        let cache = &mut caches[li];
+        let cache_len_before = cache.len;
+        let cache_capacity = cache.capacity;
+
+        // Try the deepest fusion: fused split-QKV-norm-rope that writes
+        // K/V directly into the cache slot. Skips both the head-major
+        // K/V scratch buffers and the `kv_cache_append_head_major`
+        // dispatch on the decode hot path.
+        let used_qkv_into_cache = B::split_qkv_norm_rope_into_cache(
             ctx,
             &self.scratch.qkv_out,
             q_norm_w,
@@ -448,8 +464,8 @@ impl<B: Backend> Qwen3MoeModel<B> {
             &self.rope.cos,
             &self.rope.sin,
             &mut self.scratch.q_head_major,
-            &mut self.scratch.k_head_major,
-            &mut self.scratch.v_head_major,
+            &mut cache.k,
+            &mut cache.v,
             tokens,
             nh,
             nkv,
@@ -457,81 +473,100 @@ impl<B: Backend> Qwen3MoeModel<B> {
             pos_offset,
             eps,
             qk_mode,
+            cache_len_before,
+            cache_capacity,
         )
         .is_ok();
-        if !used_fused_qkv {
-            B::split_qkv(
+        if !used_qkv_into_cache {
+            // Fallback 1: fused split-QKV-norm-rope to head-major scratch
+            // (Metal pre-decode-fusion path), then explicit cache append.
+            let used_fused_qkv = B::split_qkv_norm_rope(
                 ctx,
                 &self.scratch.qkv_out,
-                &mut self.scratch.q_buf,
-                &mut self.scratch.k_buf,
-                &mut self.scratch.v_buf,
-                tokens,
-                q_dim,
-                kv_dim,
-            );
-            B::qk_norm_rope(
-                ctx,
-                &self.scratch.q_buf,
                 q_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.q_head_major,
-                tokens,
-                nh,
-                hd,
-                pos_offset,
-                eps,
-                qk_mode,
-            );
-            B::qk_norm_rope(
-                ctx,
-                &self.scratch.k_buf,
                 k_norm_w,
                 &self.rope.cos,
                 &self.rope.sin,
+                &mut self.scratch.q_head_major,
                 &mut self.scratch.k_head_major,
+                &mut self.scratch.v_head_major,
                 tokens,
+                nh,
                 nkv,
                 hd,
                 pos_offset,
                 eps,
                 qk_mode,
-            );
-            B::qk_norm_rope(
+            )
+            .is_ok();
+            if !used_fused_qkv {
+                // Fallback 2: original four-launch chain.
+                B::split_qkv(
+                    ctx,
+                    &self.scratch.qkv_out,
+                    &mut self.scratch.q_buf,
+                    &mut self.scratch.k_buf,
+                    &mut self.scratch.v_buf,
+                    tokens,
+                    q_dim,
+                    kv_dim,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.q_buf,
+                    q_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.q_head_major,
+                    tokens,
+                    nh,
+                    hd,
+                    pos_offset,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.k_buf,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.k_head_major,
+                    tokens,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.v_buf,
+                    dummy,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.v_head_major,
+                    tokens,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    eps,
+                    0,
+                );
+            }
+            B::kv_cache_append_head_major(
                 ctx,
-                &self.scratch.v_buf,
-                dummy,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.v_head_major,
+                &mut cache.k,
+                &mut cache.v,
+                cache.len,
+                cache.capacity,
+                &self.scratch.k_head_major,
+                &self.scratch.v_head_major,
                 tokens,
                 nkv,
                 hd,
-                pos_offset,
-                eps,
-                0,
             );
         }
-
-        // 5. KV append + 6. flash attention.
-        let caches = self
-            .kv_caches
-            .get_mut(cache_id)
-            .expect("ensure_kv must be called before forward_layer");
-        let cache = &mut caches[li];
-        B::kv_cache_append_head_major(
-            ctx,
-            &mut cache.k,
-            &mut cache.v,
-            cache.len,
-            cache.capacity,
-            &self.scratch.k_head_major,
-            &self.scratch.v_head_major,
-            tokens,
-            nkv,
-            hd,
-        );
         cache.len += tokens;
         let kv_len = cache.len;
         let kv_stride = cache.capacity;

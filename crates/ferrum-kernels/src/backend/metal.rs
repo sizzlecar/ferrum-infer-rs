@@ -1480,6 +1480,58 @@ impl Backend for MetalBackend {
         Ok(())
     }
 
+    fn split_qkv_norm_rope_into_cache(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q_norm_w: &Self::Buffer,
+        k_norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        qk_mode: i32,
+        cache_len: usize,
+        cache_capacity: usize,
+    ) -> Result<()> {
+        let qkv = qkv.expect_f32("split_qkv_norm_rope_kvc qkv");
+        let q_norm_w = q_norm_w.expect_f32("split_qkv_norm_rope_kvc q_norm_w");
+        let k_norm_w = k_norm_w.expect_f32("split_qkv_norm_rope_kvc k_norm_w");
+        let cos = cos.expect_f32("split_qkv_norm_rope_kvc cos");
+        let sin = sin.expect_f32("split_qkv_norm_rope_kvc sin");
+        let q_out = q_out.expect_f32_mut("split_qkv_norm_rope_kvc q_out");
+        let cache_k = cache_k.expect_f32_mut("split_qkv_norm_rope_kvc cache_k");
+        let cache_v = cache_v.expect_f32_mut("split_qkv_norm_rope_kvc cache_v");
+        let enc = ctx.compute_encoder();
+        st().pipes.split_qkv_norm_rope_into_cache(
+            enc,
+            qkv,
+            q_norm_w,
+            k_norm_w,
+            cos,
+            sin,
+            q_out,
+            cache_k,
+            cache_v,
+            tokens,
+            q_heads,
+            kv_heads,
+            head_dim,
+            pos_offset,
+            eps,
+            qk_mode,
+            cache_len,
+            cache_capacity,
+        );
+        Ok(())
+    }
+
     fn kv_cache_append_head_major(
         ctx: &mut Self::Context,
         cache_k: &mut Self::Buffer,

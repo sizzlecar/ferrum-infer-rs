@@ -637,156 +637,157 @@ impl<B: Backend> LlamaFamilyModel<B> {
             MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 3. Split fused QKV → token-major Q/K/V
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::split_qkv(
-            ctx,
-            &self.scratch.qkv_out,
-            &mut self.scratch.q_buf,
-            &mut self.scratch.k_buf,
-            &mut self.scratch.v_buf,
-            tokens,
-            q_dim,
-            kv_dim,
-        );
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 4. Fused QK-norm + RoPE + transpose to head-major
-        //    Qwen3: mode=1 (norm + rope). Non-QK-norm variants: mode=2 (rope only).
-        //    V always uses mode=0 (transpose only).
+        // 3-5. Fused split-QKV + QK-norm + RoPE + cache-write.
+        //
+        // Single Metal dispatch replaces the (split_qkv → 3× qk_norm_rope
+        // → kv_cache_append_head_major) five-launch chain on the decode
+        // hot path. Reads qkv_out once, writes Q to head-major scratch
+        // and K/V straight into the pre-allocated KV cache slot at
+        // `cache_len + tok`. Saves 4 dispatches per layer when the
+        // backend implements the fused kernel; CPU and other backends
+        // keep using the unfused chain via the Unsupported fallbacks.
+        //
+        // qk_mode: 1 = norm + RoPE (Qwen3); 2 = RoPE only (Llama).
+        // V always passes apply_norm=0.
         let qk_mode: i32 = if cfg.has_qk_norm { 1 } else { 2 };
         let dummy = &layer.input_ln_w;
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy);
 
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::qk_norm_rope(
-            ctx,
-            &self.scratch.q_buf,
-            q_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
-            &mut self.scratch.q_head_major,
-            tokens,
-            nh,
-            hd,
-            pos_offset,
-            eps,
-            qk_mode,
-        );
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            QKR_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::qk_norm_rope(
-            ctx,
-            &self.scratch.k_buf,
-            k_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
-            &mut self.scratch.k_head_major,
-            tokens,
-            nkv,
-            hd,
-            pos_offset,
-            eps,
-            qk_mode,
-        );
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            QKR_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::qk_norm_rope(
-            ctx,
-            &self.scratch.v_buf,
-            dummy, // unused in mode 0
-            &self.rope.cos,
-            &self.rope.sin,
-            &mut self.scratch.v_head_major,
-            tokens,
-            nkv,
-            hd,
-            pos_offset,
-            eps,
-            0, // transpose only
-        );
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            QKR_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 5. Append K/V to pre-allocated head-major cache
+        // Grab the per-layer KV cache up front so the deepest fusion can
+        // write K/V straight into it.
         let caches = self
             .kv_caches
             .get_mut(cache_id)
             .expect("ensure_kv must be called before forward_layer");
         let cache = &mut caches[li];
+        let cache_len_before = cache.len;
+        let cache_capacity = cache.capacity;
+
         let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
             None
         };
-        B::kv_cache_append_head_major(
+        let used_qkv_into_cache = B::split_qkv_norm_rope_into_cache(
             ctx,
+            &self.scratch.qkv_out,
+            q_norm_w,
+            k_norm_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.q_head_major,
             &mut cache.k,
             &mut cache.v,
-            cache.len,
-            cache.capacity,
-            &self.scratch.k_head_major,
-            &self.scratch.v_head_major,
             tokens,
+            nh,
             nkv,
             hd,
-        );
+            pos_offset,
+            eps,
+            qk_mode,
+            cache_len_before,
+            cache_capacity,
+        )
+        .is_ok();
+        if !used_qkv_into_cache {
+            // Fallback 1: fused split-QKV-norm-rope to head-major scratch
+            // (PR #47 path).
+            let used_fused_qkv = B::split_qkv_norm_rope(
+                ctx,
+                &self.scratch.qkv_out,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.q_head_major,
+                &mut self.scratch.k_head_major,
+                &mut self.scratch.v_head_major,
+                tokens,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                qk_mode,
+            )
+            .is_ok();
+            if !used_fused_qkv {
+                // Fallback 2: original four-launch chain.
+                B::split_qkv(
+                    ctx,
+                    &self.scratch.qkv_out,
+                    &mut self.scratch.q_buf,
+                    &mut self.scratch.k_buf,
+                    &mut self.scratch.v_buf,
+                    tokens,
+                    q_dim,
+                    kv_dim,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.q_buf,
+                    q_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.q_head_major,
+                    tokens,
+                    nh,
+                    hd,
+                    pos_offset,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.k_buf,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.k_head_major,
+                    tokens,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.v_buf,
+                    dummy,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.v_head_major,
+                    tokens,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    eps,
+                    0,
+                );
+            }
+            B::kv_cache_append_head_major(
+                ctx,
+                &mut cache.k,
+                &mut cache.v,
+                cache.len,
+                cache.capacity,
+                &self.scratch.k_head_major,
+                &self.scratch.v_head_major,
+                tokens,
+                nkv,
+                hd,
+            );
+        }
         if let Some(t0) = _t0 {
             B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
+            QKR_TIME_US.fetch_add(
                 t0.elapsed().as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         cache.len += tokens;
         let kv_len = cache.len;
