@@ -797,6 +797,41 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Variant of [`Backend::split_qkv_norm_rope`] that writes the new
+    /// K and V directly into pre-allocated head-major KV cache buffers
+    /// at slot `[kv_heads, cache_len .. cache_len + tokens, hd]`.
+    /// Eliminates the trailing `kv_cache_append_head_major` dispatch on
+    /// the decode hot path. Q still lands in per-token head-major
+    /// scratch (flash-attention reads it as the query).
+    ///
+    /// Default returns Unsupported. Backends without the fused kernel
+    /// can keep using `split_qkv_norm_rope` + `kv_cache_append_head_major`.
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_cache(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _tokens: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _pos_offset: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _cache_len: usize,
+        _cache_capacity: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope_into_cache not implemented for this backend",
+        ))
+    }
+
     /// Append new K/V into a pre-allocated head-major cache buffer.
     ///
     /// `cache_k` / `cache_v`: `[nkv, capacity, hd]` (head-major, pre-allocated)

@@ -269,3 +269,119 @@ kernel void split_qkv_norm_rope_f32(
         dst[i + half_d] = x1 * c + x0 * s;
     }
 }
+
+// ── Variant: write K/V straight into the KV cache ────────────────────────
+// Same fused split-QKV + QK-Norm + RoPE + transpose, but K and V land
+// directly in the pre-allocated head-major KV cache at position
+// (cache_len + tok) instead of in a separate per-token scratch buffer.
+// Eliminates the trailing `kv_cache_append_head_major` dispatch on the
+// decode path (one extra dispatch saved per layer × 48 layers).
+//
+// q_out stays the per-token head-major scratch since flash_attention
+// reads it as the query.
+//
+// Cache layout: [kv_heads, cache_capacity, hd]; only the slice
+// [kv_heads, cache_len .. cache_len + tokens, hd] is written.
+
+struct SplitQkvNormRopeKvcParams {
+    int tokens;
+    int q_heads;
+    int kv_heads;
+    int head_dim;
+    int half_dim;
+    int pos_offset;
+    float eps;
+    int qk_mode;
+    int cache_len;       // existing seq length in cache (write offset)
+    int cache_capacity;  // cache stride along token axis
+};
+
+kernel void split_qkv_norm_rope_kvc_f32(
+    device const float* qkv      [[buffer(0)]],
+    device const float* q_norm_w [[buffer(1)]],
+    device const float* k_norm_w [[buffer(2)]],
+    device const float* cos_tab  [[buffer(3)]],
+    device const float* sin_tab  [[buffer(4)]],
+    device       float* q_out    [[buffer(5)]],   // [q_heads, tokens, hd]
+    device       float* cache_k  [[buffer(6)]],   // [kv_heads, cache_capacity, hd]
+    device       float* cache_v  [[buffer(7)]],   // [kv_heads, cache_capacity, hd]
+    constant SplitQkvNormRopeKvcParams& p [[buffer(8)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const int tok = tgpig.x;
+    const int head_g = tgpig.y;
+    if (tok >= p.tokens) return;
+
+    const int hd = p.head_dim;
+    const int half_d = p.half_dim;
+    const int q_dim = p.q_heads * hd;
+    const int kv_dim = p.kv_heads * hd;
+    const int qkv_stride = q_dim + 2 * kv_dim;
+
+    int region;
+    int local_head;
+    int src_off;
+    if (head_g < uint(p.q_heads)) {
+        region = 0;
+        local_head = head_g;
+        src_off = tok * qkv_stride + local_head * hd;
+    } else if (head_g < uint(p.q_heads + p.kv_heads)) {
+        region = 1;
+        local_head = head_g - p.q_heads;
+        src_off = tok * qkv_stride + q_dim + local_head * hd;
+    } else {
+        region = 2;
+        local_head = head_g - p.q_heads - p.kv_heads;
+        src_off = tok * qkv_stride + q_dim + kv_dim + local_head * hd;
+    }
+
+    device const float* src = qkv + src_off;
+    // Q stays in per-token head-major scratch; K/V go straight into the
+    // cache at slot `cache_len + tok`.
+    device float* dst;
+    if (region == 0) {
+        dst = q_out + local_head * p.tokens * hd + tok * hd;
+    } else if (region == 1) {
+        dst = cache_k + local_head * p.cache_capacity * hd
+                      + (p.cache_len + tok) * hd;
+    } else {
+        dst = cache_v + local_head * p.cache_capacity * hd
+                      + (p.cache_len + tok) * hd;
+    }
+
+    if (region == 2) {
+        for (int i = tiisg; i < hd; i += 32) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+
+    const bool apply_norm = (p.qk_mode == 1);
+    float scale = 1.0f;
+    device const float* norm_w = (region == 0) ? q_norm_w : k_norm_w;
+    if (apply_norm) {
+        float sum_sq = 0.0f;
+        for (int i = tiisg; i < hd; i += 32) {
+            float v = src[i];
+            sum_sq += v * v;
+        }
+        sum_sq = simd_sum(sum_sq);
+        scale = 1.0f / sqrt(sum_sq / float(hd) + p.eps);
+    }
+
+    const int pos = p.pos_offset + tok;
+    device const float* cos_row = cos_tab + pos * half_d;
+    device const float* sin_row = sin_tab + pos * half_d;
+
+    for (int i = tiisg; i < half_d; i += 32) {
+        float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
+        float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
+        float x0 = src[i]          * w0;
+        float x1 = src[i + half_d] * w1;
+        float c = cos_row[i];
+        float s = sin_row[i];
+        dst[i]          = x0 * c - x1 * s;
+        dst[i + half_d] = x1 * c + x0 * s;
+    }
+}
