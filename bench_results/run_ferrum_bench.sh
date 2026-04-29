@@ -60,8 +60,9 @@ run_one "qwen3_8b"        "Qwen3-8B-Q4_K_M.gguf"                  "Qwen3-8B.toke
 run_one "llama31_8b"      "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" "Meta-Llama-3.1-8B-Instruct.tokenizer.json"   "pp512" "$LONG_PROMPT" 1
 run_one "llama31_8b"      "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" "Meta-Llama-3.1-8B-Instruct.tokenizer.json"   "tg128" "Hi" 128
 
-# Qwen3-30B-A3B is MoE — ferrum's MoE transformer isn't wired yet.
-# Try anyway so we get a clean error-on-load record.
+# Qwen3-30B-A3B (MoE) — wired through Qwen3MoeModel<MetalBackend> as
+# of PR #35. Per-(token, expert) gemv loop, target ~40-50 tok/s decode
+# vs llama.cpp's 44.52 tok/s baseline.
 run_one "qwen3_30b_a3b"   "Qwen3-30B-A3B-Q4_K_M.gguf"             "Qwen3-30B-A3B.tokenizer.json"                  "pp512" "$LONG_PROMPT" 1 || true
 run_one "qwen3_30b_a3b"   "Qwen3-30B-A3B-Q4_K_M.gguf"             "Qwen3-30B-A3B.tokenizer.json"                  "tg128" "Hi" 128 || true
 

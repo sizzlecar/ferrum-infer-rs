@@ -81,12 +81,20 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub silu_buf: B::Buffer,
     /// Per-(token, expert) down-projection output — `[hidden]`.
     pub down_buf: B::Buffer,
-    /// Per-token row scratch — `[hidden]`. Reused both as a copy of the
-    /// input row for the gate_up_proj and as a row-accumulator for the
-    /// scaled-add-and-store path inside `moe_forward`.
+    /// Per-token input row scratch — `[hidden]`. Holds the post-RMSNorm
+    /// activation slice that the per-(expert) gate_up gemv reads, kept
+    /// stable across the entire top_k loop for one token.
     pub x_single: B::Buffer,
+    /// Per-token output accumulator — `[hidden]`. Holds the running
+    /// `Σ_k weight_k · expert_k(x[b])` sum that grows across the top_k
+    /// loop and is flushed to `moe_out[b]` once per token.
+    pub acc_buf: B::Buffer,
     /// MoE output `[max_tokens, hidden]`. Zeroed each forward.
     pub moe_out: B::Buffer,
+    /// Pre-allocated `[hidden]` zero scratch — `acc_buf` is reset to
+    /// this each token without going through `B::from_slice` on the
+    /// hot path.
+    pub zero_hidden: B::Buffer,
 
     // ── Final-token / lm_head outputs ────────────────────────────────
     pub last_hidden: B::Buffer,
@@ -125,7 +133,9 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             silu_buf: B::alloc(inter),
             down_buf: B::alloc(h),
             x_single: B::alloc(h),
+            acc_buf: B::alloc(h),
             moe_out: B::alloc(t * h),
+            zero_hidden: B::from_slice(&vec![0.0f32; h]),
             last_hidden: B::alloc(h),
             last_normed: B::alloc(h),
             logits: B::alloc(vocab),
@@ -531,22 +541,10 @@ impl<B: Backend> Qwen3MoeModel<B> {
             tokens,
         );
 
-        // 11. Zero moe_out before scaled-add accumulate. The simplest
-        //     write-zero in our Backend trait is `from_slice(zeros)` →
-        //     copy_slice into moe_out, but that allocates a host vec
-        //     each call. Use scaled_add_inplace with scale=-1 on itself
-        //     to zero — works for any backend. Cheaper than a host
-        //     round-trip.
-        //
-        //     Edge case: if moe_out has NaN from previous run, -1*NaN
-        //     stays NaN; still fine because next iteration overwrites
-        //     row-wise via scaled-add-into-x_single → copy back.
-        //     Use copy_slice with a zero buffer for correctness.
-        let zeros = vec![0.0f32; tokens * h];
-        let zero_buf = B::from_slice(&zeros);
-        B::copy_slice(ctx, &zero_buf, 0, &mut self.scratch.moe_out, 0, tokens * h);
-
-        // 12. Per-(token, expert) MLP dispatch + weighted combine.
+        // 11. Per-(token, expert) MLP dispatch + weighted combine.
+        //     `moe_forward` writes acc_buf → moe_out[b] once per token,
+        //     so we don't need to pre-zero `moe_out` (every byte will be
+        //     overwritten by the per-token copy_slice from acc_buf).
         moe_forward::<B>(
             ctx,
             &self.scratch.norm_out,
@@ -560,12 +558,14 @@ impl<B: Backend> Qwen3MoeModel<B> {
             self.cfg.norm_topk_prob,
             &moe_layer.experts,
             &mut self.scratch.x_single,
+            &mut self.scratch.acc_buf,
             &mut self.scratch.gate_up_buf,
             &mut self.scratch.silu_buf,
             &mut self.scratch.down_buf,
+            &self.scratch.zero_hidden,
         )?;
 
-        // 13. residual += moe_out
+        // 12. residual += moe_out
         B::add_inplace(ctx, residual, &self.scratch.moe_out, tokens * h);
 
         if let Some(t0) = moe_t0 {
