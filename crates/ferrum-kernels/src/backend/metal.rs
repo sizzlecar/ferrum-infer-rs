@@ -294,6 +294,24 @@ pub enum MetalQuantStore {
         total_rows: usize,
         n_cols: usize,
     },
+    /// 3-D expert stack for MoE indirect dispatch. Holds **all experts'
+    /// weights for one matmul role** (e.g. all `ffn_gate_exps` rows for
+    /// every expert) in one contiguous Metal buffer with byte stride
+    /// `nb02` between expert slabs. Consumed by the
+    /// `gemv_q4kw_moe_id_f32` / `gemv_q6kw_moe_id_f32` Metal kernels in
+    /// a single dispatch covering all selected (token, expert) pairs.
+    Q4KExperts {
+        blocks: metal::Buffer,
+        num_experts: usize,
+        n_rows: usize, // per-expert out_features
+        n_cols: usize, // in_features
+    },
+    Q6KExperts {
+        blocks: metal::Buffer,
+        num_experts: usize,
+        n_rows: usize,
+        n_cols: usize,
+    },
 }
 
 impl MetalQuantStore {
@@ -301,7 +319,142 @@ impl MetalQuantStore {
         match self {
             MetalQuantStore::Q4K { n_rows, .. } | MetalQuantStore::Q6K { n_rows, .. } => *n_rows,
             MetalQuantStore::Fused { total_rows, .. } => *total_rows,
+            MetalQuantStore::Q4KExperts { n_rows, .. }
+            | MetalQuantStore::Q6KExperts { n_rows, .. } => *n_rows,
         }
+    }
+}
+
+/// Build a `Q4KExperts` MoE stack from a contiguous block-bytes payload.
+///
+/// `bytes` must be exactly `num_experts * n_rows * (n_cols/256) * 144`
+/// bytes — typically the raw `ffn_gate_exps` / `ffn_up_exps` data slab
+/// straight off the GGUF.
+pub fn load_q4k_experts(
+    bytes: &[u8],
+    num_experts: usize,
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<MetalQuantStore> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 144;
+    if n_cols % QK_K != 0 {
+        return Err(FerrumError::model(format!(
+            "load_q4k_experts: n_cols {n_cols} not a multiple of {QK_K}"
+        )));
+    }
+    let expected = num_experts * n_rows * (n_cols / QK_K) * BLOCK_BYTES;
+    if bytes.len() != expected {
+        return Err(FerrumError::model(format!(
+            "load_q4k_experts: bytes {} != expected {expected} ({num_experts}E × {n_rows}R × {n_cols}C)",
+            bytes.len()
+        )));
+    }
+    let blocks = st().pipes.device.new_buffer_with_data(
+        bytes.as_ptr() as *const c_void,
+        bytes.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    Ok(MetalQuantStore::Q4KExperts {
+        blocks,
+        num_experts,
+        n_rows,
+        n_cols,
+    })
+}
+
+/// Build a `Q6KExperts` MoE stack from a contiguous block-bytes payload.
+pub fn load_q6k_experts(
+    bytes: &[u8],
+    num_experts: usize,
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<MetalQuantStore> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = crate::q6_k_gemv::Q6_K_BLOCK_BYTES;
+    if n_cols % QK_K != 0 {
+        return Err(FerrumError::model(format!(
+            "load_q6k_experts: n_cols {n_cols} not a multiple of {QK_K}"
+        )));
+    }
+    let expected = num_experts * n_rows * (n_cols / QK_K) * BLOCK_BYTES;
+    if bytes.len() != expected {
+        return Err(FerrumError::model(format!(
+            "load_q6k_experts: bytes {} != expected {expected}",
+            bytes.len()
+        )));
+    }
+    let blocks = st().pipes.device.new_buffer_with_data(
+        bytes.as_ptr() as *const c_void,
+        bytes.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    Ok(MetalQuantStore::Q6KExperts {
+        blocks,
+        num_experts,
+        n_rows,
+        n_cols,
+    })
+}
+
+/// Dispatch the MoE indirect-gemv on an existing compute encoder.
+/// `ids` is a Metal buffer of `n_selected` i32 expert IDs (one per
+/// selected slot). The kernel writes `[n_selected, n_rows]` outputs.
+/// `src1_stride` is the per-slot activation stride in elements: 0 for
+/// broadcast (gate/up), `n_cols` for per-slot (down).
+pub fn dispatch_gemv_moe_id(
+    enc: &metal::ComputeCommandEncoderRef,
+    a: &metal::Buffer,
+    weights: &MetalQuantStore,
+    ids: &metal::Buffer,
+    out: &metal::Buffer,
+    n_selected: usize,
+    src1_stride: usize,
+) -> Result<()> {
+    match weights {
+        MetalQuantStore::Q4KExperts {
+            blocks,
+            n_rows,
+            n_cols,
+            ..
+        } => {
+            crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_on_encoder(
+                &st().pipes.device,
+                enc,
+                a,
+                blocks,
+                ids,
+                out,
+                *n_rows,
+                *n_cols,
+                n_selected,
+                src1_stride,
+            );
+            Ok(())
+        }
+        MetalQuantStore::Q6KExperts {
+            blocks,
+            n_rows,
+            n_cols,
+            ..
+        } => {
+            crate::q6_k_moe_id_gemv::dispatch_gemv_q6k_moe_id_on_encoder(
+                &st().pipes.device,
+                enc,
+                a,
+                blocks,
+                ids,
+                out,
+                *n_rows,
+                *n_cols,
+                n_selected,
+                src1_stride,
+            );
+            Ok(())
+        }
+        _ => Err(FerrumError::model(
+            "dispatch_gemv_moe_id: weights must be Q4KExperts or Q6KExperts variant".to_string(),
+        )),
     }
 }
 
@@ -357,9 +510,11 @@ fn dispatch_part_gemm(
                 n_cols,
             );
         }
-        MetalQuantStore::Fused { .. } => {
+        MetalQuantStore::Fused { .. }
+        | MetalQuantStore::Q4KExperts { .. }
+        | MetalQuantStore::Q6KExperts { .. } => {
             return Err(FerrumError::model(
-                "gemm_quant Fused: nested Fused parts not supported".to_string(),
+                "gemm_quant Fused: only Q4K/Q6K leaf parts supported here".to_string(),
             ));
         }
     }
@@ -426,9 +581,11 @@ fn dispatch_part_gemv_offset(
                 n_cols,
             );
         }
-        MetalQuantStore::Fused { .. } => {
+        MetalQuantStore::Fused { .. }
+        | MetalQuantStore::Q4KExperts { .. }
+        | MetalQuantStore::Q6KExperts { .. } => {
             return Err(FerrumError::model(
-                "gemm_quant Fused: nested Fused parts not supported".to_string(),
+                "gemm_quant Fused: only Q4K/Q6K leaf parts supported here".to_string(),
             ));
         }
     }
@@ -523,6 +680,132 @@ impl Backend for MetalBackend {
             other => Err(FerrumError::unsupported(format!(
                 "Metal load_quant: {other:?} not yet implemented"
             ))),
+        }
+    }
+
+    fn load_quant_experts(
+        kind: super::GgufQuantType,
+        bytes: &[u8],
+        num_experts: usize,
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        use super::GgufQuantType;
+        match kind {
+            GgufQuantType::Q4K => load_q4k_experts(bytes, num_experts, n_rows, n_cols),
+            GgufQuantType::Q6K => load_q6k_experts(bytes, num_experts, n_rows, n_cols),
+            other => Err(FerrumError::unsupported(format!(
+                "Metal load_quant_experts: {other:?} not implemented (only Q4K / Q6K)"
+            ))),
+        }
+    }
+
+    fn gemv_quant_moe_id(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        ids: &Self::Buffer,
+        out: &mut Self::Buffer,
+        n_selected: usize,
+        src1_stride: usize,
+    ) -> Result<()> {
+        let a_buf = a.expect_f32("gemv_quant_moe_id a");
+        let ids_buf = &ids.raw;
+        let out_buf = out.expect_f32_mut("gemv_quant_moe_id out");
+        let enc = ctx.compute_encoder();
+        dispatch_gemv_moe_id(
+            enc,
+            a_buf,
+            weight,
+            ids_buf,
+            out_buf,
+            n_selected,
+            src1_stride,
+        )
+    }
+
+    fn from_slice_i32(data: &[i32]) -> Self::Buffer {
+        // Encode i32s as a Metal buffer. We tag dtype as F32 since the
+        // raw bytes are 4-byte aligned and the kernel reinterprets them
+        // as int32_t internally. `n` records the element count.
+        let bytes = data.len() * std::mem::size_of::<i32>();
+        let raw = st().pipes.device.new_buffer_with_data(
+            data.as_ptr() as *const c_void,
+            bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        MetalBuf {
+            raw,
+            dtype: Dtype::F32,
+            n: data.len(),
+        }
+    }
+
+    fn silu_mul_stacked(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        n_slots: usize,
+        ffn: usize,
+    ) -> Result<()> {
+        let gate_buf = gate.expect_f32("silu_mul_stacked gate");
+        let up_buf = up.expect_f32("silu_mul_stacked up");
+        let out_buf = out.expect_f32_mut("silu_mul_stacked out");
+        let enc = ctx.compute_encoder();
+        crate::moe_post_ops::dispatch_silu_mul_stacked(
+            &st().pipes.device,
+            enc,
+            gate_buf,
+            up_buf,
+            out_buf,
+            n_slots,
+            ffn,
+        );
+        Ok(())
+    }
+
+    fn weighted_sum_stacked(
+        ctx: &mut Self::Context,
+        slots: &Self::Buffer,
+        weights: &Self::Buffer,
+        out: &mut Self::Buffer,
+        n_slots: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        let slots_buf = slots.expect_f32("weighted_sum_stacked slots");
+        let weights_buf = weights.expect_f32("weighted_sum_stacked weights");
+        let out_buf = out.expect_f32_mut("weighted_sum_stacked out");
+        let enc = ctx.compute_encoder();
+        crate::moe_post_ops::dispatch_weighted_sum_stacked(
+            &st().pipes.device,
+            enc,
+            slots_buf,
+            weights_buf,
+            out_buf,
+            n_slots,
+            hidden,
+        );
+        Ok(())
+    }
+
+    fn write_i32_into(buf: &mut Self::Buffer, data: &[i32]) {
+        // StorageModeShared = unified memory on Apple Silicon, so the
+        // CPU can write directly into the buffer's contents pointer
+        // without involving a blit encoder. Avoids allocating a fresh
+        // MTLBuffer on every per-layer expert-id update.
+        let dst = buf.raw.contents() as *mut i32;
+        let n = data.len().min(buf.n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
+        }
+    }
+
+    fn write_f32_into(buf: &mut Self::Buffer, data: &[f32]) {
+        let dst = buf.raw.contents() as *mut f32;
+        let n = data.len().min(buf.n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
         }
     }
 
@@ -630,6 +913,11 @@ impl Backend for MetalBackend {
                 n_blocks,
             } => (blocks, *n_rows, *n_cols, *n_blocks, true),
             MetalQuantStore::Fused { .. } => unreachable!("handled above"),
+            MetalQuantStore::Q4KExperts { .. } | MetalQuantStore::Q6KExperts { .. } => {
+                return Err(FerrumError::model(
+                    "gemm_quant: ExpertsStacked must be dispatched via gemv_moe_id".to_string(),
+                ));
+            }
         };
 
         let _t0 = if debug_per_call_flush() {

@@ -96,6 +96,30 @@ pub struct Qwen3MoeScratch<B: Backend> {
     /// hot path.
     pub zero_hidden: B::Buffer,
 
+    // ── MoE batched-fast-path scratch (Metal `gemv_q*kw_moe_id_f32`) ──
+    /// `[top_k * expert_inter]` — per-slot gate output from the batched
+    /// gate_stacked dispatch. Each slot holds `expert_inter` floats for
+    /// the corresponding selected expert.
+    pub gate_out_stacked: B::Buffer,
+    /// `[top_k * expert_inter]` — per-slot up output (same shape as gate).
+    pub up_out_stacked: B::Buffer,
+    /// `[top_k * expert_inter]` — per-slot SiLU(gate)·up output, fed into
+    /// the down stacked dispatch.
+    pub silu_stacked: B::Buffer,
+    /// `[top_k * hidden]` — per-slot down output, summed into `acc_buf`
+    /// with router weights.
+    pub down_out_stacked: B::Buffer,
+    /// `[top_k]` i32 expert IDs for the current token (rebuilt each
+    /// layer from the host-side router output).
+    pub ids_buf: B::Buffer,
+    /// `[top_k]` f32 router combine weights for the current token.
+    /// Pre-allocated alongside `ids_buf` so the per-layer update is an
+    /// in-place memcpy via `B::write_f32_into` rather than a fresh
+    /// `B::from_slice` allocation (48 × 128 = 6144 fresh buffers per
+    /// 128-token decode otherwise — same allocator-pressure pattern
+    /// `ids_buf` had before being moved to `write_i32_into`).
+    pub weights_buf: B::Buffer,
+
     // ── Final-token / lm_head outputs ────────────────────────────────
     pub last_hidden: B::Buffer,
     pub last_normed: B::Buffer,
@@ -136,6 +160,12 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             acc_buf: B::alloc(h),
             moe_out: B::alloc(t * h),
             zero_hidden: B::from_slice(&vec![0.0f32; h]),
+            gate_out_stacked: B::alloc(cfg.num_experts_per_tok * inter),
+            up_out_stacked: B::alloc(cfg.num_experts_per_tok * inter),
+            silu_stacked: B::alloc(cfg.num_experts_per_tok * inter),
+            down_out_stacked: B::alloc(cfg.num_experts_per_tok * h),
+            ids_buf: B::from_slice_i32(&vec![0i32; cfg.num_experts_per_tok]),
+            weights_buf: B::from_slice(&vec![0.0f32; cfg.num_experts_per_tok]),
             last_hidden: B::alloc(h),
             last_normed: B::alloc(h),
             logits: B::alloc(vocab),
@@ -542,28 +572,45 @@ impl<B: Backend> Qwen3MoeModel<B> {
         );
 
         // 11. Per-(token, expert) MLP dispatch + weighted combine.
-        //     `moe_forward` writes acc_buf → moe_out[b] once per token,
-        //     so we don't need to pre-zero `moe_out` (every byte will be
-        //     overwritten by the per-token copy_slice from acc_buf).
-        moe_forward::<B>(
-            ctx,
-            &self.scratch.norm_out,
-            &self.scratch.router_logits,
-            &mut self.scratch.moe_out,
-            tokens,
-            h,
-            self.cfg.expert_intermediate_size,
-            self.cfg.num_experts,
-            self.cfg.num_experts_per_tok,
-            self.cfg.norm_topk_prob,
-            &moe_layer.experts,
-            &mut self.scratch.x_single,
-            &mut self.scratch.acc_buf,
-            &mut self.scratch.gate_up_buf,
-            &mut self.scratch.silu_buf,
-            &mut self.scratch.down_buf,
-            &self.scratch.zero_hidden,
-        )?;
+        //
+        // Two paths:
+        //   - **Batched fast path** (decode m=1, all stacked variants
+        //     present): single `gemv_quant_moe_id` dispatch covers all
+        //     8 selected expert × 1 token gate gemvs in parallel; same
+        //     for up and down. Cuts per-layer expert dispatches from
+        //     ~32 (8 × 4 ops/pair) to 4 (gate + up + silu + down + 1 acc).
+        //     Routes Qwen3-30B-A3B decode close to llama.cpp's
+        //     `kernel_mul_mm_id`.
+        //   - **Per-(token, expert) fallback** via `moe_forward` —
+        //     used for prefill (m > 1), or when the backend doesn't
+        //     populate stacked variants (CPU, synthetic-MoE tests).
+        let stacked_path_available = moe_layer.experts.gate_stacked.is_some()
+            && moe_layer.experts.up_stacked.is_some()
+            && moe_layer.experts.down_stacked.is_some();
+
+        if stacked_path_available {
+            self.moe_forward_stacked(ctx, li, tokens)?;
+        } else {
+            moe_forward::<B>(
+                ctx,
+                &self.scratch.norm_out,
+                &self.scratch.router_logits,
+                &mut self.scratch.moe_out,
+                tokens,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts,
+                self.cfg.num_experts_per_tok,
+                self.cfg.norm_topk_prob,
+                &moe_layer.experts,
+                &mut self.scratch.x_single,
+                &mut self.scratch.acc_buf,
+                &mut self.scratch.gate_up_buf,
+                &mut self.scratch.silu_buf,
+                &mut self.scratch.down_buf,
+                &self.scratch.zero_hidden,
+            )?;
+        }
 
         // 12. residual += moe_out
         B::add_inplace(ctx, residual, &self.scratch.moe_out, tokens * h);
@@ -578,6 +625,26 @@ impl<B: Backend> Qwen3MoeModel<B> {
         }
 
         Ok(())
+    }
+
+    fn moe_forward_stacked(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        moe_forward_stacked_decode_impl::<B>(
+            ctx,
+            &self.moe_layers[li],
+            &mut self.scratch,
+            cfg.base.hidden_size,
+            cfg.expert_intermediate_size,
+            cfg.num_experts_per_tok,
+            cfg.num_experts,
+            cfg.norm_topk_prob,
+            tokens,
+        )
     }
 
     /// Prefill: process `tokens` prompt tokens, return last-token logits.
@@ -755,6 +822,124 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
         self.kv_caches.clear();
         self.kv_free_pool.clear();
     }
+}
+
+/// Batched MoE FFN — decode (m=1) and per-token-prefill (m>1 looped).
+///
+/// Three batched `gemv_quant_moe_id` dispatches per token: gate (broadcast
+/// activation), up (broadcast activation), down (per-slot activation —
+/// each expert sees its own silu·up). The per-(token, expert) outer loop
+/// shrinks from `top_k * 4` dispatches per layer to **3 batched + 1
+/// silu_mul_split + 1 weighted_sum_dispatch_loop**.
+///
+/// For prefill (m > 1) we loop over tokens externally — each token's
+/// router output drives a single batched call. Still much faster than
+/// the per-(token, expert) per-Linear path because the gemvs are batched.
+///
+/// Free function (not a method) so the caller can split the borrow on
+/// `self` between `moe_layers[li]` (immutable) and `scratch` (mutable).
+#[allow(clippy::too_many_arguments)]
+fn moe_forward_stacked_decode_impl<B: Backend>(
+    ctx: &mut B::Context,
+    moe_layer: &Qwen3MoeLayerState<B>,
+    scratch: &mut Qwen3MoeScratch<B>,
+    h: usize,
+    inter: usize,
+    top_k: usize,
+    n_exp: usize,
+    norm_topk_prob: bool,
+    tokens: usize,
+) -> Result<()> {
+    // Host-side routing: pull router_logits for the whole batch, run
+    // softmax + top-K. One sync per call covers all `tokens`.
+    B::sync(ctx);
+    let logits_host = B::to_vec(&scratch.router_logits, tokens * n_exp);
+    let route = crate::moe::router::route(&logits_host, tokens, n_exp, top_k, norm_topk_prob);
+
+    let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
+    let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
+    let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
+
+    for b in 0..tokens {
+        // Upload this token's selected expert IDs in place — avoids
+        // re-allocating a fresh MTLBuffer per layer × per token.
+        let ids_i32: Vec<i32> = route.expert_ids[b * top_k..(b + 1) * top_k]
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
+        B::write_i32_into(&mut scratch.ids_buf, &ids_i32);
+
+        // Stage row b of norm_out into x_single (decode m=1 has it
+        // already at offset 0; prefill needs the offset). For decode
+        // we could skip the copy, but doing it uniformly keeps the
+        // kernel's src1 base predictable.
+        B::copy_slice(ctx, &scratch.norm_out, b * h, &mut scratch.x_single, 0, h);
+
+        // 1. Batched gate gemv — broadcast input across top_k slots.
+        B::gemv_quant_moe_id(
+            ctx,
+            &scratch.x_single,
+            gate_stacked,
+            &scratch.ids_buf,
+            &mut scratch.gate_out_stacked,
+            top_k,
+            0, // broadcast
+        )?;
+
+        // 2. Batched up gemv — also broadcast.
+        B::gemv_quant_moe_id(
+            ctx,
+            &scratch.x_single,
+            up_stacked,
+            &scratch.ids_buf,
+            &mut scratch.up_out_stacked,
+            top_k,
+            0,
+        )?;
+
+        // 3. Stacked SiLU·gate → silu_stacked. Single dispatch covers
+        //    all top_k slots — replaces the per-slot loop's
+        //    (3 copy_slice + 1 silu_mul) × 8 = 32 dispatches.
+        B::silu_mul_stacked(
+            ctx,
+            &scratch.gate_out_stacked,
+            &scratch.up_out_stacked,
+            &mut scratch.silu_stacked,
+            top_k,
+            inter,
+        )?;
+
+        // 4. Batched down gemv — per-slot input via src1_stride = inter.
+        //    silu_stacked[k * inter ..] is the activation row for slot k.
+        B::gemv_quant_moe_id(
+            ctx,
+            &scratch.silu_stacked,
+            down_stacked,
+            &scratch.ids_buf,
+            &mut scratch.down_out_stacked,
+            top_k,
+            inter,
+        )?;
+
+        // 5. Stacked weighted sum: acc_buf[0..h] = Σ_k w[k] · down[k].
+        //    Upload this token's combine weights in place — same trick
+        //    as ids_buf, avoids 6144 per-decode MTLBuffer allocations.
+        let weights_slice = &route.expert_weights[b * top_k..(b + 1) * top_k];
+        B::write_f32_into(&mut scratch.weights_buf, weights_slice);
+        B::weighted_sum_stacked(
+            ctx,
+            &scratch.down_out_stacked,
+            &scratch.weights_buf,
+            &mut scratch.acc_buf,
+            top_k,
+            h,
+        )?;
+
+        // 6. Final write into moe_out[b * h ..]
+        B::copy_slice(ctx, &scratch.acc_buf, 0, &mut scratch.moe_out, b * h, h);
+    }
+
+    Ok(())
 }
 
 /// Build a stub Linear<B> with the given shape but zero weights. Used to

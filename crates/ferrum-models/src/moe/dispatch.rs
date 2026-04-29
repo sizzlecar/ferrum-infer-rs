@@ -69,6 +69,20 @@ pub struct ExpertStack<B: Backend> {
     pub gate_up: Vec<Box<dyn Linear<B>>>,
     /// `down` projection per expert. Output shape per token: `[hidden_size]`.
     pub down: Vec<Box<dyn Linear<B>>>,
+    /// Stacked-experts representation for backends that have a batched
+    /// MoE indirect-dispatch kernel (Metal `gemv_q4kw_moe_id_f32` /
+    /// `gemv_q6kw_moe_id_f32`). Holds **all experts** for one matmul
+    /// role in a single `B::QuantStore` with byte stride between expert
+    /// slabs, so a single dispatch can cover all selected (token, expert)
+    /// pairs at decode m=1.
+    ///
+    /// `None` on backends without the kernel (CPU, CUDA-without-MoE-kernel)
+    /// and on quant flavours that don't have a stacked path yet — callers
+    /// fall back to the per-expert `gate_up` / `down` Linears in those
+    /// cases.
+    pub gate_stacked: Option<B::QuantStore>,
+    pub up_stacked: Option<B::QuantStore>,
+    pub down_stacked: Option<B::QuantStore>,
 }
 
 impl<B: Backend> ExpertStack<B> {
@@ -129,7 +143,13 @@ impl<B: Backend> ExpertStack<B> {
                 expert_intermediate,
             )) as Box<dyn Linear<B>>);
         }
-        Ok(Self { gate_up, down })
+        Ok(Self {
+            gate_up,
+            down,
+            gate_stacked: None,
+            up_stacked: None,
+            down_stacked: None,
+        })
     }
 
     /// Load all experts for one MoE layer from a GGUF file. Names follow
@@ -191,6 +211,8 @@ impl<B: Backend> ExpertStack<B> {
             &format!("blk.{layer_idx}.ffn_down_exps.weight"),
             &device,
         )?;
+        // Eager-dense path leaves stacked variants as None — no MoE
+        // fast path for synthesised / non-quantised expert tensors.
         Self::from_dense_stacks(
             &gate,
             &up,
@@ -280,41 +302,91 @@ impl<B: Backend> ExpertStack<B> {
             "ffn_down_exps bytes",
         )?;
 
-        let mut gate_up: Vec<Box<dyn Linear<B>>> = Vec::with_capacity(num_experts);
-        let mut down: Vec<Box<dyn Linear<B>>> = Vec::with_capacity(num_experts);
+        // Try the stacked-experts fast path FIRST. If the backend has a
+        // batched MoE kernel (Metal `gemv_q*kw_moe_id_f32`), we want to
+        // hold the experts only as one big stacked buffer per role —
+        // not as 128 per-expert MetalQuantStores PLUS the stacked one
+        // (that would double-allocate ~17 GB on a 32 GB Mac, which on
+        // Qwen3-30B-A3B Q4_K_M sends the model into swap and tanks
+        // both load and forward time).
+        let gate_stacked = B::load_quant_experts(
+            gate_kind,
+            gate_bytes,
+            num_experts,
+            expert_intermediate,
+            hidden_size,
+        )
+        .ok();
+        let up_stacked = B::load_quant_experts(
+            up_kind,
+            up_bytes,
+            num_experts,
+            expert_intermediate,
+            hidden_size,
+        )
+        .ok();
+        let down_stacked = B::load_quant_experts(
+            down_kind,
+            down_bytes,
+            num_experts,
+            hidden_size,
+            expert_intermediate,
+        )
+        .ok();
 
-        for e in 0..num_experts {
-            let g_slice = &gate_bytes[e * gate_per..(e + 1) * gate_per];
-            let u_slice = &up_bytes[e * up_per..(e + 1) * up_per];
-            let d_slice = &down_bytes[e * down_per..(e + 1) * down_per];
+        // Decide the storage shape:
+        //   * Stacked-only (Metal MoE fast path): all three stacked
+        //     loaders succeeded — skip per-expert and use stacked
+        //     for both decode and prefill. Cuts memory in half.
+        //   * Per-expert: stacked path is incomplete or unsupported —
+        //     load 128-per-layer QuantLinears and let `moe_forward`
+        //     drive the per-(token, expert) loop on top of them.
+        let stacked_complete =
+            gate_stacked.is_some() && up_stacked.is_some() && down_stacked.is_some();
 
-            // gate || up — fused QuantStore (rows = 2*expert_inter, cols = hidden).
-            // `from_gguf_fused` requires the parts share `in_features` (cols).
-            let parts: [(GgufQuantType, &[u8], usize); 2] = [
-                (gate_kind, g_slice, expert_intermediate),
-                (up_kind, u_slice, expert_intermediate),
-            ];
-            let gate_up_e = match QuantLinear::<B>::from_gguf_fused(&parts, hidden_size) {
-                Ok(q) => q,
-                // Backend doesn't support the Fused variant — fall back
-                // entirely. The caller will retry through the dense path.
-                Err(_) => return Ok(None),
-            };
-            gate_up.push(Box::new(gate_up_e) as Box<dyn Linear<B>>);
+        let (gate_up, down) = if stacked_complete {
+            // No per-expert needed — `moe_forward_stacked_decode_impl`
+            // and the per-token prefill loop both use the stacked buffers.
+            (Vec::new(), Vec::new())
+        } else {
+            let mut gate_up: Vec<Box<dyn Linear<B>>> = Vec::with_capacity(num_experts);
+            let mut down: Vec<Box<dyn Linear<B>>> = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                let g_slice = &gate_bytes[e * gate_per..(e + 1) * gate_per];
+                let u_slice = &up_bytes[e * up_per..(e + 1) * up_per];
+                let d_slice = &down_bytes[e * down_per..(e + 1) * down_per];
 
-            let down_e = match QuantLinear::<B>::from_gguf_bytes(
-                down_kind,
-                d_slice,
-                hidden_size,
-                expert_intermediate,
-            ) {
-                Ok(q) => q,
-                Err(_) => return Ok(None),
-            };
-            down.push(Box::new(down_e) as Box<dyn Linear<B>>);
-        }
+                let parts: [(GgufQuantType, &[u8], usize); 2] = [
+                    (gate_kind, g_slice, expert_intermediate),
+                    (up_kind, u_slice, expert_intermediate),
+                ];
+                let gate_up_e = match QuantLinear::<B>::from_gguf_fused(&parts, hidden_size) {
+                    Ok(q) => q,
+                    Err(_) => return Ok(None),
+                };
+                gate_up.push(Box::new(gate_up_e) as Box<dyn Linear<B>>);
 
-        Ok(Some(Self { gate_up, down }))
+                let down_e = match QuantLinear::<B>::from_gguf_bytes(
+                    down_kind,
+                    d_slice,
+                    hidden_size,
+                    expert_intermediate,
+                ) {
+                    Ok(q) => q,
+                    Err(_) => return Ok(None),
+                };
+                down.push(Box::new(down_e) as Box<dyn Linear<B>>);
+            }
+            (gate_up, down)
+        };
+
+        Ok(Some(Self {
+            gate_up,
+            down,
+            gate_stacked,
+            up_stacked,
+            down_stacked,
+        }))
     }
 
     /// Convenience: open a GGUF and load layer `layer_idx`. The GGUF
@@ -338,6 +410,12 @@ impl<B: Backend> ExpertStack<B> {
     }
 
     /// `num_experts` for the layer (consistency check helper).
+    ///
+    /// Returns the per-expert Vec length, OR — when the stacked-only
+    /// path is in effect (Metal MoE fast path with empty per-expert
+    /// Vecs) — falls back to a stored count via the stacked variants.
+    /// In the stacked-only case there's no Vec to count, so this method
+    /// is mostly used by tests on the per-expert path.
     pub fn num_experts(&self) -> usize {
         debug_assert_eq!(
             self.gate_up.len(),
