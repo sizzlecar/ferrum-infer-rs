@@ -95,14 +95,22 @@ impl LlamaFamilyConfig {
             Err(_) => infer_vocab_from_embed(gguf)?,
         };
 
-        // head_dim: GGUF doesn't always store it; derive from hidden / heads.
-        // (All known Llama-family checkpoints satisfy hidden_size % num_heads == 0.)
-        if num_heads == 0 || hidden_size % num_heads != 0 {
-            return Err(FerrumError::model(format!(
-                "GGUF config: hidden_size {hidden_size} not divisible by num_heads {num_heads}"
-            )));
-        }
-        let head_dim = hidden_size / num_heads;
+        // head_dim: prefer the explicit `<arch>.attention.key_length` key
+        // when present — Qwen3-MoE / Qwen3-30B-A3B has hidden_size=2048
+        // but num_heads*head_dim=4096 (head_dim=128), so the
+        // `hidden_size / num_heads` shortcut is WRONG for that family.
+        // Fall back to the divide only for older GGUFs that omit the key.
+        let head_dim = match read_u32(gguf, &format!("{arch}.attention.key_length")) {
+            Ok(v) => v as usize,
+            Err(_) => {
+                if num_heads == 0 || hidden_size % num_heads != 0 {
+                    return Err(FerrumError::model(format!(
+                        "GGUF config: head_dim missing AND hidden_size {hidden_size} not divisible by num_heads {num_heads}"
+                    )));
+                }
+                hidden_size / num_heads
+            }
+        };
 
         Ok(LlamaFamilyConfig {
             hidden_size,
@@ -164,12 +172,22 @@ impl Qwen3MoeConfig {
             Err(_) => infer_vocab_from_embed(gguf)?,
         };
 
-        if num_heads == 0 || hidden_size % num_heads != 0 {
-            return Err(FerrumError::model(format!(
-                "GGUF Qwen3-MoE: hidden_size {hidden_size} not divisible by num_heads {num_heads}"
-            )));
-        }
-        let head_dim = hidden_size / num_heads;
+        // See LlamaFamilyConfig::from_gguf for the rationale: prefer the
+        // explicit `qwen3moe.attention.key_length` GGUF key. For
+        // Qwen3-30B-A3B specifically, hidden=2048 but head_dim=128
+        // (num_heads*head_dim=4096 ≠ hidden), so the shortcut divide
+        // gives 64 → wrong q_dim → garbage attention output.
+        let head_dim = match read_u32(gguf, "qwen3moe.attention.key_length") {
+            Ok(v) => v as usize,
+            Err(_) => {
+                if num_heads == 0 || hidden_size % num_heads != 0 {
+                    return Err(FerrumError::model(format!(
+                        "GGUF Qwen3-MoE: head_dim missing AND hidden_size {hidden_size} not divisible by num_heads {num_heads}"
+                    )));
+                }
+                hidden_size / num_heads
+            }
+        };
 
         // MoE-specific keys.
         let num_experts = read_u32(gguf, "qwen3moe.expert_count")? as usize;
