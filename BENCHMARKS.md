@@ -226,7 +226,12 @@ Decode throughput (M1 Max, 24-core GPU, AC-powered):
 |---|---|---:|---:|
 | Qwen3-8B Q4_K_M | ferrum (Phase 1D, baseline) | ~0.27 | ~104× slower |
 | Qwen3-8B Q4_K_M | + Q6_K direct + v2 gemv | ~0.31 | ~90× slower |
-| Qwen3-8B Q4_K_M | **+ MultiQuant fused qkv (current)** | **~0.35** | **~80× slower** |
+| Qwen3-8B Q4_K_M | + MultiQuant fused qkv | ~0.35 | ~80× slower |
+| Qwen3-8B Q4_K_M | **+ FERRUM_KV_CAPACITY=256 (current)** | **24.2** | **87% (within 14%)** |
+
+The KV cap is the dominant fix. Qwen3-8B's GGUF declares max_seq_len=40960; the Phase 1D loader honoured that and pre-allocated 36 layers × 8 kv_heads × 40960 × 128 × 2(K+V) × 4 = **12 GB** of KV MTLBuffer. On a 32 GB Mac this pushed everything into swap (8 GB swap_out the whole session) and every Metal dispatch ate page-fault latency. The "GPU dynamic frequency / xctrace 27 ms gaps" theory was wrong — root cause was RAM pressure. Memory drops 18 GB → 6.8 GB with KV cap, swap_out drops 8 GB → 16 KB.
+
+Default behaviour unchanged for long-context use cases; `FERRUM_KV_CAPACITY=N` caps the upper bound when the user knows their decode budget. Smarter automatic policy (cap = prompt_len + max_tokens + slack) is a follow-up.
 
 Profile breakdown (Qwen3-8B, FERRUM_DECODE_OP_PROFILE=1):
 
