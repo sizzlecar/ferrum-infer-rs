@@ -144,10 +144,19 @@ impl<B: Backend> GgufLoader<B> {
     /// transformers; bias-bearing fusions (rare) take the eager hit.
     fn load_fused(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
         if let Some(fast) = self.try_load_fused_q4k(parts)? {
+            if std::env::var("FERRUM_GGUF_LOAD_TRACE").is_ok() {
+                eprintln!("[gguf-load] {:?} → fused-Q4 (homogeneous)", parts);
+            }
             return Ok(fast);
         }
         if let Some(multi) = self.try_load_fused_multi_quant(parts)? {
+            if std::env::var("FERRUM_GGUF_LOAD_TRACE").is_ok() {
+                eprintln!("[gguf-load] {:?} → MultiQuant (mixed dtype)", parts);
+            }
             return Ok(multi);
+        }
+        if std::env::var("FERRUM_GGUF_LOAD_TRACE").is_ok() {
+            eprintln!("[gguf-load] {:?} → eager fp32 fallback ⚠", parts);
         }
         self.load_fused_eager(parts)
     }

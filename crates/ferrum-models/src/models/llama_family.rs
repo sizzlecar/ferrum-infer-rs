@@ -529,7 +529,18 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
         let nkv = self.cfg.num_kv_heads;
         let hd = self.cfg.head_dim;
-        let max = self.cfg.max_seq_len;
+        // KV capacity defaults to the model's full context length (often
+        // 32k-128k) which can dominate the working set on a 32 GB Mac.
+        // Cap at FERRUM_KV_CAPACITY when the env var is set; otherwise
+        // honour the model's declared max so long-context use cases still
+        // work out-of-the-box. Typical decode workloads should set this
+        // to something like 4096 to free 10+ GB of GPU memory.
+        let model_max = self.cfg.max_seq_len;
+        let max = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|cap| cap.min(model_max))
+            .unwrap_or(model_max);
 
         // Try pool first — reused buffers have stable device pointers,
         // so a captured decode graph can be replayed for this request too.
