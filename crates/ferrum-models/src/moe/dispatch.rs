@@ -340,9 +340,13 @@ impl<B: Backend> ExpertStack<B> {
 ///   - `x`            : `[batch * hidden]` post-RMSNorm activations
 ///   - `router_logits`: `[batch * num_experts]` raw router output
 ///   - `out`          : `[batch * hidden]` — caller is responsible for
-///                      zeroing this before the call (we use scaled-add
-///                      to accumulate, not assign)
-///   - `x_single`     : `[hidden]` per-token slice scratch
+///                      zeroing this before the call (we accumulate,
+///                      not assign)
+///   - `x_single`     : `[hidden]` per-token input slice
+///   - `acc_buf`      : `[hidden]` per-token output accumulator (kept
+///                      separate from `x_single` so the gate_up gemv
+///                      can consume `x_single` repeatedly across the
+///                      top_k loop without an inter-pair restore)
 ///   - `gate_up_buf`  : `[2 * expert_inter]` per-(token, expert) gemv out
 ///   - `silu_buf`     : `[expert_inter]`
 ///   - `down_buf`     : `[hidden]` per-(token, expert) accumulate src
@@ -351,6 +355,13 @@ impl<B: Backend> ExpertStack<B> {
 /// `B::to_vec(router_logits, …)` — the routing computation is small
 /// (`batch * num_experts` floats) and the top-K is a sort, both of
 /// which dwarf in cost any plausible host↔device transfer.
+///
+/// Per-pair dispatch budget (m=1, Metal):
+///   gate_up Fused gemv (2 parts) + silu + down gemv + scaled_add
+///   = 5 dispatches/pair. Plus 2 copy_slice/token (load x_single,
+///   write acc_buf back to out[b]). With top_k=8 and 48 layers, that's
+///   8×5 + 2 = 42 dispatches/layer × 48 ≈ 2k/token (vs. ~3.5k in the
+///   pre-PR scheme that round-tripped through `out` per pair).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_forward<B: Backend>(
     ctx: &mut B::Context,
@@ -365,9 +376,11 @@ pub fn moe_forward<B: Backend>(
     norm_topk_prob: bool,
     experts: &ExpertStack<B>,
     x_single: &mut B::Buffer,
+    acc_buf: &mut B::Buffer,
     gate_up_buf: &mut B::Buffer,
     silu_buf: &mut B::Buffer,
     down_buf: &mut B::Buffer,
+    zero_hidden: &B::Buffer,
 ) -> Result<()> {
     let n_experts = experts.num_experts();
     if n_experts != num_experts {
@@ -385,8 +398,15 @@ pub fn moe_forward<B: Backend>(
         crate::moe::router::route(&logits_host, batch, num_experts, top_k, norm_topk_prob);
 
     for b in 0..batch {
-        // x[b] → x_single
+        // Load x[b] into x_single once per token. Stays valid across all
+        // top_k iterations because the gate_up gemv reads `x_single` and
+        // writes `gate_up_buf` — never mutates the input.
         B::copy_slice(ctx, x, b * hidden_size, x_single, 0, hidden_size);
+
+        // Reset the per-token accumulator to zero. Uses a pre-allocated
+        // host-side zero buffer to avoid creating a fresh `B::from_slice`
+        // on the hot path; the copy_slice itself is one dispatch.
+        B::copy_slice(ctx, zero_hidden, 0, acc_buf, 0, hidden_size);
 
         for k in 0..top_k {
             let pair = b * top_k + k;
@@ -407,38 +427,15 @@ pub fn moe_forward<B: Backend>(
             // down gemv → [hidden]
             experts.down[expert_id].forward(ctx, silu_buf, down_buf, 1);
 
-            // out[b] += weight * down_buf. Slice-targeted scaled add
-            // requires writing into a sub-range of `out`; we go through
-            // a per-token scratch and copy back.
-            //
-            // For Metal: `scaled_add_inplace` writes into the front of
-            // `out` only. To target row `b`, we copy down_buf into a
-            // properly-offset temp, but doing N copies per layer is
-            // wasteful. Instead, we exploit `copy_slice` to first pull
-            // out the existing row, scaled-add into it, then push back.
-            //
-            // Simpler: just use a per-row B::Buffer view via copy_slice
-            // semantics. Because top_k==1 is the common case for the
-            // synthetic tests and decode is m=1 anyway, we use
-            // copy_slice to extract row b → x_single (reusing it as
-            // a row accumulator), scaled_add into x_single, then
-            // copy_slice back. (`x_single` has sufficient capacity
-            // — it's sized [hidden].)
-            //
-            // Note: x_single is being aliased here as the accumulator
-            // for the duration of this pair — which is fine because we
-            // just consumed it (gate_up_buf is fully derived from
-            // x_single's earlier value).
-            B::copy_slice(ctx, out, b * hidden_size, x_single, 0, hidden_size);
-            B::scaled_add_inplace(ctx, x_single, down_buf, weight, hidden_size);
-            B::copy_slice(ctx, x_single, 0, out, b * hidden_size, hidden_size);
-
-            // Restore x_single to the original token's hidden state for
-            // the next k iteration's gate_up gemv. (Could be optimised
-            // away when top_k == 1 by skipping the second pull, but
-            // measure first.)
-            B::copy_slice(ctx, x, b * hidden_size, x_single, 0, hidden_size);
+            // acc_buf += weight * down_buf. No round trip through `out`
+            // — the accumulator stays on the GPU for the duration of the
+            // top_k loop and is written to `out[b]` exactly once below.
+            B::scaled_add_inplace(ctx, acc_buf, down_buf, weight, hidden_size);
         }
+
+        // Final write: out[b] = acc_buf. One copy_slice per token,
+        // independent of top_k.
+        B::copy_slice(ctx, acc_buf, 0, out, b * hidden_size, hidden_size);
     }
 
     Ok(())
