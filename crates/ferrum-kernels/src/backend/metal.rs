@@ -24,6 +24,7 @@
 use super::{AttnConfig, Backend, SrcDtype};
 use ferrum_attention::metal::pipelines::MetalPipelines;
 use ferrum_attention::AttentionParams;
+use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use metal::{Device, MTLResourceOptions};
 use std::ffi::c_void;
@@ -207,16 +208,136 @@ fn buffer_f16_from_f32(data: &[f32]) -> metal::Buffer {
 
 pub struct MetalBackend;
 
+/// Metal-side container for any GGUF k-quant flavour. Each variant
+/// keeps its raw on-disk block bytes in MTLBuffer and dequants on
+/// demand inside `gemm_quant` (per-call transient fp16 buffer).
+///
+/// Persistent footprint stays at the on-disk Q4 size (~5 GB for an 8B
+/// Q4_K_M) instead of inflating to fp16 (~16 GB) or fp32 (~32 GB).
+/// New k-quant types add new variants (and matched dequant kernel +
+/// `gemm_quant` arm) without touching the trait surface.
+pub enum MetalQuantStore {
+    Q4K {
+        blocks: metal::Buffer, // [n_blocks * 144] bytes
+        n_rows: usize,
+        n_cols: usize,
+        n_blocks: usize,
+    },
+}
+
+// SAFETY: metal::Buffer wraps an Objective-C handle. metal-rs marks it
+// Send+Sync via internal unsafe impls; we just propagate that.
+unsafe impl Send for MetalQuantStore {}
+unsafe impl Sync for MetalQuantStore {}
+
 impl Backend for MetalBackend {
     type Buffer = MetalBuf;
     type Context = MetalContext;
     type GptqStore = (); // Metal GPTQ not yet wired; load_gptq/gemm_gptq return unsupported.
+    type QuantStore = MetalQuantStore;
 
     fn new_context() -> Self::Context {
         MetalContext { cmd: None }
     }
     fn sync(ctx: &mut Self::Context) {
         ctx.flush();
+    }
+
+    // ── Q4_K_M ────────────────────────────────────────────────────────
+
+    fn load_quant(
+        kind: super::GgufQuantType,
+        bytes: &[u8],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        use super::GgufQuantType;
+        match kind {
+            GgufQuantType::Q4K => {
+                const Q4_K_QK: usize = 256;
+                const Q4_K_BLOCK_BYTES: usize = 144;
+                let total_elems = n_rows * n_cols;
+                if total_elems % Q4_K_QK != 0 {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q4K: elements {total_elems} not multiple of {Q4_K_QK}"
+                    )));
+                }
+                let n_blocks = total_elems / Q4_K_QK;
+                let expected = n_blocks * Q4_K_BLOCK_BYTES;
+                if bytes.len() != expected {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q4K: bytes {} != expected {} ({n_blocks} blocks)",
+                        bytes.len(),
+                        expected
+                    )));
+                }
+                let blocks = st().pipes.device.new_buffer_with_data(
+                    bytes.as_ptr() as *const c_void,
+                    bytes.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                Ok(MetalQuantStore::Q4K {
+                    blocks,
+                    n_rows,
+                    n_cols,
+                    n_blocks,
+                })
+            }
+            other => Err(FerrumError::unsupported(format!(
+                "Metal load_quant: {other:?} not yet implemented"
+            ))),
+        }
+    }
+
+    fn gemm_quant(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        let MetalQuantStore::Q4K {
+            blocks,
+            n_rows,
+            n_cols,
+            n_blocks,
+        } = weight;
+
+        let total_elems = (*n_rows * *n_cols) as u64;
+        let f16_bytes = total_elems * 2;
+
+        // Transient fp16 dequant target. Private storage = GPU-resident only,
+        // no host visibility, allocation is lazy/cheap on Apple Silicon.
+        let transient = st()
+            .pipes
+            .device
+            .new_buffer(f16_bytes, MTLResourceOptions::StorageModePrivate);
+
+        // 1) Dequant Q4 bytes → fp16 transient on the same cmd buffer.
+        let cmd = ctx.cmd();
+        crate::q4_k::encode_dequant_q4_k_to_f16(
+            &st().pipes.device,
+            cmd,
+            blocks,
+            &transient,
+            *n_blocks,
+        );
+
+        // 2) GEMM: out = a @ transient^T using the existing fp16-weights
+        //    kernels — same code path that runs when FERRUM_METAL_DTYPE=f16
+        //    is set on dense weights.
+        let a_buf = a.expect_f32("gemm_quant Q4K a");
+        let out_buf = out.expect_f32_mut("gemm_quant Q4K out");
+        let enc = cmd.new_compute_command_encoder();
+        if m == 1 {
+            st().pipes
+                .gemv_enc_f16w(enc, a_buf, &transient, out_buf, *n_rows, *n_cols);
+        } else {
+            st().pipes
+                .gemm_v2_f16w(enc, a_buf, &transient, out_buf, m, *n_rows, *n_cols);
+        }
+        enc.end_encoding();
+        Ok(())
     }
 
     // ── GEMM — dispatches on B-weight dtype ──────────────────────────

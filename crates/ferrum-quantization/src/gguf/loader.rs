@@ -177,11 +177,55 @@ impl<B: Backend> WeightLoader<B> for GgufLoader<B> {
         // 1) Direct path: <name>.weight exists as a single GGUF tensor.
         if let Some(gguf_weight) = ferrum_to_gguf(&format!("{name}.weight")) {
             if self.gguf.has_tensor(&gguf_weight) {
+                // Inspect the on-disk dtype before reading the payload.
+                // Q4_K_M (and future k-quant flavours) get the QuantLinear
+                // path that keeps weights quantised in backend memory;
+                // F16 / F32 / non-Q4-K dtypes fall through to GgufLinear's
+                // eager-dequant DenseLinear path.
+                let info = self.gguf.tensor_info(&gguf_weight).ok_or_else(|| {
+                    FerrumError::model(format!("tensor_info missing for '{gguf_weight}'"))
+                })?;
+                let dims = info.shape.dims();
+                if dims.len() != 2 {
+                    return Err(FerrumError::model(format!(
+                        "GgufLoader::load_linear '{name}': expected rank-2 weight, got rank {}",
+                        dims.len()
+                    )));
+                }
+                let (n_rows, n_cols) = (dims[0], dims[1]);
+
+                if matches!(info.ggml_dtype, candle_core::quantized::GgmlDType::Q4K) {
+                    // Read raw block bytes and hand to QuantLinear.
+                    // Bias on Q4-quantised projections is rare in GGUF
+                    // (Qwen2.5 attention biases land as F32), so we
+                    // currently take the bias path only when the bias
+                    // tensor is present AND the weight is non-quantised.
+                    // For Q4_K_M weights with bias, fall back to eager
+                    // dequant so Phase 1B's bias support keeps working.
+                    let has_bias = ferrum_to_gguf(&format!("{name}.bias"))
+                        .map(|n| self.gguf.has_tensor(&n))
+                        .unwrap_or(false);
+                    if !has_bias {
+                        let qt = self
+                            .gguf
+                            .read_tensor(&gguf_weight, &self.decode_device)
+                            .map_err(candle_to_ferrum)?;
+                        let bytes = qt.data().map_err(candle_to_ferrum)?;
+                        let quant = crate::QuantLinear::<B>::from_gguf_bytes(
+                            ferrum_kernels::backend::GgufQuantType::Q4K,
+                            bytes.as_ref(),
+                            n_rows,
+                            n_cols,
+                        )?;
+                        return Ok(Box::new(quant));
+                    }
+                    // else fall through to eager-dequant bias path below
+                }
+
                 let qt = self
                     .gguf
                     .read_tensor(&gguf_weight, &self.decode_device)
                     .map_err(candle_to_ferrum)?;
-                // Optional bias (Qwen2.5 / Bert variants)
                 if let Some(gguf_bias) = ferrum_to_gguf(&format!("{name}.bias")) {
                     if self.gguf.has_tensor(&gguf_bias) {
                         let bqt = self
