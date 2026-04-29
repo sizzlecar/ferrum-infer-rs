@@ -241,8 +241,7 @@ qkv) onto per-part mul_mm dispatches:
 | Qwen3-8B Q4_K_M | tg128 | **25.58 ± 0.42** | 27.94 ± 0.90 | **92%** |
 | Llama-3.1-8B Q4_K_M | pp (295-token prompt) | **251.62 ± 1.36** | 335.13 ± 24.86 (pp512) | **75%** |
 | Llama-3.1-8B Q4_K_M | tg128 | **26.47 ± 0.36** | 29.20 ± 0.44 | **91%** |
-| Qwen3-30B-A3B Q4_K_M | pp (302-token prompt) | **43.67 ± 2.05** | 596.58 ± 3.89 (pp512) | **7%** |
-| Qwen3-30B-A3B Q4_K_M | tg128 | **13.22 ± 2.86** | 44.52 ± 6.80 | **30%** |
+| Qwen3-30B-A3B Q4_K_M | ⚠ pre-#40 numbers below were measured on a **garbage-output binary** (head_dim bug). Real numbers: 43.3 t/s prefill (205 tok), 16 t/s tg @ small kv. See "MoE quality regression" section below. |
 
 Progression of prefill on Qwen3-8B (302-token prompt) through this work:
 
@@ -304,7 +303,37 @@ recover most of the 5× gap.
 Decode (m=1) already uses the fused path (`gemv_q4kw_v2` /
 `gemv_q6kw_v2`), which is why it's already within 11% of llama.cpp.
 
-### Qwen3-30B-A3B MoE — first measurement, 2026-04-29
+### MoE quality regression — discovered + fixed 2026-04-30
+
+> ⚠️ **All Qwen3-30B-A3B numbers from PRs #35–#39 below this point are
+> quality-invalid.** Every benchmark ran with `--bench-mode` which
+> suppresses generated tokens. The speed numbers were measured but the
+> output text was repeating-token gibberish (`"Dund impe impe..."`)
+> caused by a misderived `head_dim`: ferrum was computing
+> `head_dim = hidden_size / num_heads = 2048 / 32 = 64`, but
+> Qwen3-30B-A3B has explicit `head_dim=128` (the GGUF stores
+> `qwen3moe.attention.key_length=128`). Qwen3-8B happens to satisfy
+> `hidden=4096=32×128` so the divide gives the right answer there;
+> Qwen3-30B-A3B's non-square attention shape exposed the bug.
+>
+> **Fixed in PR #40** (read `<arch>.attention.key_length` from GGUF).
+> **Prefill batched fast path correctness fixed in PR #41**
+> (2-D `mul_mm_id` Q4_K/Q6_K kernels — see below).
+>
+> **Real numbers post #40 + #41 (M1 Max, single-rep, FERRUM_KV_CAPACITY=512):**
+>
+> | Test | ferrum | vs llama.cpp baseline |
+> |---|---:|---:|
+> | Prefill, 205-token prompt | **43.3 t/s** | 7% of 596 |
+> | Decode @ kv_len ≤ 5 | **15.3 t/s** | 35% of 44.5 |
+> | Decode @ kv_len = 205 | 3.4 t/s | 8% — large attention scaling cost |
+>
+> The pre-fix and post-fix prefill numbers are coincidentally close
+> (~44 t/s) — same kernel work, different output quality.
+> The full 5-rep regression suite needs a re-run on the new binary
+> before the entries below can be replaced; tracked separately.
+
+### Qwen3-30B-A3B MoE — first measurement, 2026-04-29 (PRE-FIX, INVALID)
 
 `Qwen3MoeModel<MetalBackend>` ships the MoE family decoder end-to-end:
 attention path identical to dense Qwen3, FFN replaced by router-driven
