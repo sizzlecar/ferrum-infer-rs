@@ -69,6 +69,33 @@ struct WeightedSumStackedParams {
     int n_slots;
 };
 
+// ── Weighted sum + residual add (fused) ──────────────────────────────
+// Inputs:
+//   slots    : [n_slots, hidden]
+//   weights  : [n_slots]
+//   residual : [hidden] — read AND written: residual[i] += Σ_s w[s] * slots[s,i]
+// One dispatch replaces (weighted_sum_stacked → moe_out) + (add_inplace
+// residual += moe_out): saves 1 dispatch per decode token-layer plus
+// the moe_out scratch traffic.
+
+kernel void weighted_sum_residual_stacked_f32(
+    device const float* slots    [[buffer(0)]],
+    device const float* weights  [[buffer(1)]],
+    device       float* residual [[buffer(2)]],
+    constant WeightedSumStackedParams& p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tpig  [[thread_position_in_threadgroup]])
+{
+    const uint i = tgpig.x * 256 + tpig.x;
+    if (i >= uint(p.hidden)) return;
+
+    float sum = 0.0f;
+    for (int s = 0; s < p.n_slots; s++) {
+        sum += weights[s] * slots[s * uint(p.hidden) + i];
+    }
+    residual[i] += sum;
+}
+
 kernel void weighted_sum_stacked_f32(
     device const float* slots    [[buffer(0)]],
     device const float* weights  [[buffer(1)]],

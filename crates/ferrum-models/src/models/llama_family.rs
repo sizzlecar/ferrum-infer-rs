@@ -834,21 +834,31 @@ impl<B: Backend> LlamaFamilyModel<B> {
             ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 7. Untranspose head-major → token-major for O-proj input
+        // 7. Untranspose head-major → token-major for O-proj input.
+        //
+        // For tokens=1 the head-major and token-major layouts collapse
+        // to the same flat [heads * head_dim] vector, so the dispatch is
+        // an identity memcpy — skip it and point o_proj at the
+        // head-major buffer directly.
         let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
             None
         };
-        B::transpose_head_to_token(
-            ctx,
-            &self.scratch.attn_head_major_out,
-            &mut self.scratch.attn_flat,
-            tokens,
-            nh,
-            hd,
-        );
+        let attn_token_major = if tokens == 1 {
+            &self.scratch.attn_head_major_out
+        } else {
+            B::transpose_head_to_token(
+                ctx,
+                &self.scratch.attn_head_major_out,
+                &mut self.scratch.attn_flat,
+                tokens,
+                nh,
+                hd,
+            );
+            &self.scratch.attn_flat
+        };
         if let Some(t0) = _t0 {
             B::sync(ctx);
             OTHER_TIME_US.fetch_add(
@@ -865,12 +875,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
         } else {
             None
         };
-        layer.o_proj.forward(
-            ctx,
-            &self.scratch.attn_flat,
-            &mut self.scratch.o_proj_out,
-            tokens,
-        );
+        layer
+            .o_proj
+            .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
         if let Some(t0) = _t0 {
             B::sync(ctx);
             MATMUL_TIME_US.fetch_add(
@@ -1846,20 +1853,16 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 &attn_cfg,
             );
 
-            // Untranspose head-major → token-major (tokens=1 → just contiguous).
-            B::transpose_head_to_token(
-                ctx,
-                &self.scratch.attn_head_major_single,
-                &mut self.scratch.attn_flat_single,
-                1,
-                nh,
-                hd,
-            );
-
-            // Inject item i's attn output into batched attn_flat [M, Q].
+            // Untranspose head-major → token-major + inject into batched
+            // attn_flat[M, Q]. For tokens=1 the head-major and
+            // token-major layouts are byte-identical (both flat to
+            // [heads * head_dim] = [q_dim] floats), so we skip the
+            // transpose dispatch entirely and copy attn_head_major_single
+            // straight into the per-item slot. Saves 1 dispatch per
+            // batch-item per layer.
             B::copy_slice(
                 ctx,
-                &self.scratch.attn_flat_single,
+                &self.scratch.attn_head_major_single,
                 0,
                 &mut self.scratch.attn_flat,
                 i * q_dim,
