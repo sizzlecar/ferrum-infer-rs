@@ -405,9 +405,7 @@ fn dispatch_part_gemv_offset(
     n_cols: usize,
 ) -> Result<()> {
     match part {
-        MetalQuantStore::Q4K {
-            blocks, n_rows, ..
-        } => {
+        MetalQuantStore::Q4K { blocks, n_rows, .. } => {
             if *n_rows % 4 != 0 {
                 crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
                     &st().pipes.device,
@@ -420,8 +418,7 @@ fn dispatch_part_gemv_offset(
                 );
                 if a_offset_bytes != 0 || c_offset_bytes != 0 {
                     return Err(FerrumError::model(
-                        "gemm_quant Fused: q4k v1 path doesn't support offsets yet"
-                            .to_string(),
+                        "gemm_quant Fused: q4k v1 path doesn't support offsets yet".to_string(),
                     ));
                 }
                 return Ok(());
@@ -438,9 +435,7 @@ fn dispatch_part_gemv_offset(
                 n_cols,
             );
         }
-        MetalQuantStore::Q6K {
-            blocks, n_rows, ..
-        } => {
+        MetalQuantStore::Q6K { blocks, n_rows, .. } => {
             if *n_rows % 4 != 0 {
                 return Err(FerrumError::model(format!(
                     "gemm_quant Fused: Q6K part n_rows={n_rows} not divisible by 4"

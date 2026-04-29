@@ -113,8 +113,10 @@ mod tests {
 
         // Synthetic weight, sin/cos pattern so quantisation is non-trivial.
         let raw_w: Vec<f32> = (0..n * k)
-            .map(|i| (((i % 313) as f32) * 0.0173).sin() * 0.5
-                + (((i % 251) as f32) * 0.0091).cos() * 0.5)
+            .map(|i| {
+                (((i % 313) as f32) * 0.0173).sin() * 0.5
+                    + (((i % 251) as f32) * 0.0091).cos() * 0.5
+            })
             .collect();
         let cpu = CandleDevice::Cpu;
         let t_w = Tensor::from_vec(raw_w, (n, k), &cpu).unwrap();
@@ -147,10 +149,7 @@ mod tests {
             bytes.len() as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let c_buf = device.new_buffer(
-            (n * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let c_buf = device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();

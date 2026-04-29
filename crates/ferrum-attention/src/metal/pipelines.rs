@@ -519,7 +519,11 @@ impl MetalPipelines {
         enc.set_buffer(2, Some(cos), 0);
         enc.set_buffer(3, Some(sin), 0);
         enc.set_buffer(4, Some(output), 0);
-        enc.set_bytes(5, std::mem::size_of::<P>() as u64, &params as *const _ as *const c_void as *const _);
+        enc.set_bytes(
+            5,
+            std::mem::size_of::<P>() as u64,
+            &params as *const _ as *const c_void as *const _,
+        );
         let grid = MTLSize::new(tokens as u64, heads as u64, 1);
         let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -719,7 +723,11 @@ impl MetalPipelines {
         enc.set_buffer(3, Some(weight), 0);
         enc.set_buffer(4, Some(out_res), 0);
         enc.set_buffer(5, Some(out_norm), 0);
-        enc.set_bytes(6, std::mem::size_of::<P>() as u64, &params as *const _ as *const c_void as *const _);
+        enc.set_bytes(
+            6,
+            std::mem::size_of::<P>() as u64,
+            &params as *const _ as *const c_void as *const _,
+        );
         enc.set_threadgroup_memory_length(0, 128);
         let grid = MTLSize::new(tokens as u64, 1, 1);
         let tg = MTLSize::new(32, 1, 1);
@@ -771,7 +779,11 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(k), 0);
         enc.set_buffer(2, Some(v), 0);
         enc.set_buffer(3, Some(o), 0);
-        enc.set_bytes(4, std::mem::size_of::<P>() as u64, &p as *const _ as *const c_void as *const _);
+        enc.set_bytes(
+            4,
+            std::mem::size_of::<P>() as u64,
+            &p as *const _ as *const c_void as *const _,
+        );
         let grid = MTLSize::new(
             params.q_len as u64,
             params.num_heads as u64,

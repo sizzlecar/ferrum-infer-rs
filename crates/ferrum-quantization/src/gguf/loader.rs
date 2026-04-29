@@ -167,10 +167,7 @@ impl<B: Backend> GgufLoader<B> {
     /// `MetalQuantStore::Fused` (or whatever the backend's `Fused`
     /// variant is) so each part stays compact in backend memory and
     /// gemv dispatches per part with output offsets.
-    fn try_load_fused_multi_quant(
-        &self,
-        parts: &[String],
-    ) -> Result<Option<Box<dyn Linear<B>>>> {
+    fn try_load_fused_multi_quant(&self, parts: &[String]) -> Result<Option<Box<dyn Linear<B>>>> {
         let mut spec: Vec<(ferrum_kernels::backend::GgufQuantType, Vec<u8>, usize)> = Vec::new();
         let mut cols_check: Option<usize> = None;
 
@@ -196,10 +193,9 @@ impl<B: Backend> GgufLoader<B> {
                 return Ok(None);
             }
 
-            let info = self
-                .gguf
-                .tensor_info(&gguf_name)
-                .ok_or_else(|| FerrumError::model(format!("tensor_info missing for '{gguf_name}'")))?;
+            let info = self.gguf.tensor_info(&gguf_name).ok_or_else(|| {
+                FerrumError::model(format!("tensor_info missing for '{gguf_name}'"))
+            })?;
             let kind = match info.ggml_dtype {
                 candle_core::quantized::GgmlDType::Q4K => {
                     ferrum_kernels::backend::GgufQuantType::Q4K
@@ -279,10 +275,9 @@ impl<B: Backend> GgufLoader<B> {
                 return Ok(None);
             }
 
-            let info = self
-                .gguf
-                .tensor_info(&gguf_name)
-                .ok_or_else(|| FerrumError::model(format!("tensor_info missing for '{gguf_name}'")))?;
+            let info = self.gguf.tensor_info(&gguf_name).ok_or_else(|| {
+                FerrumError::model(format!("tensor_info missing for '{gguf_name}'"))
+            })?;
 
             // Disqualifier 2: not Q4K dtype.
             if !matches!(info.ggml_dtype, candle_core::quantized::GgmlDType::Q4K) {
@@ -318,9 +313,13 @@ impl<B: Backend> GgufLoader<B> {
             let bytes = qt.data().map_err(candle_to_ferrum)?;
             // Sanity: 144 bytes per super-block, super-blocks = rows * (cols / 256).
             let expected = rows * (cols / 256) * 144;
-            debug_assert_eq!(bytes.as_ref().len(), expected,
+            debug_assert_eq!(
+                bytes.as_ref().len(),
+                expected,
                 "Q4K byte count mismatch for '{gguf_name}': got {} expected {}",
-                bytes.as_ref().len(), expected);
+                bytes.as_ref().len(),
+                expected
+            );
 
             fused_bytes.extend_from_slice(bytes.as_ref());
             total_rows += rows;

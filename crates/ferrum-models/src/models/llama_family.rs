@@ -591,7 +591,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let kv_dim = nkv * hd;
 
         // 1. Input RMSNorm
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::rms_norm(
             ctx,
             residual,
@@ -601,20 +606,44 @@ impl<B: Backend> LlamaFamilyModel<B> {
             tokens,
             h,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); NORM_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            NORM_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         layer.qkv_proj.forward(
             ctx,
             &self.scratch.norm_out,
             &mut self.scratch.qkv_out,
             tokens,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 3. Split fused QKV → token-major Q/K/V
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::split_qkv(
             ctx,
             &self.scratch.qkv_out,
@@ -625,7 +654,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
             q_dim,
             kv_dim,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 4. Fused QK-norm + RoPE + transpose to head-major
         //    Qwen3: mode=1 (norm + rope). Non-QK-norm variants: mode=2 (rope only).
@@ -635,7 +671,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy);
 
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::qk_norm_rope(
             ctx,
             &self.scratch.q_buf,
@@ -650,8 +691,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
             eps,
             qk_mode,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); QKR_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            QKR_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::qk_norm_rope(
             ctx,
             &self.scratch.k_buf,
@@ -666,8 +719,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
             eps,
             qk_mode,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); QKR_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            QKR_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::qk_norm_rope(
             ctx,
             &self.scratch.v_buf,
@@ -682,7 +747,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
             eps,
             0, // transpose only
         );
-        if let Some(t0) = _t0 { B::sync(ctx); QKR_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            QKR_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 5. Append K/V to pre-allocated head-major cache
         let caches = self
@@ -690,7 +762,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .get_mut(cache_id)
             .expect("ensure_kv must be called before forward_layer");
         let cache = &mut caches[li];
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::kv_cache_append_head_major(
             ctx,
             &mut cache.k,
@@ -703,7 +780,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
             nkv,
             hd,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         cache.len += tokens;
         let kv_len = cache.len;
         let kv_stride = cache.capacity;
@@ -743,12 +827,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
         if let Some(t0) = _attn_t0 {
             B::sync(ctx);
-            ATTN_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            ATTN_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // 7. Untranspose head-major → token-major for O-proj input
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::transpose_head_to_token(
             ctx,
             &self.scratch.attn_head_major_out,
@@ -757,22 +849,46 @@ impl<B: Backend> LlamaFamilyModel<B> {
             nh,
             hd,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 8. O projection
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         layer.o_proj.forward(
             ctx,
             &self.scratch.attn_flat,
             &mut self.scratch.o_proj_out,
             tokens,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 9. Fused residual-add + post-attention RMSNorm.
         //    Writes the new residual back into `residual` and the normed
         //    value into `norm_out`.
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::fused_add_rms_norm(
             ctx,
             residual,
@@ -783,20 +899,44 @@ impl<B: Backend> LlamaFamilyModel<B> {
             tokens,
             h,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); NORM_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            NORM_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 10. Fused gate+up projection
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         layer.gate_up_proj.forward(
             ctx,
             &self.scratch.norm_out,
             &mut self.scratch.gate_up_out,
             tokens,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 11. SwiGLU: silu(gate) * up
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::fused_silu_mul_split(
             ctx,
             &self.scratch.gate_up_out,
@@ -804,22 +944,53 @@ impl<B: Backend> LlamaFamilyModel<B> {
             tokens,
             im,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 12. Down projection
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         layer.down_proj.forward(
             ctx,
             &self.scratch.silu_out,
             &mut self.scratch.mlp_out,
             tokens,
         );
-        if let Some(t0) = _t0 { B::sync(ctx); MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 13. Final residual add
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
+        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
-        if let Some(t0) = _t0 { B::sync(ctx); OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if let Some(t0) = _t0 {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Multi-position decode-verify: run one forward pass over `tokens`
@@ -1108,19 +1279,27 @@ impl<B: Backend> LlamaFamilyModel<B> {
             let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
             eprintln!(
                 "[op-profile] flash_attn: {} calls {} ms (avg {} us)",
-                attn_n, attn_us / 1000, if attn_n > 0 { attn_us / attn_n } else { 0 }
+                attn_n,
+                attn_us / 1000,
+                if attn_n > 0 { attn_us / attn_n } else { 0 }
             );
             eprintln!(
                 "[op-profile] qk_norm_rope: {} calls {} ms (avg {} us)",
-                qkr_n, qkr_us / 1000, if qkr_n > 0 { qkr_us / qkr_n } else { 0 }
+                qkr_n,
+                qkr_us / 1000,
+                if qkr_n > 0 { qkr_us / qkr_n } else { 0 }
             );
             eprintln!(
                 "[op-profile] matmuls (Linear::forward): {} calls {} ms (avg {} us)",
-                mm_n, mm_us / 1000, if mm_n > 0 { mm_us / mm_n } else { 0 }
+                mm_n,
+                mm_us / 1000,
+                if mm_n > 0 { mm_us / mm_n } else { 0 }
             );
             eprintln!(
                 "[op-profile] norms (rms+fused_add_rms): {} calls {} ms (avg {} us)",
-                norm_n, norm_us / 1000, if norm_n > 0 { norm_us / norm_n } else { 0 }
+                norm_n,
+                norm_us / 1000,
+                if norm_n > 0 { norm_us / norm_n } else { 0 }
             );
             eprintln!(
                 "[op-profile] other (split_qkv, kv_append, transpose, silu, add): {} calls {} ms (avg {} us)",

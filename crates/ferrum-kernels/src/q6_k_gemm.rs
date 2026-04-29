@@ -95,11 +95,7 @@ pub fn dispatch_gemm_q6k_part(
 
     const NR0: u64 = 64;
     const NR1: u64 = 32;
-    let grid = MTLSize::new(
-        (m as u64).div_ceil(NR1),
-        (n as u64).div_ceil(NR0),
-        1,
-    );
+    let grid = MTLSize::new((m as u64).div_ceil(NR1), (n as u64).div_ceil(NR0), 1);
     let tg = MTLSize::new(128, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
 }
@@ -121,8 +117,9 @@ mod tests {
         let m: usize = 11;
 
         let raw_w: Vec<f32> = (0..n * k)
-            .map(|i| ((((i % 313) as f32) * 0.0173).sin()
-                + (((i % 251) as f32) * 0.0091).cos()) * 0.5)
+            .map(|i| {
+                ((((i % 313) as f32) * 0.0173).sin() + (((i % 251) as f32) * 0.0091).cos()) * 0.5
+            })
             .collect();
         let cpu = CandleDevice::Cpu;
         let t_w = Tensor::from_vec(raw_w, (n, k), &cpu).unwrap();
@@ -174,12 +171,18 @@ mod tests {
             if diff > 0.5 && rel > 0.05 {
                 mismatches += 1;
                 if mismatches < 5 {
-                    eprintln!("[{i}] m={} n={} our={our} ref={refv} diff={diff}",
-                              i / n, i % n);
+                    eprintln!(
+                        "[{i}] m={} n={} our={our} ref={refv} diff={diff}",
+                        i / n,
+                        i % n
+                    );
                 }
             }
         }
-        eprintln!("q6k mul_mm 4096x12288 m=11: max_abs={max_abs:.4} mismatches={mismatches}/{}", m * n);
+        eprintln!(
+            "q6k mul_mm 4096x12288 m=11: max_abs={max_abs:.4} mismatches={mismatches}/{}",
+            m * n
+        );
         assert!(
             mismatches == 0,
             "q6k mul_mm: {mismatches} elements outside tolerance"

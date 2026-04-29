@@ -89,7 +89,10 @@ pub fn dispatch_gemm_q4k_part(
     k: usize,
 ) {
     debug_assert!(k % 256 == 0, "K must be a multiple of 256 (got {k})");
-    debug_assert!(n <= stride_c, "n ({n}) must fit within stride_c ({stride_c})");
+    debug_assert!(
+        n <= stride_c,
+        "n ({n}) must fit within stride_c ({stride_c})"
+    );
     debug_assert!(
         c_offset_cols + n <= stride_c,
         "part [{c_offset_cols}, {}) overflows stride_c {stride_c}",
@@ -107,11 +110,11 @@ pub fn dispatch_gemm_q4k_part(
         stride_c: i32,
     }
     let params = P {
-        m: n as i32,                 // write width = part rows
-        n: m as i32,                 // batch (activation rows)
+        m: n as i32, // write width = part rows
+        n: m as i32, // batch (activation rows)
         k: k as i32,
         nb01: nb01_bytes as i32,
-        stride_c: stride_c as i32,   // dst row stride = total output rows
+        stride_c: stride_c as i32, // dst row stride = total output rows
     };
 
     let pipe = pipeline(device);
@@ -128,11 +131,7 @@ pub fn dispatch_gemm_q4k_part(
 
     const NR0: u64 = 64;
     const NR1: u64 = 32;
-    let grid = MTLSize::new(
-        (m as u64).div_ceil(NR1),
-        (n as u64).div_ceil(NR0),
-        1,
-    );
+    let grid = MTLSize::new((m as u64).div_ceil(NR1), (n as u64).div_ceil(NR0), 1);
     let tg = MTLSize::new(128, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
 }
@@ -148,13 +147,14 @@ mod tests {
     /// 64×32 single-tile correctness test (smallest meaningful shape).
     #[test]
     fn fused_gemm_q4k_smoke_64x4096_x_32() {
-        let n: usize = 64;   // weight rows / out_features
-        let k: usize = 256;  // smallest valid (1 super-block per row)
-        let m: usize = 32;   // batch tokens
+        let n: usize = 64; // weight rows / out_features
+        let k: usize = 256; // smallest valid (1 super-block per row)
+        let m: usize = 32; // batch tokens
 
         let raw_w: Vec<f32> = (0..n * k)
-            .map(|i| ((((i % 313) as f32) * 0.0173).sin()
-                + (((i % 251) as f32) * 0.0091).cos()) * 0.5)
+            .map(|i| {
+                ((((i % 313) as f32) * 0.0173).sin() + (((i % 251) as f32) * 0.0091).cos()) * 0.5
+            })
             .collect();
         let cpu = CandleDevice::Cpu;
         let t_w = Tensor::from_vec(raw_w, (n, k), &cpu).unwrap();
@@ -216,7 +216,10 @@ mod tests {
                 }
             }
         }
-        eprintln!("q4k mul_mm 64x32 max_abs={max_abs:.4} mismatches={mismatches}/{}", m * n);
+        eprintln!(
+            "q4k mul_mm 64x32 max_abs={max_abs:.4} mismatches={mismatches}/{}",
+            m * n
+        );
         assert!(
             mismatches == 0,
             "q4k mul_mm: {mismatches}/{} elements outside tolerance",
@@ -232,8 +235,9 @@ mod tests {
         let m: usize = 11;
 
         let raw_w: Vec<f32> = (0..n * k)
-            .map(|i| ((((i % 313) as f32) * 0.0173).sin()
-                + (((i % 251) as f32) * 0.0091).cos()) * 0.5)
+            .map(|i| {
+                ((((i % 313) as f32) * 0.0173).sin() + (((i % 251) as f32) * 0.0091).cos()) * 0.5
+            })
             .collect();
         let cpu = CandleDevice::Cpu;
         let t_w = Tensor::from_vec(raw_w, (n, k), &cpu).unwrap();
@@ -286,12 +290,18 @@ mod tests {
             if diff > 0.5 && rel > 0.05 {
                 mismatches += 1;
                 if mismatches < 5 {
-                    eprintln!("[{i}] m={} n={} our={our} ref={refv} diff={diff}",
-                              i / n, i % n);
+                    eprintln!(
+                        "[{i}] m={} n={} our={our} ref={refv} diff={diff}",
+                        i / n,
+                        i % n
+                    );
                 }
             }
         }
-        eprintln!("q4k mul_mm 4096x4096 m=11: max_abs={max_abs:.4} mismatches={mismatches}/{}", m * n);
+        eprintln!(
+            "q4k mul_mm 4096x4096 m=11: max_abs={max_abs:.4} mismatches={mismatches}/{}",
+            m * n
+        );
         assert!(
             mismatches == 0,
             "q4k mul_mm 4096x4096: {mismatches} elements diverge"
