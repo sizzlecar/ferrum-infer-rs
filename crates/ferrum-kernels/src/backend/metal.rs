@@ -144,6 +144,13 @@ impl MetalContext {
         match self.cmd {
             Some(c) => c,
             None => {
+                // Tried `new_command_buffer_with_unretained_references`
+                // here (matching llama.cpp): output regressed to "The The
+                // The…" — likely some buffer we bind isn't kept alive
+                // long enough between encode and execute on this code
+                // path. The retained variant is correct and the CPU
+                // overhead from retains turned out to be negligible at
+                // our dispatch rate.
                 let c = st().pipes.queue.new_command_buffer();
                 let c_static: &'static metal::CommandBufferRef =
                     unsafe { std::mem::transmute::<&metal::CommandBufferRef, _>(c) };

@@ -1111,8 +1111,51 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .expect("prefill_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
 
+        let prefill_profile = std::env::var("FERRUM_PREFILL_OP_PROFILE").is_ok();
+        let prefill_t0 = if prefill_profile {
+            B::sync(&mut ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         for li in 0..self.cfg.num_layers {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+        }
+
+        if let Some(t0) = prefill_t0 {
+            B::sync(&mut ctx);
+            let total_us = t0.elapsed().as_micros() as u64;
+            let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[prefill-profile] tokens={} layers total={} ms",
+                seq_len,
+                total_us / 1000
+            );
+            let bucket = |label: &str, n: u64, us: u64| {
+                if n > 0 {
+                    eprintln!(
+                        "[prefill-profile] {label}: {} calls {} ms (avg {} us)",
+                        n,
+                        us / 1000,
+                        us / n
+                    );
+                }
+            };
+            bucket("flash_attn", attn_n, attn_us);
+            bucket("qk_norm_rope", qkr_n, qkr_us);
+            bucket("matmuls", mm_n, mm_us);
+            bucket("norms", norm_n, norm_us);
+            bucket("other", other_n, other_us);
         }
 
         // Take the last token's hidden state: residual[(seq_len-1)*h .. seq_len*h]
