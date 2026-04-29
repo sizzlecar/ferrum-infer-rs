@@ -23,6 +23,7 @@ pub mod common;
 pub mod definition;
 pub mod executor;
 pub mod gguf_config;
+pub mod gguf_runtime;
 pub mod hf_download;
 pub mod image_processor;
 pub mod loader;
