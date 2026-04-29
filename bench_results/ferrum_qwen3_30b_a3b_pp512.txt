@@ -1,0 +1,8 @@
+## qwen3_30b_a3b / pp512
+→ backend: Metal
+Error: Model error: GGUF arch 'qwen3moe' is MoE — use Qwen3MoeConfig::from_gguf or the matching MoE config builder, not LlamaFamilyConfig::from_gguf
+rep=1 p_n= p_s= d_n= d_s=
+rep=2 p_n= p_s= d_n= d_s=
+rep=3 p_n= p_s= d_n= d_s=
+rep=4 p_n= p_s= d_n= d_s=
+rep=5 p_n= p_s= d_n= d_s=

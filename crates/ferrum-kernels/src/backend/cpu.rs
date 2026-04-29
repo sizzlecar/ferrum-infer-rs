@@ -1,8 +1,64 @@
 //! CPU backend using Accelerate (macOS) / portable fallback (Linux).
 //! Context = () — all ops execute immediately, no batching needed.
 
+use half::f16;
+
 use super::{AttnConfig, Backend};
 use ferrum_types::{FerrumError, Result};
+
+// ── Q4_K_M block layout ────────────────────────────────────────────────
+//
+// Mirrors GGML / candle's `BlockQ4K`. Used by `load_q4_k` to dequant raw
+// GGUF block bytes to fp32 row-major weights on CPU.
+
+const Q4_K_QK: usize = 256;
+const Q4_K_SCALE_SIZE: usize = 12;
+const Q4_K_BLOCK_BYTES: usize = 4 + Q4_K_SCALE_SIZE + Q4_K_QK / 2; // 144
+
+/// Bit-unpacker matching candle's `quantized::utils::get_scale_min_k4`.
+fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        let d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        (d, m)
+    }
+}
+
+/// Port of candle's CPU `BlockQ4K::to_float`. Bit-identical output for
+/// identical input — the test in `q4_k.rs` verifies our Metal kernel
+/// also matches.
+fn dequant_q4_k_cpu(bytes: &[u8], n_blocks: usize) -> Vec<f32> {
+    debug_assert_eq!(bytes.len(), n_blocks * Q4_K_BLOCK_BYTES);
+    let mut out = Vec::with_capacity(n_blocks * Q4_K_QK);
+    for b in 0..n_blocks {
+        let off = b * Q4_K_BLOCK_BYTES;
+        let d = f16::from_le_bytes([bytes[off], bytes[off + 1]]).to_f32();
+        let dmin = f16::from_le_bytes([bytes[off + 2], bytes[off + 3]]).to_f32();
+        let scales = &bytes[off + 4..off + 4 + Q4_K_SCALE_SIZE];
+        let qs = &bytes[off + 4 + Q4_K_SCALE_SIZE..off + Q4_K_BLOCK_BYTES];
+
+        let mut is = 0usize;
+        for j in (0..Q4_K_QK).step_by(64) {
+            let q_chunk = &qs[j / 2..j / 2 + 32];
+            let (sc1, mn1) = get_scale_min_k4(is, scales);
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * mn1 as f32;
+            let (sc2, mn2) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc2 as f32;
+            let m2 = dmin * mn2 as f32;
+            for q in q_chunk {
+                out.push(d1 * (q & 0xF) as f32 - m1);
+            }
+            for q in q_chunk {
+                out.push(d2 * (q >> 4) as f32 - m2);
+            }
+            is += 2;
+        }
+    }
+    out
+}
 
 pub struct CpuBackend;
 
@@ -42,10 +98,26 @@ pub struct CpuGptqStore {
     pub n: usize,
 }
 
+/// CPU-side container for any GGUF k-quant flavour. Each variant holds
+/// the dense fp32 weights post-eager-dequant — CPU isn't the bench
+/// target so we don't pay the complexity of on-the-fly dequant here;
+/// the variant tag exists so `gemm_quant` can route consistently.
+///
+/// New k-quant types (Q5_K / Q6_K / Q8_0) become new variants — no
+/// trait churn, just a new arm in `load_quant` and `gemm_quant`.
+pub enum CpuQuantStore {
+    Q4K {
+        weights: Vec<f32>, // [n_rows, n_cols] row-major
+        n_rows: usize,
+        n_cols: usize,
+    },
+}
+
 impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
     type Context = ();
     type GptqStore = CpuGptqStore;
+    type QuantStore = CpuQuantStore;
 
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
@@ -106,6 +178,61 @@ impl Backend for CpuBackend {
         // out[m, n] = a[m, k] @ w[n, k]^T — same contract as B::gemm.
         Self::gemm(ctx, a, &weight.weight_f32, out, m, weight.n, weight.k);
         Ok(())
+    }
+
+    fn load_quant(
+        kind: super::GgufQuantType,
+        bytes: &[u8],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        use super::GgufQuantType;
+        match kind {
+            GgufQuantType::Q4K => {
+                let total_elems = n_rows * n_cols;
+                if total_elems % Q4_K_QK != 0 {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q4K: elements {total_elems} not a multiple of {Q4_K_QK}"
+                    )));
+                }
+                let n_blocks = total_elems / Q4_K_QK;
+                let expected = n_blocks * Q4_K_BLOCK_BYTES;
+                if bytes.len() != expected {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q4K: bytes {} != expected {} ({n_blocks} × {Q4_K_BLOCK_BYTES})",
+                        bytes.len(),
+                        expected
+                    )));
+                }
+                Ok(CpuQuantStore::Q4K {
+                    weights: dequant_q4_k_cpu(bytes, n_blocks),
+                    n_rows,
+                    n_cols,
+                })
+            }
+            other => Err(FerrumError::unsupported(format!(
+                "CPU load_quant: {other:?} not yet implemented"
+            ))),
+        }
+    }
+
+    fn gemm_quant(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        match weight {
+            CpuQuantStore::Q4K {
+                weights,
+                n_rows,
+                n_cols,
+            } => {
+                Self::gemm(ctx, a, weights, out, m, *n_rows, *n_cols);
+                Ok(())
+            }
+        }
     }
 
     fn gemm(

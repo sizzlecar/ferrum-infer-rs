@@ -186,6 +186,22 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// doesn't pay the repack cost per forward pass.
     type GptqStore: Send + Sync;
 
+    /// Single backend-specific store for **all GGUF k-quant flavours**
+    /// (Q4_K_M today; Q5_K_M / Q6_K / Q8_0 etc. become enum variants
+    /// without changing the trait shape).
+    ///
+    /// Each backend's `QuantStore` is typically an enum dispatching on
+    /// the on-disk quant type — the public API (`load_quant`,
+    /// `gemm_quant`) takes a [`QuantKind`] discriminator so callers
+    /// don't see the variant boilerplate.
+    ///
+    /// **GPTQ stays on the older [`Self::GptqStore`] path** because its
+    /// load inputs are split arrays (qweight / scales / qzeros), not
+    /// the contiguous byte payload GGUF quants ship as. A future PR can
+    /// fold GPTQ into `QuantStore` once an input-shape unification is
+    /// agreed.
+    type QuantStore: Send + Sync;
+
     /// Create a new execution context (begin accumulating work).
     fn new_context() -> Self::Context;
 
@@ -282,6 +298,61 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "gemm_gptq not implemented for this backend",
+        ))
+    }
+
+    /// Load GGUF k-quant weights into the backend's preferred format.
+    ///
+    /// `kind` discriminates Q4_K / Q5_K / Q6_K / Q8_0 etc. The CPU path
+    /// typically eager-dequants to fp32; the Metal path keeps raw block
+    /// bytes in MTLBuffer and dequants per matmul into a transient fp16
+    /// buffer. Adding a new k-quant flavour is a matched pair of
+    /// `QuantStore` variant + `match` arm, not a new trait method.
+    ///
+    /// `bytes`: contiguous on-disk payload — `n_blocks × block_size`.
+    /// `n_rows`: out_features. `n_cols`: in_features. The block count
+    /// is derived per-kind from these dims.
+    fn load_quant(
+        _kind: GgufQuantType,
+        _bytes: &[u8],
+        _n_rows: usize,
+        _n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        Err(FerrumError::unsupported(
+            "load_quant not implemented for this backend",
+        ))
+    }
+
+    /// Build a fused `QuantStore` from multiple `(kind, bytes, n_rows)`
+    /// parts that share `n_cols`. Used by `GgufLoader::load_fused` when
+    /// parts have heterogeneous quant kinds (e.g. Qwen3 qkv_proj where
+    /// q+k are Q4_K but v is Q6_K) — byte-concatenation isn't possible,
+    /// so each part stays as its own QuantStore and the gemm dispatches
+    /// one matvec per part with output offsets.
+    ///
+    /// Default: not supported. Backends that have a `Fused`-like variant
+    /// override.
+    fn load_quant_fused(
+        _parts: &[(GgufQuantType, &[u8], usize)],
+        _n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        Err(FerrumError::unsupported(
+            "load_quant_fused not implemented for this backend",
+        ))
+    }
+
+    /// GEMM with k-quant weights. Mirrors `gemm` / `gemm_gptq` shape:
+    /// `out[m, n] = a[m, k] @ dequant(weight)^T`. The dispatch on the
+    /// quant flavour happens inside the backend's `QuantStore` enum.
+    fn gemm_quant(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::QuantStore,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_quant not implemented for this backend",
         ))
     }
 
@@ -543,30 +614,11 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Self::from_slice(&data)
     }
 
-    // ── Quantized GEMM (Phase A3 stubs) ─────────────────────────────────
-    //
-    // Backends override the kinds they actually support (e.g. Metal will
-    // implement Gptq first; CUDA will implement Gptq + Awq via Marlin).
-    // Default impl returns an `unsupported` error so missing kernels surface
-    // as clean runtime errors instead of silent wrong output.
-
-    /// GEMM with packed-quantized B matrix. `m`/`n`/`k` describe the dense
-    /// equivalent (`[m,n] = [m,k] @ [k,n]^T`).
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_quant(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weights: &QuantWeights<'_, Self>,
-        _out: &mut Self::Buffer,
-        _m: usize,
-        _n: usize,
-        _k: usize,
-        kind: &QuantKind,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(format!(
-            "gemm_quant({kind:?}) not implemented for this backend"
-        )))
-    }
+    // (The Phase A3 unified `gemm_quant(QuantWeights, QuantKind)` stub
+    // that used to live here is superseded by the `load_quant` /
+    // `gemm_quant(QuantStore)` pair earlier in this trait — same idea,
+    // but the store hides the per-kind buffer layout so callers don't
+    // have to construct a per-kind `QuantWeights<'_, Self>` packet.)
 
     // ── TP collective ops (Phase A3 stubs) ──────────────────────────────
     //

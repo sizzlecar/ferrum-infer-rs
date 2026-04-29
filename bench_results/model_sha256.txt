@@ -1,0 +1,4 @@
+Computing SHA256 for 3 GGUF files (this takes ~30s for 30GB total)...
+d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785  Qwen3-8B-Q4_K_M.gguf
+7b064f5842bf9532c91456deda288a1b672397a54fa729aa665952863033557c  Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5  Qwen3-30B-A3B-Q4_K_M.gguf

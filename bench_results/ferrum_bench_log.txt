@@ -1,0 +1,43 @@
+## qwen3_8b / pp512
+rep=1 p_n=302 p_s=1.189 d_n=1 d_s=0.000
+rep=2 p_n=302 p_s=1.200 d_n=1 d_s=0.000
+rep=3 p_n=302 p_s=1.193 d_n=1 d_s=0.000
+rep=4 p_n=302 p_s=1.199 d_n=1 d_s=0.000
+rep=5 p_n=302 p_s=1.184 d_n=1 d_s=0.000
+
+## qwen3_8b / tg128
+rep=1 p_n=1 p_s=0.128 d_n=128 d_s=4.969
+rep=2 p_n=1 p_s=0.129 d_n=128 d_s=4.983
+rep=3 p_n=1 p_s=0.125 d_n=128 d_s=5.028
+rep=4 p_n=1 p_s=0.130 d_n=128 d_s=5.137
+rep=5 p_n=1 p_s=0.138 d_n=128 d_s=4.913
+
+## llama31_8b / pp512
+rep=1 p_n=295 p_s=1.162 d_n=1 d_s=0.000
+rep=2 p_n=295 p_s=1.178 d_n=1 d_s=0.000
+rep=3 p_n=295 p_s=1.173 d_n=1 d_s=0.000
+rep=4 p_n=295 p_s=1.177 d_n=1 d_s=0.000
+rep=5 p_n=295 p_s=1.172 d_n=1 d_s=0.000
+
+## llama31_8b / tg128
+rep=1 p_n=2 p_s=0.206 d_n=128 d_s=4.958
+rep=2 p_n=2 p_s=0.200 d_n=128 d_s=4.810
+rep=3 p_n=2 p_s=0.214 d_n=128 d_s=4.775
+rep=4 p_n=2 p_s=0.213 d_n=128 d_s=4.828
+rep=5 p_n=2 p_s=0.211 d_n=128 d_s=4.812
+
+## qwen3_30b_a3b / pp512
+rep=1 p_n= p_s= d_n= d_s=
+rep=2 p_n= p_s= d_n= d_s=
+rep=3 p_n= p_s= d_n= d_s=
+rep=4 p_n= p_s= d_n= d_s=
+rep=5 p_n= p_s= d_n= d_s=
+
+## qwen3_30b_a3b / tg128
+rep=1 p_n= p_s= d_n= d_s=
+rep=2 p_n= p_s= d_n= d_s=
+rep=3 p_n= p_s= d_n= d_s=
+rep=4 p_n= p_s= d_n= d_s=
+rep=5 p_n= p_s= d_n= d_s=
+
+ALL DONE

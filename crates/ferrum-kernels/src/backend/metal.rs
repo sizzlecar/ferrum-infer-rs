@@ -24,6 +24,7 @@
 use super::{AttnConfig, Backend, SrcDtype};
 use ferrum_attention::metal::pipelines::MetalPipelines;
 use ferrum_attention::AttentionParams;
+use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use metal::{Device, MTLResourceOptions};
 use std::ffi::c_void;
@@ -124,6 +125,14 @@ unsafe impl Sync for MetalBuf {}
 /// drops the handle so the next call creates a fresh buffer.
 pub struct MetalContext {
     cmd: Option<&'static metal::CommandBufferRef>,
+    /// Sticky compute encoder. Held open across multiple `Backend`
+    /// method calls so consecutive compute dispatches share one encoder
+    /// — Metal serializes dispatches within a single encoder and prior
+    /// dispatch's device-memory writes are visible to the next
+    /// dispatch's reads, so this is correct for the model's dataflow.
+    /// Closing happens on `sync`, on `compute_encoder_end` (e.g. before
+    /// a blit encoder), or naturally on context drop.
+    encoder: Option<&'static metal::ComputeCommandEncoderRef>,
 }
 
 impl MetalContext {
@@ -144,12 +153,51 @@ impl MetalContext {
         }
     }
 
+    /// Return a compute command encoder, opening one on the current cmd
+    /// buffer if there isn't already one. Subsequent calls during the
+    /// same window return the same encoder — set the pipeline state
+    /// before each dispatch.
+    fn compute_encoder(&mut self) -> &'static metal::ComputeCommandEncoderRef {
+        if let Some(enc) = self.encoder {
+            return enc;
+        }
+        let cmd = self.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        let enc_static: &'static metal::ComputeCommandEncoderRef =
+            unsafe { std::mem::transmute::<&metal::ComputeCommandEncoderRef, _>(enc) };
+        self.encoder = Some(enc_static);
+        enc_static
+    }
+
+    /// Close the active compute encoder if one is open. Caller must do
+    /// this before switching to a blit encoder, before commit, or before
+    /// recording into a different cmd buffer.
+    fn compute_encoder_end(&mut self) {
+        if let Some(enc) = self.encoder.take() {
+            enc.end_encoding();
+        }
+    }
+
     fn flush(&mut self) {
+        self.compute_encoder_end();
         if let Some(cmd) = self.cmd.take() {
             cmd.commit();
             cmd.wait_until_completed();
         }
     }
+}
+
+// ── Profiling counters for `gemm_quant` (off by default) ─────────────
+
+static QUANT_GEMM_TIME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUANT_GEMM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUANT_GEMM_LAST_M: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUANT_GEMM_LAST_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUANT_GEMM_LAST_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn debug_per_call_flush() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("FERRUM_METAL_QUANT_PROFILE").is_ok())
 }
 
 // ── Policy: should big weights land as f16? ───────────────────────────
@@ -207,16 +255,490 @@ fn buffer_f16_from_f32(data: &[f32]) -> metal::Buffer {
 
 pub struct MetalBackend;
 
+/// Metal-side container for any GGUF k-quant flavour. Each variant
+/// keeps its raw on-disk block bytes in MTLBuffer and dequants on
+/// demand inside `gemm_quant` (per-call transient fp16 buffer).
+///
+/// Persistent footprint stays at the on-disk Q4 size (~5 GB for an 8B
+/// Q4_K_M) instead of inflating to fp16 (~16 GB) or fp32 (~32 GB).
+/// New k-quant types add new variants (and matched dequant kernel +
+/// `gemm_quant` arm) without touching the trait surface.
+pub enum MetalQuantStore {
+    Q4K {
+        blocks: metal::Buffer, // [n_blocks * 144] bytes
+        n_rows: usize,
+        n_cols: usize,
+        n_blocks: usize,
+    },
+    Q6K {
+        blocks: metal::Buffer, // [n_blocks * 210] bytes
+        n_rows: usize,
+        n_cols: usize,
+        n_blocks: usize,
+    },
+    /// Row-concatenation of multiple parts that may have different
+    /// quant types. Each part is a leaf (Q4K / Q6K) with the same
+    /// `n_cols`. Used for `qkv_proj` on Qwen3 Q4_K_M, where q & k
+    /// are Q4_K but v is Q6_K — bytes can't be concatenated, so we
+    /// keep them separate and dispatch one gemv per part with output
+    /// offsets.
+    Fused {
+        parts: Vec<MetalQuantStore>,
+        total_rows: usize,
+        n_cols: usize,
+    },
+}
+
+impl MetalQuantStore {
+    fn n_rows(&self) -> usize {
+        match self {
+            MetalQuantStore::Q4K { n_rows, .. } | MetalQuantStore::Q6K { n_rows, .. } => *n_rows,
+            MetalQuantStore::Fused { total_rows, .. } => *total_rows,
+        }
+    }
+}
+
+// SAFETY: metal::Buffer wraps an Objective-C handle. metal-rs marks it
+// Send+Sync via internal unsafe impls; we just propagate that.
+unsafe impl Send for MetalQuantStore {}
+unsafe impl Sync for MetalQuantStore {}
+
+/// Dispatch a single mul_mm for one Q4K / Q6K leaf part with output
+/// column offset + row stride. Used by the Fused m>1 path.
+fn dispatch_part_gemm(
+    enc: &metal::ComputeCommandEncoderRef,
+    a_buf: &metal::Buffer,
+    part: &MetalQuantStore,
+    out_buf: &metal::Buffer,
+    c_offset_cols: usize,
+    m: usize,
+    part_rows: usize,
+    stride_c: usize,
+    n_cols: usize,
+) -> Result<()> {
+    if part_rows % 4 != 0 {
+        return Err(FerrumError::model(format!(
+            "gemm_quant Fused: part rows {part_rows} not divisible by 4"
+        )));
+    }
+    match part {
+        MetalQuantStore::Q4K { blocks, .. } => {
+            crate::q4_k_gemm::dispatch_gemm_q4k_part(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                blocks,
+                out_buf,
+                c_offset_cols,
+                m,
+                part_rows,
+                stride_c,
+                n_cols,
+            );
+        }
+        MetalQuantStore::Q6K { blocks, .. } => {
+            crate::q6_k_gemm::dispatch_gemm_q6k_part(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                blocks,
+                out_buf,
+                c_offset_cols,
+                m,
+                part_rows,
+                stride_c,
+                n_cols,
+            );
+        }
+        MetalQuantStore::Fused { .. } => {
+            return Err(FerrumError::model(
+                "gemm_quant Fused: nested Fused parts not supported".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch a single fused gemv for one Q4K / Q6K leaf part with
+/// activation and output byte offsets. Used by the Fused m=1 path.
+fn dispatch_part_gemv_offset(
+    enc: &metal::ComputeCommandEncoderRef,
+    a_buf: &metal::Buffer,
+    a_offset_bytes: u64,
+    part: &MetalQuantStore,
+    out_buf: &metal::Buffer,
+    c_offset_bytes: u64,
+    n_cols: usize,
+) -> Result<()> {
+    match part {
+        MetalQuantStore::Q4K { blocks, n_rows, .. } => {
+            if *n_rows % 4 != 0 {
+                crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    out_buf,
+                    *n_rows,
+                    n_cols,
+                );
+                if a_offset_bytes != 0 || c_offset_bytes != 0 {
+                    return Err(FerrumError::model(
+                        "gemm_quant Fused: q4k v1 path doesn't support offsets yet".to_string(),
+                    ));
+                }
+                return Ok(());
+            }
+            crate::q4_k_gemv_v2::dispatch_gemv_q4k_v2_offset(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                a_offset_bytes,
+                blocks,
+                out_buf,
+                c_offset_bytes,
+                *n_rows,
+                n_cols,
+            );
+        }
+        MetalQuantStore::Q6K { blocks, n_rows, .. } => {
+            if *n_rows % 4 != 0 {
+                return Err(FerrumError::model(format!(
+                    "gemm_quant Fused: Q6K part n_rows={n_rows} not divisible by 4"
+                )));
+            }
+            crate::q6_k_gemv::dispatch_gemv_q6k_v2_offset(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                a_offset_bytes,
+                blocks,
+                out_buf,
+                c_offset_bytes,
+                *n_rows,
+                n_cols,
+            );
+        }
+        MetalQuantStore::Fused { .. } => {
+            return Err(FerrumError::model(
+                "gemm_quant Fused: nested Fused parts not supported".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Backend for MetalBackend {
     type Buffer = MetalBuf;
     type Context = MetalContext;
     type GptqStore = (); // Metal GPTQ not yet wired; load_gptq/gemm_gptq return unsupported.
+    type QuantStore = MetalQuantStore;
 
     fn new_context() -> Self::Context {
-        MetalContext { cmd: None }
+        MetalContext {
+            cmd: None,
+            encoder: None,
+        }
     }
     fn sync(ctx: &mut Self::Context) {
         ctx.flush();
+    }
+
+    // ── Q4_K_M ────────────────────────────────────────────────────────
+
+    fn load_quant(
+        kind: super::GgufQuantType,
+        bytes: &[u8],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        use super::GgufQuantType;
+        const QK_K: usize = 256;
+        match kind {
+            GgufQuantType::Q4K => {
+                const BLOCK_BYTES: usize = 144;
+                let total_elems = n_rows * n_cols;
+                if total_elems % QK_K != 0 {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q4K: elements {total_elems} not multiple of {QK_K}"
+                    )));
+                }
+                let n_blocks = total_elems / QK_K;
+                let expected = n_blocks * BLOCK_BYTES;
+                if bytes.len() != expected {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q4K: bytes {} != expected {} ({n_blocks} blocks)",
+                        bytes.len(),
+                        expected
+                    )));
+                }
+                let blocks = st().pipes.device.new_buffer_with_data(
+                    bytes.as_ptr() as *const c_void,
+                    bytes.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                Ok(MetalQuantStore::Q4K {
+                    blocks,
+                    n_rows,
+                    n_cols,
+                    n_blocks,
+                })
+            }
+            GgufQuantType::Q6K => {
+                const BLOCK_BYTES: usize = crate::q6_k_gemv::Q6_K_BLOCK_BYTES; // 210
+                let total_elems = n_rows * n_cols;
+                if total_elems % QK_K != 0 {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q6K: elements {total_elems} not multiple of {QK_K}"
+                    )));
+                }
+                let n_blocks = total_elems / QK_K;
+                let expected = n_blocks * BLOCK_BYTES;
+                if bytes.len() != expected {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q6K: bytes {} != expected {} ({n_blocks} blocks)",
+                        bytes.len(),
+                        expected
+                    )));
+                }
+                let blocks = st().pipes.device.new_buffer_with_data(
+                    bytes.as_ptr() as *const c_void,
+                    bytes.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                Ok(MetalQuantStore::Q6K {
+                    blocks,
+                    n_rows,
+                    n_cols,
+                    n_blocks,
+                })
+            }
+            other => Err(FerrumError::unsupported(format!(
+                "Metal load_quant: {other:?} not yet implemented"
+            ))),
+        }
+    }
+
+    fn load_quant_fused(
+        parts: &[(super::GgufQuantType, &[u8], usize)],
+        n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        let mut sub_stores: Vec<MetalQuantStore> = Vec::with_capacity(parts.len());
+        let mut total_rows = 0;
+        for (kind, bytes, n_rows) in parts {
+            let store = Self::load_quant(*kind, bytes, *n_rows, n_cols)?;
+            // Only leaf (Q4K / Q6K) parts are valid; nested Fused isn't.
+            if matches!(store, MetalQuantStore::Fused { .. }) {
+                return Err(FerrumError::model(
+                    "Metal load_quant_fused: nested Fused not supported".to_string(),
+                ));
+            }
+            total_rows += n_rows;
+            sub_stores.push(store);
+        }
+        Ok(MetalQuantStore::Fused {
+            parts: sub_stores,
+            total_rows,
+            n_cols,
+        })
+    }
+
+    fn gemm_quant(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        // Fused path: row-concatenation of mixed-quant parts (used for
+        // Qwen3 qkv_proj where q+k are Q4_K but v is Q6_K). For m=1
+        // dispatch each part with the right output offset; for m>1
+        // currently bail (prefill of mixed-fused matmuls is rare and
+        // would need a strided per-row inner loop).
+        if let MetalQuantStore::Fused {
+            parts,
+            total_rows,
+            n_cols,
+        } = weight
+        {
+            if m != 1 {
+                // **Fused mul_mm path** for prefill. Each part dispatches
+                // one mul_mm into a [m, part_rows] slice of the
+                // [m, total_rows] fused output via the strided variant
+                // (kernel uses `strideC = total_rows`, write width = part_rows,
+                // dst pre-offset to part column). Replaces the previous
+                // m × per-part gemv loop which scaled linearly with prompt
+                // length and was the dominant remaining prefill bottleneck
+                // on Qwen3 (mixed Q4+Q6 qkv).
+                let a_buf = a.expect_f32("gemm_quant a (fused)");
+                let out_buf = out.expect_f32_mut("gemm_quant out (fused)");
+                let enc = ctx.compute_encoder();
+                let mut col_off = 0usize;
+                for part in parts {
+                    let part_rows = part.n_rows();
+                    dispatch_part_gemm(
+                        enc,
+                        a_buf,
+                        part,
+                        out_buf,
+                        col_off,
+                        m,
+                        part_rows,
+                        *total_rows,
+                        *n_cols,
+                    )?;
+                    col_off += part_rows;
+                }
+                return Ok(());
+            }
+            // m == 1 — single output row of length total_rows.
+            let a_buf = a.expect_f32("gemm_quant a (fused m=1)");
+            let out_buf = out.expect_f32_mut("gemm_quant out (fused m=1)");
+            let enc = ctx.compute_encoder();
+            let mut row_off_elems = 0usize;
+            for part in parts {
+                let part_rows = part.n_rows();
+                let c_off = (row_off_elems * 4) as u64;
+                dispatch_part_gemv_offset(enc, a_buf, 0, part, out_buf, c_off, *n_cols)?;
+                row_off_elems += part_rows;
+            }
+            return Ok(());
+        }
+
+        // Borrow checker: `cmd` / `compute_encoder` need `&mut ctx` while
+        // we hold a borrow into `weight` for `blocks`. Snapshot the
+        // primitive fields out of `weight` first; `blocks` is a `Buffer`
+        // ref that is independent of ctx.
+        let (blocks, n_rows, n_cols, n_blocks, is_q6k) = match weight {
+            MetalQuantStore::Q4K {
+                blocks,
+                n_rows,
+                n_cols,
+                n_blocks,
+            } => (blocks, *n_rows, *n_cols, *n_blocks, false),
+            MetalQuantStore::Q6K {
+                blocks,
+                n_rows,
+                n_cols,
+                n_blocks,
+            } => (blocks, *n_rows, *n_cols, *n_blocks, true),
+            MetalQuantStore::Fused { .. } => unreachable!("handled above"),
+        };
+
+        let _t0 = if debug_per_call_flush() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let a_buf = a.expect_f32("gemm_quant a");
+        let out_buf = out.expect_f32_mut("gemm_quant out");
+
+        if m == 1 {
+            // **Fused path** for decode (m=1): one kernel reads the
+            // Q4_K / Q6_K super-blocks, decodes them inline, and reduces
+            // against `A`. No transient fp16 buffer materialised.
+            //
+            // All variants use N_R0=2, N_SG=2 layout from llama.cpp:
+            // 64 threads/threadgroup, 4 output rows/threadgroup. Requires
+            // N divisible by 4. Q6_K has no v1 fallback yet — Qwen3 /
+            // Llama always satisfy the constraint, so we just panic if
+            // not.
+            let enc = ctx.compute_encoder();
+            if is_q6k {
+                if n_rows % 4 != 0 {
+                    return Err(FerrumError::model(format!(
+                        "gemm_quant Q6K: n_rows={n_rows} not divisible by 4"
+                    )));
+                }
+                crate::q6_k_gemv::dispatch_gemv_q6k_v2_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    out_buf,
+                    n_rows,
+                    n_cols,
+                );
+            } else if n_rows % 4 == 0 {
+                crate::q4_k_gemv_v2::dispatch_gemv_q4k_v2_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    out_buf,
+                    n_rows,
+                    n_cols,
+                );
+            } else {
+                crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    out_buf,
+                    n_rows,
+                    n_cols,
+                );
+            }
+        } else if is_q6k {
+            // **Q6_K m>1 fused mul_mm path** — ported from llama.cpp's
+            // `kernel_mul_mm_q6_K_f32`. Same 64×32 simdgroup-matmul
+            // tile + inline dequant as the Q4_K version. Replaces the
+            // prior per-row gemv loop which scaled linearly with m
+            // and was the dominant prefill bottleneck on Q4_K_M models
+            // where down_proj / lm_head live as Q6_K.
+            let enc = ctx.compute_encoder();
+            crate::q6_k_gemm::dispatch_gemm_q6k_on_encoder(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                blocks,
+                out_buf,
+                m,
+                n_rows,
+                n_cols,
+            );
+        } else {
+            // **Fused mul_mm path** for prefill (m > 1) Q4_K — ported
+            // from llama.cpp's `kernel_mul_mm_q4_K_f32`. Inlines Q4_K
+            // dequant into the threadgroup-memory load and uses
+            // `simdgroup_half8x8` matmul, eliminating both the fp16
+            // transient buffer (~2× memory traffic) and the scalar
+            // gemm_v2_f16w inner loop.
+            let enc = ctx.compute_encoder();
+            crate::q4_k_gemm::dispatch_gemm_q4k_on_encoder(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                blocks,
+                out_buf,
+                m,
+                n_rows,
+                n_cols,
+            );
+            let _ = n_blocks; // not consumed by mul_mm path; kept for the load-time block accounting
+        }
+
+        // Optional per-call timing: commit + wait the cmd buffer right
+        // here so we measure the GPU work for *this* matmul. Off by
+        // default (would serialize the whole pipeline).
+        if let Some(t0) = _t0 {
+            ctx.flush();
+            let elapsed_us = t0.elapsed().as_micros();
+            QUANT_GEMM_TIME_US.fetch_add(elapsed_us as u64, std::sync::atomic::Ordering::Relaxed);
+            QUANT_GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            QUANT_GEMM_LAST_M.store(m as u64, std::sync::atomic::Ordering::Relaxed);
+            QUANT_GEMM_LAST_N.store(n_rows as u64, std::sync::atomic::Ordering::Relaxed);
+            QUANT_GEMM_LAST_K.store(n_cols as u64, std::sync::atomic::Ordering::Relaxed);
+            if QUANT_GEMM_CALLS.load(std::sync::atomic::Ordering::Relaxed) <= 16 {
+                eprintln!(
+                    "[gemm_quant] m={} n={} k={} took {} us",
+                    m, n_rows, n_cols, elapsed_us
+                );
+            }
+        }
+        Ok(())
     }
 
     // ── GEMM — dispatches on B-weight dtype ──────────────────────────
@@ -232,8 +754,7 @@ impl Backend for MetalBackend {
     ) {
         let a_buf = a.expect_f32("gemm a");
         let out_buf = out.expect_f32_mut("gemm out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         match b.dtype {
             Dtype::F16 => {
                 // f16 weights — route through the f32-activation / f16-weight kernels.
@@ -256,7 +777,6 @@ impl Backend for MetalBackend {
                 }
             }
         }
-        enc.end_encoding();
     }
 
     // ── Norm / attention / fused ops — all f32 ───────────────────────
@@ -273,10 +793,8 @@ impl Backend for MetalBackend {
         let x = x.expect_f32("rms_norm x");
         let w = w.expect_f32("rms_norm w");
         let out = out.expect_f32_mut("rms_norm out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.rms_norm_enc(enc, x, w, out, tokens, dim, eps);
-        enc.end_encoding();
     }
 
     fn fused_add_rms_norm(
@@ -293,12 +811,10 @@ impl Backend for MetalBackend {
         let x = x.expect_f32("fused_add_rms_norm x");
         let w = w.expect_f32("fused_add_rms_norm w");
         let out = out.expect_f32_mut("fused_add_rms_norm out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.fused_residual_norm_enc(
             enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
         );
-        enc.end_encoding();
     }
 
     fn flash_attention(
@@ -328,6 +844,10 @@ impl Backend for MetalBackend {
         let k = k.expect_f32("flash_attention k");
         let v = v.expect_f32("flash_attention v");
         let out = out.expect_f32_mut("flash_attention out");
+        // flash_attn_v2 opens its own compute encoder internally; close
+        // the sticky one first so we don't have two open at once on the
+        // same cmd buffer.
+        ctx.compute_encoder_end();
         let cmd = ctx.cmd();
         st().pipes
             .flash_attn_v2(cmd, q, k, v, out, &p, cfg.kv_seq_stride);
@@ -343,8 +863,11 @@ impl Backend for MetalBackend {
     ) {
         // Blit encoder stays in the same command buffer as neighbouring
         // compute encoders, keeping the single-command-buffer invariant.
+        // Close the sticky compute encoder first — Metal forbids two
+        // active encoders on one cmd buffer.
         let src = src.expect_f32("copy_slice src");
         let dst = dst.expect_f32_mut("copy_slice dst");
+        ctx.compute_encoder_end();
         let cmd = ctx.cmd();
         let blit = cmd.new_blit_command_encoder();
         blit.copy_from_buffer(
@@ -411,11 +934,9 @@ impl Backend for MetalBackend {
         let q = q.expect_f32_mut("split_qkv q");
         let k = k.expect_f32_mut("split_qkv k");
         let v = v.expect_f32_mut("split_qkv v");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes
             .split_qkv_enc(enc, qkv, q, k, v, tokens, q_dim, kv_dim);
-        enc.end_encoding();
     }
 
     fn fused_silu_mul_split(
@@ -427,10 +948,8 @@ impl Backend for MetalBackend {
     ) {
         let gu = gu.expect_f32("fused_silu_mul_split gate_up");
         let out = out.expect_f32_mut("fused_silu_mul_split out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.silu_mul_split_enc(enc, gu, out, tokens, im);
-        enc.end_encoding();
     }
 
     fn qk_norm_rope(
@@ -452,12 +971,10 @@ impl Backend for MetalBackend {
         let cos = cos.expect_f32("qk_norm_rope cos");
         let sin = sin.expect_f32("qk_norm_rope sin");
         let output = output.expect_f32_mut("qk_norm_rope output");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.qk_norm_rope(
             enc, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps, mode,
         );
-        enc.end_encoding();
     }
 
     fn kv_cache_append_head_major(
@@ -477,8 +994,7 @@ impl Backend for MetalBackend {
         let cache_v = cache_v.expect_f32_mut("kv_cache_append cache_v");
         let new_k_head_major = new_k_head_major.expect_f32("kv_cache_append new_k");
         let new_v_head_major = new_v_head_major.expect_f32("kv_cache_append new_v");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.kv_cache_append(
             enc,
             new_k_head_major,
@@ -499,7 +1015,6 @@ impl Backend for MetalBackend {
             new_tokens,
             cache_capacity,
         );
-        enc.end_encoding();
     }
 
     fn transpose_head_to_token(
@@ -512,10 +1027,8 @@ impl Backend for MetalBackend {
     ) {
         let src = src.expect_f32("transpose_head_to_token src");
         let dst = dst.expect_f32_mut("transpose_head_to_token dst");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.transpose_out(enc, src, dst, tokens, heads, dim);
-        enc.end_encoding();
     }
 
     fn add_bias(
@@ -527,10 +1040,8 @@ impl Backend for MetalBackend {
     ) {
         let data = data.expect_f32_mut("add_bias data");
         let bias = bias.expect_f32("add_bias bias");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.add_bias_enc(enc, data, bias, rows, cols);
-        enc.end_encoding();
     }
 
     fn layer_norm(
@@ -547,29 +1058,23 @@ impl Backend for MetalBackend {
         let gamma = gamma.expect_f32("layer_norm gamma");
         let beta = beta.expect_f32("layer_norm beta");
         let out = out.expect_f32_mut("layer_norm out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes
             .layer_norm_enc(enc, x, gamma, beta, out, tokens, dim, eps);
-        enc.end_encoding();
     }
 
     fn gelu(ctx: &mut Self::Context, x: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
         let x = x.expect_f32("gelu x");
         let out = out.expect_f32_mut("gelu out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.gelu_enc(enc, x, out, len);
-        enc.end_encoding();
     }
 
     fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
         let r = r.expect_f32_mut("add_inplace r");
         let x = x.expect_f32("add_inplace x");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.add_enc(enc, r, x, r, len);
-        enc.end_encoding();
     }
 
     // ── Buffer management ────────────────────────────────────────────
