@@ -21,8 +21,7 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use metal::{
-    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLResourceOptions,
-    MTLSize,
+    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
 };
 
 const SHADER_SRC: &str = include_str!("q4_k_gemv.metal");
@@ -73,18 +72,20 @@ pub fn dispatch_gemv_q4k_on_encoder(
         n: n as i32,
         k: k as i32,
     };
-    let params_buf = device.new_buffer_with_data(
-        &params as *const _ as *const c_void,
-        std::mem::size_of::<P>() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
 
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(a), 0);
     enc.set_buffer(1, Some(w), 0);
     enc.set_buffer(2, Some(c), 0);
-    enc.set_buffer(3, Some(&params_buf), 0);
+    // setBytes inlines small (<=4KB) params into the encoder argument
+    // table — no MTLBuffer allocation per call. With 145 quant matmuls
+    // per token, this is real money on Apple Silicon (alloc takes ~ms).
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<P>() as u64,
+        &params as *const _ as *const c_void,
+    );
 
     // 1 threadgroup per output column, exactly 1 SIMD group (32 threads)
     // per threadgroup — the kernel stripes `tiitg` ∈ [0, 32) over K with

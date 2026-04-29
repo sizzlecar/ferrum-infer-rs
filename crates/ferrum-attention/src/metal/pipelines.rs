@@ -202,16 +202,11 @@ impl MetalPipelines {
             dim: dim as i32,
             eps,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("rms_norm_f32"));
         enc.set_buffer(0, Some(input), 0);
         enc.set_buffer(1, Some(weight), 0);
         enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 8, &params as *const _ as *const c_void as *const _);
         enc.set_threadgroup_memory_length(0, 128);
         let grid = MTLSize::new(rows as u64, 1, 1);
         let tg = MTLSize::new(32, 1, 1);
@@ -232,16 +227,11 @@ impl MetalPipelines {
             n: i32,
         }
         let params = P { n: n as i32 };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            4,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("silu_mul_f32"));
         enc.set_buffer(0, Some(gate), 0);
         enc.set_buffer(1, Some(up), 0);
         enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 4, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -261,16 +251,11 @@ impl MetalPipelines {
             n: i32,
         }
         let params = P { n: n as i32 };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            4,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("add_f32"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
         enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 4, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -296,18 +281,13 @@ impl MetalPipelines {
             dim: dim as i32,
             eps,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
 
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(self.pipeline("rms_norm_f32"));
         enc.set_buffer(0, Some(input), 0);
         enc.set_buffer(1, Some(weight), 0);
         enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 8, &params as *const _ as *const c_void as *const _);
         // Shared memory for cross-simdgroup reduction
         enc.set_threadgroup_memory_length(0, 128); // 32 floats
         let grid = MTLSize::new(rows as u64, 1, 1);
@@ -330,18 +310,13 @@ impl MetalPipelines {
             n: i32,
         }
         let params = P { n: n as i32 };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            4,
-            MTLResourceOptions::StorageModeShared,
-        );
 
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(self.pipeline("silu_mul_f32"));
         enc.set_buffer(0, Some(gate), 0);
         enc.set_buffer(1, Some(up), 0);
         enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 4, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -355,18 +330,13 @@ impl MetalPipelines {
             n: i32,
         }
         let params = P { n: n as i32 };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            4,
-            MTLResourceOptions::StorageModeShared,
-        );
 
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(self.pipeline("add_f32"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
         enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 4, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -397,16 +367,11 @@ impl MetalPipelines {
             n: n as i32,
             k: k as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            12,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("gemv_f32"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
         enc.set_buffer(2, Some(c), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 12, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n as u64, 1, 1);
         let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -434,16 +399,11 @@ impl MetalPipelines {
             n: n as i32,
             k: k as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            12,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("gemm_f32_v2"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
         enc.set_buffer(2, Some(c), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 12, &params as *const _ as *const c_void as *const _);
         enc.set_threadgroup_memory_length(0, 12288);
         let grid = MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1);
         let tg = MTLSize::new(128, 1, 1);
@@ -473,16 +433,11 @@ impl MetalPipelines {
             n: n as i32,
             k: k as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            12,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("gemm_f32a_f16w_v2"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b_f16), 0);
         enc.set_buffer(2, Some(c), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 12, &params as *const _ as *const c_void as *const _);
         enc.set_threadgroup_memory_length(0, 12288);
         let grid = MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1);
         let tg = MTLSize::new(128, 1, 1);
@@ -511,16 +466,11 @@ impl MetalPipelines {
             n: n as i32,
             k: k as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            12,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("gemv_f32a_f16w"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b_f16), 0);
         enc.set_buffer(2, Some(c), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 12, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n as u64, 1, 1);
         let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -563,18 +513,13 @@ impl MetalPipelines {
             eps,
             apply_norm: norm_mode,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            std::mem::size_of::<P>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("qk_norm_rope_transpose_f32"));
         enc.set_buffer(0, Some(input), 0);
         enc.set_buffer(1, Some(weight), 0);
         enc.set_buffer(2, Some(cos), 0);
         enc.set_buffer(3, Some(sin), 0);
         enc.set_buffer(4, Some(output), 0);
-        enc.set_buffer(5, Some(&params_buf), 0);
+        enc.set_bytes(5, std::mem::size_of::<P>() as u64, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(tokens as u64, heads as u64, 1);
         let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -601,15 +546,10 @@ impl MetalPipelines {
             heads: heads as i32,
             head_dim: head_dim as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            12,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("transpose_out_f32"));
         enc.set_buffer(0, Some(input), 0);
         enc.set_buffer(1, Some(output), 0);
-        enc.set_buffer(2, Some(&params_buf), 0);
+        enc.set_bytes(2, 12, &params as *const _ as *const c_void as *const _);
         let n = tokens * heads * head_dim;
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
@@ -643,15 +583,10 @@ impl MetalPipelines {
             new_len: new_len as i32,
             max_len: max_len as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            20,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("kv_cache_append_f32"));
         enc.set_buffer(0, Some(new_data), 0);
         enc.set_buffer(1, Some(cache), 0);
-        enc.set_buffer(2, Some(&params_buf), 0);
+        enc.set_bytes(2, 20, &params as *const _ as *const c_void as *const _);
         let n = heads * new_len * head_dim;
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
@@ -675,14 +610,9 @@ impl MetalPipelines {
             rows: rows as i32,
             cols: cols as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("softmax_last_dim_f32"));
         enc.set_buffer(0, Some(data), 0);
-        enc.set_buffer(1, Some(&params_buf), 0);
+        enc.set_bytes(1, 8, &params as *const _ as *const c_void as *const _);
         enc.set_threadgroup_memory_length(0, 128);
         let grid = MTLSize::new(rows as u64, 1, 1);
         let tg = MTLSize::new(32, 1, 1);
@@ -708,16 +638,11 @@ impl MetalPipelines {
             n: n as i32,
             scale_len: scale_len as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("mul_scale_f32"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(scale), 0);
         enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&params_buf), 0);
+        enc.set_bytes(3, 8, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -743,17 +668,12 @@ impl MetalPipelines {
             n: n as i32,
             scale_len: scale_len as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("fused_scale_add_f32"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
         enc.set_buffer(2, Some(scale), 0);
         enc.set_buffer(3, Some(output), 0);
-        enc.set_buffer(4, Some(&params_buf), 0);
+        enc.set_bytes(4, 8, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -792,11 +712,6 @@ impl MetalPipelines {
             has_scale: if scale.is_some() { 1 } else { 0 },
             scale_len: scale_len as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &params as *const _ as *const c_void,
-            std::mem::size_of::<P>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("fused_residual_norm_f32"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
@@ -804,7 +719,7 @@ impl MetalPipelines {
         enc.set_buffer(3, Some(weight), 0);
         enc.set_buffer(4, Some(out_res), 0);
         enc.set_buffer(5, Some(out_norm), 0);
-        enc.set_buffer(6, Some(&params_buf), 0);
+        enc.set_bytes(6, std::mem::size_of::<P>() as u64, &params as *const _ as *const c_void as *const _);
         enc.set_threadgroup_memory_length(0, 128);
         let grid = MTLSize::new(tokens as u64, 1, 1);
         let tg = MTLSize::new(32, 1, 1);
@@ -849,11 +764,6 @@ impl MetalPipelines {
             kv_seq_stride: kv_seq_stride as i32,
             sliding_window: params.sliding_window as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &p as *const _ as *const c_void,
-            std::mem::size_of::<P>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
 
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(self.pipeline("flash_attn_f32"));
@@ -861,7 +771,7 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(k), 0);
         enc.set_buffer(2, Some(v), 0);
         enc.set_buffer(3, Some(o), 0);
-        enc.set_buffer(4, Some(&params_buf), 0);
+        enc.set_bytes(4, std::mem::size_of::<P>() as u64, &p as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(
             params.q_len as u64,
             params.num_heads as u64,
@@ -908,17 +818,12 @@ impl MetalPipelines {
             q_dim: q_dim as i32,
             kv_dim: kv_dim as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &p as *const _ as *const c_void,
-            12,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("split_qkv_f32"));
         enc.set_buffer(0, Some(qkv), 0);
         enc.set_buffer(1, Some(q), 0);
         enc.set_buffer(2, Some(k), 0);
         enc.set_buffer(3, Some(v), 0);
-        enc.set_buffer(4, Some(&params_buf), 0);
+        enc.set_bytes(4, 12, &p as *const _ as *const c_void as *const _);
         let total = tokens * (q_dim + 2 * kv_dim);
         let grid = MTLSize::new(total.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
@@ -946,17 +851,12 @@ impl MetalPipelines {
             dim: dim as i32,
             eps,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &p as *const _ as *const c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("layer_norm_f32"));
         enc.set_buffer(0, Some(x), 0);
         enc.set_buffer(1, Some(gamma), 0);
         enc.set_buffer(2, Some(beta), 0);
         enc.set_buffer(3, Some(out), 0);
-        enc.set_buffer(4, Some(&params_buf), 0);
+        enc.set_bytes(4, 8, &p as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(tokens as u64, 1, 1);
         let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -969,15 +869,10 @@ impl MetalPipelines {
             n: i32,
         }
         let p = P { n: len as i32 };
-        let params_buf = self.device.new_buffer_with_data(
-            &p as *const _ as *const c_void,
-            4,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("gelu_f32"));
         enc.set_buffer(0, Some(x), 0);
         enc.set_buffer(1, Some(out), 0);
-        enc.set_buffer(2, Some(&params_buf), 0);
+        enc.set_bytes(2, 4, &p as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(len.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
@@ -1001,15 +896,10 @@ impl MetalPipelines {
             rows: rows as i32,
             cols: cols as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &p as *const _ as *const c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("add_bias_f32"));
         enc.set_buffer(0, Some(data), 0);
         enc.set_buffer(1, Some(bias), 0);
-        enc.set_buffer(2, Some(&params_buf), 0);
+        enc.set_bytes(2, 8, &p as *const _ as *const c_void as *const _);
         let total = rows * cols;
         let grid = MTLSize::new(total.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
@@ -1034,15 +924,10 @@ impl MetalPipelines {
             tokens: tokens as i32,
             im: im as i32,
         };
-        let params_buf = self.device.new_buffer_with_data(
-            &p as *const _ as *const c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
         enc.set_compute_pipeline_state(self.pipeline("silu_mul_split_f32"));
         enc.set_buffer(0, Some(gate_up), 0);
         enc.set_buffer(1, Some(out), 0);
-        enc.set_buffer(2, Some(&params_buf), 0);
+        enc.set_bytes(2, 8, &p as *const _ as *const c_void as *const _);
         let total = tokens * im;
         let grid = MTLSize::new(total.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);

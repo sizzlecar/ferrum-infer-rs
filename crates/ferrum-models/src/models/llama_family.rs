@@ -991,8 +991,49 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .expect("decode_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, &[token], &mut residual, h);
 
+        // Per-layer wall-time profile (env-gated, off by default — adds
+        // a B::sync between layers which serializes the pipeline). Helps
+        // localise non-matmul bottlenecks during perf work.
+        let layer_profile = std::env::var("FERRUM_DECODE_LAYER_PROFILE").is_ok();
+        let mut layer_times = if layer_profile {
+            Some(Vec::with_capacity(self.cfg.num_layers))
+        } else {
+            None
+        };
+
         for li in 0..self.cfg.num_layers {
-            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
+            if layer_profile {
+                let t0 = std::time::Instant::now();
+                self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
+                B::sync(&mut ctx);
+                let elapsed_us = t0.elapsed().as_micros() as u64;
+                if let Some(v) = layer_times.as_mut() {
+                    v.push(elapsed_us);
+                }
+            } else {
+                self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
+            }
+        }
+        if let Some(times) = layer_times.take() {
+            let sum: u64 = times.iter().sum();
+            let avg = sum / times.len() as u64;
+            let mn = *times.iter().min().unwrap_or(&0);
+            let mx = *times.iter().max().unwrap_or(&0);
+            eprintln!(
+                "[layer-profile] {} layers total={} ms avg={} us min={} us max={} us",
+                times.len(),
+                sum / 1000,
+                avg,
+                mn,
+                mx
+            );
+            for (i, t) in times.iter().enumerate() {
+                eprint!("L{i}={}ms ", t / 1000);
+                if (i + 1) % 6 == 0 {
+                    eprintln!();
+                }
+            }
+            eprintln!();
         }
 
         B::rms_norm(
