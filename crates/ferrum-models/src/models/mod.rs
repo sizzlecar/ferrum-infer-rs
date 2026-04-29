@@ -16,5 +16,7 @@
 //!   - `qwen_vl`     — ViT backbone + LLM (multimodal).
 
 pub mod llama_family;
+pub mod qwen3_moe;
 
 pub use llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
+pub use qwen3_moe::Qwen3MoeModel;

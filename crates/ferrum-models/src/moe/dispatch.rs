@@ -21,12 +21,13 @@
 
 use std::path::Path;
 
+use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result as CandleResult};
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, GgufQuantType};
 use ferrum_kernels::Linear;
 use ferrum_quantization::gguf::GgufFile;
-use ferrum_quantization::DenseLinear;
+use ferrum_quantization::{DenseLinear, QuantLinear};
 use ferrum_types::{FerrumError, Result};
 
 use crate::moe::router::RouterOutput;
@@ -110,7 +111,23 @@ impl<B: Backend> ExpertStack<B> {
 
     /// Load all experts for one MoE layer from a GGUF file. Names follow
     /// the GGUF convention: `blk.{layer_idx}.ffn_{gate,up,down}_exps.weight`.
-    /// Tensors are dequantised on CPU (Phase 2 dispatch is CPU-only).
+    ///
+    /// The loader picks between two strategies based on the on-disk dtype
+    /// of the expert tensors:
+    ///
+    ///   - **Quantised path** (Q4_K / Q6_K only): each expert's
+    ///     `gate || up` becomes a single `QuantLinear<B>` (Fused
+    ///     QuantStore — gate + up share `n_cols = hidden`), and `down` is
+    ///     a plain `QuantLinear<B>`. Block bytes stay compressed in
+    ///     backend memory; per-call dequant happens inside `gemm_quant`.
+    ///   - **Dense fallback** (everything else, e.g. F32 / F16 / Q5_K
+    ///     until a kernel ships): eager-dequant to fp32 and wrap
+    ///     `DenseLinear<B>`. Memory inflates ~7× vs Q4_K_M but the
+    ///     algorithm is correctness-equivalent and this is the path the
+    ///     synthetic-MoE test fixtures need.
+    ///
+    /// The runtime dispatcher (`moe_forward<B>`) doesn't see which path
+    /// was taken — it just calls `Linear::forward` per (token, expert).
     pub fn load_from_gguf(
         gguf: &GgufFile,
         layer_idx: usize,
@@ -118,6 +135,23 @@ impl<B: Backend> ExpertStack<B> {
         hidden_size: usize,
         expert_intermediate: usize,
     ) -> Result<Self> {
+        if let Some(quant) = Self::try_load_quantised(
+            gguf,
+            layer_idx,
+            num_experts,
+            hidden_size,
+            expert_intermediate,
+        )? {
+            if std::env::var("FERRUM_MOE_LOAD_TRACE").is_ok() {
+                eprintln!("[moe-load] layer {layer_idx} → quantised expert path");
+            }
+            return Ok(quant);
+        }
+
+        if std::env::var("FERRUM_MOE_LOAD_TRACE").is_ok() {
+            eprintln!("[moe-load] layer {layer_idx} → eager fp32 dense fallback ⚠");
+        }
+
         let device = Device::Cpu;
         let gate = read_dequant_flat(
             gguf,
@@ -142,6 +176,122 @@ impl<B: Backend> ExpertStack<B> {
             hidden_size,
             expert_intermediate,
         )
+    }
+
+    /// Attempt the quantised path. Returns `Ok(None)` if any of the three
+    /// tensors isn't a supported k-quant flavour (Q4_K / Q6_K) or if the
+    /// shape doesn't match the expected per-expert tile size — caller
+    /// then takes the eager-dequant fallback. Returns `Err` only on a
+    /// genuine load failure (missing tensor, byte-count mismatch).
+    fn try_load_quantised(
+        gguf: &GgufFile,
+        layer_idx: usize,
+        num_experts: usize,
+        hidden_size: usize,
+        expert_intermediate: usize,
+    ) -> Result<Option<Self>> {
+        let device = Device::Cpu;
+
+        let gate_name = format!("blk.{layer_idx}.ffn_gate_exps.weight");
+        let up_name = format!("blk.{layer_idx}.ffn_up_exps.weight");
+        let down_name = format!("blk.{layer_idx}.ffn_down_exps.weight");
+
+        // Inspect tensor info up front — if any tensor isn't a k-quant
+        // flavour the backend can dispatch on, bail to the dense path
+        // before paying the byte-read cost.
+        let gate_kind = match quant_kind(gguf, &gate_name)? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let up_kind = match quant_kind(gguf, &up_name)? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let down_kind = match quant_kind(gguf, &down_name)? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        // Read the three 3-D quantised tensors. `qt.data()` exposes the
+        // raw block-byte payload — the same bytes that live on disk.
+        let gate_qt = gguf
+            .read_tensor(&gate_name, &device)
+            .map_err(candle_to_ferrum)?;
+        let up_qt = gguf
+            .read_tensor(&up_name, &device)
+            .map_err(candle_to_ferrum)?;
+        let down_qt = gguf
+            .read_tensor(&down_name, &device)
+            .map_err(candle_to_ferrum)?;
+        let gate_bytes = gate_qt.data().map_err(candle_to_ferrum)?;
+        let up_bytes = up_qt.data().map_err(candle_to_ferrum)?;
+        let down_bytes = down_qt.data().map_err(candle_to_ferrum)?;
+        let gate_bytes = gate_bytes.as_ref();
+        let up_bytes = up_bytes.as_ref();
+        let down_bytes = down_bytes.as_ref();
+
+        // Per-expert byte stride for each tensor. The 3-D layout is
+        // contiguous, [num_experts, rows, cols] row-major, so each
+        // expert's slab is exactly `total_bytes / num_experts`.
+        let gate_per = block_bytes_for(
+            gate_kind,
+            expert_intermediate * hidden_size,
+            "ffn_gate_exps",
+        )?;
+        let up_per = block_bytes_for(up_kind, expert_intermediate * hidden_size, "ffn_up_exps")?;
+        let down_per = block_bytes_for(
+            down_kind,
+            hidden_size * expert_intermediate,
+            "ffn_down_exps",
+        )?;
+
+        check_size(
+            gate_bytes.len(),
+            num_experts * gate_per,
+            "ffn_gate_exps bytes",
+        )?;
+        check_size(up_bytes.len(), num_experts * up_per, "ffn_up_exps bytes")?;
+        check_size(
+            down_bytes.len(),
+            num_experts * down_per,
+            "ffn_down_exps bytes",
+        )?;
+
+        let mut gate_up: Vec<Box<dyn Linear<B>>> = Vec::with_capacity(num_experts);
+        let mut down: Vec<Box<dyn Linear<B>>> = Vec::with_capacity(num_experts);
+
+        for e in 0..num_experts {
+            let g_slice = &gate_bytes[e * gate_per..(e + 1) * gate_per];
+            let u_slice = &up_bytes[e * up_per..(e + 1) * up_per];
+            let d_slice = &down_bytes[e * down_per..(e + 1) * down_per];
+
+            // gate || up — fused QuantStore (rows = 2*expert_inter, cols = hidden).
+            // `from_gguf_fused` requires the parts share `in_features` (cols).
+            let parts: [(GgufQuantType, &[u8], usize); 2] = [
+                (gate_kind, g_slice, expert_intermediate),
+                (up_kind, u_slice, expert_intermediate),
+            ];
+            let gate_up_e = match QuantLinear::<B>::from_gguf_fused(&parts, hidden_size) {
+                Ok(q) => q,
+                // Backend doesn't support the Fused variant — fall back
+                // entirely. The caller will retry through the dense path.
+                Err(_) => return Ok(None),
+            };
+            gate_up.push(Box::new(gate_up_e) as Box<dyn Linear<B>>);
+
+            let down_e = match QuantLinear::<B>::from_gguf_bytes(
+                down_kind,
+                d_slice,
+                hidden_size,
+                expert_intermediate,
+            ) {
+                Ok(q) => q,
+                Err(_) => return Ok(None),
+            };
+            down.push(Box::new(down_e) as Box<dyn Linear<B>>);
+        }
+
+        Ok(Some(Self { gate_up, down }))
     }
 
     /// Convenience: open a GGUF and load layer `layer_idx`. The GGUF
@@ -173,6 +323,125 @@ impl<B: Backend> ExpertStack<B> {
         );
         self.gate_up.len()
     }
+}
+
+/// Backend-generic MoE forward.
+///
+/// Equivalent of [`moe_forward_cpu`] but parameterised on `B: Backend`
+/// so Metal / CUDA paths can dispatch the same per-(token, expert) loop
+/// using their own kernels for the gemv + silu + scaled-add primitives.
+///
+/// The caller pre-supplies all scratch buffers — this function does no
+/// allocation, which matters because it's invoked from inside the
+/// transformer's `forward_layer` where allocation during graph capture
+/// (CUDA) would corrupt the captured graph.
+///
+/// Buffer contract (lengths, sized at scratch alloc time):
+///   - `x`            : `[batch * hidden]` post-RMSNorm activations
+///   - `router_logits`: `[batch * num_experts]` raw router output
+///   - `out`          : `[batch * hidden]` — caller is responsible for
+///                      zeroing this before the call (we use scaled-add
+///                      to accumulate, not assign)
+///   - `x_single`     : `[hidden]` per-token slice scratch
+///   - `gate_up_buf`  : `[2 * expert_inter]` per-(token, expert) gemv out
+///   - `silu_buf`     : `[expert_inter]`
+///   - `down_buf`     : `[hidden]` per-(token, expert) accumulate src
+///
+/// Routing (softmax + top-K + optional renorm) runs host-side using
+/// `B::to_vec(router_logits, …)` — the routing computation is small
+/// (`batch * num_experts` floats) and the top-K is a sort, both of
+/// which dwarf in cost any plausible host↔device transfer.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_forward<B: Backend>(
+    ctx: &mut B::Context,
+    x: &B::Buffer,
+    router_logits: &B::Buffer,
+    out: &mut B::Buffer,
+    batch: usize,
+    hidden_size: usize,
+    expert_intermediate: usize,
+    num_experts: usize,
+    top_k: usize,
+    norm_topk_prob: bool,
+    experts: &ExpertStack<B>,
+    x_single: &mut B::Buffer,
+    gate_up_buf: &mut B::Buffer,
+    silu_buf: &mut B::Buffer,
+    down_buf: &mut B::Buffer,
+) -> Result<()> {
+    let n_experts = experts.num_experts();
+    if n_experts != num_experts {
+        return Err(FerrumError::model(format!(
+            "moe_forward: experts.num_experts() = {n_experts} != cfg.num_experts = {num_experts}"
+        )));
+    }
+
+    // Routing on host. Sized batch*num_experts (e.g. 512*128 = 64k floats
+    // per layer for Qwen3-30B-A3B prefill); cheap relative to the per-
+    // expert gemvs that follow.
+    B::sync(ctx);
+    let logits_host = B::to_vec(router_logits, batch * num_experts);
+    let route_out =
+        crate::moe::router::route(&logits_host, batch, num_experts, top_k, norm_topk_prob);
+
+    for b in 0..batch {
+        // x[b] → x_single
+        B::copy_slice(ctx, x, b * hidden_size, x_single, 0, hidden_size);
+
+        for k in 0..top_k {
+            let pair = b * top_k + k;
+            let expert_id = route_out.expert_ids[pair] as usize;
+            let weight = route_out.expert_weights[pair];
+            if expert_id >= num_experts {
+                return Err(FerrumError::model(format!(
+                    "moe_forward: routed expert {expert_id} >= num_experts {num_experts}"
+                )));
+            }
+
+            // Fused gate||up gemv → [2 * expert_inter]
+            experts.gate_up[expert_id].forward(ctx, x_single, gate_up_buf, 1);
+
+            // SiLU(gate) * up → [expert_inter]
+            B::fused_silu_mul_split(ctx, gate_up_buf, silu_buf, 1, expert_intermediate);
+
+            // down gemv → [hidden]
+            experts.down[expert_id].forward(ctx, silu_buf, down_buf, 1);
+
+            // out[b] += weight * down_buf. Slice-targeted scaled add
+            // requires writing into a sub-range of `out`; we go through
+            // a per-token scratch and copy back.
+            //
+            // For Metal: `scaled_add_inplace` writes into the front of
+            // `out` only. To target row `b`, we copy down_buf into a
+            // properly-offset temp, but doing N copies per layer is
+            // wasteful. Instead, we exploit `copy_slice` to first pull
+            // out the existing row, scaled-add into it, then push back.
+            //
+            // Simpler: just use a per-row B::Buffer view via copy_slice
+            // semantics. Because top_k==1 is the common case for the
+            // synthetic tests and decode is m=1 anyway, we use
+            // copy_slice to extract row b → x_single (reusing it as
+            // a row accumulator), scaled_add into x_single, then
+            // copy_slice back. (`x_single` has sufficient capacity
+            // — it's sized [hidden].)
+            //
+            // Note: x_single is being aliased here as the accumulator
+            // for the duration of this pair — which is fine because we
+            // just consumed it (gate_up_buf is fully derived from
+            // x_single's earlier value).
+            B::copy_slice(ctx, out, b * hidden_size, x_single, 0, hidden_size);
+            B::scaled_add_inplace(ctx, x_single, down_buf, weight, hidden_size);
+            B::copy_slice(ctx, x_single, 0, out, b * hidden_size, hidden_size);
+
+            // Restore x_single to the original token's hidden state for
+            // the next k iteration's gate_up gemv. (Could be optimised
+            // away when top_k == 1 by skipping the second pull, but
+            // measure first.)
+            B::copy_slice(ctx, x, b * hidden_size, x_single, 0, hidden_size);
+        }
+    }
+
+    Ok(())
 }
 
 /// Run MoE forward on CPU.
@@ -278,6 +547,45 @@ fn check_size(actual: usize, expected: usize, label: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Map candle's `GgmlDType` to the kernel-side `GgufQuantType` for the
+/// dtypes a backend can dispatch on. Returns `None` for any other dtype
+/// (callers fall back to eager dequant).
+fn quant_kind(gguf: &GgufFile, name: &str) -> Result<Option<GgufQuantType>> {
+    let info = gguf.tensor_info(name).ok_or_else(|| {
+        FerrumError::model(format!("ExpertStack: tensor info missing for '{name}'"))
+    })?;
+    Ok(match info.ggml_dtype {
+        GgmlDType::Q4K => Some(GgufQuantType::Q4K),
+        GgmlDType::Q6K => Some(GgufQuantType::Q6K),
+        _ => None,
+    })
+}
+
+/// Per-expert block-byte count for a given k-quant flavour and element
+/// count. Q4_K = 144 B / 256 elems, Q6_K = 210 B / 256 elems. Errors if
+/// `n_elems` is not a multiple of the super-block size (256) — a Q-quant
+/// invariant.
+fn block_bytes_for(kind: GgufQuantType, n_elems: usize, label: &str) -> Result<usize> {
+    const QK_K: usize = 256;
+    if n_elems % QK_K != 0 {
+        return Err(FerrumError::model(format!(
+            "ExpertStack {label}: per-expert element count {n_elems} not a multiple of {QK_K}"
+        )));
+    }
+    let block_bytes = match kind {
+        GgufQuantType::Q4K => 144,
+        GgufQuantType::Q6K => 210,
+        // Other k-quants are filtered out earlier via `quant_kind`; reaching here
+        // with one would be a programming error.
+        other => {
+            return Err(FerrumError::model(format!(
+                "ExpertStack {label}: unsupported k-quant flavour {other:?}"
+            )))
+        }
+    };
+    Ok((n_elems / QK_K) * block_bytes)
 }
 
 fn read_dequant_flat(gguf: &GgufFile, name: &str, device: &Device) -> Result<Vec<f32>> {

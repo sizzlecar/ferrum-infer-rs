@@ -567,6 +567,32 @@ pub trait Backend: Send + Sync + Sized + 'static {
         len: usize,
     );
 
+    /// `dst[i] += scale * src[i]` — scalar-broadcast scaled add, in place.
+    ///
+    /// MoE per-token combine writes `out[b] += weight_k * expert_k(x[b])`
+    /// for each top-K expert; this primitive is the per-call accumulate.
+    /// Backends without a dedicated kernel can fall back to the default
+    /// implementation, which round-trips through host memory — correct,
+    /// but slow on a hot path. Override on any backend you actually
+    /// dispatch MoE on.
+    fn scaled_add_inplace(
+        _ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        src: &Self::Buffer,
+        scale: f32,
+        len: usize,
+    ) {
+        let mut dst_v = Self::to_vec(dst, len);
+        let src_v = Self::to_vec(src, len);
+        for i in 0..len {
+            dst_v[i] += scale * src_v[i];
+        }
+        // Move the new buffer into the slot pointed to by `dst`. Safe
+        // because `Self::Buffer: Send + Sync` and the old buffer is
+        // dropped here when overwritten.
+        *dst = Self::from_slice(&dst_v);
+    }
+
     /// Broadcast bias add: `data[r, c] += bias[c]` for every row.
     /// Required by Bert / Clip / Whisper whose linear projections carry a bias.
     fn add_bias(

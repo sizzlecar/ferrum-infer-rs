@@ -30,6 +30,8 @@ use rand::rngs::StdRng;
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_models::common::llm::DecoderOnlyLLM;
 use ferrum_models::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
+use ferrum_models::models::qwen3_moe::Qwen3MoeModel;
+use ferrum_models::moe_config::Qwen3MoeConfig;
 use ferrum_quantization::gguf::{GgufFile, GgufLoader};
 use ferrum_types::{FerrumError, Result};
 use tokenizers::Tokenizer;
@@ -54,15 +56,58 @@ pub async fn run_gguf_one_shot(cmd: RunCommand, _config: CliConfig) -> Result<()
     let load_start = Instant::now();
     let gguf = GgufFile::open(&gguf_path)
         .map_err(|e| FerrumError::model(format!("GgufFile::open: {e}")))?;
-    let cfg = LlamaFamilyConfig::from_gguf(&gguf)?;
-    eprintln!(
-        "{} GGUF parsed in {:.2}s — arch detected, {} layers, hidden={}, kv_heads={}",
-        "✓".green(),
-        load_start.elapsed().as_secs_f64(),
-        cfg.num_layers,
-        cfg.hidden_size,
-        cfg.num_kv_heads
-    );
+
+    // Architecture-aware config parse: dense Qwen3 / Llama goes through
+    // `LlamaFamilyConfig::from_gguf`; MoE variants (qwen3moe) need
+    // `Qwen3MoeConfig::from_gguf` since the MoE-specific keys (expert
+    // count, top-K, expert FFN width) live alongside the dense fields.
+    let arch_str = gguf
+        .architecture()
+        .map_err(|e| FerrumError::model(format!("read arch: {e}")))?
+        .to_string();
+    let is_moe = arch_str == "qwen3moe";
+
+    // Parse the right config flavour. Both end up exposing num_layers /
+    // hidden_size / kv_heads for the load-time banner.
+    let (dense_cfg, moe_cfg) = if is_moe {
+        let mc = Qwen3MoeConfig::from_gguf(&gguf)?;
+        (None, Some(mc))
+    } else {
+        let dc = LlamaFamilyConfig::from_gguf(&gguf)?;
+        (Some(dc), None)
+    };
+    let (n_layers, hidden, kv_heads) = if let Some(c) = dense_cfg.as_ref() {
+        (c.num_layers, c.hidden_size, c.num_kv_heads)
+    } else {
+        let c = moe_cfg.as_ref().unwrap();
+        (c.base.num_layers, c.base.hidden_size, c.base.num_kv_heads)
+    };
+    let cfg = dense_cfg
+        .clone()
+        .unwrap_or_else(|| moe_cfg.as_ref().unwrap().base.clone());
+
+    if let Some(c) = moe_cfg.as_ref() {
+        eprintln!(
+            "{} GGUF parsed in {:.2}s — MoE arch detected, {} layers, hidden={}, kv_heads={}, experts={}, top_k={}, expert_inter={}",
+            "✓".green(),
+            load_start.elapsed().as_secs_f64(),
+            n_layers,
+            hidden,
+            kv_heads,
+            c.num_experts,
+            c.num_experts_per_tok,
+            c.expert_intermediate_size,
+        );
+    } else {
+        eprintln!(
+            "{} GGUF parsed in {:.2}s — arch detected, {} layers, hidden={}, kv_heads={}",
+            "✓".green(),
+            load_start.elapsed().as_secs_f64(),
+            n_layers,
+            hidden,
+            kv_heads
+        );
+    }
 
     // Tokenizer (auto-discover if not provided)
     let tokenizer_path = cmd
@@ -97,37 +142,65 @@ pub async fn run_gguf_one_shot(cmd: RunCommand, _config: CliConfig) -> Result<()
 
     match backend_kind {
         BackendKind::Cpu => {
-            let loader = GgufLoader::<CpuBackend>::from_file(gguf_arc);
-            let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader)?;
-            let model_load_secs = model_load_start.elapsed().as_secs_f64();
-            eprintln!("{} model ready in {:.2}s", "✓".green(), model_load_secs);
-
-            run_inference(
-                &mut model,
-                &tokenizer,
-                &cmd,
-                &arch_label,
-                tokenizer_path,
-                &gguf_path,
-                BackendKind::Cpu,
-            )?;
+            let loader = GgufLoader::<CpuBackend>::from_file(gguf_arc.clone());
+            if let Some(mc) = moe_cfg.clone() {
+                let mut model = Qwen3MoeModel::<CpuBackend>::new(mc, &loader, &gguf_arc)?;
+                let model_load_secs = model_load_start.elapsed().as_secs_f64();
+                eprintln!("{} model ready in {:.2}s", "✓".green(), model_load_secs);
+                run_inference(
+                    &mut model,
+                    &tokenizer,
+                    &cmd,
+                    &arch_label,
+                    tokenizer_path,
+                    &gguf_path,
+                    BackendKind::Cpu,
+                )?;
+            } else {
+                let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader)?;
+                let model_load_secs = model_load_start.elapsed().as_secs_f64();
+                eprintln!("{} model ready in {:.2}s", "✓".green(), model_load_secs);
+                run_inference(
+                    &mut model,
+                    &tokenizer,
+                    &cmd,
+                    &arch_label,
+                    tokenizer_path,
+                    &gguf_path,
+                    BackendKind::Cpu,
+                )?;
+            }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         BackendKind::Metal => {
-            let loader = GgufLoader::<MetalBackend>::from_file(gguf_arc);
-            let mut model = LlamaFamilyModel::<MetalBackend>::new(cfg, &loader)?;
-            let model_load_secs = model_load_start.elapsed().as_secs_f64();
-            eprintln!("{} model ready in {:.2}s", "✓".green(), model_load_secs);
-
-            run_inference(
-                &mut model,
-                &tokenizer,
-                &cmd,
-                &arch_label,
-                tokenizer_path,
-                &gguf_path,
-                BackendKind::Metal,
-            )?;
+            let loader = GgufLoader::<MetalBackend>::from_file(gguf_arc.clone());
+            if let Some(mc) = moe_cfg.clone() {
+                let mut model = Qwen3MoeModel::<MetalBackend>::new(mc, &loader, &gguf_arc)?;
+                let model_load_secs = model_load_start.elapsed().as_secs_f64();
+                eprintln!("{} model ready in {:.2}s", "✓".green(), model_load_secs);
+                run_inference(
+                    &mut model,
+                    &tokenizer,
+                    &cmd,
+                    &arch_label,
+                    tokenizer_path,
+                    &gguf_path,
+                    BackendKind::Metal,
+                )?;
+            } else {
+                let mut model = LlamaFamilyModel::<MetalBackend>::new(cfg, &loader)?;
+                let model_load_secs = model_load_start.elapsed().as_secs_f64();
+                eprintln!("{} model ready in {:.2}s", "✓".green(), model_load_secs);
+                run_inference(
+                    &mut model,
+                    &tokenizer,
+                    &cmd,
+                    &arch_label,
+                    tokenizer_path,
+                    &gguf_path,
+                    BackendKind::Metal,
+                )?;
+            }
         }
     }
 
