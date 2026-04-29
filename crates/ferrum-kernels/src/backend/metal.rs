@@ -889,6 +889,38 @@ impl Backend for MetalBackend {
         Ok(())
     }
 
+    fn weighted_sum_residual_norm_stacked(
+        ctx: &mut Self::Context,
+        slots: &Self::Buffer,
+        weights: &Self::Buffer,
+        residual: &mut Self::Buffer,
+        next_norm_w: &Self::Buffer,
+        normed_out: &mut Self::Buffer,
+        n_slots: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let slots_buf = slots.expect_f32("weighted_sum_residual_norm_stacked slots");
+        let weights_buf = weights.expect_f32("weighted_sum_residual_norm_stacked weights");
+        let residual_buf = residual.expect_f32_mut("weighted_sum_residual_norm_stacked residual");
+        let nw_buf = next_norm_w.expect_f32("weighted_sum_residual_norm_stacked next_norm_w");
+        let normed_buf = normed_out.expect_f32_mut("weighted_sum_residual_norm_stacked normed_out");
+        let enc = ctx.compute_encoder();
+        crate::moe_post_ops::dispatch_weighted_sum_residual_norm_stacked(
+            &st().pipes.device,
+            enc,
+            slots_buf,
+            weights_buf,
+            residual_buf,
+            nw_buf,
+            normed_buf,
+            n_slots,
+            hidden,
+            eps,
+        );
+        Ok(())
+    }
+
     fn weighted_sum_batched(
         ctx: &mut Self::Context,
         slots: &Self::Buffer,

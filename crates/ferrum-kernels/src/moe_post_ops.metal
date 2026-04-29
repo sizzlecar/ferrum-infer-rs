@@ -114,3 +114,60 @@ kernel void weighted_sum_stacked_f32(
     }
     out[i] = sum;
 }
+
+// ── Fused weighted-sum-residual + RMSNorm (cross-layer tail) ─────────
+// Folds the trailing `weighted_sum_residual_stacked` of layer L AND
+// the leading `rms_norm` of layer L+1 into one Metal dispatch:
+//   residual[i] += Σ_s w[s] · slots[s, i]
+//   normed[i]   = residual[i] · (1 / sqrt(Σ residual^2 / hidden + eps))
+//                · next_norm_w[i]
+//
+// Saves one dispatch per layer transition on the decode hot path
+// (-47 dispatches / token at 48 layers). The next forward_layer call
+// must skip its own rms_norm when this path was taken (signalled by a
+// caller-side flag); the fused output IS its norm_out input.
+//
+// Threadgroup: 32 threads (1 simdgroup). One simdgroup per token row.
+// Each thread covers `hidden / 32` floats during the partial sum_sq
+// reduce and the final normed write.
+
+struct WSumResNormParams {
+    int hidden;
+    int n_slots;
+    float eps;
+};
+
+kernel void weighted_sum_residual_norm_stacked_f32(
+    device const float* slots       [[buffer(0)]],
+    device const float* weights     [[buffer(1)]],
+    device       float* residual    [[buffer(2)]],   // updated in place
+    device const float* next_norm_w [[buffer(3)]],   // [hidden]
+    device       float* normed_out  [[buffer(4)]],   // [hidden]
+    constant WSumResNormParams& p   [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const int hidden  = p.hidden;
+    const int n_slots = p.n_slots;
+
+    // Phase 1: residual += weighted_sum, accumulate Σ residual^2.
+    float local_sum_sq = 0.0f;
+    for (int i = tiisg; i < hidden; i += 32) {
+        float sum = 0.0f;
+        for (int s = 0; s < n_slots; s++) {
+            sum += weights[s] * slots[s * hidden + i];
+        }
+        const float new_val = residual[i] + sum;
+        residual[i] = new_val;
+        local_sum_sq += new_val * new_val;
+    }
+
+    // Phase 2: cross-simdgroup reduce.
+    const float total_sq = simd_sum(local_sum_sq);
+    const float scale    = 1.0f / sqrt(total_sq / float(hidden) + p.eps);
+
+    // Phase 3: write normed_out using next layer's norm weight.
+    for (int i = tiisg; i < hidden; i += 32) {
+        normed_out[i] = residual[i] * scale * next_norm_w[i];
+    }
+}
