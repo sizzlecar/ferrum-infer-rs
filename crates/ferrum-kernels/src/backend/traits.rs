@@ -356,6 +356,123 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Build a stacked-experts `QuantStore` from a contiguous 3-D weight
+    /// payload `[num_experts, n_rows, n_cols/256]` super-blocks.
+    /// Used for the MoE indirect-dispatch fast path; backends without
+    /// such a kernel return `Err(unsupported)` and the model code falls
+    /// back to the per-expert loop.
+    ///
+    /// Default: not supported. Override on backends with batched MoE
+    /// kernels (e.g. Metal `gemv_q*kw_moe_id_f32`).
+    fn load_quant_experts(
+        _kind: GgufQuantType,
+        _bytes: &[u8],
+        _num_experts: usize,
+        _n_rows: usize,
+        _n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        Err(FerrumError::unsupported(
+            "load_quant_experts not implemented for this backend",
+        ))
+    }
+
+    /// MoE indirect-dispatch GEMV: `out[i, :] = a[i, :] @ dequant(weight[ids[i], :])^T`
+    /// for each `i ∈ [0, n_selected)`. Single backend dispatch covers
+    /// all selected (token, expert) pairs.
+    ///
+    /// `weight` must be a stacked-experts variant produced by
+    /// [`Self::load_quant_experts`]. `ids` is a backend-side buffer of
+    /// `n_selected` i32 expert IDs. `out` is sized `[n_selected, n_rows]`.
+    /// `src1_stride` is the per-slot activation stride in **elements**:
+    /// `0` ⇒ every slot reads the same activation row (broadcast — for
+    /// `gate` / `up` projections); `n_cols` ⇒ each slot reads its own
+    /// activation row (for `down` projections, where each expert
+    /// consumes its own silu(gate)·up output).
+    fn gemv_quant_moe_id(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _n_selected: usize,
+        _src1_stride: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id not implemented for this backend",
+        ))
+    }
+
+    /// Allocate a backend buffer of i32-typed values for kernels that
+    /// need integer indices (MoE expert IDs, scatter indices, etc.).
+    ///
+    /// Default impl bit-casts the i32s to f32s and uploads via
+    /// `from_slice` — useful on backends where the buffer type is type-
+    /// erased (CPU's `Vec<f32>`, Metal's untyped MTLBuffer). Backends
+    /// that use a strongly-typed buffer override.
+    fn from_slice_i32(data: &[i32]) -> Self::Buffer {
+        let f: Vec<f32> = data.iter().map(|&i| f32::from_bits(i as u32)).collect();
+        Self::from_slice(&f)
+    }
+
+    /// Overwrite an existing i32 buffer's contents in place. Used on
+    /// the MoE decode hot path: per-layer expert-id updates do an
+    /// in-place memcpy instead of allocating a fresh device buffer
+    /// (48 layers × 128 tokens = 6144 fresh allocations per decode
+    /// run otherwise — allocator pressure dominates the secondary cost).
+    ///
+    /// Default impl falls back to `from_slice_i32` + drop. Backends
+    /// with shared CPU↔GPU memory (Metal `StorageModeShared`, CPU's
+    /// `Vec<f32>`) override with a direct write.
+    fn write_i32_into(buf: &mut Self::Buffer, data: &[i32]) {
+        *buf = Self::from_slice_i32(data);
+    }
+
+    /// Overwrite an existing f32 buffer's contents in place. Counterpart
+    /// to `write_i32_into` for f32 data — used to update the per-token
+    /// MoE combine weights into a pre-allocated scratch buffer instead
+    /// of allocating a fresh `from_slice` buffer 6144 times per decode
+    /// run.
+    fn write_f32_into(buf: &mut Self::Buffer, data: &[f32]) {
+        *buf = Self::from_slice(data);
+    }
+
+    /// Stacked SiLU·gate over `[n_slots, ffn]` rows.
+    ///
+    /// Computes `out[s, i] = silu(gate[s, i]) * up[s, i]` for each slot
+    /// `s`, element `i`. Single dispatch covers all slots — cuts the
+    /// MoE decode silu staging from `top_k * (3 copy_slice + 1 silu)`
+    /// = 32 dispatches per layer to 1.
+    fn silu_mul_stacked(
+        _ctx: &mut Self::Context,
+        _gate: &Self::Buffer,
+        _up: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _n_slots: usize,
+        _ffn: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "silu_mul_stacked not implemented for this backend",
+        ))
+    }
+
+    /// Weighted sum across `n_slots` rows of `[hidden]`.
+    ///
+    /// Computes `out[i] = Σ_s weights[s] * slots[s, i]`. Single
+    /// dispatch replaces the per-slot `(copy_slice + scaled_add)`
+    /// loop in the MoE decode path (16 dispatches per layer → 1).
+    fn weighted_sum_stacked(
+        _ctx: &mut Self::Context,
+        _slots: &Self::Buffer,
+        _weights: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _n_slots: usize,
+        _hidden: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "weighted_sum_stacked not implemented for this backend",
+        ))
+    }
+
     // ── GEMM ────────────────────────────────────────────────────────────
 
     fn gemm(
