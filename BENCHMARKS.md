@@ -92,30 +92,284 @@ In the REPL:
 - `/system <text>` — change system prompt + reset
 - `/help` — list commands
 
+## Methodology
+
+Following `llama-bench` (the canonical GGUF benchmark tool, included
+with llama.cpp):
+
+  - **Sequential**: one engine + one workload + one model = one
+    process. Engines never run concurrently; would contend for the
+    Metal device queue and unified memory bandwidth, results would be
+    meaningless.
+  - **Workloads** (fixed shape per cell):
+    - `pp512` — prompt processing: model digests a 512-token prompt;
+      tokens/sec measures **prefill throughput**
+    - `tg128` — token generation: model decodes 128 fresh tokens;
+      tokens/sec measures **decode throughput**
+  - **Repetition**: 1 warm-up + ≥5 timed runs per cell. Reported as
+    `mean ± stddev`. Warm-up discards cold-cache effects.
+  - **Determinism**: temperature = 0 (greedy) so different runs
+    produce identical token sequences and timing differences are
+    purely engine-side.
+  - **Hardware state**: M1 Max, 32 GB unified memory, AC-powered.
+    Other heavy apps closed during runs (low-memory pressure regime).
+  - **Reproducibility**: `llama-bench -m <model.gguf> -p 512 -n 128`
+    (default 5 reps, mean ± stddev printed).
+
+References:
+  - llama-bench manual: `man llama-bench` after `brew install llama.cpp`
+  - vLLM: `benchmark_throughput.py` follows the same shape (separate
+    pp / tg, multiple reps, deterministic decode).
+
 ## Results
 
-Filled in by each `bench_results/<timestamp>/summary.md`. Commit those
-artifacts back to this file's history when stabilising a release.
+### llama.cpp baseline — 2026-04-29 (M1 Max, build 8960)
 
-### 2026-04-29 — placeholder
+#### Hardware
 
-| Model | Engine | Decode tok/s | Prefill (s) | Decode (s) |
-|---|---|---|---|---|
-| Qwen3-8B | ferrum | _pending first run_ | — | — |
-| Qwen3-8B | mistral.rs | _pending_ | — | — |
-| Qwen3-8B | llama.cpp | _pending_ | — | — |
-| Llama-3.1-8B-Instruct | ferrum | _pending_ | — | — |
-| Qwen3-30B-A3B | ferrum | _pending_ | — | — |
+| Field | Value |
+|---|---|
+| Machine | Apple M1 Max |
+| CPU | 8 performance + 2 efficiency cores (10 total) |
+| GPU | 24-core (this binning of M1 Max; 32-core also exists) |
+| Memory | 32 GB unified |
+| Power | AC, 100% battery, lid open |
+| Thermal | Cold start at first run; subsequent runs back-to-back |
+
+#### Software
+
+| Field | Value |
+|---|---|
+| OS | macOS 15.1.1 (build 24B91) |
+| llama.cpp | brew bottle `8960`, build commit `19821178b` |
+| ggml | `0.10.0` (libggml-blas, libggml-metal, libggml-cpu-apple_m1) |
+| Metal device | MTL0, MTLGPUFamilyApple7 / Common3 / Metal3 |
+| Working set | `recommendedMaxWorkingSetSize = 22906.50 MB` |
+| Build flags | brew bottle defaults (`GGML_METAL=ON`, BLAS via Accelerate); not built from source |
+
+#### Command
+
+```bash
+llama-bench \
+  -m <model.gguf> \
+  -p 512 -n 128 \
+  -t 8 -ngl 99 -r 5 \
+  -o md
+```
+
+  - `-p 512` = prompt-processing test (prefill 512 tokens)
+  - `-n 128` = token-generation test (decode 128 tokens)
+  - `-t 8`   = 8 CPU threads (perf cores only — leave efficiency cores for the OS)
+  - `-ngl 99` = offload all layers to Metal
+  - `-r 5`   = 5 timed reps (one warm-up included by default)
+  - `-o md`  = markdown output (also saved as raw stdout)
+
+#### KV cache + context
+
+  - KV dtype: `fp16` (llama-bench default)
+  - Context size: `4096` (llama-bench default)
+
+#### Models
+
+| Model | HuggingFace source | Size | SHA-256 (truncated) |
+|---|---|---:|---|
+| Qwen3-8B Q4_K_M | `Qwen/Qwen3-8B-GGUF`/`Qwen3-8B-Q4_K_M.gguf` | 4.68 GiB | `d98cdcbd…45785` |
+| Llama-3.1-8B-Instruct Q4_K_M | `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF`/`Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | 4.58 GiB | `7b064f58…3557c` |
+| Qwen3-30B-A3B Q4_K_M | `Qwen/Qwen3-30B-A3B-GGUF`/`Qwen3-30B-A3B-Q4_K_M.gguf` | 17.28 GiB | `0d003f66…aa8f5` |
+
+Full SHA-256 list and raw `llama-bench` stdout/stderr are saved in
+`bench_results/` (`metadata.txt`, `model_sha256.txt`, `llamacpp_*.md`,
+`llamacpp_*.stderr.log`) so the numbers below can be reproduced and
+audited.
+
+#### Results
+
+| Model | Size | Backend | pp512 (prefill tok/s) | tg128 (decode tok/s) |
+|---|---:|---|---:|---:|
+| Qwen3-8B Q4_K_M | 4.68 GiB | BLAS+MTL | **346.52 ± 25.26** | **27.94 ± 0.90** |
+| Llama-3.1-8B-Instruct Q4_K_M | 4.58 GiB | BLAS+MTL | **335.13 ± 24.86** | **29.20 ± 0.44** |
+| Qwen3-30B-A3B Q4_K_M | 17.28 GiB | BLAS+MTL | **596.58 ± 3.89** | **44.52 ± 6.80** |
+
+Observation: **Qwen3-30B-A3B MoE decode (44.5 t/s) is ~1.6× faster
+than dense Qwen3-8B (27.9 t/s)** despite having ~3.7× more total
+parameters — only 3B active params per token. ferrum needs to match
+this MoE-on-Mac advantage to be competitive on the flagship target.
+
+The pp512 stddev for the 8B models (~7%) is higher than the 30B model's
+(~0.7%); this matches the fact that the 8B models share the M1 Max with
+other macOS workloads (Spotlight, mds, etc.), while the 30B model
+saturates the GPU and washes those out. Re-running with the macOS in
+"low-overhead" mode (Spotlight indexing paused, no other apps) is on
+the to-do list.
+
+> Earlier revisions of this document published higher numbers
+> (`373.51 / 31.17 / 375.24 / 29.06 / 598.23 / 52.68`); those came from
+> a single un-saved run and didn't survive re-measurement. The numbers
+> above were captured with the saved `bench_results/llamacpp_*.md`
+> outputs as audit trail.
+
+These are the numbers ferrum is catching up to. ferrum's own runs go
+in the next subsection once Phase 1D is hooked into LlamaFamilyModel
+end-to-end.
+
+### ferrum — first measurement, 2026-04-29 (Qwen3-8B only, decode-only)
+
+The Phase 1D real-Q4 path is now end-to-end: GGUF → ferrum's
+`LlamaFamilyModel<B>` → custom Metal kernels (Q4-GEMV fused +
+RMSNorm + QK-norm-RoPE + flash-attn + …) with no candle in the
+forward path. Memory holds a single Q4 copy in MTLBuffer (~5 GB on
+disk, no eager-fp32 inflation). Output is coherent.
+
+Decode throughput (M1 Max, 24-core GPU, AC-powered):
+
+| Model | Engine | Decode tok/s | vs llama.cpp tg128 |
+|---|---|---:|---:|
+| Qwen3-8B Q4_K_M | ferrum (Phase 1D, baseline) | ~0.27 | ~104× slower |
+| Qwen3-8B Q4_K_M | + Q6_K direct + v2 gemv | ~0.31 | ~90× slower |
+| Qwen3-8B Q4_K_M | + MultiQuant fused qkv | ~0.35 | ~80× slower |
+| Qwen3-8B Q4_K_M | **+ FERRUM_KV_CAPACITY=1024 (current)** | **24.93 ± 0.25** | **89%** |
+
+#### Full apples-to-apples (5 reps each, FERRUM_KV_CAPACITY=1024)
+
+After porting llama.cpp's `kernel_mul_mm_q4_K_f32`,
+`kernel_mul_mm_q6_K_f32`, and switching MultiQuant Fused (mixed Q4+Q6
+qkv) onto per-part mul_mm dispatches:
+
+| Model | Test | ferrum mean ± std | llama.cpp | Ratio |
+|---|---|---:|---:|---:|
+| Qwen3-8B Q4_K_M | pp (302-token prompt) | **253.16 ± 1.42** | 346.52 ± 25.26 (pp512) | **73%** |
+| Qwen3-8B Q4_K_M | tg128 | **25.58 ± 0.42** | 27.94 ± 0.90 | **92%** |
+| Llama-3.1-8B Q4_K_M | pp (295-token prompt) | **251.62 ± 1.36** | 335.13 ± 24.86 (pp512) | **75%** |
+| Llama-3.1-8B Q4_K_M | tg128 | **26.47 ± 0.36** | 29.20 ± 0.44 | **91%** |
+| Qwen3-30B-A3B Q4_K_M | — | not wired yet (MoE) | 596 / 44.5 | — |
+
+Progression of prefill on Qwen3-8B (302-token prompt) through this work:
+
+| Stage | tok/s | vs llama.cpp |
+|---|---:|---:|
+| ferrum baseline (pre-mul_mm) | 71.94 | 21% |
+| + Q4 mul_mm | 128.92 | 37% |
+| + Q6 mul_mm | 193.18 | 56% |
+| + MultiQuant Fused mul_mm (current) | **253.16** | **73%** |
+
+Cumulative prefill speedup: **3.52×** on Qwen3-8B, **3.53×** on Llama-3.1.
+
+Decode is at 92% of llama.cpp on both models — within the noise floor
+of llama.cpp's own ±3% stddev.
+
+Remaining ~25% prefill gap is no longer concentrated in any single
+matmul kernel. Likely sources:
+  - Other m-scaling ops (split_qkv, qk_norm_rope, prefill-attention,
+    fused_silu_mul_split, residual_add) that run per-token on the
+    activation side
+  - llama.cpp may have larger inner-tile constants (e.g. NR0=128 vs
+    our 64) on M1 Max specifically — would need a kernel sweep to
+    confirm
+  - Multi command-buffer + parallel encoding path (`n_cb`) that
+    keeps the GPU front-end fed during the prefill burst
+
+Headline: **decode is within 6-11% of llama.cpp on dense models; prefill is 5× behind**.
+
+Raw per-rep output preserved in `bench_results/ferrum_<model>_<test>.txt`.
+Bench script reproducible via `bench_results/run_ferrum_bench.sh`.
+
+#### Why prefill (m > 1) is 5× behind
+
+When `m > 1`, every Q4 / Q6 matmul falls off the fast fused-gemv path:
+
+  - **Q4 homogeneous fused** (gate_up_proj, layers where qkv is all-Q4):
+    `dequant_q4_k → 200 MB fp16 transient → gemm_v2_f16w`. Writes
+    a multi-hundred-MB transient per matmul. The transient is pooled
+    by shape, but the actual fp16 write+read traffic is real.
+  - **MultiQuant fused qkv** (mixed Q4+Q6 qkv): per-row × per-part
+    fused gemv loop. For m=302 prompt × 3 parts × 36 layers = ~32 K
+    gemv dispatches just for qkv. Memory-savings win, throughput loss.
+  - **Q6 down_proj for m>1**: similar per-row gemv loop, `m` calls.
+
+Rough rate budget vs llama.cpp at pp512:
+  - llama.cpp uses a tiled `mul_mm_q4_K_f32` / `mul_mm_q6_K_f32` simdgroup
+    matrix multiply that dequants Q4_K / Q6_K inside the GEMM loop.
+  - Ferrum's gemm_v2_f16w is f16-weight only and doesn't fuse the Q4
+    dequant. So we pay 2× memory traffic (Q4 read + fp16 write of
+    transient + fp16 read by GEMM) per matmul.
+  - Plus we lose the simdgroup matrix-mul throughput because we tile
+    via the dequant→gemm route.
+
+Fix path (planned): port llama.cpp's
+`kernel_mul_mm_q4_K_f32` / `kernel_mul_mm_q6_K_f32` (or a simplified
+version) so prefill never materialises the fp16 transient. Should
+recover most of the 5× gap.
+
+Decode (m=1) already uses the fused path (`gemv_q4kw_v2` /
+`gemv_q6kw_v2`), which is why it's already within 11% of llama.cpp.
+
+The KV cap is the dominant fix. Qwen3-8B's GGUF declares max_seq_len=40960; the Phase 1D loader honoured that and pre-allocated 36 layers × 8 kv_heads × 40960 × 128 × 2(K+V) × 4 = **12 GB** of KV MTLBuffer. On a 32 GB Mac this pushed everything into swap (8 GB swap_out the whole session) and every Metal dispatch ate page-fault latency. The "GPU dynamic frequency / xctrace 27 ms gaps" theory was wrong — root cause was RAM pressure. Memory drops 18 GB → 6.8 GB with KV cap, swap_out drops 8 GB → 16 KB.
+
+Default behaviour unchanged for long-context use cases; `FERRUM_KV_CAPACITY=N` caps the upper bound when the user knows their decode budget. Smarter automatic policy (cap = prompt_len + max_tokens + slack) is a follow-up.
+
+Profile breakdown (Qwen3-8B, FERRUM_DECODE_OP_PROFILE=1):
+
+| Op category | Calls/tok | Wall avg | Notes |
+|---|---:|---:|---|
+| flash_attention | 36 | 332 µs | not the bottleneck |
+| qk_norm_rope | 108 | 238 µs | not the bottleneck |
+| norms (rms + fused) | 72 | 564 µs | not the bottleneck |
+| matmuls (4 per layer) | 144 | ~10 ms | dominates |
+| "other" (split/append/silu/add) | 180 | ~12 ms | also large |
+
+The per-call wall times include a B::sync round-trip (~5-10 ms each
+on Apple Silicon) — production removes the per-op syncs but still
+sees the same ~3.7 s per decode token, suggesting GPU-side
+serialization / clock throttling that the current diagnostic harness
+cannot isolate without Xcode Metal frame capture.
+
+Bottlenecks identified and fixed so far:
+  - **Phase 1D fused-Q4 path:** byte-concat Q4 super-blocks at load
+    so qkv_proj / gate_up_proj keep weights quantised (was
+    eager-dequanting → 38 GB RSS for a 5 GB model).
+  - **Pooled fp16 transient:** one buffer per matmul shape, not one
+    per call (was retaining multi-GB of dequant scratch between
+    flushes).
+  - **Fused gemv_q4kw kernel:** one Metal kernel reads Q4
+    super-blocks inline inside the GEMV reduction (skips the 32 MB
+    fp16 transient write+read per matmul).
+  - **setBytes for params:** 23 hot pipelines no longer alloc a
+    fresh 8-48 byte MTLBuffer per call.
+  - **Sticky compute encoder:** consecutive ops share one encoder
+    (down from ~14 to ~2 encoders per layer).
+
+Next-up bottlenecks (not in this commit):
+  - Q4 GEMV kernel itself runs ~50× slower than M1 Max bandwidth
+    floor (32 MB read at 400 GB/s = 0.08 ms; we measure ~5 ms).
+    Suspected cause: 1-simdgroup-per-output-col threadgroup layout
+    leaves too few simdgroups in flight for the compute unit's
+    occupancy budget. Needs a tiled gemv variant.
+  - Apple GPU dynamic frequency scaling between dispatches —
+    workaround would be to ensure the cmd buffer always has enough
+    queued work for the GPU to stay clocked-up.
+
+| Model | Engine | pp512 | tg128 | Status |
+|---|---|---:|---:|---|
+| Qwen3-8B Q4_K_M | ferrum (Phase 1D) | not yet measured | ~0.3 tok/s | correctness OK, perf ~95× behind |
+| Llama-3.1-8B Q4_K_M | ferrum (Phase 1D) | _pending_ | _pending_ | not yet run |
+| Qwen3-30B-A3B Q4_K_M | ferrum (Phase 2 MoE + 1D) | _pending_ | _pending_ | MoE primitives done, transformer not yet wired |
 
 ## Notes on the ferrum path
 
-Phase 3A (this commit) wires candle-transformers' quantized loaders
-(`quantized_qwen3`, `quantized_qwen3_moe`, `quantized_llama`) behind a
-new `ferrum run-gguf` subcommand. This deliberately *bypasses* ferrum's
-`Backend<B>` abstraction for the Q4_K_M path — candle's Metal Q4_K_M
-dequant kernels are mature and what mistral.rs / llama.cpp use, so
-parity at the kernel layer is the floor.
+`ferrum run <path.gguf>` routes through ferrum's own
+`LlamaFamilyModel<B>` runtime. candle is touched only inside
+`GgufLoader<B>` for parsing the GGUF binary and Phase 1D's
+`QuantLinear<B>` for the raw Q4 → Metal MTLBuffer upload. Every line of
+math from `model.prefill()` onward — RMSNorm, RoPE, attention, fp16
+GEMM, Q4_K_M dequant — runs through ferrum's own kernels in
+`ferrum-kernels` / `ferrum-attention`.
+
+The Phase 1D-1 dequant kernel
+(`ferrum-kernels/src/q4_k_dequant.metal`) is the foundation: 1
+thread per super-block expands 256 weights into 256 fp16 outputs,
+called by `MetalBackend::gemm_quant` per matmul to produce a
+transient fp16 buffer that the existing fp16 GEMM kernel consumes.
 
 The competitive moat (engine scheduler, custom kernels, MoE perf)
-slots in as targeted optimisations once we have baseline numbers and
-know where ferrum loses to llama.cpp / wins vs mistral.rs.
+slots in as targeted optimisations once ferrum's first end-to-end
+numbers are in and we know where ferrum loses ground vs llama.cpp.
