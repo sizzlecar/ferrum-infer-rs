@@ -909,20 +909,28 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
     let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
     let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
 
-    for b in 0..tokens {
+    // moe_forward_stacked_decode_impl is only called when `tokens == 1`
+    // (the branch in `forward_layer` routes prefill m>1 through
+    // `moe_forward_batched_prefill_impl` instead). The for-b loop and
+    // the copy norm_out[b*h] → x_single were vestigial scaffolding;
+    // for tokens=1 norm_out[0..h] IS the activation row, and we can
+    // pass it straight to the gemv kernel via src1_stride=0 broadcast.
+    debug_assert_eq!(
+        tokens, 1,
+        "moe_forward_stacked_decode_impl expects tokens=1 (prefill goes through moe_forward_batched_prefill_impl)"
+    );
+    let _ = tokens; // silence unused-warning when assertion is compiled out
+
+    {
         // ids_buf and weights_buf populated by the GPU router above —
         // no host writes needed here in the decode path.
 
-        // Stage row b of norm_out into x_single (decode m=1 has it
-        // already at offset 0; prefill needs the offset). For decode
-        // we could skip the copy, but doing it uniformly keeps the
-        // kernel's src1 base predictable.
-        B::copy_slice(ctx, &scratch.norm_out, b * h, &mut scratch.x_single, 0, h);
-
         // 1. Batched gate gemv — broadcast input across top_k slots.
+        //    src1 = norm_out (which has hidden floats at offset 0),
+        //    src1_stride=0 → all slots read the same row.
         B::gemv_quant_moe_id(
             ctx,
-            &scratch.x_single,
+            &scratch.norm_out,
             gate_stacked,
             &scratch.ids_buf,
             &mut scratch.gate_out_stacked,
@@ -933,7 +941,7 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
         // 2. Batched up gemv — also broadcast.
         B::gemv_quant_moe_id(
             ctx,
-            &scratch.x_single,
+            &scratch.norm_out,
             up_stacked,
             &scratch.ids_buf,
             &mut scratch.up_out_stacked,
@@ -965,20 +973,20 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
             inter,
         )?;
 
-        // 5. Stacked weighted sum: acc_buf[0..h] = Σ_k w[k] · down[k].
-        //    weights_buf was populated by the GPU router — no host
-        //    upload needed here.
+        // 5. Weighted sum: moe_out[0..h] = Σ_k w[k] · down[k].
+        //    For tokens=1 we write directly to moe_out (the caller's
+        //    `add_inplace(residual, moe_out, tokens*h)` then accumulates
+        //    into the residual stream). The previous indirection via
+        //    `acc_buf` + `copy_slice` was a leftover from the per-token
+        //    prefill loop; not needed for decode.
         B::weighted_sum_stacked(
             ctx,
             &scratch.down_out_stacked,
             &scratch.weights_buf,
-            &mut scratch.acc_buf,
+            &mut scratch.moe_out,
             top_k,
             h,
         )?;
-
-        // 6. Final write into moe_out[b * h ..]
-        B::copy_slice(ctx, &scratch.acc_buf, 0, &mut scratch.moe_out, b * h, h);
     }
 
     Ok(())
