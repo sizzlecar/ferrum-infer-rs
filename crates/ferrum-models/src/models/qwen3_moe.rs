@@ -538,22 +538,30 @@ impl<B: Backend> Qwen3MoeModel<B> {
         }
 
         // 7. transpose head-major → token-major.
-        B::transpose_head_to_token(
-            ctx,
-            &self.scratch.attn_head_major_out,
-            &mut self.scratch.attn_flat,
-            tokens,
-            nh,
-            hd,
-        );
+        //
+        // For tokens=1 the two layouts are byte-identical: both
+        // collapse to the flat [heads * head_dim] vector at offset
+        // `head*hd + d`. Skip the dispatch and point o_proj at
+        // attn_head_major_out directly. Saves 1 dispatch per layer
+        // (×48 = 48 dispatches per decode token) on Qwen3-30B-A3B.
+        let attn_token_major = if tokens == 1 {
+            &self.scratch.attn_head_major_out
+        } else {
+            B::transpose_head_to_token(
+                ctx,
+                &self.scratch.attn_head_major_out,
+                &mut self.scratch.attn_flat,
+                tokens,
+                nh,
+                hd,
+            );
+            &self.scratch.attn_flat
+        };
 
         // 8. O-proj.
-        attn_layer.o_proj.forward(
-            ctx,
-            &self.scratch.attn_flat,
-            &mut self.scratch.o_proj_out,
-            tokens,
-        );
+        attn_layer
+            .o_proj
+            .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
 
         // 9. fused residual-add + post-attention RMSNorm.
         B::fused_add_rms_norm(
@@ -600,14 +608,23 @@ impl<B: Backend> Qwen3MoeModel<B> {
             && moe_layer.experts.up_stacked.is_some()
             && moe_layer.experts.down_stacked.is_some();
 
+        // Fast path for decode (tokens=1): the stacked decode impl
+        // writes the weighted-sum result *directly* into `residual` via
+        // `weighted_sum_residual_stacked`, skipping the moe_out scratch
+        // and the trailing `add_inplace`. Saves 1 dispatch per layer.
+        // Prefill (m>1) and the per-expert fallback still go through
+        // moe_out + add_inplace.
+        let decode_fast_path = stacked_path_available && tokens == 1;
+
         if stacked_path_available {
             if tokens > 1 {
                 // Prefill: one batched 2-D mul_mm_id covers all
                 // (token, expert) pairs in parallel.
                 self.moe_forward_batched_prefill(ctx, li, tokens)?;
             } else {
-                // Decode m=1: dedicated per-token path.
-                self.moe_forward_stacked(ctx, li, tokens)?;
+                // Decode m=1: dedicated per-token path that fuses
+                // residual-add into the final weighted-sum.
+                self.moe_forward_stacked(ctx, li, tokens, residual)?;
             }
         } else {
             moe_forward::<B>(
@@ -631,8 +648,11 @@ impl<B: Backend> Qwen3MoeModel<B> {
             )?;
         }
 
-        // 12. residual += moe_out
-        B::add_inplace(ctx, residual, &self.scratch.moe_out, tokens * h);
+        // 12. residual += moe_out (skipped on decode fast path — already
+        //     accumulated by `weighted_sum_residual_stacked`).
+        if !decode_fast_path {
+            B::add_inplace(ctx, residual, &self.scratch.moe_out, tokens * h);
+        }
 
         if let Some(t0) = moe_t0 {
             B::sync(ctx);
@@ -651,6 +671,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
         ctx: &mut B::Context,
         li: usize,
         tokens: usize,
+        residual: &mut B::Buffer,
     ) -> Result<()> {
         let cfg = &self.cfg;
         moe_forward_stacked_decode_impl::<B>(
@@ -663,6 +684,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
             cfg.num_experts,
             cfg.norm_topk_prob,
             tokens,
+            residual,
         )
     }
 
@@ -888,6 +910,7 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
     n_exp: usize,
     norm_topk_prob: bool,
     tokens: usize,
+    residual: &mut B::Buffer,
 ) -> Result<()> {
     // GPU-side routing: one Metal launch reads router_logits and writes
     // selected ids + combine weights directly into device-side scratch
@@ -973,17 +996,17 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
             inter,
         )?;
 
-        // 5. Weighted sum: moe_out[0..h] = Σ_k w[k] · down[k].
-        //    For tokens=1 we write directly to moe_out (the caller's
-        //    `add_inplace(residual, moe_out, tokens*h)` then accumulates
-        //    into the residual stream). The previous indirection via
-        //    `acc_buf` + `copy_slice` was a leftover from the per-token
-        //    prefill loop; not needed for decode.
-        B::weighted_sum_stacked(
+        // 5. Fused weighted-sum + residual-add:
+        //    residual[i] += Σ_k w[k] · down[k, i]. Writes directly into
+        //    the residual stream, skipping the moe_out scratch and the
+        //    trailing `add_inplace` the caller used to do. Saves 1
+        //    dispatch per layer (×48 = 48 dispatches per decode token)
+        //    plus the moe_out → residual memory traffic.
+        B::weighted_sum_residual_stacked(
             ctx,
             &scratch.down_out_stacked,
             &scratch.weights_buf,
-            &mut scratch.moe_out,
+            residual,
             top_k,
             h,
         )?;
