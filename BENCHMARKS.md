@@ -227,7 +227,52 @@ Decode throughput (M1 Max, 24-core GPU, AC-powered):
 | Qwen3-8B Q4_K_M | ferrum (Phase 1D, baseline) | ~0.27 | ~104× slower |
 | Qwen3-8B Q4_K_M | + Q6_K direct + v2 gemv | ~0.31 | ~90× slower |
 | Qwen3-8B Q4_K_M | + MultiQuant fused qkv | ~0.35 | ~80× slower |
-| Qwen3-8B Q4_K_M | **+ FERRUM_KV_CAPACITY=256 (current)** | **24.2** | **87% (within 14%)** |
+| Qwen3-8B Q4_K_M | **+ FERRUM_KV_CAPACITY=1024 (current)** | **24.93 ± 0.25** | **89%** |
+
+#### Full apples-to-apples (5 reps each, FERRUM_KV_CAPACITY=1024)
+
+| Model | Test | ferrum mean ± std | llama.cpp | Ratio |
+|---|---|---:|---:|---:|
+| Qwen3-8B Q4_K_M | pp (302-token prompt) | **71.94 ± 0.97** | 346.52 ± 25.26 (pp512) | **21%** |
+| Qwen3-8B Q4_K_M | tg128 | **24.93 ± 0.25** | 27.94 ± 0.90 | **89%** |
+| Llama-3.1-8B Q4_K_M | pp (295-token prompt) | **71.31 ± 0.30** | 335.13 ± 24.86 (pp512) | **21%** |
+| Llama-3.1-8B Q4_K_M | tg128 | **27.37 ± 0.54** | 29.20 ± 0.44 | **94%** |
+| Qwen3-30B-A3B Q4_K_M | — | not wired yet (MoE) | 596 / 44.5 | — |
+
+Headline: **decode is within 6-11% of llama.cpp on dense models; prefill is 5× behind**.
+
+Raw per-rep output preserved in `bench_results/ferrum_<model>_<test>.txt`.
+Bench script reproducible via `bench_results/run_ferrum_bench.sh`.
+
+#### Why prefill (m > 1) is 5× behind
+
+When `m > 1`, every Q4 / Q6 matmul falls off the fast fused-gemv path:
+
+  - **Q4 homogeneous fused** (gate_up_proj, layers where qkv is all-Q4):
+    `dequant_q4_k → 200 MB fp16 transient → gemm_v2_f16w`. Writes
+    a multi-hundred-MB transient per matmul. The transient is pooled
+    by shape, but the actual fp16 write+read traffic is real.
+  - **MultiQuant fused qkv** (mixed Q4+Q6 qkv): per-row × per-part
+    fused gemv loop. For m=302 prompt × 3 parts × 36 layers = ~32 K
+    gemv dispatches just for qkv. Memory-savings win, throughput loss.
+  - **Q6 down_proj for m>1**: similar per-row gemv loop, `m` calls.
+
+Rough rate budget vs llama.cpp at pp512:
+  - llama.cpp uses a tiled `mul_mm_q4_K_f32` / `mul_mm_q6_K_f32` simdgroup
+    matrix multiply that dequants Q4_K / Q6_K inside the GEMM loop.
+  - Ferrum's gemm_v2_f16w is f16-weight only and doesn't fuse the Q4
+    dequant. So we pay 2× memory traffic (Q4 read + fp16 write of
+    transient + fp16 read by GEMM) per matmul.
+  - Plus we lose the simdgroup matrix-mul throughput because we tile
+    via the dequant→gemm route.
+
+Fix path (planned): port llama.cpp's
+`kernel_mul_mm_q4_K_f32` / `kernel_mul_mm_q6_K_f32` (or a simplified
+version) so prefill never materialises the fp16 transient. Should
+recover most of the 5× gap.
+
+Decode (m=1) already uses the fused path (`gemv_q4kw_v2` /
+`gemv_q6kw_v2`), which is why it's already within 11% of llama.cpp.
 
 The KV cap is the dominant fix. Qwen3-8B's GGUF declares max_seq_len=40960; the Phase 1D loader honoured that and pre-allocated 36 layers × 8 kv_heads × 40960 × 128 × 2(K+V) × 4 = **12 GB** of KV MTLBuffer. On a 32 GB Mac this pushed everything into swap (8 GB swap_out the whole session) and every Metal dispatch ate page-fault latency. The "GPU dynamic frequency / xctrace 27 ms gaps" theory was wrong — root cause was RAM pressure. Memory drops 18 GB → 6.8 GB with KV cap, swap_out drops 8 GB → 16 KB.
 
