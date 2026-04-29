@@ -9,8 +9,12 @@ pub mod backend;
 pub mod linear;
 pub use linear::Linear;
 
+pub mod moe_host;
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod moe_post_ops;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod moe_post_ops_batched;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k;
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -20,11 +24,15 @@ pub mod q4_k_gemv;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k_gemv_v2;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod q4_k_moe_id_gemm;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k_moe_id_gemv;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q6_k_gemm;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q6_k_gemv;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod q6_k_moe_id_gemm;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q6_k_moe_id_gemv;
 

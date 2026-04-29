@@ -376,6 +376,79 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// MoE 2-D indirect-dispatch GEMM (prefill m > 1).
+    ///
+    /// Computes per (token, expert_slot) pair, batched across all
+    /// experts in one launch:
+    ///
+    ///   `out[token, slot, :] = a[token, slot_or_0, :] @ dequant(weight[expert(token, slot), :])^T`
+    ///
+    /// `ids[expert][slot] = pair_id` encodes `(token_idx, slot_within_token)`
+    /// so the kernel reads activations indirectly (src1 row for the
+    /// pair) and writes outputs directly to the natural
+    /// `[batch, top_k, M]` layout. `tpe[expert]` gives the count of
+    /// pairs assigned to each expert — threadgroups past `tpe[e]`
+    /// early-exit.
+    ///
+    /// `ne11` selects the src1 inner-batch shape:
+    /// - `1` for `gate` / `up` (broadcast — all slots read the same
+    ///   activation row per token).
+    /// - `top_k` for `down` (per-slot — each pair reads its own row in
+    ///   the upstream silu·gate output).
+    ///
+    /// Closes the prefill MoE gap: the per-token gemv loop becomes one
+    /// batched gemm where each expert's slab handles m ≈ batch·top_k /
+    /// num_experts pairs in parallel via simdgroup_half8x8 matmul.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_quant_moe_id(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _tpe: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _ne11: usize,
+        _top_k: usize,
+        _max_per_expert: usize,
+        _batch: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_quant_moe_id not implemented for this backend",
+        ))
+    }
+
+    /// Stacked SiLU·gate over `[batch * top_k, ffn]` rows (prefill version
+    /// of `silu_mul_stacked`).
+    fn silu_mul_batched(
+        _ctx: &mut Self::Context,
+        _gate: &Self::Buffer,
+        _up: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _total_pairs: usize,
+        _ffn: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "silu_mul_batched not implemented for this backend",
+        ))
+    }
+
+    /// Per-batch weighted sum: `out[b, h] = Σ_k weights[b, k] · slots[b, k, h]`.
+    /// Single dispatch covers the whole batch (prefill version of
+    /// `weighted_sum_stacked` which only handled one token).
+    fn weighted_sum_batched(
+        _ctx: &mut Self::Context,
+        _slots: &Self::Buffer,
+        _weights: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _batch: usize,
+        _top_k: usize,
+        _hidden: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "weighted_sum_batched not implemented for this backend",
+        ))
+    }
+
     /// MoE indirect-dispatch GEMV: `out[i, :] = a[i, :] @ dequant(weight[ids[i], :])^T`
     /// for each `i ∈ [0, n_selected)`. Single backend dispatch covers
     /// all selected (token, expert) pairs.
