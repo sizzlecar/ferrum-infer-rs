@@ -649,6 +649,12 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let vocab = self.cfg.base.vocab_size;
         let mut ctx = B::new_context();
 
+        let decode_t0 = if std::env::var("FERRUM_MOE_PROFILE").is_ok() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let mut residual = self
             .scratch
             .residual
@@ -679,6 +685,41 @@ impl<B: Backend> Qwen3MoeModel<B> {
 
         B::sync(&mut ctx);
         self.scratch.residual = Some(residual);
+
+        // Drain MoE per-op counters every decode step. The counters
+        // accumulate across all 48 layers; printing per-step gives a
+        // per-token breakdown.
+        if let Some(t0) = decode_t0 {
+            use crate::moe::dispatch::*;
+            use std::sync::atomic::Ordering;
+            let total_us = t0.elapsed().as_micros() as u64;
+            let sync_us = MOE_SYNC_US.swap(0, Ordering::Relaxed);
+            let sync_n = MOE_SYNC_CALLS.swap(0, Ordering::Relaxed);
+            let topk_us = MOE_HOST_TOPK_US.swap(0, Ordering::Relaxed);
+            let topk_n = MOE_HOST_TOPK_CALLS.swap(0, Ordering::Relaxed);
+            let gu_us = MOE_GEMV_GATE_UP_US.swap(0, Ordering::Relaxed);
+            let gu_n = MOE_GEMV_GATE_UP_CALLS.swap(0, Ordering::Relaxed);
+            let silu_us = MOE_SILU_US.swap(0, Ordering::Relaxed);
+            let silu_n = MOE_SILU_CALLS.swap(0, Ordering::Relaxed);
+            let dn_us = MOE_GEMV_DOWN_US.swap(0, Ordering::Relaxed);
+            let dn_n = MOE_GEMV_DOWN_CALLS.swap(0, Ordering::Relaxed);
+            let sa_us = MOE_SCALED_ADD_US.swap(0, Ordering::Relaxed);
+            let sa_n = MOE_SCALED_ADD_CALLS.swap(0, Ordering::Relaxed);
+            let cp_us = MOE_COPY_US.swap(0, Ordering::Relaxed);
+            let cp_n = MOE_COPY_CALLS.swap(0, Ordering::Relaxed);
+            eprintln!(
+                "[moe-prof] decode total={} ms | sync={} ms ({}x) | host_topk={} ms ({}x) | gate_up={} ms ({}x) | silu={} ms ({}x) | down={} ms ({}x) | scaled_add={} ms ({}x) | copy={} ms ({}x)",
+                total_us / 1000,
+                sync_us / 1000, sync_n,
+                topk_us / 1000, topk_n,
+                gu_us / 1000, gu_n,
+                silu_us / 1000, silu_n,
+                dn_us / 1000, dn_n,
+                sa_us / 1000, sa_n,
+                cp_us / 1000, cp_n,
+            );
+        }
+
         B::to_vec(&self.scratch.logits, vocab)
     }
 }

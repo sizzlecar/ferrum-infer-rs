@@ -20,6 +20,7 @@
 //! — same kernel ferrum already uses for dense Llama-family models.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result as CandleResult};
@@ -31,6 +32,28 @@ use ferrum_quantization::{DenseLinear, QuantLinear};
 use ferrum_types::{FerrumError, Result};
 
 use crate::moe::router::RouterOutput;
+
+/// MoE per-op timers. Public so the model wrapper can drain + print at
+/// end of decode. Times are in microseconds, atomically accumulated.
+/// Toggle via env `FERRUM_MOE_PROFILE=1`.
+pub static MOE_SYNC_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MOE_GEMV_GATE_UP_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_GEMV_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MOE_SILU_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_SILU_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MOE_GEMV_DOWN_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_GEMV_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MOE_SCALED_ADD_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_SCALED_ADD_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MOE_COPY_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_COPY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MOE_HOST_TOPK_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_HOST_TOPK_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn moe_profile_enabled() -> bool {
+    std::env::var("FERRUM_MOE_PROFILE").is_ok()
+}
 
 /// Per-layer expert weights, materialised as `[num_experts]`-long vectors
 /// of `Box<dyn Linear<B>>`. Each entry runs the corresponding expert's
@@ -389,24 +412,48 @@ pub fn moe_forward<B: Backend>(
         )));
     }
 
+    let prof = moe_profile_enabled();
+
     // Routing on host. Sized batch*num_experts (e.g. 512*128 = 64k floats
     // per layer for Qwen3-30B-A3B prefill); cheap relative to the per-
     // expert gemvs that follow.
+    let t0 = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     B::sync(ctx);
+    if let Some(t) = t0 {
+        MOE_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        MOE_SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let t0 = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let logits_host = B::to_vec(router_logits, batch * num_experts);
     let route_out =
         crate::moe::router::route(&logits_host, batch, num_experts, top_k, norm_topk_prob);
+    if let Some(t) = t0 {
+        MOE_HOST_TOPK_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        MOE_HOST_TOPK_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
 
     for b in 0..batch {
-        // Load x[b] into x_single once per token. Stays valid across all
-        // top_k iterations because the gate_up gemv reads `x_single` and
-        // writes `gate_up_buf` — never mutates the input.
+        // Load x[b] into x_single + reset accumulator.
+        let t0 = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::copy_slice(ctx, x, b * hidden_size, x_single, 0, hidden_size);
-
-        // Reset the per-token accumulator to zero. Uses a pre-allocated
-        // host-side zero buffer to avoid creating a fresh `B::from_slice`
-        // on the hot path; the copy_slice itself is one dispatch.
         B::copy_slice(ctx, zero_hidden, 0, acc_buf, 0, hidden_size);
+        if let Some(t) = t0 {
+            MOE_COPY_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            MOE_COPY_CALLS.fetch_add(2, Ordering::Relaxed);
+        }
 
         for k in 0..top_k {
             let pair = b * top_k + k;
@@ -419,23 +466,70 @@ pub fn moe_forward<B: Backend>(
             }
 
             // Fused gate||up gemv → [2 * expert_inter]
+            let t0 = if prof {
+                B::sync(ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             experts.gate_up[expert_id].forward(ctx, x_single, gate_up_buf, 1);
+            if let Some(t) = t0 {
+                B::sync(ctx);
+                MOE_GEMV_GATE_UP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                MOE_GEMV_GATE_UP_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
 
             // SiLU(gate) * up → [expert_inter]
+            let t0 = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             B::fused_silu_mul_split(ctx, gate_up_buf, silu_buf, 1, expert_intermediate);
+            if let Some(t) = t0 {
+                B::sync(ctx);
+                MOE_SILU_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                MOE_SILU_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
 
             // down gemv → [hidden]
+            let t0 = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             experts.down[expert_id].forward(ctx, silu_buf, down_buf, 1);
+            if let Some(t) = t0 {
+                B::sync(ctx);
+                MOE_GEMV_DOWN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                MOE_GEMV_DOWN_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
 
-            // acc_buf += weight * down_buf. No round trip through `out`
-            // — the accumulator stays on the GPU for the duration of the
-            // top_k loop and is written to `out[b]` exactly once below.
+            // acc_buf += weight * down_buf
+            let t0 = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             B::scaled_add_inplace(ctx, acc_buf, down_buf, weight, hidden_size);
+            if let Some(t) = t0 {
+                B::sync(ctx);
+                MOE_SCALED_ADD_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                MOE_SCALED_ADD_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
-        // Final write: out[b] = acc_buf. One copy_slice per token,
-        // independent of top_k.
+        // Final write: out[b] = acc_buf
+        let t0 = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::copy_slice(ctx, acc_buf, 0, out, b * hidden_size, hidden_size);
+        if let Some(t) = t0 {
+            MOE_COPY_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            MOE_COPY_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     Ok(())
