@@ -474,6 +474,34 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Fused weighted-sum-residual + RMSNorm: combines this layer's
+    /// `weighted_sum_residual_stacked` with the next layer's leading
+    /// `rms_norm` into a single dispatch.
+    ///
+    /// Computes
+    ///   `residual[i] += Σ_s w[s] · slots[s, i]`
+    ///   `normed_out[i] = residual[i] · (1 / sqrt(Σ residual² / hidden + eps)) · next_norm_w[i]`
+    ///
+    /// Caller is responsible for skipping the next layer's standalone
+    /// `rms_norm` — `normed_out` IS that layer's `norm_out` input.
+    /// Default returns Unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn weighted_sum_residual_norm_stacked(
+        _ctx: &mut Self::Context,
+        _slots: &Self::Buffer,
+        _weights: &Self::Buffer,
+        _residual: &mut Self::Buffer,
+        _next_norm_w: &Self::Buffer,
+        _normed_out: &mut Self::Buffer,
+        _n_slots: usize,
+        _hidden: usize,
+        _eps: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "weighted_sum_residual_norm_stacked not implemented for this backend",
+        ))
+    }
+
     /// Per-batch weighted sum: `out[b, h] = Σ_k weights[b, k] · slots[b, k, h]`.
     /// Single dispatch covers the whole batch (prefill version of
     /// `weighted_sum_stacked` which only handled one token).

@@ -386,7 +386,15 @@ impl<B: Backend> Qwen3MoeModel<B> {
         residual: &mut B::Buffer,
         pos_offset: usize,
         tokens: usize,
-    ) -> Result<()> {
+        // If `Some(idx)` and we land on the decode fast path, fold the
+        // next layer's leading rms_norm into this layer's MoE tail
+        // (cross-layer norm fusion). The next layer's caller must pass
+        // `prev_did_norm_fusion = true` so it skips its own rms_norm.
+        next_layer_idx: Option<usize>,
+        // If `true`, skip step 1's input rms_norm — the previous
+        // layer's tail already populated `scratch.norm_out`.
+        prev_did_norm_fusion: bool,
+    ) -> Result<bool> {
         let cfg_base = &self.cfg.base;
         let h = cfg_base.hidden_size;
         let nh = cfg_base.num_heads;
@@ -405,16 +413,19 @@ impl<B: Backend> Qwen3MoeModel<B> {
             None
         };
 
-        // 1. Input RMSNorm
-        B::rms_norm(
-            ctx,
-            residual,
-            &attn_layer.input_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
-            tokens,
-            h,
-        );
+        // 1. Input RMSNorm — skipped when the previous layer's MoE tail
+        //    fused this norm via `weighted_sum_residual_norm_stacked`.
+        if !prev_did_norm_fusion {
+            B::rms_norm(
+                ctx,
+                residual,
+                &attn_layer.input_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                tokens,
+                h,
+            );
+        }
 
         // 2. Fused QKV
         attn_layer.qkv_proj.forward(
@@ -680,6 +691,12 @@ impl<B: Backend> Qwen3MoeModel<B> {
         // Prefill (m>1) and the per-expert fallback still go through
         // moe_out + add_inplace.
         let decode_fast_path = stacked_path_available && tokens == 1;
+        // Cross-layer fusion: when on the decode fast path AND there is
+        // a next layer, fold its leading rms_norm into this layer's
+        // tail (`weighted_sum_residual_norm_stacked`). Returns whether
+        // the fusion ran so the caller can signal the next layer to
+        // skip its standalone rms_norm.
+        let did_norm_fusion = decode_fast_path && next_layer_idx.is_some();
 
         if stacked_path_available {
             if tokens > 1 {
@@ -688,8 +705,9 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 self.moe_forward_batched_prefill(ctx, li, tokens)?;
             } else {
                 // Decode m=1: dedicated per-token path that fuses
-                // residual-add into the final weighted-sum.
-                self.moe_forward_stacked(ctx, li, tokens, residual)?;
+                // residual-add into the final weighted-sum, and
+                // optionally folds the next layer's rms_norm in too.
+                self.moe_forward_stacked(ctx, li, tokens, residual, next_layer_idx)?;
             }
         } else {
             moe_forward::<B>(
@@ -728,7 +746,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
             MOE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        Ok(())
+        Ok(did_norm_fusion)
     }
 
     fn moe_forward_stacked(
@@ -737,8 +755,23 @@ impl<B: Backend> Qwen3MoeModel<B> {
         li: usize,
         tokens: usize,
         residual: &mut B::Buffer,
+        next_layer_idx: Option<usize>,
     ) -> Result<()> {
         let cfg = &self.cfg;
+        // `next_norm_w` is the next layer's `attn_layer.input_ln_w`.
+        // We can't borrow `self.attn_layers[idx]` and pass &mut
+        // self.scratch to the impl simultaneously, so collect the raw
+        // pointer here. Safety: forward_layer holds &mut self for the
+        // call; the borrow scopes are fully sequential.
+        let next_norm_w_ptr: Option<*const B::Buffer> =
+            next_layer_idx.map(|idx| &self.attn_layers[idx].input_ln_w as *const _);
+        // SAFETY: pointer dereference is valid because:
+        //   * The buffer lives in `self.attn_layers[idx]` which we
+        //     borrowed immutably to take the pointer. We do not mutate
+        //     `self.attn_layers` while `next_norm_w_ptr` is in use.
+        //   * `&mut self.scratch` and `&self.moe_layers[li]` are disjoint
+        //     fields from `self.attn_layers` so this is safe.
+        let next_norm_w: Option<&B::Buffer> = next_norm_w_ptr.map(|p| unsafe { &*p });
         moe_forward_stacked_decode_impl::<B>(
             ctx,
             &self.moe_layers[li],
@@ -750,6 +783,8 @@ impl<B: Backend> Qwen3MoeModel<B> {
             cfg.norm_topk_prob,
             tokens,
             residual,
+            next_norm_w,
+            cfg.base.rms_norm_eps,
         )
     }
 
@@ -798,8 +833,29 @@ impl<B: Backend> Qwen3MoeModel<B> {
             .expect("scratch residual missing (previous call didn't restore)");
         B::embedding_lookup(&mut ctx, &self.embed, tokens, &mut residual, h);
 
-        for li in 0..self.cfg.base.num_layers {
-            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len)
+        // For prefill (seq_len > 1) the cross-layer norm fusion does
+        // not apply (it lives on the decode fast path). We still pass
+        // `next_layer_idx = None` so forward_layer emits the regular
+        // tail.
+        let mut prev_did_norm_fusion = false;
+        let num_layers = self.cfg.base.num_layers;
+        for li in 0..num_layers {
+            let next_layer_idx = if li + 1 < num_layers {
+                Some(li + 1)
+            } else {
+                None
+            };
+            prev_did_norm_fusion = self
+                .forward_layer(
+                    &mut ctx,
+                    li,
+                    cache_id,
+                    &mut residual,
+                    pos_offset,
+                    seq_len,
+                    next_layer_idx,
+                    prev_did_norm_fusion,
+                )
                 .expect("forward_layer");
         }
 
@@ -855,8 +911,28 @@ impl<B: Backend> Qwen3MoeModel<B> {
             .expect("scratch residual missing (previous call didn't restore)");
         B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
 
-        for li in 0..self.cfg.base.num_layers {
-            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1)
+        // Cross-layer rms_norm fusion: layer L's MoE tail folds the
+        // next layer's leading rms_norm into its weighted-sum-residual
+        // when the decode fast path applies. The flag carries forward.
+        let mut prev_did_norm_fusion = false;
+        let num_layers = self.cfg.base.num_layers;
+        for li in 0..num_layers {
+            let next_layer_idx = if li + 1 < num_layers {
+                Some(li + 1)
+            } else {
+                None
+            };
+            prev_did_norm_fusion = self
+                .forward_layer(
+                    &mut ctx,
+                    li,
+                    cache_id,
+                    &mut residual,
+                    pos as usize,
+                    1,
+                    next_layer_idx,
+                    prev_did_norm_fusion,
+                )
                 .expect("forward_layer");
         }
 
@@ -976,6 +1052,10 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
     norm_topk_prob: bool,
     tokens: usize,
     residual: &mut B::Buffer,
+    // If `Some`, fold the NEXT layer's leading rms_norm into the
+    // weighted-sum-residual tail using `weighted_sum_residual_norm_stacked`.
+    next_norm_w: Option<&B::Buffer>,
+    eps: f32,
 ) -> Result<()> {
     // GPU-side routing: one Metal launch reads router_logits and writes
     // selected ids + combine weights directly into device-side scratch
@@ -1061,20 +1141,37 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
             inter,
         )?;
 
-        // 5. Fused weighted-sum + residual-add:
-        //    residual[i] += Σ_k w[k] · down[k, i]. Writes directly into
-        //    the residual stream, skipping the moe_out scratch and the
-        //    trailing `add_inplace` the caller used to do. Saves 1
-        //    dispatch per layer (×48 = 48 dispatches per decode token)
-        //    plus the moe_out → residual memory traffic.
-        B::weighted_sum_residual_stacked(
-            ctx,
-            &scratch.down_out_stacked,
-            &scratch.weights_buf,
-            residual,
-            top_k,
-            h,
-        )?;
+        // 5. Fused weighted-sum + residual-add (+ optional next-layer
+        //    rms_norm). Two paths:
+        //
+        //    * `next_norm_w = Some(_)` (cross-layer fusion): one kernel
+        //      computes residual[i] += Σ_k w[k] · down[k, i] AND
+        //      norm_out[i] = residual[i] · scale · next_norm_w[i].
+        //      The next layer's leading rms_norm is skipped. Saves an
+        //      additional dispatch per layer transition.
+        //    * `next_norm_w = None` (last layer): just residual-add.
+        if let Some(nnw) = next_norm_w {
+            B::weighted_sum_residual_norm_stacked(
+                ctx,
+                &scratch.down_out_stacked,
+                &scratch.weights_buf,
+                residual,
+                nnw,
+                &mut scratch.norm_out,
+                top_k,
+                h,
+                eps,
+            )?;
+        } else {
+            B::weighted_sum_residual_stacked(
+                ctx,
+                &scratch.down_out_stacked,
+                &scratch.weights_buf,
+                residual,
+                top_k,
+                h,
+            )?;
+        }
     }
 
     Ok(())
