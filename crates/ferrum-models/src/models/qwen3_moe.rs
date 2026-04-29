@@ -538,19 +538,30 @@ impl<B: Backend> Qwen3MoeModel<B> {
         }
 
         // 7. transpose head-major → token-major.
-        B::transpose_head_to_token(
-            ctx,
-            &self.scratch.attn_head_major_out,
-            &mut self.scratch.attn_flat,
-            tokens,
-            nh,
-            hd,
-        );
+        //
+        // For tokens=1 the two layouts are byte-identical: both
+        // collapse to the flat [heads * head_dim] vector at offset
+        // `head*hd + d`. Skip the dispatch and point o_proj at
+        // attn_head_major_out directly. Saves 1 dispatch per layer
+        // (×48 = 48 dispatches per decode token) on Qwen3-30B-A3B.
+        let attn_token_major = if tokens == 1 {
+            &self.scratch.attn_head_major_out
+        } else {
+            B::transpose_head_to_token(
+                ctx,
+                &self.scratch.attn_head_major_out,
+                &mut self.scratch.attn_flat,
+                tokens,
+                nh,
+                hd,
+            );
+            &self.scratch.attn_flat
+        };
 
         // 8. O-proj.
         attn_layer.o_proj.forward(
             ctx,
-            &self.scratch.attn_flat,
+            attn_token_major,
             &mut self.scratch.o_proj_out,
             tokens,
         );
