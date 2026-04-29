@@ -224,7 +224,9 @@ Decode throughput (M1 Max, 24-core GPU, AC-powered):
 
 | Model | Engine | Decode tok/s | vs llama.cpp tg128 |
 |---|---|---:|---:|
-| Qwen3-8B Q4_K_M | ferrum (Phase 1D) | **~0.3** | **~95× slower** |
+| Qwen3-8B Q4_K_M | ferrum (Phase 1D, baseline) | ~0.27 | ~104× slower |
+| Qwen3-8B Q4_K_M | + Q6_K direct + v2 gemv | ~0.31 | ~90× slower |
+| Qwen3-8B Q4_K_M | **+ MultiQuant fused qkv (current)** | **~0.35** | **~80× slower** |
 
 Profile breakdown (Qwen3-8B, FERRUM_DECODE_OP_PROFILE=1):
 
