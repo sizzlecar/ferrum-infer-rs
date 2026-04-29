@@ -146,7 +146,99 @@ impl<B: Backend> GgufLoader<B> {
         if let Some(fast) = self.try_load_fused_q4k(parts)? {
             return Ok(fast);
         }
+        if let Some(multi) = self.try_load_fused_multi_quant(parts)? {
+            return Ok(multi);
+        }
         self.load_fused_eager(parts)
+    }
+
+    /// Multi-quant fused fast path: each part is a Q4_K or Q6_K tensor
+    /// with no bias. Parts may have **different** quant types (e.g.
+    /// Qwen3 qkv_proj where q+k are Q4_K but v is Q6_K). Builds a
+    /// `MetalQuantStore::Fused` (or whatever the backend's `Fused`
+    /// variant is) so each part stays compact in backend memory and
+    /// gemv dispatches per part with output offsets.
+    fn try_load_fused_multi_quant(
+        &self,
+        parts: &[String],
+    ) -> Result<Option<Box<dyn Linear<B>>>> {
+        let mut spec: Vec<(ferrum_kernels::backend::GgufQuantType, Vec<u8>, usize)> = Vec::new();
+        let mut cols_check: Option<usize> = None;
+
+        for stem in parts {
+            let weight_name = format!("{stem}.weight");
+            let gguf_name = ferrum_to_gguf(&weight_name).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "GgufLoader: fusion source '{weight_name}' has no GGUF mapping"
+                ))
+            })?;
+            if !self.gguf.has_tensor(&gguf_name) {
+                return Err(FerrumError::model(format!(
+                    "GgufLoader: fusion source '{weight_name}' (gguf '{gguf_name}') missing"
+                )));
+            }
+
+            // Bias on a fused part disqualifies the whole multi-quant
+            // path; fall back to eager fusion which already handles bias.
+            let has_bias = ferrum_to_gguf(&format!("{stem}.bias"))
+                .map(|n| self.gguf.has_tensor(&n))
+                .unwrap_or(false);
+            if has_bias {
+                return Ok(None);
+            }
+
+            let info = self
+                .gguf
+                .tensor_info(&gguf_name)
+                .ok_or_else(|| FerrumError::model(format!("tensor_info missing for '{gguf_name}'")))?;
+            let kind = match info.ggml_dtype {
+                candle_core::quantized::GgmlDType::Q4K => {
+                    ferrum_kernels::backend::GgufQuantType::Q4K
+                }
+                candle_core::quantized::GgmlDType::Q6K => {
+                    ferrum_kernels::backend::GgufQuantType::Q6K
+                }
+                _ => return Ok(None), // unsupported quant in this part
+            };
+
+            let dims = info.shape.dims();
+            if dims.len() != 2 {
+                return Ok(None);
+            }
+            let (rows, cols) = (dims[0], dims[1]);
+            if cols % 256 != 0 {
+                return Ok(None);
+            }
+            match cols_check {
+                Some(c) if c != cols => {
+                    return Err(FerrumError::model(format!(
+                        "GgufLoader: fusion in_features mismatch ({c} vs {cols} for '{stem}')"
+                    )))
+                }
+                _ => cols_check = Some(cols),
+            }
+
+            let qt = self
+                .gguf
+                .read_tensor(&gguf_name, &self.decode_device)
+                .map_err(candle_to_ferrum)?;
+            let bytes = qt.data().map_err(candle_to_ferrum)?;
+            // Need owned bytes since QTensor goes out of scope before
+            // we hand the slice to the backend.
+            spec.push((kind, bytes.as_ref().to_vec(), rows));
+        }
+
+        let cols = cols_check.ok_or_else(|| FerrumError::model("fusion: no parts"))?;
+        // Borrow-as-slice for the backend API.
+        let parts_view: Vec<(_, &[u8], _)> = spec
+            .iter()
+            .map(|(kind, bytes, rows)| (*kind, bytes.as_slice(), *rows))
+            .collect();
+        let quant = match crate::QuantLinear::<B>::from_gguf_fused(&parts_view, cols) {
+            Ok(q) => q,
+            Err(_) => return Ok(None), // backend doesn't support Fused
+        };
+        Ok(Some(Box::new(quant)))
     }
 
     /// Q4_K fast path for `load_fused`. Returns `Ok(None)` if any part

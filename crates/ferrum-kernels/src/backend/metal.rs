@@ -303,12 +303,113 @@ pub enum MetalQuantStore {
         n_cols: usize,
         n_blocks: usize,
     },
+    /// Row-concatenation of multiple parts that may have different
+    /// quant types. Each part is a leaf (Q4K / Q6K) with the same
+    /// `n_cols`. Used for `qkv_proj` on Qwen3 Q4_K_M, where q & k
+    /// are Q4_K but v is Q6_K — bytes can't be concatenated, so we
+    /// keep them separate and dispatch one gemv per part with output
+    /// offsets.
+    Fused {
+        parts: Vec<MetalQuantStore>,
+        total_rows: usize,
+        n_cols: usize,
+    },
+}
+
+impl MetalQuantStore {
+    fn n_rows(&self) -> usize {
+        match self {
+            MetalQuantStore::Q4K { n_rows, .. } | MetalQuantStore::Q6K { n_rows, .. } => *n_rows,
+            MetalQuantStore::Fused { total_rows, .. } => *total_rows,
+        }
+    }
+    fn n_cols(&self) -> usize {
+        match self {
+            MetalQuantStore::Q4K { n_cols, .. }
+            | MetalQuantStore::Q6K { n_cols, .. }
+            | MetalQuantStore::Fused { n_cols, .. } => *n_cols,
+        }
+    }
 }
 
 // SAFETY: metal::Buffer wraps an Objective-C handle. metal-rs marks it
 // Send+Sync via internal unsafe impls; we just propagate that.
 unsafe impl Send for MetalQuantStore {}
 unsafe impl Sync for MetalQuantStore {}
+
+/// Dispatch a single fused gemv for one Q4K / Q6K leaf part with
+/// activation and output byte offsets. Used by the Fused path.
+fn dispatch_part_gemv_offset(
+    enc: &metal::ComputeCommandEncoderRef,
+    a_buf: &metal::Buffer,
+    a_offset_bytes: u64,
+    part: &MetalQuantStore,
+    out_buf: &metal::Buffer,
+    c_offset_bytes: u64,
+    n_cols: usize,
+) -> Result<()> {
+    match part {
+        MetalQuantStore::Q4K {
+            blocks, n_rows, ..
+        } => {
+            if *n_rows % 4 != 0 {
+                crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    out_buf,
+                    *n_rows,
+                    n_cols,
+                );
+                if a_offset_bytes != 0 || c_offset_bytes != 0 {
+                    return Err(FerrumError::model(
+                        "gemm_quant Fused: q4k v1 path doesn't support offsets yet"
+                            .to_string(),
+                    ));
+                }
+                return Ok(());
+            }
+            crate::q4_k_gemv_v2::dispatch_gemv_q4k_v2_offset(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                a_offset_bytes,
+                blocks,
+                out_buf,
+                c_offset_bytes,
+                *n_rows,
+                n_cols,
+            );
+        }
+        MetalQuantStore::Q6K {
+            blocks, n_rows, ..
+        } => {
+            if *n_rows % 4 != 0 {
+                return Err(FerrumError::model(format!(
+                    "gemm_quant Fused: Q6K part n_rows={n_rows} not divisible by 4"
+                )));
+            }
+            crate::q6_k_gemv::dispatch_gemv_q6k_v2_offset(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                a_offset_bytes,
+                blocks,
+                out_buf,
+                c_offset_bytes,
+                *n_rows,
+                n_cols,
+            );
+        }
+        MetalQuantStore::Fused { .. } => {
+            return Err(FerrumError::model(
+                "gemm_quant Fused: nested Fused parts not supported".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 impl Backend for MetalBackend {
     type Buffer = MetalBuf;
@@ -402,6 +503,30 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn load_quant_fused(
+        parts: &[(super::GgufQuantType, &[u8], usize)],
+        n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        let mut sub_stores: Vec<MetalQuantStore> = Vec::with_capacity(parts.len());
+        let mut total_rows = 0;
+        for (kind, bytes, n_rows) in parts {
+            let store = Self::load_quant(*kind, bytes, *n_rows, n_cols)?;
+            // Only leaf (Q4K / Q6K) parts are valid; nested Fused isn't.
+            if matches!(store, MetalQuantStore::Fused { .. }) {
+                return Err(FerrumError::model(
+                    "Metal load_quant_fused: nested Fused not supported".to_string(),
+                ));
+            }
+            total_rows += n_rows;
+            sub_stores.push(store);
+        }
+        Ok(MetalQuantStore::Fused {
+            parts: sub_stores,
+            total_rows,
+            n_cols,
+        })
+    }
+
     fn gemm_quant(
         ctx: &mut Self::Context,
         a: &Self::Buffer,
@@ -409,6 +534,51 @@ impl Backend for MetalBackend {
         out: &mut Self::Buffer,
         m: usize,
     ) -> Result<()> {
+        // Fused path: row-concatenation of mixed-quant parts (used for
+        // Qwen3 qkv_proj where q+k are Q4_K but v is Q6_K). For m=1
+        // dispatch each part with the right output offset; for m>1
+        // currently bail (prefill of mixed-fused matmuls is rare and
+        // would need a strided per-row inner loop).
+        if let MetalQuantStore::Fused {
+            parts,
+            total_rows,
+            n_cols,
+        } = weight
+        {
+            if m != 1 {
+                // Iterate per row × per part. Each gemv writes
+                // out[row * total_n + cumulative_part_rows ..+ part_rows].
+                let a_buf = a.expect_f32("gemm_quant a (fused)");
+                let out_buf = out.expect_f32_mut("gemm_quant out (fused)");
+                let enc = ctx.compute_encoder();
+                for row in 0..m {
+                    let a_off = (row * n_cols * 4) as u64;
+                    let mut row_off_elems = 0usize;
+                    for part in parts {
+                        let part_rows = part.n_rows();
+                        let c_off = ((row * total_rows + row_off_elems) * 4) as u64;
+                        dispatch_part_gemv_offset(
+                            enc, a_buf, a_off, part, out_buf, c_off, *n_cols,
+                        )?;
+                        row_off_elems += part_rows;
+                    }
+                }
+                return Ok(());
+            }
+            // m == 1 — single output row of length total_rows.
+            let a_buf = a.expect_f32("gemm_quant a (fused m=1)");
+            let out_buf = out.expect_f32_mut("gemm_quant out (fused m=1)");
+            let enc = ctx.compute_encoder();
+            let mut row_off_elems = 0usize;
+            for part in parts {
+                let part_rows = part.n_rows();
+                let c_off = (row_off_elems * 4) as u64;
+                dispatch_part_gemv_offset(enc, a_buf, 0, part, out_buf, c_off, *n_cols)?;
+                row_off_elems += part_rows;
+            }
+            return Ok(());
+        }
+
         // Borrow checker: `cmd` / `compute_encoder` need `&mut ctx` while
         // we hold a borrow into `weight` for `blocks`. Snapshot the
         // primitive fields out of `weight` first; `blocks` is a `Buffer`
@@ -426,6 +596,7 @@ impl Backend for MetalBackend {
                 n_cols,
                 n_blocks,
             } => (blocks, *n_rows, *n_cols, *n_blocks, true),
+            MetalQuantStore::Fused { .. } => unreachable!("handled above"),
         };
 
         let total_elems = (n_rows * n_cols) as u64;

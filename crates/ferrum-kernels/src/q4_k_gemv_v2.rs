@@ -57,10 +57,25 @@ pub fn dispatch_gemv_q4k_v2_on_encoder(
     n: usize,
     k: usize,
 ) {
+    dispatch_gemv_q4k_v2_offset(device, enc, a, 0, src0, c, 0, n, k);
+}
+
+/// Same as [`dispatch_gemv_q4k_v2_on_encoder`] with byte offsets into
+/// `a` and `c`. Used by `MultiQuantLinear` to write each fused-projection
+/// part into a disjoint slice of the shared output buffer.
+pub fn dispatch_gemv_q4k_v2_offset(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    a_offset_bytes: u64,
+    src0: &Buffer,
+    c: &Buffer,
+    c_offset_bytes: u64,
+    n: usize,
+    k: usize,
+) {
     debug_assert!(k % 256 == 0, "K must be a multiple of 256 (got {k})");
 
-    // Row stride in bytes for src0: each row has (K/256) super-blocks of
-    // 144 bytes. Equivalently `(K / 256) * 144` = `K * 9 / 16`.
     let nb01_bytes = (k / 256) * 144;
 
     #[repr(C)]
@@ -78,16 +93,14 @@ pub fn dispatch_gemv_q4k_v2_on_encoder(
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(src0), 0);
-    enc.set_buffer(1, Some(a), 0);
-    enc.set_buffer(2, Some(c), 0);
+    enc.set_buffer(1, Some(a), a_offset_bytes);
+    enc.set_buffer(2, Some(c), c_offset_bytes);
     enc.set_bytes(
         3,
         std::mem::size_of::<P>() as u64,
         &params as *const _ as *const c_void,
     );
 
-    // Each threadgroup covers 4 consecutive rows (nr0=2 × nsg=2).
-    // Threadgroup is (32, 2, 1) — one full simdgroup per (z=0..nsg).
     const TILE_ROWS: u64 = 4;
     let grid = MTLSize::new((n as u64).div_ceil(TILE_ROWS), 1, 1);
     let tg = MTLSize::new(32, 2, 1);

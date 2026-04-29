@@ -58,6 +58,25 @@ impl<B: Backend> QuantLinear<B> {
         })
     }
 
+    /// Build a fused projection from multiple `(kind, bytes, rows)`
+    /// parts that share `in_features`. Each part stays in its own
+    /// QuantStore (no byte-concat); forward dispatches one matvec per
+    /// part. Used for Qwen3 `qkv_proj` when q+k are Q4_K and v is Q6_K
+    /// — the homogeneous fused-Q4 fast path would have to fall back
+    /// to eager-fp32, blowing 100 MB per layer.
+    pub fn from_gguf_fused(
+        parts: &[(GgufQuantType, &[u8], usize)],
+        in_features: usize,
+    ) -> Result<Self> {
+        let store = B::load_quant_fused(parts, in_features)?;
+        let out_features = parts.iter().map(|(_, _, n)| *n).sum();
+        Ok(Self {
+            store,
+            in_features,
+            out_features,
+        })
+    }
+
     /// For tests / advanced callers that have already constructed a
     /// `B::QuantStore` (e.g. through the Backend's own ingestion path).
     pub fn from_store(store: B::QuantStore, out_features: usize, in_features: usize) -> Self {
