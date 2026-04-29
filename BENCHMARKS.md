@@ -320,18 +320,24 @@ Decode (m=1) already uses the fused path (`gemv_q4kw_v2` /
 > **Prefill batched fast path correctness fixed in PR #41**
 > (2-D `mul_mm_id` Q4_K/Q6_K kernels — see below).
 >
-> **Real numbers post #40 + #41 (M1 Max, single-rep, FERRUM_KV_CAPACITY=512):**
+> **Real numbers post #40 + #41 (M1 Max, single-rep cold start, FERRUM_KV_CAPACITY=512):**
 >
-> | Test | ferrum | vs llama.cpp baseline |
-> |---|---:|---:|
-> | Prefill, 205-token prompt | **43.3 t/s** | 7% of 596 |
-> | Decode @ kv_len ≤ 5 | **15.3 t/s** | 35% of 44.5 |
-> | Decode @ kv_len = 205 | 3.4 t/s | 8% — large attention scaling cost |
+> | Test | ferrum | vs llama.cpp baseline | Ratio |
+> |---|---:|---:|---:|
+> | tg128 (1 prompt → 128 decode) | **21.6 t/s** | 44.5 t/s | **49%** |
+> | Prefill, 205-token prompt | **43.3 t/s** | 596 t/s | **7%** |
+> | Decode @ kv_len ≤ 5 | 15.3 t/s | 44.5 t/s | 35% |
+> | Decode @ kv_len = 205 | 3.4 t/s | 44.5 t/s | 8% — attention scales with kv_len |
 >
-> The pre-fix and post-fix prefill numbers are coincidentally close
-> (~44 t/s) — same kernel work, different output quality.
-> The full 5-rep regression suite needs a re-run on the new binary
-> before the entries below can be replaced; tracked separately.
+> **Headline: decode is 49% of llama.cpp on the standard tg128
+> protocol** — usable for chat. Prefill still 14× behind; closing
+> that gap is the next focus.
+>
+> The pre-fix and post-fix `pp512`-style prefill numbers are
+> coincidentally close (~44 t/s) — same kernel work, different
+> output quality. Decode tg128 climbed from #39's 13.22 t/s mean
+> (on garbage output) to 21.6 t/s (correct output) — the fix path
+> through #40+#41 also cleaned up some kv-scaling overhead.
 
 ### Qwen3-30B-A3B MoE — first measurement, 2026-04-29 (PRE-FIX, INVALID)
 
