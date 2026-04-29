@@ -496,8 +496,12 @@ impl Backend for CpuBackend {
         debug_assert!(cache_len + new_tokens <= cache_capacity);
         debug_assert_eq!(cache_k.len(), nkv * cache_capacity * hd);
         debug_assert_eq!(cache_v.len(), nkv * cache_capacity * hd);
-        debug_assert_eq!(new_k_head_major.len(), nkv * new_tokens * hd);
-        debug_assert_eq!(new_v_head_major.len(), nkv * new_tokens * hd);
+        // The source buffers may be sized for `max_tokens` (the prefill-
+        // sized scratch) while only the first `nkv * new_tokens * hd`
+        // entries are valid for this call. Allow >= so reusing scratch
+        // across prefill and decode doesn't trip the assert.
+        debug_assert!(new_k_head_major.len() >= nkv * new_tokens * hd);
+        debug_assert!(new_v_head_major.len() >= nkv * new_tokens * hd);
 
         for h in 0..nkv {
             let dst_base = h * cache_capacity * hd + cache_len * hd;
@@ -534,6 +538,18 @@ impl Backend for CpuBackend {
     ) {
         for i in 0..len {
             residual[i] += x[i];
+        }
+    }
+
+    fn scaled_add_inplace(
+        _ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        src: &Self::Buffer,
+        scale: f32,
+        len: usize,
+    ) {
+        for i in 0..len {
+            dst[i] += scale * src[i];
         }
     }
 

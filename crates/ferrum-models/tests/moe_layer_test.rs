@@ -241,21 +241,23 @@ fn top_k_one_with_strong_router_picks_dominant_expert() {
     // Expert 0 gate: zeros. Expert 1 gate: 7 * I_2.
     let mut gate_data = vec![0.0_f32; n_experts * ffn * hidden];
     // Expert 1 gate (offset = 1 * ffn * hidden = 4): identity*7
-    gate_data[4 + 0 * 2 + 0] = 7.0; // [1, 0, 0]
-    gate_data[4 + 1 * 2 + 1] = 7.0; // [1, 1, 1]
+    // Index layout intentional: `[expert_offset + ffn_idx * hidden + hidden_idx]`.
+    // The first row uses ffn_idx=0, hidden_idx=0 → offset 0; second uses (1,1) → 3.
+    gate_data[4] = 7.0; // [expert=1, ffn=0, hidden=0]
+    gate_data[4 + 1 * 2 + 1] = 7.0; // [expert=1, ffn=1, hidden=1]
     let gate_t = Tensor::from_vec(gate_data, (n_experts, ffn, hidden), &device).unwrap();
     let gate_qt = QTensor::quantize(&gate_t, GgmlDType::F32).unwrap();
 
     // Same for up_exps
     let mut up_data = vec![0.0_f32; n_experts * ffn * hidden];
-    up_data[4 + 0 * 2 + 0] = 7.0;
+    up_data[4] = 7.0;
     up_data[4 + 1 * 2 + 1] = 7.0;
     let up_t = Tensor::from_vec(up_data, (n_experts, ffn, hidden), &device).unwrap();
     let up_qt = QTensor::quantize(&up_t, GgmlDType::F32).unwrap();
 
     // down_exps shape [E=2, hidden=2, ffn=2]
     let mut down_data = vec![0.0_f32; n_experts * hidden * ffn];
-    down_data[4 + 0 * 2 + 0] = 1.0; // expert 1 down identity
+    down_data[4] = 1.0; // expert 1 down identity, [expert=1, hidden=0, ffn=0]
     down_data[4 + 1 * 2 + 1] = 1.0;
     let down_t = Tensor::from_vec(down_data, (n_experts, hidden, ffn), &device).unwrap();
     let down_qt = QTensor::quantize(&down_t, GgmlDType::F32).unwrap();

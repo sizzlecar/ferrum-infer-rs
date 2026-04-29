@@ -91,6 +91,25 @@ kernel void add_f32(
     output[tid] = a[tid] + b[tid];
 }
 
+// ── Scalar-scaled add: dst[i] += scale * src[i] ─────────────────────────
+// MoE expert combine — used in the per-(token, expert) accumulate loop
+// where each contribution is weighted by a router-derived scalar.
+
+struct ScaledAddParams {
+    int   n;
+    float scale;
+};
+
+kernel void scaled_add_inplace_f32(
+    device       float* dst       [[buffer(0)]],
+    device const float* src       [[buffer(1)]],
+    constant ScaledAddParams& p   [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(p.n)) return;
+    dst[tid] += p.scale * src[tid];
+}
+
 // ── Element-wise Multiply (broadcast scale) ─────────────────────────────
 // out[i] = a[i] * scale[i % scale_len]
 

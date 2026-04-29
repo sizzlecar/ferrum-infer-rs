@@ -51,6 +51,7 @@ impl MetalPipelines {
                     "rms_norm_f32",
                     "silu_mul_f32",
                     "add_f32",
+                    "scaled_add_inplace_f32",
                     "mul_scale_f32",
                     "fused_scale_add_f32",
                     "fused_residual_norm_f32",
@@ -256,6 +257,34 @@ impl MetalPipelines {
         enc.set_buffer(1, Some(b), 0);
         enc.set_buffer(2, Some(output), 0);
         enc.set_bytes(3, 4, &params as *const _ as *const c_void as *const _);
+        let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Scalar-scaled in-place add: `dst[i] += scale * src[i]`. Used by the
+    /// MoE per-(token, expert) combine where each expert's down-projection
+    /// is weighted by a router-derived scalar before summing into the
+    /// per-token output. Inlining the multiply avoids materialising
+    /// `scale * src` into a transient buffer.
+    pub fn scaled_add_inplace_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        dst: &Buffer,
+        src: &Buffer,
+        scale: f32,
+        n: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            n: i32,
+            scale: f32,
+        }
+        let params = P { n: n as i32, scale };
+        enc.set_compute_pipeline_state(self.pipeline("scaled_add_inplace_f32"));
+        enc.set_buffer(0, Some(dst), 0);
+        enc.set_buffer(1, Some(src), 0);
+        enc.set_bytes(2, 8, &params as *const _ as *const c_void as *const _);
         let grid = MTLSize::new(n.div_ceil(256) as u64, 1, 1);
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
