@@ -758,6 +758,45 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
+    /// Fused split-QKV + QK-norm + RoPE + head-major transpose.
+    ///
+    /// Single-dispatch replacement for the (`split_qkv` → 3× `qk_norm_rope`)
+    /// chain on the decode-attention prelude. Reads the linear-layer
+    /// fused-QKV output once and writes head-major Q/K/V directly into
+    /// attention scratch.
+    ///
+    /// `qkv` layout: `[tokens, q_heads*hd + 2*kv_heads*hd]`.
+    /// `q_out`: `[q_heads, tokens, hd]`. `k_out`/`v_out`: `[kv_heads, tokens, hd]`.
+    /// `qk_mode`: 1 = norm + RoPE for Q/K (Qwen3 with QK-norm),
+    ///            2 = RoPE only for Q/K (no QK-norm; Llama-style).
+    /// V always falls through to transpose-only.
+    ///
+    /// Default returns Unsupported. Backends that implement it are
+    /// expected to be dramatically faster than the four-dispatch chain.
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _k_out: &mut Self::Buffer,
+        _v_out: &mut Self::Buffer,
+        _tokens: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _pos_offset: usize,
+        _eps: f32,
+        _qk_mode: i32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope not implemented for this backend",
+        ))
+    }
+
     /// Append new K/V into a pre-allocated head-major cache buffer.
     ///
     /// `cache_k` / `cache_v`: `[nkv, capacity, hd]` (head-major, pre-allocated)

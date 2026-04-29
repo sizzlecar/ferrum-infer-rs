@@ -153,3 +153,119 @@ kernel void kv_cache_append_f32(
     // Dest:   [head * max_len * hd + (old_len + tok) * hd + d]
     cache[head * p.max_len * hd + (p.old_len + tok) * hd + d] = new_data[tid];
 }
+
+// ── Fused Split-QKV + QK-Norm + RoPE + Transpose ─────────────────────────
+// Replaces the (split_qkv → 3× qk_norm_rope_transpose) chain with one
+// dispatch. Reads the fused-QKV linear output once, applies RMSNorm
+// (Q/K) + RoPE (Q/K) + transpose (Q/K/V) in a single pass, and writes
+// directly into the head-major Q/K/V scratch buffers used by attention.
+//
+// Layout:
+//   qkv  : [tokens, q_heads*hd + 2*kv_heads*hd] flat
+//   q_out: [q_heads,  tokens, hd]
+//   k_out: [kv_heads, tokens, hd]
+//   v_out: [kv_heads, tokens, hd]
+//
+// Grid: (tokens, q_heads + 2*kv_heads). Threadgroup: 32 threads (1 simd).
+// head_global ∈ [0, q_heads)                              → Q (norm+RoPE)
+// head_global ∈ [q_heads, q_heads+kv_heads)               → K (norm+RoPE, k_norm_w)
+// head_global ∈ [q_heads+kv_heads, q_heads+2*kv_heads)    → V (transpose only)
+//
+// qk_mode: 1 = full QK-norm + RoPE (Qwen3); 2 = RoPE only no norm
+// (vocoder Q/K). V always passes apply_norm=0.
+
+struct SplitQkvNormRopeParams {
+    int tokens;
+    int q_heads;
+    int kv_heads;
+    int head_dim;
+    int half_dim;
+    int pos_offset;
+    float eps;
+    int qk_mode;       // 1 = norm+RoPE for Q/K, 2 = RoPE only for Q/K
+};
+
+kernel void split_qkv_norm_rope_f32(
+    device const float* qkv      [[buffer(0)]],   // [tokens, q_dim+2*kv_dim]
+    device const float* q_norm_w [[buffer(1)]],   // [head_dim] (unused if qk_mode==2)
+    device const float* k_norm_w [[buffer(2)]],   // [head_dim] (unused if qk_mode==2)
+    device const float* cos_tab  [[buffer(3)]],
+    device const float* sin_tab  [[buffer(4)]],
+    device       float* q_out    [[buffer(5)]],   // [q_heads,  tokens, hd]
+    device       float* k_out    [[buffer(6)]],   // [kv_heads, tokens, hd]
+    device       float* v_out    [[buffer(7)]],   // [kv_heads, tokens, hd]
+    constant SplitQkvNormRopeParams& p [[buffer(8)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],   // (token, head_global)
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const int tok = tgpig.x;
+    const int head_g = tgpig.y;
+    if (tok >= p.tokens) return;
+
+    const int hd = p.head_dim;
+    const int half_d = p.half_dim;
+    const int q_dim = p.q_heads * hd;
+    const int kv_dim = p.kv_heads * hd;
+    const int qkv_stride = q_dim + 2 * kv_dim;
+
+    // Region selection: 0 = Q, 1 = K, 2 = V.
+    int region;
+    int local_head;
+    int src_off;
+    if (head_g < uint(p.q_heads)) {
+        region = 0;
+        local_head = head_g;
+        src_off = tok * qkv_stride + local_head * hd;
+    } else if (head_g < uint(p.q_heads + p.kv_heads)) {
+        region = 1;
+        local_head = head_g - p.q_heads;
+        src_off = tok * qkv_stride + q_dim + local_head * hd;
+    } else {
+        region = 2;
+        local_head = head_g - p.q_heads - p.kv_heads;
+        src_off = tok * qkv_stride + q_dim + kv_dim + local_head * hd;
+    }
+
+    device const float* src = qkv + src_off;
+    // Pick destination buffer + per-region tokens stride (head_major).
+    device float* dst_base = (region == 0) ? q_out
+                            : (region == 1) ? k_out : v_out;
+    device float* dst = dst_base + local_head * p.tokens * hd + tok * hd;
+
+    if (region == 2) {
+        // V: transpose only. Each thread handles HD / 32 elements.
+        for (int i = tiisg; i < hd; i += 32) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+
+    // Q or K: optional norm + RoPE.
+    const bool apply_norm = (p.qk_mode == 1);
+    float scale = 1.0f;
+    device const float* norm_w = (region == 0) ? q_norm_w : k_norm_w;
+    if (apply_norm) {
+        float sum_sq = 0.0f;
+        for (int i = tiisg; i < hd; i += 32) {
+            float v = src[i];
+            sum_sq += v * v;
+        }
+        sum_sq = simd_sum(sum_sq);
+        scale = 1.0f / sqrt(sum_sq / float(hd) + p.eps);
+    }
+
+    const int pos = p.pos_offset + tok;
+    device const float* cos_row = cos_tab + pos * half_d;
+    device const float* sin_row = sin_tab + pos * half_d;
+
+    for (int i = tiisg; i < half_d; i += 32) {
+        float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
+        float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
+        float x0 = src[i]          * w0;
+        float x1 = src[i + half_d] * w1;
+        float c = cos_row[i];
+        float s = sin_row[i];
+        dst[i]          = x0 * c - x1 * s;
+        dst[i + half_d] = x1 * c + x0 * s;
+    }
+}

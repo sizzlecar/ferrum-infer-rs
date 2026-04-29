@@ -74,6 +74,7 @@ impl MetalPipelines {
                     "qk_norm_rope_transpose_f32",
                     "transpose_out_f32",
                     "kv_cache_append_f32",
+                    "split_qkv_norm_rope_f32",
                 ][..],
             ),
             (
@@ -554,6 +555,75 @@ impl MetalPipelines {
             &params as *const _ as *const c_void as *const _,
         );
         let grid = MTLSize::new(tokens as u64, heads as u64, 1);
+        let tg = MTLSize::new(32, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Fused split-QKV + QK-norm + RoPE + transpose.
+    ///
+    /// Replaces (`split_qkv` → 3× `qk_norm_rope_transpose`) with a single
+    /// dispatch that reads the linear-layer fused-QKV output once and
+    /// writes head-major Q/K (with norm+RoPE) and V (transpose only)
+    /// directly to attention scratch.
+    ///
+    /// `qk_mode`: 1 = norm + RoPE for Q/K (Qwen3 with QK-norm),
+    ///            2 = RoPE only for Q/K (no QK-norm; Llama-style).
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_qkv_norm_rope(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        qkv: &Buffer,
+        q_norm_w: &Buffer,
+        k_norm_w: &Buffer,
+        cos: &Buffer,
+        sin: &Buffer,
+        q_out: &Buffer,
+        k_out: &Buffer,
+        v_out: &Buffer,
+        tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        qk_mode: i32,
+    ) {
+        #[repr(C)]
+        struct P {
+            tokens: i32,
+            q_heads: i32,
+            kv_heads: i32,
+            head_dim: i32,
+            half_dim: i32,
+            pos_offset: i32,
+            eps: f32,
+            qk_mode: i32,
+        }
+        let params = P {
+            tokens: tokens as i32,
+            q_heads: q_heads as i32,
+            kv_heads: kv_heads as i32,
+            head_dim: head_dim as i32,
+            half_dim: (head_dim / 2) as i32,
+            pos_offset: pos_offset as i32,
+            eps,
+            qk_mode,
+        };
+        enc.set_compute_pipeline_state(self.pipeline("split_qkv_norm_rope_f32"));
+        enc.set_buffer(0, Some(qkv), 0);
+        enc.set_buffer(1, Some(q_norm_w), 0);
+        enc.set_buffer(2, Some(k_norm_w), 0);
+        enc.set_buffer(3, Some(cos), 0);
+        enc.set_buffer(4, Some(sin), 0);
+        enc.set_buffer(5, Some(q_out), 0);
+        enc.set_buffer(6, Some(k_out), 0);
+        enc.set_buffer(7, Some(v_out), 0);
+        enc.set_bytes(
+            8,
+            std::mem::size_of::<P>() as u64,
+            &params as *const _ as *const c_void as *const _,
+        );
+        let grid = MTLSize::new(tokens as u64, (q_heads + 2 * kv_heads) as u64, 1);
         let tg = MTLSize::new(32, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }

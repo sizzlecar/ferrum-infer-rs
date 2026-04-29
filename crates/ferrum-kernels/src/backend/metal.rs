@@ -1446,6 +1446,40 @@ impl Backend for MetalBackend {
         );
     }
 
+    fn split_qkv_norm_rope(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q_norm_w: &Self::Buffer,
+        k_norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        k_out: &mut Self::Buffer,
+        v_out: &mut Self::Buffer,
+        tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        qk_mode: i32,
+    ) -> Result<()> {
+        let qkv = qkv.expect_f32("split_qkv_norm_rope qkv");
+        let q_norm_w = q_norm_w.expect_f32("split_qkv_norm_rope q_norm_w");
+        let k_norm_w = k_norm_w.expect_f32("split_qkv_norm_rope k_norm_w");
+        let cos = cos.expect_f32("split_qkv_norm_rope cos");
+        let sin = sin.expect_f32("split_qkv_norm_rope sin");
+        let q_out = q_out.expect_f32_mut("split_qkv_norm_rope q_out");
+        let k_out = k_out.expect_f32_mut("split_qkv_norm_rope k_out");
+        let v_out = v_out.expect_f32_mut("split_qkv_norm_rope v_out");
+        let enc = ctx.compute_encoder();
+        st().pipes.split_qkv_norm_rope(
+            enc, qkv, q_norm_w, k_norm_w, cos, sin, q_out, k_out, v_out, tokens, q_heads, kv_heads,
+            head_dim, pos_offset, eps, qk_mode,
+        );
+        Ok(())
+    }
+
     fn kv_cache_append_head_major(
         ctx: &mut Self::Context,
         cache_k: &mut Self::Buffer,
