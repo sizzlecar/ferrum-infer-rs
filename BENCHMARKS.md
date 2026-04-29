@@ -212,13 +212,66 @@ These are the numbers ferrum is catching up to. ferrum's own runs go
 in the next subsection once Phase 1D is hooked into LlamaFamilyModel
 end-to-end.
 
-### ferrum — pending
+### ferrum — first measurement, 2026-04-29 (Qwen3-8B only, decode-only)
 
-| Model | Engine | pp512 | tg128 | vs llama.cpp |
-|---|---|---:|---:|---:|
-| Qwen3-8B Q4_K_M | ferrum (Phase 1D) | _pending_ | _pending_ | _pending_ |
-| Llama-3.1-8B Q4_K_M | ferrum (Phase 1D) | _pending_ | _pending_ | _pending_ |
-| Qwen3-30B-A3B Q4_K_M | ferrum (Phase 2 MoE + 1D) | _pending_ | _pending_ | _pending_ |
+The Phase 1D real-Q4 path is now end-to-end: GGUF → ferrum's
+`LlamaFamilyModel<B>` → custom Metal kernels (Q4-GEMV fused +
+RMSNorm + QK-norm-RoPE + flash-attn + …) with no candle in the
+forward path. Memory holds a single Q4 copy in MTLBuffer (~5 GB on
+disk, no eager-fp32 inflation). Output is coherent.
+
+Decode throughput (M1 Max, 24-core GPU, AC-powered):
+
+| Model | Engine | Decode tok/s | vs llama.cpp tg128 |
+|---|---|---:|---:|
+| Qwen3-8B Q4_K_M | ferrum (Phase 1D) | **~0.3** | **~95× slower** |
+
+Profile breakdown (Qwen3-8B, FERRUM_DECODE_OP_PROFILE=1):
+
+| Op category | Calls/tok | Wall avg | Notes |
+|---|---:|---:|---|
+| flash_attention | 36 | 332 µs | not the bottleneck |
+| qk_norm_rope | 108 | 238 µs | not the bottleneck |
+| norms (rms + fused) | 72 | 564 µs | not the bottleneck |
+| matmuls (4 per layer) | 144 | ~10 ms | dominates |
+| "other" (split/append/silu/add) | 180 | ~12 ms | also large |
+
+The per-call wall times include a B::sync round-trip (~5-10 ms each
+on Apple Silicon) — production removes the per-op syncs but still
+sees the same ~3.7 s per decode token, suggesting GPU-side
+serialization / clock throttling that the current diagnostic harness
+cannot isolate without Xcode Metal frame capture.
+
+Bottlenecks identified and fixed so far:
+  - **Phase 1D fused-Q4 path:** byte-concat Q4 super-blocks at load
+    so qkv_proj / gate_up_proj keep weights quantised (was
+    eager-dequanting → 38 GB RSS for a 5 GB model).
+  - **Pooled fp16 transient:** one buffer per matmul shape, not one
+    per call (was retaining multi-GB of dequant scratch between
+    flushes).
+  - **Fused gemv_q4kw kernel:** one Metal kernel reads Q4
+    super-blocks inline inside the GEMV reduction (skips the 32 MB
+    fp16 transient write+read per matmul).
+  - **setBytes for params:** 23 hot pipelines no longer alloc a
+    fresh 8-48 byte MTLBuffer per call.
+  - **Sticky compute encoder:** consecutive ops share one encoder
+    (down from ~14 to ~2 encoders per layer).
+
+Next-up bottlenecks (not in this commit):
+  - Q4 GEMV kernel itself runs ~50× slower than M1 Max bandwidth
+    floor (32 MB read at 400 GB/s = 0.08 ms; we measure ~5 ms).
+    Suspected cause: 1-simdgroup-per-output-col threadgroup layout
+    leaves too few simdgroups in flight for the compute unit's
+    occupancy budget. Needs a tiled gemv variant.
+  - Apple GPU dynamic frequency scaling between dispatches —
+    workaround would be to ensure the cmd buffer always has enough
+    queued work for the GPU to stay clocked-up.
+
+| Model | Engine | pp512 | tg128 | Status |
+|---|---|---:|---:|---|
+| Qwen3-8B Q4_K_M | ferrum (Phase 1D) | not yet measured | ~0.3 tok/s | correctness OK, perf ~95× behind |
+| Llama-3.1-8B Q4_K_M | ferrum (Phase 1D) | _pending_ | _pending_ | not yet run |
+| Qwen3-30B-A3B Q4_K_M | ferrum (Phase 2 MoE + 1D) | _pending_ | _pending_ | MoE primitives done, transformer not yet wired |
 
 ## Notes on the ferrum path
 
