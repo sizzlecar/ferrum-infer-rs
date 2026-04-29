@@ -127,7 +127,117 @@ impl<B: Backend> GgufLoader<B> {
 
     /// Build a fused `Linear<B>` by row-concatenating several sub-tensors.
     /// All parts must share `cols` (in_features); rows (out_features) sum.
+    ///
+    /// Two paths:
+    ///   1. **Fast (quant-fused)** — every part is Q4_K with no bias. The
+    ///      raw super-block bytes are byte-concatenated and handed to
+    ///      `QuantLinear::from_gguf_bytes`, so weights stay quantised in
+    ///      backend memory.
+    ///   2. **Eager (dense-fused)** — fallback. Each part is dequanted to
+    ///      fp32 and concatenated; the result wraps a dense fp16 weight
+    ///      via `GgufLinear::from_dense_rows`.
+    ///
+    /// Why the dual path: an 8B Qwen3 has 36 layers × (qkv + gate_up) of
+    /// ~140M weights apiece — eager-fp32-fusing them inflates 5 GB on disk
+    /// to 25+ GB in RAM, defeating Q4_K_M entirely. The fast path only
+    /// works for Q4K-without-bias which is the vast majority of dense
+    /// transformers; bias-bearing fusions (rare) take the eager hit.
     fn load_fused(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
+        if let Some(fast) = self.try_load_fused_q4k(parts)? {
+            return Ok(fast);
+        }
+        self.load_fused_eager(parts)
+    }
+
+    /// Q4_K fast path for `load_fused`. Returns `Ok(None)` if any part
+    /// disqualifies (non-Q4K dtype, rank != 2, has bias, cols mismatch).
+    fn try_load_fused_q4k(&self, parts: &[String]) -> Result<Option<Box<dyn Linear<B>>>> {
+        let mut fused_bytes: Vec<u8> = Vec::new();
+        let mut total_rows = 0usize;
+        let mut cols_check: Option<usize> = None;
+
+        for stem in parts {
+            let weight_name = format!("{stem}.weight");
+            let gguf_name = ferrum_to_gguf(&weight_name).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "GgufLoader: fusion source '{weight_name}' has no GGUF mapping"
+                ))
+            })?;
+            if !self.gguf.has_tensor(&gguf_name) {
+                return Err(FerrumError::model(format!(
+                    "GgufLoader: fusion source '{weight_name}' (gguf '{gguf_name}') missing"
+                )));
+            }
+
+            // Disqualifier 1: bias on this part — can't byte-concat that
+            // into a single QuantLinear.
+            let bias_name = ferrum_to_gguf(&format!("{stem}.bias"))
+                .map(|n| self.gguf.has_tensor(&n))
+                .unwrap_or(false);
+            if bias_name {
+                return Ok(None);
+            }
+
+            let info = self
+                .gguf
+                .tensor_info(&gguf_name)
+                .ok_or_else(|| FerrumError::model(format!("tensor_info missing for '{gguf_name}'")))?;
+
+            // Disqualifier 2: not Q4K dtype.
+            if !matches!(info.ggml_dtype, candle_core::quantized::GgmlDType::Q4K) {
+                return Ok(None);
+            }
+
+            let dims = info.shape.dims();
+            if dims.len() != 2 {
+                return Ok(None);
+            }
+            let (rows, cols) = (dims[0], dims[1]);
+
+            // Disqualifier 3: cols not a multiple of 256 (Q4K super-block
+            // boundary) — should not happen for Q4K tensors, but guard
+            // anyway so byte-concat produces a valid block stream.
+            if cols % 256 != 0 {
+                return Ok(None);
+            }
+
+            match cols_check {
+                Some(c) if c != cols => {
+                    return Err(FerrumError::model(format!(
+                        "GgufLoader: fusion in_features mismatch ({c} vs {cols} for '{stem}')"
+                    )))
+                }
+                _ => cols_check = Some(cols),
+            }
+
+            let qt = self
+                .gguf
+                .read_tensor(&gguf_name, &self.decode_device)
+                .map_err(candle_to_ferrum)?;
+            let bytes = qt.data().map_err(candle_to_ferrum)?;
+            // Sanity: 144 bytes per super-block, super-blocks = rows * (cols / 256).
+            let expected = rows * (cols / 256) * 144;
+            debug_assert_eq!(bytes.as_ref().len(), expected,
+                "Q4K byte count mismatch for '{gguf_name}': got {} expected {}",
+                bytes.as_ref().len(), expected);
+
+            fused_bytes.extend_from_slice(bytes.as_ref());
+            total_rows += rows;
+        }
+
+        let cols = cols_check.ok_or_else(|| FerrumError::model("fusion: no parts"))?;
+        let quant = crate::QuantLinear::<B>::from_gguf_bytes(
+            ferrum_kernels::backend::GgufQuantType::Q4K,
+            &fused_bytes,
+            total_rows,
+            cols,
+        )?;
+        Ok(Some(Box::new(quant)))
+    }
+
+    /// Eager (dequant-to-fp32 then concat) fusion. Used for non-Q4K parts
+    /// or parts with bias. See `load_fused` doc for the trade-off.
+    fn load_fused_eager(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
         let mut fused: Vec<f32> = Vec::new();
         let mut total_rows = 0usize;
         let mut cols_check: Option<usize> = None;

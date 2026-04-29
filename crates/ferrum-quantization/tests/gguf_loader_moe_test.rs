@@ -195,7 +195,7 @@ fn stacked_expert_load_linear_rejects_rank_3() {
     assert!(result.is_err(), "3-D stacked expert tensor must reject");
     let err = result.err().unwrap().to_string();
     assert!(
-        err.contains("2-D"),
+        err.contains("rank-2") || err.contains("2-D") || err.contains("rank 3"),
         "error message mentions rank constraint: {err}"
     );
 }

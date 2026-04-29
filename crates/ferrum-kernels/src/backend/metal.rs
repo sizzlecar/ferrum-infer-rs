@@ -123,8 +123,20 @@ unsafe impl Sync for MetalBuf {}
 /// Metal context — one in-flight command buffer that accumulates encodes
 /// across multiple `Backend` method calls. `sync()` commits + waits and
 /// drops the handle so the next call creates a fresh buffer.
+///
+/// Also owns a per-shape pool of fp16 dequant transients used by
+/// `gemm_quant`. Without it, every Q4 matmul allocates a fresh
+/// StorageModePrivate buffer that the in-flight command buffer retains
+/// until commit; on a 36-layer model with 4 quant matmuls per layer
+/// that grew to multi-GB of leaked transients between flushes.
+/// With pooling, ~4 distinct shapes per model survive — bounded ~200 MB.
 pub struct MetalContext {
     cmd: Option<&'static metal::CommandBufferRef>,
+    /// Reusable fp16 dequant targets, keyed by byte-size. We index by
+    /// size rather than (n_rows,n_cols) because shape isn't observed by
+    /// the dequant/gemm kernels — they just need a buffer of the right
+    /// length. Same size from any matmul shares a slot.
+    quant_transients: std::collections::HashMap<u64, metal::Buffer>,
 }
 
 impl MetalContext {
@@ -143,6 +155,21 @@ impl MetalContext {
                 c_static
             }
         }
+    }
+
+    /// Get or create a private-storage fp16 transient buffer of exactly
+    /// `size_bytes`. Reused across `gemm_quant` calls so the in-flight
+    /// command buffer retains a single object per shape, not one per call.
+    fn quant_transient(&mut self, size_bytes: u64) -> &metal::Buffer {
+        // HashMap::entry borrow gymnastics: insert if missing, then return ref.
+        if !self.quant_transients.contains_key(&size_bytes) {
+            let buf = st()
+                .pipes
+                .device
+                .new_buffer(size_bytes, MTLResourceOptions::StorageModePrivate);
+            self.quant_transients.insert(size_bytes, buf);
+        }
+        self.quant_transients.get(&size_bytes).unwrap()
     }
 
     fn flush(&mut self) {
@@ -237,7 +264,10 @@ impl Backend for MetalBackend {
     type QuantStore = MetalQuantStore;
 
     fn new_context() -> Self::Context {
-        MetalContext { cmd: None }
+        MetalContext {
+            cmd: None,
+            quant_transients: std::collections::HashMap::new(),
+        }
     }
     fn sync(ctx: &mut Self::Context) {
         ctx.flush();
@@ -305,13 +335,22 @@ impl Backend for MetalBackend {
 
         let total_elems = (*n_rows * *n_cols) as u64;
         let f16_bytes = total_elems * 2;
+        // Snapshot the values we need before the mutable borrow on ctx,
+        // since the borrow checker can't see that `quant_transient` and
+        // `cmd` touch disjoint fields of MetalContext.
+        let n_rows = *n_rows;
+        let n_cols = *n_cols;
+        let n_blocks = *n_blocks;
 
-        // Transient fp16 dequant target. Private storage = GPU-resident only,
-        // no host visibility, allocation is lazy/cheap on Apple Silicon.
-        let transient = st()
-            .pipes
-            .device
-            .new_buffer(f16_bytes, MTLResourceOptions::StorageModePrivate);
+        // Pooled fp16 dequant target — reused across calls of the same
+        // shape so the in-flight cmd buffer holds one buffer per shape,
+        // not one per matmul. See MetalContext::quant_transient.
+        let transient_ptr: *const metal::Buffer = ctx.quant_transient(f16_bytes);
+        // SAFETY: transient_ptr points into ctx.quant_transients (a HashMap
+        // we own); the buffer outlives this function and the cmd buffer
+        // we encode into. We need this raw pointer because the next line
+        // takes `&mut ctx` again for `cmd`.
+        let transient: &metal::Buffer = unsafe { &*transient_ptr };
 
         // 1) Dequant Q4 bytes → fp16 transient on the same cmd buffer.
         let cmd = ctx.cmd();
@@ -319,8 +358,8 @@ impl Backend for MetalBackend {
             &st().pipes.device,
             cmd,
             blocks,
-            &transient,
-            *n_blocks,
+            transient,
+            n_blocks,
         );
 
         // 2) GEMM: out = a @ transient^T using the existing fp16-weights
@@ -331,10 +370,10 @@ impl Backend for MetalBackend {
         let enc = cmd.new_compute_command_encoder();
         if m == 1 {
             st().pipes
-                .gemv_enc_f16w(enc, a_buf, &transient, out_buf, *n_rows, *n_cols);
+                .gemv_enc_f16w(enc, a_buf, transient, out_buf, n_rows, n_cols);
         } else {
             st().pipes
-                .gemm_v2_f16w(enc, a_buf, &transient, out_buf, m, *n_rows, *n_cols);
+                .gemm_v2_f16w(enc, a_buf, transient, out_buf, m, n_rows, n_cols);
         }
         enc.end_encoding();
         Ok(())
