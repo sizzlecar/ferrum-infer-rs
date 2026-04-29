@@ -73,6 +73,27 @@ pub fn encode_dequant_q4_k_to_f16(
     enc.end_encoding();
 }
 
+/// Variant that runs on an *existing* compute encoder — the caller owns
+/// the encoder lifetime. Use this when the dequant is followed
+/// immediately by another compute dispatch (e.g. GEMM that reads the
+/// dequanted transient): subsequent dispatches on the same encoder see
+/// this dispatch's device-memory writes by Metal's serialized-execution
+/// guarantee, no explicit fence needed. Saves one
+/// `new_compute_command_encoder` round-trip per matmul.
+pub fn dispatch_dequant_q4_k_on_encoder(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    blocks_buf: &Buffer,
+    out_buf: &Buffer,
+    n_blocks: usize,
+) {
+    if n_blocks == 0 {
+        return;
+    }
+    let pipe = pipeline(device);
+    encode_dispatch(enc, pipe, blocks_buf, out_buf, n_blocks);
+}
+
 fn encode_dispatch(
     enc: &ComputeCommandEncoderRef,
     pipe: &ComputePipelineState,

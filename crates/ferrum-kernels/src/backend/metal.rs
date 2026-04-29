@@ -180,6 +180,19 @@ impl MetalContext {
     }
 }
 
+// ── Profiling counters for `gemm_quant` (off by default) ─────────────
+
+static QUANT_GEMM_TIME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUANT_GEMM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUANT_GEMM_LAST_M: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUANT_GEMM_LAST_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUANT_GEMM_LAST_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn debug_per_call_flush() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("FERRUM_METAL_QUANT_PROFILE").is_ok())
+}
+
 // ── Policy: should big weights land as f16? ───────────────────────────
 // Cached on first read so each tensor load doesn't re-parse env.
 
@@ -342,6 +355,12 @@ impl Backend for MetalBackend {
         let n_cols = *n_cols;
         let n_blocks = *n_blocks;
 
+        let _t0 = if debug_per_call_flush() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         // Pooled fp16 dequant target — reused across calls of the same
         // shape so the in-flight cmd buffer holds one buffer per shape,
         // not one per matmul. See MetalContext::quant_transient.
@@ -352,11 +371,20 @@ impl Backend for MetalBackend {
         // takes `&mut ctx` again for `cmd`.
         let transient: &metal::Buffer = unsafe { &*transient_ptr };
 
-        // 1) Dequant Q4 bytes → fp16 transient on the same cmd buffer.
+        // Dequant + GEMM on a *single* compute encoder. Within one
+        // encoder, Metal serializes dispatches and the dequant's
+        // device-memory writes are visible to the GEMM's reads — no
+        // fence needed, and we save one encoder round-trip per matmul
+        // (~10us each × 145 matmuls/token = real money on M1 Max).
+        let a_buf = a.expect_f32("gemm_quant Q4K a");
+        let out_buf = out.expect_f32_mut("gemm_quant Q4K out");
         let cmd = ctx.cmd();
-        crate::q4_k::encode_dequant_q4_k_to_f16(
+        let enc = cmd.new_compute_command_encoder();
+
+        // 1) Dequant Q4 bytes → fp16 transient.
+        crate::q4_k::dispatch_dequant_q4_k_on_encoder(
             &st().pipes.device,
-            cmd,
+            enc,
             blocks,
             transient,
             n_blocks,
@@ -365,9 +393,6 @@ impl Backend for MetalBackend {
         // 2) GEMM: out = a @ transient^T using the existing fp16-weights
         //    kernels — same code path that runs when FERRUM_METAL_DTYPE=f16
         //    is set on dense weights.
-        let a_buf = a.expect_f32("gemm_quant Q4K a");
-        let out_buf = out.expect_f32_mut("gemm_quant Q4K out");
-        let enc = cmd.new_compute_command_encoder();
         if m == 1 {
             st().pipes
                 .gemv_enc_f16w(enc, a_buf, transient, out_buf, n_rows, n_cols);
@@ -376,6 +401,25 @@ impl Backend for MetalBackend {
                 .gemm_v2_f16w(enc, a_buf, transient, out_buf, m, n_rows, n_cols);
         }
         enc.end_encoding();
+
+        // Optional per-call timing: commit + wait the cmd buffer right
+        // here so we measure the GPU work for *this* matmul. Off by
+        // default (would serialize the whole pipeline).
+        if let Some(t0) = _t0 {
+            ctx.flush();
+            let elapsed_us = t0.elapsed().as_micros();
+            QUANT_GEMM_TIME_US.fetch_add(elapsed_us as u64, std::sync::atomic::Ordering::Relaxed);
+            QUANT_GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            QUANT_GEMM_LAST_M.store(m as u64, std::sync::atomic::Ordering::Relaxed);
+            QUANT_GEMM_LAST_N.store(n_rows as u64, std::sync::atomic::Ordering::Relaxed);
+            QUANT_GEMM_LAST_K.store(n_cols as u64, std::sync::atomic::Ordering::Relaxed);
+            if QUANT_GEMM_CALLS.load(std::sync::atomic::Ordering::Relaxed) <= 16 {
+                eprintln!(
+                    "[gemm_quant] m={} n={} k={} took {} us",
+                    m, n_rows, n_cols, elapsed_us
+                );
+            }
+        }
         Ok(())
     }
 
