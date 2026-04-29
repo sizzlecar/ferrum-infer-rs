@@ -132,6 +132,14 @@ unsafe impl Sync for MetalBuf {}
 /// With pooling, ~4 distinct shapes per model survive — bounded ~200 MB.
 pub struct MetalContext {
     cmd: Option<&'static metal::CommandBufferRef>,
+    /// Sticky compute encoder. Held open across multiple `Backend`
+    /// method calls so consecutive compute dispatches share one encoder
+    /// — Metal serializes dispatches within a single encoder and prior
+    /// dispatch's device-memory writes are visible to the next
+    /// dispatch's reads, so this is correct for the model's dataflow.
+    /// Closing happens on `sync`, on `compute_encoder_end` (e.g. before
+    /// a blit encoder), or naturally on context drop.
+    encoder: Option<&'static metal::ComputeCommandEncoderRef>,
     /// Reusable fp16 dequant targets, keyed by byte-size. We index by
     /// size rather than (n_rows,n_cols) because shape isn't observed by
     /// the dequant/gemm kernels — they just need a buffer of the right
@@ -157,6 +165,31 @@ impl MetalContext {
         }
     }
 
+    /// Return a compute command encoder, opening one on the current cmd
+    /// buffer if there isn't already one. Subsequent calls during the
+    /// same window return the same encoder — set the pipeline state
+    /// before each dispatch.
+    fn compute_encoder(&mut self) -> &'static metal::ComputeCommandEncoderRef {
+        if let Some(enc) = self.encoder {
+            return enc;
+        }
+        let cmd = self.cmd();
+        let enc = cmd.new_compute_command_encoder();
+        let enc_static: &'static metal::ComputeCommandEncoderRef =
+            unsafe { std::mem::transmute::<&metal::ComputeCommandEncoderRef, _>(enc) };
+        self.encoder = Some(enc_static);
+        enc_static
+    }
+
+    /// Close the active compute encoder if one is open. Caller must do
+    /// this before switching to a blit encoder, before commit, or before
+    /// recording into a different cmd buffer.
+    fn compute_encoder_end(&mut self) {
+        if let Some(enc) = self.encoder.take() {
+            enc.end_encoding();
+        }
+    }
+
     /// Get or create a private-storage fp16 transient buffer of exactly
     /// `size_bytes`. Reused across `gemm_quant` calls so the in-flight
     /// command buffer retains a single object per shape, not one per call.
@@ -173,6 +206,7 @@ impl MetalContext {
     }
 
     fn flush(&mut self) {
+        self.compute_encoder_end();
         if let Some(cmd) = self.cmd.take() {
             cmd.commit();
             cmd.wait_until_completed();
@@ -279,6 +313,7 @@ impl Backend for MetalBackend {
     fn new_context() -> Self::Context {
         MetalContext {
             cmd: None,
+            encoder: None,
             quant_transients: std::collections::HashMap::new(),
         }
     }
@@ -372,8 +407,7 @@ impl Backend for MetalBackend {
             // chunk of the per-token wall on memory-bandwidth-bound
             // hardware. Requires `K % 256 == 0` (always holds for Q4_K_M
             // tensors).
-            let cmd = ctx.cmd();
-            let enc = cmd.new_compute_command_encoder();
+            let enc = ctx.compute_encoder();
             crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
                 &st().pipes.device,
                 enc,
@@ -383,7 +417,6 @@ impl Backend for MetalBackend {
                 n_rows,
                 n_cols,
             );
-            enc.end_encoding();
         } else {
             // **Dequant→transient→GEMM** path for prefill (m > 1). Pool
             // the fp16 transient by byte-size so repeated shapes share
@@ -395,8 +428,7 @@ impl Backend for MetalBackend {
             // cmd buffer we encode into. The raw pointer dance is needed
             // because the next call takes &mut ctx again for `cmd`.
             let transient: &metal::Buffer = unsafe { &*transient_ptr };
-            let cmd = ctx.cmd();
-            let enc = cmd.new_compute_command_encoder();
+            let enc = ctx.compute_encoder();
             crate::q4_k::dispatch_dequant_q4_k_on_encoder(
                 &st().pipes.device,
                 enc,
@@ -406,7 +438,6 @@ impl Backend for MetalBackend {
             );
             st().pipes
                 .gemm_v2_f16w(enc, a_buf, transient, out_buf, m, n_rows, n_cols);
-            enc.end_encoding();
         }
 
         // Optional per-call timing: commit + wait the cmd buffer right
@@ -443,8 +474,7 @@ impl Backend for MetalBackend {
     ) {
         let a_buf = a.expect_f32("gemm a");
         let out_buf = out.expect_f32_mut("gemm out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         match b.dtype {
             Dtype::F16 => {
                 // f16 weights — route through the f32-activation / f16-weight kernels.
@@ -467,7 +497,6 @@ impl Backend for MetalBackend {
                 }
             }
         }
-        enc.end_encoding();
     }
 
     // ── Norm / attention / fused ops — all f32 ───────────────────────
@@ -484,10 +513,8 @@ impl Backend for MetalBackend {
         let x = x.expect_f32("rms_norm x");
         let w = w.expect_f32("rms_norm w");
         let out = out.expect_f32_mut("rms_norm out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.rms_norm_enc(enc, x, w, out, tokens, dim, eps);
-        enc.end_encoding();
     }
 
     fn fused_add_rms_norm(
@@ -504,12 +531,10 @@ impl Backend for MetalBackend {
         let x = x.expect_f32("fused_add_rms_norm x");
         let w = w.expect_f32("fused_add_rms_norm w");
         let out = out.expect_f32_mut("fused_add_rms_norm out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.fused_residual_norm_enc(
             enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
         );
-        enc.end_encoding();
     }
 
     fn flash_attention(
@@ -539,6 +564,10 @@ impl Backend for MetalBackend {
         let k = k.expect_f32("flash_attention k");
         let v = v.expect_f32("flash_attention v");
         let out = out.expect_f32_mut("flash_attention out");
+        // flash_attn_v2 opens its own compute encoder internally; close
+        // the sticky one first so we don't have two open at once on the
+        // same cmd buffer.
+        ctx.compute_encoder_end();
         let cmd = ctx.cmd();
         st().pipes
             .flash_attn_v2(cmd, q, k, v, out, &p, cfg.kv_seq_stride);
@@ -554,8 +583,11 @@ impl Backend for MetalBackend {
     ) {
         // Blit encoder stays in the same command buffer as neighbouring
         // compute encoders, keeping the single-command-buffer invariant.
+        // Close the sticky compute encoder first — Metal forbids two
+        // active encoders on one cmd buffer.
         let src = src.expect_f32("copy_slice src");
         let dst = dst.expect_f32_mut("copy_slice dst");
+        ctx.compute_encoder_end();
         let cmd = ctx.cmd();
         let blit = cmd.new_blit_command_encoder();
         blit.copy_from_buffer(
@@ -622,11 +654,9 @@ impl Backend for MetalBackend {
         let q = q.expect_f32_mut("split_qkv q");
         let k = k.expect_f32_mut("split_qkv k");
         let v = v.expect_f32_mut("split_qkv v");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes
             .split_qkv_enc(enc, qkv, q, k, v, tokens, q_dim, kv_dim);
-        enc.end_encoding();
     }
 
     fn fused_silu_mul_split(
@@ -638,10 +668,8 @@ impl Backend for MetalBackend {
     ) {
         let gu = gu.expect_f32("fused_silu_mul_split gate_up");
         let out = out.expect_f32_mut("fused_silu_mul_split out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.silu_mul_split_enc(enc, gu, out, tokens, im);
-        enc.end_encoding();
     }
 
     fn qk_norm_rope(
@@ -663,12 +691,10 @@ impl Backend for MetalBackend {
         let cos = cos.expect_f32("qk_norm_rope cos");
         let sin = sin.expect_f32("qk_norm_rope sin");
         let output = output.expect_f32_mut("qk_norm_rope output");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.qk_norm_rope(
             enc, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps, mode,
         );
-        enc.end_encoding();
     }
 
     fn kv_cache_append_head_major(
@@ -688,8 +714,7 @@ impl Backend for MetalBackend {
         let cache_v = cache_v.expect_f32_mut("kv_cache_append cache_v");
         let new_k_head_major = new_k_head_major.expect_f32("kv_cache_append new_k");
         let new_v_head_major = new_v_head_major.expect_f32("kv_cache_append new_v");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.kv_cache_append(
             enc,
             new_k_head_major,
@@ -710,7 +735,6 @@ impl Backend for MetalBackend {
             new_tokens,
             cache_capacity,
         );
-        enc.end_encoding();
     }
 
     fn transpose_head_to_token(
@@ -723,10 +747,8 @@ impl Backend for MetalBackend {
     ) {
         let src = src.expect_f32("transpose_head_to_token src");
         let dst = dst.expect_f32_mut("transpose_head_to_token dst");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.transpose_out(enc, src, dst, tokens, heads, dim);
-        enc.end_encoding();
     }
 
     fn add_bias(
@@ -738,10 +760,8 @@ impl Backend for MetalBackend {
     ) {
         let data = data.expect_f32_mut("add_bias data");
         let bias = bias.expect_f32("add_bias bias");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.add_bias_enc(enc, data, bias, rows, cols);
-        enc.end_encoding();
     }
 
     fn layer_norm(
@@ -758,29 +778,23 @@ impl Backend for MetalBackend {
         let gamma = gamma.expect_f32("layer_norm gamma");
         let beta = beta.expect_f32("layer_norm beta");
         let out = out.expect_f32_mut("layer_norm out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes
             .layer_norm_enc(enc, x, gamma, beta, out, tokens, dim, eps);
-        enc.end_encoding();
     }
 
     fn gelu(ctx: &mut Self::Context, x: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
         let x = x.expect_f32("gelu x");
         let out = out.expect_f32_mut("gelu out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.gelu_enc(enc, x, out, len);
-        enc.end_encoding();
     }
 
     fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
         let r = r.expect_f32_mut("add_inplace r");
         let x = x.expect_f32("add_inplace x");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = ctx.compute_encoder();
         st().pipes.add_enc(enc, r, x, r, len);
-        enc.end_encoding();
     }
 
     // ── Buffer management ────────────────────────────────────────────
