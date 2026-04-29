@@ -123,13 +123,6 @@ unsafe impl Sync for MetalBuf {}
 /// Metal context — one in-flight command buffer that accumulates encodes
 /// across multiple `Backend` method calls. `sync()` commits + waits and
 /// drops the handle so the next call creates a fresh buffer.
-///
-/// Also owns a per-shape pool of fp16 dequant transients used by
-/// `gemm_quant`. Without it, every Q4 matmul allocates a fresh
-/// StorageModePrivate buffer that the in-flight command buffer retains
-/// until commit; on a 36-layer model with 4 quant matmuls per layer
-/// that grew to multi-GB of leaked transients between flushes.
-/// With pooling, ~4 distinct shapes per model survive — bounded ~200 MB.
 pub struct MetalContext {
     cmd: Option<&'static metal::CommandBufferRef>,
     /// Sticky compute encoder. Held open across multiple `Backend`
@@ -140,11 +133,6 @@ pub struct MetalContext {
     /// Closing happens on `sync`, on `compute_encoder_end` (e.g. before
     /// a blit encoder), or naturally on context drop.
     encoder: Option<&'static metal::ComputeCommandEncoderRef>,
-    /// Reusable fp16 dequant targets, keyed by byte-size. We index by
-    /// size rather than (n_rows,n_cols) because shape isn't observed by
-    /// the dequant/gemm kernels — they just need a buffer of the right
-    /// length. Same size from any matmul shares a slot.
-    quant_transients: std::collections::HashMap<u64, metal::Buffer>,
 }
 
 impl MetalContext {
@@ -188,21 +176,6 @@ impl MetalContext {
         if let Some(enc) = self.encoder.take() {
             enc.end_encoding();
         }
-    }
-
-    /// Get or create a private-storage fp16 transient buffer of exactly
-    /// `size_bytes`. Reused across `gemm_quant` calls so the in-flight
-    /// command buffer retains a single object per shape, not one per call.
-    fn quant_transient(&mut self, size_bytes: u64) -> &metal::Buffer {
-        // HashMap::entry borrow gymnastics: insert if missing, then return ref.
-        if !self.quant_transients.contains_key(&size_bytes) {
-            let buf = st()
-                .pipes
-                .device
-                .new_buffer(size_bytes, MTLResourceOptions::StorageModePrivate);
-            self.quant_transients.insert(size_bytes, buf);
-        }
-        self.quant_transients.get(&size_bytes).unwrap()
     }
 
     fn flush(&mut self) {
@@ -321,13 +294,6 @@ impl MetalQuantStore {
         match self {
             MetalQuantStore::Q4K { n_rows, .. } | MetalQuantStore::Q6K { n_rows, .. } => *n_rows,
             MetalQuantStore::Fused { total_rows, .. } => *total_rows,
-        }
-    }
-    fn n_cols(&self) -> usize {
-        match self {
-            MetalQuantStore::Q4K { n_cols, .. }
-            | MetalQuantStore::Q6K { n_cols, .. }
-            | MetalQuantStore::Fused { n_cols, .. } => *n_cols,
         }
     }
 }
@@ -472,7 +438,6 @@ impl Backend for MetalBackend {
         MetalContext {
             cmd: None,
             encoder: None,
-            quant_transients: std::collections::HashMap::new(),
         }
     }
     fn sync(ctx: &mut Self::Context) {
@@ -660,9 +625,6 @@ impl Backend for MetalBackend {
             MetalQuantStore::Fused { .. } => unreachable!("handled above"),
         };
 
-        let total_elems = (n_rows * n_cols) as u64;
-        let f16_bytes = total_elems * 2;
-
         let _t0 = if debug_per_call_flush() {
             Some(std::time::Instant::now())
         } else {
@@ -755,9 +717,7 @@ impl Backend for MetalBackend {
                 n_rows,
                 n_cols,
             );
-            // Touch f16_bytes / n_blocks so they don't trigger
-            // unused-warning when the old path is removed.
-            let _ = (f16_bytes, n_blocks);
+            let _ = n_blocks; // not consumed by mul_mm path; kept for the load-time block accounting
         }
 
         // Optional per-call timing: commit + wait the cmd buffer right
