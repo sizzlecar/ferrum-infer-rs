@@ -424,65 +424,95 @@ impl<B: Backend> Qwen3MoeModel<B> {
             tokens,
         );
 
-        // 3. split QKV
-        B::split_qkv(
-            ctx,
-            &self.scratch.qkv_out,
-            &mut self.scratch.q_buf,
-            &mut self.scratch.k_buf,
-            &mut self.scratch.v_buf,
-            tokens,
-            q_dim,
-            kv_dim,
-        );
-
-        // 4. QK-norm + RoPE → head-major Q/K, transpose-only V
+        // 3-4. Fused split-QKV + QK-norm + RoPE + head-major transpose.
+        //
+        // One Metal dispatch replaces (split_qkv → 3× qk_norm_rope), the
+        // four-launch chain that used to dominate the attention prelude.
+        // Reads qkv_out once, writes head-major Q/K (norm+RoPE) and V
+        // (transpose only) directly into attention scratch. Saves 3
+        // dispatches per layer (×48 = 144 dispatches per decode token).
+        //
+        // CPU and other backends without the fused kernel return
+        // Unsupported and we fall through to the original four-launch
+        // path. q_buf / k_buf / v_buf stay in scratch because that path
+        // and the per-expert MoE fallback still want them.
         let qk_mode: i32 = if cfg_base.has_qk_norm { 1 } else { 2 };
         let dummy = &attn_layer.input_ln_w;
         let q_norm_w = attn_layer.q_norm_w.as_ref().unwrap_or(dummy);
         let k_norm_w = attn_layer.k_norm_w.as_ref().unwrap_or(dummy);
-        B::qk_norm_rope(
+        let used_fused_qkv = B::split_qkv_norm_rope(
             ctx,
-            &self.scratch.q_buf,
+            &self.scratch.qkv_out,
             q_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
-            &mut self.scratch.q_head_major,
-            tokens,
-            nh,
-            hd,
-            pos_offset,
-            eps,
-            qk_mode,
-        );
-        B::qk_norm_rope(
-            ctx,
-            &self.scratch.k_buf,
             k_norm_w,
             &self.rope.cos,
             &self.rope.sin,
+            &mut self.scratch.q_head_major,
             &mut self.scratch.k_head_major,
+            &mut self.scratch.v_head_major,
             tokens,
+            nh,
             nkv,
             hd,
             pos_offset,
             eps,
             qk_mode,
-        );
-        B::qk_norm_rope(
-            ctx,
-            &self.scratch.v_buf,
-            dummy,
-            &self.rope.cos,
-            &self.rope.sin,
-            &mut self.scratch.v_head_major,
-            tokens,
-            nkv,
-            hd,
-            pos_offset,
-            eps,
-            0,
-        );
+        )
+        .is_ok();
+        if !used_fused_qkv {
+            B::split_qkv(
+                ctx,
+                &self.scratch.qkv_out,
+                &mut self.scratch.q_buf,
+                &mut self.scratch.k_buf,
+                &mut self.scratch.v_buf,
+                tokens,
+                q_dim,
+                kv_dim,
+            );
+            B::qk_norm_rope(
+                ctx,
+                &self.scratch.q_buf,
+                q_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.q_head_major,
+                tokens,
+                nh,
+                hd,
+                pos_offset,
+                eps,
+                qk_mode,
+            );
+            B::qk_norm_rope(
+                ctx,
+                &self.scratch.k_buf,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.k_head_major,
+                tokens,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                qk_mode,
+            );
+            B::qk_norm_rope(
+                ctx,
+                &self.scratch.v_buf,
+                dummy,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.v_head_major,
+                tokens,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                0,
+            );
+        }
 
         // 5. KV append + 6. flash attention.
         let caches = self
