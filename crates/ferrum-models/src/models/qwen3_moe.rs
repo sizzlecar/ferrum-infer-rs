@@ -889,24 +889,29 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
     norm_topk_prob: bool,
     tokens: usize,
 ) -> Result<()> {
-    // Host-side routing: pull router_logits for the whole batch, run
-    // softmax + top-K. One sync per call covers all `tokens`.
-    B::sync(ctx);
-    let logits_host = B::to_vec(&scratch.router_logits, tokens * n_exp);
-    let route = crate::moe::router::route(&logits_host, tokens, n_exp, top_k, norm_topk_prob);
+    // GPU-side routing: one Metal launch reads router_logits and writes
+    // selected ids + combine weights directly into device-side scratch
+    // buffers. Eliminates the per-layer `B::sync + B::to_vec(router_logits)
+    // + host route()` round trip — the dominant remaining cost in the
+    // decode hot path (~10% of total decode latency).
+    B::route_topk_softmax(
+        ctx,
+        &scratch.router_logits,
+        &mut scratch.ids_buf,
+        &mut scratch.weights_buf,
+        tokens,
+        n_exp,
+        top_k,
+        norm_topk_prob,
+    )?;
 
     let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
     let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
     let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
 
     for b in 0..tokens {
-        // Upload this token's selected expert IDs in place — avoids
-        // re-allocating a fresh MTLBuffer per layer × per token.
-        let ids_i32: Vec<i32> = route.expert_ids[b * top_k..(b + 1) * top_k]
-            .iter()
-            .map(|&id| id as i32)
-            .collect();
-        B::write_i32_into(&mut scratch.ids_buf, &ids_i32);
+        // ids_buf and weights_buf populated by the GPU router above —
+        // no host writes needed here in the decode path.
 
         // Stage row b of norm_out into x_single (decode m=1 has it
         // already at offset 0; prefill needs the offset). For decode
@@ -961,10 +966,8 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
         )?;
 
         // 5. Stacked weighted sum: acc_buf[0..h] = Σ_k w[k] · down[k].
-        //    Upload this token's combine weights in place — same trick
-        //    as ids_buf, avoids 6144 per-decode MTLBuffer allocations.
-        let weights_slice = &route.expert_weights[b * top_k..(b + 1) * top_k];
-        B::write_f32_into(&mut scratch.weights_buf, weights_slice);
+        //    weights_buf was populated by the GPU router — no host
+        //    upload needed here.
         B::weighted_sum_stacked(
             ctx,
             &scratch.down_out_stacked,
