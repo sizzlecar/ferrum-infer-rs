@@ -3,17 +3,17 @@
 ✓ GGUF parsed in 0.02s — arch detected, 36 layers, hidden=4096, kv_heads=8
 → tokenizer: /Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-8B.tokenizer.json
 → loading weights into Metal (arch: qwen3) ...
-✓ model ready in 3.56s
+✓ model ready in 3.30s
 → prompt: 1 tokens
-✓ prefill: 1 tok in 0.131s (7.6 tok/s)
+✓ prefill: 1 tok in 0.121s (8.3 tok/s)
 
 ────────────────────────────────────────────────────────────
 tokens: 1 prompt + 128 generated tok
-time: 0.131s prefill + 5.905s decode
-throughput: 21.5 tok/s (decode only)
-latency: 46.50ms / token
-rep=1 p_n=1 p_s=0.120 d_n=128 d_s=5.061
-rep=2 p_n=1 p_s=0.124 d_n=128 d_s=5.124
-rep=3 p_n=1 p_s=0.128 d_n=128 d_s=5.200
-rep=4 p_n=1 p_s=0.134 d_n=128 d_s=5.302
-rep=5 p_n=1 p_s=0.123 d_n=128 d_s=5.089
+time: 0.121s prefill + 5.287s decode
+throughput: 24.0 tok/s (decode only)
+latency: 41.63ms / token
+rep=1 p_n=1 p_s=0.113 d_n=128 d_s=5.072
+rep=2 p_n=1 p_s=0.123 d_n=128 d_s=5.088
+rep=3 p_n=1 p_s=0.125 d_n=128 d_s=5.085
+rep=4 p_n=1 p_s=0.113 d_n=128 d_s=5.038
+rep=5 p_n=1 p_s=0.115 d_n=128 d_s=5.177

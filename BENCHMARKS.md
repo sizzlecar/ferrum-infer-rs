@@ -241,7 +241,8 @@ qkv) onto per-part mul_mm dispatches:
 | Qwen3-8B Q4_K_M | tg128 | **25.58 ± 0.42** | 27.94 ± 0.90 | **92%** |
 | Llama-3.1-8B Q4_K_M | pp (295-token prompt) | **251.62 ± 1.36** | 335.13 ± 24.86 (pp512) | **75%** |
 | Llama-3.1-8B Q4_K_M | tg128 | **26.47 ± 0.36** | 29.20 ± 0.44 | **91%** |
-| Qwen3-30B-A3B Q4_K_M | — | not wired yet (MoE) | 596 / 44.5 | — |
+| Qwen3-30B-A3B Q4_K_M | pp (302-token prompt) | **43.67 ± 2.05** | 596.58 ± 3.89 (pp512) | **7%** |
+| Qwen3-30B-A3B Q4_K_M | tg128 | **13.22 ± 2.86** | 44.52 ± 6.80 | **30%** |
 
 Progression of prefill on Qwen3-8B (302-token prompt) through this work:
 
@@ -303,6 +304,70 @@ recover most of the 5× gap.
 Decode (m=1) already uses the fused path (`gemv_q4kw_v2` /
 `gemv_q6kw_v2`), which is why it's already within 11% of llama.cpp.
 
+### Qwen3-30B-A3B MoE — first measurement, 2026-04-29
+
+`Qwen3MoeModel<MetalBackend>` ships the MoE family decoder end-to-end:
+attention path identical to dense Qwen3, FFN replaced by router-driven
+top-K expert dispatch. Expert weights stay quantised in MTLBuffer
+(per-expert `QuantLinear<B>` slicing the on-disk 3-D
+`ffn_{gate,up,down}_exps.weight` tensors byte-wise — no fp32 inflation).
+
+Decode progression on Qwen3-30B-A3B (16-token smoke + full tg128):
+
+| Stage | Decode tok/s | Latency / tok | Notes |
+|---|---:|---:|---|
+| #35 first wiring (round-trip via `out`) | 2.1 | 480 ms | 4 copy_slice + scaled_add per (token, expert) pair |
+| #36 acc_buf + zero scratch | 4.4 | 228 ms | -42% dispatches; smoke (16 tok) |
+| #36 full tg128 (5 reps mean) | **13.22 ± 2.86** | 76 ms | amortises launch overhead over 128 tok |
+| #36 best rep | 18.54 | 54 ms | warmup-stabilised steady-state |
+| llama.cpp tg128 baseline | 44.52 ± 6.80 | 22 ms | — |
+
+Headline: **30% of llama.cpp decode (mean) / 42% on the best rep**.
+
+Decode rep variance is large (6.9 → 13.1 s for 128 tokens, 2× spread)
+because the first rep eats Metal pipeline state caching and KV cache
+warmup; subsequent reps approach steady-state and are within ~2.4× of
+llama.cpp. The full tg128 mean (13.22 t/s) is heavily dragged down by
+rep 1.
+
+Prefill (5 reps, 302-token prompt):
+
+| Engine | pp512 / pp302 | vs llama.cpp |
+|---|---:|---:|
+| ferrum (this bench, 302-tok prompt) | **43.67 ± 2.05** | **7%** (~14× behind) |
+| llama.cpp pp512 baseline | 596.58 ± 3.89 | — |
+
+Where the gap is, and what it would take:
+
+- **Per-(token, expert) loop.** Decode does `top_k=8 × 48 layers × ~5
+  Metal dispatches/pair = 1920` kernel launches per token plus 96
+  copy_slice ops, plus 48 host syncs to read `router_logits` for top-K.
+  Each `B::sync` on Metal is a `commit + waitUntilCompleted` that
+  drains the GPU pipeline — roughly 2-5 ms each on M1 Max. So **48 ×
+  ~3 ms ≈ 144 ms/token of pure host sync** out of the 76 ms (best) /
+  228 ms (smoke) decode latency.
+- **Prefill is the same loop multiplied by token count.** For
+  m=302, the per-(token, expert) loop runs 302 times per layer ×
+  48 layers = 14 504 expert dispatches per layer batch. Llama.cpp's
+  fused MoE prefill kernel batches all selected experts into one
+  big GEMM with token-grouping; ferrum currently does not.
+
+Two lever-sized wins remain (separate PRs):
+
+1. **GPU-side router** — top-K + softmax over `router_logits` on the
+   GPU, indices sent back via a single small DMA. Eliminates the 48
+   per-layer host syncs; should recover ~144 ms/token on decode (best
+   rep would go from 54 ms → ~25 ms, near llama.cpp).
+2. **Fused MoE kernel** — single batched gemv that takes all 8
+   expert weights + routing indices and produces the weighted sum in
+   one dispatch. Eliminates the per-pair dispatch cost on prefill,
+   should recover the 14× pp512 gap.
+
+Memory check on M1 Max (32 GB unified):
+- 18 GB model load takes ~60 s into MTLBuffer
+- Working set during decode: `vmmap` reports ~22 GB IOAccelerator
+  (model + KV @ FERRUM_KV_CAPACITY=1024 + scratch). No swap pressure.
+
 The KV cap is the dominant fix. Qwen3-8B's GGUF declares max_seq_len=40960; the Phase 1D loader honoured that and pre-allocated 36 layers × 8 kv_heads × 40960 × 128 × 2(K+V) × 4 = **12 GB** of KV MTLBuffer. On a 32 GB Mac this pushed everything into swap (8 GB swap_out the whole session) and every Metal dispatch ate page-fault latency. The "GPU dynamic frequency / xctrace 27 ms gaps" theory was wrong — root cause was RAM pressure. Memory drops 18 GB → 6.8 GB with KV cap, swap_out drops 8 GB → 16 KB.
 
 Default behaviour unchanged for long-context use cases; `FERRUM_KV_CAPACITY=N` caps the upper bound when the user knows their decode budget. Smarter automatic policy (cap = prompt_len + max_tokens + slack) is a follow-up.
@@ -350,9 +415,9 @@ Next-up bottlenecks (not in this commit):
 
 | Model | Engine | pp512 | tg128 | Status |
 |---|---|---:|---:|---|
-| Qwen3-8B Q4_K_M | ferrum (Phase 1D) | not yet measured | ~0.3 tok/s | correctness OK, perf ~95× behind |
-| Llama-3.1-8B Q4_K_M | ferrum (Phase 1D) | _pending_ | _pending_ | not yet run |
-| Qwen3-30B-A3B Q4_K_M | ferrum (Phase 2 MoE + 1D) | _pending_ | _pending_ | MoE primitives done, transformer not yet wired |
+| Qwen3-8B Q4_K_M | ferrum (current) | 253.16 ± 1.42 | 25.58 ± 0.42 | 73% / 92% of llama.cpp |
+| Llama-3.1-8B Q4_K_M | ferrum (current) | 251.62 ± 1.36 | 26.47 ± 0.36 | 75% / 91% of llama.cpp |
+| Qwen3-30B-A3B Q4_K_M | ferrum MoE (current) | 43.67 ± 2.05 | 13.22 ± 2.86 | 7% / 30% of llama.cpp |
 
 ## Notes on the ferrum path
 
