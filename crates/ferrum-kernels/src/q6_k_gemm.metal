@@ -16,6 +16,7 @@ using namespace metal;
 
 #define QK_K       256
 #define QK_NL_Q6_K 16   // 16 dequant tiles per super-block (16 weights/tile)
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
 struct block_q6_K {
     uchar  ql[QK_K / 2];
@@ -63,8 +64,8 @@ static inline void dequantize_q6_K(
     const uchar shl_h = il > 1 ? 0 : (il > 0 ? 2 : 4);
     const uchar shr_l = il > 1 ? 4 : 0;
 
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t low  = ((uint32_t)ql[2 * i] | ((uint32_t)ql[2 * i + 1] << 16)) & kmask2;
+    FOR_UNROLL (int i = 0; i < 4; ++i) {
+        const uint32_t low = ((uint32_t)ql[2 * i] | ((uint32_t)ql[2 * i + 1] << 16)) & kmask2;
         const uint32_t high = ((uint32_t)qh[2 * i] | ((uint32_t)qh[2 * i + 1] << 16)) & kmask1;
         const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
         // Verbatim from llama.cpp: dl1/2/3 absorb the byte-shift via
@@ -131,7 +132,7 @@ kernel void gemm_q6kw_f32a_f32o(
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (short i = 0; i < 16; ++i) {
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
                 const short sx = 2 * il0 + i / 8;
                 const short sy = (short(tiitg) / NL0_Q6) / 8;
                 const short lx = (short(tiitg) / NL0_Q6) % 8;
@@ -172,20 +173,20 @@ kernel void gemm_q6kw_f32a_f32o(
         threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
         threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
 
-        for (short ik = 0; ik < NK_Q6 / 8; ++ik) {
+        FOR_UNROLL (short ik = 0; ik < NK_Q6 / 8; ++ik) {
             simdgroup_barrier(mem_flags::mem_none);
 
-            for (short i = 0; i < 4; ++i) {
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
 
-            for (short i = 0; i < 2; ++i) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
             simdgroup_barrier(mem_flags::mem_none);
 
-            for (short i = 0; i < 8; ++i) {
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
 
