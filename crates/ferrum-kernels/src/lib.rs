@@ -11,6 +11,8 @@ pub use linear::Linear;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod q4_k_gemv;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod ptx {

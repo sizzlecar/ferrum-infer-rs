@@ -361,46 +361,53 @@ impl Backend for MetalBackend {
             None
         };
 
-        // Pooled fp16 dequant target — reused across calls of the same
-        // shape so the in-flight cmd buffer holds one buffer per shape,
-        // not one per matmul. See MetalContext::quant_transient.
-        let transient_ptr: *const metal::Buffer = ctx.quant_transient(f16_bytes);
-        // SAFETY: transient_ptr points into ctx.quant_transients (a HashMap
-        // we own); the buffer outlives this function and the cmd buffer
-        // we encode into. We need this raw pointer because the next line
-        // takes `&mut ctx` again for `cmd`.
-        let transient: &metal::Buffer = unsafe { &*transient_ptr };
-
-        // Dequant + GEMM on a *single* compute encoder. Within one
-        // encoder, Metal serializes dispatches and the dequant's
-        // device-memory writes are visible to the GEMM's reads — no
-        // fence needed, and we save one encoder round-trip per matmul
-        // (~10us each × 145 matmuls/token = real money on M1 Max).
         let a_buf = a.expect_f32("gemm_quant Q4K a");
         let out_buf = out.expect_f32_mut("gemm_quant Q4K out");
-        let cmd = ctx.cmd();
-        let enc = cmd.new_compute_command_encoder();
 
-        // 1) Dequant Q4 bytes → fp16 transient.
-        crate::q4_k::dispatch_dequant_q4_k_on_encoder(
-            &st().pipes.device,
-            enc,
-            blocks,
-            transient,
-            n_blocks,
-        );
-
-        // 2) GEMM: out = a @ transient^T using the existing fp16-weights
-        //    kernels — same code path that runs when FERRUM_METAL_DTYPE=f16
-        //    is set on dense weights.
         if m == 1 {
-            st().pipes
-                .gemv_enc_f16w(enc, a_buf, transient, out_buf, n_rows, n_cols);
+            // **Fused path** for decode (m=1): one kernel reads the Q4
+            // super-blocks, decodes them inline, and reduces against `A`.
+            // No transient fp16 buffer materialised — saves ~64 MB of
+            // intermediate write+read per 4K×4K matmul, which is a big
+            // chunk of the per-token wall on memory-bandwidth-bound
+            // hardware. Requires `K % 256 == 0` (always holds for Q4_K_M
+            // tensors).
+            let cmd = ctx.cmd();
+            let enc = cmd.new_compute_command_encoder();
+            crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                blocks,
+                out_buf,
+                n_rows,
+                n_cols,
+            );
+            enc.end_encoding();
         } else {
+            // **Dequant→transient→GEMM** path for prefill (m > 1). Pool
+            // the fp16 transient by byte-size so repeated shapes share
+            // one allocation; same encoder for both dispatches lets the
+            // GEMM see dequant's writes without an explicit fence.
+            let transient_ptr: *const metal::Buffer = ctx.quant_transient(f16_bytes);
+            // SAFETY: transient_ptr points into ctx.quant_transients (a
+            // HashMap we own); the buffer outlives this function and the
+            // cmd buffer we encode into. The raw pointer dance is needed
+            // because the next call takes &mut ctx again for `cmd`.
+            let transient: &metal::Buffer = unsafe { &*transient_ptr };
+            let cmd = ctx.cmd();
+            let enc = cmd.new_compute_command_encoder();
+            crate::q4_k::dispatch_dequant_q4_k_on_encoder(
+                &st().pipes.device,
+                enc,
+                blocks,
+                transient,
+                n_blocks,
+            );
             st().pipes
                 .gemm_v2_f16w(enc, a_buf, transient, out_buf, m, n_rows, n_cols);
+            enc.end_encoding();
         }
-        enc.end_encoding();
 
         // Optional per-call timing: commit + wait the cmd buffer right
         // here so we measure the GPU work for *this* matmul. Off by
