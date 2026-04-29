@@ -337,8 +337,64 @@ impl MetalQuantStore {
 unsafe impl Send for MetalQuantStore {}
 unsafe impl Sync for MetalQuantStore {}
 
+/// Dispatch a single mul_mm for one Q4K / Q6K leaf part with output
+/// column offset + row stride. Used by the Fused m>1 path.
+fn dispatch_part_gemm(
+    enc: &metal::ComputeCommandEncoderRef,
+    a_buf: &metal::Buffer,
+    part: &MetalQuantStore,
+    out_buf: &metal::Buffer,
+    c_offset_cols: usize,
+    m: usize,
+    part_rows: usize,
+    stride_c: usize,
+    n_cols: usize,
+) -> Result<()> {
+    if part_rows % 4 != 0 {
+        return Err(FerrumError::model(format!(
+            "gemm_quant Fused: part rows {part_rows} not divisible by 4"
+        )));
+    }
+    match part {
+        MetalQuantStore::Q4K { blocks, .. } => {
+            crate::q4_k_gemm::dispatch_gemm_q4k_part(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                blocks,
+                out_buf,
+                c_offset_cols,
+                m,
+                part_rows,
+                stride_c,
+                n_cols,
+            );
+        }
+        MetalQuantStore::Q6K { blocks, .. } => {
+            crate::q6_k_gemm::dispatch_gemm_q6k_part(
+                &st().pipes.device,
+                enc,
+                a_buf,
+                blocks,
+                out_buf,
+                c_offset_cols,
+                m,
+                part_rows,
+                stride_c,
+                n_cols,
+            );
+        }
+        MetalQuantStore::Fused { .. } => {
+            return Err(FerrumError::model(
+                "gemm_quant Fused: nested Fused parts not supported".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Dispatch a single fused gemv for one Q4K / Q6K leaf part with
-/// activation and output byte offsets. Used by the Fused path.
+/// activation and output byte offsets. Used by the Fused m=1 path.
 fn dispatch_part_gemv_offset(
     enc: &metal::ComputeCommandEncoderRef,
     a_buf: &metal::Buffer,
@@ -546,22 +602,32 @@ impl Backend for MetalBackend {
         } = weight
         {
             if m != 1 {
-                // Iterate per row × per part. Each gemv writes
-                // out[row * total_n + cumulative_part_rows ..+ part_rows].
+                // **Fused mul_mm path** for prefill. Each part dispatches
+                // one mul_mm into a [m, part_rows] slice of the
+                // [m, total_rows] fused output via the strided variant
+                // (kernel uses `strideC = total_rows`, write width = part_rows,
+                // dst pre-offset to part column). Replaces the previous
+                // m × per-part gemv loop which scaled linearly with prompt
+                // length and was the dominant remaining prefill bottleneck
+                // on Qwen3 (mixed Q4+Q6 qkv).
                 let a_buf = a.expect_f32("gemm_quant a (fused)");
                 let out_buf = out.expect_f32_mut("gemm_quant out (fused)");
                 let enc = ctx.compute_encoder();
-                for row in 0..m {
-                    let a_off = (row * n_cols * 4) as u64;
-                    let mut row_off_elems = 0usize;
-                    for part in parts {
-                        let part_rows = part.n_rows();
-                        let c_off = ((row * total_rows + row_off_elems) * 4) as u64;
-                        dispatch_part_gemv_offset(
-                            enc, a_buf, a_off, part, out_buf, c_off, *n_cols,
-                        )?;
-                        row_off_elems += part_rows;
-                    }
+                let mut col_off = 0usize;
+                for part in parts {
+                    let part_rows = part.n_rows();
+                    dispatch_part_gemm(
+                        enc,
+                        a_buf,
+                        part,
+                        out_buf,
+                        col_off,
+                        m,
+                        part_rows,
+                        *total_rows,
+                        *n_cols,
+                    )?;
+                    col_off += part_rows;
                 }
                 return Ok(());
             }

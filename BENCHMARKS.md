@@ -231,15 +231,16 @@ Decode throughput (M1 Max, 24-core GPU, AC-powered):
 
 #### Full apples-to-apples (5 reps each, FERRUM_KV_CAPACITY=1024)
 
-After porting llama.cpp's `kernel_mul_mm_q4_K_f32` and
-`kernel_mul_mm_q6_K_f32` (commits e0ff7dc, 12e/13e):
+After porting llama.cpp's `kernel_mul_mm_q4_K_f32`,
+`kernel_mul_mm_q6_K_f32`, and switching MultiQuant Fused (mixed Q4+Q6
+qkv) onto per-part mul_mm dispatches:
 
 | Model | Test | ferrum mean ± std | llama.cpp | Ratio |
 |---|---|---:|---:|---:|
-| Qwen3-8B Q4_K_M | pp (302-token prompt) | **193.18 ± 1.64** | 346.52 ± 25.26 (pp512) | **56%** |
-| Qwen3-8B Q4_K_M | tg128 | **25.70 ± 0.32** | 27.94 ± 0.90 | **92%** |
-| Llama-3.1-8B Q4_K_M | pp (295-token prompt) | **195.89 ± 2.59** | 335.13 ± 24.86 (pp512) | **58%** |
-| Llama-3.1-8B Q4_K_M | tg128 | **26.91 ± 0.71** | 29.20 ± 0.44 | **92%** |
+| Qwen3-8B Q4_K_M | pp (302-token prompt) | **253.16 ± 1.42** | 346.52 ± 25.26 (pp512) | **73%** |
+| Qwen3-8B Q4_K_M | tg128 | **25.58 ± 0.42** | 27.94 ± 0.90 | **92%** |
+| Llama-3.1-8B Q4_K_M | pp (295-token prompt) | **251.62 ± 1.36** | 335.13 ± 24.86 (pp512) | **75%** |
+| Llama-3.1-8B Q4_K_M | tg128 | **26.47 ± 0.36** | 29.20 ± 0.44 | **91%** |
 | Qwen3-30B-A3B Q4_K_M | — | not wired yet (MoE) | 596 / 44.5 | — |
 
 Progression of prefill on Qwen3-8B (302-token prompt) through this work:
@@ -247,13 +248,25 @@ Progression of prefill on Qwen3-8B (302-token prompt) through this work:
 | Stage | tok/s | vs llama.cpp |
 |---|---:|---:|
 | ferrum baseline (pre-mul_mm) | 71.94 | 21% |
-| + Q4 mul_mm (commit e0ff7dc) | 128.92 | 37% |
-| + Q6 mul_mm (current) | **193.18** | **56%** |
+| + Q4 mul_mm | 128.92 | 37% |
+| + Q6 mul_mm | 193.18 | 56% |
+| + MultiQuant Fused mul_mm (current) | **253.16** | **73%** |
 
-Cumulative prefill speedup: **2.69×** on Qwen3-8B, **2.75×** on Llama-3.1.
+Cumulative prefill speedup: **3.52×** on Qwen3-8B, **3.53×** on Llama-3.1.
 
 Decode is at 92% of llama.cpp on both models — within the noise floor
 of llama.cpp's own ±3% stddev.
+
+Remaining ~25% prefill gap is no longer concentrated in any single
+matmul kernel. Likely sources:
+  - Other m-scaling ops (split_qkv, qk_norm_rope, prefill-attention,
+    fused_silu_mul_split, residual_add) that run per-token on the
+    activation side
+  - llama.cpp may have larger inner-tile constants (e.g. NR0=128 vs
+    our 64) on M1 Max specifically — would need a kernel sweep to
+    confirm
+  - Multi command-buffer + parallel encoding path (`n_cb`) that
+    keeps the GPU front-end fed during the prefill burst
 
 Headline: **decode is within 6-11% of llama.cpp on dense models; prefill is 5× behind**.
 

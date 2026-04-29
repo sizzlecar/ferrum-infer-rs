@@ -33,11 +33,14 @@ struct block_q4_K {
 };
 
 struct GemmQ4KParams {
-    int M;       // weight rows (out_features)
+    int M;       // weight rows (out_features) — write width per row
     int N;       // activation rows (m / batch)
     int K;       // in_features (multiple of 256)
     int nb01;    // src0 row stride in BYTES = (K/256) * 144
-    int strideC; // dst row stride (in elements) — usually M for col-major output
+    int strideC; // dst row stride in ELEMENTS. Equals M for the
+                 // standalone case; equals total_rows when this dispatch
+                 // writes one part of a fused output (then the host
+                 // pre-offsets the dst pointer to the part's column).
 };
 
 // Dequant one 16-element tile (`il` ∈ [0,16)) of a Q4_K super-block.
@@ -203,33 +206,28 @@ kernel void gemm_q4kw_f32a_f32o(
         }
     }
 
-    // === Store the 64x32 output tile to device memory (col-major dst) ===
+    // === Store the 64x32 output tile to device memory ===
+    // Row stride is `p.strideC` (= total_rows in fused case, = p.M
+    // standalone). Write width is `p.M` (= part_rows in fused case).
     if (r0 + NR0 <= p.M && r1 + NR1 <= p.N) {
-        // Fast path: tile fully in bounds, direct simdgroup store.
         device float * C = dst
             + (r0 + 32 * (sgitg & 1))
-            + (r1 + 16 * (sgitg >> 1)) * p.M;
+            + (r1 + 16 * (sgitg >> 1)) * p.strideC;
         for (short i = 0; i < 8; ++i) {
-            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * p.M * (i / 4), p.M, 0, false);
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * p.strideC * (i / 4), p.strideC, 0, false);
         }
     } else {
-        // Tile straddles M/N edge — stage to threadgroup memory then
-        // sgitg=0 writes the valid sub-rectangle.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
         threadgroup float * temp_str = ((threadgroup float *)shmem)
             + 32 * (sgitg & 1)
             + (16 * (sgitg >> 1)) * NR0;
-
         for (short i = 0; i < 8; ++i) {
             simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
         }
-
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
-                device float * D = dst + r0 + (r1 + j) * p.M;
+                device float * D = dst + r0 + (r1 + j) * p.strideC;
                 threadgroup float * C = ((threadgroup float *)shmem) + j * NR0;
                 for (int i = 0; i < nr0; ++i) {
                     D[i] = C[i];

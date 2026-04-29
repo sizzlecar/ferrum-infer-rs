@@ -67,7 +67,34 @@ pub fn dispatch_gemm_q4k_on_encoder(
     n: usize,
     k: usize,
 ) {
+    // Standalone case: dst stride = n (out_features), no column offset.
+    dispatch_gemm_q4k_part(device, enc, a, src0, c, 0, m, n, n, k);
+}
+
+/// Strided variant for `MultiQuantLinear` Fused: writes one part of a
+/// fused output, occupying `[c_offset_cols, c_offset_cols + n)` columns
+/// of a `[m, stride_c]` output buffer. `n` is the part's row count
+/// (write width per output row); `stride_c` is the total fused-output
+/// row stride.
+pub fn dispatch_gemm_q4k_part(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    src0: &Buffer,
+    c: &Buffer,
+    c_offset_cols: usize,
+    m: usize,
+    n: usize,
+    stride_c: usize,
+    k: usize,
+) {
     debug_assert!(k % 256 == 0, "K must be a multiple of 256 (got {k})");
+    debug_assert!(n <= stride_c, "n ({n}) must fit within stride_c ({stride_c})");
+    debug_assert!(
+        c_offset_cols + n <= stride_c,
+        "part [{c_offset_cols}, {}) overflows stride_c {stride_c}",
+        c_offset_cols + n
+    );
 
     let nb01_bytes = (k / 256) * 144;
 
@@ -80,18 +107,18 @@ pub fn dispatch_gemm_q4k_on_encoder(
         stride_c: i32,
     }
     let params = P {
-        m: n as i32, // llama.cpp's M = weight rows = our `n`
-        n: m as i32, // llama.cpp's N = activation rows = our `m`
+        m: n as i32,                 // write width = part rows
+        n: m as i32,                 // batch (activation rows)
         k: k as i32,
         nb01: nb01_bytes as i32,
-        stride_c: n as i32, // unused but kept for ABI
+        stride_c: stride_c as i32,   // dst row stride = total output rows
     };
 
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(src0), 0);
     enc.set_buffer(1, Some(a), 0);
-    enc.set_buffer(2, Some(c), 0);
+    enc.set_buffer(2, Some(c), (c_offset_cols * 4) as u64);
     enc.set_bytes(
         3,
         std::mem::size_of::<P>() as u64,
@@ -99,16 +126,14 @@ pub fn dispatch_gemm_q4k_on_encoder(
     );
     enc.set_threadgroup_memory_length(0, 8192);
 
-    // Grid: (ceil(N/NR1), ceil(M/NR0), 1) — note llama.cpp's M/N
-    // labelling matches the params struct above.
-    const NR0: u64 = 64; // weight rows per threadgroup
-    const NR1: u64 = 32; // activation rows per threadgroup
+    const NR0: u64 = 64;
+    const NR1: u64 = 32;
     let grid = MTLSize::new(
-        (m as u64).div_ceil(NR1), // tgpig.x = activation tiles
-        (n as u64).div_ceil(NR0), // tgpig.y = weight tiles
+        (m as u64).div_ceil(NR1),
+        (n as u64).div_ceil(NR0),
         1,
     );
-    let tg = MTLSize::new(128, 1, 1); // 4 simdgroups × 32 threads
+    let tg = MTLSize::new(128, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
 }
 

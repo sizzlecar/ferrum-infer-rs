@@ -197,9 +197,9 @@ kernel void gemm_q6kw_f32a_f32o(
     if (r0 + NR0_Q6 <= p.M && r1 + NR1_Q6 <= p.N) {
         device float * C = dst
             + (r0 + 32 * (sgitg & 1))
-            + (r1 + 16 * (sgitg >> 1)) * p.M;
+            + (r1 + 16 * (sgitg >> 1)) * p.strideC;
         for (short i = 0; i < 8; ++i) {
-            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * p.M * (i / 4), p.M, 0, false);
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * p.strideC * (i / 4), p.strideC, 0, false);
         }
     } else {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -212,7 +212,7 @@ kernel void gemm_q6kw_f32a_f32o(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1_Q6) {
-                device float * D = dst + r0 + (r1 + j) * p.M;
+                device float * D = dst + r0 + (r1 + j) * p.strideC;
                 threadgroup float * C = ((threadgroup float *)shmem) + j * NR0_Q6;
                 for (int i = 0; i < nr0; ++i) {
                     D[i] = C[i];

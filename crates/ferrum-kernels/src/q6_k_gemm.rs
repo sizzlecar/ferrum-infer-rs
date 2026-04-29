@@ -42,7 +42,26 @@ pub fn dispatch_gemm_q6k_on_encoder(
     n: usize,
     k: usize,
 ) {
+    dispatch_gemm_q6k_part(device, enc, a, src0, c, 0, m, n, n, k);
+}
+
+/// Strided variant — see `q4_k_gemm::dispatch_gemm_q4k_part` for
+/// rationale. Writes part columns `[c_offset_cols, c_offset_cols + n)`
+/// of a `[m, stride_c]` output buffer.
+pub fn dispatch_gemm_q6k_part(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    src0: &Buffer,
+    c: &Buffer,
+    c_offset_cols: usize,
+    m: usize,
+    n: usize,
+    stride_c: usize,
+    k: usize,
+) {
     debug_assert!(k % 256 == 0, "K must be a multiple of 256 (got {k})");
+    debug_assert!(c_offset_cols + n <= stride_c);
 
     let nb01_bytes = (k / 256) * crate::q6_k_gemv::Q6_K_BLOCK_BYTES;
 
@@ -59,14 +78,14 @@ pub fn dispatch_gemm_q6k_on_encoder(
         n: m as i32,
         k: k as i32,
         nb01: nb01_bytes as i32,
-        stride_c: n as i32,
+        stride_c: stride_c as i32,
     };
 
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(src0), 0);
     enc.set_buffer(1, Some(a), 0);
-    enc.set_buffer(2, Some(c), 0);
+    enc.set_buffer(2, Some(c), (c_offset_cols * 4) as u64);
     enc.set_bytes(
         3,
         std::mem::size_of::<P>() as u64,
