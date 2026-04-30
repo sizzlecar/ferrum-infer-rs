@@ -237,8 +237,12 @@ pub fn dispatch_weighted_sum_residual_norm_stacked(
         &params as *const _ as *const c_void,
     );
 
-    // One simdgroup per token (q_len=1 in decode). 32 threads cover hidden.
+    // 256 threads = 8 simdgroups in a single threadgroup. The rms-norm
+    // sumsq reduce needs a single fan-in point so multi-TG would force
+    // a global atomic — for hidden ≤ ~16K we win more from the 8× ALU
+    // parallelism of 256 vs 32 threads than we'd lose to threadgroup
+    // memory traffic for the cross-simdgroup reduce.
     let grid = MTLSize::new(1, 1, 1);
-    let tg = MTLSize::new(32, 1, 1);
+    let tg = MTLSize::new(256, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
 }
