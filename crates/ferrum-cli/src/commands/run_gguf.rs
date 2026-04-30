@@ -447,6 +447,33 @@ fn run_repl<M: DecoderOnlyLLM>(
             .map_err(|e| FerrumError::model(format!("encode user: {e}")))?
             .get_ids()
             .to_vec();
+
+        // Pre-check KV capacity. Worst case for this turn = ingesting
+        // the full user prompt + generating `max_tokens` decode steps.
+        // If that would push past the per-cache budget, refuse cleanly
+        // here — the alternative is silent buffer overflow inside the
+        // attention kernel (garbage tokens, walking off the K/V tile,
+        // and a hard panic from `forward_layer`'s defensive check).
+        let max_new = cmd.max_tokens as usize;
+        let kv_capacity = model.kv_capacity();
+        let needed = cache_len + user_ids.len() + max_new;
+        if needed > kv_capacity {
+            eprintln!(
+                "{} context full: this turn would need {} tokens (current cache {} + prompt {} + max_tokens {}), but the KV budget is {}.",
+                "✗".red().bold(),
+                needed,
+                cache_len,
+                user_ids.len(),
+                max_new,
+                kv_capacity,
+            );
+            eprintln!(
+                "  Either run `/clear` to reset the conversation or restart with `FERRUM_KV_CAPACITY={}` (or larger).",
+                (needed.next_power_of_two()).max(8192),
+            );
+            continue;
+        }
+
         // We can't call `prefill` again on the same cache_id without
         // resetting — but we can use `decode` per-token to extend.
         // Cleaner: split the user turn into prefill semantics by feeding
@@ -466,7 +493,6 @@ fn run_repl<M: DecoderOnlyLLM>(
         io::stdout().flush().ok();
 
         let decode_start = Instant::now();
-        let max_new = cmd.max_tokens as usize;
         let mut produced: Vec<u32> = Vec::new();
         let mut next = sample_logits(&logits, &recent, &sampling, &mut rng)?;
         for step in 0..max_new {

@@ -387,12 +387,15 @@ impl<B: Backend> Qwen3MoeModel<B> {
         }
         let nkv = self.cfg.base.num_kv_heads;
         let hd = self.cfg.base.head_dim;
+        // See `LlamaFamilyModel::ensure_kv` for the rationale on the 4096
+        // chat-friendly default and how `FERRUM_KV_CAPACITY` overrides it.
         let model_max = self.cfg.base.max_seq_len;
+        const DEFAULT_KV_CAPACITY: usize = 4096;
         let max = std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map(|cap| cap.min(model_max))
-            .unwrap_or(model_max);
+            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY));
 
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
             (0..self.cfg.base.num_layers)
@@ -497,6 +500,19 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let cache = &mut caches[li];
         let cache_len_before = cache.len;
         let cache_capacity = cache.capacity;
+
+        // Defense in depth: refuse to write past the KV buffer. Silent
+        // overflow has visible failure modes (garbage output, stale token
+        // attention, slowdowns from reading uninitialised memory). The
+        // graceful path is the caller pre-checking via `kv_capacity()` and
+        // either compacting or refusing the request; this panic only
+        // fires when that contract is broken.
+        if cache_len_before + tokens > cache_capacity {
+            panic!(
+                "KV cache overflow on layer {li}: would write tokens [{cache_len_before}..{}) but capacity is {cache_capacity} (cache_id={cache_id:?}). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.",
+                cache_len_before + tokens
+            );
+        }
 
         // Try the deepest fusion: fused split-QKV-norm-rope that writes
         // K/V directly into the cache slot. Skips both the head-major
@@ -1107,6 +1123,17 @@ impl<B: Backend> Qwen3MoeModel<B> {
 impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
+    }
+
+    fn kv_capacity(&self) -> usize {
+        // Mirror the bound `ensure_kv` will use when allocating the cache.
+        let model_max = self.cfg.base.max_seq_len;
+        const DEFAULT_KV_CAPACITY: usize = 4096;
+        std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|cap| cap.min(model_max))
+            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {

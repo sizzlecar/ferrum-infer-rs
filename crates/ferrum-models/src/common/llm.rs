@@ -38,6 +38,23 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
 
+    /// Per-cache KV capacity in tokens — the maximum sequence length any
+    /// single `cache_id` can grow to before `prefill` / `decode` would
+    /// overflow the pre-allocated K/V buffers.
+    ///
+    /// Honours `FERRUM_KV_CAPACITY` and clamps to the model's declared
+    /// `max_seq_len`. Callers (REPL, HTTP server, schedulers) should
+    /// pre-check this before extending a sequence; the model panics on
+    /// append-side overflow rather than silently corrupt the cache.
+    ///
+    /// Default returns `config().max_seq_len`. Models that allocate a
+    /// smaller window (most do, capped by `FERRUM_KV_CAPACITY` or the
+    /// 4096 default in `ensure_kv`) override this to surface the real
+    /// budget.
+    fn kv_capacity(&self) -> usize {
+        self.config().max_seq_len
+    }
+
     /// Prefill the model with a prompt. Returns `[vocab_size]` logits for
     /// the last prompt token.
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32>;
