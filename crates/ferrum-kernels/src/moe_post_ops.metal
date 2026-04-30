@@ -127,9 +127,20 @@ kernel void weighted_sum_stacked_f32(
 // must skip its own rms_norm when this path was taken (signalled by a
 // caller-side flag); the fused output IS its norm_out input.
 //
-// Threadgroup: 32 threads (1 simdgroup). One simdgroup per token row.
-// Each thread covers `hidden / 32` floats during the partial sum_sq
-// reduce and the final normed write.
+// Threadgroup: WSUM_NORM_THREADS=256 threads = 8 simdgroups, all in
+// one threadgroup (the rms-norm sumsq reduce needs a single fan-in
+// point so multi-TG would need a global atomic — not worth it for the
+// hidden=2048 working set). Cross-simdgroup reduce for sum_sq goes
+// through threadgroup memory: each simdgroup leader writes its partial
+// to `sg_sum_sq[sgitg]`, thread 0 of simdgroup 0 totals them.
+//
+// Going from 32 → 256 threads gives Apple GPU 8× the parallel ALU
+// occupancy on the per-element work in phase 1 (weighted-sum + sumsq)
+// and phase 3 (normed write), which dominate the kernel runtime —
+// the cross-simdgroup reduce is a few cycles either way.
+
+constant int WSUM_NORM_THREADS = 256;
+constant int WSUM_NORM_NSG     = 8;   // = WSUM_NORM_THREADS / 32
 
 struct WSumResNormParams {
     int hidden;
@@ -145,14 +156,17 @@ kernel void weighted_sum_residual_norm_stacked_f32(
     device       float* normed_out  [[buffer(4)]],   // [hidden]
     constant WSumResNormParams& p   [[buffer(5)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]])
+    uint3 tpitg [[thread_position_in_threadgroup]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
 {
     const int hidden  = p.hidden;
     const int n_slots = p.n_slots;
+    const int tid     = int(tpitg.x);
 
     // Phase 1: residual += weighted_sum, accumulate Σ residual^2.
     float local_sum_sq = 0.0f;
-    for (int i = tiisg; i < hidden; i += 32) {
+    for (int i = tid; i < hidden; i += WSUM_NORM_THREADS) {
         float sum = 0.0f;
         for (int s = 0; s < n_slots; s++) {
             sum += weights[s] * slots[s * hidden + i];
@@ -162,12 +176,27 @@ kernel void weighted_sum_residual_norm_stacked_f32(
         local_sum_sq += new_val * new_val;
     }
 
-    // Phase 2: cross-simdgroup reduce.
-    const float total_sq = simd_sum(local_sum_sq);
-    const float scale    = 1.0f / sqrt(total_sq / float(hidden) + p.eps);
+    // Phase 2: cross-simdgroup reduce for sumsq. Each simdgroup leader
+    // contributes its simd_sum partial; thread 0 totals + broadcasts.
+    const float sg_part = simd_sum(local_sum_sq);
+    threadgroup float sg_sum_sq[WSUM_NORM_NSG];
+    if (tiisg == 0) {
+        sg_sum_sq[sgitg] = sg_part;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float scale_slot[1];
+    if (tid == 0) {
+        float total_sq = 0.0f;
+        for (int s = 0; s < WSUM_NORM_NSG; ++s) {
+            total_sq += sg_sum_sq[s];
+        }
+        scale_slot[0] = 1.0f / sqrt(total_sq / float(hidden) + p.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = scale_slot[0];
 
     // Phase 3: write normed_out using next layer's norm weight.
-    for (int i = tiisg; i < hidden; i += 32) {
+    for (int i = tid; i < hidden; i += WSUM_NORM_THREADS) {
         normed_out[i] = residual[i] * scale * next_norm_w[i];
     }
 }
