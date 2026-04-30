@@ -38,6 +38,26 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
 
+    /// Hint that an upcoming `prefill` / `decode` sequence on
+    /// `cache_id` will have at most `max_tokens` tokens per call. Lets
+    /// the model eagerly grow its internal scratch buffers AND allocate
+    /// the KV cache for `cache_id` so the first real `prefill` doesn't
+    /// have to allocate them on the hot path.
+    ///
+    /// Without this, on Qwen3-MoE's first prefill the timer captures:
+    ///   • ~25 scratch MTLBuffers (residual / qkv / head-major / MoE
+    ///     staging / batch-logits) — ~80-150 ms total alloc
+    ///   • ~96 KV-cache MTLBuffers (K and V × 48 layers) — another
+    ///     ~100-500 ms total alloc
+    ///
+    /// Combined that's the ~350 ms fixed overhead that made pp50 numbers
+    /// look 40% slower than pp512 for the same per-token compute.
+    ///
+    /// Default no-op — backends without resizable buffers ignore it.
+    fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
+        let _ = (cache_id, max_tokens);
+    }
+
     /// Per-cache KV capacity in tokens — the maximum sequence length any
     /// single `cache_id` can grow to before `prefill` / `decode` would
     /// overflow the pre-allocated K/V buffers.
