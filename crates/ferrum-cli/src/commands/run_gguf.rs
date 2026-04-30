@@ -260,9 +260,22 @@ fn run_one_shot<M: DecoderOnlyLLM>(
 
     let cache_id = "default";
 
+    // Optional Metal frame capture around the prefill iteration. Set
+    // FERRUM_METAL_CAPTURE=/path/to/out.gputrace AND MTL_CAPTURE_ENABLED=1
+    // to record one prefill into a .gputrace file you can open in Xcode
+    // (Window → Frame Capture). The capture covers exactly the prefill
+    // forward pass so the resulting trace is small and focused.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let _capture_active = ferrum_kernels::backend::metal::maybe_begin_frame_capture();
+
     let prefill_start = Instant::now();
     let logits = model.prefill(cache_id, &prompt_tokens);
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if _capture_active {
+        ferrum_kernels::backend::metal::end_frame_capture();
+    }
     eprintln!(
         "{} prefill: {} tok in {:.3}s ({:.1} tok/s)",
         "✓".green(),
