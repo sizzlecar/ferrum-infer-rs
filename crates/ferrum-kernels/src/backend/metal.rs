@@ -1133,6 +1133,32 @@ impl Backend for MetalBackend {
         Ok(())
     }
 
+    fn compute_ids_tpe_gpu(
+        ctx: &mut Self::Context,
+        selected_ids: &Self::Buffer,
+        tpe: &mut Self::Buffer,
+        ids: &mut Self::Buffer,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) -> Result<()> {
+        let sel_buf = &selected_ids.raw;
+        let tpe_buf = &tpe.raw;
+        let ids_buf = &ids.raw;
+        let enc = ctx.compute_encoder();
+        crate::moe_router::dispatch_compute_ids_tpe(
+            &st().pipes.device,
+            enc,
+            sel_buf,
+            tpe_buf,
+            ids_buf,
+            batch,
+            num_experts,
+            top_k,
+        );
+        Ok(())
+    }
+
     fn weighted_sum_residual_stacked(
         ctx: &mut Self::Context,
         slots: &Self::Buffer,

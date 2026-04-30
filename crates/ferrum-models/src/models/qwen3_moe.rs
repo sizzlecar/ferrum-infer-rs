@@ -132,6 +132,10 @@ pub struct Qwen3MoeScratch<B: Backend> {
     /// `[top_k]` f32 router combine weights for the current decode
     /// token. Decode hot-path uses `write_f32_into` to update.
     pub weights_buf: B::Buffer,
+    /// `[max_tokens * top_k]` i32 — flat selected-expert IDs from the
+    /// GPU router for the prefill batch. Consumed by `compute_ids_tpe_gpu`
+    /// to bucket pairs by expert into `tpe_buf` / `ids_2d`.
+    pub selected_ids_buf: B::Buffer,
     /// `[num_experts * max_per_expert_max]` i32 — per-expert pair
     /// index lists for prefill 2-D mul_mm_id. `max_per_expert_max`
     /// is bounded by `max_tokens * top_k` (worst-case: one expert
@@ -190,6 +194,7 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             down_out_stacked: B::alloc(t * cfg.num_experts_per_tok * h),
             ids_buf: B::from_slice_i32(&vec![0i32; cfg.num_experts_per_tok]),
             weights_buf: B::from_slice(&vec![0.0f32; cfg.num_experts_per_tok]),
+            selected_ids_buf: B::from_slice_i32(&vec![0i32; t * cfg.num_experts_per_tok]),
             ids_2d: B::from_slice_i32(&vec![0i32; n_exp * t * cfg.num_experts_per_tok]),
             tpe_buf: B::from_slice_i32(&vec![0i32; n_exp]),
             weights_2d: B::from_slice(&vec![0.0f32; t * cfg.num_experts_per_tok]),
@@ -1291,8 +1296,6 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
     norm_topk_prob: bool,
     tokens: usize,
 ) -> Result<()> {
-    use ferrum_kernels::moe_host::compute_ids_tpe;
-
     let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
     let stage_t0 = || -> Option<std::time::Instant> {
         if prof {
@@ -1313,30 +1316,70 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
             }
         };
 
-    // Host-side routing: pull the whole batch's router_logits, run
-    // softmax + top-K, then bucket pairs by expert into ids/tpe.
-    let t0 = stage_t0();
-    B::sync(ctx);
-    let logits_host = B::to_vec(&scratch.router_logits, tokens * n_exp);
-    let route = crate::moe::router::route(&logits_host, tokens, n_exp, top_k, norm_topk_prob);
-
-    let (tpe_host, ids_host, max_per_expert) =
-        compute_ids_tpe(&route.expert_ids, n_exp, tokens, top_k);
-
-    // Upload tpe + ids in place. ids_2d is sized for the worst case
-    // (n_exp * tokens * top_k); we only fill `n_exp * max_per_expert`
-    // entries — kernel reads only that much via `tpe[e]` early-exit.
-    B::write_i32_into(&mut scratch.tpe_buf, &tpe_host);
-    B::write_i32_into(&mut scratch.ids_2d, &ids_host);
-
-    // Combine weights: write [batch, top_k] flat into weights_2d.
-    B::write_f32_into(&mut scratch.weights_2d, &route.expert_weights);
-    stage_end(
-        t0,
-        ctx,
-        &MOE_PREFILL_HOST_TOPK_US,
-        &MOE_PREFILL_HOST_TOPK_CALLS,
-    );
+    // GPU-side routing: keep the whole pipeline device-resident. Two
+    // dispatches replace the per-layer `B::sync + to_vec(router_logits)
+    // + host route() + host compute_ids_tpe + write_back` round trip.
+    //
+    //   1. `route_topk_softmax` writes selected expert IDs (flat
+    //      `[batch, top_k]`) into `selected_ids_buf` and the post-renorm
+    //      combine weights directly into `weights_2d`.
+    //   2. `compute_ids_tpe_gpu` buckets those pairs into `tpe_buf` and
+    //      `ids_2d` using device-side atomic_fetch_add slot claims. The
+    //      `ids_2d` row stride is the worst-case `tokens * top_k`; the
+    //      consumer GEMM stops at `tpe[e]` so the over-strided columns
+    //      cost only launch overhead, not real compute.
+    //
+    // `FERRUM_MOE_HOST_TOPK=1` falls back to the legacy host path for
+    // A/B regression checks during the rollout.
+    let use_gpu_topk = std::env::var("FERRUM_MOE_HOST_TOPK").as_deref() != Ok("1");
+    let max_per_expert = if use_gpu_topk {
+        let t0 = stage_t0();
+        B::route_topk_softmax(
+            ctx,
+            &scratch.router_logits,
+            &mut scratch.selected_ids_buf,
+            &mut scratch.weights_2d,
+            tokens,
+            n_exp,
+            top_k,
+            norm_topk_prob,
+        )?;
+        B::compute_ids_tpe_gpu(
+            ctx,
+            &scratch.selected_ids_buf,
+            &mut scratch.tpe_buf,
+            &mut scratch.ids_2d,
+            tokens,
+            n_exp,
+            top_k,
+        )?;
+        stage_end(
+            t0,
+            ctx,
+            &MOE_PREFILL_HOST_TOPK_US,
+            &MOE_PREFILL_HOST_TOPK_CALLS,
+        );
+        // Worst-case ids row stride; matches `dispatch_compute_ids_tpe`.
+        tokens * top_k
+    } else {
+        use ferrum_kernels::moe_host::compute_ids_tpe;
+        let t0 = stage_t0();
+        B::sync(ctx);
+        let logits_host = B::to_vec(&scratch.router_logits, tokens * n_exp);
+        let route = crate::moe::router::route(&logits_host, tokens, n_exp, top_k, norm_topk_prob);
+        let (tpe_host, ids_host, max_per_expert) =
+            compute_ids_tpe(&route.expert_ids, n_exp, tokens, top_k);
+        B::write_i32_into(&mut scratch.tpe_buf, &tpe_host);
+        B::write_i32_into(&mut scratch.ids_2d, &ids_host);
+        B::write_f32_into(&mut scratch.weights_2d, &route.expert_weights);
+        stage_end(
+            t0,
+            ctx,
+            &MOE_PREFILL_HOST_TOPK_US,
+            &MOE_PREFILL_HOST_TOPK_CALLS,
+        );
+        max_per_expert
+    };
 
     let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
     let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();

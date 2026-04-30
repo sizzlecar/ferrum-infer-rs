@@ -443,6 +443,32 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// GPU-side bucket sort: turn `[batch, top_k]` selected expert IDs
+    /// (from [`Self::route_topk_softmax`]) into `tpe[num_experts]` /
+    /// `ids[num_experts * row_stride]` arrays consumed by the batched
+    /// MoE GEMM.
+    ///
+    /// The `ids` buffer's row stride is `batch * top_k` (worst case);
+    /// only the first `tpe[e]` entries of each row are populated. The
+    /// consumer GEMM kernel early-exits at `r1 >= tpe[e]`, so the over-
+    /// dispatched columns add launch overhead but no actual compute.
+    /// This avoids the host-side max-reduce + pipeline drain that the
+    /// previous CPU `compute_ids_tpe` path required.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_ids_tpe_gpu(
+        _ctx: &mut Self::Context,
+        _selected_ids: &Self::Buffer,
+        _tpe: &mut Self::Buffer,
+        _ids: &mut Self::Buffer,
+        _batch: usize,
+        _num_experts: usize,
+        _top_k: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "compute_ids_tpe_gpu not implemented for this backend",
+        ))
+    }
+
     /// Stacked SiLU·gate over `[batch * top_k, ffn]` rows (prefill version
     /// of `silu_mul_stacked`).
     fn silu_mul_batched(

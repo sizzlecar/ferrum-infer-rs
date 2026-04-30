@@ -1,6 +1,6 @@
 # M1 Max Qwen3-MoE 性能追赶 llama.cpp（2026-04-30 状态）
 
-本文档是 PR #50/#52/#53/#54 之后的状态快照、测试方法、核心实现解释和下一步计划。
+本文档是 PR #50/#52/#53/#54/#55 之后的状态快照、测试方法、核心实现解释和下一步计划。
 读者：下一个会话 / 接手者。
 
 ## 1. 目标
@@ -17,7 +17,7 @@
 - llama.cpp 在 M1 Max 上 **不**走 Metal 4 tensor matmul（`tensor API disabled for pre-M5 and pre-A19 devices`），就是普通 simdgroup_half8x8 + fp32 accum。
 - `MUL_MAT_ID` 在 ggml-blas 里**没有** handler，MoE 必走 Metal。所以这是 **纯 Metal 的对决**，不存在 AMX 加速这一层（之前的猜测错了）。
 
-**当前阶段目标**：pp512 ≥ **80% × 618 = 494 t/s**。
+**当前阶段目标**：~~pp512 ≥ **80% × 618 = 494 t/s**~~ — **2026-04-30 PR #55 后达成 547 t/s（88.5%）**。新目标：90% = 556 t/s。
 
 **为什么不要瞎猜 llama.cpp 的"魔法"**：我们已经验证过 kernel 架构和我们一致（NR0=64 NR1=32 NK=32, simdgroup_half8x8 + fp32 accum, 同款 dequant_q4_K, 同款 dispatch grid）。差距不是来自架构，而是来自具体的 kernel 写法（向量化 / 指令调度）和 attention 路径的实现质量。**直接 diff llama.cpp 源码找具体差异**，不要假设。
 
@@ -27,14 +27,14 @@
 
 ### 2.1 `BENCHMARKS` — 5× pp512 中位数
 
-| 指标 | 修复前 | **PR #50** | **PR #52** | **PR #53** | **PR #54** | llama.cpp |
-|-------|------:|---------:|---------:|---------:|---------:|---------:|
-| 加载时间 | 47-54 s | **1.0 s** | 1.0 s | 1.0 s | 1.0 s | ~1.5 s |
-| pp512 | swap (≪1 t/s) | 64 t/s | 283 t/s | 282 t/s | **370 t/s** | 618 t/s |
-| tg128 | 0.1 t/s | 27.6 t/s | 27 t/s | 27 t/s | 29 t/s | 51 t/s |
-| 内存峰值 | ~34 GB | **17 GB** | 17 GB | 17 GB | 17 GB | 17 GB |
+| 指标 | 修复前 | PR #50 | PR #52 | PR #53 | PR #54 | **PR #55** | llama.cpp |
+|-------|------:|---------:|---------:|---------:|---------:|---------:|---------:|
+| 加载时间 | 47-54 s | **1.0 s** | 1.0 s | 1.0 s | 1.0 s | 1.0 s | ~1.5 s |
+| pp512 | swap (≪1 t/s) | 64 t/s | 283 t/s | 282 t/s | 370 t/s | **547 t/s** | 618 t/s |
+| tg128 | 0.1 t/s | 27.6 t/s | 27 t/s | 27 t/s | 29 t/s | 30 t/s | 51 t/s |
+| 内存峰值 | ~34 GB | **17 GB** | 17 GB | 17 GB | 17 GB | 17 GB | 17 GB |
 
-**vs llama.cpp（PR #54 后）**：pp512 = **60%**，tg128 = **57%**，加载 + 内存 = **持平**。
+**vs llama.cpp（PR #55 后）**：pp512 = **88.5%** ✓ 已超过 §1 的 80% 目标，tg128 = **59%**，加载 + 内存 = **持平**。
 
 ### 2.2 PR 时间线
 
@@ -43,6 +43,7 @@
 - **PR #52 `perf(metal): vectorize MoE GEMM stores`** — `gemm_q4kw_moe_id_f32` 把 8 个标量 half store 改成一个 `half2x4` 向量 store。**单点改动，pp512 64 → 283 t/s（4.4×）**。这是和 llama.cpp 的关键 diff。
 - **PR #53 `perf(metal): vectorize dense GEMM + flash_attn QK loads`** — 同样的 vector-store 模式应用到 dense Q4_K/Q6_K GEMM 和 flash_attn 的 QK 点积。本模型上 ~0% 提升（这些不是当前瓶颈），合并主要为一致性。
 - **PR #54 `perf(metal): Q-tiled flash_attn with simdgroup_matmul`** — 重写 flash_attn：每个 threadgroup 处理 8 query rows × 128 thread × 4 simdgroup，每内层 32 KV cols 用 `simdgroup_multiply_accumulate` 计算 QK^T 和 P@V。**attn 时间 477→197 ms（-59%），pp512 占比 27%→13%，pp512 303→370 t/s（+22%）**。head_dim=128 / sliding_window=0 / q_len≥8 走新 kernel；其它（包括 decode m=1）走原 scalar kernel；`FERRUM_FA_LEGACY=1` 强制 legacy 用于回归对比。
+- **PR #55 `perf(metal): MoE prefill topk + ids/tpe on GPU`** — 替换 `moe_forward_batched_prefill_impl` 里 `B::sync + to_vec(router_logits) + host softmax+topk + bucket-by-expert + write_back` 的整段 host roundtrip。`route_topk_softmax`（已存在）+ 新增 `compute_ids_tpe_gpu` 两个 kernel 在同一 compute encoder 内完成。后者走 single-threadgroup × 256 threads × `atomic_fetch_add` 抢 slot；ids 用 worst-case stride（`tokens * top_k`），消费侧 GEMM 的 `r1 >= tpe[e]` 早退处理多余 TG。**pp512 318→547 t/s（+72%），vs llama.cpp 51%→88.5% — 单 PR 超过 §1 80% 目标**。`FERRUM_MOE_HOST_TOPK=1` 强制 legacy 用于回归对比。
 
 ---
 
@@ -236,24 +237,35 @@ ferrum_kernels::backend::metal::register_gguf_mmap(
 
 内层 matmul（4 simdgroup × 8 matmul tile × NK/8 iter）和 llama.cpp 完全一样。
 
-### 4.4 Routing：CPU vs GPU
+### 4.4 Routing：GPU（PR #55）
 
-ferrum 当前 routing **走 CPU**：
+PR #55 之前 routing **走 CPU**（`B::sync + to_vec + host softmax+topk + bucket + write_back`）。PR #55 之后**全部 GPU**：
 
 ```rust
 // crates/ferrum-models/src/models/qwen3_moe.rs::moe_forward_batched_prefill_impl
-B::sync(ctx);  // ← 强制 GPU flush，破坏了 attn → MoE 的 pipeline
-let logits_host = B::to_vec(&scratch.router_logits, tokens * n_exp);
-let route = crate::moe::router::route(&logits_host, ...);  // CPU softmax + topk
-let (tpe_host, ids_host, max_per_expert) = compute_ids_tpe(...);
-B::write_i32_into(&mut scratch.tpe_buf, &tpe_host);
-B::write_i32_into(&mut scratch.ids_2d, &ids_host);
-B::write_f32_into(&mut scratch.weights_2d, &route.expert_weights);
+let max_per_expert = if use_gpu_topk {
+    B::route_topk_softmax(
+        ctx, &scratch.router_logits,
+        &mut scratch.selected_ids_buf, &mut scratch.weights_2d,
+        tokens, n_exp, top_k, norm_topk_prob,
+    )?;
+    B::compute_ids_tpe_gpu(
+        ctx, &scratch.selected_ids_buf,
+        &mut scratch.tpe_buf, &mut scratch.ids_2d,
+        tokens, n_exp, top_k,
+    )?;
+    tokens * top_k    // worst-case row stride
+} else {
+    /* legacy host path under FERRUM_MOE_HOST_TOPK=1 */
+};
 ```
 
-llama.cpp 用 **GPU prepass kernel**：`kernel_mul_mm_id_map0`，每个 expert 一个线程，扫所有 token 的 selected_experts 数组，输出 `tpe[expert]` + `ids[expert][slot]`。
+**关键点**：
+- 没有 `B::sync` — 整个 prefill 一个 command buffer 跑到底。
+- `compute_ids_tpe_gpu` 用 single-threadgroup × 256 threads × `atomic_fetch_add(&tpe[e])` 抢 slot 写 `ids[e * row_stride + slot] = pair_idx`。row_stride 用 worst-case `tokens * top_k`（4008 for pp512），消费 GEMM 的 `r1 >= tpe[e]` 早退处理多余 TG，实测 launch overhead 可忽略。
+- 不需要把 max(tpe[e]) 同步回 host — worst-case stride + 早退把这块完全跳过。
 
-prefill profile 显示我们的 host topk 占 5.4%。改成 GPU 会**省掉 sync barrier**，让 attn dispatch 和 routing prepass 在 GPU 上 pipeline。
+llama.cpp 用类似的 GPU prepass `kernel_mul_mm_id_map0`，每个 expert 一个线程扫 selected_experts。我们的版本算法一样、调度更激进（256 threads atomic 而不是 num_experts threads）。
 
 ### 4.5 Flash Attention：Q-tiled simdgroup_matmul（PR #54）
 
@@ -292,30 +304,40 @@ simdgroup_store(mqk, ss + 8*sgitg, FA_C, ulong2(0, 0), false);
 - f16 Q/K 输入 + f32 累加（llama.cpp 的 FA_TYPES_F32 用法）— 减半 memory traffic 但需要 dtype 转换
 - 当前 13% 已接近收益拐点，下一步先攻 MoE 而不是再压 attn。
 
-### 5.2 主线（下一步）：MoE GEMM / topk 优化
+### 5.2 ✅ MoE topk 上 GPU — 已完成（PR #55）
 
-PR #54 之后 prefill profile：
+**实测**：pp512 318 → 547 t/s（+72%），prefill profile 中 host 占比 8.7% → 2.2%（残余是 profile 模式自身的 sync 开销）。**预估 8-10%、实测 +72%** — 因为去掉 sync 后 attn → MoE pipeline 完全 parallel。
+
+### 5.3 下一步：MoE GEMM 进一步压榨（突破 90% 目标）
+
+PR #55 之后 prefill profile：
 
 ```
-[prefill-profile] tokens=501 total=1513 ms (331 t/s)
-    attn:  197 ms (13.0%) over 48 calls       ← 已优化
-     moe: 1140 ms (75.4%) over 48 calls       ← 新主瓶颈
-    host:  131 ms ( 8.7%) over 48 calls       ← topk roundtrip
-    gate:  308 ms (20.4%) over 48 calls
-      up:  309 ms (20.4%) over 48 calls
-    silu:   17 ms ( 1.2%) over 48 calls
-    down:  342 ms (22.6%) over 48 calls
-    wsum:   17 ms ( 1.2%) over 48 calls
+[prefill-profile] tokens=501 total=2958 ms (169 t/s)   # profile mode (with per-stage sync)
+    attn:  434 ms (14.7%) over 48 calls
+     moe: 2193 ms (74.2%) over 48 calls       ← 主瓶颈
+    host:   63 ms ( 2.2%) over 48 calls       ← 已优化（GPU）
+    gate:  621 ms (21.0%) over 48 calls
+      up:  648 ms (21.9%) over 48 calls
+    silu:   30 ms ( 1.0%) over 48 calls
+    down:  792 ms (26.8%) over 48 calls       ← 最大单项
+    wsum:   22 ms ( 0.8%) over 48 calls
 ```
 
-**5.2a MoE topk 上 GPU**（半天）：写 `route_topk_softmax_compute_ids_tpe` kernel，模仿 llama.cpp `kernel_mul_mm_id_map0`。直接省 host 8.7% + 去掉 sync barrier。预估 8-10% 提升。
+bench-mode 实际 prefill 911 ms（547 t/s），MoE 占 ~74% × 911 = 674 ms（去掉 profile sync overhead）。
 
-**5.2b MoE GEMM 进一步压榨**（2-3 天）：gate/up/down 三个 GEMM 占 63%，目前 `gemm_q4kw_moe_id_f32` 已经做了 vec store（PR #52）。下一刀可能是：
-- gate + up 双 GEMM 合并（共享 lhs 激活，128 threadgroups → 64）
-- 增大 NR1 = 32 → 64（取决于 shmem 空间）
-- 用 simdgroup_multiply_accumulate 而非 simdgroup_matmul（潜在 2× ALU 吞吐，需重测）
+**剩余 gap**：547 → 618 还差 71 t/s ≈ 13%。MoE 砍 1/8 就够。可能方向：
 
-**目标**：进一步把 pp512 从 370 推到 ≥494（80% × 618）。MoE 砍 1/3 时间就够了。
+**5.3a gate + up 双 GEMM 合并**（1 天）：两个 GEMM 共享同一 lhs（`norm_out`）和同一 ids/tpe，输出 stack 到 `[batch, top_k, 2*expert_inter]`。一次 dispatch 替两次，省一半 lhs 加载和一次 dispatch 开销。预估 ~5-8% 提升。
+
+**5.3b down GEMM 优化**（2 天）：down 单项 26.8% 是最大的。lhs 是 `silu_stacked[batch * top_k, expert_inter=768]`，rhs 是 `[batch, top_k, hidden=2048]`。M=2048 比 gate/up 的 M=768 大 2.7×，但每个 (token, slot) 对的 lhs 长度只有 768 vs gate/up 的 hidden=2048。理论上不应该比 gate/up 慢，但实测 792 vs 621 ms。猜测原因：down 的 src1 ne11=top_k 下走 per-slot 索引而不是 broadcast，激活加载模式不一样。需要 frame-capture 看具体瓶颈。
+
+**5.3c NR1 = 32 → 64**（半天）：`gemm_q4kw_moe_id_f32` 当前 NR1=32（每 TG 处理 32 列）。M1 Max shmem 32KB，当前用 ~12KB，能扩到 NR1=64（更大 K-tile 摊销开销）。需要重新设计 simdgroup × tile 布局。
+
+### 5.4 已合并 PR
+
+- ~~5.1~~ Q-tiled flash_attn — PR #54 ✅
+- ~~5.2~~ MoE topk + ids_tpe → GPU — PR #55 ✅
 
 ### 5.3 Decode 优化（独立路线，不影响 prefill）
 
@@ -371,7 +393,8 @@ bench 期间 `Pages free` 跌到 < 200 MB 且 `swap` 持续涨 = 准备废测，
 
 ### 6.3 当前未合并 PR
 
-- **PR #54** `perf(metal): Q-tiled flash_attn with simdgroup_matmul` — 本次工作。CI 待开。pp512 303 → 370 t/s（+22%），attn 占比 27% → 13%。
+- **PR #54** `perf(metal): Q-tiled flash_attn with simdgroup_matmul` — pp512 303 → 370 t/s（+22%），attn 占比 27% → 13%。本地 commit c456984。
+- **PR #55** `perf(metal): MoE prefill topk + ids/tpe on GPU` — pp512 370 → 547 t/s（+48% on top of #54，累计 +72% vs PR #53），host 占比 8.7% → 2.2%。
 - ~~PR #53~~ 已合并 (e12a347)。
 
 ### 6.4 相关 memory note

@@ -131,3 +131,54 @@ kernel void moe_router_topk_softmax_f32(
         out_weights[row * top_k + tiisg] = sel_weights[tiisg] * scale;
     }
 }
+
+// ── compute_ids_tpe: bucket selected pairs by expert ────────────────────
+//
+// Replaces the host-side `compute_ids_tpe` that ran inside
+// `moe_forward_batched_prefill_impl`. After `moe_router_topk_softmax_f32`
+// emits `selected_ids[batch, top_k]`, this kernel groups those `(token,
+// slot)` pairs by their target expert, producing:
+//
+//   tpe[e]                   = number of pairs assigned to expert `e`
+//   ids[e * row_stride + s]  = global pair index (= token*top_k + slot)
+//                              for the s-th pair routed to expert `e`
+//
+// `row_stride` is the *worst-case* `batch * top_k` (the consumer GEMM
+// already stops at `tpe[e]`). Skipping the tight-stride compaction lets
+// us avoid the cross-pass max-reduce + sync we'd otherwise need before
+// dispatching the GEMM.
+//
+// Algorithm: a single 1-D threadgroup of `THREADS` threads. Phase 1
+// zeroes `tpe`. Phase 2 walks `selected_ids` and uses
+// `atomic_fetch_add_explicit` to claim a slot in each expert's row.
+
+constant int FERRUM_IDS_TPE_THREADS = 256;
+
+struct ComputeIdsTpeParams {
+    int num_experts;
+    int row_stride;     // = batch * top_k (worst-case ids row stride)
+    int total_pairs;    // = batch * top_k
+};
+
+kernel void moe_compute_ids_tpe_f32(
+    device const int      * selected_ids [[buffer(0)]],   // [total_pairs] i32
+    device atomic_int     * tpe          [[buffer(1)]],   // [num_experts] i32
+    device       int      * ids          [[buffer(2)]],   // [num_experts * row_stride] i32
+    constant ComputeIdsTpeParams & p     [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    // Phase 1: zero tpe.
+    for (int e = int(tid); e < p.num_experts; e += FERRUM_IDS_TPE_THREADS) {
+        atomic_store_explicit(&tpe[e], 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Phase 2: bucket. Each thread covers a strided slice of pairs.
+    for (int pair_idx = int(tid); pair_idx < p.total_pairs; pair_idx += FERRUM_IDS_TPE_THREADS) {
+        const int e = selected_ids[pair_idx];
+        if (e >= 0 && e < p.num_experts) {
+            const int slot = atomic_fetch_add_explicit(&tpe[e], 1, memory_order_relaxed);
+            ids[e * p.row_stride + slot] = pair_idx;
+        }
+    }
+}
