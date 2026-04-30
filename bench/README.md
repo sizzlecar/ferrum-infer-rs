@@ -53,6 +53,33 @@ $SCRIPT Qwen3-30B-A3B-Q4_K_M.gguf           Qwen3-30B-A3B.tokenizer.json        
 
 ⚠ 32 GB Mac 跑 30B-A3B 时**关掉浏览器/IDE 等大内存占用**，否则 KV cache + 模型 17 GB 会触 swap 让数字归零。
 
+### 内存监控 / Memory hygiene
+
+每次 bench 运行**自动捕获**机器状态写进结果文件（`vm_stat` 选定行 + `swapusage` + 大 RSS 进程列表），bench 前后各一次。文件里会出现：
+
+```
+──────── env snapshot: before ferrum @ 2026-05-01 ... ────────
+## vm_stat (selected)
+  Pages free: 248247.
+  Pages active: 1016049.
+  ...
+## swap
+  total = 5120.00M  used = 3815.38M  free = 1304.62M  (encrypted)
+## top non-system RSS (>50 MB)
+    901 MB  claude
+    642 MB  iTerm
+    ...
+## warning thresholds
+  ⚠ swap_used = 3815 MB (>1 GB) — bench numbers may be paging-affected
+```
+
+如果 swap usage > 2 GB（默认门槛），脚本**直接拒绝跑** bench 并告诉你关哪些 app。覆盖：`FERRUM_BENCH_SWAP_THRESHOLD_MB=N`。
+
+**为什么这个改动是必要的**（教训记录）：
+2026-05-01 我曾尝试把 gate gemv + up gemv + silu_mul 三个 dispatch 融成一个，理论上应该省 2 个 dispatch overhead × 48 layer ≈ 3 ms。实测 ferrum 38.0 vs baseline 38.2 t/s（差异 < 1%）。
+当时 `swap used = 3.82 GB`、Chrome / Spotlight / mds 共 2.4 GB RSS — 测试环境本身在 paging，3 ms 的预期收益完全淹没在 macOS 后台 IO 噪声里。修过来才知道是「环境污染」还是「优化无效」。
+完整调查记录：[`bench/notes/2026-05-01-gate-up-silu-fuse-attempt.md`](notes/2026-05-01-gate-up-silu-fuse-attempt.md).
+
 ### 4. 聚合到 markdown
 
 ```bash

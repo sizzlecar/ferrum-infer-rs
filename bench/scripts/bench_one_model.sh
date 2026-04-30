@@ -26,12 +26,25 @@ TOK_DIR="${TOK_DIR:-/Users/chejinxuan/ferrum-bench/tokenizers}"
 FERRUM_BIN="${FERRUM_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/target/release/ferrum}"
 MISTRAL_PY="${MISTRAL_PY:-/tmp/mistral_bench/bin/python}"
 BENCH_PY="${BENCH_PY:-$(cd "$(dirname "$0")" && pwd)/bench_mistral.py}"
+CAPTURE_ENV="$(cd "$(dirname "$0")" && pwd)/capture_env.sh"
 
 GGUF="$GGUF_DIR/$MODEL"
 TOK_PATH="$TOK_DIR/$TOK"
 
 mkdir -p "$OUTDIR"
 TAG="${MODEL%.gguf}"
+
+# Refuse to bench if the system is already paging hard. Without this,
+# GPU runs interleave with kernel page faults and the throughput
+# numbers silently lose 10-30% — see notes/2026-05-01-gate-up-silu-fuse-attempt.md.
+swap_used_mb=$(sysctl -n vm.swapusage | awk -F'used = ' '{print $2}' | awk '{print int($1)}')
+swap_threshold_mb="${FERRUM_BENCH_SWAP_THRESHOLD_MB:-2048}"
+if [ "${swap_used_mb:-0}" -gt "$swap_threshold_mb" ]; then
+  echo "⚠ swap_used=${swap_used_mb} MB > threshold ${swap_threshold_mb} MB" >&2
+  echo "  Close memory-heavy apps (Chrome, IDE, etc.) and rerun." >&2
+  echo "  Override with FERRUM_BENCH_SWAP_THRESHOLD_MB=N to proceed anyway." >&2
+  exit 1
+fi
 
 # Prompt of N space-separated "the" tokens — most BPE tokenizers split this 1-token-per-word.
 # Trailing pp output prints actual tokenised length, which is what we use.
@@ -46,8 +59,12 @@ echo ">>> llama.cpp (pp50, pp512, tg128 × 3 trials)"
 {
   echo "# llama-bench output for $MODEL"
   date
+} > "$OUTDIR/${TAG}__llamacpp.txt"
+"$CAPTURE_ENV" "before llama.cpp" "$OUTDIR/${TAG}__llamacpp.txt"
+{
   llama-bench -m "$GGUF" -p 50,512 -n 128 -r 3 2>&1
-} | tee "$OUTDIR/${TAG}__llamacpp.txt" >/dev/null
+} >> "$OUTDIR/${TAG}__llamacpp.txt"
+"$CAPTURE_ENV" "after llama.cpp" "$OUTDIR/${TAG}__llamacpp.txt"
 echo "    written → ${TAG}__llamacpp.txt"
 
 sleep 2
@@ -57,7 +74,9 @@ echo ">>> ferrum (9 runs: pp50×3, pp512×3, tg128×3)"
 {
   echo "# ferrum bench output for $MODEL"
   date
-
+} > "$OUTDIR/${TAG}__ferrum.txt"
+"$CAPTURE_ENV" "before ferrum" "$OUTDIR/${TAG}__ferrum.txt"
+{
   for i in 1 2 3; do
     echo "--- pp50 trial $i ---"
     "$FERRUM_BIN" run "$GGUF" --tokenizer "$TOK_PATH" \
@@ -78,7 +97,8 @@ echo ">>> ferrum (9 runs: pp50×3, pp512×3, tg128×3)"
       --prompt "Once upon a time" --max-tokens 128 --temperature 0.0 --bench-mode 2>&1 \
       | grep -E "prefill:|throughput|model ready"
   done
-} | tee "$OUTDIR/${TAG}__ferrum.txt" >/dev/null
+} >> "$OUTDIR/${TAG}__ferrum.txt"
+"$CAPTURE_ENV" "after ferrum" "$OUTDIR/${TAG}__ferrum.txt"
 echo "    written → ${TAG}__ferrum.txt"
 
 sleep 2
@@ -88,7 +108,9 @@ echo ">>> mistral.rs (3 runs: pp50, pp512, tg128 — each runs 3 trials internal
 {
   echo "# mistral.rs Python bench output for $MODEL"
   date
-
+} > "$OUTDIR/${TAG}__mistralrs.txt"
+"$CAPTURE_ENV" "before mistral.rs" "$OUTDIR/${TAG}__mistralrs.txt"
+{
   echo "--- pp50 ---"
   GGUF_DIR="$GGUF_DIR" "$MISTRAL_PY" "$BENCH_PY" "$MODEL" pp 50 1 3 2>/dev/null
 
@@ -97,7 +119,8 @@ echo ">>> mistral.rs (3 runs: pp50, pp512, tg128 — each runs 3 trials internal
 
   echo "--- tg128 ---"
   GGUF_DIR="$GGUF_DIR" "$MISTRAL_PY" "$BENCH_PY" "$MODEL" tg 0 128 3 2>/dev/null
-} | tee "$OUTDIR/${TAG}__mistralrs.txt" >/dev/null
+} >> "$OUTDIR/${TAG}__mistralrs.txt"
+"$CAPTURE_ENV" "after mistral.rs" "$OUTDIR/${TAG}__mistralrs.txt"
 echo "    written → ${TAG}__mistralrs.txt"
 
 echo "=== ${MODEL} done ==="
