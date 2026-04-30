@@ -142,25 +142,15 @@ kernel void gemm_q6kw_f32a_f32o(
             }
         }
 
-        // Load B tile (8 floats → 8 halves per thread)
+        // Load B tile — vector store (see q4_k_moe_id_gemm for rationale)
         {
             const short sx = short(tiitg) % NL1_Q6;
             const short sy = (short(tiitg) / NL1_Q6) / 8;
             const short ly = (short(tiitg) / NL1_Q6) % 8;
             const short ib = 4 * sx + sy;
 
-            float4 v0 = float4(*((device const float4 *)(y + 0)));
-            float4 v1 = float4(*((device const float4 *)(y + 4)));
-
-            threadgroup half * dst8 = sb + 64 * ib + 8 * ly;
-            dst8[0] = half(v0[0]);
-            dst8[1] = half(v0[1]);
-            dst8[2] = half(v0[2]);
-            dst8[3] = half(v0[3]);
-            dst8[4] = half(v1[0]);
-            dst8[5] = half(v1[1]);
-            dst8[6] = half(v1[2]);
-            dst8[7] = half(v1[3]);
+            *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) =
+                half2x4(*((device const float2x4 *) y));
         }
 
         il = (il + 2 < NL_BLOCK_Q6_K) ? il + 2 : il % 2;

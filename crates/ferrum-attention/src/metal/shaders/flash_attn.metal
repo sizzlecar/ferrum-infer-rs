@@ -86,18 +86,30 @@ kernel void flash_attn_f32(
             device const float* k_row = k_base + ki * d;
             device const float* v_row = v_base + ki * d;
 
-            // Compute dot product Q[qi] · K[ki] using simd reduction
-            float dot = 0.0f;
-            for (int j = tiisg; j < d; j += 32) {
-                dot += q_row[j] * k_row[j];
+            // Compute dot product Q[qi] · K[ki] using simd reduction.
+            // Vectorized: each thread loads 4 floats per iter (float4
+            // load = 16-byte coalesced access vs 4× 4-byte scalar loads).
+            // For d=128, head_dim divisible by 4: each thread does d/(32*4)
+            // = 1 float4 load and 1 metal::dot. For odd head_dims fall
+            // back to scalar tail.
+            float dot_acc = 0.0f;
+            const int d4 = d & ~3; // round down to multiple of 4
+            for (int j = tiisg * 4; j < d4; j += 32 * 4) {
+                float4 q_v = *((device const float4 *)(q_row + j));
+                float4 k_v = *((device const float4 *)(k_row + j));
+                dot_acc += metal::dot(q_v, k_v);
             }
-            dot = simd_sum(dot) * p.scale;
+            // Tail (head_dim not multiple of 4) — rare, kept for safety.
+            for (int j = d4 + tiisg; j < d; j += 32) {
+                dot_acc += q_row[j] * k_row[j];
+            }
+            float dot_v = simd_sum(dot_acc) * p.scale;
 
             // Online softmax update
             float old_M = M;
-            M = max(M, dot);
+            M = max(M, dot_v);
             float exp_diff = exp(old_M - M);
-            float exp_val = exp(dot - M);
+            float exp_val = exp(dot_v - M);
 
             // Rescale existing accumulator and sum
             S = S * exp_diff + exp_val;
