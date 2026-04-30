@@ -73,7 +73,9 @@ $SCRIPT Qwen3-30B-A3B-Q4_K_M.gguf           Qwen3-30B-A3B.tokenizer.json        
   ⚠ swap_used = 3815 MB (>1 GB) — bench numbers may be paging-affected
 ```
 
-如果 swap usage > 2 GB（默认门槛），脚本**直接拒绝跑** bench 并告诉你关哪些 app。覆盖：`FERRUM_BENCH_SWAP_THRESHOLD_MB=N`。
+脚本不再以 baseline swap 为 refuse 阈值（旧 swap 在那不动其实不影响 bench；只有 bench *期间* 触发新 paging 才是问题）。改为**测 bench 前后的 swap delta**，超 256 MB（`FERRUM_BENCH_SWAP_GROWTH_MB=N` 覆盖）就在每个结果文件追加 ⚠ 告警 banner，让后续聚合看到是「paging-affected」数据。
+
+不需要 sudo / purge / 重启 —— 只要 model 工作集装得下 (free + inactive) 内存就 OK，旧 swap 是 macOS 的历史遗留，不会影响新 GPU run。30B-A3B 在 32 GB Mac 上**会** trigger paging（17 GB 模型 + 12 GB 已 active 的进程），所以 30B 的 bench 会 flag warning；这是设计内的行为，warning 让结果可信度被人看到。
 
 **为什么这个改动是必要的**（教训记录）：
 2026-05-01 我曾尝试把 gate gemv + up gemv + silu_mul 三个 dispatch 融成一个，理论上应该省 2 个 dispatch overhead × 48 layer ≈ 3 ms。实测 ferrum 38.0 vs baseline 38.2 t/s（差异 < 1%）。
