@@ -173,6 +173,14 @@ pub async fn run_gguf_one_shot(cmd: RunCommand, _config: CliConfig) -> Result<()
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         BackendKind::Metal => {
+            // Register the GGUF mmap so subsequent `B::load_quant*` calls
+            // can wrap weight tensors in zero-copy `MTLBuffer`s instead
+            // of allocating fresh device-resident copies. Saves ~17 GB
+            // resident on Qwen3-30B-A3B Q4_K_M (CRUCIAL on a 32 GB Mac).
+            ferrum_kernels::backend::metal::register_gguf_mmap(
+                gguf_arc.mmap_bytes(),
+                gguf_arc.clone(),
+            )?;
             let loader = GgufLoader::<MetalBackend>::from_file(gguf_arc.clone());
             if let Some(mc) = moe_cfg.clone() {
                 let mut model = Qwen3MoeModel::<MetalBackend>::new(mc, &loader, &gguf_arc)?;

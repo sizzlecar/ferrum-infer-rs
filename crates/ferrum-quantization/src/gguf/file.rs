@@ -143,9 +143,67 @@ impl GgufFile {
     /// The returned tensor is **still quantized** — no dequant happens here.
     /// Wrap it in `QMatMul::from_qtensor` for inference, or call
     /// `QTensor::dequantize(device)` to get a fp32 `Tensor`.
+    ///
+    /// **Beware:** candle copies the bytes into an owned `Vec<u8>` (see
+    /// `TensorInfo::read`). For the steady-state weight upload path use
+    /// [`Self::tensor_byte_slice`] instead — it returns a slice directly
+    /// into the mmap with no allocation.
     pub fn read_tensor(&self, name: &str, device: &Device) -> CandleResult<QTensor> {
         let mut cursor = Cursor::new(&self.mmap[..]);
         self.content.tensor(&mut cursor, name, device)
+    }
+
+    /// Whole mmap region as a byte slice. Used to wrap the file as a single
+    /// zero-copy `MTLBuffer` on Metal — the lifetime of the slice is tied to
+    /// `&self`, so the caller is expected to keep an `Arc<GgufFile>` alive
+    /// for as long as anything references the mmap.
+    pub fn mmap_bytes(&self) -> &[u8] {
+        &self.mmap[..]
+    }
+
+    /// Byte slice covering exactly tensor `name` inside the mmap. The slice
+    /// points into the file mapping, so reads are demand-paged and there is
+    /// no heap allocation. Returns `None` if the tensor isn't declared.
+    ///
+    /// The byte length is computed from the tensor's `(elem_count, ggml_dtype)`
+    /// using candle's `block_size()` / `type_size()`. For raw quant tensors
+    /// (Q4K / Q6K / etc.), these bytes are exactly what `QTensor::data()`
+    /// would return — but with no copy.
+    pub fn tensor_byte_slice(&self, name: &str) -> Option<&[u8]> {
+        let info = self.content.tensor_infos.get(name)?;
+        let elem_count = info.shape.elem_count();
+        let block_size = info.ggml_dtype.block_size();
+        if !elem_count.is_multiple_of(block_size) {
+            return None;
+        }
+        let size_in_bytes = elem_count / block_size * info.ggml_dtype.type_size();
+        let abs_start = (self.content.tensor_data_offset + info.offset) as usize;
+        let abs_end = abs_start.checked_add(size_in_bytes)?;
+        if abs_end > self.mmap.len() {
+            return None;
+        }
+        Some(&self.mmap[abs_start..abs_end])
+    }
+
+    /// `(byte_offset_in_mmap, byte_length)` for tensor `name`. Same
+    /// computation as [`Self::tensor_byte_slice`] but returns the indices
+    /// rather than the slice — useful when the caller already has the
+    /// mmap base pointer (e.g. when binding a region of a shared buffer
+    /// at a given offset).
+    pub fn tensor_byte_range(&self, name: &str) -> Option<(usize, usize)> {
+        let info = self.content.tensor_infos.get(name)?;
+        let elem_count = info.shape.elem_count();
+        let block_size = info.ggml_dtype.block_size();
+        if !elem_count.is_multiple_of(block_size) {
+            return None;
+        }
+        let size_in_bytes = elem_count / block_size * info.ggml_dtype.type_size();
+        let abs_start = (self.content.tensor_data_offset + info.offset) as usize;
+        let abs_end = abs_start.checked_add(size_in_bytes)?;
+        if abs_end > self.mmap.len() {
+            return None;
+        }
+        Some((abs_start, size_in_bytes))
     }
 }
 

@@ -36,6 +36,7 @@ pub fn dispatch_gemm_q6k_moe_id_on_encoder(
     device: &Device,
     enc: &ComputeCommandEncoderRef,
     weights_stacked: &Buffer,
+    weights_byte_offset: u64,
     src1: &Buffer,
     ids: &Buffer,
     tpe: &Buffer,
@@ -78,7 +79,7 @@ pub fn dispatch_gemm_q6k_moe_id_on_encoder(
 
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
-    enc.set_buffer(0, Some(weights_stacked), 0);
+    enc.set_buffer(0, Some(weights_stacked), weights_byte_offset);
     enc.set_buffer(1, Some(src1), 0);
     enc.set_buffer(2, Some(ids), 0);
     enc.set_buffer(3, Some(tpe), 0);
