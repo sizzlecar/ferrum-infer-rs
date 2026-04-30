@@ -260,6 +260,16 @@ fn run_one_shot<M: DecoderOnlyLLM>(
 
     let cache_id = "default";
 
+    // Eager scratch + KV cache alloc so the first `prefill` doesn't
+    // pay the cold-start MTLBuffer cost on the hot path. Without this,
+    // ferrum's pp50 / pp512 numbers in `--bench-mode` (each trial is
+    // a fresh process) include the cold-start allocator overhead —
+    // that's not what we want to measure when comparing against
+    // llama-bench, which runs its `-r N` trials inside ONE process
+    // and skips alloc on subsequent rounds. See bench/fairness-audit.md
+    // for the full breakdown.
+    model.prepare(cache_id, prompt_tokens.len());
+
     // Optional Metal frame capture around the prefill iteration. Set
     // FERRUM_METAL_CAPTURE=/path/to/out.gputrace AND MTL_CAPTURE_ENABLED=1
     // to record one prefill into a .gputrace file you can open in Xcode

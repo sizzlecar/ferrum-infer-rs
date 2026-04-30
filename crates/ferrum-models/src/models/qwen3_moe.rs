@@ -1221,6 +1221,27 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
         &self.runtime_cfg
     }
 
+    fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
+        // Eager scratch + KV cache grow + a 1-token forward warmup so
+        // the first real prefill / decode doesn't pay the cold-start
+        // ~25-MTLBuffer scratch alloc + ~96-MTLBuffer KV alloc + Metal
+        // pipeline-state first-bind costs (~265 ms total on Qwen3-MoE
+        // 30B-A3B / M1 Max). Mirrors what llama-bench's --warmup does
+        // (which runs a same-shape forward before the timer).
+        self.ensure_scratch(max_tokens);
+        self.ensure_kv(cache_id);
+
+        // Warmup forward through all 48 layers under a scratch cache_id
+        // so the real `cache_id` starts at pos_offset=0. Token 0 is
+        // valid for any tokenizer (BOS or pad).
+        const WARMUP_CACHE: &str = "__ferrum_warmup__";
+        let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
+        // Drop the warmup KV cache slot — real cache_id is unaffected.
+        if let Some(caches) = self.kv_caches.remove(WARMUP_CACHE) {
+            self.kv_free_pool.push(caches);
+        }
+    }
+
     fn kv_capacity(&self) -> usize {
         // Mirror the bound `ensure_kv` will use when allocating the cache.
         let model_max = self.cfg.base.max_seq_len;

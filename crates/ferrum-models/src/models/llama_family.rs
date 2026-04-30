@@ -1936,6 +1936,21 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         &self.runtime_cfg
     }
 
+    fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
+        // Eager scratch + KV cache grow + a 1-token forward warmup —
+        // see the Qwen3MoeModel::prepare comment for the rationale.
+        // Without the warmup forward, the first real prefill pays
+        // Metal pipeline first-bind costs inside the timer window.
+        self.ensure_scratch(max_tokens);
+        self.ensure_kv(cache_id);
+
+        const WARMUP_CACHE: &str = "__ferrum_warmup__";
+        let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
+        if let Some(caches) = self.kv_caches.remove(WARMUP_CACHE) {
+            self.kv_free_pool.push(caches);
+        }
+    }
+
     fn kv_capacity(&self) -> usize {
         // Mirror the bound `ensure_kv` will use when allocating the cache.
         let model_max = self.cfg.max_seq_len;
