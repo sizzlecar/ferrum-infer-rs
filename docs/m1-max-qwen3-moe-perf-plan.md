@@ -1,0 +1,374 @@
+# M1 Max Qwen3-MoE 性能追赶 llama.cpp（2026-04-30 状态）
+
+本文档是 PR #50/#52/#53 之后的状态快照、测试方法、核心实现解释和下一步计划。
+读者：下一个会话 / 接手者。
+
+## 1. 目标
+
+在 **Apple M1 Max（32 GB 统一内存）** 上让 ferrum-infer-rs 跑 **Qwen3-30B-A3B-Q4_K_M**（17 GB GGUF）追上 llama.cpp 的性能。
+
+**衡量基准（llama.cpp build 27aef3d (225)，本机实测）**：
+
+```
+| qwen3moe 30B.A3B Q4_K - Medium | 17.28 GiB | 30.53 B | MTL,BLAS | 8 |  pp512 |  618.64 ± 11.17 |
+| qwen3moe 30B.A3B Q4_K - Medium | 17.28 GiB | 30.53 B | MTL,BLAS | 8 |  tg128 |   51.03 ± 3.32  |
+```
+
+- llama.cpp 在 M1 Max 上 **不**走 Metal 4 tensor matmul（`tensor API disabled for pre-M5 and pre-A19 devices`），就是普通 simdgroup_half8x8 + fp32 accum。
+- `MUL_MAT_ID` 在 ggml-blas 里**没有** handler，MoE 必走 Metal。所以这是 **纯 Metal 的对决**，不存在 AMX 加速这一层（之前的猜测错了）。
+
+**当前阶段目标**：pp512 ≥ **80% × 618 = 494 t/s**。
+
+**为什么不要瞎猜 llama.cpp 的"魔法"**：我们已经验证过 kernel 架构和我们一致（NR0=64 NR1=32 NK=32, simdgroup_half8x8 + fp32 accum, 同款 dequant_q4_K, 同款 dispatch grid）。差距不是来自架构，而是来自具体的 kernel 写法（向量化 / 指令调度）和 attention 路径的实现质量。**直接 diff llama.cpp 源码找具体差异**，不要假设。
+
+---
+
+## 2. 当前进展（PR #50/#52/#53 累积）
+
+### 2.1 `BENCHMARKS` — 5× pp512 中位数
+
+| 指标 | 修复前 | **PR #50** | **PR #52** | **PR #53** | llama.cpp |
+|-------|------:|---------:|---------:|---------:|---------:|
+| 加载时间 | 47-54 s | **1.0 s** | 1.0 s | 1.0 s | ~1.5 s |
+| pp512 | swap (≪1 t/s) | 64 t/s | **283 t/s** | 282 t/s | 618 t/s |
+| tg128 | 0.1 t/s | 27.6 t/s | 27 t/s | 27 t/s | 51 t/s |
+| 内存峰值 | ~34 GB | **17 GB** | 17 GB | 17 GB | 17 GB |
+
+**vs llama.cpp**：pp512 = **46%**，tg128 = **53%**，加载 + 内存 = **持平**。
+
+### 2.2 PR 时间线
+
+- **PR #50 `perf(metal): zero-copy GGUF mmap`** — 把 GGUF mmap 包装成 per-tensor `newBufferWithBytesNoCopy` MTLBuffer。修复内存翻倍（之前 `new_buffer_with_data` 拷贝），加载从 47s → 1s，30B 模型从 swap 模式 → 正常。⚠️ **不要再尝试一个大 16 GiB buffer 的方案** — 在 M1 Max 上 GPU 残留检查会让 decode 慢 70×，已验证。
+- **PR #51 `feat(metal): prefill profiling + capture hooks`** — 加 `FERRUM_DECODE_OP_PROFILE=1` 的 prefill stage 分解打印，加 `FERRUM_METAL_CAPTURE` 的 Xcode `.gputrace` 抓帧。
+- **PR #52 `perf(metal): vectorize MoE GEMM stores`** — `gemm_q4kw_moe_id_f32` 把 8 个标量 half store 改成一个 `half2x4` 向量 store。**单点改动，pp512 64 → 283 t/s（4.4×）**。这是和 llama.cpp 的关键 diff。
+- **PR #53 `perf(metal): vectorize dense GEMM + flash_attn QK loads`** — 同样的 vector-store 模式应用到 dense Q4_K/Q6_K GEMM 和 flash_attn 的 QK 点积。本模型上 ~0% 提升（这些不是当前瓶颈），合并主要为一致性。
+
+---
+
+## 3. 如何测试 / 复现 bench
+
+### 3.1 关键环境变量
+
+| 变量 | 必须 | 作用 |
+|---|---|---|
+| `FERRUM_KV_CAPACITY=512` | **是** | 限 KV cache 容量。不设默认走 `max_seq_len=32K`，会分配 ~6 GB KV cache 把 32 GB Mac 推到 swap，bench 数字直接归零。**每次都要设。** |
+| `MTL_CAPTURE_ENABLED=1` | 仅 capture | 启用 Metal 抓帧。系统层面的 gate。 |
+| `FERRUM_METAL_CAPTURE=path/out.gputrace` | 仅 capture | 让 prefill 写一个 `.gputrace` 文件。 |
+| `FERRUM_DECODE_OP_PROFILE=1` | 仅 profile | 每个 stage（attn/moe/host/gate/up/silu/down/wsum）打印分解时间。**注意会插 `B::sync(ctx)` 拖慢 1.5-2×**——不要用它的绝对数字，只用相对占比。 |
+| `FERRUM_MMAP_TRACE=1` | 调试 mmap | 打印 PR #50 的 mmap registry hit/miss。生产关。 |
+
+### 3.2 标准 bench 命令
+
+```bash
+# 基础设施
+cd /Users/chejinxuan/rust_ws/ferrum-infer-rs
+cargo build --release -p ferrum-cli --features metal
+
+# 模型路径
+GGUF=/Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf
+TOK=/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json
+```
+
+#### A. **正确性**（每次改 kernel 必跑）
+
+```bash
+FERRUM_KV_CAPACITY=512 ./target/release/ferrum run "$GGUF" \
+  --tokenizer "$TOK" \
+  --prompt "The capital of France is" --max-tokens 16 --temperature 0.0
+```
+
+**期望输出**（必须**逐字一致**）：
+
+```
+The capital of France is Paris. The capital of Italy is Rome. The capital of Spain is Madrid.
+```
+
+任何 `_Cell_Cell_Cell` / `Dund impe impe` / `, , , ,` 等回归，立刻 git diff 找最近的 kernel 改动，回滚定位。**不要用 `--bench-mode` 跑正确性**，它会吞掉文本。
+
+#### B. **pp512**（prefill 吞吐量）
+
+```bash
+PROMPT=$(printf 'The quick brown fox jumps over the lazy dog. %.0s' {1..50})
+for i in 1 2 3 4 5; do
+  FERRUM_KV_CAPACITY=512 ./target/release/ferrum run "$GGUF" \
+    --tokenizer "$TOK" \
+    --prompt "$PROMPT" --max-tokens 1 --temperature 0.0 --bench-mode \
+    2>&1 | grep "prefill:"
+done
+```
+
+**取 5 次中位数**。本机方差大（~30%），单次数字不可信。
+
+预期实际 token 数 ≈ 501（tokenizer 拆分）。
+
+#### C. **tg128**（decode 吞吐量）
+
+```bash
+for i in 1 2 3 4 5; do
+  FERRUM_KV_CAPACITY=512 ./target/release/ferrum run "$GGUF" \
+    --tokenizer "$TOK" \
+    --prompt "Hi" --max-tokens 128 --temperature 0.0 --bench-mode \
+    2>&1 | grep "throughput"
+done
+```
+
+#### D. **prefill 分解 profile**
+
+```bash
+FERRUM_DECODE_OP_PROFILE=1 FERRUM_KV_CAPACITY=512 ./target/release/ferrum run "$GGUF" \
+  --tokenizer "$TOK" --prompt "$PROMPT" \
+  --max-tokens 1 --temperature 0.0 --bench-mode 2>&1 \
+  | grep -E "prefill-profile|attn:|moe:|other:|host|gate|up:|silu|down|wsum"
+```
+
+输出例子（current PR #53 后）：
+
+```
+[prefill-profile] tokens=501 total=2830 ms (177 t/s)
+    attn:  925 ms (32.7%) over 48 calls
+     moe: 1640 ms (57.9%) over 48 calls
+   other:  265 ms ( 9.4%) over  1 calls
+    host:  151 ms ( 5.4%) over 48 calls
+    gate:  474 ms (16.7%) over 48 calls
+      up:  457 ms (16.2%) over 48 calls
+    silu:   19 ms ( 0.7%) over 48 calls
+    down:  501 ms (17.7%) over 48 calls
+    wsum:   19 ms ( 0.7%) over 48 calls
+```
+
+总时长 = 2.83s，但**实际 prefill 是 1.79s**（177 vs 282 t/s）—— `B::sync` 在每个 stage 间强制 GPU flush，破坏了 pipeline 并行性。**用相对百分比，不用绝对 ms**。
+
+#### E. **Metal 抓帧**（深度分析时用）
+
+```bash
+rm -f /tmp/ferrum_prefill.gputrace
+MTL_CAPTURE_ENABLED=1 FERRUM_METAL_CAPTURE=/tmp/ferrum_prefill.gputrace \
+FERRUM_KV_CAPACITY=512 ./target/release/ferrum run "$GGUF" \
+  --tokenizer "$TOK" \
+  --prompt "$(printf 'The quick brown fox jumps over the lazy dog. %.0s' {1..50})" \
+  --max-tokens 1 --temperature 0.0 --bench-mode
+
+open /tmp/ferrum_prefill.gputrace
+```
+
+打开后：
+1. 选设备 → 勾 **Profile GPU Trace** → 点 **Replay**（等几分钟）
+2. 左侧 **Performance** → **Counters** 标签 → **Performance Limiters** 列
+3. 找 cost 最高的 encoder（`gemm_q4kw_moe_id_f32` 或 `flash_attn_f32`）
+4. 看：**ALU Limiter / ALU Utilization / F32 Utilization**
+
+**Trace 文件 38 GB**（含所有 MTLBuffer 副本），删完看完别忘清理。
+
+#### F. **llama.cpp baseline**（已编译，不需要重 build）
+
+```bash
+/Users/chejinxuan/rust_ws/llama.cpp/build/bin/llama-bench \
+  -m "$GGUF" -p 512 -n 128 -r 3
+```
+
+---
+
+## 4. 当前核心实现（关键设计点）
+
+### 4.1 内存布局：per-tensor zero-copy MTLBuffer（PR #50）
+
+`crates/ferrum-kernels/src/backend/metal.rs::buffer_for_quant_bytes`
+
+每个 quant tensor 调用 `newBufferWithBytesNoCopy` 包装 mmap 中**该 tensor 所在的页对齐区间**。
+
+```rust
+let aligned_start = ptr_addr & !(PAGE - 1);
+let aligned_end = (ptr_addr + bytes.len()).div_ceil(PAGE) * PAGE;
+let buf = device.new_buffer_with_bytes_no_copy(
+    aligned_start as *const c_void,
+    (aligned_end - aligned_start) as u64,
+    MTLResourceOptions::StorageModeShared,
+    None,
+);
+```
+
+`MetalQuantStore::Q4K { blocks, byte_offset, ... }` 里存 buffer + 字节偏移。所有 kernel dispatch 用 `setBuffer:offset:` 绑定。
+
+**反面教材**：尝试过把整个 mmap 做成一个 16 GiB MTLBuffer（M1 Max max_buffer_length），correctness OK 但 decode 慢 **70×**。Apple GPU 残留追踪在大 buffer 上极贵。**多个小 buffer 才是对的**。
+
+### 4.2 GGUF 注册（一次性）
+
+`crates/ferrum-cli/src/commands/run_gguf.rs` 在 Metal backend 路径里：
+
+```rust
+ferrum_kernels::backend::metal::register_gguf_mmap(
+    gguf_arc.mmap_bytes(),
+    gguf_arc.clone(),  // keeper Arc — 让 mmap 在 MTLBuffer 生命周期内活着
+)?;
+```
+
+`register_gguf_mmap` 只记录范围 + Arc，**不**预先创建 MTLBuffer。MTLBuffer 在每个 `load_quant*` 调用时按需创建。
+
+### 4.3 MoE 热 kernel（PR #52 优化点）
+
+`crates/ferrum-kernels/src/q4_k_moe_id_gemm.metal::gemm_q4kw_moe_id_f32`
+
+3 个关键 store / load 点：
+
+1. **权重 dequant 后 → shmem**（每 K=32 块 fires K/NK=64 次）
+   ```c
+   FOR_UNROLL (short i = 0; i < 16; ++i) {
+       sa[64 * ib + 8 * ly + lx] = temp_a[i / 4][i % 4];  // 16 标量 store
+   }
+   ```
+   *和 llama.cpp 一致*，**已 OK**。
+
+2. **激活 → shmem**（PR #52 改动点）
+   ```c
+   // 改之前：8 个 half 标量 store
+   *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) =
+       half2x4(*((device const float2x4 *) y));   // 1 个向量 store
+   ```
+   **就是这个让 pp512 4.4×**。同样的模式 PR #53 应用到了 q4_k_gemm.metal / q6_k_gemm.metal / q6_k_moe_id_gemm.metal（这次模型上无显著收益但保持一致）。
+
+3. **输出 writeback**（PR #52 也改了）
+   ```c
+   // float4 vector copy + scalar tail
+   for (i = tiisg; i < nr0/4; i += 32) D4[i] = C4[i];
+   for (i = 4*(nr0/4)+tiisg; i < nr0; i += 32) D[i] = C[i];
+   ```
+
+内层 matmul（4 simdgroup × 8 matmul tile × NK/8 iter）和 llama.cpp 完全一样。
+
+### 4.4 Routing：CPU vs GPU
+
+ferrum 当前 routing **走 CPU**：
+
+```rust
+// crates/ferrum-models/src/models/qwen3_moe.rs::moe_forward_batched_prefill_impl
+B::sync(ctx);  // ← 强制 GPU flush，破坏了 attn → MoE 的 pipeline
+let logits_host = B::to_vec(&scratch.router_logits, tokens * n_exp);
+let route = crate::moe::router::route(&logits_host, ...);  // CPU softmax + topk
+let (tpe_host, ids_host, max_per_expert) = compute_ids_tpe(...);
+B::write_i32_into(&mut scratch.tpe_buf, &tpe_host);
+B::write_i32_into(&mut scratch.ids_2d, &ids_host);
+B::write_f32_into(&mut scratch.weights_2d, &route.expert_weights);
+```
+
+llama.cpp 用 **GPU prepass kernel**：`kernel_mul_mm_id_map0`，每个 expert 一个线程，扫所有 token 的 selected_experts 数组，输出 `tpe[expert]` + `ids[expert][slot]`。
+
+prefill profile 显示我们的 host topk 占 5.4%。改成 GPU 会**省掉 sync barrier**，让 attn dispatch 和 routing prepass 在 GPU 上 pipeline。
+
+### 4.5 Flash Attention：朴素实现
+
+`crates/ferrum-attention/src/metal/shaders/flash_attn.metal::flash_attn_f32`
+
+```c
+// Grid: (q_len, num_heads, batch) — 1 threadgroup per (Q-pos, head, batch)
+// Each: 1 simdgroup, online softmax, scalar Q·K dot product per KV pos
+for (int ki = kv_start; ki < kv_end; ++ki) {
+    float dot_acc = 0.0f;
+    for (int j = tiisg*4; j < d4; j += 32*4) {
+        float4 q_v = *((device const float4 *)(q_row + j));
+        float4 k_v = *((device const float4 *)(k_row + j));
+        dot_acc += metal::dot(q_v, k_v);
+    }
+    float dot_v = simd_sum(dot_acc) * p.scale;
+    // ... online softmax ...
+}
+```
+
+**这是当前最大瓶颈**（prefill 的 32.7%）。每个 query position 一个 simdgroup，KV 串行，没有用 simdgroup_matmul。和 llama.cpp 的 `kernel_flash_attn_ext_impl` 差距巨大。
+
+---
+
+## 5. 下一步计划
+
+### 5.1 主线：flash_attn 重写（突破 80% 的关键）
+
+**目标**：把 attn 从 32.7% 砍到 ≤ 10%，pp512 提升至 ≥ 494 t/s。
+
+**做法**：模仿 llama.cpp `kernel_flash_attn_ext_impl`（参考 `/Users/chejinxuan/rust_ws/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5801`）写一个 **Q-batched + simdgroup_matmul** 版本：
+
+- Grid: `(q_len/Q_TILE, num_heads, batch)`，`Q_TILE = 8` 或 `16`
+- 每 threadgroup: 多 simdgroup（NSG=4 或 8），各自负责部分 Q row
+- 内层：load `K[8, head_dim]` tile + simdgroup_matmul 计算 `[Q_TILE, 8]` 块的 QK^T，online softmax，乘 V
+- shmem 布局：Q + O + scratch（softmax max/sum）
+
+**需要的最小子集**（不需要照搬全部 llama.cpp 复杂度）：
+- ✅ Causal mask（必须）
+- ✅ GQA（num_heads != num_kv_heads，必须）
+- ❌ ALiBi bias（Qwen3 不需要）
+- ❌ Sliding window（Mistral v0.1 才需要，先不做）
+- ❌ KV padding 优化（先不做，正确性优先）
+- ❌ 多种 head_dim 模板（先只做 head_dim=128）
+
+**估算**：focused 1-2 天工作，包括 correctness 调试（必跑 Paris/Rome/Madrid）和 Xcode profile 验证。
+
+**风险**：online softmax 数值精度敏感，simdgroup_matmul 的 fp16 multiply / fp32 accumulate 累加误差可能让输出和当前 kernel 略不同。要 tolerance（不要 exact match）。
+
+### 5.2 次要：MoE topk 上 GPU
+
+**目标**：去掉每层 MoE 的 host roundtrip，省 sync barrier。
+
+**做法**：写一个 `route_topk_softmax_compute_ids_tpe` kernel，输入 `router_logits[batch, num_experts]`，输出 `tpe[num_experts]` 和 `ids[num_experts, max_pairs]`（用某个固定上界 `batch*top_k`）。模仿 llama.cpp 的 `kernel_mul_mm_id_map0`。
+
+**估算**：半天。**收益**：直接省 host topk 的 5.4%，加上去掉 sync 后的 pipeline 收益，预估额外 8-10% 提升。
+
+### 5.3 Decode 优化（独立路线，不影响 prefill）
+
+`docs/qwen3-moe-decode-status-2026-04-30.md` §4.1 列出的三个 dispatch 融合：
+1. **gate + up 双 gemv 融合**（48 dispatches/token）
+2. **silu_mul + down gemv 融合**（48/token）
+3. **router + topk 融合**（48/token）
+
+合计 144 dispatches/token，理论再砍 ~7 ms TPOT。decode 27.6 → ~35-38 t/s，缩小到 llama.cpp 51 t/s 的 70%。
+
+### 5.4 已知小问题
+
+- **`stub_linear` 浪费 576 MB 内存**：`qwen3_moe.rs::stub_linear` 给 dense 路径的 `gate_up_proj / down_proj` 创建 12 MB f32 0 权重 × 48 layer = 576 MB。MoE 模型从来不用这些 slot。Xcode 把这显示为 "Large Unused Resource"。可以改成 `Option<Box<dyn Linear<B>>>` 或者占位 stub 不分配实际内存。**单独小 PR**。
+
+### 5.5 不要再尝试的方向（已验证负面）
+
+| 方向 | 结果 |
+|---|---|
+| 一个 16 GiB MTLBuffer 包整个 mmap | decode 70× 退化（GPU 残留追踪开销）。多个小 buffer 是对的。 |
+| AMX / Accelerate prefill backend | llama.cpp 在 M1 Max 上不用这个（MUL_MAT_ID 在 ggml-blas 没 handler），跟我们一样纯 Metal。AMX bench 显示对 N=32 的 MoE 工作负载也不是比 GPU 快多少。 |
+| Apple Tensor matmul (`mpp::tensor_ops`) | M1 Max pre-M5，不支持。`has_tensor=false`。要等硬件升级。 |
+| 拷贝路径 weight upload (`new_buffer_with_data`) | PR #50 之前的版本，内存翻倍 + load 50s。回不去。 |
+
+---
+
+## 6. 其它历史信息
+
+### 6.1 m1 内存约束
+
+32 GB 物理 RAM 是硬约束。Qwen3-30B-A3B Q4_K_M GGUF 17.3 GB。任何同时占用 17 GB+ 多余分配的方案都会触发 swap。**始终 `FERRUM_KV_CAPACITY=512` + 关掉所有大 GUI app（VS Code / Lark / 微信 / DBeaver / Chrome 多 tab）才能稳定 bench。**
+
+vm_stat 监控：
+
+```bash
+while true; do
+  free=$(vm_stat | awk '/Pages free/ {gsub("\\.","",$3); print $3}')
+  swap=$(sysctl -n vm.swapusage | awk '{print $7}')
+  free_gb=$(echo "scale=1; $free * 16384 / 1073741824" | bc)
+  echo "[$(date +%H:%M:%S)] free=${free_gb}GB swap=${swap}"
+  sleep 5
+done
+```
+
+bench 期间 `Pages free` 跌到 < 200 MB 且 `swap` 持续涨 = 准备废测，结果不可信。
+
+### 6.2 测试机配置
+
+- **MacBook Pro M1 Max**, macOS 15.1.1
+- 32 GB unified memory
+- GPU family: Apple7 / Metal3 / **NOT Metal4**（重要——决定不能用 tensor matmul）
+- maxBufferLength = 16 GiB
+- recommendedMaxWorkingSetSize ≈ 22.9 GB
+
+### 6.3 当前未合并 PR
+
+- **PR #53** `perf(metal): vectorize dense GEMM + flash_attn QK loads (consistency)` — CI 中。本次模型无显著数字提升，主要为一致性。等 CPU + Metal 通过后合并。
+
+### 6.4 相关 memory note
+
+- `~/.claude/projects/.../memory/project_metal_zerocopy.md` — PR #50 设计要点
+- `~/.claude/projects/.../memory/project_qwen3_moe_prefill.md` — 本文档浓缩版
+- `~/.claude/projects/.../memory/project_qwen3_moe_decode_fusion.md` — 早期 decode 工作（PR #46-#49）
+- `docs/qwen3-moe-decode-status-2026-04-30.md` — decode 优化的详细分析（dispatch 融合路线）
