@@ -1081,6 +1081,86 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn gemm_quant_moe_id_indirect(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        ids: &Self::Buffer,
+        tpe: &Self::Buffer,
+        out: &mut Self::Buffer,
+        args_buf: &Self::Buffer,
+        ne11: usize,
+        top_k: usize,
+        max_per_expert: usize,
+        batch: usize,
+    ) -> Result<()> {
+        let a_buf = a.expect_f32("gemm_quant_moe_id_indirect a");
+        let ids_buf = &ids.raw;
+        let tpe_buf = &tpe.raw;
+        let out_buf = out.expect_f32_mut("gemm_quant_moe_id_indirect out");
+        let args = &args_buf.raw;
+        let enc = ctx.compute_encoder();
+        match weight {
+            MetalQuantStore::Q4KExperts {
+                blocks,
+                byte_offset,
+                num_experts,
+                n_rows,
+                n_cols,
+            } => {
+                crate::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_indirect_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    blocks,
+                    *byte_offset,
+                    a_buf,
+                    ids_buf,
+                    tpe_buf,
+                    out_buf,
+                    args,
+                    *num_experts,
+                    *n_rows,
+                    *n_cols,
+                    ne11,
+                    top_k,
+                    max_per_expert,
+                    batch,
+                );
+                Ok(())
+            }
+            MetalQuantStore::Q6KExperts {
+                blocks,
+                byte_offset,
+                num_experts,
+                n_rows,
+                n_cols,
+            } => {
+                crate::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_indirect_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    blocks,
+                    *byte_offset,
+                    a_buf,
+                    ids_buf,
+                    tpe_buf,
+                    out_buf,
+                    args,
+                    *num_experts,
+                    *n_rows,
+                    *n_cols,
+                    ne11,
+                    top_k,
+                    max_per_expert,
+                    batch,
+                );
+                Ok(())
+            }
+            _ => Err(FerrumError::model(
+                "gemm_quant_moe_id_indirect: weight must be Q4KExperts or Q6KExperts".to_string(),
+            )),
+        }
+    }
+
     fn route_topk_softmax(
         ctx: &mut Self::Context,
         logits: &Self::Buffer,
@@ -1129,6 +1209,42 @@ impl Backend for MetalBackend {
             out_buf,
             total_pairs,
             ffn,
+        );
+        Ok(())
+    }
+
+    fn compute_ids_tpe_gpu(
+        ctx: &mut Self::Context,
+        selected_ids: &Self::Buffer,
+        tpe: &mut Self::Buffer,
+        ids: &mut Self::Buffer,
+        gate_up_args: &mut Self::Buffer,
+        down_args: &mut Self::Buffer,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+        m_gate_up: usize,
+        m_down: usize,
+    ) -> Result<()> {
+        let sel_buf = &selected_ids.raw;
+        let tpe_buf = &tpe.raw;
+        let ids_buf = &ids.raw;
+        let gate_up_args_buf = &gate_up_args.raw;
+        let down_args_buf = &down_args.raw;
+        let enc = ctx.compute_encoder();
+        crate::moe_router::dispatch_compute_ids_tpe(
+            &st().pipes.device,
+            enc,
+            sel_buf,
+            tpe_buf,
+            ids_buf,
+            gate_up_args_buf,
+            down_args_buf,
+            batch,
+            num_experts,
+            top_k,
+            m_gate_up,
+            m_down,
         );
         Ok(())
     }

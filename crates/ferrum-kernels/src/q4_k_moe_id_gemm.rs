@@ -63,6 +63,90 @@ pub fn dispatch_gemm_q4k_moe_id_on_encoder(
     max_per_expert: usize,
     batch: usize,
 ) {
+    dispatch_gemm_q4k_moe_id_inner(
+        device,
+        enc,
+        weights_stacked,
+        weights_byte_offset,
+        src1,
+        ids,
+        tpe,
+        out,
+        num_experts,
+        m,
+        k,
+        ne11,
+        top_k,
+        max_per_expert,
+        batch,
+        None,
+    );
+}
+
+/// Indirect-dispatch variant: grid is read from `indirect_args` (a 12-
+/// byte u32 triple `(grid_x, grid_y, grid_z)` written by
+/// `moe_compute_ids_tpe_f32`). `max_per_expert` here is still the row
+/// stride for `ids` indexing (= worst-case `batch * top_k`); only the
+/// dispatched grid shrinks to cover `max(tpe[e])` columns instead of
+/// `max_per_expert` columns.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_gemm_q4k_moe_id_indirect_on_encoder(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    weights_stacked: &Buffer,
+    weights_byte_offset: u64,
+    src1: &Buffer,
+    ids: &Buffer,
+    tpe: &Buffer,
+    out: &Buffer,
+    indirect_args: &Buffer,
+    num_experts: usize,
+    m: usize,
+    k: usize,
+    ne11: usize,
+    top_k: usize,
+    max_per_expert: usize,
+    batch: usize,
+) {
+    dispatch_gemm_q4k_moe_id_inner(
+        device,
+        enc,
+        weights_stacked,
+        weights_byte_offset,
+        src1,
+        ids,
+        tpe,
+        out,
+        num_experts,
+        m,
+        k,
+        ne11,
+        top_k,
+        max_per_expert,
+        batch,
+        Some(indirect_args),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_gemm_q4k_moe_id_inner(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    weights_stacked: &Buffer,
+    weights_byte_offset: u64,
+    src1: &Buffer,
+    ids: &Buffer,
+    tpe: &Buffer,
+    out: &Buffer,
+    num_experts: usize,
+    m: usize,
+    k: usize,
+    ne11: usize,
+    top_k: usize,
+    max_per_expert: usize,
+    batch: usize,
+    indirect_args: Option<&Buffer>,
+) {
     debug_assert!(k % 256 == 0, "K must be a multiple of 256 (got {k})");
     debug_assert!(m % 4 == 0, "M must be a multiple of 4 (got {m})");
 
@@ -105,13 +189,18 @@ pub fn dispatch_gemm_q4k_moe_id_on_encoder(
     );
     enc.set_threadgroup_memory_length(0, 8192);
 
-    const NR0: u64 = 64;
-    const NR1: u64 = 32;
-    let grid = MTLSize::new(
-        (max_per_expert as u64).div_ceil(NR1),
-        (m as u64).div_ceil(NR0),
-        num_experts as u64,
-    );
     let tg = MTLSize::new(128, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
+    if let Some(args) = indirect_args {
+        enc.dispatch_thread_groups_indirect(args, 0, tg);
+    } else {
+        const NR0: u64 = 64;
+        const NR1: u64 = 32;
+        let grid = MTLSize::new(
+            (max_per_expert as u64).div_ceil(NR1),
+            (m as u64).div_ceil(NR0),
+            num_experts as u64,
+        );
+        let _ = num_experts; // silence unused with indirect path
+        enc.dispatch_thread_groups(grid, tg);
+    }
 }

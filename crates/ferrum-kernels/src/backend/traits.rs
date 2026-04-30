@@ -443,6 +443,70 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// GPU-side bucket sort: turn `[batch, top_k]` selected expert IDs
+    /// (from [`Self::route_topk_softmax`]) into `tpe[num_experts]` /
+    /// `ids[num_experts * row_stride]` arrays consumed by the batched
+    /// MoE GEMM, and emit indirect-dispatch args for the consumer GEMM.
+    ///
+    /// The `ids` buffer's row stride is `batch * top_k` (worst case);
+    /// only the first `tpe[e]` entries of each row are populated. The
+    /// consumer GEMM kernel early-exits at `r1 >= tpe[e]`, so the over-
+    /// strided indices cost nothing in the inner loop. The grid size,
+    /// however, would still be worst-case unless we tighten it — this
+    /// is what the `gate_up_args` / `down_args` outputs do: a 12-byte
+    /// `(grid_x, grid_y, grid_z)` u32 triple per shape, ready for
+    /// `dispatch_thread_groups_indirect`. `grid_x` is shared (depends
+    /// only on `max(tpe[e])`); `grid_y` differs because gate/up has
+    /// `M = m_gate_up` while down has `M = m_down`.
+    ///
+    /// All five output buffers are written in one kernel; no host
+    /// roundtrip and no per-layer pipeline drain.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_ids_tpe_gpu(
+        _ctx: &mut Self::Context,
+        _selected_ids: &Self::Buffer,
+        _tpe: &mut Self::Buffer,
+        _ids: &mut Self::Buffer,
+        _gate_up_args: &mut Self::Buffer,
+        _down_args: &mut Self::Buffer,
+        _batch: usize,
+        _num_experts: usize,
+        _top_k: usize,
+        _m_gate_up: usize,
+        _m_down: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "compute_ids_tpe_gpu not implemented for this backend",
+        ))
+    }
+
+    /// Indirect-dispatch variant of `gemm_quant_moe_id`.
+    ///
+    /// Identical inputs except the grid is read from `args_buf` (a 12-
+    /// byte u32 triple written by `compute_ids_tpe_gpu`) instead of
+    /// being computed from `max_per_expert`. `max_per_expert` is still
+    /// the kernel parameter used as the row stride for `ids` indexing
+    /// (= `batch * top_k`, worst case); only the dispatched grid
+    /// shrinks to cover `max(tpe[e])` columns.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_quant_moe_id_indirect(
+        _ctx: &mut Self::Context,
+        _src1: &Self::Buffer,
+        _weights: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _tpe: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _args_buf: &Self::Buffer,
+        _ne11: usize,
+        _top_k: usize,
+        _max_per_expert: usize,
+        _batch: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_quant_moe_id_indirect not implemented for this backend",
+        ))
+    }
+
     /// Stacked SiLU·gate over `[batch * top_k, ffn]` rows (prefill version
     /// of `silu_mul_stacked`).
     fn silu_mul_batched(

@@ -44,7 +44,7 @@ impl MetalPipelines {
 
         let mut pipelines = HashMap::new();
         for (lib, names) in [
-            (&fa_lib, &["flash_attn_f32"][..]),
+            (&fa_lib, &["flash_attn_f32", "flash_attn_q_tiled_f32"][..]),
             (
                 &ops_lib,
                 &[
@@ -904,6 +904,11 @@ impl MetalPipelines {
     }
 
     /// Run flash attention. kv_seq_stride: 0 = contiguous (use kv_len), >0 = strided cache.
+    ///
+    /// Dispatches the Q-tiled simdgroup_matmul kernel for the prefill-shaped
+    /// hot path (head_dim=128, no sliding window, q_len ≥ Q_TILE) and falls
+    /// back to the legacy per-query kernel otherwise (decode m=1, special
+    /// head sizes, sliding-window models).
     pub fn flash_attn_v2(
         &self,
         cmd: &CommandBufferRef,
@@ -942,24 +947,51 @@ impl MetalPipelines {
             sliding_window: params.sliding_window as i32,
         };
 
+        // Q-tiled path is enabled when the inner loop's static assumptions
+        // hold. q_len ≥ 8 keeps the trailing-tile padding cost amortised;
+        // smaller q (e.g. decode m=1) goes through the scalar kernel which
+        // is shaped for that case.
+        const Q_TILE_R: usize = 8;
+        let use_q_tiled = std::env::var("FERRUM_FA_LEGACY").as_deref() != Ok("1")
+            && params.head_dim == 128
+            && params.sliding_window == 0
+            && params.q_len >= Q_TILE_R;
+
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(self.pipeline("flash_attn_f32"));
-        enc.set_buffer(0, Some(q), 0);
-        enc.set_buffer(1, Some(k), 0);
-        enc.set_buffer(2, Some(v), 0);
-        enc.set_buffer(3, Some(o), 0);
-        enc.set_bytes(
-            4,
-            std::mem::size_of::<P>() as u64,
-            &p as *const _ as *const c_void as *const _,
-        );
-        let grid = MTLSize::new(
-            params.q_len as u64,
-            params.num_heads as u64,
-            params.batch as u64,
-        );
-        let tg = MTLSize::new(32, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
+        if use_q_tiled {
+            enc.set_compute_pipeline_state(self.pipeline("flash_attn_q_tiled_f32"));
+            enc.set_buffer(0, Some(q), 0);
+            enc.set_buffer(1, Some(k), 0);
+            enc.set_buffer(2, Some(v), 0);
+            enc.set_buffer(3, Some(o), 0);
+            enc.set_bytes(
+                4,
+                std::mem::size_of::<P>() as u64,
+                &p as *const _ as *const c_void as *const _,
+            );
+            let q_tiles = params.q_len.div_ceil(Q_TILE_R) as u64;
+            let grid = MTLSize::new(q_tiles, params.num_heads as u64, params.batch as u64);
+            let tg = MTLSize::new(128, 1, 1); // 4 simdgroups
+            enc.dispatch_thread_groups(grid, tg);
+        } else {
+            enc.set_compute_pipeline_state(self.pipeline("flash_attn_f32"));
+            enc.set_buffer(0, Some(q), 0);
+            enc.set_buffer(1, Some(k), 0);
+            enc.set_buffer(2, Some(v), 0);
+            enc.set_buffer(3, Some(o), 0);
+            enc.set_bytes(
+                4,
+                std::mem::size_of::<P>() as u64,
+                &p as *const _ as *const c_void as *const _,
+            );
+            let grid = MTLSize::new(
+                params.q_len as u64,
+                params.num_heads as u64,
+                params.batch as u64,
+            );
+            let tg = MTLSize::new(32, 1, 1);
+            enc.dispatch_thread_groups(grid, tg);
+        }
         enc.end_encoding();
     }
 
