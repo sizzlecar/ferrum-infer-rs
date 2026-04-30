@@ -133,3 +133,237 @@ kernel void flash_attn_f32(
         }
     }
 }
+
+// ── Q-tiled flash attention with simdgroup_matmul (head_dim=128, f32) ────
+//
+// Mirrors llama.cpp's kernel_flash_attn_ext_impl shape:
+//   Q_TILE = 8 query rows per threadgroup
+//   NSG    = 4 simdgroups per threadgroup (128 threads)
+//   NQ     = Q_TILE / NSG = 2 query rows per simdgroup
+//   C      = 32 KV columns per inner chunk (4 simdgroups × 8 cols each)
+//   DK=DV  = 128 head dimension
+//
+// Each threadgroup processes one (q_tile, head, batch) and walks the
+// full KV range for that head. The 4 simdgroups cooperate:
+//   • QK^T   — each simdgroup computes one [8,8] tile via simdgroup_matmul
+//   • softmax — each simdgroup handles its NQ rows
+//   • P @ V   — 16 output [8,8] tiles split across 4 simdgroups (NO=4 each)
+//
+// Restrictions (caller picks the legacy kernel when violated):
+//   • head_dim == 128
+//   • sliding_window == 0
+//   • num_heads % num_kv_heads == 0  (any GQA ratio works)
+//   • q_len divisible by 8 *or* the trailing tile is padded with zero queries
+//
+// Total threadgroup memory: 8*128 (sq) + 8*128 (so) + 8*32 (ss) = 2304 f32
+// = 9.0 KB — well within Apple7's 32 KB per-threadgroup limit.
+
+constant int Q_TILE_R = 8;
+constant int FA_NSG   = 4;
+constant int FA_NQ    = 2;        // Q_TILE_R / FA_NSG
+constant int FA_C     = 32;
+constant int FA_DK    = 128;
+constant int FA_DK8   = 16;       // FA_DK / 8
+constant int FA_DV    = 128;
+constant int FA_DV4   = 32;       // FA_DV / 4
+constant int FA_DV8   = 16;       // FA_DV / 8
+constant int FA_NO    = 4;        // FA_DV8 / FA_NSG
+
+kernel void flash_attn_q_tiled_f32(
+    device const float* Q       [[buffer(0)]],
+    device const float* K       [[buffer(1)]],
+    device const float* V       [[buffer(2)]],
+    device       float* O       [[buffer(3)]],
+    constant FlashAttnParams& p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const int qtile = int(tgpig.x);
+    const int hi    = int(tgpig.y);
+    const int bi    = int(tgpig.z);
+    const int iq1   = qtile * Q_TILE_R;
+
+    if (iq1 >= p.q_len) return;
+
+    const int kv_hi    = hi / (p.num_heads / p.num_kv_heads);
+    const int kv_stride = (p.kv_seq_stride > 0) ? p.kv_seq_stride : p.kv_len;
+
+    device const float* q_base = Q + ((bi * p.num_heads + hi) * p.q_len + iq1) * FA_DK;
+    device const float* k_base = K + (bi * p.num_kv_heads + kv_hi) * kv_stride * FA_DK;
+    device const float* v_base = V + (bi * p.num_kv_heads + kv_hi) * kv_stride * FA_DV;
+    device       float* o_base = O + ((bi * p.num_heads + hi) * p.q_len + iq1) * FA_DV;
+
+    // Threadgroup memory — laid out contiguously
+    threadgroup float sq[Q_TILE_R * FA_DK];   // queries
+    threadgroup float so[Q_TILE_R * FA_DV];   // running output (post rescale)
+    threadgroup float ss[Q_TILE_R * FA_C];    // attention scores / probabilities
+
+    // 1. Load Q tile into shared memory; pad rows beyond q_len with zero.
+    for (int jj = 0; jj < FA_NQ; ++jj) {
+        const int j = jj * FA_NSG + int(sgitg);
+        const int q_pos = iq1 + j;
+        if (q_pos < p.q_len) {
+            device const float4* q_row4 = (device const float4 *)(q_base + j * FA_DK);
+            threadgroup float4* sq4 = (threadgroup float4 *)(sq + j * FA_DK);
+            for (int i = int(tiisg); i < FA_DK / 4; i += 32) {
+                sq4[i] = q_row4[i];
+            }
+        } else {
+            threadgroup float4* sq4 = (threadgroup float4 *)(sq + j * FA_DK);
+            for (int i = int(tiisg); i < FA_DK / 4; i += 32) {
+                sq4[i] = float4(0.0f);
+            }
+        }
+    }
+
+    // 2. Zero output accumulator.
+    for (int jj = 0; jj < FA_NQ; ++jj) {
+        const int j = jj * FA_NSG + int(sgitg);
+        threadgroup float4* so4 = (threadgroup float4 *)(so + j * FA_DV);
+        for (int i = int(tiisg); i < FA_DV / 4; i += 32) {
+            so4[i] = float4(0.0f);
+        }
+    }
+
+    // Per-simdgroup running max and sum (covers FA_NQ rows).
+    float M[FA_NQ];
+    float S[FA_NQ];
+    for (int jj = 0; jj < FA_NQ; ++jj) {
+        M[jj] = -INFINITY;
+        S[jj] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Upper bound for the chunk loop. Causal: can stop after the last row's
+    // attend_end (= pos_offset + iq1 + Q_TILE_R since rows j increase).
+    int attend_end_max = p.kv_len;
+    if (p.causal) {
+        attend_end_max = min(p.pos_offset + iq1 + Q_TILE_R, p.kv_len);
+    }
+
+    // 3. Walk KV in C=32 chunks.
+    for (int ic = 0; ic < attend_end_max; ic += FA_C) {
+        // ── 3a. QK^T: each simdgroup writes one [8,8] tile to ss. ──
+        {
+            device const float* pk = k_base + (ic + 8 * int(sgitg)) * FA_DK;
+            threadgroup const float* pq = sq;
+            threadgroup       float* ps = ss + 8 * int(sgitg);
+
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+            for (int i = 0; i < FA_DK8; ++i) {
+                simdgroup_float8x8 mk;
+                simdgroup_float8x8 mq;
+                simdgroup_load(mk, pk + 8 * i, FA_DK, ulong2(0, 0), true);
+                simdgroup_load(mq, pq + 8 * i, FA_DK);
+                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+            }
+
+            simdgroup_store(mqk, ps, FA_C, ulong2(0, 0), false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── 3b. Online softmax: each simdgroup handles its FA_NQ rows. ──
+        for (int jj = 0; jj < FA_NQ; ++jj) {
+            const int j = jj * FA_NSG + int(sgitg);
+            const int q_pos = iq1 + j;
+            const int k_pos = ic + int(tiisg);
+
+            // Load this lane's score (C == warp size, so one element per lane).
+            float s = ss[j * FA_C + int(tiisg)];
+            s *= p.scale;
+
+            // Mask: out-of-range Q row, out-of-range K column, or causal.
+            bool keep = (q_pos < p.q_len) && (k_pos < p.kv_len);
+            if (p.causal) {
+                const int row_end = min(p.pos_offset + q_pos + 1, p.kv_len);
+                keep = keep && (k_pos < row_end);
+            }
+            if (!keep) {
+                s = -INFINITY;
+            }
+
+            const float old_M = M[jj];
+            const float row_max = simd_max(s);
+            const float new_M = max(old_M, row_max);
+
+            // Guard against the "all -INF" case (e.g. early causal rows).
+            const float ms = isfinite(old_M) ? exp(old_M - new_M) : 0.0f;
+            const float vs = isfinite(s)     ? exp(s - new_M)     : 0.0f;
+
+            S[jj] = ms * S[jj] + simd_sum(vs);
+
+            // Persist post-softmax probability for the P@V stage.
+            ss[j * FA_C + int(tiisg)] = vs;
+
+            // Rescale this row's running output by ms (each lane = FA_DV/32 elems).
+            threadgroup float4* so4 = (threadgroup float4 *)(so + j * FA_DV);
+            for (int i = int(tiisg); i < FA_DV / 4; i += 32) {
+                so4[i] = so4[i] * ms;
+            }
+
+            M[jj] = new_M;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── 3c. O += P @ V via simdgroup_matmul. ──
+        // Each simdgroup owns FA_NO=4 output [8,8] tiles at column offsets
+        // 8*sgitg, 8*(sgitg+NSG), 8*(sgitg+2*NSG), 8*(sgitg+3*NSG). Loading
+        // the running O tiles into registers, accumulating, then storing
+        // back avoids touching the other simdgroups' data.
+        {
+            simdgroup_float8x8 lo[FA_NO];
+            {
+                threadgroup const float* pso = so + 8 * int(sgitg);
+                for (int ii = 0; ii < FA_NO; ++ii) {
+                    simdgroup_load(lo[ii], pso, FA_DV, ulong2(0, 0), false);
+                    pso += 8 * FA_NSG;
+                }
+            }
+
+            device const float* pv = v_base + ic * FA_DV;
+            for (int cc = 0; cc < FA_C / 8; ++cc) {
+                simdgroup_float8x8 vs;
+                simdgroup_load(vs, ss + 8 * cc, FA_C, ulong2(0, 0), false);
+
+                for (int ii = 0; ii < FA_NO; ++ii) {
+                    simdgroup_float8x8 mv;
+                    simdgroup_load(mv,
+                                   pv + 8 * int(sgitg) + 8 * FA_NSG * ii,
+                                   FA_DV, ulong2(0, 0), false);
+                    simdgroup_multiply_accumulate(lo[ii], vs, mv, lo[ii]);
+                }
+
+                pv += 8 * FA_DV;
+            }
+
+            {
+                threadgroup float* pso = so + 8 * int(sgitg);
+                for (int ii = 0; ii < FA_NO; ++ii) {
+                    simdgroup_store(lo[ii], pso, FA_DV, ulong2(0, 0), false);
+                    pso += 8 * FA_NSG;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 4. Normalize and write O = so / S to global memory.
+    for (int jj = 0; jj < FA_NQ; ++jj) {
+        const int j = jj * FA_NSG + int(sgitg);
+        const int q_pos = iq1 + j;
+        if (q_pos >= p.q_len) continue;
+
+        const float inv_S = (S[jj] > 0.0f) ? (1.0f / S[jj]) : 0.0f;
+        device float4* o_row4 = (device float4 *)(o_base + j * FA_DV);
+        threadgroup const float4* so4 = (threadgroup const float4 *)(so + j * FA_DV);
+        for (int i = int(tiisg); i < FA_DV / 4; i += 32) {
+            o_row4[i] = so4[i] * inv_S;
+        }
+    }
+}
