@@ -153,24 +153,17 @@ kernel void gemm_q6kw_moe_id_f32(
             }
         }
 
+        // Vector store of 8 halves at once — see q4_k_moe_id_gemm.metal
+        // for the rationale (4.4× pp512 win on Qwen3-30B-A3B from this
+        // single substitution; same gain expected for Q6_K).
         {
             const short sx = short(tiitg) % NL1_Q6;
             const short sy = (short(tiitg) / NL1_Q6) / 8;
             const short ly = (short(tiitg) / NL1_Q6) % 8;
             const short ib = 4 * sx + sy;
 
-            float4 v0 = float4(*((device const float4 *)(y + 0)));
-            float4 v1 = float4(*((device const float4 *)(y + 4)));
-
-            threadgroup half * dst8 = sb + 64 * ib + 8 * ly;
-            dst8[0] = half(v0[0]);
-            dst8[1] = half(v0[1]);
-            dst8[2] = half(v0[2]);
-            dst8[3] = half(v0[3]);
-            dst8[4] = half(v1[0]);
-            dst8[5] = half(v1[1]);
-            dst8[6] = half(v1[2]);
-            dst8[7] = half(v1[3]);
+            *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) =
+                half2x4(*((device const float2x4 *) y));
         }
 
         il = (il + 2 < NL_BLOCK_Q6) ? il + 2 : il % 2;
@@ -219,9 +212,17 @@ kernel void gemm_q6kw_moe_id_f32(
         const short idt = id / p.top_k;
 
         device float * D = dst + (idt * p.top_k + ide) * p.M + r0;
+        device float4 * D4 = (device float4 *) D;
         threadgroup float * C = ((threadgroup float *)shmem) + j * NR0_Q6;
+        threadgroup float4 * C4 = (threadgroup float4 *) C;
 
-        for (short i = tiisg; i < nr0; i += 32) {
+        // Vector copy: 4× memory throughput vs scalar D[i]=C[i].
+        int i = tiisg;
+        for (; i < nr0 / 4; i += 32) {
+            D4[i] = C4[i];
+        }
+        i = (4 * (nr0 / 4)) + tiisg;
+        for (; i < nr0; i += 32) {
             D[i] = C[i];
         }
     }
