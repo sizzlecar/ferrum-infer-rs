@@ -55,23 +55,27 @@ pub fn dispatch_gemv_q6k_v2_on_encoder(
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     src0: &Buffer,
+    src0_byte_offset: u64,
     c: &Buffer,
     n: usize,
     k: usize,
 ) {
-    dispatch_gemv_q6k_v2_offset(device, enc, a, 0, src0, c, 0, n, k);
+    dispatch_gemv_q6k_v2_offset(device, enc, a, 0, src0, src0_byte_offset, c, 0, n, k);
 }
 
 /// Same as [`dispatch_gemv_q6k_v2_on_encoder`] but with byte offsets into
-/// `a` and `c`. Used by the m>1 prefill path to batch a multi-row matmul
-/// as a sequence of gemv calls without having to write a separate gemm
-/// kernel just for Q6_K.
+/// `a` and `c`. `src0_byte_offset` is the byte offset into the weight
+/// buffer (non-zero when `src0` is a shared zero-copy mmap buffer). Used
+/// by the m>1 prefill path to batch a multi-row matmul as a sequence of
+/// gemv calls without having to write a separate gemm kernel just for
+/// Q6_K.
 pub fn dispatch_gemv_q6k_v2_offset(
     device: &Device,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     a_offset_bytes: u64,
     src0: &Buffer,
+    src0_byte_offset: u64,
     c: &Buffer,
     c_offset_bytes: u64,
     n: usize,
@@ -95,7 +99,7 @@ pub fn dispatch_gemv_q6k_v2_offset(
 
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
-    enc.set_buffer(0, Some(src0), 0);
+    enc.set_buffer(0, Some(src0), src0_byte_offset);
     enc.set_buffer(1, Some(a), a_offset_bytes);
     enc.set_buffer(2, Some(c), c_offset_bytes);
     enc.set_bytes(
@@ -163,7 +167,7 @@ mod tests {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemv_q6k_v2_on_encoder(&device, enc, &a_buf, &w_buf, &c_buf, n, k);
+        dispatch_gemv_q6k_v2_on_encoder(&device, enc, &a_buf, &w_buf, 0, &c_buf, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();

@@ -62,25 +62,28 @@ pub fn dispatch_gemm_q4k_on_encoder(
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     src0: &Buffer,
+    src0_byte_offset: u64,
     c: &Buffer,
     m: usize,
     n: usize,
     k: usize,
 ) {
     // Standalone case: dst stride = n (out_features), no column offset.
-    dispatch_gemm_q4k_part(device, enc, a, src0, c, 0, m, n, n, k);
+    dispatch_gemm_q4k_part(device, enc, a, src0, src0_byte_offset, c, 0, m, n, n, k);
 }
 
 /// Strided variant for `MultiQuantLinear` Fused: writes one part of a
 /// fused output, occupying `[c_offset_cols, c_offset_cols + n)` columns
 /// of a `[m, stride_c]` output buffer. `n` is the part's row count
 /// (write width per output row); `stride_c` is the total fused-output
-/// row stride.
+/// row stride. `src0_byte_offset` is the byte offset into the weight
+/// buffer (non-zero when `src0` is a shared zero-copy mmap buffer).
 pub fn dispatch_gemm_q4k_part(
     device: &Device,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     src0: &Buffer,
+    src0_byte_offset: u64,
     c: &Buffer,
     c_offset_cols: usize,
     m: usize,
@@ -119,7 +122,7 @@ pub fn dispatch_gemm_q4k_part(
 
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
-    enc.set_buffer(0, Some(src0), 0);
+    enc.set_buffer(0, Some(src0), src0_byte_offset);
     enc.set_buffer(1, Some(a), 0);
     enc.set_buffer(2, Some(c), (c_offset_cols * 4) as u64);
     enc.set_bytes(
@@ -191,7 +194,7 @@ mod tests {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemm_q4k_on_encoder(&device, enc, &a_buf, &w_buf, &c_buf, m, n, k);
+        dispatch_gemm_q4k_on_encoder(&device, enc, &a_buf, &w_buf, 0, &c_buf, m, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -270,7 +273,7 @@ mod tests {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemm_q4k_on_encoder(&device, enc, &a_buf, &w_buf, &c_buf, m, n, k);
+        dispatch_gemm_q4k_on_encoder(&device, enc, &a_buf, &w_buf, 0, &c_buf, m, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();

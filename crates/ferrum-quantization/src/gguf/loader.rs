@@ -168,7 +168,7 @@ impl<B: Backend> GgufLoader<B> {
     /// variant is) so each part stays compact in backend memory and
     /// gemv dispatches per part with output offsets.
     fn try_load_fused_multi_quant(&self, parts: &[String]) -> Result<Option<Box<dyn Linear<B>>>> {
-        let mut spec: Vec<(ferrum_kernels::backend::GgufQuantType, Vec<u8>, usize)> = Vec::new();
+        let mut spec: Vec<(ferrum_kernels::backend::GgufQuantType, &[u8], usize)> = Vec::new();
         let mut cols_check: Option<usize> = None;
 
         for stem in parts {
@@ -223,21 +223,21 @@ impl<B: Backend> GgufLoader<B> {
                 _ => cols_check = Some(cols),
             }
 
-            let qt = self
-                .gguf
-                .read_tensor(&gguf_name, &self.decode_device)
-                .map_err(candle_to_ferrum)?;
-            let bytes = qt.data().map_err(candle_to_ferrum)?;
-            // Need owned bytes since QTensor goes out of scope before
-            // we hand the slice to the backend.
-            spec.push((kind, bytes.as_ref().to_vec(), rows));
+            // Slice the mmap directly. The slice's lifetime is tied to
+            // `&self.gguf`, which outlives this scope, so the backend
+            // can read the bytes safely without us owning a copy.
+            let bytes = self.gguf.tensor_byte_slice(&gguf_name).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "GgufLoader: tensor_byte_slice failed for '{gguf_name}'"
+                ))
+            })?;
+            spec.push((kind, bytes, rows));
         }
 
         let cols = cols_check.ok_or_else(|| FerrumError::model("fusion: no parts"))?;
-        // Borrow-as-slice for the backend API.
         let parts_view: Vec<(_, &[u8], _)> = spec
             .iter()
-            .map(|(kind, bytes, rows)| (*kind, bytes.as_slice(), *rows))
+            .map(|(kind, bytes, rows)| (*kind, *bytes, *rows))
             .collect();
         let quant = match crate::QuantLinear::<B>::from_gguf_fused(&parts_view, cols) {
             Ok(q) => q,
@@ -306,22 +306,28 @@ impl<B: Backend> GgufLoader<B> {
                 _ => cols_check = Some(cols),
             }
 
-            let qt = self
-                .gguf
-                .read_tensor(&gguf_name, &self.decode_device)
-                .map_err(candle_to_ferrum)?;
-            let bytes = qt.data().map_err(candle_to_ferrum)?;
+            // Read raw block bytes directly from the mmap (no candle
+            // QTensor intermediate copy). Fused tensors must still be
+            // byte-concatenated into a single buffer, so the fused
+            // payload itself remains a heap allocation — but it's
+            // a one-shot total ≪ MoE expert weights, so the
+            // consequence is negligible.
+            let bytes = self.gguf.tensor_byte_slice(&gguf_name).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "GgufLoader: tensor_byte_slice failed for '{gguf_name}'"
+                ))
+            })?;
             // Sanity: 144 bytes per super-block, super-blocks = rows * (cols / 256).
             let expected = rows * (cols / 256) * 144;
             debug_assert_eq!(
-                bytes.as_ref().len(),
+                bytes.len(),
                 expected,
                 "Q4K byte count mismatch for '{gguf_name}': got {} expected {}",
-                bytes.as_ref().len(),
+                bytes.len(),
                 expected
             );
 
-            fused_bytes.extend_from_slice(bytes.as_ref());
+            fused_bytes.extend_from_slice(bytes);
             total_rows += rows;
         }
 
@@ -426,17 +432,21 @@ impl<B: Backend> WeightLoader<B> for GgufLoader<B> {
                         .map(|n| self.gguf.has_tensor(&n))
                         .unwrap_or(false);
                     if !has_bias {
-                        let qt = self
-                            .gguf
-                            .read_tensor(&gguf_weight, &self.decode_device)
-                            .map_err(candle_to_ferrum)?;
-                        let bytes = qt.data().map_err(candle_to_ferrum)?;
-                        let quant = crate::QuantLinear::<B>::from_gguf_bytes(
-                            kind,
-                            bytes.as_ref(),
-                            n_rows,
-                            n_cols,
-                        )?;
+                        // Zero-copy: slice the mmap directly. The
+                        // backend's registry (`register_gguf_mmap`)
+                        // recognises the slice as belonging to the
+                        // shared file buffer and returns a `QuantStore`
+                        // that bind-references the big buffer with an
+                        // offset, instead of allocating a fresh device
+                        // copy. Falls back to copy if no registration
+                        // covers this slice.
+                        let bytes = self.gguf.tensor_byte_slice(&gguf_weight).ok_or_else(|| {
+                            FerrumError::model(format!(
+                                "GgufLoader: tensor_byte_slice failed for '{gguf_weight}'"
+                            ))
+                        })?;
+                        let quant =
+                            crate::QuantLinear::<B>::from_gguf_bytes(kind, bytes, n_rows, n_cols)?;
                         return Ok(Box::new(quant));
                     }
                     // else fall through to eager-dequant bias path below
