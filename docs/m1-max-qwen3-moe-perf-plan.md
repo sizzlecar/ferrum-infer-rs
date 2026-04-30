@@ -54,7 +54,7 @@
 
 | 变量 | 必须 | 作用 |
 |---|---|---|
-| `FERRUM_KV_CAPACITY=512` | **是** | 限 KV cache 容量。不设默认走 `max_seq_len=32K`，会分配 ~6 GB KV cache 把 32 GB Mac 推到 swap，bench 数字直接归零。**每次都要设。** |
+| `FERRUM_KV_CAPACITY=512` | bench 时 | 限 KV cache 容量。**默认值 = `min(model_max, 4096)`**（对 30B-A3B = 4096，约 786 MB GPU 内存），chat 直接能用。bench pp512 想剥离 KV 影响时设 512；REPL 跑长上下文设 8192-16384；超过此值 `forward_layer` 会 panic 而不是越界写脏数据（PR #57）。 |
 | `MTL_CAPTURE_ENABLED=1` | 仅 capture | 启用 Metal 抓帧。系统层面的 gate。 |
 | `FERRUM_METAL_CAPTURE=path/out.gputrace` | 仅 capture | 让 prefill 写一个 `.gputrace` 文件。 |
 | `FERRUM_DECODE_OP_PROFILE=1` | 仅 profile | 每个 stage（attn/moe/host/gate/up/silu/down/wsum）打印分解时间。**注意会插 `B::sync(ctx)` 拖慢 1.5-2×**——不要用它的绝对数字，只用相对占比。 |

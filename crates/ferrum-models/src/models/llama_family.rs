@@ -529,18 +529,19 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
         let nkv = self.cfg.num_kv_heads;
         let hd = self.cfg.head_dim;
-        // KV capacity defaults to the model's full context length (often
-        // 32k-128k) which can dominate the working set on a 32 GB Mac.
-        // Cap at FERRUM_KV_CAPACITY when the env var is set; otherwise
-        // honour the model's declared max so long-context use cases still
-        // work out-of-the-box. Typical decode workloads should set this
-        // to something like 4096 to free 10+ GB of GPU memory.
+        // KV capacity defaults to a chat-friendly 4096 to keep the working
+        // set sane on a 32 GB Mac (a 48-layer / 4-kv-head / 128-head_dim
+        // model spends ~786 MB on 4096 KV slots, vs ~6 GB on the model's
+        // declared 32K which would push the 17 GB Qwen3-30B-A3B model into
+        // swap). `FERRUM_KV_CAPACITY=N` overrides; clamp to the model's
+        // declared max so we never lie to the model about its window.
         let model_max = self.cfg.max_seq_len;
+        const DEFAULT_KV_CAPACITY: usize = 4096;
         let max = std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map(|cap| cap.min(model_max))
-            .unwrap_or(model_max);
+            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY));
 
         // Try pool first — reused buffers have stable device pointers,
         // so a captured decode graph can be replayed for this request too.
@@ -663,6 +664,18 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let cache = &mut caches[li];
         let cache_len_before = cache.len;
         let cache_capacity = cache.capacity;
+
+        // Defense in depth: refuse to write past the KV buffer. The
+        // graceful path is the caller pre-checking via `kv_capacity()`
+        // and either compacting or refusing the request; this panic only
+        // fires when that contract is broken (and silent overflow would
+        // otherwise corrupt the cache + adjacent allocations).
+        if cache_len_before + tokens > cache_capacity {
+            panic!(
+                "KV cache overflow on layer {li}: would write tokens [{cache_len_before}..{}) but capacity is {cache_capacity} (cache_id={cache_id:?}). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.",
+                cache_len_before + tokens
+            );
+        }
 
         let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
             B::sync(ctx);
@@ -1921,6 +1934,17 @@ impl<B: Backend> LlamaFamilyModel<B> {
 impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
+    }
+
+    fn kv_capacity(&self) -> usize {
+        // Mirror the bound `ensure_kv` will use when allocating the cache.
+        let model_max = self.cfg.max_seq_len;
+        const DEFAULT_KV_CAPACITY: usize = 4096;
+        std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|cap| cap.min(model_max))
+            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
