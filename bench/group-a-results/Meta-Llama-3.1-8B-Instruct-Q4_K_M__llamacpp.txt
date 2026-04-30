@@ -1,9 +1,9 @@
 # llama-bench output for Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
-2026年 4月30日 星期四 21时52分53秒 CST
+2026年 4月30日 星期四 23时25分24秒 CST
 load_backend: loaded BLAS backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-blas.so
 ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
 ggml_metal_library_init: using embedded metal library
-ggml_metal_library_init: loaded in 0.011 sec
+ggml_metal_library_init: loaded in 0.012 sec
 ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
 ggml_metal_device_init: GPU name:   MTL0
 ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
@@ -21,8 +21,8 @@ load_backend: loaded MTL backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/l
 load_backend: loaded CPU backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-cpu-apple_m1.so
 | model                          |       size |     params | backend    | threads |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |            pp50 |        258.07 ± 1.59 |
-| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |           pp512 |        379.50 ± 0.94 |
-| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |           tg128 |         33.33 ± 3.51 |
+| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |            pp50 |        250.80 ± 0.42 |
+| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |           pp512 |        363.20 ± 0.87 |
+| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |           tg128 |         31.59 ± 2.53 |
 
 build: 19821178b (8960)

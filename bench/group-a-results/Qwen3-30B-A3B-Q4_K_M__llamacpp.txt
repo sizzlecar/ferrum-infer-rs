@@ -1,9 +1,9 @@
 # llama-bench output for Qwen3-30B-A3B-Q4_K_M.gguf
-2026年 4月30日 星期四 21时55分50秒 CST
+2026年 4月30日 星期四 23时27分14秒 CST
 load_backend: loaded BLAS backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-blas.so
 ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
 ggml_metal_library_init: using embedded metal library
-ggml_metal_library_init: loaded in 0.013 sec
+ggml_metal_library_init: loaded in 0.012 sec
 ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
 ggml_metal_device_init: GPU name:   MTL0
 ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
@@ -21,8 +21,8 @@ load_backend: loaded MTL backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/l
 load_backend: loaded CPU backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-cpu-apple_m1.so
 | model                          |       size |     params | backend    | threads |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |            pp50 |        202.28 ± 1.71 |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |           pp512 |        620.69 ± 4.24 |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |           tg128 |         54.59 ± 0.28 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |            pp50 |        194.00 ± 1.18 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |           pp512 |        596.92 ± 2.26 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |           tg128 |         52.21 ± 0.43 |
 
 build: 19821178b (8960)
