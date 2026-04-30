@@ -63,8 +63,8 @@ fn dequant_q4_k_cpu(bytes: &[u8], n_blocks: usize) -> Vec<f32> {
 pub struct CpuBackend;
 
 #[cfg(target_os = "macos")]
-extern "C" {
-    fn cblas_sgemm(
+unsafe extern "C" {
+    unsafe fn cblas_sgemm(
         order: i32,
         transa: i32,
         transb: i32,

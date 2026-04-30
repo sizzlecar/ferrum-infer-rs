@@ -257,23 +257,25 @@ impl<B: Backend> ExpertStack<B> {
             None => return Ok(None),
         };
 
-        // Read the three 3-D quantised tensors. `qt.data()` exposes the
-        // raw block-byte payload — the same bytes that live on disk.
-        let gate_qt = gguf
-            .read_tensor(&gate_name, &device)
-            .map_err(candle_to_ferrum)?;
-        let up_qt = gguf
-            .read_tensor(&up_name, &device)
-            .map_err(candle_to_ferrum)?;
-        let down_qt = gguf
-            .read_tensor(&down_name, &device)
-            .map_err(candle_to_ferrum)?;
-        let gate_bytes = gate_qt.data().map_err(candle_to_ferrum)?;
-        let up_bytes = up_qt.data().map_err(candle_to_ferrum)?;
-        let down_bytes = down_qt.data().map_err(candle_to_ferrum)?;
-        let gate_bytes = gate_bytes.as_ref();
-        let up_bytes = up_bytes.as_ref();
-        let down_bytes = down_bytes.as_ref();
+        // Slice the three 3-D quantised expert stacks directly from
+        // the mmap. These are the dominant memory cost on Qwen3-MoE
+        // (~14 GB for Qwen3-30B-A3B); going through candle's
+        // `read_tensor` would copy them into a heap `Vec<u8>` first,
+        // then `load_quant_experts` would copy again into the Metal
+        // buffer — together doubling the working set and pushing a
+        // 32 GB Mac into swap. With this slice + the Metal mmap
+        // registry, we avoid both copies (steady state: just the
+        // file mmap).
+        let gate_bytes = gguf.tensor_byte_slice(&gate_name).ok_or_else(|| {
+            FerrumError::model(format!("MoE: tensor_byte_slice failed for '{gate_name}'"))
+        })?;
+        let up_bytes = gguf.tensor_byte_slice(&up_name).ok_or_else(|| {
+            FerrumError::model(format!("MoE: tensor_byte_slice failed for '{up_name}'"))
+        })?;
+        let down_bytes = gguf.tensor_byte_slice(&down_name).ok_or_else(|| {
+            FerrumError::model(format!("MoE: tensor_byte_slice failed for '{down_name}'"))
+        })?;
+        let _ = device; // candle device no longer needed for the byte read
 
         // Per-expert byte stride for each tensor. The 3-D layout is
         // contiguous, [num_experts, rows, cols] row-major, so each

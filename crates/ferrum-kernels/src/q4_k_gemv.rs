@@ -47,6 +47,10 @@ fn pipeline(device: &Device) -> &'static ComputePipelineState {
 ///
 /// Computes `c[n] = a[k] @ w[n, k]^T` where `w` is `block_q4_K[n * (k/256)]`.
 ///
+/// `w_byte_offset` is the byte offset into the `w` buffer where this
+/// tensor's super-blocks start. Set to 0 when `w` is a private
+/// allocation; non-zero when binding into a shared zero-copy mmap buffer.
+///
 /// Caller is responsible for `enc.end_encoding()` after the dispatch
 /// (or chaining further dispatches).
 pub fn dispatch_gemv_q4k_on_encoder(
@@ -54,6 +58,7 @@ pub fn dispatch_gemv_q4k_on_encoder(
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     w: &Buffer,
+    w_byte_offset: u64,
     c: &Buffer,
     n: usize,
     k: usize,
@@ -76,7 +81,7 @@ pub fn dispatch_gemv_q4k_on_encoder(
     let pipe = pipeline(device);
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(a), 0);
-    enc.set_buffer(1, Some(w), 0);
+    enc.set_buffer(1, Some(w), w_byte_offset);
     enc.set_buffer(2, Some(c), 0);
     // setBytes inlines small (<=4KB) params into the encoder argument
     // table — no MTLBuffer allocation per call. With 145 quant matmuls
@@ -153,7 +158,7 @@ mod tests {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemv_q4k_on_encoder(&device, enc, &a_buf, &w_buf, &c_buf, n, k);
+        dispatch_gemv_q4k_on_encoder(&device, enc, &a_buf, &w_buf, 0, &c_buf, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
