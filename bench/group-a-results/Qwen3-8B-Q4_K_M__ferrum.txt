@@ -1,38 +1,38 @@
 # ferrum bench output for Qwen3-8B-Q4_K_M.gguf
-2026年 4月30日 星期四 21时49分56秒 CST
+2026年 4月30日 星期四 23时23分56秒 CST
 --- pp50 trial 1 ---
 ✓ model ready in 2.03s
-✓ prefill: 51 tok in 0.293s (173.8 tok/s)
+✓ prefill: 51 tok in 0.288s (177.0 tok/s)
 throughput: 0.0 tok/s (decode only)
 --- pp50 trial 2 ---
-✓ model ready in 1.93s
-✓ prefill: 51 tok in 0.274s (186.3 tok/s)
+✓ model ready in 1.96s
+✓ prefill: 51 tok in 0.291s (175.3 tok/s)
 throughput: 0.0 tok/s (decode only)
 --- pp50 trial 3 ---
 ✓ model ready in 1.95s
-✓ prefill: 51 tok in 0.271s (188.2 tok/s)
+✓ prefill: 51 tok in 0.284s (179.8 tok/s)
 throughput: 0.0 tok/s (decode only)
 --- pp512 trial 1 ---
-✓ model ready in 1.96s
-✓ prefill: 513 tok in 1.630s (314.8 tok/s)
+✓ model ready in 1.95s
+✓ prefill: 513 tok in 1.702s (301.4 tok/s)
 throughput: 0.0 tok/s (decode only)
 --- pp512 trial 2 ---
-✓ model ready in 1.98s
-✓ prefill: 513 tok in 1.630s (314.8 tok/s)
+✓ model ready in 2.00s
+✓ prefill: 513 tok in 1.705s (300.9 tok/s)
 throughput: 0.0 tok/s (decode only)
 --- pp512 trial 3 ---
-✓ model ready in 1.97s
-✓ prefill: 513 tok in 1.632s (314.4 tok/s)
+✓ model ready in 1.98s
+✓ prefill: 513 tok in 1.702s (301.5 tok/s)
 throughput: 0.0 tok/s (decode only)
 --- tg128 trial 1 ---
-✓ model ready in 1.92s
-✓ prefill: 4 tok in 0.182s (22.0 tok/s)
-throughput: 27.9 tok/s (decode only)
+✓ model ready in 2.01s
+✓ prefill: 4 tok in 0.192s (20.8 tok/s)
+throughput: 27.2 tok/s (decode only)
 --- tg128 trial 2 ---
-✓ model ready in 1.93s
-✓ prefill: 4 tok in 0.182s (21.9 tok/s)
-throughput: 28.0 tok/s (decode only)
+✓ model ready in 1.94s
+✓ prefill: 4 tok in 0.199s (20.1 tok/s)
+throughput: 26.9 tok/s (decode only)
 --- tg128 trial 3 ---
-✓ model ready in 1.96s
-✓ prefill: 4 tok in 0.184s (21.7 tok/s)
-throughput: 28.0 tok/s (decode only)
+✓ model ready in 1.91s
+✓ prefill: 4 tok in 0.199s (20.1 tok/s)
+throughput: 27.0 tok/s (decode only)
