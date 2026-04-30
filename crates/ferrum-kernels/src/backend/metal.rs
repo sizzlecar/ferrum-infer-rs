@@ -156,6 +156,57 @@ fn slice_is_in_registered_mmap(bytes: &[u8]) -> bool {
     false
 }
 
+// ── Frame capture ─────────────────────────────────────────────────────
+
+/// Begin a Metal frame capture if `FERRUM_METAL_CAPTURE` is set to an
+/// output path. The result is a `.gputrace` file you can open in Xcode
+/// to view per-kernel GPU timing, occupancy, instruction counts, etc.
+///
+/// Requirements:
+///   - The process must have been launched with `MTL_CAPTURE_ENABLED=1`
+///     in its environment (Metal silently rejects capture otherwise).
+///   - The output path must not exist already.
+///
+/// Returns `true` if a capture started, `false` if no env var set or
+/// capture failed (in which case stderr explains).
+pub fn maybe_begin_frame_capture() -> bool {
+    use metal::{CaptureDescriptor, CaptureManager, MTLCaptureDestination};
+    let Ok(out_path) = std::env::var("FERRUM_METAL_CAPTURE") else {
+        return false;
+    };
+    if std::env::var("MTL_CAPTURE_ENABLED").is_err() {
+        eprintln!(
+            "[capture] FERRUM_METAL_CAPTURE set but MTL_CAPTURE_ENABLED is not — Metal will reject. Re-launch with MTL_CAPTURE_ENABLED=1."
+        );
+        return false;
+    }
+    let mgr = CaptureManager::shared();
+    if !mgr.supports_destination(MTLCaptureDestination::GpuTraceDocument) {
+        eprintln!("[capture] device does not support GpuTraceDocument");
+        return false;
+    }
+    let desc = CaptureDescriptor::new();
+    desc.set_capture_device(&st().pipes.device);
+    desc.set_destination(MTLCaptureDestination::GpuTraceDocument);
+    desc.set_output_url(&out_path);
+    match mgr.start_capture(&desc) {
+        Ok(()) => {
+            eprintln!("[capture] started → {out_path}");
+            true
+        }
+        Err(e) => {
+            eprintln!("[capture] start_capture failed: {e}");
+            false
+        }
+    }
+}
+
+/// Stop the active frame capture and flush the `.gputrace` to disk.
+pub fn end_frame_capture() {
+    metal::CaptureManager::shared().stop_capture();
+    eprintln!("[capture] stopped — open .gputrace in Xcode");
+}
+
 // ── Dtype tag + tagged buffer ─────────────────────────────────────────
 
 /// Element storage type for a [`MetalBuf`]. Same shape generalises to INT8
