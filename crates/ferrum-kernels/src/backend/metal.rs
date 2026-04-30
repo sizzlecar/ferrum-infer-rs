@@ -26,9 +26,30 @@ use ferrum_attention::metal::pipelines::MetalPipelines;
 use ferrum_attention::AttentionParams;
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
-use metal::{Device, MTLResourceOptions};
+use metal::{Device, MTLDispatchType, MTLResourceOptions};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// Should the Metal compute encoder open in `MTLDispatchTypeConcurrent`?
+///
+/// When concurrent, the GPU may overlap dispatches that don't share read
+/// / write buffers — but the caller must emit
+/// `memoryBarrierWithResources` before any dispatch that depends on a
+/// prior one. llama.cpp uses this mode (see `ggml-metal-device.m:462-475`
+/// and `ggml-metal-ops.cpp:147-173`); estimated win on Qwen3-MoE decode
+/// is 2-5 ms/token from the gate↔up pair alone (see
+/// `bench/notes/2026-05-01-decode-bottleneck-analysis.md`).
+///
+/// Default OFF. Enable via `FERRUM_METAL_CONCURRENT=1`. The barrier
+/// wiring in `MetalContext::barrier_for_inputs` is correct in both
+/// modes: in serial mode the barrier is a no-op (Metal already orders
+/// dispatches in encoding order); in concurrent mode the barrier
+/// ensures prior writes to listed resources are visible to this
+/// dispatch's reads.
+fn use_concurrent_encoder() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("FERRUM_METAL_CONCURRENT").is_ok())
+}
 
 // ── Shared Metal state ────────────────────────────────────────────────
 
@@ -329,16 +350,59 @@ impl MetalContext {
     /// buffer if there isn't already one. Subsequent calls during the
     /// same window return the same encoder — set the pipeline state
     /// before each dispatch.
+    ///
+    /// Encoder dispatch type is governed by [`use_concurrent_encoder`].
+    /// Default (serial) preserves existing behaviour: Metal sequences each
+    /// dispatch after the previous one in encoding order. Concurrent mode
+    /// requires callers to emit barriers via
+    /// [`MetalContext::barrier_for_inputs`] before each dispatch.
     fn compute_encoder(&mut self) -> &'static metal::ComputeCommandEncoderRef {
         if let Some(enc) = self.encoder {
             return enc;
         }
         let cmd = self.cmd();
-        let enc = cmd.new_compute_command_encoder();
+        let enc = if use_concurrent_encoder() {
+            cmd.compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent)
+        } else {
+            cmd.new_compute_command_encoder()
+        };
         let enc_static: &'static metal::ComputeCommandEncoderRef =
             unsafe { std::mem::transmute::<&metal::ComputeCommandEncoderRef, _>(enc) };
         self.encoder = Some(enc_static);
         enc_static
+    }
+
+    /// Emit a memory barrier on the listed input buffers if the encoder
+    /// is in concurrent dispatch mode. No-op in serial mode (Metal
+    /// already orders dispatches in encoding order within a serial
+    /// encoder).
+    ///
+    /// Call this *after* opening the encoder via
+    /// [`MetalContext::compute_encoder`] and *before* the new
+    /// `dispatch_thread_groups` that reads any of these buffers. The
+    /// barrier guarantees that all prior dispatches that wrote to
+    /// these buffers have completed before the new dispatch starts —
+    /// dispatches whose write sets are disjoint from these inputs are
+    /// free to run concurrently.
+    ///
+    /// This is the same model llama.cpp uses (`ggml-metal-ops.cpp`'s
+    /// `concurrency_check` + `concurrency_reset`): the barrier resource
+    /// list is the union of the new op's read+write buffers; the GPU
+    /// driver works out which prior dispatches need to drain.
+    pub fn barrier_for_inputs(&mut self, inputs: &[&metal::BufferRef]) {
+        if !use_concurrent_encoder() {
+            return;
+        }
+        let enc = match self.encoder {
+            Some(enc) => enc,
+            None => return, // No encoder open → no prior dispatch to wait on.
+        };
+        // BufferRef → ResourceRef coercion (Buffer's parent type is
+        // Resource in metal-rs). Borrow as ResourceRef without taking
+        // ownership.
+        let resources: Vec<&metal::ResourceRef> =
+            inputs.iter().map(|b| -> &metal::ResourceRef { b }).collect();
+        enc.memory_barrier_with_resources(&resources);
     }
 
     /// Close the active compute encoder if one is open. Caller must do
@@ -977,6 +1041,10 @@ impl Backend for MetalBackend {
         let ids_buf = &ids.raw;
         let out_buf = out.expect_f32_mut("gemv_quant_moe_id out");
         let enc = ctx.compute_encoder();
+        // Read inputs: activation `a` and `ids` may have been written by
+        // prior dispatches (norm_out from wsum, ids from route). Weights
+        // are load-time only, never written — skip from barrier list.
+        ctx.barrier_for_inputs(&[a_buf, ids_buf]);
         dispatch_gemv_moe_id(
             enc,
             a_buf,
@@ -1022,6 +1090,7 @@ impl Backend for MetalBackend {
         let tpe_buf = &tpe.raw;
         let out_buf = out.expect_f32_mut("gemm_quant_moe_id out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[a_buf, ids_buf, tpe_buf]);
         match weight {
             MetalQuantStore::Q4KExperts {
                 blocks,
@@ -1100,6 +1169,7 @@ impl Backend for MetalBackend {
         let out_buf = out.expect_f32_mut("gemm_quant_moe_id_indirect out");
         let args = &args_buf.raw;
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[a_buf, ids_buf, tpe_buf, args]);
         match weight {
             MetalQuantStore::Q4KExperts {
                 blocks,
@@ -1175,6 +1245,7 @@ impl Backend for MetalBackend {
         let ids_buf = &out_ids.raw;
         let weights_buf = out_weights.expect_f32_mut("route_topk_softmax out_weights");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[logits_buf]);
         crate::moe_router::dispatch_route_topk_softmax(
             &st().pipes.device,
             enc,
@@ -1201,6 +1272,7 @@ impl Backend for MetalBackend {
         let up_buf = up.expect_f32("silu_mul_batched up");
         let out_buf = out.expect_f32_mut("silu_mul_batched out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[gate_buf, up_buf]);
         crate::moe_post_ops_batched::dispatch_silu_mul_batched(
             &st().pipes.device,
             enc,
@@ -1232,6 +1304,7 @@ impl Backend for MetalBackend {
         let gate_up_args_buf = &gate_up_args.raw;
         let down_args_buf = &down_args.raw;
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[sel_buf]);
         crate::moe_router::dispatch_compute_ids_tpe(
             &st().pipes.device,
             enc,
@@ -1261,6 +1334,10 @@ impl Backend for MetalBackend {
         let weights_buf = weights.expect_f32("weighted_sum_residual_stacked weights");
         let residual_buf = residual.expect_f32_mut("weighted_sum_residual_stacked residual");
         let enc = ctx.compute_encoder();
+        // residual is read-modify-write — include in barrier so the
+        // GPU drains any prior writer (the layer's residual_add or the
+        // first-layer embed) before we accumulate into it.
+        ctx.barrier_for_inputs(&[slots_buf, weights_buf, residual_buf]);
         crate::moe_post_ops::dispatch_weighted_sum_residual_stacked(
             &st().pipes.device,
             enc,
@@ -1290,6 +1367,7 @@ impl Backend for MetalBackend {
         let nw_buf = next_norm_w.expect_f32("weighted_sum_residual_norm_stacked next_norm_w");
         let normed_buf = normed_out.expect_f32_mut("weighted_sum_residual_norm_stacked normed_out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[slots_buf, weights_buf, residual_buf, nw_buf]);
         crate::moe_post_ops::dispatch_weighted_sum_residual_norm_stacked(
             &st().pipes.device,
             enc,
@@ -1318,6 +1396,7 @@ impl Backend for MetalBackend {
         let weights_buf = weights.expect_f32("weighted_sum_batched weights");
         let out_buf = out.expect_f32_mut("weighted_sum_batched out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[slots_buf, weights_buf]);
         crate::moe_post_ops_batched::dispatch_weighted_sum_batched(
             &st().pipes.device,
             enc,
@@ -1343,6 +1422,10 @@ impl Backend for MetalBackend {
         let up_buf = up.expect_f32("silu_mul_stacked up");
         let out_buf = out.expect_f32_mut("silu_mul_stacked out");
         let enc = ctx.compute_encoder();
+        // silu reads gate AND up — explicit barrier on both lets the
+        // GPU still overlap gate↔up gemvs upstream while ensuring this
+        // dispatch sees their writes.
+        ctx.barrier_for_inputs(&[gate_buf, up_buf]);
         crate::moe_post_ops::dispatch_silu_mul_stacked(
             &st().pipes.device,
             enc,
@@ -1367,6 +1450,7 @@ impl Backend for MetalBackend {
         let weights_buf = weights.expect_f32("weighted_sum_stacked weights");
         let out_buf = out.expect_f32_mut("weighted_sum_stacked out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[slots_buf, weights_buf]);
         crate::moe_post_ops::dispatch_weighted_sum_stacked(
             &st().pipes.device,
             enc,
@@ -1453,6 +1537,7 @@ impl Backend for MetalBackend {
                 let a_buf = a.expect_f32("gemm_quant a (fused)");
                 let out_buf = out.expect_f32_mut("gemm_quant out (fused)");
                 let enc = ctx.compute_encoder();
+                ctx.barrier_for_inputs(&[a_buf]);
                 let mut col_off = 0usize;
                 for part in parts {
                     let part_rows = part.n_rows();
@@ -1475,6 +1560,7 @@ impl Backend for MetalBackend {
             let a_buf = a.expect_f32("gemm_quant a (fused m=1)");
             let out_buf = out.expect_f32_mut("gemm_quant out (fused m=1)");
             let enc = ctx.compute_encoder();
+            ctx.barrier_for_inputs(&[a_buf]);
             let mut row_off_elems = 0usize;
             for part in parts {
                 let part_rows = part.n_rows();
@@ -1532,6 +1618,7 @@ impl Backend for MetalBackend {
             // Llama always satisfy the constraint, so we just panic if
             // not.
             let enc = ctx.compute_encoder();
+            ctx.barrier_for_inputs(&[a_buf]);
             if is_q6k {
                 if n_rows % 4 != 0 {
                     return Err(FerrumError::model(format!(
@@ -1579,6 +1666,7 @@ impl Backend for MetalBackend {
             // and was the dominant prefill bottleneck on Q4_K_M models
             // where down_proj / lm_head live as Q6_K.
             let enc = ctx.compute_encoder();
+            ctx.barrier_for_inputs(&[a_buf]);
             crate::q6_k_gemm::dispatch_gemm_q6k_on_encoder(
                 &st().pipes.device,
                 enc,
@@ -1598,6 +1686,7 @@ impl Backend for MetalBackend {
             // transient buffer (~2× memory traffic) and the scalar
             // gemm_v2_f16w inner loop.
             let enc = ctx.compute_encoder();
+            ctx.barrier_for_inputs(&[a_buf]);
             crate::q4_k_gemm::dispatch_gemm_q4k_on_encoder(
                 &st().pipes.device,
                 enc,
@@ -1647,6 +1736,9 @@ impl Backend for MetalBackend {
         let a_buf = a.expect_f32("gemm a");
         let out_buf = out.expect_f32_mut("gemm out");
         let enc = ctx.compute_encoder();
+        // `b` (weights) are load-once / read-only — only `a` (activation)
+        // can have an upstream writer (residual_add, rms_norm, etc.).
+        ctx.barrier_for_inputs(&[a_buf]);
         match b.dtype {
             Dtype::F16 => {
                 // f16 weights — route through the f32-activation / f16-weight kernels.
@@ -1686,6 +1778,7 @@ impl Backend for MetalBackend {
         let w = w.expect_f32("rms_norm w");
         let out = out.expect_f32_mut("rms_norm out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[x]);
         st().pipes.rms_norm_enc(enc, x, w, out, tokens, dim, eps);
     }
 
@@ -1704,6 +1797,9 @@ impl Backend for MetalBackend {
         let w = w.expect_f32("fused_add_rms_norm w");
         let out = out.expect_f32_mut("fused_add_rms_norm out");
         let enc = ctx.compute_encoder();
+        // residual is read-modify-write; x is the projection output that
+        // just landed (e.g. O proj writing into o_proj_out).
+        ctx.barrier_for_inputs(&[residual, x]);
         st().pipes.fused_residual_norm_enc(
             enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
         );
@@ -1827,6 +1923,7 @@ impl Backend for MetalBackend {
         let k = k.expect_f32_mut("split_qkv k");
         let v = v.expect_f32_mut("split_qkv v");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[qkv]);
         st().pipes
             .split_qkv_enc(enc, qkv, q, k, v, tokens, q_dim, kv_dim);
     }
@@ -1841,6 +1938,7 @@ impl Backend for MetalBackend {
         let gu = gu.expect_f32("fused_silu_mul_split gate_up");
         let out = out.expect_f32_mut("fused_silu_mul_split out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[gu]);
         st().pipes.silu_mul_split_enc(enc, gu, out, tokens, im);
     }
 
@@ -1864,6 +1962,7 @@ impl Backend for MetalBackend {
         let sin = sin.expect_f32("qk_norm_rope sin");
         let output = output.expect_f32_mut("qk_norm_rope output");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[input]);
         st().pipes.qk_norm_rope(
             enc, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps, mode,
         );
@@ -1896,6 +1995,7 @@ impl Backend for MetalBackend {
         let k_out = k_out.expect_f32_mut("split_qkv_norm_rope k_out");
         let v_out = v_out.expect_f32_mut("split_qkv_norm_rope v_out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[qkv]);
         st().pipes.split_qkv_norm_rope(
             enc, qkv, q_norm_w, k_norm_w, cos, sin, q_out, k_out, v_out, tokens, q_heads, kv_heads,
             head_dim, pos_offset, eps, qk_mode,
@@ -1932,6 +2032,11 @@ impl Backend for MetalBackend {
         let cache_k = cache_k.expect_f32_mut("split_qkv_norm_rope_kvc cache_k");
         let cache_v = cache_v.expect_f32_mut("split_qkv_norm_rope_kvc cache_v");
         let enc = ctx.compute_encoder();
+        // qkv is the gemm output we need to fan out; cache_k/cache_v
+        // we're appending into — under concurrent dispatch we need to
+        // see prior token's writes to those cache rows before we can
+        // safely write our own row.
+        ctx.barrier_for_inputs(&[qkv, cache_k, cache_v]);
         st().pipes.split_qkv_norm_rope_into_cache(
             enc,
             qkv,
@@ -1973,6 +2078,7 @@ impl Backend for MetalBackend {
         let new_k_head_major = new_k_head_major.expect_f32("kv_cache_append new_k");
         let new_v_head_major = new_v_head_major.expect_f32("kv_cache_append new_v");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[new_k_head_major, cache_k]);
         st().pipes.kv_cache_append(
             enc,
             new_k_head_major,
@@ -1983,6 +2089,7 @@ impl Backend for MetalBackend {
             new_tokens,
             cache_capacity,
         );
+        ctx.barrier_for_inputs(&[new_v_head_major, cache_v]);
         st().pipes.kv_cache_append(
             enc,
             new_v_head_major,
@@ -2006,6 +2113,7 @@ impl Backend for MetalBackend {
         let src = src.expect_f32("transpose_head_to_token src");
         let dst = dst.expect_f32_mut("transpose_head_to_token dst");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[src]);
         st().pipes.transpose_out(enc, src, dst, tokens, heads, dim);
     }
 
@@ -2019,6 +2127,7 @@ impl Backend for MetalBackend {
         let data = data.expect_f32_mut("add_bias data");
         let bias = bias.expect_f32("add_bias bias");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[data]);
         st().pipes.add_bias_enc(enc, data, bias, rows, cols);
     }
 
@@ -2037,6 +2146,7 @@ impl Backend for MetalBackend {
         let beta = beta.expect_f32("layer_norm beta");
         let out = out.expect_f32_mut("layer_norm out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[x]);
         st().pipes
             .layer_norm_enc(enc, x, gamma, beta, out, tokens, dim, eps);
     }
@@ -2045,6 +2155,7 @@ impl Backend for MetalBackend {
         let x = x.expect_f32("gelu x");
         let out = out.expect_f32_mut("gelu out");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[x]);
         st().pipes.gelu_enc(enc, x, out, len);
     }
 
@@ -2052,6 +2163,7 @@ impl Backend for MetalBackend {
         let r = r.expect_f32_mut("add_inplace r");
         let x = x.expect_f32("add_inplace x");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[r, x]);
         st().pipes.add_enc(enc, r, x, r, len);
     }
 
@@ -2065,6 +2177,7 @@ impl Backend for MetalBackend {
         let dst_buf = dst.expect_f32_mut("scaled_add_inplace dst");
         let src_buf = src.expect_f32("scaled_add_inplace src");
         let enc = ctx.compute_encoder();
+        ctx.barrier_for_inputs(&[dst_buf, src_buf]);
         st().pipes
             .scaled_add_inplace_enc(enc, dst_buf, src_buf, scale, len);
     }
