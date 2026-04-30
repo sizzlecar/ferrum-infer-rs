@@ -44,6 +44,21 @@ static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
 static MOE_TIME_US: AtomicU64 = AtomicU64::new(0);
 static MOE_CALLS: AtomicU64 = AtomicU64::new(0);
 
+// MoE batched-prefill sub-stage counters (gate / up / down mul_mm_id +
+// silu + weighted_sum + host topk). Same FERRUM_DECODE_OP_PROFILE gate.
+static MOE_PREFILL_HOST_TOPK_US: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_HOST_TOPK_CALLS: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_GATE_US: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_GATE_CALLS: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_UP_US: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_UP_CALLS: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_SILU_US: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_SILU_CALLS: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_DOWN_US: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_WSUM_US: AtomicU64 = AtomicU64::new(0);
+static MOE_PREFILL_WSUM_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.
 pub struct Qwen3MoeLayerState<B: Backend> {
     /// Router projection `[hidden] → [num_experts]` — tiny, never sparse,
@@ -826,6 +841,37 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let vocab = self.cfg.base.vocab_size;
         let mut ctx = B::new_context();
 
+        // FERRUM_DECODE_OP_PROFILE doubles as the prefill-profile gate
+        // for Qwen3-MoE: when set, dump (attn-us, moe-us, total-us) at
+        // the end of prefill so we can attribute the prefill bottleneck
+        // between attention and MoE.
+        let prefill_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(&mut ctx);
+            for c in [
+                &ATTN_TIME_US,
+                &ATTN_CALLS,
+                &MOE_TIME_US,
+                &MOE_CALLS,
+                &MOE_PREFILL_HOST_TOPK_US,
+                &MOE_PREFILL_HOST_TOPK_CALLS,
+                &MOE_PREFILL_GATE_US,
+                &MOE_PREFILL_GATE_CALLS,
+                &MOE_PREFILL_UP_US,
+                &MOE_PREFILL_UP_CALLS,
+                &MOE_PREFILL_SILU_US,
+                &MOE_PREFILL_SILU_CALLS,
+                &MOE_PREFILL_DOWN_US,
+                &MOE_PREFILL_DOWN_CALLS,
+                &MOE_PREFILL_WSUM_US,
+                &MOE_PREFILL_WSUM_CALLS,
+            ] {
+                c.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let mut residual = self
             .scratch
             .residual
@@ -885,6 +931,51 @@ impl<B: Backend> Qwen3MoeModel<B> {
         );
 
         B::sync(&mut ctx);
+        if let Some(t0) = prefill_t0 {
+            let total_us = t0.elapsed().as_micros() as u64;
+            let attn_us = ATTN_TIME_US.load(std::sync::atomic::Ordering::Relaxed);
+            let attn_n = ATTN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let moe_us = MOE_TIME_US.load(std::sync::atomic::Ordering::Relaxed);
+            let moe_n = MOE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let other_us = total_us.saturating_sub(attn_us).saturating_sub(moe_us);
+            eprintln!(
+                "[prefill-profile] tokens={seq_len} total={} ms ({:.0} t/s)",
+                total_us / 1000,
+                seq_len as f64 * 1e6 / total_us as f64
+            );
+            let bucket = |label: &str, n: u64, us: u64| {
+                if n > 0 {
+                    eprintln!(
+                        "  {label:>6}: {:7} ms ({:5.1}%) over {n:4} calls",
+                        us / 1000,
+                        us as f64 * 100.0 / total_us as f64
+                    );
+                }
+            };
+            bucket("attn", attn_n, attn_us);
+            bucket("moe", moe_n, moe_us);
+            bucket("other", 1, other_us);
+            // MoE sub-stages — show as % of total prefill time so they
+            // reconcile against the `moe` bucket above.
+            let host_us = MOE_PREFILL_HOST_TOPK_US.load(std::sync::atomic::Ordering::Relaxed);
+            let gate_us = MOE_PREFILL_GATE_US.load(std::sync::atomic::Ordering::Relaxed);
+            let up_us = MOE_PREFILL_UP_US.load(std::sync::atomic::Ordering::Relaxed);
+            let silu_us = MOE_PREFILL_SILU_US.load(std::sync::atomic::Ordering::Relaxed);
+            let down_us = MOE_PREFILL_DOWN_US.load(std::sync::atomic::Ordering::Relaxed);
+            let wsum_us = MOE_PREFILL_WSUM_US.load(std::sync::atomic::Ordering::Relaxed);
+            let host_n = MOE_PREFILL_HOST_TOPK_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let gate_n = MOE_PREFILL_GATE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let up_n = MOE_PREFILL_UP_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let silu_n = MOE_PREFILL_SILU_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let down_n = MOE_PREFILL_DOWN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let wsum_n = MOE_PREFILL_WSUM_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            bucket("  host", host_n, host_us);
+            bucket("  gate", gate_n, gate_us);
+            bucket("  up", up_n, up_us);
+            bucket("  silu", silu_n, silu_us);
+            bucket("  down", down_n, down_us);
+            bucket("  wsum", wsum_n, wsum_us);
+        }
         self.scratch.residual = Some(residual);
         B::to_vec(&self.scratch.logits, vocab)
     }
@@ -1202,8 +1293,29 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
 ) -> Result<()> {
     use ferrum_kernels::moe_host::compute_ids_tpe;
 
+    let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+    let stage_t0 = || -> Option<std::time::Instant> {
+        if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    };
+    let stage_end =
+        |t0: Option<std::time::Instant>, ctx: &mut B::Context, us: &AtomicU64, n: &AtomicU64| {
+            if let Some(t) = t0 {
+                B::sync(ctx);
+                us.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+
     // Host-side routing: pull the whole batch's router_logits, run
     // softmax + top-K, then bucket pairs by expert into ids/tpe.
+    let t0 = stage_t0();
     B::sync(ctx);
     let logits_host = B::to_vec(&scratch.router_logits, tokens * n_exp);
     let route = crate::moe::router::route(&logits_host, tokens, n_exp, top_k, norm_topk_prob);
@@ -1219,6 +1331,12 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
 
     // Combine weights: write [batch, top_k] flat into weights_2d.
     B::write_f32_into(&mut scratch.weights_2d, &route.expert_weights);
+    stage_end(
+        t0,
+        ctx,
+        &MOE_PREFILL_HOST_TOPK_US,
+        &MOE_PREFILL_HOST_TOPK_CALLS,
+    );
 
     let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
     let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
@@ -1228,6 +1346,7 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
     //    src1 layout: [batch, ne11=1, K] (broadcast: each pair reads its
     //    token's row, slot index ignored).
     //    dst layout:  [batch, top_k, expert_inter] — natural.
+    let t0 = stage_t0();
     B::gemm_quant_moe_id(
         ctx,
         &scratch.norm_out,
@@ -1240,8 +1359,10 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
         max_per_expert,
         tokens,
     )?;
+    stage_end(t0, ctx, &MOE_PREFILL_GATE_US, &MOE_PREFILL_GATE_CALLS);
 
     // 2. Batched up gemm — same shape as gate.
+    let t0 = stage_t0();
     B::gemm_quant_moe_id(
         ctx,
         &scratch.norm_out,
@@ -1254,9 +1375,11 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
         max_per_expert,
         tokens,
     )?;
+    stage_end(t0, ctx, &MOE_PREFILL_UP_US, &MOE_PREFILL_UP_CALLS);
 
     // 3. SiLU·gate over [tokens * top_k, expert_inter] flat layout.
     let total_pairs = tokens * top_k;
+    let t0 = stage_t0();
     B::silu_mul_batched(
         ctx,
         &scratch.gate_out_stacked,
@@ -1265,9 +1388,11 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
         total_pairs,
         inter,
     )?;
+    stage_end(t0, ctx, &MOE_PREFILL_SILU_US, &MOE_PREFILL_SILU_CALLS);
 
     // 4. Batched down gemm — src1 is [batch, top_k, expert_inter] from
     //    silu_stacked. ne11 = top_k → each pair reads its own row.
+    let t0 = stage_t0();
     B::gemm_quant_moe_id(
         ctx,
         &scratch.silu_stacked,
@@ -1280,8 +1405,10 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
         max_per_expert,
         tokens,
     )?;
+    stage_end(t0, ctx, &MOE_PREFILL_DOWN_US, &MOE_PREFILL_DOWN_CALLS);
 
     // 5. Per-batch weighted sum: moe_out[b, h] = Σ_k w[b,k] · down[b,k,h]
+    let t0 = stage_t0();
     B::weighted_sum_batched(
         ctx,
         &scratch.down_out_stacked,
@@ -1291,6 +1418,7 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
         top_k,
         h,
     )?;
+    stage_end(t0, ctx, &MOE_PREFILL_WSUM_US, &MOE_PREFILL_WSUM_CALLS);
 
     Ok(())
 }
