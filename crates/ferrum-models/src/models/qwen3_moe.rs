@@ -136,6 +136,15 @@ pub struct Qwen3MoeScratch<B: Backend> {
     /// GPU router for the prefill batch. Consumed by `compute_ids_tpe_gpu`
     /// to bucket pairs by expert into `tpe_buf` / `ids_2d`.
     pub selected_ids_buf: B::Buffer,
+    /// `[3]` u32 indirect-dispatch args (`grid_x, grid_y, grid_z`) for
+    /// the gate / up MoE GEMM. Written by `compute_ids_tpe_gpu` so the
+    /// consumer GEMM grid covers exactly `max(tpe[e])` columns instead
+    /// of the worst-case `tokens * top_k`.
+    pub gate_up_args_buf: B::Buffer,
+    /// Same shape as `gate_up_args_buf` but for the down MoE GEMM
+    /// (different `grid_y` because down's `M = hidden_size` vs gate/up's
+    /// `M = expert_intermediate_size`).
+    pub down_args_buf: B::Buffer,
     /// `[num_experts * max_per_expert_max]` i32 — per-expert pair
     /// index lists for prefill 2-D mul_mm_id. `max_per_expert_max`
     /// is bounded by `max_tokens * top_k` (worst-case: one expert
@@ -195,6 +204,12 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             ids_buf: B::from_slice_i32(&vec![0i32; cfg.num_experts_per_tok]),
             weights_buf: B::from_slice(&vec![0.0f32; cfg.num_experts_per_tok]),
             selected_ids_buf: B::from_slice_i32(&vec![0i32; t * cfg.num_experts_per_tok]),
+            // 3 u32s per indirect args buffer; allocated as 3 i32s so we
+            // can reuse `from_slice_i32`. The kernel writes them as
+            // `device uint *` and the bit pattern is consumed by
+            // `dispatch_thread_groups_indirect`.
+            gate_up_args_buf: B::from_slice_i32(&[0i32, 0, 0]),
+            down_args_buf: B::from_slice_i32(&[0i32, 0, 0]),
             ids_2d: B::from_slice_i32(&vec![0i32; n_exp * t * cfg.num_experts_per_tok]),
             tpe_buf: B::from_slice_i32(&vec![0i32; n_exp]),
             weights_2d: B::from_slice(&vec![0.0f32; t * cfg.num_experts_per_tok]),
@@ -1329,9 +1344,13 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
     //      consumer GEMM stops at `tpe[e]` so the over-strided columns
     //      cost only launch overhead, not real compute.
     //
-    // `FERRUM_MOE_HOST_TOPK=1` falls back to the legacy host path for
-    // A/B regression checks during the rollout.
+    // `FERRUM_MOE_HOST_TOPK=1`        → legacy CPU softmax+topk+bucket
+    // `FERRUM_MOE_DIRECT_DISPATCH=1`  → GPU topk but worst-case GEMM grid
+    // (default)                       → GPU topk + indirect-dispatched GEMM
+    //                                    (grid sized from max(tpe[e]))
     let use_gpu_topk = std::env::var("FERRUM_MOE_HOST_TOPK").as_deref() != Ok("1");
+    let use_indirect_dispatch =
+        use_gpu_topk && std::env::var("FERRUM_MOE_DIRECT_DISPATCH").as_deref() != Ok("1");
     let max_per_expert = if use_gpu_topk {
         let t0 = stage_t0();
         B::route_topk_softmax(
@@ -1349,9 +1368,13 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
             &scratch.selected_ids_buf,
             &mut scratch.tpe_buf,
             &mut scratch.ids_2d,
+            &mut scratch.gate_up_args_buf,
+            &mut scratch.down_args_buf,
             tokens,
             n_exp,
             top_k,
+            inter,
+            h,
         )?;
         stage_end(
             t0,
@@ -1390,34 +1413,66 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
     //    token's row, slot index ignored).
     //    dst layout:  [batch, top_k, expert_inter] — natural.
     let t0 = stage_t0();
-    B::gemm_quant_moe_id(
-        ctx,
-        &scratch.norm_out,
-        gate_stacked,
-        &scratch.ids_2d,
-        &scratch.tpe_buf,
-        &mut scratch.gate_out_stacked,
-        1, // ne11 = 1: broadcast
-        top_k,
-        max_per_expert,
-        tokens,
-    )?;
+    if use_indirect_dispatch {
+        B::gemm_quant_moe_id_indirect(
+            ctx,
+            &scratch.norm_out,
+            gate_stacked,
+            &scratch.ids_2d,
+            &scratch.tpe_buf,
+            &mut scratch.gate_out_stacked,
+            &scratch.gate_up_args_buf,
+            1, // ne11 = 1: broadcast
+            top_k,
+            max_per_expert,
+            tokens,
+        )?;
+    } else {
+        B::gemm_quant_moe_id(
+            ctx,
+            &scratch.norm_out,
+            gate_stacked,
+            &scratch.ids_2d,
+            &scratch.tpe_buf,
+            &mut scratch.gate_out_stacked,
+            1,
+            top_k,
+            max_per_expert,
+            tokens,
+        )?;
+    }
     stage_end(t0, ctx, &MOE_PREFILL_GATE_US, &MOE_PREFILL_GATE_CALLS);
 
     // 2. Batched up gemm — same shape as gate.
     let t0 = stage_t0();
-    B::gemm_quant_moe_id(
-        ctx,
-        &scratch.norm_out,
-        up_stacked,
-        &scratch.ids_2d,
-        &scratch.tpe_buf,
-        &mut scratch.up_out_stacked,
-        1,
-        top_k,
-        max_per_expert,
-        tokens,
-    )?;
+    if use_indirect_dispatch {
+        B::gemm_quant_moe_id_indirect(
+            ctx,
+            &scratch.norm_out,
+            up_stacked,
+            &scratch.ids_2d,
+            &scratch.tpe_buf,
+            &mut scratch.up_out_stacked,
+            &scratch.gate_up_args_buf,
+            1,
+            top_k,
+            max_per_expert,
+            tokens,
+        )?;
+    } else {
+        B::gemm_quant_moe_id(
+            ctx,
+            &scratch.norm_out,
+            up_stacked,
+            &scratch.ids_2d,
+            &scratch.tpe_buf,
+            &mut scratch.up_out_stacked,
+            1,
+            top_k,
+            max_per_expert,
+            tokens,
+        )?;
+    }
     stage_end(t0, ctx, &MOE_PREFILL_UP_US, &MOE_PREFILL_UP_CALLS);
 
     // 3. SiLU·gate over [tokens * top_k, expert_inter] flat layout.
@@ -1436,18 +1491,34 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
     // 4. Batched down gemm — src1 is [batch, top_k, expert_inter] from
     //    silu_stacked. ne11 = top_k → each pair reads its own row.
     let t0 = stage_t0();
-    B::gemm_quant_moe_id(
-        ctx,
-        &scratch.silu_stacked,
-        down_stacked,
-        &scratch.ids_2d,
-        &scratch.tpe_buf,
-        &mut scratch.down_out_stacked,
-        top_k, // ne11 = top_k: per-slot
-        top_k,
-        max_per_expert,
-        tokens,
-    )?;
+    if use_indirect_dispatch {
+        B::gemm_quant_moe_id_indirect(
+            ctx,
+            &scratch.silu_stacked,
+            down_stacked,
+            &scratch.ids_2d,
+            &scratch.tpe_buf,
+            &mut scratch.down_out_stacked,
+            &scratch.down_args_buf,
+            top_k, // ne11 = top_k: per-slot
+            top_k,
+            max_per_expert,
+            tokens,
+        )?;
+    } else {
+        B::gemm_quant_moe_id(
+            ctx,
+            &scratch.silu_stacked,
+            down_stacked,
+            &scratch.ids_2d,
+            &scratch.tpe_buf,
+            &mut scratch.down_out_stacked,
+            top_k,
+            top_k,
+            max_per_expert,
+            tokens,
+        )?;
+    }
     stage_end(t0, ctx, &MOE_PREFILL_DOWN_US, &MOE_PREFILL_DOWN_CALLS);
 
     // 5. Per-batch weighted sum: moe_out[b, h] = Σ_k w[b,k] · down[b,k,h]

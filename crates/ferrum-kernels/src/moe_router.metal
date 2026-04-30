@@ -144,28 +144,42 @@ kernel void moe_router_topk_softmax_f32(
 //                              for the s-th pair routed to expert `e`
 //
 // `row_stride` is the *worst-case* `batch * top_k` (the consumer GEMM
-// already stops at `tpe[e]`). Skipping the tight-stride compaction lets
-// us avoid the cross-pass max-reduce + sync we'd otherwise need before
-// dispatching the GEMM.
+// kernel still uses this stride for ids indexing — only the GRID size
+// is tightened by reducing `max(tpe[e])` and emitting indirect-dispatch
+// args, leaving the kernel's `r1 >= tpe[e]` early-exit untouched).
 //
-// Algorithm: a single 1-D threadgroup of `THREADS` threads. Phase 1
-// zeroes `tpe`. Phase 2 walks `selected_ids` and uses
-// `atomic_fetch_add_explicit` to claim a slot in each expert's row.
+// Algorithm: single 1-D threadgroup, `THREADS` threads.
+//   Phase 1  zero tpe.
+//   Phase 2  walk selected_ids, atomic_fetch_add slot claim, write ids.
+//   Phase 3  max-reduce tpe[e] across threads → max_per_expert.
+//   Phase 4  thread 0 writes (grid_x, grid_y, grid_z) to two indirect
+//            args buffers — one for gate/up (M=expert_inter), one for
+//            down (M=hidden). grid_x is shared because all three GEMMs
+//            walk the same per-expert pair list.
 
 constant int FERRUM_IDS_TPE_THREADS = 256;
+constant int FERRUM_IDS_TPE_NSG     = 8;        // = THREADS / 32
+constant int FERRUM_GEMM_NR0        = 64;       // matches gemm_q4kw_moe_id_f32
+constant int FERRUM_GEMM_NR1        = 32;       // matches gemm_q4kw_moe_id_f32
 
 struct ComputeIdsTpeParams {
     int num_experts;
     int row_stride;     // = batch * top_k (worst-case ids row stride)
     int total_pairs;    // = batch * top_k
+    int m_gate_up;      // M for gate / up GEMM (= expert_intermediate_size)
+    int m_down;         // M for down GEMM (= hidden_size)
 };
 
 kernel void moe_compute_ids_tpe_f32(
     device const int      * selected_ids [[buffer(0)]],   // [total_pairs] i32
     device atomic_int     * tpe          [[buffer(1)]],   // [num_experts] i32
     device       int      * ids          [[buffer(2)]],   // [num_experts * row_stride] i32
-    constant ComputeIdsTpeParams & p     [[buffer(3)]],
-    uint tid [[thread_position_in_threadgroup]])
+    device       uint     * gate_up_args [[buffer(3)]],   // [3] u32 indirect args
+    device       uint     * down_args    [[buffer(4)]],   // [3] u32 indirect args
+    constant ComputeIdsTpeParams & p     [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
 {
     // Phase 1: zero tpe.
     for (int e = int(tid); e < p.num_experts; e += FERRUM_IDS_TPE_THREADS) {
@@ -180,5 +194,49 @@ kernel void moe_compute_ids_tpe_f32(
             const int slot = atomic_fetch_add_explicit(&tpe[e], 1, memory_order_relaxed);
             ids[e * p.row_stride + slot] = pair_idx;
         }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Phase 3: reduce max(tpe[e]) across threads.
+    int local_max = 0;
+    for (int e = int(tid); e < p.num_experts; e += FERRUM_IDS_TPE_THREADS) {
+        const int v = atomic_load_explicit(&tpe[e], memory_order_relaxed);
+        if (v > local_max) {
+            local_max = v;
+        }
+    }
+    const int sg_max = simd_max(local_max);
+    threadgroup int sg_results[FERRUM_IDS_TPE_NSG];
+    if (tiisg == 0) {
+        sg_results[sgitg] = sg_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 4: thread 0 cross-simdgroup reduce + write indirect args.
+    // grid_x is clamped to ≥ 1 so the dispatch is non-empty even on
+    // pathological "all logits identical" routings (max_per_expert = 0
+    // would otherwise produce a 0×Y×Z grid, which Metal rejects).
+    if (tid == 0) {
+        int max_pe = 0;
+        for (int s = 0; s < FERRUM_IDS_TPE_NSG; ++s) {
+            if (sg_results[s] > max_pe) {
+                max_pe = sg_results[s];
+            }
+        }
+        uint grid_x = uint((max_pe + FERRUM_GEMM_NR1 - 1) / FERRUM_GEMM_NR1);
+        if (grid_x < 1u) {
+            grid_x = 1u;
+        }
+        const uint grid_z = uint(p.num_experts);
+        const uint grid_y_gate_up = uint((p.m_gate_up + FERRUM_GEMM_NR0 - 1) / FERRUM_GEMM_NR0);
+        const uint grid_y_down    = uint((p.m_down    + FERRUM_GEMM_NR0 - 1) / FERRUM_GEMM_NR0);
+
+        gate_up_args[0] = grid_x;
+        gate_up_args[1] = grid_y_gate_up;
+        gate_up_args[2] = grid_z;
+
+        down_args[0] = grid_x;
+        down_args[1] = grid_y_down;
+        down_args[2] = grid_z;
     }
 }

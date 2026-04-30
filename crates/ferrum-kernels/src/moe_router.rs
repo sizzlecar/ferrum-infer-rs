@@ -109,27 +109,37 @@ pub fn dispatch_route_topk_softmax(
 
 /// Dispatch the GPU-side bucket-sort that turns the `[batch, top_k]`
 /// selected expert IDs from `dispatch_route_topk_softmax` into the
-/// `(tpe, ids)` arrays consumed by `gemm_quant_moe_id`.
+/// `(tpe, ids)` arrays consumed by `gemm_quant_moe_id`, plus the
+/// indirect-dispatch args buffers `gate_up_args` and `down_args`.
 ///
 /// Buffer expectations:
 /// - `selected_ids`: `[batch * top_k]` i32 (output of router)
 /// - `tpe`: `[num_experts]` i32 — overwritten (zeroed + filled)
 /// - `ids`: `[num_experts * row_stride]` i32 — only the first `tpe[e]`
-///   entries of each expert's row are written; consumer reads only that
-///   prefix
+///   entries of each expert's row are written; consumer reads only
+///   that prefix.
+/// - `gate_up_args` / `down_args`: 12-byte buffers receiving
+///   `(grid_x, grid_y, grid_z)` u32 triples. `grid_x` is shared (same
+///   `max(tpe[e])`); `grid_y` differs because `M` differs between
+///   gate/up (`m_gate_up`) and down (`m_down`).
 ///
-/// `row_stride` is the worst-case `batch * top_k`. Using the worst-case
-/// stride lets the GEMM dispatch be sized without a cross-pass
-/// max-reduction (the GEMM kernel already early-exits at `r1 >= tpe[e]`).
+/// `row_stride` is the worst-case `batch * top_k`. Tightening it would
+/// require a separate compaction pass; the GEMM kernel's
+/// `r1 >= tpe[e]` early-exit handles the over-strided indices for free.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_compute_ids_tpe(
     device: &Device,
     enc: &ComputeCommandEncoderRef,
     selected_ids: &Buffer,
     tpe: &Buffer,
     ids: &Buffer,
+    gate_up_args: &Buffer,
+    down_args: &Buffer,
     batch: usize,
     num_experts: usize,
     top_k: usize,
+    m_gate_up: usize,
+    m_down: usize,
 ) {
     debug_assert!(top_k > 0);
 
@@ -138,12 +148,16 @@ pub fn dispatch_compute_ids_tpe(
         num_experts: i32,
         row_stride: i32,
         total_pairs: i32,
+        m_gate_up: i32,
+        m_down: i32,
     }
     let total_pairs = batch * top_k;
     let params = P {
         num_experts: num_experts as i32,
         row_stride: total_pairs as i32,
         total_pairs: total_pairs as i32,
+        m_gate_up: m_gate_up as i32,
+        m_down: m_down as i32,
     };
 
     let pipe = ids_tpe_pipeline(device);
@@ -151,14 +165,16 @@ pub fn dispatch_compute_ids_tpe(
     enc.set_buffer(0, Some(selected_ids), 0);
     enc.set_buffer(1, Some(tpe), 0);
     enc.set_buffer(2, Some(ids), 0);
+    enc.set_buffer(3, Some(gate_up_args), 0);
+    enc.set_buffer(4, Some(down_args), 0);
     enc.set_bytes(
-        3,
+        5,
         std::mem::size_of::<P>() as u64,
         &params as *const _ as *const c_void,
     );
 
     // Single threadgroup with `IDS_TPE_THREADS` threads; the kernel
-    // strides over experts (zeroing) and pairs (bucketing).
+    // strides over experts (zeroing / max) and pairs (bucketing).
     let grid = MTLSize::new(1, 1, 1);
     let tg = MTLSize::new(IDS_TPE_THREADS, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
@@ -319,6 +335,12 @@ mod tests {
             (num_experts * row_stride * 4) as u64,
             MTLResourceOptions::StorageModeShared,
         );
+        let gate_up_args = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+        let down_args = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+
+        // Synthetic M values — only used to derive grid_y in the args.
+        let m_gate_up = 768usize;
+        let m_down = 2048usize;
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -328,9 +350,13 @@ mod tests {
             &sel_buf,
             &tpe_buf,
             &ids_buf,
+            &gate_up_args,
+            &down_args,
             batch,
             num_experts,
             top_k,
+            m_gate_up,
+            m_down,
         );
         enc.end_encoding();
         cmd.commit();
@@ -341,6 +367,10 @@ mod tests {
         let gpu_ids: &[i32] = unsafe {
             std::slice::from_raw_parts(ids_buf.contents() as *const i32, num_experts * row_stride)
         };
+        let gpu_gate_up_args: &[u32] =
+            unsafe { std::slice::from_raw_parts(gate_up_args.contents() as *const u32, 3) };
+        let gpu_down_args: &[u32] =
+            unsafe { std::slice::from_raw_parts(down_args.contents() as *const u32, 3) };
 
         // Host reference. Note: GPU output uses worst-case row_stride;
         // host output uses tight max_per_expert. Compare row-by-row
@@ -361,5 +391,22 @@ mod tests {
             host_row.sort_unstable();
             assert_eq!(gpu_row, host_row, "expert {e}: id set mismatch");
         }
+
+        // Verify the indirect-dispatch args track max(tpe[e]).
+        let expected_max_pe = host_tpe.iter().copied().max().unwrap_or(0).max(1);
+        let expected_grid_x = (expected_max_pe as u32 + 31) / 32;
+        let expected_grid_y_gu = (m_gate_up as u32 + 63) / 64;
+        let expected_grid_y_dn = (m_down as u32 + 63) / 64;
+        let expected_grid_z = num_experts as u32;
+        assert_eq!(
+            gpu_gate_up_args,
+            [expected_grid_x, expected_grid_y_gu, expected_grid_z],
+            "gate_up indirect args mismatch"
+        );
+        assert_eq!(
+            gpu_down_args,
+            [expected_grid_x, expected_grid_y_dn, expected_grid_z],
+            "down indirect args mismatch"
+        );
     }
 }
