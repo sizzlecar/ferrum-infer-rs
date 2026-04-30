@@ -44,6 +44,21 @@ static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
 static MOE_TIME_US: AtomicU64 = AtomicU64::new(0);
 static MOE_CALLS: AtomicU64 = AtomicU64::new(0);
 
+// Fine-grained decode-only counters, populated by
+// `moe_forward_stacked_decode_impl` when FERRUM_DECODE_OP_PROFILE is set.
+// Each is per-layer summed over the layers in one decode token; drained
+// at the bottom of `decode_internal`.
+static DEC_ROUTE_US: AtomicU64 = AtomicU64::new(0);
+static DEC_GATE_US: AtomicU64 = AtomicU64::new(0);
+static DEC_UP_US: AtomicU64 = AtomicU64::new(0);
+static DEC_SILU_US: AtomicU64 = AtomicU64::new(0);
+static DEC_DOWN_US: AtomicU64 = AtomicU64::new(0);
+static DEC_WSUM_US: AtomicU64 = AtomicU64::new(0);
+// Single-shot per decode token (not per-layer).
+static DEC_EMBED_US: AtomicU64 = AtomicU64::new(0);
+static DEC_FINAL_NORM_US: AtomicU64 = AtomicU64::new(0);
+static DEC_LM_HEAD_US: AtomicU64 = AtomicU64::new(0);
+
 // MoE batched-prefill sub-stage counters (gate / up / down mul_mm_id +
 // silu + weighted_sum + host topk). Same FERRUM_DECODE_OP_PROFILE gate.
 static MOE_PREFILL_HOST_TOPK_US: AtomicU64 = AtomicU64::new(0);
@@ -1031,12 +1046,54 @@ impl<B: Backend> Qwen3MoeModel<B> {
             None
         };
 
+        // FERRUM_DECODE_OP_PROFILE gates the per-stage breakdown emitted
+        // at the bottom of every decode token. Reuses the same atomic
+        // counters that `forward_layer` already populates (ATTN_TIME_US,
+        // MOE_TIME_US — drained here per-token instead of per-prefill).
+        let stage_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            B::sync(&mut ctx);
+            for c in [
+                &ATTN_TIME_US,
+                &ATTN_CALLS,
+                &MOE_TIME_US,
+                &MOE_CALLS,
+                &DEC_ROUTE_US,
+                &DEC_GATE_US,
+                &DEC_UP_US,
+                &DEC_SILU_US,
+                &DEC_DOWN_US,
+                &DEC_WSUM_US,
+                &DEC_EMBED_US,
+                &DEC_FINAL_NORM_US,
+                &DEC_LM_HEAD_US,
+            ] {
+                c.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let prof = stage_t0.is_some();
+        let mark = |ctx: &mut B::Context, c: &AtomicU64, t0: std::time::Instant| {
+            if prof {
+                B::sync(ctx);
+                c.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        };
+        let mt0 = std::time::Instant::now();
+
         let mut residual = self
             .scratch
             .residual
             .take()
             .expect("scratch residual missing (previous call didn't restore)");
+        let t0 = std::time::Instant::now();
         B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
+        mark(&mut ctx, &DEC_EMBED_US, t0);
+        let _ = mt0; // silence if unused on non-profile builds
 
         // Cross-layer rms_norm fusion: layer L's MoE tail folds the
         // next layer's leading rms_norm into its weighted-sum-residual
@@ -1063,6 +1120,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 .expect("forward_layer");
         }
 
+        let t0 = std::time::Instant::now();
         B::rms_norm(
             &mut ctx,
             &residual,
@@ -1072,15 +1130,53 @@ impl<B: Backend> Qwen3MoeModel<B> {
             1,
             h,
         );
+        mark(&mut ctx, &DEC_FINAL_NORM_US, t0);
+
+        let t0 = std::time::Instant::now();
         self.lm_head.forward(
             &mut ctx,
             &self.scratch.last_normed,
             &mut self.scratch.logits,
             1,
         );
+        mark(&mut ctx, &DEC_LM_HEAD_US, t0);
 
         B::sync(&mut ctx);
         self.scratch.residual = Some(residual);
+
+        // FERRUM_DECODE_OP_PROFILE: per-token decode breakdown.
+        if let Some(t0) = stage_t0 {
+            use std::sync::atomic::Ordering;
+            let total_us = t0.elapsed().as_micros() as u64;
+            let attn_us = ATTN_TIME_US.swap(0, Ordering::Relaxed);
+            let moe_us = MOE_TIME_US.swap(0, Ordering::Relaxed);
+            let route = DEC_ROUTE_US.swap(0, Ordering::Relaxed);
+            let gate = DEC_GATE_US.swap(0, Ordering::Relaxed);
+            let up = DEC_UP_US.swap(0, Ordering::Relaxed);
+            let silu = DEC_SILU_US.swap(0, Ordering::Relaxed);
+            let down = DEC_DOWN_US.swap(0, Ordering::Relaxed);
+            let wsum = DEC_WSUM_US.swap(0, Ordering::Relaxed);
+            let embed = DEC_EMBED_US.swap(0, Ordering::Relaxed);
+            let fnorm = DEC_FINAL_NORM_US.swap(0, Ordering::Relaxed);
+            let lmhead = DEC_LM_HEAD_US.swap(0, Ordering::Relaxed);
+            let other = total_us.saturating_sub(attn_us + moe_us + embed + fnorm + lmhead);
+            let pct = |us: u64| -> f64 {
+                if total_us == 0 {
+                    0.0
+                } else {
+                    100.0 * us as f64 / total_us as f64
+                }
+            };
+            eprintln!(
+                "[decode-prof] total={} ms | attn={} ({:.1}%) | moe={} ({:.1}%) [route={} gate={} up={} silu={} down={} wsum={}] | embed={} fnorm={} lmhead={} other={} ({:.1}%)",
+                total_us / 1000,
+                attn_us / 1000, pct(attn_us),
+                moe_us / 1000, pct(moe_us),
+                route / 1000, gate / 1000, up / 1000, silu / 1000, down / 1000, wsum / 1000,
+                embed / 1000, fnorm / 1000, lmhead / 1000,
+                other / 1000, pct(other),
+            );
+        }
 
         // Drain MoE per-op counters every decode step. The counters
         // accumulate across all 48 layers; printing per-step gives a
@@ -1200,6 +1296,25 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
     // buffers. Eliminates the per-layer `B::sync + B::to_vec(router_logits)
     // + host route()` round trip — the dominant remaining cost in the
     // decode hot path (~10% of total decode latency).
+    let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+    let stage_t0 = || -> Option<std::time::Instant> {
+        if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    };
+    let stage_end = |t0: Option<std::time::Instant>, ctx: &mut B::Context, c: &AtomicU64| {
+        if let Some(t) = t0 {
+            B::sync(ctx);
+            c.fetch_add(
+                t.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    };
+
+    let t0 = stage_t0();
     B::route_topk_softmax(
         ctx,
         &scratch.router_logits,
@@ -1210,6 +1325,7 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
         top_k,
         norm_topk_prob,
     )?;
+    stage_end(t0, ctx, &DEC_ROUTE_US);
 
     let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
     let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
@@ -1234,6 +1350,7 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
         // 1. Batched gate gemv — broadcast input across top_k slots.
         //    src1 = norm_out (which has hidden floats at offset 0),
         //    src1_stride=0 → all slots read the same row.
+        let t0 = stage_t0();
         B::gemv_quant_moe_id(
             ctx,
             &scratch.norm_out,
@@ -1243,8 +1360,10 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
             top_k,
             0, // broadcast
         )?;
+        stage_end(t0, ctx, &DEC_GATE_US);
 
         // 2. Batched up gemv — also broadcast.
+        let t0 = stage_t0();
         B::gemv_quant_moe_id(
             ctx,
             &scratch.norm_out,
@@ -1254,10 +1373,12 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
             top_k,
             0,
         )?;
+        stage_end(t0, ctx, &DEC_UP_US);
 
         // 3. Stacked SiLU·gate → silu_stacked. Single dispatch covers
         //    all top_k slots — replaces the per-slot loop's
         //    (3 copy_slice + 1 silu_mul) × 8 = 32 dispatches.
+        let t0 = stage_t0();
         B::silu_mul_stacked(
             ctx,
             &scratch.gate_out_stacked,
@@ -1266,9 +1387,11 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
             top_k,
             inter,
         )?;
+        stage_end(t0, ctx, &DEC_SILU_US);
 
         // 4. Batched down gemv — per-slot input via src1_stride = inter.
         //    silu_stacked[k * inter ..] is the activation row for slot k.
+        let t0 = stage_t0();
         B::gemv_quant_moe_id(
             ctx,
             &scratch.silu_stacked,
@@ -1278,6 +1401,7 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
             top_k,
             inter,
         )?;
+        stage_end(t0, ctx, &DEC_DOWN_US);
 
         // 5. Fused weighted-sum + residual-add (+ optional next-layer
         //    rms_norm). Two paths:
@@ -1288,6 +1412,7 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
         //      The next layer's leading rms_norm is skipped. Saves an
         //      additional dispatch per layer transition.
         //    * `next_norm_w = None` (last layer): just residual-add.
+        let t0 = stage_t0();
         if let Some(nnw) = next_norm_w {
             B::weighted_sum_residual_norm_stacked(
                 ctx,
@@ -1310,6 +1435,7 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
                 h,
             )?;
         }
+        stage_end(t0, ctx, &DEC_WSUM_US);
     }
 
     Ok(())
