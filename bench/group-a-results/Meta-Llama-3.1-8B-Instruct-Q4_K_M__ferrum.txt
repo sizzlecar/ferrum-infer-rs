@@ -1,0 +1,38 @@
+# ferrum bench output for Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+2026年 4月30日 星期四 21时53分16秒 CST
+--- pp50 trial 1 ---
+✓ model ready in 1.94s
+✓ prefill: 52 tok in 0.280s (185.5 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp50 trial 2 ---
+✓ model ready in 1.90s
+✓ prefill: 52 tok in 0.281s (184.9 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp50 trial 3 ---
+✓ model ready in 1.90s
+✓ prefill: 52 tok in 0.267s (195.1 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 1 ---
+✓ model ready in 1.93s
+✓ prefill: 514 tok in 1.622s (316.8 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 2 ---
+✓ model ready in 1.91s
+✓ prefill: 514 tok in 1.653s (310.9 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 3 ---
+✓ model ready in 1.96s
+✓ prefill: 514 tok in 1.623s (316.8 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- tg128 trial 1 ---
+✓ model ready in 1.86s
+✓ prefill: 5 tok in 0.183s (27.4 tok/s)
+throughput: 29.7 tok/s (decode only)
+--- tg128 trial 2 ---
+✓ model ready in 1.89s
+✓ prefill: 5 tok in 0.186s (26.9 tok/s)
+throughput: 29.4 tok/s (decode only)
+--- tg128 trial 3 ---
+✓ model ready in 1.85s
+✓ prefill: 5 tok in 0.181s (27.7 tok/s)
+throughput: 29.3 tok/s (decode only)
