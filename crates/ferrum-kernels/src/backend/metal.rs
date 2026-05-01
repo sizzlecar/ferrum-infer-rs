@@ -400,8 +400,10 @@ impl MetalContext {
         // BufferRef → ResourceRef coercion (Buffer's parent type is
         // Resource in metal-rs). Borrow as ResourceRef without taking
         // ownership.
-        let resources: Vec<&metal::ResourceRef> =
-            inputs.iter().map(|b| -> &metal::ResourceRef { b }).collect();
+        let resources: Vec<&metal::ResourceRef> = inputs
+            .iter()
+            .map(|b| -> &metal::ResourceRef { b })
+            .collect();
         enc.memory_barrier_with_resources(&resources);
     }
 
