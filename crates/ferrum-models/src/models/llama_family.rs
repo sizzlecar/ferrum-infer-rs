@@ -932,7 +932,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 &mut self.scratch.attn_head_major_out,
                 bt,
                 cl_buf,
-                1,    // num_seqs
+                1, // num_seqs
                 nh,
                 nkv,
                 hd,

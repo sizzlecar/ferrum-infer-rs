@@ -2070,7 +2070,10 @@ impl Backend for MetalBackend {
 
     fn alloc_u32(n: usize) -> Self::Buffer {
         let bytes = (n * std::mem::size_of::<u32>()) as u64;
-        let raw = st().pipes.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+        let raw = st()
+            .pipes
+            .device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
         MetalBuf {
             raw,
             dtype: Dtype::F32, // F32 tag — same word size, the kernel reads via `uint32_t*`.
