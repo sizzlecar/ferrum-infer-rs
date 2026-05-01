@@ -2028,6 +2028,7 @@ impl Backend for MetalBackend {
         head_dim: usize,
         block_size: usize,
         max_num_blocks_per_seq: usize,
+        q_len: usize,
     ) -> Result<()> {
         let q = q.expect_f32("paged_decode_attention q");
         let k_pool = k_pool.expect_f32("paged_decode_attention k_pool");
@@ -2036,6 +2037,15 @@ impl Backend for MetalBackend {
         let bt = &block_tables.raw;
         let cl = &context_lens.raw;
         let enc = ctx.compute_encoder();
+        // q_len=1 (decode): token-major layout matches scratch.q_head_major
+        // when tokens=1 (the head and token dims collapse).
+        // q_len>1 (prefill): scratch.q_head_major is `[num_heads, q_len,
+        // head_dim]` head-major from `split_qkv_norm_rope_into_paged_cache`.
+        let q_layout = if q_len == 1 {
+            ferrum_attention::metal::pipelines::PagedAttnQLayout::TokenMajor
+        } else {
+            ferrum_attention::metal::pipelines::PagedAttnQLayout::HeadMajor
+        };
         st().pipes.paged_decode_attention_on_encoder(
             enc,
             q,
@@ -2051,6 +2061,8 @@ impl Backend for MetalBackend {
                 head_dim,
                 block_size,
                 max_num_blocks_per_seq,
+                q_len,
+                q_layout,
             },
         );
         Ok(())

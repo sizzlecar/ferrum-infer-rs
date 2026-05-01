@@ -916,53 +916,31 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .as_mut()
                 .expect("paged cache missing context_lens");
             let num_blocks_per_seq = cache.capacity / cache.block_size;
-            // For each query position i in 0..tokens: write context_len
-            // = cache_len_before + i + 1, then dispatch paged decode
-            // attention reading q[i] and writing attn_out[i]. The kernel
-            // reads context_lens[seq=0]=current_kv_len each time. For
-            // tokens=1 (decode hot path), this is a single dispatch.
-            //
-            // q_head_major layout: [q_heads, tokens, head_dim]
-            // attn_head_major_out: [q_heads, tokens, head_dim]
-            // The kernel expects q/o as [num_seqs=1, q_heads, head_dim],
-            // so for token i we offset both q and o by `i*head_dim`
-            // within each head's slab — we slice via Self::Buffer
-            // sub-offsets. Simpler: for tokens > 1 we'd need a paged
-            // q-tiled kernel; for now we serialize.
-            for i in 0..tokens {
-                // Update context_lens to current_kv_len (after writing
-                // i-th token's K/V — already done by the paged write
-                // kernel above for ALL tokens at once).
-                let current_kv_len = (cache_len_before + i + 1) as u32;
-                B::write_u32(ctx, cl_buf, &[current_kv_len]);
-                if tokens == 1 {
-                    // Hot path: single dispatch, no per-token slicing.
-                    B::paged_decode_attention(
-                        ctx,
-                        &self.scratch.q_head_major,
-                        &cache.k,
-                        &cache.v,
-                        &mut self.scratch.attn_head_major_out,
-                        bt,
-                        cl_buf,
-                        1,
-                        nh,
-                        nkv,
-                        hd,
-                        cache.block_size,
-                        num_blocks_per_seq,
-                    )
-                    .expect("paged_decode_attention");
-                } else {
-                    // Prefill fallback: per-token slicing not yet
-                    // wired; we panic to surface the unsupported case
-                    // so we don't silently miscalculate. Phase 4 adds
-                    // a paged q-tiled kernel.
-                    panic!(
-                        "FERRUM_METAL_PAGED_KV: q_len > 1 prefill not yet supported (tokens={tokens}). Disable paged mode for prefill, or use a 1-token prompt for the demo."
-                    );
-                }
-            }
+            // Single dispatch handles both decode (q_len=1) and causal
+            // prefill (q_len>1). The kernel computes per-token causal
+            // limit as `context_lens[seq] - (q_len - 1 - q_token_idx)`,
+            // so we set context_lens to the FINAL kv_len after this
+            // batch's writes (= cache_len_before + tokens, which is
+            // the new `cache.len` value already updated above).
+            let final_kv_len = cache.len as u32;
+            B::write_u32(ctx, cl_buf, &[final_kv_len]);
+            B::paged_decode_attention(
+                ctx,
+                &self.scratch.q_head_major,
+                &cache.k,
+                &cache.v,
+                &mut self.scratch.attn_head_major_out,
+                bt,
+                cl_buf,
+                1,    // num_seqs
+                nh,
+                nkv,
+                hd,
+                cache.block_size,
+                num_blocks_per_seq,
+                tokens, // q_len
+            )
+            .expect("paged_decode_attention");
         } else {
             //    `causal` is always true for decoder-only LLMs — every query must
             //    mask out future tokens. Sliding-window models (Mistral v0.1) narrow

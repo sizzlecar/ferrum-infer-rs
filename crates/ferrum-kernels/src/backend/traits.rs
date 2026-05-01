@@ -981,11 +981,20 @@ pub trait Backend: Send + Sync + Sized + 'static {
 
     /// Paged-KV variant of [`Self::flash_attention`].
     ///
-    /// `q` : `[num_seqs, num_heads, head_dim]` (q_len=1 for decode)
-    /// `k_pool` / `v_pool` : `[num_blocks, num_kv_heads, block_size, head_dim]`
-    /// `block_tables` : `[num_seqs, max_num_blocks_per_seq]` u32
-    /// `context_lens` : `[num_seqs]` u32
-    /// `out` : `[num_seqs, num_heads, head_dim]`
+    /// Decode (`q_len == 1`):
+    ///   `q`/`out`: `[num_seqs, num_heads, head_dim]` (token-major)
+    ///
+    /// Causal prefill (`q_len > 1`, single seq):
+    ///   `q`/`out`: `[num_heads, q_len, head_dim]` (head-major — the
+    ///              layout produced by `split_qkv_norm_rope_into_paged_cache`)
+    ///   The kernel applies a per-q-token causal mask using
+    ///   `context_lens[seq]` as the FINAL kv_len (= `pos_offset + q_len`):
+    ///   token i sees positions `[0, context_lens - q_len + 1 + i)`.
+    ///
+    /// Common to both:
+    ///   `k_pool`/`v_pool`: `[num_blocks, num_kv_heads, block_size, head_dim]`
+    ///   `block_tables`: `[num_seqs, max_num_blocks_per_seq]` u32
+    ///   `context_lens`: `[num_seqs]` u32
     ///
     /// Backends without a paged kernel return Unsupported; callers are
     /// expected to fall back to contiguous KV.
@@ -1004,6 +1013,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         _head_dim: usize,
         _block_size: usize,
         _max_num_blocks_per_seq: usize,
+        _q_len: usize,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "paged_decode_attention not implemented for this backend",
