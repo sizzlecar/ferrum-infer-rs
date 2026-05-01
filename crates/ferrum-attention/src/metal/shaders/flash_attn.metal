@@ -538,3 +538,168 @@ kernel void flash_attn_decode_f32(
         }
     }
 }
+
+// ── Paged-KV variant of flash_attn_decode_f32 ────────────────────────
+//
+// Same online-softmax + cross-simdgroup combine as the contiguous-KV
+// variant above; the only change is HOW each simdgroup addresses K/V.
+//
+// Memory model (vLLM-style, simplified for f32-only):
+//   k_cache, v_cache : [num_blocks, num_kv_heads, BLOCK_SIZE, head_dim]
+//                      one shared pool; both cache buffers share the
+//                      block_size grid.
+//   block_tables     : [max_num_seqs, max_num_blocks_per_seq] u32
+//                      block_tables[seq][i] = physical block index for
+//                      the i-th logical block of sequence `seq`.
+//   context_lens     : [max_num_seqs] u32 — true sequence length;
+//                      simdgroups skip past it.
+//
+// The kernel takes two structs:
+//   FlashAttnParams (already defined for contiguous variant) covers
+//                   num_heads / num_kv_heads / head_dim / scale.
+//   PagedAttnParams covers block_size / max_num_blocks_per_seq /
+//                   kv_block_stride / kv_head_stride.
+//
+// `bi` (= tgpig.z) indexes into context_lens / block_tables directly
+// — one TG per (head, sequence) just like the contiguous variant.
+// pos_offset / kv_len from FlashAttnParams are NOT used here; the
+// per-sequence context_len comes from the buffer.
+//
+// Why a separate kernel rather than runtime branching: the inner KV
+// loop is the hot path (32 SGs × N positions). Apple's Metal compiler
+// generates measurably tighter code when the block-table indirection
+// is statically present rather than gated by a runtime flag. Cost:
+// ~80 extra MSL lines, no extra dispatch overhead — both variants can
+// live behind one `B::flash_attention` API.
+
+struct PagedAttnParams {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    float scale;
+    int block_size;              // KV positions per physical block (16 typical)
+    int max_num_blocks_per_seq;  // block_tables row stride
+    int kv_block_stride;         // floats between consecutive blocks (= num_kv_heads * block_size * head_dim)
+    int kv_head_stride;          // floats between consecutive kv heads within a block (= block_size * head_dim)
+    int causal;                  // unused for q_len=1 (context_len already encodes causal mask)
+};
+
+kernel void flash_attn_decode_paged_f32(
+    device const float*    Q              [[buffer(0)]],   // [num_seqs, num_heads, head_dim]
+    device const float*    K_cache        [[buffer(1)]],   // [num_blocks, num_kv_heads, block_size, head_dim]
+    device const float*    V_cache        [[buffer(2)]],   // same layout as K_cache
+    device       float*    O              [[buffer(3)]],   // [num_seqs, num_heads, head_dim]
+    device const uint32_t* block_tables   [[buffer(4)]],
+    device const uint32_t* context_lens   [[buffer(5)]],
+    constant PagedAttnParams& p           [[buffer(6)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],   // (1, head, seq)
+    uint   sgitg [[simdgroup_index_in_threadgroup]], // 0..31 — which KV-stripe
+    uint   tiisg [[thread_index_in_simdgroup]])      // 0..31 — which D slice
+{
+    const int hi    = int(tgpig.y);
+    const int bi    = int(tgpig.z);
+    const int kv_hi = hi / (p.num_heads / p.num_kv_heads);
+    const int d     = p.head_dim;
+    const int bs    = p.block_size;
+    const int context_len = int(context_lens[bi]);
+
+    // Pointers (Q / O are still token-major, same as contiguous variant).
+    device const float* q_row = Q + (bi * p.num_heads + hi) * d + tiisg * SDPA_EPT;
+    device       float* o_row = O + (bi * p.num_heads + hi) * d;
+    device const uint32_t* my_block_table = block_tables + bi * p.max_num_blocks_per_seq;
+
+    // Per-thread Q (pre-scaled), running output, scratch K/V slice.
+    float q[SDPA_EPT];
+    float o_acc[SDPA_EPT];
+    for (int i = 0; i < SDPA_EPT; ++i) {
+        q[i]     = p.scale * q_row[i];
+        o_acc[i] = 0.0f;
+    }
+
+    float max_score = -INFINITY;
+    float sum_exp   = 0.0f;
+
+    // KV loop — each simdgroup walks KV positions { sgitg, sgitg+BN, ... }.
+    // For each position: resolve logical → physical block via block_tables.
+    for (int ki = int(sgitg); ki < context_len; ki += SDPA_BN) {
+        const int logical_block = ki / bs;
+        const int slot_in_block = ki % bs;
+        const uint32_t physical_block = my_block_table[logical_block];
+
+        // Pointer to this position's K/V slice. The cache layout is
+        //   cache[physical_block][kv_hi][slot_in_block][d]
+        // = base + physical_block*kv_block_stride
+        //        + kv_hi*kv_head_stride
+        //        + slot_in_block*d
+        //        + tiisg*SDPA_EPT
+        const int slice_off = int(physical_block) * p.kv_block_stride
+                             + kv_hi * p.kv_head_stride
+                             + slot_in_block * d
+                             + int(tiisg) * SDPA_EPT;
+        device const float* k_row = K_cache + slice_off;
+        device const float* v_row = V_cache + slice_off;
+
+        // Same dot + online softmax body as flash_attn_decode_f32.
+        float dot_acc = 0.0f;
+        float k_v[SDPA_EPT];
+        for (int j = 0; j < SDPA_EPT; ++j) {
+            k_v[j]   = k_row[j];
+            dot_acc += q[j] * k_v[j];
+        }
+        const float score = simd_sum(dot_acc);
+
+        const float new_max = max(max_score, score);
+        const float factor  = exp(max_score - new_max);
+        const float exp_sc  = exp(score      - new_max);
+
+        max_score = new_max;
+        sum_exp   = sum_exp * factor + exp_sc;
+
+        for (int j = 0; j < SDPA_EPT; ++j) {
+            o_acc[j] = o_acc[j] * factor + exp_sc * v_row[j];
+        }
+    }
+
+    // Cross-simdgroup combine — identical structure to the contiguous
+    // variant. Could be factored, but the 60 lines below are the
+    // hotpath tail and we deliberately don't introduce a function-call
+    // boundary on M1 Max where it can prevent register coalescing.
+    threadgroup float outputs[SDPA_BN * SDPA_D];
+    threadgroup float max_scores[SDPA_BN];
+    threadgroup float sum_exp_scores[SDPA_BN];
+
+    threadgroup float* my_out = outputs + sgitg * SDPA_D + tiisg * SDPA_EPT;
+    for (int j = 0; j < SDPA_EPT; ++j) {
+        my_out[j] = o_acc[j];
+    }
+    if (tiisg == 0) {
+        max_scores[sgitg]     = max_score;
+        sum_exp_scores[sgitg] = sum_exp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        const float local_max = max_scores[tiisg];
+        const float global_max = simd_max(local_max);
+        const float local_factor = exp(local_max - global_max);
+        const float local_sum_scaled = sum_exp_scores[tiisg] * local_factor;
+        const float global_sum = simd_sum(local_sum_scaled);
+
+        max_scores[tiisg]     = local_factor;
+        sum_exp_scores[tiisg] = global_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        const float gs = sum_exp_scores[0];
+        const float inv_S = (gs > 0.0f) ? (1.0f / gs) : 0.0f;
+        for (int j = 0; j < SDPA_EPT; ++j) {
+            const int col = tiisg * SDPA_EPT + j;
+            float total = 0.0f;
+            for (int s = 0; s < SDPA_BN; ++s) {
+                total += outputs[s * SDPA_D + col] * max_scores[s];
+            }
+            o_row[col] = total * inv_S;
+        }
+    }
+}
