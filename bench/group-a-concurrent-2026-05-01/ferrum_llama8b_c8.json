@@ -1,0 +1,43 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8000",
+    "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M",
+    "num_prompts": 32,
+    "max_concurrency": 8,
+    "request_rate": Infinity,
+    "max_tokens": 128
+  },
+  "completed": 32,
+  "failed": 0,
+  "wall_time_s": 74.257083875,
+  "request_throughput_rps": 0.43093531728052925,
+  "input_throughput_tok_s": 6.490963216537971,
+  "output_throughput_tok_s": 55.159720611907744,
+  "total_input_tokens": 482,
+  "total_output_tokens": 4096,
+  "ttft_ms": {
+    "mean": 215.22319921875032,
+    "median": 269.48341650000174,
+    "p99": 407.01021300000326,
+    "max": 408.9832080000022
+  },
+  "tpot_ms": {
+    "mean": 144.05554714197834,
+    "median": 144.00867618110237,
+    "p99": 145.02278154889763,
+    "max": 145.02495144881888
+  },
+  "itl_ms": {
+    "mean": 144.05530123252953,
+    "median": 144.69114550000128,
+    "p99": 153.19152174999962,
+    "max": 292.87225000000205
+  },
+  "e2e_ms": {
+    "mean": 18510.27768625,
+    "median": 18518.914458,
+    "p99": 18686.983005520004,
+    "max": 18687.212625
+  },
+  "label": "ferrum_llama8b_c8"
+}

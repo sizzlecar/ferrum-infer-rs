@@ -1,0 +1,43 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8002",
+    "model": "/Users/chejinxuan/ferrum-bench/models",
+    "num_prompts": 32,
+    "max_concurrency": 16,
+    "request_rate": Infinity,
+    "max_tokens": 128
+  },
+  "completed": 32,
+  "failed": 0,
+  "wall_time_s": 188.823429167,
+  "request_throughput_rps": 0.1694704949548312,
+  "input_throughput_tok_s": 4.554519551911088,
+  "output_throughput_tok_s": 21.692223354218395,
+  "total_input_tokens": 860,
+  "total_output_tokens": 4096,
+  "ttft_ms": {
+    "mean": 35680.80681640625,
+    "median": 43691.1297495,
+    "p99": 65932.52519225,
+    "max": 65950.431916
+  },
+  "tpot_ms": {
+    "mean": 342.5196168801673,
+    "median": 285.4093791023622,
+    "p99": 680.7384000411812,
+    "max": 685.0728802519685
+  },
+  "itl_ms": {
+    "mean": 345.23776407440477,
+    "median": 239.3428329999998,
+    "p99": 3576.902480790015,
+    "max": 30268.137417000005
+  },
+  "e2e_ms": {
+    "mean": 79180.7981601875,
+    "median": 87097.334167,
+    "p99": 118824.38261848001,
+    "max": 120459.516459
+  },
+  "label": "mistralrs_llama8b_c16"
+}
