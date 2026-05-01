@@ -50,6 +50,7 @@ impl MetalPipelines {
                     "flash_attn_f32",
                     "flash_attn_q_tiled_f32",
                     "flash_attn_decode_f32",
+                    "flash_attn_decode_paged_f32",
                 ][..],
             ),
             (
@@ -1272,4 +1273,106 @@ impl MetalPipelines {
         let tg = MTLSize::new(256, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
+
+    /// Run paged-KV decode attention on the caller's existing compute
+    /// encoder. Mirrors the API of [`Self::flash_attn_v2_on_encoder`]
+    /// but takes a paged KV cache + per-sequence block tables instead
+    /// of contiguous K/V buffers.
+    ///
+    /// Layout:
+    ///   q              : `[num_seqs, num_heads, head_dim]`
+    ///   k_cache, v_cache : `[num_blocks, num_kv_heads, block_size, head_dim]`
+    ///   o              : `[num_seqs, num_heads, head_dim]`
+    ///   block_tables   : `[num_seqs, max_num_blocks_per_seq]` u32
+    ///   context_lens   : `[num_seqs]` u32
+    ///
+    /// All buffers are f32 except `block_tables` and `context_lens` which
+    /// are u32. Caller is responsible for opening / closing the encoder.
+    ///
+    /// Restrictions matching the existing `flash_attn_decode_f32`:
+    /// `head_dim == 128`. Block size is configurable via
+    /// `PagedAttnDispatchParams::block_size` (typical: 16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_decode_attention_on_encoder(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        q: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        o: &Buffer,
+        block_tables: &Buffer,
+        context_lens: &Buffer,
+        params: &PagedAttnDispatchParams,
+    ) {
+        debug_assert_eq!(
+            params.head_dim, 128,
+            "paged_decode_attention currently only supports head_dim=128"
+        );
+        debug_assert!(
+            params.num_heads % params.num_kv_heads == 0,
+            "GQA: num_heads must be divisible by num_kv_heads"
+        );
+
+        // The kernel-side struct must match the layout in flash_attn.metal
+        // (PagedAttnParams). Keep these in sync — there's no static check.
+        #[repr(C)]
+        struct P {
+            num_heads: i32,
+            num_kv_heads: i32,
+            head_dim: i32,
+            scale: f32,
+            block_size: i32,
+            max_num_blocks_per_seq: i32,
+            kv_block_stride: i32,
+            kv_head_stride: i32,
+            causal: i32,
+        }
+        let kv_head_stride = (params.block_size * params.head_dim) as i32;
+        let kv_block_stride = (params.num_kv_heads as i32) * kv_head_stride;
+        let p = P {
+            num_heads: params.num_heads as i32,
+            num_kv_heads: params.num_kv_heads as i32,
+            head_dim: params.head_dim as i32,
+            scale: 1.0 / (params.head_dim as f32).sqrt(),
+            block_size: params.block_size as i32,
+            max_num_blocks_per_seq: params.max_num_blocks_per_seq as i32,
+            kv_block_stride,
+            kv_head_stride,
+            causal: 1,
+        };
+
+        enc.set_compute_pipeline_state(self.pipeline("flash_attn_decode_paged_f32"));
+        enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(k_cache), 0);
+        enc.set_buffer(2, Some(v_cache), 0);
+        enc.set_buffer(3, Some(o), 0);
+        enc.set_buffer(4, Some(block_tables), 0);
+        enc.set_buffer(5, Some(context_lens), 0);
+        enc.set_bytes(
+            6,
+            std::mem::size_of::<P>() as u64,
+            &p as *const _ as *const c_void as *const _,
+        );
+
+        // One TG per (head, sequence). TG = 32 simdgroups × 32 threads
+        // (matches the contiguous-KV decode kernel's geometry).
+        let grid = MTLSize::new(1, params.num_heads as u64, params.num_seqs as u64);
+        let tg = MTLSize::new(32, 32, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+}
+
+/// Caller-side parameters for [`MetalPipelines::paged_decode_attention_on_encoder`].
+///
+/// Layout / stride conventions match the comments on the dispatch
+/// helper. `kv_block_stride` and `kv_head_stride` are computed inside
+/// the dispatch so callers don't have to.
+#[derive(Clone, Copy, Debug)]
+pub struct PagedAttnDispatchParams {
+    pub num_seqs: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub block_size: usize,
+    pub max_num_blocks_per_seq: usize,
 }
