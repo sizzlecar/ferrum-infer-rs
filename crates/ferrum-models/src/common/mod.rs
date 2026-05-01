@@ -2,6 +2,7 @@
 
 pub mod families;
 pub mod llm;
+pub mod paged_pool;
 
 pub use families::{
     AudioBuffer, AudioTokens, EmbeddingModel, EncoderDecoderLM, EncoderState, ImageBuffer,

@@ -174,6 +174,10 @@ pub struct KvCache<B: Backend> {
     pub block_table: Option<B::Buffer>,
     /// Paged: `[1]` u32 — current context length for the kernel to read.
     pub context_lens: Option<B::Buffer>,
+    /// Paged: host-side mirror of the physical block indices owned by
+    /// this cache. Lets the model's release path return blocks to the
+    /// shared allocator without reading them back from device.
+    pub paged_block_indices: Vec<u32>,
 }
 
 /// The core abstraction over CUDA / Metal / CPU.

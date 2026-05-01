@@ -428,6 +428,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
                     block_size: 0,
                     block_table: None,
                     context_lens: None,
+                    paged_block_indices: Vec::new(),
                 })
                 .collect()
         });
