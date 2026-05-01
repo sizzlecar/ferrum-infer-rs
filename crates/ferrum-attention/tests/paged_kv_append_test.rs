@@ -15,8 +15,7 @@ use metal::{Device, MTLResourceOptions};
 use std::ffi::c_void;
 
 fn buffer_from_f32(device: &Device, data: &[f32]) -> metal::Buffer {
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     device.new_buffer_with_data(
         bytes.as_ptr() as *const c_void,
         bytes.len() as u64,
@@ -25,8 +24,7 @@ fn buffer_from_f32(device: &Device, data: &[f32]) -> metal::Buffer {
 }
 
 fn buffer_from_u32(device: &Device, data: &[u32]) -> metal::Buffer {
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     device.new_buffer_with_data(
         bytes.as_ptr() as *const c_void,
         bytes.len() as u64,
@@ -220,9 +218,7 @@ fn compare_caches(
             let slot_in_block = global_slot % c.block_size;
             let physical_block = block_table[logical_block] as usize;
             for d in 0..c.head_dim {
-                let contig_off = kvh * c.cache_capacity * c.head_dim
-                    + global_slot * c.head_dim
-                    + d;
+                let contig_off = kvh * c.cache_capacity * c.head_dim + global_slot * c.head_dim + d;
                 let paged_off = physical_block * c.kv_heads * c.block_size * c.head_dim
                     + kvh * c.block_size * c.head_dim
                     + slot_in_block * c.head_dim
@@ -275,7 +271,9 @@ fn paged_kv_append_matches_contiguous_qk_norm() {
     // block_size=16, that's logical block 0 (slots 11-15). So we only
     // need block_table[0] populated, but allocate room for more.
     let num_physical_blocks = 8;
-    let block_table: Vec<u32> = (0..4).map(|i| ((i + 3) % num_physical_blocks) as u32).collect();
+    let block_table: Vec<u32> = (0..4)
+        .map(|i| ((i + 3) % num_physical_blocks) as u32)
+        .collect();
     let (q_paged, k_paged, v_paged) = run_paged(
         &pipes,
         &c,
