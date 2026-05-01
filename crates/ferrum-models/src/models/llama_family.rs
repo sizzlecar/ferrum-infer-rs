@@ -309,12 +309,36 @@ pub struct LlamaFamilyModel<B: Backend> {
     pub scratch: LlamaFamilyScratch<B>,
 
     /// Per-sequence KV caches, one `Vec<KvCache<B>>` of length `num_layers`.
+    ///
+    /// Two layouts overlay this same map:
+    /// - **Contiguous mode** (default): each cache holds its own
+    ///   `[num_kv_heads, capacity, head_dim]` k/v buffers.
+    /// - **Paged mode** (`FERRUM_METAL_PAGED_KV=1`): k/v are unused
+    ///   placeholders; the real K/V live in [`Self::paged_pools`] and
+    ///   the cache's `block_table` + `context_lens` index into them.
     pub kv_caches: HashMap<String, Vec<KvCache<B>>>,
     /// Free pool of pre-allocated KV cache slots. Released caches return
     /// here instead of being dropped, so their device pointers stay valid
     /// across requests — critical for graph capture (pointers baked into
     /// the captured graph would otherwise dangle).
     kv_free_pool: Vec<Vec<KvCache<B>>>,
+
+    // ── Paged-KV multi-seq state (Phase 4) ─────────────────────────────
+    //
+    // Only populated when `FERRUM_METAL_PAGED_KV=1`. When set, every
+    // `kv_caches` entry becomes a "view" into the shared pool: its
+    // `k` / `v` buffers are placeholders; reads / writes go through
+    // `paged_pools[layer].k` / `.v` indexed via the cache's
+    // `block_table`. Multiple cache_ids share the same pool, with
+    // disjoint physical block sets owned by `paged_block_alloc`.
+    //
+    /// Shared K/V pools, one per layer. Sized at model load time for the
+    /// configured `MAX_RUNNING_REQUESTS × max_blocks_per_seq` blocks.
+    pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
+    /// Block allocator hands out physical block indices from the pool.
+    /// `Mutex` because the engine can call `ensure_kv` / `release_kv`
+    /// from multiple threads in concurrent serving.
+    pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
 
     // ── Graph capture state (CUDA only; harmless no-op on other backends) ──
     /// Count of eager decode steps run so far. After `GRAPH_WARMUP`, the
@@ -424,6 +448,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
+            paged_pools: None,
+            paged_block_alloc: None,
             graph_warmup: 0,
             graph_capture_failed: false,
         })
@@ -498,6 +524,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
+            paged_pools: None,
+            paged_block_alloc: None,
             graph_warmup: 0,
             graph_capture_failed: false,
         })
@@ -558,35 +586,60 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .unwrap_or(false);
         const PAGED_BLOCK_SIZE: usize = 16;
 
+        // Phase 4 shared-pool sizing. The pool sees ALL concurrent
+        // sequences; per-cache_id state just owns indices into it.
+        let max_seqs = std::env::var("FERRUM_PAGED_MAX_SEQS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16);
+        let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
+        let total_pool_blocks = max_seqs * max_blocks_per_seq;
+
+        // Lazy-allocate the shared paged pools on the FIRST paged
+        // ensure_kv call. Pools are big — for Llama-8B (8 kv_heads,
+        // head_dim=128) at 16 seqs × 256 blocks × 16 slots = 65536 KV
+        // slots: 65536 * 8 * 128 * 4 = 256 MB per layer × 32 layers
+        // = 8 GB total. Sized this large only because `max_seqs=16`
+        // is the default; lower it via env to shrink.
+        if paged && self.paged_pools.is_none() {
+            let mut pools = Vec::with_capacity(self.cfg.num_layers);
+            for _ in 0..self.cfg.num_layers {
+                let pool_floats = total_pool_blocks * nkv * PAGED_BLOCK_SIZE * hd;
+                pools.push((B::alloc(pool_floats), B::alloc(pool_floats)));
+            }
+            self.paged_pools = Some(pools);
+            self.paged_block_alloc = Some(std::sync::Mutex::new(
+                crate::common::paged_pool::BlockAllocator::new(total_pool_blocks as u32),
+            ));
+        }
+
         // Try pool first — reused buffers have stable device pointers,
         // so a captured decode graph can be replayed for this request too.
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
             (0..self.cfg.num_layers)
                 .map(|_| {
                     if paged {
-                        let num_blocks = max.div_ceil(PAGED_BLOCK_SIZE);
-                        // Pool: [num_blocks, nkv, block_size, hd] f32.
-                        let pool_floats = num_blocks * nkv * PAGED_BLOCK_SIZE * hd;
-                        // Identity block table: logical i → physical i.
-                        let block_table_init: Vec<u32> = (0..num_blocks as u32).collect();
-                        let mut block_table = B::alloc_u32(num_blocks);
-                        let mut bt_ctx = B::new_context();
-                        B::write_u32(&mut bt_ctx, &mut block_table, &block_table_init);
-                        // context_lens starts at [0]; updated each
-                        // forward via write_u32.
+                        // Paged mode: cache holds metadata only. K/V
+                        // are 1-element placeholders (allocated cheaply
+                        // since Backend::alloc requires a non-zero
+                        // size on most backends). The real data lives
+                        // in `self.paged_pools[li].{k,v}`.
+                        let mut block_table = B::alloc_u32(max_blocks_per_seq);
                         let mut context_lens = B::alloc_u32(1);
+                        let mut bt_ctx = B::new_context();
                         B::write_u32(&mut bt_ctx, &mut context_lens, &[0u32]);
                         B::sync(&mut bt_ctx);
                         KvCache {
-                            k: B::alloc(pool_floats),
-                            v: B::alloc(pool_floats),
+                            k: B::alloc(1),
+                            v: B::alloc(1),
                             len: 0,
-                            capacity: num_blocks * PAGED_BLOCK_SIZE,
+                            capacity: max_blocks_per_seq * PAGED_BLOCK_SIZE,
                             num_kv_heads: nkv,
                             head_dim: hd,
                             block_size: PAGED_BLOCK_SIZE,
                             block_table: Some(block_table),
                             context_lens: Some(context_lens),
+                            paged_block_indices: Vec::new(),
                         }
                     } else {
                         KvCache {
@@ -599,17 +652,52 @@ impl<B: Backend> LlamaFamilyModel<B> {
                             block_size: 0,
                             block_table: None,
                             context_lens: None,
+                            paged_block_indices: Vec::new(),
                         }
                     }
                 })
                 .collect()
         });
+
+        // Allocate physical blocks for THIS cache_id from the shared
+        // pool. We allocate all `max_blocks_per_seq` upfront for
+        // simplicity (matches contig's "pre-alloc to capacity"
+        // semantics); a smarter Phase 4b can grow on demand to save
+        // pool occupancy.
+        if paged {
+            let alloc_arc = self
+                .paged_block_alloc
+                .as_ref()
+                .expect("paged_block_alloc must be initialised when paged=true");
+            let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
+            let block_indices = alloc.allocate_n(max_blocks_per_seq).unwrap_or_else(|e| {
+                panic!(
+                    "paged KV pool exhausted on ensure_kv for cache_id={cache_id:?}: {e}. \
+                     Increase FERRUM_PAGED_MAX_SEQS (currently {max_seqs}) or release \
+                     other cache_ids first.",
+                )
+            });
+            // Write the block table to each layer's cache. All layers
+            // share the same logical→physical mapping for this seq.
+            // Also stash the host-side index list so release_kv can
+            // return them to the allocator without a device readback.
+            let mut padded = block_indices.clone();
+            padded.resize(max_blocks_per_seq, 0);
+            let mut ctx_tmp = B::new_context();
+            for c in caches.iter_mut() {
+                if let Some(bt) = c.block_table.as_mut() {
+                    B::write_u32(&mut ctx_tmp, bt, &padded);
+                }
+                c.paged_block_indices = block_indices.clone();
+            }
+            B::sync(&mut ctx_tmp);
+        }
+
         // Reset logical length; buffers stay. No need to zero the memory —
         // the kv_cache_append writes new K/V in place, and attention only
         // reads up to `cache_len`.
         for c in caches.iter_mut() {
             c.len = 0;
-            // Paged: reset the per-cache context_lens to 0 (live buffer).
             if let Some(cl) = c.context_lens.as_mut() {
                 let mut ctx_tmp = B::new_context();
                 B::write_u32(&mut ctx_tmp, cl, &[0u32]);
@@ -710,6 +798,21 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
         // Grab the per-layer KV cache up front so the deepest fusion can
         // write K/V straight into it.
+        //
+        // Paged mode: also need this layer's shared pool buffers
+        // (self.paged_pools[li]). The pool is a separate field from
+        // kv_caches, so we take a raw pointer to its (k, v) here while
+        // we still hold &mut self, then deref via unsafe inside the
+        // paged dispatch below. Safety: paged_pools is allocated once
+        // and never resized; we don't touch self.paged_pools while the
+        // pointer is in use.
+        let paged_pool_ptr: Option<(*mut B::Buffer, *mut B::Buffer)> =
+            if let Some(pools) = self.paged_pools.as_mut() {
+                let pool = &mut pools[li];
+                Some((&mut pool.0 as *mut _, &mut pool.1 as *mut _))
+            } else {
+                None
+            };
         let caches = self
             .kv_caches
             .get_mut(cache_id)
@@ -746,6 +849,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .as_ref()
                 .expect("paged cache missing block_table");
             let num_blocks_per_seq = cache.capacity / cache.block_size;
+            // Paged mode: K/V live in the shared pool, not cache.k/.v.
+            let (pool_k_ptr, pool_v_ptr) =
+                paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
+            // SAFETY: paged_pools is allocated once and never resized;
+            // we do not touch self.paged_pools concurrently.
+            let pool_k = unsafe { &mut *pool_k_ptr };
+            let pool_v = unsafe { &mut *pool_v_ptr };
             B::split_qkv_norm_rope_into_paged_cache(
                 ctx,
                 &self.scratch.qkv_out,
@@ -754,8 +864,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 &self.rope.cos,
                 &self.rope.sin,
                 &mut self.scratch.q_head_major,
-                &mut cache.k,
-                &mut cache.v,
+                pool_k,
+                pool_v,
                 bt,
                 tokens,
                 nh,
@@ -916,23 +1026,29 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .as_mut()
                 .expect("paged cache missing context_lens");
             let num_blocks_per_seq = cache.capacity / cache.block_size;
+            // Paged mode: K/V come from the shared pool.
+            let (pool_k_ptr, pool_v_ptr) =
+                paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
+            // SAFETY: same as the write-side above; pool buffers are
+            // allocated-once and never moved while we hold the pointer.
+            let pool_k = unsafe { &*pool_k_ptr };
+            let pool_v = unsafe { &*pool_v_ptr };
             // Single dispatch handles both decode (q_len=1) and causal
             // prefill (q_len>1). The kernel computes per-token causal
             // limit as `context_lens[seq] - (q_len - 1 - q_token_idx)`,
             // so we set context_lens to the FINAL kv_len after this
-            // batch's writes (= cache_len_before + tokens, which is
-            // the new `cache.len` value already updated above).
+            // batch's writes.
             let final_kv_len = cache.len as u32;
             B::write_u32(ctx, cl_buf, &[final_kv_len]);
             B::paged_decode_attention(
                 ctx,
                 &self.scratch.q_head_major,
-                &cache.k,
-                &cache.v,
+                pool_k,
+                pool_v,
                 &mut self.scratch.attn_head_major_out,
                 bt,
                 cl_buf,
-                1, // num_seqs
+                1, // num_seqs (single-seq dispatch; multi-seq is fan-in via forward_layer_batched, Phase 4b)
                 nh,
                 nkv,
                 hd,
@@ -1761,6 +1877,19 @@ impl<B: Backend> LlamaFamilyModel<B> {
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
 
+        // Phase 4a: paged mode falls back to per-item decode_internal
+        // for multi-batch. Phase 4b will add a true batched-paged
+        // dispatch (num_seqs > 1 in one paged_decode_attention call).
+        // The shared pool storage already works correctly under
+        // serialized per-item calls — they just don't share the
+        // GEMM batching benefit yet.
+        if self.paged_pools.is_some() {
+            return batch
+                .iter()
+                .map(|(cid, tok, pos)| self.decode_internal(cid, *tok, *pos))
+                .collect();
+        }
+
         // Ensure all caches exist and scratch is sized for M tokens.
         for (cid, _, _) in batch {
             self.ensure_kv(cid);
@@ -2074,7 +2203,21 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
 
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
-        if let Some(caches) = self.kv_caches.remove(WARMUP_CACHE) {
+        // Release via the same path as `release` so paged blocks
+        // return to the shared allocator. Otherwise warmup leaks
+        // 256 blocks (the full per-seq quota) into the pool.
+        if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
+            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
+                let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
+                if let Some(c0) = caches.first() {
+                    if !c0.paged_block_indices.is_empty() {
+                        alloc.free(&c0.paged_block_indices);
+                    }
+                }
+                for c in caches.iter_mut() {
+                    c.paged_block_indices.clear();
+                }
+            }
             self.kv_free_pool.push(caches);
         }
     }
@@ -2137,7 +2280,25 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
 
         // Return the cache's buffers to the free pool instead of dropping.
         // Pointers stay stable for the next request's captured graph.
-        if let Some(caches) = self.kv_caches.remove(cache_id) {
+        // Paged mode: also free the cache's blocks back to the shared
+        // allocator so other sequences can reuse them.
+        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
+            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
+                let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
+                // All caches share the same block_indices set (one per
+                // cache_id), so freeing once via the first layer's cache
+                // is enough.
+                if let Some(c0) = caches.first() {
+                    if !c0.paged_block_indices.is_empty() {
+                        alloc.free(&c0.paged_block_indices);
+                    }
+                }
+                // Clear the host-side mirror on every layer so a
+                // free-pool reuse re-allocates fresh blocks.
+                for c in caches.iter_mut() {
+                    c.paged_block_indices.clear();
+                }
+            }
             self.kv_free_pool.push(caches);
         }
     }
