@@ -724,14 +724,30 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .paged_block_alloc
                 .as_ref()
                 .expect("paged_block_alloc must be initialised when paged=true");
-            let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
-            let block_indices = alloc.allocate_n(max_blocks_per_seq).unwrap_or_else(|e| {
-                panic!(
-                    "paged KV pool exhausted on ensure_kv for cache_id={cache_id:?}: {e}. \
-                     Increase FERRUM_PAGED_MAX_SEQS (currently {max_seqs}) or release \
-                     other cache_ids first.",
-                )
-            });
+            // Recover from a previously-poisoned mutex instead of panicking
+            // (poison just means a prior holder panicked; the BlockAllocator
+            // state is still intact since allocate_n is fail-safe).
+            let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let block_indices = match alloc.allocate_n(max_blocks_per_seq) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    // Pool exhaustion is a back-pressure signal, not a crash.
+                    // Drop the lock, return the cache to the free pool, and
+                    // bail before inserting it into kv_caches. The downstream
+                    // call will then fail with a clean per-request error
+                    // ("ensure_kv must be called before ...") instead of
+                    // dragging every other in-flight request down with it.
+                    drop(alloc);
+                    self.kv_free_pool.push(caches);
+                    eprintln!(
+                        "[ferrum] paged KV pool exhausted on ensure_kv for \
+                         cache_id={cache_id:?}: {e}. Increase \
+                         FERRUM_PAGED_MAX_SEQS (currently {max_seqs}) or \
+                         throttle concurrent requests.",
+                    );
+                    return;
+                }
+            };
             // Write the block table to each layer's cache. All layers
             // share the same logical→physical mapping for this seq.
             // Also stash the host-side index list so release_kv can
@@ -2449,7 +2465,7 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         // 256 blocks (the full per-seq quota) into the pool.
         if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(c0) = caches.first() {
                     if !c0.paged_block_indices.is_empty() {
                         alloc.free(&c0.paged_block_indices);
@@ -2525,7 +2541,7 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         // allocator so other sequences can reuse them.
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
                 // All caches share the same block_indices set (one per
                 // cache_id), so freeing once via the first layer's cache
                 // is enough.
