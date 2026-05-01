@@ -705,6 +705,83 @@ pub fn dispatch_gemv_moe_id(
     }
 }
 
+/// Offset-aware variant of [`dispatch_gemv_moe_id`].
+///
+/// `a_byte_offset` lets the activation pointer skip into a stacked
+/// `[M, K]` buffer at row `i*K`; `ids_byte_offset` skips into a stacked
+/// `[M, top_k]` selected-experts buffer at the i-th token's block.
+///
+/// Eliminates the `copy_slice` round-trips in the per-item batched
+/// decode path on Qwen3-MoE — saves 2 dispatches per (item × layer)
+/// at no GPU compute cost (Metal's `set_buffer(buf, offset)` is free).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_gemv_moe_id_offset(
+    enc: &metal::ComputeCommandEncoderRef,
+    a: &metal::Buffer,
+    a_byte_offset: u64,
+    weights: &MetalQuantStore,
+    ids: &metal::Buffer,
+    ids_byte_offset: u64,
+    out: &metal::Buffer,
+    n_selected: usize,
+    src1_stride: usize,
+) -> Result<()> {
+    match weights {
+        MetalQuantStore::Q4KExperts {
+            blocks,
+            byte_offset,
+            n_rows,
+            n_cols,
+            ..
+        } => {
+            crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
+                &st().pipes.device,
+                enc,
+                a,
+                a_byte_offset,
+                blocks,
+                *byte_offset,
+                ids,
+                ids_byte_offset,
+                out,
+                *n_rows,
+                *n_cols,
+                n_selected,
+                src1_stride,
+            );
+            Ok(())
+        }
+        MetalQuantStore::Q6KExperts {
+            blocks,
+            byte_offset,
+            n_rows,
+            n_cols,
+            ..
+        } => {
+            crate::q6_k_moe_id_gemv::dispatch_gemv_q6k_moe_id_offset_on_encoder(
+                &st().pipes.device,
+                enc,
+                a,
+                a_byte_offset,
+                blocks,
+                *byte_offset,
+                ids,
+                ids_byte_offset,
+                out,
+                *n_rows,
+                *n_cols,
+                n_selected,
+                src1_stride,
+            );
+            Ok(())
+        }
+        _ => Err(FerrumError::model(
+            "dispatch_gemv_moe_id_offset: weights must be Q4KExperts or Q6KExperts variant"
+                .to_string(),
+        )),
+    }
+}
+
 // SAFETY: metal::Buffer wraps an Objective-C handle. metal-rs marks it
 // Send+Sync via internal unsafe impls; we just propagate that.
 unsafe impl Send for MetalQuantStore {}
@@ -982,6 +1059,38 @@ impl Backend for MetalBackend {
             a_buf,
             weight,
             ids_buf,
+            out_buf,
+            n_selected,
+            src1_stride,
+        )
+    }
+
+    fn gemv_quant_moe_id_offset(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        a_offset: usize,
+        weight: &Self::QuantStore,
+        ids: &Self::Buffer,
+        ids_offset: usize,
+        out: &mut Self::Buffer,
+        n_selected: usize,
+        src1_stride: usize,
+    ) -> Result<()> {
+        let a_buf = a.expect_f32("gemv_quant_moe_id_offset a");
+        let ids_buf = &ids.raw;
+        let out_buf = out.expect_f32_mut("gemv_quant_moe_id_offset out");
+        let enc = ctx.compute_encoder();
+        // a_offset is in floats (a is f32), ids_offset in i32s (ids is i32).
+        // Both kernels read with 4-byte stride, so byte offset = elem * 4.
+        let a_byte_offset = (a_offset * std::mem::size_of::<f32>()) as u64;
+        let ids_byte_offset = (ids_offset * std::mem::size_of::<i32>()) as u64;
+        dispatch_gemv_moe_id_offset(
+            enc,
+            a_buf,
+            a_byte_offset,
+            weight,
+            ids_buf,
+            ids_byte_offset,
             out_buf,
             n_selected,
             src1_stride,
@@ -1324,6 +1433,40 @@ impl Backend for MetalBackend {
             slots_buf,
             weights_buf,
             out_buf,
+            batch,
+            top_k,
+            hidden,
+        );
+        Ok(())
+    }
+
+    fn weighted_sum_batched_offset(
+        ctx: &mut Self::Context,
+        slots: &Self::Buffer,
+        weights: &Self::Buffer,
+        weights_offset: usize,
+        out: &mut Self::Buffer,
+        out_offset: usize,
+        batch: usize,
+        top_k: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        let slots_buf = slots.expect_f32("weighted_sum_batched_offset slots");
+        let weights_buf = weights.expect_f32("weighted_sum_batched_offset weights");
+        let out_buf = out.expect_f32_mut("weighted_sum_batched_offset out");
+        let enc = ctx.compute_encoder();
+        // weights/out are f32; multiply by 4 for byte offset.
+        let weights_byte_offset = (weights_offset * std::mem::size_of::<f32>()) as u64;
+        let out_byte_offset = (out_offset * std::mem::size_of::<f32>()) as u64;
+        crate::moe_post_ops_batched::dispatch_weighted_sum_batched_offset(
+            &st().pipes.device,
+            enc,
+            slots_buf,
+            0,
+            weights_buf,
+            weights_byte_offset,
+            out_buf,
+            out_byte_offset,
             batch,
             top_k,
             hidden,
