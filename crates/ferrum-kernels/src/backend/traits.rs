@@ -605,6 +605,41 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Offset-aware variant of [`Self::weighted_sum_batched`] —
+    /// `weights` reads from `weights_offset` (in elements, points at
+    /// the start of `[batch, top_k]`), `out` writes from `out_offset`
+    /// (in elements, points at start of `[batch, hidden]`). Used by
+    /// the per-item batched-decode path to skip `copy_slice` round-trips.
+    /// Default falls back to the non-offset variant via two copies.
+    #[allow(clippy::too_many_arguments)]
+    fn weighted_sum_batched_offset(
+        ctx: &mut Self::Context,
+        slots: &Self::Buffer,
+        weights: &Self::Buffer,
+        weights_offset: usize,
+        out: &mut Self::Buffer,
+        out_offset: usize,
+        batch: usize,
+        top_k: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        // Default: stage through scratch — backends override for zero-copy.
+        let _ = (
+            ctx,
+            slots,
+            weights,
+            weights_offset,
+            out,
+            out_offset,
+            batch,
+            top_k,
+            hidden,
+        );
+        Err(FerrumError::unsupported(
+            "weighted_sum_batched_offset not implemented for this backend",
+        ))
+    }
+
     /// MoE indirect-dispatch GEMV: `out[i, :] = a[i, :] @ dequant(weight[ids[i], :])^T`
     /// for each `i ∈ [0, n_selected)`. Single backend dispatch covers
     /// all selected (token, expert) pairs.
@@ -628,6 +663,44 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "gemv_quant_moe_id not implemented for this backend",
+        ))
+    }
+
+    /// Offset-aware variant of [`Self::gemv_quant_moe_id`] — reads `a`
+    /// from `a_offset` (in elements; meaningful only when src1_stride=0
+    /// for the broadcast case, or as the start of an `n_selected × K`
+    /// strided read when src1_stride≥K), reads `ids` from `ids_offset`
+    /// (the i-th `top_k` block in a stacked-batch `[M, top_k]` ids
+    /// buffer), and writes `out` from offset 0 (output stays per-iter
+    /// scratch). Used by the per-item batched-decode path so the M=N
+    /// concurrent decodes can read directly from the M-batch
+    /// `selected_ids_buf` / `norm_out` without materialising
+    /// per-iteration copies.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_quant_moe_id_offset(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        a_offset: usize,
+        weight: &Self::QuantStore,
+        ids: &Self::Buffer,
+        ids_offset: usize,
+        out: &mut Self::Buffer,
+        n_selected: usize,
+        src1_stride: usize,
+    ) -> Result<()> {
+        let _ = (
+            ctx,
+            a,
+            a_offset,
+            weight,
+            ids,
+            ids_offset,
+            out,
+            n_selected,
+            src1_stride,
+        );
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id_offset not implemented for this backend",
         ))
     }
 
