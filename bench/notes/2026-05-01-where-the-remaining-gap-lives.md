@@ -38,15 +38,29 @@ The structural pattern: **easy wins came from kernels that were measurably under
 
 ## What's left, ranked by leverage
 
-### A. Per-kernel GPU time measurement via Xcode Instruments / Metal Frame Capture
+### A. Per-kernel GPU time measurement via xctrace / Metal Frame Capture
 
-**Why**: All the analysis above is wall-time + sync-inflated profiling, which conflates kernel time, encoder switching, and barrier latency. We've been guessing at where the 8B gap lives.
+**Status**: xctrace works from CLI (`xctrace record --template "Metal System Trace" --launch -- <command>`). I tested this — the output trace exports cleanly via `xctrace export --xpath '...'`. So this is doable from this CLI session, contrary to my earlier (wrong) claim.
 
-**Concrete output**: a per-kernel breakdown showing GPU-active microseconds for each dispatch, ferrum vs mistral.rs running the same prompt. Single token's worth — 30 ms × ~360 dispatches = should produce a clear "kernel X is 2× slower" or "we have a 3 ms gap nobody is in".
+**What I tried**: recorded a Metal System Trace of a tg32 ferrum decode on Qwen3-8B and parsed the result.
 
-**Cost**: ~1 day of an experienced engineer with Xcode Instruments. Can't be done from this CLI session — Instruments is GUI-driven.
+**What I found from the trace**:
+- ferrum runs **3 sticky compute encoders per decode token** — NOT 64 as I'd estimated from the flash_attn close/reopen pattern. Metal must be coalescing them or my mental model of `compute_encoder_end()` was wrong.
+- **Total host encoding time per token: ~30 µs** (sum of 3 encoders' encoding durations)
+- **GPU work per token: ~31 ms** (Frame N → Frame N+1 gap, steady-state)
+- **Encoding is 0.1% of total token time** — confirming ferrum is GPU-bound, not dispatch-bound.
 
-**Confidence**: 90% this gives actionable data. The remaining gap is below the threshold of analytical inference.
+**What this rules out**: per-call dispatch / FFI overhead is below the noise floor. Whatever is making us 5-15% slower than mistral.rs on Qwen3-8B is in **GPU kernel execution time itself**, not in encoder boundaries / Rust-to-ObjC bridging.
+
+**To get per-kernel GPU time**: the default `Metal System Trace` template ships with `Shader Timeline: Disabled`, so `metal-shader-profiler-intervals` exports as empty. Need to either:
+- Edit the binary plist template to flip `Shader Timeline: Enabled`, then `xctrace record --template <custom.tracetemplate>`
+- Or open the recorded `.trace` in Instruments GUI to dig into shader-level times.
+
+**Confirming experiment** (commits not retained, just data): tried removing the `compute_encoder_end()` around flash_attn so the sticky encoder spans flash_attn dispatches too. Result: tg128 marginal / null (30B-A3B regressed 3%, 8B nudged ~1% within noise). Confirms encoder-boundary cost is already small enough that consolidating doesn't help — and closing them between flash_attn calls actually gives M1 GPU a useful synchronization point.
+
+**Estimated cost to crack the per-kernel gap**: ~1 day of work to wire up custom template + write a parser that diffs ferrum vs mistral.rs per-kernel intervals. Can be done from CLI now that we know the pattern.
+
+**Confidence**: 90% this gives actionable data once Shader Timeline is enabled.
 
 ### B. f16 activations end-to-end on dense
 
