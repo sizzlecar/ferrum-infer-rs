@@ -15,6 +15,7 @@ use ferrum_models::HfDownloader;
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -51,11 +52,28 @@ pub struct BenchCommand {
 
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     // GGUF short-circuit: skip alias resolution + HF cache lookup when the
-    // model arg is already a `.gguf` path. The engine's executor factory
+    // model arg is already a `.gguf` path OR a registered GGUF alias
+    // (e.g. `qwen3:8b-q4_k_m`). The engine's executor factory
     // (registry.rs) detects `.gguf` and routes to GgufLoader. Tokenizer is
     // auto-discovered next to the gguf file.
-    let (model_id, source) = if super::run::looks_like_gguf_path(&cmd.model) {
-        let gguf_path = std::path::PathBuf::from(&cmd.model);
+    let cache_dir_for_gguf = super::run::get_hf_cache_dir(&config);
+    let resolved_gguf_path: Option<PathBuf> = if super::run::looks_like_gguf_path(&cmd.model) {
+        Some(PathBuf::from(&cmd.model))
+    } else if let Some((repo, filename)) = super::run::resolve_gguf_alias(&cmd.model) {
+        match super::run::find_cached_gguf(&cache_dir_for_gguf, &repo, &filename) {
+            Some(p) => Some(p),
+            None => {
+                eprintln!(
+                    "GGUF alias '{}' not in cache. Run: ferrum pull {}",
+                    cmd.model, cmd.model
+                );
+                return Err(ferrum_types::FerrumError::model("GGUF model not found"));
+            }
+        }
+    } else {
+        None
+    };
+    let (model_id, source) = if let Some(gguf_path) = resolved_gguf_path {
         let id = gguf_path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())

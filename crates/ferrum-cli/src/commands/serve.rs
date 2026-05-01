@@ -70,13 +70,29 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         .or(config.models.default_model.clone())
         .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
 
-    // GGUF short-circuit: if the user passed a `.gguf` file path directly,
-    // skip alias / HF cache resolution and ConfigManager::load_from_path
-    // (which expects an HF safetensors directory layout). The engine's
-    // CandleExecutorFactory + HuggingFaceTokenizerFactory both detect
-    // `.gguf` and route to GgufLoader + sibling-tokenizer auto-discovery.
+    // GGUF short-circuit: if the user passed a `.gguf` file path directly OR
+    // an alias resolving to a GGUF (e.g. `qwen3:8b-q4_k_m`), look up the
+    // file in the HF cache (or accept the path) and skip
+    // `ConfigManager::load_from_path` (which expects an HF safetensors
+    // directory). The engine's CandleExecutorFactory +
+    // HuggingFaceTokenizerFactory both detect `.gguf` and route to
+    // GgufLoader + sibling-tokenizer auto-discovery.
+    let cache_dir_for_gguf = get_hf_cache_dir(&config);
     let gguf_path: Option<PathBuf> = if super::run::looks_like_gguf_path(&model_name) {
         Some(PathBuf::from(&model_name))
+    } else if let Some((repo, filename)) = super::run::resolve_gguf_alias(&model_name) {
+        match super::run::find_cached_gguf(&cache_dir_for_gguf, &repo, &filename) {
+            Some(p) => Some(p),
+            None => {
+                eprintln!(
+                    "{} GGUF alias '{}' not in cache. Run: ferrum pull {}",
+                    "Error:".red().bold(),
+                    model_name,
+                    model_name
+                );
+                return Err(ferrum_types::FerrumError::model("GGUF model not found"));
+            }
+        }
     } else {
         None
     };
