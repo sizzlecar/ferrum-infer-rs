@@ -955,15 +955,21 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ///
     /// Default returns Unsupported. Backends that lack a paged kernel
     /// keep using the contiguous variant.
+    /// `qkv_byte_offset` / `q_out_byte_offset` let the caller pass a
+    /// slice of a larger batched buffer (used by the multi-seq paged
+    /// path in `decode_batch_internal`). For single-seq dispatch they
+    /// should be 0.
     #[allow(clippy::too_many_arguments)]
     fn split_qkv_norm_rope_into_paged_cache(
         _ctx: &mut Self::Context,
         _qkv: &Self::Buffer,
+        _qkv_byte_offset: u64,
         _q_norm_w: &Self::Buffer,
         _k_norm_w: &Self::Buffer,
         _cos: &Self::Buffer,
         _sin: &Self::Buffer,
         _q_out: &mut Self::Buffer,
+        _q_out_byte_offset: u64,
         _cache_k: &mut Self::Buffer,
         _cache_v: &mut Self::Buffer,
         _block_table: &Self::Buffer,
