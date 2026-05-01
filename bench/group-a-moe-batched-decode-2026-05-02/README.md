@@ -145,3 +145,95 @@ directory.
 > efficiency**. It's in the attention pipeline at small batch and the
 > bookkeeping the engine does between layers. The Tier 2 work is now
 > "batched attention plumbing", not more MoE FFN fusion.
+
+## 2026-05-02 follow-up — profile-driven debugging
+
+Added per-stage instrumentation to `decode_batch_internal` and
+`forward_layer_batched_decode` (gated by `FERRUM_DECODE_OP_PROFILE=1`).
+The profile output:
+
+```
+[batched-decode-prof] m=16 layers=48 total=377 ms
+   dense=53 (14.1%) | attn_peritem=55 (14.7%) | moe=263 (69.8%) | other=4
+```
+
+**Surprised the hypothesis.** Attention plumbing was only 14.7% — not
+the bottleneck. The cliff was in the MoE FFN block (70%), even though
+that's where the new GEMV kernel was supposed to win.
+
+Two follow-on PRs landed in this dir:
+
+1. **Batched fused gate+up+silu kernel**
+   (`q4_k_moe_id_gate_up_silu_batched.{metal,rs}` + Backend trait fn).
+   Hybrid of df64ac1 (fused m=1) and the batched-pair Z-axis layout —
+   one Metal dispatch covers all m*top_k pairs and writes
+   `silu_stacked` directly. Bitwise-correct (parity test).
+
+2. **Threshold decoupling.** Discovered that
+   `FERRUM_MOE_BATCH_THRESHOLD` was triple-purposed: engine-level
+   batched gate, legacy prefill-GEMM gate, AND inadvertently used by
+   the new batched-decode tier. Setting it low to engage batched
+   actually pushed m=16 onto the prefill GEMM path — the new kernel
+   never fired. Split it into `FERRUM_MOE_BATCH_THRESHOLD` (legacy,
+   default 8) + `FERRUM_MOE_PREFILL_THRESHOLD` (new, default 32 to
+   match llama.cpp's `ne21_mm_id_min`).
+
+After both fixes, the c=16 profile becomes:
+
+```
+[batched-decode-prof] m=16 layers=48 total=270 ms
+   dense=54 (20.0%) | attn_peritem=55 (20.5%) | moe=156 (57.7%)
+   [route=27 gate=0 up=0 silu=58 down=52 wsum=9]  | other=4
+```
+
+`gate=0 up=0 silu=58` confirms the fused gate+up+silu is firing (its
+time is bucketed under `silu`). MoE block dropped from 263 ms → 156 ms
+(**-41%**). Total step time 377 → 270 ms (**-28%**).
+
+But end-to-end bench at c=16 still loses to per-token mode:
+
+| c=16 | output_tok/s | TPOT median |
+|---|--:|--:|
+| per_token (m=1 × 16, with df64ac1 fusion)  | 49.1 | 291 ms |
+| batched (NEW, all fixes)                    | 35.9 | 411 ms |
+| batched (legacy prefill GEMM at m=16)       | 31.2 | ≈479 ms |
+| llama.cpp (reference)                       | 95.4 | — |
+
+The new batched path is **+15% over the legacy prefill GEMM** at c=16,
+but **-27% under per-token mode**. The 141 ms gap between the
+profile's 270 ms `decode_batch_internal` time and the user-perceived
+411 ms TPOT is unaccounted-for **CPU-GPU pipelining**:
+
+- `decode_batch_internal` is monolithic — all 16 users' tokens come
+  out in one synchronous call, then the engine sequentially samples
+  16 outputs, builds 16 SSE events, manages 16 sequence state
+  updates. ≈141 ms of serial CPU work per round.
+- Per-token mode overlaps this CPU work with the next forward's GPU
+  dispatch. CPU and GPU are pipelined; the user sees only the slower
+  of the two.
+
+**Conclusion (confirmed null on the MoE FFN front):** the c=16 30B-A3B
+gap to llama.cpp is **not** in MoE FFN GPU time. With my new path the
+MoE block is 156 ms / 270 ms = 58% of the round, vs ~13 ms × 48 layers
+≈ 624 ms of MoE work spread across 16 sequential per-token forwards
+that totals ~280 ms wall time (including ~50 ms of CPU-GPU overlap
+benefit). My new path is faster on the GPU side; per-token mode wins
+on aggregate because it pipelines.
+
+The remaining gap to llama.cpp (~95 vs ~49 tok/s) lives in two places:
+1. CPU-GPU pipelining (so per-token wins for now)
+2. Per-kernel GPU time (Tier 2 in the perf-status doc — and the
+   measurable target for the next PR)
+
+## Updated decision
+
+* Ship the batched fused gate+up+silu kernel + threshold decoupling +
+  profile instrumentation as **opt-in infrastructure** alongside the
+  GEMV kernel from the earlier commit.
+* The new batched path is FASTER than the legacy prefill GEMM at
+  c=16 (35.9 vs 31.2 tok/s, +15%), so ANY user who explicitly opts
+  into `FERRUM_MOE_BATCHED_DECODE=1` benefits immediately.
+* But default stays per-token because that's still fastest end-to-end
+  due to CPU-GPU pipelining. Closing that requires either a CPU-side
+  pipelining refactor or bigger per-kernel GPU savings (Tier 2
+  kernel-craft work).

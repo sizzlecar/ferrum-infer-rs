@@ -28,6 +28,8 @@ pub mod q4_k_gemv_v2;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k_moe_id_gate_up_silu;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod q4_k_moe_id_gate_up_silu_batched;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k_moe_id_gemm;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k_moe_id_gemv;

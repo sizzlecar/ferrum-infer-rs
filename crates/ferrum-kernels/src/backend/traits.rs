@@ -852,6 +852,41 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Batched fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
+    ///
+    /// Counterpart of [`Self::gemv_quant_moe_id_gate_up_silu`] for the
+    /// batched-decode path: same in-register fusion, but the grid Z
+    /// dimension covers all `m * top_k` (token, expert) pairs in one
+    /// dispatch. Folds the three batched MoE FFN dispatches per layer
+    /// (gate gemv + up gemv + silu_mul_batched) into one — the missing
+    /// fusion that left the m≥2 batched-decode path slower than the
+    /// per-token loop (which already had this fusion at m=1).
+    ///
+    /// Both `gate_w` and `up_w` must be `Q4KExperts` stacks with
+    /// matching `(num_experts, n_rows, n_cols)`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_quant_moe_id_gate_up_silu_batched(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _gate_w: &Self::QuantStore,
+        _up_w: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _silu_out: &mut Self::Buffer,
+        _m: usize,
+        _top_k: usize,
+        _src1_outer_stride: usize,
+        _src1_inner_stride: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id_gate_up_silu_batched not implemented for this backend",
+        ))
+    }
+
+    /// Capability probe for [`Self::gemv_quant_moe_id_gate_up_silu_batched`].
+    fn supports_batched_moe_gate_up_silu() -> bool {
+        false
+    }
+
     /// Weighted sum across `n_slots` rows of `[hidden]`.
     ///
     /// Computes `out[i] = Σ_s weights[s] * slots[s, i]`. Single

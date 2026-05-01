@@ -84,6 +84,14 @@ static MOE_BATCHED_DECODE_SILU_US: AtomicU64 = AtomicU64::new(0);
 static MOE_BATCHED_DECODE_DOWN_US: AtomicU64 = AtomicU64::new(0);
 static MOE_BATCHED_DECODE_WSUM_US: AtomicU64 = AtomicU64::new(0);
 
+// Coarse stage counters for `forward_layer_batched_decode` so we can
+// see where the time goes without per-op instrumentation. Summed
+// across all layers in one decode_batch_internal call.
+static BD_DENSE_US: AtomicU64 = AtomicU64::new(0); // rms_norm + qkv_proj + split_qkv + o_proj + fused_add_rms_norm
+static BD_ATTN_PERITEM_US: AtomicU64 = AtomicU64::new(0); // the for-i in 0..m attention loop (incl. plumbing)
+static BD_MOE_US: AtomicU64 = AtomicU64::new(0); // router + MoE FFN + residual add
+static BD_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.
 pub struct Qwen3MoeLayerState<B: Backend> {
     /// Router projection `[hidden] → [num_experts]` — tiny, never sparse,
@@ -1303,6 +1311,12 @@ impl<B: Backend> Qwen3MoeModel<B> {
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
 
+        let prof_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         for (cid, _, _) in batch {
             self.ensure_kv(cid);
         }
@@ -1351,6 +1365,44 @@ impl<B: Backend> Qwen3MoeModel<B> {
         self.scratch.residual = Some(residual);
 
         let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+
+        // Profile dump (one decode_batch_internal call = one decode step
+        // covering all m tokens).
+        if let Some(t0) = prof_t0 {
+            use std::sync::atomic::Ordering;
+            let total_us = t0.elapsed().as_micros() as u64;
+            let dense = BD_DENSE_US.swap(0, Ordering::Relaxed);
+            let attn = BD_ATTN_PERITEM_US.swap(0, Ordering::Relaxed);
+            let moe = BD_MOE_US.swap(0, Ordering::Relaxed);
+            let layers = BD_LAYER_CALLS.swap(0, Ordering::Relaxed);
+            let other = total_us.saturating_sub(dense + attn + moe);
+            let pct = |us: u64| -> f64 {
+                if total_us == 0 {
+                    0.0
+                } else {
+                    100.0 * us as f64 / total_us as f64
+                }
+            };
+            // MoE sub-stage breakdown — meaningful when
+            // moe_forward_batched_decode_impl was used.
+            let moe_route = MOE_BATCHED_DECODE_ROUTE_US.swap(0, Ordering::Relaxed);
+            let moe_gate = MOE_BATCHED_DECODE_GATE_US.swap(0, Ordering::Relaxed);
+            let moe_up = MOE_BATCHED_DECODE_UP_US.swap(0, Ordering::Relaxed);
+            let moe_silu = MOE_BATCHED_DECODE_SILU_US.swap(0, Ordering::Relaxed);
+            let moe_down = MOE_BATCHED_DECODE_DOWN_US.swap(0, Ordering::Relaxed);
+            let moe_wsum = MOE_BATCHED_DECODE_WSUM_US.swap(0, Ordering::Relaxed);
+            eprintln!(
+                "[batched-decode-prof] m={} layers={} total={} ms | dense={} ({:.1}%) | attn_peritem={} ({:.1}%) | moe={} ({:.1}%) [route={} gate={} up={} silu={} down={} wsum={}] | other={} ({:.1}%)",
+                m, layers, total_us / 1000,
+                dense / 1000, pct(dense),
+                attn / 1000, pct(attn),
+                moe / 1000, pct(moe),
+                moe_route / 1000, moe_gate / 1000, moe_up / 1000,
+                moe_silu / 1000, moe_down / 1000, moe_wsum / 1000,
+                other / 1000, pct(other),
+            );
+        }
+
         (0..m)
             .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
             .collect()
@@ -1382,6 +1434,29 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let dummy_w = &attn_layer.input_ln_w;
         let q_norm_w = attn_layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = attn_layer.k_norm_w.as_ref().unwrap_or(dummy_w);
+
+        let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+        let stage_t0 = || -> Option<std::time::Instant> {
+            if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            }
+        };
+        let stage_end = |t0: Option<std::time::Instant>, ctx: &mut B::Context, c: &AtomicU64| {
+            if let Some(t) = t0 {
+                B::sync(ctx);
+                c.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        };
+        if prof {
+            BD_LAYER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let dense_t0 = stage_t0();
 
         // 1. rms_norm [M, H] → norm_out
         B::rms_norm(
@@ -1446,6 +1521,11 @@ impl<B: Backend> Qwen3MoeModel<B> {
         // SAFETY: each Option holds a stable B::Buffer; we don't mutate
         // self.scratch in a way that would invalidate them inside the loop
         // (the kv_caches mutation is on a disjoint field).
+
+        // End of dense block (rms_norm + qkv_proj + split_qkv); start
+        // per-item attention loop instrumentation.
+        stage_end(dense_t0, ctx, &BD_DENSE_US);
+        let attn_t0 = stage_t0();
 
         for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
             let pos_i = *pos as usize;
@@ -1589,6 +1669,11 @@ impl<B: Backend> Qwen3MoeModel<B> {
             );
         }
 
+        // End of per-item attention loop.
+        stage_end(attn_t0, ctx, &BD_ATTN_PERITEM_US);
+
+        let post_attn_t0 = stage_t0();
+
         // 7. o_proj GEMM at m=M: attn_flat [M, Q] → o_proj_out [M, H]
         attn_layer.o_proj.forward(
             ctx,
@@ -1608,6 +1693,10 @@ impl<B: Backend> Qwen3MoeModel<B> {
             m,
             h,
         );
+
+        // o_proj + post-norm count under DENSE.
+        stage_end(post_attn_t0, ctx, &BD_DENSE_US);
+        let moe_t0 = stage_t0();
 
         // 9. Router gemv: norm_out [M, H] → router_logits [M, n_exp]
         let moe_layer = &self.moe_layers[li];
@@ -1662,16 +1751,36 @@ impl<B: Backend> Qwen3MoeModel<B> {
         // batched attention path with offset-aware QKV slicing, which
         // is the next PR's job. Until then the kernel sits as
         // infrastructure.
-        let moe_batch_threshold: usize = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
+        // Two independent thresholds:
+        //   * `FERRUM_MOE_BATCH_THRESHOLD` (default 8) — m above which
+        //     the LEGACY non-experimental path uses the prefill GEMM.
+        //     Shared with `decode_batch`'s engine-level gate, so users
+        //     who set it to a small value to engage batched decode
+        //     don't accidentally also push the inner FFN to GEMM.
+        //   * `FERRUM_MOE_PREFILL_THRESHOLD` (default 32) — m above
+        //     which the EXPERIMENTAL batched-decode path defers to the
+        //     prefill GEMM path. Mirrors llama.cpp's `ne21_mm_id_min=32`
+        //     GEMV→GEMM boundary.
+        let legacy_prefill_threshold: usize = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);
-        let use_prefill_batched = stacked_path_available && m >= moe_batch_threshold;
-        let use_batched_decode = !use_prefill_batched
-            && stacked_path_available
-            && m >= 2
+        let new_prefill_threshold: usize = std::env::var("FERRUM_MOE_PREFILL_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+        let new_batched_enabled = stacked_path_available
             && B::supports_batched_moe_gemv()
             && std::env::var("FERRUM_MOE_BATCHED_DECODE").as_deref() == Ok("1");
+
+        // When the new path is opted in, it owns the m=2..new_prefill_threshold
+        // range; the legacy threshold is overridden upward.
+        let use_prefill_batched = if new_batched_enabled {
+            stacked_path_available && m >= new_prefill_threshold
+        } else {
+            stacked_path_available && m >= legacy_prefill_threshold
+        };
+        let use_batched_decode = new_batched_enabled && !use_prefill_batched && m >= 2;
 
         if use_prefill_batched {
             moe_forward_batched_prefill_impl::<B>(
@@ -1898,6 +2007,9 @@ impl<B: Backend> Qwen3MoeModel<B> {
 
         // 11. residual += moe_out [M, H]
         B::add_inplace(ctx, residual, &self.scratch.moe_out, m * h);
+
+        // Close MoE-block instrumentation (router + FFN + residual add).
+        stage_end(moe_t0, ctx, &BD_MOE_US);
 
         Ok(())
     }
@@ -2542,49 +2654,69 @@ fn moe_forward_batched_decode_impl<B: Backend>(
     let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
     let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
 
-    // 2. Batched gate gemv — one launch covers all m*top_k pairs.
-    //    src1 = norm_out [m, K]: outer = K, inner = 0 (slots within
-    //    a token broadcast — same activation row).
-    let t0 = stage_t0();
-    B::gemv_quant_moe_id_batched(
-        ctx,
-        &scratch.norm_out,
-        gate_stacked,
-        &scratch.selected_ids_buf,
-        &mut scratch.gate_out_stacked,
-        tokens,
-        top_k,
-        h, // outer stride: K floats per token
-        0, // inner stride: 0 (gate broadcasts within token)
-    )?;
-    stage_end(t0, ctx, &MOE_BATCHED_DECODE_GATE_US);
+    // 2+3+4. Fused gate+up+silu — single Metal dispatch covers all
+    // m*top_k pairs. Falls back to the 3-dispatch sequence on backends
+    // that don't have the fused-batched kernel.
+    if B::supports_batched_moe_gate_up_silu() {
+        let t0 = stage_t0();
+        B::gemv_quant_moe_id_gate_up_silu_batched(
+            ctx,
+            &scratch.norm_out,
+            gate_stacked,
+            up_stacked,
+            &scratch.selected_ids_buf,
+            &mut scratch.silu_stacked,
+            tokens,
+            top_k,
+            h, // outer stride: K floats per token
+            0, // inner stride: 0 (slots within a token broadcast)
+        )?;
+        // Charge the whole fused step to the SiLU bucket — keeps the
+        // profile counter additive with the unfused path's silu line.
+        stage_end(t0, ctx, &MOE_BATCHED_DECODE_SILU_US);
+    } else {
+        // 2. Batched gate gemv — one launch covers all m*top_k pairs.
+        let t0 = stage_t0();
+        B::gemv_quant_moe_id_batched(
+            ctx,
+            &scratch.norm_out,
+            gate_stacked,
+            &scratch.selected_ids_buf,
+            &mut scratch.gate_out_stacked,
+            tokens,
+            top_k,
+            h,
+            0,
+        )?;
+        stage_end(t0, ctx, &MOE_BATCHED_DECODE_GATE_US);
 
-    // 3. Batched up gemv — same shape as gate.
-    let t0 = stage_t0();
-    B::gemv_quant_moe_id_batched(
-        ctx,
-        &scratch.norm_out,
-        up_stacked,
-        &scratch.selected_ids_buf,
-        &mut scratch.up_out_stacked,
-        tokens,
-        top_k,
-        h,
-        0,
-    )?;
-    stage_end(t0, ctx, &MOE_BATCHED_DECODE_UP_US);
+        // 3. Batched up gemv.
+        let t0 = stage_t0();
+        B::gemv_quant_moe_id_batched(
+            ctx,
+            &scratch.norm_out,
+            up_stacked,
+            &scratch.selected_ids_buf,
+            &mut scratch.up_out_stacked,
+            tokens,
+            top_k,
+            h,
+            0,
+        )?;
+        stage_end(t0, ctx, &MOE_BATCHED_DECODE_UP_US);
 
-    // 4. SiLU·gate over the flat [m * top_k, ffn] layout — single dispatch.
-    let t0 = stage_t0();
-    B::silu_mul_batched(
-        ctx,
-        &scratch.gate_out_stacked,
-        &scratch.up_out_stacked,
-        &mut scratch.silu_stacked,
-        total_pairs,
-        inter,
-    )?;
-    stage_end(t0, ctx, &MOE_BATCHED_DECODE_SILU_US);
+        // 4. SiLU·gate.
+        let t0 = stage_t0();
+        B::silu_mul_batched(
+            ctx,
+            &scratch.gate_out_stacked,
+            &scratch.up_out_stacked,
+            &mut scratch.silu_stacked,
+            total_pairs,
+            inter,
+        )?;
+        stage_end(t0, ctx, &MOE_BATCHED_DECODE_SILU_US);
+    }
 
     // 5. Batched down gemv — src1 = silu_stacked [m, top_k, ffn]: each
     //    pair has its own row, outer = top_k * ffn, inner = ffn.
