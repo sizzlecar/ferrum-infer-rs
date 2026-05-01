@@ -1,0 +1,90 @@
+# ferrum bench output for Qwen3-30B-A3B-Q4_K_M.gguf
+2026年 5月 1日 星期五 08时50分36秒 CST
+
+──────── env snapshot: before ferrum @ 2026年 5月 1日 星期五 08时50分36秒 CST ────────
+## vm_stat (selected)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               52982.
+Pages active:                           1427488.
+Pages inactive:                          375411.
+Pages wired down:                        151582.
+Pages purgeable:                           1236.
+## swap
+total = 5120.00M  used = 3647.31M  free = 1472.69M  (encrypted)
+## top non-system RSS (>50 MB, excluding kernel/window/etc)
+    899 MB  claude
+    682 MB  /Applications/iTerm.app/Contents/MacOS/iTerm2
+    192 MB  /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+    141 MB  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+    115 MB  /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+    108 MB  /System/Library/CoreServices/Spotlight.app/Contents/MacOS/Spotlight
+     94 MB  /System/Library/Input
+     75 MB  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+     62 MB  /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+     58 MB  /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+## warning thresholds
+  ⚠ swap_used = 3647 MB (>1 GB) — bench numbers may be paging-affected
+
+--- pp50 trial 1 ---
+✓ model ready in 1.04s
+✓ prefill: 51 tok in 0.231s (220.4 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp50 trial 2 ---
+✓ model ready in 1.00s
+✓ prefill: 51 tok in 0.230s (221.8 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp50 trial 3 ---
+✓ model ready in 0.96s
+✓ prefill: 51 tok in 0.235s (217.3 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 1 ---
+✓ model ready in 0.98s
+✓ prefill: 513 tok in 0.792s (647.7 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 2 ---
+✓ model ready in 0.95s
+✓ prefill: 513 tok in 0.805s (637.0 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 3 ---
+✓ model ready in 0.95s
+✓ prefill: 513 tok in 0.789s (650.1 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- tg128 trial 1 ---
+✓ model ready in 0.92s
+✓ prefill: 4 tok in 0.149s (26.9 tok/s)
+throughput: 54.3 tok/s (decode only)
+--- tg128 trial 2 ---
+✓ model ready in 0.93s
+✓ prefill: 4 tok in 0.149s (26.9 tok/s)
+throughput: 53.8 tok/s (decode only)
+--- tg128 trial 3 ---
+✓ model ready in 0.92s
+✓ prefill: 4 tok in 0.150s (26.6 tok/s)
+throughput: 53.4 tok/s (decode only)
+
+──────── env snapshot: after ferrum @ 2026年 5月 1日 星期五 08时51分02秒 CST ────────
+## vm_stat (selected)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              241177.
+Pages active:                            674990.
+Pages inactive:                          386349.
+Pages wired down:                        709277.
+Pages purgeable:                            355.
+## swap
+total = 5120.00M  used = 3647.31M  free = 1472.69M  (encrypted)
+## top non-system RSS (>50 MB, excluding kernel/window/etc)
+    899 MB  claude
+    682 MB  /Applications/iTerm.app/Contents/MacOS/iTerm2
+    192 MB  /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+    141 MB  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+    115 MB  /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+    108 MB  /System/Library/CoreServices/Spotlight.app/Contents/MacOS/Spotlight
+     94 MB  /System/Library/Input
+     75 MB  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+     62 MB  /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+     58 MB  /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+## warning thresholds
+  ⚠ swap_used = 3647 MB (>1 GB) — bench numbers may be paging-affected
+
+
+## ⚠ PAGING-AFFECTED RUN: swap grew by 335 MB (baseline 3647 → 3982)

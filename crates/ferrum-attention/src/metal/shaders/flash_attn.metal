@@ -367,3 +367,174 @@ kernel void flash_attn_q_tiled_f32(
         }
     }
 }
+
+// ── SDPA vector decode (m=1, head_dim=128) — MLX-style wide threadgroup ──
+//
+// Ported from MLX's sdpa_vector kernel (the same kernel candle-metal-kernels
+// uses; mistral.rs reaches it via candle's `ops::sdpa`). The legacy
+// `flash_attn_f32` above uses 32 threads (one simdgroup) per
+// (head, query) — for Llama-3.1-8B that's 32 active threads × 32 q-heads
+// = 1024 active threads total, ~3% of M1 Max's ~32K-thread concurrent
+// capacity. KV positions are walked sequentially within that single
+// simdgroup, so most of the GPU sits idle during decode m=1.
+//
+// This kernel widens the threadgroup to 32 simdgroups × 32 threads =
+// 1024 threads, one TG per (head, batch). The 32 simdgroups process
+// distinct KV positions in parallel; each thread within a simdgroup
+// owns elem_per_thread = head_dim/32 = 4 elements of Q/K/V/O. After
+// the KV loop, simdgroups merge their partial (max, sumexp, output)
+// via threadgroup memory using the same online-softmax rescaling
+// trick the inner loop uses.
+//
+// Restrictions (caller picks legacy when violated):
+//   • q_len == 1                    (decode hot path; prefill stays Q-tiled)
+//   • head_dim == 128               (4 elements/thread × 32 threads)
+//   • sliding_window == 0           (handled later if needed)
+//   • num_heads % num_kv_heads == 0 (standard GQA)
+//
+// Threadgroup memory:
+//   outputs[BN * head_dim] = 32 * 128 * 4 = 16 KB
+//   max_scores[BN]         = 128 B
+//   sum_exp_scores[BN]     = 128 B
+//   total ≈ 16.25 KB — within Apple7's 32 KB cap.
+
+constant int SDPA_BN = 32;        // simdgroups per threadgroup
+constant int SDPA_BD = 32;        // simdgroup width (Apple GPU)
+constant int SDPA_D  = 128;       // head_dim
+constant int SDPA_EPT = SDPA_D / SDPA_BD; // = 4 elements per thread
+
+kernel void flash_attn_decode_f32(
+    device const float* Q       [[buffer(0)]],
+    device const float* K       [[buffer(1)]],
+    device const float* V       [[buffer(2)]],
+    device       float* O       [[buffer(3)]],
+    constant FlashAttnParams& p [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],   // (1, head, batch)
+    uint   sgitg [[simdgroup_index_in_threadgroup]], // 0..31 — which KV-stripe
+    uint   tiisg [[thread_index_in_simdgroup]])      // 0..31 — which D slice
+{
+    const int hi    = int(tgpig.y);
+    const int bi    = int(tgpig.z);
+    const int kv_hi = hi / (p.num_heads / p.num_kv_heads);
+    const int d     = p.head_dim;
+    const int sk    = p.kv_len;
+
+    // Causal upper bound for q_len=1: attend to positions [0, pos_offset+1)
+    // (the new token can see itself once it's been written into the cache).
+    const int attend_end = p.causal ? min(p.pos_offset + 1, sk) : sk;
+
+    // Pointers — offset to the per-thread element slice. Each thread owns
+    // SDPA_EPT contiguous elements at offset `tiisg * SDPA_EPT`.
+    const int kv_stride = (p.kv_seq_stride > 0) ? p.kv_seq_stride : sk;
+    device const float* q_row = Q + ((bi * p.num_heads    + hi   ) * p.q_len) * d
+                                  + tiisg * SDPA_EPT;
+    device const float* k_base = K + (bi * p.num_kv_heads + kv_hi) * kv_stride * d;
+    device const float* v_base = V + (bi * p.num_kv_heads + kv_hi) * kv_stride * d;
+    device       float* o_row = O + ((bi * p.num_heads    + hi   ) * p.q_len) * d;
+
+    // Per-thread Q (pre-scaled), running output, scratch K/V.
+    float q[SDPA_EPT];
+    float o_acc[SDPA_EPT];
+    float k_v[SDPA_EPT];
+    for (int i = 0; i < SDPA_EPT; ++i) {
+        q[i]     = p.scale * q_row[i];
+        o_acc[i] = 0.0f;
+    }
+
+    float max_score = -INFINITY;
+    float sum_exp   = 0.0f;
+
+    // KV loop — each simdgroup walks positions { sgitg, sgitg+BN, sgitg+2*BN, ... }.
+    for (int ki = int(sgitg); ki < attend_end; ki += SDPA_BN) {
+        device const float* k_row = k_base + ki * d + tiisg * SDPA_EPT;
+        device const float* v_row = v_base + ki * d + tiisg * SDPA_EPT;
+
+        // Read this thread's slice of K and compute per-thread partial dot.
+        float dot_acc = 0.0f;
+        for (int j = 0; j < SDPA_EPT; ++j) {
+            k_v[j]   = k_row[j];
+            dot_acc += q[j] * k_v[j];
+        }
+        // Reduce across the 32 threads of this simdgroup — `score` is the
+        // full Q·K dot product for KV position `ki`.
+        const float score = simd_sum(dot_acc);
+
+        // Online softmax update (Tri Dao). All 32 threads in this simdgroup
+        // see the same `score` after simd_sum so they update identically.
+        const float new_max = max(max_score, score);
+        const float factor  = exp(max_score - new_max);
+        const float exp_sc  = exp(score      - new_max);
+
+        max_score = new_max;
+        sum_exp   = sum_exp * factor + exp_sc;
+
+        // Read this thread's slice of V and fold into accumulator.
+        for (int j = 0; j < SDPA_EPT; ++j) {
+            o_acc[j] = o_acc[j] * factor + exp_sc * v_row[j];
+        }
+    }
+
+    // ── Cross-simdgroup combine ───────────────────────────────────────
+    // Each simdgroup has its own partial (max_score, sum_exp, o_acc) over
+    // the KV positions it walked. Merge across the 32 simdgroups using
+    // threadgroup memory + the same online-softmax rescaling trick.
+
+    threadgroup float outputs[SDPA_BN * SDPA_D];   // [BN][D]
+    threadgroup float max_scores[SDPA_BN];
+    threadgroup float sum_exp_scores[SDPA_BN];
+
+    // Stash this simdgroup's partial output (one row of D floats per SG).
+    threadgroup float* my_row = outputs + sgitg * SDPA_D + tiisg * SDPA_EPT;
+    for (int j = 0; j < SDPA_EPT; ++j) {
+        my_row[j] = o_acc[j];
+    }
+    // The leader of each simdgroup publishes its scalar (max, sum_exp).
+    if (tiisg == 0) {
+        max_scores[sgitg]     = max_score;
+        sum_exp_scores[sgitg] = sum_exp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce the 32 (max_score, sum_exp) pairs to a single (M*, S*) using
+    // online softmax. Simdgroup 0 does the reduction across all 32 lanes
+    // by reading lane `tiisg` from threadgroup memory.
+    if (sgitg == 0) {
+        const float local_max = max_scores[tiisg];
+        const float global_max = simd_max(local_max);
+        const float local_factor = exp(local_max - global_max);
+        const float local_sum_scaled = sum_exp_scores[tiisg] * local_factor;
+        const float global_sum = simd_sum(local_sum_scaled);
+
+        // Store the per-simdgroup rescale factor and the broadcast totals.
+        max_scores[tiisg]     = local_factor;          // reused as factor
+        sum_exp_scores[tiisg] = global_sum;            // every lane reads the same
+        if (tiisg == 0) {
+            // Sentinel slot to keep things simple: stash global_max in [0]
+            // — no consumer reads it currently (we only need factor + sum)
+            // but it's useful for debug. (no-op write, kept as comment)
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Final write. Each thread owns SDPA_EPT output positions across D.
+    // For each of those positions we need to combine the 32 simdgroup
+    // partials. The element is at column `tiisg * SDPA_EPT + j` in the
+    // [BN][D] outputs grid; thread `tiisg` of simdgroup `sgitg` walks the
+    // 32 simdgroups.
+    //
+    // But we want exactly ONE thread to write each output element. Use
+    // simdgroup 0 to do the writes — its 32 threads cover all D output
+    // slots since SDPA_BD * SDPA_EPT = 128 = D.
+    if (sgitg == 0) {
+        const float inv_S = (sum_exp_scores[0] > 0.0f) ? (1.0f / sum_exp_scores[0]) : 0.0f;
+
+        for (int j = 0; j < SDPA_EPT; ++j) {
+            const int col = tiisg * SDPA_EPT + j;   // 0..127
+            float total = 0.0f;
+            for (int s = 0; s < SDPA_BN; ++s) {
+                total += outputs[s * SDPA_D + col] * max_scores[s];
+            }
+            o_row[col] = total * inv_S;
+        }
+    }
+}

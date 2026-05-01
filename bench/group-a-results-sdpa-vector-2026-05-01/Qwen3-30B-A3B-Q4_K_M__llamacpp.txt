@@ -1,0 +1,80 @@
+# llama-bench output for Qwen3-30B-A3B-Q4_K_M.gguf
+2026年 5月 1日 星期五 08时50分12秒 CST
+
+──────── env snapshot: before llama.cpp @ 2026年 5月 1日 星期五 08时50分12秒 CST ────────
+## vm_stat (selected)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              598969.
+Pages active:                            493873.
+Pages inactive:                          766935.
+Pages wired down:                        151900.
+Pages purgeable:                           1068.
+## swap
+total = 5120.00M  used = 3647.31M  free = 1472.69M  (encrypted)
+## top non-system RSS (>50 MB, excluding kernel/window/etc)
+    898 MB  claude
+    682 MB  /Applications/iTerm.app/Contents/MacOS/iTerm2
+    192 MB  /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+    141 MB  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+    115 MB  /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+    108 MB  /System/Library/CoreServices/Spotlight.app/Contents/MacOS/Spotlight
+     94 MB  /System/Library/Input
+     74 MB  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+     62 MB  /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+     58 MB  /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+## warning thresholds
+  ⚠ swap_used = 3647 MB (>1 GB) — bench numbers may be paging-affected
+
+load_backend: loaded BLAS backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-blas.so
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.012 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal3  (5001)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 22906.50 MB
+load_backend: loaded MTL backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-metal.so
+load_backend: loaded CPU backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-cpu-apple_m1.so
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |            pp50 |        202.19 ± 1.45 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |           pp512 |        620.54 ± 2.66 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | BLAS,MTL   |       8 |           tg128 |         54.22 ± 1.39 |
+
+build: 19821178b (8960)
+
+──────── env snapshot: after llama.cpp @ 2026年 5月 1日 星期五 08时50分34秒 CST ────────
+## vm_stat (selected)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               53056.
+Pages active:                           1430540.
+Pages inactive:                          374844.
+Pages wired down:                        153010.
+Pages purgeable:                           1207.
+## swap
+total = 5120.00M  used = 3647.31M  free = 1472.69M  (encrypted)
+## top non-system RSS (>50 MB, excluding kernel/window/etc)
+    899 MB  claude
+    682 MB  /Applications/iTerm.app/Contents/MacOS/iTerm2
+    192 MB  /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+    141 MB  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+    115 MB  /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+    108 MB  /System/Library/CoreServices/Spotlight.app/Contents/MacOS/Spotlight
+     94 MB  /System/Library/Input
+     75 MB  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+     62 MB  /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+     58 MB  /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+## warning thresholds
+  ⚠ swap_used = 3647 MB (>1 GB) — bench numbers may be paging-affected
+
+
+## ⚠ PAGING-AFFECTED RUN: swap grew by 335 MB (baseline 3647 → 3982)
