@@ -1274,24 +1274,25 @@ impl MetalPipelines {
         enc.dispatch_thread_groups(grid, tg);
     }
 
-    /// Run paged-KV decode attention on the caller's existing compute
-    /// encoder. Mirrors the API of [`Self::flash_attn_v2_on_encoder`]
-    /// but takes a paged KV cache + per-sequence block tables instead
-    /// of contiguous K/V buffers.
+    /// Run paged-KV attention on the caller's existing compute encoder.
+    /// Handles both decode (`q_len=1`) and causal prefill (`q_len>1`).
     ///
-    /// Layout:
-    ///   q              : `[num_seqs, num_heads, head_dim]`
-    ///   k_cache, v_cache : `[num_blocks, num_kv_heads, block_size, head_dim]`
-    ///   o              : `[num_seqs, num_heads, head_dim]`
-    ///   block_tables   : `[num_seqs, max_num_blocks_per_seq]` u32
-    ///   context_lens   : `[num_seqs]` u32
+    /// Q/O layout selected by `q_layout`:
+    ///   `TokenMajor` (decode): `[num_seqs, num_heads, head_dim]`
+    ///   `HeadMajor`  (prefill, single seq batch=1):
+    ///                          `[num_heads, q_len, head_dim]`
     ///
-    /// All buffers are f32 except `block_tables` and `context_lens` which
-    /// are u32. Caller is responsible for opening / closing the encoder.
+    /// K/V cache: `[num_blocks, num_kv_heads, block_size, head_dim]`
+    /// `block_tables`: `[num_seqs, max_num_blocks_per_seq]` u32
+    /// `context_lens`: `[num_seqs]` u32 — FINAL kv_len after this batch's
+    ///   writes. The kernel computes per-q-token causal limit as
+    ///   `context_lens[seq] - (q_len - 1 - q_token_idx)`, so token i
+    ///   sees positions [0, context_lens - q_len + 1 + i).
     ///
-    /// Restrictions matching the existing `flash_attn_decode_f32`:
-    /// `head_dim == 128`. Block size is configurable via
-    /// `PagedAttnDispatchParams::block_size` (typical: 16).
+    /// Caller is responsible for opening / closing the encoder.
+    ///
+    /// Restrictions: `head_dim == 128` (will panic otherwise on the
+    /// debug_assert). Block size configurable.
     #[allow(clippy::too_many_arguments)]
     pub fn paged_decode_attention_on_encoder(
         &self,
@@ -1312,9 +1313,20 @@ impl MetalPipelines {
             params.num_heads % params.num_kv_heads == 0,
             "GQA: num_heads must be divisible by num_kv_heads"
         );
+        debug_assert!(params.q_len >= 1, "q_len must be ≥ 1");
 
-        // The kernel-side struct must match the layout in flash_attn.metal
-        // (PagedAttnParams). Keep these in sync — there's no static check.
+        // Q/O strides depend on layout:
+        //   TokenMajor (q_len=1 typical): q_head_stride = head_dim
+        //   HeadMajor  (q_len>1, single seq): q_head_stride = q_len * head_dim
+        let (q_head_stride, o_head_stride) = match params.q_layout {
+            PagedAttnQLayout::TokenMajor => (params.head_dim as i32, params.head_dim as i32),
+            PagedAttnQLayout::HeadMajor => {
+                let s = (params.q_len * params.head_dim) as i32;
+                (s, s)
+            }
+        };
+
+        // Kernel-side struct mirror of `PagedAttnParams` in flash_attn.metal.
         #[repr(C)]
         struct P {
             num_heads: i32,
@@ -1325,7 +1337,9 @@ impl MetalPipelines {
             max_num_blocks_per_seq: i32,
             kv_block_stride: i32,
             kv_head_stride: i32,
-            causal: i32,
+            q_len: i32,
+            q_head_stride: i32,
+            o_head_stride: i32,
         }
         let kv_head_stride = (params.block_size * params.head_dim) as i32;
         let kv_block_stride = (params.num_kv_heads as i32) * kv_head_stride;
@@ -1338,7 +1352,9 @@ impl MetalPipelines {
             max_num_blocks_per_seq: params.max_num_blocks_per_seq as i32,
             kv_block_stride,
             kv_head_stride,
-            causal: 1,
+            q_len: params.q_len as i32,
+            q_head_stride,
+            o_head_stride,
         };
 
         enc.set_compute_pipeline_state(self.pipeline("flash_attn_decode_paged_f32"));
@@ -1354,19 +1370,41 @@ impl MetalPipelines {
             &p as *const _ as *const c_void as *const _,
         );
 
-        // One TG per (head, sequence). TG = 32 simdgroups × 32 threads
-        // (matches the contiguous-KV decode kernel's geometry).
-        let grid = MTLSize::new(1, params.num_heads as u64, params.num_seqs as u64);
+        // Grid: (q_len, num_heads, num_seqs). For q_len=1 this is
+        // identical to the previous (1, num_heads, num_seqs) shape;
+        // q_len>1 spawns one TG per query token to walk causal KV in
+        // parallel across token positions.
+        let grid = MTLSize::new(
+            params.q_len as u64,
+            params.num_heads as u64,
+            params.num_seqs as u64,
+        );
         let tg = MTLSize::new(32, 32, 1);
         enc.dispatch_thread_groups(grid, tg);
     }
 }
 
+/// Q/O memory layout for paged attention.
+///
+/// `TokenMajor` matches the contiguous decode-step layout: rows are
+/// per-sequence per-head per-token vectors. With q_len=1 (decode) it's
+/// `[num_seqs, num_heads, head_dim]`.
+///
+/// `HeadMajor` is what `split_qkv_norm_rope` writes for prefill:
+/// `[num_heads, q_len, head_dim]` with each head's q_len rows
+/// contiguous. Used when paged attention runs on prefill output
+/// directly without a transpose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagedAttnQLayout {
+    TokenMajor,
+    HeadMajor,
+}
+
 /// Caller-side parameters for [`MetalPipelines::paged_decode_attention_on_encoder`].
 ///
 /// Layout / stride conventions match the comments on the dispatch
-/// helper. `kv_block_stride` and `kv_head_stride` are computed inside
-/// the dispatch so callers don't have to.
+/// helper. `kv_block_stride` / `kv_head_stride` / `q_head_stride` /
+/// `o_head_stride` are computed inside the dispatch from these fields.
 #[derive(Clone, Copy, Debug)]
 pub struct PagedAttnDispatchParams {
     pub num_seqs: usize,
@@ -1375,4 +1413,8 @@ pub struct PagedAttnDispatchParams {
     pub head_dim: usize,
     pub block_size: usize,
     pub max_num_blocks_per_seq: usize,
+    /// 1 for decode (most common), >1 for causal prefill.
+    pub q_len: usize,
+    /// Layout of `q` and `o` buffers. See [`PagedAttnQLayout`].
+    pub q_layout: PagedAttnQLayout,
 }

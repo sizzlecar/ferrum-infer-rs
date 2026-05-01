@@ -149,6 +149,18 @@ impl Default for AttnConfig {
 // Backend trait stays model-agnostic.
 
 /// Per-layer KV cache. Each model owns its own `Vec<KvCache<B>>` per sequence.
+///
+/// Two layouts are supported, selected at allocation time:
+/// 1. **Contiguous** (default): `k`/`v` are `[num_kv_heads, capacity, head_dim]`
+///    f32 buffers. `block_size == 0` and `block_table` / `context_lens` are
+///    `None`. Original ferrum layout — used when `FERRUM_METAL_PAGED_KV` is
+///    unset.
+/// 2. **Paged** (vLLM-style): `k`/`v` are `[num_blocks, num_kv_heads,
+///    block_size, head_dim]` block pools. `block_size > 0` and
+///    `block_table` (`u32[max_num_blocks_per_seq]`) + `context_lens`
+///    (`u32[1]` single-seq for now) are populated. Multi-seq sharing
+///    is a Phase 4 concern; today every paged cache_id has its own
+///    pool but the kernel-level indirection works.
 pub struct KvCache<B: Backend> {
     pub k: B::Buffer,
     pub v: B::Buffer,
@@ -156,6 +168,12 @@ pub struct KvCache<B: Backend> {
     pub capacity: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    /// Paged: KV positions per physical block. `0` ⇒ contiguous layout.
+    pub block_size: usize,
+    /// Paged: `[max_num_blocks_per_seq]` u32 — logical → physical block.
+    pub block_table: Option<B::Buffer>,
+    /// Paged: `[1]` u32 — current context length for the kernel to read.
+    pub context_lens: Option<B::Buffer>,
 }
 
 /// The core abstraction over CUDA / Metal / CPU.
@@ -922,6 +940,106 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Err(FerrumError::unsupported(
             "split_qkv_norm_rope_into_cache not implemented for this backend",
         ))
+    }
+
+    /// Paged-KV variant of [`Self::split_qkv_norm_rope_into_cache`].
+    ///
+    /// Same fused split + qk-norm + RoPE, but K/V are written into a
+    /// paged pool `[num_blocks, kv_heads, block_size, head_dim]`
+    /// indexed via `block_table[logical_block]` → physical_block.
+    /// Q still goes to head-major scratch.
+    ///
+    /// Default returns Unsupported. Backends that lack a paged kernel
+    /// keep using the contiguous variant.
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _block_table: &Self::Buffer,
+        _tokens: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _pos_offset: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _cache_len: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope_into_paged_cache not implemented for this backend",
+        ))
+    }
+
+    /// Paged-KV variant of [`Self::flash_attention`].
+    ///
+    /// Decode (`q_len == 1`):
+    ///   `q`/`out`: `[num_seqs, num_heads, head_dim]` (token-major)
+    ///
+    /// Causal prefill (`q_len > 1`, single seq):
+    ///   `q`/`out`: `[num_heads, q_len, head_dim]` (head-major — the
+    ///              layout produced by `split_qkv_norm_rope_into_paged_cache`)
+    ///   The kernel applies a per-q-token causal mask using
+    ///   `context_lens[seq]` as the FINAL kv_len (= `pos_offset + q_len`):
+    ///   token i sees positions `[0, context_lens - q_len + 1 + i)`.
+    ///
+    /// Common to both:
+    ///   `k_pool`/`v_pool`: `[num_blocks, num_kv_heads, block_size, head_dim]`
+    ///   `block_tables`: `[num_seqs, max_num_blocks_per_seq]` u32
+    ///   `context_lens`: `[num_seqs]` u32
+    ///
+    /// Backends without a paged kernel return Unsupported; callers are
+    /// expected to fall back to contiguous KV.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_decode_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _context_lens: &Self::Buffer,
+        _num_seqs: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+        _q_len: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_decode_attention not implemented for this backend",
+        ))
+    }
+
+    /// Allocate a u32 buffer of length `n` for paged-KV bookkeeping
+    /// (block tables, context lens). Default uses the existing
+    /// `from_slice_i32` route then bit-casts; backends with a faster
+    /// path can override.
+    fn alloc_u32(n: usize) -> Self::Buffer {
+        // Reinterpret as i32 — same 4-byte word; the kernel reads
+        // bytes via `device const uint32_t *`.
+        Self::from_slice_i32(&vec![0i32; n])
+    }
+
+    /// Write a u32 slice into a buffer previously allocated via
+    /// [`Self::alloc_u32`]. Used for live block_tables / context_lens
+    /// updates between decode steps.
+    ///
+    /// Default: reads back, mutates host-side, writes back. Metal
+    /// backend overrides with a direct memcpy on the StorageModeShared
+    /// buffer.
+    fn write_u32(_ctx: &mut Self::Context, _dst: &mut Self::Buffer, _data: &[u32]) {
+        // No-op default — most backends won't exercise this path until
+        // they implement paged_decode_attention.
     }
 
     /// Append new K/V into a pre-allocated head-major cache buffer.

@@ -581,31 +581,50 @@ struct PagedAttnParams {
     int max_num_blocks_per_seq;  // block_tables row stride
     int kv_block_stride;         // floats between consecutive blocks (= num_kv_heads * block_size * head_dim)
     int kv_head_stride;          // floats between consecutive kv heads within a block (= block_size * head_dim)
-    int causal;                  // unused for q_len=1 (context_len already encodes causal mask)
+    // q_len > 1 support (causal prefill into a paged cache):
+    int q_len;                   // 1 for decode, >1 for prefill batch
+    int q_head_stride;           // floats between consecutive q heads
+                                 //   q_len=1 token-major: head_dim
+                                 //   q_len>1 head-major:  q_len * head_dim
+    int o_head_stride;           // same shape as q_head_stride for the O buffer
 };
 
 kernel void flash_attn_decode_paged_f32(
-    device const float*    Q              [[buffer(0)]],   // [num_seqs, num_heads, head_dim]
+    device const float*    Q              [[buffer(0)]],   // q_len=1: [num_seqs, num_heads, head_dim]
+                                                            // q_len>1 single seq head-major: [num_heads, q_len, head_dim]
     device const float*    K_cache        [[buffer(1)]],   // [num_blocks, num_kv_heads, block_size, head_dim]
     device const float*    V_cache        [[buffer(2)]],   // same layout as K_cache
-    device       float*    O              [[buffer(3)]],   // [num_seqs, num_heads, head_dim]
+    device       float*    O              [[buffer(3)]],   // matches Q layout
     device const uint32_t* block_tables   [[buffer(4)]],
-    device const uint32_t* context_lens   [[buffer(5)]],
+    device const uint32_t* context_lens   [[buffer(5)]],   // FINAL kv_len after this batch's writes
     constant PagedAttnParams& p           [[buffer(6)]],
-    uint3  tgpig [[threadgroup_position_in_grid]],   // (1, head, seq)
+    uint3  tgpig [[threadgroup_position_in_grid]],   // (q_token_idx, head, seq)
     uint   sgitg [[simdgroup_index_in_threadgroup]], // 0..31 — which KV-stripe
     uint   tiisg [[thread_index_in_simdgroup]])      // 0..31 — which D slice
 {
+    const int qi    = int(tgpig.x);    // 0..q_len-1
     const int hi    = int(tgpig.y);
     const int bi    = int(tgpig.z);
     const int kv_hi = hi / (p.num_heads / p.num_kv_heads);
     const int d     = p.head_dim;
     const int bs    = p.block_size;
+    // Causal: token at q_token_idx=qi sees KV positions
+    //   [0, context_len - (q_len - 1 - qi))
+    // For q_len=1 this collapses to attend_end = context_len.
     const int context_len = int(context_lens[bi]);
+    const int attend_end  = context_len - (p.q_len - 1 - qi);
 
-    // Pointers (Q / O are still token-major, same as contiguous variant).
-    device const float* q_row = Q + (bi * p.num_heads + hi) * d + tiisg * SDPA_EPT;
-    device       float* o_row = O + (bi * p.num_heads + hi) * d;
+    // Pointers — Q/O strides honour `q_head_stride` / `o_head_stride`
+    // so callers can pick token-major (q_len=1) or head-major (q_len>1)
+    // layouts without repacking. `bi` indexes into a per-seq slab via
+    // num_heads * head_stride floats.
+    device const float* q_row = Q + bi * p.num_heads * p.q_head_stride
+                                  + hi * p.q_head_stride
+                                  + qi * d
+                                  + tiisg * SDPA_EPT;
+    device       float* o_row = O + bi * p.num_heads * p.o_head_stride
+                                  + hi * p.o_head_stride
+                                  + qi * d;
     device const uint32_t* my_block_table = block_tables + bi * p.max_num_blocks_per_seq;
 
     // Per-thread Q (pre-scaled), running output, scratch K/V slice.
@@ -621,7 +640,9 @@ kernel void flash_attn_decode_paged_f32(
 
     // KV loop — each simdgroup walks KV positions { sgitg, sgitg+BN, ... }.
     // For each position: resolve logical → physical block via block_tables.
-    for (int ki = int(sgitg); ki < context_len; ki += SDPA_BN) {
+    // `attend_end` (not `context_len`) bounds the loop so that q_token i
+    // in a q_len > 1 prefill only sees positions ≤ i (causal).
+    for (int ki = int(sgitg); ki < attend_end; ki += SDPA_BN) {
         const int logical_block = ki / bs;
         const int slot_in_block = ki % bs;
         const uint32_t physical_block = my_block_table[logical_block];
