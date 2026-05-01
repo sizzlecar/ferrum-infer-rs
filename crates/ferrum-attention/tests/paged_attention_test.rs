@@ -9,7 +9,9 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
-use ferrum_attention::metal::pipelines::{MetalPipelines, PagedAttnDispatchParams};
+use ferrum_attention::metal::pipelines::{
+    MetalPipelines, PagedAttnDispatchParams, PagedAttnQLayout,
+};
 use metal::{Device, MTLResourceOptions};
 use std::ffi::c_void;
 
@@ -199,6 +201,8 @@ fn run_paged(
             head_dim,
             block_size,
             max_num_blocks_per_seq: block_table.len(),
+            q_len: 1,
+            q_layout: PagedAttnQLayout::TokenMajor,
         },
     );
     enc.end_encoding();

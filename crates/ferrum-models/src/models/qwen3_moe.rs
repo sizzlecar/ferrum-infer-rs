@@ -421,6 +421,13 @@ impl<B: Backend> Qwen3MoeModel<B> {
                     capacity: max,
                     num_kv_heads: nkv,
                     head_dim: hd,
+                    // Paged-KV not yet wired for Qwen3-MoE — keeps the
+                    // contiguous decode path. Phase 4+ may enable it
+                    // here too once the MoE expert dispatch's KV reads
+                    // also go through block_table indirection.
+                    block_size: 0,
+                    block_table: None,
+                    context_lens: None,
                 })
                 .collect()
         });

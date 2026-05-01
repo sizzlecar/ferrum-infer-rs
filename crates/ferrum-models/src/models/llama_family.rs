@@ -543,17 +543,64 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .map(|cap| cap.min(model_max))
             .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY));
 
+        // Paged-KV mode: `FERRUM_METAL_PAGED_KV=1` switches every cache
+        // for this model into block-table-indirect layout. Kernels from
+        // PR #68 (decode read) + PR #69 (decode write) handle the
+        // indirect addressing; the LlamaFamily decode path below picks
+        // them up automatically by checking `cache.block_size > 0`.
+        //
+        // Pool sizing: round capacity up to a multiple of block_size,
+        // identity-assign logical→physical block. Memory footprint is
+        // the same as contiguous (within block_size rounding); the
+        // benefit only shows up under multi-seq sharing in Phase 4+.
+        let paged = std::env::var("FERRUM_METAL_PAGED_KV")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        const PAGED_BLOCK_SIZE: usize = 16;
+
         // Try pool first — reused buffers have stable device pointers,
         // so a captured decode graph can be replayed for this request too.
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
             (0..self.cfg.num_layers)
-                .map(|_| KvCache {
-                    k: B::alloc(nkv * max * hd),
-                    v: B::alloc(nkv * max * hd),
-                    len: 0,
-                    capacity: max,
-                    num_kv_heads: nkv,
-                    head_dim: hd,
+                .map(|_| {
+                    if paged {
+                        let num_blocks = max.div_ceil(PAGED_BLOCK_SIZE);
+                        // Pool: [num_blocks, nkv, block_size, hd] f32.
+                        let pool_floats = num_blocks * nkv * PAGED_BLOCK_SIZE * hd;
+                        // Identity block table: logical i → physical i.
+                        let block_table_init: Vec<u32> = (0..num_blocks as u32).collect();
+                        let mut block_table = B::alloc_u32(num_blocks);
+                        let mut bt_ctx = B::new_context();
+                        B::write_u32(&mut bt_ctx, &mut block_table, &block_table_init);
+                        // context_lens starts at [0]; updated each
+                        // forward via write_u32.
+                        let mut context_lens = B::alloc_u32(1);
+                        B::write_u32(&mut bt_ctx, &mut context_lens, &[0u32]);
+                        B::sync(&mut bt_ctx);
+                        KvCache {
+                            k: B::alloc(pool_floats),
+                            v: B::alloc(pool_floats),
+                            len: 0,
+                            capacity: num_blocks * PAGED_BLOCK_SIZE,
+                            num_kv_heads: nkv,
+                            head_dim: hd,
+                            block_size: PAGED_BLOCK_SIZE,
+                            block_table: Some(block_table),
+                            context_lens: Some(context_lens),
+                        }
+                    } else {
+                        KvCache {
+                            k: B::alloc(nkv * max * hd),
+                            v: B::alloc(nkv * max * hd),
+                            len: 0,
+                            capacity: max,
+                            num_kv_heads: nkv,
+                            head_dim: hd,
+                            block_size: 0,
+                            block_table: None,
+                            context_lens: None,
+                        }
+                    }
                 })
                 .collect()
         });
@@ -562,6 +609,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // reads up to `cache_len`.
         for c in caches.iter_mut() {
             c.len = 0;
+            // Paged: reset the per-cache context_lens to 0 (live buffer).
+            if let Some(cl) = c.context_lens.as_mut() {
+                let mut ctx_tmp = B::new_context();
+                B::write_u32(&mut ctx_tmp, cl, &[0u32]);
+                B::sync(&mut ctx_tmp);
+            }
         }
         self.kv_caches.insert(cache_id.to_string(), caches);
     }
@@ -683,27 +736,62 @@ impl<B: Backend> LlamaFamilyModel<B> {
         } else {
             None
         };
-        let used_qkv_into_cache = B::split_qkv_norm_rope_into_cache(
-            ctx,
-            &self.scratch.qkv_out,
-            q_norm_w,
-            k_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
-            &mut self.scratch.q_head_major,
-            &mut cache.k,
-            &mut cache.v,
-            tokens,
-            nh,
-            nkv,
-            hd,
-            pos_offset,
-            eps,
-            qk_mode,
-            cache_len_before,
-            cache_capacity,
-        )
-        .is_ok();
+        // Paged-KV path: when the cache was allocated with paged
+        // metadata (`block_size > 0`), use the paged write kernel
+        // which fans out into the block pool via `block_table`.
+        // Falls back to contiguous if Backend doesn't implement it.
+        let used_qkv_into_cache = if cache.block_size > 0 {
+            let bt = cache
+                .block_table
+                .as_ref()
+                .expect("paged cache missing block_table");
+            let num_blocks_per_seq = cache.capacity / cache.block_size;
+            B::split_qkv_norm_rope_into_paged_cache(
+                ctx,
+                &self.scratch.qkv_out,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.q_head_major,
+                &mut cache.k,
+                &mut cache.v,
+                bt,
+                tokens,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                qk_mode,
+                cache_len_before,
+                cache.block_size,
+                num_blocks_per_seq,
+            )
+            .is_ok()
+        } else {
+            B::split_qkv_norm_rope_into_cache(
+                ctx,
+                &self.scratch.qkv_out,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.q_head_major,
+                &mut cache.k,
+                &mut cache.v,
+                tokens,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                qk_mode,
+                cache_len_before,
+                cache_capacity,
+            )
+            .is_ok()
+        };
         if !used_qkv_into_cache {
             // Fallback 1: fused split-QKV-norm-rope to head-major scratch
             // (PR #47 path).
@@ -806,39 +894,79 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let kv_len = cache.len;
         let kv_stride = cache.capacity;
 
-        // 6. Flash attention over strided cache.
+        // 6. Flash attention.
+        //    Paged path: when the cache uses block layout, dispatch the
+        //    paged_decode_attention kernel; for q_len > 1 (prefill),
+        //    iterate token-by-token (kernel only handles q_len=1 right
+        //    now — Phase 4 will add a paged Q-tiled path).
+        //    Contiguous path: existing flash_attention dispatch.
         let _attn_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
             None
         };
-        //    `causal` is always true for decoder-only LLMs — every query must
-        //    mask out future tokens. (The `tokens > 1` heuristic from the old
-        //    path only worked because single-token decode trivially "attends"
-        //    to one position.) Sliding-window models (Mistral v0.1) narrow
-        //    the lower bound via `sliding_window`.
-        let attn_cfg = ferrum_kernels::backend::AttnConfig {
-            num_heads: nh,
-            num_kv_heads: nkv,
-            head_dim: hd,
-            causal: true,
-            scale: 1.0 / (hd as f32).sqrt(),
-            kv_seq_stride: kv_stride,
-            sliding_window: cfg.sliding_window,
-        };
-        B::flash_attention(
-            ctx,
-            &self.scratch.q_head_major,
-            &cache.k,
-            &cache.v,
-            &mut self.scratch.attn_head_major_out,
-            1,
-            tokens,
-            kv_len,
-            pos_offset,
-            &attn_cfg,
-        );
+        if cache.block_size > 0 {
+            let bt = cache
+                .block_table
+                .as_ref()
+                .expect("paged cache missing block_table");
+            let cl_buf = cache
+                .context_lens
+                .as_mut()
+                .expect("paged cache missing context_lens");
+            let num_blocks_per_seq = cache.capacity / cache.block_size;
+            // Single dispatch handles both decode (q_len=1) and causal
+            // prefill (q_len>1). The kernel computes per-token causal
+            // limit as `context_lens[seq] - (q_len - 1 - q_token_idx)`,
+            // so we set context_lens to the FINAL kv_len after this
+            // batch's writes (= cache_len_before + tokens, which is
+            // the new `cache.len` value already updated above).
+            let final_kv_len = cache.len as u32;
+            B::write_u32(ctx, cl_buf, &[final_kv_len]);
+            B::paged_decode_attention(
+                ctx,
+                &self.scratch.q_head_major,
+                &cache.k,
+                &cache.v,
+                &mut self.scratch.attn_head_major_out,
+                bt,
+                cl_buf,
+                1, // num_seqs
+                nh,
+                nkv,
+                hd,
+                cache.block_size,
+                num_blocks_per_seq,
+                tokens, // q_len
+            )
+            .expect("paged_decode_attention");
+        } else {
+            //    `causal` is always true for decoder-only LLMs — every query must
+            //    mask out future tokens. Sliding-window models (Mistral v0.1) narrow
+            //    the lower bound via `sliding_window`.
+            let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                num_heads: nh,
+                num_kv_heads: nkv,
+                head_dim: hd,
+                causal: true,
+                scale: 1.0 / (hd as f32).sqrt(),
+                kv_seq_stride: kv_stride,
+                sliding_window: cfg.sliding_window,
+            };
+            B::flash_attention(
+                ctx,
+                &self.scratch.q_head_major,
+                &cache.k,
+                &cache.v,
+                &mut self.scratch.attn_head_major_out,
+                1,
+                tokens,
+                kv_len,
+                pos_offset,
+                &attn_cfg,
+            );
+        }
         if let Some(t0) = _attn_t0 {
             B::sync(ctx);
             ATTN_TIME_US.fetch_add(
