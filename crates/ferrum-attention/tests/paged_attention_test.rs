@@ -41,16 +41,12 @@ fn make_buffer(device: &Device, data_bytes: &[u8]) -> metal::Buffer {
 }
 
 fn buffer_from_f32(device: &Device, data: &[f32]) -> metal::Buffer {
-    let bytes = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     make_buffer(device, bytes)
 }
 
 fn buffer_from_u32(device: &Device, data: &[u32]) -> metal::Buffer {
-    let bytes = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     make_buffer(device, bytes)
 }
 
@@ -339,7 +335,7 @@ fn paged_decode_handles_shuffled_block_table() {
     let kv_len: usize = 50;
     let block_size: usize = 16;
     let num_logical_blocks = kv_len.div_ceil(block_size); // 4
-    // Allocate a bigger physical pool so we can shuffle assignments.
+                                                          // Allocate a bigger physical pool so we can shuffle assignments.
     let num_physical_blocks = 8;
     // Permutation: logical 0->5, 1->2, 2->7, 3->1.
     let permutation = [5u32, 2, 7, 1];
