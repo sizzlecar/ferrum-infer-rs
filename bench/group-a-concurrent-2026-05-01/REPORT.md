@@ -110,10 +110,53 @@ while throughput nearly doubles.
 | Test                              | Status      | Notes |
 |-----------------------------------|-------------|-------|
 | 8B × 3 engines × c=1/4/8/16       | ✅ done     | Headline tables above |
-| 30B-A3B Q4_K_M (Qwen3-MoE)        | ⚠️ blocked | Ferrum's Phase 4b batched dispatch was wired into `LlamaFamilyModel` only; `Qwen3MoeModel` still uses the per-item attention loop. Single-request timed out under paged at MAX_SEQS=4. Needs a follow-up to apply the same batched-paged path to MoE. |
+| 30B-A3B Q4_K_M (Qwen3-MoE)        | ✅ done     | See appendix below — added 2026-05-01 follow-up |
 | Long-context (≥1k input tokens)   | ⚠️ punted   | Initial test prompts only reached ~90 tokens average; need a real long-prompt dataset. Harness already supports `--dataset <jsonl>`. |
 | Poisson request rate (`--request-rate N`) | not run | Harness supports it; user explicitly excluded for this round. |
 | c=32+                             | not run     | Memory-bound on 32 GB Mac with 8B Q4_K_M + paged pool. |
+
+## Appendix — Qwen3-30B-A3B Q4_K_M (added 2026-05-01)
+
+The first attempt at 30B-A3B hung under the paged engine config. Initial
+diagnosis ("32 GB Mac is memory-constrained") turned out to be wrong:
+disabling the paged-KV env vars (Qwen3-MoE doesn't honour them anyway —
+its `ensure_kv` always allocates contiguous KV) and rerunning shows the
+model loads in 1.4 s and decodes at 44 tok/s on a single request with
+no swap. The earlier hang was likely paged-pool sizing interacting
+badly with the MoE model's contiguous KV path; tracked but not
+investigated further.
+
+Setup: `FERRUM_KV_CAPACITY=512`, no paged env vars, `max_tokens=64`,
+deterministic prompts. llama-server uses `--parallel N --batch-size 2048
+--ctx-size 4096 --jinja`.
+
+| concurrency | engine    | output tok/s | TPOT p50 (ms) | TTFT p50 (ms) | completed |
+|-------------|-----------|-------------:|--------------:|--------------:|----------:|
+| 1           | ferrum    |     44.1     |     18.67     |     275.6     |   2 / 2   |
+| 1           | llama.cpp |   **50.6**   |   **16.66**   |     210.3     |   2 / 2   |
+| 4           | ferrum    |     46.8     |     77.65     |     563.4     |   8 / 8   |
+| 4           | llama.cpp |   **63.0**   |   **45.08**   |     727.2     |   7 / 8   |
+| 8           | ferrum    |     49.4     |    156.01     |   **240.7**   |  16 / 16  |
+| 8           | llama.cpp |   **74.4**   |   **81.16**   |     407.8     |  13 / 16  |
+
+**On 30B-A3B llama.cpp wins on raw throughput by 14–50%.** Ferrum's
+TPOT scales linearly with concurrency (19→78→156 ms at c=1→4→8) — the
+classic "M sequential attention dispatches per layer" signature.
+
+Phase 4b's batched paged dispatch (PR #73) was wired into
+`LlamaFamilyModel` only; `Qwen3MoeModel` still runs the per-item path.
+Porting Phase 4b into the MoE forward (~200–300 lines, mostly mirroring
+the dense changes) should close the gap on this model — that's the
+follow-up.
+
+Counter-balancing: ferrum **completed all 26 of 26 30B-A3B requests**
+across the three concurrency settings; llama.cpp dropped 4/26
+(`--parallel` slot rejection at c=4 / c=8). Same admission story as
+on the 8B models.
+
+mistralrs 30B-A3B was not run — based on its 8B Metal numbers (4× slower
+than ferrum at c=8) the 30B comparison would be similar in shape, and
+the bench wall time at this model size is non-trivial.
 
 ## Per-run JSON files
 
