@@ -83,6 +83,7 @@ impl MetalPipelines {
                     "kv_cache_append_f32",
                     "split_qkv_norm_rope_f32",
                     "split_qkv_norm_rope_kvc_f32",
+                    "split_qkv_norm_rope_paged_kvc_f32",
                 ][..],
             ),
             (
@@ -697,6 +698,90 @@ impl MetalPipelines {
         enc.set_buffer(7, Some(cache_v), 0);
         enc.set_bytes(
             8,
+            std::mem::size_of::<P>() as u64,
+            &params as *const _ as *const c_void as *const _,
+        );
+        let grid = MTLSize::new(tokens as u64, (q_heads + 2 * kv_heads) as u64, 1);
+        let tg = MTLSize::new(32, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Paged-KV variant of [`Self::split_qkv_norm_rope_into_cache`].
+    ///
+    /// Same fused split + qk-norm + RoPE + cache-write, but K/V are
+    /// written into a paged pool `[num_blocks, kv_heads, block_size,
+    /// head_dim]` indexed via `block_table[logical_block]` →
+    /// physical_block. Q still goes to head-major scratch.
+    ///
+    /// `block_table` is the per-sequence logical→physical map for the
+    /// caller's single sequence; multi-seq dispatch threads `tgpig.z`
+    /// into a `[num_seqs, max_blocks_per_seq]` table — that's a future
+    /// PR. For now this signature handles single-seq decode + prefill
+    /// (the only call sites we're integrating in Phase 3).
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_qkv_norm_rope_into_paged_cache(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        qkv: &Buffer,
+        q_norm_w: &Buffer,
+        k_norm_w: &Buffer,
+        cos: &Buffer,
+        sin: &Buffer,
+        q_out: &Buffer,
+        cache_k: &Buffer,
+        cache_v: &Buffer,
+        block_table: &Buffer,
+        tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        qk_mode: i32,
+        cache_len: usize,
+        block_size: usize,
+        max_num_blocks_per_seq: usize,
+    ) {
+        // Layout matches `SplitQkvNormRopePagedKvcParams` in norm_rope.metal.
+        #[repr(C)]
+        struct P {
+            tokens: i32,
+            q_heads: i32,
+            kv_heads: i32,
+            head_dim: i32,
+            half_dim: i32,
+            pos_offset: i32,
+            eps: f32,
+            qk_mode: i32,
+            cache_len: i32,
+            block_size: i32,
+            max_num_blocks_per_seq: i32,
+        }
+        let params = P {
+            tokens: tokens as i32,
+            q_heads: q_heads as i32,
+            kv_heads: kv_heads as i32,
+            head_dim: head_dim as i32,
+            half_dim: (head_dim / 2) as i32,
+            pos_offset: pos_offset as i32,
+            eps,
+            qk_mode,
+            cache_len: cache_len as i32,
+            block_size: block_size as i32,
+            max_num_blocks_per_seq: max_num_blocks_per_seq as i32,
+        };
+        enc.set_compute_pipeline_state(self.pipeline("split_qkv_norm_rope_paged_kvc_f32"));
+        enc.set_buffer(0, Some(qkv), 0);
+        enc.set_buffer(1, Some(q_norm_w), 0);
+        enc.set_buffer(2, Some(k_norm_w), 0);
+        enc.set_buffer(3, Some(cos), 0);
+        enc.set_buffer(4, Some(sin), 0);
+        enc.set_buffer(5, Some(q_out), 0);
+        enc.set_buffer(6, Some(cache_k), 0);
+        enc.set_buffer(7, Some(cache_v), 0);
+        enc.set_buffer(8, Some(block_table), 0);
+        enc.set_bytes(
+            9,
             std::mem::size_of::<P>() as u64,
             &params as *const _ as *const c_void as *const _,
         );
