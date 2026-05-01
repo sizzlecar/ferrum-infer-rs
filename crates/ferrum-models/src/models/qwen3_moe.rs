@@ -75,6 +75,15 @@ static MOE_PREFILL_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
 static MOE_PREFILL_WSUM_US: AtomicU64 = AtomicU64::new(0);
 static MOE_PREFILL_WSUM_CALLS: AtomicU64 = AtomicU64::new(0);
 
+// MoE batched-DECODE sub-stage counters (small-m path that uses the
+// batched-pair GEMV in place of the per-token loop).
+static MOE_BATCHED_DECODE_ROUTE_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_GATE_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_UP_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_SILU_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_DOWN_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_WSUM_US: AtomicU64 = AtomicU64::new(0);
+
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.
 pub struct Qwen3MoeLayerState<B: Backend> {
     /// Router projection `[hidden] → [num_experts]` — tiny, never sparse,
@@ -1632,21 +1641,52 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let stacked_path_available = moe_layer.experts.gate_stacked.is_some()
             && moe_layer.experts.up_stacked.is_some()
             && moe_layer.experts.down_stacked.is_some();
-        // Hybrid MoE dispatch: at low M (≤7) the per-item stacked-decode
-        // kernels have lower per-token overhead than the prefill-batched
-        // GEMM (which pays the GPU bucketing + indirect-dispatch setup
-        // regardless of M). At high M (≥8) the bucketing amortises and
-        // the one big mul_mm_id beats M sequential gemvs.
+        // MoE FFN dispatch tiers (m = batch size of this layer call):
         //
-        // Threshold tunable via FERRUM_MOE_BATCH_THRESHOLD; default 8.
+        //   m = 1          : `moe_forward_stacked_decode_impl`
+        //                    (decode m=1 fast path, fused gate+up+silu)
+        //   m ≥ 8 (default): `moe_forward_batched_prefill_impl`
+        //                    (GEMM with simdgroup_matmul + GPU bucketing)
+        //   else (m=2..7)  : per-item stacked decode loop
+        //
+        // EXPERIMENTAL — opt-in `FERRUM_MOE_BATCHED_DECODE=1` engages the
+        // new `moe_forward_batched_decode_impl` for 2 ≤ m < 32. The
+        // kernel itself is bitwise correct and ports llama.cpp's
+        // `kernel_mul_mv_id` strategy to ferrum (one indirect-dispatch
+        // GEMV per linear covering all m*top_k pairs). Empirically OFF
+        // by default because the existing `forward_layer_batched_decode`
+        // attention plumbing (per-item copy_slice × m × 6 dispatches)
+        // scales linearly with m and overshadows the FFN savings —
+        // regression measured at -19% (c=4) and -36% (c=16) on
+        // Qwen3-30B-A3B Q4_K_M / M1 Max. Closing that gap requires a
+        // batched attention path with offset-aware QKV slicing, which
+        // is the next PR's job. Until then the kernel sits as
+        // infrastructure.
         let moe_batch_threshold: usize = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);
         let use_prefill_batched = stacked_path_available && m >= moe_batch_threshold;
+        let use_batched_decode = !use_prefill_batched
+            && stacked_path_available
+            && m >= 2
+            && B::supports_batched_moe_gemv()
+            && std::env::var("FERRUM_MOE_BATCHED_DECODE").as_deref() == Ok("1");
 
         if use_prefill_batched {
             moe_forward_batched_prefill_impl::<B>(
+                ctx,
+                moe_layer,
+                &mut self.scratch,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts_per_tok,
+                self.cfg.num_experts,
+                self.cfg.norm_topk_prob,
+                m,
+            )?;
+        } else if use_batched_decode {
+            moe_forward_batched_decode_impl::<B>(
                 ctx,
                 moe_layer,
                 &mut self.scratch,
@@ -1924,19 +1964,15 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
     // batched path engages only at M ≥ FERRUM_MOE_BATCH_THRESHOLD
     // (default 12). Below that we still go per-item.
     //
-    // 30B-A3B Q4_K_M / M1 Max (FERRUM_KV_CAPACITY=512, max_tokens=64):
-    //
-    //   c | per-item | batched (default 12) | llama.cpp
-    //   --|---------:|---------------------:|----------:
-    //   1 |    43.7  |       43.7 (m=1 fast)|     50.6
-    //   4 |    46.6  |       46.6 (per-item)|     63.0
-    //   8 |    49.2  |       49.2 (per-item)|     74.4
-    //  16 |    44.6  |       51.3 (batched) |     95.4
-    //
-    // The c=16 win is real (+15% over per-item) but ferrum is still
-    // ~50% of llama.cpp on this model. Closing that gap requires Metal
-    // MoE GEMM kernel work (offset-aware `gemv_quant_moe_id` to skip
-    // copy_slices, plus a competitive `mul_mm_id` rewrite).
+    // Empirical note 2026-05-02: a follow-up PR added a batched MoE
+    // GEMV kernel (`gemv_quant_moe_id_batched`) that holds MoE
+    // dispatch count flat as concurrency scales. Wiring it through
+    // `decode_batch_internal` regressed throughput by 19% (c=4) /
+    // 36% (c=16) — `forward_layer_batched_decode`'s per-item
+    // attention plumbing (copy_slice × m × 6 dispatches) costs more
+    // than the MoE save. The batched MoE kernel is shipped as opt-in
+    // infrastructure (`FERRUM_MOE_BATCHED_DECODE=1`); flipping it on
+    // by default has to wait until the attention plumbing is fixed.
     fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
         let m = batch.len();
         let opted_in = std::env::var("FERRUM_MOE_BATCHED").as_deref() == Ok("1");
@@ -2432,6 +2468,153 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
         h,
     )?;
     stage_end(t0, ctx, &MOE_PREFILL_WSUM_US, &MOE_PREFILL_WSUM_CALLS);
+
+    Ok(())
+}
+
+/// Batched MoE FFN for the **small-m decode** range (typically c=2..32).
+///
+/// Mirrors llama.cpp's `kernel_mul_mv_id` strategy: hold the dispatch
+/// count flat as concurrency scales by emitting **one** batched GEMV
+/// per linear (gate / up / down) that covers all `m * top_k`
+/// (token, expert) pairs in a single Metal launch. Replaces the
+/// per-token outer loop in `forward_layer` (which emitted ~5
+/// dispatches × m tokens per layer) with a fixed-shape pipeline.
+///
+/// Compared to [`moe_forward_batched_prefill_impl`]:
+///   * no `compute_ids_tpe_gpu` bucketing kernel (the new pair-indexed
+///     GEMV reads `selected_ids_buf` directly)
+///   * uses GEMV not GEMM (better tile utilisation when tokens-per-expert
+///     is small — at c=16 with top_k=8 each expert sees ~1-3 token rows,
+///     well below the simdgroup_matmul tile width)
+///   * fewer Metal dispatches per layer (5: route + 3 gemv + silu + wsum)
+///
+/// Per-layer dispatch budget: 5 (independent of m). At c=16 / 48 layers
+/// that's 240 dispatches per decode step vs the per-token loop's ~3,840.
+#[allow(clippy::too_many_arguments)]
+fn moe_forward_batched_decode_impl<B: Backend>(
+    ctx: &mut B::Context,
+    moe_layer: &Qwen3MoeLayerState<B>,
+    scratch: &mut Qwen3MoeScratch<B>,
+    h: usize,
+    inter: usize,
+    top_k: usize,
+    n_exp: usize,
+    norm_topk_prob: bool,
+    tokens: usize,
+) -> Result<()> {
+    let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+    let stage_t0 = || -> Option<std::time::Instant> {
+        if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    };
+    let stage_end = |t0: Option<std::time::Instant>, ctx: &mut B::Context, c: &AtomicU64| {
+        if let Some(t) = t0 {
+            B::sync(ctx);
+            c.fetch_add(
+                t.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    };
+
+    let total_pairs = tokens * top_k;
+
+    // 1. Single batched router pass — fills selected_ids_buf [m * top_k]
+    //    and weights_2d [m * top_k] in one Metal dispatch.
+    let t0 = stage_t0();
+    B::route_topk_softmax(
+        ctx,
+        &scratch.router_logits,
+        &mut scratch.selected_ids_buf,
+        &mut scratch.weights_2d,
+        tokens,
+        n_exp,
+        top_k,
+        norm_topk_prob,
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_ROUTE_US);
+
+    let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
+    let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
+    let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
+
+    // 2. Batched gate gemv — one launch covers all m*top_k pairs.
+    //    src1 = norm_out [m, K]: outer = K, inner = 0 (slots within
+    //    a token broadcast — same activation row).
+    let t0 = stage_t0();
+    B::gemv_quant_moe_id_batched(
+        ctx,
+        &scratch.norm_out,
+        gate_stacked,
+        &scratch.selected_ids_buf,
+        &mut scratch.gate_out_stacked,
+        tokens,
+        top_k,
+        h, // outer stride: K floats per token
+        0, // inner stride: 0 (gate broadcasts within token)
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_GATE_US);
+
+    // 3. Batched up gemv — same shape as gate.
+    let t0 = stage_t0();
+    B::gemv_quant_moe_id_batched(
+        ctx,
+        &scratch.norm_out,
+        up_stacked,
+        &scratch.selected_ids_buf,
+        &mut scratch.up_out_stacked,
+        tokens,
+        top_k,
+        h,
+        0,
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_UP_US);
+
+    // 4. SiLU·gate over the flat [m * top_k, ffn] layout — single dispatch.
+    let t0 = stage_t0();
+    B::silu_mul_batched(
+        ctx,
+        &scratch.gate_out_stacked,
+        &scratch.up_out_stacked,
+        &mut scratch.silu_stacked,
+        total_pairs,
+        inter,
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_SILU_US);
+
+    // 5. Batched down gemv — src1 = silu_stacked [m, top_k, ffn]: each
+    //    pair has its own row, outer = top_k * ffn, inner = ffn.
+    let t0 = stage_t0();
+    B::gemv_quant_moe_id_batched(
+        ctx,
+        &scratch.silu_stacked,
+        down_stacked,
+        &scratch.selected_ids_buf,
+        &mut scratch.down_out_stacked,
+        tokens,
+        top_k,
+        top_k * inter, // outer: top_k * ffn floats per token
+        inter,         // inner: ffn floats per slot
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_DOWN_US);
+
+    // 6. Per-token weighted sum across slots → moe_out [m, h]. Caller
+    //    does residual += moe_out at the end of forward_layer.
+    let t0 = stage_t0();
+    B::weighted_sum_batched(
+        ctx,
+        &scratch.down_out_stacked,
+        &scratch.weights_2d,
+        &mut scratch.moe_out,
+        tokens,
+        top_k,
+        h,
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_WSUM_US);
 
     Ok(())
 }

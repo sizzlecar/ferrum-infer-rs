@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8783  model=Qwen3-30B-A3B-Q4_K_M  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               65.63s
+  request throughput:      0.49 req/s
+  input  token throughput: 8.8 tok/s
+  output token throughput: 31.2 tok/s
+  total input tokens:      578
+  total output tokens:     2048
+
+  TTFT  mean 1521.44ms  median  527.69ms  p99 4991.40ms  max 5147.91ms
+  TPOT  mean  495.09ms  median  479.30ms  p99  558.99ms  max  560.35ms
+  ITL   mean  495.09ms  median  500.26ms  p99  656.76ms  max 2441.09ms
+  E2E   mean 32711.91ms  median 32698.30ms  p99 36321.35ms  max 36359.31ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-moe-batched-decode-2026-05-02/moe_30b_a3b__batched__c16.json

@@ -1065,6 +1065,80 @@ impl Backend for MetalBackend {
         )
     }
 
+    fn supports_batched_moe_gemv() -> bool {
+        true
+    }
+
+    fn gemv_quant_moe_id_batched(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        ids: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+        top_k: usize,
+        src1_outer_stride: usize,
+        src1_inner_stride: usize,
+    ) -> Result<()> {
+        let a_buf = a.expect_f32("gemv_quant_moe_id_batched a");
+        let ids_buf = &ids.raw;
+        let out_buf = out.expect_f32_mut("gemv_quant_moe_id_batched out");
+        let enc = ctx.compute_encoder();
+        match weight {
+            MetalQuantStore::Q4KExperts {
+                blocks,
+                byte_offset,
+                n_rows,
+                n_cols,
+                ..
+            } => {
+                crate::q4_k_moe_id_gemv_batched::dispatch_gemv_q4k_moe_id_batched_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    *byte_offset,
+                    ids_buf,
+                    out_buf,
+                    *n_rows,
+                    *n_cols,
+                    m,
+                    top_k,
+                    src1_outer_stride,
+                    src1_inner_stride,
+                );
+                Ok(())
+            }
+            MetalQuantStore::Q6KExperts {
+                blocks,
+                byte_offset,
+                n_rows,
+                n_cols,
+                ..
+            } => {
+                crate::q6_k_moe_id_gemv_batched::dispatch_gemv_q6k_moe_id_batched_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    *byte_offset,
+                    ids_buf,
+                    out_buf,
+                    *n_rows,
+                    *n_cols,
+                    m,
+                    top_k,
+                    src1_outer_stride,
+                    src1_inner_stride,
+                );
+                Ok(())
+            }
+            _ => Err(FerrumError::model(
+                "gemv_quant_moe_id_batched: weight must be Q4KExperts or Q6KExperts".to_string(),
+            )),
+        }
+    }
+
     fn gemv_quant_moe_id_offset(
         ctx: &mut Self::Context,
         a: &Self::Buffer,

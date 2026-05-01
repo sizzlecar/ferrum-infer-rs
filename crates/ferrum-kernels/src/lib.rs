@@ -32,6 +32,8 @@ pub mod q4_k_moe_id_gemm;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q4_k_moe_id_gemv;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod q4_k_moe_id_gemv_batched;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q6_k_gemm;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q6_k_gemv;
@@ -39,6 +41,8 @@ pub mod q6_k_gemv;
 pub mod q6_k_moe_id_gemm;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod q6_k_moe_id_gemv;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod q6_k_moe_id_gemv_batched;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod ptx {

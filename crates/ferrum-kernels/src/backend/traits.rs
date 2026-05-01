@@ -804,6 +804,54 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Batched MoE indirect-dispatch GEMV — one Metal launch covers
+    /// **all** `m * top_k` (token, expert) pairs at once.
+    ///
+    /// This is the symmetric counterpart of
+    /// [`Self::gemv_quant_moe_id`]: same Q4_K decode loop, same
+    /// per-pair output, but the grid Z-axis spans `m * top_k` instead
+    /// of just `top_k`. Eliminates the engine-level per-token outer
+    /// loop that emits ~16× the dispatches llama.cpp emits at c=16
+    /// (their `kernel_mul_mv_id` already handles the M batch in one
+    /// dispatch).
+    ///
+    /// `a`           : activation buffer; pair `p` reads
+    ///                 `(p / top_k) * src1_outer_stride
+    ///                  + (p % top_k) * src1_inner_stride` floats.
+    ///                 gate / up:  src1 = `norm_out [m, K]`,
+    ///                              outer = K, inner = 0
+    ///                              (slots within a token broadcast).
+    ///                 down:       src1 = `silu_stacked [m, top_k, K]`,
+    ///                              outer = top_k * K, inner = K.
+    /// `weight`      : Q4KExperts stacked weights, common across
+    ///                 selected experts.
+    /// `ids`         : flat `[m * top_k]` selected-expert IDs (i32).
+    /// `out`         : `[m * top_k, n_rows]` outputs.
+    /// `m`           : token batch size.
+    /// `top_k`       : selected experts per token.
+    /// `src1_outer_stride`, `src1_inner_stride`: in **floats**.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_quant_moe_id_batched(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _m: usize,
+        _top_k: usize,
+        _src1_outer_stride: usize,
+        _src1_inner_stride: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id_batched not implemented for this backend",
+        ))
+    }
+
+    /// Capability probe for [`Self::gemv_quant_moe_id_batched`].
+    fn supports_batched_moe_gemv() -> bool {
+        false
+    }
+
     /// Weighted sum across `n_slots` rows of `[hidden]`.
     ///
     /// Computes `out[i] = Σ_s weights[s] * slots[s, i]`. Single
