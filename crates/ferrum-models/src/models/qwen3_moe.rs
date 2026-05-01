@@ -178,6 +178,27 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub logits: B::Buffer,
     pub batch_logits: B::Buffer,
 
+    // ── Per-item single-token buffers for decode_batch (Phase 4b) ────
+    //
+    // The batched-decode path runs M GEMMs at m=M (qkv_proj / o_proj /
+    // router / MoE expert mul_mm_id) but attention stays a per-item loop
+    // (each cache_id has its own contiguous K/V buffer — no way to fan
+    // M items into a single attention dispatch without paged KV). These
+    // 1-token-shaped scratches hold the per-item slice during the loop:
+    // `copy_slice` extracts q/k/v from the batched buffers, qk_norm_rope
+    // writes head-major into _single, kv_cache_append + flash_attention
+    // run on it, then copy_slice writes back into attn_flat[i*q_dim].
+    //
+    // None until `enable_batched_decode_scratch` is called from
+    // `ensure_kv` once we know we'll be doing multi-seq decode.
+    pub q_single: Option<B::Buffer>,
+    pub k_single: Option<B::Buffer>,
+    pub v_single: Option<B::Buffer>,
+    pub q_head_major_single: Option<B::Buffer>,
+    pub k_head_major_single: Option<B::Buffer>,
+    pub v_head_major_single: Option<B::Buffer>,
+    pub attn_head_major_single: Option<B::Buffer>,
+
     pub max_tokens: usize,
 }
 
@@ -232,8 +253,34 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             last_normed: B::alloc(h),
             logits: B::alloc(vocab),
             batch_logits: B::alloc(t * vocab),
+            // Lazily-allocated; `enable_batched_decode_scratch` populates
+            // these the first time decode_batch is called with M > 1.
+            q_single: None,
+            k_single: None,
+            v_single: None,
+            q_head_major_single: None,
+            k_head_major_single: None,
+            v_head_major_single: None,
+            attn_head_major_single: None,
             max_tokens: t,
         }
+    }
+
+    /// Allocate the per-item single-token scratch buffers used by
+    /// `forward_layer_batched_decode`. Idempotent.
+    fn enable_batched_decode_scratch(&mut self, cfg: &Qwen3MoeConfig) {
+        if self.q_single.is_some() {
+            return;
+        }
+        let q_dim = cfg.base.num_heads * cfg.base.head_dim;
+        let kv_dim = cfg.base.num_kv_heads * cfg.base.head_dim;
+        self.q_single = Some(B::alloc(q_dim));
+        self.k_single = Some(B::alloc(kv_dim));
+        self.v_single = Some(B::alloc(kv_dim));
+        self.q_head_major_single = Some(B::alloc(q_dim));
+        self.k_head_major_single = Some(B::alloc(kv_dim));
+        self.v_head_major_single = Some(B::alloc(kv_dim));
+        self.attn_head_major_single = Some(B::alloc(q_dim));
     }
 }
 
@@ -1222,6 +1269,528 @@ impl<B: Backend> Qwen3MoeModel<B> {
 
         B::to_vec(&self.scratch.logits, vocab)
     }
+
+    /// Multi-sequence batched decode (Phase 4b for MoE).
+    ///
+    /// Mirrors `LlamaFamilyModel::decode_batch_internal` but adapted to
+    /// the MoE forward. The wins come from running the GEMM-heavy ops
+    /// (qkv_proj, o_proj, router, MoE expert mul_mm_id, lm_head) at
+    /// m=M, even though attention stays a per-item loop because
+    /// Qwen3-MoE uses contiguous KV — no paged path here.
+    ///
+    /// Cross-layer rms_norm fusion (the `weighted_sum_residual_norm_stacked`
+    /// fast path) is disabled in batched mode: the prefill MoE path
+    /// (`moe_forward_batched_prefill_impl`) writes to `moe_out` and we
+    /// add to residual explicitly. Each layer's leading rms_norm runs
+    /// at m=M, which is one fused dispatch on M rows — cheap.
+    pub fn decode_batch_internal(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        let m = batch.len();
+        if m == 0 {
+            return Vec::new();
+        }
+        if m == 1 {
+            let (cid, tok, pos) = &batch[0];
+            return vec![self.decode_internal(cid, *tok, *pos)];
+        }
+
+        for (cid, _, _) in batch {
+            self.ensure_kv(cid);
+        }
+        self.ensure_scratch(m);
+        self.scratch.enable_batched_decode_scratch(&self.cfg);
+
+        let h = self.cfg.base.hidden_size;
+        let vocab = self.cfg.base.vocab_size;
+        let mut ctx = B::new_context();
+
+        // 0. Embed all M tokens into residual [M, H]
+        let tokens: Vec<u32> = batch.iter().map(|(_, t, _)| *t).collect();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+        B::embedding_lookup(&mut ctx, &self.embed, &tokens, &mut residual, h);
+
+        // 1..num_layers: batched forward for each layer
+        for li in 0..self.cfg.base.num_layers {
+            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m)
+                .expect("forward_layer_batched_decode");
+        }
+
+        // Final RMSNorm on [M, H] → norm_out [M, H]
+        B::rms_norm(
+            &mut ctx,
+            &residual,
+            &self.final_norm_w,
+            self.cfg.base.rms_norm_eps,
+            &mut self.scratch.norm_out,
+            m,
+            h,
+        );
+
+        // LM head with m=M → batch_logits [M, vocab]
+        self.lm_head.forward(
+            &mut ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.batch_logits,
+            m,
+        );
+
+        B::sync(&mut ctx);
+        self.scratch.residual = Some(residual);
+
+        let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+        (0..m)
+            .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
+            .collect()
+    }
+
+    /// One transformer layer over M items: GEMMs at m=M, per-item
+    /// attention loop, MoE FFN at m=M via the prefill batched path.
+    /// Mirrors `LlamaFamilyModel::forward_layer_batched_decode` minus
+    /// the paged branch.
+    fn forward_layer_batched_decode(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        batch: &[(String, u32, u32)],
+        residual: &mut B::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        let cfg_base = &self.cfg.base;
+        let h = cfg_base.hidden_size;
+        let nh = cfg_base.num_heads;
+        let nkv = cfg_base.num_kv_heads;
+        let hd = cfg_base.head_dim;
+        let eps = cfg_base.rms_norm_eps;
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+
+        let attn_layer = &self.attn_layers[li];
+        let qk_mode: i32 = if cfg_base.has_qk_norm { 1 } else { 2 };
+        let dummy_w = &attn_layer.input_ln_w;
+        let q_norm_w = attn_layer.q_norm_w.as_ref().unwrap_or(dummy_w);
+        let k_norm_w = attn_layer.k_norm_w.as_ref().unwrap_or(dummy_w);
+
+        // 1. rms_norm [M, H] → norm_out
+        B::rms_norm(
+            ctx,
+            residual,
+            &attn_layer.input_ln_w,
+            eps,
+            &mut self.scratch.norm_out,
+            m,
+            h,
+        );
+
+        // 2. qkv_proj GEMM at m=M: norm_out [M, H] → qkv_out [M, QKV]
+        attn_layer
+            .qkv_proj
+            .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
+
+        // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
+        B::split_qkv(
+            ctx,
+            &self.scratch.qkv_out,
+            &mut self.scratch.q_buf,
+            &mut self.scratch.k_buf,
+            &mut self.scratch.v_buf,
+            m,
+            q_dim,
+            kv_dim,
+        );
+
+        // 4-6. Per-item loop: rope + kv_append + attention.
+        //      Each item has its own cache_id + pos + kv_len.
+        let q_single = self
+            .scratch
+            .q_single
+            .as_ref()
+            .expect("q_single missing — enable_batched_decode_scratch not called")
+            as *const B::Buffer;
+        let k_single =
+            self.scratch.k_single.as_ref().expect("k_single missing") as *const B::Buffer;
+        let v_single =
+            self.scratch.v_single.as_ref().expect("v_single missing") as *const B::Buffer;
+        let q_hm_single = self
+            .scratch
+            .q_head_major_single
+            .as_mut()
+            .expect("q_head_major_single missing") as *mut B::Buffer;
+        let k_hm_single = self
+            .scratch
+            .k_head_major_single
+            .as_mut()
+            .expect("k_head_major_single missing") as *mut B::Buffer;
+        let v_hm_single = self
+            .scratch
+            .v_head_major_single
+            .as_mut()
+            .expect("v_head_major_single missing") as *mut B::Buffer;
+        let attn_hm_single =
+            self.scratch
+                .attn_head_major_single
+                .as_mut()
+                .expect("attn_head_major_single missing") as *mut B::Buffer;
+        // SAFETY: each Option holds a stable B::Buffer; we don't mutate
+        // self.scratch in a way that would invalidate them inside the loop
+        // (the kv_caches mutation is on a disjoint field).
+
+        for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
+            let pos_i = *pos as usize;
+
+            // SAFETY: borrows of disjoint scratch fields, see above.
+            let q_single_ref = unsafe { &*q_single };
+            let k_single_ref = unsafe { &*k_single };
+            let v_single_ref = unsafe { &*v_single };
+            let q_hm_single_mut = unsafe { &mut *q_hm_single };
+            let k_hm_single_mut = unsafe { &mut *k_hm_single };
+            let v_hm_single_mut = unsafe { &mut *v_hm_single };
+            let attn_hm_single_mut = unsafe { &mut *attn_hm_single };
+
+            // Extract item i's Q/K/V slice from the batched buffers.
+            B::copy_slice(
+                ctx,
+                &self.scratch.q_buf,
+                i * q_dim,
+                // copy_slice signature wants &mut for dst, but q_single
+                // is shared; we need a *mut variant — since enable_*
+                // gives us Option, we can do as_mut() here.
+                self.scratch.q_single.as_mut().unwrap(),
+                0,
+                q_dim,
+            );
+            B::copy_slice(
+                ctx,
+                &self.scratch.k_buf,
+                i * kv_dim,
+                self.scratch.k_single.as_mut().unwrap(),
+                0,
+                kv_dim,
+            );
+            B::copy_slice(
+                ctx,
+                &self.scratch.v_buf,
+                i * kv_dim,
+                self.scratch.v_single.as_mut().unwrap(),
+                0,
+                kv_dim,
+            );
+
+            // qk_norm_rope with tokens=1, per-item pos.
+            B::qk_norm_rope(
+                ctx,
+                q_single_ref,
+                q_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                q_hm_single_mut,
+                1,
+                nh,
+                hd,
+                pos_i,
+                eps,
+                qk_mode,
+            );
+            B::qk_norm_rope(
+                ctx,
+                k_single_ref,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                k_hm_single_mut,
+                1,
+                nkv,
+                hd,
+                pos_i,
+                eps,
+                qk_mode,
+            );
+            B::qk_norm_rope(
+                ctx,
+                v_single_ref,
+                dummy_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                v_hm_single_mut,
+                1,
+                nkv,
+                hd,
+                pos_i,
+                eps,
+                0,
+            );
+
+            // KV append + attention for item i's cache.
+            let caches = self
+                .kv_caches
+                .get_mut(cache_id)
+                .expect("ensure_kv must be called before forward_layer_batched");
+            let cache = &mut caches[li];
+            B::kv_cache_append_head_major(
+                ctx,
+                &mut cache.k,
+                &mut cache.v,
+                cache.len,
+                cache.capacity,
+                k_hm_single_mut,
+                v_hm_single_mut,
+                1,
+                nkv,
+                hd,
+            );
+            cache.len += 1;
+            let kv_len = cache.len;
+            let kv_stride = cache.capacity;
+
+            let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                num_heads: nh,
+                num_kv_heads: nkv,
+                head_dim: hd,
+                causal: true,
+                scale: 1.0 / (hd as f32).sqrt(),
+                kv_seq_stride: kv_stride,
+                sliding_window: cfg_base.sliding_window,
+            };
+            B::flash_attention(
+                ctx,
+                q_hm_single_mut,
+                &cache.k,
+                &cache.v,
+                attn_hm_single_mut,
+                1,
+                1,
+                kv_len,
+                pos_i,
+                &attn_cfg,
+            );
+
+            // Untranspose head-major → token-major: for tokens=1 the
+            // layouts are byte-identical, so copy_slice straight into
+            // attn_flat at the per-item offset (saves a transpose).
+            B::copy_slice(
+                ctx,
+                attn_hm_single_mut,
+                0,
+                &mut self.scratch.attn_flat,
+                i * q_dim,
+                q_dim,
+            );
+        }
+
+        // 7. o_proj GEMM at m=M: attn_flat [M, Q] → o_proj_out [M, H]
+        attn_layer.o_proj.forward(
+            ctx,
+            &self.scratch.attn_flat,
+            &mut self.scratch.o_proj_out,
+            m,
+        );
+
+        // 8. fused residual_add + post_attention_layernorm
+        B::fused_add_rms_norm(
+            ctx,
+            residual,
+            &self.scratch.o_proj_out,
+            &attn_layer.post_ln_w,
+            eps,
+            &mut self.scratch.norm_out,
+            m,
+            h,
+        );
+
+        // 9. Router gemv: norm_out [M, H] → router_logits [M, n_exp]
+        let moe_layer = &self.moe_layers[li];
+        moe_layer.router.forward(
+            ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.router_logits,
+            m,
+        );
+
+        // 10. MoE expert dispatch — per-item loop using the cheap
+        //     stacked decode kernels (gemv_quant_moe_id + silu_mul_stacked
+        //     + weighted_sum_batched). NOT the batched prefill path:
+        //     `moe_forward_batched_prefill_impl` is tuned for large M
+        //     (prefill) and the GPU bucketing overhead
+        //     (`compute_ids_tpe_gpu` + indirect-dispatch arg-buffer
+        //     setup) costs more than M sequential gemv calls at small M.
+        //
+        // Strategy: route ALL M tokens once via batched
+        // `route_topk_softmax`, then loop M iterations of the stacked
+        // decode kernels. Each iteration:
+        //   - extract item i's selected ids + weights from the M-batch
+        //     buffers via copy_slice
+        //   - copy norm_out[i*h..(i+1)*h] → x_single
+        //   - 3× gemv_quant_moe_id (gate/up/down) reading from x_single
+        //   - silu_mul_stacked
+        //   - weighted_sum_batched(batch=1) → acc_buf  (fresh write,
+        //     no residual fusion)
+        //   - copy_slice acc_buf → moe_out[i*h..(i+1)*h]
+        // After the loop, single add_inplace residual += moe_out [M, H].
+        let stacked_path_available = moe_layer.experts.gate_stacked.is_some()
+            && moe_layer.experts.up_stacked.is_some()
+            && moe_layer.experts.down_stacked.is_some();
+        // Hybrid MoE dispatch: at low M (≤7) the per-item stacked-decode
+        // kernels have lower per-token overhead than the prefill-batched
+        // GEMM (which pays the GPU bucketing + indirect-dispatch setup
+        // regardless of M). At high M (≥8) the bucketing amortises and
+        // the one big mul_mm_id beats M sequential gemvs.
+        //
+        // Threshold tunable via FERRUM_MOE_BATCH_THRESHOLD; default 8.
+        let moe_batch_threshold: usize = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let use_prefill_batched = stacked_path_available && m >= moe_batch_threshold;
+
+        if use_prefill_batched {
+            moe_forward_batched_prefill_impl::<B>(
+                ctx,
+                moe_layer,
+                &mut self.scratch,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts_per_tok,
+                self.cfg.num_experts,
+                self.cfg.norm_topk_prob,
+                m,
+            )?;
+        } else if stacked_path_available {
+            let inter = self.cfg.expert_intermediate_size;
+            let top_k = self.cfg.num_experts_per_tok;
+            let n_exp = self.cfg.num_experts;
+            let norm_topk_prob = self.cfg.norm_topk_prob;
+            let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
+            let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
+            let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
+
+            // Single batched router pass: writes selected_ids_buf [M, top_k]
+            // and weights_2d [M, top_k]. Replaces M individual route calls.
+            B::route_topk_softmax(
+                ctx,
+                &self.scratch.router_logits,
+                &mut self.scratch.selected_ids_buf,
+                &mut self.scratch.weights_2d,
+                m,
+                n_exp,
+                top_k,
+                norm_topk_prob,
+            )?;
+
+            for i in 0..m {
+                // Extract this item's selected experts + combine weights.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.selected_ids_buf,
+                    i * top_k,
+                    &mut self.scratch.ids_buf,
+                    0,
+                    top_k,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.weights_2d,
+                    i * top_k,
+                    &mut self.scratch.weights_buf,
+                    0,
+                    top_k,
+                );
+                // Item i's activation row.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.norm_out,
+                    i * h,
+                    &mut self.scratch.x_single,
+                    0,
+                    h,
+                );
+
+                // Stacked gate / up gemvs — broadcast x_single across top_k.
+                B::gemv_quant_moe_id(
+                    ctx,
+                    &self.scratch.x_single,
+                    gate_stacked,
+                    &self.scratch.ids_buf,
+                    &mut self.scratch.gate_out_stacked,
+                    top_k,
+                    0, // broadcast
+                )?;
+                B::gemv_quant_moe_id(
+                    ctx,
+                    &self.scratch.x_single,
+                    up_stacked,
+                    &self.scratch.ids_buf,
+                    &mut self.scratch.up_out_stacked,
+                    top_k,
+                    0,
+                )?;
+                B::silu_mul_stacked(
+                    ctx,
+                    &self.scratch.gate_out_stacked,
+                    &self.scratch.up_out_stacked,
+                    &mut self.scratch.silu_stacked,
+                    top_k,
+                    inter,
+                )?;
+                B::gemv_quant_moe_id(
+                    ctx,
+                    &self.scratch.silu_stacked,
+                    down_stacked,
+                    &self.scratch.ids_buf,
+                    &mut self.scratch.down_out_stacked,
+                    top_k,
+                    inter,
+                )?;
+                // Combine with weights — overwrite acc_buf (no residual
+                // fusion). batch=1 covers our single token.
+                B::weighted_sum_batched(
+                    ctx,
+                    &self.scratch.down_out_stacked,
+                    &self.scratch.weights_buf,
+                    &mut self.scratch.acc_buf,
+                    1,
+                    top_k,
+                    h,
+                )?;
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.acc_buf,
+                    0,
+                    &mut self.scratch.moe_out,
+                    i * h,
+                    h,
+                );
+            }
+        } else {
+            // Backend without stacked variants — fall back to the legacy
+            // per-(token, expert) host-routed path.
+            moe_forward::<B>(
+                ctx,
+                &self.scratch.norm_out,
+                &self.scratch.router_logits,
+                &mut self.scratch.moe_out,
+                m,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts,
+                self.cfg.num_experts_per_tok,
+                self.cfg.norm_topk_prob,
+                &moe_layer.experts,
+                &mut self.scratch.x_single,
+                &mut self.scratch.acc_buf,
+                &mut self.scratch.gate_up_buf,
+                &mut self.scratch.silu_buf,
+                &mut self.scratch.down_buf,
+                &self.scratch.zero_hidden,
+            )?;
+        }
+
+        // 11. residual += moe_out [M, H]
+        B::add_inplace(ctx, residual, &self.scratch.moe_out, m * h);
+
+        Ok(())
+    }
 }
 
 impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
@@ -1267,6 +1836,52 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
 
     fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
         self.decode_internal(cache_id, token, pos)
+    }
+
+    // decode_batch is gated to use the batched path only when it's a
+    // measurable win. The crossover depends on M:
+    //
+    //   - At low M (≤ ~8) the per-item `decode_internal` loop wins
+    //     because: (a) it stays at scratch offset 0 (no copy_slice
+    //     overhead), (b) it preserves the cross-layer rms_norm fusion
+    //     fast path (`weighted_sum_residual_norm_stacked`).
+    //   - At high M (≥ ~12) the batched path wins because the dense
+    //     GEMM batching (qkv_proj, o_proj, router, lm_head at m=M) and
+    //     the prefill-batched MoE dispatch (one `gemm_quant_moe_id` for
+    //     all tokens) amortise the ~48-dispatch lost-fusion penalty.
+    //
+    // Default opted out of FERRUM_MOE_BATCHED. When opted in, the
+    // batched path engages only at M ≥ FERRUM_MOE_BATCH_THRESHOLD
+    // (default 12). Below that we still go per-item.
+    //
+    // 30B-A3B Q4_K_M / M1 Max (FERRUM_KV_CAPACITY=512, max_tokens=64):
+    //
+    //   c | per-item | batched (default 12) | llama.cpp
+    //   --|---------:|---------------------:|----------:
+    //   1 |    43.7  |       43.7 (m=1 fast)|     50.6
+    //   4 |    46.6  |       46.6 (per-item)|     63.0
+    //   8 |    49.2  |       49.2 (per-item)|     74.4
+    //  16 |    44.6  |       51.3 (batched) |     95.4
+    //
+    // The c=16 win is real (+15% over per-item) but ferrum is still
+    // ~50% of llama.cpp on this model. Closing that gap requires Metal
+    // MoE GEMM kernel work (offset-aware `gemv_quant_moe_id` to skip
+    // copy_slices, plus a competitive `mul_mm_id` rewrite).
+    fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        let m = batch.len();
+        let opted_in = std::env::var("FERRUM_MOE_BATCHED").as_deref() == Ok("1");
+        let threshold = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(12);
+        if opted_in && m >= threshold {
+            self.decode_batch_internal(batch)
+        } else {
+            batch
+                .iter()
+                .map(|(cid, tok, p)| self.decode(cid, *tok, *p))
+                .collect()
+        }
     }
 
     fn release(&mut self, cache_id: &str) {
