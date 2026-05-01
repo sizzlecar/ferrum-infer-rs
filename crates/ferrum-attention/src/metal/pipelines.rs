@@ -44,7 +44,14 @@ impl MetalPipelines {
 
         let mut pipelines = HashMap::new();
         for (lib, names) in [
-            (&fa_lib, &["flash_attn_f32", "flash_attn_q_tiled_f32"][..]),
+            (
+                &fa_lib,
+                &[
+                    "flash_attn_f32",
+                    "flash_attn_q_tiled_f32",
+                    "flash_attn_decode_f32",
+                ][..],
+            ),
             (
                 &ops_lib,
                 &[
@@ -947,15 +954,33 @@ impl MetalPipelines {
             sliding_window: params.sliding_window as i32,
         };
 
-        // Q-tiled path is enabled when the inner loop's static assumptions
-        // hold. q_len ≥ 8 keeps the trailing-tile padding cost amortised;
-        // smaller q (e.g. decode m=1) goes through the scalar kernel which
-        // is shaped for that case.
+        // Three kernel variants, picked by query length and head shape:
+        //
+        //   q_len ≥ 8  + head_dim=128         → flash_attn_q_tiled_f32
+        //                                       (4-simdgroup tile, simdgroup_matmul)
+        //   q_len == 1 + head_dim=128 + no
+        //                sliding_window       → flash_attn_decode_f32
+        //                                       (32-simdgroup wide TG; the MLX
+        //                                        sdpa_vector port — 32× more
+        //                                        active threads than the legacy
+        //                                        scalar path used to give us)
+        //   everything else                   → flash_attn_f32 (legacy scalar)
+        //
+        // Override via `FERRUM_FA_LEGACY=1` to force the scalar path (debugging
+        // / numerical comparison). `FERRUM_FA_DECODE=0` disables the new
+        // decode kernel specifically while leaving Q-tiled prefill enabled.
         const Q_TILE_R: usize = 8;
-        let use_q_tiled = std::env::var("FERRUM_FA_LEGACY").as_deref() != Ok("1")
+        let force_legacy = std::env::var("FERRUM_FA_LEGACY").as_deref() == Ok("1");
+        let allow_decode_widen = std::env::var("FERRUM_FA_DECODE").as_deref() != Ok("0");
+        let use_q_tiled = !force_legacy
             && params.head_dim == 128
             && params.sliding_window == 0
             && params.q_len >= Q_TILE_R;
+        let use_decode_widen = !force_legacy
+            && allow_decode_widen
+            && params.head_dim == 128
+            && params.sliding_window == 0
+            && params.q_len == 1;
 
         let enc = cmd.new_compute_command_encoder();
         if use_q_tiled {
@@ -972,6 +997,22 @@ impl MetalPipelines {
             let q_tiles = params.q_len.div_ceil(Q_TILE_R) as u64;
             let grid = MTLSize::new(q_tiles, params.num_heads as u64, params.batch as u64);
             let tg = MTLSize::new(128, 1, 1); // 4 simdgroups
+            enc.dispatch_thread_groups(grid, tg);
+        } else if use_decode_widen {
+            enc.set_compute_pipeline_state(self.pipeline("flash_attn_decode_f32"));
+            enc.set_buffer(0, Some(q), 0);
+            enc.set_buffer(1, Some(k), 0);
+            enc.set_buffer(2, Some(v), 0);
+            enc.set_buffer(3, Some(o), 0);
+            enc.set_bytes(
+                4,
+                std::mem::size_of::<P>() as u64,
+                &p as *const _ as *const c_void as *const _,
+            );
+            // q_len always 1 here. One TG per (head, batch); each TG has
+            // SDPA_BN=32 simdgroups × SDPA_BD=32 threads = 1024 threads.
+            let grid = MTLSize::new(1, params.num_heads as u64, params.batch as u64);
+            let tg = MTLSize::new(32, 32, 1);
             enc.dispatch_thread_groups(grid, tg);
         } else {
             enc.set_compute_pipeline_state(self.pipeline("flash_attn_f32"));
