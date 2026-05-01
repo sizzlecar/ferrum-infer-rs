@@ -1678,49 +1678,122 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 norm_topk_prob,
             )?;
 
+            // Per-item loop using offset-aware kernel APIs — eliminates
+            // the 4 copy_slice round-trips per iteration that the
+            // earlier implementation needed (ids, weights, x_single,
+            // moe_out). At c=16 / 48 layers that's ~3,072 dispatches
+            // saved per token. Uses `gemv_quant_moe_id_offset` to read
+            // `selected_ids_buf` at the i-th `top_k` block and
+            // `norm_out` at the i-th hidden row directly. Falls back
+            // to copy_slice path if backend doesn't support offsets.
             for i in 0..m {
-                // Extract this item's selected experts + combine weights.
-                B::copy_slice(
-                    ctx,
-                    &self.scratch.selected_ids_buf,
-                    i * top_k,
-                    &mut self.scratch.ids_buf,
-                    0,
-                    top_k,
-                );
-                B::copy_slice(
-                    ctx,
-                    &self.scratch.weights_2d,
-                    i * top_k,
-                    &mut self.scratch.weights_buf,
-                    0,
-                    top_k,
-                );
-                // Item i's activation row.
-                B::copy_slice(
+                let ids_offset = i * top_k;
+                let activation_offset = i * h;
+                let weights_offset = i * top_k;
+                let moe_out_offset = i * h;
+
+                // Stacked gate / up gemvs — broadcast item i's row of
+                // norm_out across top_k slots, read item i's ids.
+                let gate_res = B::gemv_quant_moe_id_offset(
                     ctx,
                     &self.scratch.norm_out,
-                    i * h,
-                    &mut self.scratch.x_single,
-                    0,
-                    h,
-                );
-
-                // Stacked gate / up gemvs — broadcast x_single across top_k.
-                B::gemv_quant_moe_id(
-                    ctx,
-                    &self.scratch.x_single,
+                    activation_offset,
                     gate_stacked,
-                    &self.scratch.ids_buf,
+                    &self.scratch.selected_ids_buf,
+                    ids_offset,
                     &mut self.scratch.gate_out_stacked,
                     top_k,
-                    0, // broadcast
-                )?;
-                B::gemv_quant_moe_id(
+                    0,
+                );
+                if gate_res.is_err() {
+                    // Backend doesn't support offset variants — fall back
+                    // to the legacy copy_slice path. Same as before.
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.selected_ids_buf,
+                        ids_offset,
+                        &mut self.scratch.ids_buf,
+                        0,
+                        top_k,
+                    );
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.weights_2d,
+                        weights_offset,
+                        &mut self.scratch.weights_buf,
+                        0,
+                        top_k,
+                    );
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.norm_out,
+                        activation_offset,
+                        &mut self.scratch.x_single,
+                        0,
+                        h,
+                    );
+                    B::gemv_quant_moe_id(
+                        ctx,
+                        &self.scratch.x_single,
+                        gate_stacked,
+                        &self.scratch.ids_buf,
+                        &mut self.scratch.gate_out_stacked,
+                        top_k,
+                        0,
+                    )?;
+                    B::gemv_quant_moe_id(
+                        ctx,
+                        &self.scratch.x_single,
+                        up_stacked,
+                        &self.scratch.ids_buf,
+                        &mut self.scratch.up_out_stacked,
+                        top_k,
+                        0,
+                    )?;
+                    B::silu_mul_stacked(
+                        ctx,
+                        &self.scratch.gate_out_stacked,
+                        &self.scratch.up_out_stacked,
+                        &mut self.scratch.silu_stacked,
+                        top_k,
+                        inter,
+                    )?;
+                    B::gemv_quant_moe_id(
+                        ctx,
+                        &self.scratch.silu_stacked,
+                        down_stacked,
+                        &self.scratch.ids_buf,
+                        &mut self.scratch.down_out_stacked,
+                        top_k,
+                        inter,
+                    )?;
+                    B::weighted_sum_batched(
+                        ctx,
+                        &self.scratch.down_out_stacked,
+                        &self.scratch.weights_buf,
+                        &mut self.scratch.acc_buf,
+                        1,
+                        top_k,
+                        h,
+                    )?;
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.acc_buf,
+                        0,
+                        &mut self.scratch.moe_out,
+                        moe_out_offset,
+                        h,
+                    );
+                    continue;
+                }
+                // Fast path: offset-aware all the way through.
+                B::gemv_quant_moe_id_offset(
                     ctx,
-                    &self.scratch.x_single,
+                    &self.scratch.norm_out,
+                    activation_offset,
                     up_stacked,
-                    &self.scratch.ids_buf,
+                    &self.scratch.selected_ids_buf,
+                    ids_offset,
                     &mut self.scratch.up_out_stacked,
                     top_k,
                     0,
@@ -1733,34 +1806,30 @@ impl<B: Backend> Qwen3MoeModel<B> {
                     top_k,
                     inter,
                 )?;
-                B::gemv_quant_moe_id(
+                B::gemv_quant_moe_id_offset(
                     ctx,
                     &self.scratch.silu_stacked,
+                    0, // silu_stacked itself stays at offset 0 each iter
                     down_stacked,
-                    &self.scratch.ids_buf,
+                    &self.scratch.selected_ids_buf,
+                    ids_offset,
                     &mut self.scratch.down_out_stacked,
                     top_k,
                     inter,
                 )?;
-                // Combine with weights — overwrite acc_buf (no residual
-                // fusion). batch=1 covers our single token.
-                B::weighted_sum_batched(
+                // Write directly into moe_out at the per-item offset —
+                // skips the copy_slice from acc_buf.
+                B::weighted_sum_batched_offset(
                     ctx,
                     &self.scratch.down_out_stacked,
-                    &self.scratch.weights_buf,
-                    &mut self.scratch.acc_buf,
+                    &self.scratch.weights_2d,
+                    weights_offset,
+                    &mut self.scratch.moe_out,
+                    moe_out_offset,
                     1,
                     top_k,
                     h,
                 )?;
-                B::copy_slice(
-                    ctx,
-                    &self.scratch.acc_buf,
-                    0,
-                    &mut self.scratch.moe_out,
-                    i * h,
-                    h,
-                );
             }
         } else {
             // Backend without stacked variants — fall back to the legacy

@@ -88,6 +88,31 @@ pub fn dispatch_weighted_sum_batched(
     top_k: usize,
     hidden: usize,
 ) {
+    dispatch_weighted_sum_batched_offset(
+        device, enc, slots, 0, weights, 0, out, 0, batch, top_k, hidden,
+    );
+}
+
+/// Offset-aware weighted_sum_batched. `weights_byte_offset` /
+/// `out_byte_offset` let `weights` start mid-buffer (e.g. read row i
+/// from a stacked `[M, top_k]` buffer at `i*top_k*4`) and `out` start
+/// mid-buffer (e.g. write row i into a stacked `[M, hidden]` buffer
+/// at `i*hidden*4`). Eliminates `copy_slice` round-trips on the
+/// per-item batched-decode path.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_weighted_sum_batched_offset(
+    device: &Device,
+    enc: &ComputeCommandEncoderRef,
+    slots: &Buffer,
+    slots_byte_offset: u64,
+    weights: &Buffer,
+    weights_byte_offset: u64,
+    out: &Buffer,
+    out_byte_offset: u64,
+    batch: usize,
+    top_k: usize,
+    hidden: usize,
+) {
     #[repr(C)]
     struct P {
         batch: i32,
@@ -102,9 +127,9 @@ pub fn dispatch_weighted_sum_batched(
 
     let pipe = wsum_pipeline(device);
     enc.set_compute_pipeline_state(pipe);
-    enc.set_buffer(0, Some(slots), 0);
-    enc.set_buffer(1, Some(weights), 0);
-    enc.set_buffer(2, Some(out), 0);
+    enc.set_buffer(0, Some(slots), slots_byte_offset);
+    enc.set_buffer(1, Some(weights), weights_byte_offset);
+    enc.set_buffer(2, Some(out), out_byte_offset);
     enc.set_bytes(
         3,
         std::mem::size_of::<P>() as u64,
