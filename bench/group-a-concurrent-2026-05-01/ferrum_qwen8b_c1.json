@@ -1,0 +1,43 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8000",
+    "model": "Qwen3-8B-Q4_K_M",
+    "num_prompts": 4,
+    "max_concurrency": 1,
+    "request_rate": Infinity,
+    "max_tokens": 128
+  },
+  "completed": 4,
+  "failed": 0,
+  "wall_time_s": 17.899725125,
+  "request_throughput_rps": 0.22346711874437233,
+  "input_throughput_tok_s": 4.245875256143075,
+  "output_throughput_tok_s": 28.60379119927966,
+  "total_input_tokens": 76,
+  "total_output_tokens": 512,
+  "ttft_ms": {
+    "mean": 209.70034374999994,
+    "median": 224.20358349999958,
+    "p99": 253.76331251000056,
+    "max": 254.6468750000006
+  },
+  "tpot_ms": {
+    "mean": 33.58340354133858,
+    "median": 32.8939363503937,
+    "p99": 36.0800630256693,
+    "max": 36.16358431496064
+  },
+  "itl_ms": {
+    "mean": 33.58270890748032,
+    "median": 32.680645999999754,
+    "p99": 39.422165500000425,
+    "max": 40.72562500000032
+  },
+  "e2e_ms": {
+    "mean": 4474.7925935,
+    "median": 4401.733499999999,
+    "p99": 4835.871844260001,
+    "max": 4847.422083000001
+  },
+  "label": "ferrum_qwen8b_c1"
+}
