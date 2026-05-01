@@ -150,7 +150,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // Create engine
     let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
-    let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
+    let engine = ferrum_engine::create_default_engine(engine_config).await?;
 
     // Print ready message
     eprintln!();
@@ -410,6 +410,104 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
         .map(|e| e.eq_ignore_ascii_case("gguf"))
         .unwrap_or(false)
         && p.is_file()
+}
+
+/// Resolve a GGUF alias to a `(repo, filename)` pair if recognised. Returns
+/// `None` for non-GGUF aliases — callers fall through to
+/// [`resolve_model_alias`].
+///
+/// These map ergonomic aliases to the `<org>/<name>-GGUF` repos the
+/// community publishes Q4_K_M quantizations under. The filename component
+/// pins a specific quantization; users wanting other quants pass the path
+/// directly or extend this table.
+pub fn resolve_gguf_alias(name: &str) -> Option<(String, String)> {
+    // Aliases verified by probing the HF API on 2026-05-01. Quantization
+    // availability differs per repo — Qwen/Qwen3-{0.6B,1.7B}-GGUF only
+    // host Q8_0; 4B / 8B / 30B-A3B host Q4_K_M.
+    match name.to_lowercase().as_str() {
+        // Group A bench targets — same models the bench scripts use for
+        // single-request PP/TG comparison vs llama.cpp / mistral.rs.
+        "qwen3:8b-q4_k_m" => Some((
+            "Qwen/Qwen3-8B-GGUF".to_string(),
+            "Qwen3-8B-Q4_K_M.gguf".to_string(),
+        )),
+        "qwen3:4b-q4_k_m" => Some((
+            "Qwen/Qwen3-4B-GGUF".to_string(),
+            "Qwen3-4B-Q4_K_M.gguf".to_string(),
+        )),
+        "qwen3:1.7b" | "qwen3:1.7b-q8_0" => Some((
+            "Qwen/Qwen3-1.7B-GGUF".to_string(),
+            "Qwen3-1.7B-Q8_0.gguf".to_string(),
+        )),
+        "qwen3:0.6b-gguf" | "qwen3:0.6b-q8_0" => Some((
+            "Qwen/Qwen3-0.6B-GGUF".to_string(),
+            "Qwen3-0.6B-Q8_0.gguf".to_string(),
+        )),
+        "qwen3-moe:30b-a3b-q4_k_m" | "qwen3:30b-a3b-q4_k_m" => Some((
+            "Qwen/Qwen3-30B-A3B-GGUF".to_string(),
+            "Qwen3-30B-A3B-Q4_K_M.gguf".to_string(),
+        )),
+        "llama3.1:8b-q4_k_m" => Some((
+            "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF".to_string(),
+            "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf".to_string(),
+        )),
+        "llama3.2:3b-q4_k_m" => Some((
+            "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
+            "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
+        )),
+        "llama3.2:1b-q4_k_m" => Some((
+            "bartowski/Llama-3.2-1B-Instruct-GGUF".to_string(),
+            "Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string(),
+        )),
+        _ => None,
+    }
+}
+
+/// For GGUF aliases whose repo lacks a tokenizer.json, return the sibling
+/// safetensors repo where the tokenizer should be pulled from. Convention:
+/// strip a trailing `-GGUF` from the repo name. Returns `None` for repos
+/// that already host their own tokenizer (e.g. bartowski/*).
+pub fn tokenizer_sibling_repo(gguf_repo: &str) -> Option<String> {
+    if let Some(stripped) = gguf_repo.strip_suffix("-GGUF") {
+        Some(stripped.to_string())
+    } else {
+        None
+    }
+}
+
+/// Locate a previously-pulled GGUF file in the HF cache.
+///
+/// Mirrors `find_cached_model` but returns the path to the specific
+/// `.gguf` file (not a directory). Looks up `refs/main` to find the
+/// active snapshot, falls back to the first snapshot containing the
+/// requested file. Returns `None` if neither finds it.
+pub fn find_cached_gguf(cache_dir: &PathBuf, repo: &str, filename: &str) -> Option<PathBuf> {
+    let repo_dir = cache_dir
+        .join("hub")
+        .join(format!("models--{}", repo.replace('/', "--")));
+    let snapshots_dir = repo_dir.join("snapshots");
+
+    let ref_main = repo_dir.join("refs").join("main");
+    if let Ok(rev) = std::fs::read_to_string(&ref_main) {
+        let rev = rev.trim();
+        if !rev.is_empty() {
+            let candidate = snapshots_dir.join(rev).join(filename);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(filename);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 pub fn select_device(backend: &str) -> ferrum_types::Device {

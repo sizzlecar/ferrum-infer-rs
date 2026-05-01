@@ -1,4 +1,4 @@
-use ferrum_engine::{create_mvp_engine, simple_engine_config};
+use ferrum_engine::{create_default_engine, simple_engine_config};
 use ferrum_interfaces::InferenceEngine;
 use ferrum_types::{Device, InferenceRequest, SamplingParams};
 use std::{path::Path, sync::Arc, time::Duration};
@@ -29,7 +29,7 @@ async fn qwen_25_05b_requests_are_serialized_for_correctness() {
     config.scheduler.max_running_requests = 4;
 
     let engine: Arc<dyn InferenceEngine + Send + Sync> =
-        Arc::from(create_mvp_engine(config).await.expect("create engine"));
+        Arc::from(create_default_engine(config).await.expect("create engine"));
 
     let monitor_engine = engine.clone();
     let monitor = tokio::spawn(async move {
