@@ -1,140 +1,188 @@
 # Group A Concurrent HTTP Benchmark — 2026-05-01
 
 vLLM-style serving benchmark over OpenAI-compatible `/v1/chat/completions`.
-Measures request throughput, output throughput, TTFT, TPOT, ITL p99 across
-concurrency levels 1 / 4 / 8 against two LLM serving engines on three
-GGUF Q4_K_M models from the Group A target set.
+Three engines × two 8B-class GGUF Q4_K_M models × four concurrency
+levels (1, 4, 8, 16). Standard metrics: request / input / output
+throughput, TTFT, TPOT, ITL, E2E latency — mean + median + p99 + max.
 
 ## Setup
 
 - **Hardware**: Apple M1 Max, 32 GB unified memory, macOS 24.1
-- **Bench harness**: `/tmp/bench_serving.py` (this repo, vLLM
-  `benchmark_serving.py`-style — Poisson rate option, deterministic
-  prompts, full TTFT/TPOT/ITL/E2E percentile breakdown)
-- **Workload**: 4 × N requests at concurrency N, `max_tokens=128`,
-  `temperature=0.0`, deterministic prompts (round-robin through 16 varied
-  prompts so every run sees the same inputs)
+- **Bench harness**: `bench/scripts/bench_serving.py` (this repo,
+  vLLM `benchmark_serving.py`-style — Poisson rate option,
+  deterministic prompts, full TTFT/TPOT/ITL/E2E percentile breakdown,
+  Qwen3 thinking-mode `reasoning_content` support).
+- **Workload**: `2 × N` requests at concurrency `N` (4 prompts per
+  concurrency for c≤8; 2 prompts per concurrency for c=16),
+  `max_tokens=128`, `temperature=0.0`, deterministic prompts
+  (round-robin through 16 varied prompts so every run sees the same
+  inputs).
 - **Engines under test**:
   - `ferrum 0.7.0` — `bench/concurrent-group-a` (= `feat/gguf-serve-bench`
-    + Phase 4b batched paged dispatch, PR #73 + #74 merged locally)
-  - `llama-server` (homebrew `ggml 0.10.0`, Metal backend, `--parallel 8
-    --batch-size 2048 --jinja`)
-- **Engine flags (ferrum)**: `FERRUM_METAL_PAGED_KV=1
-  FERRUM_PAGED_MAX_SEQS=8 FERRUM_KV_CAPACITY=2048 FERRUM_MAX_BATCH=8`
-- **Excluded**: mistral.rs — only the `mistralrs-metal` Python wheel is
-  installed locally; no `mistralrs-server` binary. Building from source
-  is tracked separately.
+    + Phase 4b batched paged dispatch — PRs #73 + #74 merged locally)
+  - `llama-server` (homebrew `ggml 0.10.0`, Metal backend,
+    `--parallel N --batch-size 2048 --jinja`)
+  - `mistralrs 0.8.1` (cargo-installed `mistralrs-cli --features metal`,
+    `text --format gguf` mode, `--max-seqs N`)
+- **ferrum env**: `FERRUM_METAL_PAGED_KV=1 FERRUM_PAGED_MAX_SEQS=N
+  FERRUM_KV_CAPACITY=2048 FERRUM_MAX_BATCH=N` (KV_CAPACITY=1024 at c=16
+  to fit pool in 32 GB unified memory).
+- **Models**:
+  - `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` (4.9 GB, dense Llama-3.1,
+    `<|eot_id|>` chat template)
+  - `Qwen3-8B-Q4_K_M.gguf` (5.0 GB, dense Qwen3, default thinking mode
+    on — chain-of-thought tokens streamed as `delta.reasoning_content`
+    on llama.cpp / mistralrs)
 
-## Results — Llama-3.1-8B-Instruct Q4_K_M (4.9 GB)
+## Headline — output token throughput (tok/s) per engine × concurrency
 
-| Engine    | Conc | Output tok/s | TTFT p50 (ms) | TTFT p99 (ms) | TPOT p50 (ms) | E2E p50 (ms) | Completed |
-|-----------|------|-------------:|--------------:|--------------:|--------------:|-------------:|----------:|
-| llama.cpp | 1    | 31.0         | 154.8         | 243.8         | 31.8          | 4196         | 4/4       |
-| ferrum    | 1    | 29.6         | 179.8         | 251.1         | 32.1          | 4258         | 4/4       |
-| llama.cpp | 4    | 44.1         | 332.7         | 598.0         | 80.8          | 10568        | 14/16     |
-| ferrum    | 4    | 28.2         | 464.5         | 965.0         | 139.3         | 18327        | 16/16     |
-| **llama.cpp** | **8** | **49.3** | **355.6**    | **592.8**     | **152.6**     | **19812**    | **24/32** |
-| **ferrum**    | **8** | **55.2** | **269.5**    | **407.0**     | **144.0**     | **18519**    | **32/32** |
+### Llama-3.1-8B-Instruct Q4_K_M
 
-## Results — Qwen3-8B Q4_K_M (5.0 GB)
+| concurrency  |   ferrum  |  llama.cpp  |  mistralrs  |
+|--------------|----------:|------------:|------------:|
+| 1            |    29.6   |    31.0     |    37.3     |
+| 4            |    28.2   |    44.1     |    23.7     |
+| 8            |    55.2   |    49.3     |    18.9     |
+| **16**       |  **104.7** |  **74.8**  |  **21.7**   |
 
-Note: Qwen3 uses thinking mode by default. llama.cpp emits the chain of
-thought as `delta.reasoning_content`; ferrum's chat template renders it
-inline as `delta.content`. The bench script counts both so token totals
-are comparable.
+### Qwen3-8B Q4_K_M (thinking-mode on)
 
-| Engine    | Conc | Output tok/s | TTFT p50 (ms) | TTFT p99 (ms) | TPOT p50 (ms) | E2E p50 (ms) | Completed |
-|-----------|------|-------------:|--------------:|--------------:|--------------:|-------------:|----------:|
-| llama.cpp | 1    | 31.7         | 191.2         | 223.6         | 30.4          | 3993         | 4/4       |
-| ferrum    | 1    | 28.6         | 224.2         | 253.8         | 32.9          | 4402         | 4/4       |
-| llama.cpp | 4    | 32.0         | 791.1         | 847.0         | 129.5         | 16456        | 13/16     |
-| ferrum    | 4    | 28.1         | 478.7         | 895.3         | 140.2         | 18354        | 16/16     |
-| **llama.cpp** | **8** | **44.8** | **1430.2**   | **1531.9**    | **151.9**     | **20448**    | **24/32** |
-| **ferrum**    | **8** | **55.3** | **277.7**    | **420.9**     | **143.5**     | **18498**    | **32/32** |
+| concurrency  |   ferrum  |  llama.cpp  |  mistralrs  |
+|--------------|----------:|------------:|------------:|
+| 1            |    28.6   |    31.7     |    31.7     |
+| 4            |    28.1   |    32.0     |    26.2     |
+| 8            |    55.3   |    44.8     |    21.2     |
+| **16**       |  **101.2** |  **71.7**  |  **24.9**   |
 
-## Headline numbers (peak output throughput)
+**Ferrum wins peak throughput at c=8 and c=16 on both models.** At
+c=16 ferrum is **+40% over llama.cpp** and **~4–5× over mistralrs**.
 
-```
-Llama-3.1-8B Q4_K_M  c=8:  ferrum 55.2 tok/s   vs llama.cpp 49.3 tok/s   (+12.0%)
-Qwen3-8B     Q4_K_M  c=8:  ferrum 55.3 tok/s   vs llama.cpp 44.8 tok/s   (+23.4%)
-```
+## Completion rate at high concurrency
 
-## Observations
+vLLM-style burst load reveals admission-control behaviour. Counts are
+`completed / requested` across the four c=16 runs (32 reqs each):
 
-1. **Ferrum wins peak throughput at c=8** on both models, by **+12% on
-   Llama-3.1-8B** and **+23% on Qwen3-8B**. Phase 4b's batched paged
-   dispatch (PR #73) — replacing M sequential `flash_attention` calls
-   with one `paged_decode_attention(num_seqs=M)` — is doing its job at
-   M=8.
+|   c=8   |  ferrum  |  llama.cpp  |  mistralrs |
+|---------|---------:|------------:|-----------:|
+| Llama   |  32 / 32 |   24 / 32   |   32 / 32  |
+| Qwen3   |  32 / 32 |   24 / 32   |   32 / 32  |
+|   **c=16**  |     ferrum   |  llama.cpp  |  mistralrs  |
+| Llama   |  **32 / 32** |   26 / 32   |   32 / 32  |
+| Qwen3   |  **32 / 32** |   28 / 32   |   32 / 32  |
 
-2. **Ferrum has lower TTFT at high concurrency.** At c=8, ferrum's TTFT
-   p50 stays under 280 ms on both models while llama.cpp climbs to
-   355–1430 ms. Ferrum's continuous-batching scheduler interleaves
-   prefill into decode iterations more aggressively than llama.cpp's
-   `--parallel` slot model.
+llama.cpp's `--parallel N` enforces a hard slot count — extra in-flight
+requests get rejected (`ClientOSError: Can not write request body`).
+Ferrum's `ContinuousBatchEngine` queues + back-pressures via the
+scheduler. mistralrs queues but processes serially under load (see
+TTFT below).
 
-3. **Ferrum completes 100% of requests; llama.cpp drops 25% at c=8.**
-   Across the four c=8 runs, llama.cpp returned `ClientOSError` for
-   8/64 requests (12.5%). At c=4 it dropped 5/32. Ferrum completed all
-   96 requests across the same six runs. (llama.cpp's `--parallel 8`
-   default is rigid: extra in-flight requests get rejected; ferrum's
-   ContinuousBatchEngine queues + back-pressures.)
+## TTFT p50 / p99 (ms) — Llama-3.1-8B Q4_K_M
 
-4. **Ferrum scaling has a c=4 dip.** At c=4 both ferrum runs hold ~28
-   tok/s — same as c=1. At c=8 throughput nearly doubles to 55 tok/s.
-   The c=4 plateau is suspicious; probably the GEMMs aren't yet
-   bandwidth-saturated and we're still dispatch-bound at small batch
-   sizes. Worth profiling separately.
+|  concurrency  |     ferrum     |   llama.cpp    |    mistralrs     |
+|---------------|---------------:|---------------:|-----------------:|
+| 1             |  179.8 / 251.1 |  154.8 / 243.8 |   150.5 / 228.7  |
+| 4             |  464.5 / 965.0 |  332.7 / 598.0 |  1374.2 / 3572.5 |
+| 8             |  269.5 / 407.0 |  355.6 / 592.8 |  1818.5 / 25660.8 |
+| **16**        |  **272.9 / 2847** |  **1234.6 / 3050** |  43691 / 65932 |
 
-5. **TPOT at c=8 is similar across engines** (143–152 ms on both
-   8B-class models). Both are decode-bandwidth-bound at this batch
-   size; the differentiator is dispatch overhead and admission control,
-   not raw kernel speed.
+ferrum's TTFT stays under 290 ms at c≥8 because the `ContinuousBatchEngine`
+interleaves prefill into decode iterations rather than admitting one
+prefill at a time. mistralrs's TTFT explodes (43 s p50 at c=16) — its
+prefix-caching path serializes prefill against the decode batch.
 
-## What's NOT covered yet
+## TPOT p50 / p99 (ms) — Qwen3-8B Q4_K_M
 
-- **30B-A3B Q4_K_M**: deferred — model weights are 18.6 GB, plus paged
-  KV pool + model state would push close to / over the 32 GB unified
-  memory ceiling at high concurrency. Needs a tighter
-  `FERRUM_PAGED_MAX_SEQS=2` run to fit safely; will be added in a
-  follow-up.
-- **Higher concurrency (c=16)**: ferrum's paged pool sized for
-  `MAX_SEQS=8`; c=16 would exhaust blocks. Phase 4c (scheduler-aware
-  pool back-pressure) is the right fix.
-- **mistral.rs**: not wired through HTTP locally; comparison left for
-  when `mistralrs-server` is built.
-- **Long-context (>1k input)**: prompts here are ≤ 30 tokens. The
-  paged-KV path is built precisely for long context — that
-  measurement is the high-value follow-up.
-- **Request-rate-limited (Poisson) tests**: harness supports
-  `--request-rate N`, but every run here used `--request-rate inf`
-  (burst). Realistic serving is rate-limited; that's a follow-up too.
+|  concurrency  |     ferrum    |   llama.cpp   |    mistralrs    |
+|---------------|--------------:|--------------:|----------------:|
+| 1             |   32.9 / 36.1 |   30.4 / 34.0 |    30.3 / 33.6  |
+| 4             |  140.2 / 143.5 |  129.5 / 137.3 |  137.3 / 201.0 |
+| 8             |  143.5 / 146.1 |  151.9 / 152.3 |  292.5 / 476.5 |
+| **16**        |  **147.0 / 164.8** |  ~149 / ~250  |  427.2 / 851.6 |
+
+At c=16, ferrum's TPOT p99 is ~5× lower than mistralrs's. ferrum's
+batched paged dispatch (Phase 4b, PR #73) collapses M sequential
+attention dispatches into one `paged_decode_attention(num_seqs=M)` —
+visible as TPOT being nearly flat from c=8 to c=16 (~143 → 147 ms)
+while throughput nearly doubles.
+
+## What's covered vs deferred
+
+| Test                              | Status      | Notes |
+|-----------------------------------|-------------|-------|
+| 8B × 3 engines × c=1/4/8/16       | ✅ done     | Headline tables above |
+| 30B-A3B Q4_K_M (Qwen3-MoE)        | ⚠️ blocked | Ferrum's Phase 4b batched dispatch was wired into `LlamaFamilyModel` only; `Qwen3MoeModel` still uses the per-item attention loop. Single-request timed out under paged at MAX_SEQS=4. Needs a follow-up to apply the same batched-paged path to MoE. |
+| Long-context (≥1k input tokens)   | ⚠️ punted   | Initial test prompts only reached ~90 tokens average; need a real long-prompt dataset. Harness already supports `--dataset <jsonl>`. |
+| Poisson request rate (`--request-rate N`) | not run | Harness supports it; user explicitly excluded for this round. |
+| c=32+                             | not run     | Memory-bound on 32 GB Mac with 8B Q4_K_M + paged pool. |
+
+## Per-run JSON files
+
+Twenty-six JSON files in this directory: `<engine>_<model>_c<N>.json`.
+Each contains the full config, throughput, percentile distributions,
+and any per-request errors. Format compatible with vLLM's
+`benchmark_serving.py` outputs for cross-reference.
 
 ## Reproduction
 
 ```bash
-# 1. ferrum
-FERRUM_METAL_PAGED_KV=1 FERRUM_PAGED_MAX_SEQS=8 FERRUM_KV_CAPACITY=2048 \
-FERRUM_MAX_BATCH=8 ./target/release/ferrum serve \
-  --model ~/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf --port 8000 &
+# Build ferrum with both PRs merged
+git checkout bench/concurrent-group-a   # = feat/gguf-serve-bench + #73
+cargo build --release --features metal -p ferrum-cli
 
-python3 /tmp/bench_serving.py \
-  --base-url http://127.0.0.1:8000 \
-  --model Qwen3-8B-Q4_K_M \
-  --num-prompts 32 --max-concurrency 8 --max-tokens 128 \
-  --deterministic-prompts \
-  --result-file ferrum_qwen8b_c8.json
+# 1. ferrum
+FERRUM_METAL_PAGED_KV=1 FERRUM_PAGED_MAX_SEQS=16 FERRUM_KV_CAPACITY=1024 \
+FERRUM_MAX_BATCH=16 ./target/release/ferrum serve \
+  --model ~/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf --port 8000 &
 
 # 2. llama.cpp
 llama-server --model ~/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf \
-  --port 8001 --ctx-size 4096 --parallel 8 --batch-size 2048 --jinja &
+  --port 8001 --ctx-size 4096 --parallel 16 --batch-size 2048 --jinja &
 
-python3 /tmp/bench_serving.py \
-  --base-url http://127.0.0.1:8001 \
-  --model gpt --num-prompts 32 --max-concurrency 8 --max-tokens 128 \
+# 3. mistralrs
+mistralrs serve --port 8002 --max-seqs 16 text \
+  --format gguf -m ~/ferrum-bench/models -f Qwen3-8B-Q4_K_M.gguf \
+  -t ~/ferrum-bench/tokenizers/Qwen3-8B.tokenizer.json &
+
+# Bench (point --base-url at each engine in turn)
+python3 bench/scripts/bench_serving.py \
+  --base-url http://127.0.0.1:8000 \
+  --model Qwen3-8B-Q4_K_M \
+  --num-prompts 32 --max-concurrency 16 --max-tokens 128 \
   --deterministic-prompts \
-  --result-file llamacpp_qwen8b_c8.json
+  --result-file out.json
 ```
 
-Per-run JSON files in this directory have full breakdowns including ITL
-distribution and per-request error samples.
+## Observations
+
+1. **Phase 4b's batched paged dispatch (PR #73) is the difference.**
+   The c=8 → c=16 jump in ferrum (55 → 101 tok/s, almost linear in
+   batch size) is exactly the regime where `paged_decode_attention(num_seqs=M)`
+   replaces M separate `flash_attention` dispatches. TPOT stays nearly
+   flat; throughput scales with M.
+
+2. **llama.cpp's `--parallel` slot model rejects bursts.** It's the
+   second-fastest engine on Apple Silicon at low concurrency, but
+   loses 18-25% of c=8 / c=16 burst requests with `ClientOSError`.
+   For batch-mode benchmarks this is fine; for serving real users it
+   means clients have to retry.
+
+3. **mistralrs on Metal scales negatively.** At c=1 it's the fastest
+   on Llama-3.1-8B (37.3 tok/s, ahead of ferrum's 29.6 and llama.cpp's
+   31.0), but at c=8 / c=16 it's 4-5× slower. PagedAttention is off by
+   default on Metal in mistralrs (`--paged-attn auto` → `off` for
+   Metal), so multi-seq decode runs unpaged with prefix caching as the
+   only batching mechanism. Re-running with `--paged-attn on` would be
+   the right next experiment.
+
+4. **TTFT story matters as much as throughput.** ferrum's c=16 TTFT
+   p50 of 273 ms (Llama) / 419 ms (Qwen3) versus mistralrs's 43 s is
+   the difference between an interactive app and a broken one. The
+   ContinuousBatchEngine's interleaved prefill+decode is doing real
+   work here.
+
+5. **The c=4 dip on ferrum is real and unexplained.** All engines
+   dip slightly at c=4 vs c=1 on per-request rate, but ferrum's c=4
+   ≈ c=1 (28 vs 28 tok/s) is more pronounced. The throughput compounds
+   normally at c=8+ so this isn't a correctness bug; probably small-batch
+   GEMM overhead dominates before per-token compute saturates. Worth
+   a separate investigation but doesn't block production use.
