@@ -1,0 +1,43 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8001",
+    "model": "gpt",
+    "num_prompts": 4,
+    "max_concurrency": 1,
+    "request_rate": Infinity,
+    "max_tokens": 128
+  },
+  "completed": 4,
+  "failed": 0,
+  "wall_time_s": 15.924141375000001,
+  "request_throughput_rps": 0.251190937445442,
+  "input_throughput_tok_s": 0.0,
+  "output_throughput_tok_s": 31.650058118125692,
+  "total_input_tokens": 0,
+  "total_output_tokens": 504,
+  "ttft_ms": {
+    "mean": 194.29514550000005,
+    "median": 191.18002050000007,
+    "p99": 223.61211049000028,
+    "max": 224.04920800000028
+  },
+  "tpot_ms": {
+    "mean": 30.293119252,
+    "median": 30.422024504000003,
+    "p99": 34.040984826,
+    "max": 34.047354336
+  },
+  "itl_ms": {
+    "mean": 30.29213292,
+    "median": 31.906396000000115,
+    "p99": 38.181417169999285,
+    "max": 45.655
+  },
+  "e2e_ms": {
+    "mean": 3980.935052,
+    "median": 3992.8783750000002,
+    "p99": 4478.73521374,
+    "max": 4479.9685
+  },
+  "label": "llamacpp_qwen8b_c1"
+}
