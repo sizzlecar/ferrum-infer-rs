@@ -1,0 +1,46 @@
+=== Starting Qwen3-8B-Q4_K_M.gguf @ 2026年 5月 1日 星期五 08时46分57秒 CST ===
+swap baseline at bench start: 3647 MB (will warn if grows by >256 MB during the run)
+=== Qwen3-8B-Q4_K_M.gguf ===
+2026年 5月 1日 星期五 08时46分58秒 CST
+>>> llama.cpp (pp50, pp512, tg128 × 3 trials)
+    written → Qwen3-8B-Q4_K_M__llamacpp.txt
+>>> ferrum (9 runs: pp50×3, pp512×3, tg128×3)
+    written → Qwen3-8B-Q4_K_M__ferrum.txt
+>>> mistral.rs (3 runs: pp50, pp512, tg128 — each runs 3 trials internally)
+    written → Qwen3-8B-Q4_K_M__mistralrs.txt
+=== Qwen3-8B-Q4_K_M.gguf done ===
+2026年 5月 1日 星期五 08时48分30秒 CST
+swap delta over bench: 0 MB (baseline=3647, after=3647)
+=== Finished Qwen3-8B-Q4_K_M.gguf @ 2026年 5月 1日 星期五 08时48分30秒 CST ===
+=== Starting Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf @ 2026年 5月 1日 星期五 08时48分35秒 CST ===
+swap baseline at bench start: 3647 MB (will warn if grows by >256 MB during the run)
+=== Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf ===
+2026年 5月 1日 星期五 08时48分36秒 CST
+>>> llama.cpp (pp50, pp512, tg128 × 3 trials)
+    written → Meta-Llama-3.1-8B-Instruct-Q4_K_M__llamacpp.txt
+>>> ferrum (9 runs: pp50×3, pp512×3, tg128×3)
+    written → Meta-Llama-3.1-8B-Instruct-Q4_K_M__ferrum.txt
+>>> mistral.rs (3 runs: pp50, pp512, tg128 — each runs 3 trials internally)
+    written → Meta-Llama-3.1-8B-Instruct-Q4_K_M__mistralrs.txt
+=== Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf done ===
+2026年 5月 1日 星期五 08时50分06秒 CST
+swap delta over bench: 0 MB (baseline=3647, after=3647)
+=== Finished Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf @ 2026年 5月 1日 星期五 08时50分06秒 CST ===
+=== Starting Qwen3-30B-A3B-Q4_K_M.gguf @ 2026年 5月 1日 星期五 08时50分11秒 CST ===
+swap baseline at bench start: 3647 MB (will warn if grows by >256 MB during the run)
+=== Qwen3-30B-A3B-Q4_K_M.gguf ===
+2026年 5月 1日 星期五 08时50分12秒 CST
+>>> llama.cpp (pp50, pp512, tg128 × 3 trials)
+    written → Qwen3-30B-A3B-Q4_K_M__llamacpp.txt
+>>> ferrum (9 runs: pp50×3, pp512×3, tg128×3)
+    written → Qwen3-30B-A3B-Q4_K_M__ferrum.txt
+>>> mistral.rs (3 runs: pp50, pp512, tg128 — each runs 3 trials internally)
+    written → Qwen3-30B-A3B-Q4_K_M__mistralrs.txt
+=== Qwen3-30B-A3B-Q4_K_M.gguf done ===
+2026年 5月 1日 星期五 08时51分37秒 CST
+swap delta over bench: 335 MB (baseline=3647, after=3982)
+⚠ ⚠ ⚠ swap grew by 335 MB during the run (>256 MB threshold)
+  Bench numbers in this output are likely paging-affected.
+  → Re-run after closing apps / `sudo purge` / reboot for clean numbers.
+=== Finished Qwen3-30B-A3B-Q4_K_M.gguf @ 2026年 5月 1日 星期五 08时51分37秒 CST ===
+=== ALL DONE @ 2026年 5月 1日 星期五 08时51分42秒 CST ===
