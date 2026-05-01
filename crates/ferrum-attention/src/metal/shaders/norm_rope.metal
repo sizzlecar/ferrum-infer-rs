@@ -385,3 +385,132 @@ kernel void split_qkv_norm_rope_kvc_f32(
         dst[i + half_d] = x1 * c + x0 * s;
     }
 }
+
+// ── Paged-KV variant of split_qkv_norm_rope_kvc_f32 ──────────────────
+//
+// Same fused split + qk-norm + RoPE + cache-write as the contiguous
+// variant above. The only change is K/V's `dst` computation: instead
+// of writing into `cache_{k,v}[kv_head][cache_len + tok][hd]`, we
+// resolve the destination via the block-table:
+//
+//   global_slot     = cache_len + tok
+//   logical_block   = global_slot / block_size
+//   slot_in_block   = global_slot % block_size
+//   physical_block  = block_table[logical_block]
+//   dst             = cache_{k,v}[physical_block][kv_head][slot_in_block][hd]
+//
+// Cache layout: [num_blocks, kv_heads, block_size, head_dim] (matches
+// flash_attn_decode_paged_f32 from the sibling PR). Q stays head-major
+// — only K/V live in the paged pool.
+
+struct SplitQkvNormRopePagedKvcParams {
+    int tokens;
+    int q_heads;
+    int kv_heads;
+    int head_dim;
+    int half_dim;
+    int pos_offset;
+    float eps;
+    int qk_mode;
+    int cache_len;              // existing seq length in cache (slot of first new token)
+    int block_size;             // KV positions per physical block (16 typical)
+    int max_num_blocks_per_seq; // block_table row stride (single-seq case for now)
+};
+
+kernel void split_qkv_norm_rope_paged_kvc_f32(
+    device const float*    qkv          [[buffer(0)]],
+    device const float*    q_norm_w     [[buffer(1)]],
+    device const float*    k_norm_w     [[buffer(2)]],
+    device const float*    cos_tab      [[buffer(3)]],
+    device const float*    sin_tab      [[buffer(4)]],
+    device       float*    q_out        [[buffer(5)]],   // [q_heads, tokens, hd]
+    device       float*    cache_k      [[buffer(6)]],   // [num_blocks, kv_heads, block_size, hd]
+    device       float*    cache_v      [[buffer(7)]],   // [num_blocks, kv_heads, block_size, hd]
+    device const uint32_t* block_table  [[buffer(8)]],   // [max_blocks_per_seq] (single seq)
+    constant SplitQkvNormRopePagedKvcParams& p [[buffer(9)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const int tok = int(tgpig.x);
+    const int head_g = int(tgpig.y);
+    if (tok >= p.tokens) return;
+
+    const int hd = p.head_dim;
+    const int half_d = p.half_dim;
+    const int q_dim = p.q_heads * hd;
+    const int kv_dim = p.kv_heads * hd;
+    const int qkv_stride = q_dim + 2 * kv_dim;
+
+    int region;
+    int local_head;
+    int src_off;
+    if (head_g < p.q_heads) {
+        region = 0;
+        local_head = head_g;
+        src_off = tok * qkv_stride + local_head * hd;
+    } else if (head_g < p.q_heads + p.kv_heads) {
+        region = 1;
+        local_head = head_g - p.q_heads;
+        src_off = tok * qkv_stride + q_dim + local_head * hd;
+    } else {
+        region = 2;
+        local_head = head_g - p.q_heads - p.kv_heads;
+        src_off = tok * qkv_stride + q_dim + kv_dim + local_head * hd;
+    }
+
+    device const float* src = qkv + src_off;
+
+    // Compute dst pointer.
+    // Q (region 0): head-major scratch as before.
+    // K/V (region 1/2): paged layout — index via block_table.
+    device float* dst;
+    if (region == 0) {
+        dst = q_out + local_head * p.tokens * hd + tok * hd;
+    } else {
+        const int global_slot     = p.cache_len + tok;
+        const int logical_block   = global_slot / p.block_size;
+        const int slot_in_block   = global_slot % p.block_size;
+        const uint32_t physical_block = block_table[logical_block];
+        const int slot_offset = int(physical_block) * p.kv_heads * p.block_size * hd
+                              + local_head * p.block_size * hd
+                              + slot_in_block * hd;
+        dst = (region == 1 ? cache_k : cache_v) + slot_offset;
+    }
+
+    // V: pure copy.
+    if (region == 2) {
+        for (int i = int(tiisg); i < hd; i += 32) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+
+    // Q / K: optional QK-norm, then RoPE.
+    const bool apply_norm = (p.qk_mode == 1);
+    float scale = 1.0f;
+    device const float* norm_w = (region == 0) ? q_norm_w : k_norm_w;
+    if (apply_norm) {
+        float sum_sq = 0.0f;
+        for (int i = int(tiisg); i < hd; i += 32) {
+            float v = src[i];
+            sum_sq += v * v;
+        }
+        sum_sq = simd_sum(sum_sq);
+        scale = 1.0f / sqrt(sum_sq / float(hd) + p.eps);
+    }
+
+    const int pos = p.pos_offset + tok;
+    device const float* cos_row = cos_tab + pos * half_d;
+    device const float* sin_row = sin_tab + pos * half_d;
+
+    for (int i = int(tiisg); i < half_d; i += 32) {
+        float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
+        float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
+        float x0 = src[i]          * w0;
+        float x1 = src[i + half_d] * w1;
+        float c = cos_row[i];
+        float s = sin_row[i];
+        dst[i]          = x0 * c - x1 * s;
+        dst[i + half_d] = x1 * c + x0 * s;
+    }
+}
