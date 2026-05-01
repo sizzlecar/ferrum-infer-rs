@@ -511,7 +511,24 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
             .or_else(|| std::env::var("FERRUM_MODEL_PATH").ok());
 
         if let Some(model_path) = tokenizer_path {
-            let tokenizer_file = std::path::Path::new(&model_path).join("tokenizer.json");
+            let path = std::path::Path::new(&model_path);
+            // GGUF path: model_path is a file. Auto-discover a sibling
+            // tokenizer.json (or the convention used by ~/ferrum-bench).
+            let tokenizer_file = if ferrum_models::gguf_engine_loader::is_gguf_path(&model_path) {
+                ferrum_models::gguf_engine_loader::auto_discover_tokenizer_path(path).ok_or_else(
+                    || {
+                        FerrumError::tokenizer(format!(
+                            "Could not find tokenizer.json for {} — \
+                             place it next to the .gguf file or in a \
+                             sibling tokenizers/ directory",
+                            path.display()
+                        ))
+                    },
+                )?
+            } else {
+                // HF safetensors layout: model_path is a directory.
+                path.join("tokenizer.json")
+            };
 
             if tokenizer_file.exists() {
                 info!("Loading HuggingFace tokenizer from: {:?}", tokenizer_file);
@@ -900,6 +917,22 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
         };
 
         info!("Loading Candle model from: {}", model_path);
+
+        // GGUF fast path — `model_path` points directly at a `.gguf` file.
+        // Bypass the safetensors `ConfigManager::load_from_path` (which
+        // expects an HF directory layout) and route through ferrum's own
+        // GgufLoader to build a `LlamaFamilyModel` / `Qwen3MoeModel`. The
+        // resulting `DecoderOnlyLLM` plugs into `LlmExecutor` exactly like
+        // the safetensors path, so the rest of the engine is unchanged.
+        if ferrum_models::gguf_engine_loader::is_gguf_path(&model_path) {
+            info!("  Detected GGUF file — using GgufLoader path");
+            let (llm, model_info) = ferrum_models::gguf_engine_loader::load_gguf_decoder_with_info(
+                std::path::Path::new(&model_path),
+                &config.device,
+                config.engine_config.model.model_id.clone(),
+            )?;
+            return Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)));
+        }
 
         // Load model definition
         let mut config_manager = ferrum_models::ConfigManager::new();

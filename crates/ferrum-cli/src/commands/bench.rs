@@ -15,6 +15,7 @@ use ferrum_models::HfDownloader;
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -50,30 +51,65 @@ pub struct BenchCommand {
 }
 
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
-    let model_id = super::run::resolve_model_alias(&cmd.model);
-    eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
-    eprintln!("{}", "=".repeat(60).dimmed());
-
-    // Find or download model
-    let cache_dir = super::run::get_hf_cache_dir(&config);
-    let source = match super::run::find_cached_model(&cache_dir, &model_id) {
-        Some(source) => source,
-        None => {
-            eprintln!("Downloading model...");
-            let token = std::env::var("HF_TOKEN")
-                .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
-                .ok();
-            let downloader = HfDownloader::new(cache_dir.clone(), token)?;
-            let snapshot_path = downloader.download(&model_id, None).await?;
-            let format = super::run::detect_format(&snapshot_path);
-            ferrum_models::source::ResolvedModelSource {
-                original: model_id.clone(),
-                local_path: snapshot_path,
-                format,
-                from_cache: false,
+    // GGUF short-circuit: skip alias resolution + HF cache lookup when the
+    // model arg is already a `.gguf` path OR a registered GGUF alias
+    // (e.g. `qwen3:8b-q4_k_m`). The engine's executor factory
+    // (registry.rs) detects `.gguf` and routes to GgufLoader. Tokenizer is
+    // auto-discovered next to the gguf file.
+    let cache_dir_for_gguf = super::run::get_hf_cache_dir(&config);
+    let resolved_gguf_path: Option<PathBuf> = if super::run::looks_like_gguf_path(&cmd.model) {
+        Some(PathBuf::from(&cmd.model))
+    } else if let Some((repo, filename)) = super::run::resolve_gguf_alias(&cmd.model) {
+        match super::run::find_cached_gguf(&cache_dir_for_gguf, &repo, &filename) {
+            Some(p) => Some(p),
+            None => {
+                eprintln!(
+                    "GGUF alias '{}' not in cache. Run: ferrum pull {}",
+                    cmd.model, cmd.model
+                );
+                return Err(ferrum_types::FerrumError::model("GGUF model not found"));
             }
         }
+    } else {
+        None
     };
+    let (model_id, source) = if let Some(gguf_path) = resolved_gguf_path {
+        let id = gguf_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| cmd.model.clone());
+        let src = ferrum_models::source::ResolvedModelSource {
+            original: cmd.model.clone(),
+            local_path: gguf_path,
+            format: ferrum_models::source::ModelFormat::Unknown,
+            from_cache: true,
+        };
+        (id, src)
+    } else {
+        let id = super::run::resolve_model_alias(&cmd.model);
+        let cache_dir = super::run::get_hf_cache_dir(&config);
+        let src = match super::run::find_cached_model(&cache_dir, &id) {
+            Some(source) => source,
+            None => {
+                eprintln!("Downloading model...");
+                let token = std::env::var("HF_TOKEN")
+                    .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+                    .ok();
+                let downloader = HfDownloader::new(cache_dir.clone(), token)?;
+                let snapshot_path = downloader.download(&id, None).await?;
+                let format = super::run::detect_format(&snapshot_path);
+                ferrum_models::source::ResolvedModelSource {
+                    original: id.clone(),
+                    local_path: snapshot_path,
+                    format,
+                    from_cache: false,
+                }
+            }
+        };
+        (id, src)
+    };
+    eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
+    eprintln!("{}", "=".repeat(60).dimmed());
 
     unsafe {
         std::env::set_var(
@@ -129,7 +165,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     // DefaultInferenceEngine (Priority) has stream lifecycle issues with bench.
     let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
-    let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
+    let engine = ferrum_engine::create_default_engine(engine_config).await?;
 
     let prompt = if cmd.long_context {
         generate_long_prompt()

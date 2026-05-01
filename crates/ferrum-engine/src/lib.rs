@@ -127,13 +127,6 @@ pub async fn create_default_engine(
     create_engine(config).await
 }
 
-/// Create MVP engine - alias for create_default_engine
-pub async fn create_mvp_engine(
-    config: EngineConfig,
-) -> Result<Box<dyn InferenceEngineInterface + Send + Sync>> {
-    create_default_engine(config).await
-}
-
 /// Create a simple engine config from minimal parameters
 pub fn simple_engine_config(
     model_id: impl Into<ferrum_types::ModelId>,
