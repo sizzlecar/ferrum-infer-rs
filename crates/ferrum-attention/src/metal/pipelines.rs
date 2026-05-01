@@ -1313,10 +1313,7 @@ impl MetalPipelines {
             params.num_heads % params.num_kv_heads == 0,
             "GQA: num_heads must be divisible by num_kv_heads"
         );
-        debug_assert!(
-            params.q_len >= 1,
-            "q_len must be ≥ 1"
-        );
+        debug_assert!(params.q_len >= 1, "q_len must be ≥ 1");
 
         // Q/O strides depend on layout:
         //   TokenMajor (q_len=1 typical): q_head_stride = head_dim
