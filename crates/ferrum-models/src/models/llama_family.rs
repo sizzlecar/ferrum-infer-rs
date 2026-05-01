@@ -236,6 +236,23 @@ pub struct LlamaFamilyScratch<B: Backend> {
     pub gate_up_out: B::Buffer,
     pub silu_out: B::Buffer,
     pub mlp_out: B::Buffer,
+    /// Paged batched dispatch scratch (Phase 4b). Sized for
+    /// `FERRUM_PAGED_MAX_SEQS × q_dim` so multi-seq decode can fan
+    /// in M items' Q into a single buffer for one batched
+    /// `paged_decode_attention(num_seqs=M)` call. `None` when paged
+    /// mode is off.
+    pub paged_batch_q: Option<B::Buffer>,
+    pub paged_batch_o: Option<B::Buffer>,
+    /// Stacked per-seq block tables for batched paged dispatch.
+    /// Layout: `[max_M, max_blocks_per_seq]` u32. Written
+    /// host-side per decode_batch step.
+    pub paged_batch_block_tables: Option<B::Buffer>,
+    /// Stacked per-seq context lengths for batched paged dispatch
+    /// (`[max_M]` u32).
+    pub paged_batch_context_lens: Option<B::Buffer>,
+    /// `max_blocks_per_seq` value baked into the stacked block_tables
+    /// stride. Set when `paged_batch_block_tables` is allocated.
+    pub paged_max_blocks_per_seq: usize,
     /// Last token's hidden state (`[h]`). For prefill this is populated via
     /// `copy_slice(residual, (seq_len-1)*h, ..)`; for decode `residual` already
     /// holds only 1 row so `last_hidden` is unused on that path.
@@ -284,8 +301,37 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             attn_head_major_single: B::alloc(q_dim),
             attn_flat_single: B::alloc(q_dim),
             batch_logits: B::alloc(t * cfg.vocab_size),
+            // Paged batched dispatch scratch. None until `enable_paged_batch`
+            // is called from `ensure_kv` once the model knows max_seqs +
+            // max_blocks_per_seq. This avoids paying the alloc cost when
+            // paged mode is off.
+            paged_batch_q: None,
+            paged_batch_o: None,
+            paged_batch_block_tables: None,
+            paged_batch_context_lens: None,
+            paged_max_blocks_per_seq: 0,
             max_tokens: t,
         }
+    }
+
+    /// Allocate scratch for batched paged dispatch (Phase 4b). Called
+    /// lazily from `ensure_kv` once paged mode is enabled and we know
+    /// the pool dimensions. Idempotent.
+    fn enable_paged_batch(
+        &mut self,
+        cfg: &LlamaFamilyConfig,
+        max_seqs: usize,
+        max_blocks_per_seq: usize,
+    ) {
+        if self.paged_batch_q.is_some() {
+            return;
+        }
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        self.paged_batch_q = Some(B::alloc(max_seqs * q_dim));
+        self.paged_batch_o = Some(B::alloc(max_seqs * q_dim));
+        self.paged_batch_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
+        self.paged_batch_context_lens = Some(B::alloc_u32(max_seqs));
+        self.paged_max_blocks_per_seq = max_blocks_per_seq;
     }
 }
 
@@ -612,6 +658,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 crate::common::paged_pool::BlockAllocator::new(total_pool_blocks as u32),
             ));
         }
+        // Phase 4b: ensure batched-dispatch scratch is allocated whenever
+        // paged is on. Idempotent — re-init is a no-op if already
+        // sized. Has to live outside the `paged_pools.is_none()` branch
+        // because `ensure_scratch` may have replaced the scratch struct
+        // since the pools were first allocated.
+        if paged {
+            self.scratch
+                .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+        }
 
         // Try pool first — reused buffers have stable device pointers,
         // so a captured decode graph can be replayed for this request too.
@@ -669,14 +724,30 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .paged_block_alloc
                 .as_ref()
                 .expect("paged_block_alloc must be initialised when paged=true");
-            let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
-            let block_indices = alloc.allocate_n(max_blocks_per_seq).unwrap_or_else(|e| {
-                panic!(
-                    "paged KV pool exhausted on ensure_kv for cache_id={cache_id:?}: {e}. \
-                     Increase FERRUM_PAGED_MAX_SEQS (currently {max_seqs}) or release \
-                     other cache_ids first.",
-                )
-            });
+            // Recover from a previously-poisoned mutex instead of panicking
+            // (poison just means a prior holder panicked; the BlockAllocator
+            // state is still intact since allocate_n is fail-safe).
+            let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let block_indices = match alloc.allocate_n(max_blocks_per_seq) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    // Pool exhaustion is a back-pressure signal, not a crash.
+                    // Drop the lock, return the cache to the free pool, and
+                    // bail before inserting it into kv_caches. The downstream
+                    // call will then fail with a clean per-request error
+                    // ("ensure_kv must be called before ...") instead of
+                    // dragging every other in-flight request down with it.
+                    drop(alloc);
+                    self.kv_free_pool.push(caches);
+                    eprintln!(
+                        "[ferrum] paged KV pool exhausted on ensure_kv for \
+                         cache_id={cache_id:?}: {e}. Increase \
+                         FERRUM_PAGED_MAX_SEQS (currently {max_seqs}) or \
+                         throttle concurrent requests.",
+                    );
+                    return;
+                }
+            };
             // Write the block table to each layer's cache. All layers
             // share the same logical→physical mapping for this seq.
             // Also stash the host-side index list so release_kv can
@@ -859,11 +930,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
             B::split_qkv_norm_rope_into_paged_cache(
                 ctx,
                 &self.scratch.qkv_out,
+                0, // qkv_byte_offset: single-seq dispatch reads from start
                 q_norm_w,
                 k_norm_w,
                 &self.rope.cos,
                 &self.rope.sin,
                 &mut self.scratch.q_head_major,
+                0, // q_out_byte_offset: writes to start of head-major scratch
                 pool_k,
                 pool_v,
                 bt,
@@ -1877,24 +1950,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
 
-        // Phase 4a: paged mode falls back to per-item decode_internal
-        // for multi-batch. Phase 4b will add a true batched-paged
-        // dispatch (num_seqs > 1 in one paged_decode_attention call).
-        // The shared pool storage already works correctly under
-        // serialized per-item calls — they just don't share the
-        // GEMM batching benefit yet.
-        if self.paged_pools.is_some() {
-            return batch
-                .iter()
-                .map(|(cid, tok, pos)| self.decode_internal(cid, *tok, *pos))
-                .collect();
-        }
-
         // Ensure all caches exist and scratch is sized for M tokens.
         for (cid, _, _) in batch {
             self.ensure_kv(cid);
         }
         self.ensure_scratch(m);
+        // Phase 4b: when paged mode is on, ensure_kv has already
+        // populated the batched scratch buffers (paged_batch_q etc.).
+        // The forward path branches on `paged_pools.is_some()` inside
+        // each layer.
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
@@ -1992,6 +2056,183 @@ impl<B: Backend> LlamaFamilyModel<B> {
         layer
             .qkv_proj
             .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
+
+        // ── Paged-KV batched path (Phase 4b) ──────────────────────────
+        // When paged is on, we skip the contig split_qkv + per-item
+        // qk_norm_rope + kv_append + flash_attention loop entirely.
+        // Instead:
+        //   1. Per item: split_qkv_norm_rope_into_paged_cache with
+        //      qkv_byte_offset = i * qkv_stride * 4 reads item i's
+        //      slice of qkv_out, writes K/V into the shared pool at
+        //      its block_table-resolved position, and stores the
+        //      RoPE'd Q at paged_batch_q[i * q_dim .. (i+1) * q_dim].
+        //   2. Build batched block_tables [M, max_blocks_per_seq] +
+        //      context_lens [M] host-side, write to scratch device
+        //      buffers.
+        //   3. Single paged_decode_attention(num_seqs=M) reads all M
+        //      seqs' K/V via per-seq block_tables, writes to
+        //      paged_batch_o.
+        //   4. Per item: copy paged_batch_o[i] → attn_flat[i * q_dim].
+        //
+        // This is the "real" multi-seq decode — one heavy attention
+        // dispatch covering all sequences instead of M sequential ones.
+        if let Some(pools) = self.paged_pools.as_mut() {
+            let pool_ptr = (
+                &mut pools[li].0 as *mut B::Buffer,
+                &mut pools[li].1 as *mut B::Buffer,
+            );
+            // SAFETY: pools allocated once; not concurrently mutated.
+            let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
+
+            let qkv_stride = q_dim + 2 * kv_dim;
+            let max_blocks_per_seq = self.scratch.paged_max_blocks_per_seq;
+            let block_size = 16; // matches PAGED_BLOCK_SIZE in ensure_kv
+
+            // Step 1: per-item paged write. We collect cache_len + block_indices
+            // up front for step 2. Note: this loop borrows self.kv_caches mutably
+            // per iteration, so we extract the batched-write parameters first then
+            // do the dispatches.
+            let mut item_state: Vec<(u32, Vec<u32>)> = Vec::with_capacity(m);
+            for (cache_id, _, _) in batch.iter() {
+                let caches = self
+                    .kv_caches
+                    .get(cache_id)
+                    .expect("ensure_kv must be called before forward_layer_batched");
+                let cache = &caches[li];
+                item_state.push((cache.len as u32, cache.paged_block_indices.clone()));
+            }
+
+            // Take block_table buffer ptrs ahead of the dispatch loop —
+            // we need both per-cache block_table (to write into) and
+            // self.scratch.paged_batch_q (to write Q stacks into).
+            let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
+            let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+            for (i, (cache_id, _, pos)) in batch.iter().enumerate() {
+                let pos_i = *pos as usize;
+                let caches = self
+                    .kv_caches
+                    .get(cache_id)
+                    .expect("paged batched: cache not present");
+                let cache = &caches[li];
+                let bt = cache
+                    .block_table
+                    .as_ref()
+                    .expect("paged batched: block_table missing");
+                let cache_len_before = cache.len;
+                let block_table_ref = bt as *const B::Buffer;
+                // SAFETY: bt is read-only in the dispatch; we don't
+                // mutate self.kv_caches between this raw deref and the
+                // call.
+                let bt_safe: &B::Buffer = unsafe { &*block_table_ref };
+                B::split_qkv_norm_rope_into_paged_cache(
+                    ctx,
+                    &self.scratch.qkv_out,
+                    (i as u64) * qkv_stride_bytes,
+                    q_norm_w,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    self.scratch
+                        .paged_batch_q
+                        .as_mut()
+                        .expect("paged_batch_q missing"),
+                    (i as u64) * q_head_major_size_bytes,
+                    pool_k,
+                    pool_v,
+                    bt_safe,
+                    1,
+                    nh,
+                    nkv,
+                    hd,
+                    pos_i,
+                    eps,
+                    qk_mode,
+                    cache_len_before,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("paged batched write");
+            }
+
+            // Step 2: bump cache.len and build the stacked block_tables +
+            // context_lens host-side, then upload to device scratch.
+            let mut stacked_bt: Vec<u32> = vec![0u32; m * max_blocks_per_seq];
+            let mut stacked_cl: Vec<u32> = vec![0u32; m];
+            for (i, (cache_id, _, _)) in batch.iter().enumerate() {
+                let caches = self
+                    .kv_caches
+                    .get_mut(cache_id)
+                    .expect("paged batched: cache not present");
+                let cache = &mut caches[li];
+                cache.len += 1;
+                let len = cache.len as u32;
+                stacked_cl[i] = len;
+                let blocks = &cache.paged_block_indices;
+                let n_to_copy = blocks.len().min(max_blocks_per_seq);
+                stacked_bt[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
+                    .copy_from_slice(&blocks[..n_to_copy]);
+            }
+            let bt_buf = self
+                .scratch
+                .paged_batch_block_tables
+                .as_mut()
+                .expect("paged_batch_block_tables missing");
+            B::write_u32(ctx, bt_buf, &stacked_bt);
+            let cl_buf = self
+                .scratch
+                .paged_batch_context_lens
+                .as_mut()
+                .expect("paged_batch_context_lens missing");
+            B::write_u32(ctx, cl_buf, &stacked_cl);
+
+            // Step 3: one batched paged_decode_attention(num_seqs=m).
+            let bt_ptr =
+                self.scratch.paged_batch_block_tables.as_ref().unwrap() as *const B::Buffer;
+            let cl_ptr =
+                self.scratch.paged_batch_context_lens.as_ref().unwrap() as *const B::Buffer;
+            let q_ptr = self.scratch.paged_batch_q.as_ref().unwrap() as *const B::Buffer;
+            let o_ptr = self.scratch.paged_batch_o.as_mut().unwrap() as *mut B::Buffer;
+            // SAFETY: the four scratch buffers above are not aliased
+            // by anything else; we only deref while &mut self is held.
+            let bt_safe = unsafe { &*bt_ptr };
+            let cl_safe = unsafe { &*cl_ptr };
+            let q_safe = unsafe { &*q_ptr };
+            let o_safe = unsafe { &mut *o_ptr };
+            B::paged_decode_attention(
+                ctx,
+                q_safe,
+                pool_k,
+                pool_v,
+                o_safe,
+                bt_safe,
+                cl_safe,
+                m,
+                nh,
+                nkv,
+                hd,
+                block_size,
+                max_blocks_per_seq,
+                1, // q_len
+            )
+            .expect("paged batched decode");
+
+            // Step 4: per-item copy paged_batch_o[i] → attn_flat[i * q_dim].
+            // Both have q_dim floats per item; same head-major-equals-token-major
+            // identity collapse used in the contig path.
+            for i in 0..m {
+                B::copy_slice(
+                    ctx,
+                    self.scratch.paged_batch_o.as_ref().unwrap(),
+                    i * q_dim,
+                    &mut self.scratch.attn_flat,
+                    i * q_dim,
+                    q_dim,
+                );
+            }
+
+            // Skip the contig split_qkv + per-item loop below.
+            return self.forward_layer_batched_decode_post_attn(ctx, li, residual, m);
+        }
 
         // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
         B::split_qkv(
@@ -2141,6 +2382,22 @@ impl<B: Backend> LlamaFamilyModel<B> {
             );
         }
 
+        self.forward_layer_batched_decode_post_attn(ctx, li, residual, m);
+    }
+
+    fn forward_layer_batched_decode_post_attn(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        residual: &mut B::Buffer,
+        m: usize,
+    ) {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let im = cfg.intermediate_size;
+        let eps = cfg.rms_norm_eps;
+        let layer = &self.layers[li];
+
         // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
         layer.o_proj.forward(
             ctx,
@@ -2208,7 +2465,7 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         // 256 blocks (the full per-seq quota) into the pool.
         if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(c0) = caches.first() {
                     if !c0.paged_block_indices.is_empty() {
                         alloc.free(&c0.paged_block_indices);
@@ -2284,7 +2541,7 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         // allocator so other sequences can reuse them.
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().expect("block alloc poisoned");
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
                 // All caches share the same block_indices set (one per
                 // cache_id), so freeing once via the first layer's cache
                 // is enough.

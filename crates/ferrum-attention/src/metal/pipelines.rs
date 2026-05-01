@@ -720,15 +720,25 @@ impl MetalPipelines {
     /// PR. For now this signature handles single-seq decode + prefill
     /// (the only call sites we're integrating in Phase 3).
     #[allow(clippy::too_many_arguments)]
+    /// Dispatch the paged split+norm+RoPE+kvc kernel.
+    ///
+    /// `qkv_byte_offset` lets the caller pass a slice into a larger
+    /// batched buffer (per-item dispatch from `decode_batch_internal`'s
+    /// paged path). `q_out_byte_offset` likewise positions the per-item
+    /// Q output into a stacked batched buffer. Both default to 0 for
+    /// the single-seq case.
+    #[allow(clippy::too_many_arguments)]
     pub fn split_qkv_norm_rope_into_paged_cache(
         &self,
         enc: &ComputeCommandEncoderRef,
         qkv: &Buffer,
+        qkv_byte_offset: u64,
         q_norm_w: &Buffer,
         k_norm_w: &Buffer,
         cos: &Buffer,
         sin: &Buffer,
         q_out: &Buffer,
+        q_out_byte_offset: u64,
         cache_k: &Buffer,
         cache_v: &Buffer,
         block_table: &Buffer,
@@ -772,12 +782,12 @@ impl MetalPipelines {
             max_num_blocks_per_seq: max_num_blocks_per_seq as i32,
         };
         enc.set_compute_pipeline_state(self.pipeline("split_qkv_norm_rope_paged_kvc_f32"));
-        enc.set_buffer(0, Some(qkv), 0);
+        enc.set_buffer(0, Some(qkv), qkv_byte_offset);
         enc.set_buffer(1, Some(q_norm_w), 0);
         enc.set_buffer(2, Some(k_norm_w), 0);
         enc.set_buffer(3, Some(cos), 0);
         enc.set_buffer(4, Some(sin), 0);
-        enc.set_buffer(5, Some(q_out), 0);
+        enc.set_buffer(5, Some(q_out), q_out_byte_offset);
         enc.set_buffer(6, Some(cache_k), 0);
         enc.set_buffer(7, Some(cache_v), 0);
         enc.set_buffer(8, Some(block_table), 0);

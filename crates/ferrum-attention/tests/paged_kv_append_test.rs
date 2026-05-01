@@ -167,11 +167,13 @@ fn run_paged(
     pipes.split_qkv_norm_rope_into_paged_cache(
         enc,
         &qkv_buf,
+        0,
         &q_norm_buf,
         &k_norm_buf,
         &cos_buf,
         &sin_buf,
         &q_out,
+        0,
         &cache_k,
         &cache_v,
         &bt_buf,
