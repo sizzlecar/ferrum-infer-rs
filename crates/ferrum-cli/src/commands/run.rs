@@ -150,7 +150,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // Create engine
     let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
-    let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
+    let engine = ferrum_engine::create_default_engine(engine_config).await?;
 
     // Print ready message
     eprintln!();

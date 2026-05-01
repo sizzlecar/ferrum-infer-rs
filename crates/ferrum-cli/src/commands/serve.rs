@@ -70,27 +70,56 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         .or(config.models.default_model.clone())
         .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
 
-    let model_id = resolve_model_alias(&model_name);
+    // GGUF short-circuit: if the user passed a `.gguf` file path directly,
+    // skip alias / HF cache resolution and ConfigManager::load_from_path
+    // (which expects an HF safetensors directory layout). The engine's
+    // CandleExecutorFactory + HuggingFaceTokenizerFactory both detect
+    // `.gguf` and route to GgufLoader + sibling-tokenizer auto-discovery.
+    let gguf_path: Option<PathBuf> = if super::run::looks_like_gguf_path(&model_name) {
+        Some(PathBuf::from(&model_name))
+    } else {
+        None
+    };
+
+    let model_id = if let Some(p) = gguf_path.as_ref() {
+        // Use the GGUF stem as the OpenAI model id — the user sees this
+        // back in /v1/models responses + chat completion `model` field.
+        p.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| model_name.clone())
+    } else {
+        resolve_model_alias(&model_name)
+    };
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
 
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
 
-    // Find cached model
-    let cache_dir = get_hf_cache_dir(&config);
-    let source = match find_cached_model(&cache_dir, &model_id) {
-        Some(source) => {
-            println!("{} {}", "Path:".dimmed(), source.local_path.display());
-            source
+    let source: ferrum_models::source::ResolvedModelSource = if let Some(p) = gguf_path.clone() {
+        println!("{} {}", "Path:".dimmed(), p.display());
+        ferrum_models::source::ResolvedModelSource {
+            original: model_name.clone(),
+            local_path: p,
+            format: ModelFormat::Unknown, // GGUF — handled by engine
+            from_cache: true,
         }
-        None => {
-            eprintln!(
-                "{} Model '{}' not found. Run: ferrum pull {}",
-                "Error:".red().bold(),
-                model_id,
-                model_name
-            );
-            return Err(ferrum_types::FerrumError::model("Model not found"));
+    } else {
+        // Find cached model
+        let cache_dir = get_hf_cache_dir(&config);
+        match find_cached_model(&cache_dir, &model_id) {
+            Some(source) => {
+                println!("{} {}", "Path:".dimmed(), source.local_path.display());
+                source
+            }
+            None => {
+                eprintln!(
+                    "{} Model '{}' not found. Run: ferrum pull {}",
+                    "Error:".red().bold(),
+                    model_id,
+                    model_name
+                );
+                return Err(ferrum_types::FerrumError::model("Model not found"));
+            }
         }
     };
 
@@ -104,8 +133,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // the engine builder picks it up. Validates that the draft model is
     // actually cached before the target load kicks in.
     if let Some(ref draft_name) = spec_draft {
+        if gguf_path.is_some() {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "Speculative decoding is not yet wired through the GGUF path",
+            ));
+        }
         let draft_id = resolve_model_alias(draft_name);
         println!("{} {}", "Draft model:".dimmed(), draft_id.cyan());
+        let cache_dir = get_hf_cache_dir(&config);
         let draft_source = find_cached_model(&cache_dir, &draft_id).ok_or_else(|| {
             eprintln!(
                 "{} Draft model '{}' not in HF cache. Run: ferrum pull {}",
@@ -131,13 +166,21 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let device = select_device();
     println!("{} {:?}", "Device:".dimmed(), device);
 
-    // Detect architecture to choose engine type
+    // Detect architecture to choose engine type. For GGUF we skip
+    // ConfigManager::load_from_path (which expects HF safetensors layout)
+    // and route directly to the continuous-batching LLM engine — the
+    // engine's CandleExecutorFactory branches to GgufLoader internally.
     println!();
-    let mut config_manager = ferrum_models::ConfigManager::new();
-    let model_def = config_manager.load_from_path(&source.local_path).await?;
+    let arch_for_dispatch: Option<ferrum_models::Architecture> = if gguf_path.is_some() {
+        None
+    } else {
+        let mut config_manager = ferrum_models::ConfigManager::new();
+        let model_def = config_manager.load_from_path(&source.local_path).await?;
+        Some(model_def.architecture)
+    };
 
-    let engine: Arc<dyn InferenceEngine + Send + Sync> = match model_def.architecture {
-        ferrum_models::Architecture::Clip => {
+    let engine: Arc<dyn InferenceEngine + Send + Sync> = match arch_for_dispatch {
+        Some(ferrum_models::Architecture::Clip) => {
             println!("{}", "Initializing CLIP embedding engine...".dimmed());
             let candle_device = candle_core::Device::Cpu;
             let executor = ferrum_models::ClipModelExecutor::from_path(
@@ -152,7 +195,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                     .with_tokenizer(tokenizer),
             )
         }
-        ferrum_models::Architecture::Whisper => {
+        Some(ferrum_models::Architecture::Whisper) => {
             println!("{}", "Initializing Whisper ASR engine...".dimmed());
             let candle_device = to_candle_device(&device);
             let executor = ferrum_models::WhisperModelExecutor::from_path(
@@ -168,7 +211,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 ),
             )
         }
-        ferrum_models::Architecture::Qwen3TTS => {
+        Some(ferrum_models::Architecture::Qwen3TTS) => {
             let n_slots = tts_slots.max(1);
             println!(
                 "{} ({} slot{})",
@@ -205,7 +248,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
-            let engine = ferrum_engine::create_mvp_engine(engine_config).await?;
+            let engine = ferrum_engine::create_default_engine(engine_config).await?;
             Arc::from(engine)
         }
     };
