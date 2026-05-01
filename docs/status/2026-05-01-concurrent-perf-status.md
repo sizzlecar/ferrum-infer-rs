@@ -154,6 +154,36 @@ schedule。**没 Xcode 也能做**——bench-driven 二分迭代每个变量，
   back-of-envelope 估算。真瓶颈要么是 per-kernel GPU 时间（kernel
   craft），要么是 memory bandwidth。
 
+**实验：gate+up+silu 三 dispatch 融合 (PR — 待编号)**
+- 假设：三个 dispatch 共用 norm_out / ids；中间 buffer
+  (`gate_out_stacked`, `up_out_stacked`) 写出再读回 = 4× `[top_k, ffn]`
+  intermediate bandwidth 浪费；融合能省 BW，预估 c=16 +5-15%
+- 实施：新 Metal kernel `gemv_q4kw_moe_id_gate_up_silu_f32` —— 内层
+  Q4_K decode loop 用同一份 `yl/yh` activation register-file，并行算
+  gate 和 up 两个 row accumulator，最后 in-register `silu(g) * u` 写
+  `silu_stacked`。Backend trait + 能力探针，默认 ON，
+  `FERRUM_MOE_FUSED_GATE_UP_SILU=0` 可关
+- 单元测试：fused vs unfused 在合成 Q4_K 权重上 **bitwise 一致**
+  (max_abs=0.000000)
+- 实测 c=4/8/16（30B-A3B Q4_K_M, prewarm cache）：
+
+  | c | unfused | fused | Δ tok/s | TPOT median |
+  |--:|--:|--:|--:|--:|
+  | 4  | 42.5 | **43.5** | +2.4% | -2.7% (82.1→79.9 ms) |
+  | 8  | 49.4 | **49.6** | +0.4% | -1.0% |
+  | 16 | 50.8 | **51.2** | +0.8% | -0.5% |
+
+- 解读：**实测 +0-2%，远小于 +5-15% 预期**。三个 dispatch 共用的
+  中间 buffer (`gate_out_stacked`, `up_out_stacked`) 加起来才
+  ~24 KB × 8 slots × 2 = ~384 KB —— 已经 fit Apple GPU L2/L3，写出
+  再读回的 bandwidth 实际上没付 DRAM 代价。Fused 路径"省"的是
+  cache→cache traffic，量级太小压不动 TPOT。
+- 启示（与 PR #79 同源教训）：**dispatch / intermediate-BW 都不是
+  真瓶颈**。剩下唯一没排除的是 per-kernel GPU 时间（kernel craft
+  本身——bank conflict / register pressure / instruction schedule），
+  这就是 Tier 2 `mul_mm_id` 重写的内容。后续 Tier 1 PR 价值低，
+  应直接进 Tier 2。
+
 ## 解决办法（按实测 ROI 排）
 
 ### Tier 0（已完成）
@@ -166,18 +196,19 @@ schedule。**没 Xcode 也能做**——bench-driven 二分迭代每个变量，
 实测：c=4 +1.9%, c=8 +0.9%。**比预估的 +30% 小一个量级**——见上面
 "经验性更新"。结构性收益保留（kernel API 干净），perf 收益微薄。
 
-### Tier 1（高 ROI、中等难度、不需要 Xcode）
+#### 2. Gate+up+silu 融合（本 PR）
 
-#### 2. Gate+up+silu fusion
+`gate_gemv + up_gemv + silu_mul` 三个 dispatch 合一，内层 Q4_K
+reduction 共享 activation register-file，gate / up 两 row accumulator
+并行，结果 in-register `silu(g) * u` 直写 `silu_stacked`。Backend
+能力探针（Metal=true，CPU/CUDA=false），`FERRUM_MOE_FUSED_GATE_UP_SILU=0`
+可关。
 
-3 个独立 dispatch（gate gemv, up gemv, silu_mul_stacked）合并成一个
-fused kernel。**这次别再靠 dispatch count 估算**——重点是
-**bandwidth 省 1× 整个 activation 的读取**。activation
-每次 H=2048 floats × top_k=8 slots = 16 KB / token / layer / kernel，
-3 个 kernel 累计 48 KB 重复读。Fused 后省 32 KB。
+实测 c=4/8/16：+0.4-2.4%（c=4 最大 +2.4%）。**比预估的 +5-15% 小一
+个量级**——见上面"经验性更新"。Bitwise correct，结构清爽，但 perf
+价值微薄。
 
-预期：bandwidth-bound 部分能省 20-40%；按 MoE 比 dense 更
-bandwidth-bound 的程度估，**c=16 +5-15%**。**~2-3 天**。
+### Tier 1（残留候选，低 ROI 优先级）
 
 #### 3. `weighted_sum_residual_norm_batched`
 
@@ -227,22 +258,23 @@ bench-driven A/B 测就能知道。**~1 天**。
 - ✅ Phase 4b MoE 框架 + threshold hybrid（PR #77，MoE c=16 +15% over 默认）
 - ✅ vLLM 风格 bench harness + Group A 三引擎报告（PR #75 / #76）
 - ✅ Offset-aware MoE kernels（PR #79，+1-2%）
+- ✅ Gate+up+silu fusion（本 PR，c=4 +2.4% / c=8 +0.4% / c=16 +0.8%）
 - ⚠️ Concurrent encoder 模式（PR #65 NULL RESULT，CPU CI 已修但不 merge）
 
 ## Roadmap 推荐（重排 — 实测后）
 
-按 **实测 ROI** 顺序，每个独立 PR：
+经过 PR #79 + 本 PR 两次 +1-2% 类的"经验性回收"，**结论已经清晰**：
+30B-A3B c=16 那 46% gap 不可能由 host 侧 dispatch / intermediate-BW
+优化吃下，必须啃 Tier 2 的 `mul_mm_id` kernel craft。后续顺序：
 
-1. **【高 ROI 容易做】Gate+up+silu fusion** —— 真正能省 bandwidth，
-   ~2-3 天，预期 c=16 +5-15%。**比 Tier 1 的其他事更有价值**——
-   现在我们知道单纯 dispatch 数量优化收益小，bandwidth 才是杠杆。
-2. **`mul_mm_id` 内部 craft**（bench-driven 或 Xcode-driven）——
-   决定性的 50% gap 闭合。**~3-14 天**取决于工具。
-3. **长上下文 + ShareGPT bench** —— 1-2 天，用 vLLM 标准数据集
+1. **`mul_mm_id` 内部 craft**（bench-driven 或 Xcode-driven）——
+   决定性的 50% gap 闭合。**~3-14 天**取决于工具。**这是唯一会
+   动 TPOT 的事**。
+2. **长上下文 + ShareGPT bench** —— 1-2 天，用 vLLM 标准数据集
    把 dense 完胜在更真实负载下展示。
-4. **Speculative decoding for Metal** —— 1-2 天，Qwen3-0.6B 当
+3. **Speculative decoding for Metal** —— 1-2 天，Qwen3-0.6B 当
    draft，4B/8B 当 target，预期 c=1 加速 1.5-2×。
-5. **NR0 大 tile 实验** —— 1 天 bench-driven，可能 +几%。
+4. **NR0 大 tile 实验** —— 1 天 bench-driven，可能 +几%。
 
 ## 记录的死路（don't go back）
 
@@ -258,6 +290,13 @@ bench-driven A/B 测就能知道。**~1 天**。
   Metal `set_buffer(offset)` 比 copy_slice 省的不多，dispatch
   count 不是 c=4/8 的真瓶颈。后续不要再用"省 N 个 dispatch ⟹ 省
   N×10µs"做 ROI 估算——必须 profile 看实际 GPU time / bandwidth。
+- **Gate+up+silu 融合 = +5-15% (估算)**：实测 c=4 +2.4% / c=8 +0.4% /
+  c=16 +0.8%。原本指望省下 `gate_out_stacked` + `up_out_stacked` 的
+  intermediate-BW，但中间 buffer (~24 KB × 8 slots × 2 ≈ 384 KB)
+  fit Apple GPU L2/L3 已经，写出再读回根本没付 DRAM 代价。
+  "intermediate-BW 估算"和"dispatch count 估算"是同一类错——
+  cache hierarchy 已经把这层 traffic 吃了，只有 DRAM-bound /
+  per-kernel GPU 时间是真瓶颈。
 
 ## 已合并的 PR 链（按时间顺序）
 
@@ -272,6 +311,7 @@ bench-driven A/B 测就能知道。**~1 天**。
 | #77 | perf(metal): Phase 4b for Qwen3-MoE | MoE c=16 +15% over 默认 |
 | #78 | docs: 2026-05-01 concurrent perf status & roadmap | 本文档（旧版） |
 | #79 | perf(metal): offset-aware MoE kernels | c=4/8 +1-2% (低于预估) |
+| 待编号 | perf(metal): gate+up+silu 融合 MoE GEMV | c=4/8/16 +0.4-2.4% (低于预估) |
 
 ## 附录：bench 复现命令
 

@@ -757,6 +757,53 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
+    ///
+    /// Folds the three back-to-back dispatches that the stacked MoE
+    /// FFN decode path emitted per layer:
+    ///   1. `gemv_quant_moe_id` (gate) → gate_out_stacked
+    ///   2. `gemv_quant_moe_id` (up)   → up_out_stacked
+    ///   3. `silu_mul_stacked`         → silu_stacked
+    /// into a single dispatch that writes `silu_stacked` directly.
+    /// Saves 2 dispatches per layer plus the entire round-trip through
+    /// the gate_out / up_out scratch buffers (≈4× `[top_k, ffn]` of
+    /// intermediate traffic). The activation read is also halved
+    /// because the inner Q4_K reduction reuses one register-file load
+    /// across both weight matrices.
+    ///
+    /// Both `gate_w` and `up_w` must be `Q4KExperts` stacks with
+    /// matching `(num_experts, n_rows, n_cols)` (true for Qwen3-MoE
+    /// GGUFs). Backends without the fused kernel can fall back to the
+    /// 3-dispatch path; callers should gate via
+    /// [`Self::supports_fused_moe_gate_up_silu`] to avoid the
+    /// `Unsupported` String-allocating error round trip on the decode
+    /// hot path.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_quant_moe_id_gate_up_silu(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _gate_w: &Self::QuantStore,
+        _up_w: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _silu_out: &mut Self::Buffer,
+        _n_selected: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id_gate_up_silu not implemented for this backend",
+        ))
+    }
+
+    /// Capability probe for [`Self::gemv_quant_moe_id_gate_up_silu`].
+    ///
+    /// `true` ⇒ the fused kernel is wired in and the caller should
+    /// prefer it on the MoE decode hot path. `false` ⇒ caller must use
+    /// the 3-dispatch fallback (gate gemv + up gemv + silu_mul_stacked).
+    /// Lets callers branch without paying the cost of an `Err(Unsupported)`
+    /// allocation per (layer, step).
+    fn supports_fused_moe_gate_up_silu() -> bool {
+        false
+    }
+
     /// Weighted sum across `n_slots` rows of `[hidden]`.
     ///
     /// Computes `out[i] = Σ_s weights[s] * slots[s, i]`. Single

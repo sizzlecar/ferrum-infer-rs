@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
+use std::sync::OnceLock;
 
 use ferrum_kernels::backend::{Backend, KvCache};
 use ferrum_quantization::WeightLoader;
@@ -2060,47 +2061,79 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
         // ids_buf and weights_buf populated by the GPU router above —
         // no host writes needed here in the decode path.
 
-        // 1. Batched gate gemv — broadcast input across top_k slots.
-        //    src1 = norm_out (which has hidden floats at offset 0),
-        //    src1_stride=0 → all slots read the same row.
-        let t0 = stage_t0();
-        B::gemv_quant_moe_id(
-            ctx,
-            &scratch.norm_out,
-            gate_stacked,
-            &scratch.ids_buf,
-            &mut scratch.gate_out_stacked,
-            top_k,
-            0, // broadcast
-        )?;
-        stage_end(t0, ctx, &DEC_GATE_US);
+        // Fused-vs-unfused gate+up+silu selection.
+        //
+        // Default: when the backend advertises support (Metal Q4KExperts),
+        // run the single fused dispatch — saves 2 dispatches and the
+        // entire round-trip through gate_out_stacked / up_out_stacked
+        // scratch (≈4× [top_k, ffn] of intermediate bandwidth).
+        //
+        // Opt-out: `FERRUM_MOE_FUSED_GATE_UP_SILU=0` forces the legacy
+        // 3-dispatch path. Used for A/B benchmarking and as a kill switch
+        // if the fused kernel ever produces divergent outputs.
+        // Cache the env-flag read once per process — the decode hot
+        // path calls this fn ~48 layers × ~steps_per_run times.
+        static FUSED_DISABLED: OnceLock<bool> = OnceLock::new();
+        let fused_disabled = *FUSED_DISABLED
+            .get_or_init(|| std::env::var("FERRUM_MOE_FUSED_GATE_UP_SILU").as_deref() == Ok("0"));
+        let use_fused = B::supports_fused_moe_gate_up_silu() && !fused_disabled;
 
-        // 2. Batched up gemv — also broadcast.
-        let t0 = stage_t0();
-        B::gemv_quant_moe_id(
-            ctx,
-            &scratch.norm_out,
-            up_stacked,
-            &scratch.ids_buf,
-            &mut scratch.up_out_stacked,
-            top_k,
-            0,
-        )?;
-        stage_end(t0, ctx, &DEC_UP_US);
+        if use_fused {
+            // 1+2+3 fused: silu_stacked = SiLU(gate · norm_out) * (up · norm_out)
+            let t0 = stage_t0();
+            B::gemv_quant_moe_id_gate_up_silu(
+                ctx,
+                &scratch.norm_out,
+                gate_stacked,
+                up_stacked,
+                &scratch.ids_buf,
+                &mut scratch.silu_stacked,
+                top_k,
+            )?;
+            stage_end(t0, ctx, &DEC_SILU_US);
+        } else {
+            // 1. Batched gate gemv — broadcast input across top_k slots.
+            //    src1 = norm_out (which has hidden floats at offset 0),
+            //    src1_stride=0 → all slots read the same row.
+            let t0 = stage_t0();
+            B::gemv_quant_moe_id(
+                ctx,
+                &scratch.norm_out,
+                gate_stacked,
+                &scratch.ids_buf,
+                &mut scratch.gate_out_stacked,
+                top_k,
+                0, // broadcast
+            )?;
+            stage_end(t0, ctx, &DEC_GATE_US);
 
-        // 3. Stacked SiLU·gate → silu_stacked. Single dispatch covers
-        //    all top_k slots — replaces the per-slot loop's
-        //    (3 copy_slice + 1 silu_mul) × 8 = 32 dispatches.
-        let t0 = stage_t0();
-        B::silu_mul_stacked(
-            ctx,
-            &scratch.gate_out_stacked,
-            &scratch.up_out_stacked,
-            &mut scratch.silu_stacked,
-            top_k,
-            inter,
-        )?;
-        stage_end(t0, ctx, &DEC_SILU_US);
+            // 2. Batched up gemv — also broadcast.
+            let t0 = stage_t0();
+            B::gemv_quant_moe_id(
+                ctx,
+                &scratch.norm_out,
+                up_stacked,
+                &scratch.ids_buf,
+                &mut scratch.up_out_stacked,
+                top_k,
+                0,
+            )?;
+            stage_end(t0, ctx, &DEC_UP_US);
+
+            // 3. Stacked SiLU·gate → silu_stacked. Single dispatch covers
+            //    all top_k slots — replaces the per-slot loop's
+            //    (3 copy_slice + 1 silu_mul) × 8 = 32 dispatches.
+            let t0 = stage_t0();
+            B::silu_mul_stacked(
+                ctx,
+                &scratch.gate_out_stacked,
+                &scratch.up_out_stacked,
+                &mut scratch.silu_stacked,
+                top_k,
+                inter,
+            )?;
+            stage_end(t0, ctx, &DEC_SILU_US);
+        }
 
         // 4. Batched down gemv — per-slot input via src1_stride = inter.
         //    silu_stacked[k * inter ..] is the activation row for slot k.

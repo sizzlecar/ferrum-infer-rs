@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8783  model=Qwen3-30B-A3B-Q4_K_M  reqs=16  conc=4  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               16/16
+  wall time:               23.56s
+  request throughput:      0.68 req/s
+  input  token throughput: 12.3 tok/s
+  output token throughput: 43.5 tok/s
+  total input tokens:      289
+  total output tokens:     1024
+
+  TTFT  mean  862.91ms  median  856.05ms  p99 1246.06ms  max 1255.10ms
+  TPOT  mean   79.69ms  median   79.89ms  p99   84.76ms  max   84.77ms
+  ITL   mean   79.69ms  median   76.41ms  p99  317.61ms  max  355.15ms
+  E2E   mean 5883.46ms  median 5888.10ms  p99 5927.55ms  max 5931.44ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-moe-fused-gate-up-silu-2026-05-01/moe_30b_a3b__fused__c4.json
