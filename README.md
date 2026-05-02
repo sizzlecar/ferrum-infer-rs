@@ -9,9 +9,11 @@ Production-grade LLM inference in Rust. Single binary, OpenAI-compatible, runs o
 
 ## What it is
 
-ferrum-infer-rs is a Rust-native inference engine for transformer LLMs. It runs as a single binary with no Python or system dependencies, starts in seconds, and exposes an OpenAI-compatible HTTP API.
+ferrum-infer-rs is a Rust-native inference engine for transformer LLMs:
+single binary, no Python, OpenAI-compatible HTTP API, seconds to start.
 
-If your deployment uses single-GPU servers, edge devices, or Apple Silicon — and if Docker image size, cold start time, or Python tooling friction matters in your workflow — ferrum is designed for you.
+Designed for single-GPU servers, edge devices, and Apple Silicon —
+where Docker image size, cold start time, and Python toolchain friction matter.
 
 ## Performance highlight: Apple Silicon at concurrency
 
@@ -71,12 +73,33 @@ vLLM-style scheduling features included: PagedAttention, continuous batching, Fl
 
 ## Quick Start
 
-```bash
-# Install
-cargo install ferrum-cli
-# Or build from source
-cargo build --release -p ferrum-cli --bin ferrum
+### Prebuilt binaries
 
+```bash
+# Linux x86_64
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64.tar.gz | tar xz
+./ferrum --help
+
+# macOS Apple Silicon (Metal)
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
+./ferrum --help
+```
+
+Linux x86_64 is the CPU build. macOS aarch64 is the Metal build (the same backend that beats llama.cpp at c=16 on the [Group A bench](docs/bench/macos-2026-05-02/README.md)). For CUDA, build from source.
+
+### From source
+
+```bash
+# crates.io
+cargo install ferrum-cli
+
+# or git
+cargo build --release -p ferrum-cli --bin ferrum
+```
+
+### Run
+
+```bash
 # Set HF token for gated models (e.g. Llama 3.x)
 export HF_TOKEN=hf_your_token_here
 
@@ -94,21 +117,6 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
 ```
-
-### Docker (CPU)
-
-A prebuilt CPU image is published to GHCR on each tagged release (`:cpu`, `:cpu-<version>`). Runs on any x86_64 Linux host — no Rust toolchain needed.
-
-```bash
-docker pull ghcr.io/sizzlecar/ferrum-infer-rs:cpu
-
-docker run --rm -p 8000:8000 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
-  serve --model qwen3:0.6b --port 8000
-```
-
-CUDA and Metal images are on the roadmap — for now run Metal natively on macOS, CUDA natively on Linux.
 
 ## Supported Models
 
