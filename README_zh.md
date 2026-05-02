@@ -118,21 +118,6 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-### Docker (CPU)
-
-每次打 tag 发布时会推送 CPU 镜像到 GHCR(`:cpu`、`:cpu-<version>`)。任意 x86_64 Linux 主机即可运行,无需预装 Rust 工具链。
-
-```bash
-docker pull ghcr.io/sizzlecar/ferrum-infer-rs:cpu
-
-docker run --rm -p 8000:8000 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
-  serve --model qwen3:0.6b --port 8000
-```
-
-CUDA 与 Metal 镜像还在路上 —— 目前 macOS 请本地编译 Metal 版本,Linux + NVIDIA 请本地编译 CUDA 版本。
-
 ## 支持的模型
 
 | 架构 | Apple Silicon | CUDA | INT4 (GPTQ) | Tensor Parallel |

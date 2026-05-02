@@ -118,21 +118,6 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-### Docker (CPU)
-
-A prebuilt CPU image is published to GHCR on each tagged release (`:cpu`, `:cpu-<version>`). Runs on any x86_64 Linux host — no Rust toolchain needed.
-
-```bash
-docker pull ghcr.io/sizzlecar/ferrum-infer-rs:cpu
-
-docker run --rm -p 8000:8000 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
-  serve --model qwen3:0.6b --port 8000
-```
-
-CUDA and Metal images are on the roadmap — for now run Metal natively on macOS, CUDA natively on Linux.
-
 ## Supported Models
 
 | Architecture | Apple Silicon | CUDA | INT4 (GPTQ) | Tensor Parallel |
