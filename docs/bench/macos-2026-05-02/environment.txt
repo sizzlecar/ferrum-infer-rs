@@ -1,0 +1,19 @@
+# Hardware
+ProductName:		macOS
+ProductVersion:		15.1.1
+BuildVersion:		24B91
+
+Model: MacBookPro18,4
+CPU: Apple M1 Max (10 cores)
+RAM: 32 GB
+
+      Chipset Model: Apple M1 Max
+      Total Number of Cores: 24
+      Metal Support: Metal 3
+
+# Software
+ferrum: 0.7.0 @ d7cfaae
+llama.cpp: llama.cpp 8960
+ggml (homebrew): ggml 0.10.0
+mistralrs: mistralrs 0.8.1
+Python: Python 3.9.6

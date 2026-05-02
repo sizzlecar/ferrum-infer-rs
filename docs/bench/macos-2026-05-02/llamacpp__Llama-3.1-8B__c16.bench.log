@@ -1,0 +1,24 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8001  model=Llama-3.1-8B  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               27/32
+  wall time:               27.51s
+  request throughput:      0.98 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 62.3 tok/s
+  total input tokens:      0
+  total output tokens:     1714
+
+  TTFT  mean 1604.59ms  median  901.12ms  p99 3153.06ms  max 3153.07ms
+  TPOT  mean  185.83ms  median  163.37ms  p99  256.06ms  max  257.60ms
+  ITL   mean  185.39ms  median  133.25ms  p99  346.01ms  max 2253.18ms
+  E2E   mean 13202.13ms  median 11352.55ms  p99 16313.88ms  max 16314.38ms
+
+  errors (first 5):
+    - ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions
+    - ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions
+    - ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions
+    - ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions
+    - ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/llamacpp__Llama-3.1-8B__c16.json

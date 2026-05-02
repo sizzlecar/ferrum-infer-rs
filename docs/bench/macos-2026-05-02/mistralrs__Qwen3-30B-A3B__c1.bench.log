@@ -1,0 +1,14 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8002  model=default  reqs=8  conc=1  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               8/8
+  wall time:               0.01s
+  request throughput:      1013.39 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 0.0 tok/s
+  total input tokens:      0
+  total output tokens:     0
+
+  E2E   mean    0.94ms  median    0.88ms  p99    1.53ms  max    1.57ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/mistralrs__Qwen3-30B-A3B__c1.json

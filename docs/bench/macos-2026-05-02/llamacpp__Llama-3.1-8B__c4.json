@@ -1,0 +1,46 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8001",
+    "model": "Llama-3.1-8B",
+    "num_prompts": 16,
+    "max_concurrency": 4,
+    "request_rate": Infinity,
+    "max_tokens": 64
+  },
+  "completed": 14,
+  "failed": 2,
+  "wall_time_s": 21.669992083,
+  "request_throughput_rps": 0.6460546891931229,
+  "input_throughput_tok_s": 0.0,
+  "output_throughput_tok_s": 41.024472763763306,
+  "total_input_tokens": 0,
+  "total_output_tokens": 889,
+  "ttft_ms": {
+    "mean": 491.07796128571437,
+    "median": 537.0735625000002,
+    "p99": 772.62261625,
+    "max": 772.693125
+  },
+  "tpot_ms": {
+    "mean": 80.75886260586735,
+    "median": 83.40909445535712,
+    "p99": 90.52537617793654,
+    "max": 90.67166865079368
+  },
+  "itl_ms": {
+    "mean": 80.64584076228572,
+    "median": 79.08312499999992,
+    "p99": 301.22601207999844,
+    "max": 658.4237499999999
+  },
+  "e2e_ms": {
+    "mean": 5537.898761928572,
+    "median": 5580.440229,
+    "p99": 6007.637101079998,
+    "max": 6007.651541999998
+  },
+  "error_samples": [
+    "ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions",
+    "ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions"
+  ]
+}

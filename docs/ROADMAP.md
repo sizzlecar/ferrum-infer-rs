@@ -2,18 +2,31 @@
 
 ## Vision
 
-Production-grade LLM inference engine in Rust, targeting the same market as vLLM.
+Production-grade LLM inference engine in Rust. Targets the same workloads as
+vLLM, with a focus on lightweight deployment: single binary, fast cold start,
+first-class Apple Silicon and CUDA support.
 
-Core value proposition: **vLLM-level scheduling capabilities, rewritten with Rust's determinism and performance guarantees.**
+Core value proposition: **vLLM-level scheduling, rewritten with Rust's
+determinism and a real Metal backend so Apple Silicon laptops are not a
+second-class citizen.**
 
-- **Stable P99 latency** - no Python GIL, no GC pauses
-- **Higher memory utilization** - precise KV cache lifecycle control, no Python object overhead
-- **Single-binary deployment** - no conda environment, no Python dependency chain
-- **Embeddable** - usable as a library in Rust/C++ services, not just a standalone process
+- **Stable P99 latency** — no Python GIL, no GC pauses
+- **High memory utilization** — paged KV with block reclamation, no Python
+  object overhead
+- **Single-binary deployment** — no conda environment, no Python dependency
+  chain, fast cold start
+- **First-class Apple Silicon** — the Metal backend is not a port; MoE,
+  paged-KV, fused norms, and a custom Q4_K/Q6_K kernel set ship as part of
+  the same engine that runs CUDA in production
+- **Embeddable** — usable as a library in Rust/C++ services, not just a
+  standalone process
 
 ## Current State
 
-MVP phase on the `mvp` branch. Phase 1 (Core Scheduling Engine) is complete.
+Architecture v2 (Model-as-Code) complete. CUDA decode runner shipping with
+Marlin INT4. Metal backend now matches or beats llama.cpp on Group A models
+at c=16 on M1 Max — see [docs/bench/macos-2026-05-02/](bench/macos-2026-05-02/)
+for the audited report.
 
 ### What's done
 
@@ -71,23 +84,35 @@ MVP phase on the `mvp` branch. Phase 1 (Core Scheduling Engine) is complete.
 
 ### What's next
 
-**Phase 2: CUDA Kernel Layer** — Custom CUDA kernels for decode, flash decoding, paged attention, and batch decode. Candle retained for prefill (FlashAttention-2) and weight loading.
+**Phase 2: CUDA Kernel Layer** — **Done.** Custom CUDA kernels for decode,
+flash decoding, paged attention, batched paged attention, and Marlin INT4
+GEMM all shipping. Candle retained for prefill (FlashAttention-2) and weight
+loading.
+
+**Phase 3: Apple Silicon Metal backend** — **Done** for Group A models
+(LLaMA-3.x, Qwen3, Qwen3-MoE). Custom Q4_K/Q6_K kernels, fused MoE GEMV,
+paged-KV with batched flash attention, fused norms. See
+[bench/macos-2026-05-02/](bench/macos-2026-05-02/).
+
+**Phase 4 (in progress)**: Long-context tuning + FP8 on Hopper/Blackwell.
 
 ## Gap Analysis vs vLLM
 
 | Capability | vLLM | Ferrum | Gap |
 |---|---|---|---|
-| PagedAttention | Mature | **Done** — GPU paged KV pool, block-table attention kernel, free-list reclamation | Closed |
+| PagedAttention | Mature | **Done** — GPU paged KV pool (CUDA + Metal), block-table attention kernel, free-list reclamation | Closed |
 | Continuous Batching | Iteration-level, prefill/decode mixed | **Done** — iteration-level mixed batching, concurrent requests | Closed |
 | Preemption | Swap/recomputation | **Done** — recomputation-based preemption with auto-resubmit | Closed |
 | Prefix Caching | Yes | **Done** — exact-match prefix cache with LRU eviction | Closed |
-| CUDA Kernel Optimization | FlashAttention / FlashInfer | **Done** — custom decode kernels, flash decoding (split-K), fused ops | Closed |
-| Batch Decode | Batched GEMM + attention | **Done** — batched cuBLAS GEMM (m=batch), per-item attention | Partial (attention not yet batched) |
-| Quantization | AWQ / GPTQ / FP8 | **Done** — GPTQ INT4 auto-detect, Marlin fused kernel (+48% vs FP16), Blackwell compatible | Closed |
-| Tensor Parallelism | Multi-GPU via NCCL | Type stubs only | Large |
-| Model Support | Dozens | 4 | Medium |
-| Structured Output | JSON mode / grammar-guided | **Done** — JSON mode via logits biasing, OpenAI API support | Partial (grammar-guided future) |
-| Benchmarking | Comprehensive | **Done** — sequential, concurrent, long-context modes | Closed |
+| CUDA Kernel Optimization | FlashAttention / FlashInfer | **Done** — custom decode kernels, flash decoding (split-K), fused ops, piecewise CUDA Graphs | Closed |
+| Batch Decode | Batched GEMM + attention | **Done** — batched cuBLAS GEMM, batched paged attention (Metal + CUDA) | Closed |
+| Quantization | AWQ / GPTQ / FP8 | **Done** — GPTQ INT4 auto-detect, Marlin (Blackwell-tuned), Triton w4a16; Q4_K/Q6_K MoE on Metal | Partial — FP8 future |
+| Tensor Parallelism | Multi-GPU via NCCL | **Done** — persistent per-rank threads + NCCL all-reduce | Closed (PCIe-bound; NVLink machines see real wins) |
+| Apple Silicon | Not supported | **Done** — full Metal backend, beats llama.cpp at c=16 on Group A | n/a (we cover this, vLLM doesn't) |
+| Model Support | Dozens | LLaMA-3.x, Qwen3, Qwen2/2.5, Mistral, Qwen3-MoE; plus Whisper, Qwen3-TTS, BERT/CLIP/SigLIP | Medium |
+| Structured Output | JSON mode / grammar-guided | **Done** — `json_object` + `json_schema` with DFA-guided hard masking | Partial (full grammar-guided future) |
+| Speculative Decoding | Yes | **Done** — `--spec-draft <MODEL>` DeepMind accept/reject | Closed |
+| Benchmarking | Comprehensive | **Done** — sequential, concurrent, long-context, plus per-engine continuous-batching harness vs llama.cpp/mistralrs | Closed |
 
 ## Architecture Principle
 
@@ -221,24 +246,28 @@ Without this, performance cannot compete. The strategy is FFI bindings, not reim
 
 ## Priority Summary
 
-| Priority | Item | Rationale |
+| Status | Item | Notes |
 |---|---|---|
-| **P0** | PagedAttention + Continuous Batching | Core value of the project |
-| **P0** | CUDA kernel FFI layer | Without this, no competitive performance |
-| **P1** | Benchmark framework | Need data to prove Rust scheduling advantage |
-| **P1** | FlashAttention/FlashInfer integration | Foundation for attention performance |
-| **P1** | FP8/INT8 quantization | Standard cost reduction in production |
-| **P1** | Tensor Parallelism | Required for large models |
-| **P2** | Disaggregated prefill/decode | Advanced scaling architecture |
-| **P2** | Speculative decoding | Throughput multiplier |
-| **P2** | Structured output | Product feature, not core engine |
-| **Deprioritized** | More model architectures | Get Llama to excellence first, then expand |
-| **Deprioritized** | Metal support | Production inference is CUDA; Metal is nice-to-have |
-| **Deprioritized** | CLI pull/list polish | That's Ollama's job; production serving doesn't need it |
+| **Done** | PagedAttention + Continuous Batching | Core scheduler. Block reclamation, mixed prefill+decode batches, preemption on OOM, prefix cache |
+| **Done** | CUDA kernel layer | Custom decode runner (Qwen3 + LLaMA), piecewise CUDA Graphs, paged-KV, Marlin INT4, NCCL TP |
+| **Done** | Apple Silicon (Metal) backend | Custom Q4_K/Q6_K dequant, fused MoE GEMV, paged-KV decode, batched flash attention. Group A matches/beats llama.cpp at c=16 — see bench report |
+| **Done** | INT4 quantization | GPTQ auto-detect, Marlin Blackwell-tuned, also Triton w4a16 (interactive path) |
+| **Done** | Speculative decoding | Draft model + DeepMind accept/reject (`--spec-draft`) |
+| **Done** | Structured output | OpenAI `response_format: json_object` + `json_schema`, DFA-guided masking |
+| **Done** | Tensor parallelism | Persistent per-rank threads + NCCL all-reduce. Most useful with NVLink — PCIe path is bandwidth-bound |
+| **Done** | Whisper ASR + Qwen3-TTS | Custom forward passes on Metal/CUDA/CPU, OpenAI-compatible APIs |
+| **Done** | Benchmark + observability | Continuous-batching bench harness, Prometheus metrics, `/health` |
+| **P1** | Long-context tuning | Flash decoding split-K is in; verify scaling at 32k+ seq lens, paged prefill chunking polish |
+| **P1** | FP8 (Hopper/Blackwell) | After paged-KV scaling. Marlin INT4 already at 24% bandwidth peak — there's headroom before FP8 is the bottleneck |
+| **P2** | More architectures | Phi, DeepSeek, Gemma. Llama-family covers most of what people actually serve |
+| **P2** | Disaggregated prefill/decode | Advanced scaling pattern; depends on real multi-node deployment demand |
+| **P2** | Multi-LoRA serving | Dynamic adapter swap per request |
 
 ## Non-Goals
 
-- Competing with Ollama on the edge/desktop inference use case
 - Training or fine-tuning
-- Reimplementing CUDA kernels from scratch
-- Supporting every model architecture early on
+- Reimplementing CUDA kernels from scratch when a battle-tested library
+  exists. Hand-written kernels exist where the upstream library doesn't fit
+  (decode hot path, paged-KV, Q4_K/Q6_K MoE for Metal, Marlin INT4 for
+  Blackwell)
+- Becoming a generic ML framework — this is an inference engine

@@ -1,0 +1,42 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8002",
+    "model": "default",
+    "num_prompts": 8,
+    "max_concurrency": 1,
+    "request_rate": Infinity,
+    "max_tokens": 64
+  },
+  "completed": 8,
+  "failed": 0,
+  "wall_time_s": 0.007894290999999998,
+  "request_throughput_rps": 1013.3905628763878,
+  "input_throughput_tok_s": 0.0,
+  "output_throughput_tok_s": 0.0,
+  "total_input_tokens": 0,
+  "total_output_tokens": 0,
+  "ttft_ms": {
+    "mean": NaN,
+    "median": NaN,
+    "p99": NaN,
+    "max": NaN
+  },
+  "tpot_ms": {
+    "mean": NaN,
+    "median": NaN,
+    "p99": NaN,
+    "max": NaN
+  },
+  "itl_ms": {
+    "mean": NaN,
+    "median": NaN,
+    "p99": NaN,
+    "max": NaN
+  },
+  "e2e_ms": {
+    "mean": 0.9371199999999962,
+    "median": 0.8764584999999964,
+    "p99": 1.5271898700000093,
+    "max": 1.5701670000000112
+  }
+}

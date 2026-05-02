@@ -1,0 +1,191 @@
+====================================================
+macOS Group A bench suite — start: 2026-05-02 16:57:03 CST
+====================================================
+
+[hardware/os]
+ProductName:		macOS
+ProductVersion:		15.1.1
+BuildVersion:		24B91
+
+Model: MacBookPro18,4
+CPU: Apple M1 Max
+Cores (logical): 10
+Cores (physical): 10
+RAM: 32 GB
+      Chipset Model: Apple M1 Max
+      Total Number of Cores: 24
+      Metal Support: Metal 3
+
+[software]
+ferrum: 0.7.0 @ d7cfaae perf(metal): paged-KV in Qwen3MoeModel — c=16 matches llama.cpp (#81)
+llama.cpp (homebrew): llama.cpp 8960
+ggml (homebrew): ggml 0.10.0
+mistralrs: mistralrs 0.8.1
+Python: Python 3.9.6
+
+[memory state at suite start]
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              466177.
+Pages active:                            669747.
+Pages inactive:                          590331.
+Pages speculative:                        78850.
+Pages throttled:                              0.
+Pages wired down:                        188088.
+vm.swapusage: total = 5120.00M  used = 3986.94M  free = 1133.06M  (encrypted)
+
+[bench harness]
+Script: bench/scripts/bench_serving.py (vLLM benchmark_serving.py style)
+Deterministic prompts, temperature=0.0, max_tokens=64
+Per-c (num_prompts, max_tokens):
+  c=1 → num_prompts=8, max_tokens=64
+  c=4 → num_prompts=16, max_tokens=64
+  c=8 → num_prompts=24, max_tokens=64
+  c=16 → num_prompts=32, max_tokens=64
+
+[ferrum env]
+FERRUM_METAL_PAGED_KV=1
+FERRUM_PAGED_MAX_SEQS=$((c*2))    # 2× concurrency for pool headroom
+FERRUM_KV_CAPACITY=512             # per-seq cap, keeps pool ≈3.1 GB at MAX_SEQS=32
+FERRUM_MAX_BATCH=$c
+
+[llama.cpp env]
+llama-server --ctx-size 4096 --parallel $c --batch-size 2048 --jinja
+
+[mistralrs env]
+mistralrs serve --port $port --max-seqs $c text --format gguf -m $GGUF_DIR -f $gguf -t $tokenizer
+Note: mistralrs HTTP API requires literal model='default' in request body
+
+================================================================
+  Llama-3.1-8B
+================================================================
+prewarming Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf page cache...
+
+▶ ferrum__Llama-3.1-8B__c1
+  out_tok/s=29.1  TPOT_med=31.7  TTFT_med=142.6
+
+▶ llamacpp__Llama-3.1-8B__c1
+  out_tok/s=28.7  TPOT_med=34.2  TTFT_med=143.1
+
+▶ mistralrs__Llama-3.1-8B__c1
+  out_tok/s=30.2  TPOT_med=32.1  TTFT_med=163.8
+
+▶ ferrum__Llama-3.1-8B__c4
+  out_tok/s=27.0  TPOT_med=140.5  TTFT_med=541.8
+
+▶ llamacpp__Llama-3.1-8B__c4
+  out_tok/s=41.0  TPOT_med=83.4  TTFT_med=537.1
+
+▶ mistralrs__Llama-3.1-8B__c4
+  out_tok/s=18.4  TPOT_med=203.0  TTFT_med=1664.3
+
+▶ ferrum__Llama-3.1-8B__c8
+  out_tok/s=51.3  TPOT_med=145.0  TTFT_med=519.9
+
+▶ llamacpp__Llama-3.1-8B__c8
+  out_tok/s=42.3  TPOT_med=149.0  TTFT_med=854.3
+
+▶ mistralrs__Llama-3.1-8B__c8
+  out_tok/s=14.6  TPOT_med=543.0  TTFT_med=2928.7
+
+▶ ferrum__Llama-3.1-8B__c16
+  out_tok/s=95.0  TPOT_med=146.3  TTFT_med=427.3
+
+▶ llamacpp__Llama-3.1-8B__c16
+  out_tok/s=62.3  TPOT_med=163.4  TTFT_med=901.1
+
+▶ mistralrs__Llama-3.1-8B__c16
+  out_tok/s=23.3  TPOT_med=403.4  TTFT_med=2452.0
+
+================================================================
+  Qwen3-8B
+================================================================
+prewarming Qwen3-8B-Q4_K_M.gguf page cache...
+
+▶ ferrum__Qwen3-8B__c1
+  out_tok/s=28.4  TPOT_med=33.0  TTFT_med=140.6
+
+▶ llamacpp__Qwen3-8B__c1
+  out_tok/s=29.8  TPOT_med=32.2  TTFT_med=195.5
+
+▶ mistralrs__Qwen3-8B__c1
+  out_tok/s=32.2  TPOT_med=27.7  TTFT_med=182.4
+
+▶ ferrum__Qwen3-8B__c4
+  out_tok/s=26.7  TPOT_med=143.4  TTFT_med=534.0
+
+▶ llamacpp__Qwen3-8B__c4
+  out_tok/s=48.4  TPOT_med=72.7  TTFT_med=754.4
+
+▶ mistralrs__Qwen3-8B__c4
+  out_tok/s=23.3  TPOT_med=143.8  TTFT_med=1159.5
+
+▶ ferrum__Qwen3-8B__c8
+  out_tok/s=50.5  TPOT_med=147.3  TTFT_med=520.4
+
+▶ llamacpp__Qwen3-8B__c8
+  out_tok/s=44.9  TPOT_med=132.1  TTFT_med=1234.5
+
+▶ mistralrs__Qwen3-8B__c8
+  out_tok/s=22.3  TPOT_med=279.6  TTFT_med=2080.2
+
+▶ ferrum__Qwen3-8B__c16
+  out_tok/s=93.2  TPOT_med=149.1  TTFT_med=427.1
+
+▶ llamacpp__Qwen3-8B__c16
+  out_tok/s=68.6  TPOT_med=122.1  TTFT_med=2413.8
+
+▶ mistralrs__Qwen3-8B__c16
+  out_tok/s=23.5  TPOT_med=392.1  TTFT_med=3630.6
+
+================================================================
+  Qwen3-30B-A3B
+================================================================
+prewarming Qwen3-30B-A3B-Q4_K_M.gguf page cache...
+
+▶ ferrum__Qwen3-30B-A3B__c1
+  out_tok/s=42.3  TPOT_med=19.5  TTFT_med=279.8
+
+▶ llamacpp__Qwen3-30B-A3B__c1
+  out_tok/s=48.0  TPOT_med=17.4  TTFT_med=222.9
+
+▶ mistralrs__Qwen3-30B-A3B__c1
+  out_tok/s=0.0  TPOT_med=nan  TTFT_med=nan
+
+▶ ferrum__Qwen3-30B-A3B__c4
+  out_tok/s=42.5  TPOT_med=79.5  TTFT_med=986.7
+
+▶ llamacpp__Qwen3-30B-A3B__c4
+  out_tok/s=66.3  TPOT_med=47.2  TTFT_med=719.3
+
+▶ mistralrs__Qwen3-30B-A3B__c4
+  out_tok/s=0.0  TPOT_med=nan  TTFT_med=nan
+
+▶ ferrum__Qwen3-30B-A3B__c8
+  out_tok/s=47.2  TPOT_med=151.9  TTFT_med=883.2
+
+▶ llamacpp__Qwen3-30B-A3B__c8
+  out_tok/s=74.4  TPOT_med=82.8  TTFT_med=953.5
+
+▶ mistralrs__Qwen3-30B-A3B__c8
+  out_tok/s=0.0  TPOT_med=nan  TTFT_med=nan
+
+▶ ferrum__Qwen3-30B-A3B__c16
+  out_tok/s=48.0  TPOT_med=299.1  TTFT_med=520.6
+
+▶ llamacpp__Qwen3-30B-A3B__c16
+  out_tok/s=78.1  TPOT_med=149.4  TTFT_med=1941.3
+
+▶ mistralrs__Qwen3-30B-A3B__c16
+  out_tok/s=0.0  TPOT_med=nan  TTFT_med=nan
+====================================================
+[memory state at suite end]
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               13155.
+Pages active:                            349134.
+Pages inactive:                          328159.
+Pages speculative:                        19903.
+Pages throttled:                              0.
+Pages wired down:                        269839.
+vm.swapusage: total = 8192.00M  used = 7556.12M  free = 635.88M  (encrypted)
+
+All cells written under /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/

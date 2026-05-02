@@ -1,0 +1,21 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8002  model=default  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               26/32
+  wall time:               0.01s
+  request throughput:      3875.94 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 0.0 tok/s
+  total input tokens:      0
+  total output tokens:     0
+
+  E2E   mean    2.57ms  median    3.11ms  p99    4.08ms  max    4.12ms
+
+  errors (first 5):
+    - HTTP 500: {"message":"channel closed"}
+    - HTTP 500: {"message":"channel closed"}
+    - HTTP 500: {"message":"channel closed"}
+    - HTTP 500: {"message":"channel closed"}
+    - HTTP 500: {"message":"channel closed"}
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/mistralrs__Qwen3-30B-A3B__c16.json

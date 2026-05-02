@@ -1,0 +1,21 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8001  model=Qwen3-30B-A3B  reqs=16  conc=4  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               14/16
+  wall time:               13.10s
+  request throughput:      1.07 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 66.3 tok/s
+  total input tokens:      0
+  total output tokens:     868
+
+  TTFT  mean  706.44ms  median  719.29ms  p99  857.02ms  max  857.17ms
+  TPOT  mean   44.66ms  median   47.21ms  p99   47.80ms  max   47.80ms
+  ITL   mean   44.66ms  median   47.23ms  p99   49.15ms  max   50.95ms
+  E2E   mean 3430.76ms  median 3601.19ms  p99 3772.41ms  max 3772.48ms
+
+  errors (first 5):
+    - ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions
+    - ClientOSError: [Errno None] Can not write request body for http://127.0.0.1:8001/v1/chat/completions
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/llamacpp__Qwen3-30B-A3B__c4.json

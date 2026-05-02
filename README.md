@@ -1,322 +1,215 @@
-# Ferrum Infer
+# ferrum-infer-rs
 
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-A Rust-native LLM inference engine. Load models from Hugging Face, chat locally or serve via OpenAI-compatible API. Single binary, no Python, no runtime dependencies.
+Production-grade LLM inference in Rust. Single binary, OpenAI-compatible, runs on Apple Silicon and CUDA.
 
 [中文说明](README_zh.md)
 
-## Install
+## What it is
+
+ferrum-infer-rs is a Rust-native inference engine for transformer LLMs. It runs as a single binary with no Python or system dependencies, starts in seconds, and exposes an OpenAI-compatible HTTP API.
+
+If your deployment uses single-GPU servers, edge devices, or Apple Silicon — and if Docker image size, cold start time, or Python tooling friction matters in your workflow — ferrum is designed for you.
+
+## Performance highlight: Apple Silicon at concurrency
+
+The hard case for laptop inference is concurrent serving. ferrum holds its own at single-request decode and pulls ahead as concurrency goes up. Same machine, same `Q4_K_M` GGUFs, same OpenAI-compatible HTTP load — see the audit-quality report at [`docs/bench/macos-2026-05-02/`](docs/bench/macos-2026-05-02/) (env, scripts, raw JSON, logs).
+
+**M1 Max 32 GB · Q4_K_M · output throughput (tok/s)** — best of multiple runs, see [bench report § Methodology](docs/bench/macos-2026-05-02/README.md#methodology--why-two-reruns) for variance and re-run protocol.
+
+| Model | c | ferrum | llama.cpp (b8960) | mistralrs (0.8.1) |
+|---|---:|---:|---:|---:|
+| LLaMA-3.1-8B | 1 | 29.1 | 28.7 | 30.2 |
+| LLaMA-3.1-8B | 8 | **51.3** | 42.3 | 14.6 |
+| LLaMA-3.1-8B | 16 | **96.7** | 67.2 | 23.3 |
+| Qwen3-8B | 16 | **93.2** | 68.6 | 23.5 |
+| Qwen3-30B-A3B (MoE) | 16 | 79.2¹ | 83.4 | panic² |
+
+> ¹ ferrum MoE c ≥ 8 requires `FERRUM_MOE_BATCHED=1 FERRUM_MOE_BATCHED_DECODE=1` (currently opt-in). Without it, MoE c = 16 falls to 48 tok/s. ² mistralrs 0.8.1 PoisonError-panics on Qwen3-30B-A3B-Q4_K_M (`add_request.rs:466`) — not a ferrum issue.
+
+> The Qwen3-30B-A3B (MoE) row is the headline. That's the model where Apple Silicon Rust support was effectively missing two months ago. ferrum closed it from a 51 → 80 tok/s gap to llama.cpp in a single PR (#81) by mirroring the Phase-4 paged-KV scaffolding into `Qwen3MoeModel`. On the dense 8B models, ferrum is +36–44% over llama.cpp at c = 16.
+
+The full 36-cell grid (c = 1, 4, 8, 16 across all three engines and three models, including TPOT / TTFT distributions) is in the [bench report](docs/bench/macos-2026-05-02/README.md).
+
+## Performance highlight: NVIDIA GPUs (CUDA)
+
+ferrum maintains a custom CUDA decode runner with INT4 Marlin support. Numbers from RTX PRO 6000 (Blackwell):
+
+**Qwen3-4B**
+
+| Mode | Decode (tok/s) | VRAM |
+|---|---:|---:|
+| FP16 (eager) | 70.3 | ~8 GB |
+| FP16 + CUDA Graphs | 82.9 (+18%) | ~8 GB |
+| INT4 (GPTQ + Marlin) | **130.4 (+85%)** | **~2.5 GB (-69%)** |
+| 4 concurrent (INT4) | 124.2 | ~2.5 GB |
+
+**TinyLlama-1.1B**
+
+| Backend | Decode (tok/s) |
+|---|---:|
+| Candle | 126 |
+| ferrum CUDA | **256.5 (+103%)** |
+
+vLLM-style scheduling features included: PagedAttention, continuous batching, FlashAttention-2 prefill, batched decode, custom fused kernels, piecewise CUDA Graphs, NCCL tensor parallel.
+
+## Comparison
+
+|  | ferrum | vLLM | llama.cpp | mistralrs |
+|---|---|---|---|---|
+| Language | Rust | Python+CUDA | C++ | Rust |
+| Single binary | ✓ | ✗ (Docker) | ✓ | ✓ |
+| Apple Silicon | ✓ (incl. MoE) | ✗ | ✓ | partial (no MoE) |
+| CUDA | ✓ (custom) | ✓ (best) | ✓ | ✓ |
+| Concurrent serving | ✓ | ✓ (best) | ✓ | ✓ |
+| Continuous batching | ✓ | ✓ | partial | ✓ |
+| INT4 quantization | ✓ Marlin / Triton | GPTQ / AWQ | GGUF only | varies |
+| OpenAI-compatible API | ✓ | ✓ | ✓ | ✓ |
+| Embeddable as a library | ✓ | ✗ | ✓ | ✓ |
+
+## Quick Start
 
 ```bash
-# From crates.io
+# Install
 cargo install ferrum-cli
-
 # Or build from source
 cargo build --release -p ferrum-cli --bin ferrum
 
-# CUDA (Linux + NVIDIA)
-CUDA_HOME=/usr/local/cuda cargo build --release --features cuda -p ferrum-cli --bin ferrum
+# Set HF token for gated models (e.g. Llama 3.x)
+export HF_TOKEN=hf_your_token_here
+
+# Chat directly
+ferrum run qwen3:4b
+
+# Or serve via OpenAI-compatible API
+ferrum serve --model qwen3:4b --port 8000
+```
+
+API call:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 ### Docker (CPU)
 
-A prebuilt CPU image is published to GHCR on each tagged release (`:cpu`,
-`:cpu-<version>`). Runs on any x86_64 Linux host — no Rust toolchain needed.
+A prebuilt CPU image is published to GHCR on each tagged release (`:cpu`, `:cpu-<version>`). Runs on any x86_64 Linux host — no Rust toolchain needed.
 
 ```bash
-# Pull the latest CPU image (available after the next tagged release)
 docker pull ghcr.io/sizzlecar/ferrum-infer-rs:cpu
 
-# Serve a model on port 8000 (HF cache mounted so weights persist across runs)
 docker run --rm -p 8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
   serve --model qwen3:0.6b --port 8000
-
-# Gated models: pass HF_TOKEN
-docker run --rm -e HF_TOKEN=$HF_TOKEN \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
-  pull meta-llama/Llama-3.2-1B-Instruct
 ```
 
-To build the image yourself:
+CUDA and Metal images are on the roadmap — for now run Metal natively on macOS, CUDA natively on Linux.
+
+## Supported Models
+
+| Architecture | Apple Silicon | CUDA | INT4 (GPTQ) | Tensor Parallel |
+|---|:---:|:---:|:---:|:---:|
+| LLaMA (3.x, TinyLlama, Vicuna, Mistral) | ✓ | ✓ | ✓ | ✓ |
+| Qwen3 dense (0.6B – 8B) | ✓ | ✓ | ✓ | ✓ |
+| Qwen3-MoE (30B-A3B) | ✓ | — | — | — |
+| Qwen2 / Qwen2.5 | ✓ | ✓ | ✓ | — |
+| BERT (embeddings) | ✓ | — | — | — |
+| Whisper ASR (tiny → large-v3-turbo) | ✓ | — | — | — |
+| Qwen3-TTS (0.6B / 1.7B, voice clone) | ✓ | — | — | — |
+| CLIP / Chinese-CLIP / SigLIP (text + image) | ✓ | — | — | — |
+
+Use any HuggingFace model ID:
 
 ```bash
-docker build -t ferrum:cpu .
-```
-
-CUDA and Metal images are on the roadmap — for now run Metal natively on
-macOS, CUDA natively on Linux.
-
-## Quick Start
-
-For gated models (e.g. Llama 3.2), set your Hugging Face token first:
-```bash
-export HF_TOKEN=hf_your_token_here
-```
-
-```bash
-# Download a model
-ferrum pull qwen3:0.6b
-
-# Chat
-ferrum run qwen3:0.6b
-
-# Or start an API server
-ferrum serve --model qwen3:0.6b --port 8000
-```
-
-## Supported Architectures
-
-Any Hugging Face model using a supported architecture works out of the box:
-
-### Text Generation
-
-| Architecture | CUDA Decode | INT4 (GPTQ) | Tensor Parallel | Example Models |
-|-------------|-------------|-------------|-----------------|----------------|
-| **LLaMA** | Yes | Yes | Yes | Llama-3.x, TinyLlama, Vicuna, Alpaca, ... |
-| **Qwen3** | Yes | Yes | Yes | Qwen3-0.6B ~ 4B |
-| **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
-
-### Speech-to-Text (Whisper ASR)
-
-| Architecture | Metal | CUDA | Example Models |
-|-------------|-------|------|----------------|
-| **Whisper** | Yes | — | whisper-tiny, whisper-base, whisper-small, whisper-medium, whisper-large-v3, **whisper-turbo** (recommended) |
-
-### Text-to-Speech (Qwen3-TTS)
-
-| Architecture | Metal | CPU | Voice Clone | Example Models |
-|-------------|-------|-----|-------------|----------------|
-| **Qwen3-TTS** | Yes | Yes | Yes (ICL) | Qwen3-TTS-12Hz-0.6B-Base |
-
-### Embeddings (text + image)
-
-| Architecture | Modality | Embedding Dim | Example Models |
-|-------------|----------|--------------|----------------|
-| **CLIP** | Text + Image | 512/768 | openai/clip-vit-base-patch32 |
-| **Chinese-CLIP** | Text + Image | 512 | OFA-Sys/chinese-clip-vit-base-patch16 |
-| **SigLIP** | Text + Image | 768 | google/siglip-base-patch16-224 |
-| **BERT** | Text | 768 | google-bert/bert-base-chinese |
-
-```bash
-# Text generation
 ferrum run Qwen/Qwen3-4B
-ferrum run llama3.2:3b
+ferrum run meta-llama/Llama-3.2-3B-Instruct
+ferrum run JunHowie/Qwen3-4B-GPTQ-Int4    # INT4 auto-detected
+```
 
-# Speech-to-Text (supports WAV/M4A/MP3/FLAC — auto ffmpeg conversion)
+### Multi-modal
+
+```bash
+# Speech-to-text (WAV/M4A/MP3/FLAC, auto ffmpeg conversion)
 ferrum transcribe whisper-turbo recording.m4a -l zh
-ferrum transcribe whisper-turbo meeting.wav -l en
-
-# Text-to-Speech
-ferrum tts qwen3-tts "Hello, welcome to Ferrum TTS" -o output.wav
-ferrum tts qwen3-tts "你好欢迎使用语音合成系统" -o output.wav
-
-# Voice clone (ICL mode — clone any voice from 5s reference audio)
-ferrum tts qwen3-tts "你好" --ref-audio ref.wav --ref-text "参考文本" -o clone.wav
-
-# Streaming TTS (first audio chunk in ~2.5s)
-ferrum tts qwen3-tts "你好世界" --streaming -o output.wav
-
-# TTS API server (OpenAI-compatible)
-ferrum serve qwen3-tts
-curl localhost:8000/v1/audio/speech -d '{"input":"你好","language":"chinese"}' -o speech.wav
-
-# Whisper API server (OpenAI-compatible)
 ferrum serve whisper-turbo
-curl localhost:8000/v1/audio/transcriptions -F "file=@audio.wav" -F "language=zh"
+
+# Text-to-speech (incl. voice clone via ICL prompting)
+ferrum tts qwen3-tts "Hello, welcome to Ferrum TTS" -o output.wav
+ferrum tts qwen3-tts "你好" --ref-audio ref.wav --ref-text "参考文本" -o clone.wav
+ferrum serve qwen3-tts
 
 # Embeddings (text + image)
 ferrum embed OFA-Sys/chinese-clip-vit-base-patch16 --text "sunset at the beach"
 ferrum embed google/siglip-base-patch16-224 --image photo.jpg
-
-# Embedding API server
-ferrum serve --model OFA-Sys/chinese-clip-vit-base-patch16
-curl localhost:8000/v1/embeddings -d '{"model":"clip","input":"hello"}'
-curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to/photo.jpg"}}'
 ```
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `ferrum run <model>` | Interactive chat |
-| `ferrum serve --model <model>` | OpenAI-compatible HTTP server |
-| `ferrum stop` | Stop running server |
-| `ferrum pull <model>` | Download model from Hugging Face |
-| `ferrum list` | Show cached models |
-| `ferrum bench <model>` | Performance benchmark |
-| `ferrum transcribe <model> <audio>` | Speech-to-text (Whisper, supports WAV/M4A/MP3) |
-| `ferrum tts <model> <text>` | Text-to-speech (Qwen3-TTS, voice clone with `--ref-audio`) |
-| `ferrum embed <model>` | Generate embeddings (BERT/CLIP/SigLIP, text + image) |
-
-## API Endpoints
-
-```bash
-# Chat completions (OpenAI-compatible)
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"Hello"}]}'
-
-# Audio transcription (OpenAI-compatible, multipart form)
-curl http://localhost:8000/v1/audio/transcriptions \
-  -F "file=@audio.wav" -F "language=zh"
-
-# Text-to-speech (OpenAI-compatible)
-curl http://localhost:8000/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"input":"Hello world","language":"english"}' -o speech.wav
-
-# Embeddings
-curl http://localhost:8000/v1/embeddings \
-  -d '{"model":"clip","input":"hello"}'
-
-# List models
-curl http://localhost:8000/v1/models
-
-# Health check
-curl http://localhost:8000/health
-```
-
-## Performance
-
-Benchmarked on **RTX PRO 6000 (Blackwell)**:
-
-### Qwen3-4B
-
-| Mode | FP16 (eager) | FP16 + CUDA graph | INT4 (GPTQ + Marlin) |
-|------|--------------|-------------------|----------------------|
-| Single request decode | 70.3 tok/s | **82.9 tok/s (+18%)** | **130.4 tok/s** |
-| 4 concurrent (batch) | 109.4 tok/s | — | **124.2 tok/s** |
-| TPOT (p50) | 14.2 ms | **12.1 ms** | — |
-| VRAM | ~8 GB | — | **~2.5 GB (-69%)** |
-
-> CUDA graph replay is automatic after 3-step warmup; eliminates per-step launch overhead and sits on the Blackwell + CUDA 13 path we hardened in this cycle (see [docs/phase-e-cuda-status.md](docs/phase-e-cuda-status.md)).
-
-### TinyLlama-1.1B (Llama architecture)
-
-| Mode | Candle | CUDA Runner |
-|------|--------|-------------|
-| Decode | 126 tok/s | **256.5 tok/s (+103%)** |
-
-### Tensor Parallelism (multi-GPU)
-
-| Config | Qwen3-4B FP16 |
-|--------|---------------|
-| 1× GPU | 82.3 tok/s (TPOT 12.1ms) |
-| 2× GPU TP | 26.1 tok/s (TPOT 38.4ms) |
-
-> TP decode uses persistent per-rank threads with NCCL all-reduce. Current bottleneck is PCIe interconnect latency (~0.44ms × 72 NCCL calls/step). TP is most beneficial for models that don't fit on a single GPU, or with NVLink interconnect.
-
-### Whisper ASR (Apple Silicon Metal)
-
-| Model | 5-min audio | Realtime factor |
-|-------|------------|-----------------|
-| whisper-large-v3-turbo | **~72s** | **4.2x realtime** |
-| whisper-tiny | ~20s | 15x realtime |
-
-> Custom Whisper forward pass with rustfft STFT. Full decode pipeline: timestamp-based sequential decode, temperature fallback, compression ratio check. Mel precision matches Python whisper exactly.
-
-### Qwen3-TTS (Apple Silicon Metal)
-
-| Model | Text | Audio | Time | RTF | First chunk |
-|-------|------|-------|------|-----|-------------|
-| 0.6B | 29 chars Chinese | 4.6s | **11.3s** | **2.8x** | ~2.5s (streaming) |
-| 1.7B | Voice clone (ICL) | 5.8s | **25s** | **4.4x** | ~5s (streaming) |
-
-> All-Metal fused transformer pipeline: custom GEMM (64×32 simdgroup tiles), fused residual+norm, flash attention with layer_scale. Full Mimi-based vocoder with 8-layer pre-transformer. Zero-copy on Apple Silicon unified memory.
-
-### Key Optimizations
-
-- **Custom CUDA decode runner**: bypasses candle for the decode hot path (Qwen3 + LLaMA)
-- **INT4 quantization**: GPTQ models auto-detected, Marlin fused INT4×FP16 kernel
-- **Tensor parallelism**: persistent per-rank threads, barrier sync, NCCL all-reduce (Megatron-LM pattern)
-- **Batched attention kernel**: single launch for all batch items (SM utilization 17%→67%)
-- **Batched RoPE**: per-item positions in single kernel launch
-- **Custom CUDA kernels**: fused RmsNorm, SiLU×mul, RoPE, decode attention (all on single stream)
-- **Flash Decoding**: split-K for long-context decode (auto at KV > 256)
-- **Batch decode**: batched cuBLAS GEMM + batched attention for concurrent requests
-- **Metal TTS pipeline**: all-Metal fused transformer for talker (28 layers) + SubTalker (5 layers) + vocoder (8 layers), GPU-side RMSNorm, cached projection weights
-- **TTS streaming**: chunk-by-chunk audio generation (~800ms chunks), first audio in ~2.5s
-- **TTS voice clone**: ICL prompting with speaker encoder (ECAPA-TDNN) + speech tokenizer (Mimi RVQ), sinc resampling
-- **TTS HTTP API**: OpenAI-compatible `/v1/audio/speech` with streaming support
-- **Paged KV attention**: GPU block pool with block-table indirection
-- **Double-buffered residual**: cross-layer norm fusion (-108 kernel launches)
-
-## Current Status
-
-What works:
-- CLI chat, HTTP serving with streaming, benchmarking
-- Qwen3, Qwen2/2.5, LLaMA 3.x, Mistral (sliding-window), TinyLlama
-- Custom CUDA decode runner for Qwen3 and LLaMA (2x speedup)
-- Metal GPU acceleration (macOS), CUDA (NVIDIA), CPU
-- INT4 GPTQ quantization with Marlin fused kernel (Blackwell compatible)
-- FlashAttention-2 prefill + custom CUDA decode runner
-- Paged KV cache with block reclamation
-- Continuous batching with batch decode
-- Chunked prefill (`FERRUM_CHUNKED_PREFILL=<size>`) — split long prompts
-- Prefix cache for repeated prompts (safe exact-match gate)
-- Speculative decoding (`--spec-draft <MODEL>`) — DeepMind accept/reject
-- Structured output — OpenAI-compatible `response_format: json_object` +
-  `json_schema` with DFA-guided hard token masking
-- Tensor parallelism (multi-GPU NCCL, auto-detects GPU count)
-- CLIP/Chinese-CLIP/SigLIP embeddings (text + image, `/v1/embeddings` API)
-- Whisper ASR (speech-to-text, Metal accelerated, `/v1/audio/transcriptions` API)
-- Multi-format audio support (WAV/MP3/FLAC/M4A/OGG) via pure-Rust `symphonia`
-- Top-k/top-p/temperature/repetition-penalty sampling
-
-## Roadmap
-
-- **More model architectures** — Phi, DeepSeek, Gemma
-- **Qwen2 CUDA runner** — same pattern as LLaMA
-- **FP8 / Marlin INT4 on more architectures**
-
-See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
-
-## Build Options
+## Build options
 
 ```bash
 # CPU only (default)
 cargo install ferrum-cli
 
-# With Metal acceleration (macOS)
+# Metal acceleration (macOS)
 cargo install ferrum-cli --features metal
 
-# With CUDA acceleration (NVIDIA, requires CUDA toolkit + nvcc)
+# CUDA acceleration (NVIDIA, requires CUDA toolkit + nvcc)
 cargo install ferrum-cli --features cuda
 ```
 
-Or build from source:
-```bash
-cargo build --release -p ferrum-cli                    # CPU
-cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
-cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
-cargo build --release -p ferrum-cli --features cuda    # Multi-GPU auto-detected when available
-```
-
-Prerequisites: Rust stable toolchain.
-
-## Project Structure
+## Architecture
 
 ```
 crates/
-├── ferrum-types          # Shared type definitions
-├── ferrum-interfaces     # Core trait contracts (ComputeBackend, KernelOps, ModelExecutor)
-├── ferrum-runtime        # Backend implementations (Candle, CPU)
-├── ferrum-engine         # Metal kernels, model orchestration
-├── ferrum-models         # Model architectures (LLaMA, Qwen2, Qwen3, BERT, Whisper)
-├── ferrum-kernels   # Custom CUDA kernels + decode runner
+├── ferrum-types          # Shared types
+├── ferrum-interfaces     # Trait contracts (Backend<B>, ModelExecutor, ...)
+├── ferrum-runtime        # Backend registry
+├── ferrum-engine         # Continuous-batch engine, Metal shader pipeline
+├── ferrum-models         # Model architectures (LlamaFamilyModel<B>, MoE, ...)
+├── ferrum-kernels        # Custom CUDA + Metal kernels, decode runner
+├── ferrum-attention      # Fused-transformer prototype (Metal/CPU)
+├── ferrum-quantization   # GPTQ loader, Marlin, native safetensors
 ├── ferrum-tokenizer      # Tokenization
-├── ferrum-sampler        # Sampling strategies
-├── ferrum-scheduler      # Request scheduling
-├── ferrum-kv             # KV cache management
-├── ferrum-server         # HTTP API server
-├── ferrum-cli            # CLI binary
-└── ferrum-testkit        # Testing utilities
+├── ferrum-sampler        # Top-k/p, temperature, repetition penalty, JSON-mode
+├── ferrum-scheduler      # Continuous batching, paged-KV scheduling
+├── ferrum-kv             # Paged KV cache (CUDA + Metal pools)
+├── ferrum-server         # HTTP API
+├── ferrum-cli            # Binary entry point
+└── ferrum-testkit        # Test infrastructure
 ```
+
+Architecture v2 (Model-as-Code) means the model layer is an explicit Rust generic over a `Backend<B>` trait, not a config-driven runner. Adding a backend = implementing the trait, not editing models. See [docs/architecture-v2.md](docs/architecture-v2.md).
+
+## Status
+
+What works today:
+- CLI chat, OpenAI-compatible HTTP server with streaming
+- Continuous batching, PagedAttention (CUDA + Metal pools), prefix caching, preemption
+- Custom CUDA decode runner (Qwen3, LLaMA): 2× over Candle baseline
+- Apple Silicon MoE inference (Qwen3-30B-A3B) — matches llama.cpp at c=16
+- INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); also Triton w4a16
+- Tensor parallelism (multi-GPU NCCL, persistent per-rank threads)
+- Speculative decoding (`--spec-draft <MODEL>` DeepMind accept/reject)
+- Structured output (`response_format: json_object` + `json_schema` with DFA-guided masking)
+- Whisper ASR (Metal-accelerated forward pass) + Qwen3-TTS (voice clone, streaming)
+- Top-k / top-p / temperature / repetition penalty
+
+Known regressions / in-progress:
+- Apple Silicon dense at c = 4 underperforms c = 1 on small models (paged-batched is below crossover). Per-token mode remains the default for c ≤ 4 until the small-m path catches up.
+- FP8 (Hopper / Blackwell) — INT4 path is at 24% peak DRAM bandwidth, so there's headroom before FP8 becomes the bottleneck.
+
+## Roadmap
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full picture.
+
+Near-term:
+- v0.1: Apple Silicon Group A production release with concurrent serving benchmarks (this PR)
+- v0.2: CUDA serving benchmark vs vLLM on commodity hardware (RTX 4090)
+- v0.3: Long-context tuning (32k+), more architectures (Phi, DeepSeek, Gemma)
 
 ## License
 
