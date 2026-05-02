@@ -9,9 +9,11 @@ Production-grade LLM inference in Rust. Single binary, OpenAI-compatible, runs o
 
 ## What it is
 
-ferrum-infer-rs is a Rust-native inference engine for transformer LLMs. It runs as a single binary with no Python or system dependencies, starts in seconds, and exposes an OpenAI-compatible HTTP API.
+ferrum-infer-rs is a Rust-native inference engine for transformer LLMs:
+single binary, no Python, OpenAI-compatible HTTP API, seconds to start.
 
-If your deployment uses single-GPU servers, edge devices, or Apple Silicon — and if Docker image size, cold start time, or Python tooling friction matters in your workflow — ferrum is designed for you.
+Designed for single-GPU servers, edge devices, and Apple Silicon —
+where Docker image size, cold start time, and Python toolchain friction matter.
 
 ## Performance highlight: Apple Silicon at concurrency
 
