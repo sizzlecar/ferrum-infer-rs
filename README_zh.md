@@ -73,7 +73,15 @@ ferrum 拥有自研 CUDA decode runner,支持 INT4 Marlin。来自 RTX PRO 6000 
 
 ## 快速开始
 
-### 预编译二进制
+### Homebrew (macOS Apple Silicon、Linux x86_64)
+
+```bash
+brew tap sizzlecar/ferrum
+brew install ferrum
+ferrum --version
+```
+
+### 预编译二进制 (原始 tarball)
 
 ```bash
 # Linux x86_64
