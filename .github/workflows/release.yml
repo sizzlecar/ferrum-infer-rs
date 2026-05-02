@@ -1,0 +1,159 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.1.0). Required for manual runs.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ── Linux x86_64 (CPU only) ──────────────────────────────────────────
+  # Built on ubuntu-22.04 for broader glibc compatibility (2.35 covers
+  # Ubuntu 22.04+, Debian 12+, RHEL 9+, Fedora 36+). CUDA users build
+  # from source — bundling CUDA in the release tarball is too large
+  # and pins them to a specific toolkit version anyway.
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/share/powershell /usr/share/swift
+          sudo docker system prune -af --volumes 2>/dev/null || true
+          df -h /
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-linux-x86_64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-linux-x86_64-
+
+      - name: Build (release, CPU)
+        run: cargo build --release -p ferrum-cli --bin ferrum
+
+      - name: Strip binary
+        run: strip target/release/ferrum
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Package tarball
+        id: package
+        run: |
+          mkdir -p dist
+          cp target/release/ferrum dist/ferrum
+          cp LICENSE dist/LICENSE
+          cp README.md dist/README.md
+          tar -C dist -czf ferrum-linux-x86_64.tar.gz ferrum LICENSE README.md
+          ls -lh ferrum-linux-x86_64.tar.gz
+          shasum -a 256 ferrum-linux-x86_64.tar.gz | tee ferrum-linux-x86_64.tar.gz.sha256
+
+      - name: Smoke test the packaged binary
+        run: |
+          mkdir -p smoke && tar -C smoke -xzf ferrum-linux-x86_64.tar.gz
+          ./smoke/ferrum --help | head -5
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            ferrum-linux-x86_64.tar.gz
+            ferrum-linux-x86_64.tar.gz.sha256
+
+  # ── macOS aarch64 (Apple Silicon, Metal) ─────────────────────────────
+  # Built on the macos-14 Apple Silicon runner so we get a native
+  # aarch64 binary. Metal is bundled — same backend as our M1 Max
+  # benchmarks ship.
+  macos-aarch64:
+    name: macOS aarch64 (Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-macos-aarch64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-macos-aarch64-
+
+      - name: Build (release, Metal)
+        run: cargo build --release -p ferrum-cli --bin ferrum --features metal
+
+      - name: Strip binary
+        run: strip target/release/ferrum
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          cp target/release/ferrum dist/ferrum
+          cp LICENSE dist/LICENSE
+          cp README.md dist/README.md
+          tar -C dist -czf ferrum-macos-aarch64.tar.gz ferrum LICENSE README.md
+          ls -lh ferrum-macos-aarch64.tar.gz
+          shasum -a 256 ferrum-macos-aarch64.tar.gz | tee ferrum-macos-aarch64.tar.gz.sha256
+
+      - name: Smoke test the packaged binary
+        run: |
+          mkdir -p smoke && tar -C smoke -xzf ferrum-macos-aarch64.tar.gz
+          ./smoke/ferrum --help | head -5
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            ferrum-macos-aarch64.tar.gz
+            ferrum-macos-aarch64.tar.gz.sha256
