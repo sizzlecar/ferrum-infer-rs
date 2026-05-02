@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8001  model=Qwen3-8B  reqs=8  conc=1  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               8/8
+  wall time:               16.67s
+  request throughput:      0.48 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 29.8 tok/s
+  total input tokens:      0
+  total output tokens:     496
+
+  TTFT  mean  200.74ms  median  195.51ms  p99  274.17ms  max  279.89ms
+  TPOT  mean   30.87ms  median   32.18ms  p99   33.16ms  max   33.23ms
+  ITL   mean   30.86ms  median   31.83ms  p99   37.63ms  max   41.36ms
+  E2E   mean 2083.62ms  median 2160.96ms  p99 2220.28ms  max 2221.38ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/llamacpp__Qwen3-8B__c1.json

@@ -1,0 +1,42 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8002",
+    "model": "default",
+    "num_prompts": 16,
+    "max_concurrency": 4,
+    "request_rate": Infinity,
+    "max_tokens": 64
+  },
+  "completed": 16,
+  "failed": 0,
+  "wall_time_s": 43.954626667,
+  "request_throughput_rps": 0.3640117369490113,
+  "input_throughput_tok_s": 9.782815430504678,
+  "output_throughput_tok_s": 23.296751164736722,
+  "total_input_tokens": 430,
+  "total_output_tokens": 1024,
+  "ttft_ms": {
+    "mean": 1482.4233750624999,
+    "median": 1159.534708499999,
+    "p99": 3645.751558949999,
+    "max": 3839.0974589999996
+  },
+  "tpot_ms": {
+    "mean": 142.55449140079364,
+    "median": 143.75734093650794,
+    "p99": 202.36812718095237,
+    "max": 207.11097023809523
+  },
+  "itl_ms": {
+    "mean": 144.99933900706355,
+    "median": 127.62108300000108,
+    "p99": 1028.5411667000017,
+    "max": 1887.748541999999
+  },
+  "e2e_ms": {
+    "mean": 10463.3563333125,
+    "median": 9962.677021,
+    "p99": 16301.27637765,
+    "max": 16887.088584
+  }
+}

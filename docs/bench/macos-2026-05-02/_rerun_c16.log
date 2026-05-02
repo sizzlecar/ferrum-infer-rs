@@ -1,0 +1,51 @@
+
+================================================================
+  Llama-3.1-8B (rerun, clean state)
+================================================================
+[mem] used = 5177.06M | free=793204.
+
+▶ rerun_ferrum__Llama-3.1-8B__c16
+  out_tok/s=96.7  TPOT_med=143.6
+[mem] used = 5097.06M | free=774267.
+
+▶ rerun_llamacpp__Llama-3.1-8B__c16
+  out_tok/s=67.2  TPOT_med=148.8
+[mem] used = 5097.06M | free=770676.
+
+▶ rerun_mistralrs__Llama-3.1-8B__c16
+  out_tok/s=22.8  TPOT_med=452.2
+
+================================================================
+  Qwen3-8B (rerun, clean state)
+================================================================
+[mem] used = 5057.06M | free=777602.
+
+▶ rerun_ferrum__Qwen3-8B__c16
+  out_tok/s=88.6  TPOT_med=168.5
+[mem] used = 5057.06M | free=776116.
+
+▶ rerun_llamacpp__Qwen3-8B__c16
+  out_tok/s=43.2  TPOT_med=174.1
+[mem] used = 5041.06M | free=771883.
+
+▶ rerun_mistralrs__Qwen3-8B__c16
+  out_tok/s=22.3  TPOT_med=429.9
+
+================================================================
+  Qwen3-30B-A3B (rerun, clean state)
+================================================================
+[mem] used = 5025.06M | free=5237.
+
+▶ rerun_ferrum__Qwen3-30B-A3B__c16
+  out_tok/s=48.6  TPOT_med=294.0
+[mem] used = 5025.06M | free=460577.
+
+▶ rerun_llamacpp__Qwen3-30B-A3B__c16
+  out_tok/s=71.5  TPOT_med=163.0
+[mem] used = 5025.06M | free=458604.
+
+▶ rerun_mistralrs__Qwen3-30B-A3B__c16
+  out_tok/s=0.0  TPOT_med=nan
+
+[done] 2026-05-02 17:28:31
+vm.swapusage: total = 7168.00M  used = 6464.00M  free = 704.00M  (encrypted)

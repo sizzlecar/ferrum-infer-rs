@@ -1,0 +1,35 @@
+[mem] used = 6279.81M | free=487085.
+
+▶ ferrum_moebatched__Qwen3-30B-A3B__c1
+  out_tok/s=43.0  TPOT_med=19.1
+[mem] used = 6263.81M | free=476882.
+
+▶ llamacpp_moe__Qwen3-30B-A3B__c1
+  out_tok/s=47.5  TPOT_med=17.4
+[mem] used = 6255.81M | free=471833.
+
+▶ ferrum_moebatched__Qwen3-30B-A3B__c4
+  out_tok/s=39.4  TPOT_med=89.2
+[mem] used = 6247.81M | free=470113.
+
+▶ llamacpp_moe__Qwen3-30B-A3B__c4
+  out_tok/s=66.6  TPOT_med=47.1
+[mem] used = 6247.81M | free=468157.
+
+▶ ferrum_moebatched__Qwen3-30B-A3B__c8
+  out_tok/s=59.2  TPOT_med=121.8
+[mem] used = 6239.81M | free=466665.
+
+▶ llamacpp_moe__Qwen3-30B-A3B__c8
+  out_tok/s=77.9  TPOT_med=83.3
+[mem] used = 6239.81M | free=464230.
+
+▶ ferrum_moebatched__Qwen3-30B-A3B__c16
+  out_tok/s=79.2  TPOT_med=165.4
+[mem] used = 6239.81M | free=465000.
+
+▶ llamacpp_moe__Qwen3-30B-A3B__c16
+  out_tok/s=83.4  TPOT_med=145.0
+
+[done] 2026-05-02 17:35:04
+vm.swapusage: total = 7168.00M  used = 6231.81M  free = 936.19M  (encrypted)
