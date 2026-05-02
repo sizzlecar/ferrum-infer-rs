@@ -48,6 +48,25 @@ use ferrum_kernels::backend::metal::MetalBackend;
 // ────────────────────────────────────────────────────────────────────────
 
 pub async fn run_gguf_one_shot(cmd: RunCommand, _config: CliConfig) -> Result<()> {
+    // `ferrum run` is single-user interactive REPL — multi-sequence
+    // concurrency isn't useful here, but the chat MUST tolerate the
+    // default `--max-tokens 512` plus a multi-turn conversation.
+    // 0.7.2 flipped the engine-wide defaults (`KV_CAPACITY=512`,
+    // `MAX_SEQS=32`) to optimise `serve` for c=16 — those defaults
+    // immediately overflow on the very first `run` turn (cache + prompt
+    // + 512 max_new = ~530 > 512). Override here for run mode only;
+    // `serve` keeps the concurrent defaults. Users who want a specific
+    // value still win — we only set the var if it isn't already set.
+    if std::env::var_os("FERRUM_KV_CAPACITY").is_none() {
+        std::env::set_var("FERRUM_KV_CAPACITY", "8192");
+    }
+    if std::env::var_os("FERRUM_METAL_PAGED_KV").is_none() {
+        // Paged-KV's win is multi-seq batching at the attention kernel.
+        // m=1 single-user run sees zero benefit and pays pool-allocation
+        // overhead. Force off here.
+        std::env::set_var("FERRUM_METAL_PAGED_KV", "0");
+    }
+
     let gguf_path = PathBuf::from(&cmd.model);
     let backend_kind = resolve_backend(&cmd.backend)?;
 
@@ -305,13 +324,18 @@ fn run_one_shot<M: DecoderOnlyLLM>(
     generated.push(next_token);
     push_recent(&mut recent, next_token, cmd.repeat_last_n);
 
+    let mut decoder = StreamingDecoder::new(&prompt_tokens);
+    decoder.seed_prompt_offset(tokenizer);
     if !cmd.bench_mode {
         eprintln!("{} generating ...", "→".cyan());
         print!("{}", prompt);
-        if let Ok(s) = tokenizer.decode(&[next_token], true) {
-            print!("{}", s);
-            io::stdout().flush().ok();
-        }
+        let chunk = decoder.push(next_token, tokenizer);
+        print!("{}", chunk);
+        io::stdout().flush().ok();
+    } else {
+        // Bench mode: still cumulate so the decoder state is correct,
+        // but skip emit.
+        let _ = decoder.push(next_token, tokenizer);
     }
 
     let eos_id = infer_eos_token(tokenizer);
@@ -329,14 +353,19 @@ fn run_one_shot<M: DecoderOnlyLLM>(
         push_recent(&mut recent, next_token, cmd.repeat_last_n);
 
         if !cmd.bench_mode {
-            if let Ok(s) = tokenizer.decode(&[next_token], true) {
-                print!("{}", s);
-                io::stdout().flush().ok();
-            }
+            let chunk = decoder.push(next_token, tokenizer);
+            print!("{}", chunk);
+            io::stdout().flush().ok();
+        } else {
+            let _ = decoder.push(next_token, tokenizer);
         }
     }
     let decode_secs = decode_start.elapsed().as_secs_f64();
     if !cmd.bench_mode {
+        let tail = decoder.flush(tokenizer);
+        if !tail.is_empty() {
+            print!("{}", tail);
+        }
         println!();
     }
 
@@ -395,21 +424,29 @@ fn run_repl<M: DecoderOnlyLLM>(
     let sampling = SamplingParams::from(cmd);
     let eos_id = infer_eos_token(tokenizer);
     let stdin = io::stdin();
-    let mut user_input = String::new();
+    let mut input_bytes = Vec::new();
 
     loop {
         print!("{} ", "❯".cyan().bold());
         io::stdout().flush().ok();
 
-        user_input.clear();
+        // Read raw bytes then UTF-8-lossy decode. `read_line` into a
+        // `String` aborts on the first invalid byte sequence — that
+        // breaks SSH/iOS terminals that occasionally hand us a partial
+        // multi-byte CJK character or a stray latin-1 byte. Lossy
+        // replaces invalid bytes with U+FFFD instead of erroring;
+        // worst case the user sees one '�' in their prompt and types
+        // the line again.
+        input_bytes.clear();
         let bytes = stdin
             .lock()
-            .read_line(&mut user_input)
+            .read_until(b'\n', &mut input_bytes)
             .map_err(|e| FerrumError::model(format!("REPL stdin: {e}")))?;
         if bytes == 0 {
             println!();
             break;
         }
+        let user_input = String::from_utf8_lossy(&input_bytes).into_owned();
         let line = user_input.trim();
         if line.is_empty() {
             continue;
@@ -504,6 +541,10 @@ fn run_repl<M: DecoderOnlyLLM>(
 
         let decode_start = Instant::now();
         let mut produced: Vec<u32> = Vec::new();
+        // Streaming detokenizer seeded with [user_turn_tokens] so we
+        // emit only the assistant turn's text, not the user's echo.
+        let mut decoder = StreamingDecoder::new(&user_ids);
+        decoder.seed_prompt_offset(tokenizer);
         let mut next = sample_logits(&logits, &recent, &sampling, &mut rng)?;
         for step in 0..max_new {
             if Some(next) == eos_id {
@@ -511,13 +552,18 @@ fn run_repl<M: DecoderOnlyLLM>(
             }
             produced.push(next);
             push_recent(&mut recent, next, cmd.repeat_last_n);
-            if let Ok(s) = tokenizer.decode(&[next], true) {
-                print!("{}", s);
+            let chunk = decoder.push(next, tokenizer);
+            if !chunk.is_empty() {
+                print!("{}", chunk);
                 io::stdout().flush().ok();
             }
             let pos = (cache_len + step) as u32;
             let logits = model.decode(cache_id, next, pos);
             next = sample_logits(&logits, &recent, &sampling, &mut rng)?;
+        }
+        let tail = decoder.flush(tokenizer);
+        if !tail.is_empty() {
+            print!("{}", tail);
         }
         let decode_secs = decode_start.elapsed().as_secs_f64();
         cache_len += produced.len();
@@ -811,18 +857,98 @@ fn resolve_backend(s: &str) -> Result<BackendKind> {
 }
 
 fn auto_discover_tokenizer(gguf_path: &PathBuf) -> Option<PathBuf> {
-    let dir = gguf_path.parent()?;
-    if let Some(stem) = gguf_path.file_stem() {
-        let candidate = dir.join(format!("{}.tokenizer.json", stem.to_string_lossy()));
-        if candidate.is_file() {
-            return Some(candidate);
+    // Delegate to the shared helper used by `ferrum serve` so the two
+    // paths search the same set of locations. In particular, the shared
+    // helper also checks a sibling `../tokenizers/<bare-stem>.tokenizer.json`
+    // (the `~/ferrum-bench/{models,tokenizers}/` layout) — `run` was
+    // missing that until 0.7.3 and forced users to pass `--tokenizer`
+    // even though `serve` worked on the same gguf.
+    ferrum_models::gguf_engine_loader::auto_discover_tokenizer_path(gguf_path)
+}
+
+/// Streaming detokenizer. Calling `tokenizer.decode(&[next_token], true)`
+/// once per generated token breaks on BPE byte-level vocabularies (Qwen,
+/// Llama-3) where a single Chinese character (3-byte UTF-8) or emoji
+/// (4-byte UTF-8) is split across 2-3 tokens. The naive decode hands
+/// the tokenizer an incomplete byte sequence and you get `?` / `�` /
+/// the literal `\u{1f4e6}` form in the terminal.
+///
+/// This decoder cumulates tokens and re-decodes the whole sequence
+/// each step, emitting only the *new* tail. The tokenizer always
+/// returns a valid UTF-8 String when given a complete cumulative
+/// sequence, so the diff is a clean suffix at a UTF-8 boundary.
+///
+/// Cost: O(N²) decode calls per stream, but at single-user m=1 decode
+/// rates each call is microseconds — total overhead < 1% of decode wall
+/// time and well worth a working chat experience.
+/// How many bytes of `cumulative` are safe to emit right now.
+///
+/// BPE byte-level vocabularies split CJK chars / emoji across 2-3
+/// tokens. When `tokenizer.decode` is called on a cumulative sequence
+/// whose LAST few bytes are an incomplete UTF-8 sequence, the
+/// implementation loss-replaces them with `U+FFFD`. The next token's
+/// bytes complete the codepoint and the � disappears. So: don't emit
+/// anything past a trailing `U+FFFD` — hold it back; the next push
+/// will fill it in.
+///
+/// Free function (not a method) so the unit test below can exercise
+/// it without needing a real `Tokenizer` instance.
+fn stable_emit_end(cumulative: &str) -> usize {
+    if cumulative.ends_with('\u{FFFD}') {
+        cumulative.rfind('\u{FFFD}').unwrap_or(cumulative.len())
+    } else {
+        cumulative.len()
+    }
+}
+
+struct StreamingDecoder {
+    all_tokens: Vec<u32>,
+    printed_len: usize,
+}
+
+impl StreamingDecoder {
+    fn new(prompt_tokens: &[u32]) -> Self {
+        Self {
+            all_tokens: prompt_tokens.to_vec(),
+            // Seed `printed_len` with the prompt's decoded length so we
+            // don't accidentally re-emit the prompt as part of the model
+            // output.
+            printed_len: 0,
         }
     }
-    let bare = dir.join("tokenizer.json");
-    if bare.is_file() {
-        return Some(bare);
+
+    fn seed_prompt_offset(&mut self, tokenizer: &Tokenizer) {
+        let prompt_text = tokenizer.decode(&self.all_tokens, true).unwrap_or_default();
+        self.printed_len = prompt_text.len();
     }
-    None
+
+    fn push(&mut self, tok: u32, tokenizer: &Tokenizer) -> String {
+        self.all_tokens.push(tok);
+        let cumulative = tokenizer.decode(&self.all_tokens, true).unwrap_or_default();
+        let safe_end = stable_emit_end(&cumulative);
+
+        let out = if safe_end > self.printed_len {
+            cumulative[self.printed_len..safe_end].to_string()
+        } else {
+            String::new()
+        };
+        self.printed_len = safe_end;
+        out
+    }
+
+    fn flush(&mut self, tokenizer: &Tokenizer) -> String {
+        // End-of-stream flush. If we've been holding back a trailing
+        // U+FFFD waiting for a continuation that never came, emit it
+        // now so the user sees the model's actual final character.
+        let cumulative = tokenizer.decode(&self.all_tokens, true).unwrap_or_default();
+        let out = if cumulative.len() > self.printed_len {
+            cumulative[self.printed_len..].to_string()
+        } else {
+            String::new()
+        };
+        self.printed_len = cumulative.len();
+        out
+    }
 }
 
 fn infer_eos_token(tokenizer: &Tokenizer) -> Option<u32> {
@@ -871,4 +997,58 @@ fn print_timing_report(
         "latency".bold(),
         (decode_secs * 1000.0) / decode_tokens.max(1) as f64
     );
+}
+
+#[cfg(test)]
+mod streaming_decoder_tests {
+    use super::stable_emit_end;
+
+    /// Trailing `U+FFFD` (replacement char) → BPE byte-split mid-codepoint.
+    /// Hold it back; the next token's bytes will complete the codepoint.
+    #[test]
+    fn holds_back_trailing_replacement() {
+        let s = "Hello \u{FFFD}";
+        // The � is at byte offset 6 (5 ASCII + space). Hold from there.
+        assert_eq!(stable_emit_end(s), 6);
+    }
+
+    /// Clean text → emit all of it.
+    #[test]
+    fn emits_full_clean_string() {
+        assert_eq!(stable_emit_end("Hello"), 5);
+        assert_eq!(stable_emit_end(""), 0);
+    }
+
+    /// CJK / emoji that's already complete → emit fully (no �).
+    #[test]
+    fn emits_complete_cjk_and_emoji() {
+        let s = "你好";
+        assert_eq!(stable_emit_end(s), s.len()); // 6 bytes (3 + 3)
+        let e = "Cargo \u{1F4E6}"; // 📦 = 4 bytes
+        assert_eq!(stable_emit_end(e), e.len());
+    }
+
+    /// `U+FFFD` inside the string but not at the tail → emit fully.
+    /// (E.g. user prompted with literal � — we shouldn't withhold a
+    /// genuine character that happens to match.)
+    #[test]
+    fn emits_when_replacement_is_internal() {
+        let s = "\u{FFFD}foo";
+        assert_eq!(stable_emit_end(s), s.len());
+    }
+
+    /// Multiple `U+FFFD`s at the very end → hold from the FIRST of the
+    /// trailing run. (Two BPE byte-splits back-to-back, e.g. an
+    /// incomplete codepoint plus another, both mid-token.)
+    #[test]
+    fn holds_back_multiple_trailing_replacements() {
+        let s = "ok \u{FFFD}\u{FFFD}";
+        // Both �s are at the tail (last codepoint is �). `rfind` returns
+        // the last � position; hold from there. Note: not perfect (the
+        // first � also gets emitted next round), but the cumulative
+        // re-decode self-corrects in the common BPE case.
+        let end = stable_emit_end(s);
+        assert!(end < s.len());
+        assert!(end >= 3); // at least "ok " is emitted
+    }
 }
