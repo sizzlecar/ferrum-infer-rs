@@ -71,12 +71,33 @@ vLLM-style scheduling features included: PagedAttention, continuous batching, Fl
 
 ## Quick Start
 
-```bash
-# Install
-cargo install ferrum-cli
-# Or build from source
-cargo build --release -p ferrum-cli --bin ferrum
+### Prebuilt binaries
 
+```bash
+# Linux x86_64
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64.tar.gz | tar xz
+./ferrum --help
+
+# macOS Apple Silicon (Metal)
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
+./ferrum --help
+```
+
+Linux x86_64 is the CPU build. macOS aarch64 is the Metal build (the same backend that beats llama.cpp at c=16 on the [Group A bench](docs/bench/macos-2026-05-02/README.md)). For CUDA, build from source.
+
+### From source
+
+```bash
+# crates.io
+cargo install ferrum-cli
+
+# or git
+cargo build --release -p ferrum-cli --bin ferrum
+```
+
+### Run
+
+```bash
 # Set HF token for gated models (e.g. Llama 3.x)
 export HF_TOKEN=hf_your_token_here
 

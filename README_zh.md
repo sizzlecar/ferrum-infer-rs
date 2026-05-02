@@ -71,12 +71,33 @@ ferrum 拥有自研 CUDA decode runner,支持 INT4 Marlin。来自 RTX PRO 6000 
 
 ## 快速开始
 
-```bash
-# 安装
-cargo install ferrum-cli
-# 或从源码构建
-cargo build --release -p ferrum-cli --bin ferrum
+### 预编译二进制
 
+```bash
+# Linux x86_64
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64.tar.gz | tar xz
+./ferrum --help
+
+# macOS Apple Silicon (Metal)
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
+./ferrum --help
+```
+
+Linux x86_64 是 CPU 构建。macOS aarch64 是 Metal 构建(就是在 [Group A bench](docs/bench/macos-2026-05-02/README.md) 中 c=16 击败 llama.cpp 的那个 Metal 后端)。CUDA 用户请从源码构建。
+
+### 从源码
+
+```bash
+# crates.io
+cargo install ferrum-cli
+
+# 或 git
+cargo build --release -p ferrum-cli --bin ferrum
+```
+
+### 运行
+
+```bash
 # Gated 模型(如 Llama 3.x)需要设置 HF token
 export HF_TOKEN=hf_your_token_here
 
