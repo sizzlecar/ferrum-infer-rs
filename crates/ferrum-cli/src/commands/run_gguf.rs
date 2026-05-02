@@ -48,6 +48,25 @@ use ferrum_kernels::backend::metal::MetalBackend;
 // ────────────────────────────────────────────────────────────────────────
 
 pub async fn run_gguf_one_shot(cmd: RunCommand, _config: CliConfig) -> Result<()> {
+    // `ferrum run` is single-user interactive REPL — multi-sequence
+    // concurrency isn't useful here, but the chat MUST tolerate the
+    // default `--max-tokens 512` plus a multi-turn conversation.
+    // 0.7.2 flipped the engine-wide defaults (`KV_CAPACITY=512`,
+    // `MAX_SEQS=32`) to optimise `serve` for c=16 — those defaults
+    // immediately overflow on the very first `run` turn (cache + prompt
+    // + 512 max_new = ~530 > 512). Override here for run mode only;
+    // `serve` keeps the concurrent defaults. Users who want a specific
+    // value still win — we only set the var if it isn't already set.
+    if std::env::var_os("FERRUM_KV_CAPACITY").is_none() {
+        std::env::set_var("FERRUM_KV_CAPACITY", "8192");
+    }
+    if std::env::var_os("FERRUM_METAL_PAGED_KV").is_none() {
+        // Paged-KV's win is multi-seq batching at the attention kernel.
+        // m=1 single-user run sees zero benefit and pays pool-allocation
+        // overhead. Force off here.
+        std::env::set_var("FERRUM_METAL_PAGED_KV", "0");
+    }
+
     let gguf_path = PathBuf::from(&cmd.model);
     let backend_kind = resolve_backend(&cmd.backend)?;
 
