@@ -1,318 +1,216 @@
-# Ferrum Infer
+# ferrum-infer-rs
 
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-纯 Rust 实现的 LLM 推理引擎。从 Hugging Face 加载模型，本地对话或通过 OpenAI 兼容 API 提供服务。单二进制文件，无需 Python，无运行时依赖。
+Rust 编写的生产级 LLM 推理引擎。单二进制，OpenAI 兼容 API，原生支持 Apple Silicon 与 CUDA。
 
 [English](README.md)
 
-## 安装
+## 项目简介
+
+ferrum-infer-rs 是一个 Rust 原生的 LLM 推理引擎。编译为单一二进制文件，无 Python 或系统依赖,秒级启动,提供 OpenAI 兼容 HTTP API。
+
+如果你的部署场景是单 GPU 服务器、边缘设备或 Apple Silicon —— 并且你在意 Docker 镜像体积、冷启动时间或 Python 工具链复杂度 —— ferrum 适合你。
+
+## 性能亮点：Apple Silicon 并发
+
+笔记本本地推理的硬骨头是「并发服务」。ferrum 在单请求上和主流引擎打平,并发越高优势越明显。同一台机器、同一份 `Q4_K_M` GGUF、同一份 OpenAI HTTP 压测脚本 —— 完整的可审阅报告(环境、脚本、原始 JSON 与日志)在 [`docs/bench/macos-2026-05-02/`](docs/bench/macos-2026-05-02/)。
+
+**M1 Max 32 GB · Q4_K_M · 输出吞吐 (tok/s)** —— 多次运行取最优值,详细方差与重跑协议见 [bench 报告 § Methodology](docs/bench/macos-2026-05-02/README.md#methodology--why-two-reruns)。
+
+| 模型 | c | ferrum | llama.cpp (b8960) | mistralrs (0.8.1) |
+|---|---:|---:|---:|---:|
+| LLaMA-3.1-8B | 1 | 29.1 | 28.7 | 30.2 |
+| LLaMA-3.1-8B | 8 | **51.3** | 42.3 | 14.6 |
+| LLaMA-3.1-8B | 16 | **96.7** | 67.2 | 23.3 |
+| Qwen3-8B | 16 | **93.2** | 68.6 | 23.5 |
+| Qwen3-30B-A3B (MoE) | 16 | 79.2¹ | 83.4 | panic² |
+
+> ¹ ferrum MoE 在 c ≥ 8 时需要 `FERRUM_MOE_BATCHED=1 FERRUM_MOE_BATCHED_DECODE=1` (当前为 opt-in)。不开启的话 MoE c = 16 跌到 48 tok/s。² mistralrs 0.8.1 在 Qwen3-30B-A3B-Q4_K_M 上 PoisonError-panic (`add_request.rs:466`) —— 不是 ferrum 的问题。
+
+> Qwen3-30B-A3B (MoE) 这一行是头条 —— 两个月前 Apple Silicon 上 Rust 引擎实质性缺失的就是这种模型。ferrum 通过 PR #81 把 `LlamaFamilyModel` 的 Phase-4 paged-KV 镜像到 `Qwen3MoeModel`,把对 llama.cpp 的差距从 51 → 80 tok/s 抹平。在 dense 8B 模型上 c = 16 ferrum 比 llama.cpp 快 +36–44%。
+
+完整的 36-cell 矩阵(c = 1, 4, 8, 16,三引擎 × 三模型,含 TPOT / TTFT 分布)见 [bench 报告](docs/bench/macos-2026-05-02/README.md)。
+
+## 性能亮点：NVIDIA GPUs (CUDA)
+
+ferrum 拥有自研 CUDA decode runner,支持 INT4 Marlin。来自 RTX PRO 6000 (Blackwell) 的数据:
+
+**Qwen3-4B**
+
+| 模式 | Decode (tok/s) | 显存 |
+|---|---:|---:|
+| FP16 (eager) | 70.3 | ~8 GB |
+| FP16 + CUDA Graphs | 82.9 (+18%) | ~8 GB |
+| INT4 (GPTQ + Marlin) | **130.4 (+85%)** | **~2.5 GB (-69%)** |
+| 4 并发 (INT4) | 124.2 | ~2.5 GB |
+
+**TinyLlama-1.1B**
+
+| Backend | Decode (tok/s) |
+|---|---:|
+| Candle | 126 |
+| ferrum CUDA | **256.5 (+103%)** |
+
+包含 vLLM 风格的全部调度特性: PagedAttention、continuous batching、FlashAttention-2 prefill、batched decode、自研 fused kernel、piecewise CUDA Graphs、NCCL tensor parallel。
+
+## 横向对比
+
+|  | ferrum | vLLM | llama.cpp | mistralrs |
+|---|---|---|---|---|
+| 语言 | Rust | Python+CUDA | C++ | Rust |
+| 单二进制 | ✓ | ✗ (Docker) | ✓ | ✓ |
+| Apple Silicon | ✓ (含 MoE) | ✗ | ✓ | 部分 (无 MoE) |
+| CUDA | ✓ (自研) | ✓ (最强) | ✓ | ✓ |
+| 并发服务 | ✓ | ✓ (最强) | ✓ | ✓ |
+| Continuous batching | ✓ | ✓ | 部分 | ✓ |
+| INT4 量化 | ✓ Marlin / Triton | GPTQ / AWQ | 仅 GGUF | 视情况 |
+| OpenAI 兼容 API | ✓ | ✓ | ✓ | ✓ |
+| 可作为库嵌入 | ✓ | ✗ | ✓ | ✓ |
+
+## 快速开始
 
 ```bash
-# 从 crates.io 安装
+# 安装
 cargo install ferrum-cli
-
-# 或从源码编译
+# 或从源码构建
 cargo build --release -p ferrum-cli --bin ferrum
 
-# CUDA（Linux + NVIDIA）
-CUDA_HOME=/usr/local/cuda cargo build --release --features cuda -p ferrum-cli --bin ferrum
+# Gated 模型(如 Llama 3.x)需要设置 HF token
+export HF_TOKEN=hf_your_token_here
+
+# 直接对话
+ferrum run qwen3:4b
+
+# 或启动 OpenAI 兼容 API
+ferrum serve --model qwen3:4b --port 8000
+```
+
+API 调用:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 ### Docker (CPU)
 
-每次打 tag 发布时会推送 CPU 镜像到 GHCR（`:cpu`、`:cpu-<version>`）。任意
-x86_64 Linux 主机即可运行，无需预装 Rust 工具链。
+每次打 tag 发布时会推送 CPU 镜像到 GHCR(`:cpu`、`:cpu-<version>`)。任意 x86_64 Linux 主机即可运行,无需预装 Rust 工具链。
 
 ```bash
-# 拉取最新 CPU 镜像（下一个 tag 发布后可用）
 docker pull ghcr.io/sizzlecar/ferrum-infer-rs:cpu
 
-# 启动 HTTP 服务（挂载 HF 缓存，权重在容器间持久化）
 docker run --rm -p 8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
   serve --model qwen3:0.6b --port 8000
-
-# 受限模型：通过环境变量传入 HF_TOKEN
-docker run --rm -e HF_TOKEN=$HF_TOKEN \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/sizzlecar/ferrum-infer-rs:cpu \
-  pull meta-llama/Llama-3.2-1B-Instruct
 ```
 
-也可以自己构建：
+CUDA 与 Metal 镜像还在路上 —— 目前 macOS 请本地编译 Metal 版本,Linux + NVIDIA 请本地编译 CUDA 版本。
+
+## 支持的模型
+
+| 架构 | Apple Silicon | CUDA | INT4 (GPTQ) | Tensor Parallel |
+|---|:---:|:---:|:---:|:---:|
+| LLaMA (3.x, TinyLlama, Vicuna, Mistral) | ✓ | ✓ | ✓ | ✓ |
+| Qwen3 dense (0.6B – 8B) | ✓ | ✓ | ✓ | ✓ |
+| Qwen3-MoE (30B-A3B) | ✓ | — | — | — |
+| Qwen2 / Qwen2.5 | ✓ | ✓ | ✓ | — |
+| BERT (embeddings) | ✓ | — | — | — |
+| Whisper ASR (tiny → large-v3-turbo) | ✓ | — | — | — |
+| Qwen3-TTS (0.6B / 1.7B, 含声音克隆) | ✓ | — | — | — |
+| CLIP / Chinese-CLIP / SigLIP (文本 + 图像) | ✓ | — | — | — |
+
+可使用任意 HuggingFace 模型 ID:
 
 ```bash
-docker build -t ferrum:cpu .
-```
-
-CUDA 和 Metal 镜像尚未发布 —— 目前 macOS 请本地编译 Metal 版本，
-Linux + NVIDIA 请本地编译 CUDA 版本。
-
-## 快速开始
-
-访问受限模型（如 Llama 3.2）需先设置 Hugging Face token：
-```bash
-export HF_TOKEN=hf_your_token_here
-```
-
-```bash
-# 下载模型
-ferrum pull qwen3:0.6b
-
-# 对话
-ferrum run qwen3:0.6b
-
-# 或启动 API 服务
-ferrum serve --model qwen3:0.6b --port 8000
-```
-
-## 支持的架构
-
-任何使用以下架构的 Hugging Face 模型都可以直接运行：
-
-### 文本生成
-
-| 架构 | CUDA Decode | INT4 (GPTQ) | 张量并行 | 示例模型 |
-|------|-------------|-------------|---------|----------|
-| **LLaMA** | 支持 | 支持 | 支持 | Llama-3.x, TinyLlama, Vicuna, Alpaca, ... |
-| **Qwen3** | 支持 | 支持 | 支持 | Qwen3-0.6B ~ 4B |
-| **Qwen2** | — | — | — | Qwen2.5-Instruct-0.5B ~ 7B |
-
-### 语音转文字（Whisper ASR）
-
-| 架构 | Metal | CUDA | 示例模型 |
-|------|-------|------|----------|
-| **Whisper** | 支持 | — | whisper-tiny, whisper-base, whisper-small, whisper-medium, whisper-large-v3, **whisper-turbo**（推荐） |
-
-### 文字转语音（Qwen3-TTS）
-
-| 架构 | Metal | CPU | 声音克隆 | 示例模型 |
-|------|-------|-----|---------|----------|
-| **Qwen3-TTS** | 支持 | 支持 | 支持（ICL） | Qwen3-TTS-12Hz-0.6B-Base |
-
-### 向量化（文本 + 图片）
-
-| 架构 | 模态 | 向量维度 | 示例模型 |
-|------|------|---------|----------|
-| **CLIP** | 文本 + 图片 | 512/768 | openai/clip-vit-base-patch32 |
-| **Chinese-CLIP** | 文本 + 图片 | 512 | OFA-Sys/chinese-clip-vit-base-patch16 |
-| **SigLIP** | 文本 + 图片 | 768 | google/siglip-base-patch16-224 |
-| **BERT** | 文本 | 768 | google-bert/bert-base-chinese |
-
-```bash
-# 文本生成
 ferrum run Qwen/Qwen3-4B
-ferrum run llama3.2:3b
+ferrum run meta-llama/Llama-3.2-3B-Instruct
+ferrum run JunHowie/Qwen3-4B-GPTQ-Int4    # INT4 自动识别
+```
 
-# 语音转文字（支持 WAV/M4A/MP3/FLAC，自动 ffmpeg 转码）
-ferrum transcribe whisper-turbo 录音.m4a -l zh
-ferrum transcribe whisper-turbo meeting.wav -l en
+### 多模态
 
-# 文字转语音
-ferrum tts qwen3-tts "你好欢迎使用语音合成系统" -o output.wav
-
-# 声音克隆（ICL 模式，5 秒参考音频即可克隆任何声音）
-ferrum tts qwen3-tts "你好" --ref-audio ref.wav --ref-text "参考文本" -o clone.wav
-
-# 流式语音合成（首音频 ~2.5s 可用）
-ferrum tts qwen3-tts "你好世界" --streaming -o output.wav
-
-# TTS API 服务（OpenAI 兼容）
-ferrum serve qwen3-tts
-curl localhost:8000/v1/audio/speech -d '{"input":"你好","language":"chinese"}' -o speech.wav
-
-# Whisper API 服务（OpenAI 兼容）
+```bash
+# 语音转文字 (WAV/M4A/MP3/FLAC,自动 ffmpeg 转码)
+ferrum transcribe whisper-turbo recording.m4a -l zh
 ferrum serve whisper-turbo
-curl localhost:8000/v1/audio/transcriptions -F "file=@audio.wav" -F "language=zh"
 
-# 向量化（文本 + 图片）
-ferrum embed OFA-Sys/chinese-clip-vit-base-patch16 --text "海边日落"
+# 文本转语音 (含 ICL 声音克隆)
+ferrum tts qwen3-tts "你好欢迎使用语音合成系统" -o output.wav
+ferrum tts qwen3-tts "你好" --ref-audio ref.wav --ref-text "参考文本" -o clone.wav
+ferrum serve qwen3-tts
+
+# Embedding (文本 + 图像)
+ferrum embed OFA-Sys/chinese-clip-vit-base-patch16 --text "海边的日落"
 ferrum embed google/siglip-base-patch16-224 --image photo.jpg
-
-# Embedding API 服务
-ferrum serve --model OFA-Sys/chinese-clip-vit-base-patch16
-curl localhost:8000/v1/embeddings -d '{"model":"clip","input":"你好"}'
-curl localhost:8000/v1/embeddings -d '{"model":"clip","input":{"image":"/path/to/photo.jpg"}}'
 ```
 
-## 命令
-
-| 命令 | 说明 |
-|------|------|
-| `ferrum run <model>` | 交互式对话 |
-| `ferrum serve --model <model>` | 启动 OpenAI 兼容 HTTP 服务 |
-| `ferrum stop` | 停止服务 |
-| `ferrum pull <model>` | 从 Hugging Face 下载模型 |
-| `ferrum list` | 查看已缓存模型 |
-| `ferrum bench <model>` | 性能基准测试 |
-| `ferrum transcribe <model> <audio>` | 语音转文字（Whisper，支持 WAV/M4A/MP3） |
-| `ferrum tts <model> <text>` | 文字转语音（Qwen3-TTS，`--ref-audio` 声音克隆） |
-| `ferrum embed <model>` | 生成向量（BERT/CLIP/SigLIP，文本 + 图片） |
-
-## API 接口
+## 构建选项
 
 ```bash
-# Chat completions（OpenAI 兼容）
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"你好"}]}'
-
-# 语音转文字（OpenAI 兼容，multipart form）
-curl http://localhost:8000/v1/audio/transcriptions \
-  -F "file=@audio.wav" -F "language=zh"
-
-# 文字转语音（OpenAI 兼容）
-curl http://localhost:8000/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"input":"你好世界","language":"chinese"}' -o speech.wav
-
-# 向量化
-curl http://localhost:8000/v1/embeddings \
-  -d '{"model":"clip","input":"你好"}'
-
-# 模型列表
-curl http://localhost:8000/v1/models
-
-# 健康检查
-curl http://localhost:8000/health
-```
-
-## 性能测试
-
-测试环境：**RTX PRO 6000 (Blackwell)**
-
-### Qwen3-4B
-
-| 模式 | FP16（eager） | FP16 + CUDA 图 | INT4 (GPTQ + Marlin) |
-|------|--------------|----------------|----------------------|
-| 单请求 decode | 70.3 tok/s | **82.9 tok/s (+18%)** | **130.4 tok/s** |
-| 4 并发 (batch decode) | 109.4 tok/s | — | **124.2 tok/s** |
-| TPOT (p50) | 14.2 ms | **12.1 ms** | — |
-| 显存占用 | ~8 GB | — | **~2.5 GB (-69%)** |
-
-> CUDA graph 模式 warmup 3 步后自动启用，消除 per-step kernel 启动开销。已在 Blackwell + CUDA 13 路径上加固（见 [docs/phase-e-cuda-status.md](docs/phase-e-cuda-status.md)）。
-
-### TinyLlama-1.1B（Llama 架构）
-
-| 模式 | Candle | CUDA Runner |
-|------|--------|-------------|
-| Decode | 126 tok/s | **256.5 tok/s (+103%)** |
-
-### 张量并行（多 GPU）
-
-| 配置 | Qwen3-4B FP16 |
-|------|---------------|
-| 单卡 | 82.3 tok/s (TPOT 12.1ms) |
-| 双卡 TP | 26.1 tok/s (TPOT 38.4ms) |
-
-> TP decode 使用持久化 per-rank 线程 + NCCL all-reduce。当前瓶颈为 PCIe 互联延迟（~0.44ms × 72 次 NCCL 调用/步）。TP 主要适用于单卡放不下的大模型，或 NVLink 互联场景。
-
-### Whisper ASR（Apple Silicon Metal）
-
-| 模型 | 5 分钟音频 | 实时率 |
-|------|-----------|--------|
-| whisper-large-v3-turbo | **~72s** | **4.2 倍实时** |
-| whisper-tiny | ~20s | 15 倍实时 |
-
-> 自研 Whisper 前向推理 + rustfft STFT，mel 精度与 Python whisper 完全一致。完整解码管线：带时间戳的顺序解码、温度回退、压缩率检测。
-
-### Qwen3-TTS（Apple Silicon Metal）
-
-| 模型 | 文本 | 音频时长 | 耗时 | 实时率 | 首音频延迟 |
-|------|------|---------|------|--------|-----------|
-| 0.6B | 29 字中文 | 4.6s | **11.3s** | **2.8x** | ~2.5s（流式） |
-| 1.7B | 声音克隆（ICL） | 5.8s | **25s** | **4.4x** | ~5s（流式） |
-
-> 全 Metal fused transformer 管线：自研 GEMM（64×32 simdgroup tiles）、fused residual+norm、flash attention + layer_scale。完整 Mimi vocoder（8 层 pre-transformer）。流式合成 ~800ms/chunk。OpenAI 兼容 `/v1/audio/speech` API。
-
-### 核心优化
-
-- **自定义 CUDA decode runner**：绕过 candle 的 decode 热路径（Qwen3 + LLaMA）
-- **INT4 量化**：GPTQ 模型自动检测，Marlin fused INT4×FP16 内核
-- **张量并行**：持久化 per-rank 线程、Barrier 同步、NCCL all-reduce（Megatron-LM 模式）
-- **Batched attention 内核**：单次 launch 处理所有 batch 项（SM 利用率 17%→67%）
-- **Batched RoPE**：单次 launch + per-item position 数组
-- **自定义 CUDA 内核**：fused RmsNorm、SiLU×mul、RoPE、decode attention（统一 stream 零同步）
-- **Flash Decoding**：长上下文 split-K（KV > 256 时自动启用）
-- **Batch decode**：batched cuBLAS GEMM + batched attention 支持并发请求
-- **Metal TTS 管线**：全 Metal fused transformer，talker（28 层）+ SubTalker（5 层）+ vocoder（8 层），GPU-side RMSNorm，缓存投射权重
-- **TTS 流式合成**：分块音频生成（~800ms/chunk），首音频 ~2.5s 可用
-- **TTS 声音克隆**：ICL 提示 + 说话人编码器（ECAPA-TDNN）+ 语音分词器（Mimi RVQ），sinc 重采样
-- **TTS HTTP API**：OpenAI 兼容 `/v1/audio/speech`，支持流式传输
-- **Paged KV attention**：GPU block pool + block-table 间接寻址
-- **双缓冲 residual**：跨层 norm 融合（-108 次 kernel launch）
-
-## 当前状态
-
-已完成：
-- CLI 对话、HTTP 服务（流式输出）、性能基准测试
-- Qwen3、Qwen2/2.5、LLaMA 3.x、TinyLlama 架构
-- 自定义 CUDA decode runner（Qwen3 + LLaMA，2x 加速）
-- Metal GPU 加速（macOS）、CUDA（NVIDIA）、CPU
-- INT4 GPTQ 量化 + Marlin fused kernel（Blackwell 兼容）
-- FlashAttention-2 prefill + 自定义 CUDA decode runner
-- Paged KV cache + block 回收
-- 连续批处理 + batch decode
-- 张量并行（多 GPU NCCL，自动检测 GPU 数量）
-- CLIP/Chinese-CLIP/SigLIP 向量化（文本 + 图片，`/v1/embeddings` API）
-- Whisper 语音识别（Metal 加速，`/v1/audio/transcriptions` API）
-- Qwen3-TTS 语音合成（Metal 加速，ICL 声音克隆，流式输出，`/v1/audio/speech` API）
-- 多格式音频支持（WAV/M4A/MP3/FLAC，自动 ffmpeg 转码）
-- Top-k / Top-p / Temperature / 重复惩罚采样
-
-## 路线图
-
-- **推测解码** — draft model 验证
-- **更多模型架构** — Mistral、Phi、DeepSeek 等
-- **Qwen2 CUDA runner** — 同 LLaMA 模式
-
-详见 [docs/ROADMAP.md](docs/ROADMAP.md)。
-
-## 编译选项
-
-```bash
-# 仅 CPU（默认）
+# 仅 CPU (默认)
 cargo install ferrum-cli
 
-# 启用 Metal 加速（macOS）
+# Metal 加速 (macOS)
 cargo install ferrum-cli --features metal
 
-# 启用 CUDA 加速（NVIDIA，需要 CUDA Toolkit + nvcc）
+# CUDA 加速 (NVIDIA, 需要 CUDA toolkit + nvcc)
 cargo install ferrum-cli --features cuda
 ```
-
-或从源码编译：
-```bash
-cargo build --release -p ferrum-cli                    # CPU
-cargo build --release -p ferrum-cli --features metal   # Metal (macOS)
-cargo build --release -p ferrum-cli --features cuda    # CUDA (NVIDIA)
-cargo build --release -p ferrum-cli --features cuda    # 多卡自动检测
-```
-
-前置条件：Rust stable 工具链。
 
 ## 项目结构
 
 ```
 crates/
-├── ferrum-types          # 共享类型定义
-├── ferrum-interfaces     # 核心 trait 契约（ComputeBackend, KernelOps, ModelExecutor）
-├── ferrum-runtime        # 后端实现（Candle, CPU）
-├── ferrum-engine         # Metal 内核、模型编排
-├── ferrum-models         # 模型架构（LLaMA, Qwen2, Qwen3, BERT, Whisper）
-├── ferrum-kernels   # 自定义 CUDA 内核 + decode runner
-├── ferrum-tokenizer      # 分词器
-├── ferrum-sampler        # 采样策略
-├── ferrum-scheduler      # 请求调度
-├── ferrum-kv             # KV 缓存管理
-├── ferrum-server         # HTTP API 服务
-├── ferrum-cli            # CLI 二进制
-└── ferrum-testkit        # 测试工具
+├── ferrum-types          # 共享类型
+├── ferrum-interfaces     # Trait 契约 (Backend<B>, ModelExecutor, ...)
+├── ferrum-runtime        # Backend 注册
+├── ferrum-engine         # Continuous-batch 引擎、Metal shader 流水线
+├── ferrum-models         # 模型架构 (LlamaFamilyModel<B>, MoE, ...)
+├── ferrum-kernels        # 自研 CUDA + Metal kernels, decode runner
+├── ferrum-attention      # Fused-transformer 原型 (Metal/CPU)
+├── ferrum-quantization   # GPTQ 加载、Marlin、native safetensors
+├── ferrum-tokenizer      # Tokenization
+├── ferrum-sampler        # 采样策略 (top-k/p、温度、重复惩罚、JSON-mode)
+├── ferrum-scheduler      # 请求调度、paged-KV 调度
+├── ferrum-kv             # Paged KV cache (CUDA + Metal pools)
+├── ferrum-server         # HTTP API
+├── ferrum-cli            # 二进制入口
+└── ferrum-testkit        # 测试基础设施
 ```
 
-## 许可证
+Architecture v2 (Model-as-Code) 的意思是: 模型层是显式的 Rust 泛型,基于 `Backend<B>` trait,而不是 config-driven runner。增加一个后端 = 实现 trait,不需要改模型。详见 [docs/architecture-v2.md](docs/architecture-v2.md)。
+
+## 当前状态
+
+已可用:
+- CLI 对话、OpenAI 兼容 HTTP server (含流式)
+- Continuous batching、PagedAttention (CUDA + Metal pools)、前缀缓存、抢占
+- 自研 CUDA decode runner (Qwen3, LLaMA): 比 Candle 快 2×
+- Apple Silicon MoE 推理 (Qwen3-30B-A3B) —— c=16 与 llama.cpp 持平
+- INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); 同时有 Triton w4a16
+- Tensor parallelism (多 GPU NCCL, 持久化 per-rank 线程)
+- Speculative decoding (`--spec-draft <MODEL>` DeepMind accept/reject)
+- 结构化输出 (`response_format: json_object` + `json_schema`,DFA-guided 硬遮蔽)
+- Whisper ASR (Metal 加速 forward pass) + Qwen3-TTS (声音克隆、流式)
+- Top-k / top-p / 温度 / 重复惩罚
+
+已知 regression / 优化中:
+- Apple Silicon dense 在 c = 4 上吞吐低于 c = 1 (paged-batched 在小 m 下处于 crossover 之下)。c ≤ 4 默认仍是 per-token 模式,直到小 m 路径补齐为止。
+- FP8 (Hopper / Blackwell) —— INT4 路径目前只占用 24% DRAM 峰值带宽,FP8 还没成为瓶颈。
+
+## 路线图
+
+完整路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+近期:
+- v0.1: Apple Silicon Group A 生产 release,含并发 benchmark (本次 PR)
+- v0.2: 普及型硬件(RTX 4090) 上的 CUDA serving benchmark vs vLLM
+- v0.3: 长上下文调优 (32k+)、更多架构 (Phi、DeepSeek、Gemma)
+
+## License
 
 MIT

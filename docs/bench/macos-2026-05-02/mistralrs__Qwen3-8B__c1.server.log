@@ -1,0 +1,48 @@
+[2m2026-05-02T09:06:17.794965Z[0m [32m INFO[0m [2mmistralrs_server_core::mistralrs_for_server_builder[0m[2m:[0m avx: false, neon: true, simd128: false, f16c: false
+[2m2026-05-02T09:06:17.795033Z[0m [32m INFO[0m [2mmistralrs_server_core::mistralrs_for_server_builder[0m[2m:[0m Sampling method: penalties -> temperature -> topk -> topp -> minp -> multinomial
+[2m2026-05-02T09:06:17.795054Z[0m [32m INFO[0m [2mmistralrs_server_core::mistralrs_for_server_builder[0m[2m:[0m Model kind is: gguf quantized from gguf (no adapters)
+[2m2026-05-02T09:06:17.795083Z[0m [32m INFO[0m [2mhf_hub[0m[2m:[0m Using token file found "/Users/chejinxuan/.cache/huggingface/token"
+[2m2026-05-02T09:06:17.795280Z[0m [32m INFO[0m [2mhf_hub[0m[2m:[0m Using token file found "/Users/chejinxuan/.cache/huggingface/token"
+[2m2026-05-02T09:06:17.795325Z[0m [32m INFO[0m [2mmistralrs_core::pipeline::hf[0m[2m:[0m Loading `Qwen3-8B-Q4_K_M.gguf` locally at `/Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf`
+[2m2026-05-02T09:06:17.795345Z[0m [32m INFO[0m [2mmistralrs_core::pipeline::gguf[0m[2m:[0m GGUF file(s) ["/Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf"]
+[2m2026-05-02T09:06:17.795356Z[0m [32m INFO[0m [2mmistralrs_core::pipeline::gguf[0m[2m:[0m Prompt chunk size is 1024.
+[2m2026-05-02T09:06:18.187019Z[0m [32m INFO[0m [2mmistralrs_core::gguf::content[0m[2m:[0m Model config:
+general.architecture: qwen3
+general.basename: Qwen3
+general.file_type: 15
+general.finetune: awq-compatible-Instruct
+general.name: Qwen3 8B Awq Compatible Instruct
+general.quantization_version: 2
+general.size_label: 8B
+general.type: model
+qwen3.attention.head_count: 32
+qwen3.attention.head_count_kv: 8
+qwen3.attention.key_length: 128
+qwen3.attention.layer_norm_rms_epsilon: 0.000001
+qwen3.attention.value_length: 128
+qwen3.block_count: 36
+qwen3.context_length: 40960
+qwen3.embedding_length: 4096
+qwen3.feed_forward_length: 12288
+qwen3.rope.freq_base: 1000000
+[2m2026-05-02T09:06:18.192645Z[0m [32m INFO[0m [2mmistralrs_core::utils::normal[0m[2m:[0m DType selected is BF16.
+[2m2026-05-02T09:06:18.192679Z[0m [32m INFO[0m [2mmistralrs_core::pipeline::loaders::auto_device_map[0m[2m:[0m Using automatic device mapping parameters: text[max_seq_len: 4096, max_batch_size: 1].
+[2m2026-05-02T09:06:18.193447Z[0m [32m INFO[0m [2mmistralrs_quant::utils::log[0m[2m:[0m Model has 36 repeating layers.
+[2m2026-05-02T09:06:18.193479Z[0m [32m INFO[0m [2mmistralrs_quant::utils::log[0m[2m:[0m Loading model according to the following repeating layer mappings:
+[2m2026-05-02T09:06:18.206570Z[0m [32m INFO[0m [2mmistralrs_quant::utils::log[0m[2m:[0m Layers 0-35: metal[4294970136] (22 GB)
+[2m2026-05-02T09:06:18.343718Z[0m [32m INFO[0m [2mmistralrs_core::gguf::gguf_tokenizer[0m[2m:[0m GGUF tokenizer model is `gpt2`, kind: `Bpe`, num tokens: 151936, num special tokens 293, num added tokens: 0, num merges: 151387, num scores: 0
+[2m2026-05-02T09:06:18.347350Z[0m [32m INFO[0m [2mmistralrs_core::gguf::chat_template[0m[2m:[0m Discovered and using GGUF chat template: `{%- if tools %}\n    {{- '<|im_start|>system\n' }}\n    {%- if messages[0].role == 'system' %}\n        {{- messages[0].content + '\n\n' }}\n    {%- endif %}\n    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}\n    {%- for tool in tools %}\n        {{- "\n" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for index in range(ns.last_query_index, -1, -1) %}\n    {%- set message = messages[index] %}\n    {%- if ns.multi_step_tool and message.role == "user" and not('<tool_response>' in message.content and '</tool_response>' in message.content) %}\n        {%- set ns.multi_step_tool = false %}\n        {%- set ns.last_query_index = index %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}\n        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}\n    {%- elif message.role == "assistant" %}\n        {%- set content = message.content %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in message.content %}\n                {%- set content = message.content.split('</think>')[-1].lstrip('\n') %}\n                {%- set reasoning_content = message.content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {%- if loop.last or (not loop.last and reasoning_content) %}\n                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}\n            {%- else %}\n                {{- '<|im_start|>' + message.role + '\n' + content }}\n            {%- endif %}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if (loop.first and content) or (not loop.first) %}\n                    {{- '\n' }}\n                {%- endif %}\n                {%- if tool_call.function %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {{- '<tool_call>\n{"name": "' }}\n                {{- tool_call.name }}\n                {{- '", "arguments": ' }}\n                {%- if tool_call.arguments is string %}\n                    {{- tool_call.arguments }}\n                {%- else %}\n                    {{- tool_call.arguments | tojson }}\n                {%- endif %}\n                {{- '}\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\n' }}\n    {%- elif message.role == "tool" %}\n        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\n<tool_response>\n' }}\n        {{- message.content }}\n        {{- '\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}\n            {{- '<|im_end|>\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\n' }}\n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\n\n</think>\n\n' }}\n    {%- endif %}\n{%- endif %}`
+[2m2026-05-02T09:06:18.351280Z[0m [32m INFO[0m [2mmistralrs_core::utils::normal[0m[2m:[0m DType selected is BF16.
+[2m2026-05-02T09:06:20.784088Z[0m [32m INFO[0m [2mmistralrs_core::pipeline::paths[0m[2m:[0m Using literal chat template.
+[2m2026-05-02T09:06:21.226777Z[0m [32m INFO[0m [2mmistralrs_core::pipeline::chat_template[0m[2m:[0m bos_toks = "<|endoftext|>", eos_toks = "<|im_end|>", unk_tok = `None`
+[2m2026-05-02T09:06:21.237970Z[0m [32m INFO[0m [2mmistralrs_server_core::mistralrs_for_server_builder[0m[2m:[0m Model loaded.
+[2m2026-05-02T09:06:21.238003Z[0m [32m INFO[0m [2mmistralrs_core[0m[2m:[0m git revision: unknown
+[2m2026-05-02T09:06:21.238063Z[0m [32m INFO[0m [2mmistralrs_core[0m[2m:[0m Pipeline input modalities are [📝 Text]
+[2m2026-05-02T09:06:21.238068Z[0m [32m INFO[0m [2mmistralrs_core[0m[2m:[0m Pipeline output modalities are [📝 Text]
+[2m2026-05-02T09:06:21.238149Z[0m [32m INFO[0m [2mmistralrs_core[0m[2m:[0m Beginning dummy run.
+[2m2026-05-02T09:06:21.238338Z[0m [32m INFO[0m [2mmistralrs_core::prefix_cacher[0m[2m:[0m Prefix caching enabled (sequence-level, non-paged attention). Expect higher multi-turn throughput for both text and multimodal.
+[2m2026-05-02T09:06:21.492528Z[0m [32m INFO[0m [2mmistralrs_core[0m[2m:[0m Dummy run completed in 0.254368833s.
+[2m2026-05-02T09:06:21.493581Z[0m [32m INFO[0m [2mmistralrs::commands::serve[0m[2m:[0m Server listening on http://0.0.0.0:8002
+[2m2026-05-02T09:06:26.247390Z[0m [32m INFO[0m [2mmistralrs_core::engine::logger[0m[2m:[0m Throughput (T/s) 40.60, Prefix cache hitrate 50.00%, 1 running, 0 waiting
+[2m2026-05-02T09:06:31.255700Z[0m [32m INFO[0m [2mmistralrs_core::engine::logger[0m[2m:[0m Throughput (T/s) 50.40, Prefix cache hitrate 71.43%, 1 running, 0 waiting
+[2m2026-05-02T09:06:36.265749Z[0m [32m INFO[0m [2mmistralrs_core::engine::logger[0m[2m:[0m Throughput (T/s) 41.80, Prefix cache hitrate 80.00%, 1 running, 0 waiting

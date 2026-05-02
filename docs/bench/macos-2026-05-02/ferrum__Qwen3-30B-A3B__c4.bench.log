@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8783  model=Qwen3-30B-A3B  reqs=16  conc=4  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               16/16
+  wall time:               24.07s
+  request throughput:      0.66 req/s
+  input  token throughput: 12.0 tok/s
+  output token throughput: 42.5 tok/s
+  total input tokens:      289
+  total output tokens:     1024
+
+  TTFT  mean  926.52ms  median  986.75ms  p99 1197.62ms  max 1197.63ms
+  TPOT  mean   80.82ms  median   79.53ms  p99   87.27ms  max   87.37ms
+  ITL   mean   80.82ms  median   77.59ms  p99   79.02ms  max  696.02ms
+  E2E   mean 6018.49ms  median 6019.75ms  p99 6081.59ms  max 6081.63ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/ferrum__Qwen3-30B-A3B__c4.json

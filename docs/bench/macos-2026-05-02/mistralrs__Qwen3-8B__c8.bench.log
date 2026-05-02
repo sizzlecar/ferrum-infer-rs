@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8002  model=default  reqs=24  conc=8  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               24/24
+  wall time:               68.82s
+  request throughput:      0.35 req/s
+  input  token throughput: 9.4 tok/s
+  output token throughput: 22.3 tok/s
+  total input tokens:      648
+  total output tokens:     1536
+
+  TTFT  mean 2067.40ms  median 2080.23ms  p99 5364.74ms  max 6002.79ms
+  TPOT  mean  297.10ms  median  279.64ms  p99  491.28ms  max  497.77ms
+  ITL   mean  301.90ms  median  193.33ms  p99 2145.43ms  max 5982.10ms
+  E2E   mean 20784.98ms  median 18895.88ms  p99 33627.56ms  max 33977.30ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/mistralrs__Qwen3-8B__c8.json

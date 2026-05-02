@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8783  model=Llama-3.1-8B  reqs=16  conc=4  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               16/16
+  wall time:               37.94s
+  request throughput:      0.42 req/s
+  input  token throughput: 6.4 tok/s
+  output token throughput: 27.0 tok/s
+  total input tokens:      241
+  total output tokens:     1024
+
+  TTFT  mean  586.28ms  median  541.77ms  p99  982.57ms  max  983.24ms
+  TPOT  mean  141.05ms  median  140.49ms  p99  149.74ms  max  150.11ms
+  ITL   mean  141.05ms  median  137.90ms  p99  289.57ms  max  399.93ms
+  E2E   mean 9472.49ms  median 9461.36ms  p99 9809.09ms  max 9809.26ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/macos-2026-05-02/ferrum__Llama-3.1-8B__c4.json
