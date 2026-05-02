@@ -610,7 +610,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // swap). `FERRUM_KV_CAPACITY=N` overrides; clamp to the model's
         // declared max so we never lie to the model about its window.
         let model_max = self.cfg.max_seq_len;
-        const DEFAULT_KV_CAPACITY: usize = 4096;
+        // 512 in 0.7.2 — matches the value used in
+        // docs/bench/macos-2026-05-02 to get the published numbers.
+        // pre-0.7.2 default of 4096 was safe only because paged-KV was
+        // opt-in (pool wasn't allocated). With paged-KV now on by
+        // default + MAX_SEQS=32, the pool occupies physical memory:
+        // ~3 GB on Qwen3-30B-A3B Q4_K_M leaves 18 GB weights + 3 GB pool
+        // = 21 GB, fits comfortably on a 32 GB Mac. Long-context users
+        // can `FERRUM_KV_CAPACITY=4096` and accept lower max_seqs.
+        const DEFAULT_KV_CAPACITY: usize = 512;
         let max = std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -627,17 +635,27 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // identity-assign logical→physical block. Memory footprint is
         // the same as contiguous (within block_size rounding); the
         // benefit only shows up under multi-seq sharing in Phase 4+.
+        // Default ON when the backend supports paged-KV (Metal). Users
+        // can force off with `FERRUM_METAL_PAGED_KV=0`. The flag was
+        // opt-in pre-0.7.2; flipping the default so default `ferrum
+        // serve` matches the bench-quality numbers without requiring
+        // env-var knowledge.
         let paged = std::env::var("FERRUM_METAL_PAGED_KV")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or_else(|_| B::supports_paged_kv());
         const PAGED_BLOCK_SIZE: usize = 16;
 
         // Phase 4 shared-pool sizing. The pool sees ALL concurrent
         // sequences; per-cache_id state just owns indices into it.
+        // Default 32: covers c=16 burst with 2× headroom for the
+        // fresh-cache-id-per-request pattern that bench/server harnesses
+        // use. Pool memory is `max_seqs × max_blocks_per_seq` total
+        // blocks — we lowered DEFAULT_KV_CAPACITY to 2048 so this 2× max_seqs
+        // bump keeps the pool footprint identical to the pre-0.7.2 default.
         let max_seqs = std::env::var("FERRUM_PAGED_MAX_SEQS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(16);
+            .unwrap_or(32);
         let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
         let total_pool_blocks = max_seqs * max_blocks_per_seq;
 
@@ -2482,7 +2500,7 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     fn kv_capacity(&self) -> usize {
         // Mirror the bound `ensure_kv` will use when allocating the cache.
         let model_max = self.cfg.max_seq_len;
-        const DEFAULT_KV_CAPACITY: usize = 4096;
+        const DEFAULT_KV_CAPACITY: usize = 512;
         std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())

@@ -517,10 +517,11 @@ impl<B: Backend> Qwen3MoeModel<B> {
         }
         let nkv = self.cfg.base.num_kv_heads;
         let hd = self.cfg.base.head_dim;
-        // See `LlamaFamilyModel::ensure_kv` for the rationale on the 4096
-        // chat-friendly default and how `FERRUM_KV_CAPACITY` overrides it.
+        // 512 in 0.7.2 — same value the published bench used to hit 79
+        // tok/s at c=16 on this exact MoE model. See
+        // `LlamaFamilyModel::ensure_kv` for the full rationale.
         let model_max = self.cfg.base.max_seq_len;
-        const DEFAULT_KV_CAPACITY: usize = 4096;
+        const DEFAULT_KV_CAPACITY: usize = 512;
         let max = std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -533,15 +534,24 @@ impl<B: Backend> Qwen3MoeModel<B> {
         // once at num_seqs=m for batched decode (replacing the per-item
         // attention loop that currently dominates `attn_peritem` in the
         // c=16 profile).
+        // Default ON when the backend supports paged-KV (Metal). Users
+        // can force off with `FERRUM_METAL_PAGED_KV=0`. The flag was
+        // opt-in pre-0.7.2; flipping the default so default `ferrum
+        // serve` matches the bench-quality numbers without requiring
+        // env-var knowledge.
         let paged = std::env::var("FERRUM_METAL_PAGED_KV")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or_else(|_| B::supports_paged_kv());
         const PAGED_BLOCK_SIZE: usize = 16;
 
+        // Default 32: covers c=16 burst with 2× headroom for the
+        // fresh-cache-id-per-request pattern that bench/server harnesses
+        // use. Pool memory unchanged from pre-0.7.2 default because
+        // DEFAULT_KV_CAPACITY dropped 4096 → 2048 in lockstep.
         let max_seqs = std::env::var("FERRUM_PAGED_MAX_SEQS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(16);
+            .unwrap_or(32);
         let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
         let total_pool_blocks = max_seqs * max_blocks_per_seq;
 
@@ -2175,9 +2185,20 @@ impl<B: Backend> Qwen3MoeModel<B> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(32);
-        let new_batched_enabled = stacked_path_available
-            && B::supports_batched_moe_gemv()
-            && std::env::var("FERRUM_MOE_BATCHED_DECODE").as_deref() == Ok("1");
+        // 0.7.2: default to ON when paged-KV is also on (which is now
+        // the default for Metal). The historical regression for this
+        // flag (-19% c=4 / -36% c=16) was measured in the pre-paged-KV
+        // world where `forward_layer_batched_decode`'s per-item
+        // copy_slice × m × 6 attention dispatches cost more than the
+        // batched MoE FFN saved. Once paged-KV is on, attention runs as
+        // one `paged_decode_attention(num_seqs=m)` dispatch, the
+        // plumbing cost drops, and the batched MoE GEMV's win net out
+        // to ~+50% at c=16. `FERRUM_MOE_BATCHED_DECODE=0` forces off.
+        let new_batched_default = stacked_path_available && B::supports_batched_moe_gemv();
+        let new_batched_enabled = new_batched_default
+            && std::env::var("FERRUM_MOE_BATCHED_DECODE")
+                .map(|v| v != "0")
+                .unwrap_or(true);
 
         // When the new path is opted in, it owns the m=2..new_prefill_threshold
         // range; the legacy threshold is overridden upward.
@@ -2450,7 +2471,7 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
     fn kv_capacity(&self) -> usize {
         // Mirror the bound `ensure_kv` will use when allocating the cache.
         let model_max = self.cfg.base.max_seq_len;
-        const DEFAULT_KV_CAPACITY: usize = 4096;
+        const DEFAULT_KV_CAPACITY: usize = 512;
         std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -2493,11 +2514,18 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
     // by default has to wait until the attention plumbing is fixed.
     fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
         let m = batch.len();
-        let opted_in = std::env::var("FERRUM_MOE_BATCHED").as_deref() == Ok("1");
+        // Default ON in 0.7.2+. The threshold (default 8) keeps small-m
+        // requests on the per-token loop where it still wins on this
+        // hardware — see docs/bench/macos-2026-05-02 for the crossover
+        // measurements (c=4 batched 39 < per_token 42; c=8 batched 59 >
+        // per_token 47). `FERRUM_MOE_BATCHED=0` forces the legacy loop.
+        let opted_in = std::env::var("FERRUM_MOE_BATCHED")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let threshold = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(12);
+            .unwrap_or(8);
         if opted_in && m >= threshold {
             self.decode_batch_internal(batch)
         } else {

@@ -1073,6 +1073,10 @@ impl Backend for MetalBackend {
         true
     }
 
+    fn supports_paged_kv() -> bool {
+        true
+    }
+
     fn gemv_quant_moe_id_gate_up_silu_batched(
         ctx: &mut Self::Context,
         a: &Self::Buffer,

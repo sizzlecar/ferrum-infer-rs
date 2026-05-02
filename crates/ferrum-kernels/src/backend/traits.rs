@@ -852,6 +852,16 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Whether this backend has a paged-KV decode path
+    /// (`paged_decode_attention` etc.). Currently true for Metal, false
+    /// for CPU. Used to decide the default of `FERRUM_METAL_PAGED_KV` —
+    /// the `serve` path should opt in automatically when supported so
+    /// users get the bench-quality concurrent-decode numbers without
+    /// having to learn the flag.
+    fn supports_paged_kv() -> bool {
+        false
+    }
+
     /// Batched fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
     ///
     /// Counterpart of [`Self::gemv_quant_moe_id_gate_up_silu`] for the
