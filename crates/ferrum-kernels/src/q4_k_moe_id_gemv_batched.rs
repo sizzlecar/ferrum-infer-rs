@@ -475,4 +475,417 @@ mod tests {
             "batched(down) diverges from per-token — max_abs={max_abs:.6}"
         );
     }
+
+    /// Microbenchmark: how does the batched MoE GEMV scale from m=1 → m=16?
+    ///
+    /// Goal: empirically measure whether the kernel itself gets sublinear
+    /// scaling (1 launch at m=16 < 16× the m=1 time) like llama.cpp's
+    /// `kernel_mul_mv_id` does, or whether each m=N pair-equivalent costs
+    /// the same as m=1 (so 16× pairs takes 16× the time, defeating the
+    /// purpose of batching).
+    ///
+    /// Production-shaped: N=14336 (Qwen3-30B-A3B expert_inter), K=2048
+    /// (hidden), top_k=8, NUM_EXPERTS=8 (subset of the 128 in the real
+    /// model — enough for m=1 routing diversity while keeping the
+    /// synthetic stack under 200 MB).
+    ///
+    /// Run with: `cargo test -p ferrum-kernels --features metal --release \
+    ///            -- --ignored --nocapture moe_gemv_scaling_microbench`
+    #[test]
+    #[ignore = "microbench — only run manually with --release"]
+    fn moe_gemv_scaling_microbench() {
+        // Qwen3-30B-A3B-Q4_K_M production shape:
+        //   hidden K=2048, expert_feed_forward_length N=768,
+        //   num_experts=128, top_k=8.
+        // Use 8 experts (subset) for memory budget; routing diversity
+        // across 8 is sufficient.
+        const NUM_EXPERTS: usize = 8;
+        const N: usize = 768;
+        const K: usize = 2048;
+        const TOP_K: usize = 8;
+        const M_VALUES: &[usize] = &[1, 2, 4, 8, 16];
+        const ITERS: usize = 500;
+
+        let cpu = CDevice::Cpu;
+        eprintln!(
+            "preparing synthetic Q4_K stack: {} experts × {} × {} ...",
+            NUM_EXPERTS, N, K
+        );
+        let mut weights_bytes = Vec::new();
+        for e in 0..NUM_EXPERTS {
+            let raw: Vec<f32> = (0..N * K)
+                .map(|i| ((((i + e * 313) % 251) as f32) * 0.013).sin() * 0.4 + 0.05)
+                .collect();
+            let t = Tensor::from_vec(raw, (N, K), &cpu).unwrap();
+            let qt = QTensor::quantize(&t, GgmlDType::Q4K).unwrap();
+            weights_bytes.extend_from_slice(&qt.data().unwrap());
+        }
+        eprintln!("  stack size: {} MB", weights_bytes.len() / (1024 * 1024));
+
+        let Some(device) = metal::Device::system_default() else {
+            eprintln!("no Metal device — skipping");
+            return;
+        };
+        let queue = device.new_command_queue();
+
+        let w_buf = device.new_buffer_with_data(
+            weights_bytes.as_ptr() as *const _,
+            weights_bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Activations and ids sized for the largest m.
+        let max_m = *M_VALUES.iter().max().unwrap();
+        let act: Vec<f32> = (0..max_m * K)
+            .map(|i| ((i as f32) * 0.0021).cos() * 0.7)
+            .collect();
+        let ids: Vec<i32> = (0..max_m * TOP_K)
+            .map(|i| (i as i32) % NUM_EXPERTS as i32)
+            .collect();
+
+        let a_buf = device.new_buffer_with_data(
+            act.as_ptr() as *const _,
+            (act.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let ids_buf = device.new_buffer_with_data(
+            ids.as_ptr() as *const _,
+            (ids.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_size = (max_m * TOP_K * N * 4) as u64;
+        let out_buf = device.new_buffer(out_size, MTLResourceOptions::StorageModeShared);
+
+        eprintln!();
+        eprintln!(
+            "{:<8} {:<10} {:<14} {:<14} {:<14} {:<14}",
+            "m", "n_pairs", "ms_per_iter", "us_per_pair", "us_per_pair_layer*", "scaling_vs_m1"
+        );
+        eprintln!(
+            "{:<8} {:<10} {:<14} {:<14} {:<14} {:<14}",
+            "-", "-", "-", "-", "-", "-"
+        );
+
+        let mut m1_us_per_pair: Option<f64> = None;
+        for &m in M_VALUES {
+            let n_pairs = m * TOP_K;
+
+            // Warmup: ensure pipeline is JIT'd.
+            for _ in 0..3 {
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                dispatch_gemv_q4k_moe_id_batched_on_encoder(
+                    &device, enc, &a_buf, &w_buf, 0, &ids_buf, &out_buf, N, K, m, TOP_K, K, 0,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            }
+
+            // Timed loop: each iter = encode + commit + wait. Single
+            // dispatch per iter, so wall time ≈ GPU compute (no
+            // CPU-GPU pipelining benefit).
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                dispatch_gemv_q4k_moe_id_batched_on_encoder(
+                    &device, enc, &a_buf, &w_buf, 0, &ids_buf, &out_buf, N, K, m, TOP_K, K, 0,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            }
+            let elapsed_us = t0.elapsed().as_micros() as f64;
+            let us_per_iter = elapsed_us / ITERS as f64;
+            let us_per_pair = us_per_iter / n_pairs as f64;
+
+            // Scaling: ratio of us_per_iter at this m vs m=1.
+            // Perfectly linear scaling = ratio of n_pairs (8 → 16, etc).
+            // Sublinear (good) = lower than n_pairs ratio.
+            // Our threshold for "the kernel batches well" = scaling
+            // factor < 0.6 × pair-ratio, i.e., m=16 takes < 60% of
+            // the time 16× m=1 invocations would take.
+            let scaling = if let Some(m1) = m1_us_per_pair {
+                us_per_pair / m1
+            } else {
+                m1_us_per_pair = Some(us_per_pair);
+                1.0
+            };
+
+            // The "*per_layer" column is just a renaming to remind
+            // ourselves: this is per (token, slot) pair-layer in
+            // production, where 48 layers × per_pair time = total
+            // MoE FFN time per (token, slot).
+            eprintln!(
+                "{:<8} {:<10} {:<14.3} {:<14.3} {:<14.3} {:<14.3}",
+                m,
+                n_pairs,
+                us_per_iter / 1000.0,
+                us_per_pair,
+                us_per_pair,
+                scaling
+            );
+        }
+        eprintln!();
+        eprintln!("scaling_vs_m1 = us_per_pair(m) / us_per_pair(m=1)");
+        eprintln!("  = 1.0 → kernel scales perfectly with m (each pair takes same time as m=1)");
+        eprintln!("  < 1.0 → kernel benefits from batching (cache reuse, occupancy)");
+        eprintln!("  > 1.0 → kernel REGRESSES with m (cache thrashing, register spill)");
+    }
+
+    /// Programmatic GPU capture wrapping ONE iteration of the fused
+    /// gate+up+silu batched MoE GEMV at production shape (Qwen3-30B-A3B
+    /// expert: K=2048, N=768, top_k=8) at m=16.
+    ///
+    /// Writes a `.gputrace` bundle to /tmp/ferrum_moe_gemv_m16.gputrace
+    /// — open with Xcode → Performance tab shows per-dispatch GPU time,
+    /// occupancy, stalls, register pressure, threadgroup memory, etc.
+    ///
+    /// Run with:
+    ///   MTL_CAPTURE_ENABLED=1 cargo test -p ferrum-kernels \
+    ///     --features metal --release --lib \
+    ///     moe_gemv_capture_one_iter -- --ignored --nocapture
+    #[test]
+    #[ignore = "manually-run capture — needs MTL_CAPTURE_ENABLED=1"]
+    fn moe_gemv_capture_one_iter() {
+        use crate::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder;
+        use metal::{CaptureDescriptor, MTLCaptureDestination};
+
+        const NUM_EXPERTS: usize = 8;
+        const N: usize = 768; // expert_feed_forward_length
+        const K: usize = 2048; // hidden
+        const TOP_K: usize = 8;
+        const M: usize = 16;
+
+        if std::env::var("MTL_CAPTURE_ENABLED").as_deref() != Ok("1") {
+            eprintln!("MTL_CAPTURE_ENABLED=1 not set — capture would silently no-op");
+            return;
+        }
+
+        let cpu = CDevice::Cpu;
+        eprintln!("preparing 2 synthetic Q4_K stacks (gate + up) ...");
+        let pack_stack = |seed: f32| -> Vec<u8> {
+            let mut buf = Vec::new();
+            for e in 0..NUM_EXPERTS {
+                let raw: Vec<f32> = (0..N * K)
+                    .map(|i| ((((i + e * 313) % 251) as f32) * 0.013).sin() * 0.4 + seed)
+                    .collect();
+                let t = Tensor::from_vec(raw, (N, K), &cpu).unwrap();
+                let qt = QTensor::quantize(&t, GgmlDType::Q4K).unwrap();
+                buf.extend_from_slice(&qt.data().unwrap());
+            }
+            buf
+        };
+        let gate_bytes = pack_stack(0.05);
+        let up_bytes = pack_stack(-0.07);
+
+        let Some(device) = metal::Device::system_default() else {
+            eprintln!("no Metal device");
+            return;
+        };
+        let queue = device.new_command_queue();
+
+        let gate_buf = device.new_buffer_with_data(
+            gate_bytes.as_ptr() as *const _,
+            gate_bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let up_buf = device.new_buffer_with_data(
+            up_bytes.as_ptr() as *const _,
+            up_bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let act: Vec<f32> = (0..M * K)
+            .map(|i| ((i as f32) * 0.0021).cos() * 0.7)
+            .collect();
+        let ids: Vec<i32> = (0..M * TOP_K)
+            .map(|i| (i as i32) % NUM_EXPERTS as i32)
+            .collect();
+        let a_buf = device.new_buffer_with_data(
+            act.as_ptr() as *const _,
+            (act.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let ids_buf = device.new_buffer_with_data(
+            ids.as_ptr() as *const _,
+            (ids.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_size = (M * TOP_K * N * 4) as u64;
+        let out_buf = device.new_buffer(out_size, MTLResourceOptions::StorageModeShared);
+
+        // Warmup outside the capture window — we want the steady-state
+        // trace, not the JIT-compile event.
+        for _ in 0..3 {
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
+                &device, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, M, TOP_K,
+                K, 0,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        // Programmatic capture window.
+        let trace_path = std::path::PathBuf::from("/tmp/ferrum_moe_gemv_m16.gputrace");
+        // Capture to file requires the path NOT exist first.
+        let _ = std::fs::remove_dir_all(&trace_path);
+
+        let descriptor = CaptureDescriptor::new();
+        descriptor.set_capture_command_queue(&queue);
+        descriptor.set_destination(MTLCaptureDestination::GpuTraceDocument);
+        descriptor.set_output_url(&trace_path);
+
+        let manager = metal::CaptureManager::shared();
+        manager.start_capture(&descriptor).expect("start_capture");
+
+        // The actual recorded iteration — fire 5 dispatches in a row so
+        // the trace shows multiple identical kernel launches; Xcode's
+        // perf view averages across them and you can spot variance.
+        for _ in 0..5 {
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
+                &device, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, M, TOP_K,
+                K, 0,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        manager.stop_capture();
+
+        eprintln!();
+        eprintln!("===========================================================");
+        eprintln!("  GPU trace saved: {}", trace_path.display());
+        eprintln!();
+        eprintln!("  open with:  open '{}'", trace_path.display());
+        eprintln!("===========================================================");
+    }
+
+    /// Same shape but for the FUSED gate+up+silu kernel — measures
+    /// scaling for the fused path that ferrum's batched-decode actually
+    /// uses in production.
+    #[test]
+    #[ignore = "microbench — only run manually with --release"]
+    fn moe_gemv_fused_scaling_microbench() {
+        use crate::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder;
+
+        const NUM_EXPERTS: usize = 8;
+        const N: usize = 768;
+        const K: usize = 2048;
+        const TOP_K: usize = 8;
+        const M_VALUES: &[usize] = &[1, 2, 4, 8, 16];
+        const ITERS: usize = 500;
+
+        let cpu = CDevice::Cpu;
+        eprintln!("preparing 2 synthetic Q4_K stacks (gate + up) ...");
+        let pack_stack = |seed: f32| -> Vec<u8> {
+            let mut buf = Vec::new();
+            for e in 0..NUM_EXPERTS {
+                let raw: Vec<f32> = (0..N * K)
+                    .map(|i| ((((i + e * 313) % 251) as f32) * 0.013).sin() * 0.4 + seed)
+                    .collect();
+                let t = Tensor::from_vec(raw, (N, K), &cpu).unwrap();
+                let qt = QTensor::quantize(&t, GgmlDType::Q4K).unwrap();
+                buf.extend_from_slice(&qt.data().unwrap());
+            }
+            buf
+        };
+        let gate_bytes = pack_stack(0.05);
+        let up_bytes = pack_stack(-0.07);
+        eprintln!("  each stack: {} MB", gate_bytes.len() / (1024 * 1024));
+
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let queue = device.new_command_queue();
+
+        let gate_buf = device.new_buffer_with_data(
+            gate_bytes.as_ptr() as *const _,
+            gate_bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let up_buf = device.new_buffer_with_data(
+            up_bytes.as_ptr() as *const _,
+            up_bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let max_m = *M_VALUES.iter().max().unwrap();
+        let act: Vec<f32> = (0..max_m * K)
+            .map(|i| ((i as f32) * 0.0021).cos() * 0.7)
+            .collect();
+        let ids: Vec<i32> = (0..max_m * TOP_K)
+            .map(|i| (i as i32) % NUM_EXPERTS as i32)
+            .collect();
+
+        let a_buf = device.new_buffer_with_data(
+            act.as_ptr() as *const _,
+            (act.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let ids_buf = device.new_buffer_with_data(
+            ids.as_ptr() as *const _,
+            (ids.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_size = (max_m * TOP_K * N * 4) as u64;
+        let out_buf = device.new_buffer(out_size, MTLResourceOptions::StorageModeShared);
+
+        eprintln!();
+        eprintln!(
+            "{:<8} {:<10} {:<14} {:<14} {:<14}",
+            "m", "n_pairs", "ms_per_iter", "us_per_pair", "scaling_vs_m1"
+        );
+        let mut m1_us_per_pair: Option<f64> = None;
+        for &m in M_VALUES {
+            let n_pairs = m * TOP_K;
+            for _ in 0..3 {
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
+                    &device, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, m,
+                    TOP_K, K, 0,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
+                    &device, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, m,
+                    TOP_K, K, 0,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            }
+            let elapsed_us = t0.elapsed().as_micros() as f64;
+            let us_per_iter = elapsed_us / ITERS as f64;
+            let us_per_pair = us_per_iter / n_pairs as f64;
+            let scaling = if let Some(m1) = m1_us_per_pair {
+                us_per_pair / m1
+            } else {
+                m1_us_per_pair = Some(us_per_pair);
+                1.0
+            };
+            eprintln!(
+                "{:<8} {:<10} {:<14.3} {:<14.3} {:<14.3}",
+                m,
+                n_pairs,
+                us_per_iter / 1000.0,
+                us_per_pair,
+                scaling
+            );
+        }
+    }
 }
