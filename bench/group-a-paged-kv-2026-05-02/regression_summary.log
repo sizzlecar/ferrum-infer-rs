@@ -1,0 +1,34 @@
+
+==========================================================
+  Llama-3.1-8B-Q4_K_M  (gguf=Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf)
+==========================================================
+
+▶ ferrum paged batched @ c=16
+  out_tok/s=96.1  TPOT_med=144.2  TTFT_med=319.2
+
+▶ mistralrs serve @ c=16
+  out_tok/s=0.0  TPOT_med=nan  TTFT_med=nan
+
+==========================================================
+  Qwen3-8B-Q4_K_M  (gguf=Qwen3-8B-Q4_K_M.gguf)
+==========================================================
+
+▶ ferrum paged batched @ c=16
+  out_tok/s=93.5  TPOT_med=148.9  TTFT_med=400.1
+
+▶ mistralrs serve @ c=16
+  out_tok/s=0.0  TPOT_med=nan  TTFT_med=nan
+
+==========================================================
+  Qwen3-30B-A3B-Q4_K_M  (gguf=Qwen3-30B-A3B-Q4_K_M.gguf)
+==========================================================
+
+▶ ferrum paged batched @ c=16
+  out_tok/s=80.1  TPOT_med=163.0  TTFT_med=487.8
+
+▶ mistralrs serve @ c=16
+  out_tok/s=0.0  TPOT_med=nan  TTFT_med=nan
+
+==========================================================
+  ALL DONE
+==========================================================

@@ -1,0 +1,33 @@
+prewarming macOS page cache for Qwen3-30B-A3B-Q4_K_M.gguf ...
+prewarm done
+
+=== moe_30b_a3b__batched__c4 ===
+2026年 5月 2日 星期六 15时47分20秒 CST
+starting ferrum serve (env: FERRUM_MOE_BATCHED=1 FERRUM_MOE_BATCH_THRESHOLD=2 FERRUM_MOE_BATCHED_DECODE=1) → /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-paged-kv-2026-05-02/moe_30b_a3b__batched__c4.server.log
+waiting for server (pid=61421) to be ready ...
+server ready (took 4s)
+warmup ...
+running bench c=4 num_prompts=16 max_tokens=64 ...
+done — results in /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-paged-kv-2026-05-02/moe_30b_a3b__batched__c4.json
+  output_tok/s=38.9  req/s=0.6
+  TTFT median=900.2 p99=1354.1 ms
+  TPOT median=90.2 p99=95.7 ms
+  ITL  median=85.8 p99=348.9 ms
+  successful=None/None
+
+=== moe_30b_a3b__per_token__c4 ===
+2026年 5月 2日 星期六 15时47分52秒 CST
+starting ferrum serve (env: ) → /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-paged-kv-2026-05-02/moe_30b_a3b__per_token__c4.server.log
+waiting for server (pid=61517) to be ready ...
+server ready (took 37s)
+warmup ...
+running bench c=4 num_prompts=16 max_tokens=64 ...
+done — results in /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-paged-kv-2026-05-02/moe_30b_a3b__per_token__c4.json
+  output_tok/s=42.1  req/s=0.7
+  TTFT median=884.2 p99=1202.4 ms
+  TPOT median=82.2 p99=90.9 ms
+  ITL  median=77.6 p99=104.5 ms
+  successful=None/None
+
+=== ALL DONE ===
+2026年 5月 2日 星期六 15时48分24秒 CST

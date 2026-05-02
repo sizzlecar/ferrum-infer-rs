@@ -88,9 +88,42 @@ deterministic prompts；temperature=0。
 
 **MoE 落后：c=16 我们 51.3 vs llama.cpp 95.4 = 我们只有他们 54%。**
 
-## 问题诊断
+### 2026-05-02 突破后的 Group A 数据（同机器同日同 harness）
 
-### 为什么 Dense 完胜，MoE 落后？
+paged-KV mirror（commit 79f32a3）落地后 Qwen3-MoE 也走上 LlamaFamily
+已在用的 batched paged_decode_attention 路径。重测：
+
+| Model | ferrum (paged batched) | llama-server | mistralrs serve |
+|---|--:|--:|--:|
+| **Llama-3.1-8B-Q4_K_M** | **96.1** | 54.2 | 23.6 |
+| **Qwen3-8B-Q4_K_M** | **93.5** | 64.4 | 23.0 |
+| **Qwen3-30B-A3B-Q4_K_M** | **80.1** | 78.9 | ❌ panic |
+
+**结论翻转**：c=16 ferrum **dense 反超 llama.cpp +45-77%**，**MoE 持平**（80.1 vs 78.9）。
+全 Group A 三个模型都达到或超过对照引擎。mistralrs 在 dense 上落后 4×，
+在 Qwen3-MoE 上直接 PoisonError panic（mistralrs-core 0.8.1 add_request.rs:466）。
+
+数据 / bench artifacts: `bench/group-a-paged-kv-2026-05-02/`。
+
+#### Qwen3-MoE 同机器 sweep（paged 开 vs 关）
+
+| c | ferrum per_token | ferrum paged batched | Δ |
+|---:|--:|--:|--:|
+| 4 | 42.1 | 38.9 | -8% |
+| 8 | 47.4 | 58.9 | +24% |
+| 16 | 47.9 | 79.7 | +66% |
+
+paged 路径在 c≥8 显著领先，c=4 仍输 8%（grid `(1, num_heads, num_seqs=4)`
+GPU 没饱和）—— c=4 默认走 per_token，c≥8 默认走 paged batched 是合理切分。
+
+## 问题诊断（历史 — 2026-05-01 视角）
+
+> 下面这一节描述的是 2026-05-01 时的瓶颈分析。**结论后来被实测推翻**——
+> 见上面"2026-05-02 突破"。真正的 c=16 MoE 瓶颈不在 MoE FFN kernel
+> craft，而在 Qwen3MoeModel 没接 paged-KV 架构（见末尾"教训"）。
+> 历史分析保留，作为"猜瓶颈失败一次的教训"。
+
+### 为什么 Dense 完胜，MoE 落后？（2026-05-01 当时的猜测）
 
 **Dense 的瓶颈在 dense GEMM 的 batch 红利**：
 - 每 token 全部计算就是 qkv_proj / o_proj / gate_up_proj / down_proj
@@ -154,6 +187,36 @@ schedule。**没 Xcode 也能做**——bench-driven 二分迭代每个变量，
   back-of-envelope 估算。真瓶颈要么是 per-kernel GPU 时间（kernel
   craft），要么是 memory bandwidth。
 
+**实验：gate+up+silu 三 dispatch 融合 (PR — 待编号)**
+- 假设：三个 dispatch 共用 norm_out / ids；中间 buffer
+  (`gate_out_stacked`, `up_out_stacked`) 写出再读回 = 4× `[top_k, ffn]`
+  intermediate bandwidth 浪费；融合能省 BW，预估 c=16 +5-15%
+- 实施：新 Metal kernel `gemv_q4kw_moe_id_gate_up_silu_f32` —— 内层
+  Q4_K decode loop 用同一份 `yl/yh` activation register-file，并行算
+  gate 和 up 两个 row accumulator，最后 in-register `silu(g) * u` 写
+  `silu_stacked`。Backend trait + 能力探针，默认 ON，
+  `FERRUM_MOE_FUSED_GATE_UP_SILU=0` 可关
+- 单元测试：fused vs unfused 在合成 Q4_K 权重上 **bitwise 一致**
+  (max_abs=0.000000)
+- 实测 c=4/8/16（30B-A3B Q4_K_M, prewarm cache）：
+
+  | c | unfused | fused | Δ tok/s | TPOT median |
+  |--:|--:|--:|--:|--:|
+  | 4  | 42.5 | **43.5** | +2.4% | -2.7% (82.1→79.9 ms) |
+  | 8  | 49.4 | **49.6** | +0.4% | -1.0% |
+  | 16 | 50.8 | **51.2** | +0.8% | -0.5% |
+
+- 解读：**实测 +0-2%，远小于 +5-15% 预期**。三个 dispatch 共用的
+  中间 buffer (`gate_out_stacked`, `up_out_stacked`) 加起来才
+  ~24 KB × 8 slots × 2 = ~384 KB —— 已经 fit Apple GPU L2/L3，写出
+  再读回的 bandwidth 实际上没付 DRAM 代价。Fused 路径"省"的是
+  cache→cache traffic，量级太小压不动 TPOT。
+- 启示（与 PR #79 同源教训）：**dispatch / intermediate-BW 都不是
+  真瓶颈**。剩下唯一没排除的是 per-kernel GPU 时间（kernel craft
+  本身——bank conflict / register pressure / instruction schedule），
+  这就是 Tier 2 `mul_mm_id` 重写的内容。后续 Tier 1 PR 价值低，
+  应直接进 Tier 2。
+
 ## 解决办法（按实测 ROI 排）
 
 ### Tier 0（已完成）
@@ -166,18 +229,19 @@ schedule。**没 Xcode 也能做**——bench-driven 二分迭代每个变量，
 实测：c=4 +1.9%, c=8 +0.9%。**比预估的 +30% 小一个量级**——见上面
 "经验性更新"。结构性收益保留（kernel API 干净），perf 收益微薄。
 
-### Tier 1（高 ROI、中等难度、不需要 Xcode）
+#### 2. Gate+up+silu 融合（本 PR）
 
-#### 2. Gate+up+silu fusion
+`gate_gemv + up_gemv + silu_mul` 三个 dispatch 合一，内层 Q4_K
+reduction 共享 activation register-file，gate / up 两 row accumulator
+并行，结果 in-register `silu(g) * u` 直写 `silu_stacked`。Backend
+能力探针（Metal=true，CPU/CUDA=false），`FERRUM_MOE_FUSED_GATE_UP_SILU=0`
+可关。
 
-3 个独立 dispatch（gate gemv, up gemv, silu_mul_stacked）合并成一个
-fused kernel。**这次别再靠 dispatch count 估算**——重点是
-**bandwidth 省 1× 整个 activation 的读取**。activation
-每次 H=2048 floats × top_k=8 slots = 16 KB / token / layer / kernel，
-3 个 kernel 累计 48 KB 重复读。Fused 后省 32 KB。
+实测 c=4/8/16：+0.4-2.4%（c=4 最大 +2.4%）。**比预估的 +5-15% 小一
+个量级**——见上面"经验性更新"。Bitwise correct，结构清爽，但 perf
+价值微薄。
 
-预期：bandwidth-bound 部分能省 20-40%；按 MoE 比 dense 更
-bandwidth-bound 的程度估，**c=16 +5-15%**。**~2-3 天**。
+### Tier 1（残留候选，低 ROI 优先级）
 
 #### 3. `weighted_sum_residual_norm_batched`
 
@@ -227,22 +291,28 @@ bench-driven A/B 测就能知道。**~1 天**。
 - ✅ Phase 4b MoE 框架 + threshold hybrid（PR #77，MoE c=16 +15% over 默认）
 - ✅ vLLM 风格 bench harness + Group A 三引擎报告（PR #75 / #76）
 - ✅ Offset-aware MoE kernels（PR #79，+1-2%）
+- ✅ Gate+up+silu fusion m=1（df64ac1，+0.4-2.4%）
+- ✅ Batched MoE GEMV kernel infrastructure（e85baeb，opt-in）
+- ✅ Batched fused gate+up+silu + threshold decoupling + profile（3b68b91）
+- ✅ GPU-side profiling tooling — xctrace + Xcode capture（b4f3ac6）
+- ✅ **Paged-KV mirror in Qwen3MoeModel**（79f32a3，**MoE c=16 51 → 80 tok/s = +56% / 追平 llama.cpp**）
 - ⚠️ Concurrent encoder 模式（PR #65 NULL RESULT，CPU CI 已修但不 merge）
 
 ## Roadmap 推荐（重排 — 实测后）
 
-按 **实测 ROI** 顺序，每个独立 PR：
+**目标已达成**：c=16 ferrum 在所有 3 个 Group A 模型上 ≥ llama.cpp。
+继续优化的下一波价值（每条都可独立挂 PR）：
 
-1. **【高 ROI 容易做】Gate+up+silu fusion** —— 真正能省 bandwidth，
-   ~2-3 天，预期 c=16 +5-15%。**比 Tier 1 的其他事更有价值**——
-   现在我们知道单纯 dispatch 数量优化收益小，bandwidth 才是杠杆。
-2. **`mul_mm_id` 内部 craft**（bench-driven 或 Xcode-driven）——
-   决定性的 50% gap 闭合。**~3-14 天**取决于工具。
-3. **长上下文 + ShareGPT bench** —— 1-2 天，用 vLLM 标准数据集
-   把 dense 完胜在更真实负载下展示。
-4. **Speculative decoding for Metal** —— 1-2 天，Qwen3-0.6B 当
-   draft，4B/8B 当 target，预期 c=1 加速 1.5-2×。
-5. **NR0 大 tile 实验** —— 1 天 bench-driven，可能 +几%。
+1. **长上下文 + ShareGPT bench** —— 1-2 天，用 vLLM 标准数据集把
+   dense / MoE 完胜在更真实负载下展示。当前 max_tokens=64 的 burst
+   bench 是 stress test 而非生产 workload。
+2. **Speculative decoding for Metal** —— 1-2 天，Qwen3-0.6B 当 draft
+   model，4B/8B 当 target，预期 c=1 加速 1.5-2×（c=1 是 ferrum 唯一
+   还输 llama.cpp 的档位：54 vs 50.6 早期数据，今天没复测）。
+3. **`mul_mm_id` 内部 craft 仍是开放话题** —— 但根据今天的实测
+   ferrum c=16 已经追上 llama.cpp，没有"必须 close 50% gap"的紧
+   迫性。可以等出现新瓶颈再回来。降级到 nice-to-have。
+4. **NR0 大 tile 实验** —— 1 天 bench-driven，可能 +几%。
 
 ## 记录的死路（don't go back）
 
@@ -252,12 +322,23 @@ bench-driven A/B 测就能知道。**~1 天**。
 - **lx/ly swap 实验性 port to llama.cpp 的 layout**：单纯 swap 让输出全
   是 `]]]` —— layout 不只 swap 这么简单，整个 simdgroup_load 配套都
   得改
-- **Qwen3MoeModel 加 paged KV**：不必要 ——`Qwen3MoeModel::ensure_kv` 是
-  contig-only 的，paged 开关不影响它，dispatch 仍正确
+- ~~**Qwen3MoeModel 加 paged KV**：不必要~~ **(2026-05-02 反转)** —— 之前
+  以为不必要因为 m=1 路径 paged/contig 等价。但 c≥8 batched 路径下
+  paged 是结构性必需：单次 `paged_decode_attention(num_seqs=m)` 比 m
+  次 m=1 flash + plumbing 快得多。落地 commit 79f32a3 = c=16 +56%。
+  **教训：「m=1 等价」不代表「c=N 等价」**。dispatch 数量 / batched
+  dispatch 形态在多 sequence 场景才有结构性差异。
 - **Offset-aware kernels = +30% (估算)**：实测只 +1-2%。
   Metal `set_buffer(offset)` 比 copy_slice 省的不多，dispatch
   count 不是 c=4/8 的真瓶颈。后续不要再用"省 N 个 dispatch ⟹ 省
   N×10µs"做 ROI 估算——必须 profile 看实际 GPU time / bandwidth。
+- **Gate+up+silu 融合 = +5-15% (估算)**：实测 c=4 +2.4% / c=8 +0.4% /
+  c=16 +0.8%。原本指望省下 `gate_out_stacked` + `up_out_stacked` 的
+  intermediate-BW，但中间 buffer (~24 KB × 8 slots × 2 ≈ 384 KB)
+  fit Apple GPU L2/L3 已经，写出再读回根本没付 DRAM 代价。
+  "intermediate-BW 估算"和"dispatch count 估算"是同一类错——
+  cache hierarchy 已经把这层 traffic 吃了，只有 DRAM-bound /
+  per-kernel GPU 时间是真瓶颈。
 
 ## 已合并的 PR 链（按时间顺序）
 
@@ -272,6 +353,39 @@ bench-driven A/B 测就能知道。**~1 天**。
 | #77 | perf(metal): Phase 4b for Qwen3-MoE | MoE c=16 +15% over 默认 |
 | #78 | docs: 2026-05-01 concurrent perf status & roadmap | 本文档（旧版） |
 | #79 | perf(metal): offset-aware MoE kernels | c=4/8 +1-2% (低于预估) |
+| 待编号 | perf(metal): gate+up+silu 融合 MoE GEMV (df64ac1) | c=4/8/16 +0.4-2.4% (低于预估) |
+| 待编号 | perf(metal): batched MoE GEMV kernel infrastructure (e85baeb) | opt-in 基础设施 |
+| 待编号 | perf(metal): batched fused gate+up+silu + threshold + profile (3b68b91) | opt-in 基础设施 |
+| 待编号 | bench: GPU-side profiling tooling (b4f3ac6) | xctrace + Xcode capture 脚手架 |
+| 待编号 | **perf(metal): paged-KV in Qwen3MoeModel (79f32a3)** | **MoE c=16 51 → 80 = +56% / 追平 llama.cpp** |
+
+## 教训（关键认知）
+
+经过 2026-05-01 三次 +1-2% 的 MoE FFN 优化（PR #79、df64ac1、3b68b91）
+全部低于预估，到 2026-05-02 paged-KV mirror 一次 +56% 命中目标，复盘：
+
+1. **kernel 微观优化天花板很低**。本机 MoE GEMV 在 GPU Frame Capture 上
+   显示 ALU Limiter 84% / ALU Util 60% —— 已经接近 Apple GPU 这种
+   Q4_K 内核的合理上限。再调内层 FMA 依赖链得到的 +19% 在小 m
+   时被 register pressure 吃成 -80% 反向。**当现有 kernel 已经
+   60%+ ALU util 时，再榨 craft 通常 < +5%，且容易有反向回归**。
+
+2. **架构层 1.5×+ 的 gap 看起来像很多个 5%**。本来是「16 次 m=1
+   sequential flash_attn + 6 dispatches/item plumbing」的结构，
+   被替换成「1 次 batched paged_decode_attention(num_seqs=16)」。
+   Dispatch count 从 9m=144/层 降到 m+1=17/层，**而且单 dispatch
+   内部 GPU 调度更高效**。这就是 +56%。
+
+3. **「同一个 kernel 在 m=1 和 m=N 等价」≠ 「整条 path 在 c=1 和
+   c=N 等价」**。Qwen3MoeModel 的 contig-KV 路径在 m=1 跟 paged
+   完全等价，所以早期"paged 不必做"的判断没有立刻翻车。但
+   c≥8 时 batched dispatch 形态完全不同，paged 是结构性必需。
+   **下次评估优化范围时要按 c=N 算 dispatch 拓扑，不是按 m=1**。
+
+4. **profile-driven 比 hypothesis-driven 强**。三次 hypothesis-driven 优化
+   全部偏离实际瓶颈。直到 GPU Frame Capture（xctrace + Xcode）量到
+   `attn_peritem` 在 batched-decode 路径占 20% 时间，才把目标重新
+   锁定到正确位置。**没 ground-truth 数据之前不要写优化代码**。
 
 ## 附录：bench 复现命令
 
