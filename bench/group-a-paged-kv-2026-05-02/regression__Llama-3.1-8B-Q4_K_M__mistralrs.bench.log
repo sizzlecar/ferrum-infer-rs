@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8002  model=default  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               82.74s
+  request throughput:      0.39 req/s
+  input  token throughput: 23.5 tok/s
+  output token throughput: 23.6 tok/s
+  total input tokens:      1948
+  total output tokens:     1950
+
+  TTFT  mean 2939.14ms  median 2366.63ms  p99 12978.54ms  max 15309.79ms
+  TPOT  mean  474.49ms  median  390.91ms  p99  830.94ms  max  832.65ms
+  ITL   mean  484.58ms  median  251.54ms  p99 5196.16ms  max 19437.55ms
+  E2E   mean 31967.39ms  median 27444.82ms  p99 56191.09ms  max 56224.91ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-paged-kv-2026-05-02/regression__Llama-3.1-8B-Q4_K_M__mistralrs.json

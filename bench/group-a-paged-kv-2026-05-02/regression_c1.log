@@ -1,0 +1,18 @@
+
+▶ Llama-3.1-8B / paged
+  out_tok/s=30.1  TPOT_med=30.8  TTFT_med=136.4
+
+▶ Llama-3.1-8B / contig
+  out_tok/s=30.1  TPOT_med=30.9  TTFT_med=138.4
+
+▶ Qwen3-8B / paged
+  out_tok/s=28.7  TPOT_med=32.1  TTFT_med=142.0
+
+▶ Qwen3-8B / contig
+  out_tok/s=28.5  TPOT_med=32.1  TTFT_med=142.2
+
+▶ Qwen3-30B-A3B / paged
+  out_tok/s=43.7  TPOT_med=18.7  TTFT_med=280.2
+
+▶ Qwen3-30B-A3B / contig
+  out_tok/s=44.0  TPOT_med=18.7  TTFT_med=275.6
