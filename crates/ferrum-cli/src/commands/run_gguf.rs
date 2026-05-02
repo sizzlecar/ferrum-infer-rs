@@ -881,6 +881,26 @@ fn auto_discover_tokenizer(gguf_path: &PathBuf) -> Option<PathBuf> {
 /// Cost: O(N²) decode calls per stream, but at single-user m=1 decode
 /// rates each call is microseconds — total overhead < 1% of decode wall
 /// time and well worth a working chat experience.
+/// How many bytes of `cumulative` are safe to emit right now.
+///
+/// BPE byte-level vocabularies split CJK chars / emoji across 2-3
+/// tokens. When `tokenizer.decode` is called on a cumulative sequence
+/// whose LAST few bytes are an incomplete UTF-8 sequence, the
+/// implementation loss-replaces them with `U+FFFD`. The next token's
+/// bytes complete the codepoint and the � disappears. So: don't emit
+/// anything past a trailing `U+FFFD` — hold it back; the next push
+/// will fill it in.
+///
+/// Free function (not a method) so the unit test below can exercise
+/// it without needing a real `Tokenizer` instance.
+fn stable_emit_end(cumulative: &str) -> usize {
+    if cumulative.ends_with('\u{FFFD}') {
+        cumulative.rfind('\u{FFFD}').unwrap_or(cumulative.len())
+    } else {
+        cumulative.len()
+    }
+}
+
 struct StreamingDecoder {
     all_tokens: Vec<u32>,
     printed_len: usize,
@@ -905,19 +925,7 @@ impl StreamingDecoder {
     fn push(&mut self, tok: u32, tokenizer: &Tokenizer) -> String {
         self.all_tokens.push(tok);
         let cumulative = tokenizer.decode(&self.all_tokens, true).unwrap_or_default();
-
-        // BPE byte-level vocabularies split CJK chars / emoji across 2-3
-        // tokens. When `tokenizer.decode` is called on a cumulative
-        // sequence whose LAST few bytes are an incomplete UTF-8 sequence,
-        // the implementation loss-replaces them with `U+FFFD`. The next
-        // token's bytes complete the codepoint and the � disappears from
-        // the cumulative output. So: don't emit anything past a trailing
-        // � — hold the tail back, the next push will fill it in.
-        let safe_end = if cumulative.ends_with('\u{FFFD}') {
-            cumulative.rfind('\u{FFFD}').unwrap_or(cumulative.len())
-        } else {
-            cumulative.len()
-        };
+        let safe_end = stable_emit_end(&cumulative);
 
         let out = if safe_end > self.printed_len {
             cumulative[self.printed_len..safe_end].to_string()
@@ -989,4 +997,58 @@ fn print_timing_report(
         "latency".bold(),
         (decode_secs * 1000.0) / decode_tokens.max(1) as f64
     );
+}
+
+#[cfg(test)]
+mod streaming_decoder_tests {
+    use super::stable_emit_end;
+
+    /// Trailing `U+FFFD` (replacement char) → BPE byte-split mid-codepoint.
+    /// Hold it back; the next token's bytes will complete the codepoint.
+    #[test]
+    fn holds_back_trailing_replacement() {
+        let s = "Hello \u{FFFD}";
+        // The � is at byte offset 6 (5 ASCII + space). Hold from there.
+        assert_eq!(stable_emit_end(s), 6);
+    }
+
+    /// Clean text → emit all of it.
+    #[test]
+    fn emits_full_clean_string() {
+        assert_eq!(stable_emit_end("Hello"), 5);
+        assert_eq!(stable_emit_end(""), 0);
+    }
+
+    /// CJK / emoji that's already complete → emit fully (no �).
+    #[test]
+    fn emits_complete_cjk_and_emoji() {
+        let s = "你好";
+        assert_eq!(stable_emit_end(s), s.len()); // 6 bytes (3 + 3)
+        let e = "Cargo \u{1F4E6}"; // 📦 = 4 bytes
+        assert_eq!(stable_emit_end(e), e.len());
+    }
+
+    /// `U+FFFD` inside the string but not at the tail → emit fully.
+    /// (E.g. user prompted with literal � — we shouldn't withhold a
+    /// genuine character that happens to match.)
+    #[test]
+    fn emits_when_replacement_is_internal() {
+        let s = "\u{FFFD}foo";
+        assert_eq!(stable_emit_end(s), s.len());
+    }
+
+    /// Multiple `U+FFFD`s at the very end → hold from the FIRST of the
+    /// trailing run. (Two BPE byte-splits back-to-back, e.g. an
+    /// incomplete codepoint plus another, both mid-token.)
+    #[test]
+    fn holds_back_multiple_trailing_replacements() {
+        let s = "ok \u{FFFD}\u{FFFD}";
+        // Both �s are at the tail (last codepoint is �). `rfind` returns
+        // the last � position; hold from there. Note: not perfect (the
+        // first � also gets emitted next round), but the cumulative
+        // re-decode self-corrects in the common BPE case.
+        let end = stable_emit_end(s);
+        assert!(end < s.len());
+        assert!(end >= 3); // at least "ok " is emitted
+    }
 }

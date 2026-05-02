@@ -28,7 +28,7 @@ pub struct RunCommand {
     pub system: Option<String>,
 
     /// Maximum tokens to generate
-    #[arg(long, default_value = "512")]
+    #[arg(long, default_value = "2048")]
     pub max_tokens: u32,
 
     /// Sampling temperature (0.0–2.0). 0.0 = greedy / argmax (deterministic,
