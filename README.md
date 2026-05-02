@@ -73,7 +73,15 @@ vLLM-style scheduling features included: PagedAttention, continuous batching, Fl
 
 ## Quick Start
 
-### Prebuilt binaries
+### Homebrew (macOS Apple Silicon, Linux x86_64)
+
+```bash
+brew tap sizzlecar/ferrum
+brew install ferrum
+ferrum --version
+```
+
+### Prebuilt binaries (raw tarball)
 
 ```bash
 # Linux x86_64
