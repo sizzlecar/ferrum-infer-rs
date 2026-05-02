@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8783  model=Qwen3-30B-A3B-Q4_K_M  reqs=24  conc=8  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               24/24
+  wall time:               32.38s
+  request throughput:      0.74 req/s
+  input  token throughput: 13.4 tok/s
+  output token throughput: 47.4 tok/s
+  total input tokens:      434
+  total output tokens:     1536
+
+  TTFT  mean  918.20ms  median  912.49ms  p99 2428.71ms  max 2445.71ms
+  TPOT  mean  156.09ms  median  158.10ms  p99  173.72ms  max  174.10ms
+  ITL   mean  156.09ms  median  146.74ms  p99  604.64ms  max 1215.65ms
+  E2E   mean 10751.88ms  median 10955.95ms  p99 12757.99ms  max 12758.01ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-paged-kv-2026-05-02/moe_30b_a3b__per_token__c8.json

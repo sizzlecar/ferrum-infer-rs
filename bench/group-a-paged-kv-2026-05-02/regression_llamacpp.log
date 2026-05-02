@@ -1,0 +1,8 @@
+
+▶ llama-server Llama-3.1-8B-Q4_K_M
+  ready in 2s
+  out_tok/s=54.2  TPOT_med=150.8  TTFT_med=1370.0
+
+▶ llama-server Qwen3-8B-Q4_K_M
+  ready in 2s
+  out_tok/s=64.4  TPOT_med=122.1  TTFT_med=2179.1

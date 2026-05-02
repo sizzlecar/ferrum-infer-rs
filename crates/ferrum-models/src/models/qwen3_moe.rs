@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
+use std::sync::OnceLock;
 
 use ferrum_kernels::backend::{Backend, KvCache};
 use ferrum_quantization::WeightLoader;
@@ -73,6 +74,23 @@ static MOE_PREFILL_DOWN_US: AtomicU64 = AtomicU64::new(0);
 static MOE_PREFILL_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
 static MOE_PREFILL_WSUM_US: AtomicU64 = AtomicU64::new(0);
 static MOE_PREFILL_WSUM_CALLS: AtomicU64 = AtomicU64::new(0);
+
+// MoE batched-DECODE sub-stage counters (small-m path that uses the
+// batched-pair GEMV in place of the per-token loop).
+static MOE_BATCHED_DECODE_ROUTE_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_GATE_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_UP_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_SILU_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_DOWN_US: AtomicU64 = AtomicU64::new(0);
+static MOE_BATCHED_DECODE_WSUM_US: AtomicU64 = AtomicU64::new(0);
+
+// Coarse stage counters for `forward_layer_batched_decode` so we can
+// see where the time goes without per-op instrumentation. Summed
+// across all layers in one decode_batch_internal call.
+static BD_DENSE_US: AtomicU64 = AtomicU64::new(0); // rms_norm + qkv_proj + split_qkv + o_proj + fused_add_rms_norm
+static BD_ATTN_PERITEM_US: AtomicU64 = AtomicU64::new(0); // the for-i in 0..m attention loop (incl. plumbing)
+static BD_MOE_US: AtomicU64 = AtomicU64::new(0); // router + MoE FFN + residual add
+static BD_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.
 pub struct Qwen3MoeLayerState<B: Backend> {
@@ -199,6 +217,20 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub v_head_major_single: Option<B::Buffer>,
     pub attn_head_major_single: Option<B::Buffer>,
 
+    // ── Paged batched dispatch scratch ──────────────────────────────────
+    //
+    // Mirrors the same fields on `LlamaFamilyScratch`. `Some` only when
+    // `FERRUM_METAL_PAGED_KV=1` and `enable_paged_batch` was called once
+    // we know the pool dimensions. Sized for `FERRUM_PAGED_MAX_SEQS ×
+    // q_dim` so the multi-seq decode path can fan in M items' Q into a
+    // single batched buffer for one `paged_decode_attention(num_seqs=M)`
+    // call instead of running M sequential m=1 attentions.
+    pub paged_batch_q: Option<B::Buffer>,
+    pub paged_batch_o: Option<B::Buffer>,
+    pub paged_batch_block_tables: Option<B::Buffer>,
+    pub paged_batch_context_lens: Option<B::Buffer>,
+    pub paged_max_blocks_per_seq: usize,
+
     pub max_tokens: usize,
 }
 
@@ -262,8 +294,34 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             k_head_major_single: None,
             v_head_major_single: None,
             attn_head_major_single: None,
+            // Lazily-allocated; `enable_paged_batch` populates these when
+            // FERRUM_METAL_PAGED_KV=1 + we know the pool dimensions.
+            paged_batch_q: None,
+            paged_batch_o: None,
+            paged_batch_block_tables: None,
+            paged_batch_context_lens: None,
+            paged_max_blocks_per_seq: 0,
             max_tokens: t,
         }
+    }
+
+    /// Allocate scratch for paged batched dispatch. Mirrors
+    /// `LlamaFamilyScratch::enable_paged_batch`. Idempotent.
+    fn enable_paged_batch(
+        &mut self,
+        cfg: &Qwen3MoeConfig,
+        max_seqs: usize,
+        max_blocks_per_seq: usize,
+    ) {
+        if self.paged_batch_q.is_some() {
+            return;
+        }
+        let q_dim = cfg.base.num_heads * cfg.base.head_dim;
+        self.paged_batch_q = Some(B::alloc(max_seqs * q_dim));
+        self.paged_batch_o = Some(B::alloc(max_seqs * q_dim));
+        self.paged_batch_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
+        self.paged_batch_context_lens = Some(B::alloc_u32(max_seqs));
+        self.paged_max_blocks_per_seq = max_blocks_per_seq;
     }
 
     /// Allocate the per-item single-token scratch buffers used by
@@ -308,6 +366,14 @@ pub struct Qwen3MoeModel<B: Backend> {
 
     pub kv_caches: HashMap<String, Vec<KvCache<B>>>,
     kv_free_pool: Vec<Vec<KvCache<B>>>,
+
+    // ── Paged-KV multi-seq state ────────────────────────────────────────
+    //
+    // Mirrors `LlamaFamilyModel`. Only populated when
+    // `FERRUM_METAL_PAGED_KV=1`. Kv_caches entries become metadata-only
+    // views (block_table + context_lens) into the shared `paged_pools`.
+    pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
+    pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
 }
 
 impl<B: Backend> Qwen3MoeModel<B> {
@@ -430,6 +496,8 @@ impl<B: Backend> Qwen3MoeModel<B> {
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
+            paged_pools: None,
+            paged_block_alloc: None,
         })
     }
 
@@ -459,28 +527,125 @@ impl<B: Backend> Qwen3MoeModel<B> {
             .map(|cap| cap.min(model_max))
             .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY));
 
+        // Paged-KV mode: `FERRUM_METAL_PAGED_KV=1` switches caches into
+        // block-table-indirect layout. Mirrors LlamaFamilyModel's path so
+        // the existing `paged_decode_attention` Metal kernel can fire
+        // once at num_seqs=m for batched decode (replacing the per-item
+        // attention loop that currently dominates `attn_peritem` in the
+        // c=16 profile).
+        let paged = std::env::var("FERRUM_METAL_PAGED_KV")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        const PAGED_BLOCK_SIZE: usize = 16;
+
+        let max_seqs = std::env::var("FERRUM_PAGED_MAX_SEQS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16);
+        let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
+        let total_pool_blocks = max_seqs * max_blocks_per_seq;
+
+        // Lazy-allocate the shared paged pools on the first paged
+        // ensure_kv call.
+        if paged && self.paged_pools.is_none() {
+            let mut pools = Vec::with_capacity(self.cfg.base.num_layers);
+            for _ in 0..self.cfg.base.num_layers {
+                let pool_floats = total_pool_blocks * nkv * PAGED_BLOCK_SIZE * hd;
+                pools.push((B::alloc(pool_floats), B::alloc(pool_floats)));
+            }
+            self.paged_pools = Some(pools);
+            self.paged_block_alloc = Some(std::sync::Mutex::new(
+                crate::common::paged_pool::BlockAllocator::new(total_pool_blocks as u32),
+            ));
+        }
+        if paged {
+            self.scratch
+                .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+        }
+
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
             (0..self.cfg.base.num_layers)
-                .map(|_| KvCache {
-                    k: B::alloc(nkv * max * hd),
-                    v: B::alloc(nkv * max * hd),
-                    len: 0,
-                    capacity: max,
-                    num_kv_heads: nkv,
-                    head_dim: hd,
-                    // Paged-KV not yet wired for Qwen3-MoE — keeps the
-                    // contiguous decode path. Phase 4+ may enable it
-                    // here too once the MoE expert dispatch's KV reads
-                    // also go through block_table indirection.
-                    block_size: 0,
-                    block_table: None,
-                    context_lens: None,
-                    paged_block_indices: Vec::new(),
+                .map(|_| {
+                    if paged {
+                        // Paged mode: cache holds metadata only. K/V are
+                        // 1-element placeholders. Real data lives in
+                        // `self.paged_pools[li].{k,v}`.
+                        let mut block_table = B::alloc_u32(max_blocks_per_seq);
+                        let _ = &mut block_table; // suppress unused-mut on backends that no-op write_u32
+                        let mut context_lens = B::alloc_u32(1);
+                        let mut bt_ctx = B::new_context();
+                        B::write_u32(&mut bt_ctx, &mut context_lens, &[0u32]);
+                        B::sync(&mut bt_ctx);
+                        KvCache {
+                            k: B::alloc(1),
+                            v: B::alloc(1),
+                            len: 0,
+                            capacity: max_blocks_per_seq * PAGED_BLOCK_SIZE,
+                            num_kv_heads: nkv,
+                            head_dim: hd,
+                            block_size: PAGED_BLOCK_SIZE,
+                            block_table: Some(block_table),
+                            context_lens: Some(context_lens),
+                            paged_block_indices: Vec::new(),
+                        }
+                    } else {
+                        KvCache {
+                            k: B::alloc(nkv * max * hd),
+                            v: B::alloc(nkv * max * hd),
+                            len: 0,
+                            capacity: max,
+                            num_kv_heads: nkv,
+                            head_dim: hd,
+                            block_size: 0,
+                            block_table: None,
+                            context_lens: None,
+                            paged_block_indices: Vec::new(),
+                        }
+                    }
                 })
                 .collect()
         });
+
+        // Allocate physical blocks for THIS cache_id from the shared pool.
+        if paged {
+            let alloc_arc = self
+                .paged_block_alloc
+                .as_ref()
+                .expect("paged_block_alloc must be initialised when paged=true");
+            let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let block_indices = match alloc.allocate_n(max_blocks_per_seq) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    drop(alloc);
+                    self.kv_free_pool.push(caches);
+                    eprintln!(
+                        "[ferrum] paged KV pool exhausted on ensure_kv for \
+                         cache_id={cache_id:?}: {e}. Increase \
+                         FERRUM_PAGED_MAX_SEQS (currently {max_seqs}) or \
+                         throttle concurrent requests.",
+                    );
+                    return;
+                }
+            };
+            let mut padded = block_indices.clone();
+            padded.resize(max_blocks_per_seq, 0);
+            let mut ctx_tmp = B::new_context();
+            for c in caches.iter_mut() {
+                if let Some(bt) = c.block_table.as_mut() {
+                    B::write_u32(&mut ctx_tmp, bt, &padded);
+                }
+                c.paged_block_indices = block_indices.clone();
+            }
+            B::sync(&mut ctx_tmp);
+        }
+
         for c in caches.iter_mut() {
             c.len = 0;
+            if let Some(cl) = c.context_lens.as_mut() {
+                let mut ctx_tmp = B::new_context();
+                B::write_u32(&mut ctx_tmp, cl, &[0u32]);
+                B::sync(&mut ctx_tmp);
+            }
         }
         self.kv_caches.insert(cache_id.to_string(), caches);
     }
@@ -563,6 +728,22 @@ impl<B: Backend> Qwen3MoeModel<B> {
         // 5. Grab the per-layer KV cache up front — the deepest fused
         //    variant writes K/V straight into it, avoiding a trailing
         //    `kv_cache_append_head_major` dispatch.
+        //
+        // Paged mode: extract a raw pointer to the layer's pool buffers
+        // BEFORE the &mut cache borrow, so we can pass &mut to the
+        // paged kernel below without holding two simultaneous mutable
+        // borrows on `self`. Safety: `paged_pools` is allocated once at
+        // first ensure_kv call and never resized; the only concurrent
+        // mutation is the pool's own kernel writes (sequenced via
+        // command buffers), so the raw pointer remains valid for the
+        // duration of this layer call.
+        let paged_pool_ptr: Option<(*mut B::Buffer, *mut B::Buffer)> =
+            if let Some(pools) = self.paged_pools.as_mut() {
+                let pool = &mut pools[li];
+                Some((&mut pool.0 as *mut _, &mut pool.1 as *mut _))
+            } else {
+                None
+            };
         let caches = self
             .kv_caches
             .get_mut(cache_id)
@@ -585,30 +766,69 @@ impl<B: Backend> Qwen3MoeModel<B> {
         }
 
         // Try the deepest fusion: fused split-QKV-norm-rope that writes
-        // K/V directly into the cache slot. Skips both the head-major
-        // K/V scratch buffers and the `kv_cache_append_head_major`
-        // dispatch on the decode hot path.
-        let used_qkv_into_cache = B::split_qkv_norm_rope_into_cache(
-            ctx,
-            &self.scratch.qkv_out,
-            q_norm_w,
-            k_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
-            &mut self.scratch.q_head_major,
-            &mut cache.k,
-            &mut cache.v,
-            tokens,
-            nh,
-            nkv,
-            hd,
-            pos_offset,
-            eps,
-            qk_mode,
-            cache_len_before,
-            cache_capacity,
-        )
-        .is_ok();
+        // K/V directly into the cache slot. Paged mode writes into the
+        // shared pool via block_table indirection; contiguous mode
+        // writes into the per-cache_id k/v buffers directly.
+        let used_qkv_into_cache = if cache.block_size > 0 {
+            // Paged path.
+            let bt = cache
+                .block_table
+                .as_ref()
+                .expect("paged cache missing block_table");
+            let num_blocks_per_seq = cache.capacity / cache.block_size;
+            let (pool_k_ptr, pool_v_ptr) =
+                paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
+            // SAFETY: pools allocated-once, see paged_pool_ptr setup above.
+            let pool_k = unsafe { &mut *pool_k_ptr };
+            let pool_v = unsafe { &mut *pool_v_ptr };
+            B::split_qkv_norm_rope_into_paged_cache(
+                ctx,
+                &self.scratch.qkv_out,
+                0,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.q_head_major,
+                0,
+                pool_k,
+                pool_v,
+                bt,
+                tokens,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                qk_mode,
+                cache_len_before,
+                cache.block_size,
+                num_blocks_per_seq,
+            )
+            .is_ok()
+        } else {
+            B::split_qkv_norm_rope_into_cache(
+                ctx,
+                &self.scratch.qkv_out,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.q_head_major,
+                &mut cache.k,
+                &mut cache.v,
+                tokens,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                qk_mode,
+                cache_len_before,
+                cache_capacity,
+            )
+            .is_ok()
+        };
         if !used_qkv_into_cache {
             // Fallback 1: fused split-QKV-norm-rope to head-major scratch
             // (Metal pre-decode-fusion path), then explicit cache append.
@@ -703,27 +923,65 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let kv_len = cache.len;
         let kv_stride = cache.capacity;
 
-        let attn_cfg = ferrum_kernels::backend::AttnConfig {
-            num_heads: nh,
-            num_kv_heads: nkv,
-            head_dim: hd,
-            causal: true,
-            scale: 1.0 / (hd as f32).sqrt(),
-            kv_seq_stride: kv_stride,
-            sliding_window: cfg_base.sliding_window,
-        };
-        B::flash_attention(
-            ctx,
-            &self.scratch.q_head_major,
-            &cache.k,
-            &cache.v,
-            &mut self.scratch.attn_head_major_out,
-            1,
-            tokens,
-            kv_len,
-            pos_offset,
-            &attn_cfg,
-        );
+        if cache.block_size > 0 {
+            // Paged decode: read from the shared pool via block_table.
+            let bt = cache
+                .block_table
+                .as_ref()
+                .expect("paged cache missing block_table");
+            let cl_buf = cache
+                .context_lens
+                .as_mut()
+                .expect("paged cache missing context_lens");
+            let num_blocks_per_seq = cache.capacity / cache.block_size;
+            let (pool_k_ptr, pool_v_ptr) =
+                paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
+            // SAFETY: see paged_pool_ptr setup above.
+            let pool_k = unsafe { &*pool_k_ptr };
+            let pool_v = unsafe { &*pool_v_ptr };
+            let final_kv_len = cache.len as u32;
+            B::write_u32(ctx, cl_buf, &[final_kv_len]);
+            B::paged_decode_attention(
+                ctx,
+                &self.scratch.q_head_major,
+                pool_k,
+                pool_v,
+                &mut self.scratch.attn_head_major_out,
+                bt,
+                cl_buf,
+                1, // num_seqs (single-seq m=1 path)
+                nh,
+                nkv,
+                hd,
+                cache.block_size,
+                num_blocks_per_seq,
+                tokens,
+            )
+            .expect("paged_decode_attention");
+            let _ = kv_stride; // consumed by contig path only
+        } else {
+            let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                num_heads: nh,
+                num_kv_heads: nkv,
+                head_dim: hd,
+                causal: true,
+                scale: 1.0 / (hd as f32).sqrt(),
+                kv_seq_stride: kv_stride,
+                sliding_window: cfg_base.sliding_window,
+            };
+            B::flash_attention(
+                ctx,
+                &self.scratch.q_head_major,
+                &cache.k,
+                &cache.v,
+                &mut self.scratch.attn_head_major_out,
+                1,
+                tokens,
+                kv_len,
+                pos_offset,
+                &attn_cfg,
+            );
+        }
 
         if let Some(t0) = attn_t0 {
             B::sync(ctx);
@@ -1293,6 +1551,12 @@ impl<B: Backend> Qwen3MoeModel<B> {
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
 
+        let prof_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         for (cid, _, _) in batch {
             self.ensure_kv(cid);
         }
@@ -1341,6 +1605,44 @@ impl<B: Backend> Qwen3MoeModel<B> {
         self.scratch.residual = Some(residual);
 
         let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+
+        // Profile dump (one decode_batch_internal call = one decode step
+        // covering all m tokens).
+        if let Some(t0) = prof_t0 {
+            use std::sync::atomic::Ordering;
+            let total_us = t0.elapsed().as_micros() as u64;
+            let dense = BD_DENSE_US.swap(0, Ordering::Relaxed);
+            let attn = BD_ATTN_PERITEM_US.swap(0, Ordering::Relaxed);
+            let moe = BD_MOE_US.swap(0, Ordering::Relaxed);
+            let layers = BD_LAYER_CALLS.swap(0, Ordering::Relaxed);
+            let other = total_us.saturating_sub(dense + attn + moe);
+            let pct = |us: u64| -> f64 {
+                if total_us == 0 {
+                    0.0
+                } else {
+                    100.0 * us as f64 / total_us as f64
+                }
+            };
+            // MoE sub-stage breakdown — meaningful when
+            // moe_forward_batched_decode_impl was used.
+            let moe_route = MOE_BATCHED_DECODE_ROUTE_US.swap(0, Ordering::Relaxed);
+            let moe_gate = MOE_BATCHED_DECODE_GATE_US.swap(0, Ordering::Relaxed);
+            let moe_up = MOE_BATCHED_DECODE_UP_US.swap(0, Ordering::Relaxed);
+            let moe_silu = MOE_BATCHED_DECODE_SILU_US.swap(0, Ordering::Relaxed);
+            let moe_down = MOE_BATCHED_DECODE_DOWN_US.swap(0, Ordering::Relaxed);
+            let moe_wsum = MOE_BATCHED_DECODE_WSUM_US.swap(0, Ordering::Relaxed);
+            eprintln!(
+                "[batched-decode-prof] m={} layers={} total={} ms | dense={} ({:.1}%) | attn_peritem={} ({:.1}%) | moe={} ({:.1}%) [route={} gate={} up={} silu={} down={} wsum={}] | other={} ({:.1}%)",
+                m, layers, total_us / 1000,
+                dense / 1000, pct(dense),
+                attn / 1000, pct(attn),
+                moe / 1000, pct(moe),
+                moe_route / 1000, moe_gate / 1000, moe_up / 1000,
+                moe_silu / 1000, moe_down / 1000, moe_wsum / 1000,
+                other / 1000, pct(other),
+            );
+        }
+
         (0..m)
             .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
             .collect()
@@ -1373,6 +1675,29 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let q_norm_w = attn_layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = attn_layer.k_norm_w.as_ref().unwrap_or(dummy_w);
 
+        let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+        let stage_t0 = || -> Option<std::time::Instant> {
+            if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            }
+        };
+        let stage_end = |t0: Option<std::time::Instant>, ctx: &mut B::Context, c: &AtomicU64| {
+            if let Some(t) = t0 {
+                B::sync(ctx);
+                c.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        };
+        if prof {
+            BD_LAYER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let dense_t0 = stage_t0();
+
         // 1. rms_norm [M, H] → norm_out
         B::rms_norm(
             ctx,
@@ -1389,195 +1714,371 @@ impl<B: Backend> Qwen3MoeModel<B> {
             .qkv_proj
             .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
 
-        // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
-        B::split_qkv(
-            ctx,
-            &self.scratch.qkv_out,
-            &mut self.scratch.q_buf,
-            &mut self.scratch.k_buf,
-            &mut self.scratch.v_buf,
-            m,
-            q_dim,
-            kv_dim,
-        );
+        // ── Paged batched attention path ───────────────────────────────
+        //
+        // Mirrors LlamaFamilyModel's Phase 4b paged batched-decode. When
+        // `FERRUM_METAL_PAGED_KV=1` was set at ensure_kv time, each
+        // cache_id has paged metadata (block_table + context_lens) and
+        // K/V live in the shared `paged_pools[layer]` pool. This path:
+        //   1. m × `split_qkv_norm_rope_into_paged_cache` writes K/V into
+        //      the pool at each item's allocated blocks AND fills
+        //      `paged_batch_q[i*q_dim ..]` with that item's head-major Q.
+        //   2. Build `paged_batch_block_tables [m, max_blocks_per_seq]`
+        //      and `paged_batch_context_lens [m]` host-side, upload.
+        //   3. ONE `paged_decode_attention(num_seqs=m)` call reads all m
+        //      sequences' K/V from the pool via per-seq block_tables,
+        //      writes outputs to `paged_batch_o [m, q_dim]`.
+        //   4. Per-item copy_slice paged_batch_o[i] → attn_flat[i*q_dim].
+        //
+        // This is the structural fix for the c=16 attn_peritem cliff
+        // (~55 ms / round of 16 sequential m=1 flash_attn + plumbing).
+        let is_paged = self.paged_pools.is_some();
+        if is_paged {
+            stage_end(dense_t0, ctx, &BD_DENSE_US);
+            let attn_t0 = stage_t0();
 
-        // 4-6. Per-item loop: rope + kv_append + attention.
-        //      Each item has its own cache_id + pos + kv_len.
-        let q_single = self
-            .scratch
-            .q_single
-            .as_ref()
-            .expect("q_single missing — enable_batched_decode_scratch not called")
-            as *const B::Buffer;
-        let k_single =
-            self.scratch.k_single.as_ref().expect("k_single missing") as *const B::Buffer;
-        let v_single =
-            self.scratch.v_single.as_ref().expect("v_single missing") as *const B::Buffer;
-        let q_hm_single = self
-            .scratch
-            .q_head_major_single
-            .as_mut()
-            .expect("q_head_major_single missing") as *mut B::Buffer;
-        let k_hm_single = self
-            .scratch
-            .k_head_major_single
-            .as_mut()
-            .expect("k_head_major_single missing") as *mut B::Buffer;
-        let v_hm_single = self
-            .scratch
-            .v_head_major_single
-            .as_mut()
-            .expect("v_head_major_single missing") as *mut B::Buffer;
-        let attn_hm_single =
-            self.scratch
-                .attn_head_major_single
-                .as_mut()
-                .expect("attn_head_major_single missing") as *mut B::Buffer;
-        // SAFETY: each Option holds a stable B::Buffer; we don't mutate
-        // self.scratch in a way that would invalidate them inside the loop
-        // (the kv_caches mutation is on a disjoint field).
+            let max_blocks_per_seq = self.scratch.paged_max_blocks_per_seq;
+            let block_size = 16; // matches PAGED_BLOCK_SIZE in ensure_kv
+            let qkv_stride = q_dim + 2 * kv_dim;
 
-        for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
-            let pos_i = *pos as usize;
-
-            // SAFETY: borrows of disjoint scratch fields, see above.
-            let q_single_ref = unsafe { &*q_single };
-            let k_single_ref = unsafe { &*k_single };
-            let v_single_ref = unsafe { &*v_single };
-            let q_hm_single_mut = unsafe { &mut *q_hm_single };
-            let k_hm_single_mut = unsafe { &mut *k_hm_single };
-            let v_hm_single_mut = unsafe { &mut *v_hm_single };
-            let attn_hm_single_mut = unsafe { &mut *attn_hm_single };
-
-            // Extract item i's Q/K/V slice from the batched buffers.
-            B::copy_slice(
-                ctx,
-                &self.scratch.q_buf,
-                i * q_dim,
-                // copy_slice signature wants &mut for dst, but q_single
-                // is shared; we need a *mut variant — since enable_*
-                // gives us Option, we can do as_mut() here.
-                self.scratch.q_single.as_mut().unwrap(),
-                0,
-                q_dim,
-            );
-            B::copy_slice(
-                ctx,
-                &self.scratch.k_buf,
-                i * kv_dim,
-                self.scratch.k_single.as_mut().unwrap(),
-                0,
-                kv_dim,
-            );
-            B::copy_slice(
-                ctx,
-                &self.scratch.v_buf,
-                i * kv_dim,
-                self.scratch.v_single.as_mut().unwrap(),
-                0,
-                kv_dim,
-            );
-
-            // qk_norm_rope with tokens=1, per-item pos.
-            B::qk_norm_rope(
-                ctx,
-                q_single_ref,
-                q_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                q_hm_single_mut,
-                1,
-                nh,
-                hd,
-                pos_i,
-                eps,
-                qk_mode,
-            );
-            B::qk_norm_rope(
-                ctx,
-                k_single_ref,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                k_hm_single_mut,
-                1,
-                nkv,
-                hd,
-                pos_i,
-                eps,
-                qk_mode,
-            );
-            B::qk_norm_rope(
-                ctx,
-                v_single_ref,
-                dummy_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                v_hm_single_mut,
-                1,
-                nkv,
-                hd,
-                pos_i,
-                eps,
-                0,
-            );
-
-            // KV append + attention for item i's cache.
-            let caches = self
-                .kv_caches
-                .get_mut(cache_id)
-                .expect("ensure_kv must be called before forward_layer_batched");
-            let cache = &mut caches[li];
-            B::kv_cache_append_head_major(
-                ctx,
-                &mut cache.k,
-                &mut cache.v,
-                cache.len,
-                cache.capacity,
-                k_hm_single_mut,
-                v_hm_single_mut,
-                1,
-                nkv,
-                hd,
-            );
-            cache.len += 1;
-            let kv_len = cache.len;
-            let kv_stride = cache.capacity;
-
-            let attn_cfg = ferrum_kernels::backend::AttnConfig {
-                num_heads: nh,
-                num_kv_heads: nkv,
-                head_dim: hd,
-                causal: true,
-                scale: 1.0 / (hd as f32).sqrt(),
-                kv_seq_stride: kv_stride,
-                sliding_window: cfg_base.sliding_window,
+            // Step 1: per-item paged write. Read each item's qkv out of
+            // the batched qkv_out buffer; write its head-major Q into
+            // paged_batch_q[i*q_dim ..]; write its K/V into the pool at
+            // its allocated blocks via block_table.
+            let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
+            let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+            let pool_ptr = {
+                let pools = self.paged_pools.as_mut().unwrap();
+                (
+                    &mut pools[li].0 as *mut B::Buffer,
+                    &mut pools[li].1 as *mut B::Buffer,
+                )
             };
-            B::flash_attention(
+            // SAFETY: pools allocated-once, see paged_pools field comment.
+            let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
+            for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
+                let pos_i = *pos as usize;
+                let caches = self
+                    .kv_caches
+                    .get(cache_id)
+                    .expect("paged batched: cache not present");
+                let cache = &caches[li];
+                let bt = cache
+                    .block_table
+                    .as_ref()
+                    .expect("paged batched: block_table missing");
+                let cache_len_before = cache.len;
+                let bt_ptr = bt as *const B::Buffer;
+                // SAFETY: bt is read-only during the dispatch; we don't
+                // touch self.kv_caches between this raw deref and the
+                // call below.
+                let bt_safe: &B::Buffer = unsafe { &*bt_ptr };
+                B::split_qkv_norm_rope_into_paged_cache(
+                    ctx,
+                    &self.scratch.qkv_out,
+                    (i as u64) * qkv_stride_bytes,
+                    q_norm_w,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    self.scratch
+                        .paged_batch_q
+                        .as_mut()
+                        .expect("paged_batch_q missing"),
+                    (i as u64) * q_head_major_size_bytes,
+                    pool_k,
+                    pool_v,
+                    bt_safe,
+                    1,
+                    nh,
+                    nkv,
+                    hd,
+                    pos_i,
+                    eps,
+                    qk_mode,
+                    cache_len_before,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("split_qkv_norm_rope_into_paged_cache (batched)");
+            }
+
+            // Step 2: bump cache.len and stack block_tables + context_lens
+            // host-side, then upload to device scratch.
+            let mut stacked_bt: Vec<u32> = vec![0u32; m * max_blocks_per_seq];
+            let mut stacked_cl: Vec<u32> = vec![0u32; m];
+            for (i, (cache_id, _, _)) in batch.iter().enumerate() {
+                let caches = self
+                    .kv_caches
+                    .get_mut(cache_id)
+                    .expect("paged batched: cache not present");
+                let cache = &mut caches[li];
+                cache.len += 1;
+                let len = cache.len as u32;
+                stacked_cl[i] = len;
+                let blocks = &cache.paged_block_indices;
+                let n_to_copy = blocks.len().min(max_blocks_per_seq);
+                stacked_bt[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
+                    .copy_from_slice(&blocks[..n_to_copy]);
+            }
+            let bt_buf = self
+                .scratch
+                .paged_batch_block_tables
+                .as_mut()
+                .expect("paged_batch_block_tables missing");
+            B::write_u32(ctx, bt_buf, &stacked_bt);
+            let cl_buf = self
+                .scratch
+                .paged_batch_context_lens
+                .as_mut()
+                .expect("paged_batch_context_lens missing");
+            B::write_u32(ctx, cl_buf, &stacked_cl);
+
+            // Step 3: one batched paged_decode_attention(num_seqs=m).
+            let bt_ptr =
+                self.scratch.paged_batch_block_tables.as_ref().unwrap() as *const B::Buffer;
+            let cl_ptr =
+                self.scratch.paged_batch_context_lens.as_ref().unwrap() as *const B::Buffer;
+            let q_ptr = self.scratch.paged_batch_q.as_ref().unwrap() as *const B::Buffer;
+            let o_ptr = self.scratch.paged_batch_o.as_mut().unwrap() as *mut B::Buffer;
+            // SAFETY: scratch buffers are not aliased; we hold &mut self
+            // through this entire block.
+            let bt_safe = unsafe { &*bt_ptr };
+            let cl_safe = unsafe { &*cl_ptr };
+            let q_safe = unsafe { &*q_ptr };
+            let o_safe = unsafe { &mut *o_ptr };
+            B::paged_decode_attention(
                 ctx,
-                q_hm_single_mut,
-                &cache.k,
-                &cache.v,
-                attn_hm_single_mut,
-                1,
-                1,
-                kv_len,
-                pos_i,
-                &attn_cfg,
+                q_safe,
+                pool_k,
+                pool_v,
+                o_safe,
+                bt_safe,
+                cl_safe,
+                m,
+                nh,
+                nkv,
+                hd,
+                block_size,
+                max_blocks_per_seq,
+                1, // q_len
+            )
+            .expect("paged batched decode");
+
+            // Step 4: per-item copy paged_batch_o[i] → attn_flat[i*q_dim].
+            for i in 0..m {
+                B::copy_slice(
+                    ctx,
+                    self.scratch.paged_batch_o.as_ref().unwrap(),
+                    i * q_dim,
+                    &mut self.scratch.attn_flat,
+                    i * q_dim,
+                    q_dim,
+                );
+            }
+
+            stage_end(attn_t0, ctx, &BD_ATTN_PERITEM_US);
+        } else {
+            // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
+            B::split_qkv(
+                ctx,
+                &self.scratch.qkv_out,
+                &mut self.scratch.q_buf,
+                &mut self.scratch.k_buf,
+                &mut self.scratch.v_buf,
+                m,
+                q_dim,
+                kv_dim,
             );
 
-            // Untranspose head-major → token-major: for tokens=1 the
-            // layouts are byte-identical, so copy_slice straight into
-            // attn_flat at the per-item offset (saves a transpose).
-            B::copy_slice(
-                ctx,
-                attn_hm_single_mut,
-                0,
-                &mut self.scratch.attn_flat,
-                i * q_dim,
-                q_dim,
-            );
-        }
+            // 4-6. Per-item loop: rope + kv_append + attention.
+            //      Each item has its own cache_id + pos + kv_len.
+            let q_single = self
+                .scratch
+                .q_single
+                .as_ref()
+                .expect("q_single missing — enable_batched_decode_scratch not called")
+                as *const B::Buffer;
+            let k_single =
+                self.scratch.k_single.as_ref().expect("k_single missing") as *const B::Buffer;
+            let v_single =
+                self.scratch.v_single.as_ref().expect("v_single missing") as *const B::Buffer;
+            let q_hm_single =
+                self.scratch
+                    .q_head_major_single
+                    .as_mut()
+                    .expect("q_head_major_single missing") as *mut B::Buffer;
+            let k_hm_single =
+                self.scratch
+                    .k_head_major_single
+                    .as_mut()
+                    .expect("k_head_major_single missing") as *mut B::Buffer;
+            let v_hm_single =
+                self.scratch
+                    .v_head_major_single
+                    .as_mut()
+                    .expect("v_head_major_single missing") as *mut B::Buffer;
+            let attn_hm_single =
+                self.scratch
+                    .attn_head_major_single
+                    .as_mut()
+                    .expect("attn_head_major_single missing") as *mut B::Buffer;
+            // SAFETY: each Option holds a stable B::Buffer; we don't mutate
+            // self.scratch in a way that would invalidate them inside the loop
+            // (the kv_caches mutation is on a disjoint field).
+
+            // End of dense block (rms_norm + qkv_proj + split_qkv); start
+            // per-item attention loop instrumentation.
+            stage_end(dense_t0, ctx, &BD_DENSE_US);
+            let attn_t0 = stage_t0();
+
+            for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
+                let pos_i = *pos as usize;
+
+                // SAFETY: borrows of disjoint scratch fields, see above.
+                let q_single_ref = unsafe { &*q_single };
+                let k_single_ref = unsafe { &*k_single };
+                let v_single_ref = unsafe { &*v_single };
+                let q_hm_single_mut = unsafe { &mut *q_hm_single };
+                let k_hm_single_mut = unsafe { &mut *k_hm_single };
+                let v_hm_single_mut = unsafe { &mut *v_hm_single };
+                let attn_hm_single_mut = unsafe { &mut *attn_hm_single };
+
+                // Extract item i's Q/K/V slice from the batched buffers.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.q_buf,
+                    i * q_dim,
+                    // copy_slice signature wants &mut for dst, but q_single
+                    // is shared; we need a *mut variant — since enable_*
+                    // gives us Option, we can do as_mut() here.
+                    self.scratch.q_single.as_mut().unwrap(),
+                    0,
+                    q_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.k_buf,
+                    i * kv_dim,
+                    self.scratch.k_single.as_mut().unwrap(),
+                    0,
+                    kv_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.v_buf,
+                    i * kv_dim,
+                    self.scratch.v_single.as_mut().unwrap(),
+                    0,
+                    kv_dim,
+                );
+
+                // qk_norm_rope with tokens=1, per-item pos.
+                B::qk_norm_rope(
+                    ctx,
+                    q_single_ref,
+                    q_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    q_hm_single_mut,
+                    1,
+                    nh,
+                    hd,
+                    pos_i,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    k_single_ref,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    k_hm_single_mut,
+                    1,
+                    nkv,
+                    hd,
+                    pos_i,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    v_single_ref,
+                    dummy_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    v_hm_single_mut,
+                    1,
+                    nkv,
+                    hd,
+                    pos_i,
+                    eps,
+                    0,
+                );
+
+                // KV append + attention for item i's cache.
+                let caches = self
+                    .kv_caches
+                    .get_mut(cache_id)
+                    .expect("ensure_kv must be called before forward_layer_batched");
+                let cache = &mut caches[li];
+                B::kv_cache_append_head_major(
+                    ctx,
+                    &mut cache.k,
+                    &mut cache.v,
+                    cache.len,
+                    cache.capacity,
+                    k_hm_single_mut,
+                    v_hm_single_mut,
+                    1,
+                    nkv,
+                    hd,
+                );
+                cache.len += 1;
+                let kv_len = cache.len;
+                let kv_stride = cache.capacity;
+
+                let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                    num_heads: nh,
+                    num_kv_heads: nkv,
+                    head_dim: hd,
+                    causal: true,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                    kv_seq_stride: kv_stride,
+                    sliding_window: cfg_base.sliding_window,
+                };
+                B::flash_attention(
+                    ctx,
+                    q_hm_single_mut,
+                    &cache.k,
+                    &cache.v,
+                    attn_hm_single_mut,
+                    1,
+                    1,
+                    kv_len,
+                    pos_i,
+                    &attn_cfg,
+                );
+
+                // Untranspose head-major → token-major: for tokens=1 the
+                // layouts are byte-identical, so copy_slice straight into
+                // attn_flat at the per-item offset (saves a transpose).
+                B::copy_slice(
+                    ctx,
+                    attn_hm_single_mut,
+                    0,
+                    &mut self.scratch.attn_flat,
+                    i * q_dim,
+                    q_dim,
+                );
+            }
+
+            // End of per-item attention loop.
+            stage_end(attn_t0, ctx, &BD_ATTN_PERITEM_US);
+        } // end of `else` for non-paged path
+
+        let post_attn_t0 = stage_t0();
 
         // 7. o_proj GEMM at m=M: attn_flat [M, Q] → o_proj_out [M, H]
         attn_layer.o_proj.forward(
@@ -1598,6 +2099,10 @@ impl<B: Backend> Qwen3MoeModel<B> {
             m,
             h,
         );
+
+        // o_proj + post-norm count under DENSE.
+        stage_end(post_attn_t0, ctx, &BD_DENSE_US);
+        let moe_t0 = stage_t0();
 
         // 9. Router gemv: norm_out [M, H] → router_logits [M, n_exp]
         let moe_layer = &self.moe_layers[li];
@@ -1631,21 +2136,72 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let stacked_path_available = moe_layer.experts.gate_stacked.is_some()
             && moe_layer.experts.up_stacked.is_some()
             && moe_layer.experts.down_stacked.is_some();
-        // Hybrid MoE dispatch: at low M (≤7) the per-item stacked-decode
-        // kernels have lower per-token overhead than the prefill-batched
-        // GEMM (which pays the GPU bucketing + indirect-dispatch setup
-        // regardless of M). At high M (≥8) the bucketing amortises and
-        // the one big mul_mm_id beats M sequential gemvs.
+        // MoE FFN dispatch tiers (m = batch size of this layer call):
         //
-        // Threshold tunable via FERRUM_MOE_BATCH_THRESHOLD; default 8.
-        let moe_batch_threshold: usize = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
+        //   m = 1          : `moe_forward_stacked_decode_impl`
+        //                    (decode m=1 fast path, fused gate+up+silu)
+        //   m ≥ 8 (default): `moe_forward_batched_prefill_impl`
+        //                    (GEMM with simdgroup_matmul + GPU bucketing)
+        //   else (m=2..7)  : per-item stacked decode loop
+        //
+        // EXPERIMENTAL — opt-in `FERRUM_MOE_BATCHED_DECODE=1` engages the
+        // new `moe_forward_batched_decode_impl` for 2 ≤ m < 32. The
+        // kernel itself is bitwise correct and ports llama.cpp's
+        // `kernel_mul_mv_id` strategy to ferrum (one indirect-dispatch
+        // GEMV per linear covering all m*top_k pairs). Empirically OFF
+        // by default because the existing `forward_layer_batched_decode`
+        // attention plumbing (per-item copy_slice × m × 6 dispatches)
+        // scales linearly with m and overshadows the FFN savings —
+        // regression measured at -19% (c=4) and -36% (c=16) on
+        // Qwen3-30B-A3B Q4_K_M / M1 Max. Closing that gap requires a
+        // batched attention path with offset-aware QKV slicing, which
+        // is the next PR's job. Until then the kernel sits as
+        // infrastructure.
+        // Two independent thresholds:
+        //   * `FERRUM_MOE_BATCH_THRESHOLD` (default 8) — m above which
+        //     the LEGACY non-experimental path uses the prefill GEMM.
+        //     Shared with `decode_batch`'s engine-level gate, so users
+        //     who set it to a small value to engage batched decode
+        //     don't accidentally also push the inner FFN to GEMM.
+        //   * `FERRUM_MOE_PREFILL_THRESHOLD` (default 32) — m above
+        //     which the EXPERIMENTAL batched-decode path defers to the
+        //     prefill GEMM path. Mirrors llama.cpp's `ne21_mm_id_min=32`
+        //     GEMV→GEMM boundary.
+        let legacy_prefill_threshold: usize = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);
-        let use_prefill_batched = stacked_path_available && m >= moe_batch_threshold;
+        let new_prefill_threshold: usize = std::env::var("FERRUM_MOE_PREFILL_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+        let new_batched_enabled = stacked_path_available
+            && B::supports_batched_moe_gemv()
+            && std::env::var("FERRUM_MOE_BATCHED_DECODE").as_deref() == Ok("1");
+
+        // When the new path is opted in, it owns the m=2..new_prefill_threshold
+        // range; the legacy threshold is overridden upward.
+        let use_prefill_batched = if new_batched_enabled {
+            stacked_path_available && m >= new_prefill_threshold
+        } else {
+            stacked_path_available && m >= legacy_prefill_threshold
+        };
+        let use_batched_decode = new_batched_enabled && !use_prefill_batched && m >= 2;
 
         if use_prefill_batched {
             moe_forward_batched_prefill_impl::<B>(
+                ctx,
+                moe_layer,
+                &mut self.scratch,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts_per_tok,
+                self.cfg.num_experts,
+                self.cfg.norm_topk_prob,
+                m,
+            )?;
+        } else if use_batched_decode {
+            moe_forward_batched_decode_impl::<B>(
                 ctx,
                 moe_layer,
                 &mut self.scratch,
@@ -1858,6 +2414,9 @@ impl<B: Backend> Qwen3MoeModel<B> {
         // 11. residual += moe_out [M, H]
         B::add_inplace(ctx, residual, &self.scratch.moe_out, m * h);
 
+        // Close MoE-block instrumentation (router + FFN + residual add).
+        stage_end(moe_t0, ctx, &BD_MOE_US);
+
         Ok(())
     }
 }
@@ -1923,19 +2482,15 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
     // batched path engages only at M ≥ FERRUM_MOE_BATCH_THRESHOLD
     // (default 12). Below that we still go per-item.
     //
-    // 30B-A3B Q4_K_M / M1 Max (FERRUM_KV_CAPACITY=512, max_tokens=64):
-    //
-    //   c | per-item | batched (default 12) | llama.cpp
-    //   --|---------:|---------------------:|----------:
-    //   1 |    43.7  |       43.7 (m=1 fast)|     50.6
-    //   4 |    46.6  |       46.6 (per-item)|     63.0
-    //   8 |    49.2  |       49.2 (per-item)|     74.4
-    //  16 |    44.6  |       51.3 (batched) |     95.4
-    //
-    // The c=16 win is real (+15% over per-item) but ferrum is still
-    // ~50% of llama.cpp on this model. Closing that gap requires Metal
-    // MoE GEMM kernel work (offset-aware `gemv_quant_moe_id` to skip
-    // copy_slices, plus a competitive `mul_mm_id` rewrite).
+    // Empirical note 2026-05-02: a follow-up PR added a batched MoE
+    // GEMV kernel (`gemv_quant_moe_id_batched`) that holds MoE
+    // dispatch count flat as concurrency scales. Wiring it through
+    // `decode_batch_internal` regressed throughput by 19% (c=4) /
+    // 36% (c=16) — `forward_layer_batched_decode`'s per-item
+    // attention plumbing (copy_slice × m × 6 dispatches) costs more
+    // than the MoE save. The batched MoE kernel is shipped as opt-in
+    // infrastructure (`FERRUM_MOE_BATCHED_DECODE=1`); flipping it on
+    // by default has to wait until the attention plumbing is fixed.
     fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
         let m = batch.len();
         let opted_in = std::env::var("FERRUM_MOE_BATCHED").as_deref() == Ok("1");
@@ -1958,7 +2513,25 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
         B::sync(&mut ctx);
         B::reset_graph(&mut ctx);
         B::sync(&mut ctx);
-        if let Some(caches) = self.kv_caches.remove(cache_id) {
+        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
+            // Paged mode: return the cache_id's blocks to the shared
+            // allocator so other sequences can reuse them. Without this,
+            // every request consumes max_blocks_per_seq blocks
+            // permanently — pool exhausts after FERRUM_PAGED_MAX_SEQS
+            // requests and subsequent ensure_kv panics with
+            // "scratch residual missing" (the cascade panic from a
+            // failed ensure_kv path leaving scratch poisoned).
+            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(c0) = caches.first() {
+                    if !c0.paged_block_indices.is_empty() {
+                        alloc.free(&c0.paged_block_indices);
+                    }
+                }
+                for c in caches.iter_mut() {
+                    c.paged_block_indices.clear();
+                }
+            }
             self.kv_free_pool.push(caches);
         }
     }
@@ -2060,47 +2633,79 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
         // ids_buf and weights_buf populated by the GPU router above —
         // no host writes needed here in the decode path.
 
-        // 1. Batched gate gemv — broadcast input across top_k slots.
-        //    src1 = norm_out (which has hidden floats at offset 0),
-        //    src1_stride=0 → all slots read the same row.
-        let t0 = stage_t0();
-        B::gemv_quant_moe_id(
-            ctx,
-            &scratch.norm_out,
-            gate_stacked,
-            &scratch.ids_buf,
-            &mut scratch.gate_out_stacked,
-            top_k,
-            0, // broadcast
-        )?;
-        stage_end(t0, ctx, &DEC_GATE_US);
+        // Fused-vs-unfused gate+up+silu selection.
+        //
+        // Default: when the backend advertises support (Metal Q4KExperts),
+        // run the single fused dispatch — saves 2 dispatches and the
+        // entire round-trip through gate_out_stacked / up_out_stacked
+        // scratch (≈4× [top_k, ffn] of intermediate bandwidth).
+        //
+        // Opt-out: `FERRUM_MOE_FUSED_GATE_UP_SILU=0` forces the legacy
+        // 3-dispatch path. Used for A/B benchmarking and as a kill switch
+        // if the fused kernel ever produces divergent outputs.
+        // Cache the env-flag read once per process — the decode hot
+        // path calls this fn ~48 layers × ~steps_per_run times.
+        static FUSED_DISABLED: OnceLock<bool> = OnceLock::new();
+        let fused_disabled = *FUSED_DISABLED
+            .get_or_init(|| std::env::var("FERRUM_MOE_FUSED_GATE_UP_SILU").as_deref() == Ok("0"));
+        let use_fused = B::supports_fused_moe_gate_up_silu() && !fused_disabled;
 
-        // 2. Batched up gemv — also broadcast.
-        let t0 = stage_t0();
-        B::gemv_quant_moe_id(
-            ctx,
-            &scratch.norm_out,
-            up_stacked,
-            &scratch.ids_buf,
-            &mut scratch.up_out_stacked,
-            top_k,
-            0,
-        )?;
-        stage_end(t0, ctx, &DEC_UP_US);
+        if use_fused {
+            // 1+2+3 fused: silu_stacked = SiLU(gate · norm_out) * (up · norm_out)
+            let t0 = stage_t0();
+            B::gemv_quant_moe_id_gate_up_silu(
+                ctx,
+                &scratch.norm_out,
+                gate_stacked,
+                up_stacked,
+                &scratch.ids_buf,
+                &mut scratch.silu_stacked,
+                top_k,
+            )?;
+            stage_end(t0, ctx, &DEC_SILU_US);
+        } else {
+            // 1. Batched gate gemv — broadcast input across top_k slots.
+            //    src1 = norm_out (which has hidden floats at offset 0),
+            //    src1_stride=0 → all slots read the same row.
+            let t0 = stage_t0();
+            B::gemv_quant_moe_id(
+                ctx,
+                &scratch.norm_out,
+                gate_stacked,
+                &scratch.ids_buf,
+                &mut scratch.gate_out_stacked,
+                top_k,
+                0, // broadcast
+            )?;
+            stage_end(t0, ctx, &DEC_GATE_US);
 
-        // 3. Stacked SiLU·gate → silu_stacked. Single dispatch covers
-        //    all top_k slots — replaces the per-slot loop's
-        //    (3 copy_slice + 1 silu_mul) × 8 = 32 dispatches.
-        let t0 = stage_t0();
-        B::silu_mul_stacked(
-            ctx,
-            &scratch.gate_out_stacked,
-            &scratch.up_out_stacked,
-            &mut scratch.silu_stacked,
-            top_k,
-            inter,
-        )?;
-        stage_end(t0, ctx, &DEC_SILU_US);
+            // 2. Batched up gemv — also broadcast.
+            let t0 = stage_t0();
+            B::gemv_quant_moe_id(
+                ctx,
+                &scratch.norm_out,
+                up_stacked,
+                &scratch.ids_buf,
+                &mut scratch.up_out_stacked,
+                top_k,
+                0,
+            )?;
+            stage_end(t0, ctx, &DEC_UP_US);
+
+            // 3. Stacked SiLU·gate → silu_stacked. Single dispatch covers
+            //    all top_k slots — replaces the per-slot loop's
+            //    (3 copy_slice + 1 silu_mul) × 8 = 32 dispatches.
+            let t0 = stage_t0();
+            B::silu_mul_stacked(
+                ctx,
+                &scratch.gate_out_stacked,
+                &scratch.up_out_stacked,
+                &mut scratch.silu_stacked,
+                top_k,
+                inter,
+            )?;
+            stage_end(t0, ctx, &DEC_SILU_US);
+        }
 
         // 4. Batched down gemv — per-slot input via src1_stride = inter.
         //    silu_stacked[k * inter ..] is the activation row for slot k.
@@ -2399,6 +3004,173 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
         h,
     )?;
     stage_end(t0, ctx, &MOE_PREFILL_WSUM_US, &MOE_PREFILL_WSUM_CALLS);
+
+    Ok(())
+}
+
+/// Batched MoE FFN for the **small-m decode** range (typically c=2..32).
+///
+/// Mirrors llama.cpp's `kernel_mul_mv_id` strategy: hold the dispatch
+/// count flat as concurrency scales by emitting **one** batched GEMV
+/// per linear (gate / up / down) that covers all `m * top_k`
+/// (token, expert) pairs in a single Metal launch. Replaces the
+/// per-token outer loop in `forward_layer` (which emitted ~5
+/// dispatches × m tokens per layer) with a fixed-shape pipeline.
+///
+/// Compared to [`moe_forward_batched_prefill_impl`]:
+///   * no `compute_ids_tpe_gpu` bucketing kernel (the new pair-indexed
+///     GEMV reads `selected_ids_buf` directly)
+///   * uses GEMV not GEMM (better tile utilisation when tokens-per-expert
+///     is small — at c=16 with top_k=8 each expert sees ~1-3 token rows,
+///     well below the simdgroup_matmul tile width)
+///   * fewer Metal dispatches per layer (5: route + 3 gemv + silu + wsum)
+///
+/// Per-layer dispatch budget: 5 (independent of m). At c=16 / 48 layers
+/// that's 240 dispatches per decode step vs the per-token loop's ~3,840.
+#[allow(clippy::too_many_arguments)]
+fn moe_forward_batched_decode_impl<B: Backend>(
+    ctx: &mut B::Context,
+    moe_layer: &Qwen3MoeLayerState<B>,
+    scratch: &mut Qwen3MoeScratch<B>,
+    h: usize,
+    inter: usize,
+    top_k: usize,
+    n_exp: usize,
+    norm_topk_prob: bool,
+    tokens: usize,
+) -> Result<()> {
+    let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+    let stage_t0 = || -> Option<std::time::Instant> {
+        if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    };
+    let stage_end = |t0: Option<std::time::Instant>, ctx: &mut B::Context, c: &AtomicU64| {
+        if let Some(t) = t0 {
+            B::sync(ctx);
+            c.fetch_add(
+                t.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    };
+
+    let total_pairs = tokens * top_k;
+
+    // 1. Single batched router pass — fills selected_ids_buf [m * top_k]
+    //    and weights_2d [m * top_k] in one Metal dispatch.
+    let t0 = stage_t0();
+    B::route_topk_softmax(
+        ctx,
+        &scratch.router_logits,
+        &mut scratch.selected_ids_buf,
+        &mut scratch.weights_2d,
+        tokens,
+        n_exp,
+        top_k,
+        norm_topk_prob,
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_ROUTE_US);
+
+    let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
+    let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
+    let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
+
+    // 2+3+4. Fused gate+up+silu — single Metal dispatch covers all
+    // m*top_k pairs. Falls back to the 3-dispatch sequence on backends
+    // that don't have the fused-batched kernel.
+    if B::supports_batched_moe_gate_up_silu() {
+        let t0 = stage_t0();
+        B::gemv_quant_moe_id_gate_up_silu_batched(
+            ctx,
+            &scratch.norm_out,
+            gate_stacked,
+            up_stacked,
+            &scratch.selected_ids_buf,
+            &mut scratch.silu_stacked,
+            tokens,
+            top_k,
+            h, // outer stride: K floats per token
+            0, // inner stride: 0 (slots within a token broadcast)
+        )?;
+        // Charge the whole fused step to the SiLU bucket — keeps the
+        // profile counter additive with the unfused path's silu line.
+        stage_end(t0, ctx, &MOE_BATCHED_DECODE_SILU_US);
+    } else {
+        // 2. Batched gate gemv — one launch covers all m*top_k pairs.
+        let t0 = stage_t0();
+        B::gemv_quant_moe_id_batched(
+            ctx,
+            &scratch.norm_out,
+            gate_stacked,
+            &scratch.selected_ids_buf,
+            &mut scratch.gate_out_stacked,
+            tokens,
+            top_k,
+            h,
+            0,
+        )?;
+        stage_end(t0, ctx, &MOE_BATCHED_DECODE_GATE_US);
+
+        // 3. Batched up gemv.
+        let t0 = stage_t0();
+        B::gemv_quant_moe_id_batched(
+            ctx,
+            &scratch.norm_out,
+            up_stacked,
+            &scratch.selected_ids_buf,
+            &mut scratch.up_out_stacked,
+            tokens,
+            top_k,
+            h,
+            0,
+        )?;
+        stage_end(t0, ctx, &MOE_BATCHED_DECODE_UP_US);
+
+        // 4. SiLU·gate.
+        let t0 = stage_t0();
+        B::silu_mul_batched(
+            ctx,
+            &scratch.gate_out_stacked,
+            &scratch.up_out_stacked,
+            &mut scratch.silu_stacked,
+            total_pairs,
+            inter,
+        )?;
+        stage_end(t0, ctx, &MOE_BATCHED_DECODE_SILU_US);
+    }
+
+    // 5. Batched down gemv — src1 = silu_stacked [m, top_k, ffn]: each
+    //    pair has its own row, outer = top_k * ffn, inner = ffn.
+    let t0 = stage_t0();
+    B::gemv_quant_moe_id_batched(
+        ctx,
+        &scratch.silu_stacked,
+        down_stacked,
+        &scratch.selected_ids_buf,
+        &mut scratch.down_out_stacked,
+        tokens,
+        top_k,
+        top_k * inter, // outer: top_k * ffn floats per token
+        inter,         // inner: ffn floats per slot
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_DOWN_US);
+
+    // 6. Per-token weighted sum across slots → moe_out [m, h]. Caller
+    //    does residual += moe_out at the end of forward_layer.
+    let t0 = stage_t0();
+    B::weighted_sum_batched(
+        ctx,
+        &scratch.down_out_stacked,
+        &scratch.weights_2d,
+        &mut scratch.moe_out,
+        tokens,
+        top_k,
+        h,
+    )?;
+    stage_end(t0, ctx, &MOE_BATCHED_DECODE_WSUM_US);
 
     Ok(())
 }

@@ -1065,6 +1065,155 @@ impl Backend for MetalBackend {
         )
     }
 
+    fn supports_batched_moe_gemv() -> bool {
+        true
+    }
+
+    fn supports_batched_moe_gate_up_silu() -> bool {
+        true
+    }
+
+    fn gemv_quant_moe_id_gate_up_silu_batched(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        gate_w: &Self::QuantStore,
+        up_w: &Self::QuantStore,
+        ids: &Self::Buffer,
+        silu_out: &mut Self::Buffer,
+        m: usize,
+        top_k: usize,
+        src1_outer_stride: usize,
+        src1_inner_stride: usize,
+    ) -> Result<()> {
+        let (gate_blocks, gate_byte_offset, gate_n_rows, gate_n_cols) = match gate_w {
+            MetalQuantStore::Q4KExperts {
+                blocks,
+                byte_offset,
+                n_rows,
+                n_cols,
+                ..
+            } => (blocks, *byte_offset, *n_rows, *n_cols),
+            _ => {
+                return Err(FerrumError::model(
+                    "gemv_quant_moe_id_gate_up_silu_batched: gate_w must be Q4KExperts".to_string(),
+                ));
+            }
+        };
+        let (up_blocks, up_byte_offset, up_n_rows, up_n_cols) = match up_w {
+            MetalQuantStore::Q4KExperts {
+                blocks,
+                byte_offset,
+                n_rows,
+                n_cols,
+                ..
+            } => (blocks, *byte_offset, *n_rows, *n_cols),
+            _ => {
+                return Err(FerrumError::model(
+                    "gemv_quant_moe_id_gate_up_silu_batched: up_w must be Q4KExperts".to_string(),
+                ));
+            }
+        };
+        if gate_n_rows != up_n_rows || gate_n_cols != up_n_cols {
+            return Err(FerrumError::model(format!(
+                "gemv_quant_moe_id_gate_up_silu_batched: gate/up shape mismatch — \
+                 gate=({gate_n_rows}, {gate_n_cols}) up=({up_n_rows}, {up_n_cols})"
+            )));
+        }
+
+        let a_buf = a.expect_f32("gemv_quant_moe_id_gate_up_silu_batched a");
+        let ids_buf = &ids.raw;
+        let out_buf = silu_out.expect_f32_mut("gemv_quant_moe_id_gate_up_silu_batched silu_out");
+        let enc = ctx.compute_encoder();
+        crate::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
+            &st().pipes.device,
+            enc,
+            a_buf,
+            gate_blocks,
+            gate_byte_offset,
+            up_blocks,
+            up_byte_offset,
+            ids_buf,
+            out_buf,
+            gate_n_rows,
+            gate_n_cols,
+            m,
+            top_k,
+            src1_outer_stride,
+            src1_inner_stride,
+        );
+        Ok(())
+    }
+
+    fn gemv_quant_moe_id_batched(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        ids: &Self::Buffer,
+        out: &mut Self::Buffer,
+        m: usize,
+        top_k: usize,
+        src1_outer_stride: usize,
+        src1_inner_stride: usize,
+    ) -> Result<()> {
+        let a_buf = a.expect_f32("gemv_quant_moe_id_batched a");
+        let ids_buf = &ids.raw;
+        let out_buf = out.expect_f32_mut("gemv_quant_moe_id_batched out");
+        let enc = ctx.compute_encoder();
+        match weight {
+            MetalQuantStore::Q4KExperts {
+                blocks,
+                byte_offset,
+                n_rows,
+                n_cols,
+                ..
+            } => {
+                crate::q4_k_moe_id_gemv_batched::dispatch_gemv_q4k_moe_id_batched_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    *byte_offset,
+                    ids_buf,
+                    out_buf,
+                    *n_rows,
+                    *n_cols,
+                    m,
+                    top_k,
+                    src1_outer_stride,
+                    src1_inner_stride,
+                );
+                Ok(())
+            }
+            MetalQuantStore::Q6KExperts {
+                blocks,
+                byte_offset,
+                n_rows,
+                n_cols,
+                ..
+            } => {
+                crate::q6_k_moe_id_gemv_batched::dispatch_gemv_q6k_moe_id_batched_on_encoder(
+                    &st().pipes.device,
+                    enc,
+                    a_buf,
+                    blocks,
+                    *byte_offset,
+                    ids_buf,
+                    out_buf,
+                    *n_rows,
+                    *n_cols,
+                    m,
+                    top_k,
+                    src1_outer_stride,
+                    src1_inner_stride,
+                );
+                Ok(())
+            }
+            _ => Err(FerrumError::model(
+                "gemv_quant_moe_id_batched: weight must be Q4KExperts or Q6KExperts".to_string(),
+            )),
+        }
+    }
+
     fn gemv_quant_moe_id_offset(
         ctx: &mut Self::Context,
         a: &Self::Buffer,
@@ -1494,6 +1643,75 @@ impl Backend for MetalBackend {
             out_buf,
             n_slots,
             ffn,
+        );
+        Ok(())
+    }
+
+    fn supports_fused_moe_gate_up_silu() -> bool {
+        true
+    }
+
+    fn gemv_quant_moe_id_gate_up_silu(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        gate_w: &Self::QuantStore,
+        up_w: &Self::QuantStore,
+        ids: &Self::Buffer,
+        silu_out: &mut Self::Buffer,
+        n_selected: usize,
+    ) -> Result<()> {
+        let (gate_blocks, gate_byte_offset, gate_n_rows, gate_n_cols) = match gate_w {
+            MetalQuantStore::Q4KExperts {
+                blocks,
+                byte_offset,
+                n_rows,
+                n_cols,
+                ..
+            } => (blocks, *byte_offset, *n_rows, *n_cols),
+            _ => {
+                return Err(FerrumError::model(
+                    "gemv_quant_moe_id_gate_up_silu: gate_w must be Q4KExperts".to_string(),
+                ));
+            }
+        };
+        let (up_blocks, up_byte_offset, up_n_rows, up_n_cols) = match up_w {
+            MetalQuantStore::Q4KExperts {
+                blocks,
+                byte_offset,
+                n_rows,
+                n_cols,
+                ..
+            } => (blocks, *byte_offset, *n_rows, *n_cols),
+            _ => {
+                return Err(FerrumError::model(
+                    "gemv_quant_moe_id_gate_up_silu: up_w must be Q4KExperts".to_string(),
+                ));
+            }
+        };
+        if gate_n_rows != up_n_rows || gate_n_cols != up_n_cols {
+            return Err(FerrumError::model(format!(
+                "gemv_quant_moe_id_gate_up_silu: gate/up shape mismatch — \
+                 gate=({gate_n_rows}, {gate_n_cols}) up=({up_n_rows}, {up_n_cols})"
+            )));
+        }
+
+        let a_buf = a.expect_f32("gemv_quant_moe_id_gate_up_silu a");
+        let ids_buf = &ids.raw;
+        let out_buf = silu_out.expect_f32_mut("gemv_quant_moe_id_gate_up_silu silu_out");
+        let enc = ctx.compute_encoder();
+        crate::q4_k_moe_id_gate_up_silu::dispatch_gemv_q4k_moe_id_gate_up_silu_on_encoder(
+            &st().pipes.device,
+            enc,
+            a_buf,
+            gate_blocks,
+            gate_byte_offset,
+            up_blocks,
+            up_byte_offset,
+            ids_buf,
+            out_buf,
+            gate_n_rows,
+            gate_n_cols,
+            n_selected,
         );
         Ok(())
     }

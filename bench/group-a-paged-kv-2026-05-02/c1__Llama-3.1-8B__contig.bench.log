@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8783  model=Llama-3.1-8B  reqs=8  conc=1  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               8/8
+  wall time:               17.02s
+  request throughput:      0.47 req/s
+  input  token throughput: 7.1 tok/s
+  output token throughput: 30.1 tok/s
+  total input tokens:      121
+  total output tokens:     512
+
+  TTFT  mean  156.07ms  median  138.41ms  p99  216.08ms  max  216.08ms
+  TPOT  mean   31.28ms  median   30.90ms  p99   32.83ms  max   32.85ms
+  ITL   mean   31.28ms  median   30.72ms  p99   33.58ms  max   34.10ms
+  E2E   mean 2127.00ms  median 2137.11ms  p99 2206.95ms  max 2208.32ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-paged-kv-2026-05-02/c1__Llama-3.1-8B__contig.json

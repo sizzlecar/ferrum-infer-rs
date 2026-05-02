@@ -1,0 +1,12 @@
+
+▶ mistralrs Llama-3.1-8B-Q4_K_M
+  ready in 5s
+  out_tok/s=23.6  TPOT_med=390.9  TTFT_med=2366.6
+
+▶ mistralrs Qwen3-8B-Q4_K_M
+  ready in 5s
+  out_tok/s=23.0  TPOT_med=421.2  TTFT_med=3705.4
+
+▶ mistralrs Qwen3-30B-A3B-Q4_K_M
+  ready in 12s
+  out_tok/s=0.0  TPOT_med=nan  TTFT_med=nan

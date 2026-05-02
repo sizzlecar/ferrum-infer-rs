@@ -1,0 +1,14 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:8002  model=default  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               0.01s
+  request throughput:      5581.76 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 0.0 tok/s
+  total input tokens:      0
+  total output tokens:     0
+
+  E2E   mean    2.16ms  median    2.07ms  p99    3.61ms  max    3.63ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/bench/group-a-paged-kv-2026-05-02/regression__Qwen3-30B-A3B-Q4_K_M__mistralrs.json
