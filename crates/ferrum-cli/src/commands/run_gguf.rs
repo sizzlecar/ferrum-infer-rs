@@ -414,21 +414,29 @@ fn run_repl<M: DecoderOnlyLLM>(
     let sampling = SamplingParams::from(cmd);
     let eos_id = infer_eos_token(tokenizer);
     let stdin = io::stdin();
-    let mut user_input = String::new();
+    let mut input_bytes = Vec::new();
 
     loop {
         print!("{} ", "❯".cyan().bold());
         io::stdout().flush().ok();
 
-        user_input.clear();
+        // Read raw bytes then UTF-8-lossy decode. `read_line` into a
+        // `String` aborts on the first invalid byte sequence — that
+        // breaks SSH/iOS terminals that occasionally hand us a partial
+        // multi-byte CJK character or a stray latin-1 byte. Lossy
+        // replaces invalid bytes with U+FFFD instead of erroring;
+        // worst case the user sees one '�' in their prompt and types
+        // the line again.
+        input_bytes.clear();
         let bytes = stdin
             .lock()
-            .read_line(&mut user_input)
+            .read_until(b'\n', &mut input_bytes)
             .map_err(|e| FerrumError::model(format!("REPL stdin: {e}")))?;
         if bytes == 0 {
             println!();
             break;
         }
+        let user_input = String::from_utf8_lossy(&input_bytes).into_owned();
         let line = user_input.trim();
         if line.is_empty() {
             continue;
@@ -830,18 +838,13 @@ fn resolve_backend(s: &str) -> Result<BackendKind> {
 }
 
 fn auto_discover_tokenizer(gguf_path: &PathBuf) -> Option<PathBuf> {
-    let dir = gguf_path.parent()?;
-    if let Some(stem) = gguf_path.file_stem() {
-        let candidate = dir.join(format!("{}.tokenizer.json", stem.to_string_lossy()));
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    let bare = dir.join("tokenizer.json");
-    if bare.is_file() {
-        return Some(bare);
-    }
-    None
+    // Delegate to the shared helper used by `ferrum serve` so the two
+    // paths search the same set of locations. In particular, the shared
+    // helper also checks a sibling `../tokenizers/<bare-stem>.tokenizer.json`
+    // (the `~/ferrum-bench/{models,tokenizers}/` layout) — `run` was
+    // missing that until 0.7.3 and forced users to pass `--tokenizer`
+    // even though `serve` worked on the same gguf.
+    ferrum_models::gguf_engine_loader::auto_discover_tokenizer_path(gguf_path)
 }
 
 fn infer_eos_token(tokenizer: &Tokenizer) -> Option<u32> {
