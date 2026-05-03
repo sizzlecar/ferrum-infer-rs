@@ -91,7 +91,7 @@ vllm_start() {
     --max-num-seqs $MAX_SEQS \
     --max-model-len 4096 \
     --no-enable-prefix-caching \
-    --disable-log-requests \
+    --no-enable-log-requests \
     $quant_args \
     > "$server_log" 2>&1 &
   ENGINE_PID=$!
