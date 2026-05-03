@@ -1073,19 +1073,21 @@ impl Backend for CudaBackend {
     // is already production-grade (112 tok/s on RTX PRO 6000 per pre-v2
     // benchmarks); wiring is a structural concern, not a kernel concern.
 
+    // Trait signature was tightened (`Self::QuantStore` instead of the
+    // historical 8-param `QuantWeights` shape). The CUDA path no longer
+    // dispatches through this entry — INT4 goes through `gemm_gptq +
+    // GptqStore`, k-quants stay on Metal/CPU. Stub kept so the trait
+    // is satisfied and the cuda feature builds on Linux.
     fn gemm_quant(
         _ctx: &mut Self::Context,
         _a: &Self::Buffer,
-        _weights: &QuantWeights<'_, Self>,
+        _weight: &Self::QuantStore,
         _out: &mut Self::Buffer,
         _m: usize,
-        _n: usize,
-        _k: usize,
-        kind: &QuantKind,
     ) -> Result<()> {
-        Err(FerrumError::unsupported(format!(
-            "CudaBackend::gemm_quant({kind:?}) deprecated — use gemm_gptq + GptqStore"
-        )))
+        Err(FerrumError::unsupported(
+            "CudaBackend::gemm_quant deprecated — use gemm_gptq + GptqStore",
+        ))
     }
 
     // ── GPTQ INT4 dispatch (Marlin default; Triton-rs alt via env) ──────
