@@ -207,6 +207,21 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn alloc_u32(n: usize) -> Self::Buffer {
+        // Buffer storage is f16 (2 bytes per element). For n u32 slots
+        // we need n*4 bytes = 2*n f16 elements. The trait default
+        // collapses f32→f16 one-for-one which under-allocates (buffer
+        // is HALF the bytes the kernel expects), causing writes into
+        // un-mapped pool memory and CUDA_ERROR_MISALIGNED_ADDRESS at
+        // sync. Override to allocate the right byte count.
+        let n = n.max(1);
+        with_stream(|stream| {
+            stream
+                .alloc_zeros::<f16>(2 * n)
+                .expect("CudaBackend::alloc_u32: alloc_zeros<f16>")
+        })
+    }
+
     fn write_u32(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
         // CUDA backend's f16 buffer can carry raw bytes; the kernel-side
         // signature reinterprets it as i32* / u32* (e.g. cache_lens,
