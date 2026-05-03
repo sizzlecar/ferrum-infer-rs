@@ -1,0 +1,12 @@
+# v0.2 CUDA bench — engine version pins.
+# Anyone reproducing this bench should pin to these exact versions.
+#
+ferrum=0.7.3                # this repo, `cargo build --release --features cuda`
+vllm=0.20.0                 # `pip install vllm==0.20.0`
+mistralrs=0.8.0             # `cargo install mistralrs-server --version 0.8.0`
+benchmark_serving=vllm@v0.20.0  # vendored from vLLM repo at this tag
+
+# CUDA / driver minimums implied by the pins above:
+cuda>=12.4
+driver>=550
+sm>=80                      # Marlin requires Ampere+; RTX 4090 = sm_89 (Ada)
