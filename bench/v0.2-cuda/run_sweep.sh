@@ -61,10 +61,17 @@ ferrum_start() {
   local model_dir="$MODELS_DIR/$model_tag"
   local server_log="$RESULTS_DIR/ferrum__${model_tag}__server.log"
   echo "  starting ferrum on $model_tag ..." >&2
-  # No paged-KV / max-seqs env vars — those are Metal-only.
-  # ferrum's CUDA path uses its own decode runner config; matches
-  # what `smoke_engines.sh` proved boots cleanly.
+  # FERRUM_KV_CAPACITY: per-sequence KV slot length.
+  # Default 512 is too small for the v0.2 workload — prompts.jsonl
+  # samples ShareGPT prompts up to ~579 tokens (sometimes more once
+  # tokenized) and decode adds another 256-512, so a single request
+  # easily exceeds 512 and panics with "KV cache overflow on layer 0:
+  # would write tokens [0..579) but capacity is 512".
+  # 2048 covers prompt(≤512) + output(≤512) plus headroom; on 4090 with
+  # max_seqs=64 it consumes ~17 GB of KV memory which still leaves
+  # ~6 GB for the 5.7 GB INT4-Marlin weights.
   CUDA_VISIBLE_DEVICES=0 \
+  FERRUM_KV_CAPACITY=2048 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
       > "$server_log" 2>&1 &
