@@ -18,6 +18,42 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
+## Phase 4 (foundation): device-buffer kv_lens + stable scratch (commits `3448269`, `7c15ac7`, `5ef6736`)
+
+Refactor of the batched kernel API to take `&Self::Buffer` for cache_lens
+/ kv_lens (instead of `&[u32]` host slice). Caller writes the device
+buffer via `B::write_u32` before the call. Required for any future
+CUDA-graph capture replay — the kernel-arg buffer addresses must be
+stable across calls.
+
+Hidden bug exposed during testing: CudaBackend was inheriting the
+trait-default no-op `write_u32`. The refactored path read zeros from
+the un-written device buffer → -15% c=16 regression. Fix: override
+`write_u32` in CudaBackend with `cuMemcpyHtoDAsync_v2`.
+
+| | Phase 3 | **Phase 4** | vs Phase 3 | vs vllm |
+|---|---|---|---|---|
+| c=4 INT4 tok/s | 198 | **227** (227/229/225) | **+15%** | 44% (was 38%) |
+| c=4 TPOT_p50 | 14.9 ms | **13.4 ms** | **-10%** | (vllm 6.84) |
+| c=16 INT4 tok/s | 410 | **428** (433/433/419) | +4% | **27%** (was 26%) |
+| c=16 TPOT_p50 | 29.3 ms | **27.9 ms** | -5% | (vllm 8.65) |
+
+The c=4 +15% likely from removing the per-call `alloc_zeros` overhead;
+c=16 was already alloc-overhead-irrelevant so smaller delta. Diag log
+confirms all three batched paths still take effect with the new API:
+```
+[batched-qkr]       first call: m=4 use_batched_qkr=true
+[batched-kv-append] first call: m=4 ok=true
+[batched-attn]      first call: m=4 ok=true
+```
+
+**Cumulative impact since baseline (commit `6112ce3`):**
+- c=4 TPOT_p50: 18.7 ms → **13.4 ms** (-28%)
+- c=4 tok/s: 186 → **227** (+22%)
+- c=16 tok/s: 292 → **428** (**+47%**)
+- c=16 TPOT_p50: 50.7 ms → **27.9 ms** (-45%)
+- c=16 vs vllm: 18% → **27%** (+9 pp)
+
 ## Phase 3: batched kv_cache_append across M caches (commit `60057e0`)
 
 New CUDA kernel `kv_cache_append_batched_per_cache_f16` writes M items'
