@@ -868,14 +868,16 @@ impl Backend for CudaBackend {
                 ctx.batched_scratch_i32_cache_lens.as_mut().unwrap(),
             )
             .map_err(|e| FerrumError::model(format!("memcpy cache_lens: {e}")))?;
-        let cache_ptrs_dev = ctx.batched_scratch_u64_cache.as_ref().unwrap();
-        let cache_lens_dev = ctx.batched_scratch_i32_cache_lens.as_ref().unwrap();
-
+        // Resolve func BEFORE taking immutable refs of ctx.batched_*
+        // so the &mut self in ctx.func() doesn't overlap with the
+        // immutable borrows passed to the launch builder.
         let func = ctx.func(
             "kv_cache_append_batched",
             ptx::KV_CACHE_APPEND,
             "kv_cache_append_batched_per_cache_f16",
         );
+        let cache_ptrs_dev = ctx.batched_scratch_u64_cache.as_ref().unwrap();
+        let cache_lens_dev = ctx.batched_scratch_i32_cache_lens.as_ref().unwrap();
         let m_i32 = m as i32;
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
@@ -988,15 +990,16 @@ impl Backend for CudaBackend {
                 ctx.batched_scratch_i32_kv_lens.as_mut().unwrap(),
             )
             .map_err(|e| FerrumError::model(format!("memcpy kv_lens: {e}")))?;
-        let k_ptrs_dev = ctx.batched_scratch_u64_k.as_ref().unwrap();
-        let v_ptrs_dev = ctx.batched_scratch_u64_v.as_ref().unwrap();
-        let kv_lens_dev = ctx.batched_scratch_i32_kv_lens.as_ref().unwrap();
-
+        // Resolve func before immutable scratch refs (same borrow ordering
+        // as kv_cache_append_batched_per_cache).
         let func = ctx.func(
             "batched_decode_attn",
             ptx::BATCHED_DECODE_ATTENTION,
             "batched_decode_attention_f16",
         );
+        let k_ptrs_dev = ctx.batched_scratch_u64_k.as_ref().unwrap();
+        let v_ptrs_dev = ctx.batched_scratch_u64_v.as_ref().unwrap();
+        let kv_lens_dev = ctx.batched_scratch_i32_kv_lens.as_ref().unwrap();
         let nq_i32 = nq as i32;
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
