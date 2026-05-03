@@ -82,9 +82,13 @@ ok "ferrum built"
 
 # ── 4. vLLM ──────────────────────────────────────────────────────────
 log "[4/8] vLLM ${VLLM_VERSION}"
-pip install --quiet "vllm==${VLLM_VERSION}"
-python -c "import vllm; print('  vllm:', vllm.__version__)"
-ok "vllm installed"
+# `vllm[bench]` extra is required for `vllm bench serve` (it pulls in
+# pandas, which CustomDataset uses to read the JSONL prompt set).
+# Without it, every bench cell dies with `ImportError: Please install
+# vllm[bench] for bench support`.
+pip install --quiet "vllm[bench]==${VLLM_VERSION}"
+python -c "import vllm, pandas; print('  vllm:', vllm.__version__, ' pandas:', pandas.__version__)"
+ok "vllm + bench extras installed"
 
 # ── 5. (mistralrs dropped from v0.2 scope) ───────────────────────────
 log "[5/7] mistralrs skipped (dropped from v0.2 scope)"
