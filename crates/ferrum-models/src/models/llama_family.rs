@@ -2334,6 +2334,24 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
         let use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
 
+        // One-time diagnostic so we can verify in server logs that the
+        // batched qkr path is actually being taken (vs. silently falling
+        // back to the per-item loop). Prints once total per process.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[batched-qkr] first batched_decode call: m={} use_batched_qkr={} (q={:?} k={:?} v={:?})",
+                    m,
+                    use_batched_qkr,
+                    q_batched.as_ref().err().map(|e| e.to_string()),
+                    k_batched.as_ref().err().map(|e| e.to_string()),
+                    v_batched.as_ref().err().map(|e| e.to_string()),
+                );
+            }
+        }
+
         // 5-6. Per-item loop for kv_append + attention.
         //      Each item has its own cache_id + pos + kv_len.
         for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
