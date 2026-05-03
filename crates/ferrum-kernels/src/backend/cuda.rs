@@ -788,6 +788,94 @@ impl Backend for CudaBackend {
         .expect("fused_silu_mul_split launch");
     }
 
+    fn flash_attention_batched_per_cache(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_caches: &[&Self::Buffer],
+        v_caches: &[&Self::Buffer],
+        kv_lens: &[u32],
+        out: &mut Self::Buffer,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        scale: f32,
+        max_valid_kv: usize,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        let m = k_caches.len();
+        if m == 0 {
+            return Ok(());
+        }
+        if v_caches.len() != m || kv_lens.len() != m {
+            return Err(FerrumError::model(
+                "flash_attention_batched_per_cache: k/v/kv_lens length mismatch",
+            ));
+        }
+
+        // Build per-item device pointer arrays + kv_lens.
+        let stream = ctx.stream.clone();
+        let mut k_ptrs_host: Vec<u64> = Vec::with_capacity(m);
+        let mut v_ptrs_host: Vec<u64> = Vec::with_capacity(m);
+        for i in 0..m {
+            let (kp, _) = k_caches[i].device_ptr(&stream);
+            let (vp, _) = v_caches[i].device_ptr(&stream);
+            k_ptrs_host.push(kp);
+            v_ptrs_host.push(vp);
+        }
+        let kv_lens_host: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
+
+        // Tiny per-call allocations (m × 8 + m × 8 + m × 4 = ~m·20 bytes).
+        // Could be hoisted into scratch in a follow-up, but at m≤64 the
+        // alloc overhead is sub-µs each.
+        let mut k_ptrs_dev = stream
+            .alloc_zeros::<u64>(m)
+            .map_err(|e| FerrumError::model(format!("alloc k_ptrs: {e}")))?;
+        let mut v_ptrs_dev = stream
+            .alloc_zeros::<u64>(m)
+            .map_err(|e| FerrumError::model(format!("alloc v_ptrs: {e}")))?;
+        let mut kv_lens_dev = stream
+            .alloc_zeros::<i32>(m)
+            .map_err(|e| FerrumError::model(format!("alloc kv_lens: {e}")))?;
+        stream
+            .memcpy_htod(&k_ptrs_host, &mut k_ptrs_dev)
+            .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
+        stream
+            .memcpy_htod(&v_ptrs_host, &mut v_ptrs_dev)
+            .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
+        stream
+            .memcpy_htod(&kv_lens_host, &mut kv_lens_dev)
+            .map_err(|e| FerrumError::model(format!("memcpy kv_lens: {e}")))?;
+
+        let func = ctx.func(
+            "batched_decode_attn",
+            ptx::BATCHED_DECODE_ATTENTION,
+            "batched_decode_attention",
+        );
+        let nq_i32 = nq as i32;
+        let nkv_i32 = nkv as i32;
+        let hd_i32 = hd as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(q);
+        b.arg(&k_ptrs_dev);
+        b.arg(&v_ptrs_dev);
+        b.arg(out);
+        b.arg(&kv_lens_dev);
+        b.arg(&nq_i32);
+        b.arg(&nkv_i32);
+        b.arg(&hd_i32);
+        b.arg(&scale);
+        let shared_bytes = (max_valid_kv as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (nq as u32, m as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("flash_attn_batched: {e}")))?;
+        Ok(())
+    }
+
     fn qk_norm_rope_batched_per_item(
         ctx: &mut Self::Context,
         input: &Self::Buffer,

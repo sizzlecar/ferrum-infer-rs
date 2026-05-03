@@ -2352,26 +2352,22 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
-        // 5-6. Per-item loop for kv_append + attention.
-        //      Each item has its own cache_id + pos + kv_len.
+        // 5-6. Per-item loop for kv_append (always per-item — per-cache writes)
+        //      and per-item attention when the backend lacks the batched
+        //      flash_attn kernel. Tracks each item's post-append kv_len so
+        //      the optional batched flash_attn after the loop can dispatch
+        //      with one launch.
+        let mut kv_lens_host: Vec<u32> = Vec::with_capacity(m);
         for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
             let pos_i = *pos as usize;
 
             if use_batched_qkr {
                 // Batched qk_norm_rope wrote into q/k/v_normed_batched.
-                // For per-item flash_attention we still need the per-item
-                // single-buffer view (kernel takes &Buffer, not a sliced
-                // view), but we copy from the already-normed batched
-                // buffers — saving the 3 qk_norm_rope dispatches per
-                // item that the fallback below runs.
-                B::copy_slice(
-                    ctx,
-                    &self.scratch.q_normed_batched,
-                    i * q_dim,
-                    &mut self.scratch.q_head_major_single,
-                    0,
-                    q_dim,
-                );
+                // For per-item kv_append we need K/V in the single
+                // buffers that kv_cache_append_head_major expects.
+                // Q copy is deferred — only the per-item flash_attn
+                // fallback below needs it; the batched flash_attn
+                // reads q_normed_batched directly.
                 B::copy_slice(
                     ctx,
                     &self.scratch.k_normed_batched,
@@ -2461,7 +2457,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 );
             }
 
-            // KV append + attention for item i's cache.
+            // KV append for item i's cache.
             let caches = self
                 .kv_caches
                 .get_mut(cache_id)
@@ -2482,44 +2478,148 @@ impl<B: Backend> LlamaFamilyModel<B> {
             cache.len += 1;
             let kv_len = cache.len;
             let kv_stride = cache.capacity;
+            kv_lens_host.push(kv_len as u32);
 
-            let attn_cfg = ferrum_kernels::backend::AttnConfig {
-                num_heads: nh,
-                num_kv_heads: nkv,
-                head_dim: hd,
-                causal: true,
-                scale: 1.0 / (hd as f32).sqrt(),
-                kv_seq_stride: kv_stride,
-                sliding_window: cfg.sliding_window,
-            };
-            B::flash_attention(
-                ctx,
-                &self.scratch.q_head_major_single,
-                &cache.k,
-                &cache.v,
-                &mut self.scratch.attn_head_major_single,
-                1,
-                1,
-                kv_len,
-                pos_i,
-                &attn_cfg,
-            );
+            // Per-item flash_attn ONLY when batched qkr fallback is in
+            // use. Otherwise the batched flash_attn after the loop
+            // covers it in one launch. Q comes from the already-normed
+            // q_head_major_single populated by per-item qk_norm_rope.
+            if !use_batched_qkr {
+                let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                    num_heads: nh,
+                    num_kv_heads: nkv,
+                    head_dim: hd,
+                    causal: true,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                    kv_seq_stride: kv_stride,
+                    sliding_window: cfg.sliding_window,
+                };
+                B::flash_attention(
+                    ctx,
+                    &self.scratch.q_head_major_single,
+                    &cache.k,
+                    &cache.v,
+                    &mut self.scratch.attn_head_major_single,
+                    1,
+                    1,
+                    kv_len,
+                    pos_i,
+                    &attn_cfg,
+                );
+                // For tokens=1 head-major and token-major are
+                // byte-identical, so just copy into the per-item slot
+                // of attn_flat without a transpose dispatch.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.attn_head_major_single,
+                    0,
+                    &mut self.scratch.attn_flat,
+                    i * q_dim,
+                    q_dim,
+                );
+            }
+        }
 
-            // Untranspose head-major → token-major + inject into batched
-            // attn_flat[M, Q]. For tokens=1 the head-major and
-            // token-major layouts are byte-identical (both flat to
-            // [heads * head_dim] = [q_dim] floats), so we skip the
-            // transpose dispatch entirely and copy attn_head_major_single
-            // straight into the per-item slot. Saves 1 dispatch per
-            // batch-item per layer.
-            B::copy_slice(
+        // 7. Batched flash_attention: one launch covers all M items.
+        //    Reads q_normed_batched directly (item-major) and writes
+        //    output straight into attn_flat at [m, q_dim] item-major.
+        //    On Err (backend lacks the batched kernel) we fall through
+        //    to a per-item flash_attn loop that mirrors the original
+        //    code path.
+        if use_batched_qkr {
+            let mut k_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
+            let mut v_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
+            let mut max_kv = 0usize;
+            for (cache_id, _, _) in batch.iter() {
+                let caches = self
+                    .kv_caches
+                    .get(cache_id)
+                    .expect("kv_caches must be present");
+                let cache = &caches[li];
+                k_caches_ref.push(&cache.k);
+                v_caches_ref.push(&cache.v);
+                if cache.len > max_kv {
+                    max_kv = cache.len;
+                }
+            }
+            let scale = 1.0 / (hd as f32).sqrt();
+            let batched_attn_res = B::flash_attention_batched_per_cache(
                 ctx,
-                &self.scratch.attn_head_major_single,
-                0,
+                &self.scratch.q_normed_batched,
+                &k_caches_ref,
+                &v_caches_ref,
+                &kv_lens_host,
                 &mut self.scratch.attn_flat,
-                i * q_dim,
-                q_dim,
+                nh,
+                nkv,
+                hd,
+                scale,
+                max_kv,
             );
+            // One-time diagnostic
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static REPORTED_ATTN: AtomicBool = AtomicBool::new(false);
+                if !REPORTED_ATTN.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[batched-attn] first call: m={} ok={} err={:?}",
+                        m,
+                        batched_attn_res.is_ok(),
+                        batched_attn_res.as_ref().err().map(|e| e.to_string()),
+                    );
+                }
+            }
+            if batched_attn_res.is_err() {
+                // Per-item flash_attn fallback for backends that
+                // implement the batched qkr but not the batched attn.
+                for (i, (cache_id, _, pos)) in batch.iter().enumerate() {
+                    let pos_i = *pos as usize;
+                    // Populate q_head_major_single from the normed Q.
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.q_normed_batched,
+                        i * q_dim,
+                        &mut self.scratch.q_head_major_single,
+                        0,
+                        q_dim,
+                    );
+                    let caches = self
+                        .kv_caches
+                        .get(cache_id)
+                        .expect("kv_caches must be present");
+                    let cache = &caches[li];
+                    let kv_stride = cache.capacity;
+                    let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                        num_heads: nh,
+                        num_kv_heads: nkv,
+                        head_dim: hd,
+                        causal: true,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                        kv_seq_stride: kv_stride,
+                        sliding_window: cfg.sliding_window,
+                    };
+                    B::flash_attention(
+                        ctx,
+                        &self.scratch.q_head_major_single,
+                        &cache.k,
+                        &cache.v,
+                        &mut self.scratch.attn_head_major_single,
+                        1,
+                        1,
+                        cache.len,
+                        pos_i,
+                        &attn_cfg,
+                    );
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.attn_head_major_single,
+                        0,
+                        &mut self.scratch.attn_flat,
+                        i * q_dim,
+                        q_dim,
+                    );
+                }
+            }
         }
 
         self.forward_layer_batched_decode_post_attn(ctx, li, residual, m);

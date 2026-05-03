@@ -1085,6 +1085,41 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
+    /// Batched flash_attention across M decode caches in one launch.
+    /// Replaces the per-item `flash_attention(q_len=1, ...)` × M
+    /// loop in the non-paged batched-decode path.
+    ///
+    /// API takes Vec<&Buffer> for the per-cache K/V buffers (each
+    /// `[nkv, capacity, hd]` head-major) plus host-side `kv_lens`.
+    /// Backends that implement it must extract per-cache device
+    /// pointers, build the device arrays the kernel needs, and launch
+    /// one kernel covering all M items.
+    ///
+    /// `q` layout: [m, nq, hd] item-major (matches the
+    /// `qk_norm_rope_batched_per_item` output for q_len=1).
+    /// `out` layout: [m, nq, hd] item-major — written directly into
+    /// the caller's batched attn_out buffer, no per-item copy needed.
+    ///
+    /// CUDA-only for now (kernel `batched_decode_attention` exists in
+    /// `kernels/batched_decode_attention.cu`).
+    fn flash_attention_batched_per_cache(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_caches: &[&Self::Buffer],
+        _v_caches: &[&Self::Buffer],
+        _kv_lens: &[u32],
+        _out: &mut Self::Buffer,
+        _nq: usize,
+        _nkv: usize,
+        _hd: usize,
+        _scale: f32,
+        _max_valid_kv: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "flash_attention_batched_per_cache not implemented for this backend",
+        ))
+    }
+
     /// Batched per-item-position variant of `qk_norm_rope` for the
     /// non-paged batched-decode path. Each of the `m` items has its own
     /// absolute RoPE position (read from a device i32 buffer of length
