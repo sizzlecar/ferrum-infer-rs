@@ -91,8 +91,9 @@ mistralrs_start() {
   echo "  starting mistralrs on $model_tag ..."
   # Use the `run` (auto loader) subcommand — detects quant from
   # config.json. `plain` doesn't handle GPTQ; we'd need separate
-  # subcommands per quant otherwise.
-  mistralrs-server --port "$PORT" --max-seqs $MAX_SEQS \
+  # subcommands per quant otherwise. Full path because the script
+  # may run in a non-login shell that doesn't have ~/.cargo/bin.
+  /root/.cargo/bin/mistralrs-server --port "$PORT" --max-seqs $MAX_SEQS \
     run -m "$model_dir" \
     > "$server_log" 2>&1 &
   echo $!

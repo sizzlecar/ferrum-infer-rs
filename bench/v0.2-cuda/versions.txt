@@ -2,9 +2,9 @@
 # Anyone reproducing this bench should pin to these exact versions.
 #
 ferrum=0.7.3                # this repo, `cargo build --release --features cuda`
-vllm=0.20.0                 # `pip install vllm==0.20.0`
-mistralrs=0.8.0             # `cargo install mistralrs-server --version 0.8.0`
-benchmark_serving=vllm@v0.20.0  # vendored from vLLM repo at this tag
+vllm=0.10.2                 # downgraded from 0.20: vLLM 0.20's PyTorch is built for CUDA 12.6/12.8 (needs driver ≥555). Pod driver 550 (CUDA 12.4). 0.10.2 is the highest still cu124-compatible.
+mistralrs=0.8.0             # via `cargo install --git https://github.com/EricLBuehler/mistral.rs --tag v0.8.0 mistralrs-server --features cuda` (NOT on crates.io)
+benchmark_serving=vllm-bench-cli  # `vllm bench serve` from the installed vLLM (0.10+ CLI)
 
 # CUDA / driver minimums implied by the pins above:
 cuda>=12.4
