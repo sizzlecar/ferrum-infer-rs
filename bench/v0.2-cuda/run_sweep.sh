@@ -66,7 +66,7 @@ ferrum_start() {
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
       > "$server_log" 2>&1 &
-  echo $!  # ONLY the pid goes to stdout — caller does PID=$(ferrum_start ...)
+  ENGINE_PID=$!
 }
 
 vllm_start() {
@@ -92,7 +92,7 @@ vllm_start() {
     --disable-log-requests \
     $quant_args \
     > "$server_log" 2>&1 &
-  echo $!
+  ENGINE_PID=$!
 }
 
 # mistralrs_start removed in v0.2 scope — see ENGINES list above.
@@ -166,11 +166,15 @@ for engine in "${ENGINES[@]}"; do
     echo " $PAIR — $REMAINING cells remaining"
     echo "════════════════════════════════════════════════════════════"
 
-    # Start server
+    # Start server. We avoid `$(engine_start ...)` capture because
+    # `&` inside $() runs in a subshell — $! is the subshell-local
+    # background PID, and subshell exit can confuse downstream
+    # `kill -0` checks. Use a global ENGINE_PID set by the start fn.
     case "$engine" in
-      ferrum)    PID=$(ferrum_start "$model")    ;;
-      vllm)      PID=$(vllm_start "$model")      ;;
+      ferrum)    ferrum_start "$model"    ;;
+      vllm)      vllm_start "$model"      ;;
     esac
+    PID="$ENGINE_PID"
 
     if ! wait_ready "$PID" >> "$PAIR_LOG" 2>&1; then
       echo "  $PAIR FAILED to come up (see $PAIR_LOG and ${PAIR}__server.log) — skip 12 cells"
