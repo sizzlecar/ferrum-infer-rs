@@ -1085,6 +1085,30 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
+    /// Batched kv_cache_append across M caches in one launch. Each item
+    /// writes its (head-major) K-or-V row into its own cache at offset
+    /// `cache_lens[i]`. Replaces M sequential `kv_cache_append_head_major`
+    /// calls with a single dispatch.
+    ///
+    /// `new_data` layout: `[m, nkv, hd]` item-major (each item's slice
+    /// is contiguous, identical to the `k/v_normed_batched` produced by
+    /// `qk_norm_rope_batched_per_item`).
+    /// `caches`: per-cache `[nkv, capacity, hd]` head-major.
+    fn kv_cache_append_batched_per_cache(
+        _ctx: &mut Self::Context,
+        _caches: &[&Self::Buffer],
+        _new_data: &Self::Buffer,
+        _cache_lens: &[u32],
+        _capacity: usize,
+        _m: usize,
+        _nkv: usize,
+        _hd: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "kv_cache_append_batched_per_cache not implemented for this backend",
+        ))
+    }
+
     /// Batched flash_attention across M decode caches in one launch.
     /// Replaces the per-item `flash_attention(q_len=1, ...)` × M
     /// loop in the non-paged batched-decode path.

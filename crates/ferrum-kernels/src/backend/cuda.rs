@@ -788,6 +788,78 @@ impl Backend for CudaBackend {
         .expect("fused_silu_mul_split launch");
     }
 
+    fn kv_cache_append_batched_per_cache(
+        ctx: &mut Self::Context,
+        caches: &[&Self::Buffer],
+        new_data: &Self::Buffer,
+        cache_lens: &[u32],
+        capacity: usize,
+        m: usize,
+        nkv: usize,
+        hd: usize,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        if m == 0 {
+            return Ok(());
+        }
+        if caches.len() != m || cache_lens.len() != m {
+            return Err(FerrumError::model(
+                "kv_cache_append_batched_per_cache: caches/cache_lens length mismatch",
+            ));
+        }
+
+        let stream = ctx.stream.clone();
+        let mut cache_ptrs_host: Vec<u64> = Vec::with_capacity(m);
+        for i in 0..m {
+            let (cp, _) = caches[i].device_ptr(&stream);
+            cache_ptrs_host.push(cp);
+        }
+        let cache_lens_host: Vec<i32> = cache_lens.iter().map(|&x| x as i32).collect();
+
+        let mut cache_ptrs_dev = stream
+            .alloc_zeros::<u64>(m)
+            .map_err(|e| FerrumError::model(format!("alloc cache_ptrs: {e}")))?;
+        let mut cache_lens_dev = stream
+            .alloc_zeros::<i32>(m)
+            .map_err(|e| FerrumError::model(format!("alloc cache_lens: {e}")))?;
+        stream
+            .memcpy_htod(&cache_ptrs_host, &mut cache_ptrs_dev)
+            .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
+        stream
+            .memcpy_htod(&cache_lens_host, &mut cache_lens_dev)
+            .map_err(|e| FerrumError::model(format!("memcpy cache_lens: {e}")))?;
+
+        let func = ctx.func(
+            "kv_cache_append_batched",
+            ptx::KV_CACHE_APPEND,
+            "kv_cache_append_batched_per_cache_f16",
+        );
+        let m_i32 = m as i32;
+        let nkv_i32 = nkv as i32;
+        let hd_i32 = hd as i32;
+        let capacity_i32 = capacity as i32;
+        let per_item = nkv * hd;
+        let block_dim = 256u32;
+        let grid_x = (per_item as u32 + block_dim - 1) / block_dim;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&cache_ptrs_dev);
+        b.arg(new_data);
+        b.arg(&cache_lens_dev);
+        b.arg(&m_i32);
+        b.arg(&nkv_i32);
+        b.arg(&hd_i32);
+        b.arg(&capacity_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid_x, m as u32, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("kv_cache_append_batched: {e}")))?;
+        Ok(())
+    }
+
     fn flash_attention_batched_per_cache(
         ctx: &mut Self::Context,
         q: &Self::Buffer,

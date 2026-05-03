@@ -2352,22 +2352,93 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
-        // 5-6. Per-item loop for kv_append (always per-item — per-cache writes)
-        //      and per-item attention when the backend lacks the batched
-        //      flash_attn kernel. Tracks each item's post-append kv_len so
-        //      the optional batched flash_attn after the loop can dispatch
-        //      with one launch.
+        // 5. Batched kv_cache_append (when use_batched_qkr is on): one
+        //    launch each for K and V replaces M sequential per-item
+        //    kv_append calls. Reads k/v_normed_batched directly so the
+        //    M K/V copy_slice dispatches into single buffers also go
+        //    away. cache_lens captured BEFORE the bump.
         let mut kv_lens_host: Vec<u32> = Vec::with_capacity(m);
+        let mut batched_kv_append_ok = false;
+        if use_batched_qkr {
+            let mut k_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
+            let mut v_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
+            let mut pre_append_lens: Vec<u32> = Vec::with_capacity(m);
+            let mut capacity_first: usize = 0;
+            for (cache_id, _, _) in batch.iter() {
+                let caches = self
+                    .kv_caches
+                    .get(cache_id)
+                    .expect("kv_caches must be present");
+                let cache = &caches[li];
+                k_caches_ref.push(&cache.k);
+                v_caches_ref.push(&cache.v);
+                pre_append_lens.push(cache.len as u32);
+                if capacity_first == 0 {
+                    capacity_first = cache.capacity;
+                }
+            }
+            let k_append_res = B::kv_cache_append_batched_per_cache(
+                ctx,
+                &k_caches_ref,
+                &self.scratch.k_normed_batched,
+                &pre_append_lens,
+                capacity_first,
+                m,
+                nkv,
+                hd,
+            );
+            let v_append_res = B::kv_cache_append_batched_per_cache(
+                ctx,
+                &v_caches_ref,
+                &self.scratch.v_normed_batched,
+                &pre_append_lens,
+                capacity_first,
+                m,
+                nkv,
+                hd,
+            );
+            batched_kv_append_ok = k_append_res.is_ok() && v_append_res.is_ok();
+            // One-time diag
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static REPORTED_KV: AtomicBool = AtomicBool::new(false);
+                if !REPORTED_KV.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[batched-kv-append] first call: m={} ok={} k_err={:?} v_err={:?}",
+                        m,
+                        batched_kv_append_ok,
+                        k_append_res.as_ref().err().map(|e| e.to_string()),
+                        v_append_res.as_ref().err().map(|e| e.to_string()),
+                    );
+                }
+            }
+            if batched_kv_append_ok {
+                // Bump cache.len for each item; record post-bump kv_lens.
+                for (cache_id, _, _) in batch.iter() {
+                    let caches = self
+                        .kv_caches
+                        .get_mut(cache_id)
+                        .expect("kv_caches must be present");
+                    caches[li].len += 1;
+                    kv_lens_host.push(caches[li].len as u32);
+                }
+            }
+        }
+
+        // 6. Per-item loop: only runs when the batched paths are NOT
+        //    in effect, OR when batched_kv_append failed (Err fallback).
         for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
+            if use_batched_qkr && batched_kv_append_ok {
+                // Already handled by batched kv_append above. Skip
+                // per-item copy + kv_append + per-item flash_attn.
+                continue;
+            }
             let pos_i = *pos as usize;
 
             if use_batched_qkr {
-                // Batched qk_norm_rope wrote into q/k/v_normed_batched.
-                // For per-item kv_append we need K/V in the single
-                // buffers that kv_cache_append_head_major expects.
-                // Q copy is deferred — only the per-item flash_attn
-                // fallback below needs it; the batched flash_attn
-                // reads q_normed_batched directly.
+                // batched_kv_append fallback: still need per-item
+                // copy_slice for K/V into single buffers for the
+                // per-item kv_append below.
                 B::copy_slice(
                     ctx,
                     &self.scratch.k_normed_batched,
