@@ -76,6 +76,15 @@ Implementation details:
   trait API forbids `&` ↔ `&mut` aliasing on the same buffer)
 - New scratch buffer `batch_positions: u32 [max_M]` for per-item RoPE
 
+## MAX_BATCH=32 verification (commit `1ab6ccb`)
+
+`FERRUM_MAX_BATCH=32` env baked into `run_sweep.sh`. Diagnostic
+confirms c=4 now batches at m=4 (`[batched-attn] m=4 ok=true`).
+Throughput at c=4 is unchanged (184 tok/s vs 188 with m=2 batching),
+which **rules out scheduler batch size as the c=4 bottleneck**. The
+c=4 plateau is something else — most likely prefill-decode overlap
+or per-request setup overhead. Tracking as a separate item.
+
 ## Roadmap (ranked by ROI)
 
 Next phases to ship as separate commits, each measured against the
