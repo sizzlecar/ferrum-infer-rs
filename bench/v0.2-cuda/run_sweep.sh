@@ -77,11 +77,16 @@ vllm_start() {
     quant_args="--quantization gptq_marlin"
   fi
   echo "  starting vllm on $model_tag (quant=$precision) ..."
+  # max-model-len 4096: our bench's worst case is prompt 512 +
+  # output 512 = 1024; 4096 leaves headroom. Default model max
+  # (e.g. 131072 for Llama-3.1) demands a 16 GB KV pool by itself,
+  # which doesn't fit on a 24 GB 4090 alongside the weights.
   python3 -m vllm.entrypoints.openai.api_server \
     --model "$model_dir" \
     --port "$PORT" \
     --max-num-seqs $MAX_SEQS \
-    --enable-prefix-caching false \
+    --max-model-len 4096 \
+    --no-enable-prefix-caching \
     --disable-log-requests \
     $quant_args \
     > "$server_log" 2>&1 &

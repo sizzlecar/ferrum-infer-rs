@@ -69,7 +69,7 @@ echo "" | tee -a "$LOG"
 echo "=== vllm 0.20 ===" | tee -a "$LOG"
 CUDA_VISIBLE_DEVICES=0 nohup python3 -m vllm.entrypoints.openai.api_server \
   --model "$M2" --port 9202 --max-num-seqs 4 --quantization gptq_marlin \
-  --no-enable-prefix-caching \
+  --max-model-len 4096 --no-enable-prefix-caching \
   > "$RESULTS_DIR/_smoke_vllm.log" 2>&1 &
 PID=$!
 probe vllm 9202 240 || FAIL=$((FAIL+1))
