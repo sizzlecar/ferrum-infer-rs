@@ -253,6 +253,17 @@ pub struct LlamaFamilyScratch<B: Backend> {
     /// `max_blocks_per_seq` value baked into the stacked block_tables
     /// stride. Set when `paged_batch_block_tables` is allocated.
     pub paged_max_blocks_per_seq: usize,
+    /// Per-item RoPE positions for the batched-decode path (`[max_M]`
+    /// i32 / u32). Written host-side once per batched-decode step from
+    /// each request's `pos` field, read by the batched
+    /// `qk_norm_rope_batched_per_item` CUDA kernel.
+    pub batch_positions: B::Buffer,
+    /// Output buffers for the batched per-item qk_norm_rope kernel.
+    /// Same shape as q_buf / k_buf / v_buf — separate so the kernel
+    /// API can take `&input` and `&mut output` without aliasing.
+    pub q_normed_batched: B::Buffer,
+    pub k_normed_batched: B::Buffer,
+    pub v_normed_batched: B::Buffer,
     /// Last token's hidden state (`[h]`). For prefill this is populated via
     /// `copy_slice(residual, (seq_len-1)*h, ..)`; for decode `residual` already
     /// holds only 1 row so `last_hidden` is unused on that path.
@@ -310,6 +321,10 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             paged_batch_block_tables: None,
             paged_batch_context_lens: None,
             paged_max_blocks_per_seq: 0,
+            batch_positions: B::alloc_u32(t.max(1)),
+            q_normed_batched: B::alloc(t * q_dim),
+            k_normed_batched: B::alloc(t * kv_dim),
+            v_normed_batched: B::alloc(t * kv_dim),
             max_tokens: t,
         }
     }
@@ -2264,80 +2279,169 @@ impl<B: Backend> LlamaFamilyModel<B> {
             kv_dim,
         );
 
-        // 4-6. Per-item loop for rope + kv_append + attention.
+        // 4. Try the batched per-item qk_norm_rope path: one launch
+        //    each for Q/K/V instead of M sequential per-item launches.
+        //    Saves 3*(M-1) qk_norm_rope dispatches per layer (and at
+        //    M=16 with 32 layers that's ~1500 launches, ~10 ms TPOT).
+        //    Backends that don't implement it return Err and we drop
+        //    back into the per-item loop unchanged.
+        let positions_host: Vec<u32> = batch.iter().map(|(_, _, p)| *p as u32).collect();
+        B::write_u32(ctx, &mut self.scratch.batch_positions, &positions_host);
+        let q_batched = B::qk_norm_rope_batched_per_item(
+            ctx,
+            &self.scratch.q_buf,
+            q_norm_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.q_normed_batched,
+            &self.scratch.batch_positions,
+            m,
+            nh,
+            hd,
+            eps,
+            qk_mode,
+        );
+        let k_batched = B::qk_norm_rope_batched_per_item(
+            ctx,
+            &self.scratch.k_buf,
+            k_norm_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.k_normed_batched,
+            &self.scratch.batch_positions,
+            m,
+            nkv,
+            hd,
+            eps,
+            qk_mode,
+        );
+        // V's "qk_norm_rope" runs in mode=0 (transpose-only). For
+        // tokens-per-item=1 in batched decode this is a memcpy — kept
+        // for layout-equivalence with the per-item path. Cheap.
+        let v_batched = B::qk_norm_rope_batched_per_item(
+            ctx,
+            &self.scratch.v_buf,
+            dummy_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.v_normed_batched,
+            &self.scratch.batch_positions,
+            m,
+            nkv,
+            hd,
+            eps,
+            0,
+        );
+        let use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
+
+        // 5-6. Per-item loop for kv_append + attention.
         //      Each item has its own cache_id + pos + kv_len.
         for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
             let pos_i = *pos as usize;
 
-            // Extract item i's Q/K/V from batched buffers.
-            B::copy_slice(
-                ctx,
-                &self.scratch.q_buf,
-                i * q_dim,
-                &mut self.scratch.q_single,
-                0,
-                q_dim,
-            );
-            B::copy_slice(
-                ctx,
-                &self.scratch.k_buf,
-                i * kv_dim,
-                &mut self.scratch.k_single,
-                0,
-                kv_dim,
-            );
-            B::copy_slice(
-                ctx,
-                &self.scratch.v_buf,
-                i * kv_dim,
-                &mut self.scratch.v_single,
-                0,
-                kv_dim,
-            );
+            if use_batched_qkr {
+                // Batched qk_norm_rope wrote into q/k/v_normed_batched.
+                // For per-item flash_attention we still need the per-item
+                // single-buffer view (kernel takes &Buffer, not a sliced
+                // view), but we copy from the already-normed batched
+                // buffers — saving the 3 qk_norm_rope dispatches per
+                // item that the fallback below runs.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.q_normed_batched,
+                    i * q_dim,
+                    &mut self.scratch.q_head_major_single,
+                    0,
+                    q_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.k_normed_batched,
+                    i * kv_dim,
+                    &mut self.scratch.k_head_major_single,
+                    0,
+                    kv_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.v_normed_batched,
+                    i * kv_dim,
+                    &mut self.scratch.v_head_major_single,
+                    0,
+                    kv_dim,
+                );
+            } else {
+                // Fallback: extract item i's Q/K/V then run per-item
+                // qk_norm_rope. Same dispatch budget as before this
+                // commit — used on backends without the batched kernel.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.q_buf,
+                    i * q_dim,
+                    &mut self.scratch.q_single,
+                    0,
+                    q_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.k_buf,
+                    i * kv_dim,
+                    &mut self.scratch.k_single,
+                    0,
+                    kv_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.v_buf,
+                    i * kv_dim,
+                    &mut self.scratch.v_single,
+                    0,
+                    kv_dim,
+                );
 
-            // qk_norm_rope with tokens=1, per-item pos.
-            B::qk_norm_rope(
-                ctx,
-                &self.scratch.q_single,
-                q_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.q_head_major_single,
-                1,
-                nh,
-                hd,
-                pos_i,
-                eps,
-                qk_mode,
-            );
-            B::qk_norm_rope(
-                ctx,
-                &self.scratch.k_single,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.k_head_major_single,
-                1,
-                nkv,
-                hd,
-                pos_i,
-                eps,
-                qk_mode,
-            );
-            B::qk_norm_rope(
-                ctx,
-                &self.scratch.v_single,
-                dummy_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.v_head_major_single,
-                1,
-                nkv,
-                hd,
-                pos_i,
-                eps,
-                0,
-            );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.q_single,
+                    q_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.q_head_major_single,
+                    1,
+                    nh,
+                    hd,
+                    pos_i,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.k_single,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.k_head_major_single,
+                    1,
+                    nkv,
+                    hd,
+                    pos_i,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.v_single,
+                    dummy_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.v_head_major_single,
+                    1,
+                    nkv,
+                    hd,
+                    pos_i,
+                    eps,
+                    0,
+                );
+            }
 
             // KV append + attention for item i's cache.
             let caches = self
