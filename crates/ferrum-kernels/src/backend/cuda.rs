@@ -67,6 +67,21 @@ pub struct CudaState {
     batched_scratch_u64_cache: Option<CudaSlice<u64>>,
     batched_scratch_i32_kv_lens: Option<CudaSlice<i32>>,
     batched_scratch_i32_cache_lens: Option<CudaSlice<i32>>,
+    /// Stable HOST-side staging buffers for the per-item u64/i32 arrays
+    /// fed into the device-side scratch via `stream.memcpy_htod`. The
+    /// memcpy is async and gets recorded in any active CUDA-graph
+    /// capture, which captures the HOST POINTER. If we used a local
+    /// Vec, that Vec drops at function return → captured graph holds a
+    /// dangling host pointer → replay reads garbage → MISALIGNED at
+    /// later kernel. Owning these on the long-lived CudaState keeps
+    /// the host pointers stable, and clearing+re-filling between calls
+    /// updates the contents the captured memcpy reads on each replay.
+    /// Fixed-size arrays (not Vec) avoid the realloc-invalidates-ptr trap.
+    batched_host_k_ptrs: Box<[u64; BATCHED_SCRATCH_CAP]>,
+    batched_host_v_ptrs: Box<[u64; BATCHED_SCRATCH_CAP]>,
+    batched_host_cache_ptrs: Box<[u64; BATCHED_SCRATCH_CAP]>,
+    batched_host_kv_lens: Box<[i32; BATCHED_SCRATCH_CAP]>,
+    batched_host_cache_lens: Box<[i32; BATCHED_SCRATCH_CAP]>,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -204,6 +219,11 @@ impl Backend for CudaBackend {
             batched_scratch_u64_cache: None,
             batched_scratch_i32_kv_lens: None,
             batched_scratch_i32_cache_lens: None,
+            batched_host_k_ptrs: Box::new([0u64; BATCHED_SCRATCH_CAP]),
+            batched_host_v_ptrs: Box::new([0u64; BATCHED_SCRATCH_CAP]),
+            batched_host_cache_ptrs: Box::new([0u64; BATCHED_SCRATCH_CAP]),
+            batched_host_kv_lens: Box::new([0i32; BATCHED_SCRATCH_CAP]),
+            batched_host_cache_lens: Box::new([0i32; BATCHED_SCRATCH_CAP]),
         }
     }
 
@@ -871,19 +891,17 @@ impl Backend for CudaBackend {
         }
 
         let stream = ctx.stream.clone();
-        let mut cache_ptrs_host: Vec<u64> = Vec::with_capacity(m);
-        for i in 0..m {
-            let (cp, _) = caches[i].device_ptr(&stream);
-            cache_ptrs_host.push(cp);
-        }
-
-        // cache_lens is now a device buffer — caller fills it with
-        // write_u32_into BEFORE this call. We only need scratch for
-        // the per-cache pointer array.
         if m > BATCHED_SCRATCH_CAP {
             return Err(FerrumError::model(format!(
                 "kv_cache_append_batched_per_cache: m={m} exceeds BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
             )));
+        }
+        // Write cache device pointers into the STABLE host array
+        // (owned by CudaState — survives across calls so a captured
+        // graph's memcpy_htod can re-read it on replay).
+        for i in 0..m {
+            let (cp, _) = caches[i].device_ptr(&stream);
+            ctx.batched_host_cache_ptrs[i] = cp;
         }
         if ctx.batched_scratch_u64_cache.is_none() {
             ctx.batched_scratch_u64_cache = Some(
@@ -892,9 +910,14 @@ impl Backend for CudaBackend {
                     .map_err(|e| FerrumError::model(format!("alloc cache_ptrs scratch: {e}")))?,
             );
         }
+        // memcpy from stable host buffer (slice of fixed array) into
+        // device scratch. Inside graph capture this records the host
+        // pointer into the graph; the array's address is stable for
+        // process lifetime so replay reads correct data.
+        let host_slice: &[u64] = &ctx.batched_host_cache_ptrs[..m];
         stream
             .memcpy_htod(
-                &cache_ptrs_host,
+                host_slice,
                 ctx.batched_scratch_u64_cache.as_mut().unwrap(),
             )
             .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
@@ -956,22 +979,20 @@ impl Backend for CudaBackend {
         }
 
         let stream = ctx.stream.clone();
-        let mut k_ptrs_host: Vec<u64> = Vec::with_capacity(m);
-        let mut v_ptrs_host: Vec<u64> = Vec::with_capacity(m);
-        for i in 0..m {
-            let (kp, _) = k_caches[i].device_ptr(&stream);
-            let (vp, _) = v_caches[i].device_ptr(&stream);
-            k_ptrs_host.push(kp);
-            v_ptrs_host.push(vp);
-        }
-
-        // kv_lens is now a device buffer — caller fills it before the
-        // call (so the captured graph reads from a stable buffer). We
-        // still cache the per-cache pointer arrays in CudaState scratch.
         if m > BATCHED_SCRATCH_CAP {
             return Err(FerrumError::model(format!(
                 "flash_attention_batched_per_cache: m={m} exceeds BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
             )));
+        }
+        // Use STABLE host buffers (owned by CudaState) for graph-capture
+        // safety. See kv_cache_append_batched_per_cache for the rationale
+        // (Vec drops at fn return → captured memcpy reads dangling host
+        // memory → MISALIGNED at next replay).
+        for i in 0..m {
+            let (kp, _) = k_caches[i].device_ptr(&stream);
+            let (vp, _) = v_caches[i].device_ptr(&stream);
+            ctx.batched_host_k_ptrs[i] = kp;
+            ctx.batched_host_v_ptrs[i] = vp;
         }
         if ctx.batched_scratch_u64_k.is_none() {
             ctx.batched_scratch_u64_k = Some(
@@ -987,15 +1008,17 @@ impl Backend for CudaBackend {
                     .map_err(|e| FerrumError::model(format!("alloc v_ptrs scratch: {e}")))?,
             );
         }
+        let k_host_slice: &[u64] = &ctx.batched_host_k_ptrs[..m];
+        let v_host_slice: &[u64] = &ctx.batched_host_v_ptrs[..m];
         stream
             .memcpy_htod(
-                &k_ptrs_host,
+                k_host_slice,
                 ctx.batched_scratch_u64_k.as_mut().unwrap(),
             )
             .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
         stream
             .memcpy_htod(
-                &v_ptrs_host,
+                v_host_slice,
                 ctx.batched_scratch_u64_v.as_mut().unwrap(),
             )
             .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
