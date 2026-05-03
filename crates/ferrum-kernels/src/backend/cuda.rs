@@ -811,7 +811,7 @@ impl Backend for CudaBackend {
         ctx: &mut Self::Context,
         caches: &[&Self::Buffer],
         new_data: &Self::Buffer,
-        cache_lens: &[u32],
+        cache_lens: &Self::Buffer,
         capacity: usize,
         m: usize,
         nkv: usize,
@@ -821,9 +821,9 @@ impl Backend for CudaBackend {
         if m == 0 {
             return Ok(());
         }
-        if caches.len() != m || cache_lens.len() != m {
+        if caches.len() != m {
             return Err(FerrumError::model(
-                "kv_cache_append_batched_per_cache: caches/cache_lens length mismatch",
+                "kv_cache_append_batched_per_cache: caches length != m",
             ));
         }
 
@@ -833,10 +833,10 @@ impl Backend for CudaBackend {
             let (cp, _) = caches[i].device_ptr(&stream);
             cache_ptrs_host.push(cp);
         }
-        let cache_lens_host: Vec<i32> = cache_lens.iter().map(|&x| x as i32).collect();
 
-        // Use cached scratch buffers (same rationale as
-        // flash_attention_batched_per_cache).
+        // cache_lens is now a device buffer — caller fills it with
+        // write_u32_into BEFORE this call. We only need scratch for
+        // the per-cache pointer array.
         if m > BATCHED_SCRATCH_CAP {
             return Err(FerrumError::model(format!(
                 "kv_cache_append_batched_per_cache: m={m} exceeds BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
@@ -849,35 +849,19 @@ impl Backend for CudaBackend {
                     .map_err(|e| FerrumError::model(format!("alloc cache_ptrs scratch: {e}")))?,
             );
         }
-        if ctx.batched_scratch_i32_cache_lens.is_none() {
-            ctx.batched_scratch_i32_cache_lens = Some(
-                stream
-                    .alloc_zeros::<i32>(BATCHED_SCRATCH_CAP)
-                    .map_err(|e| FerrumError::model(format!("alloc cache_lens scratch: {e}")))?,
-            );
-        }
         stream
             .memcpy_htod(
                 &cache_ptrs_host,
                 ctx.batched_scratch_u64_cache.as_mut().unwrap(),
             )
             .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
-        stream
-            .memcpy_htod(
-                &cache_lens_host,
-                ctx.batched_scratch_i32_cache_lens.as_mut().unwrap(),
-            )
-            .map_err(|e| FerrumError::model(format!("memcpy cache_lens: {e}")))?;
-        // Resolve func BEFORE taking immutable refs of ctx.batched_*
-        // so the &mut self in ctx.func() doesn't overlap with the
-        // immutable borrows passed to the launch builder.
         let func = ctx.func(
             "kv_cache_append_batched",
             ptx::KV_CACHE_APPEND,
             "kv_cache_append_batched_per_cache_f16",
         );
         let cache_ptrs_dev = ctx.batched_scratch_u64_cache.as_ref().unwrap();
-        let cache_lens_dev = ctx.batched_scratch_i32_cache_lens.as_ref().unwrap();
+        let cache_lens_dev = cache_lens;
         let m_i32 = m as i32;
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
@@ -909,7 +893,7 @@ impl Backend for CudaBackend {
         q: &Self::Buffer,
         k_caches: &[&Self::Buffer],
         v_caches: &[&Self::Buffer],
-        kv_lens: &[u32],
+        kv_lens: &Self::Buffer,
         out: &mut Self::Buffer,
         nq: usize,
         nkv: usize,
@@ -922,13 +906,12 @@ impl Backend for CudaBackend {
         if m == 0 {
             return Ok(());
         }
-        if v_caches.len() != m || kv_lens.len() != m {
+        if v_caches.len() != m {
             return Err(FerrumError::model(
-                "flash_attention_batched_per_cache: k/v/kv_lens length mismatch",
+                "flash_attention_batched_per_cache: k/v length mismatch",
             ));
         }
 
-        // Build per-item device pointer arrays + kv_lens.
         let stream = ctx.stream.clone();
         let mut k_ptrs_host: Vec<u64> = Vec::with_capacity(m);
         let mut v_ptrs_host: Vec<u64> = Vec::with_capacity(m);
@@ -938,12 +921,10 @@ impl Backend for CudaBackend {
             k_ptrs_host.push(kp);
             v_ptrs_host.push(vp);
         }
-        let kv_lens_host: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
 
-        // Use cached CudaState scratch buffers so the addresses stay
-        // stable across calls. Required for any future CUDA-graph
-        // capture replay; also saves ~3 alloc_zeros per call (32 layers
-        // × 1 batched_attn × 3 = 96 allocs/token).
+        // kv_lens is now a device buffer — caller fills it before the
+        // call (so the captured graph reads from a stable buffer). We
+        // still cache the per-cache pointer arrays in CudaState scratch.
         if m > BATCHED_SCRATCH_CAP {
             return Err(FerrumError::model(format!(
                 "flash_attention_batched_per_cache: m={m} exceeds BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
@@ -963,15 +944,6 @@ impl Backend for CudaBackend {
                     .map_err(|e| FerrumError::model(format!("alloc v_ptrs scratch: {e}")))?,
             );
         }
-        if ctx.batched_scratch_i32_kv_lens.is_none() {
-            ctx.batched_scratch_i32_kv_lens = Some(
-                stream
-                    .alloc_zeros::<i32>(BATCHED_SCRATCH_CAP)
-                    .map_err(|e| FerrumError::model(format!("alloc kv_lens scratch: {e}")))?,
-            );
-        }
-        // Two-step borrow: do the host→device copies first (need &mut),
-        // then take immutable refs for the kernel-arg builder below.
         stream
             .memcpy_htod(
                 &k_ptrs_host,
@@ -984,14 +956,6 @@ impl Backend for CudaBackend {
                 ctx.batched_scratch_u64_v.as_mut().unwrap(),
             )
             .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
-        stream
-            .memcpy_htod(
-                &kv_lens_host,
-                ctx.batched_scratch_i32_kv_lens.as_mut().unwrap(),
-            )
-            .map_err(|e| FerrumError::model(format!("memcpy kv_lens: {e}")))?;
-        // Resolve func before immutable scratch refs (same borrow ordering
-        // as kv_cache_append_batched_per_cache).
         let func = ctx.func(
             "batched_decode_attn",
             ptx::BATCHED_DECODE_ATTENTION,
@@ -999,7 +963,7 @@ impl Backend for CudaBackend {
         );
         let k_ptrs_dev = ctx.batched_scratch_u64_k.as_ref().unwrap();
         let v_ptrs_dev = ctx.batched_scratch_u64_v.as_ref().unwrap();
-        let kv_lens_dev = ctx.batched_scratch_i32_kv_lens.as_ref().unwrap();
+        let kv_lens_dev = kv_lens;
         let nq_i32 = nq as i32;
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;

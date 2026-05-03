@@ -2393,11 +2393,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     capacity_first = cache.capacity;
                 }
             }
+            // Upload pre_append_lens to scratch.batch_kv_lens_pre device
+            // buffer; trait method now reads from device (graph-friendly).
+            B::write_u32(ctx, &mut self.scratch.batch_kv_lens_pre, &pre_append_lens);
             let k_append_res = B::kv_cache_append_batched_per_cache(
                 ctx,
                 &k_caches_ref,
                 &self.scratch.k_normed_batched,
-                &pre_append_lens,
+                &self.scratch.batch_kv_lens_pre,
                 capacity_first,
                 m,
                 nkv,
@@ -2407,7 +2410,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 ctx,
                 &v_caches_ref,
                 &self.scratch.v_normed_batched,
-                &pre_append_lens,
+                &self.scratch.batch_kv_lens_pre,
                 capacity_first,
                 m,
                 nkv,
@@ -2630,12 +2633,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 }
             }
             let scale = 1.0 / (hd as f32).sqrt();
+            // Upload post-append kv_lens to scratch.batch_kv_lens_post
+            // (graph-friendly device buffer).
+            B::write_u32(ctx, &mut self.scratch.batch_kv_lens_post, &kv_lens_host);
             let batched_attn_res = B::flash_attention_batched_per_cache(
                 ctx,
                 &self.scratch.q_normed_batched,
                 &k_caches_ref,
                 &v_caches_ref,
-                &kv_lens_host,
+                &self.scratch.batch_kv_lens_post,
                 &mut self.scratch.attn_flat,
                 nh,
                 nkv,

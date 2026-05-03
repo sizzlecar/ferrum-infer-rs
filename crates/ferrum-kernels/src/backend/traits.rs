@@ -1087,18 +1087,23 @@ pub trait Backend: Send + Sync + Sized + 'static {
 
     /// Batched kv_cache_append across M caches in one launch. Each item
     /// writes its (head-major) K-or-V row into its own cache at offset
-    /// `cache_lens[i]`. Replaces M sequential `kv_cache_append_head_major`
-    /// calls with a single dispatch.
+    /// read from `cache_lens[i]`. Replaces M sequential
+    /// `kv_cache_append_head_major` calls with a single dispatch.
     ///
     /// `new_data` layout: `[m, nkv, hd]` item-major (each item's slice
     /// is contiguous, identical to the `k/v_normed_batched` produced by
     /// `qk_norm_rope_batched_per_item`).
     /// `caches`: per-cache `[nkv, capacity, hd]` head-major.
+    /// `cache_lens`: device buffer (u32 storage, length ≥ m). Caller
+    /// fills via `B::write_u32_into` BEFORE the call. Required for
+    /// CUDA-graph capture: the kernel reads from this stable device
+    /// buffer, so a captured graph can be replayed with new lens by
+    /// just rewriting the buffer between launches.
     fn kv_cache_append_batched_per_cache(
         _ctx: &mut Self::Context,
         _caches: &[&Self::Buffer],
         _new_data: &Self::Buffer,
-        _cache_lens: &[u32],
+        _cache_lens: &Self::Buffer,
         _capacity: usize,
         _m: usize,
         _nkv: usize,
@@ -1126,12 +1131,14 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ///
     /// CUDA-only for now (kernel `batched_decode_attention` exists in
     /// `kernels/batched_decode_attention.cu`).
+    /// `kv_lens`: device buffer (u32 storage, length ≥ m) — same
+    /// design as `kv_cache_append_batched_per_cache::cache_lens`.
     fn flash_attention_batched_per_cache(
         _ctx: &mut Self::Context,
         _q: &Self::Buffer,
         _k_caches: &[&Self::Buffer],
         _v_caches: &[&Self::Buffer],
-        _kv_lens: &[u32],
+        _kv_lens: &Self::Buffer,
         _out: &mut Self::Buffer,
         _nq: usize,
         _nkv: usize,
