@@ -2,7 +2,9 @@
 
 **Status:** drafted 2026-05-03, not yet executed
 **Target test runner:** RunPod RTX 4090 (24 GB), $0.40/hr, ≤ $10 total
-**Headline goal:** Publish a v0.2 bench report comparing **ferrum vs vLLM vs mistralrs** across **4 model × precision configs × 4 concurrency levels = 48 cells × 3 repeats = 144 runs**, with the same audit-quality rigor as the macOS Group A bench at [`docs/bench/macos-2026-05-02/`](../macos-2026-05-02/).
+**Headline goal:** Publish a v0.2 bench report comparing **ferrum vs vLLM** across **3 model × precision configs × 4 concurrency levels = 24 cells × 3 repeats = 72 runs**, with the same audit-quality rigor as the macOS Group A bench at [`docs/bench/macos-2026-05-02/`](../macos-2026-05-02/).
+
+**Scope cuts (2026-05-03)**: mistralrs and M4 (Qwen3-Coder-30B-A3B GPTQ) dropped — see § 3.1 / § 3.2 for rationale. Original plan was 144 cells; halved.
 
 This doc is the **plan**. The actual run, raw artifacts, and final report will be at `docs/bench/cuda-rtx4090-2026-05-XX/` (date filled in when we kick off).
 
@@ -33,7 +35,7 @@ Non-goal: be the fastest engine on H100 8×. We're pitching **single-GPU 4090 / 
 | Setup + model download | 30-45 min one-time |
 | Buffer (debugging, OOM retries, partial reruns) | ~6 hr |
 
-**Cost target: $5-7 used, $3-5 buffer.** Headroom matters because the first 1-2 hours **will** discover something (vLLM CUDA mismatch, Qwen3-Coder-30B GPTQ doesn't exist, mistralrs panics on MoE again, ...).
+**Cost target: $3-5 used, $2-3 buffer.** With scope cut to 72 cells, expected wall is ~4-5 hr (was 8-12 hr at 144 cells). Headroom remains because the first 1-2 hours **will** discover something — first attempt found 7 separate bugs (cuda trait sig, GPTQ config field name, ferrum local-dir support, mistralrs PATH, vLLM driver compat, ...).
 
 ---
 
@@ -117,13 +119,13 @@ Every minute we spend on the rented box at $0.40/hr is a minute not spent locall
 
 - [ ] `cargo build --release -p ferrum-cli --features cuda` builds on the M1 Max (it cross-compiles the Rust glue; CUDA kernels need an NVCC step that fails locally — that's expected, defer to RunPod). Confirm the **non-CUDA-kernel** parts of the cuda feature compile.
 - [ ] `cargo install vllm` — N/A; vLLM is Python. Verify `pip install vllm==<pin>` resolves on Linux x86_64 + CUDA 12.x.
-- [ ] `cargo install mistralrs-server --version <pin>` — at least lock the version we'll bench so the report is reproducible.
+- [x] ~~`cargo install mistralrs-server`~~ — mistralrs dropped from v0.2 scope.
 
 ### 5.2 Model availability
 
 - [ ] M1: `huggingface-cli download meta-llama/Llama-3.1-8B-Instruct --revision <commit> --token $HF_TOKEN` (gated — confirm token works)
 - [ ] M2: similarly, find a working GPTQ-INT4 pack. Candidates: `hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4`. Verify it loads in vLLM and ferrum locally (CPU loader can at least parse).
-- [ ] **M3 / M4**: Search HF for `Qwen3-30B-A3B-*-GPTQ-Int4` and `Qwen3-Coder-30B-A3B-*-GPTQ-Int4`. If only AWQ exists, decide: switch to AWQ across the board, or drop the cell.
+- [x] **M3**: Verified `Qwen/Qwen3-30B-A3B-GPTQ-Int4` (Qwen-official, 239k dl/mo). ~~M4 dropped from scope~~.
 - [ ] All 4 model IDs frozen in `bench/v0.2-cuda/models.txt` BEFORE renting.
 
 ### 5.3 Bench harness sanity (M1 Max)
@@ -135,10 +137,10 @@ Every minute we spend on the rented box at $0.40/hr is a minute not spent locall
 ### 5.4 Scripts authored locally
 
 `bench/v0.2-cuda/` will hold:
-- `setup.sh` — one-shot, run on rented box first (apt deps, Rust, build ferrum, pip install vllm, cargo install mistralrs, download models to network volume).
-- `run_ferrum.sh` `run_vllm.sh` `run_mistralrs.sh` — single-engine launchers parameterized by `<MODEL_ID> <port>`.
+- `setup.sh` — one-shot, run on rented box first (apt deps, Rust, build ferrum, pip install vllm, parallel `hf download` of 3 models, ShareGPT subset, verify `vllm bench serve` CLI).
+- `smoke_engines.sh` — boots ferrum + vLLM on M2, runs one chat completion each, ~2 min total. **Run before `run_sweep.sh`** to catch integration failures cheaply.
 - `run_cell.sh <engine> <model> <c>` — runs one cell: starts engine if not running, prewarms, calls `benchmark_serving.py`, saves JSON, kills engine.
-- `run_sweep.sh` — outer loop over the matrix, calls `run_cell.sh` 144 times. Skips cells whose output JSON already exists (resume safe).
+- `run_sweep.sh` — outer loop over the matrix, calls `run_cell.sh` 72 times. Skips cells whose output JSON already exists (resume safe).
 - `pull_results.sh` — runs locally; rsync results back from the pod.
 
 All scripts authored and committed BEFORE the pod boots. Mistakes in shell logic at $0.40/hr are real money.
