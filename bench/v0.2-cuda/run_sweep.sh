@@ -27,11 +27,15 @@ RESULTS_DIR="$BENCH_DIR/results"
 MODELS_DIR="${WORKSPACE}/models"
 mkdir -p "$RESULTS_DIR"
 
-# Matrix axes
-ENGINES=(ferrum vllm mistralrs)
-MODEL_ORDER=(M2 M1 M3 M4)         # cheapest blast radius first
+# Matrix axes (v0.2 scope, 2026-05-03):
+#   - mistralrs dropped (PoisonError on MoE, finicky setup, not the
+#     primary target of comparison)
+#   - M4 (Qwen3-Coder-30B-A3B GPTQ) dropped (community pack only)
+ENGINES=(ferrum vllm)
+MODEL_ORDER=(M2 M1 M3)            # cheapest blast radius first (8B INT4 → 8B FP16 → 30B MoE INT4)
 CONCURRENCIES=(1 4 16 32)
 REPEATS=(1 2 3)
+# Total cells: 3 models × 2 engines × 4 c × 3 reps = 72
 
 # Per-pair max-seqs sized for c=32 max + headroom
 MAX_SEQS=64
@@ -84,20 +88,7 @@ vllm_start() {
   echo $!
 }
 
-mistralrs_start() {
-  local model_tag="$1"
-  local model_dir="$MODELS_DIR/$model_tag"
-  local server_log="$RESULTS_DIR/mistralrs__${model_tag}__server.log"
-  echo "  starting mistralrs on $model_tag ..."
-  # Use the `run` (auto loader) subcommand — detects quant from
-  # config.json. `plain` doesn't handle GPTQ; we'd need separate
-  # subcommands per quant otherwise. Full path because the script
-  # may run in a non-login shell that doesn't have ~/.cargo/bin.
-  /root/.cargo/bin/mistralrs-server --port "$PORT" --max-seqs $MAX_SEQS \
-    run -m "$model_dir" \
-    > "$server_log" 2>&1 &
-  echo $!
-}
+# mistralrs_start removed in v0.2 scope — see ENGINES list above.
 
 # Wait for the engine to be ready (up to 5 min). Kill if not up.
 wait_ready() {
@@ -172,7 +163,6 @@ for engine in "${ENGINES[@]}"; do
     case "$engine" in
       ferrum)    PID=$(ferrum_start "$model")    ;;
       vllm)      PID=$(vllm_start "$model")      ;;
-      mistralrs) PID=$(mistralrs_start "$model") ;;
     esac
 
     if ! wait_ready "$PID" >> "$PAIR_LOG" 2>&1; then

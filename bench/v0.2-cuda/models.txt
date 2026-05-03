@@ -2,19 +2,19 @@
 #
 # Format: <tag>|<hf_repo>|<precision>|<approx_disk_size>
 # tag goes in result filenames; hf_repo is the canonical HuggingFace
-# repo to download from (`huggingface-cli download <repo>`); precision
-# is informational only.
+# repo to download from (`hf download <repo>`).
 #
-# Verified on HF as of 2026-05-03:
-#   M1: gated=manual, 9.6M downloads/30d
-#   M2: open, 21k downloads/30d
+# Verified on HF 2026-05-03:
+#   M1: open (unsloth mirror — meta-llama/Llama-3.1 requires per-account
+#       approval which adds a reviewer step we don't need)
+#   M2: open, 21k downloads/30d (hugging-quants AutoGPTQ pack)
 #   M3: open, **official Qwen org**, 239k downloads/30d
-#   M4: open, community pack, 26k downloads/30d (highest GPTQ Int4
-#        Qwen3-Coder-30B I could find; if it ever flakes the
-#        most-used INT4 alt is `cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit`
-#        but that's AWQ not GPTQ — would break the matrix axis.)
 #
-M1|meta-llama/Llama-3.1-8B-Instruct|FP16|16GB
+# v0.2 SCOPE NOTE: M4 (Qwen3-Coder-30B-A3B GPTQ-Int4) was dropped on
+# 2026-05-03. Only available as a community pack (no official Qwen
+# GPTQ); one more variable than necessary for the headline comparison.
+# Add back if/when Qwen ships an official GPTQ for that model.
+#
+M1|unsloth/Meta-Llama-3.1-8B-Instruct|FP16|16GB
 M2|hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4|GPTQ_INT4|5.7GB
 M3|Qwen/Qwen3-30B-A3B-GPTQ-Int4|GPTQ_INT4|17GB
-M4|btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit|GPTQ_INT4|17GB

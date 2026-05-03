@@ -41,22 +41,22 @@ Non-goal: be the fastest engine on H100 8×. We're pitching **single-GPU 4090 / 
 
 ### 3.1 Models × precision
 
-| # | Model | Precision | HF source (target — verify in pre-flight) | On-disk |
+| # | Model | Precision | HF source | On-disk |
 |---|---|---|---|---|
-| M1 | Llama-3.1-8B-Instruct | FP16 | `meta-llama/Llama-3.1-8B-Instruct` (safetensors) | 16 GB |
+| M1 | Llama-3.1-8B-Instruct | FP16 | `unsloth/Meta-Llama-3.1-8B-Instruct` (open mirror — meta-llama/* requires per-account approval) | 16 GB |
 | M2 | Llama-3.1-8B-Instruct | GPTQ-INT4 | `hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4` | 5.7 GB |
-| M3 | Qwen3-30B-A3B | GPTQ-INT4 | `Qwen/Qwen3-30B-A3B-Instruct-2507-GPTQ-Int4` (verify) | 17 GB |
-| M4 | Qwen3-Coder-30B-A3B | GPTQ-INT4 | `Qwen/Qwen3-Coder-30B-A3B-Instruct-GPTQ-Int4` (verify) | 17 GB |
+| M3 | Qwen3-30B-A3B | GPTQ-INT4 | `Qwen/Qwen3-30B-A3B-GPTQ-Int4` (official Qwen org) | 17 GB |
 
-**Pre-flight verification (§ 5)**: M3/M4 GPTQ versions may not exist; if not, the fallback is to AWQ-Int4 the model on-pod (slow) or drop M4 entirely.
+**Out of v0.2 scope**: ~~M4 Qwen3-Coder-30B-A3B~~ — only available as community pack (no official Qwen GPTQ); one variable too many.
 
 ### 3.2 Engines
 
 | # | Engine | Pin | Notes |
 |---|---|---|---|
-| E1 | ferrum | this repo @ v0.7.3+ (`cargo build --release --features cuda`) | Marlin INT4 path; FERRUM_KV_PAGED auto for serve |
-| E2 | vLLM | `vllm==0.7.3` (pin in pre-flight) | Force `--quantization gptq_marlin` for INT4 |
-| E3 | mistralrs | `mistralrs-server` latest stable | Known to PoisonError on Qwen3-MoE GGUF — try GPTQ safetensors path |
+| E1 | ferrum | this repo @ branch `bench/v0.2-cuda` (`cargo build --release --features cuda`) | Marlin INT4 path; paged-KV auto |
+| E2 | vLLM | `vllm==0.20.0` (latest PyPI; **requires CUDA ≥12.6 / driver ≥555** — pick pod accordingly) | `--quantization gptq_marlin` for INT4 |
+
+**Out of v0.2 scope**: ~~mistralrs~~ — PoisonError on MoE (per macOS bench), brittle install path, not the primary point of comparison.
 
 ### 3.3 Workloads
 
@@ -82,10 +82,12 @@ Per-c prompt counts (so the run isn't dominated by head/tail): **`num_prompts = 
 ### 3.5 Cell counting
 
 ```
-4 models × 3 engines × 4 workloads = 48 cells
+3 models × 2 engines × 4 workloads = 24 cells
 × 3 repetitions (for noise floor / median)
-= 144 runs total
+= 72 runs total
 ```
+
+(Was 144 in the original plan; halved by dropping mistralrs + M4.)
 
 **Reporting**: median of 3 (drops the worst run). p50/p95 of TTFT and TPOT come from the per-request distribution **within** each median run — not across runs.
 
