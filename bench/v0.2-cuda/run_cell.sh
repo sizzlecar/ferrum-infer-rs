@@ -76,7 +76,7 @@ timeout 900 vllm bench serve \
   --endpoint /v1/chat/completions \
   --model "$MODEL_ARG" \
   --dataset-name custom \
-  --dataset-path "$BENCH_DIR/prompts.json" \
+  --dataset-path "$BENCH_DIR/prompts.jsonl" \
   --num-prompts "$NUM_PROMPTS" \
   --max-concurrency "$C" \
   --request-rate inf \
