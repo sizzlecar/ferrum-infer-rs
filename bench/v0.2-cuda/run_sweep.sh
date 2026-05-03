@@ -49,7 +49,10 @@ done < "$BENCH_DIR/models.txt"
 PORT=8800
 
 ferrum_start() {
-  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag"
+  # Bash with `set -u` doesn't guarantee left-to-right evaluation of
+  # `local a=… b=…$a` on a single line, so split the dependent vars.
+  local model_tag="$1"
+  local model_dir="$MODELS_DIR/$model_tag"
   local server_log="$RESULTS_DIR/ferrum__${model_tag}__server.log"
   echo "  starting ferrum on $model_tag ..."
   FERRUM_KV_PAGED=1 FERRUM_PAGED_MAX_SEQS=$MAX_SEQS FERRUM_KV_CAPACITY=1024 \
@@ -61,7 +64,9 @@ ferrum_start() {
 }
 
 vllm_start() {
-  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag" precision="${MODEL_PRECISION[$model_tag]}"
+  local model_tag="$1"
+  local model_dir="$MODELS_DIR/$model_tag"
+  local precision="${MODEL_PRECISION[$model_tag]}"
   local server_log="$RESULTS_DIR/vllm__${model_tag}__server.log"
   local quant_args=""
   if [[ "$precision" == "GPTQ_INT4" ]]; then
@@ -80,7 +85,8 @@ vllm_start() {
 }
 
 mistralrs_start() {
-  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag"
+  local model_tag="$1"
+  local model_dir="$MODELS_DIR/$model_tag"
   local server_log="$RESULTS_DIR/mistralrs__${model_tag}__server.log"
   echo "  starting mistralrs on $model_tag ..."
   mistralrs-server --port "$PORT" --max-seqs $MAX_SEQS \
