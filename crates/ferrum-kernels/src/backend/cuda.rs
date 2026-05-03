@@ -884,9 +884,9 @@ impl Backend for CudaBackend {
         let block_dim = 256u32;
         let grid_x = (per_item as u32 + block_dim - 1) / block_dim;
         let mut b = stream.launch_builder(&func);
-        b.arg(&cache_ptrs_dev);
+        b.arg(cache_ptrs_dev);
         b.arg(new_data);
-        b.arg(&cache_lens_dev);
+        b.arg(cache_lens_dev);
         b.arg(&m_i32);
         b.arg(&nkv_i32);
         b.arg(&hd_i32);
@@ -1002,10 +1002,10 @@ impl Backend for CudaBackend {
         let hd_i32 = hd as i32;
         let mut b = stream.launch_builder(&func);
         b.arg(q);
-        b.arg(&k_ptrs_dev);
-        b.arg(&v_ptrs_dev);
+        b.arg(k_ptrs_dev);
+        b.arg(v_ptrs_dev);
         b.arg(out);
-        b.arg(&kv_lens_dev);
+        b.arg(kv_lens_dev);
         b.arg(&nq_i32);
         b.arg(&nkv_i32);
         b.arg(&hd_i32);
