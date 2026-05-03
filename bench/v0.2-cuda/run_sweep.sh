@@ -58,7 +58,7 @@ ferrum_start() {
   local model_tag="$1"
   local model_dir="$MODELS_DIR/$model_tag"
   local server_log="$RESULTS_DIR/ferrum__${model_tag}__server.log"
-  echo "  starting ferrum on $model_tag ..."
+  echo "  starting ferrum on $model_tag ..." >&2
   # No paged-KV / max-seqs env vars — those are Metal-only.
   # ferrum's CUDA path uses its own decode runner config; matches
   # what `smoke_engines.sh` proved boots cleanly.
@@ -66,7 +66,7 @@ ferrum_start() {
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
       > "$server_log" 2>&1 &
-  echo $!
+  echo $!  # ONLY the pid goes to stdout — caller does PID=$(ferrum_start ...)
 }
 
 vllm_start() {
@@ -78,7 +78,7 @@ vllm_start() {
   if [[ "$precision" == "GPTQ_INT4" ]]; then
     quant_args="--quantization gptq_marlin"
   fi
-  echo "  starting vllm on $model_tag (quant=$precision) ..."
+  echo "  starting vllm on $model_tag (quant=$precision) ..." >&2
   # max-model-len 4096: our bench's worst case is prompt 512 +
   # output 512 = 1024; 4096 leaves headroom. Default model max
   # (e.g. 131072 for Llama-3.1) demands a 16 GB KV pool by itself,
