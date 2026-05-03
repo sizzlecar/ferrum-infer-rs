@@ -788,6 +788,52 @@ impl Backend for CudaBackend {
         .expect("fused_silu_mul_split launch");
     }
 
+    fn qk_norm_rope_batched_per_item(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        positions: &Self::Buffer,
+        m: usize,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+        mode: i32,
+    ) -> Result<()> {
+        let func = ctx.func(
+            "qk_norm_rope_batched",
+            ptx::QK_NORM_ROPE,
+            "qk_norm_rope_batched_decode_f16",
+        );
+        let m_i32 = m as i32;
+        let heads_i32 = heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(input);
+        b.arg(norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(output);
+        b.arg(&m_i32);
+        b.arg(&heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(positions);
+        b.arg(&eps);
+        b.arg(&mode);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (m as u32, heads as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qk_norm_rope_batched_per_item: {e}")))?;
+        Ok(())
+    }
+
     fn qk_norm_rope(
         ctx: &mut Self::Context,
         input: &Self::Buffer,

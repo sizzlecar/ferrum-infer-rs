@@ -1085,6 +1085,41 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
+    /// Batched per-item-position variant of `qk_norm_rope` for the
+    /// non-paged batched-decode path. Each of the `m` items has its own
+    /// absolute RoPE position (read from a device i32 buffer of length
+    /// `m`). Layout is item-major in *both* input and output:
+    ///
+    ///   input  [m, heads, head_dim]
+    ///   output [m, heads, head_dim]   (no head-major transpose)
+    ///
+    /// Item-major output keeps the per-item flash_attention slice
+    /// contiguous (`output[i * heads * head_dim ..]` is item i's whole
+    /// Q tensor in head-major-equivalent layout for q_len=1).
+    ///
+    /// Replaces the M sequential single-item launches in the existing
+    /// `forward_layer_batched_decode` path with one batched dispatch.
+    /// CUDA-only for now; other backends fall through to the default
+    /// `unsupported` and the caller falls back to the per-item loop.
+    fn qk_norm_rope_batched_per_item(
+        _ctx: &mut Self::Context,
+        _input: &Self::Buffer,
+        _norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _output: &mut Self::Buffer,
+        _positions: &Self::Buffer,
+        _m: usize,
+        _heads: usize,
+        _head_dim: usize,
+        _eps: f32,
+        _mode: i32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qk_norm_rope_batched_per_item not implemented for this backend",
+        ))
+    }
+
     /// Fused split-QKV + QK-norm + RoPE + head-major transpose.
     ///
     /// Single-dispatch replacement for the (`split_qkv` → 3× `qk_norm_rope`)
