@@ -258,6 +258,19 @@ pub struct LlamaFamilyScratch<B: Backend> {
     /// each request's `pos` field, read by the batched
     /// `qk_norm_rope_batched_per_item` CUDA kernel.
     pub batch_positions: B::Buffer,
+    /// Per-item input token ids for the batched-decode path (`[max_M]`
+    /// u32). Written once per call before forward; read by the
+    /// graph-capture-friendly `embedding_lookup_batched_dyn` variant.
+    pub batch_tokens: B::Buffer,
+    /// Per-item KV-cache length BEFORE this step's kv_append
+    /// (`[max_M]` u32). Used by `kv_cache_append_batched_per_cache_dyn`
+    /// to write at the right slot for graph replay.
+    pub batch_kv_lens_pre: B::Buffer,
+    /// Per-item KV-cache length AFTER this step's kv_append
+    /// (`[max_M]` u32 = pre + 1). Used by
+    /// `flash_attention_batched_per_cache_dyn` for the attention
+    /// reduce window length.
+    pub batch_kv_lens_post: B::Buffer,
     /// Output buffers for the batched per-item qk_norm_rope kernel.
     /// Same shape as q_buf / k_buf / v_buf — separate so the kernel
     /// API can take `&input` and `&mut output` without aliasing.
@@ -322,6 +335,9 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             paged_batch_context_lens: None,
             paged_max_blocks_per_seq: 0,
             batch_positions: B::alloc_u32(t.max(1)),
+            batch_tokens: B::alloc_u32(t.max(1)),
+            batch_kv_lens_pre: B::alloc_u32(t.max(1)),
+            batch_kv_lens_post: B::alloc_u32(t.max(1)),
             q_normed_batched: B::alloc(t * q_dim),
             k_normed_batched: B::alloc(t * kv_dim),
             v_normed_batched: B::alloc(t * kv_dim),

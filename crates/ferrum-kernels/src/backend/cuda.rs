@@ -55,7 +55,21 @@ pub struct CudaState {
     pub use_dev_state: bool,
     /// True between begin_graph_capture and end_graph_capture.
     pub capture_in_flight: bool,
+    /// Stable scratch buffers for batched-decode kernels that take per-item
+    /// device-pointer arrays (flash_attn_batched, kv_cache_append_batched).
+    /// Per-call `alloc_zeros::<T>(m)` was 3 allocs × 32 layers × 3 ops
+    /// = ~96 allocs/token. Caching here saves the allocator overhead AND
+    /// keeps the buffer addresses stable across calls — required so a
+    /// future CUDA-graph capture can replay over them.
+    /// Allocated lazily to `BATCHED_SCRATCH_CAP` (covers max_seqs ≤ 64).
+    batched_scratch_u64_k: Option<CudaSlice<u64>>,
+    batched_scratch_u64_v: Option<CudaSlice<u64>>,
+    batched_scratch_u64_cache: Option<CudaSlice<u64>>,
+    batched_scratch_i32_kv_lens: Option<CudaSlice<i32>>,
+    batched_scratch_i32_cache_lens: Option<CudaSlice<i32>>,
 }
+
+const BATCHED_SCRATCH_CAP: usize = 64;
 
 impl CudaState {
     fn module(&mut self, key: &'static str, ptx_src: &str) -> Arc<CudaModule> {
@@ -185,6 +199,11 @@ impl Backend for CudaBackend {
             modules: HashMap::new(),
             use_dev_state: false,
             capture_in_flight: false,
+            batched_scratch_u64_k: None,
+            batched_scratch_u64_v: None,
+            batched_scratch_u64_cache: None,
+            batched_scratch_i32_kv_lens: None,
+            batched_scratch_i32_cache_lens: None,
         }
     }
 
@@ -816,17 +835,34 @@ impl Backend for CudaBackend {
         }
         let cache_lens_host: Vec<i32> = cache_lens.iter().map(|&x| x as i32).collect();
 
-        let mut cache_ptrs_dev = stream
-            .alloc_zeros::<u64>(m)
-            .map_err(|e| FerrumError::model(format!("alloc cache_ptrs: {e}")))?;
-        let mut cache_lens_dev = stream
-            .alloc_zeros::<i32>(m)
-            .map_err(|e| FerrumError::model(format!("alloc cache_lens: {e}")))?;
+        // Use cached scratch buffers (same rationale as
+        // flash_attention_batched_per_cache).
+        if m > BATCHED_SCRATCH_CAP {
+            return Err(FerrumError::model(format!(
+                "kv_cache_append_batched_per_cache: m={m} exceeds BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
+            )));
+        }
+        if ctx.batched_scratch_u64_cache.is_none() {
+            ctx.batched_scratch_u64_cache = Some(
+                stream
+                    .alloc_zeros::<u64>(BATCHED_SCRATCH_CAP)
+                    .map_err(|e| FerrumError::model(format!("alloc cache_ptrs scratch: {e}")))?,
+            );
+        }
+        if ctx.batched_scratch_i32_cache_lens.is_none() {
+            ctx.batched_scratch_i32_cache_lens = Some(
+                stream
+                    .alloc_zeros::<i32>(BATCHED_SCRATCH_CAP)
+                    .map_err(|e| FerrumError::model(format!("alloc cache_lens scratch: {e}")))?,
+            );
+        }
+        let cache_ptrs_dev = ctx.batched_scratch_u64_cache.as_mut().unwrap();
+        let cache_lens_dev = ctx.batched_scratch_i32_cache_lens.as_mut().unwrap();
         stream
-            .memcpy_htod(&cache_ptrs_host, &mut cache_ptrs_dev)
+            .memcpy_htod(&cache_ptrs_host, cache_ptrs_dev)
             .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
         stream
-            .memcpy_htod(&cache_lens_host, &mut cache_lens_dev)
+            .memcpy_htod(&cache_lens_host, cache_lens_dev)
             .map_err(|e| FerrumError::model(format!("memcpy cache_lens: {e}")))?;
 
         let func = ctx.func(
@@ -896,26 +932,47 @@ impl Backend for CudaBackend {
         }
         let kv_lens_host: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
 
-        // Tiny per-call allocations (m × 8 + m × 8 + m × 4 = ~m·20 bytes).
-        // Could be hoisted into scratch in a follow-up, but at m≤64 the
-        // alloc overhead is sub-µs each.
-        let mut k_ptrs_dev = stream
-            .alloc_zeros::<u64>(m)
-            .map_err(|e| FerrumError::model(format!("alloc k_ptrs: {e}")))?;
-        let mut v_ptrs_dev = stream
-            .alloc_zeros::<u64>(m)
-            .map_err(|e| FerrumError::model(format!("alloc v_ptrs: {e}")))?;
-        let mut kv_lens_dev = stream
-            .alloc_zeros::<i32>(m)
-            .map_err(|e| FerrumError::model(format!("alloc kv_lens: {e}")))?;
+        // Use cached CudaState scratch buffers so the addresses stay
+        // stable across calls. Required for any future CUDA-graph
+        // capture replay; also saves ~3 alloc_zeros per call (32 layers
+        // × 1 batched_attn × 3 = 96 allocs/token).
+        if m > BATCHED_SCRATCH_CAP {
+            return Err(FerrumError::model(format!(
+                "flash_attention_batched_per_cache: m={m} exceeds BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
+            )));
+        }
+        if ctx.batched_scratch_u64_k.is_none() {
+            ctx.batched_scratch_u64_k = Some(
+                stream
+                    .alloc_zeros::<u64>(BATCHED_SCRATCH_CAP)
+                    .map_err(|e| FerrumError::model(format!("alloc k_ptrs scratch: {e}")))?,
+            );
+        }
+        if ctx.batched_scratch_u64_v.is_none() {
+            ctx.batched_scratch_u64_v = Some(
+                stream
+                    .alloc_zeros::<u64>(BATCHED_SCRATCH_CAP)
+                    .map_err(|e| FerrumError::model(format!("alloc v_ptrs scratch: {e}")))?,
+            );
+        }
+        if ctx.batched_scratch_i32_kv_lens.is_none() {
+            ctx.batched_scratch_i32_kv_lens = Some(
+                stream
+                    .alloc_zeros::<i32>(BATCHED_SCRATCH_CAP)
+                    .map_err(|e| FerrumError::model(format!("alloc kv_lens scratch: {e}")))?,
+            );
+        }
+        let k_ptrs_dev = ctx.batched_scratch_u64_k.as_mut().unwrap();
+        let v_ptrs_dev = ctx.batched_scratch_u64_v.as_mut().unwrap();
+        let kv_lens_dev = ctx.batched_scratch_i32_kv_lens.as_mut().unwrap();
         stream
-            .memcpy_htod(&k_ptrs_host, &mut k_ptrs_dev)
+            .memcpy_htod(&k_ptrs_host, k_ptrs_dev)
             .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
         stream
-            .memcpy_htod(&v_ptrs_host, &mut v_ptrs_dev)
+            .memcpy_htod(&v_ptrs_host, v_ptrs_dev)
             .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
         stream
-            .memcpy_htod(&kv_lens_host, &mut kv_lens_dev)
+            .memcpy_htod(&kv_lens_host, kv_lens_dev)
             .map_err(|e| FerrumError::model(format!("memcpy kv_lens: {e}")))?;
 
         let func = ctx.func(
