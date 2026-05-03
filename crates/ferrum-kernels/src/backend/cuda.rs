@@ -849,7 +849,7 @@ impl Backend for CudaBackend {
         let func = ctx.func(
             "batched_decode_attn",
             ptx::BATCHED_DECODE_ATTENTION,
-            "batched_decode_attention",
+            "batched_decode_attention_f16",
         );
         let nq_i32 = nq as i32;
         let nkv_i32 = nkv as i32;
