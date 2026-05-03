@@ -207,6 +207,40 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn write_u32(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
+        // CUDA backend's f16 buffer can carry raw bytes; the kernel-side
+        // signature reinterprets it as i32* / u32* (e.g. cache_lens,
+        // positions). Convert to i32 (kernels read int32) and memcpy_htod.
+        // Trait default is no-op; without this override the device-buffer
+        // batched-decode path reads zeros — observed as a -15% c=16
+        // regression after the API refactor (Phase 4 7c15ac7) until this
+        // override landed.
+        if data.is_empty() {
+            return;
+        }
+        let stream = ctx.stream.clone();
+        let host_i32: Vec<i32> = data.iter().map(|&x| x as i32).collect();
+        // Reinterpret target buffer as &mut CudaSlice<i32>. dst is
+        // CudaSlice<f16>; we use the same underlying bytes (4 bytes per
+        // i32, 2 bytes per f16 → caller must size the buffer with at
+        // least data.len()*2 f16 slots == data.len() i32 slots).
+        // Use the raw cu_stream + cuMemcpyHtoDAsync to avoid the type
+        // mismatch issue.
+        use cudarc::driver::DevicePtrMut;
+        let (dst_ptr, _g) = dst.device_ptr_mut(&stream);
+        unsafe {
+            let st = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst_ptr,
+                host_i32.as_ptr() as *const std::ffi::c_void,
+                host_i32.len() * std::mem::size_of::<i32>(),
+                stream.cu_stream(),
+            );
+            if st != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                eprintln!("write_u32 cuMemcpyHtoDAsync failed: {st:?}");
+            }
+        }
+    }
+
     fn set_decode_state(ctx: &mut Self::Context, token: u32, step: u32) {
         let valid_kv = (step as i32) + 1;
         let step_i = step as i32;
