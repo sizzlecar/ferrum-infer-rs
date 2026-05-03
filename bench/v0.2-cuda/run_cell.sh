@@ -84,6 +84,7 @@ timeout 900 vllm bench serve \
   --top-p 1 \
   --result-dir "$RESULTS_DIR" \
   --result-filename "$CELL.json" \
+  --save-result \
   > "$LOG" 2>&1 || {
     EC=$?
     echo "[$CELL] FAILED (exit=$EC) — see $LOG"
