@@ -179,6 +179,85 @@ fn cudarc_graph_with_many_allocs() {
     eprintln!("[cudarc-repro-heavy] SUCCESS (200 bufs + graph)");
 }
 
+/// Tests captured graph with INTERNAL `stream.memcpy_htod` from a stable
+/// host Box array. Mirrors ferrum's batched_decode capture path:
+/// `flash_attention_batched_per_cache` and `kv_cache_append_batched_per_cache`
+/// each call `stream.memcpy_htod(host_slice, dev_buf)` for cache pointers
+/// + lengths, INSIDE the captured region.
+///
+/// If post-capture replay works (we already verified) but a SECOND
+/// cuGraphLaunch hangs, the captured async memcpy interaction with
+/// repeat-launch is suspect. This isolates that.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CUDA hardware"]
+fn cudarc_graph_internal_memcpy() {
+    eprintln!("[cudarc-internal-memcpy] init");
+    let ctx = CudaContext::new(0).expect("CudaContext::new");
+    unsafe {
+        ctx.disable_event_tracking();
+    }
+    let stream = ctx.new_stream().expect("new_stream");
+
+    let ptx = compile_ptx(TOUCH_PTX).expect("compile_ptx");
+    let module = ctx.load_module(ptx).expect("load_module");
+    let touch = module.load_function("touch").expect("load_function");
+
+    let n: usize = 4096;
+    let mut buf = stream.alloc_zeros::<f32>(n).expect("alloc");
+
+    // Stable host pointer scratch on heap — mirrors ferrum's
+    // `batched_host_cache_ptrs: Box<[u64; 64]>`.
+    let host_ptrs: Box<[u64; 4]> = Box::new([1u64, 2, 3, 4]);
+    let mut device_ptrs = stream.alloc_zeros::<u64>(4).expect("alloc ptrs");
+
+    stream.synchronize().expect("warmup sync");
+
+    let n_i32 = n as i32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (((n + 127) / 128) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Warm-up outside capture.
+    let mut b = stream.launch_builder(&touch);
+    b.arg(&mut buf).arg(&n_i32);
+    unsafe { b.launch(cfg).expect("warmup") };
+    stream.synchronize().expect("warmup sync");
+
+    eprintln!("[cudarc-internal-memcpy] begin capture");
+    stream
+        .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        .expect("begin_capture");
+
+    // INSIDE capture: async memcpy from stable host array to device.
+    let host_slice: &[u64] = &host_ptrs[..4];
+    stream
+        .memcpy_htod(host_slice, &mut device_ptrs)
+        .expect("captured memcpy");
+
+    // INSIDE capture: kernel launch.
+    let mut b = stream.launch_builder(&touch);
+    b.arg(&mut buf).arg(&n_i32);
+    unsafe { b.launch(cfg).expect("captured launch") };
+
+    let graph = stream
+        .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+        .expect("end_capture")
+        .expect("non-null");
+    graph.upload().expect("upload");
+    stream.synchronize().expect("post-upload sync");
+
+    for i in 0..6 {
+        eprintln!("[cudarc-internal-memcpy] cuGraphLaunch #{}", i + 1);
+        let st = unsafe { sys::cuGraphLaunch(graph.cu_graph_exec(), stream.cu_stream()) };
+        assert_eq!(st, sys::CUresult::CUDA_SUCCESS, "launch: {st:?}");
+        stream.synchronize().expect("sync");
+    }
+    eprintln!("[cudarc-internal-memcpy] SUCCESS");
+}
+
 /// Mirrors ferrum's path even more closely — adds:
 /// - cuBLAS handle + 32 MB workspace + DEVICE pointer mode + sgemm inside capture
 /// - multiple different PTX modules loaded dynamically
