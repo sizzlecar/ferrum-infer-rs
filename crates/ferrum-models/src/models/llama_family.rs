@@ -2094,9 +2094,24 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
             self.batched_graph_warmup += 1;
 
+            // Trace mode (env): sync after each major op so that the
+            // first panicking sync localises which kernel/section faulted.
+            // Off by default (adds 32 syncs per token = pipeline serialisation).
+            let trace = std::env::var("FERRUM_BATCHED_TRACE").is_ok();
+            macro_rules! tracesync {
+                ($label:expr) => {
+                    if trace {
+                        B::sync(&mut ctx);
+                        eprintln!("[trace-batched] {}", $label);
+                    }
+                };
+            }
+            tracesync!("entry-after-writes-and-embed");
+
             // Eager forward (records into graph if capture is active).
             for li in 0..num_layers {
                 self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+                tracesync!(format!("after layer {}", li));
             }
             B::rms_norm(
                 &mut ctx,
@@ -2107,6 +2122,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 m,
                 h,
             );
+            tracesync!("after final rms_norm");
             let lm_head = self
                 .lm_head
                 .as_ref()
@@ -2117,6 +2133,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 &mut self.scratch.batch_logits,
                 m,
             );
+            tracesync!("after lm_head");
 
             if should_capture && !self.batched_graph_failed {
                 if B::end_graph_capture(&mut ctx).is_err() {
