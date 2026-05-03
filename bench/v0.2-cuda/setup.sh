@@ -186,7 +186,7 @@ log "writing _env.txt"
   done
   echo
   echo "--- bench harness ---"
-  echo "benchmark_serving.py: vllm-project/vllm@${VLLM_BENCH_TAG}"
+  echo "bench harness: vllm bench serve (CLI from installed vLLM ${VLLM_VERSION})"
   echo "prompts.json: $(jq -r '.count' "$BENCH_DIR/prompts.json") prompts, seed=$(jq -r '.seed' "$BENCH_DIR/prompts.json")"
 } > "$BENCH_DIR/_env.txt"
 cat "$BENCH_DIR/_env.txt"
