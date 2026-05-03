@@ -243,15 +243,24 @@ impl Backend for CudaBackend {
     }
 
     fn write_u32(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
-        // CUDA backend's f16 buffer carries raw bytes; the kernel-side
-        // signature reinterprets it as i32* / u32* (cache_lens, positions).
-        // Use the SYNCHRONOUS cuMemcpyHtoD_v2 (not Async) so the host
-        // Vec stays alive across the actual memcpy. The async variant
-        // queued the memcpy on the stream and returned, then host_i32
-        // dropped → stream later read freed heap → MISALIGNED fault at
-        // the next sync. The 16–128 byte copies are sub-µs; the
-        // synchronicity cost is negligible compared to a panic.
+        // Synchronous host→device write of int32 values. Used by callers
+        // to populate device-side scratch buffers (positions, kv_lens)
+        // BEFORE a CUDA-graph replay so the buffer's contents are
+        // current when the replay re-runs the kernels that read them.
+        //
+        // - Synchronous (`cuMemcpyHtoD_v2`, not `..Async`) so the local
+        //   host Vec stays alive across the copy. Async memcpy on a
+        //   captured stream would record a stale host pointer.
+        // - Explicit `bind_to_thread` because tokio shifts decode_batch
+        //   calls across worker threads. Without it, calls landing on a
+        //   thread that hadn't bound the context fail with
+        //   `CUDA_ERROR_INVALID_CONTEXT` — observed after graph capture
+        //   activated and the next call ran on a fresh worker.
         if data.is_empty() {
+            return;
+        }
+        if let Err(e) = ctx.ctx.bind_to_thread() {
+            eprintln!("write_u32 bind_to_thread failed: {e}");
             return;
         }
         let stream = ctx.stream.clone();
