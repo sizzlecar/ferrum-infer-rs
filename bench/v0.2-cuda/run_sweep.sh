@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# run_sweep.sh — outer loop over the 144-cell matrix.
+#
+# Strategy (saves ~2 hr vs naive nested loop):
+#   - For each (engine, model) pair, start the server ONCE with
+#     --max-seqs=32 (covers all c values), prewarm with one small
+#     request, then iterate (c × repeat) without restarting.
+#   - 12 server starts total instead of 144.
+#
+# Order of (engine, model) pairs is fail-fast:
+#   M2 (Llama-INT4)   first  — smallest, lowest blast radius
+#   M1 (Llama-FP16)   second — biggest dense memory pressure
+#   M3 (Qwen3-MoE)    third  — first MoE; mistralrs may panic here
+#   M4 (Qwen3-Coder)  last   — same shape as M3, infrastructure proven
+#
+# Within each pair: c=1 first (catches correctness issues cheaply),
+# c=32 last (catches resource issues), 3 repeats per c.
+#
+# Resume-safe: every completed cell is detected by results/*.json
+# existing with output_throughput_tok_s > 0.
+
+set -uo pipefail
+
+WORKSPACE="${WORKSPACE:-/workspace}"
+BENCH_DIR="${WORKSPACE}/ferrum-infer-rs/bench/v0.2-cuda"
+RESULTS_DIR="$BENCH_DIR/results"
+MODELS_DIR="${WORKSPACE}/models"
+mkdir -p "$RESULTS_DIR"
+
+# Matrix axes
+ENGINES=(ferrum vllm mistralrs)
+MODEL_ORDER=(M2 M1 M3 M4)         # cheapest blast radius first
+CONCURRENCIES=(1 4 16 32)
+REPEATS=(1 2 3)
+
+# Per-pair max-seqs sized for c=32 max + headroom
+MAX_SEQS=64
+
+# Read models.txt into associative arrays
+declare -A MODEL_REPO MODEL_PRECISION MODEL_SIZE
+while IFS='|' read -r tag repo precision size; do
+  [[ -z "$tag" || "$tag" =~ ^# ]] && continue
+  MODEL_REPO[$tag]="$repo"
+  MODEL_PRECISION[$tag]="$precision"
+  MODEL_SIZE[$tag]="$size"
+done < "$BENCH_DIR/models.txt"
+
+# Engine launch / kill helpers (one fn per engine).
+PORT=8800
+
+ferrum_start() {
+  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag"
+  local server_log="$RESULTS_DIR/ferrum__${model_tag}__server.log"
+  echo "  starting ferrum on $model_tag ..."
+  FERRUM_KV_PAGED=1 FERRUM_PAGED_MAX_SEQS=$MAX_SEQS FERRUM_KV_CAPACITY=1024 \
+  CUDA_VISIBLE_DEVICES=0 \
+    "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
+      --model "$model_dir" --port "$PORT" \
+      > "$server_log" 2>&1 &
+  echo $!
+}
+
+vllm_start() {
+  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag" precision="${MODEL_PRECISION[$model_tag]}"
+  local server_log="$RESULTS_DIR/vllm__${model_tag}__server.log"
+  local quant_args=""
+  if [[ "$precision" == "GPTQ_INT4" ]]; then
+    quant_args="--quantization gptq_marlin"
+  fi
+  echo "  starting vllm on $model_tag (quant=$precision) ..."
+  python3 -m vllm.entrypoints.openai.api_server \
+    --model "$model_dir" \
+    --port "$PORT" \
+    --max-num-seqs $MAX_SEQS \
+    --enable-prefix-caching false \
+    --disable-log-requests \
+    $quant_args \
+    > "$server_log" 2>&1 &
+  echo $!
+}
+
+mistralrs_start() {
+  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag"
+  local server_log="$RESULTS_DIR/mistralrs__${model_tag}__server.log"
+  echo "  starting mistralrs on $model_tag ..."
+  mistralrs-server --port "$PORT" --max-seqs $MAX_SEQS \
+    plain -m "$model_dir" \
+    > "$server_log" 2>&1 &
+  echo $!
+}
+
+# Wait for the engine to be ready (up to 5 min). Kill if not up.
+wait_ready() {
+  local pid="$1"
+  for i in $(seq 1 300); do
+    if curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+      echo "  ready in ${i}s"
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "  process died before becoming ready"
+      return 1
+    fi
+    sleep 1
+  done
+  echo "  timeout (5 min) waiting for ready"
+  return 1
+}
+
+# Prewarm with one small chat completion (drops cold-start variance
+# from the very first cell of each pair).
+prewarm() {
+  curl -sf -m 60 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":4,"temperature":0,"stream":false}' \
+    > /dev/null 2>&1 || true
+}
+
+# Cleanly kill the engine process tree.
+kill_engine() {
+  local pid="$1"
+  if [[ -n "$pid" ]]; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  pkill -9 -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+  pkill -9 -f "mistralrs-server" 2>/dev/null || true
+  pkill -9 -f "ferrum.*serve" 2>/dev/null || true
+  sleep 3
+}
+
+# ── outer loop ──────────────────────────────────────────────────────
+START_T=$SECONDS
+for engine in "${ENGINES[@]}"; do
+  for model in "${MODEL_ORDER[@]}"; do
+    PAIR="${engine}__${model}"
+    PAIR_LOG="$RESULTS_DIR/${PAIR}__pair.log"
+
+    # Skip pair if all 12 cells already exist.
+    REMAINING=0
+    for c in "${CONCURRENCIES[@]}"; do
+      for r in "${REPEATS[@]}"; do
+        cell="$RESULTS_DIR/${engine}__${model}__c${c}__r${r}.json"
+        if [[ ! -f "$cell" ]] || [[ "$(python3 -c "import json,sys; print(json.load(open('$cell')).get('output_throughput_tok_s',0))" 2>/dev/null || echo 0)" == "0.0" ]]; then
+          REMAINING=$((REMAINING+1))
+        fi
+      done
+    done
+    if [[ $REMAINING -eq 0 ]]; then
+      echo "── skip $PAIR (12/12 cells already done) ──"
+      continue
+    fi
+
+    echo
+    echo "════════════════════════════════════════════════════════════"
+    echo " $PAIR — $REMAINING cells remaining"
+    echo "════════════════════════════════════════════════════════════"
+
+    # Start server
+    case "$engine" in
+      ferrum)    PID=$(ferrum_start "$model")    ;;
+      vllm)      PID=$(vllm_start "$model")      ;;
+      mistralrs) PID=$(mistralrs_start "$model") ;;
+    esac
+
+    if ! wait_ready "$PID" >> "$PAIR_LOG" 2>&1; then
+      echo "  $PAIR FAILED to come up (see $PAIR_LOG and ${PAIR}__server.log) — skip 12 cells"
+      kill_engine "$PID"
+      continue
+    fi
+    prewarm
+
+    # Run all (c × repeat) cells against this server
+    for c in "${CONCURRENCIES[@]}"; do
+      for r in "${REPEATS[@]}"; do
+        bash "$BENCH_DIR/run_cell.sh" "$engine" "$model" "$c" "$r" "$PORT" || true
+      done
+    done
+
+    kill_engine "$PID"
+
+    # Disk space + time check
+    DISK_USED=$(df -h "$WORKSPACE" | tail -1 | awk '{print $5}')
+    ELAPSED=$((SECONDS - START_T))
+    echo "── $PAIR done; total elapsed: $((ELAPSED/60)) min; disk: $DISK_USED ──"
+  done
+done
+
+echo
+echo "═══════════════════════════════════════════════════════════"
+echo "  sweep complete in $(( (SECONDS - START_T) / 60 )) min"
+echo "  results: $RESULTS_DIR"
+echo "  exfil:   bash bench/v0.2-cuda/pull_results.sh   (run from local)"
+echo "═══════════════════════════════════════════════════════════"
