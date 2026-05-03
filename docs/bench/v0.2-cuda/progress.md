@@ -18,6 +18,38 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
+## Phase 3: batched kv_cache_append across M caches (commit `60057e0`)
+
+New CUDA kernel `kv_cache_append_batched_per_cache_f16` writes M items'
+K-or-V into M independent caches in a single launch. Replaces the
+per-item kv_cache_append + the per-item K/V copy_slice into single
+buffers that fed it. Saves 3M dispatches/layer (2× kv_append + 1× copy
+each for K and V; the V transpose was already being skipped).
+
+| | Phase 2 | **Phase 3** | vs Phase 2 | vs vllm |
+|---|---|---|---|---|
+| c=4 INT4 tok/s | 188 | 198 (203/207/186) | +5% | 38% (was 36%) |
+| c=4 TPOT_p50 | 14.7 ms | 14.9 ms | flat | (vllm 6.84) |
+| c=16 INT4 tok/s | 367 | **410** (422/406/401) | **+12%** | **26%** (was 23%) |
+| c=16 TPOT_p50 | 32.7 ms | **29.3 ms** | **-10%** | (vllm 8.65) |
+
+**Cumulative impact since baseline (commit `6112ce3`):**
+
+| | baseline | Phase 3 | delta |
+|---|---|---|---|
+| c=4 TPOT_p50 | 18.7 ms | 14.9 ms | **-20%** |
+| c=4 tok/s | 186 | 198 | +6% |
+| c=16 tok/s | 292 | **410** | **+40%** |
+| c=16 TPOT_p50 | 50.7 ms | 29.3 ms | **-42%** |
+| c=16 vs vllm ratio | 18% | **26%** | +8pp |
+
+Diag log confirms all three batched paths run with `ok=true`:
+```
+[batched-qkr]       first call: m=4 use_batched_qkr=true
+[batched-kv-append] first call: m=4 ok=true k_err=None v_err=None
+[batched-attn]      first call: m=4 ok=true err=None
+```
+
 ## Phase 2: batched flash_attention across M caches (commit `447b009` + symbol fix `19a0f55`)
 
 Single CUDA kernel covers all M items' attention in one launch (replaces
