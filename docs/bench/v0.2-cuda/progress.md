@@ -18,7 +18,27 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
-## Phase 4 (foundation): device-buffer kv_lens + stable scratch (commits `3448269`, `7c15ac7`, `5ef6736`)
+## Phase 4d (CUDA Graph capture wiring) — partial, env-gated (commits `96eae06`, `b00ae94`, `156dcab`)
+
+Wires `decode_batch_internal` with begin_graph_capture / replay around
+the layer loop + final norm + lm_head. Per-m_padded graph cache,
+embedding_lookup stays outside (host tokens). All variable args
+(positions, kv_lens_pre, kv_lens_post) hoisted to once-per-step writes
+into stable scratch device buffers. cache.len bumping moved
+post-forward (replay's lack of Rust execution would otherwise desync).
+
+**Status: env-gated (`FERRUM_BATCHED_GRAPH=1`), currently UNSTABLE.**
+Setting the env triggers `CUDA_ERROR_MISALIGNED_ADDRESS` at the first
+post-forward sync. The same binary works fine with the env unset
+(default = Phase 4 baseline numbers below). Code path on first call
+is identical between ON/OFF (warmup gates capture; m_matches=false
+gates replay), so the panic is some interaction we couldn't bisect
+in-band — ride for a separate session with a minimal cudarc
+reproducer. Bug filed mentally: see `project_v02_cuda_bench.md`.
+
+Defaults remain SAFE because `FERRUM_BATCHED_GRAPH` is unset.
+
+## Phase 4 (foundation): device-buffer kv_lens + stable scratch (commits `3448269`, `7c15ac7`, `5ef6736`, `b00ae94`, `156dcab`)
 
 Refactor of the batched kernel API to take `&Self::Buffer` for cache_lens
 / kv_lens (instead of `&[u32]` host slice). Caller writes the device
@@ -31,12 +51,15 @@ trait-default no-op `write_u32`. The refactored path read zeros from
 the un-written device buffer → -15% c=16 regression. Fix: override
 `write_u32` in CudaBackend with `cuMemcpyHtoDAsync_v2`.
 
-| | Phase 3 | **Phase 4** | vs Phase 3 | vs vllm |
+| | Phase 3 | **Phase 4 (post-fix)** | **Phase 4 (build13)** | vs vllm |
 |---|---|---|---|---|
-| c=4 INT4 tok/s | 198 | **227** (227/229/225) | **+15%** | 44% (was 38%) |
-| c=4 TPOT_p50 | 14.9 ms | **13.4 ms** | **-10%** | (vllm 6.84) |
-| c=16 INT4 tok/s | 410 | **428** (433/433/419) | +4% | **27%** (was 26%) |
-| c=16 TPOT_p50 | 29.3 ms | **27.9 ms** | -5% | (vllm 8.65) |
+| c=4 INT4 tok/s | 198 | 227 | **235** (228/237/241) | **44%** (was 38%) |
+| c=4 TPOT_p50 | 14.9 ms | 13.4 ms | **13.0 ms** | (vllm 6.84) |
+| c=16 INT4 tok/s | 410 | 428 | **443** (446/440/442) | **27.7%** (was 26%) |
+| c=16 TPOT_p50 | 29.3 ms | 27.9 ms | **27.0 ms** | (vllm 8.65) |
+
+build13 includes the alloc_u32 sizing fix (`b00ae94`) and sync memcpy
+fix (`156dcab`) — small additional gains over Phase 4 post-fix.
 
 The c=4 +15% likely from removing the per-call `alloc_zeros` overhead;
 c=16 was already alloc-overhead-irrelevant so smaller delta. Diag log
