@@ -424,6 +424,13 @@ pub struct LlamaFamilyModel<B: Backend> {
     /// True if capture was attempted but failed (e.g. backend doesn't
     /// support graph capture). Stops further attempts, falls back to eager.
     graph_capture_failed: bool,
+    /// Same warmup counter for the batched-decode path.
+    batched_graph_warmup: usize,
+    /// True if batched graph capture failed.
+    batched_graph_failed: bool,
+    /// `m.next_power_of_two()` of the currently captured batched-decode
+    /// graph. Single slot — replay only when `m` matches.
+    batched_graph_for_m_padded: Option<usize>,
 }
 
 impl<B: Backend> LlamaFamilyModel<B> {
@@ -529,6 +536,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
             paged_block_alloc: None,
             graph_warmup: 0,
             graph_capture_failed: false,
+            batched_graph_warmup: 0,
+            batched_graph_failed: false,
+            batched_graph_for_m_padded: None,
         })
     }
 
@@ -605,6 +615,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
             paged_block_alloc: None,
             graph_warmup: 0,
             graph_capture_failed: false,
+            batched_graph_warmup: 0,
+            batched_graph_failed: false,
+            batched_graph_for_m_padded: None,
         })
     }
 
@@ -2011,10 +2024,30 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
+        let num_layers = self.cfg.num_layers;
         let mut ctx = B::new_context();
 
-        // 0. Embed all M tokens into residual [M, H]
+        // Pre-step state (positions, kv_lens_pre, kv_lens_post). All
+        // 32 layers' batched kernels read these from scratch device
+        // buffers — written ONCE here, NEVER inside the layer loop, so
+        // the captured graph below replays with stable buffer addresses
+        // and the next step's content update reaches the kernels.
+        let positions: Vec<u32> = batch.iter().map(|(_, _, p)| *p as u32).collect();
         let tokens: Vec<u32> = batch.iter().map(|(_, t, _)| *t).collect();
+        let kv_pre: Vec<u32> = batch
+            .iter()
+            .map(|(cid, _, _)| {
+                self.kv_caches.get(cid).expect("kv_caches missing")[0].len as u32
+            })
+            .collect();
+        let kv_post: Vec<u32> = kv_pre.iter().map(|&x| x + 1).collect();
+        B::write_u32(&mut ctx, &mut self.scratch.batch_positions, &positions);
+        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
+        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
+
+        // 0. Embed all M tokens into residual [M, H]. Eager, OUTSIDE
+        //    any captured graph (host tokens slice; embedding_lookup_dyn
+        //    is single-item only).
         let mut residual = self
             .scratch
             .residual
@@ -2026,33 +2059,92 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .expect("decode_batch_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
 
-        // 1..num_layers: batched forward for each layer
-        for li in 0..self.cfg.num_layers {
-            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+        // ── Phase 4d: CUDA-graph replay path ─────────────────────────
+        // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
+        // graph support (begin_graph_capture returns Err).
+        let graph_enabled = std::env::var("FERRUM_BATCHED_GRAPH")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let m_padded = m.next_power_of_two();
+        let m_matches = self.batched_graph_for_m_padded == Some(m_padded);
+
+        let mut did_pure_replay = false;
+        if graph_enabled && m_matches && !self.batched_graph_failed {
+            // Run replay with `use_dev_state` = true so kernels read
+            // captured device-buffer args.
+            B::set_dev_state_mode(&mut ctx, true);
+            match B::replay_last_graph(&mut ctx) {
+                Ok(true) => did_pure_replay = true,
+                _ => self.batched_graph_failed = true,
+            }
+            B::set_dev_state_mode(&mut ctx, false);
         }
 
-        // Final RMSNorm on [M, H] → norm_out [M, H]
-        B::rms_norm(
-            &mut ctx,
-            &residual,
-            &self.final_norm_w,
-            self.cfg.rms_norm_eps,
-            &mut self.scratch.norm_out,
-            m,
-            h,
-        );
+        if !did_pure_replay {
+            const BATCHED_GRAPH_WARMUP: usize = 3;
+            let should_capture = graph_enabled
+                && !self.batched_graph_failed
+                && self.batched_graph_warmup >= BATCHED_GRAPH_WARMUP;
+            if should_capture {
+                B::set_dev_state_mode(&mut ctx, true);
+                if B::begin_graph_capture(&mut ctx).is_err() {
+                    self.batched_graph_failed = true;
+                    B::set_dev_state_mode(&mut ctx, false);
+                }
+            }
+            self.batched_graph_warmup += 1;
 
-        // LM head with m=M → batch_logits [M, vocab]
-        let lm_head = self
-            .lm_head
-            .as_ref()
-            .expect("decode_batch_internal called on backbone-only model (no lm_head)");
-        lm_head.forward(
-            &mut ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.batch_logits,
-            m,
-        );
+            // Eager forward (records into graph if capture is active).
+            for li in 0..num_layers {
+                self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+            }
+            B::rms_norm(
+                &mut ctx,
+                &residual,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.norm_out,
+                m,
+                h,
+            );
+            let lm_head = self
+                .lm_head
+                .as_ref()
+                .expect("decode_batch_internal called on backbone-only model (no lm_head)");
+            lm_head.forward(
+                &mut ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.batch_logits,
+                m,
+            );
+
+            if should_capture && !self.batched_graph_failed {
+                if B::end_graph_capture(&mut ctx).is_err() {
+                    self.batched_graph_failed = true;
+                } else {
+                    self.batched_graph_for_m_padded = Some(m_padded);
+                    // Capture-mode records but doesn't execute. Replay
+                    // once now to actually populate batch_logits.
+                    if B::replay_last_graph(&mut ctx).is_err() {
+                        self.batched_graph_failed = true;
+                    }
+                }
+                B::set_dev_state_mode(&mut ctx, false);
+            }
+        }
+
+        // Bump cache.len for all (m × num_layers) caches. forward_layer
+        // no longer bumps (so a graph replay's lack of Rust execution
+        // doesn't desync it). One central bump covers eager and replay.
+        for (cid, _, _) in batch.iter() {
+            let caches = self
+                .kv_caches
+                .get_mut(cid)
+                .expect("kv_caches missing");
+            for li in 0..num_layers {
+                caches[li].len += 1;
+            }
+        }
 
         // Sync before to_vec (Metal: no internal sync on buffer read).
         B::sync(&mut ctx);
@@ -2301,8 +2393,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
         //    M=16 with 32 layers that's ~1500 launches, ~10 ms TPOT).
         //    Backends that don't implement it return Err and we drop
         //    back into the per-item loop unchanged.
-        let positions_host: Vec<u32> = batch.iter().map(|(_, _, p)| *p as u32).collect();
-        B::write_u32(ctx, &mut self.scratch.batch_positions, &positions_host);
+        // batch_positions, batch_kv_lens_pre, batch_kv_lens_post are
+        // populated by `decode_batch_internal` ONCE per step before the
+        // layer loop — required so a captured CUDA graph reads from
+        // stable buffer contents on replay (per-layer write_u32 inside
+        // the captured region would freeze the values).
         let q_batched = B::qk_norm_rope_batched_per_item(
             ctx,
             &self.scratch.q_buf,
@@ -2393,9 +2488,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     capacity_first = cache.capacity;
                 }
             }
-            // Upload pre_append_lens to scratch.batch_kv_lens_pre device
-            // buffer; trait method now reads from device (graph-friendly).
-            B::write_u32(ctx, &mut self.scratch.batch_kv_lens_pre, &pre_append_lens);
+            // batch_kv_lens_pre is pre-populated by decode_batch_internal.
             let k_append_res = B::kv_cache_append_batched_per_cache(
                 ctx,
                 &k_caches_ref,
@@ -2431,18 +2524,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     );
                 }
             }
-            if batched_kv_append_ok {
-                // Bump cache.len for each item; record post-bump kv_lens.
-                for (cache_id, _, _) in batch.iter() {
-                    let caches = self
-                        .kv_caches
-                        .get_mut(cache_id)
-                        .expect("kv_caches must be present");
-                    caches[li].len += 1;
-                    kv_lens_host.push(caches[li].len as u32);
-                }
-            }
+            // Note: cache.len bump moved to decode_batch_internal post-forward
+            // (so a graph replay doesn't double-bump). No-op here.
         }
+        // kv_lens_host no longer used; flash_attn reads
+        // scratch.batch_kv_lens_post (also pre-populated).
+        let _ = kv_lens_host;
 
         // 6. Per-item loop: only runs when the batched paths are NOT
         //    in effect, OR when batched_kv_append failed (Err fallback).
@@ -2565,8 +2652,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 nkv,
                 hd,
             );
-            cache.len += 1;
-            let kv_len = cache.len;
+            // cache.len bump moved to decode_batch_internal post-forward
+            // for graph-replay correctness. flash_attn below uses
+            // cache.len + 1 directly.
+            let kv_len = cache.len + 1;
             let kv_stride = cache.capacity;
             kv_lens_host.push(kv_len as u32);
 
@@ -2633,9 +2722,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 }
             }
             let scale = 1.0 / (hd as f32).sqrt();
-            // Upload post-append kv_lens to scratch.batch_kv_lens_post
-            // (graph-friendly device buffer).
-            B::write_u32(ctx, &mut self.scratch.batch_kv_lens_post, &kv_lens_host);
+            // batch_kv_lens_post pre-populated by decode_batch_internal.
             let batched_attn_res = B::flash_attention_batched_per_cache(
                 ctx,
                 &self.scratch.q_normed_batched,
