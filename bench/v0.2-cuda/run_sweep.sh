@@ -59,7 +59,9 @@ ferrum_start() {
   local model_dir="$MODELS_DIR/$model_tag"
   local server_log="$RESULTS_DIR/ferrum__${model_tag}__server.log"
   echo "  starting ferrum on $model_tag ..."
-  FERRUM_KV_PAGED=1 FERRUM_PAGED_MAX_SEQS=$MAX_SEQS FERRUM_KV_CAPACITY=1024 \
+  # No paged-KV / max-seqs env vars — those are Metal-only.
+  # ferrum's CUDA path uses its own decode runner config; matches
+  # what `smoke_engines.sh` proved boots cleanly.
   CUDA_VISIBLE_DEVICES=0 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
