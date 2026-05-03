@@ -2084,9 +2084,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let mut did_pure_replay = false;
         if graph_enabled && m_matches && !self.batched_graph_failed {
             eprintln!("[batched-trace] attempting replay (m_padded={})", m_padded);
-            // Run replay with `use_dev_state` = true so kernels read
-            // captured device-buffer args.
-            B::set_dev_state_mode(&mut ctx, true);
+            // Do NOT touch use_dev_state — that flag dispatches kernels
+            // like rms_norm, fused_silu_mul to their _dyn variants which
+            // read SINGLE-ITEM decode_state buffers (token/pos/valid_kv).
+            // Those single-item state buffers are wrong for batched
+            // forward, so we leave use_dev_state=false and rely on the
+            // batched kernels reading their own device-buffer args
+            // (positions, kv_lens) directly.
             match B::replay_last_graph(&mut ctx) {
                 Ok(true) => {
                     did_pure_replay = true;
@@ -2098,7 +2102,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     eprintln!("[batched-trace] replay err: {}", e);
                 }
             }
-            B::set_dev_state_mode(&mut ctx, false);
         }
 
         if !did_pure_replay {
@@ -2108,11 +2111,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 && self.batched_graph_warmup >= BATCHED_GRAPH_WARMUP;
             if should_capture {
                 eprintln!("[batched-trace] BEGIN CAPTURE (m_padded={})", m_padded);
-                B::set_dev_state_mode(&mut ctx, true);
+                // No use_dev_state flag — see comment in replay path.
                 if let Err(e) = B::begin_graph_capture(&mut ctx) {
                     eprintln!("[batched-trace] begin_capture err: {}", e);
                     self.batched_graph_failed = true;
-                    B::set_dev_state_mode(&mut ctx, false);
                 }
             }
             self.batched_graph_warmup += 1;
@@ -2171,7 +2173,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
                         self.batched_graph_failed = true;
                     }
                 }
-                B::set_dev_state_mode(&mut ctx, false);
             }
         }
 
