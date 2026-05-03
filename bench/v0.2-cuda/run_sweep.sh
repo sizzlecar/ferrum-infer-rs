@@ -153,7 +153,8 @@ for engine in "${ENGINES[@]}"; do
     for c in "${CONCURRENCIES[@]}"; do
       for r in "${REPEATS[@]}"; do
         cell="$RESULTS_DIR/${engine}__${model}__c${c}__r${r}.json"
-        if [[ ! -f "$cell" ]] || [[ "$(python3 -c "import json,sys; print(json.load(open('$cell')).get('output_throughput_tok_s',0))" 2>/dev/null || echo 0)" == "0.0" ]]; then
+        # vLLM 0.20 renamed the throughput key; accept either.
+        if [[ ! -f "$cell" ]] || [[ "$(python3 -c "import json; d=json.load(open('$cell')); print(d.get('output_throughput', d.get('output_throughput_tok_s', 0)))" 2>/dev/null || echo 0)" == "0.0" ]]; then
           REMAINING=$((REMAINING+1))
         fi
       done

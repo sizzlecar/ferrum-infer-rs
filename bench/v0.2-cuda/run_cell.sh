@@ -28,9 +28,12 @@ CELL="${ENGINE}__${MODEL_TAG}__c${C}__r${REPEAT}"
 JSON="$RESULTS_DIR/$CELL.json"
 LOG="$RESULTS_DIR/$CELL.bench.log"
 
-# Resume: skip if already completed.
+# Resume: skip if already completed. vLLM 0.20 calls it
+# `output_throughput`; older bench harnesses used
+# `output_throughput_tok_s`. Accept either so old result dirs still
+# resume cleanly.
 if [[ -f "$JSON" ]]; then
-  EXISTING=$(python3 -c "import json,sys; print(json.load(open('$JSON')).get('output_throughput_tok_s',0))" 2>/dev/null || echo 0)
+  EXISTING=$(python3 -c "import json; d=json.load(open('$JSON')); print(d.get('output_throughput', d.get('output_throughput_tok_s', 0)))" 2>/dev/null || echo 0)
   if [[ "$EXISTING" != "0" && "$EXISTING" != "0.0" ]]; then
     echo "[$CELL] skip (already $EXISTING tok/s)"
     exit 0
@@ -95,12 +98,13 @@ timeout 900 vllm bench serve \
 kill $SMI_PID 2>/dev/null || true
 trap - EXIT
 
-# Print one-line summary
+# Print one-line summary. vLLM 0.20 schema: flat keys
+# (output_throughput, median_tpot_ms, p99_ttft_ms, …) — older bench
+# harness used nested tpot_ms.{median,p95}. p99 instead of p95.
 python3 -c "
 import json
 d = json.load(open('$JSON'))
 def f(x): return f'{x:.1f}' if isinstance(x, (int, float)) else 'n/a'
-tpot = d.get('tpot_ms', {})
-ttft = d.get('ttft_ms', {})
-print(f'[$CELL] out={f(d.get(\"output_throughput_tok_s\"))} tok/s  TPOT_p50={f(tpot.get(\"median\"))}ms  TPOT_p95={f(tpot.get(\"p95\"))}ms  TTFT_p50={f(ttft.get(\"median\"))}ms  TTFT_p95={f(ttft.get(\"p95\"))}ms  ({d.get(\"completed\", 0)}/{d.get(\"completed\", 0)+d.get(\"failed\", 0)} ok)')
+out_tps = d.get('output_throughput')
+print(f'[$CELL] out={f(out_tps)} tok/s  TPOT_p50={f(d.get(\"median_tpot_ms\"))}ms  TPOT_p99={f(d.get(\"p99_tpot_ms\"))}ms  TTFT_p50={f(d.get(\"median_ttft_ms\"))}ms  TTFT_p99={f(d.get(\"p99_ttft_ms\"))}ms  ({d.get(\"completed\", 0)}/{d.get(\"completed\", 0)+d.get(\"failed\", 0)} ok)')
 " 2>&1 || echo "[$CELL] (could not parse JSON)"
