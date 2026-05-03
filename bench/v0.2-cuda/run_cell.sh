@@ -60,13 +60,23 @@ trap "kill $SMI_PID 2>/dev/null || true" EXIT
 
 echo "[$CELL] num_prompts=$NUM_PROMPTS max_output=$MAX_OUTPUT"
 
+# Per-engine model arg for vllm bench serve. ferrum/mistralrs accept
+# any model name in the request body ("default" works); vLLM matches
+# the request's "model" against `--served-model-name` (defaults to the
+# --model path passed at server start).
+case "$ENGINE" in
+  ferrum)    MODEL_ARG="default" ;;
+  vllm)      MODEL_ARG="$WORKSPACE/models/$MODEL_TAG" ;;
+  *)         MODEL_ARG="default" ;;
+esac
+
 # Run with hard timeout — never let one cell burn 15+ min.
 # vLLM 0.20+ moved benchmark_serving.py to the CLI: `vllm bench serve`.
-# Same arg surface in spirit, slight flag differences.
 timeout 900 vllm bench serve \
   --backend openai-chat \
   --base-url "http://127.0.0.1:$PORT" \
   --endpoint /v1/chat/completions \
+  --model "$MODEL_ARG" \
   --dataset-name custom \
   --dataset-path "$BENCH_DIR/prompts.json" \
   --num-prompts "$NUM_PROMPTS" \
