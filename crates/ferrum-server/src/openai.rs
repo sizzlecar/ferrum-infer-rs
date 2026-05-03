@@ -101,12 +101,50 @@ pub struct ChatMessage {
     /// Message role
     pub role: MessageRole,
 
-    /// Message content
+    /// Message content. Accepts either a plain string or the OpenAI
+    /// "typed parts" array form (`[{"type":"text","text":"..."}]`)
+    /// — both shapes deserialize into a single String. Non-text parts
+    /// are dropped (we don't support multimodal input here).
+    #[serde(deserialize_with = "deserialize_message_content")]
     pub content: String,
 
     /// Message name (for function calls)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Deserialize chat message content from either a plain string or the
+/// OpenAI typed-parts array form. Real OpenAI clients (and `vllm bench
+/// serve`'s openai-chat backend) send `content` as
+/// `[{"type":"text","text":"..."}]` even for plain text; refusing that
+/// breaks every standard client.
+fn deserialize_message_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Text(String),
+        Parts(Vec<ContentPart>),
+    }
+
+    #[derive(Deserialize)]
+    struct ContentPart {
+        #[serde(rename = "type")]
+        ty: String,
+        #[serde(default)]
+        text: Option<String>,
+    }
+
+    match Repr::deserialize(deserializer)? {
+        Repr::Text(s) => Ok(s),
+        Repr::Parts(parts) => Ok(parts
+            .into_iter()
+            .filter_map(|p| if p.ty == "text" { p.text } else { None })
+            .collect::<Vec<_>>()
+            .join("\n")),
+    }
 }
 
 /// Message roles
