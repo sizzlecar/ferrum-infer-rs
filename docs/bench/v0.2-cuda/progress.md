@@ -18,6 +18,41 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
+## Phase 2: batched flash_attention across M caches (commit `447b009` + symbol fix `19a0f55`)
+
+Single CUDA kernel covers all M items' attention in one launch (replaces
+M sequential `flash_attention(q_len=1)` calls and the M attn-output
+copy_slice dispatches that follow). Kernel `batched_decode_attention_f16`
+already existed in `kernels/batched_decode_attention.cu` — the work was
+the trait wire-up + per-cache device-pointer plumbing.
+
+Bug: first commit had the wrong kernel symbol name
+(`"batched_decode_attention"` vs the actual `"batched_decode_attention_f16"`).
+Caused the panic cascade on first decode — fixed in `19a0f55`.
+
+| | Phase 1 | **Phase 2** | vs Phase 1 | vs vllm |
+|---|---|---|---|---|
+| c=4 INT4 tok/s | 234 | 188 (192/196/177)* | -20% | 36% |
+| c=4 TPOT_p50 | 15.9 ms | 14.7 ms | -7% | (vllm 6.84) |
+| c=16 INT4 tok/s | 326 | **367** (366/364/370) | **+13%** | **23%** (was 20%) |
+| c=16 TPOT_p50 | 44.4 ms | **32.7 ms** | **-26%** | (vllm 8.65) |
+
+*c=4 throughput regression is **not** a kernel issue — `[batched-attn]`
+diag confirms `ok=true` on the first call, but `m=2` (not 4). The
+ContinuousBatchScheduler batches at most 2 of the 4 concurrent c=4
+requests per decode step, so `forward_layer_batched_decode` fires twice
+serially with m=2 each instead of once with m=4. TPOT itself improved;
+total throughput drops because of the extra scheduling round-trip.
+Tracking separately as a scheduler-tuning item.
+
+Cumulative impact since the no-optimization baseline (commit `6112ce3`):
+
+| | baseline | now | delta |
+|---|---|---|---|
+| c=4 TPOT_p50 | 18.7 ms | 14.7 ms | **-21%** |
+| c=16 tok/s | 292 | 367 | **+26%** |
+| c=16 TPOT_p50 | 50.7 ms | 32.7 ms | **-36%** |
+
 ## Phase 1: batched per-item qk_norm_rope (commit `510ebad` + diag `c2e9757`)
 
 Single CUDA kernel processes all M items' Q/K/V in one launch, with each
