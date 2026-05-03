@@ -856,14 +856,20 @@ impl Backend for CudaBackend {
                     .map_err(|e| FerrumError::model(format!("alloc cache_lens scratch: {e}")))?,
             );
         }
-        let cache_ptrs_dev = ctx.batched_scratch_u64_cache.as_mut().unwrap();
-        let cache_lens_dev = ctx.batched_scratch_i32_cache_lens.as_mut().unwrap();
         stream
-            .memcpy_htod(&cache_ptrs_host, cache_ptrs_dev)
+            .memcpy_htod(
+                &cache_ptrs_host,
+                ctx.batched_scratch_u64_cache.as_mut().unwrap(),
+            )
             .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
         stream
-            .memcpy_htod(&cache_lens_host, cache_lens_dev)
+            .memcpy_htod(
+                &cache_lens_host,
+                ctx.batched_scratch_i32_cache_lens.as_mut().unwrap(),
+            )
             .map_err(|e| FerrumError::model(format!("memcpy cache_lens: {e}")))?;
+        let cache_ptrs_dev = ctx.batched_scratch_u64_cache.as_ref().unwrap();
+        let cache_lens_dev = ctx.batched_scratch_i32_cache_lens.as_ref().unwrap();
 
         let func = ctx.func(
             "kv_cache_append_batched",
@@ -962,18 +968,29 @@ impl Backend for CudaBackend {
                     .map_err(|e| FerrumError::model(format!("alloc kv_lens scratch: {e}")))?,
             );
         }
-        let k_ptrs_dev = ctx.batched_scratch_u64_k.as_mut().unwrap();
-        let v_ptrs_dev = ctx.batched_scratch_u64_v.as_mut().unwrap();
-        let kv_lens_dev = ctx.batched_scratch_i32_kv_lens.as_mut().unwrap();
+        // Two-step borrow: do the host→device copies first (need &mut),
+        // then take immutable refs for the kernel-arg builder below.
         stream
-            .memcpy_htod(&k_ptrs_host, k_ptrs_dev)
+            .memcpy_htod(
+                &k_ptrs_host,
+                ctx.batched_scratch_u64_k.as_mut().unwrap(),
+            )
             .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
         stream
-            .memcpy_htod(&v_ptrs_host, v_ptrs_dev)
+            .memcpy_htod(
+                &v_ptrs_host,
+                ctx.batched_scratch_u64_v.as_mut().unwrap(),
+            )
             .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
         stream
-            .memcpy_htod(&kv_lens_host, kv_lens_dev)
+            .memcpy_htod(
+                &kv_lens_host,
+                ctx.batched_scratch_i32_kv_lens.as_mut().unwrap(),
+            )
             .map_err(|e| FerrumError::model(format!("memcpy kv_lens: {e}")))?;
+        let k_ptrs_dev = ctx.batched_scratch_u64_k.as_ref().unwrap();
+        let v_ptrs_dev = ctx.batched_scratch_u64_v.as_ref().unwrap();
+        let kv_lens_dev = ctx.batched_scratch_i32_kv_lens.as_ref().unwrap();
 
         let func = ctx.func(
             "batched_decode_attn",
