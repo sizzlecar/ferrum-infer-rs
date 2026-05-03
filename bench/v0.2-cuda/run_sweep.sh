@@ -31,7 +31,9 @@ mkdir -p "$RESULTS_DIR"
 #   - mistralrs dropped (PoisonError on MoE, finicky setup, not the
 #     primary target of comparison)
 #   - M4 (Qwen3-Coder-30B-A3B GPTQ) dropped (community pack only)
-ENGINES=(ferrum vllm)
+#   - vllm runs FIRST: per user direction, get the baseline numbers
+#     locked in before we debug + tune ferrum to beat them.
+ENGINES=(vllm ferrum)
 MODEL_ORDER=(M2 M1 M3)            # cheapest blast radius first (8B INT4 → 8B FP16 → 30B MoE INT4)
 CONCURRENCIES=(1 4 16 32)
 REPEATS=(1 2 3)

@@ -60,15 +60,13 @@ trap "kill $SMI_PID 2>/dev/null || true" EXIT
 
 echo "[$CELL] num_prompts=$NUM_PROMPTS max_output=$MAX_OUTPUT"
 
-# Per-engine model arg for vllm bench serve. ferrum/mistralrs accept
-# any model name in the request body ("default" works); vLLM matches
-# the request's "model" against `--served-model-name` (defaults to the
-# --model path passed at server start).
-case "$ENGINE" in
-  ferrum)    MODEL_ARG="default" ;;
-  vllm)      MODEL_ARG="$WORKSPACE/models/$MODEL_TAG" ;;
-  *)         MODEL_ARG="default" ;;
-esac
+# `vllm bench serve --model X` does TWO things: (1) sends X as the
+# request body "model" field (must match what the server accepts;
+# ferrum accepts any name, vLLM matches its --model), (2) loads
+# X as a tokenizer for prompt-length stats — so X needs to be a
+# valid HF id or a local path with tokenizer.json. Pointing it at
+# the model dir works for all our engines.
+MODEL_ARG="$WORKSPACE/models/$MODEL_TAG"
 
 # Run with hard timeout — never let one cell burn 15+ min.
 # vLLM 0.20+ moved benchmark_serving.py to the CLI: `vllm bench serve`.
