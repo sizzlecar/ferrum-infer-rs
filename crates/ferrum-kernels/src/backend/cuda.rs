@@ -392,16 +392,16 @@ impl Backend for CudaBackend {
     fn replay_last_graph(ctx: &mut Self::Context) -> Result<bool> {
         use cudarc::driver::sys;
         let cu_stream = ctx.stream.cu_stream();
-        // Bind ctx to this thread — cuGraphLaunch from an un-bound tokio
-        // worker thread was silently hanging (not returning an error,
-        // just never completing). cudarc's CudaGraph::launch wraps this
-        // bind internally; our raw-FFI path bypassed it.
+        eprintln!("[replay] enter");
         ctx.ctx
             .bind_to_thread()
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
+        eprintln!("[replay] bound, locking slot");
         with_decode_graph(|g_opt| {
+            eprintln!("[replay] slot locked, has_graph={}", g_opt.is_some());
             if let Some(g) = g_opt {
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
+                eprintln!("[replay] cuGraphLaunch returned: {st:?}");
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
                 }
