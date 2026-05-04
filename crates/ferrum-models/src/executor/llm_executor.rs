@@ -278,6 +278,8 @@ impl ModelExecutor for LlmExecutor {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+        let t0 = if prof { Some(std::time::Instant::now()) } else { None };
         // Pre-extract all per-input metadata OUTSIDE the lock — this is pure
         // borrow/downcast work that doesn't touch the model.
         struct Prep {
@@ -306,21 +308,29 @@ impl ModelExecutor for LlmExecutor {
                 handle: Arc::new(input_handle.with_sequence_length((seq_len + 1) as usize)),
             });
         }
+        let t_prep = if prof { Some(std::time::Instant::now()) } else { None };
 
         // One lock for the whole batch, dispatch to model's decode_batch —
         // which implementations may fuse into a single forward pass (GEMMs
         // with m=batch, per-item attention) for true concurrency speedup.
         // Trait default falls back to sequential decode per item.
-        let all_logits: Vec<Vec<f32>> = {
+        let (all_logits, t_lock_acq, t_model_call): (Vec<Vec<f32>>, _, _) = {
+            let lock_t0 = if prof { Some(std::time::Instant::now()) } else { None };
             let mut model = self.model.lock();
+            let lock_acq = lock_t0.map(|t| t.elapsed());
             let tuples: Vec<(String, u32, u32)> = prepped
                 .iter()
                 .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
                 .collect();
-            model.decode_batch(&tuples)
+            let model_t0 = if prof { Some(std::time::Instant::now()) } else { None };
+            let logits = model.decode_batch(&tuples);
+            let model_call = model_t0.map(|t| t.elapsed());
+            (logits, lock_acq, model_call)
         };
+        let t_model_done = if prof { Some(std::time::Instant::now()) } else { None };
 
-        let mut outputs = Vec::with_capacity(prepped.len());
+        let m_count = prepped.len();
+        let mut outputs = Vec::with_capacity(m_count);
         for (p, logits) in prepped.into_iter().zip(all_logits.into_iter()) {
             debug!(
                 "LlmExecutor batch_decode: token={}, pos={}",
@@ -332,6 +342,23 @@ impl ModelExecutor for LlmExecutor {
                 .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?;
             let logits_ref = common::wrap_tensor(logits_tensor);
             outputs.push(DecodeOutput::new(logits_ref, p.handle));
+        }
+        if let (Some(t0), Some(tp), Some(tm)) = (t0, t_prep, t_model_done) {
+            static EX_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = EX_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_multiple_of(8) {
+                let total = t0.elapsed().as_micros();
+                let prep = tp.duration_since(t0).as_micros();
+                let lock_acq = t_lock_acq.map(|d| d.as_micros()).unwrap_or(0);
+                let model_call = t_model_call.map(|d| d.as_micros()).unwrap_or(0);
+                let model_block = tm.duration_since(tp).as_micros();
+                let wrap = tm.elapsed().as_micros();
+                eprintln!(
+                    "[exec-batch-decode-prof] call#{} m={} total={}us prep={}us model_block={}us(lock_acq={}us model_call={}us) wrap={}us",
+                    n, m_count, total, prep, model_block, lock_acq, model_call, wrap,
+                );
+            }
         }
         Ok(outputs)
     }
