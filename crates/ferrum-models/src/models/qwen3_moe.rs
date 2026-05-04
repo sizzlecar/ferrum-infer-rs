@@ -2537,11 +2537,9 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
     }
 
     fn release(&mut self, cache_id: &str) {
-        // No graph invalidation: kv buffers go to free_pool (pointers
-        // stay stable), and the captured graph reads kv_lens/cache
-        // pointers from per-call device buffers. The shared global
-        // graph slot was being thrashed every time a request finished.
         let mut ctx = B::new_context();
+        B::sync(&mut ctx);
+        B::reset_graph(&mut ctx);
         B::sync(&mut ctx);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             // Paged mode: return the cache_id's blocks to the shared
