@@ -816,11 +816,18 @@ impl EngineInner {
             let total_us = t0.elapsed().as_micros();
             let prep_us = tp.duration_since(t0).as_micros();
             let decode_us = td.duration_since(tp).as_micros();
-            // Throttle: print every 32nd iter (avoid log spam)
-            let n = self.total_decode_tokens.load(Ordering::Relaxed);
-            if n.is_multiple_of(32) {
+            // Dedicated call counter so the throttle never silently misses.
+            // The previous total_decode_tokens-based throttle never fired
+            // when the decode batch size wasn't a multiple-of-32 — e.g.
+            // a continuous batch of 15 produces token counts 15,30,45,60
+            // which are never multiples of 32.
+            static BD_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let call_n = BD_PROF_CALLS.fetch_add(1, Ordering::Relaxed);
+            if call_n.is_multiple_of(8) {
                 eprintln!(
-                    "[batch-decode-prof] m={} total={}us prep={}us decode={}us post={}us (logits={}us lock={}us sample={}us emit={}us)",
+                    "[batch-decode-prof] call#{} m={} total={}us prep={}us decode={}us post={}us (logits={}us lock={}us sample={}us emit={}us)",
+                    call_n,
                     rids.len(),
                     total_us,
                     prep_us,

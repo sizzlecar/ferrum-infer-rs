@@ -90,23 +90,23 @@ echo ""
 echo "=== aggregate (iter-prof) ==="
 grep '\[iter-prof\]' "$SERVER_LOG" | python3 - <<'PY'
 import sys, re
-from collections import defaultdict
 samples = []
-pat = re.compile(r"total=(\d+)us sched=(\d+)us process=(\d+)us batch_size=(\d+)")
+pat = re.compile(r"iter#(\d+) total=(\d+)us sched=(\d+)us process=(\d+)us batch_size=(\d+)")
 for line in sys.stdin:
     m = pat.search(line)
     if m:
-        samples.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))))
+        samples.append([int(g) for g in m.groups()])
 if not samples:
-    print("NO iter-prof samples")
+    print("NO iter-prof samples (check raw lines below)")
     sys.exit(0)
 n = len(samples)
 def avg(i): return sum(s[i] for s in samples)//n
 def med(i):
     sorted_v = sorted(s[i] for s in samples)
     return sorted_v[n//2]
-print(f"n={n}  avg total={avg(0)}us  sched={avg(1)}us({100*avg(1)/avg(0):.1f}%)  process={avg(2)}us({100*avg(2)/avg(0):.1f}%)  avg_batch={avg(3)}")
-print(f"   median total={med(0)}us sched={med(1)}us process={med(2)}us")
+total, sched, proc, bs = avg(1), avg(2), avg(3), avg(4)
+print(f"n={n}  avg iter total={total}us  sched={sched}us({100*sched/total:.1f}%)  process={proc}us({100*proc/total:.1f}%)  avg_batch={bs}")
+print(f"   medians: total={med(1)}us sched={med(2)}us process={med(3)}us")
 PY
 
 echo ""
@@ -114,23 +114,26 @@ echo "=== aggregate (batch-decode-prof) ==="
 grep '\[batch-decode-prof\]' "$SERVER_LOG" | python3 - <<'PY'
 import sys, re
 samples = []
-pat = re.compile(r"m=(\d+) total=(\d+)us prep=(\d+)us decode=(\d+)us post=(\d+)us \(logits=(\d+)us lock=(\d+)us sample=(\d+)us emit=(\d+)us\)")
+pat = re.compile(r"call#(\d+) m=(\d+) total=(\d+)us prep=(\d+)us decode=(\d+)us post=(\d+)us \(logits=(\d+)us lock=(\d+)us sample=(\d+)us emit=(\d+)us\)")
 for line in sys.stdin:
     m = pat.search(line)
     if m:
         samples.append([int(g) for g in m.groups()])
 if not samples:
-    print("NO batch-decode-prof samples")
+    print("NO batch-decode-prof samples (check raw)")
     sys.exit(0)
 n = len(samples)
 def avg(i): return sum(s[i] for s in samples)//n
 def pct(x,t): return f'{100*x/t:5.1f}%' if t else '   0%'
-m = avg(0)
-total = avg(1); prep = avg(2); dec = avg(3); post = avg(4)
-log = avg(5); lock = avg(6); samp = avg(7); emit = avg(8)
-print(f"n={n}  m={m}  total={total}us")
+mm = avg(1); total = avg(2); prep = avg(3); dec = avg(4); post = avg(5)
+log = avg(6); lock = avg(7); samp = avg(8); emit = avg(9)
+print(f"n={n}  m={mm}  total/call={total}us")
 print(f"   prep={prep}us({pct(prep,total)})  decode={dec}us({pct(dec,total)})  post={post}us({pct(post,total)})")
-print(f"   post breakdown:  logits={log}us({pct(log,total)})  lock={lock}us({pct(lock,total)})  sample={samp}us({pct(samp,total)})  emit={emit}us({pct(emit,total)})")
+print(f"   post breakdown (totals across {mm} seqs):")
+print(f"     logits.to_vec_f32 = {log}us({pct(log,total)})  ← per-seq sync device→host")
+print(f"     write-lock acquire= {lock}us({pct(lock,total)})  ← per-seq")
+print(f"     sample            = {samp}us({pct(samp,total)})  ← per-seq host work")
+print(f"     send_stream_update= {emit}us({pct(emit,total)})  ← per-seq tokio send")
 PY
 
 echo ""
