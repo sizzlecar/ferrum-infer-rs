@@ -18,6 +18,53 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
+## Phase 7 — batch scaling diagnosis (post g_idx fix, 2026-05-04)
+
+c=4 vs c=16 per-iter timing (FERRUM_BATCH_DECODE_PROF=1, M2 desc_act
+dequant→Dense, 32 layers, RTX 4090):
+
+| | iter (median) | vLLM TPOT_p50 | iter ratio |
+|---|---|---|---|
+| c=4 | **21.98 ms** | 6.84 ms | 3.21× |
+| c=16 | **29.03 ms** | 8.65 ms | 3.36× |
+
+Δ iter time c=4→c=16 = 7.05 ms for 12 more sequences = 0.59 ms/seq.
+
+Per-iter throughput capacity:
+- c=4:  4 toks / 22 ms = **182 tok/s/iter**
+- c=16: 16 toks / 29 ms = **552 tok/s/iter**
+
+Bench-measured (real harness):
+- c=4:  150 tok/s (= 82% of iter capacity, 18% loss to HTTP/SSE/tokio)
+- c=16: 351 tok/s (= 64% of iter capacity, 36% loss)
+
+**Conclusion**: batch scaling at the kernel level is FINE. The c=16 ratio
+worsening (2.32× vs vLLM 3.09×) is dominated by:
+1. **iter is 3.2-3.4× slower than vLLM** at BOTH c=4 and c=16. Not a
+   scaling problem — a per-iter speed problem. Each layer's GEMMs run
+   on FP16 dense (cuBLAS) instead of perm-aware Marlin INT4.
+2. **HTTP/SSE/tokio overhead doubles at c=16** (18%→36%). Likely
+   per-stream channel buffering or token-serialisation cost in the SSE
+   emit path. Worth investigating — but smaller ROI than the iter speed.
+
+**ROI ranking for closing the vLLM gap (revised):**
+
+1. **Perm-aware Marlin INT4 GEMM** — recovers desc_act models' INT4 path.
+   vLLM's gptq_marlin gathers activations via `perm = argsort(g_idx)`
+   in shared-mem load; Marlin kernel takes `perm` as kernel arg. Effort:
+   ~1 day to integrate into ferrum's `marlin_repack` + `gptq_gemm`. Win:
+   ~2-3× iter speedup on M2 / Llama-3.1-INT4 → c=16 ~700 tok/s plausible.
+
+2. **CUDA Graph capture for batched** — 32 layers × ~10 kernel launches
+   = ~300 launches/iter. Each launch ~3-5us. Total ~1-1.5ms saved.
+   BLOCKED on multi-replay SIGSEGV (commit `39f813c` documents finding).
+
+3. **HTTP/SSE optimisation at c=16** — 36% loss is excessive. Profile the
+   tokio task emit pattern + see if batching SSE chunks helps.
+
+4. **cuBLAS tile tuning for thin-tall m × H @ H × N** at m=4..16. cuBLAS
+   auto-pick may not be optimal. Lower ROI than (1) but quick win.
+
 ## Phase 6 — INT4 desc_act g_idx fix (commits `bcb076b`, `e9968d0`, `e83188a`, `dad43e3`)
 
 **Bug** (silent): all M2_* models on this pod (Llama-3.1-8B-GPTQ-INT4) have
