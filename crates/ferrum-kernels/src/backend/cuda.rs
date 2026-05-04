@@ -1049,6 +1049,7 @@ impl Backend for CudaBackend {
         hd: usize,
         slot: usize,
     ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
         if m == 0 {
             return Ok(());
         }
@@ -1070,21 +1071,44 @@ impl Backend for CudaBackend {
             )));
         }
         let host_start = slot * BATCHED_SCRATCH_CAP;
+        // Write cache device pointers into per-slot region of the host
+        // staging array. Each call site uses a distinct slot to support
+        // future graph-capture replay (graph records the host POINTER;
+        // shared regions across captured memcpys all read the latest
+        // write at replay time — verified by
+        // `cudarc_graph_shared_host_array_multi_memcpy`). Slot fix
+        // preserved even though graph-capture is shelved.
+        for i in 0..m {
+            let (cp, _) = caches[i].device_ptr(&stream);
+            ctx.batched_host_cache_ptrs[host_start + i] = cp;
+        }
         if ctx.batched_scratch_u64_cache.is_none() {
-            return Err(FerrumError::model(
-                "kv_cache_append_batched_per_cache: device scratch not populated; call populate_batched_pointers first",
-            ));
+            ctx.batched_scratch_u64_cache = Some(
+                stream
+                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
+                    .map_err(|e| FerrumError::model(format!("alloc cache_ptrs scratch: {e}")))?,
+            );
         }
         let func = ctx.func(
             "kv_cache_append_batched",
             ptx::KV_CACHE_APPEND,
             "kv_cache_append_batched_per_cache_f16",
         );
-        // Kernel reads from pre-populated device scratch — no captured
-        // memcpy here. populate_batched_pointers (sync, before forward)
-        // is the source of truth. caches arg is unused on the device
-        // side but kept for API consistency / future paged paths.
-        let _ = caches;
+        // Async memcpy host_slice → device per-slot region. On non-capture
+        // path: just queues on stream. On capture path: gets recorded
+        // into the graph (needs the host array to be stable across
+        // replays — currently NOT the case since CudaState is per-call;
+        // graph capture is env-gated OFF until process-global scratch
+        // refactor).
+        {
+            let host_slice: &[u64] =
+                &ctx.batched_host_cache_ptrs[host_start..host_start + m];
+            let scratch = ctx.batched_scratch_u64_cache.as_mut().unwrap();
+            let mut view = scratch.slice_mut(host_start..host_start + m);
+            stream
+                .memcpy_htod(host_slice, &mut view)
+                .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
+        }
         let cache_ptrs_view = ctx
             .batched_scratch_u64_cache
             .as_ref()
@@ -1131,6 +1155,7 @@ impl Backend for CudaBackend {
         max_valid_kv: usize,
         slot: usize,
     ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
         let m = k_caches.len();
         if m == 0 {
             return Ok(());
@@ -1153,20 +1178,50 @@ impl Backend for CudaBackend {
             )));
         }
         let host_start = slot * BATCHED_SCRATCH_CAP;
-        if ctx.batched_scratch_u64_k.is_none() || ctx.batched_scratch_u64_v.is_none() {
-            return Err(FerrumError::model(
-                "flash_attention_batched_per_cache: device scratch not populated; call populate_batched_pointers first",
-            ));
+        for i in 0..m {
+            let (kp, _) = k_caches[i].device_ptr(&stream);
+            let (vp, _) = v_caches[i].device_ptr(&stream);
+            ctx.batched_host_k_ptrs[host_start + i] = kp;
+            ctx.batched_host_v_ptrs[host_start + i] = vp;
+        }
+        if ctx.batched_scratch_u64_k.is_none() {
+            ctx.batched_scratch_u64_k = Some(
+                stream
+                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
+                    .map_err(|e| FerrumError::model(format!("alloc k_ptrs scratch: {e}")))?,
+            );
+        }
+        if ctx.batched_scratch_u64_v.is_none() {
+            ctx.batched_scratch_u64_v = Some(
+                stream
+                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
+                    .map_err(|e| FerrumError::model(format!("alloc v_ptrs scratch: {e}")))?,
+            );
         }
         let func = ctx.func(
             "batched_decode_attn",
             ptx::BATCHED_DECODE_ATTENTION,
             "batched_decode_attention_f16",
         );
-        // No captured memcpy — populate_batched_pointers wrote
-        // host_k_ptrs / host_v_ptrs to device scratch synchronously
-        // before the forward started.
-        let _ = (k_caches, v_caches);
+        // Two memcpys, each into its own per-slot region.
+        {
+            let k_host_slice: &[u64] =
+                &ctx.batched_host_k_ptrs[host_start..host_start + m];
+            let scratch = ctx.batched_scratch_u64_k.as_mut().unwrap();
+            let mut view = scratch.slice_mut(host_start..host_start + m);
+            stream
+                .memcpy_htod(k_host_slice, &mut view)
+                .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
+        }
+        {
+            let v_host_slice: &[u64] =
+                &ctx.batched_host_v_ptrs[host_start..host_start + m];
+            let scratch = ctx.batched_scratch_u64_v.as_mut().unwrap();
+            let mut view = scratch.slice_mut(host_start..host_start + m);
+            stream
+                .memcpy_htod(v_host_slice, &mut view)
+                .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
+        }
         let k_ptrs_view = ctx
             .batched_scratch_u64_k
             .as_ref()

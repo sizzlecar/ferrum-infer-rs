@@ -2060,39 +2060,18 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // captured `stream.memcpy_htod` records host pointers and the
         // 2nd pure-replay reads stale/corrupted data → ILLEGAL_ADDRESS.
         //
-        // Cache by batch composition: the cache buffer device pointers
-        // for a given (cache_id) don't change across decode steps, so we
-        // only need to re-populate when the SET of active requests
-        // changes (new request joined / one finished). 99% of decode
-        // iters take the fast skip path — saves ~5% TPOT vs unconditional
-        // populate.
-        let current_cids: Vec<String> = batch.iter().map(|(c, _, _)| c.clone()).collect();
-        let needs_populate = self
-            .batched_pointers_for
-            .as_ref()
-            .map_or(true, |prev| prev != &current_cids);
-        if needs_populate {
-            let mut k_caches_flat: Vec<&B::Buffer> = Vec::with_capacity(num_layers * m);
-            let mut v_caches_flat: Vec<&B::Buffer> = Vec::with_capacity(num_layers * m);
-            for li in 0..num_layers {
-                for (cid, _, _) in batch.iter() {
-                    let cache = &self
-                        .kv_caches
-                        .get(cid)
-                        .expect("kv_caches must be present")[li];
-                    k_caches_flat.push(&cache.k);
-                    v_caches_flat.push(&cache.v);
-                }
-            }
-            let _ = B::populate_batched_pointers(
-                &mut ctx,
-                &k_caches_flat,
-                &v_caches_flat,
-                num_layers,
-                m,
-            );
-            self.batched_pointers_for = Some(current_cids);
-        }
+        // populate_batched_pointers was intended to support
+        // FERRUM_BATCHED_GRAPH=1 (Phase 4d graph capture) by pre-filling
+        // device scratch outside the captured forward. Phase 4d is
+        // shelved (CUDA driver state accumulates and SIGSEGVs after
+        // ~14 launches even with all the right knobs), so the populate
+        // call adds overhead with no benefit on the OFF path. Skip it —
+        // the kv_cache_append / flash_attn batched impls fall back to
+        // their inline captured memcpy when scratch isn't pre-populated.
+        // batched_pointers_for kept for future use; revisit when we
+        // either (a) get graph capture working, or (b) move scratch to
+        // process-global static.
+        let _ = &self.batched_pointers_for;
 
         // 0. Embed all M tokens into residual [M, H]. Eager, OUTSIDE
         //    any captured graph (host tokens slice; embedding_lookup_dyn
