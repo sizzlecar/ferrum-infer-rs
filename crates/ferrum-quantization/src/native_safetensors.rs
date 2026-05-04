@@ -356,6 +356,25 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         } else {
             None
         };
+        // FAIL LOUD: ferrum's load_gptq currently ignores g_idx. For
+        // desc_act=true models (most modern AutoGPTQ outputs), this
+        // produces silently-degenerate logits — the model emits the
+        // same single token in a loop. Detect and refuse instead of
+        // letting the user blame GEMM correctness.
+        // Heuristic: g_idx is non-trivial when its values are not the
+        // 0..K identity permutation. AutoGPTQ writes [0..K] for
+        // desc_act=false and a permuted version for desc_act=true.
+        if let Some(gx) = g_idx.as_ref() {
+            let identity = gx.iter().enumerate().all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32);
+            if !identity {
+                return Err(FerrumError::unsupported(format!(
+                    "GPTQ tensor '{name}' has non-trivial g_idx (desc_act=true / act-order); \
+                     ferrum's gptq_marlin / triton_w4a16 paths do not yet apply g_idx. \
+                     Use a model with desc_act=false (re-quantize via AutoGPTQ with desc_act=False) \
+                     or wait for the act-order repack feature."
+                )));
+            }
+        }
 
         // Shape inference: qweight is [K/8, N]; scales is [K/group, N].
         // → K = qw_shape[0] * 8, N = qw_shape[1].
