@@ -24,7 +24,8 @@
 #endif
 
 #include "kernel.h"
-#include "core/registration.h"
+// Removed for ferrum-infer-rs port: PyBind/Torch registration not needed.
+// #include "core/registration.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -46,20 +47,8 @@ __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
 
 }  // namespace marlin
 
-torch::Tensor marlin_gemm(
-    torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
-    torch::Tensor& b_q_weight,
-    std::optional<torch::Tensor> const& b_bias_or_none, torch::Tensor& b_scales,
-    std::optional<torch::Tensor> const& b_zeros_or_none,
-    std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
-    vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
-    int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
-    bool is_zp_float) {
-  TORCH_CHECK_NOT_IMPLEMENTED(false,
-                              "marlin_gemm(..) requires CUDA_ARCH >= 7.5");
-  return torch::empty({1, 1});
-}
+// Removed for ferrum-infer-rs port: torch::Tensor entry stub for sm < 75.
+// We target sm_89/sm_90/sm_120 only.
 
 #else
 
@@ -528,6 +517,17 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
 }  // namespace marlin
 
+// =============================================================================
+// ferrum-infer-rs port: removed `torch::Tensor marlin_gemm(...)` (lines 520-846
+// in upstream vLLM marlin.cu). That function did torch tensor validation +
+// dtype detection + a_scales/global_scale/zp/bias defaults + dispatch into
+// `marlin::marlin_mm()` (line 315). The Rust side handles those concerns
+// explicitly and calls a thin extern "C" wrapper below that forwards to
+// `marlin::marlin_mm`. Also removed the TORCH_LIBRARY_IMPL_EXPAND macro
+// at the bottom of upstream marlin.cu (it registered marlin_gemm as a torch
+// op for PyBind — irrelevant in our standalone-C++/Rust setup).
+// =============================================================================
+#if false
 torch::Tensor marlin_gemm(
     torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
     torch::Tensor& b_q_weight,
@@ -857,7 +857,37 @@ torch::Tensor marlin_gemm(
 }
 
 #endif
+#endif  // closes #if false (disabled torch::Tensor marlin_gemm wrapper)
 
-TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
-  m.impl("marlin_gemm", &marlin_gemm);
+// ─────────────────────────────────────────────────────────────────────────────
+// extern "C" entry point used by the ferrum-kernels Rust FFI. Forwards to
+// marlin::marlin_mm with explicit args. Caller is responsible for resolving
+// vllm::ScalarType from passed type ids (e.g. vllm::kFloat16, vllm::kU4B8).
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" void ferrum_marlin_mm_f16_u4b8(
+    const void* A, const void* B, void* C, void* C_tmp,
+    void* a_s, void* b_s, void* g_idx, void* perm, void* a_tmp,
+    int prob_m, int prob_n, int prob_k, int lda, void* workspace,
+    bool has_act_order, bool is_k_full, int num_groups, int group_size,
+    int dev, cudaStream_t stream, int thread_k_init, int thread_n_init, int sms,
+    bool use_atomic_add, bool use_fp32_reduce) {
+  marlin::marlin_mm(A, B, C, C_tmp,
+                    /* b_bias */ nullptr,
+                    a_s, b_s,
+                    /* g_s    (global scale) */ nullptr,
+                    /* zp                    */ nullptr,
+                    g_idx, perm, a_tmp,
+                    prob_m, prob_n, prob_k, lda,
+                    workspace,
+                    vllm::kFloat16,   // a_type
+                    vllm::kU4B8,      // b_type
+                    vllm::kFloat16,   // c_type
+                    vllm::kFloat16,   // s_type
+                    /* has_bias */ false,
+                    has_act_order, is_k_full,
+                    /* has_zp */ false,
+                    num_groups, group_size, dev, stream,
+                    thread_k_init, thread_n_init, sms,
+                    use_atomic_add, use_fp32_reduce,
+                    /* is_zp_float */ false);
 }

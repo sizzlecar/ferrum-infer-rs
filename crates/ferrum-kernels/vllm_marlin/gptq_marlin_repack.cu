@@ -1,6 +1,7 @@
 #include "marlin.cuh"
 
-#include "core/registration.h"
+// Removed for ferrum-infer-rs port: PyBind/Torch registration not needed.
+// #include "core/registration.h"
 
 namespace marlin {
 
@@ -275,6 +276,14 @@ __global__ void gptq_marlin_repack_kernel(
             b_q_weight_ptr, perm_ptr, out_ptr, size_k, size_n);             \
   }
 
+// =============================================================================
+// ferrum-infer-rs port: original `torch::Tensor gptq_marlin_repack(...)` kept
+// as reference under `#if false` since ferrum currently has its own perm-aware
+// repack on the Rust side (commit 48bf17b — runtime gather + standard Marlin
+// repack). If we later want to use vLLM's repack instead, expose via an
+// extern "C" wrapper similar to ferrum_marlin_mm_f16_u4b8 in marlin.cu.
+// =============================================================================
+#if false
 torch::Tensor gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm,
                                  int64_t size_k, int64_t size_n,
                                  int64_t num_bits, bool is_a_8bit) {
@@ -351,7 +360,4 @@ torch::Tensor gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm,
 
   return out;
 }
-
-TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
-  m.impl("gptq_marlin_repack", &gptq_marlin_repack);
-}
+#endif  // closes #if false (disabled torch::Tensor gptq_marlin_repack wrapper)
