@@ -1386,6 +1386,50 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Variable-length paged attention with GQA + causal mask.
+    ///
+    /// Supports a unified mixed batch where each sequence contributes
+    /// 1 (decode) or N (prefill chunk) query tokens — the workhorse for
+    /// chunked-prefill. See `kernels/paged_varlen_attention.cu` for the
+    /// kernel itself.
+    ///
+    /// Layouts:
+    /// - `q` / `out`: `[total_q_tokens, num_heads, head_dim]` (token-
+    ///   major, FP16). `total_q_tokens` = `cu_seqlens_q[num_seqs]`.
+    /// - `k_pool` / `v_pool`: paged block pool, layout matches
+    ///   `paged_decode_attention`.
+    /// - `cu_seqlens_q`: `[num_seqs + 1]` u32 prefix sum, with
+    ///   `cu_seqlens_q[0] = 0` and `cu_seqlens_q[num_seqs] = total_q_tokens`.
+    /// - `pos_offsets`: `[num_seqs]` u32, the starting absolute KV
+    ///   position of each seq's first q token (= prior `kv_len`).
+    /// - `block_tables`: `[num_seqs, max_num_blocks_per_seq]` i32 grid.
+    ///
+    /// Each query token attends causally to all KV positions
+    /// `[0, pos_offsets[s] + local_idx]`.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_varlen_attention not implemented for this backend",
+        ))
+    }
+
     /// Allocate a u32 buffer of length `n` for paged-KV bookkeeping
     /// (block tables, context lens). Default uses the existing
     /// `from_slice_i32` route then bit-casts; backends with a faster

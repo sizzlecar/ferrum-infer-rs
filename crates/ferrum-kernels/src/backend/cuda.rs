@@ -1159,6 +1159,78 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn paged_varlen_attention(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        cu_seqlens_q: &Self::Buffer,
+        pos_offsets: &Self::Buffer,
+        block_tables: &Self::Buffer,
+        num_seqs: usize,
+        total_q_tokens: usize,
+        max_kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if num_seqs == 0 || total_q_tokens == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "paged_varlen_attn",
+            ptx::PAGED_VARLEN_ATTENTION,
+            "paged_varlen_attn_f16",
+        );
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let stream = ctx.stream.clone();
+        // CudaBackend::Buffer is monomorphic CudaSlice<f16>; i32 data
+        // (cu_seqlens_q / pos_offsets / block_tables) is stored in
+        // f16-typed buffers via `from_slice_i32` + matching alloc, the
+        // kernel reads them as `int*`. Same pattern as kv_lens in
+        // `flash_attention_batched_per_cache`.
+        let qv = q.slice(..);
+        let kp = k_pool.slice(..);
+        let vp = v_pool.slice(..);
+        let csq = cu_seqlens_q.slice(..);
+        let po = pos_offsets.slice(..);
+        let bt = block_tables.slice(..);
+        let ns = num_seqs as i32;
+        let nqi = num_heads as i32;
+        let nkvi = num_kv_heads as i32;
+        let hdi = head_dim as i32;
+        let mbps = max_blocks_per_seq as i32;
+        let bsi = block_size as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(&csq);
+        b.arg(&po);
+        b.arg(&bt);
+        b.arg(out);
+        b.arg(&ns);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mbps);
+        b.arg(&bsi);
+        b.arg(&scale);
+        let shared_bytes = (max_kv_len.max(1) as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| FerrumError::model(format!("paged_varlen_attn: {e}")))
+    }
+
     fn flash_attention_batched_per_cache(
         ctx: &mut Self::Context,
         q: &Self::Buffer,

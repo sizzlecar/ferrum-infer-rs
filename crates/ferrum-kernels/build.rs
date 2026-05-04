@@ -34,6 +34,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/residual_add.cu");
     println!("cargo:rerun-if-changed=kernels/flash_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/paged_decode_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/paged_varlen_attention.cu");
     println!("cargo:rerun-if-changed=kernels/dequant_int4.cu");
     println!("cargo:rerun-if-changed=kernels/batched_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/common.cuh");
@@ -69,6 +70,7 @@ fn main() {
             "kernels/residual_add.cu",
             "kernels/flash_decode_attention.cu",
             "kernels/paged_decode_attention.cu",
+            "kernels/paged_varlen_attention.cu",
             "kernels/dequant_int4.cu",
             "kernels/batched_decode_attention.cu",
             "kernels/softmax.cu",

@@ -2920,6 +2920,78 @@ impl CudaDecodeRunner {
         .map_err(|e| candle_core::Error::Msg(format!("paged_attn: {e}")))
     }
 
+    /// Variable-length paged attention launcher (chunked-prefill mixed
+    /// batch). One block per `(head, global_query_token)`; each block
+    /// finds its owning seq via `cu_seqlens_q` and runs causal Q·K·V over
+    /// the seq's KV pool slice.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_paged_varlen_attention(
+        device: &CudaDevice,
+        stream: &Arc<CudaStream>,
+        q: &CudaSlice<half::f16>,
+        k_pool: &CudaSlice<half::f16>,
+        v_pool: &CudaSlice<half::f16>,
+        cu_seqlens_q: &CudaSlice<i32>,
+        pos_offsets: &CudaSlice<i32>,
+        block_tables: &CudaSlice<i32>,
+        output: &mut CudaSlice<half::f16>,
+        num_seqs: usize,
+        total_q_tokens: usize,
+        max_kv_len: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+        scale: f32,
+    ) -> candle_core::Result<()> {
+        let func = device.get_or_load_custom_func(
+            "paged_varlen_attn_f16",
+            "paged_varlen_attention",
+            ptx::PAGED_VARLEN_ATTENTION,
+        )?;
+        let qv = q.slice(..);
+        let kp = k_pool.slice(..);
+        let vp = v_pool.slice(..);
+        let csq = cu_seqlens_q.slice(..);
+        let po = pos_offsets.slice(..);
+        let bt = block_tables.slice(..);
+        let ns = num_seqs as i32;
+        let nqi = nq as i32;
+        let nkvi = nkv as i32;
+        let hdi = hd as i32;
+        let mbps = max_blocks_per_seq as i32;
+        let bsi = block_size as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(&csq);
+        b.arg(&po);
+        b.arg(&bt);
+        b.arg(output);
+        b.arg(&ns);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mbps);
+        b.arg(&bsi);
+        b.arg(&scale);
+        // Shared memory holds one f32 score per kv position the longest-
+        // query block will visit. max_kv_len = max over seqs of
+        // (pos_offset + q_len), passed by caller — bounds the worst case.
+        let shared_bytes = (max_kv_len.max(1) as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (nq as u32, total_q_tokens as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| candle_core::Error::Msg(format!("paged_varlen_attn: {e}")))
+    }
+
     fn launch_fused_add_rms_norm(
         device: &CudaDevice,
         stream: &Arc<CudaStream>,
