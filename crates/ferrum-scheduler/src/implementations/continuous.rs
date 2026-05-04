@@ -177,26 +177,11 @@ pub struct ContinuousBatchConfig {
 
 impl Default for ContinuousBatchConfig {
     fn default() -> Self {
-        // Env overrides for Phase 13b chunked-prefill experiment without
-        // requiring a code rebuild between A/B configs:
-        //   FERRUM_MAX_PREFILL_BATCH (default 8)
-        //   FERRUM_PREFILL_CHUNK_SIZE (default 512)
-        // Smaller chunks → more iters with `(1 chunk + N decode batched)`
-        // mix → decode token output continues during long prefills instead
-        // of being entirely paused for the prefill duration.
-        let max_prefill_batch = std::env::var("FERRUM_MAX_PREFILL_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8);
-        let prefill_chunk_size = std::env::var("FERRUM_PREFILL_CHUNK_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(512);
         Self {
-            max_prefill_batch,
+            max_prefill_batch: 8,
             max_decode_batch: 256,
             enable_chunked_prefill: true,
-            prefill_chunk_size,
+            prefill_chunk_size: 512,
             max_kv_blocks_per_request: 1024,
             enable_swapping: true,
             swap_priority_threshold: Priority::Low,
