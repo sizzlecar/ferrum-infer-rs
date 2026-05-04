@@ -3042,6 +3042,18 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         // while the allocator pool still has in-flight references from the
         // graph's kernels corrupts stream state. Sync first to drain, then
         // destroy graph, then sync again to ensure cleanup completes.
+        //
+        // Side benefit: the reset acts as a workaround for the
+        // multi-replay batched SIGSEGV. Empirically, the second
+        // pure-replay of a batched graph hits CUDA_ERROR (silent SIGSEGV
+        // with no panic message) — see /tmp/ferrum_graph2.log when
+        // FERRUM_BATCHED_GRAPH=1 + reset_graph removed: server crashes
+        // mid-replay after one successful post-capture replay. With
+        // reset_graph here, every request completion forces re-capture,
+        // limiting how many replays happen on a single graph instance.
+        // Bench result: 4/16 reqs succeed (with reset/thrash) vs 0/16
+        // (without reset, multi-replay crash). Real fix requires
+        // addressing the cuGraphLaunch instability — separate work.
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
         B::reset_graph(&mut ctx);
