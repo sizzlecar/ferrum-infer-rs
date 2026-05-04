@@ -25,6 +25,10 @@ use ferrum_kernels::backend::{Backend, KvCache, MAX_LAYERS_FOR_GRAPH};
 /// Distinct from any `m_padded`-based key used by the batched path.
 const SINGLE_ITEM_GRAPH_KEY: u64 = 0;
 
+/// Diag counters for the batched graph dispatcher (replay vs eager).
+static BATCHED_GRAPH_REPLAY_COUNT: AtomicU64 = AtomicU64::new(0);
+static BATCHED_GRAPH_EAGER_COUNT: AtomicU64 = AtomicU64::new(0);
+
 static ATTN_TIME_US: AtomicU64 = AtomicU64::new(0);
 static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
 static QKR_TIME_US: AtomicU64 = AtomicU64::new(0);
@@ -2120,6 +2124,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             match B::replay_graph(&mut ctx, graph_key) {
                 Ok(true) => {
                     did_pure_replay = true;
+                    BATCHED_GRAPH_REPLAY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -2127,6 +2132,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     eprintln!("[batched-trace] replay err: {}", e);
                 }
             }
+        }
+        if graph_enabled && !did_pure_replay {
+            BATCHED_GRAPH_EAGER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Periodic stats (every 256 calls).
+        let total = BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+            + BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        if graph_enabled && total > 0 && total.is_multiple_of(256) {
+            eprintln!(
+                "[batched-graph-stats] m={m} m_padded={m_padded} replays={} eagers={} keys_seen={:?}",
+                BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                self.batched_graph_keys_seen,
+            );
         }
 
         if !did_pure_replay {
