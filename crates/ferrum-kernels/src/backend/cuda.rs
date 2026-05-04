@@ -421,26 +421,52 @@ impl Backend for CudaBackend {
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
         with_decode_graph(key, |g_opt| {
             if let Some(g) = g_opt {
+                let prof = std::env::var("FERRUM_GRAPH_PROF").is_ok();
+                let t_pre = if prof { Some(std::time::Instant::now()) } else { None };
                 // Re-upload before each launch. Without it, c=4 throughput
                 // drops 257→178 tok/s (post-Phase-8 measurement). The
                 // graph instantiate-then-upload-once design didn't pan out
                 // empirically; keep the per-replay upload until we
                 // understand why removing it slows things down.
-                let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
-                if st_up != sys::CUresult::CUDA_SUCCESS {
-                    return Err(FerrumError::unsupported(format!(
-                        "cuGraphUpload: {st_up:?}"
-                    )));
+                let skip_upload = std::env::var("FERRUM_GRAPH_SKIP_UPLOAD")
+                    .map_or(false, |v| v == "1");
+                if !skip_upload {
+                    let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
+                    if st_up != sys::CUresult::CUDA_SUCCESS {
+                        return Err(FerrumError::unsupported(format!(
+                            "cuGraphUpload: {st_up:?}"
+                        )));
+                    }
                 }
+                let t_after_upload = if prof { Some(std::time::Instant::now()) } else { None };
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
                 }
-                let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
-                if st_sync != sys::CUresult::CUDA_SUCCESS {
-                    return Err(FerrumError::unsupported(format!(
-                        "post-launch sync: {st_sync:?}"
-                    )));
+                let t_after_launch = if prof { Some(std::time::Instant::now()) } else { None };
+                let skip_sync = std::env::var("FERRUM_GRAPH_SKIP_SYNC")
+                    .map_or(false, |v| v == "1");
+                if !skip_sync {
+                    let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
+                    if st_sync != sys::CUresult::CUDA_SUCCESS {
+                        return Err(FerrumError::unsupported(format!(
+                            "post-launch sync: {st_sync:?}"
+                        )));
+                    }
+                }
+                if let (Some(t0), Some(t1), Some(t2)) = (t_pre, t_after_upload, t_after_launch) {
+                    static N: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n.is_multiple_of(64) {
+                        let upload = t1.duration_since(t0).as_micros();
+                        let launch = t2.duration_since(t1).as_micros();
+                        let sync = t2.elapsed().as_micros();
+                        eprintln!(
+                            "[graph-prof] call#{n} upload={upload}us launch={launch}us sync={sync}us total={}us",
+                            t0.elapsed().as_micros()
+                        );
+                    }
                 }
                 Ok(true)
             } else {
