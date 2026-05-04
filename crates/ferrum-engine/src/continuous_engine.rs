@@ -686,6 +686,8 @@ impl EngineInner {
     /// Run batch decode for multiple requests in a single forward pass.
     async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
         // Build DecodeInput for each request
+        let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+        let t0 = if prof { Some(Instant::now()) } else { None };
         let mut decode_inputs = Vec::with_capacity(request_ids.len());
         let rids: Vec<RequestId> = request_ids.to_vec();
         {
@@ -710,21 +712,39 @@ impl EngineInner {
                 ));
             }
         }
+        let t_prep = if prof { Some(Instant::now()) } else { None };
 
         // Call batch_decode on the executor
         let decode_outputs = self.model_executor.batch_decode(&decode_inputs).await?;
+        let t_decode = if prof { Some(Instant::now()) } else { None };
 
         // Process each result: sample, update state, stream
+        let mut t_post_total_us = 0u128;
+        let mut t_logits_us = 0u128;
+        let mut t_sample_us = 0u128;
+        let mut t_lock_us = 0u128;
+        let mut t_emit_us = 0u128;
         for (rid, decode_output) in rids.iter().zip(decode_outputs.iter()) {
+            let ti = if prof { Some(Instant::now()) } else { None };
             let logits_vec = decode_output.logits.to_vec_f32()?;
-
+            if let Some(t) = ti {
+                t_logits_us += t.elapsed().as_micros();
+            }
+            let ti = if prof { Some(Instant::now()) } else { None };
             let next_token = {
                 let mut sequences = self.sequences.write();
+                if let Some(t) = ti {
+                    t_lock_us += t.elapsed().as_micros();
+                }
                 let seq = sequences
                     .get_mut(rid)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
                 let mut logits = logits_vec;
+                let ti2 = if prof { Some(Instant::now()) } else { None };
                 let token = seq.sample_with_processors(&mut logits)?;
+                if let Some(t) = ti2 {
+                    t_sample_us += t.elapsed().as_micros();
+                }
                 seq.generated_tokens.push(token);
                 seq.kv_cache = Some(decode_output.kv_cache.clone());
                 seq.tokens_this_iteration += 1;
@@ -742,7 +762,11 @@ impl EngineInner {
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
 
+            let ti = if prof { Some(Instant::now()) } else { None };
             self.send_stream_update(rid, next_token).await;
+            if let Some(t) = ti {
+                t_emit_us += t.elapsed().as_micros();
+            }
 
             let should_stop = {
                 let sequences = self.sequences.read();
@@ -764,6 +788,29 @@ impl EngineInner {
                     }
                 };
                 self.complete_request(rid, finish_reason).await?;
+            }
+        }
+
+        if let (Some(t0), Some(tp), Some(td)) = (t0, t_prep, t_decode) {
+            t_post_total_us = td.elapsed().as_micros();
+            let total_us = t0.elapsed().as_micros();
+            let prep_us = tp.duration_since(t0).as_micros();
+            let decode_us = td.duration_since(tp).as_micros();
+            // Throttle: print every 32nd iter (avoid log spam)
+            let n = self.total_decode_tokens.load(Ordering::Relaxed);
+            if n.is_multiple_of(32) {
+                eprintln!(
+                    "[batch-decode-prof] m={} total={}us prep={}us decode={}us post={}us (logits={}us lock={}us sample={}us emit={}us)",
+                    rids.len(),
+                    total_us,
+                    prep_us,
+                    decode_us,
+                    t_post_total_us,
+                    t_logits_us,
+                    t_lock_us,
+                    t_sample_us,
+                    t_emit_us,
+                );
             }
         }
 
