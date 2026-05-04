@@ -489,6 +489,21 @@ impl EngineInner {
     // ── prefill ────────────────────────────────────────────────────────
 
     async fn run_prefill(&self, request_id: &RequestId) -> Result<()> {
+        let prefill_prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+        let prefill_t0 = if prefill_prof { Some(std::time::Instant::now()) } else { None };
+        let res = self.run_prefill_inner(request_id).await;
+        if let Some(t0) = prefill_t0 {
+            static PREFILL_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = PREFILL_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let elapsed = t0.elapsed().as_micros();
+            eprintln!("[prefill-prof] call#{} req={} elapsed={}us ok={}",
+                n, request_id, elapsed, res.is_ok());
+        }
+        res
+    }
+
+    async fn run_prefill_inner(&self, request_id: &RequestId) -> Result<()> {
         let (input_tokens_clone, num_tokens) = {
             let sequences = self.sequences.read();
             let seq = sequences
@@ -1398,16 +1413,34 @@ impl ContinuousBatchEngine {
         inner.is_running.store(true, Ordering::SeqCst);
         tokio::spawn(async move {
             info!("Background iteration loop started");
+            let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+            let mut last_iter_end: Option<std::time::Instant> = None;
+            static GAP_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             loop {
                 if !inner.is_running.load(Ordering::SeqCst) {
                     break;
                 }
+                let inter_iter_us = if let Some(prev) = last_iter_end {
+                    Some(prev.elapsed().as_micros() as u64)
+                } else {
+                    None
+                };
                 {
                     let _guard = inner.iteration_lock.lock().await;
                     if let Err(e) = inner.run_iteration().await {
                         warn!("Iteration error: {}", e);
                     }
                 }
+                if prof {
+                    let n = GAP_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n.is_multiple_of(8) {
+                        if let Some(gap_us) = inter_iter_us {
+                            eprintln!("[bg-loop-gap] call#{} inter_iter={}us", n, gap_us);
+                        }
+                    }
+                }
+                last_iter_end = Some(std::time::Instant::now());
                 tokio::task::yield_now().await;
             }
             info!("Background iteration loop stopped");
