@@ -377,14 +377,8 @@ impl EngineInner {
             }
         }
 
-        // Decode continuing requests through the batched path (handles
-        // m=1 cleanly via key=1 in the multi-slot graph cache). Previous
-        // logic split single-item out to run_decode_step which (a) used
-        // a different GPU code path (no batched scratch reuse) and (b)
-        // mid-bench at c≥4 routed many iters to single-item when prefill
-        // waves dropped active-decode count to 1. Routing everything to
-        // batched gives consistent perf.
-        if !decode_ids.is_empty() {
+        // Decode continuing requests (batch when possible)
+        if decode_ids.len() > 1 {
             if let Err(e) = self.run_batch_decode(&decode_ids).await {
                 warn!("Batch decode failed, falling back to per-request: {}", e);
                 for rid in &decode_ids {
@@ -392,6 +386,13 @@ impl EngineInner {
                         warn!("Decode failed for {}: {}", rid, e);
                         self.complete_request(rid, FinishReason::Error).await?;
                     }
+                }
+            }
+        } else {
+            for rid in &decode_ids {
+                if let Err(e) = self.run_decode_step(rid).await {
+                    warn!("Decode failed for {}: {}", rid, e);
+                    self.complete_request(rid, FinishReason::Error).await?;
                 }
             }
         }
