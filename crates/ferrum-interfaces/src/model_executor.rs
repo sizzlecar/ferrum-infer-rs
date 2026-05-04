@@ -265,6 +265,35 @@ pub trait ModelExecutor: Send + Sync {
         Ok(outputs)
     }
 
+    /// Unified mixed-batch forward: process a [`UnifiedBatch`] containing
+    /// any combination of prefill chunks (one or more `q_tokens` per item,
+    /// possibly continuing from `pos_offset > 0`) and decode steps
+    /// (`q_tokens.len() == 1`, `is_final_chunk = true`) in a single model
+    /// forward pass.
+    ///
+    /// Returns one element per `batch.items[i]`:
+    /// - `Some(logits)` for items with `is_final_chunk = true` (the
+    ///   request's final-position logits, ready for sampling)
+    /// - `None` for intermediate prefill chunks (no lm_head executed —
+    ///   model only updates KV state)
+    ///
+    /// Default implementation returns `Err(unsupported)`. Concrete LLM
+    /// executors should override with either:
+    /// - A behavioral fallback that dispatches each chunk via existing
+    ///   `prefill()` and groups decode items into `batch_decode()` (this
+    ///   preserves current behavior; no perf change), OR
+    /// - A real unified-forward path that runs all items through one
+    ///   `[M_total, hidden]` GEMM chain with a varlen attention kernel
+    ///   (this is the chunked-prefill perf unlock).
+    async fn unified_decode(
+        &self,
+        _batch: &UnifiedBatch,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "unified_decode not implemented for this executor",
+        ))
+    }
+
     /// Optional: full forward pass (for non-autoregressive use cases)
     async fn forward(&self, _input: &TensorRef) -> Result<TensorRef> {
         // Default implementation not supported

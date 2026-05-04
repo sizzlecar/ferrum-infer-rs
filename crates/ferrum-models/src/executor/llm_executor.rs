@@ -19,7 +19,7 @@ use tracing::debug;
 use ferrum_interfaces::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
-        MemoryRequirements, PrefillInput, PrefillOutput,
+        MemoryRequirements, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     ModelExecutor,
 };
@@ -361,6 +361,82 @@ impl ModelExecutor for LlmExecutor {
             }
         }
         Ok(outputs)
+    }
+
+    /// Unified mixed-batch dispatch (chunked-prefill API).
+    ///
+    /// This impl is a behavior-preserving FALLBACK over the existing
+    /// trait methods on `DecoderOnlyLLM`: prefill items go through
+    /// `model.prefill(seq_id, &q_tokens)` (one at a time, mirroring the
+    /// engine's current sequential prefill loop), decode items
+    /// (`q_len == 1 && is_final_chunk`) are grouped into a single
+    /// `model.decode_batch(...)` call. Net behavior is identical to the
+    /// engine's pre-Phase-13 path; this just changes WHO orchestrates
+    /// the prefill/decode split (caller → unified_decode) so the engine
+    /// can converge on a single call.
+    ///
+    /// The real performance unlock comes in Step 5 when models override
+    /// this with a true unified-forward (one [M_total, hidden] forward
+    /// + varlen attention) — at that point the kernel-level mix replaces
+    /// the host-side serial dispatch here.
+    async fn unified_decode(
+        &self,
+        batch: &UnifiedBatch,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut results: Vec<Option<Vec<f32>>> = vec![None; batch.items.len()];
+        if batch.items.is_empty() {
+            return Ok(results);
+        }
+
+        // Partition: pure decode items vs prefill chunks.
+        // A "decode" item has q_len == 1 AND is_final_chunk == true.
+        // Anything else (chunked prefill mid-stream OR a single-token
+        // prefill that returns logits) goes through the per-item prefill
+        // path so the model receives the right pos_offset behaviour.
+        let mut prefill_indices: Vec<usize> = Vec::new();
+        let mut decode_indices: Vec<usize> = Vec::new();
+        for (i, item) in batch.items.iter().enumerate() {
+            if item.q_tokens.len() == 1 && item.is_final_chunk {
+                decode_indices.push(i);
+            } else {
+                prefill_indices.push(i);
+            }
+        }
+
+        // Prefill items — sequential, mirrors current engine behaviour.
+        // Held under a single model lock to amortise lock acquire across
+        // all prefills in this batch (we may revisit per-call locking
+        // when chunked-prefill becomes the perf-critical path).
+        if !prefill_indices.is_empty() {
+            let mut model = self.model.lock();
+            for &i in &prefill_indices {
+                let item = &batch.items[i];
+                let logits = model.prefill(&item.seq_id, &item.q_tokens);
+                if item.is_final_chunk {
+                    results[i] = Some(logits);
+                }
+            }
+        }
+
+        // Decode items — single batched dispatch.
+        if !decode_indices.is_empty() {
+            let tuples: Vec<(String, u32, u32)> = decode_indices
+                .iter()
+                .map(|&i| {
+                    let it = &batch.items[i];
+                    (it.seq_id.clone(), it.q_tokens[0], it.pos_offset as u32)
+                })
+                .collect();
+            let logits_vec = {
+                let mut model = self.model.lock();
+                model.decode_batch(&tuples)
+            };
+            for (j, &i) in decode_indices.iter().enumerate() {
+                results[i] = Some(logits_vec[j].clone());
+            }
+        }
+
+        Ok(results)
     }
 
     fn release_cache(&self, cache_id: &str) {
