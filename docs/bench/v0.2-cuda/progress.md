@@ -18,6 +18,43 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
+## Phase 6 — INT4 desc_act g_idx fix (commits `bcb076b`, `e9968d0`, `e83188a`, `dad43e3`)
+
+**Bug** (silent): all M2_* models on this pod (Llama-3.1-8B-GPTQ-INT4) have
+`desc_act=true` (act-order). ferrum's gemm_gptq path (Marlin AND Triton)
+ignored `g_idx` entirely — it computed group from `k/group_size` instead of
+`g_idx[k]`. With desc_act the group assignment is non-monotonic, so almost
+every dequantised weight used the wrong scale/zero → garbage tokens.
+
+**Symptom**: M2 c=1..16 produced `]\n]\n]\n...` repeated ~40× across all
+prompts/concurrencies. Bench harness measured *throughput of garbage*.
+**ALL prior M2 numbers (94/186/235/443 tok/s) were invalid.**
+
+**Fix** (`dad43e3`): when `quantize_config.json` has `desc_act=true`,
+dequantise INT4 → f32 on CPU at LOAD time using `g_idx[k]` for scale/zero
+lookup, then build `DenseLinear<B>` (cuBLAS f16 GEMM). Disk row k IS
+original column k — no row permutation. Verified against vLLM exllama
+math (`gptq.py:368`'s `argsort` + `gptq_shuffle` reduces to the same
+y[n] = Σⱼ x[j]·dequant(qweight[j,n], scales[g_idx[j],n])).
+
+| | ferrum c=1 | ferrum c=4 | ferrum c=16 | vLLM c=1/4/16 |
+|---|---|---|---|---|
+| **post-fix M2 INT4 (now FP16-dense)** | 50.2 tok/s | 150.8 tok/s | 350.9 tok/s | 149/517/1597 |
+| ratio | 33% | 29% | 22% | — |
+| TPOT_p50 | 19.3 ms | 22.6 ms | 37.8 ms | — |
+| **content correct (16/16 c=4, 64/64 c=16)** | ✓ | ✓ | ✓ | ✓ |
+
+The ratio dropped vs the (garbage) M1 FP16 baseline because vLLM's gptq_marlin
+runs perm-aware INT4 and gets ~1.5-2× over its own FP16. ferrum now runs FP16
+dense for these models (loses INT4 memory savings: 5.5 GB → ~16 GB; loses
+INT4 GEMM speedup). Performance roughly matches M1 FP16 (153/361 tok/s),
+which is the expected dequant→Dense ceiling.
+
+**Future work**: perm-aware Marlin dispatch — vLLM's gptq_marlin takes
+`perm = argsort(g_idx)` as a kernel arg and gathers activations in shared
+memory load. Adding this to ferrum's Marlin call recovers INT4 perf for
+desc_act=true models.
+
 ## Phase 5 — c=4 plateau investigation (commits `1afdd2c`, `da2f725`)
 
 Profiling per-iter at c=4 to find where the throughput-flat-but-TPOT-down
