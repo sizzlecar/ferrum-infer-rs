@@ -649,58 +649,43 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
 /// return original-order f32 weights laid out `[N, K]` row-major (matches
 /// `DenseLinear::from_rows`).
 ///
-/// vLLM's gptq_marlin uses `perm = argsort(g_idx)` to gather activations
-/// at runtime; we apply the same perm here at LOAD time so the GEMM at
-/// runtime is plain A @ W_orig.
+/// Key insight: in AutoGPTQ desc_act format, qweight rows are NOT
+/// permuted from original-K order. The act-order trick is encoded purely
+/// in `g_idx[k]` — which records the QUANTISATION GROUP (not column
+/// position) chosen for disk row k. Different rows that originally
+/// belonged to far-apart positions can share a group via g_idx.
 ///
-/// Math: `argsort(g_idx)[i]` = disk position sorted-by-g_idx-ascending.
-/// We place `dequant(qweight[disk_k, :])` at original position
-/// `argsort(g_idx).index_of(disk_k)` = the rank of disk_k when sorting
-/// by g_idx. Equivalently, define `inv_argsort[disk_k] = i` such that
-/// `argsort(g_idx)[i] = disk_k`. Then
-/// `W_orig[inv_argsort[disk_k], :] = dequant(qweight[disk_k, :])`.
+/// Verified against vLLM's exllama path (gptq.py:368): for desc_act it
+/// runs `g_idx ← argsort(g_idx)` then `gptq_shuffle(qweight, g_idx)`,
+/// which physically reorders qweight by argsort and gathers x by argsort
+/// at GEMM. Net effect: y[n] = Σⱼ x[j] · dequant(qweight[j, n],
+/// scales[g_idx_orig[j], n], qzeros[g_idx_orig[j], n]).
+/// → disk_k IS original_k; only the (scale, zero) LOOKUP differs.
 fn dequantize_gptq_with_g_idx(
     qweight: &[i32], // [K/8, N] packed int4
     scales: &[f32],  // [num_groups, N]
     qzeros: &[i32],  // [num_groups, N/8] packed int4
     g_idx: &[i32],   // [K]
-    group_size: usize,
+    _group_size: usize,
     k: usize,
     n: usize,
 ) -> Vec<f32> {
-    let num_groups = k / group_size;
     debug_assert_eq!(g_idx.len(), k);
-    debug_assert_eq!(scales.len(), num_groups * n);
 
-    // Compute argsort(g_idx): sorted_indices[i] = disk position with
-    // i-th smallest g_idx. Stable sort: ties broken by original index.
-    let mut sorted_indices: Vec<usize> = (0..k).collect();
-    sorted_indices.sort_by_key(|&i| g_idx[i]);
-
-    // Compute inv_argsort: inv_argsort[disk_k] = position of disk_k in
-    // sorted_indices (= the rank of disk_k when g_idx is sorted).
-    let mut inv_argsort = vec![0usize; k];
-    for (rank, &disk_k) in sorted_indices.iter().enumerate() {
-        inv_argsort[disk_k] = rank;
-    }
-
-    // Dequant + place at inv_argsort[disk_k] in original-K layout.
-    // Output: [N, K] row-major → out[col * k + orig_k] = value.
+    // Output: [N, K] row-major → out[col * k + k_idx] = value.
     let mut w = vec![0.0f32; n * k];
     let packed_rows = k / 8;
     for pr in 0..packed_rows {
         for col in 0..n {
             let packed = qweight[pr * n + col] as u32;
             for bi in 0..8 {
-                let disk_ki = pr * 8 + bi;
+                let ki = pr * 8 + bi;
                 let q = ((packed >> (bi * 4)) & 0xF) as i32;
-                let g = g_idx[disk_ki] as usize;
+                let g = g_idx[ki] as usize;
                 let scale = scales[g * n + col];
                 let z_packed = qzeros[g * (n / 8) + (col / 8)] as u32;
                 let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
-                let val = (q - zero) as f32 * scale;
-                let orig_ki = inv_argsort[disk_ki];
-                w[col * k + orig_ki] = val;
+                w[col * k + ki] = (q - zero) as f32 * scale;
             }
         }
     }
