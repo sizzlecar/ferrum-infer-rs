@@ -356,25 +356,6 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         } else {
             None
         };
-        // FAIL LOUD: ferrum's load_gptq currently ignores g_idx. For
-        // desc_act=true models (most modern AutoGPTQ outputs), this
-        // produces silently-degenerate logits — the model emits the
-        // same single token in a loop. Detect and refuse instead of
-        // letting the user blame GEMM correctness.
-        // Heuristic: g_idx is non-trivial when its values are not the
-        // 0..K identity permutation. AutoGPTQ writes [0..K] for
-        // desc_act=false and a permuted version for desc_act=true.
-        if let Some(gx) = g_idx.as_ref() {
-            let identity = gx.iter().enumerate().all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32);
-            if !identity {
-                return Err(FerrumError::unsupported(format!(
-                    "GPTQ tensor '{name}' has non-trivial g_idx (desc_act=true / act-order); \
-                     ferrum's gptq_marlin / triton_w4a16 paths do not yet apply g_idx. \
-                     Use a model with desc_act=false (re-quantize via AutoGPTQ with desc_act=False) \
-                     or wait for the act-order repack feature."
-                )));
-            }
-        }
 
         // Shape inference: qweight is [K/8, N]; scales is [K/group, N].
         // → K = qw_shape[0] * 8, N = qw_shape[1].
@@ -385,6 +366,47 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         }
         let in_features = qw_shape[0] * 8;
         let out_features = qw_shape[1];
+
+        // desc_act=true detection. AutoGPTQ writes g_idx[k] = k/group_size
+        // for desc_act=false (trivial). Non-monotonic values → act-order.
+        let is_desc_act = g_idx.as_ref().map_or(false, |gx| {
+            !gx.iter()
+                .enumerate()
+                .all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32)
+        });
+
+        // Act-order GPTQ requires permuting input activations by g_idx during
+        // GEMM, OR equivalently dequantising + reordering on load. Marlin /
+        // Triton-rs paths in ferrum don't yet wire the per-call permute, so
+        // we eager-dequant on CPU and store as a plain DenseLinear (FP16).
+        // Trades INT4 memory savings for correctness — GEMM is then standard
+        // cuBLAS f16. Re-add INT4 perf later by adding a perm-aware Marlin
+        // dispatch (vLLM's gptq_marlin does this via a `perm` kernel arg).
+        if is_desc_act {
+            let dequant_f32 = dequantize_gptq_with_g_idx(
+                &qweight,
+                &scales_f32,
+                &qzeros,
+                g_idx.as_ref().expect("desc_act=true requires g_idx"),
+                qcfg.group_size,
+                in_features,
+                out_features,
+            );
+            let mut linear = crate::dense::DenseLinear::<B>::from_rows(
+                &dequant_f32,
+                out_features,
+                in_features,
+            );
+            let bias_key = format!("{name}.bias");
+            if self.has(&bias_key) {
+                let (bias, _) = self.read_f32(&bias_key)?;
+                linear = linear.with_bias(B::from_slice(&bias));
+            }
+            tracing::info!(
+                "GPTQ load (desc_act dequant→DenseLinear): name={name} K={in_features} N={out_features}"
+            );
+            return Ok(Box::new(linear));
+        }
         if sc_shape.len() != 2 || sc_shape[1] != out_features {
             return Err(FerrumError::model(format!(
                 "'{name}.scales' {sc_shape:?} incompatible with qweight {qw_shape:?}"
@@ -507,6 +529,54 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
 
         let in_features = qw_rows * 8;
         let out_features = total_n;
+
+        // desc_act detection — same as load_gptq_linear. Q/K/V (or
+        // gate/up) share K, so g_idx from first part covers all.
+        let is_desc_act = g_idx.as_ref().map_or(false, |gx| {
+            !gx.iter()
+                .enumerate()
+                .all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32)
+        });
+        if is_desc_act {
+            let dequant_f32 = dequantize_gptq_with_g_idx(
+                &qw_acc,
+                &sc_acc,
+                &qz_acc,
+                g_idx.as_ref().expect("desc_act=true requires g_idx"),
+                qcfg.group_size,
+                in_features,
+                out_features,
+            );
+            let mut linear = crate::dense::DenseLinear::<B>::from_rows(
+                &dequant_f32,
+                out_features,
+                in_features,
+            );
+            // Optional bias for fused linear (concat of part biases) — none
+            // expected for Llama-3.x but support for Qwen2.5 etc.
+            let mut bias_acc: Vec<f32> = Vec::new();
+            let mut any_bias = false;
+            for p in parts {
+                let bk = format!("{p}.bias");
+                if self.has(&bk) {
+                    any_bias = true;
+                    bias_acc.extend_from_slice(&self.read_f32(&bk)?.0);
+                } else if any_bias {
+                    return Err(FerrumError::model(format!(
+                        "GPTQ fusion bias mix: '{p}' has no bias but earlier part did"
+                    )));
+                }
+            }
+            if any_bias {
+                linear = linear.with_bias(B::from_slice(&bias_acc));
+            }
+            tracing::info!(
+                "GPTQ fused load (desc_act dequant→DenseLinear): K={in_features} N={out_features} parts={}",
+                parts.len()
+            );
+            return Ok(Box::new(linear));
+        }
+
         let mut linear = GptqLinear::<B>::from_raw(
             &qw_acc,
             &sc_acc,
@@ -573,6 +643,67 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         }
         Ok((total_rows, cols, out))
     }
+}
+
+/// Dequantise GPTQ INT4 weights with desc_act=true (act-order) g_idx and
+/// return original-order f32 weights laid out `[N, K]` row-major (matches
+/// `DenseLinear::from_rows`).
+///
+/// AutoGPTQ stores qweight in act-order (rows shuffled by activation
+/// magnitude). g_idx[k] gives the GROUP of the original feature at disk
+/// position k (values in [0, num_groups)). Within a group, AutoGPTQ
+/// preserves original order — so we can reconstruct perm from g_idx by
+/// counting per-group disk-position arrivals.
+///
+///   perm[disk_k] = g_idx[disk_k] * group_size + group_count[g_idx[disk_k]]
+///
+/// where group_count[g] is the running count of disk positions with
+/// g_idx==g seen so far.
+fn dequantize_gptq_with_g_idx(
+    qweight: &[i32], // [K/8, N] packed int4
+    scales: &[f32],  // [num_groups, N]
+    qzeros: &[i32],  // [num_groups, N/8] packed int4
+    g_idx: &[i32],   // [K]
+    group_size: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    let num_groups = k / group_size;
+    debug_assert_eq!(g_idx.len(), k);
+    debug_assert_eq!(scales.len(), num_groups * n);
+
+    // Reconstruct perm: for each disk position k, which original feature
+    // sits there.
+    let mut group_count = vec![0usize; num_groups];
+    let mut perm = vec![0usize; k];
+    for disk_k in 0..k {
+        let g = g_idx[disk_k] as usize;
+        debug_assert!(g < num_groups, "g_idx out of range");
+        perm[disk_k] = g * group_size + group_count[g];
+        group_count[g] += 1;
+    }
+
+    // Dequant + place at original position.
+    // Output layout: [N, K] row-major → out[col * k + orig_k] = value.
+    let mut w = vec![0.0f32; n * k];
+    let packed_rows = k / 8;
+    for pr in 0..packed_rows {
+        for col in 0..n {
+            let packed = qweight[pr * n + col] as u32;
+            for bi in 0..8 {
+                let disk_ki = pr * 8 + bi;
+                let q = ((packed >> (bi * 4)) & 0xF) as i32;
+                let g = g_idx[disk_ki] as usize;
+                let scale = scales[g * n + col];
+                let z_packed = qzeros[g * (n / 8) + (col / 8)] as u32;
+                let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
+                let val = (q - zero) as f32 * scale;
+                let orig_ki = perm[disk_ki];
+                w[col * k + orig_ki] = val;
+            }
+        }
+    }
+    w
 }
 
 fn dtype_to_f32(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {
