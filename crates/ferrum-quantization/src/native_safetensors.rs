@@ -649,16 +649,16 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
 /// return original-order f32 weights laid out `[N, K]` row-major (matches
 /// `DenseLinear::from_rows`).
 ///
-/// AutoGPTQ stores qweight in act-order (rows shuffled by activation
-/// magnitude). g_idx[k] gives the GROUP of the original feature at disk
-/// position k (values in [0, num_groups)). Within a group, AutoGPTQ
-/// preserves original order — so we can reconstruct perm from g_idx by
-/// counting per-group disk-position arrivals.
+/// vLLM's gptq_marlin uses `perm = argsort(g_idx)` to gather activations
+/// at runtime; we apply the same perm here at LOAD time so the GEMM at
+/// runtime is plain A @ W_orig.
 ///
-///   perm[disk_k] = g_idx[disk_k] * group_size + group_count[g_idx[disk_k]]
-///
-/// where group_count[g] is the running count of disk positions with
-/// g_idx==g seen so far.
+/// Math: `argsort(g_idx)[i]` = disk position sorted-by-g_idx-ascending.
+/// We place `dequant(qweight[disk_k, :])` at original position
+/// `argsort(g_idx).index_of(disk_k)` = the rank of disk_k when sorting
+/// by g_idx. Equivalently, define `inv_argsort[disk_k] = i` such that
+/// `argsort(g_idx)[i] = disk_k`. Then
+/// `W_orig[inv_argsort[disk_k], :] = dequant(qweight[disk_k, :])`.
 fn dequantize_gptq_with_g_idx(
     qweight: &[i32], // [K/8, N] packed int4
     scales: &[f32],  // [num_groups, N]
@@ -672,19 +672,20 @@ fn dequantize_gptq_with_g_idx(
     debug_assert_eq!(g_idx.len(), k);
     debug_assert_eq!(scales.len(), num_groups * n);
 
-    // Reconstruct perm: for each disk position k, which original feature
-    // sits there.
-    let mut group_count = vec![0usize; num_groups];
-    let mut perm = vec![0usize; k];
-    for disk_k in 0..k {
-        let g = g_idx[disk_k] as usize;
-        debug_assert!(g < num_groups, "g_idx out of range");
-        perm[disk_k] = g * group_size + group_count[g];
-        group_count[g] += 1;
+    // Compute argsort(g_idx): sorted_indices[i] = disk position with
+    // i-th smallest g_idx. Stable sort: ties broken by original index.
+    let mut sorted_indices: Vec<usize> = (0..k).collect();
+    sorted_indices.sort_by_key(|&i| g_idx[i]);
+
+    // Compute inv_argsort: inv_argsort[disk_k] = position of disk_k in
+    // sorted_indices (= the rank of disk_k when g_idx is sorted).
+    let mut inv_argsort = vec![0usize; k];
+    for (rank, &disk_k) in sorted_indices.iter().enumerate() {
+        inv_argsort[disk_k] = rank;
     }
 
-    // Dequant + place at original position.
-    // Output layout: [N, K] row-major → out[col * k + orig_k] = value.
+    // Dequant + place at inv_argsort[disk_k] in original-K layout.
+    // Output: [N, K] row-major → out[col * k + orig_k] = value.
     let mut w = vec![0.0f32; n * k];
     let packed_rows = k / 8;
     for pr in 0..packed_rows {
@@ -698,7 +699,7 @@ fn dequantize_gptq_with_g_idx(
                 let z_packed = qzeros[g * (n / 8) + (col / 8)] as u32;
                 let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
                 let val = (q - zero) as f32 * scale;
-                let orig_ki = perm[disk_ki];
+                let orig_ki = inv_argsort[disk_ki];
                 w[col * k + orig_ki] = val;
             }
         }
