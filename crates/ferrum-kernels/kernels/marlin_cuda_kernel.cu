@@ -23,6 +23,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <iostream>
+#include <cstdlib>
+#include <cstring>
 
 
 __host__ __device__ constexpr int ceildiv(int a, int b) {
@@ -758,6 +760,16 @@ extern "C" int marlin_cuda(
     } else {
       thread_k = 64;
       thread_n = 256;
+    }
+    // Override via env for tile-tuning experiments. Accepts "64x256",
+    // "128x128", "64x128", "128x64". Per-shape dispatch can be added
+    // later once we identify which tile wins for which (M,N,K).
+    const char* env = std::getenv("FERRUM_MARLIN_TILE");
+    if (env != nullptr) {
+      if (strcmp(env, "64x256") == 0) { thread_k = 64;  thread_n = 256; }
+      else if (strcmp(env, "128x128") == 0) { thread_k = 128; thread_n = 128; }
+      else if (strcmp(env, "64x128") == 0) { thread_k = 64;  thread_n = 128; }
+      else if (strcmp(env, "128x64") == 0) { thread_k = 128; thread_n = 64;  }
     }
   }
 
