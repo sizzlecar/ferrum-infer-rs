@@ -241,6 +241,11 @@ struct EngineInner {
     total_decode_tokens: AtomicU64,
     total_preemptions: AtomicU64,
     prefix_cache_hits: AtomicU64,
+    /// Set true the first time `ensure_bg_loop` runs, so per-request
+    /// `infer_stream` callers don't each spawn their own competing
+    /// driver task (16 streaming requests = 16 drivers thrashing on
+    /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
+    bg_loop_spawned: AtomicBool,
 }
 
 impl EngineInner {
@@ -1353,7 +1358,24 @@ impl ContinuousBatchEngine {
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
                 prefix_cache_hits: AtomicU64::new(0),
+                bg_loop_spawned: AtomicBool::new(false),
             }),
+        }
+    }
+
+    /// Spawn the background iteration loop on first request. Without this,
+    /// every concurrent infer/infer_stream call spawned its own
+    /// drive_to_completion task → 16 streaming requests = 16 tasks all
+    /// racing for `iteration_lock` (thundering herd, observed as ~5ms of
+    /// per-iter tokio scheduling overhead at c=16). With one bg loop +
+    /// per-request tasks just consuming their channel, lock is uncontested.
+    fn ensure_bg_loop(&self) {
+        if !self
+            .inner
+            .bg_loop_spawned
+            .swap(true, Ordering::SeqCst)
+        {
+            let _ = self.start_loop();
         }
     }
 
@@ -1418,11 +1440,11 @@ impl InferenceEngine for ContinuousBatchEngine {
             .write()
             .insert(request_id.clone(), seq_state);
 
-        // Notify any background loop
+        // Make sure the single shared bg loop is running, then just wait
+        // for our oneshot to fire. Avoids per-request drive_to_completion
+        // contention on iteration_lock.
+        self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
-
-        // Drive iterations until our request completes
-        self.inner.drive_to_completion(&request_id).await?;
 
         let result = resp_rx
             .await
@@ -1467,16 +1489,14 @@ impl InferenceEngine for ContinuousBatchEngine {
             .write()
             .insert(request_id.clone(), seq_state);
 
-        // Notify any background loop
+        // Single shared bg loop drives iters; per-request stream just
+        // consumes from `rx`. Used to spawn a per-request drive_to_completion
+        // task here, but with c=N concurrent streams that produced N
+        // tasks all racing for `iteration_lock` — measured ~5ms/iter of
+        // tokio thundering-herd overhead at c=16.
+        let _ = request_id;
+        self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
-
-        // Spawn a driver task so we can return the stream immediately
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            if let Err(e) = inner.drive_to_completion(&request_id).await {
-                warn!("Stream driver error for {}: {}", request_id, e);
-            }
-        });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
