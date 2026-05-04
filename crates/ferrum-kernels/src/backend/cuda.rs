@@ -1608,7 +1608,7 @@ impl Backend for CudaBackend {
         qweight: &[i32],
         scales: &[f32],
         qzeros: &[i32],
-        _g_idx: Option<&[i32]>,
+        g_idx: Option<&[i32]>,
         bits: u32,
         group_size: usize,
         k: usize,
@@ -1619,6 +1619,7 @@ impl Backend for CudaBackend {
                 "CUDA GPTQ: only bits=4 supported (got {bits})"
             )));
         }
+        let _ = qzeros; // qzeros baked into Marlin scales path; unused for Marlin store
 
         // Path B: triton-rs w4a16 GPTQ kernel — operates on the on-disk
         // GPTQ tensor layout directly. Just upload the three tensors and
@@ -1649,9 +1650,44 @@ impl Backend for CudaBackend {
             ));
         }
 
+        // Detect desc_act=true (act-order GPTQ): g_idx is non-trivial.
+        // AutoGPTQ writes g_idx[k] = k/group_size for desc_act=false; any
+        // deviation = act-order. Build perm = argsort(g_idx) and permute
+        // qweight rows so that group_idx = i / group_size after the perm
+        // (matches Marlin's sequential group access). Standard scales/zeros
+        // layout works because they're already indexed by group, not by k.
+        let (qweight_for_repack, perm_dev_opt): (Vec<i32>, Option<CudaSlice<i32>>) =
+            if let Some(gx) = g_idx {
+                let is_desc_act = gx
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &g)| g != (i as i32) / group_size as i32);
+                if is_desc_act {
+                    // perm[i] = disk row whose g_idx is the i-th smallest.
+                    let mut perm: Vec<usize> = (0..k).collect();
+                    perm.sort_by_key(|&i| gx[i]);
+                    let permuted_qweight =
+                        crate::marlin::permute_gptq_qweight_rows(qweight, &perm, k, n);
+                    let perm_i32: Vec<i32> = perm.iter().map(|&p| p as i32).collect();
+                    let stream = default_stream();
+                    let perm_dev = stream
+                        .clone_htod(&perm_i32)
+                        .map_err(|e| FerrumError::model(format!("perm htod: {e}")))?;
+                    tracing::info!(
+                        "GPTQ load (Marlin + desc_act perm-aware): K={k} N={n} gs={group_size}"
+                    );
+                    (permuted_qweight, Some(perm_dev))
+                } else {
+                    (qweight.to_vec(), None)
+                }
+            } else {
+                (qweight.to_vec(), None)
+            };
+
         // Path A (default): Marlin. Repack on CPU, then upload. Matches
         // IST-DASLab/marlin Layer.pack().
-        let marlin_qweight_i32 = crate::marlin::repack_gptq_to_marlin(qweight, k, n);
+        let marlin_qweight_i32 =
+            crate::marlin::repack_gptq_to_marlin(&qweight_for_repack, k, n);
         // Scales arrive as f32 but Marlin expects f16. Convert + permute.
         let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
         let marlin_scales_f16 =
@@ -1681,6 +1717,7 @@ impl Backend for CudaBackend {
             k,
             n,
             group_size: group_size as i32,
+            perm: perm_dev_opt,
         };
 
         // Wrap in the Marlin variant (or pass through, depending on cfg).

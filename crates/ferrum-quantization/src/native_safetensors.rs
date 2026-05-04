@@ -382,6 +382,10 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         // Trades INT4 memory savings for correctness — GEMM is then standard
         // cuBLAS f16. Re-add INT4 perf later by adding a perm-aware Marlin
         // dispatch (vLLM's gptq_marlin does this via a `perm` kernel arg).
+        // Scaffolding for perm-aware Marlin lives in
+        // crates/ferrum-kernels/{kernels/gather_columns.cu, src/marlin.rs}
+        // (MarlinWeight.perm field, permute_gptq_qweight_rows helper) but
+        // the runtime gather + gemm_gptq dispatch is not yet wired.
         if is_desc_act {
             let dequant_f32 = dequantize_gptq_with_g_idx(
                 &qweight,

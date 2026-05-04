@@ -49,6 +49,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/layer_norm.cu");
     println!("cargo:rerun-if-changed=kernels/gelu.cu");
     println!("cargo:rerun-if-changed=kernels/decode_attention_hm.cu");
+    println!("cargo:rerun-if-changed=kernels/gather_columns.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -82,6 +83,7 @@ fn main() {
             "kernels/layer_norm.cu",
             "kernels/gelu.cu",
             "kernels/decode_attention_hm.cu",
+            "kernels/gather_columns.cu",
         ])
         .out_dir(out_dir)
         .arg("-Ikernels") // for common.cuh
