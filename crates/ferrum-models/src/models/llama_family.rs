@@ -2917,6 +2917,28 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     );
                 }
             }
+            // BISECT: dump attn_flat right after batched flash_attn at layer 0
+            // to compare against per-item path's attn_flat (also written here).
+            if li == 0 && std::env::var("FERRUM_DUMP_KV_APPEND").is_ok() && batched_attn_res.is_ok()
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static REPORTED_ATTN_OUT: AtomicBool = AtomicBool::new(false);
+                if !REPORTED_ATTN_OUT.swap(true, Ordering::Relaxed) {
+                    B::sync(ctx);
+                    let attn_dump = B::to_vec(&self.scratch.attn_flat, m * nh * hd);
+                    let mode = if batched_kv_append_ok { "BATCHED" } else { "PER_ITEM" };
+                    let item0 = &attn_dump[0..8];
+                    let item1 = &attn_dump[nh * hd..nh * hd + 8];
+                    eprintln!(
+                        "[DUMP] {} attn_flat[item=0,head=0,:8]: {:?}",
+                        mode, item0
+                    );
+                    eprintln!(
+                        "[DUMP] {} attn_flat[item=1,head=0,:8]: {:?}",
+                        mode, item1
+                    );
+                }
+            }
             if batched_attn_res.is_err() {
                 // Per-item flash_attn fallback for backends that
                 // implement the batched qkr but not the batched attn.
