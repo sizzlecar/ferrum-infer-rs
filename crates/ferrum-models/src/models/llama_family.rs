@@ -3029,23 +3029,36 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
                 }
             }
         }
-        // Captured graph expects a specific cache layout; roll it back too.
-        let mut ctx = B::new_context();
-        B::reset_graph(&mut ctx);
+        // kv_len is read from a per-call device buffer (DECODE_STATE.kv /
+        // cache_lens_dev), not from a captured kernel arg, and buffer
+        // pointers are unchanged. Don't invalidate the slot — batched
+        // replay must keep working. Single-item path forces re-capture
+        // via warmup reset to be safe against potential cache layout
+        // assumptions captured into kernel literals.
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
     }
 
     fn release(&mut self, cache_id: &str) {
-        // Sync + drop graph BEFORE touching cache buffers. The graph was
-        // actively running replays up to this point; destroying the graph
-        // while the allocator pool still has in-flight references from the
-        // graph's kernels corrupts stream state. Sync first to drain, then
-        // destroy graph, then sync again to ensure cleanup completes.
+        // No graph invalidation needed: cache buffers go to kv_free_pool
+        // (not dropped), so the captured graph's KV pointer args remain
+        // valid. Batched graph reads cache pointers from BATCHED_SCRATCH
+        // populated per-call, so freed cache_ids are simply not in the
+        // next call's pointer set. The shared global graph slot
+        // (single-item AND batched) was being thrashed every time a
+        // request finished — for c=4 bench that meant ~12 of 16
+        // requests failing under FERRUM_BATCHED_GRAPH=1 because every
+        // release() between iterations cleared the cached batched graph.
+        //
+        // Drain in-flight kernels still required: a sequence completion
+        // is the natural sync point — the dtoh of final logits already
+        // forced ordering, but be paranoid about untouched ops.
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        B::reset_graph(&mut ctx);
-        B::sync(&mut ctx);
+        // Single-item graph still uses direct cache-pointer kernel args.
+        // If the next request gets a different buffer from the pool, the
+        // captured pointers go stale. Force re-capture for the single-item
+        // path; batched graph state is independent and stays valid.
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
 
