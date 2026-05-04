@@ -724,12 +724,21 @@ impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
     /// Run batch decode for multiple requests in a single forward pass.
+    ///
+    /// Dispatches via the unified-batch API: we build a `UnifiedBatch`
+    /// of decode-only items (each `q_len = 1`, `is_final_chunk = true`)
+    /// and call `model_executor.unified_decode(...)`. The default fallback
+    /// in `LlmModelExecutor` recognises the all-decode shape and reroutes
+    /// to the existing batched decode path; once `LlmFamilyModel` ships
+    /// a real unified forward (Step 5), the same call benefits from the
+    /// chunked-prefill kernel work without further engine changes.
     async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
-        // Build DecodeInput for each request
-        let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
-        let t0 = if prof { Some(Instant::now()) } else { None };
-        let mut decode_inputs = Vec::with_capacity(request_ids.len());
+        use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
+
         let rids: Vec<RequestId> = request_ids.to_vec();
+
+        // Build the unified batch from sequence state.
+        let mut batch = UnifiedBatch::new();
         {
             let sequences = self.sequences.read();
             for rid in &rids {
@@ -746,64 +755,55 @@ impl EngineInner {
                     .last()
                     .copied()
                     .unwrap_or(TokenId::new(0));
-                let tensor = self.tokens_to_tensor(&[last_token.get()])?;
-                decode_inputs.push(ferrum_interfaces::model_executor::DecodeInput::new(
-                    tensor, kv_cache,
-                ));
+                use ferrum_interfaces::KvCacheHandle;
+                let pos_offset = kv_cache.block_table().sequence_length;
+                batch.items.push(UnifiedBatchItem {
+                    seq_id: rid.to_string(),
+                    q_tokens: vec![last_token.get()],
+                    kv_cache,
+                    pos_offset,
+                    is_final_chunk: true,
+                });
             }
         }
-        let t_prep = if prof { Some(Instant::now()) } else { None };
 
-        // Call batch_decode on the executor
-        let decode_outputs = self.model_executor.batch_decode(&decode_inputs).await?;
-        let t_decode = if prof { Some(Instant::now()) } else { None };
+        let results = self.model_executor.unified_decode(&batch).await?;
+        if results.len() != rids.len() {
+            return Err(FerrumError::internal(format!(
+                "unified_decode returned {} results for {} requests",
+                results.len(),
+                rids.len(),
+            )));
+        }
 
-        // Optional A/B switch: skip sampling+logits-readback entirely.
-        // If FERRUM_SKIP_SAMPLE=1, every request gets token=1 each iter
-        // (no logits.to_vec_f32, no top-k/p/penalty, no rng). Used to
-        // measure how much wall-clock the sampling path actually costs
-        // — if throughput jumps significantly with this on, sampling is
-        // a real engine bottleneck worth optimizing.
-        let skip_sample = std::env::var("FERRUM_SKIP_SAMPLE").is_ok();
+        // Per-item post-processing: sample, update sequence state, stream
+        // the new token, check stop conditions. Decode-only items always
+        // produce Some(logits); a None here would indicate a backend bug.
+        for (rid, logits_opt) in rids.iter().zip(results.into_iter()) {
+            let mut logits = logits_opt.ok_or_else(|| {
+                FerrumError::internal(format!(
+                    "unified_decode returned None for decode item (rid={rid})"
+                ))
+            })?;
 
-        // Process each result: sample, update state, stream
-        let mut t_post_total_us = 0u128;
-        let mut t_logits_us = 0u128;
-        let mut t_sample_us = 0u128;
-        let mut t_lock_us = 0u128;
-        let mut t_emit_us = 0u128;
-        for (rid, decode_output) in rids.iter().zip(decode_outputs.iter()) {
-            let ti = if prof { Some(Instant::now()) } else { None };
-            let logits_vec = if skip_sample {
-                Vec::new()
-            } else {
-                decode_output.logits.to_vec_f32()?
-            };
-            if let Some(t) = ti {
-                t_logits_us += t.elapsed().as_micros();
-            }
-            let ti = if prof { Some(Instant::now()) } else { None };
             let next_token = {
                 let mut sequences = self.sequences.write();
-                if let Some(t) = ti {
-                    t_lock_us += t.elapsed().as_micros();
-                }
                 let seq = sequences
                     .get_mut(rid)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                let ti2 = if prof { Some(Instant::now()) } else { None };
-                let token = if skip_sample {
-                    TokenId::new(1)
-                } else {
-                    let mut logits = logits_vec;
-                    seq.sample_with_processors(&mut logits)?
-                };
-                if let Some(t) = ti2 {
-                    t_sample_us += t.elapsed().as_micros();
-                }
+                let token = seq.sample_with_processors(&mut logits)?;
                 seq.generated_tokens.push(token);
-                seq.kv_cache = Some(decode_output.kv_cache.clone());
                 seq.tokens_this_iteration += 1;
+                // The model has appended this iter's token to its internal
+                // KV; update the engine-side handle so the NEXT iter's
+                // pos_offset (read via block_table().sequence_length)
+                // sees the bumped count. The legacy run_batch_decode path
+                // got this for free by replacing seq.kv_cache with
+                // decode_output.kv_cache (which the executor pre-bumped).
+                if let Some(h) = seq.kv_cache.take() {
+                    let new_len = h.block_table().sequence_length + 1;
+                    seq.kv_cache = Some(self.make_kv_handle_with_seq(&h, new_len));
+                }
                 token
             };
 
@@ -818,11 +818,7 @@ impl EngineInner {
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
 
-            let ti = if prof { Some(Instant::now()) } else { None };
             self.send_stream_update(rid, next_token).await;
-            if let Some(t) = ti {
-                t_emit_us += t.elapsed().as_micros();
-            }
 
             let should_stop = {
                 let sequences = self.sequences.read();
@@ -844,36 +840,6 @@ impl EngineInner {
                     }
                 };
                 self.complete_request(rid, finish_reason).await?;
-            }
-        }
-
-        if let (Some(t0), Some(tp), Some(td)) = (t0, t_prep, t_decode) {
-            t_post_total_us = td.elapsed().as_micros();
-            let total_us = t0.elapsed().as_micros();
-            let prep_us = tp.duration_since(t0).as_micros();
-            let decode_us = td.duration_since(tp).as_micros();
-            // Dedicated call counter so the throttle never silently misses.
-            // The previous total_decode_tokens-based throttle never fired
-            // when the decode batch size wasn't a multiple-of-32 — e.g.
-            // a continuous batch of 15 produces token counts 15,30,45,60
-            // which are never multiples of 32.
-            static BD_PROF_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let call_n = BD_PROF_CALLS.fetch_add(1, Ordering::Relaxed);
-            if call_n.is_multiple_of(8) {
-                eprintln!(
-                    "[batch-decode-prof] call#{} m={} total={}us prep={}us decode={}us post={}us (logits={}us lock={}us sample={}us emit={}us)",
-                    call_n,
-                    rids.len(),
-                    total_us,
-                    prep_us,
-                    decode_us,
-                    t_post_total_us,
-                    t_logits_us,
-                    t_lock_us,
-                    t_sample_us,
-                    t_emit_us,
-                );
             }
         }
 
