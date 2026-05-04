@@ -22,6 +22,10 @@ if [ "${SKIP_SAMPLE:-0}" = "1" ]; then
   export FERRUM_SKIP_SAMPLE=1
   echo "  [A/B] FERRUM_SKIP_SAMPLE=1 active"
 fi
+if [ "${VLLM_MARLIN:-0}" = "1" ]; then
+  export FERRUM_VLLM_MARLIN=1
+  echo "  [A/B] FERRUM_VLLM_MARLIN=1 active (Phase 12 vLLM port)"
+fi
 CUDA_VISIBLE_DEVICES=0 \
 FERRUM_KV_CAPACITY=2048 \
 FERRUM_MAX_BATCH=32 \
