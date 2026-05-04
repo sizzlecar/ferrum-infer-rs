@@ -293,6 +293,8 @@ impl EngineInner {
     async fn run_iteration(&self) -> Result<()> {
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
         counter!("ferrum.engine.iterations_total").increment(1);
+        let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+        let t_iter_start = if prof { Some(Instant::now()) } else { None };
 
         let hint = ferrum_interfaces::BatchHint {
             max_batch_size: self.config.batching.max_batch_size,
@@ -309,6 +311,7 @@ impl EngineInner {
                 return Ok(());
             }
         };
+        let t_after_sched = if prof { Some(Instant::now()) } else { None };
 
         debug!(
             "Iteration {}: batch with {} requests",
@@ -316,7 +319,24 @@ impl EngineInner {
             batch.size()
         );
 
-        self.process_batch(&batch).await
+        let r = self.process_batch(&batch).await;
+        if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
+            let n = self.iteration_count.load(Ordering::Relaxed);
+            if n.is_multiple_of(32) {
+                let total = t0.elapsed().as_micros();
+                let sched = ts.duration_since(t0).as_micros();
+                let proc = ts.elapsed().as_micros();
+                eprintln!(
+                    "[iter-prof] iter#{} total={}us sched={}us process={}us batch_size={}",
+                    iteration,
+                    total,
+                    sched,
+                    proc,
+                    batch.size()
+                );
+            }
+        }
+        r
     }
 
     // ── batch processing ───────────────────────────────────────────────
