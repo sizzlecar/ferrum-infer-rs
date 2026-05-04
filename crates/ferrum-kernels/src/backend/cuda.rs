@@ -2368,6 +2368,15 @@ fn launch_vllm_marlin(
     m: usize,
 ) -> Result<()> {
     use cudarc::driver::DevicePtr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static VLLM_MARLIN_CALLS: AtomicU64 = AtomicU64::new(0);
+    let n = VLLM_MARLIN_CALLS.fetch_add(1, Ordering::Relaxed);
+    if n == 0 || n.is_multiple_of(1024) {
+        eprintln!(
+            "[vllm-marlin] launch #{n} m={m} n={} k={} group_size={}",
+            weight.n, weight.k, weight.group_size,
+        );
+    }
     // Zero workspace (it's used as mutex locks in vLLM's marlin too).
     {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
