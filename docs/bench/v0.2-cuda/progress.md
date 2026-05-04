@@ -18,7 +18,7 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
-## Phase 4d (CUDA Graph capture wiring) — partial, env-gated (commits `96eae06`, `b00ae94`, `156dcab`)
+## Phase 4d (CUDA Graph capture wiring) — root cause found, fix shipped (commits `96eae06`, `b00ae94`, `156dcab`, `9b79001`)
 
 Wires `decode_batch_internal` with begin_graph_capture / replay around
 the layer loop + final norm + lm_head. Per-m_padded graph cache,
@@ -27,16 +27,35 @@ embedding_lookup stays outside (host tokens). All variable args
 into stable scratch device buffers. cache.len bumping moved
 post-forward (replay's lack of Rust execution would otherwise desync).
 
-**Status: env-gated (`FERRUM_BATCHED_GRAPH=1`), currently UNSTABLE.**
-Setting the env triggers `CUDA_ERROR_MISALIGNED_ADDRESS` at the first
-post-forward sync. The same binary works fine with the env unset
-(default = Phase 4 baseline numbers below). Code path on first call
-is identical between ON/OFF (warmup gates capture; m_matches=false
-gates replay), so the panic is some interaction we couldn't bisect
-in-band — ride for a separate session with a minimal cudarc
-reproducer. Bug filed mentally: see `project_v02_cuda_bench.md`.
+**Root cause (commit `9b79001`):** the batched kernels memcpy
+device-pointer arrays from a STABLE host array into device scratch
+inside graph capture. Each layer overwrote the SAME shared host
+region. CUDA graph capture records the host POINTER, not its
+contents — so on replay all 32 captured memcpys re-read the same
+host slice (= layer 31's pointers), and layers 0..30 launched with
+the wrong cache pointers → MISALIGNED at first sync.
 
-Defaults remain SAFE because `FERRUM_BATCHED_GRAPH` is unset.
+Verified at the cudarc level by `cudarc_graph_shared_host_array_multi_memcpy`:
+two captured memcpys reading from one Box<[u64;4]> both yield
+[5,6,7,8] (the last write) on replay, proving the pattern is broken
+regardless of driver version.
+
+**Fix:** per-call `slot: usize` argument on
+`kv_cache_append_batched_per_cache` and
+`flash_attention_batched_per_cache`. Host arrays grow from
+`BATCHED_SCRATCH_CAP` (64) to `2 * MAX_LAYERS_FOR_GRAPH * BATCHED_SCRATCH_CAP`
+(8192 u64 = 64 KB each — trivial). CudaBackend uses
+`host_array[slot*CAP..]` and `dev_scratch.slice(slot*CAP..)` for both
+the staging memcpy and the kernel arg. Caller passes:
+- K-append: `slot = li`
+- V-append: `slot = li + MAX_LAYERS_FOR_GRAPH` (cache_ptrs is shared)
+- flash_attn: `slot = li`
+
+**Status: build21 in progress. To validate: rerun
+`bash bench/v0.2-cuda/run_sweep.sh` with FERRUM_BATCHED_GRAPH=1, expect
+non-zero throughput at c=4/c=16. Post-fix theoretical TPOT win ≈ 5 ms
+(removing the per-iter Rust overhead between layers — graph dispatches
+the whole forward in one go).**
 
 ## Phase 4 (foundation): device-buffer kv_lens + stable scratch (commits `3448269`, `7c15ac7`, `5ef6736`, `b00ae94`, `156dcab`)
 
