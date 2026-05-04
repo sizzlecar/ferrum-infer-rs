@@ -5,7 +5,9 @@
 
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"
-#include "core/scalar_type.hpp"
+// ferrum-infer-rs port: vllm puts scalar_type.hpp under csrc/core/, but we
+// flattened the dir so it sits next to this header.
+#include "scalar_type.hpp"
 
 #define MARLIN_KERNEL_PARAMS                                                   \
   const int4 *__restrict__ A, const int4 *__restrict__ B,                      \

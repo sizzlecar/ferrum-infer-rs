@@ -2,7 +2,8 @@
 #ifndef _data_types_cuh
 #define _data_types_cuh
 #include "marlin.cuh"
-#include "core/scalar_type.hpp"
+// ferrum-infer-rs port: flattened csrc/core/scalar_type.hpp into vllm_marlin/.
+#include "scalar_type.hpp"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>

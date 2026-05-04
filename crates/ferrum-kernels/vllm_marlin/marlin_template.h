@@ -27,7 +27,8 @@
 #include "marlin_dtypes.cuh"
 #include "dequant.h"
 #include "marlin_mma.h"
-#include "core/scalar_type.hpp"
+// ferrum-infer-rs port: flattened csrc/core/scalar_type.hpp into vllm_marlin/.
+#include "scalar_type.hpp"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
