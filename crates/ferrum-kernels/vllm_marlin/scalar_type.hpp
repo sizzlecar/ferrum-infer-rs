@@ -3,6 +3,11 @@
 // For TORCH_CHECK — replaced with our stub.
 #include "torch_stubs.h"
 
+// ferrum-infer-rs port: vLLM's build pulls these via <torch/all.h>; we need
+// them explicitly when compiling standalone with nvcc.
+#include <cstdint>
+#include <variant>
+
 namespace vllm {
 
 //
