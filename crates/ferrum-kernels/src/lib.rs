@@ -156,6 +156,11 @@ pub mod quant;
 #[cfg(feature = "cuda")]
 pub mod marlin;
 
+// vLLM gptq_marlin port (Phase 12). Behind its own feature for opt-in
+// while we validate correctness + perf vs ferrum's existing IST-DASLab Marlin.
+#[cfg(feature = "vllm-marlin")]
+pub mod vllm_marlin;
+
 #[cfg(feature = "cuda")]
 pub mod gpu_paged_kv;
 
