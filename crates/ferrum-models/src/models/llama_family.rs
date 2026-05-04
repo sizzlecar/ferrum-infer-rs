@@ -2176,11 +2176,29 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
             tracesync!("entry-after-writes-and-embed");
 
+            // Op-profile: time the entire batched forward (eager only —
+            // pure replay short-circuits above and does not increment
+            // the per-op counters since the wrapped ops aren't executed
+            // by the Rust dispatch path).
+            let batched_profile = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+            let batched_iter_t0 = if batched_profile {
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
             // Eager forward (records into graph if capture is active).
             for li in 0..num_layers {
                 self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
                 tracesync!(format!("after layer {}", li));
             }
+            let _t0_norm = if batched_profile {
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             B::rms_norm(
                 &mut ctx,
                 &residual,
@@ -2190,18 +2208,62 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 m,
                 h,
             );
+            if let Some(t0) = _t0_norm {
+                B::sync(&mut ctx);
+                NORM_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             tracesync!("after final rms_norm");
             let lm_head = self
                 .lm_head
                 .as_ref()
                 .expect("decode_batch_internal called on backbone-only model (no lm_head)");
+            let _t0_lm = if batched_profile {
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.norm_out,
                 &mut self.scratch.batch_logits,
                 m,
             );
+            if let Some(t0) = _t0_lm {
+                B::sync(&mut ctx);
+                MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             tracesync!("after lm_head");
+
+            if let Some(t0) = batched_iter_t0 {
+                B::sync(&mut ctx);
+                let total_us = t0.elapsed().as_micros() as u64;
+                let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let wrapped_us = attn_us + qkr_us + mm_us + norm_us + other_us;
+                let unwrapped_us = total_us.saturating_sub(wrapped_us);
+                eprintln!(
+                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({})  unwrapped={}us",
+                    m,
+                    total_us,
+                    mm_us, mm_n,
+                    attn_us, attn_n,
+                    qkr_us, qkr_n,
+                    norm_us, norm_n,
+                    other_us, other_n,
+                    unwrapped_us,
+                );
+            }
 
             if should_capture && !self.batched_graph_failed {
                 if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
@@ -2266,7 +2328,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
 
+        let _bp = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+
         // 1. rms_norm [M, H]  → norm_out
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         B::rms_norm(
             ctx,
             residual,
@@ -2276,11 +2341,22 @@ impl<B: Backend> LlamaFamilyModel<B> {
             m,
             h,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            NORM_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 2. qkv_proj (GEMM m=M): norm_out [M, H] → qkv_out [M, QKV]
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         layer
             .qkv_proj
             .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // ── Paged-KV batched path (Phase 4b) ──────────────────────────
         // When paged is on, we skip the contig split_qkv + per-item
@@ -2332,6 +2408,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // self.scratch.paged_batch_q (to write Q stacks into).
             let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
             let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+            let _t_qkr = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
             for (i, (cache_id, _, pos)) in batch.iter().enumerate() {
                 let pos_i = *pos as usize;
                 let caches = self
@@ -2378,6 +2455,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 )
                 .expect("paged batched write");
             }
+            if let Some(t0) = _t_qkr {
+                B::sync(ctx);
+                QKR_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
             // Step 2: bump cache.len and build the stacked block_tables +
             // context_lens host-side, then upload to device scratch.
@@ -2423,6 +2505,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             let cl_safe = unsafe { &*cl_ptr };
             let q_safe = unsafe { &*q_ptr };
             let o_safe = unsafe { &mut *o_ptr };
+            let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
             B::paged_decode_attention(
                 ctx,
                 q_safe,
@@ -2440,6 +2523,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 1, // q_len
             )
             .expect("paged batched decode");
+            if let Some(t0) = _t {
+                B::sync(ctx);
+                ATTN_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
             // Step 4: per-item copy paged_batch_o[i] → attn_flat[i * q_dim].
             // Both have q_dim floats per item; same head-major-equals-token-major
@@ -2924,16 +3012,24 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let im = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
         let layer = &self.layers[li];
+        let _bp = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
 
         // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         layer.o_proj.forward(
             ctx,
             &self.scratch.attn_flat,
             &mut self.scratch.o_proj_out,
             m,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 8. Fused residual add + post-attention RMSNorm.
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         B::fused_add_rms_norm(
             ctx,
             residual,
@@ -2944,16 +3040,28 @@ impl<B: Backend> LlamaFamilyModel<B> {
             m,
             h,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            NORM_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 9. gate_up_proj (GEMM m=M)
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         layer.gate_up_proj.forward(
             ctx,
             &self.scratch.norm_out,
             &mut self.scratch.gate_up_out,
             m,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 10. SwiGLU
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         B::fused_silu_mul_split(
             ctx,
             &self.scratch.gate_up_out,
@@ -2961,14 +3069,31 @@ impl<B: Backend> LlamaFamilyModel<B> {
             m,
             im,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 11. down_proj (GEMM m=M)
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         layer
             .down_proj
             .forward(ctx, &self.scratch.silu_out, &mut self.scratch.mlp_out, m);
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 12. Residual add
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         B::add_inplace(ctx, residual, &self.scratch.mlp_out, m * h);
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
