@@ -2315,6 +2315,8 @@ fn marlin_gemm_with_perm(
     out: &mut CudaSlice<f16>,
     m: usize,
 ) -> Result<()> {
+    let use_vllm = std::env::var("FERRUM_VLLM_MARLIN").map_or(false, |v| v == "1");
+
     if let Some(perm) = weight.perm.as_ref() {
         let k = weight.k;
         let stream = ctx.stream.clone();
@@ -2343,12 +2345,99 @@ fn marlin_gemm_with_perm(
             })
         }
         .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
+        if use_vllm {
+            return launch_vllm_marlin(&ctx.stream, &a_gathered, weight, out, m);
+        }
         crate::marlin::marlin_gemm(&ctx.stream, &a_gathered, weight, out, m as i32)
             .map_err(|e| FerrumError::model(format!("marlin_gemm (perm): {e}")))
     } else {
+        if use_vllm {
+            return launch_vllm_marlin(&ctx.stream, a, weight, out, m);
+        }
         crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
             .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
     }
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn launch_vllm_marlin(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    a: &CudaSlice<f16>,
+    weight: &crate::marlin::MarlinWeight,
+    out: &mut CudaSlice<f16>,
+    m: usize,
+) -> Result<()> {
+    use cudarc::driver::DevicePtr;
+    // Zero workspace (it's used as mutex locks in vLLM's marlin too).
+    {
+        let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
+        let raw_stream = stream.cu_stream();
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(
+                ws_ptr,
+                0,
+                weight.workspace.len(),
+                raw_stream,
+            );
+        }
+    }
+    let (a_ptr, _g_a) = a.device_ptr(stream);
+    let (b_ptr, _g_b) = weight.qweight.device_ptr(stream);
+    let (c_ptr, _g_c) = out.device_ptr(stream);
+    let (s_ptr, _g_s) = weight.scales.device_ptr(stream);
+    let (ws_ptr, _g_w) = weight.workspace.device_ptr(stream);
+    let raw_stream = stream.cu_stream();
+    let n = weight.n as i32;
+    let k = weight.k as i32;
+    let group_size = weight.group_size;
+    let num_groups = if group_size > 0 { k / group_size } else { 1 };
+    // RTX 4090 = 128 SMs. TODO: query CudaDevice attribute.
+    let sms = std::env::var("FERRUM_VLLM_MARLIN_SMS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(128);
+
+    unsafe {
+        crate::vllm_marlin::launch_marlin_mm_f16_u4b8(
+            a_ptr as *const _,
+            b_ptr as *const _,
+            c_ptr as *mut _,
+            std::ptr::null_mut(),               // C_tmp (use_fp32_reduce=false)
+            std::ptr::null_mut(),               // a_s   (FP16 act, no per-token scale)
+            s_ptr as *mut _,                    // b_s
+            std::ptr::null_mut(),               // g_idx (we already gathered A by perm)
+            std::ptr::null_mut(),               // perm  (ditto)
+            std::ptr::null_mut(),               // a_tmp
+            m as i32,
+            n,
+            k,
+            k,                                  // lda = K (row-major FP16 A)
+            ws_ptr as *mut _,
+            false,                              // has_act_order — pre-applied via perm-gather
+            true,                               // is_k_full
+            num_groups,
+            group_size,
+            0,                                  // dev
+            raw_stream as cudarc::driver::sys::CUstream,
+            sms,
+            false,                              // use_atomic_add
+            false,                              // use_fp32_reduce
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vllm-marlin"))]
+fn launch_vllm_marlin(
+    _stream: &Arc<cudarc::driver::CudaStream>,
+    _a: &CudaSlice<f16>,
+    _weight: &crate::marlin::MarlinWeight,
+    _out: &mut CudaSlice<f16>,
+    _m: usize,
+) -> Result<()> {
+    Err(FerrumError::model(
+        "FERRUM_VLLM_MARLIN=1 set but binary not built with --features vllm-marlin",
+    ))
 }
 
 fn ensure_module(
