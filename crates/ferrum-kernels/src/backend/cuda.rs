@@ -104,10 +104,10 @@ impl CudaState {
         if let Some(m) = self.modules.get(key) {
             return m.clone();
         }
-        let m = self
-            .ctx
-            .load_module(Ptx::from_src(ptx_src.to_string()))
-            .unwrap_or_else(|e| panic!("CudaBackend: load_module({key}): {e}"));
+        // Route through process-global cache — keeps Arc<CudaModule>
+        // alive forever so captured CUfunction handles never go stale
+        // even after this CudaState drops.
+        let m = ensure_module(&self.ctx, key, ptx_src);
         self.modules.insert(key, m.clone());
         m
     }
@@ -210,6 +210,12 @@ impl Backend for CudaBackend {
         let blas = ensure_blas_handle(&stream);
         // Ensure process-global decode state buffers exist.
         ensure_decode_state_bufs(&stream);
+        // Process-global batched-scratch device + host arrays. SAME
+        // graph-capture lifetime requirement as cuBLAS workspace above:
+        // captured stream.memcpy_htod records the host array address;
+        // captured kernel arg holds the device scratch address; both
+        // must outlive every CudaState that triggers a capture+replay.
+        ensure_batched_scratch(&stream);
 
         // Disable cudarc's per-slice event tracking globally. We run everything
         // on one stream → CUDA stream semantics handle ordering natively.
@@ -1071,50 +1077,19 @@ impl Backend for CudaBackend {
             )));
         }
         let host_start = slot * BATCHED_SCRATCH_CAP;
-        // Write cache device pointers into per-slot region of the host
-        // staging array. Each call site uses a distinct slot to support
-        // future graph-capture replay (graph records the host POINTER;
-        // shared regions across captured memcpys all read the latest
-        // write at replay time — verified by
-        // `cudarc_graph_shared_host_array_multi_memcpy`). Slot fix
-        // preserved even though graph-capture is shelved.
-        for i in 0..m {
-            let (cp, _) = caches[i].device_ptr(&stream);
-            ctx.batched_host_cache_ptrs[host_start + i] = cp;
-        }
-        if ctx.batched_scratch_u64_cache.is_none() {
-            ctx.batched_scratch_u64_cache = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc cache_ptrs scratch: {e}")))?,
-            );
-        }
         let func = ctx.func(
             "kv_cache_append_batched",
             ptx::KV_CACHE_APPEND,
             "kv_cache_append_batched_per_cache_f16",
         );
-        // Async memcpy host_slice → device per-slot region. On non-capture
-        // path: just queues on stream. On capture path: gets recorded
-        // into the graph (needs the host array to be stable across
-        // replays — currently NOT the case since CudaState is per-call;
-        // graph capture is env-gated OFF until process-global scratch
-        // refactor).
-        {
-            let host_slice: &[u64] =
-                &ctx.batched_host_cache_ptrs[host_start..host_start + m];
-            let scratch = ctx.batched_scratch_u64_cache.as_mut().unwrap();
-            let mut view = scratch.slice_mut(host_start..host_start + m);
-            stream
-                .memcpy_htod(host_slice, &mut view)
-                .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
-        }
-        let cache_ptrs_view = ctx
-            .batched_scratch_u64_cache
-            .as_ref()
-            .unwrap()
-            .slice(host_start..host_start + m);
-        let cache_lens_dev = cache_lens;
+        // Per-slot region of the PROCESS-GLOBAL host_cache_ptrs +
+        // scratch_u64_cache. Each call site uses a distinct slot.
+        // Captured graph records host pointer (per-slot region of the
+        // global Box) + device pointer (per-slot view of the global
+        // scratch); both outlive any CudaState. Replay across decode
+        // calls re-reads CURRENT host content from the same address,
+        // launches kernel reading CURRENT device content from the same
+        // address. This is what makes FERRUM_BATCHED_GRAPH=1 safe.
         let m_i32 = m as i32;
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
@@ -1122,22 +1097,46 @@ impl Backend for CudaBackend {
         let per_item = nkv * hd;
         let block_dim = 256u32;
         let grid_x = (per_item as u32 + block_dim - 1) / block_dim;
-        let mut b = stream.launch_builder(&func);
-        b.arg(&cache_ptrs_view);
-        b.arg(new_data);
-        b.arg(cache_lens_dev);
-        b.arg(&m_i32);
-        b.arg(&nkv_i32);
-        b.arg(&hd_i32);
-        b.arg(&capacity_i32);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (grid_x, m as u32, 1),
-                block_dim: (block_dim, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map_err(|e| FerrumError::model(format!("kv_cache_append_batched: {e}")))?;
+        with_batched_scratch_mut(|slot_g| {
+            for i in 0..m {
+                let (cp, _) = caches[i].device_ptr(&stream);
+                slot_g.host_cache_ptrs[host_start + i] = cp;
+            }
+            // Async memcpy host_slice → device per-slot region. Recorded
+            // into the captured graph when capture is in flight; both
+            // endpoints are stable global addresses.
+            {
+                let host_slice: &[u64] =
+                    &slot_g.host_cache_ptrs[host_start..host_start + m];
+                let mut view = slot_g
+                    .scratch_u64_cache
+                    .slice_mut(host_start..host_start + m);
+                stream
+                    .memcpy_htod(host_slice, &mut view)
+                    .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
+            }
+            let cache_ptrs_view = slot_g
+                .scratch_u64_cache
+                .slice(host_start..host_start + m);
+            let cache_lens_dev = cache_lens;
+            let mut b = stream.launch_builder(&func);
+            b.arg(&cache_ptrs_view);
+            b.arg(new_data);
+            b.arg(cache_lens_dev);
+            b.arg(&m_i32);
+            b.arg(&nkv_i32);
+            b.arg(&hd_i32);
+            b.arg(&capacity_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (grid_x, m as u32, 1),
+                    block_dim: (block_dim, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("kv_cache_append_batched: {e}")))?;
+            Ok::<(), FerrumError>(())
+        })?;
         Ok(())
     }
 
@@ -1178,83 +1177,74 @@ impl Backend for CudaBackend {
             )));
         }
         let host_start = slot * BATCHED_SCRATCH_CAP;
-        for i in 0..m {
-            let (kp, _) = k_caches[i].device_ptr(&stream);
-            let (vp, _) = v_caches[i].device_ptr(&stream);
-            ctx.batched_host_k_ptrs[host_start + i] = kp;
-            ctx.batched_host_v_ptrs[host_start + i] = vp;
-        }
-        if ctx.batched_scratch_u64_k.is_none() {
-            ctx.batched_scratch_u64_k = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc k_ptrs scratch: {e}")))?,
-            );
-        }
-        if ctx.batched_scratch_u64_v.is_none() {
-            ctx.batched_scratch_u64_v = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc v_ptrs scratch: {e}")))?,
-            );
-        }
         let func = ctx.func(
             "batched_decode_attn",
             ptx::BATCHED_DECODE_ATTENTION,
             "batched_decode_attention_f16",
         );
-        // Two memcpys, each into its own per-slot region.
-        {
-            let k_host_slice: &[u64] =
-                &ctx.batched_host_k_ptrs[host_start..host_start + m];
-            let scratch = ctx.batched_scratch_u64_k.as_mut().unwrap();
-            let mut view = scratch.slice_mut(host_start..host_start + m);
-            stream
-                .memcpy_htod(k_host_slice, &mut view)
-                .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
-        }
-        {
-            let v_host_slice: &[u64] =
-                &ctx.batched_host_v_ptrs[host_start..host_start + m];
-            let scratch = ctx.batched_scratch_u64_v.as_mut().unwrap();
-            let mut view = scratch.slice_mut(host_start..host_start + m);
-            stream
-                .memcpy_htod(v_host_slice, &mut view)
-                .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
-        }
-        let k_ptrs_view = ctx
-            .batched_scratch_u64_k
-            .as_ref()
-            .unwrap()
-            .slice(host_start..host_start + m);
-        let v_ptrs_view = ctx
-            .batched_scratch_u64_v
-            .as_ref()
-            .unwrap()
-            .slice(host_start..host_start + m);
-        let kv_lens_dev = kv_lens;
         let nq_i32 = nq as i32;
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
-        let mut b = stream.launch_builder(&func);
-        b.arg(q);
-        b.arg(&k_ptrs_view);
-        b.arg(&v_ptrs_view);
-        b.arg(out);
-        b.arg(kv_lens_dev);
-        b.arg(&nq_i32);
-        b.arg(&nkv_i32);
-        b.arg(&hd_i32);
-        b.arg(&scale);
         let shared_bytes = (max_valid_kv as u32) * 4;
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (nq as u32, m as u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: shared_bytes,
-            })
-        }
-        .map_err(|e| FerrumError::model(format!("flash_attn_batched: {e}")))?;
+        with_batched_scratch_mut(|slot_g| {
+            for i in 0..m {
+                let (kp, _) = k_caches[i].device_ptr(&stream);
+                let (vp, _) = v_caches[i].device_ptr(&stream);
+                slot_g.host_k_ptrs[host_start + i] = kp;
+                slot_g.host_v_ptrs[host_start + i] = vp;
+            }
+            // Two captured memcpys, each into its own per-slot region of
+            // process-global device scratch. Both host arrays + both
+            // device scratches live in BATCHED_SCRATCH (process-global,
+            // outlives every CudaState) — replay across decode calls is
+            // safe because no pointer dangles.
+            {
+                let k_host_slice: &[u64] =
+                    &slot_g.host_k_ptrs[host_start..host_start + m];
+                let mut view = slot_g
+                    .scratch_u64_k
+                    .slice_mut(host_start..host_start + m);
+                stream
+                    .memcpy_htod(k_host_slice, &mut view)
+                    .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
+            }
+            {
+                let v_host_slice: &[u64] =
+                    &slot_g.host_v_ptrs[host_start..host_start + m];
+                let mut view = slot_g
+                    .scratch_u64_v
+                    .slice_mut(host_start..host_start + m);
+                stream
+                    .memcpy_htod(v_host_slice, &mut view)
+                    .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
+            }
+            let k_ptrs_view = slot_g
+                .scratch_u64_k
+                .slice(host_start..host_start + m);
+            let v_ptrs_view = slot_g
+                .scratch_u64_v
+                .slice(host_start..host_start + m);
+            let kv_lens_dev = kv_lens;
+            let mut b = stream.launch_builder(&func);
+            b.arg(q);
+            b.arg(&k_ptrs_view);
+            b.arg(&v_ptrs_view);
+            b.arg(out);
+            b.arg(kv_lens_dev);
+            b.arg(&nq_i32);
+            b.arg(&nkv_i32);
+            b.arg(&hd_i32);
+            b.arg(&scale);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (nq as u32, m as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("flash_attn_batched: {e}")))?;
+            Ok::<(), FerrumError>(())
+        })?;
         Ok(())
     }
 
@@ -2128,4 +2118,136 @@ fn with_blas_scalars<R>(f: impl FnOnce(&CudaSlice<f32>, &CudaSlice<f32>) -> R) -
     let g = blas_slot().read().expect("BLAS poisoned");
     let s = g.as_ref().expect("BLAS not init");
     f(&s.alpha_f32, &s.beta_f32)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Process-global batched-scratch device + host arrays
+// ────────────────────────────────────────────────────────────────────────
+//
+// Used by `kv_cache_append_batched_per_cache` and
+// `flash_attention_batched_per_cache`. CRITICAL for FERRUM_BATCHED_GRAPH=1:
+//
+//   * Captured graph contains `cuMemcpy(host_array, device_scratch, ...)`
+//     and kernel launches reading `device_scratch[slot..slot+m]`.
+//   * Captured memcpy reads HOST POINTER at REPLAY time
+//     (verified: cudarc_graph_shared_host_array_multi_memcpy).
+//   * Captured kernel arg holds a fixed device pointer.
+//
+// If either array lives in per-call CudaState, drop()-ing the state
+// between decode calls invalidates the pointer the captured graph
+// holds → 2nd replay's cuGraphLaunch SIGSEGVs inside libcuda.so.
+// Per-call new_context() in this file is exactly that pattern.
+// Process-global slot keeps both arrays alive forever.
+
+struct BatchedScratchSlot {
+    /// Device staging for K cache pointers (flash_attn read).
+    pub scratch_u64_k: CudaSlice<u64>,
+    /// Device staging for V cache pointers (flash_attn read).
+    pub scratch_u64_v: CudaSlice<u64>,
+    /// Device staging for K-or-V cache pointers (kv_cache_append read).
+    pub scratch_u64_cache: CudaSlice<u64>,
+    /// Host staging — captured memcpy reads these heap addresses on replay.
+    /// Box keeps stable heap address; static slot keeps Box alive forever.
+    pub host_k_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    pub host_v_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    pub host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+}
+unsafe impl Send for BatchedScratchSlot {}
+unsafe impl Sync for BatchedScratchSlot {}
+
+static BATCHED_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<BatchedScratchSlot>>> =
+    std::sync::OnceLock::new();
+
+fn batched_scratch_slot() -> &'static std::sync::RwLock<Option<BatchedScratchSlot>> {
+    BATCHED_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn ensure_batched_scratch(stream: &Arc<CudaStream>) {
+    {
+        let g = batched_scratch_slot()
+            .read()
+            .expect("BATCHED_SCRATCH poisoned");
+        if g.is_some() {
+            return;
+        }
+    }
+    let mut w = batched_scratch_slot()
+        .write()
+        .expect("BATCHED_SCRATCH poisoned");
+    if w.is_none() {
+        let scratch_u64_k = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+            .expect("batched scratch_u64_k alloc");
+        let scratch_u64_v = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+            .expect("batched scratch_u64_v alloc");
+        let scratch_u64_cache = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+            .expect("batched scratch_u64_cache alloc");
+        *w = Some(BatchedScratchSlot {
+            scratch_u64_k,
+            scratch_u64_v,
+            scratch_u64_cache,
+            host_k_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+            host_v_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+            host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+        });
+    }
+}
+
+/// Access the process-global batched scratch for the duration of one
+/// captured-or-eager kernel call. Holds the slot's RwLock write guard
+/// for that duration — no other batched op runs concurrently (single
+/// stream, single decode_batch_internal at a time per iteration_lock).
+fn with_batched_scratch_mut<R>(f: impl FnOnce(&mut BatchedScratchSlot) -> R) -> R {
+    let mut g = batched_scratch_slot()
+        .write()
+        .expect("BATCHED_SCRATCH poisoned");
+    f(g.as_mut().expect("BatchedScratchSlot not initialised"))
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Process-global PTX module cache
+// ────────────────────────────────────────────────────────────────────────
+//
+// Same graph-capture lifetime requirement as cuBLAS workspace + batched
+// scratch above: cudarc records a CUfunction handle into the captured
+// graph's kernel node. CUfunction handles are owned by their CUmodule;
+// when the last Arc<CudaModule> drops, cudarc unloads the module and the
+// CUfunction goes invalid → captured graph's kernel node references a
+// stale handle → 2nd cuGraphLaunch SIGSEGVs inside libcuda.so.
+//
+// Per-CudaState `modules: HashMap<...>` was the third pointer-lifetime
+// bug in this file (after BLAS workspace and batched scratch). Routing
+// loads through a process-global cache keeps every loaded CudaModule
+// alive for the rest of the process — captured graphs always find a
+// valid CUfunction at replay time.
+//
+// CudaState still keeps its local HashMap as a hot-path cache so that
+// per-kernel launches don't lock the global Mutex.
+
+static MODULES: std::sync::OnceLock<std::sync::Mutex<HashMap<&'static str, Arc<CudaModule>>>> =
+    std::sync::OnceLock::new();
+
+fn modules_cache() -> &'static std::sync::Mutex<HashMap<&'static str, Arc<CudaModule>>> {
+    MODULES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn ensure_module(
+    ctx: &Arc<CudaContext>,
+    key: &'static str,
+    ptx_src: &str,
+) -> Arc<CudaModule> {
+    {
+        let g = modules_cache().lock().expect("MODULES poisoned");
+        if let Some(m) = g.get(key) {
+            return m.clone();
+        }
+    }
+    let mut g = modules_cache().lock().expect("MODULES poisoned");
+    if let Some(m) = g.get(key) {
+        return m.clone();
+    }
+    let m = ctx
+        .load_module(Ptx::from_src(ptx_src.to_string()))
+        .unwrap_or_else(|e| panic!("CudaBackend: load_module({key}): {e}"));
+    g.insert(key, m.clone());
+    m
 }
