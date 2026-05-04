@@ -418,6 +418,19 @@ impl Backend for CudaBackend {
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
                 }
+                // Explicit synchronize after launch — matches the
+                // working cudarc test pattern (`for i in 0..6 { launch;
+                // synchronize; }`). Without this, the second replay
+                // SIGSEGVs inside libcuda. Eats ~5ms but unblocks
+                // correctness; eventually we want to drop the sync
+                // and let the natural dtoh of logits force ordering.
+                let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
+                eprintln!("[replay] post-launch cuStreamSynchronize: {st_sync:?}");
+                if st_sync != sys::CUresult::CUDA_SUCCESS {
+                    return Err(FerrumError::unsupported(format!(
+                        "post-launch sync: {st_sync:?}"
+                    )));
+                }
                 Ok(true)
             } else {
                 Ok(false)
