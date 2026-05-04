@@ -358,12 +358,13 @@ impl Backend for CudaBackend {
             ));
         }
 
-        // Use AUTO_FREE_ON_LAUNCH (value 1). Paired with cuGraphUpload
-        // below; flags=0 + no upload was producing SIGSEGV inside libcuda
-        // at cuGraphLaunch on Blackwell + CUDA 13. Matches what cudarc's
-        // default end_capture uses in the passing repro tests.
-        let flags =
-            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64;
+        // flags=0: no AUTO_FREE_ON_LAUNCH. The captured graph contains
+        // only kernel launches (memcpys are sync via cuMemcpyHtoD_v2
+        // outside capture, see populate_batched_pointers), so
+        // AUTO_FREE has nothing to free. With AUTO_FREE on, replays
+        // worked for ~14 iters then SIGSEGV — likely device-side
+        // launch resources getting freed mid-launch sequence.
+        let flags = 0u64;
         let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
         let st2 = unsafe { sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, flags) };
         if st2 != sys::CUresult::CUDA_SUCCESS {
