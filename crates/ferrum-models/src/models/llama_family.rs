@@ -2096,22 +2096,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let m_padded = m.next_power_of_two();
         let m_matches = self.batched_graph_for_m_padded == Some(m_padded);
 
-        // Per-call diag while debugging Phase 4d.
-        if graph_enabled {
-            eprintln!(
-                "[batched-trace] entry m={} m_padded={} matches={} warmup={} failed={} cached_m_padded={:?}",
-                m,
-                m_padded,
-                m_matches,
-                self.batched_graph_warmup,
-                self.batched_graph_failed,
-                self.batched_graph_for_m_padded,
-            );
-        }
-
         let mut did_pure_replay = false;
         if graph_enabled && m_matches && !self.batched_graph_failed {
-            eprintln!("[batched-trace] attempting replay (m_padded={})", m_padded);
             // Sync stream first so embedding_lookup (just queued) plus
             // any null-stream cuMemcpyHtoD_v2's from write_u32 are all
             // settled before cuGraphLaunch. cuGraphLaunch waiting on
@@ -2122,9 +2108,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
             match B::replay_last_graph(&mut ctx) {
                 Ok(true) => {
                     did_pure_replay = true;
-                    eprintln!("[batched-trace] replay ok");
                 }
-                Ok(false) => eprintln!("[batched-trace] replay returned no-graph"),
+                Ok(false) => {}
                 Err(e) => {
                     self.batched_graph_failed = true;
                     eprintln!("[batched-trace] replay err: {}", e);
@@ -2138,8 +2123,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 && !self.batched_graph_failed
                 && self.batched_graph_warmup >= BATCHED_GRAPH_WARMUP;
             if should_capture {
-                eprintln!("[batched-trace] BEGIN CAPTURE (m_padded={})", m_padded);
-                // No use_dev_state flag — see comment in replay path.
+                tracing::debug!("[batched-graph] BEGIN CAPTURE m_padded={m_padded}");
                 if let Err(e) = B::begin_graph_capture(&mut ctx) {
                     eprintln!("[batched-trace] begin_capture err: {}", e);
                     self.batched_graph_failed = true;
@@ -2189,13 +2173,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             tracesync!("after lm_head");
 
             if should_capture && !self.batched_graph_failed {
-                eprintln!("[batched-trace] END CAPTURE");
                 if let Err(e) = B::end_graph_capture(&mut ctx) {
                     eprintln!("[batched-trace] end_capture err: {}", e);
                     self.batched_graph_failed = true;
                 } else {
                     self.batched_graph_for_m_padded = Some(m_padded);
-                    eprintln!("[batched-trace] post-capture replay");
                     if let Err(e) = B::replay_last_graph(&mut ctx) {
                         eprintln!("[batched-trace] post-capture replay err: {}", e);
                         self.batched_graph_failed = true;

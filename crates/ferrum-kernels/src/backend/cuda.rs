@@ -412,38 +412,27 @@ impl Backend for CudaBackend {
     fn replay_last_graph(ctx: &mut Self::Context) -> Result<bool> {
         use cudarc::driver::sys;
         let cu_stream = ctx.stream.cu_stream();
-        eprintln!("[replay] enter");
         ctx.ctx
             .bind_to_thread()
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
-        eprintln!("[replay] bound, locking slot");
         with_decode_graph(|g_opt| {
-            eprintln!("[replay] slot locked, has_graph={}", g_opt.is_some());
             if let Some(g) = g_opt {
-                // Re-upload before each launch. AUTO_FREE_ON_LAUNCH may
-                // be invalidating the device-side prepared state after
-                // each launch, so we need to refresh. Adds one extra
-                // host→device sync per launch but unblocks correctness.
-                let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
-                eprintln!("[replay] cuGraphUpload returned: {st_up:?}");
-                if st_up != sys::CUresult::CUDA_SUCCESS {
-                    return Err(FerrumError::unsupported(format!(
-                        "cuGraphUpload: {st_up:?}"
-                    )));
-                }
+                // cuGraphUpload was previously called before each launch
+                // to work around suspected AUTO_FREE_ON_LAUNCH state
+                // invalidation. We now instantiate with flags=0 (no
+                // AUTO_FREE), and uploaded the graph ONCE in
+                // end_graph_capture, so the per-replay upload is
+                // pure overhead. Removed.
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
-                eprintln!("[replay] cuGraphLaunch returned: {st:?}");
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
                 }
-                // Explicit synchronize after launch — matches the
-                // working cudarc test pattern (`for i in 0..6 { launch;
-                // synchronize; }`). Without this, the second replay
-                // SIGSEGVs inside libcuda. Eats ~5ms but unblocks
-                // correctness; eventually we want to drop the sync
-                // and let the natural dtoh of logits force ordering.
+                // Explicit synchronize after launch was added to fix
+                // a 2nd-replay SIGSEGV; Phase 8 (Marlin path) seems to
+                // have stabilised this, but keep the sync — it's cheap
+                // and natural dtoh-of-logits would force ordering soon
+                // anyway.
                 let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
-                eprintln!("[replay] post-launch cuStreamSynchronize: {st_sync:?}");
                 if st_sync != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!(
                         "post-launch sync: {st_sync:?}"
