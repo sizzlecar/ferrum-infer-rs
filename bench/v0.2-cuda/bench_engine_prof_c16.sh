@@ -87,6 +87,10 @@ echo "=== batch-decode-prof samples ==="
 grep '\[batch-decode-prof\]' "$SERVER_LOG" | head -10
 
 echo ""
+echo "=== exec-batch-decode-prof samples (llm_executor breakdown) ==="
+grep '\[exec-batch-decode-prof\]' "$SERVER_LOG" | head -10
+
+echo ""
 echo "=== aggregate (iter-prof) ==="
 grep '\[iter-prof\]' "$SERVER_LOG" | python3 - <<'PY'
 import sys, re
