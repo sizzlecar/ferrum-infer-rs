@@ -2820,8 +2820,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
-        // BISECT dump: at layer 0, dump cache[item=0, h=0, pos=cache.len, :8]
-        // BEFORE flash_attn, AFTER any kv_append (batched or per-item).
+        // BISECT dump: K + V at pos=0 (prefill) + pos=cache_len (new write).
         if li == 0 && std::env::var("FERRUM_DUMP_KV_APPEND").is_ok() && use_batched_qkr {
             use std::sync::atomic::{AtomicBool, Ordering};
             static REPORTED_DUMP_PRE_ATTN: AtomicBool = AtomicBool::new(false);
@@ -2833,15 +2832,17 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     .get(cid)
                     .expect("kv_caches missing for dump");
                 let cap = cache[0].capacity;
-                let cache_len = cache[0].len; // pre-bump (bump is at end of decode_batch_internal)
-                let head0_pos = cache_len; // newly written position
-                let offset = 0 * cap * hd + head0_pos * hd; // head 0
-                let dump = B::to_vec(&cache[0].k, cap * nkv * hd);
-                let win = &dump[offset..offset + 8.min(hd)];
-                eprintln!(
-                    "[DUMP] before-flash_attn layer=0 item=0 head=0 cache_len={} pos={} batched_kv_append_ok={}: {:?}",
-                    cache_len, head0_pos, batched_kv_append_ok, win
-                );
+                let cache_len = cache[0].len;
+                let kdump = B::to_vec(&cache[0].k, cap * nkv * hd);
+                let vdump = B::to_vec(&cache[0].v, cap * nkv * hd);
+                let mode = if batched_kv_append_ok { "BATCHED" } else { "PER_ITEM" };
+                for &p in &[0usize, cache_len] {
+                    let off = 0 * cap * hd + p * hd; // head 0
+                    let kw = &kdump[off..off + 8];
+                    let vw = &vdump[off..off + 8];
+                    eprintln!("[DUMP] {} K[h=0,pos={}]: {:?}", mode, p, kw);
+                    eprintln!("[DUMP] {} V[h=0,pos={}]: {:?}", mode, p, vw);
+                }
             }
         }
 
