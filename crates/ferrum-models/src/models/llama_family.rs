@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_kernels::backend::{Backend, KvCache};
+use ferrum_kernels::backend::{Backend, KvCache, MAX_LAYERS_FOR_GRAPH};
 
 static ATTN_TIME_US: AtomicU64 = AtomicU64::new(0);
 static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -2532,6 +2532,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 }
             }
             // batch_kv_lens_pre is pre-populated by decode_batch_internal.
+            // Per-layer slot for K/V append. cache_ptrs is shared
+            // between the K and V calls, so V uses an offset slot
+            // (layer_idx + MAX_LAYERS_FOR_GRAPH) to keep its captured
+            // memcpy reading from a distinct host region. See
+            // ferrum-kernels::backend::cuda for the rationale (graph
+            // capture records host POINTERS; same slot → all replays
+            // read whichever value was written last).
             let k_append_res = B::kv_cache_append_batched_per_cache(
                 ctx,
                 &k_caches_ref,
@@ -2541,6 +2548,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 m,
                 nkv,
                 hd,
+                li,
             );
             let v_append_res = B::kv_cache_append_batched_per_cache(
                 ctx,
@@ -2551,6 +2559,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 m,
                 nkv,
                 hd,
+                li + MAX_LAYERS_FOR_GRAPH,
             );
             batched_kv_append_ok = k_append_res.is_ok() && v_append_res.is_ok();
             // One-time diag
@@ -2766,6 +2775,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
             let scale = 1.0 / (hd as f32).sqrt();
             // batch_kv_lens_post pre-populated by decode_batch_internal.
+            // flash_attn_batched uses its own k_ptrs/v_ptrs host
+            // arrays in CudaState (separate from kv_cache_append's
+            // cache_ptrs), so per-layer slot = li is sufficient.
             let batched_attn_res = B::flash_attention_batched_per_cache(
                 ctx,
                 &self.scratch.q_normed_batched,
@@ -2778,6 +2790,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 hd,
                 scale,
                 max_kv,
+                li,
             );
             // One-time diagnostic
             {

@@ -3,6 +3,14 @@
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 
+/// Maximum decode-graph layer count. Per-layer call sites that share
+/// graph-captured host staging arrays use this as the stride between
+/// distinct slots. CUDA-only invariant (other backends ignore the
+/// `slot` argument); 64 covers all current LLM families up to and
+/// including Llama-3-70B (80 layers — but 70B doesn't run on a single
+/// 4090 anyway, so 64 is safe in practice for v0.2).
+pub const MAX_LAYERS_FOR_GRAPH: usize = 64;
+
 /// Source dtype for a weight tensor read straight from safetensors mmap.
 ///
 /// Passed to `Backend::from_weight_bytes` so each backend can choose whether
@@ -1108,6 +1116,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         _m: usize,
         _nkv: usize,
         _hd: usize,
+        _slot: usize,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "kv_cache_append_batched_per_cache not implemented for this backend",
@@ -1145,6 +1154,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         _hd: usize,
         _scale: f32,
         _max_valid_kv: usize,
+        _slot: usize,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "flash_attention_batched_per_cache not implemented for this backend",
