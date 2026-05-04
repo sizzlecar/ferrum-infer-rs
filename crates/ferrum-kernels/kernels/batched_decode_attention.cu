@@ -13,10 +13,16 @@
 #define WARP_SIZE 32
 
 // q_all:         [B, num_q_heads, head_dim] — all batch items' Q vectors
-// k_cache_ptrs:  [B] — device pointer array, each -> [max_kv_len, num_kv_heads, head_dim]
+// k_cache_ptrs:  [B] — device pointer array, each -> [num_kv_heads, capacity, head_dim] (HEAD-MAJOR)
 // v_cache_ptrs:  [B] — device pointer array, same layout
 // output:        [B, num_q_heads, head_dim]
-// valid_kv_lens: [B] — per-item valid KV length
+// valid_kv_lens: [B] — per-item valid KV length (post-append, i.e. cache.len + 1)
+// capacity:      per-cache slot count along the seq axis (kv_seq_stride).
+//
+// Cache layout MUST match `kv_cache_append_batched_per_cache_f16` /
+// `kv_cache_append_head_major_f16` (both write head-major). Earlier
+// versions of this kernel assumed token-major; that mismatched the
+// writer's head-major layout at m≥2 → garbage output.
 extern "C" __global__ void batched_decode_attention_f16(
     const __half* __restrict__ q_all,
     const __half* const* __restrict__ k_cache_ptrs,
@@ -26,6 +32,7 @@ extern "C" __global__ void batched_decode_attention_f16(
     const int num_q_heads,
     const int num_kv_heads,
     const int head_dim,
+    const int capacity,
     const float scale
 ) {
     const int q_head = blockIdx.x;
@@ -40,12 +47,13 @@ extern "C" __global__ void batched_decode_attention_f16(
     const __half* q_ptr = q_all + batch_idx * q_dim + q_head * head_dim;
     __half* out_ptr = output + batch_idx * q_dim + q_head * head_dim;
 
-    // K/V cache for this batch item
+    // K/V cache for this batch item — HEAD-MAJOR [num_kv_heads, capacity, head_dim].
     const __half* k_cache = k_cache_ptrs[batch_idx];
     const __half* v_cache = v_cache_ptrs[batch_idx];
 
-    // K/V cache layout: [seq_len, num_kv_heads, head_dim]
-    const int kv_stride = num_kv_heads * head_dim;
+    // Per-head base: skip kv_head slabs of `capacity * head_dim` floats each.
+    const __half* k_head_base = k_cache + (size_t)kv_head * capacity * head_dim;
+    const __half* v_head_base = v_cache + (size_t)kv_head * capacity * head_dim;
 
     // Shared memory for attention scores
     extern __shared__ float s_scores[];
@@ -64,7 +72,8 @@ extern "C" __global__ void batched_decode_attention_f16(
 
     float local_max = -1e20f;
     for (int kv_pos = warp_id; kv_pos < valid_kv_len; kv_pos += num_warps) {
-        const __half* k_row = k_cache + kv_pos * kv_stride + kv_head * head_dim;
+        // Head-major: K[kv_head, kv_pos, :head_dim].
+        const __half* k_row = k_head_base + (size_t)kv_pos * head_dim;
         float partial = 0.0f;
         for (int i = 0; i < elems_per_thread; i++) {
             int d = lane_id + i * WARP_SIZE;
@@ -108,12 +117,12 @@ extern "C" __global__ void batched_decode_attention_f16(
         s_scores[i] *= inv_sum;
     __syncthreads();
 
-    // ====== Step 3: Weighted sum of V ======
+    // ====== Step 3: Weighted sum of V (head-major V[kv_head, kv_pos, d]) ======
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int kv_pos = 0; kv_pos < valid_kv_len; kv_pos++) {
-            acc += s_scores[kv_pos] * __half2float(
-                v_cache[kv_pos * kv_stride + kv_head * head_dim + d]);
+            acc += s_scores[kv_pos] *
+                   __half2float(v_head_base[(size_t)kv_pos * head_dim + d]);
         }
         out_ptr[d] = __float2half(acc);
     }

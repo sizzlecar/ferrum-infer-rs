@@ -2804,6 +2804,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             let mut k_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
             let mut v_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
             let mut max_kv = 0usize;
+            let mut capacity_for_kernel = 0usize;
             for (cache_id, _, _) in batch.iter() {
                 let caches = self
                     .kv_caches
@@ -2812,8 +2813,16 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 let cache = &caches[li];
                 k_caches_ref.push(&cache.k);
                 v_caches_ref.push(&cache.v);
-                if cache.len > max_kv {
-                    max_kv = cache.len;
+                // POST-append valid_kv_len: kv_cache_append_batched_per_cache
+                // wrote position cache.len, so attention reads cache.len + 1
+                // entries. Pre-append cache.len under-sized the shared mem
+                // and corrupted s_scores (silent garbage tokens at m≥2).
+                let post_len = cache.len + 1;
+                if post_len > max_kv {
+                    max_kv = post_len;
+                }
+                if capacity_for_kernel == 0 {
+                    capacity_for_kernel = cache.capacity;
                 }
             }
             let scale = 1.0 / (hd as f32).sqrt();
@@ -2821,20 +2830,28 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // flash_attn_batched uses its own k_ptrs/v_ptrs host
             // arrays in CudaState (separate from kv_cache_append's
             // cache_ptrs), so per-layer slot = li is sufficient.
-            let batched_attn_res = B::flash_attention_batched_per_cache(
-                ctx,
-                &self.scratch.q_normed_batched,
-                &k_caches_ref,
-                &v_caches_ref,
-                &self.scratch.batch_kv_lens_post,
-                &mut self.scratch.attn_flat,
-                nh,
-                nkv,
-                hd,
-                scale,
-                max_kv,
-                li,
-            );
+            let batched_attn_res = if std::env::var("FERRUM_FORCE_PER_ITEM_FLASH_ATTN").is_ok() {
+                // BISECT: force fallback to per-item flash_attn loop below.
+                Err(ferrum_types::FerrumError::unsupported(
+                    "FERRUM_FORCE_PER_ITEM_FLASH_ATTN bisect override",
+                ))
+            } else {
+                B::flash_attention_batched_per_cache(
+                    ctx,
+                    &self.scratch.q_normed_batched,
+                    &k_caches_ref,
+                    &v_caches_ref,
+                    &self.scratch.batch_kv_lens_post,
+                    &mut self.scratch.attn_flat,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    max_kv,
+                    capacity_for_kernel,
+                    li,
+                )
+            };
             // One-time diagnostic
             {
                 use std::sync::atomic::{AtomicBool, Ordering};

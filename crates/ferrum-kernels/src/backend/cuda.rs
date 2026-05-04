@@ -1152,6 +1152,7 @@ impl Backend for CudaBackend {
         hd: usize,
         scale: f32,
         max_valid_kv: usize,
+        capacity: usize,
         slot: usize,
     ) -> Result<()> {
         use cudarc::driver::DevicePtr;
@@ -1185,7 +1186,11 @@ impl Backend for CudaBackend {
         let nq_i32 = nq as i32;
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
-        let shared_bytes = (max_valid_kv as u32) * 4;
+        let capacity_i32 = capacity as i32;
+        // Shared mem must cover post-append max kv_len. Caller passes
+        // `max_valid_kv` already accounting for the +1; sizing also
+        // bounded by capacity to mirror the per-item kernel's pattern.
+        let shared_bytes = (max_valid_kv.min(capacity).max(1) as u32) * 4;
         with_batched_scratch_mut(|slot_g| {
             for i in 0..m {
                 let (kp, _) = k_caches[i].device_ptr(&stream);
@@ -1234,6 +1239,7 @@ impl Backend for CudaBackend {
             b.arg(&nq_i32);
             b.arg(&nkv_i32);
             b.arg(&hd_i32);
+            b.arg(&capacity_i32);
             b.arg(&scale);
             unsafe {
                 b.launch(LaunchConfig {

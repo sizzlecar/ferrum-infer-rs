@@ -1180,6 +1180,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         _hd: usize,
         _scale: f32,
         _max_valid_kv: usize,
+        _capacity: usize,
         _slot: usize,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
