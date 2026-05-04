@@ -2514,15 +2514,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             eps,
             0,
         );
-        let mut use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
-        // BISECT: force-disable all batched paths to test whether the
-        // batched qkr/kv_append/flash_attn ops are the m≥2 garbage bug.
-        // FERRUM_FORCE_PER_ITEM=1 → use_batched_qkr=false → per-item loop
-        // covers everything. If output becomes correct, batched ops are
-        // the bug. To remove, revert this hunk.
-        if std::env::var("FERRUM_FORCE_PER_ITEM").is_ok() {
-            use_batched_qkr = false;
-        }
+        let use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
 
         // One-time diagnostic so we can verify in server logs that the
         // batched qkr path is actually being taken (vs. silently falling
@@ -2598,39 +2590,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 li + MAX_LAYERS_FOR_GRAPH,
             );
             batched_kv_append_ok = k_append_res.is_ok() && v_append_res.is_ok();
-            // BISECT: force fallback to per-item kv_append + per-item flash_attn
-            // (the per-item flash_attn is gated on batched_kv_append_ok).
-            // Combined with batched qkr still active, this isolates whether
-            // batched qkr alone produces correct output.
-            if std::env::var("FERRUM_FORCE_PER_ITEM_KV_APPEND").is_ok() {
-                batched_kv_append_ok = false;
-            }
-            // BISECT: dump first batched K-append's cache write at layer 0
-            // to compare with per-item kv_append's content.
-            if li == 0
-                && std::env::var("FERRUM_DUMP_KV_APPEND").is_ok()
-                && batched_kv_append_ok
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static REPORTED_DUMP: AtomicBool = AtomicBool::new(false);
-                if !REPORTED_DUMP.swap(true, Ordering::Relaxed) {
-                    B::sync(ctx);
-                    let cache0 = self
-                        .kv_caches
-                        .get(&batch[0].0)
-                        .expect("kv_caches missing for dump");
-                    let cap = cache0[0].capacity;
-                    let pre_len = pre_append_lens[0] as usize;
-                    let head0_pos = pre_len; // newly written position
-                    let offset = 0 * cap * hd + head0_pos * hd; // head 0
-                    let dump = B::to_vec(&cache0[0].k, cap * nkv * hd);
-                    let win = &dump[offset..offset + 8.min(hd)];
-                    eprintln!(
-                        "[DUMP] batched-K-append layer=0 item=0 head=0 pos={}: {:?}",
-                        head0_pos, win
-                    );
-                }
-            }
             // One-time diag
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2820,32 +2779,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
-        // BISECT dump: K + V at pos=0 (prefill) + pos=cache_len (new write).
-        if li == 0 && std::env::var("FERRUM_DUMP_KV_APPEND").is_ok() && use_batched_qkr {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static REPORTED_DUMP_PRE_ATTN: AtomicBool = AtomicBool::new(false);
-            if !REPORTED_DUMP_PRE_ATTN.swap(true, Ordering::Relaxed) {
-                B::sync(ctx);
-                let cid = &batch[0].0;
-                let cache = self
-                    .kv_caches
-                    .get(cid)
-                    .expect("kv_caches missing for dump");
-                let cap = cache[0].capacity;
-                let cache_len = cache[0].len;
-                let kdump = B::to_vec(&cache[0].k, cap * nkv * hd);
-                let vdump = B::to_vec(&cache[0].v, cap * nkv * hd);
-                let mode = if batched_kv_append_ok { "BATCHED" } else { "PER_ITEM" };
-                for &p in &[0usize, cache_len] {
-                    let off = 0 * cap * hd + p * hd; // head 0
-                    let kw = &kdump[off..off + 8];
-                    let vw = &vdump[off..off + 8];
-                    eprintln!("[DUMP] {} K[h=0,pos={}]: {:?}", mode, p, kw);
-                    eprintln!("[DUMP] {} V[h=0,pos={}]: {:?}", mode, p, vw);
-                }
-            }
-        }
-
         // 7. Batched flash_attention: one launch covers all M items.
         //    Reads q_normed_batched directly (item-major) and writes
         //    output straight into attn_flat at [m, q_dim] item-major.
@@ -2882,28 +2815,21 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // flash_attn_batched uses its own k_ptrs/v_ptrs host
             // arrays in CudaState (separate from kv_cache_append's
             // cache_ptrs), so per-layer slot = li is sufficient.
-            let batched_attn_res = if std::env::var("FERRUM_FORCE_PER_ITEM_FLASH_ATTN").is_ok() {
-                // BISECT: force fallback to per-item flash_attn loop below.
-                Err(ferrum_types::FerrumError::unsupported(
-                    "FERRUM_FORCE_PER_ITEM_FLASH_ATTN bisect override",
-                ))
-            } else {
-                B::flash_attention_batched_per_cache(
-                    ctx,
-                    &self.scratch.q_normed_batched,
-                    &k_caches_ref,
-                    &v_caches_ref,
-                    &self.scratch.batch_kv_lens_post,
-                    &mut self.scratch.attn_flat,
-                    nh,
-                    nkv,
-                    hd,
-                    scale,
-                    max_kv,
-                    capacity_for_kernel,
-                    li,
-                )
-            };
+            let batched_attn_res = B::flash_attention_batched_per_cache(
+                ctx,
+                &self.scratch.q_normed_batched,
+                &k_caches_ref,
+                &v_caches_ref,
+                &self.scratch.batch_kv_lens_post,
+                &mut self.scratch.attn_flat,
+                nh,
+                nkv,
+                hd,
+                scale,
+                max_kv,
+                capacity_for_kernel,
+                li,
+            );
             // One-time diagnostic
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2914,28 +2840,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
                         m,
                         batched_attn_res.is_ok(),
                         batched_attn_res.as_ref().err().map(|e| e.to_string()),
-                    );
-                }
-            }
-            // BISECT: dump attn_flat right after batched flash_attn at layer 0
-            // to compare against per-item path's attn_flat (also written here).
-            if li == 0 && std::env::var("FERRUM_DUMP_KV_APPEND").is_ok() && batched_attn_res.is_ok()
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static REPORTED_ATTN_OUT: AtomicBool = AtomicBool::new(false);
-                if !REPORTED_ATTN_OUT.swap(true, Ordering::Relaxed) {
-                    B::sync(ctx);
-                    let attn_dump = B::to_vec(&self.scratch.attn_flat, m * nh * hd);
-                    let mode = if batched_kv_append_ok { "BATCHED" } else { "PER_ITEM" };
-                    let item0 = &attn_dump[0..8];
-                    let item1 = &attn_dump[nh * hd..nh * hd + 8];
-                    eprintln!(
-                        "[DUMP] {} attn_flat[item=0,head=0,:8]: {:?}",
-                        mode, item0
-                    );
-                    eprintln!(
-                        "[DUMP] {} attn_flat[item=1,head=0,:8]: {:?}",
-                        mode, item1
                     );
                 }
             }
