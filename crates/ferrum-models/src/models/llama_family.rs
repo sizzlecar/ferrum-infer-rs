@@ -2514,7 +2514,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
             eps,
             0,
         );
-        let use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
+        let mut use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
+        // BISECT: force-disable all batched paths to test whether the
+        // batched qkr/kv_append/flash_attn ops are the m≥2 garbage bug.
+        // FERRUM_FORCE_PER_ITEM=1 → use_batched_qkr=false → per-item loop
+        // covers everything. If output becomes correct, batched ops are
+        // the bug. To remove, revert this hunk.
+        if std::env::var("FERRUM_FORCE_PER_ITEM").is_ok() {
+            use_batched_qkr = false;
+        }
 
         // One-time diagnostic so we can verify in server logs that the
         // batched qkr path is actually being taken (vs. silently falling
@@ -2590,6 +2598,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 li + MAX_LAYERS_FOR_GRAPH,
             );
             batched_kv_append_ok = k_append_res.is_ok() && v_append_res.is_ok();
+            // BISECT: force fallback to per-item kv_append + per-item flash_attn
+            // (the per-item flash_attn is gated on batched_kv_append_ok).
+            // Combined with batched qkr still active, this isolates whether
+            // batched qkr alone produces correct output.
+            if std::env::var("FERRUM_FORCE_PER_ITEM_KV_APPEND").is_ok() {
+                batched_kv_append_ok = false;
+            }
             // One-time diag
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
