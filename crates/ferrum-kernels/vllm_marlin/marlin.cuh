@@ -2,10 +2,11 @@
 
 #ifndef _marlin_cuh
   #define _marlin_cuh
-  #include <torch/all.h>
-
-  #include <ATen/cuda/CUDAContext.h>
-  #include <c10/cuda/CUDAGuard.h>
+  // Removed for ferrum-infer-rs port: torch/aten/c10 not available standalone.
+  // We don't use any tensor-API symbols from these (only their cuda headers).
+  // #include <torch/all.h>
+  // #include <ATen/cuda/CUDAContext.h>
+  // #include <c10/cuda/CUDAGuard.h>
   #include <cuda.h>
   #include <cuda_fp16.h>
   #include <cuda_runtime.h>
