@@ -2820,6 +2820,31 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
+        // BISECT dump: at layer 0, dump cache[item=0, h=0, pos=cache.len, :8]
+        // BEFORE flash_attn, AFTER any kv_append (batched or per-item).
+        if li == 0 && std::env::var("FERRUM_DUMP_KV_APPEND").is_ok() && use_batched_qkr {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static REPORTED_DUMP_PRE_ATTN: AtomicBool = AtomicBool::new(false);
+            if !REPORTED_DUMP_PRE_ATTN.swap(true, Ordering::Relaxed) {
+                B::sync(ctx);
+                let cid = &batch[0].0;
+                let cache = self
+                    .kv_caches
+                    .get(cid)
+                    .expect("kv_caches missing for dump");
+                let cap = cache[0].capacity;
+                let cache_len = cache[0].len; // pre-bump (bump is at end of decode_batch_internal)
+                let head0_pos = cache_len; // newly written position
+                let offset = 0 * cap * hd + head0_pos * hd; // head 0
+                let dump = B::to_vec(&cache[0].k, cap * nkv * hd);
+                let win = &dump[offset..offset + 8.min(hd)];
+                eprintln!(
+                    "[DUMP] before-flash_attn layer=0 item=0 head=0 cache_len={} pos={} batched_kv_append_ok={}: {:?}",
+                    cache_len, head0_pos, batched_kv_append_ok, win
+                );
+            }
+        }
+
         // 7. Batched flash_attention: one launch covers all M items.
         //    Reads q_normed_batched directly (item-major) and writes
         //    output straight into attn_flat at [m, q_dim] item-major.
