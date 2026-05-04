@@ -18,9 +18,14 @@ sleep 2
 : > "$BENCH_LOG"
 
 echo "[$(date +%H:%M:%S)] starting ferrum (NO PROF) ..."
+EXTRA_ENV=""
+if [ "${SKIP_SAMPLE:-0}" = "1" ]; then
+  EXTRA_ENV="FERRUM_SKIP_SAMPLE=1"
+fi
 CUDA_VISIBLE_DEVICES=0 \
 FERRUM_KV_CAPACITY=2048 \
 FERRUM_MAX_BATCH=32 \
+$EXTRA_ENV \
   $WORKSPACE/ferrum-infer-rs/target/release/ferrum serve \
     --model "$MODEL_DIR" --port $PORT \
     > "$SERVER_LOG" 2>&1 &

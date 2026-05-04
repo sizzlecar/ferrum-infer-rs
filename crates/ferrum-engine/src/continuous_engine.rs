@@ -758,6 +758,14 @@ impl EngineInner {
         let decode_outputs = self.model_executor.batch_decode(&decode_inputs).await?;
         let t_decode = if prof { Some(Instant::now()) } else { None };
 
+        // Optional A/B switch: skip sampling+logits-readback entirely.
+        // If FERRUM_SKIP_SAMPLE=1, every request gets token=1 each iter
+        // (no logits.to_vec_f32, no top-k/p/penalty, no rng). Used to
+        // measure how much wall-clock the sampling path actually costs
+        // — if throughput jumps significantly with this on, sampling is
+        // a real engine bottleneck worth optimizing.
+        let skip_sample = std::env::var("FERRUM_SKIP_SAMPLE").is_ok();
+
         // Process each result: sample, update state, stream
         let mut t_post_total_us = 0u128;
         let mut t_logits_us = 0u128;
@@ -766,7 +774,11 @@ impl EngineInner {
         let mut t_emit_us = 0u128;
         for (rid, decode_output) in rids.iter().zip(decode_outputs.iter()) {
             let ti = if prof { Some(Instant::now()) } else { None };
-            let logits_vec = decode_output.logits.to_vec_f32()?;
+            let logits_vec = if skip_sample {
+                Vec::new()
+            } else {
+                decode_output.logits.to_vec_f32()?
+            };
             if let Some(t) = ti {
                 t_logits_us += t.elapsed().as_micros();
             }
@@ -779,9 +791,13 @@ impl EngineInner {
                 let seq = sequences
                     .get_mut(rid)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                let mut logits = logits_vec;
                 let ti2 = if prof { Some(Instant::now()) } else { None };
-                let token = seq.sample_with_processors(&mut logits)?;
+                let token = if skip_sample {
+                    TokenId::new(1)
+                } else {
+                    let mut logits = logits_vec;
+                    seq.sample_with_processors(&mut logits)?
+                };
                 if let Some(t) = ti2 {
                     t_sample_us += t.elapsed().as_micros();
                 }
