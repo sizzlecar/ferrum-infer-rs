@@ -1093,6 +1093,32 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
+    /// Pre-populate the per-slot device-pointer scratch arrays used by
+    /// the batched kernels (`kv_cache_append_batched_per_cache` and
+    /// `flash_attention_batched_per_cache`). Required by the CUDA-graph
+    /// capture path: the captured graph contains only kernel launches
+    /// (no captured `memcpy_htod`), so the device scratch must be fresh
+    /// when the graph replays.
+    ///
+    /// Caller passes flat layer-major slices: `k_caches[li * m + i]` and
+    /// `v_caches[li * m + i]`. Backend extracts each cache's device
+    /// pointer and writes into its corresponding slot in the device
+    /// scratch via SYNCHRONOUS memcpy (not captured by stream capture).
+    ///
+    /// CUDA-only; other backends fall through to the default
+    /// `unsupported` and the caller skips the population call.
+    fn populate_batched_pointers(
+        _ctx: &mut Self::Context,
+        _k_caches: &[&Self::Buffer],
+        _v_caches: &[&Self::Buffer],
+        _num_layers: usize,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "populate_batched_pointers not implemented for this backend",
+        ))
+    }
+
     /// Batched kv_cache_append across M caches in one launch. Each item
     /// writes its (head-major) K-or-V row into its own cache at offset
     /// read from `cache_lens[i]`. Replaces M sequential

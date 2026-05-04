@@ -2045,6 +2045,36 @@ impl<B: Backend> LlamaFamilyModel<B> {
         B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
         B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
 
+        // Pre-populate per-slot device-pointer scratch for the batched
+        // kernels (kv_cache_append_batched, flash_attention_batched).
+        // Done OUTSIDE any captured forward — sync memcpy on the legacy
+        // null stream is not captured by stream capture, so the captured
+        // graph contains only kernel launches. Without this, the
+        // captured `stream.memcpy_htod` records host pointers and the
+        // 2nd pure-replay reads stale/corrupted data → ILLEGAL_ADDRESS.
+        // Backends that don't implement this just no-op (returns
+        // Unsupported, which we silently ignore — non-CUDA paths use
+        // the per-call code path).
+        let mut k_caches_flat: Vec<&B::Buffer> = Vec::with_capacity(num_layers * m);
+        let mut v_caches_flat: Vec<&B::Buffer> = Vec::with_capacity(num_layers * m);
+        for li in 0..num_layers {
+            for (cid, _, _) in batch.iter() {
+                let cache = &self
+                    .kv_caches
+                    .get(cid)
+                    .expect("kv_caches must be present")[li];
+                k_caches_flat.push(&cache.k);
+                v_caches_flat.push(&cache.v);
+            }
+        }
+        let _ = B::populate_batched_pointers(
+            &mut ctx,
+            &k_caches_flat,
+            &v_caches_flat,
+            num_layers,
+            m,
+        );
+
         // 0. Embed all M tokens into residual [M, H]. Eager, OUTSIDE
         //    any captured graph (host tokens slice; embedding_lookup_dyn
         //    is single-item only).
