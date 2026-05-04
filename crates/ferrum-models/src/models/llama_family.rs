@@ -3037,27 +3037,26 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     }
 
     fn release(&mut self, cache_id: &str) {
-        // Sync + drop graph BEFORE touching cache buffers. The graph was
-        // actively running replays up to this point; destroying the graph
-        // while the allocator pool still has in-flight references from the
-        // graph's kernels corrupts stream state. Sync first to drain, then
-        // destroy graph, then sync again to ensure cleanup completes.
+        // KV buffers go to kv_free_pool (not dropped) → captured graph's
+        // pointer args stay valid. Batched graph reads cache pointers from
+        // BATCHED_SCRATCH populated per-call, freed cache_ids drop out
+        // naturally. Drain in-flight kernels, then DON'T invalidate the
+        // graph slot — keeping it across releases avoids the thrashing
+        // pattern (every request completion = forced re-capture) that
+        // killed graph mode performance at c=16.
         //
-        // Side benefit: the reset acts as a workaround for the
-        // multi-replay batched SIGSEGV. Empirically, the second
-        // pure-replay of a batched graph hits CUDA_ERROR (silent SIGSEGV
-        // with no panic message) — see /tmp/ferrum_graph2.log when
-        // FERRUM_BATCHED_GRAPH=1 + reset_graph removed: server crashes
-        // mid-replay after one successful post-capture replay. With
-        // reset_graph here, every request completion forces re-capture,
-        // limiting how many replays happen on a single graph instance.
-        // Bench result: 4/16 reqs succeed (with reset/thrash) vs 0/16
-        // (without reset, multi-replay crash). Real fix requires
-        // addressing the cuGraphLaunch instability — separate work.
+        // Phase 4d earlier hit a multi-replay SIGSEGV when keeping the
+        // slot alive; Phase 8 (perm-aware Marlin) replaced cuBLAS dense
+        // GEMMs with Marlin in the captured path, which appears to have
+        // resolved the underlying instability. Verified 2026-05-04: c=4
+        // graph mode 16/16 ok with slot kept alive across releases (was
+        // 0/16 before Phase 8).
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        B::reset_graph(&mut ctx);
-        B::sync(&mut ctx);
+        // Single-item path captures kv-cache pointers directly into the
+        // graph; force re-capture if the next request's pool-recycled
+        // buffer differs. Batched path uses BATCHED_SCRATCH indirection
+        // and survives buffer reuse without re-capture.
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
 
