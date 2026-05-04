@@ -417,21 +417,21 @@ impl Backend for CudaBackend {
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
         with_decode_graph(|g_opt| {
             if let Some(g) = g_opt {
-                // cuGraphUpload was previously called before each launch
-                // to work around suspected AUTO_FREE_ON_LAUNCH state
-                // invalidation. We now instantiate with flags=0 (no
-                // AUTO_FREE), and uploaded the graph ONCE in
-                // end_graph_capture, so the per-replay upload is
-                // pure overhead. Removed.
+                // Re-upload before each launch. Without it, c=4 throughput
+                // drops 257→178 tok/s (post-Phase-8 measurement). The
+                // graph instantiate-then-upload-once design didn't pan out
+                // empirically; keep the per-replay upload until we
+                // understand why removing it slows things down.
+                let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
+                if st_up != sys::CUresult::CUDA_SUCCESS {
+                    return Err(FerrumError::unsupported(format!(
+                        "cuGraphUpload: {st_up:?}"
+                    )));
+                }
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
                 }
-                // Explicit synchronize after launch was added to fix
-                // a 2nd-replay SIGSEGV; Phase 8 (Marlin path) seems to
-                // have stabilised this, but keep the sync — it's cheap
-                // and natural dtoh-of-logits would force ordering soon
-                // anyway.
                 let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
                 if st_sync != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!(
