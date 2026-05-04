@@ -375,17 +375,11 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 .all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32)
         });
 
-        // Act-order GPTQ requires permuting input activations by g_idx during
-        // GEMM, OR equivalently dequantising + reordering on load. Marlin /
-        // Triton-rs paths in ferrum don't yet wire the per-call permute, so
-        // we eager-dequant on CPU and store as a plain DenseLinear (FP16).
-        // Trades INT4 memory savings for correctness — GEMM is then standard
-        // cuBLAS f16. Re-add INT4 perf later by adding a perm-aware Marlin
-        // dispatch (vLLM's gptq_marlin does this via a `perm` kernel arg).
-        // Scaffolding for perm-aware Marlin lives in
-        // crates/ferrum-kernels/{kernels/gather_columns.cu, src/marlin.rs}
-        // (MarlinWeight.perm field, permute_gptq_qweight_rows helper) but
-        // the runtime gather + gemm_gptq dispatch is not yet wired.
+        // Act-order GPTQ. CUDA backend has perm-aware Marlin (load_gptq
+        // builds perm = argsort(g_idx) + permutes qweight rows at load;
+        // gemm_gptq gathers input columns before the standard Marlin call).
+        // CPU/Metal still need the dequant→DenseLinear fallback.
+        #[cfg(not(feature = "cuda"))]
         if is_desc_act {
             let dequant_f32 = dequantize_gptq_with_g_idx(
                 &qweight,
@@ -407,10 +401,12 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 linear = linear.with_bias(B::from_slice(&bias));
             }
             tracing::info!(
-                "GPTQ load (desc_act dequant→DenseLinear): name={name} K={in_features} N={out_features}"
+                "GPTQ load (desc_act dequant→DenseLinear, non-cuda): name={name} K={in_features} N={out_features}"
             );
             return Ok(Box::new(linear));
         }
+        #[cfg(feature = "cuda")]
+        let _ = is_desc_act; // CUDA: g_idx threaded through to GptqLinear below
         if sc_shape.len() != 2 || sc_shape[1] != out_features {
             return Err(FerrumError::model(format!(
                 "'{name}.scales' {sc_shape:?} incompatible with qweight {qw_shape:?}"
@@ -541,6 +537,8 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 .enumerate()
                 .all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32)
         });
+        // CUDA: perm-aware Marlin via load_gptq. CPU/Metal: dequant→Dense.
+        #[cfg(not(feature = "cuda"))]
         if is_desc_act {
             let dequant_f32 = dequantize_gptq_with_g_idx(
                 &qw_acc,
@@ -556,8 +554,6 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 out_features,
                 in_features,
             );
-            // Optional bias for fused linear (concat of part biases) — none
-            // expected for Llama-3.x but support for Qwen2.5 etc.
             let mut bias_acc: Vec<f32> = Vec::new();
             let mut any_bias = false;
             for p in parts {
@@ -575,11 +571,13 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 linear = linear.with_bias(B::from_slice(&bias_acc));
             }
             tracing::info!(
-                "GPTQ fused load (desc_act dequant→DenseLinear): K={in_features} N={out_features} parts={}",
+                "GPTQ fused load (desc_act dequant→DenseLinear, non-cuda): K={in_features} N={out_features} parts={}",
                 parts.len()
             );
             return Ok(Box::new(linear));
         }
+        #[cfg(feature = "cuda")]
+        let _ = is_desc_act;
 
         let mut linear = GptqLinear::<B>::from_raw(
             &qw_acc,

@@ -1742,10 +1742,7 @@ impl Backend for CudaBackend {
         // Branch on store variant (only present when triton-kernels is on).
         #[cfg(feature = "triton-kernels")]
         match weight {
-            GptqStoreCuda::Marlin(mw) => {
-                crate::marlin::marlin_gemm(&ctx.stream, a, mw, out, m as i32)
-                    .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
-            }
+            GptqStoreCuda::Marlin(mw) => marlin_gemm_with_perm(ctx, a, mw, out, m),
             GptqStoreCuda::Triton(tw) => {
                 // Pre-load (and cache) the CudaFunction once per CudaState.
                 // Subsequent calls hit the HashMap and skip the PTX parse.
@@ -1761,8 +1758,7 @@ impl Backend for CudaBackend {
         }
         #[cfg(not(feature = "triton-kernels"))]
         {
-            crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
-                .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+            marlin_gemm_with_perm(ctx, a, weight, out, m)
         }
     }
 
@@ -2271,6 +2267,66 @@ static MODULES: std::sync::OnceLock<std::sync::Mutex<HashMap<&'static str, Arc<C
 
 fn modules_cache() -> &'static std::sync::Mutex<HashMap<&'static str, Arc<CudaModule>>> {
     MODULES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Perm-aware Marlin GEMM (desc_act=true GPTQ act-order)
+// ────────────────────────────────────────────────────────────────────────
+//
+// When MarlinWeight.perm is Some, the qweight rows have been permuted at
+// load time by `argsort(g_idx)`. For the standard Marlin kernel to compute
+// the un-permuted GEMM result, we gather input columns by the same perm
+// before the call: input_perm[m, j] = input[m, perm[j]]. After:
+//   y[n] = Σⱼ input_perm[m, j] · dequant(qweight_sorted[j, n])
+//        = Σⱼ input[m, perm[j]] · dequant(qweight[perm[j], n])  (let k = perm[j])
+//        = Σ_k input[m, k] · dequant(qweight[k, n])             ← un-permuted GEMM
+//
+// Same approach as vLLM's gptq_marlin runtime gather. Adds one f16 column
+// gather kernel per Marlin call (~10us on H≤14336 / m≤32) — net cost
+// dominated by the Marlin GEMM that follows, not the gather.
+
+#[cfg(feature = "marlin")]
+fn marlin_gemm_with_perm(
+    ctx: &mut CudaState,
+    a: &CudaSlice<f16>,
+    weight: &crate::marlin::MarlinWeight,
+    out: &mut CudaSlice<f16>,
+    m: usize,
+) -> Result<()> {
+    if let Some(perm) = weight.perm.as_ref() {
+        let k = weight.k;
+        let stream = ctx.stream.clone();
+        let mut a_gathered = unsafe { stream.alloc::<f16>(m * k) }
+            .map_err(|e| FerrumError::model(format!("gather scratch alloc: {e}")))?;
+        let func = ctx.func(
+            "gather_columns",
+            ptx::GATHER_COLUMNS,
+            "gather_columns_f16",
+        );
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(a);
+        b.arg(perm);
+        b.arg(&mut a_gathered);
+        b.arg(&m_i32);
+        b.arg(&k_i32);
+        let block_x: u32 = 512;
+        let grid_y: u32 = ((k as u32) + block_x - 1) / block_x;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (m as u32, grid_y, 1),
+                block_dim: (block_x, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
+        crate::marlin::marlin_gemm(&ctx.stream, &a_gathered, weight, out, m as i32)
+            .map_err(|e| FerrumError::model(format!("marlin_gemm (perm): {e}")))
+    } else {
+        crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
+            .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+    }
 }
 
 fn ensure_module(
