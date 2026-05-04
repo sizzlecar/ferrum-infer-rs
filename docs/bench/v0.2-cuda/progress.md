@@ -18,6 +18,60 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
+## Phase 8 — perm-aware Marlin INT4 GEMM (2026-05-04, commits `5ba7e38`, `48bf17b`)
+
+Recovers INT4 GEMM speed for desc_act=true models. Phase 6's
+dequant→DenseLinear fix was correct but ran FP16 dense GEMM (lost
+the INT4 2-3× speedup). vLLM's gptq_marlin solves this via runtime
+activation gather; we land the same approach.
+
+**Implementation:**
+- `kernels/gather_columns.cu`: `output[m, j] = input[m, perm[j]]` f16
+- `marlin.rs::permute_gptq_qweight_rows`: unpack INT4 → permute rows
+  by `argsort(g_idx)` → repack INT4 (one-time CPU work at load)
+- `MarlinWeight.perm: Option<CudaSlice<i32>>`: device-side perm buffer
+- `cuda.rs::load_gptq`: detects desc_act, builds perm + permutes qweight
+  before standard Marlin repack
+- `cuda.rs::marlin_gemm_with_perm`: gathers input by perm into f16 scratch
+  (cudarc pool alloc), then standard `marlin_gemm` on gathered input
+- `native_safetensors.rs`: cfg-gates the dequant→Dense fallback to
+  non-cuda only — CUDA now passes g_idx through to GptqLinear
+
+**Math correctness:** identical output to dequant→Dense path (Pavlov
++ Schrödinger joke matches byte-for-byte). Verified at c=1 with
+`temperature=0`.
+
+**Real bench (M2, RTX 4090, content correct, 16/16 c=4, 64/64 c=16):**
+
+| c | Phase 6 (FP16-dense) | **Phase 8 (perm-aware Marlin)** | Δ | vLLM | ratio |
+|---|---|---|---|---|---|
+| 1  | 50.2 tok/s | **105.3 tok/s** | +109% | 149  | 71% (was 33%) |
+| 4  | 151.5 | **262.6** | +73% | 517  | 51% (was 29%) |
+| 16 | 350.9 | **480.7** | +37% | 1597 | 30% (was 22%) |
+
+TPOT_p50 (ms): c=1 19.3→8.8 (-54%), c=4 22.5→11.4 (-49%), c=16 37.1→25.6 (-31%).
+
+Memory: ~16 GB → ~5.5 GB (INT4 weights restored).
+
+**Why c=1 wins more than c=16**: at c=1 the GEMM is bandwidth-bound
+(loading weights dominates), so INT4 (4× less DRAM) helps most. At c=16
+the GEMM has higher arithmetic intensity, FP16 cuBLAS already saturates
+compute well. Still, vLLM's c=16 = 1597 tok/s suggests their Marlin
+batched path is more efficient — likely tile tuning + kernel-level
+gather (saves 1 launch/GEMM = ~1.3ms/iter at c=16).
+
+**Next ROI items (post Phase 8):**
+1. **cuBLAS replacement: try Marlin's batched paths for non-INT4 layers**
+   — actually, the only INT4 layers ARE the linear projections, and they
+   ALL use Marlin now. Other ops (rms_norm, attention, etc.) are
+   bandwidth-bound and well-optimised.
+2. **Multi-replay graph SIGSEGV** — graph capture at c=4 would shave
+   ~1ms/iter; still blocked.
+3. **HTTP/SSE/tokio overhead at c=16** — measured 36% loss, lower-ROI
+   but easy investigation.
+4. **In-kernel gather** — fold the gather into Marlin (vLLM's approach)
+   to save the scratch alloc + 1 launch per GEMM. ~2-5% win.
+
 ## Phase 7 — batch scaling diagnosis (post g_idx fix, 2026-05-04)
 
 c=4 vs c=16 per-iter timing (FERRUM_BATCH_DECODE_PROF=1, M2 desc_act
