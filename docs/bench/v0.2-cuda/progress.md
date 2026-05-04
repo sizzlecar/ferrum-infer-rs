@@ -18,6 +18,46 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
+## Phase 9 — multi-slot batched graph cache (2026-05-04, commits `fb21ebd`, `8260d76`)
+
+Native CUDA microbench (`scripts/graph_upload_bench.cu`) confirmed
+multi-slot replay is stable: 320 launches × 500 iters alternating two
+graph sizes ran clean at ~0.26 ms/iter with no degradation vs single
+slot, and `cuGraphUpload`-per-replay had near-zero impact (-0.014 ms
+single-slot, +0.002 ms multi-slot).
+
+Refactored `static DECODE_GRAPH: Option<GraphSlotRaw>` →
+`HashMap<u64, GraphSlotRaw>`. Backend trait now takes `key: u64` on
+end_graph_capture / replay_graph / reset_graph. Single-item path uses
+`SINGLE_ITEM_GRAPH_KEY=0`; batched path uses `m_padded as u64`.
+
+**Bench (M2 INT4, RTX 4090, FERRUM_BATCHED_GRAPH=1):**
+
+| Scenario | tok/s | Comment |
+|---|---|---|
+| Fresh server, c=16 alone | **479.4** | matches no-graph 484; multi-slot fully functional |
+| Fresh server, c=4 alone | 261.6 | matches no-graph 264 |
+| c=4 → c=16 sequence (same server) | 134 (c=16) | **state pollution** — see below |
+
+Sequence stats (c=4 → c=16 → c=4) showed only 256 batched_decode calls
+during c=16 instead of the expected ~1000+ that fresh c=16 alone has,
+so most c=16 work routed through the single-item decode path. Some
+state set during c=4 (likely single-item warmup counter or pool-
+recycled cache buffer interaction) was forcing the engine to skip
+batched decode for c=16. Fresh server vs c=16 alone has no issue.
+
+**Stability win (was the primary blocker):** SIGSEGV that killed
+graph mode in earlier sessions is GONE post Phase 8. cuBLAS GEMM in
+captured path was the real culprit; Marlin (perm-aware) replaced it
+and graph capture+multi-replay now run clean. Native repro confirmed
+the failure mode.
+
+**Open: c=4 → c=16 cell sequence pollution.** Workaround: restart
+server between cells (the bench sweep already does this for major
+runs). Real fix: trace what state the c=4 cell leaks that pushes
+c=16 onto single-item path. Lower priority now that graph mode is
+stable + matches no-graph at clean startup.
+
 ## Phase 8 — perm-aware Marlin INT4 GEMM (2026-05-04, commits `5ba7e38`, `48bf17b`)
 
 Recovers INT4 GEMM speed for desc_act=true models. Phase 6's
