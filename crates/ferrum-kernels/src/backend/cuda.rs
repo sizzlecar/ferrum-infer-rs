@@ -2405,6 +2405,11 @@ fn launch_vllm_marlin(
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(128);
+    // vLLM perf knobs — try toggling via env to see if either helps.
+    let use_atomic_add = std::env::var("FERRUM_VLLM_ATOMIC_ADD")
+        .map_or(false, |v| v == "1");
+    let use_fp32_reduce = std::env::var("FERRUM_VLLM_FP32_REDUCE")
+        .map_or(false, |v| v == "1");
 
     unsafe {
         crate::vllm_marlin::launch_marlin_mm_f16_u4b8(
@@ -2429,8 +2434,8 @@ fn launch_vllm_marlin(
             0,                                  // dev
             raw_stream as cudarc::driver::sys::CUstream,
             sms,
-            false,                              // use_atomic_add
-            false,                              // use_fp32_reduce
+            use_atomic_add,
+            use_fp32_reduce,
         );
     }
     Ok(())
