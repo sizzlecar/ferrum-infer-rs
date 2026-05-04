@@ -51,20 +51,22 @@ curl -s "http://127.0.0.1:$PORT/v1/chat/completions" \
 sleep 2
 
 # Reset op-profile counters by reading and discarding pre-bench lines
-PRE_PROFILE_LINES=$(grep -c 'batched-op-profile' "$SERVER_LOG" 2>/dev/null || echo 0)
+PRE_PROFILE_LINES=$(grep -c 'batched-op-profile' "$SERVER_LOG" 2>/dev/null)
+PRE_PROFILE_LINES=${PRE_PROFILE_LINES:-0}
 echo "[$(date +%H:%M:%S)] pre-bench profile lines: $PRE_PROFILE_LINES"
 
-# Run vllm bench at c=16, random dataset
+# Smaller workload — 32 prompts × 128 output tokens to fit timeout
+# comfortably and produce many clean per-iter profile lines.
 echo "[$(date +%H:%M:%S)] running vllm bench c=16 ..."
-timeout 180 vllm bench serve \
+timeout 240 vllm bench serve \
   --backend openai-chat \
   --base-url "http://127.0.0.1:$PORT" \
   --endpoint /v1/chat/completions \
   --model "$MODEL_DIR" \
   --dataset-name random \
-  --random-input-len 512 \
-  --random-output-len 256 \
-  --num-prompts 64 \
+  --random-input-len 256 \
+  --random-output-len 128 \
+  --num-prompts 32 \
   --max-concurrency 16 \
   --request-rate inf \
   --temperature 0 \
@@ -90,7 +92,8 @@ grep -E 'Output token throughput|Mean TPOT|Median TPOT|P99 TPOT|Successful reque
 # Extract op-profile lines AFTER warmup
 echo ""
 echo "=== OP-PROFILE (post-warmup, only m>1 batched iters) ==="
-TOTAL_PROF_LINES=$(grep -c 'batched-op-profile' "$SERVER_LOG" || echo 0)
+TOTAL_PROF_LINES=$(grep -c 'batched-op-profile' "$SERVER_LOG" 2>/dev/null)
+TOTAL_PROF_LINES=${TOTAL_PROF_LINES:-0}
 POST_LINES=$((TOTAL_PROF_LINES - PRE_PROFILE_LINES))
 echo "captured $POST_LINES post-warmup batched-op-profile lines (warmup=$PRE_PROFILE_LINES, total=$TOTAL_PROF_LINES)"
 

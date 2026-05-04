@@ -2182,6 +2182,18 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // by the Rust dispatch path).
             let batched_profile = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
             let batched_iter_t0 = if batched_profile {
+                // Drain shared counters first so this iter's print isn't
+                // contaminated by prior prefill/single-decode contributions.
+                ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 B::sync(&mut ctx);
                 Some(std::time::Instant::now())
             } else {
@@ -2548,6 +2560,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
 
         // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
+        let _t = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         B::split_qkv(
             ctx,
             &self.scratch.qkv_out,
@@ -2558,6 +2571,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             q_dim,
             kv_dim,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 4. Try the batched per-item qk_norm_rope path: one launch
         //    each for Q/K/V instead of M sequential per-item launches.
@@ -2570,6 +2588,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // layer loop — required so a captured CUDA graph reads from
         // stable buffer contents on replay (per-layer write_u32 inside
         // the captured region would freeze the values).
+        let _t_qkr_contig = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         let q_batched = B::qk_norm_rope_batched_per_item(
             ctx,
             &self.scratch.q_buf,
@@ -2616,6 +2635,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             0,
         );
         let use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
+        if let Some(t0) = _t_qkr_contig {
+            B::sync(ctx);
+            QKR_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // One-time diagnostic so we can verify in server logs that the
         // batched qkr path is actually being taken (vs. silently falling
@@ -2642,6 +2666,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         //    away. cache_lens captured BEFORE the bump.
         let mut kv_lens_host: Vec<u32> = Vec::with_capacity(m);
         let mut batched_kv_append_ok = false;
+        let _t_kvapp = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
         if use_batched_qkr {
             let mut k_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
             let mut v_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
@@ -2707,6 +2732,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
             // Note: cache.len bump moved to decode_batch_internal post-forward
             // (so a graph replay doesn't double-bump). No-op here.
+        }
+        if let Some(t0) = _t_kvapp {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // kv_lens_host no longer used; flash_attn reads
         // scratch.batch_kv_lens_post (also pre-populated).
@@ -2916,6 +2946,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // flash_attn_batched uses its own k_ptrs/v_ptrs host
             // arrays in CudaState (separate from kv_cache_append's
             // cache_ptrs), so per-layer slot = li is sufficient.
+            let _t_attn = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
             let batched_attn_res = B::flash_attention_batched_per_cache(
                 ctx,
                 &self.scratch.q_normed_batched,
@@ -2931,6 +2962,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 capacity_for_kernel,
                 li,
             );
+            if let Some(t0) = _t_attn {
+                B::sync(ctx);
+                ATTN_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // One-time diagnostic
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
