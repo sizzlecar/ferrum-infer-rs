@@ -143,6 +143,79 @@ impl DecodeInput {
     }
 }
 
+/// One sequence's contribution to a unified mixed-batch forward.
+///
+/// A unified batch lets a single model forward pass process a mix of
+/// per-sequence work units: a prefill chunk (q_tokens.len() ≥ 1, possibly
+/// continuing from `pos_offset > 0` for chunked prefill) and a decode step
+/// (q_tokens.len() == 1, `pos_offset` = current cache length) coexist in
+/// the same call. The model layer concatenates all `q_tokens` into one
+/// [M_total, hidden] tensor and runs all GEMMs / norms once; only the
+/// attention kernel sees per-item segmentation.
+///
+/// This is the abstraction that enables vLLM-style chunked prefill where
+/// decode tokens for already-running sequences are produced in the same
+/// iter as a prefill chunk for a newly-arriving sequence.
+#[derive(Clone)]
+pub struct UnifiedBatchItem {
+    /// Identifier matching the sequence's KV cache (model-side keying).
+    pub seq_id: String,
+    /// Tokens to process this iter. For decode this is exactly 1 token;
+    /// for prefill (chunked or whole) this is the chunk's tokens.
+    pub q_tokens: Vec<u32>,
+    /// KV cache handle for this sequence.
+    pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Starting absolute position for the FIRST token in `q_tokens`.
+    /// 0 for a fresh prefill, `kv_len` for a decode step or a continuing
+    /// chunked-prefill slice.
+    pub pos_offset: usize,
+    /// True iff this item completes the request's prefill (or is a decode
+    /// item) — i.e. logits at the last token of `q_tokens` should be
+    /// returned for sampling. Intermediate prefill chunks set this false
+    /// to skip the lm_head + sampling path.
+    pub is_final_chunk: bool,
+}
+
+impl std::fmt::Debug for UnifiedBatchItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnifiedBatchItem")
+            .field("seq_id", &self.seq_id)
+            .field("q_len", &self.q_tokens.len())
+            .field("pos_offset", &self.pos_offset)
+            .field("is_final_chunk", &self.is_final_chunk)
+            .finish()
+    }
+}
+
+/// A mixed-batch forward request: any combination of in-progress prefill
+/// chunks and decode steps. See [`UnifiedBatchItem`] for the per-item
+/// semantics. The producer (engine) groups all sequences active in this
+/// iter into a single batch; the consumer (model) runs one forward and
+/// returns per-item logits (only for items with `is_final_chunk = true`,
+/// in the order they appear in `items`).
+#[derive(Debug, Clone, Default)]
+pub struct UnifiedBatch {
+    pub items: Vec<UnifiedBatchItem>,
+}
+
+impl UnifiedBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Total query tokens across all items — corresponds to the M dim of
+    /// the model's per-layer GEMMs in the unified forward.
+    pub fn total_q_tokens(&self) -> usize {
+        self.items.iter().map(|it| it.q_tokens.len()).sum()
+    }
+
+    /// Number of items that will produce a logits vector (decode items
+    /// always; prefill items only on their final chunk).
+    pub fn num_sampled_items(&self) -> usize {
+        self.items.iter().filter(|it| it.is_final_chunk).count()
+    }
+}
+
 /// Output from decode phase
 #[derive(Debug, Clone)]
 pub struct DecodeOutput {
