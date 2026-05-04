@@ -336,7 +336,7 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
-    fn end_graph_capture(ctx: &mut Self::Context) -> Result<()> {
+    fn end_graph_capture(ctx: &mut Self::Context, key: u64) -> Result<()> {
         use cudarc::driver::sys;
         if !ctx.capture_in_flight {
             return Err(FerrumError::unsupported("end_capture without begin"));
@@ -397,25 +397,29 @@ impl Backend for CudaBackend {
             )));
         }
 
-        // Wrap back into cudarc's CudaGraph so we can use .launch() etc.
-        // Unsafe but matches cudarc's internal struct layout (pub fields).
-        // Actually cudarc's CudaGraph has private fields — we can't construct
-        // it directly. Instead, store cu_graph_exec in our own slot.
-        install_decode_graph_raw(cu_graph, cu_graph_exec, ctx.stream.clone());
+        // Install into the multi-slot cache keyed by `key`. Replaces any
+        // existing graph for the same key; the old GraphSlotRaw drops
+        // (cuCtxSync + cuGraphExecDestroy + cuGraphDestroy in its Drop
+        // impl) before the new one takes its place.
+        install_decode_graph_raw(key, cu_graph, cu_graph_exec, ctx.stream.clone());
         Ok(())
     }
 
-    fn reset_graph(_ctx: &mut Self::Context) {
-        invalidate_decode_graph();
+    fn reset_graph(_ctx: &mut Self::Context, key: u64) {
+        invalidate_decode_graph(key);
     }
 
-    fn replay_last_graph(ctx: &mut Self::Context) -> Result<bool> {
+    fn reset_all_graphs(_ctx: &mut Self::Context) {
+        invalidate_all_decode_graphs();
+    }
+
+    fn replay_graph(ctx: &mut Self::Context, key: u64) -> Result<bool> {
         use cudarc::driver::sys;
         let cu_stream = ctx.stream.cu_stream();
         ctx.ctx
             .bind_to_thread()
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
-        with_decode_graph(|g_opt| {
+        with_decode_graph(key, |g_opt| {
             if let Some(g) = g_opt {
                 // Re-upload before each launch. Without it, c=4 throughput
                 // drops 257→178 tok/s (post-Phase-8 measurement). The
@@ -1995,34 +1999,63 @@ impl Drop for GraphSlotRaw {
 unsafe impl Send for GraphSlotRaw {}
 unsafe impl Sync for GraphSlotRaw {}
 
-static DECODE_GRAPH: std::sync::OnceLock<std::sync::RwLock<Option<GraphSlotRaw>>> =
-    std::sync::OnceLock::new();
+// Multi-slot graph cache, keyed by an opaque `u64`. Caller chooses the
+// key — the model uses `m_padded` (or 0 for single-item) so that
+// different batch shapes get their own captured graph instead of
+// thrashing a single slot at every shape change.
+//
+// Native CUDA microbench (graph_upload_bench.cu, 320 launches × 500 iters,
+// alternating two graph sizes) confirmed multi-slot replay is stable
+// at ~0.26ms/iter with no degradation vs single slot.
+static DECODE_GRAPHS: std::sync::OnceLock<
+    std::sync::RwLock<HashMap<u64, GraphSlotRaw>>,
+> = std::sync::OnceLock::new();
 
-fn graph_slot() -> &'static std::sync::RwLock<Option<GraphSlotRaw>> {
-    DECODE_GRAPH.get_or_init(|| std::sync::RwLock::new(None))
+fn graph_slots() -> &'static std::sync::RwLock<HashMap<u64, GraphSlotRaw>> {
+    DECODE_GRAPHS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 fn install_decode_graph_raw(
+    key: u64,
     cu_graph: cudarc::driver::sys::CUgraph,
     cu_graph_exec: cudarc::driver::sys::CUgraphExec,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
 ) {
-    *graph_slot().write().expect("DECODE_GRAPH poisoned") = Some(GraphSlotRaw {
-        cu_graph,
-        cu_graph_exec,
-        _stream: stream,
-    });
+    let mut g = graph_slots().write().expect("DECODE_GRAPHS poisoned");
+    g.insert(
+        key,
+        GraphSlotRaw {
+            cu_graph,
+            cu_graph_exec,
+            _stream: stream,
+        },
+    );
 }
 
-fn with_decode_graph<R>(f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>) -> Result<R> {
-    let guard = graph_slot().read().expect("DECODE_GRAPH poisoned");
-    f(guard.as_ref())
+fn with_decode_graph<R>(
+    key: u64,
+    f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>,
+) -> Result<R> {
+    let guard = graph_slots().read().expect("DECODE_GRAPHS poisoned");
+    f(guard.get(&key))
 }
 
-/// Evict the cached graph — call this when model weights/scratch pointers
-/// change (e.g. scratch resize, model reload). Next decode will re-capture.
-pub fn invalidate_decode_graph() {
-    *graph_slot().write().expect("DECODE_GRAPH poisoned") = None;
+/// Evict ONE cached graph — call when its kernel-arg pointers (KV cache,
+/// scratch buffers) might be invalidated.
+pub fn invalidate_decode_graph(key: u64) {
+    graph_slots()
+        .write()
+        .expect("DECODE_GRAPHS poisoned")
+        .remove(&key);
+}
+
+/// Evict ALL cached graphs — used by hard reset (model reload, scratch
+/// realloc) when every captured pointer might be stale.
+pub fn invalidate_all_decode_graphs() {
+    graph_slots()
+        .write()
+        .expect("DECODE_GRAPHS poisoned")
+        .clear();
 }
 
 // ────────────────────────────────────────────────────────────────────────

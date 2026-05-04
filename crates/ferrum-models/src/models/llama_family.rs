@@ -21,6 +21,10 @@ use std::sync::atomic::AtomicU64;
 
 use ferrum_kernels::backend::{Backend, KvCache, MAX_LAYERS_FOR_GRAPH};
 
+/// Graph cache key for the single-item decode path (`decode_internal`).
+/// Distinct from any `m_padded`-based key used by the batched path.
+const SINGLE_ITEM_GRAPH_KEY: u64 = 0;
+
 static ATTN_TIME_US: AtomicU64 = AtomicU64::new(0);
 static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
 static QKR_TIME_US: AtomicU64 = AtomicU64::new(0);
@@ -428,9 +432,10 @@ pub struct LlamaFamilyModel<B: Backend> {
     batched_graph_warmup: usize,
     /// True if batched graph capture failed.
     batched_graph_failed: bool,
-    /// `m.next_power_of_two()` of the currently captured batched-decode
-    /// graph. Single slot — replay only when `m` matches.
-    batched_graph_for_m_padded: Option<usize>,
+    /// Set of `m_padded` values (as u64 graph keys) for which a batched
+    /// graph has been captured. Multi-slot via cuda.rs's HashMap-keyed
+    /// graph cache — different batch shapes don't thrash a single slot.
+    batched_graph_keys_seen: std::collections::HashSet<u64>,
     /// Cache IDs for which device-pointer scratch is currently populated.
     /// Populate only re-runs when the batch composition changes (new
     /// requests joined / requests finished). Hot-path optimization:
@@ -450,7 +455,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // pointers. Matters for test suites where multiple models coexist.
         {
             let mut ctx = B::new_context();
-            B::reset_graph(&mut ctx);
+            B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg);
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1); // decode-sized; prefill resizes
@@ -543,7 +548,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             graph_capture_failed: false,
             batched_graph_warmup: 0,
             batched_graph_failed: false,
-            batched_graph_for_m_padded: None,
+            batched_graph_keys_seen: std::collections::HashSet::new(),
             batched_pointers_for: None,
         })
     }
@@ -563,7 +568,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // See `new` — invalidate stale graph referring to prior model's scratch.
         {
             let mut ctx = B::new_context();
-            B::reset_graph(&mut ctx);
+            B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg);
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
@@ -623,7 +628,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             graph_capture_failed: false,
             batched_graph_warmup: 0,
             batched_graph_failed: false,
-            batched_graph_for_m_padded: None,
+            batched_graph_keys_seen: std::collections::HashSet::new(),
             batched_pointers_for: None,
         })
     }
@@ -632,16 +637,19 @@ impl<B: Backend> LlamaFamilyModel<B> {
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
         if self.scratch.max_tokens < tokens {
             // Any captured decode graph holds pointers to the old scratch
-            // buffers; those are about to be freed. Invalidate first so the
-            // next decode falls back to eager + re-captures with fresh ptrs.
-            // Critical for multi-turn chat (turn N+1's prefill may grow scratch).
+            // buffers; those are about to be freed. Invalidate ALL captured
+            // graphs (both single-item and per-m_padded batched) — every
+            // captured kernel-arg pointer into scratch is stale.
             {
                 let mut ctx = B::new_context();
-                B::reset_graph(&mut ctx);
+                B::reset_all_graphs(&mut ctx);
             }
             self.scratch = LlamaFamilyScratch::alloc(&self.cfg, tokens);
             self.graph_warmup = 0;
             self.graph_capture_failed = false;
+            self.batched_graph_keys_seen.clear();
+            self.batched_graph_warmup = 0;
+            self.batched_graph_failed = false;
         }
     }
 
@@ -1636,8 +1644,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // replay — captured graph reads these from device buffers.
             B::set_decode_state(&mut ctx, token, pos);
 
-            // Fast path: graph replay (if available).
-            match B::replay_last_graph(&mut ctx) {
+            // Fast path: graph replay (if available). Single-item path
+            // uses key=SINGLE_ITEM_GRAPH_KEY (0) — separate from the
+            // batched path's m_padded keys.
+            match B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) {
                 Ok(true) => {
                     B::sync(&mut ctx);
                     return B::to_vec(&self.scratch.logits, vocab);
@@ -1779,7 +1789,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
 
         if should_capture && !self.graph_capture_failed {
-            if B::end_graph_capture(&mut ctx).is_err() {
+            if B::end_graph_capture(&mut ctx, SINGLE_ITEM_GRAPH_KEY).is_err() {
                 self.graph_capture_failed = true;
             } else {
                 // Stream capture mode RECORDS ops into the graph without
@@ -1788,7 +1798,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 // actually execute and produce this step's logits. Without
                 // this, the capture step's to_vec returns stale logits,
                 // yielding a 1-token offset in the generated sequence.
-                if B::replay_last_graph(&mut ctx).is_err() {
+                if B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY).is_err() {
                     self.graph_capture_failed = true;
                 }
             }
@@ -2094,18 +2104,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .map(|v| v != "0")
             .unwrap_or(false);
         let m_padded = m.next_power_of_two();
-        let m_matches = self.batched_graph_for_m_padded == Some(m_padded);
+        // Per-m_padded graph cache: each batch shape gets its own
+        // captured graph instead of thrashing a single slot. Native
+        // CUDA microbench (graph_upload_bench) confirmed multi-slot
+        // replay is stable.
+        let graph_key = m_padded as u64;
+        let cache_has_key = self.batched_graph_keys_seen.contains(&graph_key);
 
         let mut did_pure_replay = false;
-        if graph_enabled && m_matches && !self.batched_graph_failed {
+        if graph_enabled && cache_has_key && !self.batched_graph_failed {
             // Sync stream first so embedding_lookup (just queued) plus
             // any null-stream cuMemcpyHtoD_v2's from write_u32 are all
-            // settled before cuGraphLaunch. cuGraphLaunch waiting on
-            // not-yet-arrived stream events causes a hang on the second
-            // replay (post-capture replay works because the stream was
-            // empty after end_graph_capture).
+            // settled before cuGraphLaunch.
             B::sync(&mut ctx);
-            match B::replay_last_graph(&mut ctx) {
+            match B::replay_graph(&mut ctx, graph_key) {
                 Ok(true) => {
                     did_pure_replay = true;
                 }
@@ -2173,12 +2185,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
             tracesync!("after lm_head");
 
             if should_capture && !self.batched_graph_failed {
-                if let Err(e) = B::end_graph_capture(&mut ctx) {
+                if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
                     eprintln!("[batched-trace] end_capture err: {}", e);
                     self.batched_graph_failed = true;
                 } else {
-                    self.batched_graph_for_m_padded = Some(m_padded);
-                    if let Err(e) = B::replay_last_graph(&mut ctx) {
+                    self.batched_graph_keys_seen.insert(graph_key);
+                    if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
                         eprintln!("[batched-trace] post-capture replay err: {}", e);
                         self.batched_graph_failed = true;
                     }
@@ -3011,9 +3023,12 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
                 }
             }
         }
-        // Captured graph expects a specific cache layout; roll it back too.
+        // Single-item graph captures kv-cache pointers directly; truncate
+        // doesn't change pointer but the captured kv_len-bumping pattern
+        // is fragile against state walks. Force single-item re-capture;
+        // batched path is layout-agnostic (per-call cache_lens write).
         let mut ctx = B::new_context();
-        B::reset_graph(&mut ctx);
+        B::reset_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
     }
@@ -3068,13 +3083,16 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     }
 
     fn reset(&mut self) {
-        // Hard reset: drop all caches AND the pool, invalidate graph.
+        // Hard reset: drop all caches AND the pool, invalidate ALL graphs.
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        B::reset_graph(&mut ctx);
+        B::reset_all_graphs(&mut ctx);
         B::sync(&mut ctx);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
+        self.batched_graph_keys_seen.clear();
+        self.batched_graph_warmup = 0;
+        self.batched_graph_failed = false;
         self.kv_caches.clear();
         self.kv_free_pool.clear();
     }

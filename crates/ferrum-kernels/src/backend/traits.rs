@@ -271,22 +271,27 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Err(FerrumError::unsupported("graph capture not supported"))
     }
 
-    /// End stream capture and install the captured graph as this context's
-    /// "last graph" for future `replay_last_graph` calls.
-    fn end_graph_capture(_ctx: &mut Self::Context) -> Result<()> {
+    /// End stream capture and install the captured graph keyed by
+    /// `_key` (opaque caller-chosen u64; the model uses `m_padded` so
+    /// that different batch shapes don't thrash a single slot).
+    fn end_graph_capture(_ctx: &mut Self::Context, _key: u64) -> Result<()> {
         Err(FerrumError::unsupported("graph capture not supported"))
     }
 
-    /// Replay the last captured graph. Returns `Ok(false)` if no graph
-    /// is cached; caller should run eager.
-    fn replay_last_graph(_ctx: &mut Self::Context) -> Result<bool> {
+    /// Replay the captured graph for `_key`. Returns `Ok(false)` if no
+    /// graph is cached for that key; caller should run eager.
+    fn replay_graph(_ctx: &mut Self::Context, _key: u64) -> Result<bool> {
         Ok(false)
     }
 
-    /// Drop the cached decode graph — required when the KV cache it
-    /// was captured against is about to be freed (e.g. request release),
-    /// since the graph holds raw device pointers into that cache.
-    fn reset_graph(_ctx: &mut Self::Context) {}
+    /// Drop the cached graph for `_key` — required when its kernel-arg
+    /// pointers (KV cache, scratch) might no longer be valid. Use
+    /// `reset_all_graphs` when EVERY cached graph should be evicted
+    /// (hard model reload / scratch realloc).
+    fn reset_graph(_ctx: &mut Self::Context, _key: u64) {}
+
+    /// Drop ALL cached graphs — used by hard reset paths.
+    fn reset_all_graphs(_ctx: &mut Self::Context) {}
 
     // ── GPTQ (INT4 quantization) ────────────────────────────────────────
     //
