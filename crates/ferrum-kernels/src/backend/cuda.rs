@@ -413,6 +413,17 @@ impl Backend for CudaBackend {
         with_decode_graph(|g_opt| {
             eprintln!("[replay] slot locked, has_graph={}", g_opt.is_some());
             if let Some(g) = g_opt {
+                // Re-upload before each launch. AUTO_FREE_ON_LAUNCH may
+                // be invalidating the device-side prepared state after
+                // each launch, so we need to refresh. Adds one extra
+                // host→device sync per launch but unblocks correctness.
+                let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
+                eprintln!("[replay] cuGraphUpload returned: {st_up:?}");
+                if st_up != sys::CUresult::CUDA_SUCCESS {
+                    return Err(FerrumError::unsupported(format!(
+                        "cuGraphUpload: {st_up:?}"
+                    )));
+                }
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
                 eprintln!("[replay] cuGraphLaunch returned: {st:?}");
                 if st != sys::CUresult::CUDA_SUCCESS {
