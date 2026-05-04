@@ -18,7 +18,33 @@ Gap analysis (c=4 example): 12 ms TPOT delta = ~9 ms launch overhead from
 per-item dispatch (qk_norm_rope, copy_slice, flash_attn, kv_append) + ~3 ms
 matmul efficiency loss.
 
-## Phase 4d (CUDA Graph capture wiring) — root cause found, fix shipped (commits `96eae06`, `b00ae94`, `156dcab`, `9b79001`)
+## Phase 5 — c=4 plateau investigation (commits `1afdd2c`, `da2f725`)
+
+Profiling per-iter at c=4 to find where the throughput-flat-but-TPOT-down
+inconsistency lives:
+
+| Phase | Time | % |
+|---|---|---|
+| scheduler.next_batch | 4μs | 0% |
+| process_batch (= run_batch_decode) | **10.7ms** | 96% |
+| ↳ decode (forward + dtoh) | 10.2ms | 96% of run_batch_decode |
+| ↳ post (logits 67μs + sample 326μs + emit 19μs) | 0.42ms | 4% |
+| iter total | 10.7ms | |
+| TPOT_p50 measured | 13.0ms | |
+| **Gap (HTTP/SSE/tokio)** | **2.3ms** | 18% of TPOT |
+
+**Conclusion**: engine internal is fine. Real bottleneck = decode forward
+(10.2ms) which is dominated by Marlin matmuls (~9ms across 4 INT4
+GEMMs × 32 layers at m=4). Marlin currently uses auto-tile (`thread_k=-1,
+thread_n=-1`) which may not be optimal for m=4. **Next**: tile tuning
+sweep at m=4.
+
+Theoretical headroom:
+- Current: 226 tok/s at c=4 (TPOT 13.0ms)
+- If decode 10.2 → 7ms (Marlin 1.5×): TPOT ~9.3ms → ~430 tok/s (84% of vLLM)
+- If decode 10.2 → 5ms (Marlin 2×): TPOT ~7.3ms → ~550 tok/s (**beats vLLM**)
+
+## Phase 4d (CUDA Graph capture wiring) — shelved (commits `96eae06`, `b00ae94`, `156dcab`, `9b79001`, `08b0b46`)
 
 Wires `decode_batch_internal` with begin_graph_capture / replay around
 the layer loop + final norm + lm_head. Per-m_padded graph cache,
