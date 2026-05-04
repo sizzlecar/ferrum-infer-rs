@@ -2605,6 +2605,32 @@ impl<B: Backend> LlamaFamilyModel<B> {
             if std::env::var("FERRUM_FORCE_PER_ITEM_KV_APPEND").is_ok() {
                 batched_kv_append_ok = false;
             }
+            // BISECT: dump first batched K-append's cache write at layer 0
+            // to compare with per-item kv_append's content.
+            if li == 0
+                && std::env::var("FERRUM_DUMP_KV_APPEND").is_ok()
+                && batched_kv_append_ok
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static REPORTED_DUMP: AtomicBool = AtomicBool::new(false);
+                if !REPORTED_DUMP.swap(true, Ordering::Relaxed) {
+                    B::sync(ctx);
+                    let cache0 = self
+                        .kv_caches
+                        .get(&batch[0].0)
+                        .expect("kv_caches missing for dump");
+                    let cap = cache0[0].capacity;
+                    let pre_len = pre_append_lens[0] as usize;
+                    let head0_pos = pre_len; // newly written position
+                    let offset = 0 * cap * hd + head0_pos * hd; // head 0
+                    let dump = B::to_vec(&cache0[0].k, cap * nkv * hd);
+                    let win = &dump[offset..offset + 8.min(hd)];
+                    eprintln!(
+                        "[DUMP] batched-K-append layer=0 item=0 head=0 pos={}: {:?}",
+                        head0_pos, win
+                    );
+                }
+            }
             // One-time diag
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
