@@ -3406,10 +3406,25 @@ impl<B: Backend> LlamaFamilyModel<B> {
             B::write_u32(&mut ctx, bt, &stacked);
         }
 
-        // Optional per-layer timing: `FERRUM_UNIFIED_PROFILE=1` triggers
-        // a sync+stopwatch around each layer call. Off in production —
-        // sync is expensive. Throttle log emission to once every 64 calls
-        // to keep the bench log readable.
+        // ── CUDA-graph capture/replay control ────────────────────────
+        // `FERRUM_UNIFIED_GRAPH=1` opts in. Per-shape graph cache keyed
+        // by (m_total, num_seqs); high bit set so we never collide with
+        // legacy keys (SINGLE_ITEM = 0, batched = m_padded). The captured
+        // region covers the layer loop + final rms_norm + per-item
+        // copy_slice + lm_head — every kernel that's stable across iters.
+        // Pre-work (write_u32 + embedding_lookup) and post-work (sync +
+        // to_vec) stay eager.
+        let graph_enabled = std::env::var("FERRUM_UNIFIED_GRAPH")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let graph_key: u64 =
+            (1u64 << 63) | ((m_total as u64) << 32) | (num_seqs as u64);
+        let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
+
+        // Sync eager pre-work (write_u32 + embedding) before either a
+        // replay or a capture starts — buffer state must be settled.
+        B::sync(&mut ctx);
+
         let unified_profile = std::env::var("FERRUM_UNIFIED_PROFILE").is_ok();
         let layer_t0 = if unified_profile {
             B::sync(&mut ctx);
@@ -3417,31 +3432,63 @@ impl<B: Backend> LlamaFamilyModel<B> {
         } else {
             None
         };
-        for li in 0..num_layers {
-            self.unified_forward_layer(
-                &mut ctx,
-                li,
-                items,
-                &q_lens,
-                &cu_seqlens_q,
-                &pos_offsets,
-                &mut residual,
-                m_total,
-                max_kv_len,
-                num_seqs,
-                max_blocks_per_seq,
-                block_size,
-                qkv_stride,
-                q_dim,
-                kv_dim,
-                nh,
-                nkv,
-                hd,
-                im,
-                h,
-                eps,
-                qk_mode,
-            );
+
+        let mut did_pure_replay = false;
+        if graph_enabled && cache_has_key && !self.unified_graph_failed {
+            match B::replay_graph(&mut ctx, graph_key) {
+                Ok(true) => did_pure_replay = true,
+                Ok(false) => {}
+                Err(e) => {
+                    self.unified_graph_failed = true;
+                    eprintln!("[unified-graph] replay err: {e}");
+                }
+            }
+        }
+
+        const UNIFIED_GRAPH_WARMUP: usize = 3;
+        let should_capture = graph_enabled
+            && !self.unified_graph_failed
+            && !cache_has_key
+            && self.unified_graph_warmup >= UNIFIED_GRAPH_WARMUP
+            && !did_pure_replay;
+        if !did_pure_replay {
+            self.unified_graph_warmup += 1;
+        }
+
+        if should_capture {
+            if let Err(e) = B::begin_graph_capture(&mut ctx) {
+                eprintln!("[unified-graph] begin_capture err: {e}");
+                self.unified_graph_failed = true;
+            }
+        }
+
+        if !did_pure_replay {
+            for li in 0..num_layers {
+                self.unified_forward_layer(
+                    &mut ctx,
+                    li,
+                    items,
+                    &q_lens,
+                    &cu_seqlens_q,
+                    &pos_offsets,
+                    &mut residual,
+                    m_total,
+                    max_kv_len,
+                    num_seqs,
+                    max_blocks_per_seq,
+                    block_size,
+                    qkv_stride,
+                    q_dim,
+                    kv_dim,
+                    nh,
+                    nkv,
+                    hd,
+                    im,
+                    h,
+                    eps,
+                    qk_mode,
+                );
+            }
         }
         if let Some(t0) = layer_t0 {
             B::sync(&mut ctx);
@@ -3496,19 +3543,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
-        // Final norm on the WHOLE M_total then extract last-token rows
-        // for is_final_chunk items via per-item copy_slice into a packed
-        // buffer; lm_head runs on the packed [num_sampled, h].
-        let final_norm_w = &self.final_norm_w;
-        // Reuse unified_norm_out as final-norm output (it's free post-layer).
-        let mut norm_out = self
-            .scratch
-            .unified_norm_out
-            .take()
-            .expect("unified_norm_out missing");
-        B::rms_norm(&mut ctx, &residual, final_norm_w, eps, &mut norm_out, m_total, h);
-
-        // Identify per-item last-token global indices for is_final_chunk items.
+        // Identify per-item last-token global indices for is_final_chunk
+        // items. Pure host work — same shape across iters at c=16
+        // steady state, so the captured copy_slice + lm_head launches
+        // record stable offsets.
         let final_indices: Vec<(usize, usize)> = items
             .iter()
             .enumerate()
@@ -3521,10 +3559,76 @@ impl<B: Backend> LlamaFamilyModel<B> {
             })
             .collect();
         let num_sampled = final_indices.len();
-        let lm_head = self
-            .lm_head
-            .as_ref()
-            .expect("unified_forward_internal called on backbone-only model");
+
+        // Take scratch buffers we'll either record into the graph or
+        // restore on return — outside the !did_pure_replay branch so
+        // both paths can put them back.
+        let final_norm_w = &self.final_norm_w;
+        let mut norm_out = self
+            .scratch
+            .unified_norm_out
+            .take()
+            .expect("unified_norm_out missing");
+
+        if !did_pure_replay {
+            B::rms_norm(&mut ctx, &residual, final_norm_w, eps, &mut norm_out, m_total, h);
+            if num_sampled > 0 {
+                let packed_normed = self
+                    .scratch
+                    .unified_packed_normed
+                    .as_mut()
+                    .expect("unified_packed_normed missing");
+                for (j, &(_, global)) in final_indices.iter().enumerate() {
+                    B::copy_slice(
+                        &mut ctx,
+                        &norm_out,
+                        global * h,
+                        packed_normed,
+                        j * h,
+                        h,
+                    );
+                }
+                let lm_head = self
+                    .lm_head
+                    .as_ref()
+                    .expect("unified_forward_internal called on backbone-only model");
+                let packed_logits = self
+                    .scratch
+                    .unified_packed_logits
+                    .as_mut()
+                    .expect("unified_packed_logits missing");
+                lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+            }
+        }
+
+        // End capture (if active) and install graph. The first replay
+        // is implicit — control falls through to the sync/to_vec below
+        // since the eager pass already wrote `packed_logits` into the
+        // captured buffer ranges.
+        if should_capture && !self.unified_graph_failed {
+            if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
+                eprintln!("[unified-graph] end_capture err: {e}");
+                self.unified_graph_failed = true;
+            } else {
+                self.unified_graph_keys_seen.insert(graph_key);
+            }
+        }
+
+        // Sync + readback. ALWAYS eager — to_vec needs the host result.
+        B::sync(&mut ctx);
+        let mut out: Vec<Option<Vec<f32>>> = (0..items.len()).map(|_| None).collect();
+        if num_sampled > 0 {
+            let packed_logits = self
+                .scratch
+                .unified_packed_logits
+                .as_ref()
+                .expect("unified_packed_logits missing");
+            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
+                out[orig_idx] = Some(row);
+            }
+        }
 
         // Bump cache.len for each item (we wrote q_lens[i] tokens into seq i's
         // KV pool inside the layer loop). Centralised post-loop bump matches
@@ -3539,53 +3643,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
-        // Restore unified_residual / unified_norm_out so a subsequent
-        // call's `take()` finds them. norm_out was written by final
-        // rms_norm; residual is post-final-layer state we no longer need.
+        // Restore scratch for next call.
         self.scratch.unified_residual = Some(residual);
-        // norm_out is consumed by the per-item copy_slice below before
-        // being put back.
-
-        let mut out: Vec<Option<Vec<f32>>> = (0..items.len()).map(|_| None).collect();
-
-        if num_sampled > 0 {
-            // Pack final-chunk hidden states into a contiguous buffer
-            // [num_sampled, h] via per-item copy_slice. Inexpensive — at
-            // c=16 worst case 16 small copies.
-            let packed_normed = self
-                .scratch
-                .unified_packed_normed
-                .as_mut()
-                .expect("unified_packed_normed missing");
-            for (j, &(_, global)) in final_indices.iter().enumerate() {
-                B::copy_slice(
-                    &mut ctx,
-                    &norm_out,
-                    global * h,
-                    packed_normed,
-                    j * h,
-                    h,
-                );
-            }
-            // lm_head [num_sampled, h] → packed_logits [num_sampled, vocab]
-            let packed_logits = self
-                .scratch
-                .unified_packed_logits
-                .as_mut()
-                .expect("unified_packed_logits missing");
-            lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
-            // Sync + readback.
-            B::sync(&mut ctx);
-            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
-            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
-                out[orig_idx] = Some(row);
-            }
-        } else {
-            B::sync(&mut ctx);
-        }
-
-        // Restore norm_out for next call.
         self.scratch.unified_norm_out = Some(norm_out);
 
         out
