@@ -3414,8 +3414,18 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // copy_slice + lm_head — every kernel that's stable across iters.
         // Pre-work (write_u32 + embedding_lookup) and post-work (sync +
         // to_vec) stay eager.
+        //
+        // Status (2026-05-05): capture inside the layer loop trips
+        // `gather_columns launch: CUDA_ERROR_INVALID_VALUE` in the
+        // perm-aware Marlin path, even with the post-capture replay
+        // wired correctly. Marlin's gather scratch is a process-global
+        // RwLock'd slot — the lock-acquire-while-capturing pattern (or
+        // some interaction with cudarc's launch_builder during capture)
+        // appears to be the root cause. Default OFF until isolated;
+        // varlen single-launch (committed previously) gives most of the
+        // expected launch-overhead win on its own.
         let graph_enabled = std::env::var("FERRUM_UNIFIED_GRAPH")
-            .map(|v| v != "0")
+            .map(|v| v == "1")
             .unwrap_or(false);
         let graph_key: u64 =
             (1u64 << 63) | ((m_total as u64) << 32) | (num_seqs as u64);
