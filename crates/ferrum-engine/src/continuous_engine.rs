@@ -490,15 +490,24 @@ impl EngineInner {
 
     async fn run_prefill(&self, request_id: &RequestId) -> Result<()> {
         let prefill_prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
-        let prefill_t0 = if prefill_prof { Some(std::time::Instant::now()) } else { None };
+        let prefill_t0 = if prefill_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let res = self.run_prefill_inner(request_id).await;
         if let Some(t0) = prefill_t0 {
             static PREFILL_PROF_CALLS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = PREFILL_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let elapsed = t0.elapsed().as_micros();
-            eprintln!("[prefill-prof] call#{} req={} elapsed={}us ok={}",
-                n, request_id, elapsed, res.is_ok());
+            eprintln!(
+                "[prefill-prof] call#{} req={} elapsed={}us ok={}",
+                n,
+                request_id,
+                elapsed,
+                res.is_ok()
+            );
         }
         res
     }
@@ -1378,11 +1387,7 @@ impl ContinuousBatchEngine {
     /// per-iter tokio scheduling overhead at c=16). With one bg loop +
     /// per-request tasks just consuming their channel, lock is uncontested.
     fn ensure_bg_loop(&self) {
-        if !self
-            .inner
-            .bg_loop_spawned
-            .swap(true, Ordering::SeqCst)
-        {
+        if !self.inner.bg_loop_spawned.swap(true, Ordering::SeqCst) {
             let _ = self.start_loop();
         }
     }

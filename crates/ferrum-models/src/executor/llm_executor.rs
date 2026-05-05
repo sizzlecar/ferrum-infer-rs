@@ -318,7 +318,11 @@ impl ModelExecutor for LlmExecutor {
             return Ok(Vec::new());
         }
         let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
-        let t0 = if prof { Some(std::time::Instant::now()) } else { None };
+        let t0 = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // Pre-extract all per-input metadata OUTSIDE the lock — this is pure
         // borrow/downcast work that doesn't touch the model.
         struct Prep {
@@ -347,7 +351,11 @@ impl ModelExecutor for LlmExecutor {
                 handle: Arc::new(input_handle.with_sequence_length((seq_len + 1) as usize)),
             });
         }
-        let t_prep = if prof { Some(std::time::Instant::now()) } else { None };
+        let t_prep = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // One lock for the whole batch. Try unified_forward first: paged
         // configs route through the varlen kernel (single mixed dispatch
@@ -355,10 +363,18 @@ impl ModelExecutor for LlmExecutor {
         // legacy decode_batch (separate paged_decode_attention call per
         // item, batched matmul for QKV/MLP).
         let (all_logits, t_lock_acq, t_model_call): (Vec<Vec<f32>>, _, _) = {
-            let lock_t0 = if prof { Some(std::time::Instant::now()) } else { None };
+            let lock_t0 = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let mut model = self.model.lock();
             let lock_acq = lock_t0.map(|t| t.elapsed());
-            let model_t0 = if prof { Some(std::time::Instant::now()) } else { None };
+            let model_t0 = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let unified_items: Vec<(String, Vec<u32>, usize, bool)> = prepped
                 .iter()
                 .map(|p| (p.cache_id.clone(), vec![p.token], p.seq_len as usize, true))
@@ -394,7 +410,11 @@ impl ModelExecutor for LlmExecutor {
             let model_call = model_t0.map(|t| t.elapsed());
             (logits, lock_acq, model_call)
         };
-        let t_model_done = if prof { Some(std::time::Instant::now()) } else { None };
+        let t_model_done = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let m_count = prepped.len();
         let mut outputs = Vec::with_capacity(m_count);
@@ -446,10 +466,7 @@ impl ModelExecutor for LlmExecutor {
     /// this with a true unified-forward (one [M_total, hidden] forward
     /// + varlen attention) — at that point the kernel-level mix replaces
     /// the host-side serial dispatch here.
-    async fn unified_decode(
-        &self,
-        batch: &UnifiedBatch,
-    ) -> Result<Vec<Option<Vec<f32>>>> {
+    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
         let mut results: Vec<Option<Vec<f32>>> = vec![None; batch.items.len()];
         if batch.items.is_empty() {
             return Ok(results);

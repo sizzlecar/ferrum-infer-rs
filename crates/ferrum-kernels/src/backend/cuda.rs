@@ -422,14 +422,18 @@ impl Backend for CudaBackend {
         with_decode_graph(key, |g_opt| {
             if let Some(g) = g_opt {
                 let prof = std::env::var("FERRUM_GRAPH_PROF").is_ok();
-                let t_pre = if prof { Some(std::time::Instant::now()) } else { None };
+                let t_pre = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 // Re-upload before each launch. Without it, c=4 throughput
                 // drops 257→178 tok/s (post-Phase-8 measurement). The
                 // graph instantiate-then-upload-once design didn't pan out
                 // empirically; keep the per-replay upload until we
                 // understand why removing it slows things down.
-                let skip_upload = std::env::var("FERRUM_GRAPH_SKIP_UPLOAD")
-                    .map_or(false, |v| v == "1");
+                let skip_upload =
+                    std::env::var("FERRUM_GRAPH_SKIP_UPLOAD").map_or(false, |v| v == "1");
                 if !skip_upload {
                     let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
                     if st_up != sys::CUresult::CUDA_SUCCESS {
@@ -438,14 +442,21 @@ impl Backend for CudaBackend {
                         )));
                     }
                 }
-                let t_after_upload = if prof { Some(std::time::Instant::now()) } else { None };
+                let t_after_upload = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
                 }
-                let t_after_launch = if prof { Some(std::time::Instant::now()) } else { None };
-                let skip_sync = std::env::var("FERRUM_GRAPH_SKIP_SYNC")
-                    .map_or(false, |v| v == "1");
+                let t_after_launch = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let skip_sync = std::env::var("FERRUM_GRAPH_SKIP_SYNC").map_or(false, |v| v == "1");
                 if !skip_sync {
                     let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
                     if st_sync != sys::CUresult::CUDA_SUCCESS {
@@ -455,8 +466,7 @@ impl Backend for CudaBackend {
                     }
                 }
                 if let (Some(t0), Some(t1), Some(t2)) = (t_pre, t_after_upload, t_after_launch) {
-                    static N: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
+                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n.is_multiple_of(64) {
                         let upload = t1.duration_since(t0).as_micros();
@@ -1137,8 +1147,7 @@ impl Backend for CudaBackend {
             // into the captured graph when capture is in flight; both
             // endpoints are stable global addresses.
             {
-                let host_slice: &[u64] =
-                    &slot_g.host_cache_ptrs[host_start..host_start + m];
+                let host_slice: &[u64] = &slot_g.host_cache_ptrs[host_start..host_start + m];
                 let mut view = slot_g
                     .scratch_u64_cache
                     .slice_mut(host_start..host_start + m);
@@ -1146,9 +1155,7 @@ impl Backend for CudaBackend {
                     .memcpy_htod(host_slice, &mut view)
                     .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
             }
-            let cache_ptrs_view = slot_g
-                .scratch_u64_cache
-                .slice(host_start..host_start + m);
+            let cache_ptrs_view = slot_g.scratch_u64_cache.slice(host_start..host_start + m);
             let cache_lens_dev = cache_lens;
             let mut b = stream.launch_builder(&func);
             b.arg(&cache_ptrs_view);
@@ -1319,9 +1326,7 @@ impl Backend for CudaBackend {
             })
         }
         .map(|_| ())
-        .map_err(|e| {
-            FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache: {e}"))
-        })
+        .map_err(|e| FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache: {e}")))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1396,9 +1401,7 @@ impl Backend for CudaBackend {
         }
         .map(|_| ())
         .map_err(|e| {
-            FerrumError::model(format!(
-                "split_qkv_norm_rope_into_paged_cache_varlen: {e}"
-            ))
+            FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache_varlen: {e}"))
         })
     }
 
@@ -1466,31 +1469,21 @@ impl Backend for CudaBackend {
             // outlives every CudaState) — replay across decode calls is
             // safe because no pointer dangles.
             {
-                let k_host_slice: &[u64] =
-                    &slot_g.host_k_ptrs[host_start..host_start + m];
-                let mut view = slot_g
-                    .scratch_u64_k
-                    .slice_mut(host_start..host_start + m);
+                let k_host_slice: &[u64] = &slot_g.host_k_ptrs[host_start..host_start + m];
+                let mut view = slot_g.scratch_u64_k.slice_mut(host_start..host_start + m);
                 stream
                     .memcpy_htod(k_host_slice, &mut view)
                     .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
             }
             {
-                let v_host_slice: &[u64] =
-                    &slot_g.host_v_ptrs[host_start..host_start + m];
-                let mut view = slot_g
-                    .scratch_u64_v
-                    .slice_mut(host_start..host_start + m);
+                let v_host_slice: &[u64] = &slot_g.host_v_ptrs[host_start..host_start + m];
+                let mut view = slot_g.scratch_u64_v.slice_mut(host_start..host_start + m);
                 stream
                     .memcpy_htod(v_host_slice, &mut view)
                     .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
             }
-            let k_ptrs_view = slot_g
-                .scratch_u64_k
-                .slice(host_start..host_start + m);
-            let v_ptrs_view = slot_g
-                .scratch_u64_v
-                .slice(host_start..host_start + m);
+            let k_ptrs_view = slot_g.scratch_u64_k.slice(host_start..host_start + m);
+            let v_ptrs_view = slot_g.scratch_u64_v.slice(host_start..host_start + m);
             let kv_lens_dev = kv_lens;
             let mut b = stream.launch_builder(&func);
             b.arg(q);
@@ -1948,8 +1941,7 @@ impl Backend for CudaBackend {
 
         // Path A (default): Marlin. Repack on CPU, then upload. Matches
         // IST-DASLab/marlin Layer.pack().
-        let marlin_qweight_i32 =
-            crate::marlin::repack_gptq_to_marlin(&qweight_for_repack, k, n);
+        let marlin_qweight_i32 = crate::marlin::repack_gptq_to_marlin(&qweight_for_repack, k, n);
         // Scales arrive as f32 but Marlin expects f16. Convert + permute.
         let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
         let marlin_scales_f16 =
@@ -2276,9 +2268,8 @@ unsafe impl Sync for GraphSlotRaw {}
 // Native CUDA microbench (graph_upload_bench.cu, 320 launches × 500 iters,
 // alternating two graph sizes) confirmed multi-slot replay is stable
 // at ~0.26ms/iter with no degradation vs single slot.
-static DECODE_GRAPHS: std::sync::OnceLock<
-    std::sync::RwLock<HashMap<u64, GraphSlotRaw>>,
-> = std::sync::OnceLock::new();
+static DECODE_GRAPHS: std::sync::OnceLock<std::sync::RwLock<HashMap<u64, GraphSlotRaw>>> =
+    std::sync::OnceLock::new();
 
 fn graph_slots() -> &'static std::sync::RwLock<HashMap<u64, GraphSlotRaw>> {
     DECODE_GRAPHS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
@@ -2301,10 +2292,7 @@ fn install_decode_graph_raw(
     );
 }
 
-fn with_decode_graph<R>(
-    key: u64,
-    f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>,
-) -> Result<R> {
+fn with_decode_graph<R>(key: u64, f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>) -> Result<R> {
     let guard = graph_slots().read().expect("DECODE_GRAPHS poisoned");
     f(guard.get(&key))
 }
@@ -2590,13 +2578,10 @@ struct MarlinGatherScratch {
 unsafe impl Send for MarlinGatherScratch {}
 unsafe impl Sync for MarlinGatherScratch {}
 
-static MARLIN_GATHER_SCRATCH: std::sync::OnceLock<
-    std::sync::RwLock<Option<MarlinGatherScratch>>,
-> = std::sync::OnceLock::new();
+static MARLIN_GATHER_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<MarlinGatherScratch>>> =
+    std::sync::OnceLock::new();
 
-fn marlin_gather_scratch_slot()
-    -> &'static std::sync::RwLock<Option<MarlinGatherScratch>>
-{
+fn marlin_gather_scratch_slot() -> &'static std::sync::RwLock<Option<MarlinGatherScratch>> {
     MARLIN_GATHER_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
 }
 
@@ -2661,8 +2646,8 @@ fn with_marlin_gather_scratch<R>(
         None => true,
     };
     if need_new {
-        let buf = unsafe { stream.alloc::<f16>(required) }
-            .expect("MARLIN_GATHER_SCRATCH alloc failed");
+        let buf =
+            unsafe { stream.alloc::<f16>(required) }.expect("MARLIN_GATHER_SCRATCH alloc failed");
         *w = Some(MarlinGatherScratch {
             buf,
             capacity: required,
@@ -2684,11 +2669,7 @@ fn marlin_gemm_with_perm(
     if let Some(perm) = weight.perm.as_ref() {
         let k = weight.k;
         let stream = ctx.stream.clone();
-        let func = ctx.func(
-            "gather_columns",
-            ptx::GATHER_COLUMNS,
-            "gather_columns_f16",
-        );
+        let func = ctx.func("gather_columns", ptx::GATHER_COLUMNS, "gather_columns_f16");
         let m_i32 = m as i32;
         let k_i32 = k as i32;
         let block_x: u32 = 512;
@@ -2755,12 +2736,7 @@ fn launch_vllm_marlin(
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         let raw_stream = stream.cu_stream();
         unsafe {
-            cudarc::driver::sys::cuMemsetD32Async(
-                ws_ptr,
-                0,
-                weight.workspace.len(),
-                raw_stream,
-            );
+            cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, weight.workspace.len(), raw_stream);
         }
     }
     let (a_ptr, _g_a) = a.device_ptr(stream);
@@ -2779,32 +2755,30 @@ fn launch_vllm_marlin(
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(128);
     // vLLM perf knobs — try toggling via env to see if either helps.
-    let use_atomic_add = std::env::var("FERRUM_VLLM_ATOMIC_ADD")
-        .map_or(false, |v| v == "1");
-    let use_fp32_reduce = std::env::var("FERRUM_VLLM_FP32_REDUCE")
-        .map_or(false, |v| v == "1");
+    let use_atomic_add = std::env::var("FERRUM_VLLM_ATOMIC_ADD").map_or(false, |v| v == "1");
+    let use_fp32_reduce = std::env::var("FERRUM_VLLM_FP32_REDUCE").map_or(false, |v| v == "1");
 
     unsafe {
         crate::vllm_marlin::launch_marlin_mm_f16_u4b8(
             a_ptr as *const _,
             b_ptr as *const _,
             c_ptr as *mut _,
-            std::ptr::null_mut(),               // C_tmp (use_fp32_reduce=false)
-            std::ptr::null_mut(),               // a_s   (FP16 act, no per-token scale)
-            s_ptr as *mut _,                    // b_s
-            std::ptr::null_mut(),               // g_idx (we already gathered A by perm)
-            std::ptr::null_mut(),               // perm  (ditto)
-            std::ptr::null_mut(),               // a_tmp
+            std::ptr::null_mut(), // C_tmp (use_fp32_reduce=false)
+            std::ptr::null_mut(), // a_s   (FP16 act, no per-token scale)
+            s_ptr as *mut _,      // b_s
+            std::ptr::null_mut(), // g_idx (we already gathered A by perm)
+            std::ptr::null_mut(), // perm  (ditto)
+            std::ptr::null_mut(), // a_tmp
             m as i32,
             n,
             k,
-            k,                                  // lda = K (row-major FP16 A)
+            k, // lda = K (row-major FP16 A)
             ws_ptr as *mut _,
-            false,                              // has_act_order — pre-applied via perm-gather
-            true,                               // is_k_full
+            false, // has_act_order — pre-applied via perm-gather
+            true,  // is_k_full
             num_groups,
             group_size,
-            0,                                  // dev
+            0, // dev
             raw_stream as cudarc::driver::sys::CUstream,
             sms,
             use_atomic_add,
@@ -2827,11 +2801,7 @@ fn launch_vllm_marlin(
     ))
 }
 
-fn ensure_module(
-    ctx: &Arc<CudaContext>,
-    key: &'static str,
-    ptx_src: &str,
-) -> Arc<CudaModule> {
+fn ensure_module(ctx: &Arc<CudaContext>, key: &'static str, ptx_src: &str) -> Arc<CudaModule> {
     {
         let g = modules_cache().lock().expect("MODULES poisoned");
         if let Some(m) = g.get(key) {
