@@ -3878,6 +3878,19 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
                  Engine will fall back to per-item dispatch.",
             ));
         }
+        // ensure_kv all items up front and surface pool-exhaust as a clean
+        // per-request error (`ResourceExhausted`) instead of panicking
+        // inside `unified_forward_internal` — a panic kills the tokio
+        // worker and dangles every cache_id still in flight, which then
+        // permanently exhausts the pool.
+        for (cid, _, _, _) in items {
+            self.ensure_kv(cid);
+            if !self.kv_caches.contains_key(cid) {
+                return Err(ferrum_types::FerrumError::resource_exhausted(format!(
+                    "paged KV pool exhausted for cache_id={cid:?}; back off"
+                )));
+            }
+        }
         Ok(self.unified_forward_internal(items))
     }
 
