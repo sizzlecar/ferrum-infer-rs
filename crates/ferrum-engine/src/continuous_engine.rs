@@ -757,8 +757,19 @@ impl EngineInner {
                     .unwrap_or(TokenId::new(0));
                 use ferrum_interfaces::KvCacheHandle;
                 let pos_offset = kv_cache.block_table().sequence_length;
+                // Use the model-side cache_id (set in `run_prefill_inner`
+                // from `prefill_output.kv_cache.cache_id()`), NOT the
+                // engine's request_id. The model's `kv_caches` is keyed
+                // by the executor-generated id (e.g. "llm-cache-N"); using
+                // the request_id (UUID) makes `ensure_kv` allocate a
+                // fresh cache + 128 paged blocks for every decode iter,
+                // exhausting the pool within ~60 prompts.
+                let seq_id = seq
+                    .model_cache_id
+                    .clone()
+                    .unwrap_or_else(|| rid.to_string());
                 batch.items.push(UnifiedBatchItem {
-                    seq_id: rid.to_string(),
+                    seq_id,
                     q_tokens: vec![last_token.get()],
                     kv_cache,
                     pos_offset,
