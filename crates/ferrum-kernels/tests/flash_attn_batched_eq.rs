@@ -84,9 +84,9 @@ fn flash_attn_batched_matches_per_item() {
             k_ref,
             v_ref,
             &mut out_single_scratch,
-            1,        // batch
-            1,        // q_len
-            VALID_KV, // kv_len
+            1,            // batch
+            1,            // q_len
+            VALID_KV,     // kv_len
             VALID_KV - 1, // pos_offset (irrelevant for head-major decode)
             &attn_cfg,
         );
@@ -126,7 +126,11 @@ fn flash_attn_batched_matches_per_item() {
     let mut max_abs = 0.0f32;
     let mut argmax = 0usize;
     let mut mismatches = 0usize;
-    for (i, (a, b)) in per_item_concat.iter().zip(batched_concat.iter()).enumerate() {
+    for (i, (a, b)) in per_item_concat
+        .iter()
+        .zip(batched_concat.iter())
+        .enumerate()
+    {
         let diff = (a - b).abs();
         if diff > max_abs {
             max_abs = diff;

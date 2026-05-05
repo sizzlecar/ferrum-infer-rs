@@ -390,11 +390,8 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 in_features,
                 out_features,
             );
-            let mut linear = crate::dense::DenseLinear::<B>::from_rows(
-                &dequant_f32,
-                out_features,
-                in_features,
-            );
+            let mut linear =
+                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features);
             let bias_key = format!("{name}.bias");
             if self.has(&bias_key) {
                 let (bias, _) = self.read_f32(&bias_key)?;
@@ -549,11 +546,8 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 in_features,
                 out_features,
             );
-            let mut linear = crate::dense::DenseLinear::<B>::from_rows(
-                &dequant_f32,
-                out_features,
-                in_features,
-            );
+            let mut linear =
+                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features);
             let mut bias_acc: Vec<f32> = Vec::new();
             let mut any_bias = false;
             for p in parts {

@@ -285,10 +285,7 @@ pub trait ModelExecutor: Send + Sync {
     /// - A real unified-forward path that runs all items through one
     ///   `[M_total, hidden]` GEMM chain with a varlen attention kernel
     ///   (this is the chunked-prefill perf unlock).
-    async fn unified_decode(
-        &self,
-        _batch: &UnifiedBatch,
-    ) -> Result<Vec<Option<Vec<f32>>>> {
+    async fn unified_decode(&self, _batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
         Err(ferrum_types::FerrumError::unsupported(
             "unified_decode not implemented for this executor",
         ))

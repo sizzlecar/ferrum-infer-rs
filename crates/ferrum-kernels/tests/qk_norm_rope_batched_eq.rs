@@ -148,7 +148,11 @@ fn run_eq(mode: i32, label: &str) {
     let mut max_rel = 0.0f32;
     let mut argmax = 0usize;
     let mut mismatches = 0usize;
-    for (idx, (a, b)) in per_item_concat.iter().zip(batched_concat.iter()).enumerate() {
+    for (idx, (a, b)) in per_item_concat
+        .iter()
+        .zip(batched_concat.iter())
+        .enumerate()
+    {
         let diff = (a - b).abs();
         if diff > max_abs {
             max_abs = diff;

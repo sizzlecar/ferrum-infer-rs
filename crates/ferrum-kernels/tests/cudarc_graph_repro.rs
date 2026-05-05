@@ -351,12 +351,8 @@ fn cudarc_graph_shared_host_array_multi_memcpy() {
     }
 
     // Verify dev1 vs dev2 actually got DIFFERENT data on replay
-    let dev1_host: Vec<u64> = stream
-        .memcpy_dtov(&dev1)
-        .expect("dtov dev1");
-    let dev2_host: Vec<u64> = stream
-        .memcpy_dtov(&dev2)
-        .expect("dtov dev2");
+    let dev1_host: Vec<u64> = stream.memcpy_dtov(&dev1).expect("dtov dev1");
+    let dev2_host: Vec<u64> = stream.memcpy_dtov(&dev2).expect("dtov dev2");
     eprintln!("[shared-host-multi] dev1 = {:?}", dev1_host);
     eprintln!("[shared-host-multi] dev2 = {:?}", dev2_host);
     eprintln!("[shared-host-multi] SUCCESS — ran without hang. Data correctness:");

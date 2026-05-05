@@ -83,7 +83,7 @@ fn kv_append_batched_matches_per_item_head_major() {
             CAPACITY,
             &single_scratch,
             &v_dummy,
-            1,   // new_tokens
+            1, // new_tokens
             NKV,
             HD,
         );
