@@ -2406,6 +2406,67 @@ fn modules_cache() -> &'static std::sync::Mutex<HashMap<&'static str, Arc<CudaMo
 // dominated by the Marlin GEMM that follows, not the gather.
 
 #[cfg(feature = "marlin")]
+/// Process-global scratch buffer for the perm-aware Marlin's `a_gathered`
+/// staging slot. Without this, every `marlin_gemm_with_perm` call did
+/// `stream.alloc::<f16>(m * k)` and dropped at scope end — cudarc's
+/// allocator pool grew unboundedly (≥ 32 MB / iter × 200 iters → ~6 GB
+/// VRAM after one c=16 bench rep, OOM on rep 2). Now we keep one slot
+/// per process, grown on demand to the largest `m * k` ever requested.
+struct MarlinGatherScratch {
+    buf: CudaSlice<f16>,
+    capacity: usize, // in f16 elements
+}
+unsafe impl Send for MarlinGatherScratch {}
+unsafe impl Sync for MarlinGatherScratch {}
+
+static MARLIN_GATHER_SCRATCH: std::sync::OnceLock<
+    std::sync::RwLock<Option<MarlinGatherScratch>>,
+> = std::sync::OnceLock::new();
+
+fn marlin_gather_scratch_slot()
+    -> &'static std::sync::RwLock<Option<MarlinGatherScratch>>
+{
+    MARLIN_GATHER_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Run `body` with a mut ref to a Marlin-gather scratch buffer of at
+/// least `required` f16 elements. Reuses the existing slot if it fits;
+/// reallocates (replacing the old one) if it needs to grow.
+fn with_marlin_gather_scratch<R>(
+    stream: &Arc<CudaStream>,
+    required: usize,
+    body: impl FnOnce(&mut CudaSlice<f16>) -> R,
+) -> R {
+    let slot = marlin_gather_scratch_slot();
+    {
+        let g = slot.read().expect("MARLIN_GATHER_SCRATCH poisoned");
+        if let Some(ref s) = *g {
+            if s.capacity >= required {
+                drop(g);
+                let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+                let s = w.as_mut().expect("just observed Some");
+                return body(&mut s.buf);
+            }
+        }
+    }
+    // Need to (re)allocate.
+    let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+    let need_new = match &*w {
+        Some(s) => s.capacity < required,
+        None => true,
+    };
+    if need_new {
+        let buf = unsafe { stream.alloc::<f16>(required) }
+            .expect("MARLIN_GATHER_SCRATCH alloc failed");
+        *w = Some(MarlinGatherScratch {
+            buf,
+            capacity: required,
+        });
+    }
+    let s = w.as_mut().expect("just allocated");
+    body(&mut s.buf)
+}
+
 fn marlin_gemm_with_perm(
     ctx: &mut CudaState,
     a: &CudaSlice<f16>,
@@ -2418,8 +2479,6 @@ fn marlin_gemm_with_perm(
     if let Some(perm) = weight.perm.as_ref() {
         let k = weight.k;
         let stream = ctx.stream.clone();
-        let mut a_gathered = unsafe { stream.alloc::<f16>(m * k) }
-            .map_err(|e| FerrumError::model(format!("gather scratch alloc: {e}")))?;
         let func = ctx.func(
             "gather_columns",
             ptx::GATHER_COLUMNS,
@@ -2427,27 +2486,38 @@ fn marlin_gemm_with_perm(
         );
         let m_i32 = m as i32;
         let k_i32 = k as i32;
-        let mut b = stream.launch_builder(&func);
-        b.arg(a);
-        b.arg(perm);
-        b.arg(&mut a_gathered);
-        b.arg(&m_i32);
-        b.arg(&k_i32);
         let block_x: u32 = 512;
         let grid_y: u32 = ((k as u32) + block_x - 1) / block_x;
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (m as u32, grid_y, 1),
-                block_dim: (block_x, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
-        if use_vllm {
-            return launch_vllm_marlin(&ctx.stream, &a_gathered, weight, out, m);
-        }
-        crate::marlin::marlin_gemm(&ctx.stream, &a_gathered, weight, out, m as i32)
-            .map_err(|e| FerrumError::model(format!("marlin_gemm (perm): {e}")))
+        // Borrow the gather-scratch slot for the entire (gather +
+        // marlin_gemm) sequence so the GPU work using `a_gathered`
+        // completes (or at least gets stream-ordered) before another
+        // marlin_gemm_with_perm caller can grab the same buffer.
+        // RwLock write-guard is held across the launch+marlin_gemm
+        // calls; both queue async on the same `stream`, and the next
+        // caller's Marlin work also serialises on this stream — so
+        // even a weaker single-slot pool is correct as long as we
+        // don't leave the function before the kernel queues complete.
+        with_marlin_gather_scratch(&stream, m * k, |a_gathered| -> Result<()> {
+            let mut b = stream.launch_builder(&func);
+            b.arg(a);
+            b.arg(perm);
+            b.arg(a_gathered);
+            b.arg(&m_i32);
+            b.arg(&k_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (m as u32, grid_y, 1),
+                    block_dim: (block_x, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
+            if use_vllm {
+                return launch_vllm_marlin(&ctx.stream, a_gathered, weight, out, m);
+            }
+            crate::marlin::marlin_gemm(&ctx.stream, a_gathered, weight, out, m as i32)
+                .map_err(|e| FerrumError::model(format!("marlin_gemm (perm): {e}")))
+        })
     } else {
         if use_vllm {
             return launch_vllm_marlin(&ctx.stream, a, weight, out, m);
