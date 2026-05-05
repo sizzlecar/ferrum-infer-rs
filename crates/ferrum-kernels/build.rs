@@ -43,6 +43,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/flash_attn_full.cu");
     println!("cargo:rerun-if-changed=kernels/batched_flash_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/qk_norm_rope.cu");
+    println!("cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_paged_cache.cu");
     println!("cargo:rerun-if-changed=kernels/transpose.cu");
     println!("cargo:rerun-if-changed=kernels/kv_cache_append.cu");
     println!("cargo:rerun-if-changed=kernels/split_qkv.cu");
@@ -78,6 +79,7 @@ fn main() {
             "kernels/flash_attn_full.cu",
             "kernels/batched_flash_decode_attention.cu",
             "kernels/qk_norm_rope.cu",
+            "kernels/split_qkv_norm_rope_into_paged_cache.cu",
             "kernels/transpose.cu",
             "kernels/kv_cache_append.cu",
             "kernels/split_qkv.cu",

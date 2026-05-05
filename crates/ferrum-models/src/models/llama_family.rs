@@ -3840,29 +3840,14 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        // Bail out cleanly if the backend doesn't yet implement the kernels
-        // unified_forward_internal needs (paged write +
-        // `paged_varlen_attention`). Today only Metal ships the full set;
-        // CUDA needs `split_qkv_norm_rope_into_paged_cache` before paged
-        // unified_forward will work — until then the engine falls back to
-        // the per-item legacy path on `Unsupported`.
-        if !B::supports_paged_kv() {
-            return Err(ferrum_types::FerrumError::unsupported(
-                "LlamaFamilyModel::unified_forward: backend lacks paged-KV \
-                 kernels (split_qkv_norm_rope_into_paged_cache + \
-                 paged_varlen_attention); engine will fall back to per-item \
-                 dispatch.",
-            ));
-        }
         // Touch the first item's KV cache so `ensure_kv` lazily allocates
-        // `paged_pools` when paged is enabled. The check below then sees
-        // the just-allocated pools and routes to the unified path.
+        // `paged_pools` when paged is enabled (env or backend default).
         self.ensure_kv(&items[0].0);
         if self.paged_pools.is_none() {
             return Err(ferrum_types::FerrumError::unsupported(
                 "LlamaFamilyModel::unified_forward: paged KV required; \
-                 enable via FERRUM_METAL_PAGED_KV=1 (Metal) or paged-on-CUDA \
-                 opt-in. Engine will fall back to per-item dispatch.",
+                 enable via FERRUM_METAL_PAGED_KV=1 (cross-backend env). \
+                 Engine will fall back to per-item dispatch.",
             ));
         }
         Ok(self.unified_forward_internal(items))
