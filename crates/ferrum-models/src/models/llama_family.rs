@@ -3431,8 +3431,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
             (1u64 << 63) | ((m_total as u64) << 32) | (num_seqs as u64);
         let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
 
-        // Sync eager pre-work (write_u32 + embedding) before either a
-        // replay or a capture starts — buffer state must be settled.
+        // Pre-grow the marlin gather scratch slot to the worst-case
+        // size for THIS call's matmul shapes. Done eagerly BEFORE
+        // begin_capture: `with_marlin_gather_scratch`'s in-place grow
+        // does `stream.alloc` which is forbidden inside a captured
+        // stream (CUDA_ERROR_INVALID_VALUE on the next launch).
+        // `down_proj` has the largest k = intermediate_size, so
+        // m_total * intermediate_size is the upper bound across all
+        // 4 matmuls in the layer.
+        let max_marlin_required = m_total * im;
+        B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
+
+        // Sync eager pre-work (write_u32 + embedding + scratch grow)
+        // before either a replay or a capture starts — buffer state
+        // must be settled.
         B::sync(&mut ctx);
 
         let unified_profile = std::env::var("FERRUM_UNIFIED_PROFILE").is_ok();

@@ -483,6 +483,18 @@ impl Backend for CudaBackend {
         with_stream(|stream| unsafe { stream.alloc::<f16>(len) }.expect("cuda alloc"))
     }
 
+    fn pregrow_marlin_gather_scratch(ctx: &mut Self::Context, required: usize) {
+        #[cfg(feature = "marlin")]
+        {
+            let stream = ctx.stream.clone();
+            pregrow_marlin_gather_scratch(&stream, required);
+        }
+        #[cfg(not(feature = "marlin"))]
+        {
+            let _ = (ctx, required);
+        }
+    }
+
     fn from_slice(data: &[f32]) -> Self::Buffer {
         let host: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
         with_stream(|stream| stream.clone_htod(&host).expect("cuda htod"))
@@ -2591,6 +2603,40 @@ fn marlin_gather_scratch_slot()
 /// Run `body` with a mut ref to a Marlin-gather scratch buffer of at
 /// least `required` f16 elements. Reuses the existing slot if it fits;
 /// reallocates (replacing the old one) if it needs to grow.
+/// Pre-grow the marlin_gather_scratch slot to at least `required`
+/// elements. Idempotent. Used by callers that are about to enter a
+/// CUDA-graph capture region — `with_marlin_gather_scratch`'s
+/// in-place grow does `stream.alloc::<f16>(required)`, and CUDA
+/// graph capture rejects runtime allocs inside the captured region
+/// with `CUDA_ERROR_INVALID_VALUE`. Pre-warming OUTSIDE the capture
+/// keeps the alloc eager, the capture-region kernel launches just
+/// re-use the existing slot's pointer.
+#[cfg(feature = "marlin")]
+pub fn pregrow_marlin_gather_scratch(stream: &Arc<CudaStream>, required: usize) {
+    let slot = marlin_gather_scratch_slot();
+    {
+        let g = slot.read().expect("MARLIN_GATHER_SCRATCH poisoned");
+        if let Some(ref s) = *g {
+            if s.capacity >= required {
+                return;
+            }
+        }
+    }
+    let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+    let need_new = match &*w {
+        Some(s) => s.capacity < required,
+        None => true,
+    };
+    if need_new {
+        let buf = unsafe { stream.alloc::<f16>(required) }
+            .expect("MARLIN_GATHER_SCRATCH pregrow alloc failed");
+        *w = Some(MarlinGatherScratch {
+            buf,
+            capacity: required,
+        });
+    }
+}
+
 fn with_marlin_gather_scratch<R>(
     stream: &Arc<CudaStream>,
     required: usize,

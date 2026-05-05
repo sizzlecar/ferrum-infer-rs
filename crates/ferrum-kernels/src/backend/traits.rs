@@ -875,6 +875,17 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Pre-grow any backend-internal scratch slots whose size depends
+    /// on `m_total * intermediate_size` (the largest matmul fan-in
+    /// inside `unified_forward_internal`). Default no-op. CUDA
+    /// implements this to grow the perm-aware Marlin gather scratch
+    /// EAGERLY before the caller enters a CUDA-graph capture region —
+    /// `cuLaunchKernel` after a runtime alloc inside a captured
+    /// stream returns `CUDA_ERROR_INVALID_VALUE`.
+    fn pregrow_marlin_gather_scratch(_ctx: &mut Self::Context, _required: usize) {
+        // default: no scratch to pre-grow
+    }
+
     /// Batched fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
     ///
     /// Counterpart of [`Self::gemv_quant_moe_id_gate_up_silu`] for the
