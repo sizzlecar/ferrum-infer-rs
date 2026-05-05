@@ -285,6 +285,34 @@ pub struct LlamaFamilyScratch<B: Backend> {
     pub q_normed_batched: B::Buffer,
     pub k_normed_batched: B::Buffer,
     pub v_normed_batched: B::Buffer,
+
+    // ── Unified mixed-batch scratch (chunked-prefill path; Step 5b) ─────
+    // Buffers sized for `M_total = sum(items[i].q_tokens.len())`. Grown
+    // on demand by `ensure_unified_scratch(M_total_max)`. Used only by
+    // the new `unified_forward_internal`; legacy `forward_layer_batched_decode`
+    // continues to use the per-item-stride scratch above.
+    pub unified_capacity: usize, // current allocated M_total slots
+    pub unified_residual: Option<B::Buffer>,
+    pub unified_norm_out: Option<B::Buffer>,
+    pub unified_qkv_out: Option<B::Buffer>,
+    pub unified_packed_q: Option<B::Buffer>,
+    pub unified_attn_out: Option<B::Buffer>,
+    pub unified_o_proj_out: Option<B::Buffer>,
+    pub unified_gate_up_out: Option<B::Buffer>,
+    pub unified_silu_out: Option<B::Buffer>,
+    pub unified_mlp_out: Option<B::Buffer>,
+    /// Per-item index buffers (i32-stored-as-f16): cu_seqlens_q is
+    /// length `max_seqs+1`, pos_offsets is `max_seqs`, block_tables is
+    /// `max_seqs * max_blocks_per_seq`. Sized once at first use to
+    /// match `paged_batch_*` capacity since they share `max_seqs`.
+    pub unified_cu_seqlens_q: Option<B::Buffer>,
+    pub unified_pos_offsets: Option<B::Buffer>,
+    pub unified_block_tables: Option<B::Buffer>,
+    /// Packed last-token hidden states for is_final_chunk items
+    /// (`[num_sampled, h]`). Used as input to lm_head.
+    pub unified_packed_normed: Option<B::Buffer>,
+    /// Packed logits output (`[num_sampled, vocab]`).
+    pub unified_packed_logits: Option<B::Buffer>,
     /// Last token's hidden state (`[h]`). For prefill this is populated via
     /// `copy_slice(residual, (seq_len-1)*h, ..)`; for decode `residual` already
     /// holds only 1 row so `last_hidden` is unused on that path.
@@ -349,8 +377,65 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             q_normed_batched: B::alloc(t * q_dim),
             k_normed_batched: B::alloc(t * kv_dim),
             v_normed_batched: B::alloc(t * kv_dim),
+            unified_capacity: 0,
+            unified_residual: None,
+            unified_norm_out: None,
+            unified_qkv_out: None,
+            unified_packed_q: None,
+            unified_attn_out: None,
+            unified_o_proj_out: None,
+            unified_gate_up_out: None,
+            unified_silu_out: None,
+            unified_mlp_out: None,
+            unified_cu_seqlens_q: None,
+            unified_pos_offsets: None,
+            unified_block_tables: None,
+            unified_packed_normed: None,
+            unified_packed_logits: None,
             max_tokens: t,
         }
+    }
+
+    /// Grow unified-path scratch buffers to accommodate `m_total` query
+    /// tokens. Called lazily from `unified_forward_internal` so single-
+    /// path workloads (no chunked prefill) don't pay the alloc cost.
+    fn ensure_unified_scratch(
+        &mut self,
+        cfg: &LlamaFamilyConfig,
+        m_total: usize,
+        max_seqs: usize,
+        max_blocks_per_seq: usize,
+    ) {
+        if m_total <= self.unified_capacity
+            && self.unified_residual.is_some()
+            && self.unified_cu_seqlens_q.is_some()
+        {
+            return;
+        }
+        let cap = m_total.max(self.unified_capacity).max(1);
+        let h = cfg.hidden_size;
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let im = cfg.intermediate_size;
+        let v = cfg.vocab_size;
+        self.unified_residual = Some(B::alloc(cap * h));
+        self.unified_norm_out = Some(B::alloc(cap * h));
+        self.unified_qkv_out = Some(B::alloc(cap * qkv_dim));
+        self.unified_packed_q = Some(B::alloc(cap * q_dim));
+        self.unified_attn_out = Some(B::alloc(cap * q_dim));
+        self.unified_o_proj_out = Some(B::alloc(cap * h));
+        self.unified_gate_up_out = Some(B::alloc(cap * 2 * im));
+        self.unified_silu_out = Some(B::alloc(cap * im));
+        self.unified_mlp_out = Some(B::alloc(cap * h));
+        if self.unified_cu_seqlens_q.is_none() {
+            self.unified_cu_seqlens_q = Some(B::alloc_u32(max_seqs + 1));
+            self.unified_pos_offsets = Some(B::alloc_u32(max_seqs));
+            self.unified_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
+            self.unified_packed_normed = Some(B::alloc(max_seqs * h));
+            self.unified_packed_logits = Some(B::alloc(max_seqs * v));
+        }
+        self.unified_capacity = cap;
     }
 
     /// Allocate scratch for batched paged dispatch (Phase 4b). Called
@@ -3131,6 +3216,554 @@ impl<B: Backend> LlamaFamilyModel<B> {
             OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    /// Unified mixed-batch forward (chunked-prefill workhorse).
+    ///
+    /// Each item is `(cache_id, q_tokens, pos_offset, is_final_chunk)`:
+    /// - `q_tokens.len() == 1` is a decode step
+    /// - `q_tokens.len() >= 1` with `pos_offset > 0` is a continuing
+    ///   prefill chunk
+    /// - `is_final_chunk == true` ⇒ logits returned for sampling, else
+    ///   `None` (intermediate prefill chunks just advance KV state)
+    ///
+    /// Concatenates all q_tokens into a single `[M_total, hidden]`
+    /// forward, dispatches per-item `split_qkv_norm_rope_into_paged_cache`
+    /// to write per-seq K/V into the paged pool with correct RoPE per
+    /// token position, then a single `paged_varlen_attention` call
+    /// (Step 4 kernel) handles attention for all q-tokens with per-seq
+    /// causal masks.
+    ///
+    /// REQUIRES paged KV (self.paged_pools.is_some()). Caller (the
+    /// public `unified_forward` impl on the trait) returns
+    /// `Err(unsupported)` for the contig path so the engine falls
+    /// back to legacy dispatch.
+    pub(crate) fn unified_forward_internal(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> Vec<Option<Vec<f32>>> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        // Snapshot cfg fields into Copy locals so we can take &mut self later
+        // without a long-lived `&self.cfg` borrow conflicting.
+        let h = self.cfg.hidden_size;
+        let nh = self.cfg.num_heads;
+        let nkv = self.cfg.num_kv_heads;
+        let hd = self.cfg.head_dim;
+        let im = self.cfg.intermediate_size;
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+        let qkv_stride = q_dim + 2 * kv_dim;
+        let eps = self.cfg.rms_norm_eps;
+        let qk_mode: i32 = if self.cfg.has_qk_norm { 1 } else { 2 };
+        let vocab = self.cfg.vocab_size;
+        let num_layers = self.cfg.num_layers;
+        let num_seqs = items.len();
+
+        // Per-item bookkeeping (host).
+        let q_lens: Vec<usize> = items.iter().map(|it| it.1.len()).collect();
+        let mut cu_seqlens_q: Vec<u32> = Vec::with_capacity(num_seqs + 1);
+        cu_seqlens_q.push(0);
+        for &l in &q_lens {
+            let prev = *cu_seqlens_q.last().unwrap();
+            cu_seqlens_q.push(prev + l as u32);
+        }
+        let m_total = *cu_seqlens_q.last().unwrap() as usize;
+        let pos_offsets: Vec<u32> = items.iter().map(|it| it.2 as u32).collect();
+        // Causal max over (pos_offset + q_len) — shared-mem size for the
+        // varlen attn kernel needs to fit the longest reachable kv_pos.
+        let max_kv_len: usize = items
+            .iter()
+            .map(|it| it.2 + it.1.len())
+            .max()
+            .unwrap_or(0);
+
+        // Ensure all items' KV caches exist.
+        for (cid, _, _, _) in items {
+            self.ensure_kv(cid);
+        }
+
+        // Concatenated input tokens for one embedding_lookup.
+        let all_tokens: Vec<u32> = items.iter().flat_map(|it| it.1.iter().copied()).collect();
+        debug_assert_eq!(all_tokens.len(), m_total);
+
+        // Paged path requirements.
+        let pools_present = self.paged_pools.is_some();
+        if !pools_present {
+            // Caller should have routed to fallback; defensive.
+            panic!(
+                "unified_forward_internal called without paged_pools — caller must check"
+            );
+        }
+        let max_blocks_per_seq = self.scratch.paged_max_blocks_per_seq;
+        let block_size = 16usize; // matches PAGED_BLOCK_SIZE in ensure_kv
+
+        // Make sure scratch fits this batch.
+        // max_seqs uses paged_batch's existing limit so unified shares
+        // the cap; if items.len() exceeds it, panic loudly (engine
+        // shouldn't ever produce that).
+        let max_seqs = num_seqs;
+        // Take cfg ref only for the immediate ensure call (Copy fields
+        // already snapshotted above into h/nh/etc — cfg is just for the
+        // shape constants ensure_unified_scratch needs).
+        let cfg_for_alloc = self.cfg.clone();
+        self.scratch
+            .ensure_unified_scratch(&cfg_for_alloc, m_total, max_seqs, max_blocks_per_seq);
+
+        let mut ctx = B::new_context();
+
+        // Embed all q-tokens into the unified residual buffer.
+        let mut residual = self
+            .scratch
+            .unified_residual
+            .take()
+            .expect("unified_residual missing after ensure");
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("unified_forward_internal called on backbone-only model");
+        B::embedding_lookup(&mut ctx, embed, &all_tokens, &mut residual, h);
+
+        // Upload index buffers.
+        {
+            let csq = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_mut()
+                .expect("unified_cu_seqlens_q missing");
+            B::write_u32(&mut ctx, csq, &cu_seqlens_q);
+        }
+        {
+            let po = self
+                .scratch
+                .unified_pos_offsets
+                .as_mut()
+                .expect("unified_pos_offsets missing");
+            B::write_u32(&mut ctx, po, &pos_offsets);
+        }
+        // Stack per-seq block tables host-side, then upload.
+        {
+            let mut stacked: Vec<u32> =
+                vec![0u32; num_seqs * max_blocks_per_seq];
+            for (i, (cid, _, _, _)) in items.iter().enumerate() {
+                let caches = self
+                    .kv_caches
+                    .get(cid)
+                    .expect("kv cache missing for unified item");
+                let cache0 = &caches[0];
+                let blocks = &cache0.paged_block_indices;
+                let n_to_copy = blocks.len().min(max_blocks_per_seq);
+                stacked[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
+                    .copy_from_slice(&blocks[..n_to_copy]);
+            }
+            let bt = self
+                .scratch
+                .unified_block_tables
+                .as_mut()
+                .expect("unified_block_tables missing");
+            B::write_u32(&mut ctx, bt, &stacked);
+        }
+
+        for li in 0..num_layers {
+            self.unified_forward_layer(
+                &mut ctx,
+                li,
+                items,
+                &q_lens,
+                &cu_seqlens_q,
+                &pos_offsets,
+                &mut residual,
+                m_total,
+                max_kv_len,
+                num_seqs,
+                max_blocks_per_seq,
+                block_size,
+                qkv_stride,
+                q_dim,
+                kv_dim,
+                nh,
+                nkv,
+                hd,
+                im,
+                h,
+                eps,
+                qk_mode,
+            );
+        }
+
+        // Final norm on the WHOLE M_total then extract last-token rows
+        // for is_final_chunk items via per-item copy_slice into a packed
+        // buffer; lm_head runs on the packed [num_sampled, h].
+        let final_norm_w = &self.final_norm_w;
+        // Reuse unified_norm_out as final-norm output (it's free post-layer).
+        let mut norm_out = self
+            .scratch
+            .unified_norm_out
+            .take()
+            .expect("unified_norm_out missing");
+        B::rms_norm(&mut ctx, &residual, final_norm_w, eps, &mut norm_out, m_total, h);
+
+        // Identify per-item last-token global indices for is_final_chunk items.
+        let final_indices: Vec<(usize, usize)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.3)
+            .map(|(orig_idx, _)| {
+                let item = &items[orig_idx];
+                let last_token_local = item.1.len() - 1;
+                let global = (cu_seqlens_q[orig_idx] as usize) + last_token_local;
+                (orig_idx, global)
+            })
+            .collect();
+        let num_sampled = final_indices.len();
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .expect("unified_forward_internal called on backbone-only model");
+
+        // Bump cache.len for each item (we wrote q_lens[i] tokens into seq i's
+        // KV pool inside the layer loop). Centralised post-loop bump matches
+        // the pattern in decode_batch_internal.
+        for (i, (cid, _, _, _)) in items.iter().enumerate() {
+            let caches = self
+                .kv_caches
+                .get_mut(cid)
+                .expect("kv cache missing for unified item post-loop");
+            for c in caches.iter_mut() {
+                c.len += q_lens[i];
+            }
+        }
+
+        // Restore unified_residual / unified_norm_out so a subsequent
+        // call's `take()` finds them. norm_out was written by final
+        // rms_norm; residual is post-final-layer state we no longer need.
+        self.scratch.unified_residual = Some(residual);
+        // norm_out is consumed by the per-item copy_slice below before
+        // being put back.
+
+        let mut out: Vec<Option<Vec<f32>>> = (0..items.len()).map(|_| None).collect();
+
+        if num_sampled > 0 {
+            // Pack final-chunk hidden states into a contiguous buffer
+            // [num_sampled, h] via per-item copy_slice. Inexpensive — at
+            // c=16 worst case 16 small copies.
+            let packed_normed = self
+                .scratch
+                .unified_packed_normed
+                .as_mut()
+                .expect("unified_packed_normed missing");
+            for (j, &(_, global)) in final_indices.iter().enumerate() {
+                B::copy_slice(
+                    &mut ctx,
+                    &norm_out,
+                    global * h,
+                    packed_normed,
+                    j * h,
+                    h,
+                );
+            }
+            // lm_head [num_sampled, h] → packed_logits [num_sampled, vocab]
+            let packed_logits = self
+                .scratch
+                .unified_packed_logits
+                .as_mut()
+                .expect("unified_packed_logits missing");
+            lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+            // Sync + readback.
+            B::sync(&mut ctx);
+            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
+                out[orig_idx] = Some(row);
+            }
+        } else {
+            B::sync(&mut ctx);
+        }
+
+        // Restore norm_out for next call.
+        self.scratch.unified_norm_out = Some(norm_out);
+
+        out
+    }
+
+    /// One transformer layer for the unified mixed-batch forward.
+    /// Mirrors `forward_layer_batched_decode` paged path but operates
+    /// on `[M_total, *]` tensors and uses `paged_varlen_attention`.
+    #[allow(clippy::too_many_arguments)]
+    fn unified_forward_layer(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        items: &[(String, Vec<u32>, usize, bool)],
+        q_lens: &[usize],
+        cu_seqlens_q: &[u32],
+        pos_offsets: &[u32],
+        residual: &mut B::Buffer,
+        m_total: usize,
+        max_kv_len: usize,
+        num_seqs: usize,
+        max_blocks_per_seq: usize,
+        block_size: usize,
+        qkv_stride: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        im: usize,
+        h: usize,
+        eps: f32,
+        qk_mode: i32,
+    ) {
+        let layer = &self.layers[li];
+        let dummy_w = &layer.input_ln_w;
+        let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
+        let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
+
+        // 1. rms_norm [M_total, h] → unified_norm_out
+        {
+            let norm_out = self
+                .scratch
+                .unified_norm_out
+                .as_mut()
+                .expect("unified_norm_out missing");
+            B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
+        }
+
+        // 2. qkv_proj GEMM (m=M_total): unified_norm_out → unified_qkv_out
+        {
+            let norm_out = self
+                .scratch
+                .unified_norm_out
+                .as_ref()
+                .expect("unified_norm_out missing");
+            let qkv_out = self
+                .scratch
+                .unified_qkv_out
+                .as_mut()
+                .expect("unified_qkv_out missing");
+            layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
+        }
+
+        // 3. Per-item split_qkv_norm_rope_into_paged_cache. Writes K/V
+        // into seq's paged pool slot AND stores RoPE'd Q at packed_q
+        // offset. Handles per-item q_len + pos_offset (the same kernel
+        // already supports tokens > 1 per call — used by prefill_internal).
+        let pools = self
+            .paged_pools
+            .as_mut()
+            .expect("unified_forward_layer requires paged_pools");
+        let pool_ptr = (
+            &mut pools[li].0 as *mut B::Buffer,
+            &mut pools[li].1 as *mut B::Buffer,
+        );
+        // SAFETY: pools allocated once; not concurrently mutated.
+        let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
+        let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
+        let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+
+        for (i, (cid, _q_tokens, pos_offset, _)) in items.iter().enumerate() {
+            let q_token_offset = cu_seqlens_q[i] as u64;
+            let cache_len_before;
+            let bt_safe: &B::Buffer;
+            {
+                let caches = self
+                    .kv_caches
+                    .get(cid)
+                    .expect("paged unified: cache not present");
+                let cache = &caches[li];
+                cache_len_before = cache.len;
+                let bt = cache
+                    .block_table
+                    .as_ref()
+                    .expect("paged unified: block_table missing");
+                let block_table_ref = bt as *const B::Buffer;
+                // SAFETY: bt is read-only; we don't mutate kv_caches between
+                // this raw deref and the call.
+                bt_safe = unsafe { &*block_table_ref };
+            }
+            let qkv_out = self
+                .scratch
+                .unified_qkv_out
+                .as_ref()
+                .expect("unified_qkv_out missing");
+            let packed_q = self
+                .scratch
+                .unified_packed_q
+                .as_mut()
+                .expect("unified_packed_q missing");
+            B::split_qkv_norm_rope_into_paged_cache(
+                ctx,
+                qkv_out,
+                q_token_offset * qkv_stride_bytes,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                packed_q,
+                q_token_offset * q_head_major_size_bytes,
+                pool_k,
+                pool_v,
+                bt_safe,
+                q_lens[i],
+                nh,
+                nkv,
+                hd,
+                *pos_offset,
+                eps,
+                qk_mode,
+                cache_len_before,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("paged unified: split_qkv_norm_rope_into_paged_cache");
+        }
+
+        // 4. paged_varlen_attention: one call covering all M_total tokens.
+        {
+            let packed_q = self
+                .scratch
+                .unified_packed_q
+                .as_ref()
+                .expect("unified_packed_q missing");
+            let cu_seqlens_buf = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_ref()
+                .expect("unified_cu_seqlens_q missing");
+            let pos_offsets_buf = self
+                .scratch
+                .unified_pos_offsets
+                .as_ref()
+                .expect("unified_pos_offsets missing");
+            let bt_buf = self
+                .scratch
+                .unified_block_tables
+                .as_ref()
+                .expect("unified_block_tables missing");
+            let attn_out = self
+                .scratch
+                .unified_attn_out
+                .as_mut()
+                .expect("unified_attn_out missing");
+            B::paged_varlen_attention(
+                ctx,
+                packed_q,
+                pool_k,
+                pool_v,
+                attn_out,
+                cu_seqlens_buf,
+                pos_offsets_buf,
+                bt_buf,
+                num_seqs,
+                m_total,
+                max_kv_len,
+                nh,
+                nkv,
+                hd,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("paged_varlen_attention");
+        }
+
+        // 5. o_proj (M_total): attn_out → o_proj_out
+        {
+            let attn_out = self
+                .scratch
+                .unified_attn_out
+                .as_ref()
+                .expect("unified_attn_out missing");
+            let o_proj_out = self
+                .scratch
+                .unified_o_proj_out
+                .as_mut()
+                .expect("unified_o_proj_out missing");
+            layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
+        }
+
+        // 6. fused_add_rms_norm: residual = residual + o_proj_out;
+        //    norm_out = rms_norm(new_residual, post_ln_w)
+        {
+            let o_proj_out = self
+                .scratch
+                .unified_o_proj_out
+                .as_ref()
+                .expect("unified_o_proj_out missing");
+            let norm_out = self
+                .scratch
+                .unified_norm_out
+                .as_mut()
+                .expect("unified_norm_out missing");
+            B::fused_add_rms_norm(
+                ctx,
+                residual,
+                o_proj_out,
+                &layer.post_ln_w,
+                eps,
+                norm_out,
+                m_total,
+                h,
+            );
+        }
+
+        // 7. gate_up_proj
+        {
+            let norm_out = self
+                .scratch
+                .unified_norm_out
+                .as_ref()
+                .expect("unified_norm_out missing");
+            let gate_up_out = self
+                .scratch
+                .unified_gate_up_out
+                .as_mut()
+                .expect("unified_gate_up_out missing");
+            layer
+                .gate_up_proj
+                .forward(ctx, norm_out, gate_up_out, m_total);
+        }
+
+        // 8. SwiGLU
+        {
+            let gate_up_out = self
+                .scratch
+                .unified_gate_up_out
+                .as_ref()
+                .expect("unified_gate_up_out missing");
+            let silu_out = self
+                .scratch
+                .unified_silu_out
+                .as_mut()
+                .expect("unified_silu_out missing");
+            B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im);
+        }
+
+        // 9. down_proj
+        {
+            let silu_out = self
+                .scratch
+                .unified_silu_out
+                .as_ref()
+                .expect("unified_silu_out missing");
+            let mlp_out = self
+                .scratch
+                .unified_mlp_out
+                .as_mut()
+                .expect("unified_mlp_out missing");
+            layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
+        }
+
+        // 10. residual_add
+        {
+            let mlp_out = self
+                .scratch
+                .unified_mlp_out
+                .as_ref()
+                .expect("unified_mlp_out missing");
+            B::add_inplace(ctx, residual, mlp_out, m_total * h);
+        }
+    }
 }
 
 impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
@@ -3192,18 +3825,14 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
 
     /// Unified mixed-batch forward (chunked-prefill API).
     ///
-    /// Step 5b1 (this commit): supports the all-decode case only —
-    /// every item has `q_len == 1` and `is_final_chunk == true`. Routes
-    /// to `decode_batch_internal`. Behaviour is byte-identical to
-    /// `decode_batch` going through `LlmExecutor::unified_decode`'s
-    /// fallback; the difference is purely architectural — the engine
-    /// can now treat decode and prefill chunks through one API surface,
-    /// and the model owns the dispatch decision.
+    /// When paged KV is on, dispatches to `unified_forward_internal`
+    /// which runs ONE `[M_total, hidden]` forward through the layer
+    /// loop + `paged_varlen_attention` kernel — the chunked-prefill
+    /// perf path.
     ///
-    /// Mixed prefill+decode batches return `Err(unsupported)` so the
-    /// executor falls back to the per-item dispatch path. Step 5b2 will
-    /// extend this to the real unified [M_total, hidden] forward + the
-    /// `paged_varlen_attention` kernel landed in Step 4.
+    /// On the contig-KV path (CUDA default, no paged pool), returns
+    /// `Err(unsupported)` so the executor's fallback handles each item
+    /// via existing `prefill()` / `decode_batch()`.
     fn unified_forward(
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
@@ -3211,21 +3840,14 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let all_decode = items
-            .iter()
-            .all(|(_, q, _, fin)| q.len() == 1 && *fin);
-        if !all_decode {
+        if self.paged_pools.is_none() {
             return Err(ferrum_types::FerrumError::unsupported(
-                "LlamaFamilyModel::unified_forward: only all-decode batches \
-                 supported in Step 5b1; mixed prefill+decode lands in Step 5b2",
+                "LlamaFamilyModel::unified_forward: paged KV required; \
+                 enable via FERRUM_METAL_PAGED_KV=1 (Metal) or paged-on-CUDA \
+                 opt-in. Engine will fall back to per-item dispatch.",
             ));
         }
-        let batch: Vec<(String, u32, u32)> = items
-            .iter()
-            .map(|(cid, q, pos, _)| (cid.clone(), q[0], *pos as u32))
-            .collect();
-        let logits = self.decode_batch_internal(&batch);
-        Ok(logits.into_iter().map(Some).collect())
+        Ok(self.unified_forward_internal(items))
     }
 
     fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
