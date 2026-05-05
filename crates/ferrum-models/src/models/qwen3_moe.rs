@@ -392,7 +392,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
     ) -> Result<Self> {
         {
             let mut ctx = B::new_context();
-            B::reset_graph(&mut ctx);
+            B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg.base);
         let scratch = Qwen3MoeScratch::alloc(&cfg, 1);
@@ -505,7 +505,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
         if self.scratch.max_tokens < tokens {
             {
                 let mut ctx = B::new_context();
-                B::reset_graph(&mut ctx);
+                B::reset_all_graphs(&mut ctx);
             }
             self.scratch = Qwen3MoeScratch::alloc(&self.cfg, tokens);
         }
@@ -2537,9 +2537,11 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
     }
 
     fn release(&mut self, cache_id: &str) {
+        // qwen3_moe doesn't currently use the batched-graph capture path,
+        // so single-key reset is sufficient.
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        B::reset_graph(&mut ctx);
+        B::reset_graph(&mut ctx, 0);
         B::sync(&mut ctx);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             // Paged mode: return the cache_id's blocks to the shared
@@ -2567,7 +2569,7 @@ impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
     fn reset(&mut self) {
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        B::reset_graph(&mut ctx);
+        B::reset_all_graphs(&mut ctx);
         B::sync(&mut ctx);
         self.kv_caches.clear();
         self.kv_free_pool.clear();

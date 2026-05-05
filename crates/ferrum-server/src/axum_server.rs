@@ -248,7 +248,15 @@ async fn handle_chat_completions_stream(
 
                             // Check stopping conditions
                             if token_count >= max_tokens || chunk.finish_reason.is_some() {
-                                // Send final chunk
+                                // Send final chunk. OpenAI-style streaming
+                                // clients (e.g. `vllm bench serve`) blindly
+                                // read `choices[0]["delta"]` on every chunk
+                                // that has any `choices` entries, so the
+                                // last chunk must include `delta` even when
+                                // empty. Skipping it triggers
+                                // `KeyError: 'delta'` on the client side
+                                // and the request is reported as failed
+                                // despite returning a 200 with content.
                                 let final_chunk = ChatCompletionsResponse {
                                     id: request_id.clone(),
                                     object: "chat.completion.chunk".to_string(),
@@ -257,7 +265,11 @@ async fn handle_chat_completions_stream(
                                     choices: vec![ChatChoice {
                                         index: 0,
                                         message: None,
-                                        delta: None,
+                                        delta: Some(ChatMessage {
+                                            role: MessageRole::Assistant,
+                                            content: String::new(),
+                                            name: None,
+                                        }),
                                         finish_reason: chunk
                                             .finish_reason
                                             .as_ref()

@@ -28,9 +28,12 @@ CELL="${ENGINE}__${MODEL_TAG}__c${C}__r${REPEAT}"
 JSON="$RESULTS_DIR/$CELL.json"
 LOG="$RESULTS_DIR/$CELL.bench.log"
 
-# Resume: skip if already completed.
+# Resume: skip if already completed. vLLM 0.20 calls it
+# `output_throughput`; older bench harnesses used
+# `output_throughput_tok_s`. Accept either so old result dirs still
+# resume cleanly.
 if [[ -f "$JSON" ]]; then
-  EXISTING=$(python3 -c "import json,sys; print(json.load(open('$JSON')).get('output_throughput_tok_s',0))" 2>/dev/null || echo 0)
+  EXISTING=$(python3 -c "import json; d=json.load(open('$JSON')); print(d.get('output_throughput', d.get('output_throughput_tok_s', 0)))" 2>/dev/null || echo 0)
   if [[ "$EXISTING" != "0" && "$EXISTING" != "0.0" ]]; then
     echo "[$CELL] skip (already $EXISTING tok/s)"
     exit 0
@@ -60,15 +63,23 @@ trap "kill $SMI_PID 2>/dev/null || true" EXIT
 
 echo "[$CELL] num_prompts=$NUM_PROMPTS max_output=$MAX_OUTPUT"
 
+# `vllm bench serve --model X` does TWO things: (1) sends X as the
+# request body "model" field (must match what the server accepts;
+# ferrum accepts any name, vLLM matches its --model), (2) loads
+# X as a tokenizer for prompt-length stats — so X needs to be a
+# valid HF id or a local path with tokenizer.json. Pointing it at
+# the model dir works for all our engines.
+MODEL_ARG="$WORKSPACE/models/$MODEL_TAG"
+
 # Run with hard timeout — never let one cell burn 15+ min.
 # vLLM 0.20+ moved benchmark_serving.py to the CLI: `vllm bench serve`.
-# Same arg surface in spirit, slight flag differences.
 timeout 900 vllm bench serve \
   --backend openai-chat \
   --base-url "http://127.0.0.1:$PORT" \
   --endpoint /v1/chat/completions \
+  --model "$MODEL_ARG" \
   --dataset-name custom \
-  --dataset-path "$BENCH_DIR/prompts.json" \
+  --dataset-path "$BENCH_DIR/prompts.jsonl" \
   --num-prompts "$NUM_PROMPTS" \
   --max-concurrency "$C" \
   --request-rate inf \
@@ -76,6 +87,7 @@ timeout 900 vllm bench serve \
   --top-p 1 \
   --result-dir "$RESULTS_DIR" \
   --result-filename "$CELL.json" \
+  --save-result \
   > "$LOG" 2>&1 || {
     EC=$?
     echo "[$CELL] FAILED (exit=$EC) — see $LOG"
@@ -86,12 +98,13 @@ timeout 900 vllm bench serve \
 kill $SMI_PID 2>/dev/null || true
 trap - EXIT
 
-# Print one-line summary
+# Print one-line summary. vLLM 0.20 schema: flat keys
+# (output_throughput, median_tpot_ms, p99_ttft_ms, …) — older bench
+# harness used nested tpot_ms.{median,p95}. p99 instead of p95.
 python3 -c "
 import json
 d = json.load(open('$JSON'))
 def f(x): return f'{x:.1f}' if isinstance(x, (int, float)) else 'n/a'
-tpot = d.get('tpot_ms', {})
-ttft = d.get('ttft_ms', {})
-print(f'[$CELL] out={f(d.get(\"output_throughput_tok_s\"))} tok/s  TPOT_p50={f(tpot.get(\"median\"))}ms  TPOT_p95={f(tpot.get(\"p95\"))}ms  TTFT_p50={f(ttft.get(\"median\"))}ms  TTFT_p95={f(ttft.get(\"p95\"))}ms  ({d.get(\"completed\", 0)}/{d.get(\"completed\", 0)+d.get(\"failed\", 0)} ok)')
+out_tps = d.get('output_throughput')
+print(f'[$CELL] out={f(out_tps)} tok/s  TPOT_p50={f(d.get(\"median_tpot_ms\"))}ms  TPOT_p99={f(d.get(\"p99_tpot_ms\"))}ms  TTFT_p50={f(d.get(\"median_ttft_ms\"))}ms  TTFT_p99={f(d.get(\"p99_ttft_ms\"))}ms  ({d.get(\"completed\", 0)}/{d.get(\"completed\", 0)+d.get(\"failed\", 0)} ok)')
 " 2>&1 || echo "[$CELL] (could not parse JSON)"

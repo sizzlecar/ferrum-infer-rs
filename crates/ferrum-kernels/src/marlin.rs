@@ -47,6 +47,13 @@ pub struct MarlinWeight {
     pub k: usize,
     pub n: usize,
     pub group_size: i32,
+    /// Activation gather permutation for desc_act=true (act-order) GPTQ.
+    /// `perm[i]` = original column index that should appear at position i
+    /// after gather. Computed at load time as `argsort(g_idx_disk)`.
+    /// `qweight` rows have already been permuted by this; runtime gathers
+    /// input columns by the same perm so the standard Marlin kernel
+    /// produces the un-permuted GEMM result. None for desc_act=false.
+    pub perm: Option<CudaSlice<i32>>,
 }
 
 /// Run Marlin INT4xFP16 fused GEMM.
@@ -131,6 +138,55 @@ pub fn marlin_gemm(
 }
 
 // ===================== Weight Repacking (GPTQ → Marlin) =====================
+
+/// Permute GPTQ INT4 qweight rows by `perm` (one-time, CPU work at load).
+/// Input qweight is [K/8, N] packed (8 INT4s per i32 along K). Output is
+/// the same shape, with rows reordered: out[i, n] = in[perm[i], n] (after
+/// unpacking + repacking). Used to put rows in g_idx-sorted order so the
+/// downstream Marlin repack sees a layout where group_idx = i / group_size.
+pub fn permute_gptq_qweight_rows(
+    qweight_gptq: &[i32], // [K/8, N] packed
+    perm: &[usize],       // [K]
+    k: usize,
+    n: usize,
+) -> Vec<i32> {
+    debug_assert_eq!(perm.len(), k);
+    debug_assert_eq!(qweight_gptq.len(), (k / 8) * n);
+
+    // Step 1: Unpack [K/8, N] → [K, N] (one INT4 per byte slot, low 4 bits).
+    let mut kn = vec![0u8; k * n];
+    let packed_rows = k / 8;
+    for pr in 0..packed_rows {
+        for col in 0..n {
+            let packed = qweight_gptq[pr * n + col] as u32;
+            for i in 0..8 {
+                kn[(pr * 8 + i) * n + col] = ((packed >> (i * 4)) & 0xF) as u8;
+            }
+        }
+    }
+
+    // Step 2: Permute rows. out[i, n] = in[perm[i], n].
+    let mut sorted = vec![0u8; k * n];
+    for i in 0..k {
+        let src_row = perm[i];
+        for col in 0..n {
+            sorted[i * n + col] = kn[src_row * n + col];
+        }
+    }
+
+    // Step 3: Repack [K, N] → [K/8, N] (8 INT4s per i32 along K).
+    let mut packed = vec![0i32; (k / 8) * n];
+    for pr in 0..packed_rows {
+        for col in 0..n {
+            let mut word = 0u32;
+            for i in 0..8 {
+                word |= (sorted[(pr * 8 + i) * n + col] as u32) << (i * 4);
+            }
+            packed[pr * n + col] = word as i32;
+        }
+    }
+    packed
+}
 
 /// Repack GPTQ INT4 weights to Marlin format on CPU.
 ///

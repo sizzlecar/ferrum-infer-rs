@@ -27,11 +27,17 @@ RESULTS_DIR="$BENCH_DIR/results"
 MODELS_DIR="${WORKSPACE}/models"
 mkdir -p "$RESULTS_DIR"
 
-# Matrix axes
-ENGINES=(ferrum vllm mistralrs)
-MODEL_ORDER=(M2 M1 M3 M4)         # cheapest blast radius first
+# Matrix axes (v0.2 scope, 2026-05-03):
+#   - mistralrs dropped (PoisonError on MoE, finicky setup, not the
+#     primary target of comparison)
+#   - M4 (Qwen3-Coder-30B-A3B GPTQ) dropped (community pack only)
+#   - vllm runs FIRST: per user direction, get the baseline numbers
+#     locked in before we debug + tune ferrum to beat them.
+ENGINES=(vllm ferrum)
+MODEL_ORDER=(M2 M1 M3)            # cheapest blast radius first (8B INT4 → 8B FP16 → 30B MoE INT4)
 CONCURRENCIES=(1 4 16 32)
 REPEATS=(1 2 3)
+# Total cells: 3 models × 2 engines × 4 c × 3 reps = 72
 
 # Per-pair max-seqs sized for c=32 max + headroom
 MAX_SEQS=64
@@ -49,45 +55,57 @@ done < "$BENCH_DIR/models.txt"
 PORT=8800
 
 ferrum_start() {
-  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag"
+  # Bash with `set -u` doesn't guarantee left-to-right evaluation of
+  # `local a=… b=…$a` on a single line, so split the dependent vars.
+  local model_tag="$1"
+  local model_dir="$MODELS_DIR/$model_tag"
   local server_log="$RESULTS_DIR/ferrum__${model_tag}__server.log"
-  echo "  starting ferrum on $model_tag ..."
-  FERRUM_KV_PAGED=1 FERRUM_PAGED_MAX_SEQS=$MAX_SEQS FERRUM_KV_CAPACITY=1024 \
+  echo "  starting ferrum on $model_tag ..." >&2
+  # FERRUM_KV_CAPACITY: per-sequence KV slot length.
+  # Default 512 is too small for the v0.2 workload — prompts.jsonl
+  # samples ShareGPT prompts up to ~579 tokens (sometimes more once
+  # tokenized) and decode adds another 256-512, so a single request
+  # easily exceeds 512 and panics with "KV cache overflow on layer 0:
+  # would write tokens [0..579) but capacity is 512".
+  # 2048 covers prompt(≤512) + output(≤512) plus headroom; on 4090 with
+  # max_seqs=64 it consumes ~17 GB of KV memory which still leaves
+  # ~6 GB for the 5.7 GB INT4-Marlin weights.
   CUDA_VISIBLE_DEVICES=0 \
+  FERRUM_KV_CAPACITY=2048 \
+  FERRUM_MAX_BATCH=32 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
       > "$server_log" 2>&1 &
-  echo $!
+  ENGINE_PID=$!
 }
 
 vllm_start() {
-  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag" precision="${MODEL_PRECISION[$model_tag]}"
+  local model_tag="$1"
+  local model_dir="$MODELS_DIR/$model_tag"
+  local precision="${MODEL_PRECISION[$model_tag]}"
   local server_log="$RESULTS_DIR/vllm__${model_tag}__server.log"
   local quant_args=""
   if [[ "$precision" == "GPTQ_INT4" ]]; then
     quant_args="--quantization gptq_marlin"
   fi
-  echo "  starting vllm on $model_tag (quant=$precision) ..."
+  echo "  starting vllm on $model_tag (quant=$precision) ..." >&2
+  # max-model-len 4096: our bench's worst case is prompt 512 +
+  # output 512 = 1024; 4096 leaves headroom. Default model max
+  # (e.g. 131072 for Llama-3.1) demands a 16 GB KV pool by itself,
+  # which doesn't fit on a 24 GB 4090 alongside the weights.
   python3 -m vllm.entrypoints.openai.api_server \
     --model "$model_dir" \
     --port "$PORT" \
     --max-num-seqs $MAX_SEQS \
-    --enable-prefix-caching false \
-    --disable-log-requests \
+    --max-model-len 4096 \
+    --no-enable-prefix-caching \
+    --no-enable-log-requests \
     $quant_args \
     > "$server_log" 2>&1 &
-  echo $!
+  ENGINE_PID=$!
 }
 
-mistralrs_start() {
-  local model_tag="$1" model_dir="$MODELS_DIR/$model_tag"
-  local server_log="$RESULTS_DIR/mistralrs__${model_tag}__server.log"
-  echo "  starting mistralrs on $model_tag ..."
-  mistralrs-server --port "$PORT" --max-seqs $MAX_SEQS \
-    plain -m "$model_dir" \
-    > "$server_log" 2>&1 &
-  echo $!
-}
+# mistralrs_start removed in v0.2 scope — see ENGINES list above.
 
 # Wait for the engine to be ready (up to 5 min). Kill if not up.
 wait_ready() {
@@ -143,7 +161,8 @@ for engine in "${ENGINES[@]}"; do
     for c in "${CONCURRENCIES[@]}"; do
       for r in "${REPEATS[@]}"; do
         cell="$RESULTS_DIR/${engine}__${model}__c${c}__r${r}.json"
-        if [[ ! -f "$cell" ]] || [[ "$(python3 -c "import json,sys; print(json.load(open('$cell')).get('output_throughput_tok_s',0))" 2>/dev/null || echo 0)" == "0.0" ]]; then
+        # vLLM 0.20 renamed the throughput key; accept either.
+        if [[ ! -f "$cell" ]] || [[ "$(python3 -c "import json; d=json.load(open('$cell')); print(d.get('output_throughput', d.get('output_throughput_tok_s', 0)))" 2>/dev/null || echo 0)" == "0.0" ]]; then
           REMAINING=$((REMAINING+1))
         fi
       done
@@ -158,12 +177,15 @@ for engine in "${ENGINES[@]}"; do
     echo " $PAIR — $REMAINING cells remaining"
     echo "════════════════════════════════════════════════════════════"
 
-    # Start server
+    # Start server. We avoid `$(engine_start ...)` capture because
+    # `&` inside $() runs in a subshell — $! is the subshell-local
+    # background PID, and subshell exit can confuse downstream
+    # `kill -0` checks. Use a global ENGINE_PID set by the start fn.
     case "$engine" in
-      ferrum)    PID=$(ferrum_start "$model")    ;;
-      vllm)      PID=$(vllm_start "$model")      ;;
-      mistralrs) PID=$(mistralrs_start "$model") ;;
+      ferrum)    ferrum_start "$model"    ;;
+      vllm)      vllm_start "$model"      ;;
     esac
+    PID="$ENGINE_PID"
 
     if ! wait_ready "$PID" >> "$PAIR_LOG" 2>&1; then
       echo "  $PAIR FAILED to come up (see $PAIR_LOG and ${PAIR}__server.log) — skip 12 cells"

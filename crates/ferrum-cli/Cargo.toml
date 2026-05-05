@@ -87,6 +87,7 @@ accelerate = ["ferrum-engine/accelerate"]  # Use Apple Accelerate BLAS (matches 
 metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/metal"]  # Apple GPU
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
 marlin = ["cuda"]  # backward compat alias
+vllm-marlin = ["cuda", "ferrum-kernels/vllm-marlin"]  # Phase 12 — vLLM gptq_marlin port (opt-in)
 tensor-parallel = ["cuda"]  # backward compat alias
 # Triton-rs PTX path swap for the LLM decode kernels. Requires cuda.
 triton-kernels = ["cuda", "ferrum-engine/triton-kernels"]

@@ -86,6 +86,85 @@ extern "C" __global__ void qk_norm_rope_transpose_f16(
     }
 }
 
+// Batched per-item-position variant for batched decode (m sequences, q_len=1
+// each, every item at its own absolute position). Replaces M sequential
+// `qk_norm_rope_transpose_f16` launches with one launch.
+//
+// Layout (DECODE only — preserves item-major order for downstream
+// per-item flash_attention to slice contiguous chunks):
+//   Input:  [m, heads, head_dim] (token-major, output of split_qkv at m=batch)
+//   Output: [m, heads, head_dim] (token-major, in-place safe)
+//
+// `positions[m]` (device-side i32) gives each item's absolute RoPE pos.
+// `mode` is the same enum used by qk_norm_rope_transpose_f16:
+//   0 = transpose-only path (V) — degenerate to identity here since we
+//       keep token-major; included for API symmetry.
+//   1 = per-head RMSNorm + RoPE  (Q/K with QK-norm, Qwen3)
+//   2 = RoPE-only                (Q/K without QK-norm, Llama/Mistral)
+//
+// Launch: grid = (m, heads, 1), block = (warpSize=32, 1, 1).
+// Each warp handles one (item, head) pair.
+extern "C" __global__ void qk_norm_rope_batched_decode_f16(
+    const __half* __restrict__ input,        // [m, heads, head_dim]
+    const __half* __restrict__ norm_w,       // [head_dim] (mode 1 only)
+    const __half* __restrict__ cos_tab,      // [max_seq, head_dim/2]
+    const __half* __restrict__ sin_tab,      // [max_seq, head_dim/2]
+    __half* __restrict__ output,             // [m, heads, head_dim]
+    const int m,
+    const int heads,
+    const int head_dim,
+    const int* __restrict__ positions,       // [m] absolute rope position per item
+    const float eps,
+    const int mode
+) {
+    const int item = blockIdx.x;
+    const int head = blockIdx.y;
+    const int lane = threadIdx.x;          // 0..31
+    if (item >= m || head >= heads) return;
+
+    const int hd = head_dim;
+    const int half_d = hd / 2;
+
+    // Token-major: item i's head h sits at offset (i * heads + h) * hd.
+    const __half* src = input  + (item * heads + head) * hd;
+    __half* dst       = output + (item * heads + head) * hd;
+
+    if (mode == 0) {
+        for (int i = lane; i < hd; i += 32) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+
+    float scale = 1.0f;
+    if (mode == 1) {
+        float sum_sq = 0.0f;
+        for (int i = lane; i < hd; i += 32) {
+            float v = __half2float(src[i]);
+            sum_sq += v * v;
+        }
+        sum_sq = warp_reduce_sum(sum_sq);
+        scale = rsqrtf(sum_sq / (float)hd + eps);
+    }
+
+    const int pos = positions[item];
+    const __half* cos_row = cos_tab + pos * half_d;
+    const __half* sin_row = sin_tab + pos * half_d;
+
+    for (int i = lane; i < half_d; i += 32) {
+        float x0 = __half2float(src[i]);
+        float x1 = __half2float(src[i + half_d]);
+        if (mode == 1) {
+            x0 *= scale * __half2float(norm_w[i]);
+            x1 *= scale * __half2float(norm_w[i + half_d]);
+        }
+        float c = __half2float(cos_row[i]);
+        float s = __half2float(sin_row[i]);
+        dst[i]          = __float2half(x0 * c - x1 * s);
+        dst[i + half_d] = __float2half(x1 * c + x0 * s);
+    }
+}
+
 // Device-state variant: pos_offset read from a device slot for graph capture.
 // Same math as qk_norm_rope_transpose_f16 but `pos_offset` replaced by
 // `*pos_ptr`. Decode launches with tokens=1 — we can specialise blockIdx.x

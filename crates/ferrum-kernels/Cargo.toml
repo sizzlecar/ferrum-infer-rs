@@ -24,6 +24,9 @@ default = []
 cuda = ["candle-core/cuda", "dep:cudarc", "marlin", "cudarc?/nccl"]
 metal = ["dep:metal", "dep:ferrum-attention", "ferrum-attention/metal"]  # Metal backend (macOS)
 marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)
+vllm-marlin = ["cuda"]  # vLLM gptq_marlin port (Phase 12). NOT enabled by default
+                        # — opt-in until correctness + perf validated. Adds
+                        # ~30 min to first build (compiles 19 .cu instantiations).
 tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

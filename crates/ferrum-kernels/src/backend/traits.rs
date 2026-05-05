@@ -3,6 +3,14 @@
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 
+/// Maximum decode-graph layer count. Per-layer call sites that share
+/// graph-captured host staging arrays use this as the stride between
+/// distinct slots. CUDA-only invariant (other backends ignore the
+/// `slot` argument); 64 covers all current LLM families up to and
+/// including Llama-3-70B (80 layers — but 70B doesn't run on a single
+/// 4090 anyway, so 64 is safe in practice for v0.2).
+pub const MAX_LAYERS_FOR_GRAPH: usize = 64;
+
 /// Source dtype for a weight tensor read straight from safetensors mmap.
 ///
 /// Passed to `Backend::from_weight_bytes` so each backend can choose whether
@@ -263,22 +271,27 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Err(FerrumError::unsupported("graph capture not supported"))
     }
 
-    /// End stream capture and install the captured graph as this context's
-    /// "last graph" for future `replay_last_graph` calls.
-    fn end_graph_capture(_ctx: &mut Self::Context) -> Result<()> {
+    /// End stream capture and install the captured graph keyed by
+    /// `_key` (opaque caller-chosen u64; the model uses `m_padded` so
+    /// that different batch shapes don't thrash a single slot).
+    fn end_graph_capture(_ctx: &mut Self::Context, _key: u64) -> Result<()> {
         Err(FerrumError::unsupported("graph capture not supported"))
     }
 
-    /// Replay the last captured graph. Returns `Ok(false)` if no graph
-    /// is cached; caller should run eager.
-    fn replay_last_graph(_ctx: &mut Self::Context) -> Result<bool> {
+    /// Replay the captured graph for `_key`. Returns `Ok(false)` if no
+    /// graph is cached for that key; caller should run eager.
+    fn replay_graph(_ctx: &mut Self::Context, _key: u64) -> Result<bool> {
         Ok(false)
     }
 
-    /// Drop the cached decode graph — required when the KV cache it
-    /// was captured against is about to be freed (e.g. request release),
-    /// since the graph holds raw device pointers into that cache.
-    fn reset_graph(_ctx: &mut Self::Context) {}
+    /// Drop the cached graph for `_key` — required when its kernel-arg
+    /// pointers (KV cache, scratch) might no longer be valid. Use
+    /// `reset_all_graphs` when EVERY cached graph should be evicted
+    /// (hard model reload / scratch realloc).
+    fn reset_graph(_ctx: &mut Self::Context, _key: u64) {}
+
+    /// Drop ALL cached graphs — used by hard reset paths.
+    fn reset_all_graphs(_ctx: &mut Self::Context) {}
 
     // ── GPTQ (INT4 quantization) ────────────────────────────────────────
     //
@@ -862,6 +875,17 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Pre-grow any backend-internal scratch slots whose size depends
+    /// on `m_total * intermediate_size` (the largest matmul fan-in
+    /// inside `unified_forward_internal`). Default no-op. CUDA
+    /// implements this to grow the perm-aware Marlin gather scratch
+    /// EAGERLY before the caller enters a CUDA-graph capture region —
+    /// `cuLaunchKernel` after a runtime alloc inside a captured
+    /// stream returns `CUDA_ERROR_INVALID_VALUE`.
+    fn pregrow_marlin_gather_scratch(_ctx: &mut Self::Context, _required: usize) {
+        // default: no scratch to pre-grow
+    }
+
     /// Batched fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
     ///
     /// Counterpart of [`Self::gemv_quant_moe_id_gate_up_silu`] for the
@@ -1085,6 +1109,136 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
+    /// Pre-populate the per-slot device-pointer scratch arrays used by
+    /// the batched kernels (`kv_cache_append_batched_per_cache` and
+    /// `flash_attention_batched_per_cache`). Required by the CUDA-graph
+    /// capture path: the captured graph contains only kernel launches
+    /// (no captured `memcpy_htod`), so the device scratch must be fresh
+    /// when the graph replays.
+    ///
+    /// Caller passes flat layer-major slices: `k_caches[li * m + i]` and
+    /// `v_caches[li * m + i]`. Backend extracts each cache's device
+    /// pointer and writes into its corresponding slot in the device
+    /// scratch via SYNCHRONOUS memcpy (not captured by stream capture).
+    ///
+    /// CUDA-only; other backends fall through to the default
+    /// `unsupported` and the caller skips the population call.
+    fn populate_batched_pointers(
+        _ctx: &mut Self::Context,
+        _k_caches: &[&Self::Buffer],
+        _v_caches: &[&Self::Buffer],
+        _num_layers: usize,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "populate_batched_pointers not implemented for this backend",
+        ))
+    }
+
+    /// Batched kv_cache_append across M caches in one launch. Each item
+    /// writes its (head-major) K-or-V row into its own cache at offset
+    /// read from `cache_lens[i]`. Replaces M sequential
+    /// `kv_cache_append_head_major` calls with a single dispatch.
+    ///
+    /// `new_data` layout: `[m, nkv, hd]` item-major (each item's slice
+    /// is contiguous, identical to the `k/v_normed_batched` produced by
+    /// `qk_norm_rope_batched_per_item`).
+    /// `caches`: per-cache `[nkv, capacity, hd]` head-major.
+    /// `cache_lens`: device buffer (u32 storage, length ≥ m). Caller
+    /// fills via `B::write_u32_into` BEFORE the call. Required for
+    /// CUDA-graph capture: the kernel reads from this stable device
+    /// buffer, so a captured graph can be replayed with new lens by
+    /// just rewriting the buffer between launches.
+    fn kv_cache_append_batched_per_cache(
+        _ctx: &mut Self::Context,
+        _caches: &[&Self::Buffer],
+        _new_data: &Self::Buffer,
+        _cache_lens: &Self::Buffer,
+        _capacity: usize,
+        _m: usize,
+        _nkv: usize,
+        _hd: usize,
+        _slot: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "kv_cache_append_batched_per_cache not implemented for this backend",
+        ))
+    }
+
+    /// Batched flash_attention across M decode caches in one launch.
+    /// Replaces the per-item `flash_attention(q_len=1, ...)` × M
+    /// loop in the non-paged batched-decode path.
+    ///
+    /// API takes Vec<&Buffer> for the per-cache K/V buffers (each
+    /// `[nkv, capacity, hd]` head-major) plus host-side `kv_lens`.
+    /// Backends that implement it must extract per-cache device
+    /// pointers, build the device arrays the kernel needs, and launch
+    /// one kernel covering all M items.
+    ///
+    /// `q` layout: [m, nq, hd] item-major (matches the
+    /// `qk_norm_rope_batched_per_item` output for q_len=1).
+    /// `out` layout: [m, nq, hd] item-major — written directly into
+    /// the caller's batched attn_out buffer, no per-item copy needed.
+    ///
+    /// CUDA-only for now (kernel `batched_decode_attention` exists in
+    /// `kernels/batched_decode_attention.cu`).
+    /// `kv_lens`: device buffer (u32 storage, length ≥ m) — same
+    /// design as `kv_cache_append_batched_per_cache::cache_lens`.
+    fn flash_attention_batched_per_cache(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_caches: &[&Self::Buffer],
+        _v_caches: &[&Self::Buffer],
+        _kv_lens: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _nq: usize,
+        _nkv: usize,
+        _hd: usize,
+        _scale: f32,
+        _max_valid_kv: usize,
+        _capacity: usize,
+        _slot: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "flash_attention_batched_per_cache not implemented for this backend",
+        ))
+    }
+
+    /// Batched per-item-position variant of `qk_norm_rope` for the
+    /// non-paged batched-decode path. Each of the `m` items has its own
+    /// absolute RoPE position (read from a device i32 buffer of length
+    /// `m`). Layout is item-major in *both* input and output:
+    ///
+    ///   input  [m, heads, head_dim]
+    ///   output [m, heads, head_dim]   (no head-major transpose)
+    ///
+    /// Item-major output keeps the per-item flash_attention slice
+    /// contiguous (`output[i * heads * head_dim ..]` is item i's whole
+    /// Q tensor in head-major-equivalent layout for q_len=1).
+    ///
+    /// Replaces the M sequential single-item launches in the existing
+    /// `forward_layer_batched_decode` path with one batched dispatch.
+    /// CUDA-only for now; other backends fall through to the default
+    /// `unsupported` and the caller falls back to the per-item loop.
+    fn qk_norm_rope_batched_per_item(
+        _ctx: &mut Self::Context,
+        _input: &Self::Buffer,
+        _norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _output: &mut Self::Buffer,
+        _positions: &Self::Buffer,
+        _m: usize,
+        _heads: usize,
+        _head_dim: usize,
+        _eps: f32,
+        _mode: i32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qk_norm_rope_batched_per_item not implemented for this backend",
+        ))
+    }
+
     /// Fused split-QKV + QK-norm + RoPE + head-major transpose.
     ///
     /// Single-dispatch replacement for the (`split_qkv` → 3× `qk_norm_rope`)
@@ -1240,6 +1394,95 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "paged_decode_attention not implemented for this backend",
+        ))
+    }
+
+    /// Varlen variant of [`Self::split_qkv_norm_rope_into_paged_cache`].
+    ///
+    /// Single launch covering ALL sequences in the batch. Reads
+    /// `pos_offsets[seq]`, `cu_seqlens_q[seq]`, and the per-seq
+    /// block_table from device buffers — graph-capturable (the per-iter
+    /// state is in buffers, not kernel scalars). Replaces the per-item
+    /// dispatch loop in `unified_forward_layer` with one call.
+    ///
+    /// Layouts:
+    /// - `qkv`: `[m_total, q_dim + 2 * kv_dim]` token-major
+    /// - `q_out`: `[m_total, q_heads, head_dim]` token-major (matches
+    ///   what `paged_varlen_attention` reads)
+    /// - `cache_k` / `cache_v`: paged pool same as `paged_varlen_attention`
+    /// - `cu_seqlens_q`: `[num_seqs + 1]` u32 prefix sum
+    /// - `pos_offsets`: `[num_seqs]` u32, starting kv_pos per seq
+    /// - `block_tables`: `[num_seqs, max_blocks_per_seq]` i32 stacked
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache_varlen(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _m_total: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _block_size: usize,
+        _max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend",
+        ))
+    }
+
+    /// Variable-length paged attention with GQA + causal mask.
+    ///
+    /// Supports a unified mixed batch where each sequence contributes
+    /// 1 (decode) or N (prefill chunk) query tokens — the workhorse for
+    /// chunked-prefill. See `kernels/paged_varlen_attention.cu` for the
+    /// kernel itself.
+    ///
+    /// Layouts:
+    /// - `q` / `out`: `[total_q_tokens, num_heads, head_dim]` (token-
+    ///   major, FP16). `total_q_tokens` = `cu_seqlens_q[num_seqs]`.
+    /// - `k_pool` / `v_pool`: paged block pool, layout matches
+    ///   `paged_decode_attention`.
+    /// - `cu_seqlens_q`: `[num_seqs + 1]` u32 prefix sum, with
+    ///   `cu_seqlens_q[0] = 0` and `cu_seqlens_q[num_seqs] = total_q_tokens`.
+    /// - `pos_offsets`: `[num_seqs]` u32, the starting absolute KV
+    ///   position of each seq's first q token (= prior `kv_len`).
+    /// - `block_tables`: `[num_seqs, max_num_blocks_per_seq]` i32 grid.
+    ///
+    /// Each query token attends causally to all KV positions
+    /// `[0, pos_offsets[s] + local_idx]`.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_varlen_attention not implemented for this backend",
         ))
     }
 

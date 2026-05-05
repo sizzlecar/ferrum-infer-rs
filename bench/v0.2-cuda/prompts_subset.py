@@ -100,6 +100,15 @@ def main():
     Path(args.output).write_text(json.dumps(out, indent=2, ensure_ascii=False))
     print(f"wrote {args.output}: {args.count} prompts (seed={args.seed})", file=sys.stderr)
 
+    # vllm bench serve --dataset-name custom requires JSONL with a
+    # "prompt" field per line. Keep the rich JSON (above) for humans;
+    # emit a sibling .jsonl that the harness actually reads.
+    jsonl_path = Path(args.output).with_suffix(".jsonl")
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for p in sample:
+            f.write(json.dumps({"prompt": p}, ensure_ascii=False) + "\n")
+    print(f"wrote {jsonl_path}: {len(sample)} prompts (jsonl for vllm bench serve)", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()

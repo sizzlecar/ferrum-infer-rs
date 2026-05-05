@@ -24,6 +24,11 @@ pub enum QuantMethod {
 /// Combined quantization config.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct QuantConfig {
+    // AutoGPTQ writes `quant_method`; some older / hand-written packs use
+    // `method`. Accept both. Default to None if absent (which would have
+    // been an error before — but in practice every real quant pack has
+    // one of the two).
+    #[serde(rename = "quant_method", alias = "method", default)]
     pub method: QuantMethod,
     /// Bit-width (typically 4 or 8 for GPTQ/AWQ).
     #[serde(default)]

@@ -24,10 +24,10 @@
 set -euo pipefail
 
 # ── pins (synced with versions.txt) ──────────────────────────────────
-FERRUM_REF="${FERRUM_REF:-v0.7.3}"
+FERRUM_REF="${FERRUM_REF:-bench/v0.2-cuda}"
 VLLM_VERSION="${VLLM_VERSION:-0.20.0}"
-MISTRALRS_VERSION="${MISTRALRS_VERSION:-0.8.0}"
-VLLM_BENCH_TAG="${VLLM_BENCH_TAG:-v0.20.0}"
+# mistralrs dropped from v0.2 scope — see bench/v0.2-cuda/models.txt
+# VLLM_BENCH_TAG no longer needed: 0.10+ ships `vllm bench serve` CLI
 
 # ── paths ────────────────────────────────────────────────────────────
 WORKSPACE="${WORKSPACE:-/workspace}"
@@ -82,22 +82,20 @@ ok "ferrum built"
 
 # ── 4. vLLM ──────────────────────────────────────────────────────────
 log "[4/8] vLLM ${VLLM_VERSION}"
-pip install --quiet "vllm==${VLLM_VERSION}"
-python -c "import vllm; print('  vllm:', vllm.__version__)"
-ok "vllm installed"
+# `vllm[bench]` extra is required for `vllm bench serve` (it pulls in
+# pandas, which CustomDataset uses to read the JSONL prompt set).
+# Without it, every bench cell dies with `ImportError: Please install
+# vllm[bench] for bench support`.
+pip install --quiet "vllm[bench]==${VLLM_VERSION}"
+python -c "import vllm, pandas; print('  vllm:', vllm.__version__, ' pandas:', pandas.__version__)"
+ok "vllm + bench extras installed"
 
-# ── 5. mistralrs ─────────────────────────────────────────────────────
-log "[5/8] mistralrs-server ${MISTRALRS_VERSION}"
-if ! command -v mistralrs-server >/dev/null; then
-  cargo install --quiet --features cuda --version "${MISTRALRS_VERSION}" mistralrs-server || \
-    cargo install --quiet --version "${MISTRALRS_VERSION}" mistralrs-server
-fi
-mistralrs-server --version
-ok "mistralrs installed"
+# ── 5. (mistralrs dropped from v0.2 scope) ───────────────────────────
+log "[5/7] mistralrs skipped (dropped from v0.2 scope)"
 
 # ── 6. parallel HF model downloads ───────────────────────────────────
-log "[6/8] HF model downloads (parallel, 4 jobs)"
-[[ -n "${HF_TOKEN:-}" ]] || warn "HF_TOKEN not set — Llama-3.1-8B (gated) will fail"
+log "[6/7] HF model downloads (parallel, 3 jobs)"
+[[ -n "${HF_TOKEN:-}" ]] || warn "HF_TOKEN not set — gated repos will fail"
 pip install --quiet -U "huggingface_hub[cli]"
 
 download_one() {
@@ -109,7 +107,9 @@ download_one() {
   fi
   mkdir -p "$target"
   echo "[$tag] downloading $repo to $target"
-  huggingface-cli download "$repo" --local-dir "$target" --quiet \
+  # `hf` CLI (huggingface_hub v1.x). Also caches under HF_HOME by
+  # hardlink, so deleting `--local-dir` doesn't waste cache space.
+  hf download "$repo" --local-dir "$target" --quiet \
     ${HF_TOKEN:+--token "$HF_TOKEN"} || {
       echo "[$tag] FAILED" >&2
       return 1
@@ -133,15 +133,15 @@ for pid in "${DL_PIDS[@]}"; do
 done
 [[ $DL_FAILED -gt 0 ]] && die "$DL_FAILED model download(s) failed"
 df -h "$WORKSPACE" | tail -1
-ok "all 4 models downloaded"
+ok "all models downloaded"
 
-# ── 7. ShareGPT + prompts.json ───────────────────────────────────────
-log "[7/8] ShareGPT subset"
+# ── 7. ShareGPT + prompts.json + bench harness ──────────────────────
+log "[7/7] ShareGPT subset + verify \`vllm bench serve\`"
 SG_FILE="$DATASETS_DIR/ShareGPT_V3_unfiltered_cleaned_split.json"
 if [[ ! -f "$SG_FILE" ]]; then
-  huggingface-cli download anon8231489123/ShareGPT_Vicuna_unfiltered \
+  hf download anon8231489123/ShareGPT_Vicuna_unfiltered \
     ShareGPT_V3_unfiltered_cleaned_split.json \
-    --local-dir "$DATASETS_DIR" --quiet
+    --repo-type dataset --local-dir "$DATASETS_DIR" --quiet
 fi
 SEED="$(git -C "$FERRUM_DIR" rev-parse --short HEAD)"
 python3 "$BENCH_DIR/prompts_subset.py" \
@@ -150,11 +150,9 @@ python3 "$BENCH_DIR/prompts_subset.py" \
   --seed "$SEED"
 ok "prompts.json built (seed=$SEED)"
 
-# ── 8. bench harness verification ────────────────────────────────────
-# vLLM 0.20+ moved benchmark_serving.py into the CLI: `vllm bench serve`.
-# It's already available since we pip-installed vllm above. Just
-# verify `vllm bench serve --help` runs.
-log "[8/8] verify \`vllm bench serve\` CLI"
+# vLLM 0.10+ ships `vllm bench serve` CLI (replaces the deprecated
+# standalone benchmark_serving.py). We pip-installed vllm above, just
+# verify the CLI is wired.
 vllm bench serve --help > /tmp/vllm_bench_help.txt 2>&1 || \
   die "\`vllm bench serve --help\` failed — vllm install is broken"
 HELP_LINES=$(wc -l < /tmp/vllm_bench_help.txt)
@@ -182,7 +180,6 @@ log "writing _env.txt"
   echo "ferrum: $($FERRUM_DIR/target/release/ferrum --version)"
   echo "ferrum git: $(git -C $FERRUM_DIR rev-parse HEAD) ($FERRUM_REF)"
   echo "vllm: $(python -c 'import vllm; print(vllm.__version__)')"
-  echo "mistralrs: $(mistralrs-server --version 2>&1 | head -1)"
   echo "rust: $(cargo --version)"
   echo
   echo "--- model HF revisions ---"
@@ -193,7 +190,7 @@ log "writing _env.txt"
   done
   echo
   echo "--- bench harness ---"
-  echo "benchmark_serving.py: vllm-project/vllm@${VLLM_BENCH_TAG}"
+  echo "bench harness: vllm bench serve (CLI from installed vLLM ${VLLM_VERSION})"
   echo "prompts.json: $(jq -r '.count' "$BENCH_DIR/prompts.json") prompts, seed=$(jq -r '.seed' "$BENCH_DIR/prompts.json")"
 } > "$BENCH_DIR/_env.txt"
 cat "$BENCH_DIR/_env.txt"
