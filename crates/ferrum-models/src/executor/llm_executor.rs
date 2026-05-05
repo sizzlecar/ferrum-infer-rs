@@ -103,9 +103,34 @@ impl ModelExecutor for LlmExecutor {
             .clone()
             .unwrap_or_else(|| self.gen_cache_id());
 
+        // For chunked-prefill continuation, the prior KV length is the seq
+        // length already in the supplied handle; for fresh prefill it's 0.
+        let prior_seq_len = input
+            .kv_cache
+            .as_ref()
+            .and_then(|h| h.as_any().downcast_ref::<GenericKvCacheHandle>())
+            .map(|g| {
+                use ferrum_interfaces::KvCacheHandle;
+                g.block_table().sequence_length
+            })
+            .unwrap_or(0);
+
+        // Try the unified_forward path first: when the model has it wired
+        // (paged KV pools allocated), this routes through the chunked-prefill
+        // varlen kernel — the same code that handles mixed prefill+decode
+        // batches. On Unsupported, fall back to the legacy single-item
+        // prefill path so contig-KV configs keep their existing behaviour.
         let logits = {
             let mut model = self.model.lock();
-            model.prefill(&cache_id, &tokens)
+            let unified_item = vec![(cache_id.clone(), tokens.clone(), prior_seq_len, true)];
+            match model.unified_forward(&unified_item) {
+                Ok(mut per_item) => per_item
+                    .pop()
+                    .flatten()
+                    .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
+                Err(FerrumError::Unsupported { .. }) => model.prefill(&cache_id, &tokens),
+                Err(e) => return Err(e),
+            }
         };
 
         // Wrap logits as TensorRef: [1, 1, vocab_size]
@@ -255,9 +280,23 @@ impl ModelExecutor for LlmExecutor {
 
         debug!("LlmExecutor decode: token={token}, pos={seq_len}");
 
+        // Try unified_forward first so paged-KV configs route the single
+        // decode through the same varlen kernel used by batched mixed
+        // batches. Falls back to legacy paged_decode_attention for contig
+        // configs that haven't wired unified_forward.
         let logits = {
             let mut model = self.model.lock();
-            model.decode(&cache_id, token, seq_len as u32)
+            let unified_item = vec![(cache_id.clone(), vec![token], seq_len, true)];
+            match model.unified_forward(&unified_item) {
+                Ok(mut per_item) => per_item
+                    .pop()
+                    .flatten()
+                    .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
+                Err(FerrumError::Unsupported { .. }) => {
+                    model.decode(&cache_id, token, seq_len as u32)
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         let logits_tensor = candle_core::Tensor::new(&logits[..], &candle_core::Device::Cpu)
@@ -310,20 +349,48 @@ impl ModelExecutor for LlmExecutor {
         }
         let t_prep = if prof { Some(std::time::Instant::now()) } else { None };
 
-        // One lock for the whole batch, dispatch to model's decode_batch —
-        // which implementations may fuse into a single forward pass (GEMMs
-        // with m=batch, per-item attention) for true concurrency speedup.
-        // Trait default falls back to sequential decode per item.
+        // One lock for the whole batch. Try unified_forward first: paged
+        // configs route through the varlen kernel (single mixed dispatch
+        // for the whole batch); contig configs fall back to model's
+        // legacy decode_batch (separate paged_decode_attention call per
+        // item, batched matmul for QKV/MLP).
         let (all_logits, t_lock_acq, t_model_call): (Vec<Vec<f32>>, _, _) = {
             let lock_t0 = if prof { Some(std::time::Instant::now()) } else { None };
             let mut model = self.model.lock();
             let lock_acq = lock_t0.map(|t| t.elapsed());
-            let tuples: Vec<(String, u32, u32)> = prepped
-                .iter()
-                .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
-                .collect();
             let model_t0 = if prof { Some(std::time::Instant::now()) } else { None };
-            let logits = model.decode_batch(&tuples);
+            let unified_items: Vec<(String, Vec<u32>, usize, bool)> = prepped
+                .iter()
+                .map(|p| (p.cache_id.clone(), vec![p.token], p.seq_len as usize, true))
+                .collect();
+            let logits = match model.unified_forward(&unified_items) {
+                Ok(per_item) => {
+                    if per_item.len() != prepped.len() {
+                        return Err(FerrumError::model(format!(
+                            "unified_forward returned {} entries for {} items",
+                            per_item.len(),
+                            prepped.len(),
+                        )));
+                    }
+                    let mut out = Vec::with_capacity(prepped.len());
+                    for (i, opt) in per_item.into_iter().enumerate() {
+                        out.push(opt.ok_or_else(|| {
+                            FerrumError::model(format!(
+                                "unified_forward returned None for decode item {i}"
+                            ))
+                        })?);
+                    }
+                    out
+                }
+                Err(FerrumError::Unsupported { .. }) => {
+                    let tuples: Vec<(String, u32, u32)> = prepped
+                        .iter()
+                        .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
+                        .collect();
+                    model.decode_batch(&tuples)
+                }
+                Err(e) => return Err(e),
+            };
             let model_call = model_t0.map(|t| t.elapsed());
             (logits, lock_acq, model_call)
         };
