@@ -657,6 +657,7 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
 /// at GEMM. Net effect: y[n] = Σⱼ x[j] · dequant(qweight[j, n],
 /// scales[g_idx_orig[j], n], qzeros[g_idx_orig[j], n]).
 /// → disk_k IS original_k; only the (scale, zero) LOOKUP differs.
+#[cfg(not(feature = "cuda"))]
 fn dequantize_gptq_with_g_idx(
     qweight: &[i32], // [K/8, N] packed int4
     scales: &[f32],  // [num_groups, N]
