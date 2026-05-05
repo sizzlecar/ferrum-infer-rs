@@ -3601,16 +3601,21 @@ impl<B: Backend> LlamaFamilyModel<B> {
             }
         }
 
-        // End capture (if active) and install graph. The first replay
-        // is implicit — control falls through to the sync/to_vec below
-        // since the eager pass already wrote `packed_logits` into the
-        // captured buffer ranges.
+        // End capture (if active), install graph, and immediately
+        // replay it — capture only RECORDS the launches, so without a
+        // post-capture replay the layer loop's kernels never actually
+        // execute and packed_logits stays uninitialised. Mirrors the
+        // legacy `forward_layer_batched_decode_post_attn` pattern.
         if should_capture && !self.unified_graph_failed {
             if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
                 eprintln!("[unified-graph] end_capture err: {e}");
                 self.unified_graph_failed = true;
             } else {
                 self.unified_graph_keys_seen.insert(graph_key);
+                if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
+                    eprintln!("[unified-graph] post-capture replay err: {e}");
+                    self.unified_graph_failed = true;
+                }
             }
         }
 
