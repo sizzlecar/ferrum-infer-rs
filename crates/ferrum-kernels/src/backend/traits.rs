@@ -1386,6 +1386,51 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Varlen variant of [`Self::split_qkv_norm_rope_into_paged_cache`].
+    ///
+    /// Single launch covering ALL sequences in the batch. Reads
+    /// `pos_offsets[seq]`, `cu_seqlens_q[seq]`, and the per-seq
+    /// block_table from device buffers — graph-capturable (the per-iter
+    /// state is in buffers, not kernel scalars). Replaces the per-item
+    /// dispatch loop in `unified_forward_layer` with one call.
+    ///
+    /// Layouts:
+    /// - `qkv`: `[m_total, q_dim + 2 * kv_dim]` token-major
+    /// - `q_out`: `[m_total, q_heads, head_dim]` token-major (matches
+    ///   what `paged_varlen_attention` reads)
+    /// - `cache_k` / `cache_v`: paged pool same as `paged_varlen_attention`
+    /// - `cu_seqlens_q`: `[num_seqs + 1]` u32 prefix sum
+    /// - `pos_offsets`: `[num_seqs]` u32, starting kv_pos per seq
+    /// - `block_tables`: `[num_seqs, max_blocks_per_seq]` i32 stacked
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache_varlen(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _m_total: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _block_size: usize,
+        _max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend",
+        ))
+    }
+
     /// Variable-length paged attention with GQA + causal mask.
     ///
     /// Supports a unified mixed batch where each sequence contributes

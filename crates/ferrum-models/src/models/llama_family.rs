@@ -538,6 +538,13 @@ pub struct LlamaFamilyModel<B: Backend> {
     /// requests joined / requests finished). Hot-path optimization:
     /// avoids 3 sync cuMemcpyHtoD_v2's per decode token (~5% TPOT).
     batched_pointers_for: Option<Vec<String>>,
+    /// CUDA-graph state for the unified_forward path. Mirrors the
+    /// `batched_graph_*` triple but keyed on `(m_total, num_seqs)`
+    /// so different concurrency levels each get their own cached
+    /// graph instead of thrashing a single slot.
+    unified_graph_warmup: usize,
+    unified_graph_failed: bool,
+    unified_graph_keys_seen: std::collections::HashSet<u64>,
 }
 
 impl<B: Backend> LlamaFamilyModel<B> {
@@ -647,6 +654,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
             batched_graph_failed: false,
             batched_graph_keys_seen: std::collections::HashSet::new(),
             batched_pointers_for: None,
+            unified_graph_warmup: 0,
+            unified_graph_failed: false,
+            unified_graph_keys_seen: std::collections::HashSet::new(),
         })
     }
 
@@ -727,6 +737,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
             batched_graph_failed: false,
             batched_graph_keys_seen: std::collections::HashSet::new(),
             batched_pointers_for: None,
+            unified_graph_warmup: 0,
+            unified_graph_failed: false,
+            unified_graph_keys_seen: std::collections::HashSet::new(),
         })
     }
 
@@ -747,6 +760,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
             self.batched_graph_keys_seen.clear();
             self.batched_graph_warmup = 0;
             self.batched_graph_failed = false;
+            self.unified_graph_keys_seen.clear();
+            self.unified_graph_warmup = 0;
+            self.unified_graph_failed = false;
         }
     }
 
@@ -3650,10 +3666,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
             layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
         });
 
-        // 3. Per-item split_qkv_norm_rope_into_paged_cache. Writes K/V
-        // into seq's paged pool slot AND stores RoPE'd Q at packed_q
-        // offset. Handles per-item q_len + pos_offset (the same kernel
-        // already supports tokens > 1 per call — used by prefill_internal).
+        // 3. Single-launch varlen split_qkv_norm_rope. Reads
+        //    cu_seqlens_q / pos_offsets / block_tables from device
+        //    buffers (graph-capturable; kernel scalars are stable across
+        //    iters). Replaces the prior per-item dispatch loop (16 small
+        //    launches per layer at c=16) with one launch.
         let pools = self
             .paged_pools
             .as_mut()
@@ -3664,68 +3681,63 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
         // SAFETY: pools allocated once; not concurrently mutated.
         let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
-        // f16 buffers — see the comment in `forward_layer_batched_decode_post_attn`
-        // about the prior 2× overshoot from `size_of::<f32>()`.
-        let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
-        let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
+        // Suppress unused warning until the legacy per-item path goes.
+        let _ = items;
+        let _ = q_lens;
+        let _ = cu_seqlens_q;
+        let _ = pos_offsets;
+        let _ = qkv_stride;
 
         time_op!(QKR_TIME_US, QKR_CALLS, {
-            for (i, (cid, _q_tokens, pos_offset, _)) in items.iter().enumerate() {
-                let q_token_offset = cu_seqlens_q[i] as u64;
-                let cache_len_before;
-                let bt_safe: &B::Buffer;
-                {
-                    let caches = self
-                        .kv_caches
-                        .get(cid)
-                        .expect("paged unified: cache not present");
-                    let cache = &caches[li];
-                    cache_len_before = cache.len;
-                    let bt = cache
-                        .block_table
-                        .as_ref()
-                        .expect("paged unified: block_table missing");
-                    let block_table_ref = bt as *const B::Buffer;
-                    // SAFETY: bt is read-only; we don't mutate kv_caches between
-                    // this raw deref and the call.
-                    bt_safe = unsafe { &*block_table_ref };
-                }
-                let qkv_out = self
-                    .scratch
-                    .unified_qkv_out
-                    .as_ref()
-                    .expect("unified_qkv_out missing");
-                let packed_q = self
-                    .scratch
-                    .unified_packed_q
-                    .as_mut()
-                    .expect("unified_packed_q missing");
-                B::split_qkv_norm_rope_into_paged_cache(
-                    ctx,
-                    qkv_out,
-                    q_token_offset * qkv_stride_bytes,
-                    q_norm_w,
-                    k_norm_w,
-                    &self.rope.cos,
-                    &self.rope.sin,
-                    packed_q,
-                    q_token_offset * q_head_major_size_bytes,
-                    pool_k,
-                    pool_v,
-                    bt_safe,
-                    q_lens[i],
-                    nh,
-                    nkv,
-                    hd,
-                    *pos_offset,
-                    eps,
-                    qk_mode,
-                    cache_len_before,
-                    block_size,
-                    max_blocks_per_seq,
-                )
-                .expect("paged unified: split_qkv_norm_rope_into_paged_cache");
-            }
+            let qkv_out = self
+                .scratch
+                .unified_qkv_out
+                .as_ref()
+                .expect("unified_qkv_out missing");
+            let packed_q = self
+                .scratch
+                .unified_packed_q
+                .as_mut()
+                .expect("unified_packed_q missing");
+            let cu_seqlens_buf = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_ref()
+                .expect("unified_cu_seqlens_q missing");
+            let pos_offsets_buf = self
+                .scratch
+                .unified_pos_offsets
+                .as_ref()
+                .expect("unified_pos_offsets missing");
+            let bt_buf = self
+                .scratch
+                .unified_block_tables
+                .as_ref()
+                .expect("unified_block_tables missing");
+            B::split_qkv_norm_rope_into_paged_cache_varlen(
+                ctx,
+                qkv_out,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                packed_q,
+                pool_k,
+                pool_v,
+                cu_seqlens_buf,
+                pos_offsets_buf,
+                bt_buf,
+                num_seqs,
+                m_total,
+                nh,
+                nkv,
+                hd,
+                eps,
+                qk_mode,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("paged unified: split_qkv_norm_rope_into_paged_cache_varlen");
         });
 
         // 4. paged_varlen_attention: one call covering all M_total tokens.
