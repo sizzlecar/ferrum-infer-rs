@@ -2503,8 +2503,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // Take block_table buffer ptrs ahead of the dispatch loop —
             // we need both per-cache block_table (to write into) and
             // self.scratch.paged_batch_q (to write Q stacks into).
-            let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
-            let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+            // f16 buffers (CudaSlice<f16> / Metal half) — 2 bytes per
+            // element. Earlier `size_of::<f32>()` was 2× too large; for
+            // tokens=1 batched decode the per-item Q stack still landed
+            // at the right offset because the caller's stride is q_dim
+            // and i==0..m gives base+i*q_dim, but split-fused with
+            // q_token_offset>0 (chunked prefill) tripped on the bad
+            // offset by skipping every other token row.
+            let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
+            let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
             let _t_qkr = if _bp { B::sync(ctx); Some(std::time::Instant::now()) } else { None };
             for (i, (cache_id, _, pos)) in batch.iter().enumerate() {
                 let pos_i = *pos as usize;
@@ -3559,8 +3566,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
         // SAFETY: pools allocated once; not concurrently mutated.
         let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
-        let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
-        let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+        // f16 buffers — see the comment in `forward_layer_batched_decode_post_attn`
+        // about the prior 2× overshoot from `size_of::<f32>()`.
+        let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
+        let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
 
         for (i, (cid, _q_tokens, pos_offset, _)) in items.iter().enumerate() {
             let q_token_offset = cu_seqlens_q[i] as u64;

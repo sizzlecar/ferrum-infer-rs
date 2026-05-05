@@ -102,9 +102,13 @@ extern "C" __global__ void split_qkv_norm_rope_into_paged_cache_f16(
     // Resolve destination pointer.
     __half* dst;
     if (is_q) {
-        // Q: head-major [q_heads, tokens, hd] at q_out_byte_offset.
+        // Q: token-major [tokens, q_heads, hd] — matches what
+        // `paged_varlen_attention.cu` expects (`q[total_q, num_heads, hd]`).
+        // The legacy paged decode path uses tokens=1, where token- and
+        // head-major collapse to the same flat layout, so this is also
+        // a no-op for the Phase 4b batched dispatch.
         __half* q_out = (__half*)((char*)q_out_base + q_out_byte_offset);
-        dst = q_out + (local_head * tokens + tok) * hd;
+        dst = q_out + (tok * q_heads + local_head) * hd;
     } else {
         const int abs_pos = pos_offset + tok;
         const int logical_block = abs_pos / block_size;
