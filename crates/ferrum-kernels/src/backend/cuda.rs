@@ -55,17 +55,59 @@ pub struct CudaState {
     pub use_dev_state: bool,
     /// True between begin_graph_capture and end_graph_capture.
     pub capture_in_flight: bool,
+    /// Stable scratch buffers for batched-decode kernels that take per-item
+    /// device-pointer arrays (flash_attn_batched, kv_cache_append_batched).
+    /// Per-call `alloc_zeros::<T>(m)` was 3 allocs × 32 layers × 3 ops
+    /// = ~96 allocs/token. Caching here saves the allocator overhead AND
+    /// keeps the buffer addresses stable across calls — required so a
+    /// future CUDA-graph capture can replay over them.
+    /// Allocated lazily to `BATCHED_SCRATCH_CAP` (covers max_seqs ≤ 64).
+    batched_scratch_u64_k: Option<CudaSlice<u64>>,
+    batched_scratch_u64_v: Option<CudaSlice<u64>>,
+    batched_scratch_u64_cache: Option<CudaSlice<u64>>,
+    batched_scratch_i32_kv_lens: Option<CudaSlice<i32>>,
+    batched_scratch_i32_cache_lens: Option<CudaSlice<i32>>,
+    /// Stable HOST-side staging buffers for the per-item u64/i32 arrays
+    /// fed into the device-side scratch via `stream.memcpy_htod`. The
+    /// memcpy is async and gets recorded in any active CUDA-graph
+    /// capture, which captures the HOST POINTER. If we used a local
+    /// Vec, that Vec drops at function return → captured graph holds a
+    /// dangling host pointer → replay reads garbage → MISALIGNED at
+    /// later kernel. Owning these on the long-lived CudaState keeps
+    /// the host pointers stable, and clearing+re-filling between calls
+    /// updates the contents the captured memcpy reads on each replay.
+    /// Fixed-size arrays (not Vec) avoid the realloc-invalidates-ptr trap.
+    batched_host_k_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    batched_host_v_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    batched_host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    batched_host_kv_lens: Box<[i32; HOST_STAGING_TOTAL]>,
+    batched_host_cache_lens: Box<[i32; HOST_STAGING_TOTAL]>,
 }
+
+const BATCHED_SCRATCH_CAP: usize = 64;
+/// Number of distinct call sites per token-step that may be captured
+/// inside one CUDA graph: `cache_ptrs` is shared by K-append AND V-append
+/// calls (so 2 × MAX_LAYERS_FOR_GRAPH); `k_ptrs`/`v_ptrs` are used once
+/// per layer (so 1 × MAX_LAYERS_FOR_GRAPH each). Sizing every host
+/// staging array to `2 × MAX_LAYERS_FOR_GRAPH` simplifies indexing —
+/// we waste a few KB to keep call sites uniform. Each captured
+/// `stream.memcpy_htod` reads from a non-overlapping host slice — the
+/// graph records the host pointer, so two memcpys sharing the same
+/// region read each other's latest write on replay (verified bug:
+/// `cudarc_graph_shared_host_array_multi_memcpy`).
+const MAX_GRAPH_SLOTS: usize = 2 * super::MAX_LAYERS_FOR_GRAPH;
+/// Total size of the per-call host staging arrays for graph capture.
+const HOST_STAGING_TOTAL: usize = MAX_GRAPH_SLOTS * BATCHED_SCRATCH_CAP;
 
 impl CudaState {
     fn module(&mut self, key: &'static str, ptx_src: &str) -> Arc<CudaModule> {
         if let Some(m) = self.modules.get(key) {
             return m.clone();
         }
-        let m = self
-            .ctx
-            .load_module(Ptx::from_src(ptx_src.to_string()))
-            .unwrap_or_else(|e| panic!("CudaBackend: load_module({key}): {e}"));
+        // Route through process-global cache — keeps Arc<CudaModule>
+        // alive forever so captured CUfunction handles never go stale
+        // even after this CudaState drops.
+        let m = ensure_module(&self.ctx, key, ptx_src);
         self.modules.insert(key, m.clone());
         m
     }
@@ -168,6 +210,12 @@ impl Backend for CudaBackend {
         let blas = ensure_blas_handle(&stream);
         // Ensure process-global decode state buffers exist.
         ensure_decode_state_bufs(&stream);
+        // Process-global batched-scratch device + host arrays. SAME
+        // graph-capture lifetime requirement as cuBLAS workspace above:
+        // captured stream.memcpy_htod records the host array address;
+        // captured kernel arg holds the device scratch address; both
+        // must outlive every CudaState that triggers a capture+replay.
+        ensure_batched_scratch(&stream);
 
         // Disable cudarc's per-slice event tracking globally. We run everything
         // on one stream → CUDA stream semantics handle ordering natively.
@@ -185,6 +233,68 @@ impl Backend for CudaBackend {
             modules: HashMap::new(),
             use_dev_state: false,
             capture_in_flight: false,
+            batched_scratch_u64_k: None,
+            batched_scratch_u64_v: None,
+            batched_scratch_u64_cache: None,
+            batched_scratch_i32_kv_lens: None,
+            batched_scratch_i32_cache_lens: None,
+            batched_host_k_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+            batched_host_v_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+            batched_host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+            batched_host_kv_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
+            batched_host_cache_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
+        }
+    }
+
+    fn alloc_u32(n: usize) -> Self::Buffer {
+        // Buffer storage is f16 (2 bytes per element). For n u32 slots
+        // we need n*4 bytes = 2*n f16 elements. The trait default
+        // collapses f32→f16 one-for-one which under-allocates (buffer
+        // is HALF the bytes the kernel expects), causing writes into
+        // un-mapped pool memory and CUDA_ERROR_MISALIGNED_ADDRESS at
+        // sync. Override to allocate the right byte count.
+        let n = n.max(1);
+        with_stream(|stream| {
+            stream
+                .alloc_zeros::<f16>(2 * n)
+                .expect("CudaBackend::alloc_u32: alloc_zeros<f16>")
+        })
+    }
+
+    fn write_u32(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
+        // Synchronous host→device write of int32 values. Used by callers
+        // to populate device-side scratch buffers (positions, kv_lens)
+        // BEFORE a CUDA-graph replay so the buffer's contents are
+        // current when the replay re-runs the kernels that read them.
+        //
+        // - Synchronous (`cuMemcpyHtoD_v2`, not `..Async`) so the local
+        //   host Vec stays alive across the copy. Async memcpy on a
+        //   captured stream would record a stale host pointer.
+        // - Explicit `bind_to_thread` because tokio shifts decode_batch
+        //   calls across worker threads. Without it, calls landing on a
+        //   thread that hadn't bound the context fail with
+        //   `CUDA_ERROR_INVALID_CONTEXT` — observed after graph capture
+        //   activated and the next call ran on a fresh worker.
+        if data.is_empty() {
+            return;
+        }
+        if let Err(e) = ctx.ctx.bind_to_thread() {
+            eprintln!("write_u32 bind_to_thread failed: {e}");
+            return;
+        }
+        let stream = ctx.stream.clone();
+        let host_i32: Vec<i32> = data.iter().map(|&x| x as i32).collect();
+        use cudarc::driver::DevicePtrMut;
+        let (dst_ptr, _g) = dst.device_ptr_mut(&stream);
+        unsafe {
+            let st = cudarc::driver::sys::cuMemcpyHtoD_v2(
+                dst_ptr,
+                host_i32.as_ptr() as *const std::ffi::c_void,
+                host_i32.len() * std::mem::size_of::<i32>(),
+            );
+            if st != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                eprintln!("write_u32 cuMemcpyHtoD failed: {st:?}");
+            }
         }
     }
 
@@ -226,7 +336,7 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
-    fn end_graph_capture(ctx: &mut Self::Context) -> Result<()> {
+    fn end_graph_capture(ctx: &mut Self::Context, key: u64) -> Result<()> {
         use cudarc::driver::sys;
         if !ctx.capture_in_flight {
             return Err(FerrumError::unsupported("end_capture without begin"));
@@ -254,12 +364,13 @@ impl Backend for CudaBackend {
             ));
         }
 
-        // Use AUTO_FREE_ON_LAUNCH (value 1). Paired with cuGraphUpload
-        // below; flags=0 + no upload was producing SIGSEGV inside libcuda
-        // at cuGraphLaunch on Blackwell + CUDA 13. Matches what cudarc's
-        // default end_capture uses in the passing repro tests.
-        let flags =
-            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64;
+        // flags=0: no AUTO_FREE_ON_LAUNCH. The captured graph contains
+        // only kernel launches (memcpys are sync via cuMemcpyHtoD_v2
+        // outside capture, see populate_batched_pointers), so
+        // AUTO_FREE has nothing to free. With AUTO_FREE on, replays
+        // worked for ~14 iters then SIGSEGV — likely device-side
+        // launch resources getting freed mid-launch sequence.
+        let flags = 0u64;
         let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
         let st2 = unsafe { sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, flags) };
         if st2 != sys::CUresult::CUDA_SUCCESS {
@@ -286,33 +397,86 @@ impl Backend for CudaBackend {
             )));
         }
 
-        // Wrap back into cudarc's CudaGraph so we can use .launch() etc.
-        // Unsafe but matches cudarc's internal struct layout (pub fields).
-        // Actually cudarc's CudaGraph has private fields — we can't construct
-        // it directly. Instead, store cu_graph_exec in our own slot.
-        install_decode_graph_raw(cu_graph, cu_graph_exec, ctx.stream.clone());
+        // Install into the multi-slot cache keyed by `key`. Replaces any
+        // existing graph for the same key; the old GraphSlotRaw drops
+        // (cuCtxSync + cuGraphExecDestroy + cuGraphDestroy in its Drop
+        // impl) before the new one takes its place.
+        install_decode_graph_raw(key, cu_graph, cu_graph_exec, ctx.stream.clone());
         Ok(())
     }
 
-    fn reset_graph(_ctx: &mut Self::Context) {
-        invalidate_decode_graph();
+    fn reset_graph(_ctx: &mut Self::Context, key: u64) {
+        invalidate_decode_graph(key);
     }
 
-    fn replay_last_graph(ctx: &mut Self::Context) -> Result<bool> {
+    fn reset_all_graphs(_ctx: &mut Self::Context) {
+        invalidate_all_decode_graphs();
+    }
+
+    fn replay_graph(ctx: &mut Self::Context, key: u64) -> Result<bool> {
         use cudarc::driver::sys;
         let cu_stream = ctx.stream.cu_stream();
-        // Bind ctx to this thread — cuGraphLaunch from an un-bound tokio
-        // worker thread was silently hanging (not returning an error,
-        // just never completing). cudarc's CudaGraph::launch wraps this
-        // bind internally; our raw-FFI path bypassed it.
         ctx.ctx
             .bind_to_thread()
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
-        with_decode_graph(|g_opt| {
+        with_decode_graph(key, |g_opt| {
             if let Some(g) = g_opt {
+                let prof = std::env::var("FERRUM_GRAPH_PROF").is_ok();
+                let t_pre = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                // Re-upload before each launch. Without it, c=4 throughput
+                // drops 257→178 tok/s (post-Phase-8 measurement). The
+                // graph instantiate-then-upload-once design didn't pan out
+                // empirically; keep the per-replay upload until we
+                // understand why removing it slows things down.
+                let skip_upload =
+                    std::env::var("FERRUM_GRAPH_SKIP_UPLOAD").map_or(false, |v| v == "1");
+                if !skip_upload {
+                    let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
+                    if st_up != sys::CUresult::CUDA_SUCCESS {
+                        return Err(FerrumError::unsupported(format!(
+                            "cuGraphUpload: {st_up:?}"
+                        )));
+                    }
+                }
+                let t_after_upload = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
+                }
+                let t_after_launch = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let skip_sync = std::env::var("FERRUM_GRAPH_SKIP_SYNC").map_or(false, |v| v == "1");
+                if !skip_sync {
+                    let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
+                    if st_sync != sys::CUresult::CUDA_SUCCESS {
+                        return Err(FerrumError::unsupported(format!(
+                            "post-launch sync: {st_sync:?}"
+                        )));
+                    }
+                }
+                if let (Some(t0), Some(t1), Some(t2)) = (t_pre, t_after_upload, t_after_launch) {
+                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n.is_multiple_of(64) {
+                        let upload = t1.duration_since(t0).as_micros();
+                        let launch = t2.duration_since(t1).as_micros();
+                        let sync = t2.elapsed().as_micros();
+                        eprintln!(
+                            "[graph-prof] call#{n} upload={upload}us launch={launch}us sync={sync}us total={}us",
+                            t0.elapsed().as_micros()
+                        );
+                    }
                 }
                 Ok(true)
             } else {
@@ -327,6 +491,18 @@ impl Backend for CudaBackend {
 
     fn alloc(len: usize) -> Self::Buffer {
         with_stream(|stream| unsafe { stream.alloc::<f16>(len) }.expect("cuda alloc"))
+    }
+
+    fn pregrow_marlin_gather_scratch(ctx: &mut Self::Context, required: usize) {
+        #[cfg(feature = "marlin")]
+        {
+            let stream = ctx.stream.clone();
+            pregrow_marlin_gather_scratch(&stream, required);
+        }
+        #[cfg(not(feature = "marlin"))]
+        {
+            let _ = (ctx, required);
+        }
     }
 
     fn from_slice(data: &[f32]) -> Self::Buffer {
@@ -788,6 +964,597 @@ impl Backend for CudaBackend {
         .expect("fused_silu_mul_split launch");
     }
 
+    fn populate_batched_pointers(
+        ctx: &mut Self::Context,
+        k_caches: &[&Self::Buffer],
+        v_caches: &[&Self::Buffer],
+        num_layers: usize,
+        m: usize,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        if num_layers == 0 || m == 0 {
+            return Ok(());
+        }
+        if num_layers > super::MAX_LAYERS_FOR_GRAPH {
+            return Err(FerrumError::model(format!(
+                "populate_batched_pointers: num_layers={num_layers} > MAX_LAYERS_FOR_GRAPH={}",
+                super::MAX_LAYERS_FOR_GRAPH
+            )));
+        }
+        if m > BATCHED_SCRATCH_CAP {
+            return Err(FerrumError::model(format!(
+                "populate_batched_pointers: m={m} > BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
+            )));
+        }
+        if k_caches.len() != num_layers * m || v_caches.len() != num_layers * m {
+            return Err(FerrumError::model(
+                "populate_batched_pointers: k/v_caches length != num_layers * m",
+            ));
+        }
+
+        let stream = ctx.stream.clone();
+        // Lazy-alloc all three device scratch buffers to HOST_STAGING_TOTAL
+        // u64 elements. Done outside any captured stream — sync allocs only.
+        if ctx.batched_scratch_u64_cache.is_none() {
+            ctx.batched_scratch_u64_cache = Some(
+                stream
+                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
+                    .map_err(|e| FerrumError::model(format!("alloc cache_ptrs: {e}")))?,
+            );
+        }
+        if ctx.batched_scratch_u64_k.is_none() {
+            ctx.batched_scratch_u64_k = Some(
+                stream
+                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
+                    .map_err(|e| FerrumError::model(format!("alloc k_ptrs: {e}")))?,
+            );
+        }
+        if ctx.batched_scratch_u64_v.is_none() {
+            ctx.batched_scratch_u64_v = Some(
+                stream
+                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
+                    .map_err(|e| FerrumError::model(format!("alloc v_ptrs: {e}")))?,
+            );
+        }
+        // Fill host arrays at every slot we'll launch from. Layout:
+        //   K-append (kv_cache_append): slot = li → host_cache_ptrs[li * CAP ..]
+        //   V-append (kv_cache_append): slot = li + MAX_LAYERS_FOR_GRAPH
+        //   flash_attn:                 slot = li → host_k_ptrs / host_v_ptrs
+        for li in 0..num_layers {
+            let k_off = li * BATCHED_SCRATCH_CAP;
+            let v_off = (li + super::MAX_LAYERS_FOR_GRAPH) * BATCHED_SCRATCH_CAP;
+            for i in 0..m {
+                let (kp, _) = k_caches[li * m + i].device_ptr(&stream);
+                let (vp, _) = v_caches[li * m + i].device_ptr(&stream);
+                ctx.batched_host_cache_ptrs[k_off + i] = kp;
+                ctx.batched_host_cache_ptrs[v_off + i] = vp;
+                ctx.batched_host_k_ptrs[k_off + i] = kp;
+                ctx.batched_host_v_ptrs[k_off + i] = vp;
+            }
+        }
+        // Bind context for sync memcpys (tokio thread-shift safe).
+        ctx.ctx
+            .bind_to_thread()
+            .map_err(|e| FerrumError::unsupported(format!("populate bind_to_thread: {e}")))?;
+
+        // Sync memcpy each entire host array to its device scratch in one shot.
+        // cuMemcpyHtoD_v2 is on the legacy default (null) stream → NOT
+        // captured by stream capture, so the captured graph contains
+        // only kernel launches. Device scratch is fresh before every
+        // call, including pure-replay (which doesn't re-enter Rust).
+        let total_bytes = HOST_STAGING_TOTAL * std::mem::size_of::<u64>();
+        unsafe {
+            use cudarc::driver::{sys, DevicePtrMut};
+            let scratch_cache = ctx.batched_scratch_u64_cache.as_mut().unwrap();
+            let (dst, _g) = scratch_cache.device_ptr_mut(&stream);
+            let st = sys::cuMemcpyHtoD_v2(
+                dst,
+                ctx.batched_host_cache_ptrs.as_ptr() as *const std::ffi::c_void,
+                total_bytes,
+            );
+            if st != sys::CUresult::CUDA_SUCCESS {
+                return Err(FerrumError::unsupported(format!(
+                    "populate cache_ptrs sync memcpy: {st:?}"
+                )));
+            }
+            let scratch_k = ctx.batched_scratch_u64_k.as_mut().unwrap();
+            let (dst, _g) = scratch_k.device_ptr_mut(&stream);
+            let st = sys::cuMemcpyHtoD_v2(
+                dst,
+                ctx.batched_host_k_ptrs.as_ptr() as *const std::ffi::c_void,
+                total_bytes,
+            );
+            if st != sys::CUresult::CUDA_SUCCESS {
+                return Err(FerrumError::unsupported(format!(
+                    "populate k_ptrs sync memcpy: {st:?}"
+                )));
+            }
+            let scratch_v = ctx.batched_scratch_u64_v.as_mut().unwrap();
+            let (dst, _g) = scratch_v.device_ptr_mut(&stream);
+            let st = sys::cuMemcpyHtoD_v2(
+                dst,
+                ctx.batched_host_v_ptrs.as_ptr() as *const std::ffi::c_void,
+                total_bytes,
+            );
+            if st != sys::CUresult::CUDA_SUCCESS {
+                return Err(FerrumError::unsupported(format!(
+                    "populate v_ptrs sync memcpy: {st:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn kv_cache_append_batched_per_cache(
+        ctx: &mut Self::Context,
+        caches: &[&Self::Buffer],
+        new_data: &Self::Buffer,
+        cache_lens: &Self::Buffer,
+        capacity: usize,
+        m: usize,
+        nkv: usize,
+        hd: usize,
+        slot: usize,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        if m == 0 {
+            return Ok(());
+        }
+        if caches.len() != m {
+            return Err(FerrumError::model(
+                "kv_cache_append_batched_per_cache: caches length != m",
+            ));
+        }
+
+        let stream = ctx.stream.clone();
+        if m > BATCHED_SCRATCH_CAP {
+            return Err(FerrumError::model(format!(
+                "kv_cache_append_batched_per_cache: m={m} exceeds BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
+            )));
+        }
+        if slot >= MAX_GRAPH_SLOTS {
+            return Err(FerrumError::model(format!(
+                "kv_cache_append_batched_per_cache: slot={slot} exceeds MAX_GRAPH_SLOTS={MAX_GRAPH_SLOTS}",
+            )));
+        }
+        let host_start = slot * BATCHED_SCRATCH_CAP;
+        let func = ctx.func(
+            "kv_cache_append_batched",
+            ptx::KV_CACHE_APPEND,
+            "kv_cache_append_batched_per_cache_f16",
+        );
+        // Per-slot region of the PROCESS-GLOBAL host_cache_ptrs +
+        // scratch_u64_cache. Each call site uses a distinct slot.
+        // Captured graph records host pointer (per-slot region of the
+        // global Box) + device pointer (per-slot view of the global
+        // scratch); both outlive any CudaState. Replay across decode
+        // calls re-reads CURRENT host content from the same address,
+        // launches kernel reading CURRENT device content from the same
+        // address. This is what makes FERRUM_BATCHED_GRAPH=1 safe.
+        let m_i32 = m as i32;
+        let nkv_i32 = nkv as i32;
+        let hd_i32 = hd as i32;
+        let capacity_i32 = capacity as i32;
+        let per_item = nkv * hd;
+        let block_dim = 256u32;
+        let grid_x = (per_item as u32 + block_dim - 1) / block_dim;
+        with_batched_scratch_mut(|slot_g| {
+            for i in 0..m {
+                let (cp, _) = caches[i].device_ptr(&stream);
+                slot_g.host_cache_ptrs[host_start + i] = cp;
+            }
+            // Async memcpy host_slice → device per-slot region. Recorded
+            // into the captured graph when capture is in flight; both
+            // endpoints are stable global addresses.
+            {
+                let host_slice: &[u64] = &slot_g.host_cache_ptrs[host_start..host_start + m];
+                let mut view = slot_g
+                    .scratch_u64_cache
+                    .slice_mut(host_start..host_start + m);
+                stream
+                    .memcpy_htod(host_slice, &mut view)
+                    .map_err(|e| FerrumError::model(format!("memcpy cache_ptrs: {e}")))?;
+            }
+            let cache_ptrs_view = slot_g.scratch_u64_cache.slice(host_start..host_start + m);
+            let cache_lens_dev = cache_lens;
+            let mut b = stream.launch_builder(&func);
+            b.arg(&cache_ptrs_view);
+            b.arg(new_data);
+            b.arg(cache_lens_dev);
+            b.arg(&m_i32);
+            b.arg(&nkv_i32);
+            b.arg(&hd_i32);
+            b.arg(&capacity_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (grid_x, m as u32, 1),
+                    block_dim: (block_dim, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("kv_cache_append_batched: {e}")))?;
+            Ok::<(), FerrumError>(())
+        })?;
+        Ok(())
+    }
+
+    fn paged_varlen_attention(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        cu_seqlens_q: &Self::Buffer,
+        pos_offsets: &Self::Buffer,
+        block_tables: &Self::Buffer,
+        num_seqs: usize,
+        total_q_tokens: usize,
+        max_kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if num_seqs == 0 || total_q_tokens == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "paged_varlen_attn",
+            ptx::PAGED_VARLEN_ATTENTION,
+            "paged_varlen_attn_f16",
+        );
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let stream = ctx.stream.clone();
+        // CudaBackend::Buffer is monomorphic CudaSlice<f16>; i32 data
+        // (cu_seqlens_q / pos_offsets / block_tables) is stored in
+        // f16-typed buffers via `from_slice_i32` + matching alloc, the
+        // kernel reads them as `int*`. Same pattern as kv_lens in
+        // `flash_attention_batched_per_cache`.
+        let qv = q.slice(..);
+        let kp = k_pool.slice(..);
+        let vp = v_pool.slice(..);
+        let csq = cu_seqlens_q.slice(..);
+        let po = pos_offsets.slice(..);
+        let bt = block_tables.slice(..);
+        let ns = num_seqs as i32;
+        let nqi = num_heads as i32;
+        let nkvi = num_kv_heads as i32;
+        let hdi = head_dim as i32;
+        let mbps = max_blocks_per_seq as i32;
+        let bsi = block_size as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(&csq);
+        b.arg(&po);
+        b.arg(&bt);
+        b.arg(out);
+        b.arg(&ns);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mbps);
+        b.arg(&bsi);
+        b.arg(&scale);
+        let shared_bytes = (max_kv_len.max(1) as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| FerrumError::model(format!("paged_varlen_attn: {e}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        qkv_byte_offset: u64,
+        q_norm_w: &Self::Buffer,
+        k_norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        q_out_byte_offset: u64,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        block_table: &Self::Buffer,
+        tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        qk_mode: i32,
+        cache_len: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "split_qkv_norm_rope_into_paged_cache",
+            ptx::SPLIT_QKV_NORM_ROPE_INTO_PAGED_CACHE,
+            "split_qkv_norm_rope_into_paged_cache_f16",
+        );
+        let stream = ctx.stream.clone();
+        let qkv_byte_offset_u64 = qkv_byte_offset;
+        let q_out_byte_offset_u64 = q_out_byte_offset;
+        let tokens_i32 = tokens as i32;
+        let q_heads_i32 = q_heads as i32;
+        let kv_heads_i32 = kv_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let pos_offset_i32 = pos_offset as i32;
+        let cache_len_i32 = cache_len as i32;
+        let block_size_i32 = block_size as i32;
+        let max_blocks_per_seq_i32 = max_blocks_per_seq as i32;
+        let qk_mode_i32 = qk_mode;
+        let mut b = stream.launch_builder(&func);
+        b.arg(qkv);
+        b.arg(&qkv_byte_offset_u64);
+        b.arg(q_norm_w);
+        b.arg(k_norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(q_out);
+        b.arg(&q_out_byte_offset_u64);
+        b.arg(cache_k);
+        b.arg(cache_v);
+        b.arg(block_table);
+        b.arg(&tokens_i32);
+        b.arg(&q_heads_i32);
+        b.arg(&kv_heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(&pos_offset_i32);
+        b.arg(&eps);
+        b.arg(&qk_mode_i32);
+        b.arg(&cache_len_i32);
+        b.arg(&block_size_i32);
+        b.arg(&max_blocks_per_seq_i32);
+        let total_heads = (q_heads + 2 * kv_heads) as u32;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (tokens as u32, total_heads, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache: {e}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache_varlen(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q_norm_w: &Self::Buffer,
+        k_norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        cu_seqlens_q: &Self::Buffer,
+        pos_offsets: &Self::Buffer,
+        block_tables: &Self::Buffer,
+        num_seqs: usize,
+        m_total: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        qk_mode: i32,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if m_total == 0 || num_seqs == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "split_qkv_norm_rope_into_paged_cache_varlen",
+            ptx::SPLIT_QKV_NORM_ROPE_INTO_PAGED_CACHE,
+            "split_qkv_norm_rope_into_paged_cache_varlen_f16",
+        );
+        let stream = ctx.stream.clone();
+        let num_seqs_i32 = num_seqs as i32;
+        let m_total_i32 = m_total as i32;
+        let q_heads_i32 = q_heads as i32;
+        let kv_heads_i32 = kv_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let qk_mode_i32 = qk_mode;
+        let block_size_i32 = block_size as i32;
+        let max_blocks_per_seq_i32 = max_blocks_per_seq as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(qkv);
+        b.arg(q_norm_w);
+        b.arg(k_norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(q_out);
+        b.arg(cache_k);
+        b.arg(cache_v);
+        b.arg(cu_seqlens_q);
+        b.arg(pos_offsets);
+        b.arg(block_tables);
+        b.arg(&num_seqs_i32);
+        b.arg(&m_total_i32);
+        b.arg(&q_heads_i32);
+        b.arg(&kv_heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(&eps);
+        b.arg(&qk_mode_i32);
+        b.arg(&block_size_i32);
+        b.arg(&max_blocks_per_seq_i32);
+        let total_heads = (q_heads + 2 * kv_heads) as u32;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (m_total as u32, total_heads, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| {
+            FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache_varlen: {e}"))
+        })
+    }
+
+    fn flash_attention_batched_per_cache(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_caches: &[&Self::Buffer],
+        v_caches: &[&Self::Buffer],
+        kv_lens: &Self::Buffer,
+        out: &mut Self::Buffer,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        scale: f32,
+        max_valid_kv: usize,
+        capacity: usize,
+        slot: usize,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        let m = k_caches.len();
+        if m == 0 {
+            return Ok(());
+        }
+        if v_caches.len() != m {
+            return Err(FerrumError::model(
+                "flash_attention_batched_per_cache: k/v length mismatch",
+            ));
+        }
+
+        let stream = ctx.stream.clone();
+        if m > BATCHED_SCRATCH_CAP {
+            return Err(FerrumError::model(format!(
+                "flash_attention_batched_per_cache: m={m} exceeds BATCHED_SCRATCH_CAP={BATCHED_SCRATCH_CAP}",
+            )));
+        }
+        if slot >= MAX_GRAPH_SLOTS {
+            return Err(FerrumError::model(format!(
+                "flash_attention_batched_per_cache: slot={slot} exceeds MAX_GRAPH_SLOTS={MAX_GRAPH_SLOTS}",
+            )));
+        }
+        let host_start = slot * BATCHED_SCRATCH_CAP;
+        let func = ctx.func(
+            "batched_decode_attn",
+            ptx::BATCHED_DECODE_ATTENTION,
+            "batched_decode_attention_f16",
+        );
+        let nq_i32 = nq as i32;
+        let nkv_i32 = nkv as i32;
+        let hd_i32 = hd as i32;
+        let capacity_i32 = capacity as i32;
+        // Shared mem must cover post-append max kv_len. Caller passes
+        // `max_valid_kv` already accounting for the +1; sizing also
+        // bounded by capacity to mirror the per-item kernel's pattern.
+        let shared_bytes = (max_valid_kv.min(capacity).max(1) as u32) * 4;
+        with_batched_scratch_mut(|slot_g| {
+            for i in 0..m {
+                let (kp, _) = k_caches[i].device_ptr(&stream);
+                let (vp, _) = v_caches[i].device_ptr(&stream);
+                slot_g.host_k_ptrs[host_start + i] = kp;
+                slot_g.host_v_ptrs[host_start + i] = vp;
+            }
+            // Two captured memcpys, each into its own per-slot region of
+            // process-global device scratch. Both host arrays + both
+            // device scratches live in BATCHED_SCRATCH (process-global,
+            // outlives every CudaState) — replay across decode calls is
+            // safe because no pointer dangles.
+            {
+                let k_host_slice: &[u64] = &slot_g.host_k_ptrs[host_start..host_start + m];
+                let mut view = slot_g.scratch_u64_k.slice_mut(host_start..host_start + m);
+                stream
+                    .memcpy_htod(k_host_slice, &mut view)
+                    .map_err(|e| FerrumError::model(format!("memcpy k_ptrs: {e}")))?;
+            }
+            {
+                let v_host_slice: &[u64] = &slot_g.host_v_ptrs[host_start..host_start + m];
+                let mut view = slot_g.scratch_u64_v.slice_mut(host_start..host_start + m);
+                stream
+                    .memcpy_htod(v_host_slice, &mut view)
+                    .map_err(|e| FerrumError::model(format!("memcpy v_ptrs: {e}")))?;
+            }
+            let k_ptrs_view = slot_g.scratch_u64_k.slice(host_start..host_start + m);
+            let v_ptrs_view = slot_g.scratch_u64_v.slice(host_start..host_start + m);
+            let kv_lens_dev = kv_lens;
+            let mut b = stream.launch_builder(&func);
+            b.arg(q);
+            b.arg(&k_ptrs_view);
+            b.arg(&v_ptrs_view);
+            b.arg(out);
+            b.arg(kv_lens_dev);
+            b.arg(&nq_i32);
+            b.arg(&nkv_i32);
+            b.arg(&hd_i32);
+            b.arg(&capacity_i32);
+            b.arg(&scale);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (nq as u32, m as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("flash_attn_batched: {e}")))?;
+            Ok::<(), FerrumError>(())
+        })?;
+        Ok(())
+    }
+
+    fn qk_norm_rope_batched_per_item(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        positions: &Self::Buffer,
+        m: usize,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+        mode: i32,
+    ) -> Result<()> {
+        let func = ctx.func(
+            "qk_norm_rope_batched",
+            ptx::QK_NORM_ROPE,
+            "qk_norm_rope_batched_decode_f16",
+        );
+        let m_i32 = m as i32;
+        let heads_i32 = heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(input);
+        b.arg(norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(output);
+        b.arg(&m_i32);
+        b.arg(&heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(positions);
+        b.arg(&eps);
+        b.arg(&mode);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (m as u32, heads as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qk_norm_rope_batched_per_item: {e}")))?;
+        Ok(())
+    }
+
     fn qk_norm_rope(
         ctx: &mut Self::Context,
         input: &Self::Buffer,
@@ -1073,19 +1840,21 @@ impl Backend for CudaBackend {
     // is already production-grade (112 tok/s on RTX PRO 6000 per pre-v2
     // benchmarks); wiring is a structural concern, not a kernel concern.
 
+    // Trait signature was tightened (`Self::QuantStore` instead of the
+    // historical 8-param `QuantWeights` shape). The CUDA path no longer
+    // dispatches through this entry — INT4 goes through `gemm_gptq +
+    // GptqStore`, k-quants stay on Metal/CPU. Stub kept so the trait
+    // is satisfied and the cuda feature builds on Linux.
     fn gemm_quant(
         _ctx: &mut Self::Context,
         _a: &Self::Buffer,
-        _weights: &QuantWeights<'_, Self>,
+        _weight: &Self::QuantStore,
         _out: &mut Self::Buffer,
         _m: usize,
-        _n: usize,
-        _k: usize,
-        kind: &QuantKind,
     ) -> Result<()> {
-        Err(FerrumError::unsupported(format!(
-            "CudaBackend::gemm_quant({kind:?}) deprecated — use gemm_gptq + GptqStore"
-        )))
+        Err(FerrumError::unsupported(
+            "CudaBackend::gemm_quant deprecated — use gemm_gptq + GptqStore",
+        ))
     }
 
     // ── GPTQ INT4 dispatch (Marlin default; Triton-rs alt via env) ──────
@@ -1094,7 +1863,7 @@ impl Backend for CudaBackend {
         qweight: &[i32],
         scales: &[f32],
         qzeros: &[i32],
-        _g_idx: Option<&[i32]>,
+        g_idx: Option<&[i32]>,
         bits: u32,
         group_size: usize,
         k: usize,
@@ -1105,6 +1874,7 @@ impl Backend for CudaBackend {
                 "CUDA GPTQ: only bits=4 supported (got {bits})"
             )));
         }
+        let _ = qzeros; // qzeros baked into Marlin scales path; unused for Marlin store
 
         // Path B: triton-rs w4a16 GPTQ kernel — operates on the on-disk
         // GPTQ tensor layout directly. Just upload the three tensors and
@@ -1135,9 +1905,43 @@ impl Backend for CudaBackend {
             ));
         }
 
+        // Detect desc_act=true (act-order GPTQ): g_idx is non-trivial.
+        // AutoGPTQ writes g_idx[k] = k/group_size for desc_act=false; any
+        // deviation = act-order. Build perm = argsort(g_idx) and permute
+        // qweight rows so that group_idx = i / group_size after the perm
+        // (matches Marlin's sequential group access). Standard scales/zeros
+        // layout works because they're already indexed by group, not by k.
+        let (qweight_for_repack, perm_dev_opt): (Vec<i32>, Option<CudaSlice<i32>>) =
+            if let Some(gx) = g_idx {
+                let is_desc_act = gx
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &g)| g != (i as i32) / group_size as i32);
+                if is_desc_act {
+                    // perm[i] = disk row whose g_idx is the i-th smallest.
+                    let mut perm: Vec<usize> = (0..k).collect();
+                    perm.sort_by_key(|&i| gx[i]);
+                    let permuted_qweight =
+                        crate::marlin::permute_gptq_qweight_rows(qweight, &perm, k, n);
+                    let perm_i32: Vec<i32> = perm.iter().map(|&p| p as i32).collect();
+                    let stream = default_stream();
+                    let perm_dev = stream
+                        .clone_htod(&perm_i32)
+                        .map_err(|e| FerrumError::model(format!("perm htod: {e}")))?;
+                    tracing::info!(
+                        "GPTQ load (Marlin + desc_act perm-aware): K={k} N={n} gs={group_size}"
+                    );
+                    (permuted_qweight, Some(perm_dev))
+                } else {
+                    (qweight.to_vec(), None)
+                }
+            } else {
+                (qweight.to_vec(), None)
+            };
+
         // Path A (default): Marlin. Repack on CPU, then upload. Matches
         // IST-DASLab/marlin Layer.pack().
-        let marlin_qweight_i32 = crate::marlin::repack_gptq_to_marlin(qweight, k, n);
+        let marlin_qweight_i32 = crate::marlin::repack_gptq_to_marlin(&qweight_for_repack, k, n);
         // Scales arrive as f32 but Marlin expects f16. Convert + permute.
         let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
         let marlin_scales_f16 =
@@ -1167,6 +1971,7 @@ impl Backend for CudaBackend {
             k,
             n,
             group_size: group_size as i32,
+            perm: perm_dev_opt,
         };
 
         // Wrap in the Marlin variant (or pass through, depending on cfg).
@@ -1191,10 +1996,7 @@ impl Backend for CudaBackend {
         // Branch on store variant (only present when triton-kernels is on).
         #[cfg(feature = "triton-kernels")]
         match weight {
-            GptqStoreCuda::Marlin(mw) => {
-                crate::marlin::marlin_gemm(&ctx.stream, a, mw, out, m as i32)
-                    .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
-            }
+            GptqStoreCuda::Marlin(mw) => marlin_gemm_with_perm(ctx, a, mw, out, m),
             GptqStoreCuda::Triton(tw) => {
                 // Pre-load (and cache) the CudaFunction once per CudaState.
                 // Subsequent calls hit the HashMap and skip the PTX parse.
@@ -1210,8 +2012,7 @@ impl Backend for CudaBackend {
         }
         #[cfg(not(feature = "triton-kernels"))]
         {
-            crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
-                .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+            marlin_gemm_with_perm(ctx, a, weight, out, m)
         }
     }
 
@@ -1459,34 +2260,59 @@ impl Drop for GraphSlotRaw {
 unsafe impl Send for GraphSlotRaw {}
 unsafe impl Sync for GraphSlotRaw {}
 
-static DECODE_GRAPH: std::sync::OnceLock<std::sync::RwLock<Option<GraphSlotRaw>>> =
+// Multi-slot graph cache, keyed by an opaque `u64`. Caller chooses the
+// key — the model uses `m_padded` (or 0 for single-item) so that
+// different batch shapes get their own captured graph instead of
+// thrashing a single slot at every shape change.
+//
+// Native CUDA microbench (graph_upload_bench.cu, 320 launches × 500 iters,
+// alternating two graph sizes) confirmed multi-slot replay is stable
+// at ~0.26ms/iter with no degradation vs single slot.
+static DECODE_GRAPHS: std::sync::OnceLock<std::sync::RwLock<HashMap<u64, GraphSlotRaw>>> =
     std::sync::OnceLock::new();
 
-fn graph_slot() -> &'static std::sync::RwLock<Option<GraphSlotRaw>> {
-    DECODE_GRAPH.get_or_init(|| std::sync::RwLock::new(None))
+fn graph_slots() -> &'static std::sync::RwLock<HashMap<u64, GraphSlotRaw>> {
+    DECODE_GRAPHS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 fn install_decode_graph_raw(
+    key: u64,
     cu_graph: cudarc::driver::sys::CUgraph,
     cu_graph_exec: cudarc::driver::sys::CUgraphExec,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
 ) {
-    *graph_slot().write().expect("DECODE_GRAPH poisoned") = Some(GraphSlotRaw {
-        cu_graph,
-        cu_graph_exec,
-        _stream: stream,
-    });
+    let mut g = graph_slots().write().expect("DECODE_GRAPHS poisoned");
+    g.insert(
+        key,
+        GraphSlotRaw {
+            cu_graph,
+            cu_graph_exec,
+            _stream: stream,
+        },
+    );
 }
 
-fn with_decode_graph<R>(f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>) -> Result<R> {
-    let guard = graph_slot().read().expect("DECODE_GRAPH poisoned");
-    f(guard.as_ref())
+fn with_decode_graph<R>(key: u64, f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>) -> Result<R> {
+    let guard = graph_slots().read().expect("DECODE_GRAPHS poisoned");
+    f(guard.get(&key))
 }
 
-/// Evict the cached graph — call this when model weights/scratch pointers
-/// change (e.g. scratch resize, model reload). Next decode will re-capture.
-pub fn invalidate_decode_graph() {
-    *graph_slot().write().expect("DECODE_GRAPH poisoned") = None;
+/// Evict ONE cached graph — call when its kernel-arg pointers (KV cache,
+/// scratch buffers) might be invalidated.
+pub fn invalidate_decode_graph(key: u64) {
+    graph_slots()
+        .write()
+        .expect("DECODE_GRAPHS poisoned")
+        .remove(&key);
+}
+
+/// Evict ALL cached graphs — used by hard reset (model reload, scratch
+/// realloc) when every captured pointer might be stale.
+pub fn invalidate_all_decode_graphs() {
+    graph_slots()
+        .write()
+        .expect("DECODE_GRAPHS poisoned")
+        .clear();
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1610,4 +2436,385 @@ fn with_blas_scalars<R>(f: impl FnOnce(&CudaSlice<f32>, &CudaSlice<f32>) -> R) -
     let g = blas_slot().read().expect("BLAS poisoned");
     let s = g.as_ref().expect("BLAS not init");
     f(&s.alpha_f32, &s.beta_f32)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Process-global batched-scratch device + host arrays
+// ────────────────────────────────────────────────────────────────────────
+//
+// Used by `kv_cache_append_batched_per_cache` and
+// `flash_attention_batched_per_cache`. CRITICAL for FERRUM_BATCHED_GRAPH=1:
+//
+//   * Captured graph contains `cuMemcpy(host_array, device_scratch, ...)`
+//     and kernel launches reading `device_scratch[slot..slot+m]`.
+//   * Captured memcpy reads HOST POINTER at REPLAY time
+//     (verified: cudarc_graph_shared_host_array_multi_memcpy).
+//   * Captured kernel arg holds a fixed device pointer.
+//
+// If either array lives in per-call CudaState, drop()-ing the state
+// between decode calls invalidates the pointer the captured graph
+// holds → 2nd replay's cuGraphLaunch SIGSEGVs inside libcuda.so.
+// Per-call new_context() in this file is exactly that pattern.
+// Process-global slot keeps both arrays alive forever.
+
+struct BatchedScratchSlot {
+    /// Device staging for K cache pointers (flash_attn read).
+    pub scratch_u64_k: CudaSlice<u64>,
+    /// Device staging for V cache pointers (flash_attn read).
+    pub scratch_u64_v: CudaSlice<u64>,
+    /// Device staging for K-or-V cache pointers (kv_cache_append read).
+    pub scratch_u64_cache: CudaSlice<u64>,
+    /// Host staging — captured memcpy reads these heap addresses on replay.
+    /// Box keeps stable heap address; static slot keeps Box alive forever.
+    pub host_k_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    pub host_v_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    pub host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+}
+unsafe impl Send for BatchedScratchSlot {}
+unsafe impl Sync for BatchedScratchSlot {}
+
+static BATCHED_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<BatchedScratchSlot>>> =
+    std::sync::OnceLock::new();
+
+fn batched_scratch_slot() -> &'static std::sync::RwLock<Option<BatchedScratchSlot>> {
+    BATCHED_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn ensure_batched_scratch(stream: &Arc<CudaStream>) {
+    {
+        let g = batched_scratch_slot()
+            .read()
+            .expect("BATCHED_SCRATCH poisoned");
+        if g.is_some() {
+            return;
+        }
+    }
+    let mut w = batched_scratch_slot()
+        .write()
+        .expect("BATCHED_SCRATCH poisoned");
+    if w.is_none() {
+        let scratch_u64_k = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+            .expect("batched scratch_u64_k alloc");
+        let scratch_u64_v = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+            .expect("batched scratch_u64_v alloc");
+        let scratch_u64_cache = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+            .expect("batched scratch_u64_cache alloc");
+        *w = Some(BatchedScratchSlot {
+            scratch_u64_k,
+            scratch_u64_v,
+            scratch_u64_cache,
+            host_k_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+            host_v_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+            host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
+        });
+    }
+}
+
+/// Access the process-global batched scratch for the duration of one
+/// captured-or-eager kernel call. Holds the slot's RwLock write guard
+/// for that duration — no other batched op runs concurrently (single
+/// stream, single decode_batch_internal at a time per iteration_lock).
+fn with_batched_scratch_mut<R>(f: impl FnOnce(&mut BatchedScratchSlot) -> R) -> R {
+    let mut g = batched_scratch_slot()
+        .write()
+        .expect("BATCHED_SCRATCH poisoned");
+    f(g.as_mut().expect("BatchedScratchSlot not initialised"))
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Process-global PTX module cache
+// ────────────────────────────────────────────────────────────────────────
+//
+// Same graph-capture lifetime requirement as cuBLAS workspace + batched
+// scratch above: cudarc records a CUfunction handle into the captured
+// graph's kernel node. CUfunction handles are owned by their CUmodule;
+// when the last Arc<CudaModule> drops, cudarc unloads the module and the
+// CUfunction goes invalid → captured graph's kernel node references a
+// stale handle → 2nd cuGraphLaunch SIGSEGVs inside libcuda.so.
+//
+// Per-CudaState `modules: HashMap<...>` was the third pointer-lifetime
+// bug in this file (after BLAS workspace and batched scratch). Routing
+// loads through a process-global cache keeps every loaded CudaModule
+// alive for the rest of the process — captured graphs always find a
+// valid CUfunction at replay time.
+//
+// CudaState still keeps its local HashMap as a hot-path cache so that
+// per-kernel launches don't lock the global Mutex.
+
+static MODULES: std::sync::OnceLock<std::sync::Mutex<HashMap<&'static str, Arc<CudaModule>>>> =
+    std::sync::OnceLock::new();
+
+fn modules_cache() -> &'static std::sync::Mutex<HashMap<&'static str, Arc<CudaModule>>> {
+    MODULES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Perm-aware Marlin GEMM (desc_act=true GPTQ act-order)
+// ────────────────────────────────────────────────────────────────────────
+//
+// When MarlinWeight.perm is Some, the qweight rows have been permuted at
+// load time by `argsort(g_idx)`. For the standard Marlin kernel to compute
+// the un-permuted GEMM result, we gather input columns by the same perm
+// before the call: input_perm[m, j] = input[m, perm[j]]. After:
+//   y[n] = Σⱼ input_perm[m, j] · dequant(qweight_sorted[j, n])
+//        = Σⱼ input[m, perm[j]] · dequant(qweight[perm[j], n])  (let k = perm[j])
+//        = Σ_k input[m, k] · dequant(qweight[k, n])             ← un-permuted GEMM
+//
+// Same approach as vLLM's gptq_marlin runtime gather. Adds one f16 column
+// gather kernel per Marlin call (~10us on H≤14336 / m≤32) — net cost
+// dominated by the Marlin GEMM that follows, not the gather.
+
+#[cfg(feature = "marlin")]
+/// Process-global scratch buffer for the perm-aware Marlin's `a_gathered`
+/// staging slot. Without this, every `marlin_gemm_with_perm` call did
+/// `stream.alloc::<f16>(m * k)` and dropped at scope end — cudarc's
+/// allocator pool grew unboundedly (≥ 32 MB / iter × 200 iters → ~6 GB
+/// VRAM after one c=16 bench rep, OOM on rep 2). Now we keep one slot
+/// per process, grown on demand to the largest `m * k` ever requested.
+struct MarlinGatherScratch {
+    buf: CudaSlice<f16>,
+    capacity: usize, // in f16 elements
+}
+unsafe impl Send for MarlinGatherScratch {}
+unsafe impl Sync for MarlinGatherScratch {}
+
+static MARLIN_GATHER_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<MarlinGatherScratch>>> =
+    std::sync::OnceLock::new();
+
+fn marlin_gather_scratch_slot() -> &'static std::sync::RwLock<Option<MarlinGatherScratch>> {
+    MARLIN_GATHER_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Run `body` with a mut ref to a Marlin-gather scratch buffer of at
+/// least `required` f16 elements. Reuses the existing slot if it fits;
+/// reallocates (replacing the old one) if it needs to grow.
+/// Pre-grow the marlin_gather_scratch slot to at least `required`
+/// elements. Idempotent. Used by callers that are about to enter a
+/// CUDA-graph capture region — `with_marlin_gather_scratch`'s
+/// in-place grow does `stream.alloc::<f16>(required)`, and CUDA
+/// graph capture rejects runtime allocs inside the captured region
+/// with `CUDA_ERROR_INVALID_VALUE`. Pre-warming OUTSIDE the capture
+/// keeps the alloc eager, the capture-region kernel launches just
+/// re-use the existing slot's pointer.
+#[cfg(feature = "marlin")]
+pub fn pregrow_marlin_gather_scratch(stream: &Arc<CudaStream>, required: usize) {
+    let slot = marlin_gather_scratch_slot();
+    {
+        let g = slot.read().expect("MARLIN_GATHER_SCRATCH poisoned");
+        if let Some(ref s) = *g {
+            if s.capacity >= required {
+                return;
+            }
+        }
+    }
+    let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+    let need_new = match &*w {
+        Some(s) => s.capacity < required,
+        None => true,
+    };
+    if need_new {
+        let buf = unsafe { stream.alloc::<f16>(required) }
+            .expect("MARLIN_GATHER_SCRATCH pregrow alloc failed");
+        *w = Some(MarlinGatherScratch {
+            buf,
+            capacity: required,
+        });
+    }
+}
+
+fn with_marlin_gather_scratch<R>(
+    stream: &Arc<CudaStream>,
+    required: usize,
+    body: impl FnOnce(&mut CudaSlice<f16>) -> R,
+) -> R {
+    let slot = marlin_gather_scratch_slot();
+    {
+        let g = slot.read().expect("MARLIN_GATHER_SCRATCH poisoned");
+        if let Some(ref s) = *g {
+            if s.capacity >= required {
+                drop(g);
+                let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+                let s = w.as_mut().expect("just observed Some");
+                return body(&mut s.buf);
+            }
+        }
+    }
+    // Need to (re)allocate.
+    let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+    let need_new = match &*w {
+        Some(s) => s.capacity < required,
+        None => true,
+    };
+    if need_new {
+        let buf =
+            unsafe { stream.alloc::<f16>(required) }.expect("MARLIN_GATHER_SCRATCH alloc failed");
+        *w = Some(MarlinGatherScratch {
+            buf,
+            capacity: required,
+        });
+    }
+    let s = w.as_mut().expect("just allocated");
+    body(&mut s.buf)
+}
+
+fn marlin_gemm_with_perm(
+    ctx: &mut CudaState,
+    a: &CudaSlice<f16>,
+    weight: &crate::marlin::MarlinWeight,
+    out: &mut CudaSlice<f16>,
+    m: usize,
+) -> Result<()> {
+    let use_vllm = std::env::var("FERRUM_VLLM_MARLIN").map_or(false, |v| v == "1");
+
+    if let Some(perm) = weight.perm.as_ref() {
+        let k = weight.k;
+        let stream = ctx.stream.clone();
+        let func = ctx.func("gather_columns", ptx::GATHER_COLUMNS, "gather_columns_f16");
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let block_x: u32 = 512;
+        let grid_y: u32 = ((k as u32) + block_x - 1) / block_x;
+        // Borrow the gather-scratch slot for the entire (gather +
+        // marlin_gemm) sequence so the GPU work using `a_gathered`
+        // completes (or at least gets stream-ordered) before another
+        // marlin_gemm_with_perm caller can grab the same buffer.
+        // RwLock write-guard is held across the launch+marlin_gemm
+        // calls; both queue async on the same `stream`, and the next
+        // caller's Marlin work also serialises on this stream — so
+        // even a weaker single-slot pool is correct as long as we
+        // don't leave the function before the kernel queues complete.
+        with_marlin_gather_scratch(&stream, m * k, |a_gathered| -> Result<()> {
+            let mut b = stream.launch_builder(&func);
+            b.arg(a);
+            b.arg(perm);
+            b.arg(&mut *a_gathered);
+            b.arg(&m_i32);
+            b.arg(&k_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (m as u32, grid_y, 1),
+                    block_dim: (block_x, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
+            if use_vllm {
+                return launch_vllm_marlin(&ctx.stream, a_gathered, weight, out, m);
+            }
+            crate::marlin::marlin_gemm(&ctx.stream, a_gathered, weight, out, m as i32)
+                .map_err(|e| FerrumError::model(format!("marlin_gemm (perm): {e}")))
+        })
+    } else {
+        if use_vllm {
+            return launch_vllm_marlin(&ctx.stream, a, weight, out, m);
+        }
+        crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
+            .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
+    }
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn launch_vllm_marlin(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    a: &CudaSlice<f16>,
+    weight: &crate::marlin::MarlinWeight,
+    out: &mut CudaSlice<f16>,
+    m: usize,
+) -> Result<()> {
+    use cudarc::driver::DevicePtr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static VLLM_MARLIN_CALLS: AtomicU64 = AtomicU64::new(0);
+    let n = VLLM_MARLIN_CALLS.fetch_add(1, Ordering::Relaxed);
+    if n == 0 || n.is_multiple_of(1024) {
+        eprintln!(
+            "[vllm-marlin] launch #{n} m={m} n={} k={} group_size={}",
+            weight.n, weight.k, weight.group_size,
+        );
+    }
+    // Zero workspace (it's used as mutex locks in vLLM's marlin too).
+    {
+        let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
+        let raw_stream = stream.cu_stream();
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, weight.workspace.len(), raw_stream);
+        }
+    }
+    let (a_ptr, _g_a) = a.device_ptr(stream);
+    let (b_ptr, _g_b) = weight.qweight.device_ptr(stream);
+    let (c_ptr, _g_c) = out.device_ptr(stream);
+    let (s_ptr, _g_s) = weight.scales.device_ptr(stream);
+    let (ws_ptr, _g_w) = weight.workspace.device_ptr(stream);
+    let raw_stream = stream.cu_stream();
+    let n = weight.n as i32;
+    let k = weight.k as i32;
+    let group_size = weight.group_size;
+    let num_groups = if group_size > 0 { k / group_size } else { 1 };
+    // RTX 4090 = 128 SMs. TODO: query CudaDevice attribute.
+    let sms = std::env::var("FERRUM_VLLM_MARLIN_SMS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(128);
+    // vLLM perf knobs — try toggling via env to see if either helps.
+    let use_atomic_add = std::env::var("FERRUM_VLLM_ATOMIC_ADD").map_or(false, |v| v == "1");
+    let use_fp32_reduce = std::env::var("FERRUM_VLLM_FP32_REDUCE").map_or(false, |v| v == "1");
+
+    unsafe {
+        crate::vllm_marlin::launch_marlin_mm_f16_u4b8(
+            a_ptr as *const _,
+            b_ptr as *const _,
+            c_ptr as *mut _,
+            std::ptr::null_mut(), // C_tmp (use_fp32_reduce=false)
+            std::ptr::null_mut(), // a_s   (FP16 act, no per-token scale)
+            s_ptr as *mut _,      // b_s
+            std::ptr::null_mut(), // g_idx (we already gathered A by perm)
+            std::ptr::null_mut(), // perm  (ditto)
+            std::ptr::null_mut(), // a_tmp
+            m as i32,
+            n,
+            k,
+            k, // lda = K (row-major FP16 A)
+            ws_ptr as *mut _,
+            false, // has_act_order — pre-applied via perm-gather
+            true,  // is_k_full
+            num_groups,
+            group_size,
+            0, // dev
+            raw_stream as cudarc::driver::sys::CUstream,
+            sms,
+            use_atomic_add,
+            use_fp32_reduce,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vllm-marlin"))]
+fn launch_vllm_marlin(
+    _stream: &Arc<cudarc::driver::CudaStream>,
+    _a: &CudaSlice<f16>,
+    _weight: &crate::marlin::MarlinWeight,
+    _out: &mut CudaSlice<f16>,
+    _m: usize,
+) -> Result<()> {
+    Err(FerrumError::model(
+        "FERRUM_VLLM_MARLIN=1 set but binary not built with --features vllm-marlin",
+    ))
+}
+
+fn ensure_module(ctx: &Arc<CudaContext>, key: &'static str, ptx_src: &str) -> Arc<CudaModule> {
+    {
+        let g = modules_cache().lock().expect("MODULES poisoned");
+        if let Some(m) = g.get(key) {
+            return m.clone();
+        }
+    }
+    let mut g = modules_cache().lock().expect("MODULES poisoned");
+    if let Some(m) = g.get(key) {
+        return m.clone();
+    }
+    let m = ctx
+        .load_module(Ptx::from_src(ptx_src.to_string()))
+        .unwrap_or_else(|e| panic!("CudaBackend: load_module({key}): {e}"));
+    g.insert(key, m.clone());
+    m
 }

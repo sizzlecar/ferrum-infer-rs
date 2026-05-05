@@ -366,6 +366,44 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         }
         let in_features = qw_shape[0] * 8;
         let out_features = qw_shape[1];
+
+        // desc_act=true detection. AutoGPTQ writes g_idx[k] = k/group_size
+        // for desc_act=false (trivial). Non-monotonic values → act-order.
+        let is_desc_act = g_idx.as_ref().map_or(false, |gx| {
+            !gx.iter()
+                .enumerate()
+                .all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32)
+        });
+
+        // Act-order GPTQ. CUDA backend has perm-aware Marlin (load_gptq
+        // builds perm = argsort(g_idx) + permutes qweight rows at load;
+        // gemm_gptq gathers input columns before the standard Marlin call).
+        // CPU/Metal still need the dequant→DenseLinear fallback.
+        #[cfg(not(feature = "cuda"))]
+        if is_desc_act {
+            let dequant_f32 = dequantize_gptq_with_g_idx(
+                &qweight,
+                &scales_f32,
+                &qzeros,
+                g_idx.as_ref().expect("desc_act=true requires g_idx"),
+                qcfg.group_size,
+                in_features,
+                out_features,
+            );
+            let mut linear =
+                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features);
+            let bias_key = format!("{name}.bias");
+            if self.has(&bias_key) {
+                let (bias, _) = self.read_f32(&bias_key)?;
+                linear = linear.with_bias(B::from_slice(&bias));
+            }
+            tracing::info!(
+                "GPTQ load (desc_act dequant→DenseLinear, non-cuda): name={name} K={in_features} N={out_features}"
+            );
+            return Ok(Box::new(linear));
+        }
+        #[cfg(feature = "cuda")]
+        let _ = is_desc_act; // CUDA: g_idx threaded through to GptqLinear below
         if sc_shape.len() != 2 || sc_shape[1] != out_features {
             return Err(FerrumError::model(format!(
                 "'{name}.scales' {sc_shape:?} incompatible with qweight {qw_shape:?}"
@@ -488,6 +526,53 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
 
         let in_features = qw_rows * 8;
         let out_features = total_n;
+
+        // desc_act detection — same as load_gptq_linear. Q/K/V (or
+        // gate/up) share K, so g_idx from first part covers all.
+        let is_desc_act = g_idx.as_ref().map_or(false, |gx| {
+            !gx.iter()
+                .enumerate()
+                .all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32)
+        });
+        // CUDA: perm-aware Marlin via load_gptq. CPU/Metal: dequant→Dense.
+        #[cfg(not(feature = "cuda"))]
+        if is_desc_act {
+            let dequant_f32 = dequantize_gptq_with_g_idx(
+                &qw_acc,
+                &sc_acc,
+                &qz_acc,
+                g_idx.as_ref().expect("desc_act=true requires g_idx"),
+                qcfg.group_size,
+                in_features,
+                out_features,
+            );
+            let mut linear =
+                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features);
+            let mut bias_acc: Vec<f32> = Vec::new();
+            let mut any_bias = false;
+            for p in parts {
+                let bk = format!("{p}.bias");
+                if self.has(&bk) {
+                    any_bias = true;
+                    bias_acc.extend_from_slice(&self.read_f32(&bk)?.0);
+                } else if any_bias {
+                    return Err(FerrumError::model(format!(
+                        "GPTQ fusion bias mix: '{p}' has no bias but earlier part did"
+                    )));
+                }
+            }
+            if any_bias {
+                linear = linear.with_bias(B::from_slice(&bias_acc));
+            }
+            tracing::info!(
+                "GPTQ fused load (desc_act dequant→DenseLinear, non-cuda): K={in_features} N={out_features} parts={}",
+                parts.len()
+            );
+            return Ok(Box::new(linear));
+        }
+        #[cfg(feature = "cuda")]
+        let _ = is_desc_act;
+
         let mut linear = GptqLinear::<B>::from_raw(
             &qw_acc,
             &sc_acc,
@@ -554,6 +639,54 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         }
         Ok((total_rows, cols, out))
     }
+}
+
+/// Dequantise GPTQ INT4 weights with desc_act=true (act-order) g_idx and
+/// return original-order f32 weights laid out `[N, K]` row-major (matches
+/// `DenseLinear::from_rows`).
+///
+/// Key insight: in AutoGPTQ desc_act format, qweight rows are NOT
+/// permuted from original-K order. The act-order trick is encoded purely
+/// in `g_idx[k]` — which records the QUANTISATION GROUP (not column
+/// position) chosen for disk row k. Different rows that originally
+/// belonged to far-apart positions can share a group via g_idx.
+///
+/// Verified against vLLM's exllama path (gptq.py:368): for desc_act it
+/// runs `g_idx ← argsort(g_idx)` then `gptq_shuffle(qweight, g_idx)`,
+/// which physically reorders qweight by argsort and gathers x by argsort
+/// at GEMM. Net effect: y[n] = Σⱼ x[j] · dequant(qweight[j, n],
+/// scales[g_idx_orig[j], n], qzeros[g_idx_orig[j], n]).
+/// → disk_k IS original_k; only the (scale, zero) LOOKUP differs.
+#[cfg(not(feature = "cuda"))]
+fn dequantize_gptq_with_g_idx(
+    qweight: &[i32], // [K/8, N] packed int4
+    scales: &[f32],  // [num_groups, N]
+    qzeros: &[i32],  // [num_groups, N/8] packed int4
+    g_idx: &[i32],   // [K]
+    _group_size: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(g_idx.len(), k);
+
+    // Output: [N, K] row-major → out[col * k + k_idx] = value.
+    let mut w = vec![0.0f32; n * k];
+    let packed_rows = k / 8;
+    for pr in 0..packed_rows {
+        for col in 0..n {
+            let packed = qweight[pr * n + col] as u32;
+            for bi in 0..8 {
+                let ki = pr * 8 + bi;
+                let q = ((packed >> (bi * 4)) & 0xF) as i32;
+                let g = g_idx[ki] as usize;
+                let scale = scales[g * n + col];
+                let z_packed = qzeros[g * (n / 8) + (col / 8)] as u32;
+                let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
+                w[col * k + ki] = (q - zero) as f32 * scale;
+            }
+        }
+    }
+    w
 }
 
 fn dtype_to_f32(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {

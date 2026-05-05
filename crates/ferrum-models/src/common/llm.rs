@@ -119,6 +119,41 @@ pub trait DecoderOnlyLLM: Send + Sync {
         out
     }
 
+    /// Unified mixed-batch forward (chunked-prefill API).
+    ///
+    /// Accepts a heterogeneous batch where each item is `(cache_id,
+    /// q_tokens, pos_offset, is_final_chunk)`:
+    /// - `q_tokens.len() == 1` & `is_final_chunk == true` → decode step
+    /// - `q_tokens.len() >= 1` & `is_final_chunk == true` → final
+    ///   prefill chunk (returns logits for sampling)
+    /// - `q_tokens.len() >= 1` & `is_final_chunk == false` → intermediate
+    ///   prefill chunk (advances KV state, returns None)
+    ///
+    /// `pos_offset` is the absolute KV position of the first q-token
+    /// for that sequence (0 for fresh prefill, prior `kv_len` for
+    /// continuing chunks or decode steps).
+    ///
+    /// Returns one entry per `items[i]`: `Some(logits)` iff
+    /// `is_final_chunk == true`, else `None`.
+    ///
+    /// Default implementation: returns `Err(unsupported)`. Concrete
+    /// models that support a true unified forward (single forward pass
+    /// over the concatenated `[M_total, hidden]` tensor + varlen
+    /// attention) override this. The engine's caller (`LlmExecutor`)
+    /// recognises the unsupported error and falls back to splitting
+    /// the batch into per-item `prefill()` and a single `decode_batch()`
+    /// — behaviour-preserving but doesn't get the chunked-prefill perf
+    /// win until the model exposes a real unified path.
+    #[allow(clippy::type_complexity)]
+    fn unified_forward(
+        &mut self,
+        _items: &[(String, Vec<u32>, usize, bool)],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, ferrum_types::FerrumError> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "unified_forward not implemented for this model",
+        ))
+    }
+
     /// Release the KV cache for a completed sequence.
     fn release(&mut self, cache_id: &str);
 

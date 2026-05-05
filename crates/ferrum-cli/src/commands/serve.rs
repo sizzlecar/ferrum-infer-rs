@@ -97,10 +97,32 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         None
     };
 
+    // Local safetensors directory passthrough: if `--model` is a path to
+    // a directory containing `config.json` (the canonical HF safetensors
+    // layout), use it directly without going through the HF cache lookup.
+    // Lets bench scripts / tooling point at any locally-staged model
+    // (e.g. `--local-dir` pulls or symlinked snapshots) without having
+    // to mimic the `models--owner--repo/snapshots/<sha>/` cache layout.
+    let local_dir_path: Option<PathBuf> = if gguf_path.is_none() {
+        let p = PathBuf::from(&model_name);
+        if p.is_dir() && p.join("config.json").is_file() {
+            Some(p)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let model_id = if let Some(p) = gguf_path.as_ref() {
         // Use the GGUF stem as the OpenAI model id — the user sees this
         // back in /v1/models responses + chat completion `model` field.
         p.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| model_name.clone())
+    } else if let Some(p) = local_dir_path.as_ref() {
+        // Local safetensors dir → use the dir name as the public id.
+        p.file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| model_name.clone())
     } else {
@@ -118,6 +140,15 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             local_path: p,
             format: ModelFormat::Unknown, // GGUF — handled by engine
             from_cache: true,
+        }
+    } else if let Some(p) = local_dir_path.clone() {
+        // Local safetensors directory passed via --model.
+        println!("{} {}", "Path:".dimmed(), p.display());
+        ferrum_models::source::ResolvedModelSource {
+            original: model_name.clone(),
+            local_path: p,
+            format: ModelFormat::SafeTensors,
+            from_cache: false,
         }
     } else {
         // Find cached model

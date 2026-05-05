@@ -19,7 +19,15 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_kernels::backend::{Backend, KvCache};
+use ferrum_kernels::backend::{Backend, KvCache, MAX_LAYERS_FOR_GRAPH};
+
+/// Graph cache key for the single-item decode path (`decode_internal`).
+/// Distinct from any `m_padded`-based key used by the batched path.
+const SINGLE_ITEM_GRAPH_KEY: u64 = 0;
+
+/// Diag counters for the batched graph dispatcher (replay vs eager).
+static BATCHED_GRAPH_REPLAY_COUNT: AtomicU64 = AtomicU64::new(0);
+static BATCHED_GRAPH_EAGER_COUNT: AtomicU64 = AtomicU64::new(0);
 
 static ATTN_TIME_US: AtomicU64 = AtomicU64::new(0);
 static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -253,6 +261,64 @@ pub struct LlamaFamilyScratch<B: Backend> {
     /// `max_blocks_per_seq` value baked into the stacked block_tables
     /// stride. Set when `paged_batch_block_tables` is allocated.
     pub paged_max_blocks_per_seq: usize,
+    /// Engine-side max concurrent sequences (= `FERRUM_PAGED_MAX_SEQS`).
+    /// Pinned at the first `enable_paged_batch` so the unified-forward
+    /// scratch sizes (`unified_cu_seqlens_q`, `unified_pos_offsets`,
+    /// `unified_block_tables`, `unified_packed_*`) are big enough for
+    /// any subsequent batch up to that bound.
+    pub paged_max_seqs: usize,
+    /// Per-item RoPE positions for the batched-decode path (`[max_M]`
+    /// i32 / u32). Written host-side once per batched-decode step from
+    /// each request's `pos` field, read by the batched
+    /// `qk_norm_rope_batched_per_item` CUDA kernel.
+    pub batch_positions: B::Buffer,
+    /// Per-item input token ids for the batched-decode path (`[max_M]`
+    /// u32). Written once per call before forward; read by the
+    /// graph-capture-friendly `embedding_lookup_batched_dyn` variant.
+    pub batch_tokens: B::Buffer,
+    /// Per-item KV-cache length BEFORE this step's kv_append
+    /// (`[max_M]` u32). Used by `kv_cache_append_batched_per_cache_dyn`
+    /// to write at the right slot for graph replay.
+    pub batch_kv_lens_pre: B::Buffer,
+    /// Per-item KV-cache length AFTER this step's kv_append
+    /// (`[max_M]` u32 = pre + 1). Used by
+    /// `flash_attention_batched_per_cache_dyn` for the attention
+    /// reduce window length.
+    pub batch_kv_lens_post: B::Buffer,
+    /// Output buffers for the batched per-item qk_norm_rope kernel.
+    /// Same shape as q_buf / k_buf / v_buf — separate so the kernel
+    /// API can take `&input` and `&mut output` without aliasing.
+    pub q_normed_batched: B::Buffer,
+    pub k_normed_batched: B::Buffer,
+    pub v_normed_batched: B::Buffer,
+
+    // ── Unified mixed-batch scratch (chunked-prefill path; Step 5b) ─────
+    // Buffers sized for `M_total = sum(items[i].q_tokens.len())`. Grown
+    // on demand by `ensure_unified_scratch(M_total_max)`. Used only by
+    // the new `unified_forward_internal`; legacy `forward_layer_batched_decode`
+    // continues to use the per-item-stride scratch above.
+    pub unified_capacity: usize, // current allocated M_total slots
+    pub unified_residual: Option<B::Buffer>,
+    pub unified_norm_out: Option<B::Buffer>,
+    pub unified_qkv_out: Option<B::Buffer>,
+    pub unified_packed_q: Option<B::Buffer>,
+    pub unified_attn_out: Option<B::Buffer>,
+    pub unified_o_proj_out: Option<B::Buffer>,
+    pub unified_gate_up_out: Option<B::Buffer>,
+    pub unified_silu_out: Option<B::Buffer>,
+    pub unified_mlp_out: Option<B::Buffer>,
+    /// Per-item index buffers (i32-stored-as-f16): cu_seqlens_q is
+    /// length `max_seqs+1`, pos_offsets is `max_seqs`, block_tables is
+    /// `max_seqs * max_blocks_per_seq`. Sized once at first use to
+    /// match `paged_batch_*` capacity since they share `max_seqs`.
+    pub unified_cu_seqlens_q: Option<B::Buffer>,
+    pub unified_pos_offsets: Option<B::Buffer>,
+    pub unified_block_tables: Option<B::Buffer>,
+    /// Packed last-token hidden states for is_final_chunk items
+    /// (`[num_sampled, h]`). Used as input to lm_head.
+    pub unified_packed_normed: Option<B::Buffer>,
+    /// Packed logits output (`[num_sampled, vocab]`).
+    pub unified_packed_logits: Option<B::Buffer>,
     /// Last token's hidden state (`[h]`). For prefill this is populated via
     /// `copy_slice(residual, (seq_len-1)*h, ..)`; for decode `residual` already
     /// holds only 1 row so `last_hidden` is unused on that path.
@@ -310,8 +376,73 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             paged_batch_block_tables: None,
             paged_batch_context_lens: None,
             paged_max_blocks_per_seq: 0,
+            paged_max_seqs: 0,
+            batch_positions: B::alloc_u32(t.max(1)),
+            batch_tokens: B::alloc_u32(t.max(1)),
+            batch_kv_lens_pre: B::alloc_u32(t.max(1)),
+            batch_kv_lens_post: B::alloc_u32(t.max(1)),
+            q_normed_batched: B::alloc(t * q_dim),
+            k_normed_batched: B::alloc(t * kv_dim),
+            v_normed_batched: B::alloc(t * kv_dim),
+            unified_capacity: 0,
+            unified_residual: None,
+            unified_norm_out: None,
+            unified_qkv_out: None,
+            unified_packed_q: None,
+            unified_attn_out: None,
+            unified_o_proj_out: None,
+            unified_gate_up_out: None,
+            unified_silu_out: None,
+            unified_mlp_out: None,
+            unified_cu_seqlens_q: None,
+            unified_pos_offsets: None,
+            unified_block_tables: None,
+            unified_packed_normed: None,
+            unified_packed_logits: None,
             max_tokens: t,
         }
+    }
+
+    /// Grow unified-path scratch buffers to accommodate `m_total` query
+    /// tokens. Called lazily from `unified_forward_internal` so single-
+    /// path workloads (no chunked prefill) don't pay the alloc cost.
+    fn ensure_unified_scratch(
+        &mut self,
+        cfg: &LlamaFamilyConfig,
+        m_total: usize,
+        max_seqs: usize,
+        max_blocks_per_seq: usize,
+    ) {
+        if m_total <= self.unified_capacity
+            && self.unified_residual.is_some()
+            && self.unified_cu_seqlens_q.is_some()
+        {
+            return;
+        }
+        let cap = m_total.max(self.unified_capacity).max(1);
+        let h = cfg.hidden_size;
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let im = cfg.intermediate_size;
+        let v = cfg.vocab_size;
+        self.unified_residual = Some(B::alloc(cap * h));
+        self.unified_norm_out = Some(B::alloc(cap * h));
+        self.unified_qkv_out = Some(B::alloc(cap * qkv_dim));
+        self.unified_packed_q = Some(B::alloc(cap * q_dim));
+        self.unified_attn_out = Some(B::alloc(cap * q_dim));
+        self.unified_o_proj_out = Some(B::alloc(cap * h));
+        self.unified_gate_up_out = Some(B::alloc(cap * 2 * im));
+        self.unified_silu_out = Some(B::alloc(cap * im));
+        self.unified_mlp_out = Some(B::alloc(cap * h));
+        if self.unified_cu_seqlens_q.is_none() {
+            self.unified_cu_seqlens_q = Some(B::alloc_u32(max_seqs + 1));
+            self.unified_pos_offsets = Some(B::alloc_u32(max_seqs));
+            self.unified_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
+            self.unified_packed_normed = Some(B::alloc(max_seqs * h));
+            self.unified_packed_logits = Some(B::alloc(max_seqs * v));
+        }
+        self.unified_capacity = cap;
     }
 
     /// Allocate scratch for batched paged dispatch (Phase 4b). Called
@@ -332,6 +463,7 @@ impl<B: Backend> LlamaFamilyScratch<B> {
         self.paged_batch_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
         self.paged_batch_context_lens = Some(B::alloc_u32(max_seqs));
         self.paged_max_blocks_per_seq = max_blocks_per_seq;
+        self.paged_max_seqs = max_seqs;
     }
 }
 
@@ -393,6 +525,26 @@ pub struct LlamaFamilyModel<B: Backend> {
     /// True if capture was attempted but failed (e.g. backend doesn't
     /// support graph capture). Stops further attempts, falls back to eager.
     graph_capture_failed: bool,
+    /// Same warmup counter for the batched-decode path.
+    batched_graph_warmup: usize,
+    /// True if batched graph capture failed.
+    batched_graph_failed: bool,
+    /// Set of `m_padded` values (as u64 graph keys) for which a batched
+    /// graph has been captured. Multi-slot via cuda.rs's HashMap-keyed
+    /// graph cache — different batch shapes don't thrash a single slot.
+    batched_graph_keys_seen: std::collections::HashSet<u64>,
+    /// Cache IDs for which device-pointer scratch is currently populated.
+    /// Populate only re-runs when the batch composition changes (new
+    /// requests joined / requests finished). Hot-path optimization:
+    /// avoids 3 sync cuMemcpyHtoD_v2's per decode token (~5% TPOT).
+    batched_pointers_for: Option<Vec<String>>,
+    /// CUDA-graph state for the unified_forward path. Mirrors the
+    /// `batched_graph_*` triple but keyed on `(m_total, num_seqs)`
+    /// so different concurrency levels each get their own cached
+    /// graph instead of thrashing a single slot.
+    unified_graph_warmup: usize,
+    unified_graph_failed: bool,
+    unified_graph_keys_seen: std::collections::HashSet<u64>,
 }
 
 impl<B: Backend> LlamaFamilyModel<B> {
@@ -407,7 +559,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // pointers. Matters for test suites where multiple models coexist.
         {
             let mut ctx = B::new_context();
-            B::reset_graph(&mut ctx);
+            B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg);
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1); // decode-sized; prefill resizes
@@ -498,6 +650,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
             paged_block_alloc: None,
             graph_warmup: 0,
             graph_capture_failed: false,
+            batched_graph_warmup: 0,
+            batched_graph_failed: false,
+            batched_graph_keys_seen: std::collections::HashSet::new(),
+            batched_pointers_for: None,
+            unified_graph_warmup: 0,
+            unified_graph_failed: false,
+            unified_graph_keys_seen: std::collections::HashSet::new(),
         })
     }
 
@@ -516,7 +675,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // See `new` — invalidate stale graph referring to prior model's scratch.
         {
             let mut ctx = B::new_context();
-            B::reset_graph(&mut ctx);
+            B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg);
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
@@ -574,6 +733,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
             paged_block_alloc: None,
             graph_warmup: 0,
             graph_capture_failed: false,
+            batched_graph_warmup: 0,
+            batched_graph_failed: false,
+            batched_graph_keys_seen: std::collections::HashSet::new(),
+            batched_pointers_for: None,
+            unified_graph_warmup: 0,
+            unified_graph_failed: false,
+            unified_graph_keys_seen: std::collections::HashSet::new(),
         })
     }
 
@@ -581,16 +747,22 @@ impl<B: Backend> LlamaFamilyModel<B> {
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
         if self.scratch.max_tokens < tokens {
             // Any captured decode graph holds pointers to the old scratch
-            // buffers; those are about to be freed. Invalidate first so the
-            // next decode falls back to eager + re-captures with fresh ptrs.
-            // Critical for multi-turn chat (turn N+1's prefill may grow scratch).
+            // buffers; those are about to be freed. Invalidate ALL captured
+            // graphs (both single-item and per-m_padded batched) — every
+            // captured kernel-arg pointer into scratch is stale.
             {
                 let mut ctx = B::new_context();
-                B::reset_graph(&mut ctx);
+                B::reset_all_graphs(&mut ctx);
             }
             self.scratch = LlamaFamilyScratch::alloc(&self.cfg, tokens);
             self.graph_warmup = 0;
             self.graph_capture_failed = false;
+            self.batched_graph_keys_seen.clear();
+            self.batched_graph_warmup = 0;
+            self.batched_graph_failed = false;
+            self.unified_graph_keys_seen.clear();
+            self.unified_graph_warmup = 0;
+            self.unified_graph_failed = false;
         }
     }
 
@@ -1585,8 +1757,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // replay — captured graph reads these from device buffers.
             B::set_decode_state(&mut ctx, token, pos);
 
-            // Fast path: graph replay (if available).
-            match B::replay_last_graph(&mut ctx) {
+            // Fast path: graph replay (if available). Single-item path
+            // uses key=SINGLE_ITEM_GRAPH_KEY (0) — separate from the
+            // batched path's m_padded keys.
+            match B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) {
                 Ok(true) => {
                     B::sync(&mut ctx);
                     return B::to_vec(&self.scratch.logits, vocab);
@@ -1728,7 +1902,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         );
 
         if should_capture && !self.graph_capture_failed {
-            if B::end_graph_capture(&mut ctx).is_err() {
+            if B::end_graph_capture(&mut ctx, SINGLE_ITEM_GRAPH_KEY).is_err() {
                 self.graph_capture_failed = true;
             } else {
                 // Stream capture mode RECORDS ops into the graph without
@@ -1737,7 +1911,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 // actually execute and produce this step's logits. Without
                 // this, the capture step's to_vec returns stale logits,
                 // yielding a 1-token offset in the generated sequence.
-                if B::replay_last_graph(&mut ctx).is_err() {
+                if B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY).is_err() {
                     self.graph_capture_failed = true;
                 }
             }
@@ -1980,10 +2154,49 @@ impl<B: Backend> LlamaFamilyModel<B> {
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
+        let num_layers = self.cfg.num_layers;
         let mut ctx = B::new_context();
 
-        // 0. Embed all M tokens into residual [M, H]
+        // Pre-step state (positions, kv_lens_pre, kv_lens_post). All
+        // 32 layers' batched kernels read these from scratch device
+        // buffers — written ONCE here, NEVER inside the layer loop, so
+        // the captured graph below replays with stable buffer addresses
+        // and the next step's content update reaches the kernels.
+        let positions: Vec<u32> = batch.iter().map(|(_, _, p)| *p as u32).collect();
         let tokens: Vec<u32> = batch.iter().map(|(_, t, _)| *t).collect();
+        let kv_pre: Vec<u32> = batch
+            .iter()
+            .map(|(cid, _, _)| self.kv_caches.get(cid).expect("kv_caches missing")[0].len as u32)
+            .collect();
+        let kv_post: Vec<u32> = kv_pre.iter().map(|&x| x + 1).collect();
+        B::write_u32(&mut ctx, &mut self.scratch.batch_positions, &positions);
+        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
+        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
+
+        // Pre-populate per-slot device-pointer scratch for the batched
+        // kernels (kv_cache_append_batched, flash_attention_batched).
+        // Done OUTSIDE any captured forward — sync memcpy on the legacy
+        // null stream is not captured by stream capture, so the captured
+        // graph contains only kernel launches. Without this, the
+        // captured `stream.memcpy_htod` records host pointers and the
+        // 2nd pure-replay reads stale/corrupted data → ILLEGAL_ADDRESS.
+        //
+        // populate_batched_pointers was intended to support
+        // FERRUM_BATCHED_GRAPH=1 (Phase 4d graph capture) by pre-filling
+        // device scratch outside the captured forward. Phase 4d is
+        // shelved (CUDA driver state accumulates and SIGSEGVs after
+        // ~14 launches even with all the right knobs), so the populate
+        // call adds overhead with no benefit on the OFF path. Skip it —
+        // the kv_cache_append / flash_attn batched impls fall back to
+        // their inline captured memcpy when scratch isn't pre-populated.
+        // batched_pointers_for kept for future use; revisit when we
+        // either (a) get graph capture working, or (b) move scratch to
+        // process-global static.
+        let _ = &self.batched_pointers_for;
+
+        // 0. Embed all M tokens into residual [M, H]. Eager, OUTSIDE
+        //    any captured graph (host tokens slice; embedding_lookup_dyn
+        //    is single-item only).
         let mut residual = self
             .scratch
             .residual
@@ -1995,33 +2208,211 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .expect("decode_batch_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
 
-        // 1..num_layers: batched forward for each layer
-        for li in 0..self.cfg.num_layers {
-            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+        // ── Phase 4d: CUDA-graph replay path ─────────────────────────
+        // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
+        // graph support (begin_graph_capture returns Err).
+        let graph_enabled = std::env::var("FERRUM_BATCHED_GRAPH")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let m_padded = m.next_power_of_two();
+        // Per-m_padded graph cache: each batch shape gets its own
+        // captured graph instead of thrashing a single slot. Native
+        // CUDA microbench (graph_upload_bench) confirmed multi-slot
+        // replay is stable.
+        let graph_key = m_padded as u64;
+        let cache_has_key = self.batched_graph_keys_seen.contains(&graph_key);
+
+        let mut did_pure_replay = false;
+        if graph_enabled && cache_has_key && !self.batched_graph_failed {
+            // Sync stream first so embedding_lookup (just queued) plus
+            // any null-stream cuMemcpyHtoD_v2's from write_u32 are all
+            // settled before cuGraphLaunch.
+            B::sync(&mut ctx);
+            match B::replay_graph(&mut ctx, graph_key) {
+                Ok(true) => {
+                    did_pure_replay = true;
+                    BATCHED_GRAPH_REPLAY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    self.batched_graph_failed = true;
+                    eprintln!("[batched-trace] replay err: {}", e);
+                }
+            }
+        }
+        if graph_enabled && !did_pure_replay {
+            BATCHED_GRAPH_EAGER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Periodic stats (every 256 calls).
+        let total = BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+            + BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        if graph_enabled && total > 0 && total.is_multiple_of(256) {
+            eprintln!(
+                "[batched-graph-stats] m={m} m_padded={m_padded} replays={} eagers={} keys_seen={:?}",
+                BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                self.batched_graph_keys_seen,
+            );
         }
 
-        // Final RMSNorm on [M, H] → norm_out [M, H]
-        B::rms_norm(
-            &mut ctx,
-            &residual,
-            &self.final_norm_w,
-            self.cfg.rms_norm_eps,
-            &mut self.scratch.norm_out,
-            m,
-            h,
-        );
+        if !did_pure_replay {
+            const BATCHED_GRAPH_WARMUP: usize = 3;
+            let should_capture = graph_enabled
+                && !self.batched_graph_failed
+                && self.batched_graph_warmup >= BATCHED_GRAPH_WARMUP;
+            if should_capture {
+                tracing::debug!("[batched-graph] BEGIN CAPTURE m_padded={m_padded}");
+                if let Err(e) = B::begin_graph_capture(&mut ctx) {
+                    eprintln!("[batched-trace] begin_capture err: {}", e);
+                    self.batched_graph_failed = true;
+                }
+            }
+            self.batched_graph_warmup += 1;
 
-        // LM head with m=M → batch_logits [M, vocab]
-        let lm_head = self
-            .lm_head
-            .as_ref()
-            .expect("decode_batch_internal called on backbone-only model (no lm_head)");
-        lm_head.forward(
-            &mut ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.batch_logits,
-            m,
-        );
+            // Trace mode (env): sync after each major op so that the
+            // first panicking sync localises which kernel/section faulted.
+            // Off by default (adds 32 syncs per token = pipeline serialisation).
+            let trace = std::env::var("FERRUM_BATCHED_TRACE").is_ok();
+            macro_rules! tracesync {
+                ($label:expr) => {
+                    if trace {
+                        B::sync(&mut ctx);
+                        eprintln!("[trace-batched] {}", $label);
+                    }
+                };
+            }
+            tracesync!("entry-after-writes-and-embed");
+
+            // Op-profile: time the entire batched forward (eager only —
+            // pure replay short-circuits above and does not increment
+            // the per-op counters since the wrapped ops aren't executed
+            // by the Rust dispatch path).
+            let batched_profile = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+            let batched_iter_t0 = if batched_profile {
+                // Drain shared counters first so this iter's print isn't
+                // contaminated by prior prefill/single-decode contributions.
+                ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            // Eager forward (records into graph if capture is active).
+            for li in 0..num_layers {
+                self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+                tracesync!(format!("after layer {}", li));
+            }
+            let _t0_norm = if batched_profile {
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            B::rms_norm(
+                &mut ctx,
+                &residual,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.norm_out,
+                m,
+                h,
+            );
+            if let Some(t0) = _t0_norm {
+                B::sync(&mut ctx);
+                NORM_TIME_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tracesync!("after final rms_norm");
+            let lm_head = self
+                .lm_head
+                .as_ref()
+                .expect("decode_batch_internal called on backbone-only model (no lm_head)");
+            let _t0_lm = if batched_profile {
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            lm_head.forward(
+                &mut ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.batch_logits,
+                m,
+            );
+            if let Some(t0) = _t0_lm {
+                B::sync(&mut ctx);
+                MATMUL_TIME_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tracesync!("after lm_head");
+
+            if let Some(t0) = batched_iter_t0 {
+                B::sync(&mut ctx);
+                let total_us = t0.elapsed().as_micros() as u64;
+                let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let wrapped_us = attn_us + qkr_us + mm_us + norm_us + other_us;
+                let unwrapped_us = total_us.saturating_sub(wrapped_us);
+                eprintln!(
+                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({})  unwrapped={}us",
+                    m,
+                    total_us,
+                    mm_us, mm_n,
+                    attn_us, attn_n,
+                    qkr_us, qkr_n,
+                    norm_us, norm_n,
+                    other_us, other_n,
+                    unwrapped_us,
+                );
+            }
+
+            if should_capture && !self.batched_graph_failed {
+                if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
+                    eprintln!("[batched-trace] end_capture err: {}", e);
+                    self.batched_graph_failed = true;
+                } else {
+                    self.batched_graph_keys_seen.insert(graph_key);
+                    if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
+                        eprintln!("[batched-trace] post-capture replay err: {}", e);
+                        self.batched_graph_failed = true;
+                    }
+                }
+            }
+        }
+
+        // Bump cache.len for all (m × num_layers) caches. forward_layer
+        // no longer bumps (so a graph replay's lack of Rust execution
+        // doesn't desync it). One central bump covers eager and replay.
+        for (cid, _, _) in batch.iter() {
+            let caches = self.kv_caches.get_mut(cid).expect("kv_caches missing");
+            for li in 0..num_layers {
+                caches[li].len += 1;
+            }
+        }
 
         // Sync before to_vec (Metal: no internal sync on buffer read).
         B::sync(&mut ctx);
@@ -2059,7 +2450,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
 
+        let _bp = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+
         // 1. rms_norm [M, H]  → norm_out
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::rms_norm(
             ctx,
             residual,
@@ -2069,11 +2468,33 @@ impl<B: Backend> LlamaFamilyModel<B> {
             m,
             h,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            NORM_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 2. qkv_proj (GEMM m=M): norm_out [M, H] → qkv_out [M, QKV]
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         layer
             .qkv_proj
             .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // ── Paged-KV batched path (Phase 4b) ──────────────────────────
         // When paged is on, we skip the contig split_qkv + per-item
@@ -2123,8 +2544,21 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // Take block_table buffer ptrs ahead of the dispatch loop —
             // we need both per-cache block_table (to write into) and
             // self.scratch.paged_batch_q (to write Q stacks into).
-            let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
-            let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+            // f16 buffers (CudaSlice<f16> / Metal half) — 2 bytes per
+            // element. Earlier `size_of::<f32>()` was 2× too large; for
+            // tokens=1 batched decode the per-item Q stack still landed
+            // at the right offset because the caller's stride is q_dim
+            // and i==0..m gives base+i*q_dim, but split-fused with
+            // q_token_offset>0 (chunked prefill) tripped on the bad
+            // offset by skipping every other token row.
+            let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
+            let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
+            let _t_qkr = if _bp {
+                B::sync(ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             for (i, (cache_id, _, pos)) in batch.iter().enumerate() {
                 let pos_i = *pos as usize;
                 let caches = self
@@ -2171,6 +2605,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 )
                 .expect("paged batched write");
             }
+            if let Some(t0) = _t_qkr {
+                B::sync(ctx);
+                QKR_TIME_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
             // Step 2: bump cache.len and build the stacked block_tables +
             // context_lens host-side, then upload to device scratch.
@@ -2216,6 +2658,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
             let cl_safe = unsafe { &*cl_ptr };
             let q_safe = unsafe { &*q_ptr };
             let o_safe = unsafe { &mut *o_ptr };
+            let _t = if _bp {
+                B::sync(ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             B::paged_decode_attention(
                 ctx,
                 q_safe,
@@ -2233,6 +2681,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 1, // q_len
             )
             .expect("paged batched decode");
+            if let Some(t0) = _t {
+                B::sync(ctx);
+                ATTN_TIME_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
             // Step 4: per-item copy paged_batch_o[i] → attn_flat[i * q_dim].
             // Both have q_dim floats per item; same head-major-equals-token-major
@@ -2253,6 +2709,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
         }
 
         // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::split_qkv(
             ctx,
             &self.scratch.qkv_out,
@@ -2263,83 +2725,300 @@ impl<B: Backend> LlamaFamilyModel<B> {
             q_dim,
             kv_dim,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
-        // 4-6. Per-item loop for rope + kv_append + attention.
-        //      Each item has its own cache_id + pos + kv_len.
+        // 4. Try the batched per-item qk_norm_rope path: one launch
+        //    each for Q/K/V instead of M sequential per-item launches.
+        //    Saves 3*(M-1) qk_norm_rope dispatches per layer (and at
+        //    M=16 with 32 layers that's ~1500 launches, ~10 ms TPOT).
+        //    Backends that don't implement it return Err and we drop
+        //    back into the per-item loop unchanged.
+        // batch_positions, batch_kv_lens_pre, batch_kv_lens_post are
+        // populated by `decode_batch_internal` ONCE per step before the
+        // layer loop — required so a captured CUDA graph reads from
+        // stable buffer contents on replay (per-layer write_u32 inside
+        // the captured region would freeze the values).
+        let _t_qkr_contig = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let q_batched = B::qk_norm_rope_batched_per_item(
+            ctx,
+            &self.scratch.q_buf,
+            q_norm_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.q_normed_batched,
+            &self.scratch.batch_positions,
+            m,
+            nh,
+            hd,
+            eps,
+            qk_mode,
+        );
+        let k_batched = B::qk_norm_rope_batched_per_item(
+            ctx,
+            &self.scratch.k_buf,
+            k_norm_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.k_normed_batched,
+            &self.scratch.batch_positions,
+            m,
+            nkv,
+            hd,
+            eps,
+            qk_mode,
+        );
+        // V's "qk_norm_rope" runs in mode=0 (transpose-only). For
+        // tokens-per-item=1 in batched decode this is a memcpy — kept
+        // for layout-equivalence with the per-item path. Cheap.
+        let v_batched = B::qk_norm_rope_batched_per_item(
+            ctx,
+            &self.scratch.v_buf,
+            dummy_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.v_normed_batched,
+            &self.scratch.batch_positions,
+            m,
+            nkv,
+            hd,
+            eps,
+            0,
+        );
+        let use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
+        if let Some(t0) = _t_qkr_contig {
+            B::sync(ctx);
+            QKR_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // One-time diagnostic so we can verify in server logs that the
+        // batched qkr path is actually being taken (vs. silently falling
+        // back to the per-item loop). Prints once total per process.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[batched-qkr] first batched_decode call: m={} use_batched_qkr={} (q={:?} k={:?} v={:?})",
+                    m,
+                    use_batched_qkr,
+                    q_batched.as_ref().err().map(|e| e.to_string()),
+                    k_batched.as_ref().err().map(|e| e.to_string()),
+                    v_batched.as_ref().err().map(|e| e.to_string()),
+                );
+            }
+        }
+
+        // 5. Batched kv_cache_append (when use_batched_qkr is on): one
+        //    launch each for K and V replaces M sequential per-item
+        //    kv_append calls. Reads k/v_normed_batched directly so the
+        //    M K/V copy_slice dispatches into single buffers also go
+        //    away. cache_lens captured BEFORE the bump.
+        let mut kv_lens_host: Vec<u32> = Vec::with_capacity(m);
+        let mut batched_kv_append_ok = false;
+        let _t_kvapp = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        if use_batched_qkr {
+            let mut k_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
+            let mut v_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
+            let mut pre_append_lens: Vec<u32> = Vec::with_capacity(m);
+            let mut capacity_first: usize = 0;
+            for (cache_id, _, _) in batch.iter() {
+                let caches = self
+                    .kv_caches
+                    .get(cache_id)
+                    .expect("kv_caches must be present");
+                let cache = &caches[li];
+                k_caches_ref.push(&cache.k);
+                v_caches_ref.push(&cache.v);
+                pre_append_lens.push(cache.len as u32);
+                if capacity_first == 0 {
+                    capacity_first = cache.capacity;
+                }
+            }
+            // batch_kv_lens_pre is pre-populated by decode_batch_internal.
+            // Per-layer slot for K/V append. cache_ptrs is shared
+            // between the K and V calls, so V uses an offset slot
+            // (layer_idx + MAX_LAYERS_FOR_GRAPH) to keep its captured
+            // memcpy reading from a distinct host region. See
+            // ferrum-kernels::backend::cuda for the rationale (graph
+            // capture records host POINTERS; same slot → all replays
+            // read whichever value was written last).
+            let k_append_res = B::kv_cache_append_batched_per_cache(
+                ctx,
+                &k_caches_ref,
+                &self.scratch.k_normed_batched,
+                &self.scratch.batch_kv_lens_pre,
+                capacity_first,
+                m,
+                nkv,
+                hd,
+                li,
+            );
+            let v_append_res = B::kv_cache_append_batched_per_cache(
+                ctx,
+                &v_caches_ref,
+                &self.scratch.v_normed_batched,
+                &self.scratch.batch_kv_lens_pre,
+                capacity_first,
+                m,
+                nkv,
+                hd,
+                li + MAX_LAYERS_FOR_GRAPH,
+            );
+            batched_kv_append_ok = k_append_res.is_ok() && v_append_res.is_ok();
+            // One-time diag
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static REPORTED_KV: AtomicBool = AtomicBool::new(false);
+                if !REPORTED_KV.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[batched-kv-append] first call: m={} ok={} k_err={:?} v_err={:?}",
+                        m,
+                        batched_kv_append_ok,
+                        k_append_res.as_ref().err().map(|e| e.to_string()),
+                        v_append_res.as_ref().err().map(|e| e.to_string()),
+                    );
+                }
+            }
+            // Note: cache.len bump moved to decode_batch_internal post-forward
+            // (so a graph replay doesn't double-bump). No-op here.
+        }
+        if let Some(t0) = _t_kvapp {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // kv_lens_host no longer used; flash_attn reads
+        // scratch.batch_kv_lens_post (also pre-populated).
+        let _ = kv_lens_host;
+
+        // 6. Per-item loop: only runs when the batched paths are NOT
+        //    in effect, OR when batched_kv_append failed (Err fallback).
         for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
+            if use_batched_qkr && batched_kv_append_ok {
+                // Already handled by batched kv_append above. Skip
+                // per-item copy + kv_append + per-item flash_attn.
+                continue;
+            }
             let pos_i = *pos as usize;
 
-            // Extract item i's Q/K/V from batched buffers.
-            B::copy_slice(
-                ctx,
-                &self.scratch.q_buf,
-                i * q_dim,
-                &mut self.scratch.q_single,
-                0,
-                q_dim,
-            );
-            B::copy_slice(
-                ctx,
-                &self.scratch.k_buf,
-                i * kv_dim,
-                &mut self.scratch.k_single,
-                0,
-                kv_dim,
-            );
-            B::copy_slice(
-                ctx,
-                &self.scratch.v_buf,
-                i * kv_dim,
-                &mut self.scratch.v_single,
-                0,
-                kv_dim,
-            );
+            if use_batched_qkr {
+                // batched_kv_append fallback: still need per-item
+                // copy_slice for K/V into single buffers for the
+                // per-item kv_append below.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.k_normed_batched,
+                    i * kv_dim,
+                    &mut self.scratch.k_head_major_single,
+                    0,
+                    kv_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.v_normed_batched,
+                    i * kv_dim,
+                    &mut self.scratch.v_head_major_single,
+                    0,
+                    kv_dim,
+                );
+            } else {
+                // Fallback: extract item i's Q/K/V then run per-item
+                // qk_norm_rope. Same dispatch budget as before this
+                // commit — used on backends without the batched kernel.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.q_buf,
+                    i * q_dim,
+                    &mut self.scratch.q_single,
+                    0,
+                    q_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.k_buf,
+                    i * kv_dim,
+                    &mut self.scratch.k_single,
+                    0,
+                    kv_dim,
+                );
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.v_buf,
+                    i * kv_dim,
+                    &mut self.scratch.v_single,
+                    0,
+                    kv_dim,
+                );
 
-            // qk_norm_rope with tokens=1, per-item pos.
-            B::qk_norm_rope(
-                ctx,
-                &self.scratch.q_single,
-                q_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.q_head_major_single,
-                1,
-                nh,
-                hd,
-                pos_i,
-                eps,
-                qk_mode,
-            );
-            B::qk_norm_rope(
-                ctx,
-                &self.scratch.k_single,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.k_head_major_single,
-                1,
-                nkv,
-                hd,
-                pos_i,
-                eps,
-                qk_mode,
-            );
-            B::qk_norm_rope(
-                ctx,
-                &self.scratch.v_single,
-                dummy_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.v_head_major_single,
-                1,
-                nkv,
-                hd,
-                pos_i,
-                eps,
-                0,
-            );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.q_single,
+                    q_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.q_head_major_single,
+                    1,
+                    nh,
+                    hd,
+                    pos_i,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.k_single,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.k_head_major_single,
+                    1,
+                    nkv,
+                    hd,
+                    pos_i,
+                    eps,
+                    qk_mode,
+                );
+                B::qk_norm_rope(
+                    ctx,
+                    &self.scratch.v_single,
+                    dummy_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.v_head_major_single,
+                    1,
+                    nkv,
+                    hd,
+                    pos_i,
+                    eps,
+                    0,
+                );
+            }
 
-            // KV append + attention for item i's cache.
+            // KV append for item i's cache.
             let caches = self
                 .kv_caches
                 .get_mut(cache_id)
@@ -2357,47 +3036,182 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 nkv,
                 hd,
             );
-            cache.len += 1;
-            let kv_len = cache.len;
+            // cache.len bump moved to decode_batch_internal post-forward
+            // for graph-replay correctness. flash_attn below uses
+            // cache.len + 1 directly.
+            let kv_len = cache.len + 1;
             let kv_stride = cache.capacity;
+            kv_lens_host.push(kv_len as u32);
 
-            let attn_cfg = ferrum_kernels::backend::AttnConfig {
-                num_heads: nh,
-                num_kv_heads: nkv,
-                head_dim: hd,
-                causal: true,
-                scale: 1.0 / (hd as f32).sqrt(),
-                kv_seq_stride: kv_stride,
-                sliding_window: cfg.sliding_window,
+            // Per-item flash_attn ONLY when batched qkr fallback is in
+            // use. Otherwise the batched flash_attn after the loop
+            // covers it in one launch. Q comes from the already-normed
+            // q_head_major_single populated by per-item qk_norm_rope.
+            if !use_batched_qkr {
+                let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                    num_heads: nh,
+                    num_kv_heads: nkv,
+                    head_dim: hd,
+                    causal: true,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                    kv_seq_stride: kv_stride,
+                    sliding_window: cfg.sliding_window,
+                };
+                B::flash_attention(
+                    ctx,
+                    &self.scratch.q_head_major_single,
+                    &cache.k,
+                    &cache.v,
+                    &mut self.scratch.attn_head_major_single,
+                    1,
+                    1,
+                    kv_len,
+                    pos_i,
+                    &attn_cfg,
+                );
+                // For tokens=1 head-major and token-major are
+                // byte-identical, so just copy into the per-item slot
+                // of attn_flat without a transpose dispatch.
+                B::copy_slice(
+                    ctx,
+                    &self.scratch.attn_head_major_single,
+                    0,
+                    &mut self.scratch.attn_flat,
+                    i * q_dim,
+                    q_dim,
+                );
+            }
+        }
+
+        // 7. Batched flash_attention: one launch covers all M items.
+        //    Reads q_normed_batched directly (item-major) and writes
+        //    output straight into attn_flat at [m, q_dim] item-major.
+        //    On Err (backend lacks the batched kernel) we fall through
+        //    to a per-item flash_attn loop that mirrors the original
+        //    code path.
+        if use_batched_qkr {
+            let mut k_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
+            let mut v_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
+            let mut max_kv = 0usize;
+            let mut capacity_for_kernel = 0usize;
+            for (cache_id, _, _) in batch.iter() {
+                let caches = self
+                    .kv_caches
+                    .get(cache_id)
+                    .expect("kv_caches must be present");
+                let cache = &caches[li];
+                k_caches_ref.push(&cache.k);
+                v_caches_ref.push(&cache.v);
+                // POST-append valid_kv_len: kv_cache_append_batched_per_cache
+                // wrote position cache.len, so attention reads cache.len + 1
+                // entries. Pre-append cache.len under-sized the shared mem
+                // and corrupted s_scores (silent garbage tokens at m≥2).
+                let post_len = cache.len + 1;
+                if post_len > max_kv {
+                    max_kv = post_len;
+                }
+                if capacity_for_kernel == 0 {
+                    capacity_for_kernel = cache.capacity;
+                }
+            }
+            let scale = 1.0 / (hd as f32).sqrt();
+            // batch_kv_lens_post pre-populated by decode_batch_internal.
+            // flash_attn_batched uses its own k_ptrs/v_ptrs host
+            // arrays in CudaState (separate from kv_cache_append's
+            // cache_ptrs), so per-layer slot = li is sufficient.
+            let _t_attn = if _bp {
+                B::sync(ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
             };
-            B::flash_attention(
+            let batched_attn_res = B::flash_attention_batched_per_cache(
                 ctx,
-                &self.scratch.q_head_major_single,
-                &cache.k,
-                &cache.v,
-                &mut self.scratch.attn_head_major_single,
-                1,
-                1,
-                kv_len,
-                pos_i,
-                &attn_cfg,
-            );
-
-            // Untranspose head-major → token-major + inject into batched
-            // attn_flat[M, Q]. For tokens=1 the head-major and
-            // token-major layouts are byte-identical (both flat to
-            // [heads * head_dim] = [q_dim] floats), so we skip the
-            // transpose dispatch entirely and copy attn_head_major_single
-            // straight into the per-item slot. Saves 1 dispatch per
-            // batch-item per layer.
-            B::copy_slice(
-                ctx,
-                &self.scratch.attn_head_major_single,
-                0,
+                &self.scratch.q_normed_batched,
+                &k_caches_ref,
+                &v_caches_ref,
+                &self.scratch.batch_kv_lens_post,
                 &mut self.scratch.attn_flat,
-                i * q_dim,
-                q_dim,
+                nh,
+                nkv,
+                hd,
+                scale,
+                max_kv,
+                capacity_for_kernel,
+                li,
             );
+            if let Some(t0) = _t_attn {
+                B::sync(ctx);
+                ATTN_TIME_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // One-time diagnostic
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static REPORTED_ATTN: AtomicBool = AtomicBool::new(false);
+                if !REPORTED_ATTN.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[batched-attn] first call: m={} ok={} err={:?}",
+                        m,
+                        batched_attn_res.is_ok(),
+                        batched_attn_res.as_ref().err().map(|e| e.to_string()),
+                    );
+                }
+            }
+            if batched_attn_res.is_err() {
+                // Per-item flash_attn fallback for backends that
+                // implement the batched qkr but not the batched attn.
+                for (i, (cache_id, _, pos)) in batch.iter().enumerate() {
+                    let pos_i = *pos as usize;
+                    // Populate q_head_major_single from the normed Q.
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.q_normed_batched,
+                        i * q_dim,
+                        &mut self.scratch.q_head_major_single,
+                        0,
+                        q_dim,
+                    );
+                    let caches = self
+                        .kv_caches
+                        .get(cache_id)
+                        .expect("kv_caches must be present");
+                    let cache = &caches[li];
+                    let kv_stride = cache.capacity;
+                    let attn_cfg = ferrum_kernels::backend::AttnConfig {
+                        num_heads: nh,
+                        num_kv_heads: nkv,
+                        head_dim: hd,
+                        causal: true,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                        kv_seq_stride: kv_stride,
+                        sliding_window: cfg.sliding_window,
+                    };
+                    B::flash_attention(
+                        ctx,
+                        &self.scratch.q_head_major_single,
+                        &cache.k,
+                        &cache.v,
+                        &mut self.scratch.attn_head_major_single,
+                        1,
+                        1,
+                        cache.len,
+                        pos_i,
+                        &attn_cfg,
+                    );
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.attn_head_major_single,
+                        0,
+                        &mut self.scratch.attn_flat,
+                        i * q_dim,
+                        q_dim,
+                    );
+                }
+            }
         }
 
         self.forward_layer_batched_decode_post_attn(ctx, li, residual, m);
@@ -2415,16 +3229,37 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let im = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
         let layer = &self.layers[li];
+        let _bp = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
 
         // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         layer.o_proj.forward(
             ctx,
             &self.scratch.attn_flat,
             &mut self.scratch.o_proj_out,
             m,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 8. Fused residual add + post-attention RMSNorm.
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::fused_add_rms_norm(
             ctx,
             residual,
@@ -2435,16 +3270,44 @@ impl<B: Backend> LlamaFamilyModel<B> {
             m,
             h,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            NORM_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 9. gate_up_proj (GEMM m=M)
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         layer.gate_up_proj.forward(
             ctx,
             &self.scratch.norm_out,
             &mut self.scratch.gate_up_out,
             m,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 10. SwiGLU
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::fused_silu_mul_split(
             ctx,
             &self.scratch.gate_up_out,
@@ -2452,14 +3315,767 @@ impl<B: Backend> LlamaFamilyModel<B> {
             m,
             im,
         );
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 11. down_proj (GEMM m=M)
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         layer
             .down_proj
             .forward(ctx, &self.scratch.silu_out, &mut self.scratch.mlp_out, m);
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            MATMUL_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 12. Residual add
+        let _t = if _bp {
+            B::sync(ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::add_inplace(ctx, residual, &self.scratch.mlp_out, m * h);
+        if let Some(t0) = _t {
+            B::sync(ctx);
+            OTHER_TIME_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Unified mixed-batch forward (chunked-prefill workhorse).
+    ///
+    /// Each item is `(cache_id, q_tokens, pos_offset, is_final_chunk)`:
+    /// - `q_tokens.len() == 1` is a decode step
+    /// - `q_tokens.len() >= 1` with `pos_offset > 0` is a continuing
+    ///   prefill chunk
+    /// - `is_final_chunk == true` ⇒ logits returned for sampling, else
+    ///   `None` (intermediate prefill chunks just advance KV state)
+    ///
+    /// Concatenates all q_tokens into a single `[M_total, hidden]`
+    /// forward, dispatches per-item `split_qkv_norm_rope_into_paged_cache`
+    /// to write per-seq K/V into the paged pool with correct RoPE per
+    /// token position, then a single `paged_varlen_attention` call
+    /// (Step 4 kernel) handles attention for all q-tokens with per-seq
+    /// causal masks.
+    ///
+    /// REQUIRES paged KV (self.paged_pools.is_some()). Caller (the
+    /// public `unified_forward` impl on the trait) returns
+    /// `Err(unsupported)` for the contig path so the engine falls
+    /// back to legacy dispatch.
+    pub(crate) fn unified_forward_internal(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> Vec<Option<Vec<f32>>> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        // Snapshot cfg fields into Copy locals so we can take &mut self later
+        // without a long-lived `&self.cfg` borrow conflicting.
+        let h = self.cfg.hidden_size;
+        let nh = self.cfg.num_heads;
+        let nkv = self.cfg.num_kv_heads;
+        let hd = self.cfg.head_dim;
+        let im = self.cfg.intermediate_size;
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+        let qkv_stride = q_dim + 2 * kv_dim;
+        let eps = self.cfg.rms_norm_eps;
+        let qk_mode: i32 = if self.cfg.has_qk_norm { 1 } else { 2 };
+        let vocab = self.cfg.vocab_size;
+        let num_layers = self.cfg.num_layers;
+        let num_seqs = items.len();
+
+        // Per-item bookkeeping (host).
+        let q_lens: Vec<usize> = items.iter().map(|it| it.1.len()).collect();
+        let mut cu_seqlens_q: Vec<u32> = Vec::with_capacity(num_seqs + 1);
+        cu_seqlens_q.push(0);
+        for &l in &q_lens {
+            let prev = *cu_seqlens_q.last().unwrap();
+            cu_seqlens_q.push(prev + l as u32);
+        }
+        let m_total = *cu_seqlens_q.last().unwrap() as usize;
+        let pos_offsets: Vec<u32> = items.iter().map(|it| it.2 as u32).collect();
+        // Causal max over (pos_offset + q_len) — shared-mem size for the
+        // varlen attn kernel needs to fit the longest reachable kv_pos.
+        let max_kv_len: usize = items.iter().map(|it| it.2 + it.1.len()).max().unwrap_or(0);
+
+        // Ensure all items' KV caches exist.
+        for (cid, _, _, _) in items {
+            self.ensure_kv(cid);
+        }
+
+        // Concatenated input tokens for one embedding_lookup.
+        let all_tokens: Vec<u32> = items.iter().flat_map(|it| it.1.iter().copied()).collect();
+        debug_assert_eq!(all_tokens.len(), m_total);
+
+        // Paged path requirements.
+        let pools_present = self.paged_pools.is_some();
+        if !pools_present {
+            // Caller should have routed to fallback; defensive.
+            panic!("unified_forward_internal called without paged_pools — caller must check");
+        }
+        let max_blocks_per_seq = self.scratch.paged_max_blocks_per_seq;
+        let block_size = 16usize; // matches PAGED_BLOCK_SIZE in ensure_kv
+
+        // Make sure scratch fits this batch. Use the engine-side
+        // `paged_max_seqs` cap (set in `enable_paged_batch` from
+        // `FERRUM_PAGED_MAX_SEQS`, default 32) so the index buffers
+        // (`unified_cu_seqlens_q`, `unified_pos_offsets`,
+        // `unified_block_tables`, `unified_packed_*`) are sized for the
+        // largest batch the engine will ever submit. Earlier we used
+        // `num_seqs` and the buffers were pinned at the FIRST call's
+        // batch size — c=1 warmup → c=16 bench would write 17 ints into
+        // a 2-int buffer (CUDA_ERROR_INVALID_VALUE).
+        debug_assert!(
+            self.scratch.paged_max_seqs >= num_seqs,
+            "unified_forward batch ({} items) exceeds engine paged_max_seqs ({})",
+            num_seqs,
+            self.scratch.paged_max_seqs,
+        );
+        let max_seqs = self.scratch.paged_max_seqs.max(num_seqs);
+        // Take cfg ref only for the immediate ensure call (Copy fields
+        // already snapshotted above into h/nh/etc — cfg is just for the
+        // shape constants ensure_unified_scratch needs).
+        let cfg_for_alloc = self.cfg.clone();
+        self.scratch
+            .ensure_unified_scratch(&cfg_for_alloc, m_total, max_seqs, max_blocks_per_seq);
+
+        let mut ctx = B::new_context();
+
+        // Embed all q-tokens into the unified residual buffer.
+        let mut residual = self
+            .scratch
+            .unified_residual
+            .take()
+            .expect("unified_residual missing after ensure");
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("unified_forward_internal called on backbone-only model");
+        B::embedding_lookup(&mut ctx, embed, &all_tokens, &mut residual, h);
+
+        // Upload index buffers.
+        {
+            let csq = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_mut()
+                .expect("unified_cu_seqlens_q missing");
+            B::write_u32(&mut ctx, csq, &cu_seqlens_q);
+        }
+        {
+            let po = self
+                .scratch
+                .unified_pos_offsets
+                .as_mut()
+                .expect("unified_pos_offsets missing");
+            B::write_u32(&mut ctx, po, &pos_offsets);
+        }
+        // Stack per-seq block tables host-side, then upload.
+        {
+            let mut stacked: Vec<u32> = vec![0u32; num_seqs * max_blocks_per_seq];
+            for (i, (cid, _, _, _)) in items.iter().enumerate() {
+                let caches = self
+                    .kv_caches
+                    .get(cid)
+                    .expect("kv cache missing for unified item");
+                let cache0 = &caches[0];
+                let blocks = &cache0.paged_block_indices;
+                let n_to_copy = blocks.len().min(max_blocks_per_seq);
+                stacked[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
+                    .copy_from_slice(&blocks[..n_to_copy]);
+            }
+            let bt = self
+                .scratch
+                .unified_block_tables
+                .as_mut()
+                .expect("unified_block_tables missing");
+            B::write_u32(&mut ctx, bt, &stacked);
+        }
+
+        // ── CUDA-graph capture/replay control ────────────────────────
+        // `FERRUM_UNIFIED_GRAPH=1` opts in. Per-shape graph cache keyed
+        // by (m_total, num_seqs); high bit set so we never collide with
+        // legacy keys (SINGLE_ITEM = 0, batched = m_padded). The captured
+        // region covers the layer loop + final rms_norm + per-item
+        // copy_slice + lm_head — every kernel that's stable across iters.
+        // Pre-work (write_u32 + embedding_lookup) and post-work (sync +
+        // to_vec) stay eager.
+        //
+        // Status (2026-05-05): WORKING. The earlier
+        // `gather_columns launch: CUDA_ERROR_INVALID_VALUE` was caused
+        // by `with_marlin_gather_scratch` doing an in-place
+        // `stream.alloc::<f16>` when its slot was too small — runtime
+        // alloc inside a captured stream is illegal. Fix:
+        // `B::pregrow_marlin_gather_scratch(m_total * intermediate_size)`
+        // called eagerly above, BEFORE this section.
+        //
+        // Bench (RTX 4090, Llama-3.1-8B GPTQ-INT4, c=16):
+        //   varlen-only:     680 tok/s, TPOT 19.3 ms
+        //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
+        let graph_enabled = std::env::var("FERRUM_UNIFIED_GRAPH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let graph_key: u64 = (1u64 << 63) | ((m_total as u64) << 32) | (num_seqs as u64);
+        let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
+
+        // Pre-grow the marlin gather scratch slot to the worst-case
+        // size for THIS call's matmul shapes. Done eagerly BEFORE
+        // begin_capture: `with_marlin_gather_scratch`'s in-place grow
+        // does `stream.alloc` which is forbidden inside a captured
+        // stream (CUDA_ERROR_INVALID_VALUE on the next launch).
+        // `down_proj` has the largest k = intermediate_size, so
+        // m_total * intermediate_size is the upper bound across all
+        // 4 matmuls in the layer.
+        let max_marlin_required = m_total * im;
+        B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
+
+        // Sync eager pre-work (write_u32 + embedding + scratch grow)
+        // before either a replay or a capture starts — buffer state
+        // must be settled.
+        B::sync(&mut ctx);
+
+        let unified_profile = std::env::var("FERRUM_UNIFIED_PROFILE").is_ok();
+        let layer_t0 = if unified_profile {
+            B::sync(&mut ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let mut did_pure_replay = false;
+        if graph_enabled && cache_has_key && !self.unified_graph_failed {
+            match B::replay_graph(&mut ctx, graph_key) {
+                Ok(true) => did_pure_replay = true,
+                Ok(false) => {}
+                Err(e) => {
+                    self.unified_graph_failed = true;
+                    eprintln!("[unified-graph] replay err: {e}");
+                }
+            }
+        }
+
+        const UNIFIED_GRAPH_WARMUP: usize = 3;
+        let should_capture = graph_enabled
+            && !self.unified_graph_failed
+            && !cache_has_key
+            && self.unified_graph_warmup >= UNIFIED_GRAPH_WARMUP
+            && !did_pure_replay;
+        if !did_pure_replay {
+            self.unified_graph_warmup += 1;
+        }
+
+        if should_capture {
+            if let Err(e) = B::begin_graph_capture(&mut ctx) {
+                eprintln!("[unified-graph] begin_capture err: {e}");
+                self.unified_graph_failed = true;
+            }
+        }
+
+        if !did_pure_replay {
+            for li in 0..num_layers {
+                self.unified_forward_layer(
+                    &mut ctx,
+                    li,
+                    items,
+                    &q_lens,
+                    &cu_seqlens_q,
+                    &pos_offsets,
+                    &mut residual,
+                    m_total,
+                    max_kv_len,
+                    num_seqs,
+                    max_blocks_per_seq,
+                    block_size,
+                    qkv_stride,
+                    q_dim,
+                    kv_dim,
+                    nh,
+                    nkv,
+                    hd,
+                    im,
+                    h,
+                    eps,
+                    qk_mode,
+                );
+            }
+        }
+        if let Some(t0) = layer_t0 {
+            B::sync(&mut ctx);
+            static UNIFIED_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = UNIFIED_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_multiple_of(64) {
+                let total_us = t0.elapsed().as_micros();
+                let per_layer = total_us / num_layers as u128;
+                eprintln!(
+                    "[unified-prof] call#{n} m_total={m_total} num_seqs={num_seqs} layers={num_layers} total={total_us}us per_layer={per_layer}us"
+                );
+            }
+        }
+        // Drain per-op counters every 64 calls when DECODE_OP_PROFILE is on.
+        // The op-profile macro inside unified_forward_layer adds to these
+        // global atomics; without a swap the totals would just keep growing.
+        if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            static OP_DRAIN_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = OP_DRAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_multiple_of(64) {
+                use std::sync::atomic::Ordering;
+                let norm_us = NORM_TIME_US.swap(0, Ordering::Relaxed);
+                let norm_n = NORM_CALLS.swap(0, Ordering::Relaxed);
+                let mm_us = MATMUL_TIME_US.swap(0, Ordering::Relaxed);
+                let mm_n = MATMUL_CALLS.swap(0, Ordering::Relaxed);
+                let qkr_us = QKR_TIME_US.swap(0, Ordering::Relaxed);
+                let qkr_n = QKR_CALLS.swap(0, Ordering::Relaxed);
+                let attn_us = ATTN_TIME_US.swap(0, Ordering::Relaxed);
+                let attn_n = ATTN_CALLS.swap(0, Ordering::Relaxed);
+                let other_us = OTHER_TIME_US.swap(0, Ordering::Relaxed);
+                let other_n = OTHER_CALLS.swap(0, Ordering::Relaxed);
+                let bucket = |label: &str, n: u64, us: u64| {
+                    if n > 0 {
+                        eprintln!(
+                            "[unified-op] {label}: {} calls {} ms total avg={}us",
+                            n,
+                            us / 1000,
+                            us / n.max(1)
+                        );
+                    }
+                };
+                eprintln!("[unified-op] drain#{n} (over last 64 unified_forward calls):");
+                bucket("rms_norm/fused_rms", norm_n, norm_us);
+                bucket("matmul (qkv/o/gate_up/down)", mm_n, mm_us);
+                bucket("split_qkv_norm_rope_paged", qkr_n, qkr_us);
+                bucket("paged_varlen_attention", attn_n, attn_us);
+                bucket("silu/residual_add", other_n, other_us);
+            }
+        }
+
+        // Identify per-item last-token global indices for is_final_chunk
+        // items. Pure host work — same shape across iters at c=16
+        // steady state, so the captured copy_slice + lm_head launches
+        // record stable offsets.
+        let final_indices: Vec<(usize, usize)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.3)
+            .map(|(orig_idx, _)| {
+                let item = &items[orig_idx];
+                let last_token_local = item.1.len() - 1;
+                let global = (cu_seqlens_q[orig_idx] as usize) + last_token_local;
+                (orig_idx, global)
+            })
+            .collect();
+        let num_sampled = final_indices.len();
+
+        // Take scratch buffers we'll either record into the graph or
+        // restore on return — outside the !did_pure_replay branch so
+        // both paths can put them back.
+        let final_norm_w = &self.final_norm_w;
+        let mut norm_out = self
+            .scratch
+            .unified_norm_out
+            .take()
+            .expect("unified_norm_out missing");
+
+        if !did_pure_replay {
+            B::rms_norm(
+                &mut ctx,
+                &residual,
+                final_norm_w,
+                eps,
+                &mut norm_out,
+                m_total,
+                h,
+            );
+            if num_sampled > 0 {
+                let packed_normed = self
+                    .scratch
+                    .unified_packed_normed
+                    .as_mut()
+                    .expect("unified_packed_normed missing");
+                for (j, &(_, global)) in final_indices.iter().enumerate() {
+                    B::copy_slice(&mut ctx, &norm_out, global * h, packed_normed, j * h, h);
+                }
+                let lm_head = self
+                    .lm_head
+                    .as_ref()
+                    .expect("unified_forward_internal called on backbone-only model");
+                let packed_logits = self
+                    .scratch
+                    .unified_packed_logits
+                    .as_mut()
+                    .expect("unified_packed_logits missing");
+                lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+            }
+        }
+
+        // End capture (if active), install graph, and immediately
+        // replay it — capture only RECORDS the launches, so without a
+        // post-capture replay the layer loop's kernels never actually
+        // execute and packed_logits stays uninitialised. Mirrors the
+        // legacy `forward_layer_batched_decode_post_attn` pattern.
+        if should_capture && !self.unified_graph_failed {
+            if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
+                eprintln!("[unified-graph] end_capture err: {e}");
+                self.unified_graph_failed = true;
+            } else {
+                self.unified_graph_keys_seen.insert(graph_key);
+                if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
+                    eprintln!("[unified-graph] post-capture replay err: {e}");
+                    self.unified_graph_failed = true;
+                }
+            }
+        }
+
+        // Sync + readback. ALWAYS eager — to_vec needs the host result.
+        B::sync(&mut ctx);
+        let mut out: Vec<Option<Vec<f32>>> = (0..items.len()).map(|_| None).collect();
+        if num_sampled > 0 {
+            let packed_logits = self
+                .scratch
+                .unified_packed_logits
+                .as_ref()
+                .expect("unified_packed_logits missing");
+            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
+                out[orig_idx] = Some(row);
+            }
+        }
+
+        // Bump cache.len for each item (we wrote q_lens[i] tokens into seq i's
+        // KV pool inside the layer loop). Centralised post-loop bump matches
+        // the pattern in decode_batch_internal.
+        for (i, (cid, _, _, _)) in items.iter().enumerate() {
+            let caches = self
+                .kv_caches
+                .get_mut(cid)
+                .expect("kv cache missing for unified item post-loop");
+            for c in caches.iter_mut() {
+                c.len += q_lens[i];
+            }
+        }
+
+        // Restore scratch for next call.
+        self.scratch.unified_residual = Some(residual);
+        self.scratch.unified_norm_out = Some(norm_out);
+
+        out
+    }
+
+    /// One transformer layer for the unified mixed-batch forward.
+    /// Mirrors `forward_layer_batched_decode` paged path but operates
+    /// on `[M_total, *]` tensors and uses `paged_varlen_attention`.
+    #[allow(clippy::too_many_arguments)]
+    fn unified_forward_layer(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        items: &[(String, Vec<u32>, usize, bool)],
+        q_lens: &[usize],
+        cu_seqlens_q: &[u32],
+        pos_offsets: &[u32],
+        residual: &mut B::Buffer,
+        m_total: usize,
+        max_kv_len: usize,
+        num_seqs: usize,
+        max_blocks_per_seq: usize,
+        block_size: usize,
+        qkv_stride: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        im: usize,
+        h: usize,
+        eps: f32,
+        qk_mode: i32,
+    ) {
+        let layer = &self.layers[li];
+        let dummy_w = &layer.input_ln_w;
+        let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
+        let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
+        let op_prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+
+        macro_rules! time_op {
+            ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
+                if op_prof {
+                    B::sync(ctx);
+                    let _t0 = std::time::Instant::now();
+                    $body
+                    B::sync(ctx);
+                    $bucket_us.fetch_add(_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    $bucket_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    $body
+                }
+            }};
+        }
+
+        // 1. rms_norm [M_total, h] → unified_norm_out
+        time_op!(NORM_TIME_US, NORM_CALLS, {
+            let norm_out = self
+                .scratch
+                .unified_norm_out
+                .as_mut()
+                .expect("unified_norm_out missing");
+            B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
+        });
+
+        // 2. qkv_proj GEMM (m=M_total): unified_norm_out → unified_qkv_out
+        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
+            let norm_out = self
+                .scratch
+                .unified_norm_out
+                .as_ref()
+                .expect("unified_norm_out missing");
+            let qkv_out = self
+                .scratch
+                .unified_qkv_out
+                .as_mut()
+                .expect("unified_qkv_out missing");
+            layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
+        });
+
+        // 3. Single-launch varlen split_qkv_norm_rope. Reads
+        //    cu_seqlens_q / pos_offsets / block_tables from device
+        //    buffers (graph-capturable; kernel scalars are stable across
+        //    iters). Replaces the prior per-item dispatch loop (16 small
+        //    launches per layer at c=16) with one launch.
+        let pools = self
+            .paged_pools
+            .as_mut()
+            .expect("unified_forward_layer requires paged_pools");
+        let pool_ptr = (
+            &mut pools[li].0 as *mut B::Buffer,
+            &mut pools[li].1 as *mut B::Buffer,
+        );
+        // SAFETY: pools allocated once; not concurrently mutated.
+        let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
+        // Suppress unused warning until the legacy per-item path goes.
+        let _ = items;
+        let _ = q_lens;
+        let _ = cu_seqlens_q;
+        let _ = pos_offsets;
+        let _ = qkv_stride;
+
+        time_op!(QKR_TIME_US, QKR_CALLS, {
+            let qkv_out = self
+                .scratch
+                .unified_qkv_out
+                .as_ref()
+                .expect("unified_qkv_out missing");
+            let packed_q = self
+                .scratch
+                .unified_packed_q
+                .as_mut()
+                .expect("unified_packed_q missing");
+            let cu_seqlens_buf = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_ref()
+                .expect("unified_cu_seqlens_q missing");
+            let pos_offsets_buf = self
+                .scratch
+                .unified_pos_offsets
+                .as_ref()
+                .expect("unified_pos_offsets missing");
+            let bt_buf = self
+                .scratch
+                .unified_block_tables
+                .as_ref()
+                .expect("unified_block_tables missing");
+            B::split_qkv_norm_rope_into_paged_cache_varlen(
+                ctx,
+                qkv_out,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                packed_q,
+                pool_k,
+                pool_v,
+                cu_seqlens_buf,
+                pos_offsets_buf,
+                bt_buf,
+                num_seqs,
+                m_total,
+                nh,
+                nkv,
+                hd,
+                eps,
+                qk_mode,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("paged unified: split_qkv_norm_rope_into_paged_cache_varlen");
+        });
+
+        // 4. paged_varlen_attention: one call covering all M_total tokens.
+        time_op!(ATTN_TIME_US, ATTN_CALLS, {
+            let packed_q = self
+                .scratch
+                .unified_packed_q
+                .as_ref()
+                .expect("unified_packed_q missing");
+            let cu_seqlens_buf = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_ref()
+                .expect("unified_cu_seqlens_q missing");
+            let pos_offsets_buf = self
+                .scratch
+                .unified_pos_offsets
+                .as_ref()
+                .expect("unified_pos_offsets missing");
+            let bt_buf = self
+                .scratch
+                .unified_block_tables
+                .as_ref()
+                .expect("unified_block_tables missing");
+            let attn_out = self
+                .scratch
+                .unified_attn_out
+                .as_mut()
+                .expect("unified_attn_out missing");
+            B::paged_varlen_attention(
+                ctx,
+                packed_q,
+                pool_k,
+                pool_v,
+                attn_out,
+                cu_seqlens_buf,
+                pos_offsets_buf,
+                bt_buf,
+                num_seqs,
+                m_total,
+                max_kv_len,
+                nh,
+                nkv,
+                hd,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("paged_varlen_attention");
+        });
+
+        // 5. o_proj (M_total): attn_out → o_proj_out
+        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
+            let attn_out = self
+                .scratch
+                .unified_attn_out
+                .as_ref()
+                .expect("unified_attn_out missing");
+            let o_proj_out = self
+                .scratch
+                .unified_o_proj_out
+                .as_mut()
+                .expect("unified_o_proj_out missing");
+            layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
+        });
+
+        // 6. fused_add_rms_norm: residual = residual + o_proj_out;
+        //    norm_out = rms_norm(new_residual, post_ln_w)
+        time_op!(NORM_TIME_US, NORM_CALLS, {
+            let o_proj_out = self
+                .scratch
+                .unified_o_proj_out
+                .as_ref()
+                .expect("unified_o_proj_out missing");
+            let norm_out = self
+                .scratch
+                .unified_norm_out
+                .as_mut()
+                .expect("unified_norm_out missing");
+            B::fused_add_rms_norm(
+                ctx,
+                residual,
+                o_proj_out,
+                &layer.post_ln_w,
+                eps,
+                norm_out,
+                m_total,
+                h,
+            );
+        });
+
+        // 7. gate_up_proj
+        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
+            let norm_out = self
+                .scratch
+                .unified_norm_out
+                .as_ref()
+                .expect("unified_norm_out missing");
+            let gate_up_out = self
+                .scratch
+                .unified_gate_up_out
+                .as_mut()
+                .expect("unified_gate_up_out missing");
+            layer
+                .gate_up_proj
+                .forward(ctx, norm_out, gate_up_out, m_total);
+        });
+
+        // 8. SwiGLU
+        time_op!(OTHER_TIME_US, OTHER_CALLS, {
+            let gate_up_out = self
+                .scratch
+                .unified_gate_up_out
+                .as_ref()
+                .expect("unified_gate_up_out missing");
+            let silu_out = self
+                .scratch
+                .unified_silu_out
+                .as_mut()
+                .expect("unified_silu_out missing");
+            B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im);
+        });
+
+        // 9. down_proj
+        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
+            let silu_out = self
+                .scratch
+                .unified_silu_out
+                .as_ref()
+                .expect("unified_silu_out missing");
+            let mlp_out = self
+                .scratch
+                .unified_mlp_out
+                .as_mut()
+                .expect("unified_mlp_out missing");
+            layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
+        });
+
+        // 10. residual_add
+        time_op!(OTHER_TIME_US, OTHER_CALLS, {
+            let mlp_out = self
+                .scratch
+                .unified_mlp_out
+                .as_ref()
+                .expect("unified_mlp_out missing");
+            B::add_inplace(ctx, residual, mlp_out, m_total * h);
+        });
     }
 }
 
@@ -2520,6 +4136,49 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         self.decode_batch_internal(batch)
     }
 
+    /// Unified mixed-batch forward (chunked-prefill API).
+    ///
+    /// When paged KV is on, dispatches to `unified_forward_internal`
+    /// which runs ONE `[M_total, hidden]` forward through the layer
+    /// loop + `paged_varlen_attention` kernel — the chunked-prefill
+    /// perf path.
+    ///
+    /// On the contig-KV path (CUDA default, no paged pool), returns
+    /// `Err(unsupported)` so the executor's fallback handles each item
+    /// via existing `prefill()` / `decode_batch()`.
+    fn unified_forward(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, ferrum_types::FerrumError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Touch the first item's KV cache so `ensure_kv` lazily allocates
+        // `paged_pools` when paged is enabled (env or backend default).
+        self.ensure_kv(&items[0].0);
+        if self.paged_pools.is_none() {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "LlamaFamilyModel::unified_forward: paged KV required; \
+                 enable via FERRUM_METAL_PAGED_KV=1 (cross-backend env). \
+                 Engine will fall back to per-item dispatch.",
+            ));
+        }
+        // ensure_kv all items up front and surface pool-exhaust as a clean
+        // per-request error (`ResourceExhausted`) instead of panicking
+        // inside `unified_forward_internal` — a panic kills the tokio
+        // worker and dangles every cache_id still in flight, which then
+        // permanently exhausts the pool.
+        for (cid, _, _, _) in items {
+            self.ensure_kv(cid);
+            if !self.kv_caches.contains_key(cid) {
+                return Err(ferrum_types::FerrumError::resource_exhausted(format!(
+                    "paged KV pool exhausted for cache_id={cid:?}; back off"
+                )));
+            }
+        }
+        Ok(self.unified_forward_internal(items))
+    }
+
     fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         // Delegate to the inherent implementation on LlamaFamilyModel.
         LlamaFamilyModel::<B>::forward_verify(self, cache_id, tokens)
@@ -2533,23 +4192,37 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
                 }
             }
         }
-        // Captured graph expects a specific cache layout; roll it back too.
+        // Single-item graph captures kv-cache pointers directly; truncate
+        // doesn't change pointer but the captured kv_len-bumping pattern
+        // is fragile against state walks. Force single-item re-capture;
+        // batched path is layout-agnostic (per-call cache_lens write).
         let mut ctx = B::new_context();
-        B::reset_graph(&mut ctx);
+        B::reset_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
     }
 
     fn release(&mut self, cache_id: &str) {
-        // Sync + drop graph BEFORE touching cache buffers. The graph was
-        // actively running replays up to this point; destroying the graph
-        // while the allocator pool still has in-flight references from the
-        // graph's kernels corrupts stream state. Sync first to drain, then
-        // destroy graph, then sync again to ensure cleanup completes.
+        // KV buffers go to kv_free_pool (not dropped) → captured graph's
+        // pointer args stay valid. Batched graph reads cache pointers from
+        // BATCHED_SCRATCH populated per-call, freed cache_ids drop out
+        // naturally. Drain in-flight kernels, then DON'T invalidate the
+        // graph slot — keeping it across releases avoids the thrashing
+        // pattern (every request completion = forced re-capture) that
+        // killed graph mode performance at c=16.
+        //
+        // Phase 4d earlier hit a multi-replay SIGSEGV when keeping the
+        // slot alive; Phase 8 (perm-aware Marlin) replaced cuBLAS dense
+        // GEMMs with Marlin in the captured path, which appears to have
+        // resolved the underlying instability. Verified 2026-05-04: c=4
+        // graph mode 16/16 ok with slot kept alive across releases (was
+        // 0/16 before Phase 8).
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        B::reset_graph(&mut ctx);
-        B::sync(&mut ctx);
+        // Single-item path captures kv-cache pointers directly into the
+        // graph; force re-capture if the next request's pool-recycled
+        // buffer differs. Batched path uses BATCHED_SCRATCH indirection
+        // and survives buffer reuse without re-capture.
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
 
@@ -2579,13 +4252,16 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
     }
 
     fn reset(&mut self) {
-        // Hard reset: drop all caches AND the pool, invalidate graph.
+        // Hard reset: drop all caches AND the pool, invalidate ALL graphs.
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        B::reset_graph(&mut ctx);
+        B::reset_all_graphs(&mut ctx);
         B::sync(&mut ctx);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
+        self.batched_graph_keys_seen.clear();
+        self.batched_graph_warmup = 0;
+        self.batched_graph_failed = false;
         self.kv_caches.clear();
         self.kv_free_pool.clear();
     }

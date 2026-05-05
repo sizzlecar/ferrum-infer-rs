@@ -19,7 +19,7 @@ use tracing::debug;
 use ferrum_interfaces::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
-        MemoryRequirements, PrefillInput, PrefillOutput,
+        MemoryRequirements, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     ModelExecutor,
 };
@@ -103,9 +103,34 @@ impl ModelExecutor for LlmExecutor {
             .clone()
             .unwrap_or_else(|| self.gen_cache_id());
 
+        // For chunked-prefill continuation, the prior KV length is the seq
+        // length already in the supplied handle; for fresh prefill it's 0.
+        let prior_seq_len = input
+            .kv_cache
+            .as_ref()
+            .and_then(|h| h.as_any().downcast_ref::<GenericKvCacheHandle>())
+            .map(|g| {
+                use ferrum_interfaces::KvCacheHandle;
+                g.block_table().sequence_length
+            })
+            .unwrap_or(0);
+
+        // Try the unified_forward path first: when the model has it wired
+        // (paged KV pools allocated), this routes through the chunked-prefill
+        // varlen kernel — the same code that handles mixed prefill+decode
+        // batches. On Unsupported, fall back to the legacy single-item
+        // prefill path so contig-KV configs keep their existing behaviour.
         let logits = {
             let mut model = self.model.lock();
-            model.prefill(&cache_id, &tokens)
+            let unified_item = vec![(cache_id.clone(), tokens.clone(), prior_seq_len, true)];
+            match model.unified_forward(&unified_item) {
+                Ok(mut per_item) => per_item
+                    .pop()
+                    .flatten()
+                    .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
+                Err(FerrumError::Unsupported { .. }) => model.prefill(&cache_id, &tokens),
+                Err(e) => return Err(e),
+            }
         };
 
         // Wrap logits as TensorRef: [1, 1, vocab_size]
@@ -255,9 +280,23 @@ impl ModelExecutor for LlmExecutor {
 
         debug!("LlmExecutor decode: token={token}, pos={seq_len}");
 
+        // Try unified_forward first so paged-KV configs route the single
+        // decode through the same varlen kernel used by batched mixed
+        // batches. Falls back to legacy paged_decode_attention for contig
+        // configs that haven't wired unified_forward.
         let logits = {
             let mut model = self.model.lock();
-            model.decode(&cache_id, token, seq_len as u32)
+            let unified_item = vec![(cache_id.clone(), vec![token], seq_len, true)];
+            match model.unified_forward(&unified_item) {
+                Ok(mut per_item) => per_item
+                    .pop()
+                    .flatten()
+                    .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
+                Err(FerrumError::Unsupported { .. }) => {
+                    model.decode(&cache_id, token, seq_len as u32)
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         let logits_tensor = candle_core::Tensor::new(&logits[..], &candle_core::Device::Cpu)
@@ -278,6 +317,12 @@ impl ModelExecutor for LlmExecutor {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+        let t0 = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // Pre-extract all per-input metadata OUTSIDE the lock — this is pure
         // borrow/downcast work that doesn't touch the model.
         struct Prep {
@@ -306,21 +351,73 @@ impl ModelExecutor for LlmExecutor {
                 handle: Arc::new(input_handle.with_sequence_length((seq_len + 1) as usize)),
             });
         }
-
-        // One lock for the whole batch, dispatch to model's decode_batch —
-        // which implementations may fuse into a single forward pass (GEMMs
-        // with m=batch, per-item attention) for true concurrency speedup.
-        // Trait default falls back to sequential decode per item.
-        let all_logits: Vec<Vec<f32>> = {
-            let mut model = self.model.lock();
-            let tuples: Vec<(String, u32, u32)> = prepped
-                .iter()
-                .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
-                .collect();
-            model.decode_batch(&tuples)
+        let t_prep = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
         };
 
-        let mut outputs = Vec::with_capacity(prepped.len());
+        // One lock for the whole batch. Try unified_forward first: paged
+        // configs route through the varlen kernel (single mixed dispatch
+        // for the whole batch); contig configs fall back to model's
+        // legacy decode_batch (separate paged_decode_attention call per
+        // item, batched matmul for QKV/MLP).
+        let (all_logits, t_lock_acq, t_model_call): (Vec<Vec<f32>>, _, _) = {
+            let lock_t0 = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let mut model = self.model.lock();
+            let lock_acq = lock_t0.map(|t| t.elapsed());
+            let model_t0 = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let unified_items: Vec<(String, Vec<u32>, usize, bool)> = prepped
+                .iter()
+                .map(|p| (p.cache_id.clone(), vec![p.token], p.seq_len as usize, true))
+                .collect();
+            let logits = match model.unified_forward(&unified_items) {
+                Ok(per_item) => {
+                    if per_item.len() != prepped.len() {
+                        return Err(FerrumError::model(format!(
+                            "unified_forward returned {} entries for {} items",
+                            per_item.len(),
+                            prepped.len(),
+                        )));
+                    }
+                    let mut out = Vec::with_capacity(prepped.len());
+                    for (i, opt) in per_item.into_iter().enumerate() {
+                        out.push(opt.ok_or_else(|| {
+                            FerrumError::model(format!(
+                                "unified_forward returned None for decode item {i}"
+                            ))
+                        })?);
+                    }
+                    out
+                }
+                Err(FerrumError::Unsupported { .. }) => {
+                    let tuples: Vec<(String, u32, u32)> = prepped
+                        .iter()
+                        .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
+                        .collect();
+                    model.decode_batch(&tuples)
+                }
+                Err(e) => return Err(e),
+            };
+            let model_call = model_t0.map(|t| t.elapsed());
+            (logits, lock_acq, model_call)
+        };
+        let t_model_done = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let m_count = prepped.len();
+        let mut outputs = Vec::with_capacity(m_count);
         for (p, logits) in prepped.into_iter().zip(all_logits.into_iter()) {
             debug!(
                 "LlmExecutor batch_decode: token={}, pos={}",
@@ -333,7 +430,136 @@ impl ModelExecutor for LlmExecutor {
             let logits_ref = common::wrap_tensor(logits_tensor);
             outputs.push(DecodeOutput::new(logits_ref, p.handle));
         }
+        if let (Some(t0), Some(tp), Some(tm)) = (t0, t_prep, t_model_done) {
+            static EX_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = EX_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_multiple_of(8) {
+                let total = t0.elapsed().as_micros();
+                let prep = tp.duration_since(t0).as_micros();
+                let lock_acq = t_lock_acq.map(|d| d.as_micros()).unwrap_or(0);
+                let model_call = t_model_call.map(|d| d.as_micros()).unwrap_or(0);
+                let model_block = tm.duration_since(tp).as_micros();
+                let wrap = tm.elapsed().as_micros();
+                eprintln!(
+                    "[exec-batch-decode-prof] call#{} m={} total={}us prep={}us model_block={}us(lock_acq={}us model_call={}us) wrap={}us",
+                    n, m_count, total, prep, model_block, lock_acq, model_call, wrap,
+                );
+            }
+        }
         Ok(outputs)
+    }
+
+    /// Unified mixed-batch dispatch (chunked-prefill API).
+    ///
+    /// This impl is a behavior-preserving FALLBACK over the existing
+    /// trait methods on `DecoderOnlyLLM`: prefill items go through
+    /// `model.prefill(seq_id, &q_tokens)` (one at a time, mirroring the
+    /// engine's current sequential prefill loop), decode items
+    /// (`q_len == 1 && is_final_chunk`) are grouped into a single
+    /// `model.decode_batch(...)` call. Net behavior is identical to the
+    /// engine's pre-Phase-13 path; this just changes WHO orchestrates
+    /// the prefill/decode split (caller → unified_decode) so the engine
+    /// can converge on a single call.
+    ///
+    /// The real performance unlock comes in Step 5 when models override
+    /// this with a true unified-forward (one [M_total, hidden] forward
+    /// + varlen attention) — at that point the kernel-level mix replaces
+    /// the host-side serial dispatch here.
+    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut results: Vec<Option<Vec<f32>>> = vec![None; batch.items.len()];
+        if batch.items.is_empty() {
+            return Ok(results);
+        }
+
+        // ── Real unified path (Step 5b+): if the model implements
+        // `DecoderOnlyLLM::unified_forward`, route the entire batch
+        // through one model forward (mixed prefill chunks + decode
+        // tokens in a single [M_total, hidden] pass). The model returns
+        // `Err(unsupported)` if it hasn't been wired yet — fall through
+        // to the behaviour-preserving fallback below.
+        let unified_items: Vec<(String, Vec<u32>, usize, bool)> = batch
+            .items
+            .iter()
+            .map(|it| {
+                (
+                    it.seq_id.clone(),
+                    it.q_tokens.clone(),
+                    it.pos_offset,
+                    it.is_final_chunk,
+                )
+            })
+            .collect();
+        let model_result = {
+            let mut model = self.model.lock();
+            model.unified_forward(&unified_items)
+        };
+        match model_result {
+            Ok(per_item) => {
+                if per_item.len() != batch.items.len() {
+                    return Err(FerrumError::model(format!(
+                        "unified_forward returned {} entries for {} items",
+                        per_item.len(),
+                        batch.items.len(),
+                    )));
+                }
+                return Ok(per_item);
+            }
+            Err(FerrumError::Unsupported { .. }) => {
+                // Fall through to the dispatch fallback below.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Partition: pure decode items vs prefill chunks.
+        // A "decode" item has q_len == 1 AND is_final_chunk == true.
+        // Anything else (chunked prefill mid-stream OR a single-token
+        // prefill that returns logits) goes through the per-item prefill
+        // path so the model receives the right pos_offset behaviour.
+        let mut prefill_indices: Vec<usize> = Vec::new();
+        let mut decode_indices: Vec<usize> = Vec::new();
+        for (i, item) in batch.items.iter().enumerate() {
+            if item.q_tokens.len() == 1 && item.is_final_chunk {
+                decode_indices.push(i);
+            } else {
+                prefill_indices.push(i);
+            }
+        }
+
+        // Prefill items — sequential, mirrors current engine behaviour.
+        // Held under a single model lock to amortise lock acquire across
+        // all prefills in this batch (we may revisit per-call locking
+        // when chunked-prefill becomes the perf-critical path).
+        if !prefill_indices.is_empty() {
+            let mut model = self.model.lock();
+            for &i in &prefill_indices {
+                let item = &batch.items[i];
+                let logits = model.prefill(&item.seq_id, &item.q_tokens);
+                if item.is_final_chunk {
+                    results[i] = Some(logits);
+                }
+            }
+        }
+
+        // Decode items — single batched dispatch.
+        if !decode_indices.is_empty() {
+            let tuples: Vec<(String, u32, u32)> = decode_indices
+                .iter()
+                .map(|&i| {
+                    let it = &batch.items[i];
+                    (it.seq_id.clone(), it.q_tokens[0], it.pos_offset as u32)
+                })
+                .collect();
+            let logits_vec = {
+                let mut model = self.model.lock();
+                model.decode_batch(&tuples)
+            };
+            for (j, &i) in decode_indices.iter().enumerate() {
+                results[i] = Some(logits_vec[j].clone());
+            }
+        }
+
+        Ok(results)
     }
 
     fn release_cache(&self, cache_id: &str) {

@@ -241,6 +241,11 @@ struct EngineInner {
     total_decode_tokens: AtomicU64,
     total_preemptions: AtomicU64,
     prefix_cache_hits: AtomicU64,
+    /// Set true the first time `ensure_bg_loop` runs, so per-request
+    /// `infer_stream` callers don't each spawn their own competing
+    /// driver task (16 streaming requests = 16 drivers thrashing on
+    /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
+    bg_loop_spawned: AtomicBool,
 }
 
 impl EngineInner {
@@ -274,25 +279,12 @@ impl EngineInner {
 
     // ── iteration loop ─────────────────────────────────────────────────
 
-    /// Drive iterations until the given request is removed from `sequences`.
-    async fn drive_to_completion(&self, request_id: &RequestId) -> Result<()> {
-        loop {
-            {
-                let _guard = self.iteration_lock.lock().await;
-                self.run_iteration().await?;
-            }
-            if !self.sequences.read().contains_key(request_id) {
-                return Ok(());
-            }
-            // Yield to let other tasks progress between iterations.
-            tokio::task::yield_now().await;
-        }
-    }
-
     /// Run one iteration: ask the scheduler for a batch, then process it.
     async fn run_iteration(&self) -> Result<()> {
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
         counter!("ferrum.engine.iterations_total").increment(1);
+        let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+        let t_iter_start = if prof { Some(Instant::now()) } else { None };
 
         let hint = ferrum_interfaces::BatchHint {
             max_batch_size: self.config.batching.max_batch_size,
@@ -309,6 +301,7 @@ impl EngineInner {
                 return Ok(());
             }
         };
+        let t_after_sched = if prof { Some(Instant::now()) } else { None };
 
         debug!(
             "Iteration {}: batch with {} requests",
@@ -316,7 +309,24 @@ impl EngineInner {
             batch.size()
         );
 
-        self.process_batch(&batch).await
+        let r = self.process_batch(&batch).await;
+        if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
+            let n = self.iteration_count.load(Ordering::Relaxed);
+            if n.is_multiple_of(32) {
+                let total = t0.elapsed().as_micros();
+                let sched = ts.duration_since(t0).as_micros();
+                let proc = ts.elapsed().as_micros();
+                eprintln!(
+                    "[iter-prof] iter#{} total={}us sched={}us process={}us batch_size={}",
+                    iteration,
+                    total,
+                    sched,
+                    proc,
+                    batch.size()
+                );
+            }
+        }
+        r
     }
 
     // ── batch processing ───────────────────────────────────────────────
@@ -464,6 +474,30 @@ impl EngineInner {
     // ── prefill ────────────────────────────────────────────────────────
 
     async fn run_prefill(&self, request_id: &RequestId) -> Result<()> {
+        let prefill_prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+        let prefill_t0 = if prefill_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let res = self.run_prefill_inner(request_id).await;
+        if let Some(t0) = prefill_t0 {
+            static PREFILL_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = PREFILL_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let elapsed = t0.elapsed().as_micros();
+            eprintln!(
+                "[prefill-prof] call#{} req={} elapsed={}us ok={}",
+                n,
+                request_id,
+                elapsed,
+                res.is_ok()
+            );
+        }
+        res
+    }
+
+    async fn run_prefill_inner(&self, request_id: &RequestId) -> Result<()> {
         let (input_tokens_clone, num_tokens) = {
             let sequences = self.sequences.read();
             let seq = sequences
@@ -684,10 +718,21 @@ impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
     /// Run batch decode for multiple requests in a single forward pass.
+    ///
+    /// Dispatches via the unified-batch API: we build a `UnifiedBatch`
+    /// of decode-only items (each `q_len = 1`, `is_final_chunk = true`)
+    /// and call `model_executor.unified_decode(...)`. The default fallback
+    /// in `LlmModelExecutor` recognises the all-decode shape and reroutes
+    /// to the existing batched decode path; once `LlmFamilyModel` ships
+    /// a real unified forward (Step 5), the same call benefits from the
+    /// chunked-prefill kernel work without further engine changes.
     async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
-        // Build DecodeInput for each request
-        let mut decode_inputs = Vec::with_capacity(request_ids.len());
+        use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
+
         let rids: Vec<RequestId> = request_ids.to_vec();
+
+        // Build the unified batch from sequence state.
+        let mut batch = UnifiedBatch::new();
         {
             let sequences = self.sequences.read();
             for rid in &rids {
@@ -704,30 +749,65 @@ impl EngineInner {
                     .last()
                     .copied()
                     .unwrap_or(TokenId::new(0));
-                let tensor = self.tokens_to_tensor(&[last_token.get()])?;
-                decode_inputs.push(ferrum_interfaces::model_executor::DecodeInput::new(
-                    tensor, kv_cache,
-                ));
+                let pos_offset = kv_cache.block_table().sequence_length;
+                // Use the model-side cache_id (set in `run_prefill_inner`
+                // from `prefill_output.kv_cache.cache_id()`), NOT the
+                // engine's request_id. The model's `kv_caches` is keyed
+                // by the executor-generated id (e.g. "llm-cache-N"); using
+                // the request_id (UUID) makes `ensure_kv` allocate a
+                // fresh cache + 128 paged blocks for every decode iter,
+                // exhausting the pool within ~60 prompts.
+                let seq_id = seq
+                    .model_cache_id
+                    .clone()
+                    .unwrap_or_else(|| rid.to_string());
+                batch.items.push(UnifiedBatchItem {
+                    seq_id,
+                    q_tokens: vec![last_token.get()],
+                    kv_cache,
+                    pos_offset,
+                    is_final_chunk: true,
+                });
             }
         }
 
-        // Call batch_decode on the executor
-        let decode_outputs = self.model_executor.batch_decode(&decode_inputs).await?;
+        let results = self.model_executor.unified_decode(&batch).await?;
+        if results.len() != rids.len() {
+            return Err(FerrumError::internal(format!(
+                "unified_decode returned {} results for {} requests",
+                results.len(),
+                rids.len(),
+            )));
+        }
 
-        // Process each result: sample, update state, stream
-        for (rid, decode_output) in rids.iter().zip(decode_outputs.iter()) {
-            let logits_vec = decode_output.logits.to_vec_f32()?;
+        // Per-item post-processing: sample, update sequence state, stream
+        // the new token, check stop conditions. Decode-only items always
+        // produce Some(logits); a None here would indicate a backend bug.
+        for (rid, logits_opt) in rids.iter().zip(results.into_iter()) {
+            let mut logits = logits_opt.ok_or_else(|| {
+                FerrumError::internal(format!(
+                    "unified_decode returned None for decode item (rid={rid})"
+                ))
+            })?;
 
             let next_token = {
                 let mut sequences = self.sequences.write();
                 let seq = sequences
                     .get_mut(rid)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                let mut logits = logits_vec;
                 let token = seq.sample_with_processors(&mut logits)?;
                 seq.generated_tokens.push(token);
-                seq.kv_cache = Some(decode_output.kv_cache.clone());
                 seq.tokens_this_iteration += 1;
+                // The model has appended this iter's token to its internal
+                // KV; update the engine-side handle so the NEXT iter's
+                // pos_offset (read via block_table().sequence_length)
+                // sees the bumped count. The legacy run_batch_decode path
+                // got this for free by replacing seq.kv_cache with
+                // decode_output.kv_cache (which the executor pre-bumped).
+                if let Some(h) = seq.kv_cache.take() {
+                    let new_len = h.block_table().sequence_length + 1;
+                    seq.kv_cache = Some(self.make_kv_handle_with_seq(&h, new_len));
+                }
                 token
             };
 
@@ -1279,7 +1359,20 @@ impl ContinuousBatchEngine {
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
                 prefix_cache_hits: AtomicU64::new(0),
+                bg_loop_spawned: AtomicBool::new(false),
             }),
+        }
+    }
+
+    /// Spawn the background iteration loop on first request. Without this,
+    /// every concurrent infer/infer_stream call spawned its own
+    /// drive_to_completion task → 16 streaming requests = 16 tasks all
+    /// racing for `iteration_lock` (thundering herd, observed as ~5ms of
+    /// per-iter tokio scheduling overhead at c=16). With one bg loop +
+    /// per-request tasks just consuming their channel, lock is uncontested.
+    fn ensure_bg_loop(&self) {
+        if !self.inner.bg_loop_spawned.swap(true, Ordering::SeqCst) {
+            let _ = self.start_loop();
         }
     }
 
@@ -1302,16 +1395,34 @@ impl ContinuousBatchEngine {
         inner.is_running.store(true, Ordering::SeqCst);
         tokio::spawn(async move {
             info!("Background iteration loop started");
+            let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+            let mut last_iter_end: Option<std::time::Instant> = None;
+            static GAP_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             loop {
                 if !inner.is_running.load(Ordering::SeqCst) {
                     break;
                 }
+                let inter_iter_us = if let Some(prev) = last_iter_end {
+                    Some(prev.elapsed().as_micros() as u64)
+                } else {
+                    None
+                };
                 {
                     let _guard = inner.iteration_lock.lock().await;
                     if let Err(e) = inner.run_iteration().await {
                         warn!("Iteration error: {}", e);
                     }
                 }
+                if prof {
+                    let n = GAP_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n.is_multiple_of(8) {
+                        if let Some(gap_us) = inter_iter_us {
+                            eprintln!("[bg-loop-gap] call#{} inter_iter={}us", n, gap_us);
+                        }
+                    }
+                }
+                last_iter_end = Some(std::time::Instant::now());
                 tokio::task::yield_now().await;
             }
             info!("Background iteration loop stopped");
@@ -1344,11 +1455,11 @@ impl InferenceEngine for ContinuousBatchEngine {
             .write()
             .insert(request_id.clone(), seq_state);
 
-        // Notify any background loop
+        // Make sure the single shared bg loop is running, then just wait
+        // for our oneshot to fire. Avoids per-request drive_to_completion
+        // contention on iteration_lock.
+        self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
-
-        // Drive iterations until our request completes
-        self.inner.drive_to_completion(&request_id).await?;
 
         let result = resp_rx
             .await
@@ -1393,16 +1504,14 @@ impl InferenceEngine for ContinuousBatchEngine {
             .write()
             .insert(request_id.clone(), seq_state);
 
-        // Notify any background loop
+        // Single shared bg loop drives iters; per-request stream just
+        // consumes from `rx`. Used to spawn a per-request drive_to_completion
+        // task here, but with c=N concurrent streams that produced N
+        // tasks all racing for `iteration_lock` — measured ~5ms/iter of
+        // tokio thundering-herd overhead at c=16.
+        let _ = request_id;
+        self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
-
-        // Spawn a driver task so we can return the stream immediately
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            if let Err(e) = inner.drive_to_completion(&request_id).await {
-                warn!("Stream driver error for {}: {}", request_id, e);
-            }
-        });
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }

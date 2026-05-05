@@ -1,12 +1,17 @@
 # v0.2 CUDA bench — engine version pins.
 # Anyone reproducing this bench should pin to these exact versions.
 #
-ferrum=0.7.3                # this repo, `cargo build --release --features cuda`
-vllm=0.20.0                 # `pip install vllm==0.20.0`
-mistralrs=0.8.0             # `cargo install mistralrs-server --version 0.8.0`
-benchmark_serving=vllm@v0.20.0  # vendored from vLLM repo at this tag
+ferrum=0.7.3+bench/v0.2-cuda  # this repo, branch `bench/v0.2-cuda`
+                              # build: `cargo build --release -p ferrum-cli --bin ferrum --features cuda`
+vllm=0.20.0                   # latest PyPI; ships PyTorch built for CUDA 12.8.
+                              # REQUIRES: NVIDIA driver ≥ 555 (i.e. CUDA toolkit ≥ 12.6
+                              # on the host). Picking a vast.ai pod with `cuda_max_good>=12.6`
+                              # is mandatory — older CUDA pods fail at vLLM init.
+benchmark_serving=vllm-bench-cli  # `vllm bench serve` from the installed vLLM (0.10+ CLI)
+
+# (mistralrs pin removed: dropped from v0.2 scope. See models.txt comments.)
 
 # CUDA / driver minimums implied by the pins above:
-cuda>=12.4
-driver>=550
-sm>=80                      # Marlin requires Ampere+; RTX 4090 = sm_89 (Ada)
+cuda>=12.6                  # CRITICAL — vLLM 0.20 PyTorch is cu128 wheels
+driver>=555                 # ensures CUDA 12.6+ runtime support
+sm>=80                      # Marlin requires Ampere+; RTX 4090 = sm_89 (Ada) ✓
