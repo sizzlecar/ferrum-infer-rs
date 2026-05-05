@@ -388,6 +388,45 @@ impl ModelExecutor for LlmExecutor {
             return Ok(results);
         }
 
+        // ── Real unified path (Step 5b+): if the model implements
+        // `DecoderOnlyLLM::unified_forward`, route the entire batch
+        // through one model forward (mixed prefill chunks + decode
+        // tokens in a single [M_total, hidden] pass). The model returns
+        // `Err(unsupported)` if it hasn't been wired yet — fall through
+        // to the behaviour-preserving fallback below.
+        let unified_items: Vec<(String, Vec<u32>, usize, bool)> = batch
+            .items
+            .iter()
+            .map(|it| {
+                (
+                    it.seq_id.clone(),
+                    it.q_tokens.clone(),
+                    it.pos_offset,
+                    it.is_final_chunk,
+                )
+            })
+            .collect();
+        let model_result = {
+            let mut model = self.model.lock();
+            model.unified_forward(&unified_items)
+        };
+        match model_result {
+            Ok(per_item) => {
+                if per_item.len() != batch.items.len() {
+                    return Err(FerrumError::model(format!(
+                        "unified_forward returned {} entries for {} items",
+                        per_item.len(),
+                        batch.items.len(),
+                    )));
+                }
+                return Ok(per_item);
+            }
+            Err(FerrumError::Unsupported { .. }) => {
+                // Fall through to the dispatch fallback below.
+            }
+            Err(e) => return Err(e),
+        }
+
         // Partition: pure decode items vs prefill chunks.
         // A "decode" item has q_len == 1 AND is_final_chunk == true.
         // Anything else (chunked prefill mid-stream OR a single-token
