@@ -279,21 +279,6 @@ impl EngineInner {
 
     // ── iteration loop ─────────────────────────────────────────────────
 
-    /// Drive iterations until the given request is removed from `sequences`.
-    async fn drive_to_completion(&self, request_id: &RequestId) -> Result<()> {
-        loop {
-            {
-                let _guard = self.iteration_lock.lock().await;
-                self.run_iteration().await?;
-            }
-            if !self.sequences.read().contains_key(request_id) {
-                return Ok(());
-            }
-            // Yield to let other tasks progress between iterations.
-            tokio::task::yield_now().await;
-        }
-    }
-
     /// Run one iteration: ask the scheduler for a batch, then process it.
     async fn run_iteration(&self) -> Result<()> {
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
@@ -764,7 +749,6 @@ impl EngineInner {
                     .last()
                     .copied()
                     .unwrap_or(TokenId::new(0));
-                use ferrum_interfaces::KvCacheHandle;
                 let pos_offset = kv_cache.block_table().sequence_length;
                 // Use the model-side cache_id (set in `run_prefill_inner`
                 // from `prefill_output.kv_cache.cache_id()`), NOT the
