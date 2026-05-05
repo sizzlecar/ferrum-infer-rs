@@ -2501,7 +2501,7 @@ fn marlin_gemm_with_perm(
             let mut b = stream.launch_builder(&func);
             b.arg(a);
             b.arg(perm);
-            b.arg(a_gathered);
+            b.arg(&mut *a_gathered);
             b.arg(&m_i32);
             b.arg(&k_i32);
             unsafe {
