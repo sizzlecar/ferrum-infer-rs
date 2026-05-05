@@ -3190,6 +3190,44 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         self.decode_batch_internal(batch)
     }
 
+    /// Unified mixed-batch forward (chunked-prefill API).
+    ///
+    /// Step 5b1 (this commit): supports the all-decode case only —
+    /// every item has `q_len == 1` and `is_final_chunk == true`. Routes
+    /// to `decode_batch_internal`. Behaviour is byte-identical to
+    /// `decode_batch` going through `LlmExecutor::unified_decode`'s
+    /// fallback; the difference is purely architectural — the engine
+    /// can now treat decode and prefill chunks through one API surface,
+    /// and the model owns the dispatch decision.
+    ///
+    /// Mixed prefill+decode batches return `Err(unsupported)` so the
+    /// executor falls back to the per-item dispatch path. Step 5b2 will
+    /// extend this to the real unified [M_total, hidden] forward + the
+    /// `paged_varlen_attention` kernel landed in Step 4.
+    fn unified_forward(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, ferrum_types::FerrumError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let all_decode = items
+            .iter()
+            .all(|(_, q, _, fin)| q.len() == 1 && *fin);
+        if !all_decode {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "LlamaFamilyModel::unified_forward: only all-decode batches \
+                 supported in Step 5b1; mixed prefill+decode lands in Step 5b2",
+            ));
+        }
+        let batch: Vec<(String, u32, u32)> = items
+            .iter()
+            .map(|(cid, q, pos, _)| (cid.clone(), q[0], *pos as u32))
+            .collect();
+        let logits = self.decode_batch_internal(&batch);
+        Ok(logits.into_iter().map(Some).collect())
+    }
+
     fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         // Delegate to the inherent implementation on LlamaFamilyModel.
         LlamaFamilyModel::<B>::forward_verify(self, cache_id, tokens)
