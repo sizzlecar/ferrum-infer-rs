@@ -261,6 +261,12 @@ pub struct LlamaFamilyScratch<B: Backend> {
     /// `max_blocks_per_seq` value baked into the stacked block_tables
     /// stride. Set when `paged_batch_block_tables` is allocated.
     pub paged_max_blocks_per_seq: usize,
+    /// Engine-side max concurrent sequences (= `FERRUM_PAGED_MAX_SEQS`).
+    /// Pinned at the first `enable_paged_batch` so the unified-forward
+    /// scratch sizes (`unified_cu_seqlens_q`, `unified_pos_offsets`,
+    /// `unified_block_tables`, `unified_packed_*`) are big enough for
+    /// any subsequent batch up to that bound.
+    pub paged_max_seqs: usize,
     /// Per-item RoPE positions for the batched-decode path (`[max_M]`
     /// i32 / u32). Written host-side once per batched-decode step from
     /// each request's `pos` field, read by the batched
@@ -370,6 +376,7 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             paged_batch_block_tables: None,
             paged_batch_context_lens: None,
             paged_max_blocks_per_seq: 0,
+            paged_max_seqs: 0,
             batch_positions: B::alloc_u32(t.max(1)),
             batch_tokens: B::alloc_u32(t.max(1)),
             batch_kv_lens_pre: B::alloc_u32(t.max(1)),
@@ -456,6 +463,7 @@ impl<B: Backend> LlamaFamilyScratch<B> {
         self.paged_batch_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
         self.paged_batch_context_lens = Some(B::alloc_u32(max_seqs));
         self.paged_max_blocks_per_seq = max_blocks_per_seq;
+        self.paged_max_seqs = max_seqs;
     }
 }
 
@@ -3305,11 +3313,22 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let max_blocks_per_seq = self.scratch.paged_max_blocks_per_seq;
         let block_size = 16usize; // matches PAGED_BLOCK_SIZE in ensure_kv
 
-        // Make sure scratch fits this batch.
-        // max_seqs uses paged_batch's existing limit so unified shares
-        // the cap; if items.len() exceeds it, panic loudly (engine
-        // shouldn't ever produce that).
-        let max_seqs = num_seqs;
+        // Make sure scratch fits this batch. Use the engine-side
+        // `paged_max_seqs` cap (set in `enable_paged_batch` from
+        // `FERRUM_PAGED_MAX_SEQS`, default 32) so the index buffers
+        // (`unified_cu_seqlens_q`, `unified_pos_offsets`,
+        // `unified_block_tables`, `unified_packed_*`) are sized for the
+        // largest batch the engine will ever submit. Earlier we used
+        // `num_seqs` and the buffers were pinned at the FIRST call's
+        // batch size — c=1 warmup → c=16 bench would write 17 ints into
+        // a 2-int buffer (CUDA_ERROR_INVALID_VALUE).
+        debug_assert!(
+            self.scratch.paged_max_seqs >= num_seqs,
+            "unified_forward batch ({} items) exceeds engine paged_max_seqs ({})",
+            num_seqs,
+            self.scratch.paged_max_seqs,
+        );
+        let max_seqs = self.scratch.paged_max_seqs.max(num_seqs);
         // Take cfg ref only for the immediate ensure call (Copy fields
         // already snapshotted above into h/nh/etc — cfg is just for the
         // shape constants ensure_unified_scratch needs).
