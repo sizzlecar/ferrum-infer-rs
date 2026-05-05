@@ -3390,6 +3390,17 @@ impl<B: Backend> LlamaFamilyModel<B> {
             B::write_u32(&mut ctx, bt, &stacked);
         }
 
+        // Optional per-layer timing: `FERRUM_UNIFIED_PROFILE=1` triggers
+        // a sync+stopwatch around each layer call. Off in production —
+        // sync is expensive. Throttle log emission to once every 64 calls
+        // to keep the bench log readable.
+        let unified_profile = std::env::var("FERRUM_UNIFIED_PROFILE").is_ok();
+        let layer_t0 = if unified_profile {
+            B::sync(&mut ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         for li in 0..num_layers {
             self.unified_forward_layer(
                 &mut ctx,
@@ -3415,6 +3426,58 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 eps,
                 qk_mode,
             );
+        }
+        if let Some(t0) = layer_t0 {
+            B::sync(&mut ctx);
+            static UNIFIED_PROF_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = UNIFIED_PROF_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_multiple_of(64) {
+                let total_us = t0.elapsed().as_micros();
+                let per_layer = total_us / num_layers as u128;
+                eprintln!(
+                    "[unified-prof] call#{n} m_total={m_total} num_seqs={num_seqs} layers={num_layers} total={total_us}us per_layer={per_layer}us"
+                );
+            }
+        }
+        // Drain per-op counters every 64 calls when DECODE_OP_PROFILE is on.
+        // The op-profile macro inside unified_forward_layer adds to these
+        // global atomics; without a swap the totals would just keep growing.
+        if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+            static OP_DRAIN_CALLS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = OP_DRAIN_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_multiple_of(64) {
+                use std::sync::atomic::Ordering;
+                let norm_us = NORM_TIME_US.swap(0, Ordering::Relaxed);
+                let norm_n = NORM_CALLS.swap(0, Ordering::Relaxed);
+                let mm_us = MATMUL_TIME_US.swap(0, Ordering::Relaxed);
+                let mm_n = MATMUL_CALLS.swap(0, Ordering::Relaxed);
+                let qkr_us = QKR_TIME_US.swap(0, Ordering::Relaxed);
+                let qkr_n = QKR_CALLS.swap(0, Ordering::Relaxed);
+                let attn_us = ATTN_TIME_US.swap(0, Ordering::Relaxed);
+                let attn_n = ATTN_CALLS.swap(0, Ordering::Relaxed);
+                let other_us = OTHER_TIME_US.swap(0, Ordering::Relaxed);
+                let other_n = OTHER_CALLS.swap(0, Ordering::Relaxed);
+                let bucket = |label: &str, n: u64, us: u64| {
+                    if n > 0 {
+                        eprintln!(
+                            "[unified-op] {label}: {} calls {} ms total avg={}us",
+                            n,
+                            us / 1000,
+                            us / n.max(1)
+                        );
+                    }
+                };
+                eprintln!("[unified-op] drain#{n} (over last 64 unified_forward calls):");
+                bucket("rms_norm/fused_rms", norm_n, norm_us);
+                bucket("matmul (qkv/o/gate_up/down)", mm_n, mm_us);
+                bucket("split_qkv_norm_rope_paged", qkr_n, qkr_us);
+                bucket("paged_varlen_attention", attn_n, attn_us);
+                bucket("silu/residual_add", other_n, other_us);
+            }
         }
 
         // Final norm on the WHOLE M_total then extract last-token rows
@@ -3545,19 +3608,35 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let dummy_w = &layer.input_ln_w;
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
+        let op_prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+
+        macro_rules! time_op {
+            ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
+                if op_prof {
+                    B::sync(ctx);
+                    let _t0 = std::time::Instant::now();
+                    $body
+                    B::sync(ctx);
+                    $bucket_us.fetch_add(_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    $bucket_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    $body
+                }
+            }};
+        }
 
         // 1. rms_norm [M_total, h] → unified_norm_out
-        {
+        time_op!(NORM_TIME_US, NORM_CALLS, {
             let norm_out = self
                 .scratch
                 .unified_norm_out
                 .as_mut()
                 .expect("unified_norm_out missing");
             B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
-        }
+        });
 
         // 2. qkv_proj GEMM (m=M_total): unified_norm_out → unified_qkv_out
-        {
+        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
             let norm_out = self
                 .scratch
                 .unified_norm_out
@@ -3569,7 +3648,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .as_mut()
                 .expect("unified_qkv_out missing");
             layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
-        }
+        });
 
         // 3. Per-item split_qkv_norm_rope_into_paged_cache. Writes K/V
         // into seq's paged pool slot AND stores RoPE'd Q at packed_q
@@ -3590,65 +3669,67 @@ impl<B: Backend> LlamaFamilyModel<B> {
         let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
         let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
 
-        for (i, (cid, _q_tokens, pos_offset, _)) in items.iter().enumerate() {
-            let q_token_offset = cu_seqlens_q[i] as u64;
-            let cache_len_before;
-            let bt_safe: &B::Buffer;
-            {
-                let caches = self
-                    .kv_caches
-                    .get(cid)
-                    .expect("paged unified: cache not present");
-                let cache = &caches[li];
-                cache_len_before = cache.len;
-                let bt = cache
-                    .block_table
+        time_op!(QKR_TIME_US, QKR_CALLS, {
+            for (i, (cid, _q_tokens, pos_offset, _)) in items.iter().enumerate() {
+                let q_token_offset = cu_seqlens_q[i] as u64;
+                let cache_len_before;
+                let bt_safe: &B::Buffer;
+                {
+                    let caches = self
+                        .kv_caches
+                        .get(cid)
+                        .expect("paged unified: cache not present");
+                    let cache = &caches[li];
+                    cache_len_before = cache.len;
+                    let bt = cache
+                        .block_table
+                        .as_ref()
+                        .expect("paged unified: block_table missing");
+                    let block_table_ref = bt as *const B::Buffer;
+                    // SAFETY: bt is read-only; we don't mutate kv_caches between
+                    // this raw deref and the call.
+                    bt_safe = unsafe { &*block_table_ref };
+                }
+                let qkv_out = self
+                    .scratch
+                    .unified_qkv_out
                     .as_ref()
-                    .expect("paged unified: block_table missing");
-                let block_table_ref = bt as *const B::Buffer;
-                // SAFETY: bt is read-only; we don't mutate kv_caches between
-                // this raw deref and the call.
-                bt_safe = unsafe { &*block_table_ref };
+                    .expect("unified_qkv_out missing");
+                let packed_q = self
+                    .scratch
+                    .unified_packed_q
+                    .as_mut()
+                    .expect("unified_packed_q missing");
+                B::split_qkv_norm_rope_into_paged_cache(
+                    ctx,
+                    qkv_out,
+                    q_token_offset * qkv_stride_bytes,
+                    q_norm_w,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    packed_q,
+                    q_token_offset * q_head_major_size_bytes,
+                    pool_k,
+                    pool_v,
+                    bt_safe,
+                    q_lens[i],
+                    nh,
+                    nkv,
+                    hd,
+                    *pos_offset,
+                    eps,
+                    qk_mode,
+                    cache_len_before,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("paged unified: split_qkv_norm_rope_into_paged_cache");
             }
-            let qkv_out = self
-                .scratch
-                .unified_qkv_out
-                .as_ref()
-                .expect("unified_qkv_out missing");
-            let packed_q = self
-                .scratch
-                .unified_packed_q
-                .as_mut()
-                .expect("unified_packed_q missing");
-            B::split_qkv_norm_rope_into_paged_cache(
-                ctx,
-                qkv_out,
-                q_token_offset * qkv_stride_bytes,
-                q_norm_w,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                packed_q,
-                q_token_offset * q_head_major_size_bytes,
-                pool_k,
-                pool_v,
-                bt_safe,
-                q_lens[i],
-                nh,
-                nkv,
-                hd,
-                *pos_offset,
-                eps,
-                qk_mode,
-                cache_len_before,
-                block_size,
-                max_blocks_per_seq,
-            )
-            .expect("paged unified: split_qkv_norm_rope_into_paged_cache");
-        }
+        });
 
         // 4. paged_varlen_attention: one call covering all M_total tokens.
-        {
+        time_op!(ATTN_TIME_US, ATTN_CALLS, {
             let packed_q = self
                 .scratch
                 .unified_packed_q
@@ -3693,10 +3774,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 max_blocks_per_seq,
             )
             .expect("paged_varlen_attention");
-        }
+        });
 
         // 5. o_proj (M_total): attn_out → o_proj_out
-        {
+        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
             let attn_out = self
                 .scratch
                 .unified_attn_out
@@ -3708,11 +3789,11 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .as_mut()
                 .expect("unified_o_proj_out missing");
             layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
-        }
+        });
 
         // 6. fused_add_rms_norm: residual = residual + o_proj_out;
         //    norm_out = rms_norm(new_residual, post_ln_w)
-        {
+        time_op!(NORM_TIME_US, NORM_CALLS, {
             let o_proj_out = self
                 .scratch
                 .unified_o_proj_out
@@ -3733,10 +3814,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 m_total,
                 h,
             );
-        }
+        });
 
         // 7. gate_up_proj
-        {
+        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
             let norm_out = self
                 .scratch
                 .unified_norm_out
@@ -3750,10 +3831,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
             layer
                 .gate_up_proj
                 .forward(ctx, norm_out, gate_up_out, m_total);
-        }
+        });
 
         // 8. SwiGLU
-        {
+        time_op!(OTHER_TIME_US, OTHER_CALLS, {
             let gate_up_out = self
                 .scratch
                 .unified_gate_up_out
@@ -3765,10 +3846,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .as_mut()
                 .expect("unified_silu_out missing");
             B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im);
-        }
+        });
 
         // 9. down_proj
-        {
+        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
             let silu_out = self
                 .scratch
                 .unified_silu_out
@@ -3780,17 +3861,17 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .as_mut()
                 .expect("unified_mlp_out missing");
             layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
-        }
+        });
 
         // 10. residual_add
-        {
+        time_op!(OTHER_TIME_US, OTHER_CALLS, {
             let mlp_out = self
                 .scratch
                 .unified_mlp_out
                 .as_ref()
                 .expect("unified_mlp_out missing");
             B::add_inplace(ctx, residual, mlp_out, m_total * h);
-        }
+        });
     }
 }
 
