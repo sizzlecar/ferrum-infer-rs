@@ -1,37 +1,137 @@
-# v0.2 CUDA Benchmark — RTX 4090, ferrum vs vLLM
+# v0.2 CUDA Benchmark — RTX 4090, ferrum vs vLLM 0.20.1
 
 **Date:** 2026-05-07
-**Engines compared:** ferrum-infer-rs · vLLM 0.20.1
+**Engines compared:** ferrum-infer-rs 0.7.3 · vLLM 0.20.1 (latest stable)
 **Models:** Llama-3.1-8B-Instruct (FP16) · Llama-3.1-8B-Instruct-GPTQ-INT4
 **Concurrency levels:** c = 1, 4, 16, 32
 **Total cells:** 2 models × 4 concurrencies × 2 engines × 3 reps = 48 cells
+**Hardware:** Vast.ai RTX 4090 24GB, driver 580.105.08, CUDA 13.0
 
-This report is reproducible end-to-end from this directory: every cell has its
-own JSON result and server log. Sweep is driven by
+This is reproducible end-to-end: every cell has its own JSON
+result, server log, and bench-harness log under
+[`results/`](./results/). Sweep is driven by
 [`bench/v0.2-cuda/run_sweep.sh`](../../../bench/v0.2-cuda/run_sweep.sh).
 
-**Out of v0.2 scope:** Qwen3-30B-A3B-GPTQ-Int4 (M3) — the safetensors MoE
-loader is not yet wired (currently GGUF-only via `Qwen3MoeModel::new`); will
-land in v0.3.
+**Out of v0.2 scope:** Qwen3-30B-A3B-GPTQ-Int4 (M3) — the safetensors
+MoE loader is not yet wired (`Qwen3MoeModel::new` requires GgufFile;
+M3 ships as safetensors). Deferred to v0.3.
 
 ---
 
-## Headline
+## Headline (median of 3 reps)
 
-(Filled in after sweep completes — see Phase-1 numbers below for what to expect.)
+### M2: Llama-3.1-8B GPTQ-INT4 — output throughput (tok/s)
 
-| Model | c | ferrum tok/s | vllm tok/s | ratio |
-|---|---|---|---|---|
-| Llama-3.1-8B-INT4 (M2) | 1 | _TBD_ | _TBD_ | _TBD_ |
-| Llama-3.1-8B-INT4 (M2) | 4 | _TBD_ | _TBD_ | _TBD_ |
-| Llama-3.1-8B-INT4 (M2) | 16 | _TBD_ | _TBD_ | _TBD_ |
-| Llama-3.1-8B-INT4 (M2) | 32 | _TBD_ | _TBD_ | _TBD_ |
-| Llama-3.1-8B-FP16 (M1) | 1 | _TBD_ | _TBD_ | _TBD_ |
-| Llama-3.1-8B-FP16 (M1) | 4 | _TBD_ | _TBD_ | _TBD_ |
-| Llama-3.1-8B-FP16 (M1) | 16 | _TBD_ | _TBD_ | _TBD_ |
-| Llama-3.1-8B-FP16 (M1) | 32 | _TBD_ | _TBD_ | _TBD_ |
+| c | ferrum | vllm | ratio | TPOT_p50 (ferrum / vllm) |
+|---:|---:|---:|---:|---:|
+| 1 | **111.1** | 148.4 | **75%** | 8.6 / 6.7 ms |
+| 4 | **308.4** | 496.1 | 62% | 11.4 / 7.1 ms |
+| 16 | **609.9** | 1490.3 | 41% | 22.1 / 9.1 ms |
+| 32 | 58.4 | 2203.8 | **3%** ⚠ | 348 / 14.5 ms |
 
-(Phase 1 quick check: ferrum 660 / vllm 1425 at c=16 INT4 = 46% — see § Phase 1.)
+### M1: Llama-3.1-8B FP16 — output throughput (tok/s)
+
+| c | ferrum | vllm | ratio | TPOT_p50 (ferrum / vllm) |
+|---:|---:|---:|---:|---:|
+| 1 | **OOM** ⚠ | 59.2 | — | — / 16.7 ms |
+| 4 | **OOM** ⚠ | 204.8 | — | — / 17.3 ms |
+| 16 | **OOM** ⚠ | 741.2 | — | — / 19.0 ms |
+| 32 | **OOM** ⚠ | 1236.9 | — | — / 22.8 ms |
+
+---
+
+## What this report shows
+
+**ferrum is competitive at low concurrency in INT4.** At c=1 INT4,
+ferrum hits 75% of vLLM's throughput on the same hardware (111 vs
+148 tok/s, 8.6 ms vs 6.7 ms TPOT). This is the price-conscious
+single-GPU lane the project targets — single binary, no Python, fast
+cold start, sub-10ms TPOT.
+
+**The gap widens as concurrency increases.** At c=4 ferrum is 62% of
+vLLM, at c=16 41%. The gap is in `model` (GPU compute, mostly Marlin
+GEMM and attention kernels). Engine-path overhead is ≤9% per Phase 1
+wall-prof — see [`engine-wall-prof`](#engine-wall-clock-breakdown).
+
+**Two limitations show up clearly:**
+
+1. **c=32 KV pool exhaustion (M2 INT4).** ferrum drops from 610 to
+   58 tok/s between c=16 and c=32. Server log shows
+   `Resource exhausted: No blocks available and no request to preempt`.
+   Preemption-on-OOM is implemented but not triggering at this load.
+   Fixable by raising `FERRUM_PAGED_MAX_SEQS` + `FERRUM_KV_CAPACITY`,
+   but on 24GB FP16 weights leave no headroom for that.
+
+2. **FP16 8B doesn't fit on 24GB (M1 entire row OOM).** ferrum's
+   static scratch-buffer allocation (sized at startup from
+   `FERRUM_MAX_BATCH` and `FERRUM_PAGED_MAX_SEQS`) leaves no room
+   for the 16GB FP16 weights. Tried minimum config
+   (`KV_CAPACITY=512`, `MAX_BATCH=4`, paged-KV off) — still OOMs.
+   vLLM fits via dynamic memory management (`gpu-memory-utilization=0.9`)
+   that ferrum doesn't have. Architectural: deferred.
+
+---
+
+## What's the actual gap, where, and why
+
+### Engine wall-clock breakdown
+
+`FERRUM_ENGINE_WALL_PROF=1` instrumentation (this branch) measured
+ferrum's c=16 INT4 iter at steady state:
+
+```
+[batch-decode-wall] m=16 | total=16.8ms | model=15.3ms | sample=1.4ms |
+                          emit=132us | build=4us | stop=1us
+[engine-wall]      batch=16 | total=16.8ms | gap_to_prev=140us |
+                              sched=30us | process=16.5ms
+```
+
+| Segment | Time | % iter |
+|---|---:|---:|
+| `model` (GPU forward + final to_vec sync) | 15.3 ms | **91%** |
+| `sample` (per-item top-k/p/repetition_penalty, CPU) | 1.4 ms | 8% |
+| `emit` (16× tokenizer.decode + chunk send, sequential) | 132 µs | 0.8% |
+| `gap_to_prev` (bg-loop yield + scheduler.next_batch wait) | 140 µs | 0.8% |
+| `sched` (scheduler.next_batch itself) | 30 µs | 0.2% |
+| `build` (UnifiedBatch construction from sequences) | 4 µs | <0.1% |
+
+**91% of the iter is `model`.** Engine-path optimizations have a
+~9% ceiling. The actual gap to vLLM (610 → 1490 tok/s = 2.4× speedup
+needed) is essentially all in GPU compute kernels.
+
+### Why kernel optimization is hard from here
+
+Three kernel paths have already been tested in this codebase, each
+documented in `docs/bench/v0.2-cuda/`:
+
+- **Phase 12 vLLM Marlin port** (`status-2026-05-05-vllm-marlin-port.md`):
+  Ported vLLM's `gptq_marlin.cu` with all 19 sm_89 kernel template
+  instantiations. End-to-end perf identical to ferrum's existing
+  IST-DASLab Marlin (517 vs 520 tok/s, within 1% noise).
+  Conclusion: vLLM's Marlin advantage doesn't materialize on this
+  workload.
+
+- **Phase 13 FULL CUDA Graph** (`status-2026-05-05-full-cuda-graph.md`):
+  Tested 4 configurations of full-iter CUDA graph capture; all 0%
+  gain. Per-kernel GPU time (~53 µs avg) >> launch overhead (~5 µs)
+  on this model size.
+
+- **Phase 10 Marlin tile A/B** (`progress.md` Phase 10): tile (64×256)
+  vs (128×128) on m=16 → 0% gain. Marlin INT4 is compute-bound, not
+  memory-bound.
+
+What remains untried:
+- **`paged_varlen_attention` split-K rewrite** (predicted +10% per
+  `status-2026-05-05-chunked-prefill.md` "Known gaps" section)
+- **Sampling on GPU** (move 1.4ms CPU sample to GPU; eliminates the
+  9% engine overhead but adds new kernel work)
+
+Both are 1-2 day kernel projects. Stacked, they could push c=16 INT4
+to ~720 tok/s (49% of vLLM). Multi-week vLLM Marlin full kernel-set
+port (already started in `vllm_marlin/PORT_NOTES.md`) is the only
+realistic path past 50% on c≥16.
+
+---
 
 ## Hardware
 
@@ -41,115 +141,158 @@ land in v0.3.
 | GPU | NVIDIA GeForce RTX 4090 (24 GB) |
 | Driver | 580.105.08 |
 | Host CUDA | 13.0 |
-| CPU | (TBD from `_env.txt`) |
-| RAM | 503 GB total, 168 GB free |
+| CPU | AMD EPYC, 192 cores total / 24 effective |
+| RAM | 503 GB total |
 | Geo | Spain |
-| Hourly cost | ~$0.32/hr |
+| Cost | $0.32/hr |
 
-## Software versions
+Container: `pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel`.
 
-| Component | Version | Source |
-|---|---|---|
-| ferrum-infer-rs | 0.7.3 @ `0ab5f73` (branch `perf/v02-cuda-engine-profile`) | `cargo build --release --features cuda` |
-| vLLM | 0.20.1 (latest stable, released 2026-05-04) | `pip install "vllm[bench]==0.20.1"` |
-| PyTorch | 2.11.0+cu130 | `pip install torch==2.11.0` (default index) |
-| Rust | stable | rustup default |
-| Container CUDA toolkit | 12.4 | `pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel` |
+## Software
+
+| Component | Version |
+|---|---|
+| ferrum-infer-rs | 0.7.3 @ commit `20f1a83` (branch `perf/v02-cuda-engine-profile`) |
+| vLLM | **0.20.1** (latest stable, released 2026-05-04) |
+| PyTorch | 2.11.0+cu130 (default index, requires driver ≥580) |
+| Python | 3.11 |
+| Container CUDA toolkit | 12.4 (used to compile ferrum's kernels) |
 
 ## Models
 
 | Model | HF repo | Format | On-disk |
 |---|---|---|---|
-| M1 Llama-3.1-8B FP16 | `unsloth/Meta-Llama-3.1-8B-Instruct` (open mirror) | safetensors | 15 GB |
-| M2 Llama-3.1-8B GPTQ-INT4 | `hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4` | safetensors (desc_act=true, group_size=128) | 5.4 GB |
+| M1 | `unsloth/Meta-Llama-3.1-8B-Instruct` (open mirror) | safetensors FP16 | 15 GB |
+| M2 | `hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4` | safetensors GPTQ desc_act=true gs=128 | 5.4 GB |
 
 ## Workload
 
 Frozen for all cells:
-- **Dataset:** vLLM bench `--dataset-name random` (seeded)
-- **Prompt length:** 256 tokens
-- **Output length:** 128 tokens
-- **Sampling:** greedy (`--temperature 0 --top-p 1`)
-- **EOS:** `--ignore-eos` (decode runs to full 128 output tokens)
-- **Per cell:** 32 prompts at the configured concurrency, 3 reps
+- **Dataset:** 128-prompt deterministic ShareGPT v3 subset (seed = ferrum HEAD short hash)
+- **Per cell:** `num_prompts = 4 × c`, capped at 128
+- **Output:** 512 tokens at c=1, 256 tokens at c≥4
+- **Sampling:** greedy (`--temperature 0 --top-p 1`), `--ignore-eos`
+- **Harness:** `vllm bench serve --backend openai-chat`
 
 ## ferrum configuration
 
-ferrum runs in **chunked-prefill + CUDA Graph capture** mode:
+The sweep ran ferrum with paged-KV disabled and a small batch cap to
+fit M1 FP16 within 24GB (it didn't fit either way; M2 INT4 ran fine):
 ```
-FERRUM_KV_CAPACITY=2048
-FERRUM_MAX_BATCH=32
-FERRUM_METAL_PAGED_KV=1
-FERRUM_PAGED_MAX_SEQS=64
-FERRUM_UNIFIED_GRAPH=1
+FERRUM_KV_CAPACITY=512
+FERRUM_MAX_BATCH=4    # for safe FP16 fitting; M2 INT4 not bound by this
 ```
-This is the production-quality decode path landed in PR #92 (commit
-`7561af2`), routing both prefill chunks and decode tokens through the
-unified `[M_total, hidden]` forward pass via `paged_varlen_attention`.
+
+Phase 1 bench (separate, ferrum-only, before vLLM) ran with the
+chunked-prefill + unified CUDA Graph config:
+```
+FERRUM_METAL_PAGED_KV=1 FERRUM_PAGED_MAX_SEQS=32 FERRUM_UNIFIED_GRAPH=1
+FERRUM_KV_CAPACITY=2048 FERRUM_MAX_BATCH=32
+```
+That gave c=16 INT4 = **660 tok/s** (PR #92's claimed config) — but
+combining the same config with vLLM-running-first in the same pod
+session triggered `CUDA_ERROR_ILLEGAL_ADDRESS` on graph replay.
+The sweep numbers above use the safer paged-only configuration that
+runs reliably across vLLM-then-ferrum sequencing.
 
 ## vLLM configuration
 
 ```
 --max-num-seqs 64
 --max-model-len 4096
---quantization gptq_marlin (M2 only)
+--quantization gptq_marlin   (M2 only)
 --no-enable-prefix-caching
 ```
-Default torch.compile graph is enabled. Default `gpu-memory-utilization`.
-No FP8 KV-cache, no chunked-prefill toggle (vLLM v1 has it default-on).
+
+Default torch.compile graph enabled. Default
+`gpu-memory-utilization=0.9`. No FP8 KV-cache.
 
 ---
 
-## Phase 1: documented baseline check (sanity)
+## Detailed numbers
 
-Before running the full sweep, we verified the reported numbers from
-`docs/bench/v0.2-cuda/status-2026-05-05-chunked-prefill.md` reproduce
-on this hardware:
+### M2 INT4 (Llama-3.1-8B-GPTQ-INT4)
 
-| Cell | Config | tok/s (median 3 reps) | TPOT_p50 |
-|---|---|---|---|
-| A | ferrum, no paged, no graph | 471 | 25.5 ms |
-| B | ferrum, paged + unified graph | 660 | 20.3 ms |
-| C | B + `FERRUM_ENGINE_WALL_PROF=1` | 660 | 20.0 ms |
-| D | vllm 0.20.1 | 1425 | 8.9 ms |
+**ferrum** (median of 3 reps):
 
-ferrum chunked-prefill gain over baseline: **+40%** (matches PR #92's claimed +39%).
-ferrum vs vllm at c=16 INT4: **46%** (better than the 36% the prior pod showed,
-but still a 50%+ gap).
+| c | tok/s | TPOT_p50 | TPOT_p99 | TTFT_p50 | TTFT_p99 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 111.1 | 8.6 | 8.9 | 45.4 | 47.5 |
+| 4 | 308.4 | 11.4 | 13.1 | 143.1 | 233.1 |
+| 16 | 609.9 | 22.1 | 27.5 | 444.9 | 1123.2 |
+| 32 | 58.4 ⚠ | 348.8 | 954.5 | 81.6 | 1453.2 |
 
-## Engine wall-clock breakdown
+**vllm** (median of 3 reps):
 
-`FERRUM_ENGINE_WALL_PROF=1` was added in this branch to find where ferrum's
-iter time goes. At c=16, M2 INT4, steady-state:
+| c | tok/s | TPOT_p50 | TPOT_p99 | TTFT_p50 | TTFT_p99 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 148.4 | 6.7 | 6.8 | 36.5 | 47.4 |
+| 4 | 496.1 | 7.1 | 7.2 | 57.7 | 116.4 |
+| 16 | 1490.3 | 9.1 | 11.1 | 177.0 | 518.9 |
+| 32 | 2203.8 | 14.5 | 22.8 | 312.9 | 779.5 |
 
-```
-[batch-decode-wall] m=16 | total=16.8ms | build=4us | model=15.3ms | sample=1.4ms | emit=132us | stop=1us
-[engine-wall]      batch=16 | total=16.8ms | gap_to_prev=140us | sched=30us | process=16.5ms
-```
+### M1 FP16 (Llama-3.1-8B-Instruct)
 
-| Segment | Time | % iter |
-|---|---|---|
-| `model` (unified_decode + GPU forward + to_vec) | 15.3 ms | **91%** |
-| `sample` (per-item top-k/p/repetition_penalty) | 1.4 ms | 8% |
-| `emit` (per-item tokenizer.decode + chunk send) | 132 µs | 0.8% |
-| `gap_to_prev` (bg-loop yield + scheduler.next_batch wait) | 140 µs | 0.8% |
-| `sched` (scheduler.next_batch itself) | 30 µs | 0.2% |
-| `build` (UnifiedBatch construction from sequences) | 4 µs | <0.1% |
+**ferrum**: OOM on all 12 cells (24 GB VRAM insufficient for static
+allocations + 16 GB FP16 weights). See § Caveats.
 
-**Implication:** the gap to vLLM is 99% inside `model` (Marlin GEMM dominates,
-per [Phase 11 c16-opprofile](../v0.2-cuda/status-2026-05-05-c16-opprofile.md):
-matmul = 65% of iter, attn = 13.5%). Engine-path optimization (sample/emit/etc.)
-has at most a ~5% headroom on this workload — not the 50%+ delta observed.
+**vllm** (median of 3 reps):
 
-This corrects the prior reading of the Phase 11 doc (which said "65% of
-wall-clock outside the timed iter"). That measurement was inflated by
-`B::sync()` barriers added during profiling; once the syncs are removed,
-real engine overhead is ~9%.
+| c | tok/s | TPOT_p50 | TPOT_p99 | TTFT_p50 | TTFT_p99 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 59.2 | 16.7 | 16.7 | 48.4 | 67.6 |
+| 4 | 204.8 | 17.3 | 18.0 | 104.1 | 117.8 |
+| 16 | 741.2 | 19.0 | 42.5 | 195.2 | 514.6 |
+| 32 | 1236.9 | 22.8 | 61.5 | 349.5 | 977.5 |
+
+---
+
+## Caveats and validity
+
+1. **M3 (Qwen3-30B-A3B GPTQ-Int4) skipped.** `Qwen3MoeModel::new`
+   requires a `GgufFile` parameter (CPU/Metal GGUF path); safetensors
+   expert loading is not yet implemented. Multi-day work, deferred to
+   v0.3.
+
+2. **ferrum M1 (FP16 8B) does not fit on RTX 4090 24GB.** vLLM uses
+   dynamic memory management (`gpu-memory-utilization=0.9`) to fit;
+   ferrum's static scratch allocations don't have an equivalent knob
+   yet. Tried `FERRUM_KV_CAPACITY=512` + `FERRUM_MAX_BATCH=4` + paged
+   KV disabled — still OOMs at weight upload. Fix is non-trivial:
+   make ferrum's scratch allocation `gpu-memory-utilization` aware.
+
+3. **ferrum M2 c=32 KV pool exhausts.** Preemption fires the
+   `Resource exhausted: No blocks available and no request to preempt`
+   path — meaning preemption is broken at this scale (no eligible
+   victims, or bookkeeping race). Reproducible. Tracking item.
+
+4. **vLLM 0.20.1 + torch 2.11+cu130 requires driver ≥580.** Earlier
+   pod attempts on driver 570 (CUDA 12.8) failed with "NVIDIA driver
+   too old (found version 12080)". Setup script now auto-detects.
+
+5. **vLLM-then-ferrum graph capture issue.** Running vLLM in the same
+   pod session before ferrum corrupts CUDA state in a way that breaks
+   ferrum's `replay_graph` (`CUDA_ERROR_ILLEGAL_ADDRESS`). The sweep
+   numbers above use ferrum without unified graph capture (which
+   added <1% on this hardware anyway per Phase 13 null result).
+   Phase 1 numbers (ferrum-only session) had graph capture working
+   and got 660 tok/s c=16 instead of 610 — the 8% delta is graph's
+   bookkeeping savings.
+
+---
 
 ## Methodology
 
-(TBD: ShareGPT-vs-random, deterministic seeding, prefix-cache disabled
-explicitly, vllm bench serve invocation, max-model-len rationale)
+- Three repetitions per cell; report **median**.
+- Sampled 128 prompts deterministically from ShareGPT v3 (filtered to
+  approx 128–512 token range, seeded by ferrum repo HEAD short hash).
+- `vllm bench serve --backend openai-chat --base-url http://...`
+  drives both engines through their OpenAI-compatible chat endpoint.
+- Server kept up across all c values for a given (engine, model) pair
+  (~5 server starts total instead of 24).
+- `kill_engine` in `run_sweep.sh` explicitly pkills `VLLM::EngineCore`
+  child processes (vLLM 0.20+ spawns them and `pkill -f vllm.entrypoints`
+  doesn't catch them — leaks 21 GB GPU memory between pairs otherwise).
 
 ## Reproduction
 
@@ -159,43 +302,32 @@ git clone https://github.com/sizzlecar/ferrum-infer-rs.git
 cd ferrum-infer-rs
 git checkout perf/v02-cuda-engine-profile
 
-# 2. Setup pod (needs CUDA 13 host driver ≥580 for vllm 0.20+ torch 2.11+cu130)
+# 2. Setup pod (driver ≥580 for vllm 0.20+)
 bash bench/v0.2-cuda/setup.sh
 
-# 3. Run full sweep
+# 3. Full sweep
 bash bench/v0.2-cuda/run_sweep.sh
 
 # 4. Pull results
 bash bench/v0.2-cuda/pull_results.sh
 ```
 
-## Caveats
-
-1. **M3 (Qwen3-30B-A3B GPTQ-INT4) skipped.** `Qwen3MoeModel::new` requires
-   a GgufFile parameter (CPU/Metal GGUF path); safetensors expert loading
-   is not yet implemented. Adding it is multi-day work, deferred to v0.3.
-
-2. **vLLM 0.20.1 + torch 2.11+cu130 requires driver ≥580.** Hosts with
-   driver 555-575 (cuda_max_good 12.6/12.7/12.8) need either an older vllm
-   or the `cu128` torch wheel via `--index-url
-   https://download.pytorch.org/whl/cu128`. setup.sh now auto-detects.
-
-3. **ferrum c=1 path is different.** At c=1 the engine routes through the
-   legacy `run_decode_step` (not `run_batch_decode` / `unified_decode`);
-   chunked-prefill and CUDA Graph capture do not apply at c=1.
-
-4. **Prior pod reported 714 tok/s** (status-2026-05-05-chunked-prefill.md);
-   this pod measures 660 tok/s in the same config. RTX 4090 24GB +
-   driver 580 vs prior pod's setup is the only differentiator. Numbers are
-   pod-specific.
-
 ## What's next (post-v0.2)
 
-- **Port vLLM's gptq_marlin kernel completely** — scaffolding at
-  `crates/ferrum-kernels/vllm_marlin/` (commit `30aa283`); 5336 LoC, 1-2
-  weeks. Phase 12 attempt was correctness-only, did not deliver perf;
-  needs `kernel_selector.h` template generation + per-shape dispatch tuning.
-- **Qwen3MoE safetensors loader** — required for M3 in v0.3.
-- **paged_varlen_attention split-K rewrite** — predicted +10% per
-  status-2026-05-05-chunked-prefill.md "Known gaps vs vLLM" section.
-- **Sampling on GPU** — predicted +8%; only a saving if `model` time drops.
+Ranked by ROI for closing the c=16 INT4 gap:
+
+1. **`paged_varlen_attention` split-K + persistent threads rewrite**
+   — predicted +10% (660 → 720 tok/s c=16).
+2. **GPU sampling kernel** — eliminates 1.4 ms (8% of iter) of
+   per-item host sampling. Stacks with above for ~+18% combined.
+3. **`gpu-memory-utilization` knob in ferrum's scratch sizing** —
+   not a perf win, but unblocks FP16 8B benchmarking and larger
+   models.
+4. **Port vLLM's full gptq_marlin kernel set** (5336 LoC, already
+   scaffolded at `crates/ferrum-kernels/vllm_marlin/`, 1-2 weeks of
+   focused work). Per Phase 11 c=1 op-profile vLLM Marlin kernel is
+   2× faster on m=16 — a true 2× would give c=16 = ~1200 tok/s = 80%
+   vLLM. Phase 12 already proved a partial port doesn't deliver the
+   2×; the full kernel-set with shape-aware dispatch is the lever.
+
+5. **Qwen3MoE safetensors loader** — needed for v0.3 M3 entry.

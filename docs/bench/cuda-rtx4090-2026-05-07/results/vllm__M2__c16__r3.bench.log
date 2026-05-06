@@ -1,0 +1,37 @@
+INFO 05-06 18:38:56 [nixl_utils.py:20] Setting UCX_RCACHE_MAX_UNRELEASED to '1024' to avoid a rare memory leak in UCX when using NIXL.
+WARNING 05-06 18:38:56 [nixl_utils.py:34] NIXL is not available
+WARNING 05-06 18:38:56 [nixl_utils.py:44] NIXL agent config is not available
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7f12d89ccd60>, trust_remote_code=False, seed=0, num_prompts=64, dataset_name='custom', no_stream=False, dataset_path='/workspace/ferrum-infer-rs/bench/v0.2-cuda/prompts.jsonl', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai-chat', base_url='http://127.0.0.1:8800', host='127.0.0.1', port=8000, endpoint='/v1/chat/completions', header=None, max_concurrency=16, model='/workspace/models/M2', input_len=None, output_len=None, tokenizer=None, tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=False, append_result=False, metadata=None, result_dir='/workspace/ferrum-infer-rs/bench/v0.2-cuda/results', result_filename='vllm__M2__c16__r3.json', ignore_eos=False, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-318a7374-', top_p=1.0, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 16
+  0%|          | 0/64 [00:00<?, ?it/s]  2%|▏         | 1/64 [00:01<01:07,  1.07s/it]  3%|▎         | 2/64 [00:01<00:41,  1.49it/s]  6%|▋         | 4/64 [00:02<00:29,  2.03it/s]  8%|▊         | 5/64 [00:02<00:23,  2.48it/s] 11%|█         | 7/64 [00:02<00:14,  3.96it/s] 28%|██▊       | 18/64 [00:03<00:04, 10.29it/s] 31%|███▏      | 20/64 [00:03<00:03, 11.01it/s] 34%|███▍      | 22/64 [00:03<00:05,  7.44it/s] 38%|███▊      | 24/64 [00:04<00:05,  7.17it/s] 39%|███▉      | 25/64 [00:04<00:07,  5.28it/s] 42%|████▏     | 27/64 [00:05<00:06,  5.71it/s] 45%|████▌     | 29/64 [00:05<00:05,  6.90it/s] 55%|█████▍    | 35/64 [00:05<00:03,  8.64it/s] 56%|█████▋    | 36/64 [00:05<00:03,  8.75it/s] 59%|█████▉    | 38/64 [00:06<00:02,  8.99it/s] 61%|██████    | 39/64 [00:06<00:03,  6.74it/s] 62%|██████▎   | 40/64 [00:06<00:03,  6.72it/s] 64%|██████▍   | 41/64 [00:06<00:03,  6.00it/s] 66%|██████▌   | 42/64 [00:07<00:05,  4.07it/s] 69%|██████▉   | 44/64 [00:07<00:04,  4.97it/s] 73%|███████▎  | 47/64 [00:07<00:02,  6.96it/s] 81%|████████▏ | 52/64 [00:08<00:01,  9.52it/s] 83%|████████▎ | 53/64 [00:08<00:01,  9.29it/s] 86%|████████▌ | 55/64 [00:08<00:01,  7.78it/s] 88%|████████▊ | 56/64 [00:08<00:01,  7.83it/s] 89%|████████▉ | 57/64 [00:08<00:00,  7.10it/s] 91%|█████████ | 58/64 [00:09<00:01,  4.90it/s] 94%|█████████▍| 60/64 [00:09<00:00,  6.22it/s] 98%|█████████▊| 63/64 [00:09<00:00,  9.27it/s]100%|██████████| 64/64 [00:09<00:00,  6.59it/s]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     64        
+Failed requests:                         0         
+Maximum request concurrency:             16        
+Benchmark duration (s):                  9.71      
+Total input tokens:                      19753     
+Total generated tokens:                  14487     
+Request throughput (req/s):              6.59      
+Output token throughput (tok/s):         1491.28   
+Peak output token throughput (tok/s):    1946.00   
+Peak concurrent requests:                30.00     
+Total token throughput (tok/s):          3524.63   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          192.53    
+Median TTFT (ms):                        144.29    
+P99 TTFT (ms):                           519.80    
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          9.05      
+Median TPOT (ms):                        9.12      
+P99 TPOT (ms):                           11.43     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           8.92      
+Median ITL (ms):                         7.63      
+P99 ITL (ms):                            31.03     
+==================================================
