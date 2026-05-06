@@ -75,7 +75,6 @@ ferrum_start() {
   FERRUM_MAX_BATCH=32 \
   FERRUM_METAL_PAGED_KV=1 \
   FERRUM_PAGED_MAX_SEQS=64 \
-  FERRUM_UNIFIED_GRAPH=1 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
       > "$server_log" 2>&1 &
