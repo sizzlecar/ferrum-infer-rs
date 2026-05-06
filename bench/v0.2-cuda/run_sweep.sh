@@ -71,7 +71,7 @@ ferrum_start() {
   # max_seqs=64 it consumes ~17 GB of KV memory which still leaves
   # ~6 GB for the 5.7 GB INT4-Marlin weights.
   CUDA_VISIBLE_DEVICES=0 \
-  FERRUM_KV_CAPACITY=1024 \
+  FERRUM_KV_CAPACITY=512 \
   FERRUM_MAX_BATCH=32 \
   FERRUM_METAL_PAGED_KV=1 \
   FERRUM_PAGED_MAX_SEQS=32 \
