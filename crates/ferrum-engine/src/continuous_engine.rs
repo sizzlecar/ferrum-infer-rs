@@ -20,7 +20,7 @@ use ferrum_types::{
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -246,6 +246,10 @@ struct EngineInner {
     /// driver task (16 streaming requests = 16 drivers thrashing on
     /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
     bg_loop_spawned: AtomicBool,
+    /// Wall-clock end of the previous run_iteration. Touched only when
+    /// FERRUM_ENGINE_WALL_PROF=1 is set; serialized by iteration_lock so
+    /// the Mutex contention is uncontended.
+    last_iter_end: Mutex<Option<Instant>>,
 }
 
 impl EngineInner {
@@ -284,7 +288,20 @@ impl EngineInner {
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
         counter!("ferrum.engine.iterations_total").increment(1);
         let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
-        let t_iter_start = if prof { Some(Instant::now()) } else { None };
+        let prof_wall = std::env::var("FERRUM_ENGINE_WALL_PROF").is_ok();
+        let any_prof = prof || prof_wall;
+        let t_iter_start = if any_prof { Some(Instant::now()) } else { None };
+
+        let inter_iter_gap_us = if prof_wall {
+            let mut guard = self.last_iter_end.lock();
+            let gap = guard
+                .map(|t| t_iter_start.unwrap().duration_since(t).as_micros())
+                .unwrap_or(0);
+            *guard = None;
+            gap
+        } else {
+            0
+        };
 
         let hint = ferrum_interfaces::BatchHint {
             max_batch_size: self.config.batching.max_batch_size,
@@ -301,7 +318,7 @@ impl EngineInner {
                 return Ok(());
             }
         };
-        let t_after_sched = if prof { Some(Instant::now()) } else { None };
+        let t_after_sched = if any_prof { Some(Instant::now()) } else { None };
 
         debug!(
             "Iteration {}: batch with {} requests",
@@ -310,20 +327,36 @@ impl EngineInner {
         );
 
         let r = self.process_batch(&batch).await;
-        if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
+        let t_iter_end = if any_prof { Some(Instant::now()) } else { None };
+        if prof_wall {
+            *self.last_iter_end.lock() = t_iter_end;
+        }
+        if let (Some(t0), Some(ts), Some(te)) = (t_iter_start, t_after_sched, t_iter_end) {
             let n = self.iteration_count.load(Ordering::Relaxed);
             if n.is_multiple_of(32) {
-                let total = t0.elapsed().as_micros();
+                let total = te.duration_since(t0).as_micros();
                 let sched = ts.duration_since(t0).as_micros();
-                let proc = ts.elapsed().as_micros();
-                eprintln!(
-                    "[iter-prof] iter#{} total={}us sched={}us process={}us batch_size={}",
-                    iteration,
-                    total,
-                    sched,
-                    proc,
-                    batch.size()
-                );
+                let proc = te.duration_since(ts).as_micros();
+                if prof_wall {
+                    eprintln!(
+                        "[engine-wall] iter#{} batch={} | total={}us | gap_to_prev={}us | sched={}us | process={}us",
+                        iteration,
+                        batch.size(),
+                        total,
+                        inter_iter_gap_us,
+                        sched,
+                        proc,
+                    );
+                } else {
+                    eprintln!(
+                        "[iter-prof] iter#{} total={}us sched={}us process={}us batch_size={}",
+                        iteration,
+                        total,
+                        sched,
+                        proc,
+                        batch.size()
+                    );
+                }
             }
         }
         r
@@ -729,6 +762,9 @@ impl EngineInner {
     async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
         use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
 
+        let prof_wall = std::env::var("FERRUM_ENGINE_WALL_PROF").is_ok();
+        let t_a = if prof_wall { Some(Instant::now()) } else { None };
+
         let rids: Vec<RequestId> = request_ids.to_vec();
 
         // Build the unified batch from sequence state.
@@ -771,6 +807,8 @@ impl EngineInner {
             }
         }
 
+        let t_b = if prof_wall { Some(Instant::now()) } else { None };
+
         let results = self.model_executor.unified_decode(&batch).await?;
         if results.len() != rids.len() {
             return Err(FerrumError::internal(format!(
@@ -779,6 +817,11 @@ impl EngineInner {
                 rids.len(),
             )));
         }
+
+        let t_c = if prof_wall { Some(Instant::now()) } else { None };
+        let mut sample_us: u128 = 0;
+        let mut emit_us: u128 = 0;
+        let mut stop_us: u128 = 0;
 
         // Per-item post-processing: sample, update sequence state, stream
         // the new token, check stop conditions. Decode-only items always
@@ -790,6 +833,7 @@ impl EngineInner {
                 ))
             })?;
 
+            let t_sample0 = if prof_wall { Some(Instant::now()) } else { None };
             let next_token = {
                 let mut sequences = self.sequences.write();
                 let seq = sequences
@@ -821,9 +865,17 @@ impl EngineInner {
             self.scheduler.update_decode_progress(rid, generated_count);
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
+            if let Some(t0) = t_sample0 {
+                sample_us += t0.elapsed().as_micros();
+            }
 
+            let t_emit0 = if prof_wall { Some(Instant::now()) } else { None };
             self.send_stream_update(rid, next_token).await;
+            if let Some(t0) = t_emit0 {
+                emit_us += t0.elapsed().as_micros();
+            }
 
+            let t_stop0 = if prof_wall { Some(Instant::now()) } else { None };
             let should_stop = {
                 let sequences = self.sequences.read();
                 sequences
@@ -844,6 +896,29 @@ impl EngineInner {
                     }
                 };
                 self.complete_request(rid, finish_reason).await?;
+            }
+            if let Some(t0) = t_stop0 {
+                stop_us += t0.elapsed().as_micros();
+            }
+        }
+
+        if let (Some(ta), Some(tb), Some(tc)) = (t_a, t_b, t_c) {
+            let n = self.iteration_count.load(Ordering::Relaxed);
+            if n.is_multiple_of(32) {
+                let build_us = tb.duration_since(ta).as_micros();
+                let model_us = tc.duration_since(tb).as_micros();
+                let total_us = ta.elapsed().as_micros();
+                eprintln!(
+                    "[batch-decode-wall] iter#{} m={} | total={}us | build={}us | model={}us | sample={}us | emit={}us | stop={}us",
+                    n,
+                    rids.len(),
+                    total_us,
+                    build_us,
+                    model_us,
+                    sample_us,
+                    emit_us,
+                    stop_us,
+                );
             }
         }
 
@@ -1360,6 +1435,7 @@ impl ContinuousBatchEngine {
                 total_preemptions: AtomicU64::new(0),
                 prefix_cache_hits: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
+                last_iter_end: Mutex::new(None),
             }),
         }
     }
