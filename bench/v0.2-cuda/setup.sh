@@ -25,7 +25,14 @@ set -euo pipefail
 
 # ── pins (synced with versions.txt) ──────────────────────────────────
 FERRUM_REF="${FERRUM_REF:-bench/v0.2-cuda}"
-VLLM_VERSION="${VLLM_VERSION:-0.20.0}"
+# vLLM: pin to LATEST stable when running. 0.20.1 is current as of 2026-05-07.
+# Always check `pip index versions vllm` before running and bump if newer
+# stable exists — comparing ferrum vs an old vllm is meaningless.
+VLLM_VERSION="${VLLM_VERSION:-0.20.1}"
+# vLLM 0.20.x defaults to torch 2.11+cu13 wheel which needs driver ≥580.
+# On hosts with driver <580 (cuda_max_good < 13.0), pip-install vllm via
+# the cu128 wheel index instead. Set TORCH_CUDA_INDEX to override.
+TORCH_CUDA_INDEX="${TORCH_CUDA_INDEX:-}"
 # mistralrs dropped from v0.2 scope — see bench/v0.2-cuda/models.txt
 # VLLM_BENCH_TAG no longer needed: 0.10+ ships `vllm bench serve` CLI
 
@@ -82,12 +89,47 @@ ok "ferrum built"
 
 # ── 4. vLLM ──────────────────────────────────────────────────────────
 log "[4/8] vLLM ${VLLM_VERSION}"
+# pip 24.0 has a metadata-parse bug (`TypeError: NoneType` on installed
+# packages with version=None) that blocks vllm install in fresh PyTorch
+# images. Upgrade pip first.
+pip install --quiet --upgrade pip
+
 # `vllm[bench]` extra is required for `vllm bench serve` (it pulls in
 # pandas, which CustomDataset uses to read the JSONL prompt set).
 # Without it, every bench cell dies with `ImportError: Please install
 # vllm[bench] for bench support`.
+#
+# CUDA driver compatibility: vLLM 0.20.x pins torch 2.11 which by default
+# pulls cu13 wheels (need driver ≥580). On older drivers (e.g. cuda_max_good
+# 12.6/12.7/12.8 — driver 555-575), force the cu128 wheel:
+#   TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu128 bash setup.sh
+# Determine driver's max CUDA at runtime to pick the right index automatically.
+HOST_CUDA_MAX="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | awk -F. '{
+  major=$1; minor=$2;
+  if (major>=580) print "13.0";
+  else if (major>=575) print "12.9";
+  else if (major>=565) print "12.7";
+  else if (major>=555) print "12.6";
+  else if (major>=550) print "12.4";
+  else print "12.0";
+}')"
+if [[ -z "$TORCH_CUDA_INDEX" ]]; then
+  case "$HOST_CUDA_MAX" in
+    13.*) TORCH_CUDA_INDEX="" ;;  # default index has cu13 wheels
+    12.9|12.8|12.7|12.6) TORCH_CUDA_INDEX="https://download.pytorch.org/whl/cu128" ;;
+    *) warn "host driver supports only CUDA $HOST_CUDA_MAX — vLLM 0.20+ may fail; consider re-renting"
+       TORCH_CUDA_INDEX="https://download.pytorch.org/whl/cu126" ;;
+  esac
+fi
+echo "  HOST_CUDA_MAX=$HOST_CUDA_MAX, TORCH_CUDA_INDEX=${TORCH_CUDA_INDEX:-(default)}"
+
+if [[ -n "$TORCH_CUDA_INDEX" ]]; then
+  pip install --quiet --index-url "$TORCH_CUDA_INDEX" \
+    torch==2.11.0 torchaudio==2.11.0 torchvision==0.26.0 || \
+    die "torch wheel install failed (cuda index $TORCH_CUDA_INDEX)"
+fi
 pip install --quiet "vllm[bench]==${VLLM_VERSION}"
-python -c "import vllm, pandas; print('  vllm:', vllm.__version__, ' pandas:', pandas.__version__)"
+python -c "import vllm, pandas, torch; print('  vllm:', vllm.__version__, ' torch:', torch.__version__, ' cuda:', torch.version.cuda, ' pandas:', pandas.__version__)"
 ok "vllm + bench extras installed"
 
 # ── 5. (mistralrs dropped from v0.2 scope) ───────────────────────────
