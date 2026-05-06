@@ -34,7 +34,7 @@ mkdir -p "$RESULTS_DIR"
 #   - vllm runs FIRST: per user direction, get the baseline numbers
 #     locked in before we debug + tune ferrum to beat them.
 ENGINES=(vllm ferrum)
-MODEL_ORDER=(M2 M1 M3)            # cheapest blast radius first (8B INT4 → 8B FP16 → 30B MoE INT4)
+MODEL_ORDER=(M2 M1)               # M3 (Qwen3-30B-A3B safetensors MoE) deferred to v0.3
 CONCURRENCIES=(1 4 16 32)
 REPEATS=(1 2 3)
 # Total cells: 3 models × 2 engines × 4 c × 3 reps = 72
@@ -73,6 +73,9 @@ ferrum_start() {
   CUDA_VISIBLE_DEVICES=0 \
   FERRUM_KV_CAPACITY=2048 \
   FERRUM_MAX_BATCH=32 \
+  FERRUM_METAL_PAGED_KV=1 \
+  FERRUM_PAGED_MAX_SEQS=64 \
+  FERRUM_UNIFIED_GRAPH=1 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
       > "$server_log" 2>&1 &
@@ -135,6 +138,10 @@ prewarm() {
 }
 
 # Cleanly kill the engine process tree.
+# vLLM 0.20+ spawns child processes named `VLLM::EngineCore` that hold
+# GPU memory until killed independently. `pkill -f vllm.entrypoints` does
+# NOT match them, so the next engine launch OOMs at weight upload.
+# Verify GPU memory drains before returning.
 kill_engine() {
   local pid="$1"
   if [[ -n "$pid" ]]; then
@@ -144,10 +151,25 @@ kill_engine() {
     wait "$pid" 2>/dev/null || true
   fi
   pkill -9 -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+  pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
+  pkill -9 -f "VLLM::" 2>/dev/null || true
+  pkill -9 -f "multiprocessing.resource_tracker" 2>/dev/null || true
   pkill -9 -f "mistralrs-server" 2>/dev/null || true
   pkill -9 -f "ferrum.*serve" 2>/dev/null || true
-  sleep 3
+  # Wait for GPU to actually clear (vllm cache release can take a few sec)
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    if [[ -n "$USED" ]] && [[ "$USED" -lt 1000 ]]; then break; fi
+    sleep 2
+  done
+  sleep 1
 }
+
+# Initial cleanup: kill any leftover GPU procs from prior runs
+echo "[init] cleaning leftover engine processes..."
+kill_engine ""
+USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+echo "[init] GPU mem.used after cleanup: ${USED} MiB"
 
 # ── outer loop ──────────────────────────────────────────────────────
 START_T=$SECONDS
