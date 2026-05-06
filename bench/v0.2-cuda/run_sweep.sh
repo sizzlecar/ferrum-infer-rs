@@ -73,8 +73,6 @@ ferrum_start() {
   CUDA_VISIBLE_DEVICES=0 \
   FERRUM_KV_CAPACITY=512 \
   FERRUM_MAX_BATCH=32 \
-  FERRUM_METAL_PAGED_KV=1 \
-  FERRUM_PAGED_MAX_SEQS=32 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
       > "$server_log" 2>&1 &
