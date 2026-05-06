@@ -1,0 +1,17 @@
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.3
+
+Model: M3
+Path: /workspace/models/M3
+Device: CUDA(0)
+
+Initializing engine (continuous batching)...
+Error: Configuration error: Failed to create executor 'candle' in model mode: Model error: Architecture Unknown not supported

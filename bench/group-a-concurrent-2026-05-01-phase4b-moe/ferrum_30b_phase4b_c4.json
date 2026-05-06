@@ -1,0 +1,43 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8000",
+    "model": "Qwen3-30B-A3B-Q4_K_M",
+    "num_prompts": 8,
+    "max_concurrency": 4,
+    "request_rate": Infinity,
+    "max_tokens": 64
+  },
+  "completed": 8,
+  "failed": 0,
+  "wall_time_s": 22.693739625,
+  "request_throughput_rps": 0.35252012811440725,
+  "input_throughput_tok_s": 6.389427322073631,
+  "output_throughput_tok_s": 22.561288199322064,
+  "total_input_tokens": 145,
+  "total_output_tokens": 512,
+  "ttft_ms": {
+    "mean": 628.9596196250002,
+    "median": 692.4574165000008,
+    "p99": 1312.6421558099996,
+    "max": 1344.8687499999999
+  },
+  "tpot_ms": {
+    "mean": 169.8889357638889,
+    "median": 170.9307843888889,
+    "p99": 176.7754241269841,
+    "max": 177.01853968253965
+  },
+  "itl_ms": {
+    "mean": 169.88839616468252,
+    "median": 167.56900050000036,
+    "p99": 416.7928530099984,
+    "max": 447.601167
+  },
+  "e2e_ms": {
+    "mean": 11331.96257275,
+    "median": 11344.853542,
+    "p99": 11503.18803381,
+    "max": 11503.364708
+  },
+  "label": "ferrum_30b_phase4b_c4"
+}

@@ -1,0 +1,8 @@
+
+▶ Llama-3.1-8B / c=4
+  out_tok/s=28.1  TPOT_med=135.7  TTFT_med=511.7
+
+▶ Llama-3.1-8B / c=8
+  out_tok/s=52.5  TPOT_med=140.9  TTFT_med=634.0
+
+▶ Qwen3-8B / c=4
