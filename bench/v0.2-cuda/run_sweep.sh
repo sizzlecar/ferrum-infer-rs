@@ -72,7 +72,7 @@ ferrum_start() {
   # ~6 GB for the 5.7 GB INT4-Marlin weights.
   CUDA_VISIBLE_DEVICES=0 \
   FERRUM_KV_CAPACITY=512 \
-  FERRUM_MAX_BATCH=32 \
+  FERRUM_MAX_BATCH=4 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
       > "$server_log" 2>&1 &
