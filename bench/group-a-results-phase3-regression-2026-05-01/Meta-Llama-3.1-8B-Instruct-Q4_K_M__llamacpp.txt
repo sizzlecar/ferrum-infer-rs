@@ -1,0 +1,78 @@
+# llama-bench output for Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+2026年 5月 1日 星期五 10时56分19秒 CST
+
+──────── env snapshot: before llama.cpp @ 2026年 5月 1日 星期五 10时56分19秒 CST ────────
+## vm_stat (selected)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              979359.
+Pages active:                            291439.
+Pages inactive:                          548801.
+Pages wired down:                        189909.
+Pages purgeable:                           2854.
+## swap
+total = 5120.00M  used = 3638.00M  free = 1482.00M  (encrypted)
+## top non-system RSS (>50 MB, excluding kernel/window/etc)
+   1001 MB  /System/Library/ExtensionKit/Extensions/Ventura.appex/Contents/MacOS/Ventura
+    983 MB  claude
+    752 MB  /Applications/iTerm.app/Contents/MacOS/iTerm2
+    232 MB  /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+    119 MB  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+    111 MB  /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+     70 MB  /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+     65 MB  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+     61 MB  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+     51 MB  /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+## warning thresholds
+  ⚠ swap_used = 3638 MB (>1 GB) — bench numbers may be paging-affected
+
+load_backend: loaded BLAS backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-blas.so
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.012 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal3  (5001)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 22906.50 MB
+load_backend: loaded MTL backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-metal.so
+load_backend: loaded CPU backend from /opt/homebrew/Cellar/ggml/0.10.0/libexec/libggml-cpu-apple_m1.so
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |            pp50 |        250.45 ± 0.91 |
+| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |           pp512 |        363.34 ± 0.34 |
+| llama 8B Q4_K - Medium         |   4.58 GiB |     8.03 B | BLAS,MTL   |       8 |           tg128 |         31.14 ± 1.78 |
+
+build: 19821178b (8960)
+
+──────── env snapshot: after llama.cpp @ 2026年 5月 1日 星期五 10时56分40秒 CST ────────
+## vm_stat (selected)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              680615.
+Pages active:                            591965.
+Pages inactive:                          547538.
+Pages wired down:                        191223.
+Pages purgeable:                           2882.
+## swap
+total = 5120.00M  used = 3638.00M  free = 1482.00M  (encrypted)
+## top non-system RSS (>50 MB, excluding kernel/window/etc)
+   1001 MB  /System/Library/ExtensionKit/Extensions/Ventura.appex/Contents/MacOS/Ventura
+    986 MB  claude
+    752 MB  /Applications/iTerm.app/Contents/MacOS/iTerm2
+    232 MB  /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+    119 MB  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+    111 MB  /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+     70 MB  /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+     65 MB  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+     61 MB  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+     51 MB  /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+## warning thresholds
+  ⚠ swap_used = 3638 MB (>1 GB) — bench numbers may be paging-affected
+
