@@ -1,0 +1,43 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8000",
+    "model": "Qwen3-30B-A3B-Q4_K_M",
+    "num_prompts": 16,
+    "max_concurrency": 8,
+    "request_rate": Infinity,
+    "max_tokens": 64
+  },
+  "completed": 16,
+  "failed": 0,
+  "wall_time_s": 22.673777667,
+  "request_throughput_rps": 0.7056609725553944,
+  "input_throughput_tok_s": 12.746001316781811,
+  "output_throughput_tok_s": 45.16230224354524,
+  "total_input_tokens": 289,
+  "total_output_tokens": 1024,
+  "ttft_ms": {
+    "mean": 628.04136725,
+    "median": 415.3424379999998,
+    "p99": 1928.6378579500004,
+    "max": 1946.7208330000005
+  },
+  "tpot_ms": {
+    "mean": 168.88333767261906,
+    "median": 169.23718286507938,
+    "p99": 185.28144503888888,
+    "max": 185.57876984126983
+  },
+  "itl_ms": {
+    "mean": 168.8828142361111,
+    "median": 159.86810450000098,
+    "p99": 625.8948078100005,
+    "max": 1311.0938329999992
+  },
+  "e2e_ms": {
+    "mean": 11267.691640625,
+    "median": 11289.9338335,
+    "p99": 12452.415350000001,
+    "max": 12472.128500000003
+  },
+  "label": "ferrum_30b_moebatched_v2_c8"
+}

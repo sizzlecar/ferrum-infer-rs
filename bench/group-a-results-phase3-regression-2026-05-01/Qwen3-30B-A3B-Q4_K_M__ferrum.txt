@@ -1,0 +1,90 @@
+# ferrum bench output for Qwen3-30B-A3B-Q4_K_M.gguf
+2026年 5月 1日 星期五 10时58分23秒 CST
+
+──────── env snapshot: before ferrum @ 2026年 5月 1日 星期五 10时58分23秒 CST ────────
+## vm_stat (selected)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               53341.
+Pages active:                           1376636.
+Pages inactive:                          402851.
+Pages wired down:                        190547.
+Pages purgeable:                           2893.
+## swap
+total = 5120.00M  used = 3638.00M  free = 1482.00M  (encrypted)
+## top non-system RSS (>50 MB, excluding kernel/window/etc)
+   1001 MB  /System/Library/ExtensionKit/Extensions/Ventura.appex/Contents/MacOS/Ventura
+    986 MB  claude
+    752 MB  /Applications/iTerm.app/Contents/MacOS/iTerm2
+    233 MB  /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+    120 MB  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+    112 MB  /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+     70 MB  /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+     65 MB  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+     61 MB  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+     51 MB  /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+## warning thresholds
+  ⚠ swap_used = 3638 MB (>1 GB) — bench numbers may be paging-affected
+
+--- pp50 trial 1 ---
+✓ model ready in 1.10s
+✓ prefill: 51 tok in 0.282s (181.0 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp50 trial 2 ---
+✓ model ready in 1.05s
+✓ prefill: 51 tok in 0.244s (209.4 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp50 trial 3 ---
+✓ model ready in 1.03s
+✓ prefill: 51 tok in 0.244s (209.3 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 1 ---
+✓ model ready in 1.02s
+✓ prefill: 513 tok in 0.837s (613.2 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 2 ---
+✓ model ready in 1.00s
+✓ prefill: 513 tok in 0.838s (612.0 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- pp512 trial 3 ---
+✓ model ready in 0.98s
+✓ prefill: 513 tok in 0.837s (613.0 tok/s)
+throughput: 0.0 tok/s (decode only)
+--- tg128 trial 1 ---
+✓ model ready in 1.00s
+✓ prefill: 4 tok in 0.157s (25.4 tok/s)
+throughput: 52.9 tok/s (decode only)
+--- tg128 trial 2 ---
+✓ model ready in 0.98s
+✓ prefill: 4 tok in 0.156s (25.7 tok/s)
+throughput: 50.8 tok/s (decode only)
+--- tg128 trial 3 ---
+✓ model ready in 1.00s
+✓ prefill: 4 tok in 0.155s (25.8 tok/s)
+throughput: 51.1 tok/s (decode only)
+
+──────── env snapshot: after ferrum @ 2026年 5月 1日 星期五 10时58分50秒 CST ────────
+## vm_stat (selected)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              240916.
+Pages active:                            687127.
+Pages inactive:                          366769.
+Pages wired down:                        712156.
+Pages purgeable:                            426.
+## swap
+total = 5120.00M  used = 3638.00M  free = 1482.00M  (encrypted)
+## top non-system RSS (>50 MB, excluding kernel/window/etc)
+    827 MB  claude
+    338 MB  /Applications/iTerm.app/Contents/MacOS/iTerm2
+    321 MB  /System/Library/ExtensionKit/Extensions/Ventura.appex/Contents/MacOS/Ventura
+    206 MB  /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+    118 MB  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+    102 MB  /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+     68 MB  /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+     55 MB  /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+     51 MB  /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+     50 MB  /System/Library/CoreServices/NotificationCenter.app/Contents/MacOS/NotificationCenter
+## warning thresholds
+  ⚠ swap_used = 3638 MB (>1 GB) — bench numbers may be paging-affected
+
+
+## ⚠ PAGING-AFFECTED RUN: swap grew by 1944 MB (baseline 3638 → 5582)
