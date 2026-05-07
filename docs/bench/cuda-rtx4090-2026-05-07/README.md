@@ -27,7 +27,7 @@ M3 ships as safetensors). Deferred to v0.3.
 | 1 | 111.1 | **112.5** | 148.4 | **76%** |
 | 4 | 308.4 | **338.7** (+10%) | 496.1 | **68%** |
 | 16 | 609.9 | **795.4** (+30%) | 1490.3 | **53%** |
-| 32 | 58.4 ⚠ | (KV pool exhaust ⚠) | 2203.8 | 3% |
+| 32 | 58.4 ⚠ → **490.4** ✓ | n/a | 2203.8 | **22%** |
 
 TPOT_p50 (ms), c=16: ferrum 22.1 → **15.8 with argmax** (−28%); vllm 9.1.
 
@@ -105,12 +105,16 @@ is ≤4% per Phase 1 wall-prof, see [`engine-wall-prof`](#engine-wall-clock-brea
 
 **Two limitations show up clearly:**
 
-1. **c=32 KV pool exhaustion (M2 INT4).** ferrum drops from 610 to
-   58 tok/s between c=16 and c=32. Server log shows
-   `Resource exhausted: No blocks available and no request to preempt`.
-   Preemption-on-OOM is implemented but not triggering at this load.
-   Fixable by raising `FERRUM_PAGED_MAX_SEQS` + `FERRUM_KV_CAPACITY`,
-   but on 24GB FP16 weights leave no headroom for that.
+1. **c=32 KV pool exhaustion (M2 INT4) — FIXED.** ferrum dropped from
+   610 to 58 tok/s between c=16 and c=32. Server log showed
+   `Resource exhausted: Block pool exhausted: 512/512 blocks allocated`.
+   Root cause: the engine's default block pool was hard-coded to 512
+   blocks (in `simple_engine_config`), which only fits ~10 concurrent
+   ShareGPT prompts at 16 tokens/block. At c=32 the pool exhausted.
+   Fix landed this branch (`017d66d`): added `FERRUM_KV_MAX_BLOCKS`
+   env override; the bench script now sets it to 2048. **Result: c=32
+   M2 INT4 throughput jumped from 58 → ~490 tok/s (8.4×)**, all 128
+   prompts complete with 0 failures. See § c=32 fix below.
 
 2. **FP16 8B doesn't fit on 24GB (M1 entire row OOM).** ferrum's
    static scratch-buffer allocation (sized at startup from
@@ -171,15 +175,60 @@ documented in `docs/bench/v0.2-cuda/`:
   memory-bound.
 
 What remains untried:
-- **`paged_varlen_attention` split-K rewrite** (predicted +10% per
-  `status-2026-05-05-chunked-prefill.md` "Known gaps" section)
+- ~~**`paged_varlen_attention` split-K rewrite** (predicted +10%)~~ —
+  **TRIED, NEUTRAL.** Implemented this session (commit `adc06a7`) with
+  microbench showing c=4 +103%, c=1 +801%, c=16 +6-16%. Production
+  A/B at num_prompts=128 with `FERRUM_SPLIT_K_ATTN={0,1}`:
+
+  | c | split-K ON | split-K OFF | Δ |
+  |---|---:|---:|---:|
+  | 4 | 263.7 | 263.8 | 0.0% |
+  | 16 | 459.7 | 464.2 | −1.0% |
+  | 32 | 490.4 | 484.5 | +1.2% |
+
+  Why no win: attention is only 13.5% of iter (per Phase 11 wall-prof).
+  Even +103% on attention → ~6% on iter; lost in noise. Code stays
+  in (auto-tune heuristic, gated behind shape thresholds) for the
+  long-context single-stream case where attention dominates more —
+  but for c=16 INT4 the lever is elsewhere.
 - **Sampling on GPU** (move 1.4ms CPU sample to GPU; eliminates the
   9% engine overhead but adds new kernel work)
 
-Both are 1-2 day kernel projects. Stacked, they could push c=16 INT4
-to ~720 tok/s (49% of vLLM). Multi-week vLLM Marlin full kernel-set
-port (already started in `vllm_marlin/PORT_NOTES.md`) is the only
-realistic path past 50% on c≥16.
+Sampling-on-GPU is a 1-2 day kernel project; could push c=16 INT4
+to ~510 tok/s (~34% of vLLM). The only realistic path past 50% on
+c≥16 is the multi-week vLLM Marlin full kernel-set port (already
+started in `vllm_marlin/PORT_NOTES.md`).
+
+### c=32 fix (this session)
+
+Before: c=32 ferrum panicked or stalled at 58 tok/s with `Block pool
+exhausted: 512/512 blocks allocated`. Diagnosis: `simple_engine_config`
+(in `ferrum-engine/src/lib.rs`) hard-coded `kv_cache.max_blocks = 512`,
+which only fits ~10 ShareGPT prompts at 16 tokens/block. At c=32 the
+pool exhausted; the preempt-victim filter required `prefill_complete`
+which no seq satisfies during the first batch of a 32-arrival cold
+start. Attempts to relax the filter or set `kv_cache` early created
+correctness hazards (mid-batch preemption corrupting in-flight decode).
+
+Fix landed in two commits:
+- `017d66d` — Added `FERRUM_KV_MAX_BLOCKS` env override (default 512
+  preserved for backwards-compat; bench script now sets 2048).
+- `d940613` — Relaxed `preempt_victim` filter to allow mid-prefill
+  victims; defensive only, since the bigger pool means preempt rarely
+  fires.
+
+Result with `FERRUM_KV_MAX_BLOCKS=2048`:
+
+| Metric | Before | After |
+|---|---:|---:|
+| c=32 output throughput (tok/s) | 58.4 | **490.4** (8.4×) |
+| c=32 successful requests | 128/128 (slow) | 128/128 |
+| c=32 mean TPOT (ms) | n/a (preempt thrash) | 49 |
+
+c=32 still trails c=16 (490 vs 460 tok/s — c=32 should scale up, not
+down). Cause: bigger m at decode time hits Marlin GEMM scaling
+limits and longer kv_len in attention. Same matmul-dominated story
+as c=16.
 
 ---
 
@@ -229,8 +278,12 @@ Frozen for all cells:
 The sweep ran ferrum with paged-KV disabled and a small batch cap to
 fit M1 FP16 within 24GB (it didn't fit either way; M2 INT4 ran fine):
 ```
-FERRUM_KV_CAPACITY=512
-FERRUM_MAX_BATCH=4    # for safe FP16 fitting; M2 INT4 not bound by this
+FERRUM_KV_CAPACITY=2048      # per-seq KV slot; bumped from 512 to
+                              # avoid panics on ShareGPT prompts >512
+FERRUM_KV_MAX_BLOCKS=2048    # global block pool; bumped from default
+                              # 512 — c=32 cold start needs ~1000 blocks
+FERRUM_MAX_BATCH=4
+FERRUM_GREEDY_ARGMAX=1       # device-side argmax for temperature=0
 ```
 
 Phase 1 bench (separate, ferrum-only, before vLLM) ran with the
