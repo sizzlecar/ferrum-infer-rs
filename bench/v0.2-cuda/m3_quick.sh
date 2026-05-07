@@ -26,10 +26,13 @@ ferrum_start() {
     per_pair) bucketed_env="FERRUM_MOE_BUCKETED=0" ;;
   esac
   echo "  starting ferrum (${mode}) on M3 ..." >&2
+  # Small KV pool — per-expert MarlinWeights eat ~14 GB on M3, leaving
+  # only ~7 GB headroom for KV pool + scratch. KV_MAX_BLOCKS=128
+  # × 32 KB/block × 48 layers ≈ 200 MB pool.
   CUDA_VISIBLE_DEVICES=0 \
-  FERRUM_KV_CAPACITY=2048 \
-  FERRUM_KV_MAX_BLOCKS=2048 \
-  FERRUM_PAGED_MAX_SEQS=32 \
+  FERRUM_KV_CAPACITY=512 \
+  FERRUM_KV_MAX_BLOCKS=256 \
+  FERRUM_PAGED_MAX_SEQS=8 \
   FERRUM_METAL_PAGED_KV=0 \
   FERRUM_MIXED_BATCH=0 \
   FERRUM_GREEDY_ARGMAX=1 \
@@ -114,7 +117,7 @@ run_engine() {
     return 1
   fi
   prewarm
-  for c in 1 4 16; do
+  for c in 1 4 8; do
     run_bench "$engine" "$c"
   done
   kill -INT "$ENGINE_PID" 2>/dev/null
@@ -127,7 +130,7 @@ echo "Output dir: $RESULTS_DIR"
 nvidia-smi --query-gpu=name,memory.free --format=csv,noheader
 echo ""
 
-for engine in ferrum_bucketed ferrum_per_pair vllm; do
+for engine in ferrum_per_pair vllm; do
   echo "--- $engine ---"
   run_engine "$engine" || echo "skipping rest of $engine"
   echo ""
