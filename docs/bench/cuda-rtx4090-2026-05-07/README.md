@@ -22,12 +22,60 @@ M3 ships as safetensors). Deferred to v0.3.
 
 ### M2: Llama-3.1-8B GPTQ-INT4 — output throughput (tok/s)
 
-| c | ferrum | vllm | ratio | TPOT_p50 (ferrum / vllm) |
+| c | ferrum (default) | ferrum + GPU argmax | vllm | ratio (argmax) |
 |---:|---:|---:|---:|---:|
-| 1 | **111.1** | 148.4 | **75%** | 8.6 / 6.7 ms |
-| 4 | **308.4** | 496.1 | 62% | 11.4 / 7.1 ms |
-| 16 | **609.9** | 1490.3 | 41% | 22.1 / 9.1 ms |
-| 32 | 58.4 | 2203.8 | **3%** ⚠ | 348 / 14.5 ms |
+| 1 | 111.1 | **112.5** | 148.4 | **76%** |
+| 4 | 308.4 | **338.7** (+10%) | 496.1 | **68%** |
+| 16 | 609.9 | **795.4** (+30%) | 1490.3 | **53%** |
+| 32 | 58.4 ⚠ | (KV pool exhaust ⚠) | 2203.8 | 3% |
+
+TPOT_p50 (ms), c=16: ferrum 22.1 → **15.8 with argmax** (−28%); vllm 9.1.
+
+The "**GPU argmax**" column uses `FERRUM_GREEDY_ARGMAX=1` — a new fast
+path landed in this branch (commit `5c2e030`). It replaces the heavy
+`device → host` transfer of full logits when sampling is greedy
+(`temperature=0`) with on-device argmax + a tiny `n_rows × 4 bytes`
+DTOH. See § GPU argmax fast path.
+
+### GPU argmax fast path (live optimization win)
+
+The default ferrum unified-decode path returns full logits
+(`Vec<Option<Vec<f32>>>`) so the engine's per-request sampler can
+apply temperature/top-k/top-p. At c=16 vocab=128k f16 this means a
+**8 MB device→host transfer per iter** plus a per-item host argmax
+loop — collectively ~3-4 ms per iter on this hardware.
+
+For greedy (`temperature=0`) the full logits are wasted: only the
+argmax token is consumed. Implemented this commit:
+
+- New `Backend::argmax_rows_to_u32(buf, n_rows, vocab) -> Vec<u32>`
+  trait method (default falls back to `to_vec` + host argmax;
+  CudaBackend overrides with a kernel launch).
+- New CUDA kernel `kernels/argmax_rows.cu` — one block per row, 1024
+  threads, shared-mem reduction over vocab elements.
+- `LlamaFamilyModel::unified_forward_internal` gates on
+  `FERRUM_GREEDY_ARGMAX=1`: device argmax → synthesise a
+  one-hot `Vec<f32>` host-side, so the engine sampler still sees
+  logits but the heavy transfer is gone.
+
+Measured impact (M2 INT4 c=16, RTX 4090):
+
+| Metric | Default | + GPU argmax | Delta |
+|---|---:|---:|---:|
+| Output throughput (tok/s) | 609.9 | **795.4** | **+30.4%** |
+| TPOT_p50 (ms) | 22.1 | 15.8 | −28% |
+| TPOT_p99 (ms) | 27.5 | 20.6 | −25% |
+| Ratio vs vLLM 0.20.1 | 41% | **53%** | +12 pp |
+
+Why the gain is bigger than the predicted 6-10%: the breakdown
+underestimated the to_vec cost. The DTOH at vocab=128k × 16 rows ×
+2 bytes = 4 MB is bigger than the 1ms estimate (≈3 ms in practice
+with cudarc sync), and the host argmax over 128k × 16 floats was
+also ≈1.4 ms. Combined ≈ 4-5 ms per iter eliminated.
+
+See `results-argmax/` for raw JSON of all 11 cells. Same model, same
+prompts, same harness, same engine version with the env flag
+toggled.
 
 ### M1: Llama-3.1-8B FP16 — output throughput (tok/s)
 
@@ -43,15 +91,17 @@ M3 ships as safetensors). Deferred to v0.3.
 ## What this report shows
 
 **ferrum is competitive at low concurrency in INT4.** At c=1 INT4,
-ferrum hits 75% of vLLM's throughput on the same hardware (111 vs
-148 tok/s, 8.6 ms vs 6.7 ms TPOT). This is the price-conscious
+ferrum hits 76% of vLLM's throughput on the same hardware (112 vs
+148 tok/s, 8.5 ms vs 6.7 ms TPOT). This is the price-conscious
 single-GPU lane the project targets — single binary, no Python, fast
 cold start, sub-10ms TPOT.
 
-**The gap widens as concurrency increases.** At c=4 ferrum is 62% of
-vLLM, at c=16 41%. The gap is in `model` (GPU compute, mostly Marlin
-GEMM and attention kernels). Engine-path overhead is ≤9% per Phase 1
-wall-prof — see [`engine-wall-prof`](#engine-wall-clock-breakdown).
+**The gap widens as concurrency increases, but the GPU-argmax fast
+path landed in this branch closes ~12 pp at c=16.** With
+`FERRUM_GREEDY_ARGMAX=1`, c=4 lifts to 68% (was 62%), c=16 to **53%
+(was 41%)**. The remaining gap to vLLM at c=16 is in `model` (GPU
+compute — Marlin GEMM + attention). Engine-path overhead post-argmax
+is ≤4% per Phase 1 wall-prof, see [`engine-wall-prof`](#engine-wall-clock-breakdown).
 
 **Two limitations show up clearly:**
 
