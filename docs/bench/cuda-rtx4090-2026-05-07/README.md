@@ -22,14 +22,21 @@ M3 ships as safetensors). Deferred to v0.3.
 
 ### M2: Llama-3.1-8B GPTQ-INT4 — output throughput (tok/s)
 
-| c | ferrum (default) | ferrum + GPU argmax | vllm | ratio (argmax) |
-|---:|---:|---:|---:|---:|
-| 1 | 111.1 | **112.5** | 148.4 | **76%** |
-| 4 | 308.4 | **338.7** (+10%) | 496.1 | **68%** |
-| 16 | 609.9 | **795.4** (+30%) | 1490.3 | **53%** |
-| 32 | 58.4 ⚠ → **490.4** ✓ | n/a | 2203.8 | **22%** |
+| c | ferrum baseline | ferrum + argmax (old) | ferrum + mixed batch + argmax | vllm | ratio (mixed) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 111.1 | 112.5 | _TBD_ | 148.4 | _TBD_ |
+| 4 | 308.4 | 338.7 | **364** (+8%) | 496.1 | **73%** |
+| 16 | 609.9 | 795.4 | **947** (+19%) | 1490.3 | **64%** |
+| 32 | 58.4 ⚠ | n/a (KV bug) | **1175** (+48% over no-mixed 838) | 2203.8 | **53%** |
 
-TPOT_p50 (ms), c=16: ferrum 22.1 → **15.8 with argmax** (−28%); vllm 9.1.
+The "**mixed batch**" column adds `FERRUM_MIXED_BATCH=1` (this session's
+big landing): one `unified_decode` call per iter packs prefill chunks
++ active decodes through a varlen attention kernel, eliminating the
+50% bench time previously lost to prefill iters that stalled all 16
+in-flight decoders. Plus the greedy fast path that skips the
+128k-float vocab scan in the engine sampler when temperature=0.
+
+TPOT_p50 (ms), c=16: 22.1 → 15.8 (argmax) → **14.3 (mixed batch)**.
 
 The "**GPU argmax**" column uses `FERRUM_GREEDY_ARGMAX=1` — a new fast
 path landed in this branch (commit `5c2e030`). It replaces the heavy
