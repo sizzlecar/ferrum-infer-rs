@@ -82,6 +82,13 @@ pub struct CudaState {
     batched_host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
     batched_host_kv_lens: Box<[i32; HOST_STAGING_TOTAL]>,
     batched_host_cache_lens: Box<[i32; HOST_STAGING_TOTAL]>,
+    /// Stream pool for parallel MoE expert dispatch. At c=32 with 128
+    /// active experts, ~256 sequential Marlin GEMMs/layer hit launch +
+    /// SM-allocation serialization. Round-robin across N streams lets
+    /// multiple Marlin kernels overlap; only valid for small-m where
+    /// each kernel uses a fraction of available SMs. Lazy-init on first
+    /// MoE call.
+    moe_streams: Option<Vec<Arc<CudaStream>>>,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -252,7 +259,32 @@ impl Backend for CudaBackend {
             batched_host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
             batched_host_kv_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
             batched_host_cache_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
+            moe_streams: None,
         }
+    }
+
+    /// Lazy-init the MoE stream pool on first access. Pool size is
+    /// 4 by default; override via FERRUM_MOE_STREAMS env (1 disables
+    /// multi-stream dispatch).
+    pub fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
+        if self.moe_streams.is_none() {
+            let n = std::env::var("FERRUM_MOE_STREAMS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4)
+                .max(1);
+            let mut pool = Vec::with_capacity(n);
+            for _ in 0..n {
+                let s = self
+                    .ctx
+                    .new_stream()
+                    .expect("CudaState::moe_stream_pool: new_stream failed");
+                pool.push(s);
+            }
+            tracing::info!("MoE stream pool initialized: {} streams", n);
+            self.moe_streams = Some(pool);
+        }
+        self.moe_streams.as_ref().unwrap()
     }
 
     fn alloc_u32(n: usize) -> Self::Buffer {
@@ -2553,6 +2585,86 @@ impl Backend for CudaBackend {
             expert_n as i32,
         )
         .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
+    }
+
+    #[cfg(feature = "marlin")]
+    fn moe_gemm_phase_batched(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::GptqStore,
+        dispatches: &[(usize, usize, usize, usize)],
+        n_per_expert: usize,
+        output: &mut Self::Buffer,
+        k: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "moe_gemm_phase_batched: Triton w4a16 not supported",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+
+        // Pull stream pool (lazy-init on first call). Clone Arcs to avoid
+        // borrow conflicts (mw and output need mutable access via the
+        // marlin function).
+        let pool: Vec<Arc<CudaStream>> = ctx.moe_stream_pool().to_vec();
+        let n_streams = pool.len();
+        if n_streams == 1 {
+            // No multi-stream win possible — serial fast path.
+            for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
+                crate::marlin::marlin_gemm_with_offset_strided(
+                    &pool[0],
+                    input,
+                    *in_row_offset as i32,
+                    mw,
+                    output,
+                    *out_row_offset as i32,
+                    *m as i32,
+                    (expert_idx * n_per_expert) as i32,
+                    n_per_expert as i32,
+                )
+                .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
+            }
+            return Ok(());
+        }
+
+        // Round-robin dispatches across stream pool. Each Marlin call
+        // owns disjoint workspace mutex slots (per-expert range), the
+        // input buffer is read-only, and outputs are written to
+        // disjoint rows — concurrent execution is race-free.
+        for (i, (expert_idx, in_row_offset, out_row_offset, m)) in
+            dispatches.iter().enumerate()
+        {
+            let stream = &pool[i % n_streams];
+            crate::marlin::marlin_gemm_with_offset_strided(
+                stream,
+                input,
+                *in_row_offset as i32,
+                mw,
+                output,
+                *out_row_offset as i32,
+                *m as i32,
+                (expert_idx * n_per_expert) as i32,
+                n_per_expert as i32,
+            )
+            .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
+        }
+
+        // Sync all pool streams to the default before returning.
+        // This ensures subsequent ops on the default stream see all
+        // GEMM results. Lighter than cudaDeviceSynchronize.
+        let _ = k; // unused (Marlin reads k from weight.k)
+        for stream in &pool {
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::model(format!("moe stream sync: {e}")))?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "marlin")]

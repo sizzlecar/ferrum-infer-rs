@@ -767,50 +767,37 @@ pub fn moe_forward_bucketed<B: Backend>(
     // the packed input/output buffers via in_row_offset / out_row_offset.
     let gate_up_dim_per_expert = 2 * expert_intermediate;
     let down_n_per_expert = hidden_size;
-    // Bulk-zero the gate_up workspace for ALL experts at once. With
-    // FERRUM_MARLIN_SKIP_WS_ZERO=1, the per-call workspace zero in
-    // marlin_gemm_with_offset_strided is skipped and we save N-1
-    // memset launches per phase. At c=32 (~128 active experts) that's
-    // ~127 memset launches saved per phase × 2 phases × 48 layers =
-    // ~12 000 launches/token saved.
-    if let Some(gu_store) = experts.gate_up_stacked_store(0) {
-        let _ = B::marlin_zero_stacked_workspace(ctx, gu_store);
-    }
+    // Bulk-zero the gate_up workspace ONCE before phase 1. With
+    // FERRUM_MARLIN_SKIP_WS_ZERO=1, per-call workspace zero is skipped.
+    let gu_store = experts.gate_up_stacked_store(0).ok_or_else(|| {
+        FerrumError::model(
+            "moe_forward_bucketed requires stacked gate_up store \
+             (load via Qwen3MoeModel::new_safetensors)",
+        )
+    })?;
+    let _ = B::marlin_zero_stacked_workspace(ctx, gu_store);
 
-    // Phase 1: gate_up GEMM per active expert (offset GEMM into shared
-    // stacked Marlin store).
+    // Build the dispatch list for phase 1. (expert_idx, in_row, out_row, m)
+    // for each active expert. Send to the multi-stream batched dispatcher.
+    let mut phase1_dispatches: Vec<(usize, usize, usize, usize)> =
+        Vec::with_capacity(num_experts);
     for e in 0..num_experts {
         let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
         if m_e == 0 {
             continue;
         }
         let pair_off = plan.expert_offsets[e];
-
-        if let Some(gu_store) = experts.gate_up_stacked_store(e) {
-            B::gemm_gptq_with_offset_strided(
-                ctx,
-                x_packed,
-                pair_off,
-                gu_store,
-                e * gate_up_dim_per_expert,
-                gate_up_dim_per_expert,
-                gate_up_packed,
-                pair_off,
-                m_e,
-                hidden_size,
-            )
-            .map_err(|err| {
-                FerrumError::model(format!(
-                    "moe_forward_bucketed gate_up expert {e}: {err}"
-                ))
-            })?;
-        } else {
-            return Err(FerrumError::model(
-                "moe_forward_bucketed requires stacked gate_up store \
-                 (load via Qwen3MoeModel::new_safetensors)",
-            ));
-        }
+        phase1_dispatches.push((e, pair_off, pair_off, m_e));
     }
+    B::moe_gemm_phase_batched(
+        ctx,
+        x_packed,
+        gu_store,
+        &phase1_dispatches,
+        gate_up_dim_per_expert,
+        gate_up_packed,
+        hidden_size,
+    )?;
 
     // Phase 2: SiLU(gate) * up — single launch covering ALL active
     // expert rows in the packed buffer. The unused rows (zeros from
@@ -826,44 +813,33 @@ pub fn moe_forward_bucketed<B: Backend>(
         expert_intermediate,
     );
 
-    // Bulk-zero the down workspace before phase 3.
-    if let Some(d_store) = experts.down_stacked_store(0) {
-        let _ = B::marlin_zero_stacked_workspace(ctx, d_store);
-    }
-
-    // Phase 3: down GEMM per active expert.
+    // Phase 3: down GEMM per active expert. Multi-stream batched.
+    let d_store = experts.down_stacked_store(0).ok_or_else(|| {
+        FerrumError::model(
+            "moe_forward_bucketed requires stacked down store \
+             (load via Qwen3MoeModel::new_safetensors)",
+        )
+    })?;
+    let _ = B::marlin_zero_stacked_workspace(ctx, d_store);
+    let mut phase3_dispatches: Vec<(usize, usize, usize, usize)> =
+        Vec::with_capacity(num_experts);
     for e in 0..num_experts {
         let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
         if m_e == 0 {
             continue;
         }
         let pair_off = plan.expert_offsets[e];
-
-        if let Some(d_store) = experts.down_stacked_store(e) {
-            B::gemm_gptq_with_offset_strided(
-                ctx,
-                silu_packed,
-                pair_off,
-                d_store,
-                e * down_n_per_expert,
-                down_n_per_expert,
-                down_packed,
-                pair_off,
-                m_e,
-                expert_intermediate,
-            )
-            .map_err(|err| {
-                FerrumError::model(format!(
-                    "moe_forward_bucketed down expert {e}: {err}"
-                ))
-            })?;
-        } else {
-            return Err(FerrumError::model(
-                "moe_forward_bucketed requires stacked down store \
-                 (load via Qwen3MoeModel::new_safetensors)",
-            ));
-        }
+        phase3_dispatches.push((e, pair_off, pair_off, m_e));
     }
+    B::moe_gemm_phase_batched(
+        ctx,
+        silu_packed,
+        d_store,
+        &phase3_dispatches,
+        down_n_per_expert,
+        down_packed,
+        expert_intermediate,
+    )?;
 
     // ── Combine: out[b, h] = Σ_k weights[b,k] * down_packed[pairs_by_token[b,k], h]
     let total_pairs = batch * top_k;

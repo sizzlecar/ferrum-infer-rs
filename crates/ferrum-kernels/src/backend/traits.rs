@@ -409,6 +409,46 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Batched per-expert offset GEMM dispatch — runs N concurrent
+    /// Marlin calls across a stream pool to amortize launch overhead
+    /// and overlap small-m kernels that under-utilize SMs individually.
+    ///
+    /// `dispatches[i]`: (expert_idx, in_row_offset, out_row_offset, m).
+    /// All calls share the same `weight`, `input`, `output`, `n_per_expert`,
+    /// `k`. Caller is responsible for bulk-zeroing workspace before this
+    /// call (use `marlin_zero_stacked_workspace`).
+    ///
+    /// Default: serial fallback that loops calling
+    /// `gemm_gptq_with_offset_strided`. CUDA backend overrides with
+    /// round-robin streams + sync-all at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemm_phase_batched(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::GptqStore,
+        dispatches: &[(usize, usize, usize, usize)],
+        n_per_expert: usize,
+        output: &mut Self::Buffer,
+        k: usize,
+    ) -> Result<()> {
+        // Default impl: serial fallback. CUDA overrides with multi-stream.
+        for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
+            Self::gemm_gptq_with_offset_strided(
+                ctx,
+                input,
+                *in_row_offset,
+                weight,
+                expert_idx * n_per_expert,
+                n_per_expert,
+                output,
+                *out_row_offset,
+                *m,
+                k,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Load GGUF k-quant weights into the backend's preferred format.
     ///
     /// `kind` discriminates Q4_K / Q5_K / Q6_K / Q8_0 etc. The CPU path
