@@ -524,6 +524,46 @@ impl Backend for CudaBackend {
         })
     }
 
+    /// Greedy fast path: argmax on device, return n_rows u32 indices.
+    /// Replaces ~n_rows × vocab × 2 bytes DTOH + host argmax with a
+    /// single launch + n_rows × 4 bytes DTOH.
+    fn argmax_rows_to_u32(buf: &Self::Buffer, n_rows: usize, vocab: usize) -> Vec<u32> {
+        if n_rows == 0 {
+            return Vec::new();
+        }
+        with_stream(|stream| {
+            let ctx = stream.context();
+            let module = ensure_module(ctx, "argmax_rows", ptx::ARGMAX_ROWS);
+            let func = module
+                .load_function("argmax_rows_f16")
+                .expect("argmax_rows_f16 load_function");
+
+            let mut dev_out: cudarc::driver::CudaSlice<i32> = stream
+                .alloc_zeros::<i32>(n_rows)
+                .expect("argmax dev_out alloc");
+
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (n_rows as u32, 1, 1),
+                block_dim: (1024, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let view = buf.slice(0..(n_rows * vocab));
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(&view)
+                    .arg(&mut dev_out)
+                    .arg(&(n_rows as i32))
+                    .arg(&(vocab as i32))
+                    .launch(cfg)
+                    .expect("argmax launch");
+            }
+            stream.synchronize().expect("argmax sync");
+            let host_i32 = stream.memcpy_dtov(&dev_out).expect("argmax dtoh");
+            host_i32.into_iter().map(|x| x as u32).collect()
+        })
+    }
+
     // ── Norms ────────────────────────────────────────────────────────────
 
     fn rms_norm(

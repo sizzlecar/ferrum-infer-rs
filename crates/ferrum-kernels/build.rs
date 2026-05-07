@@ -52,6 +52,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/gelu.cu");
     println!("cargo:rerun-if-changed=kernels/decode_attention_hm.cu");
     println!("cargo:rerun-if-changed=kernels/gather_columns.cu");
+    println!("cargo:rerun-if-changed=kernels/argmax_rows.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -88,6 +89,7 @@ fn main() {
             "kernels/gelu.cu",
             "kernels/decode_attention_hm.cu",
             "kernels/gather_columns.cu",
+            "kernels/argmax_rows.cu",
         ])
         .out_dir(out_dir)
         .arg("-Ikernels") // for common.cuh

@@ -3756,10 +3756,31 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .unified_packed_logits
                 .as_ref()
                 .expect("unified_packed_logits missing");
-            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
-            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
-                out[orig_idx] = Some(row);
+
+            // Greedy fast-path: with FERRUM_GREEDY_ARGMAX=1, do argmax on
+            // device + return one-hot Vec<f32>. Cuts the DTOH transfer
+            // from `num_sampled * vocab * 2 bytes` (≈ 8 MB at c=16,
+            // vocab=128k, f16) to `num_sampled * 4 bytes` and skips the
+            // host argmax in the engine's sample loop. The synthetic
+            // one-hot vec keeps `sample_with_processors` correct (greedy
+            // picks the same token; non-greedy callers shouldn't enable
+            // this flag).
+            if std::env::var("FERRUM_GREEDY_ARGMAX").map_or(false, |v| v == "1") {
+                let tokens = B::argmax_rows_to_u32(packed_logits, num_sampled, vocab);
+                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                    let mut row = vec![0.0_f32; vocab];
+                    let tok = tokens[j] as usize;
+                    if tok < vocab {
+                        row[tok] = 1.0;
+                    }
+                    out[orig_idx] = Some(row);
+                }
+            } else {
+                let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                    let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
+                    out[orig_idx] = Some(row);
+                }
             }
         }
 
