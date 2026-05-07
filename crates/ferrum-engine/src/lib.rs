@@ -141,7 +141,10 @@ pub fn simple_engine_config(
     // Set reasonable defaults for MVP
     config.batching.max_batch_size = 32;
     config.kv_cache.block_size = 16;
-    config.kv_cache.max_blocks = 512;
+    config.kv_cache.max_blocks = std::env::var("FERRUM_KV_MAX_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
     config.scheduler.max_running_requests = 32;
 
     config

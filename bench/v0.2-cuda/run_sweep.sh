@@ -70,8 +70,13 @@ ferrum_start() {
   # 2048 covers prompt(≤512) + output(≤512) plus headroom; on 4090 with
   # max_seqs=64 it consumes ~17 GB of KV memory which still leaves
   # ~6 GB for the 5.7 GB INT4-Marlin weights.
+  # FERRUM_KV_MAX_BLOCKS sizes the global block pool (default 512 was
+  # not enough for c=32 ShareGPT prompts — ~32×500 tok/16 = 1000 blocks).
+  # 2048 fits c=32 comfortably for INT4 models. M1 (FP16 8B) is OOM
+  # regardless of this setting — its weights alone fill the 24 GB card.
   CUDA_VISIBLE_DEVICES=0 \
   FERRUM_KV_CAPACITY=512 \
+  FERRUM_KV_MAX_BLOCKS=2048 \
   FERRUM_MAX_BATCH=4 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
