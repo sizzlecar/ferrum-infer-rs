@@ -2555,6 +2555,33 @@ impl Backend for CudaBackend {
         .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
     }
 
+    #[cfg(feature = "marlin")]
+    fn marlin_zero_stacked_workspace(
+        ctx: &mut Self::Context,
+        weight: &Self::GptqStore,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "marlin_zero_stacked_workspace: not applicable to Triton store",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+        let stream = ctx.stream.clone();
+        let raw_stream = stream.cu_stream();
+        let (ws_ptr, _g) = mw.workspace.device_ptr(&stream);
+        let ws_len = mw.workspace.len();
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, ws_len, raw_stream);
+        }
+        Ok(())
+    }
+
     // ── TP collectives ──────────────────────────────────────────────────
     //
     // World size / rank come from env vars (FERRUM_TP, FERRUM_RANK).

@@ -393,6 +393,22 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Bulk-zero the per-expert Marlin workspace mutex slots for a
+    /// stacked GptqStore. Call ONCE before a batch of
+    /// `gemm_gptq_with_offset_strided_no_ws_zero` calls — saves the
+    /// per-call cuMemsetD32Async (one launch each → one launch total).
+    ///
+    /// At c=32 with 128 active experts × 2 (gate_up + down) × 48 layers:
+    /// 12 288 memset launches/token. Bulk-zeroing brings that to 96.
+    fn marlin_zero_stacked_workspace(
+        _ctx: &mut Self::Context,
+        _weight: &Self::GptqStore,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "marlin_zero_stacked_workspace not implemented for this backend",
+        ))
+    }
+
     /// Load GGUF k-quant weights into the backend's preferred format.
     ///
     /// `kind` discriminates Q4_K / Q5_K / Q6_K / Q8_0 etc. The CPU path

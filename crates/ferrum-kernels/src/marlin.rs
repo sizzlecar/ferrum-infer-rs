@@ -309,7 +309,13 @@ pub fn marlin_gemm_with_offset_strided(
     const MAX_PAR: usize = 16;
     let ws_per_expert = (n_per / 128).max(1) * MAX_PAR;
     let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
-    {
+    // Skip per-call workspace zeroing if env says so. Caller is then
+    // responsible for bulk-zeroing the workspace before the batch
+    // (saves N-1 cuMemsetD32Async launches per phase).
+    let skip_ws_zero = std::env::var("FERRUM_MARLIN_SKIP_WS_ZERO")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !skip_ws_zero {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(

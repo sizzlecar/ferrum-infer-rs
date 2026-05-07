@@ -767,6 +767,16 @@ pub fn moe_forward_bucketed<B: Backend>(
     // the packed input/output buffers via in_row_offset / out_row_offset.
     let gate_up_dim_per_expert = 2 * expert_intermediate;
     let down_n_per_expert = hidden_size;
+    // Bulk-zero the gate_up workspace for ALL experts at once. With
+    // FERRUM_MARLIN_SKIP_WS_ZERO=1, the per-call workspace zero in
+    // marlin_gemm_with_offset_strided is skipped and we save N-1
+    // memset launches per phase. At c=32 (~128 active experts) that's
+    // ~127 memset launches saved per phase × 2 phases × 48 layers =
+    // ~12 000 launches/token saved.
+    if let Some(gu_store) = experts.gate_up_stacked_store(0) {
+        let _ = B::marlin_zero_stacked_workspace(ctx, gu_store);
+    }
+
     // Phase 1: gate_up GEMM per active expert (offset GEMM into shared
     // stacked Marlin store).
     for e in 0..num_experts {
@@ -815,6 +825,11 @@ pub fn moe_forward_bucketed<B: Backend>(
         total_pairs_active,
         expert_intermediate,
     );
+
+    // Bulk-zero the down workspace before phase 3.
+    if let Some(d_store) = experts.down_stacked_store(0) {
+        let _ = B::marlin_zero_stacked_workspace(ctx, d_store);
+    }
 
     // Phase 3: down GEMM per active expert.
     for e in 0..num_experts {
