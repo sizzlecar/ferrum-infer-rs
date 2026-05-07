@@ -42,13 +42,26 @@ use crate::gptq::GptqLinear;
 use crate::loader::WeightLoader;
 use crate::traits::Linear;
 
-/// A single shard file: mmap + name→(shape, dtype, byte-offset-in-mmap).
+/// Tensor metadata extracted ONCE from the safetensors header at open time.
+/// Avoids the per-tensor `SafeTensors::deserialize(&mmap)` re-parse that
+/// previously dominated cold-load on stacked-MoE (>= 18 000 calls per
+/// model, ~30 ms each on a 7 000-tensor header → 9+ minutes of header
+/// re-parse alone).
+struct TensorMeta {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    /// Byte range in the shard's mmap that holds the raw tensor data.
+    data_start: usize,
+    data_end: usize,
+}
+
+/// A single shard file: mmap + name→TensorMeta cache.
 struct Shard {
     mmap: Mmap,
-    /// Parsed entries. Safetensors' `SafeTensors` type borrows from the mmap,
-    /// so we can't store it directly — instead we pre-extract name → metadata
-    /// and rebuild a `SafeTensors` view on demand via `SafeTensors::deserialize`.
     names: Vec<String>,
+    /// Pre-extracted tensor metadata. Looked up by name; no header
+    /// re-parse on every read.
+    meta: HashMap<String, TensorMeta>,
 }
 
 impl Shard {
@@ -57,19 +70,57 @@ impl Shard {
         let mmap = unsafe {
             Mmap::map(&file).map_err(|e| FerrumError::io(format!("mmap {path:?}: {e}")))?
         };
-        // Parse just to validate and extract names; the SafeTensors view is
-        // rebuilt on each read (cheap — it's a header reparse).
+        // Parse the header ONCE and cache (offset, len, dtype, shape) for
+        // every tensor — re-deriving the data slice from the cache is a
+        // simple `&mmap[start..end]` rather than a full header re-parse.
         let st = SafeTensors::deserialize(&mmap)
             .map_err(|e| FerrumError::model(format!("parse {path:?}: {e}")))?;
-        let names = st.names().iter().map(|s| s.to_string()).collect();
-        Ok(Self { mmap, names })
+        // SafeTensors stores: 8-byte little-endian header_len + header_json
+        // + data_blob. The TensorView's `data()` returns a slice into the
+        // data_blob region. We compute the data_blob base by reading the
+        // 8-byte header_len.
+        debug_assert!(mmap.len() >= 8, "safetensors smaller than 8 bytes");
+        let header_len = u64::from_le_bytes(
+            mmap[0..8]
+                .try_into()
+                .expect("8-byte header len read failed"),
+        ) as usize;
+        let data_base = 8 + header_len;
+        let names: Vec<String> = st.names().iter().map(|s| s.to_string()).collect();
+        let mut meta = HashMap::with_capacity(names.len());
+        for name in &names {
+            let view = st.tensor(name).map_err(|e| {
+                FerrumError::model(format!("tensor '{name}' missing during preindex: {e}"))
+            })?;
+            // TensorView::data() is &[u8] into the mmap; we recompute its
+            // [start, end) byte range relative to the mmap base via
+            // pointer arithmetic.
+            let view_data = view.data();
+            let start = view_data.as_ptr() as usize - mmap.as_ptr() as usize;
+            let end = start + view_data.len();
+            debug_assert!(start >= data_base);
+            meta.insert(
+                name.clone(),
+                TensorMeta {
+                    dtype: view.dtype(),
+                    shape: view.shape().to_vec(),
+                    data_start: start,
+                    data_end: end,
+                },
+            );
+        }
+        let _ = data_base;
+        Ok(Self { mmap, names, meta })
     }
 
-    fn get<'a>(&'a self, name: &str) -> Result<safetensors::tensor::TensorView<'a>> {
-        let st = SafeTensors::deserialize(&self.mmap)
-            .map_err(|e| FerrumError::model(format!("reparse: {e}")))?;
-        st.tensor(name)
-            .map_err(|e| FerrumError::model(format!("tensor '{name}': {e}")))
+    /// Returns (data_bytes, dtype, shape) for the named tensor without
+    /// re-parsing the safetensors header.
+    fn get_cached(&self, name: &str) -> Result<(&[u8], Dtype, &[usize])> {
+        let m = self
+            .meta
+            .get(name)
+            .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in shard")))?;
+        Ok((&self.mmap[m.data_start..m.data_end], m.dtype, &m.shape))
     }
 }
 
@@ -147,10 +198,9 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             .index
             .get(name)
             .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in index")))?;
-        let view = self.shards[shard_idx].get(name)?;
-        let shape = view.shape().to_vec();
-        let data = dtype_to_f32(view.dtype(), view.data())?;
-        Ok((data, shape))
+        let (data_bytes, dtype, shape) = self.shards[shard_idx].get_cached(name)?;
+        let data = dtype_to_f32(dtype, data_bytes)?;
+        Ok((data, shape.to_vec()))
     }
 
     /// Read the raw on-disk byte slice plus dtype and shape. Zero-copy into
@@ -161,10 +211,9 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             .index
             .get(name)
             .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in index")))?;
-        let view = self.shards[shard_idx].get(name)?;
-        let shape = view.shape().to_vec();
-        let dtype = map_src_dtype(view.dtype())?;
-        Ok((view.data(), dtype, shape))
+        let (data_bytes, st_dtype, shape) = self.shards[shard_idx].get_cached(name)?;
+        let dtype = map_src_dtype(st_dtype)?;
+        Ok((data_bytes, dtype, shape.to_vec()))
     }
 
     /// Concatenate several tensors along dim 0 at the byte level. All parts
@@ -213,15 +262,13 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             .index
             .get(name)
             .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in index")))?;
-        let view = self.shards[shard_idx].get(name)?;
-        let shape = view.shape().to_vec();
-        if view.dtype() != Dtype::I32 {
+        let (bytes, dtype, shape) = self.shards[shard_idx].get_cached(name)?;
+        if dtype != Dtype::I32 {
             return Err(FerrumError::model(format!(
                 "'{name}': expected I32, got {:?}",
-                view.dtype()
+                dtype
             )));
         }
-        let bytes = view.data();
         debug_assert_eq!(bytes.len() % 4, 0);
         let count = bytes.len() / 4;
         let mut out = Vec::<i32>::with_capacity(count);
@@ -237,7 +284,7 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             );
             out.set_len(count);
         }
-        Ok((out, shape))
+        Ok((out, shape.to_vec()))
     }
 
     fn has(&self, name: &str) -> bool {
