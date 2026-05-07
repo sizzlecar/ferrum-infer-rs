@@ -797,14 +797,12 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // swap). `FERRUM_KV_CAPACITY=N` overrides; clamp to the model's
         // declared max so we never lie to the model about its window.
         let model_max = self.cfg.max_seq_len;
-        // 2048 in v0.7.3+: covers ShareGPT prompts (~579 tok) +
-        // generated output (~256 tok) with headroom. Old 512 default
-        // panicked on real workloads with "KV cache overflow on layer 0:
-        // would write tokens [0..579) but capacity is 512". Mac users
-        // running 30B-class models can `FERRUM_KV_CAPACITY=512` to
-        // shrink the pool footprint (~3 GB at 512 vs ~12 GB at 2048
-        // on Qwen3-30B-A3B Q4_K_M).
-        const DEFAULT_KV_CAPACITY: usize = 2048;
+        // 1024 default: covers ShareGPT prompts (~579 tok) plus typical
+        // 256-tok output. Old 512 panicked on >512-tok prompts; 2048
+        // was too generous and combined with paged_max_seqs=32 it
+        // needed an 8 GB pool, OOMing on FP16 8B-class models. 1024
+        // halves that. Long-context users can FERRUM_KV_CAPACITY=4096.
+        const DEFAULT_KV_CAPACITY: usize = 1024;
         let max = std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -838,13 +836,17 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // use. Pool memory is `max_seqs × max_blocks_per_seq` total
         // blocks — we lowered DEFAULT_KV_CAPACITY to 2048 so this 2× max_seqs
         // bump keeps the pool footprint identical to the pre-0.7.2 default.
-        // 64 covers c=32 + a few prefill chunks safely. Old 32 would
-        // panic at c=32 once any prefill chunk arrived alongside the
-        // 32 active decoders. Override down for memory-tight cases.
+        // 32 default keeps the GPU paged pool sane on consumer 24 GB
+        // cards (pool ~ max_seqs × 128 × 2 MB = 8 GB at 32). Bumping
+        // to 64 was too aggressive — combined with KV_CAPACITY=2048 it
+        // demanded a 16 GB pool, OOMing weight load on Llama-8B FP16.
+        // Bench scripts override to 64 explicitly when they know the
+        // workload fits; CLI's --gpu-memory-utilization auto-sizes
+        // higher when there's headroom.
         let max_seqs = std::env::var("FERRUM_PAGED_MAX_SEQS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(64);
+            .unwrap_or(32);
         let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
         let total_pool_blocks = max_seqs * max_blocks_per_seq;
 

@@ -144,19 +144,87 @@ pub fn auto_size_kv_blocks(model_dir: &Path, gpu_util: f32) -> Option<AutoSizeRe
     })
 }
 
-/// Apply auto-sizing: read CLI flag, query nvidia-smi, set env var.
-/// Idempotent — caller invokes once per CLI invocation before engine init.
-/// Respects user-set FERRUM_KV_MAX_BLOCKS (no override).
+/// Apply auto-sizing: read CLI flag, query nvidia-smi, set env vars.
+/// Sets BOTH `FERRUM_KV_MAX_BLOCKS` (engine-side BlockPool) and
+/// `FERRUM_PAGED_MAX_SEQS` (model-side paged_pools — sizes the GPU
+/// KV pool as `max_seqs × max_blocks_per_seq`). Without bounding
+/// max_seqs the GPU pool can grow far past the engine pool budget
+/// — e.g. on Llama-3.1-8B FP16 with PAGED_MAX_SEQS=64 +
+/// KV_CAPACITY=2048 the pool is 16 GB by itself, OOMing weight load
+/// on a 24 GB card.
+///
+/// Idempotent — caller invokes once per CLI invocation before engine
+/// init. Respects user overrides (no clobber if env already set).
 pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
-    if std::env::var("FERRUM_KV_MAX_BLOCKS").is_ok() {
-        // User explicitly set it — don't override.
+    let kv_overridden = std::env::var("FERRUM_KV_MAX_BLOCKS").is_ok();
+    let max_seqs_overridden = std::env::var("FERRUM_PAGED_MAX_SEQS").is_ok();
+    if kv_overridden && max_seqs_overridden {
         return;
     }
-    if let Some(result) = auto_size_kv_blocks(model_dir, gpu_util) {
-        result.print_summary();
-        // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
-        unsafe {
-            std::env::set_var("FERRUM_KV_MAX_BLOCKS", result.max_blocks.to_string());
+    let Some(result) = auto_size_kv_blocks(model_dir, gpu_util) else {
+        return;
+    };
+    result.print_summary();
+
+    // Pool sizing: pool_blocks = max_seqs × (KV_CAPACITY / 16).
+    // We want pool_blocks ≤ result.max_blocks (the budget) AND
+    // max_seqs ≥ 16 (so c=16 bench works). When the budget is tight
+    // (e.g. FP16 8B on 24 GB), shrink KV_CAPACITY first; if even
+    // that can't keep max_seqs ≥ 16, accept lower max_seqs (caps
+    // bench concurrency but at least lets the model run).
+    const TARGET_MAX_SEQS: usize = 32;
+    const MIN_MAX_SEQS: usize = 8;
+    const TARGET_KV_CAPACITY_BLOCKS: usize = 128; // 2048 tokens / 16
+
+    let (max_seqs_clamped, kv_capacity) = {
+        // First try: TARGET_MAX_SEQS at TARGET_KV_CAPACITY.
+        if TARGET_MAX_SEQS * TARGET_KV_CAPACITY_BLOCKS <= result.max_blocks {
+            (TARGET_MAX_SEQS, 0_usize) // 0 → don't override KV_CAPACITY
+        } else if MIN_MAX_SEQS * TARGET_KV_CAPACITY_BLOCKS <= result.max_blocks {
+            // Shrink max_seqs first.
+            let s = result.max_blocks / TARGET_KV_CAPACITY_BLOCKS;
+            (s.max(MIN_MAX_SEQS), 0)
+        } else {
+            // Budget too tight even for MIN_MAX_SEQS at full capacity.
+            // Pin max_seqs=MIN_MAX_SEQS, shrink KV_CAPACITY.
+            let blocks_per_seq = (result.max_blocks / MIN_MAX_SEQS).max(8);
+            let kv_cap_tokens = blocks_per_seq * 16;
+            (MIN_MAX_SEQS, kv_cap_tokens)
+        }
+    };
+
+    let kv_capacity_overridden = std::env::var("FERRUM_KV_CAPACITY").is_ok();
+    // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
+    unsafe {
+        if !kv_overridden {
+            std::env::set_var(
+                "FERRUM_KV_MAX_BLOCKS",
+                result.max_blocks.to_string(),
+            );
+        }
+        if !max_seqs_overridden {
+            std::env::set_var(
+                "FERRUM_PAGED_MAX_SEQS",
+                max_seqs_clamped.to_string(),
+            );
+        }
+        if kv_capacity > 0 && !kv_capacity_overridden {
+            std::env::set_var(
+                "FERRUM_KV_CAPACITY",
+                kv_capacity.to_string(),
+            );
         }
     }
+    eprintln!(
+        "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={}",
+        if kv_overridden { "<user>".to_string() } else { result.max_blocks.to_string() },
+        if max_seqs_overridden { "<user>".to_string() } else { max_seqs_clamped.to_string() },
+        if kv_capacity_overridden {
+            "<user>".to_string()
+        } else if kv_capacity > 0 {
+            kv_capacity.to_string()
+        } else {
+            "<default>".to_string()
+        },
+    );
 }
