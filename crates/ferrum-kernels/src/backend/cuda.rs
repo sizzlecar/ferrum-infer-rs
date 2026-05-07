@@ -1239,6 +1239,29 @@ impl Backend for CudaBackend {
         if num_seqs == 0 || total_q_tokens == 0 {
             return Ok(());
         }
+
+        // Auto-tune: split-K helps under-occupied grids — low concurrency
+        // OR long context. Microbench (scripts/microbench_split_k.cu)
+        // shows c=1/kv=4096 9× speedup, c=4/kv=384 +103%, c=16/kv=384
+        // marginal/-2%. Heuristic gates split-K to regions where it wins.
+        // FERRUM_SPLIT_K_ATTN=1 forces on, FERRUM_SPLIT_K_ATTN=0 forces off.
+        let split_k_force = std::env::var("FERRUM_SPLIT_K_ATTN").ok();
+        let use_split_k = match split_k_force.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => num_seqs <= 4 || max_kv_len >= 768,
+        };
+
+        if use_split_k {
+            return paged_varlen_split_k_dispatch(
+                ctx, q, k_pool, v_pool, out,
+                cu_seqlens_q, pos_offsets, block_tables,
+                num_seqs, total_q_tokens, max_kv_len,
+                num_heads, num_kv_heads, head_dim,
+                block_size, max_blocks_per_seq,
+            );
+        }
+
         let func = ctx.func(
             "paged_varlen_attn",
             ptx::PAGED_VARLEN_ATTENTION,
@@ -2695,6 +2718,190 @@ fn with_marlin_gather_scratch<R>(
     }
     let s = w.as_mut().expect("just allocated");
     body(&mut s.buf)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Paged-varlen split-K scratch + dispatch
+// ────────────────────────────────────────────────────────────────────────
+
+/// Process-global scratch for split-K phase1 outputs. Three buffers
+/// (partial_out f32, partial_m f32, partial_l f32) sized to the largest
+/// shape ever requested. Same lazy-grow pattern as Marlin gather scratch.
+struct SplitKScratch {
+    partial_out: CudaSlice<f32>,    // [M_total * num_q_heads * num_splits * head_dim]
+    partial_m:   CudaSlice<f32>,    // [M_total * num_q_heads * num_splits]
+    partial_l:   CudaSlice<f32>,    // [M_total * num_q_heads * num_splits]
+    out_capacity: usize,
+    ml_capacity:  usize,
+}
+unsafe impl Send for SplitKScratch {}
+unsafe impl Sync for SplitKScratch {}
+
+static SPLIT_K_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<SplitKScratch>>> =
+    std::sync::OnceLock::new();
+
+fn split_k_scratch_slot() -> &'static std::sync::RwLock<Option<SplitKScratch>> {
+    SPLIT_K_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn with_split_k_scratch<R>(
+    stream: &Arc<CudaStream>,
+    out_required: usize,
+    ml_required: usize,
+    body: impl FnOnce(&mut CudaSlice<f32>, &mut CudaSlice<f32>, &mut CudaSlice<f32>) -> R,
+) -> R {
+    let slot = split_k_scratch_slot();
+    {
+        let g = slot.read().expect("SPLIT_K_SCRATCH poisoned");
+        if let Some(ref s) = *g {
+            if s.out_capacity >= out_required && s.ml_capacity >= ml_required {
+                drop(g);
+                let mut w = slot.write().expect("SPLIT_K_SCRATCH poisoned");
+                let s = w.as_mut().expect("just observed Some");
+                return body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l);
+            }
+        }
+    }
+    let mut w = slot.write().expect("SPLIT_K_SCRATCH poisoned");
+    let need_new = match &*w {
+        Some(s) => s.out_capacity < out_required || s.ml_capacity < ml_required,
+        None => true,
+    };
+    if need_new {
+        let partial_out = unsafe { stream.alloc::<f32>(out_required) }
+            .expect("SPLIT_K_SCRATCH partial_out alloc");
+        let partial_m = unsafe { stream.alloc::<f32>(ml_required) }
+            .expect("SPLIT_K_SCRATCH partial_m alloc");
+        let partial_l = unsafe { stream.alloc::<f32>(ml_required) }
+            .expect("SPLIT_K_SCRATCH partial_l alloc");
+        *w = Some(SplitKScratch {
+            partial_out, partial_m, partial_l,
+            out_capacity: out_required,
+            ml_capacity:  ml_required,
+        });
+    }
+    let s = w.as_mut().expect("just allocated");
+    body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paged_varlen_split_k_dispatch(
+    ctx: &mut CudaState,
+    q: &CudaSlice<f16>,
+    k_pool: &CudaSlice<f16>,
+    v_pool: &CudaSlice<f16>,
+    out: &mut CudaSlice<f16>,
+    cu_seqlens_q: &CudaSlice<f16>,
+    pos_offsets: &CudaSlice<f16>,
+    block_tables: &CudaSlice<f16>,
+    num_seqs: usize,
+    total_q_tokens: usize,
+    max_kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+) -> Result<()> {
+    // Pick num_splits based on kv_len. Microbench peak points:
+    //   kv ≤ 384  → N=2 (or skip if c≥16)
+    //   kv ≤ 1024 → N=4
+    //   kv ≤ 2048 → N=8
+    //   else      → N=16
+    let num_splits: usize = match max_kv_len {
+        kv if kv <= 384  => 2,
+        kv if kv <= 1024 => 4,
+        kv if kv <= 2048 => 8,
+        _                => 16,
+    };
+
+    let chunk = (max_kv_len + num_splits - 1) / num_splits;
+    let out_required = total_q_tokens * num_heads * num_splits * head_dim;
+    let ml_required  = total_q_tokens * num_heads * num_splits;
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+    let stream = ctx.stream.clone();
+
+    let phase1 = ctx.func(
+        "paged_varlen_split_k_phase1",
+        ptx::PAGED_VARLEN_ATTENTION,
+        "paged_varlen_attn_split_k_phase1_f16",
+    );
+    let reduce = ctx.func(
+        "paged_varlen_split_k_reduce",
+        ptx::PAGED_VARLEN_ATTENTION,
+        "paged_varlen_split_k_reduce_f16",
+    );
+
+    with_split_k_scratch(&stream, out_required, ml_required, |partial_out, partial_m, partial_l| {
+        let qv = q.slice(..);
+        let kp = k_pool.slice(..);
+        let vp = v_pool.slice(..);
+        let csq = cu_seqlens_q.slice(..);
+        let po = pos_offsets.slice(..);
+        let bt = block_tables.slice(..);
+        let pout = partial_out.slice(..);
+        let pm   = partial_m.slice(..);
+        let pl   = partial_l.slice(..);
+        let ns   = num_seqs as i32;
+        let nqi  = num_heads as i32;
+        let nkvi = num_kv_heads as i32;
+        let hdi  = head_dim as i32;
+        let mbps = max_blocks_per_seq as i32;
+        let bsi  = block_size as i32;
+        let nsp  = num_splits as i32;
+
+        // Phase 1: (num_heads, M_total, num_splits)
+        let mut b1 = stream.launch_builder(&phase1);
+        b1.arg(&qv);
+        b1.arg(&kp);
+        b1.arg(&vp);
+        b1.arg(&csq);
+        b1.arg(&po);
+        b1.arg(&bt);
+        b1.arg(&pout);
+        b1.arg(&pm);
+        b1.arg(&pl);
+        b1.arg(&ns);
+        b1.arg(&nqi);
+        b1.arg(&nkvi);
+        b1.arg(&hdi);
+        b1.arg(&mbps);
+        b1.arg(&bsi);
+        b1.arg(&scale);
+        b1.arg(&nsp);
+        let shmem1 = (chunk.max(1) as u32) * 4;
+        unsafe {
+            b1.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, total_q_tokens as u32, num_splits as u32),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shmem1,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("paged_varlen_split_k_phase1: {e}")))?;
+
+        // Phase 2: (num_heads, M_total)
+        let pout2 = partial_out.slice(..);
+        let pm2   = partial_m.slice(..);
+        let pl2   = partial_l.slice(..);
+        let mut b2 = stream.launch_builder(&reduce);
+        b2.arg(&pout2);
+        b2.arg(&pm2);
+        b2.arg(&pl2);
+        b2.arg(out);
+        b2.arg(&nqi);
+        b2.arg(&hdi);
+        b2.arg(&nsp);
+        unsafe {
+            b2.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("paged_varlen_split_k_reduce: {e}")))?;
+
+        Ok::<(), FerrumError>(())
+    })
 }
 
 fn marlin_gemm_with_perm(
