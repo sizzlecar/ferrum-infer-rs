@@ -22,7 +22,13 @@ M3 ships as safetensors). Deferred to v0.3.
 
 ### M2: Llama-3.1-8B GPTQ-INT4 — output throughput (tok/s)
 
-3 reps each, median reported. All optimizations on.
+**Final config** (all numbers below): `FERRUM_METAL_PAGED_KV=1
+FERRUM_PAGED_MAX_SEQS=64 FERRUM_KV_MAX_BLOCKS=2048 FERRUM_KV_CAPACITY=2048
+FERRUM_GREEDY_ARGMAX=1 FERRUM_MIXED_BATCH=1 FERRUM_UNIFIED_TOKEN_BUDGET=128
+FERRUM_UNIFIED_GRAPH=0 FERRUM_SPLIT_K_ATTN=0`. Why GRAPH/SPLIT_K stay
+OFF: see § What's next at the bottom.
+
+3 reps each, median reported.
 
 n=64 (per cell):
 
@@ -448,20 +454,39 @@ bash bench/v0.2-cuda/pull_results.sh
 
 ## What's next (post-v0.2)
 
-Ranked by ROI for closing the c=16 INT4 gap:
+Updated this session — all earlier "predicted +X%" numbers re-tested:
 
-1. **`paged_varlen_attention` split-K + persistent threads rewrite**
-   — predicted +10% (660 → 720 tok/s c=16).
-2. **GPU sampling kernel** — eliminates 1.4 ms (8% of iter) of
-   per-item host sampling. Stacks with above for ~+18% combined.
-3. **`gpu-memory-utilization` knob in ferrum's scratch sizing** —
+1. ~~**`paged_varlen_attention` split-K**~~ — **DEAD.** Microbench
+   predicted +103% c=4 / +801% c=1; production A/B 0% at c=16, **−3%
+   at c=4** (kernel exists, code paths exercised, just doesn't pay).
+2. ~~**FULL CUDA Graph for unified path**~~ — **DEAD.** compute-sanitizer
+   found OOB shared-mem write in `paged_varlen_attn_f16` (graph
+   capture freezes shared_mem_bytes; replay kv_len grows past it).
+   Fix landed (`3cc8755`) and graphs no longer crash, but graph still
+   regresses **−2-4%** because mixed-batch shape variation makes
+   capture overhead exceed replay savings.
+3. **GPU sampling kernel** — eliminates 1.4 ms host sampling/iter
+   (now ~6% with greedy fast path covering most of it). Maybe
+   +3-5% c=16. Untried.
+4. **Port vLLM's full gptq_marlin kernel set** (5336 LoC, scaffolded
+   at `crates/ferrum-kernels/vllm_marlin/`). Phase 12 partial port
+   gave 0% perf. Full kernel-set + shape-aware dispatch may help on
+   shapes Phase 12 didn't exercise. **1-2 weeks**, uncertain ROI.
+5. **`paged_decode_attention` (true batched paged) for pure-decode
+   iters** — currently unified path uses `paged_varlen_attention`
+   (79us/call) for ALL iters. Pure-decode (m_total == num_seqs)
+   COULD use a faster batched paged kernel — but I checked: existing
+   `paged_decode_attention.cu` is single-seq, no multi-seq batched
+   variant. Writing one is ~1-2 days. The 25us/call gap between
+   varlen and non-paged-batched (54us) is mostly paging indirection,
+   so a paged-batched kernel would be in-between. Realistic +3-5%.
+6. **vLLM-style persistent kernel** (single kernel that runs all
+   layers without re-launching). Eliminates per-launch overhead
+   entirely. Complete forward-pass rewrite. **1-2 weeks**.
+7. **`gpu-memory-utilization` knob in ferrum's scratch sizing** —
    not a perf win, but unblocks FP16 8B benchmarking and larger
    models.
-4. **Port vLLM's full gptq_marlin kernel set** (5336 LoC, already
-   scaffolded at `crates/ferrum-kernels/vllm_marlin/`, 1-2 weeks of
-   focused work). Per Phase 11 c=1 op-profile vLLM Marlin kernel is
-   2× faster on m=16 — a true 2× would give c=16 = ~1200 tok/s = 80%
-   vLLM. Phase 12 already proved a partial port doesn't deliver the
-   2×; the full kernel-set with shape-aware dispatch is the lever.
+8. **Qwen3MoE safetensors loader** — needed for v0.3 M3 entry.
 
-5. **Qwen3MoE safetensors loader** — needed for v0.3 M3 entry.
+**Realistic ceiling without weeks of work**: c=16 INT4 ~1000 tok/s
+(67% of vllm) by stacking #3 + #5. Past 75% requires #4 or #6.
