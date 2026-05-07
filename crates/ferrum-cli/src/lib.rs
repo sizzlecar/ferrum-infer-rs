@@ -12,6 +12,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod gpu_mem_autosize;
 pub mod utils;
 
 // Re-exports

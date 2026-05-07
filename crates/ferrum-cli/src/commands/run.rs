@@ -84,6 +84,14 @@ pub struct RunCommand {
     /// Random seed for sampling (when temperature > 0). Default 42.
     #[arg(long, default_value = "42")]
     pub seed: u64,
+
+    /// Fraction of GPU memory ferrum is allowed to use (mirrors vLLM's
+    /// `--gpu-memory-utilization`). Auto-sizes the KV pool: at 0.9
+    /// ferrum will use ≤ 90 % of the GPU's reported total memory,
+    /// reserving ~4 GB scratch + the weight bytes. Set to 1.0 for an
+    /// exclusive GPU; leave at 0.9 if other processes share the card.
+    #[arg(long, default_value = "0.9")]
+    pub gpu_memory_utilization: f32,
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
@@ -91,6 +99,20 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // the file to candle-transformers' quantized loaders.
     if looks_like_gguf_path(&cmd.model) {
         return crate::commands::run_gguf::run_gguf_one_shot(cmd, config).await;
+    }
+
+    // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
+    // KV pool + 4 GB scratch reserve fit in `total_gpu_mem * gpu_util`.
+    // No-op on Mac / when nvidia-smi is missing; respected by user
+    // explicit FERRUM_KV_MAX_BLOCKS override.
+    {
+        let direct_for_autosize = std::path::PathBuf::from(&cmd.model);
+        if direct_for_autosize.is_dir() {
+            crate::gpu_mem_autosize::apply_auto_size(
+                &direct_for_autosize,
+                cmd.gpu_memory_utilization,
+            );
+        }
     }
 
     // Local directory path: short-circuit the HF cache lookup +

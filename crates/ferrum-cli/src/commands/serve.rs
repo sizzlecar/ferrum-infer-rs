@@ -48,6 +48,13 @@ pub struct ServeCommand {
     /// Only active when --spec-draft is set.
     #[arg(long, default_value = "4")]
     pub spec_tokens: usize,
+
+    /// Fraction of GPU memory ferrum is allowed to use (mirrors vLLM's
+    /// `--gpu-memory-utilization`). Auto-sizes the KV pool to fit
+    /// weights + scratch + KV inside `total_mem * util`. Default 0.9.
+    /// Set 1.0 for an exclusive GPU; lower if you share the card.
+    #[arg(long, default_value = "0.9")]
+    pub gpu_memory_utilization: f32,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -59,6 +66,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         tts_slots,
         spec_draft,
         spec_tokens,
+        gpu_memory_utilization,
     } = cmd;
 
     // Print banner
@@ -113,6 +121,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     } else {
         None
     };
+
+    // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
+    // KV pool + 4 GB scratch reserve fit in `total_gpu_mem * gpu_util`.
+    // Skipped on Mac / when nvidia-smi is missing; respects user-set
+    // FERRUM_KV_MAX_BLOCKS overrides.
+    if let Some(p) = local_dir_path.as_ref() {
+        crate::gpu_mem_autosize::apply_auto_size(p, gpu_memory_utilization);
+    }
 
     let model_id = if let Some(p) = gguf_path.as_ref() {
         // Use the GGUF stem as the OpenAI model id — the user sees this
