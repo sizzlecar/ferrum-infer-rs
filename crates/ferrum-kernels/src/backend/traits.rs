@@ -336,6 +336,30 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// GEMM on a column-slice of a stacked GPTQ store. Used for MoE
+    /// expert dispatch where one big stacked weight tile holds all
+    /// experts' weights along N; per-expert calls process columns
+    /// `[expert_offset .. expert_offset + expert_n)` only.
+    ///
+    /// Output is written to `out[m, expert_n]` (NOT the full stacked N).
+    /// Caller is responsible for sizing `out` correctly.
+    ///
+    /// `expert_offset` and `expert_n` MUST be multiples of the backend's
+    /// natural N tile size (Marlin: 64). Default returns Err(unsupported).
+    fn gemm_gptq_with_offset(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::GptqStore,
+        _expert_offset: usize,
+        _expert_n: usize,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_gptq_with_offset not implemented for this backend",
+        ))
+    }
+
     /// Load GGUF k-quant weights into the backend's preferred format.
     ///
     /// `kind` discriminates Q4_K / Q5_K / Q6_K / Q8_0 etc. The CPU path

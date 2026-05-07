@@ -502,20 +502,21 @@ impl<B: Backend> Qwen3MoeModel<B> {
     }
 
     /// Build from a HuggingFace safetensors model directory (GPTQ-INT4
-    /// expected). Mirrors [`Self::new`] but loads experts via the standard
-    /// `WeightLoader::load_linear` path — so each expert's `gate_proj +
-    /// up_proj` get auto-fused via the GPTQ shim in
-    /// `native_safetensors.rs::load_linear`, and `down_proj` loads the
-    /// usual way.
+    /// expected). Mirrors [`Self::new`] but with a STACKED expert loader:
+    /// reads all `num_experts` experts' raw GPTQ tensors per layer once,
+    /// concats along N host-side, single `B::load_gptq` repacks the
+    /// whole thing into one Marlin tile per (layer, role).
     ///
-    /// `gate_stacked / up_stacked / down_stacked` stay `None` — the
-    /// MoE dispatch falls back to per-expert `Linear::forward` calls.
-    /// Slow at decode (top_k * Marlin GEMMs per token per layer) but
-    /// correct; the batched MoE Marlin kernel is a follow-up.
+    /// 128 experts × 48 layers × 3 projs would otherwise trigger 18 432
+    /// per-call Marlin repacks (~30+ minute cold start at ~100 ms each
+    /// on Llama-MoE shapes). The stacked path drops that to 96 repacks
+    /// — one per (layer × {gate_up, down}) — and dispatch slices per
+    /// expert via `B::gemm_gptq_with_offset`.
     pub fn new_safetensors(
         cfg: Qwen3MoeConfig,
-        loader: &dyn WeightLoader<B>,
+        loader: &ferrum_quantization::NativeSafetensorsLoader<B>,
     ) -> Result<Self> {
+        use ferrum_quantization::WeightLoader as _;
         {
             let mut ctx = B::new_context();
             B::reset_all_graphs(&mut ctx);
@@ -576,22 +577,43 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 )));
             }
 
-            // Per-expert GPTQ Marlin Linears. The safetensors GPTQ shim
-            // auto-detects the `gate_up_proj` synthetic name and fuses
-            // gate_proj + up_proj host-side along the N dim.
+            // STACKED expert load: read all `num_experts` experts' raw
+            // GPTQ tensors host-side, concat along N, single B::load_gptq.
+            // Builds num_experts StackedExpertLinear views over one shared
+            // Marlin store per role.
+            let expert_prefix = format!("{prefix}.mlp.experts.{{e}}.");
+            let (gate_up_store, gate_up_n_per_expert, gate_up_k) = loader
+                .load_stacked_gptq_experts(
+                    &expert_prefix,
+                    cfg.num_experts,
+                    &["gate_proj", "up_proj"],
+                )?;
+            let (down_store, down_n_per_expert, down_k) = loader
+                .load_stacked_gptq_experts(
+                    &expert_prefix,
+                    cfg.num_experts,
+                    &["down_proj"],
+                )?;
+            let gate_up_arc = std::sync::Arc::new(gate_up_store);
+            let down_arc = std::sync::Arc::new(down_store);
+
             let mut gate_up: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
                 Vec::with_capacity(cfg.num_experts);
             let mut down: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
                 Vec::with_capacity(cfg.num_experts);
             for e in 0..cfg.num_experts {
-                let g = loader.load_linear(&format!(
-                    "{prefix}.mlp.experts.{e}.gate_up_proj"
-                ))?;
-                let d = loader.load_linear(&format!(
-                    "{prefix}.mlp.experts.{e}.down_proj"
-                ))?;
-                gate_up.push(g);
-                down.push(d);
+                gate_up.push(Box::new(ferrum_quantization::StackedExpertLinear::<B>::new(
+                    gate_up_arc.clone(),
+                    e * gate_up_n_per_expert,
+                    gate_up_n_per_expert,
+                    gate_up_k,
+                )));
+                down.push(Box::new(ferrum_quantization::StackedExpertLinear::<B>::new(
+                    down_arc.clone(),
+                    e * down_n_per_expert,
+                    down_n_per_expert,
+                    down_k,
+                )));
             }
             let experts = crate::moe::ExpertStack::<B> {
                 gate_up,
@@ -602,12 +624,17 @@ impl<B: Backend> Qwen3MoeModel<B> {
             };
             moe_layers.push(Qwen3MoeLayerState { router, experts });
 
-            if li == 0 || li == cfg.base.num_layers - 1 {
+            if li == 0 || li.is_multiple_of(8) || li == cfg.base.num_layers - 1 {
                 tracing::info!(
                     "Qwen3MoeModel safetensors: layer {li}/{} loaded \
-                     ({} experts × gate_up + down)",
+                     (stacked: gate_up={}x{} k={}, down={}x{} k={})",
                     cfg.base.num_layers,
                     cfg.num_experts,
+                    gate_up_n_per_expert,
+                    gate_up_k,
+                    cfg.num_experts,
+                    down_n_per_expert,
+                    down_k,
                 );
             }
         }

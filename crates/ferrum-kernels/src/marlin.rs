@@ -137,6 +137,128 @@ pub fn marlin_gemm(
     ))
 }
 
+/// Marlin GEMM on a column-slice of a stacked weight (used for MoE
+/// expert dispatch). The stacked `weight` holds num_experts × n_per_expert
+/// columns concatenated along N; this call processes columns
+/// `[expert_offset .. expert_offset + expert_n)` only.
+///
+/// `expert_offset` and `expert_n` MUST be multiples of Marlin's `tile_n`
+/// (typically 64). The repack laid out the whole N contiguously so a
+/// pointer offset lands on a tile boundary.
+///
+/// Workspace: shares the parent stacked workspace; we offset its pointer
+/// by `expert_offset / 128` ints so each expert uses its own mutex slot
+/// range.
+#[cfg(feature = "marlin")]
+pub fn marlin_gemm_with_offset(
+    stream: &Arc<CudaStream>,
+    input: &CudaSlice<half::f16>,
+    weight: &MarlinWeight,
+    output: &mut CudaSlice<half::f16>,
+    m: i32,
+    expert_offset: i32,
+    expert_n: i32,
+) -> candle_core::Result<()> {
+    use cudarc::driver::DevicePtr;
+    let n = expert_n;
+    let k = weight.k as i32;
+    if expert_offset < 0 || expert_n <= 0 || expert_offset + expert_n > weight.n as i32 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin offset out of range: offset={expert_offset} n={expert_n} stacked_n={}",
+            weight.n
+        )));
+    }
+    let raw_stream = stream.cu_stream();
+
+    // Zero only the expert's slice of the workspace (Marlin uses each entry
+    // as a mutex; safe to share when slices don't overlap, but we still
+    // zero before each call).
+    let ws_blocks = (expert_n / 128) as usize;
+    let ws_offset_bytes = ((expert_offset / 128) as usize) * std::mem::size_of::<i32>();
+    {
+        let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(
+                ws_ptr + ws_offset_bytes as u64,
+                0,
+                ws_blocks,
+                raw_stream,
+            );
+        }
+    }
+
+    // Compute byte offsets for B (qweight) and scales:
+    //   qweight is [K/8 × N/16, 8 × 16] tile-major in Marlin layout. Each
+    //   tile is 16x16 ints × 8 (8 INT4 packed). The N dim's tile size is
+    //   16 — qweight stride per col = (K/16) × tile_words, so col offset
+    //   in i32s is (expert_offset / 16) * (K/16) * 16 × 4 bytes.
+    // Simpler observation: Marlin lays out qweight with N as the slowest
+    // axis (N-block-major). qweight.len() == K/8 × N i32 elements. So
+    // column offset in i32 elements = (expert_offset / 8) × K... wait
+    // Marlin tiles are 16×16 with INT4 packing. The col_dim_stride is
+    //   (K * tile_n) / 32  (8 INT4 per i32, n_tile = 16, packed 16 per i32)
+    // Empirically Marlin's repack stores N columns column-block-major, so
+    // a contiguous column-range is contiguous bytes. Use:
+    //   bytes_per_col = qweight.len() * 4 / weight.n
+    let qw_bytes_per_col = (weight.qweight.len() * 4) / weight.n;
+    let qw_offset_bytes = expert_offset as usize * qw_bytes_per_col;
+
+    let scales_per_col = weight.scales.len() / weight.n;
+    let scales_offset_bytes = expert_offset as usize
+        * scales_per_col
+        * std::mem::size_of::<half::f16>();
+
+    let (a_ptr, _a_guard) = input.device_ptr(stream);
+    let (b_ptr_full, _b_guard) = weight.qweight.device_ptr(stream);
+    let (c_ptr, _c_guard) = output.device_ptr(stream);
+    let (s_ptr_full, _s_guard) = weight.scales.device_ptr(stream);
+    let (ws_ptr_full, _ws_guard) = weight.workspace.device_ptr(stream);
+    let b_ptr = b_ptr_full + qw_offset_bytes as u64;
+    let s_ptr = s_ptr_full + scales_offset_bytes as u64;
+    let ws_ptr = ws_ptr_full + ws_offset_bytes as u64;
+
+    let ret = unsafe {
+        marlin_cuda(
+            a_ptr as *const _,
+            b_ptr as *const _,
+            c_ptr as *mut _,
+            s_ptr as *const _,
+            m,
+            n,
+            k,
+            ws_ptr as *mut _,
+            weight.group_size,
+            0,
+            raw_stream,
+            -1,
+            -1,
+            -1,
+            16,
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin_cuda (offset) failed ret={ret} m={m} n={n} k={k} offset={expert_offset}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "marlin"))]
+pub fn marlin_gemm_with_offset(
+    _stream: &Arc<CudaStream>,
+    _input: &CudaSlice<half::f16>,
+    _weight: &MarlinWeight,
+    _output: &mut CudaSlice<half::f16>,
+    _m: i32,
+    _expert_offset: i32,
+    _expert_n: i32,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "Marlin kernel not available (compile with --features marlin)".into(),
+    ))
+}
+
 // ===================== Weight Repacking (GPTQ → Marlin) =====================
 
 /// Permute GPTQ INT4 qweight rows by `perm` (one-time, CPU work at load).

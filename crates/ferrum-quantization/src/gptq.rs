@@ -105,3 +105,60 @@ impl<B: Backend> Linear<B> for GptqLinear<B> {
         }
     }
 }
+
+/// View into a single column-slice of a shared stacked GPTQ store.
+/// All MoE experts in a layer share one big repacked Marlin tile that
+/// concatenates `num_experts × n_per_expert` columns; each
+/// `StackedExpertLinear` knows its expert's offset and width and
+/// dispatches to `B::gemm_gptq_with_offset` at forward time.
+///
+/// The store itself is `Arc<B::GptqStore>` so cloning a view is cheap;
+/// dropping all views drops the underlying store.
+pub struct StackedExpertLinear<B: Backend> {
+    pub store: std::sync::Arc<B::GptqStore>,
+    pub expert_offset: usize,
+    pub expert_n: usize,
+    pub k: usize,
+    pub bias: Option<B::Buffer>,
+}
+
+impl<B: Backend> StackedExpertLinear<B> {
+    pub fn new(
+        store: std::sync::Arc<B::GptqStore>,
+        expert_offset: usize,
+        expert_n: usize,
+        k: usize,
+    ) -> Self {
+        Self {
+            store,
+            expert_offset,
+            expert_n,
+            k,
+            bias: None,
+        }
+    }
+}
+
+impl<B: Backend> Linear<B> for StackedExpertLinear<B> {
+    fn in_features(&self) -> usize {
+        self.k
+    }
+    fn out_features(&self) -> usize {
+        self.expert_n
+    }
+    fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
+        B::gemm_gptq_with_offset(
+            ctx,
+            input,
+            &self.store,
+            self.expert_offset,
+            self.expert_n,
+            out,
+            m,
+        )
+        .unwrap_or_else(|e| panic!("StackedExpert forward failed: {e}"));
+        if let Some(bias) = &self.bias {
+            B::add_bias(ctx, out, bias, m, self.expert_n);
+        }
+    }
+}

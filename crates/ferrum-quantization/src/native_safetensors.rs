@@ -233,6 +233,193 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
     fn has(&self, name: &str) -> bool {
         self.index.contains_key(name)
     }
+
+    /// Read the four raw GPTQ tensors for a named projection without
+    /// triggering a Backend repack. Used by MoE batch loading: callers
+    /// stack many experts host-side then issue a single `B::load_gptq`,
+    /// avoiding the 12 288× per-expert Marlin repack overhead.
+    ///
+    /// Returns `(qweight, scales, qzeros, g_idx, k, n)`.
+    /// `g_idx` is `None` when desc_act=false (no act-order perm needed).
+    pub fn read_gptq_raw(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<i32>, Vec<f32>, Vec<i32>, Option<Vec<i32>>, usize, usize)> {
+        let (qweight, qw_shape) = self.read_i32(&format!("{name}.qweight"))?;
+        let (scales, _) = self.read_f32(&format!("{name}.scales"))?;
+        let (qzeros, _) = self.read_i32(&format!("{name}.qzeros"))?;
+        let g_idx = if self.has(&format!("{name}.g_idx")) {
+            Some(self.read_i32(&format!("{name}.g_idx"))?.0)
+        } else {
+            None
+        };
+        if qw_shape.len() != 2 {
+            return Err(FerrumError::model(format!(
+                "'{name}.qweight' expected 2D, got {qw_shape:?}"
+            )));
+        }
+        let k = qw_shape[0] * 8;
+        let n = qw_shape[1];
+        Ok((qweight, scales, qzeros, g_idx, k, n))
+    }
+
+    pub fn quant_config_ref(&self) -> Option<&crate::config::QuantConfig> {
+        self.quant_config.as_ref()
+    }
+
+    /// Load a STACKED GPTQ tile that concatenates `num_experts` experts'
+    /// raw GPTQ tensors along the N (column) axis and runs ONE backend
+    /// repack — instead of `num_experts × proj_names.len()` repacks.
+    ///
+    /// Layout: per row `r`, the cols are emitted in expert-major order:
+    /// `expert_0[proj_0|proj_1|...] | expert_1[...] | ... | expert_{N-1}[...]`.
+    /// Caller can therefore index expert `e` at column offset
+    /// `e * n_per_expert`, where `n_per_expert = Σ n(proj)` across the
+    /// `proj_names` for one expert.
+    ///
+    /// `expert_prefix_fmt` should be a closure-style `&str` that contains
+    /// `"{e}"` placeholder (replaced by the expert index) and ends *just
+    /// before* the proj name — e.g. `"model.layers.5.mlp.experts.{e}."`.
+    /// The full tensor name probed is `{expert_prefix}{proj}`.
+    ///
+    /// Returns `(store, n_per_expert, k)` where `n_per_expert` is the
+    /// per-expert column width and `k = in_features` (shared by all).
+    pub fn load_stacked_gptq_experts(
+        &self,
+        expert_prefix_fmt: &str,
+        num_experts: usize,
+        proj_names: &[&str],
+    ) -> Result<(B::GptqStore, usize, usize)> {
+        let qcfg = self.quant_config.as_ref().ok_or_else(|| {
+            FerrumError::model(
+                "load_stacked_gptq_experts requires quantize_config.json".to_string(),
+            )
+        })?;
+        if qcfg.method != QuantMethod::Gptq {
+            return Err(FerrumError::model(format!(
+                "stacked GPTQ load but quant_method={:?}",
+                qcfg.method
+            )));
+        }
+
+        let mut qw_rows = 0usize;
+        let mut sc_rows = 0usize;
+        let mut qz_rows = 0usize;
+        let mut n_per_expert = 0usize;
+        let mut n_per_expert_scales = 0usize;
+        let mut n_per_expert_zeros = 0usize;
+        let mut k_shared = 0usize;
+        let mut g_idx_first: Option<Vec<i32>> = None;
+
+        // Per (expert, proj) raw slices — row-major (rows × cols).
+        let total_pairs = num_experts * proj_names.len();
+        let mut qw_parts: Vec<(Vec<i32>, usize)> = Vec::with_capacity(total_pairs); // (data, cols)
+        let mut sc_parts: Vec<(Vec<f32>, usize)> = Vec::with_capacity(total_pairs);
+        let mut qz_parts: Vec<(Vec<i32>, usize)> = Vec::with_capacity(total_pairs);
+
+        for e in 0..num_experts {
+            let prefix = expert_prefix_fmt.replace("{e}", &e.to_string());
+            let mut e_n = 0usize;
+            let mut e_n_scales = 0usize;
+            let mut e_n_zeros = 0usize;
+            for proj in proj_names {
+                let name = format!("{prefix}{proj}");
+                let (qw, qw_sh) = self.read_i32(&format!("{name}.qweight"))?;
+                let (sc, sc_sh) = self.read_f32(&format!("{name}.scales"))?;
+                let (qz, qz_sh) = self.read_i32(&format!("{name}.qzeros"))?;
+                if qw_sh.len() != 2 || sc_sh.len() != 2 || qz_sh.len() != 2 {
+                    return Err(FerrumError::model(format!(
+                        "stacked GPTQ '{name}': expected 2D, got qw {qw_sh:?} sc {sc_sh:?} qz {qz_sh:?}"
+                    )));
+                }
+                if qw_rows == 0 {
+                    qw_rows = qw_sh[0];
+                    sc_rows = sc_sh[0];
+                    qz_rows = qz_sh[0];
+                    k_shared = qw_sh[0] * 8;
+                } else if qw_sh[0] != qw_rows
+                    || sc_sh[0] != sc_rows
+                    || qz_sh[0] != qz_rows
+                {
+                    return Err(FerrumError::model(format!(
+                        "stacked GPTQ '{name}': row mismatch qw {} sc {} qz {} vs ref {qw_rows}/{sc_rows}/{qz_rows}",
+                        qw_sh[0], sc_sh[0], qz_sh[0]
+                    )));
+                }
+                e_n += qw_sh[1];
+                e_n_scales += sc_sh[1];
+                e_n_zeros += qz_sh[1];
+                qw_parts.push((qw, qw_sh[1]));
+                sc_parts.push((sc, sc_sh[1]));
+                qz_parts.push((qz, qz_sh[1]));
+
+                // g_idx is a permutation over K — same across experts in
+                // the same role for all GPTQ exports we've seen. Take the
+                // first one we encounter; ignore subsequent (they should
+                // match — Marlin assumes a single g_idx for the tile).
+                if g_idx_first.is_none() && self.has(&format!("{name}.g_idx")) {
+                    g_idx_first = Some(self.read_i32(&format!("{name}.g_idx"))?.0);
+                }
+            }
+            if e == 0 {
+                n_per_expert = e_n;
+                n_per_expert_scales = e_n_scales;
+                n_per_expert_zeros = e_n_zeros;
+            } else if e_n != n_per_expert
+                || e_n_scales != n_per_expert_scales
+                || e_n_zeros != n_per_expert_zeros
+            {
+                return Err(FerrumError::model(format!(
+                    "stacked GPTQ expert {e} N mismatch: qw {e_n} sc {e_n_scales} qz {e_n_zeros} vs expert 0 {n_per_expert}/{n_per_expert_scales}/{n_per_expert_zeros}"
+                )));
+            }
+        }
+
+        let total_n = num_experts * n_per_expert;
+        let total_n_scales = num_experts * n_per_expert_scales;
+        let total_n_zeros = num_experts * n_per_expert_zeros;
+
+        // Row-major concat. Order within each row: expert-major, proj-minor.
+        let mut qw_acc: Vec<i32> = Vec::with_capacity(qw_rows * total_n);
+        for r in 0..qw_rows {
+            for pair_idx in 0..total_pairs {
+                let (data, cols) = &qw_parts[pair_idx];
+                qw_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
+            }
+        }
+        let mut sc_acc: Vec<f32> = Vec::with_capacity(sc_rows * total_n_scales);
+        for r in 0..sc_rows {
+            for pair_idx in 0..total_pairs {
+                let (data, cols) = &sc_parts[pair_idx];
+                sc_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
+            }
+        }
+        let mut qz_acc: Vec<i32> = Vec::with_capacity(qz_rows * total_n_zeros);
+        for r in 0..qz_rows {
+            for pair_idx in 0..total_pairs {
+                let (data, cols) = &qz_parts[pair_idx];
+                qz_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
+            }
+        }
+
+        // Drop intermediates eagerly — these can be ~hundreds of MB on
+        // 30B-A3B and we still have to feed B::load_gptq below.
+        drop(qw_parts);
+        drop(sc_parts);
+        drop(qz_parts);
+
+        let store = B::load_gptq(
+            &qw_acc,
+            &sc_acc,
+            &qz_acc,
+            g_idx_first.as_deref(),
+            qcfg.bits,
+            qcfg.group_size,
+            k_shared,
+            total_n,
+        )?;
+        Ok((store, n_per_expert, k_shared))
+    }
 }
 
 impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {

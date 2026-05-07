@@ -2223,6 +2223,49 @@ impl Backend for CudaBackend {
         ))
     }
 
+    /// MoE expert dispatch: GEMM over a column-slice of a stacked Marlin
+    /// store. Lets all 128 experts share one Marlin repack; the runtime
+    /// dispatch picks one expert by `expert_offset`.
+    ///
+    /// Currently Marlin-only (the Triton w4a16 variant doesn't support
+    /// strided access on the on-disk layout). When triton-kernels is on
+    /// and the store is Triton, returns Unsupported — caller should ensure
+    /// MoE models load through the Marlin path (default).
+    #[cfg(feature = "marlin")]
+    fn gemm_gptq_with_offset(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::GptqStore,
+        expert_offset: usize,
+        expert_n: usize,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "gemm_gptq_with_offset: Triton w4a16 store has no \
+                     stride-aware variant; load MoE via Marlin (default)",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+        let stream = ctx.stream.clone();
+        crate::marlin::marlin_gemm_with_offset(
+            &stream,
+            a,
+            mw,
+            out,
+            m as i32,
+            expert_offset as i32,
+            expert_n as i32,
+        )
+        .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
+    }
+
     // ── TP collectives ──────────────────────────────────────────────────
     //
     // World size / rank come from env vars (FERRUM_TP, FERRUM_RANK).
