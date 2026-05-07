@@ -180,6 +180,33 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn gemm_gptq_with_offset(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::GptqStore,
+        expert_offset: usize,
+        expert_n: usize,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        if expert_offset + expert_n > weight.n {
+            return Err(FerrumError::model(format!(
+                "gemm_gptq_with_offset OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
+                weight.n
+            )));
+        }
+        // weight_f32 layout is [N, K] row-major; copy the
+        // [expert_offset .. expert_offset + expert_n) row range into
+        // a Vec (CPU path isn't perf-critical for MoE — Marlin owns
+        // that on CUDA).
+        let k = weight.k;
+        let row_start = expert_offset * k;
+        let row_end = (expert_offset + expert_n) * k;
+        let slice = weight.weight_f32[row_start..row_end].to_vec();
+        Self::gemm(ctx, a, &slice, out, m, expert_n, k);
+        Ok(())
+    }
+
     fn load_quant(
         kind: super::GgufQuantType,
         bytes: &[u8],
