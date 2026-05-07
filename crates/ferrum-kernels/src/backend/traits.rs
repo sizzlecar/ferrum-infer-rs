@@ -322,6 +322,39 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Load num_experts GPTQ weight tiles into ONE stacked store, with
+    /// the property that **each expert's packed bytes are contiguous**
+    /// in the resulting store. This is what the offset GEMM needs to
+    /// dispatch per expert via pointer offset alone.
+    ///
+    /// Why this is a separate API from `load_gptq` + post-hoc concat:
+    /// Marlin's repack permutes data in `[K-tile-row outer, N-tile inner]`
+    /// order. A single repack of `concat(all experts along N)` produces
+    /// a buffer where expert e's bytes are spread across K-tile-rows,
+    /// NOT contiguous. Per-expert repack-then-concat keeps each
+    /// expert's data in one contiguous block.
+    ///
+    /// `qweights[i] / scales[i] / qzeros[i]` are each expert's raw GPTQ
+    /// tensors. All share the same K + group_size + bits + g_idx.
+    ///
+    /// Default returns Err(unsupported); override on backends with a
+    /// per-expert MoE GPTQ path.
+    #[allow(clippy::too_many_arguments)]
+    fn load_gptq_stacked(
+        _qweights: &[&[i32]],
+        _scales: &[&[f32]],
+        _qzeros: &[&[i32]],
+        _g_idx: Option<&[i32]>,
+        _bits: u32,
+        _group_size: usize,
+        _k: usize,
+        _n_per_expert: usize,
+    ) -> Result<Self::GptqStore> {
+        Err(FerrumError::unsupported(
+            "load_gptq_stacked not implemented for this backend",
+        ))
+    }
+
     /// GEMM with pre-loaded GPTQ weights.
     /// `out[m, n] = a[m, k] @ dequant(weight)^T`
     fn gemm_gptq(

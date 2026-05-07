@@ -447,60 +447,73 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             }
         }
 
-        let total_n = num_experts * n_per_expert;
-        let total_n_scales = num_experts * n_per_expert_scales;
-        let total_n_zeros = num_experts * n_per_expert_zeros;
         let proj_count = proj_names.len();
         let pairs_per_expert = proj_count;
         debug_assert_eq!(total_pairs, num_experts * pairs_per_expert);
 
-        // GROUP-MAJOR layout for ALL THREE (qweight + scales + qzeros).
-        // Layout: out[g * total_n + e * n_per_expert + c]. Marlin's
-        // CUDA kernel uses prob_n_full as the stride for both b_gl_stride
-        // and s_gl_stride — i.e. the kernel walks `prob_n_full` cols
-        // between K-tile rows / between groups. With group-major,
-        // group g of expert e is at byte offset
-        // `(g * total_n + e * n_per) * sizeof`, exactly where the
-        // kernel reads when given pointer offset = `e * n_per * sizeof`
-        // and stride = `total_n`.
-        let _ = pairs_per_expert; // silence unused-var
-        let mut qw_acc: Vec<i32> = Vec::with_capacity(qw_rows * total_n);
-        for r in 0..qw_rows {
-            for pair_idx in 0..total_pairs {
-                let (data, cols) = &qw_parts[pair_idx];
-                qw_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
+        // PER-EXPERT layout: build num_experts independent
+        // `[K/8, n_per_expert]` qweight tiles + scales + qzeros, each
+        // a row-major concat of the proj_names within that expert.
+        // Hand them to `B::load_gptq_stacked` which repacks PER-EXPERT
+        // and concats the resulting Marlin-format tiles into one
+        // contiguous buffer. Each expert's packed bytes are then
+        // contiguous, so the offset GEMM dispatches correctly via
+        // pointer arithmetic alone.
+        //
+        // Without per-expert repack, a single concat-then-repack of
+        // the stacked tile mangles per-expert tile boundaries (Marlin
+        // permutes in K-tile-major order across the whole tile).
+        let mut per_expert_qw: Vec<Vec<i32>> = Vec::with_capacity(num_experts);
+        let mut per_expert_sc: Vec<Vec<f32>> = Vec::with_capacity(num_experts);
+        let mut per_expert_qz: Vec<Vec<i32>> = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let mut qw: Vec<i32> = Vec::with_capacity(qw_rows * n_per_expert);
+            let mut sc: Vec<f32> = Vec::with_capacity(sc_rows * n_per_expert_scales);
+            let mut qz: Vec<i32> = Vec::with_capacity(qz_rows * n_per_expert_zeros);
+            for r in 0..qw_rows {
+                for j in 0..pairs_per_expert {
+                    let pair_idx = e * pairs_per_expert + j;
+                    let (data, cols) = &qw_parts[pair_idx];
+                    qw.extend_from_slice(&data[r * cols..(r + 1) * cols]);
+                }
             }
-        }
-        let mut sc_acc: Vec<f32> = Vec::with_capacity(sc_rows * total_n_scales);
-        for r in 0..sc_rows {
-            for pair_idx in 0..total_pairs {
-                let (data, cols) = &sc_parts[pair_idx];
-                sc_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
+            for r in 0..sc_rows {
+                for j in 0..pairs_per_expert {
+                    let pair_idx = e * pairs_per_expert + j;
+                    let (data, cols) = &sc_parts[pair_idx];
+                    sc.extend_from_slice(&data[r * cols..(r + 1) * cols]);
+                }
             }
-        }
-        let mut qz_acc: Vec<i32> = Vec::with_capacity(qz_rows * total_n_zeros);
-        for r in 0..qz_rows {
-            for pair_idx in 0..total_pairs {
-                let (data, cols) = &qz_parts[pair_idx];
-                qz_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
+            for r in 0..qz_rows {
+                for j in 0..pairs_per_expert {
+                    let pair_idx = e * pairs_per_expert + j;
+                    let (data, cols) = &qz_parts[pair_idx];
+                    qz.extend_from_slice(&data[r * cols..(r + 1) * cols]);
+                }
             }
+            per_expert_qw.push(qw);
+            per_expert_sc.push(sc);
+            per_expert_qz.push(qz);
         }
 
-        // Drop intermediates eagerly — these can be ~hundreds of MB on
-        // 30B-A3B and we still have to feed B::load_gptq below.
+        // Drop the original part buffers — we own copies in per_expert_*.
         drop(qw_parts);
         drop(sc_parts);
         drop(qz_parts);
 
-        let store = B::load_gptq(
-            &qw_acc,
-            &sc_acc,
-            &qz_acc,
+        let qw_refs: Vec<&[i32]> = per_expert_qw.iter().map(|v| v.as_slice()).collect();
+        let sc_refs: Vec<&[f32]> = per_expert_sc.iter().map(|v| v.as_slice()).collect();
+        let qz_refs: Vec<&[i32]> = per_expert_qz.iter().map(|v| v.as_slice()).collect();
+
+        let store = B::load_gptq_stacked(
+            &qw_refs,
+            &sc_refs,
+            &qz_refs,
             g_idx_first.as_deref(),
             qcfg.bits,
             qcfg.group_size,
             k_shared,
-            total_n,
+            n_per_expert,
         )?;
         Ok((store, n_per_expert, k_shared))
     }

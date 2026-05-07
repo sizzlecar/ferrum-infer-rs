@@ -2282,6 +2282,159 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn load_gptq_stacked(
+        qweights: &[&[i32]],
+        scales: &[&[f32]],
+        qzeros: &[&[i32]],
+        g_idx: Option<&[i32]>,
+        bits: u32,
+        group_size: usize,
+        k: usize,
+        n_per_expert: usize,
+    ) -> Result<Self::GptqStore> {
+        if bits != 4 {
+            return Err(FerrumError::unsupported(format!(
+                "CUDA GPTQ stacked: only bits=4 supported (got {bits})"
+            )));
+        }
+        let num_experts = qweights.len();
+        if num_experts == 0 {
+            return Err(FerrumError::model("load_gptq_stacked: 0 experts"));
+        }
+        if scales.len() != num_experts || qzeros.len() != num_experts {
+            return Err(FerrumError::model(format!(
+                "load_gptq_stacked length mismatch: qw={} sc={} qz={}",
+                num_experts,
+                scales.len(),
+                qzeros.len()
+            )));
+        }
+        let _ = qzeros; // Marlin doesn't read qzeros (sym=true)
+
+        // Triton path: would need a stacked variant — not implemented.
+        // Fall through to Marlin.
+        #[cfg(feature = "triton-kernels")]
+        if use_triton_int4() {
+            return Err(FerrumError::unsupported(
+                "load_gptq_stacked: Triton w4a16 path not implemented; \
+                 unset FERRUM_TRITON_INT4 to use Marlin",
+            ));
+        }
+
+        // desc_act perm-aware path: sample expert 0's g_idx (all experts
+        // share K-axis quantization, so g_idx is identical across experts).
+        let (perm_dev_opt, perm_for_repack): (Option<CudaSlice<i32>>, Option<Vec<usize>>) =
+            if let Some(gx) = g_idx {
+                let is_desc_act = gx
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &g)| g != (i as i32) / group_size as i32);
+                if is_desc_act {
+                    let mut perm: Vec<usize> = (0..k).collect();
+                    perm.sort_by_key(|&i| gx[i]);
+                    let perm_i32: Vec<i32> = perm.iter().map(|&p| p as i32).collect();
+                    let stream = default_stream();
+                    let perm_dev = stream
+                        .clone_htod(&perm_i32)
+                        .map_err(|e| FerrumError::model(format!("perm htod: {e}")))?;
+                    (Some(perm_dev), Some(perm))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+        // Per-expert repack in parallel via rayon. Each produces its
+        // own packed qweight + permuted scales tile. Concat in expert
+        // order — each expert's bytes are CONTIGUOUS in the output
+        // buffer, so an offset GEMM with prob_n=n_per_expert just
+        // walks the right slice.
+        use rayon::prelude::*;
+        let qw_per_expert_i32 = (n_per_expert * k) / 8;
+        let sc_per_expert_f16 = (k / group_size) * n_per_expert;
+
+        let mut packed_qw: Vec<i32> = vec![0i32; num_experts * qw_per_expert_i32];
+        let mut packed_sc: Vec<f16> = vec![f16::ZERO; num_experts * sc_per_expert_f16];
+
+        // Parallelize across experts: each writes to a disjoint output
+        // slice. Per-expert repack runs the inner-rayon-parallel
+        // 4-pass kernel — at num_experts > num_cores, outer parallelism
+        // wins; at smaller num_experts, inner parallelism wins. Rayon
+        // nests fine.
+        packed_qw
+            .par_chunks_mut(qw_per_expert_i32)
+            .zip(packed_sc.par_chunks_mut(sc_per_expert_f16))
+            .enumerate()
+            .for_each(|(e, (qw_out, sc_out))| {
+                let qw_in: Vec<i32> = if let Some(perm) = &perm_for_repack {
+                    crate::marlin::permute_gptq_qweight_rows(qweights[e], perm, k, n_per_expert)
+                } else {
+                    qweights[e].to_vec()
+                };
+                let qw_packed =
+                    crate::marlin::repack_gptq_to_marlin(&qw_in, k, n_per_expert);
+                qw_out.copy_from_slice(&qw_packed);
+
+                let sc_f16: Vec<f16> = scales[e].iter().map(|&x| f16::from_f32(x)).collect();
+                let sc_packed = crate::marlin::repack_scales_to_marlin(
+                    &sc_f16,
+                    k,
+                    n_per_expert,
+                    group_size,
+                );
+                sc_out.copy_from_slice(&sc_packed);
+            });
+
+        // Single htod upload of the concatenated packed buffer.
+        let stream = default_stream();
+        let qweight_dev = stream
+            .clone_htod(&packed_qw)
+            .map_err(|e| FerrumError::model(format!("stacked qweight htod: {e}")))?;
+        let scales_dev = stream
+            .clone_htod(&packed_sc)
+            .map_err(|e| FerrumError::model(format!("stacked scales htod: {e}")))?;
+
+        // Workspace: per-expert range concatenated. Each expert owns
+        // (n_per_expert/128) × max_par i32 mutex slots starting at
+        // its expert_idx * that_size.
+        let max_par = 16usize;
+        let ws_per_expert = (n_per_expert / 128).max(1) * max_par;
+        let ws_len = num_experts * ws_per_expert;
+        let workspace_dev = stream
+            .alloc_zeros::<i32>(ws_len)
+            .map_err(|e| FerrumError::model(format!("stacked ws alloc: {e}")))?;
+
+        // Total stacked N for downstream offset arithmetic. We store
+        // total_n in MarlinWeight.n so byte_per_col-style helpers see
+        // the full width; the offset GEMM uses per-expert stride
+        // (= n_per_expert) regardless of weight.n.
+        let total_n = num_experts * n_per_expert;
+        let marlin_weight = crate::marlin::MarlinWeight {
+            qweight: qweight_dev,
+            scales: scales_dev,
+            workspace: workspace_dev,
+            k,
+            n: total_n,
+            group_size: group_size as i32,
+            perm: perm_dev_opt,
+        };
+
+        tracing::info!(
+            "GPTQ stacked load: {} experts × N={n_per_expert} × K={k} (gs={group_size})",
+            num_experts
+        );
+
+        #[cfg(feature = "triton-kernels")]
+        {
+            Ok(GptqStoreCuda::Marlin(marlin_weight))
+        }
+        #[cfg(not(feature = "triton-kernels"))]
+        {
+            Ok(marlin_weight)
+        }
+    }
+
     #[cfg(feature = "marlin")]
     fn gemm_gptq(
         ctx: &mut Self::Context,

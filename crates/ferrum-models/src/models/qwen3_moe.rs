@@ -589,13 +589,10 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 )));
             }
 
-            // Stacked GPTQ Marlin load. Now correct after fixing the
-            // Marlin C wrapper's b_gl_stride / s_gl_stride (commit
-            // adding prob_n_full param to marlin_cuda) — the kernel
-            // walks the full N stride for B/s while iterating only
-            // over the expert subset. Combined with the expert-major
-            // scales/qzeros layout (commit 21b0c78), the offset GEMM
-            // gives the same logits as a per-expert MarlinWeight.
+            // Stacked GPTQ Marlin load via per-expert-repack-then-concat
+            // (B::load_gptq_stacked). Each expert's Marlin-packed bytes
+            // are contiguous in the GPU buffer, so offset GEMM
+            // dispatches via pointer offset alone — no stride magic.
             let expert_prefix = format!("{prefix}.mlp.experts.{{e}}.");
             let probe_split = loader.has_tensor(&format!(
                 "{prefix}.mlp.experts.0.gate_proj.qweight"

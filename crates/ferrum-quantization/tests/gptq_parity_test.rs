@@ -262,36 +262,14 @@ fn cuda_stacked_offset_vs_per_expert() {
         })
         .collect();
 
-    // Stacked layout (matches load_stacked_gptq_experts):
-    // GROUP-MAJOR for ALL three. out[g * total_n + e * n_per + c].
-    // Marlin's kernel uses prob_n_full as stride for both qweight and
-    // scales; with this layout, group g of expert e at pointer offset
-    // (e * n_per * sizeof) lands at the right (group, expert, col).
-    let total_n = num_experts * n_per;
-    let qw_rows = k / 8;
-    let sc_rows = k / gs;
-    let qz_rows = k / gs;
-    let mut qw_acc = Vec::<i32>::with_capacity(qw_rows * total_n);
-    for r in 0..qw_rows {
-        for e in 0..num_experts {
-            qw_acc.extend_from_slice(&experts[e].qweight[r * n_per..(r + 1) * n_per]);
-        }
-    }
-    let mut sc_acc = Vec::<f32>::with_capacity(sc_rows * total_n);
-    for r in 0..sc_rows {
-        for e in 0..num_experts {
-            sc_acc.extend_from_slice(&experts[e].scales[r * n_per..(r + 1) * n_per]);
-        }
-    }
-    let mut qz_acc = Vec::<i32>::with_capacity(qz_rows * num_experts * (n_per / 8));
-    for r in 0..qz_rows {
-        for e in 0..num_experts {
-            let cols = n_per / 8;
-            qz_acc.extend_from_slice(&experts[e].qzeros[r * cols..(r + 1) * cols]);
-        }
-    }
-    let stacked = <CudaBackend as Backend>::load_gptq(
-        &qw_acc, &sc_acc, &qz_acc, None, 4, gs, k, total_n,
+    // Stacked store: use the new per-expert-repack-then-concat API.
+    // Each expert's packed bytes are CONTIGUOUS in the resulting
+    // store, so offset GEMM dispatches via pointer offset alone.
+    let qw_refs: Vec<&[i32]> = experts.iter().map(|e| e.qweight.as_slice()).collect();
+    let sc_refs: Vec<&[f32]> = experts.iter().map(|e| e.scales.as_slice()).collect();
+    let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
+    let stacked = <CudaBackend as Backend>::load_gptq_stacked(
+        &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
     .expect("stacked load_gptq");
 

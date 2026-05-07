@@ -175,45 +175,45 @@ pub fn marlin_gemm_with_offset(
     }
     let raw_stream = stream.cu_stream();
 
-    // Workspace layout is `[n_total/128, max_par]` flat i32, where
-    // max_par=16 (matches kernel arg below). For an expert that owns
-    // columns [expert_offset, expert_offset + expert_n), it owns the
-    // mutex slots
+    // PER-EXPERT CONTIGUOUS LAYOUT (built by load_gptq_stacked):
+    // Each expert's packed bytes are CONTIGUOUS in the buffer.
+    // Buffer = [exp0_marlin_tile | exp1_marlin_tile | ...].
+    // expert_idx is implicit: expert_offset / expert_n.
     //
-    //   workspace[(expert_offset/128) * max_par .. (expert_offset/128 +
-    //                                              expert_n/128) * max_par]
+    // qweight: per-expert tile = (n_per_expert * k / 8) i32. Offset
+    //          by expert_idx × that_size i32.
+    // scales:  per-expert tile = (k/group_size * n_per_expert) f16.
+    //          Offset by expert_idx × that_size f16.
+    // workspace: per-expert range = (n_per_expert/128) * MAX_PAR i32.
+    //          Offset by expert_idx × that_size i32.
     //
-    // Zero that range before launch — Marlin uses these as atomic
-    // tile-completion locks and expects them initially zero.
+    // Marlin sees a regular N=expert_n tile per call. prob_n =
+    // prob_n_full = expert_n (no stride decoupling needed).
+    let expert_idx = (expert_offset / expert_n) as usize;
+    let n_per = expert_n as usize;
+    let k_us = k as usize;
+
     const MAX_PAR: usize = 16;
-    let ws_blocks = (expert_n / 128) as usize * MAX_PAR;
-    let ws_offset_bytes =
-        (expert_offset / 128) as usize * MAX_PAR * std::mem::size_of::<i32>();
+    let ws_per_expert = (n_per / 128).max(1) * MAX_PAR;
+    let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
     {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(
                 ws_ptr + ws_offset_bytes as u64,
                 0,
-                ws_blocks,
+                ws_per_expert,
                 raw_stream,
             );
         }
     }
 
-    // Marlin's repack stores N columns N-block-major, so a contiguous
-    // column-range maps to contiguous bytes:
-    //   bytes_per_col = qweight.len() * 4 / weight.n
-    let qw_bytes_per_col = (weight.qweight.len() * 4) / weight.n;
-    let qw_offset_bytes = expert_offset as usize * qw_bytes_per_col;
+    let qw_per_expert_i32 = (n_per * k_us) / 8;
+    let qw_offset_bytes = expert_idx * qw_per_expert_i32 * std::mem::size_of::<i32>();
 
-    // Scales are GROUP-MAJOR after repack: layout [num_groups, total_n].
-    // Col `c` is at flat positions {0 + c, total_n + c, 2*total_n + c, ...}
-    // — first scale of col c is just `c` f16s in. Offset by expert_offset
-    // f16s; the kernel then strides by total_n (via prob_n_full =
-    // weight.n) for each group, picking up the right column of every
-    // group inside expert e.
-    let scales_offset_bytes = expert_offset as usize * std::mem::size_of::<half::f16>();
+    let num_groups = k_us / weight.group_size as usize;
+    let sc_per_expert_f16 = num_groups * n_per;
+    let scales_offset_bytes = expert_idx * sc_per_expert_f16 * std::mem::size_of::<half::f16>();
 
     let (a_ptr, _a_guard) = input.device_ptr(stream);
     let (b_ptr_full, _b_guard) = weight.qweight.device_ptr(stream);
@@ -241,11 +241,8 @@ pub fn marlin_gemm_with_offset(
             -1,
             -1,
             16,
-            // Stacked B/s: full N stride is weight.n. Iteration is
-            // expert_n. Without this, b_gl_stride / s_gl_stride
-            // would compute from prob_n=expert_n and walk the
-            // wrong number of cols between K-tile rows.
-            weight.n as i32,
+            // Per-expert contiguous: stride == iteration width.
+            -1,
         )
     };
     if ret != 0 {
@@ -303,29 +300,33 @@ pub fn marlin_gemm_with_offset_strided(
     }
     let raw_stream = stream.cu_stream();
 
-    // Same workspace layout reasoning as in `marlin_gemm_with_offset`.
+    // Per-expert contiguous layout, same offset arithmetic as
+    // marlin_gemm_with_offset.
+    let expert_idx = (expert_offset / expert_n) as usize;
+    let n_per = expert_n as usize;
+    let k_us = k as usize;
+
     const MAX_PAR: usize = 16;
-    let ws_blocks = (expert_n / 128) as usize * MAX_PAR;
-    let ws_offset_bytes =
-        (expert_offset / 128) as usize * MAX_PAR * std::mem::size_of::<i32>();
+    let ws_per_expert = (n_per / 128).max(1) * MAX_PAR;
+    let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
     {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(
                 ws_ptr + ws_offset_bytes as u64,
                 0,
-                ws_blocks,
+                ws_per_expert,
                 raw_stream,
             );
         }
     }
 
-    let qw_bytes_per_col = (weight.qweight.len() * 4) / weight.n;
-    let qw_offset_bytes = expert_offset as usize * qw_bytes_per_col;
+    let qw_per_expert_i32 = (n_per * k_us) / 8;
+    let qw_offset_bytes = expert_idx * qw_per_expert_i32 * std::mem::size_of::<i32>();
 
-    // Group-major scales: offset by expert_offset f16s
-    // (see marlin_gemm_with_offset comment).
-    let scales_offset_bytes = expert_offset as usize * std::mem::size_of::<half::f16>();
+    let num_groups = k_us / weight.group_size as usize;
+    let sc_per_expert_f16 = num_groups * n_per;
+    let scales_offset_bytes = expert_idx * sc_per_expert_f16 * std::mem::size_of::<half::f16>();
 
     let in_offset_bytes =
         in_row_offset as usize * (k as usize) * std::mem::size_of::<half::f16>();
@@ -360,8 +361,8 @@ pub fn marlin_gemm_with_offset_strided(
             -1,
             -1,
             16,
-            // Stacked B/s stride: weight.n. See marlin_gemm_with_offset.
-            weight.n as i32,
+            // Per-expert contiguous: stride == iteration.
+            -1,
         )
     };
     if ret != 0 {
