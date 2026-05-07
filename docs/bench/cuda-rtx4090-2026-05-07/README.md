@@ -130,12 +130,34 @@ toggled.
 
 ### M1: Llama-3.1-8B FP16 — output throughput (tok/s)
 
+Now runs (was OOM in v0.7.2): `--gpu-memory-utilization 1.0` auto-sizes
+`FERRUM_KV_MAX_BLOCKS / FERRUM_PAGED_MAX_SEQS / FERRUM_KV_CAPACITY`
+to fit weights (15 GB) + scratch (~4 GB) + KV (~5 GB) in 24 GB.
+
+3 reps median, num_prompts=128 (steady state) for c=16/32; n=64 c=1/4.
+
 | c | ferrum | vllm | ratio | TPOT_p50 (ferrum / vllm) |
 |---:|---:|---:|---:|---:|
-| 1 | **OOM** ⚠ | 59.2 | — | — / 16.7 ms |
-| 4 | **OOM** ⚠ | 204.8 | — | — / 17.3 ms |
-| 16 | **OOM** ⚠ | 741.2 | — | — / 19.0 ms |
-| 32 | **OOM** ⚠ | 1236.9 | — | — / 22.8 ms |
+| 1 | **55.1** | 59.2 | **93%** | 17.6 / 6.6 ms |
+| 4 | **192.7** | 204.8 | **94%** | 19.5 / 7.1 ms |
+| 16 | **622.6** | 741.2 | **84%** | 23.1 / 9.1 ms |
+| 32 | **895** | 1236.9 | **72%** | 28.0 / 12.1 ms |
+
+**FP16 vs INT4 ratio comparison** (same hardware, same dataset):
+
+| c | INT4 ratio | FP16 ratio | Δ |
+|---:|---:|---:|---:|
+| 1 | 75% | **93%** | +18 pp |
+| 4 | 74% | **94%** | +20 pp |
+| 16 | 65% | **84%** | +19 pp |
+| 32 | 55% | **72%** | +17 pp |
+
+ferrum's FP16 path is consistently 17–20 pp closer to vLLM than its
+INT4 path. Reason: FP16 routes through cuBLAS GEMM (a vendor kernel
+identical between ferrum and vLLM), while INT4 routes through ferrum's
+IST-DASLab Marlin port. vLLM's `gptq_marlin` has ~30 % better weight-
+loading efficiency on these shapes — a kernel-level difference that
+the Phase 12 ferrum→vLLM Marlin port did not capture.
 
 ---
 
