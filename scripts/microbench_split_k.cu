@@ -345,16 +345,38 @@ double bench_ms(cudaEvent_t s, cudaEvent_t e, int iters) {
     return ms / iters;
 }
 
+struct Cfg { int c; int kv_len; int max_blocks; int splits; };
+
 int main() {
+    std::vector<Cfg> sweep = {
+        {16,  256,  20,  2}, {16,  256,  20,  4},
+        {16,  384,  28,  2}, {16,  384,  28,  4}, {16,  384,  28,  8},
+        {16,  768,  52,  4}, {16,  768,  52,  8},
+        {16, 1536, 100,  4}, {16, 1536, 100,  8}, {16, 1536, 100, 16},
+        {16, 4096, 260,  8}, {16, 4096, 260, 16},
+        {32,  256,  20,  2}, {32,  256,  20,  4},
+        {32,  384,  28,  2}, {32,  384,  28,  4},
+        {32,  768,  52,  4}, {32, 1536, 100,  8},
+        { 8,  384,  28,  2}, { 8,  384,  28,  4},
+        { 4,  384,  28,  4}, { 4, 1536, 100,  8},
+        { 1, 4096, 260, 16}, { 1, 4096, 260, 32},
+    };
+
+    printf("=== paged attention split-K sweep (RTX 4090) ===\n");
+    printf("c   kv_len  N | A (ms)   B (ms)   B/A   delta%%\n");
+    printf("-------------+--------------------------------\n");
+
+    for (const auto& cfg : sweep) {
     Workload w {
-        .num_seqs = 16, .num_q_heads = 32, .num_kv_heads = 8,
-        .head_dim = 128, .block_size = 16, .max_blocks_per_seq = 24,
-        .avg_kv_len = 384,
+        .num_seqs = cfg.c, .num_q_heads = 32, .num_kv_heads = 8,
+        .head_dim = 128, .block_size = 16, .max_blocks_per_seq = cfg.max_blocks,
+        .avg_kv_len = cfg.kv_len,
     };
     int M_total = w.num_seqs;
     int kv_len = w.avg_kv_len;
     int pool_blocks = w.num_seqs * w.max_blocks_per_seq;
     float scale = 1.0f / sqrtf((float)w.head_dim);
+    int NUM_SPLITS = cfg.splits;
 
     // Allocate dummy buffers
     size_t q_bytes = (size_t)M_total * w.num_q_heads * w.head_dim * sizeof(__half);
@@ -392,7 +414,6 @@ int main() {
     CHECK(cudaMemcpy(d_pos, h_pos.data(), h_pos.size() * sizeof(int), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_blk, h_blk.data(), h_blk.size() * sizeof(int), cudaMemcpyHostToDevice));
 
-    const int NUM_SPLITS = 4;
     float *d_pmax, *d_psum, *d_pout;
     CHECK(cudaMalloc(&d_pout, (size_t)M_total * w.num_q_heads * NUM_SPLITS * w.head_dim * sizeof(float)));
     CHECK(cudaMalloc(&d_pmax, (size_t)M_total * w.num_q_heads * NUM_SPLITS * sizeof(float)));
@@ -450,17 +471,14 @@ int main() {
     cudaDeviceSynchronize();
     double b_ms = bench_ms(start, stop, ITERS);
 
-    printf("=== paged attention microbench (RTX 4090) ===\n");
-    printf("Workload: c=%d M_total=%d heads=%d/%d head_dim=%d kv_len=%d block_size=%d\n",
-           w.num_seqs, M_total, w.num_q_heads, w.num_kv_heads, w.head_dim, kv_len, w.block_size);
-    printf("Iters: %d  (warmup %d)\n\n", ITERS, WARMUP);
-    printf("Variant A (current paged_varlen_attn):     %.4f ms/iter\n", a_ms);
-    printf("Variant B (split-K phase1+reduce, N=%d): %.4f ms/iter\n", NUM_SPLITS, b_ms);
-    printf("Speedup B vs A: %.2fx  (%+.1f%%)\n", a_ms / b_ms, (a_ms / b_ms - 1.0) * 100.0);
+    printf("%-3d %-6d  %-2d| %.4f  %.4f  %.2fx  %+.1f%%\n",
+           w.num_seqs, kv_len, NUM_SPLITS, a_ms, b_ms,
+           a_ms / b_ms, (a_ms / b_ms - 1.0) * 100.0);
 
     cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
     cudaFree(d_out_a); cudaFree(d_out_b);
     cudaFree(d_cu); cudaFree(d_pos); cudaFree(d_blk);
     cudaFree(d_pout); cudaFree(d_pmax); cudaFree(d_psum);
+    }
     return 0;
 }
