@@ -159,6 +159,16 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub silu_stacked: B::Buffer,
     /// `[max_tokens * top_k * hidden]` — down gemm output per pair.
     pub down_out_stacked: B::Buffer,
+
+    // ── Bucketed CUDA path scratch (shared with stacked Metal where
+    //    layout matches; used by `moe_forward_bucketed`).
+    /// `[max_tokens * top_k * hidden]` — input gather output: per-pair
+    /// row gathered from `x[batch, hidden]` via embedding_lookup.
+    pub x_packed_bucket: B::Buffer,
+    /// `[max_tokens * top_k * 2 * expert_inter]` — gate_up Marlin output
+    /// per pair (gate cols then up cols). Distinct from `gate_out_stacked`
+    /// + `up_out_stacked` which the Metal path keeps separate.
+    pub gate_up_packed_bucket: B::Buffer,
     /// `[top_k]` i32 expert IDs for the current token (decode reuses;
     /// prefill writes per-pair indices into `ids_2d` instead).
     pub ids_buf: B::Buffer,
@@ -269,6 +279,8 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             up_out_stacked: B::alloc(t * cfg.num_experts_per_tok * inter),
             silu_stacked: B::alloc(t * cfg.num_experts_per_tok * inter),
             down_out_stacked: B::alloc(t * cfg.num_experts_per_tok * h),
+            x_packed_bucket: B::alloc(t * cfg.num_experts_per_tok * h),
+            gate_up_packed_bucket: B::alloc(t * cfg.num_experts_per_tok * 2 * inter),
             ids_buf: B::from_slice_i32(&vec![0i32; cfg.num_experts_per_tok]),
             weights_buf: B::from_slice(&vec![0.0f32; cfg.num_experts_per_tok]),
             selected_ids_buf: B::from_slice_i32(&vec![0i32; t * cfg.num_experts_per_tok]),
@@ -1253,6 +1265,12 @@ impl<B: Backend> Qwen3MoeModel<B> {
             && moe_layer.experts.up_stacked.is_some()
             && moe_layer.experts.down_stacked.is_some();
 
+        // CUDA Marlin bucketed path: shared GPTQ store per (gate_up, down)
+        // role + offset GEMMs per expert. Disabled with FERRUM_MOE_BUCKETED=0.
+        let bucketed_path_available = moe_layer.experts.gate_up_gptq_stacked.is_some()
+            && moe_layer.experts.down_gptq_stacked.is_some()
+            && std::env::var("FERRUM_MOE_BUCKETED").as_deref() != Ok("0");
+
         // Fast path for decode (tokens=1): the stacked decode impl
         // writes the weighted-sum result *directly* into `residual` via
         // `weighted_sum_residual_stacked`, skipping the moe_out scratch
@@ -1267,7 +1285,27 @@ impl<B: Backend> Qwen3MoeModel<B> {
         // skip its standalone rms_norm.
         let did_norm_fusion = decode_fast_path && next_layer_idx.is_some();
 
-        if stacked_path_available {
+        if bucketed_path_available {
+            // CUDA: gather → per-expert m=N Marlin → silu → per-expert
+            // m=N Marlin → moe_combine. Single-launch combine.
+            crate::moe::moe_forward_bucketed::<B>(
+                ctx,
+                &self.scratch.norm_out,
+                &self.scratch.router_logits,
+                &mut self.scratch.moe_out,
+                tokens,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts,
+                self.cfg.num_experts_per_tok,
+                self.cfg.norm_topk_prob,
+                &moe_layer.experts,
+                &mut self.scratch.x_packed_bucket,
+                &mut self.scratch.gate_up_packed_bucket,
+                &mut self.scratch.silu_stacked,
+                &mut self.scratch.down_out_stacked,
+            )?;
+        } else if stacked_path_available {
             if tokens > 1 {
                 // Prefill: one batched 2-D mul_mm_id covers all
                 // (token, expert) pairs in parallel.
@@ -2588,6 +2626,28 @@ impl<B: Backend> Qwen3MoeModel<B> {
                     h,
                 )?;
             }
+        } else if moe_layer.experts.gate_up_gptq_stacked.is_some()
+            && moe_layer.experts.down_gptq_stacked.is_some()
+            && std::env::var("FERRUM_MOE_BUCKETED").as_deref() != Ok("0")
+        {
+            // CUDA Marlin bucketed path (decode_batch m ≥ 1 entry).
+            crate::moe::moe_forward_bucketed::<B>(
+                ctx,
+                &self.scratch.norm_out,
+                &self.scratch.router_logits,
+                &mut self.scratch.moe_out,
+                m,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts,
+                self.cfg.num_experts_per_tok,
+                self.cfg.norm_topk_prob,
+                &moe_layer.experts,
+                &mut self.scratch.x_packed_bucket,
+                &mut self.scratch.gate_up_packed_bucket,
+                &mut self.scratch.silu_stacked,
+                &mut self.scratch.down_out_stacked,
+            )?;
         } else {
             // Backend without stacked variants — fall back to the legacy
             // per-(token, expert) host-routed path.
