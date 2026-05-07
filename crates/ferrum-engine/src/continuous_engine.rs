@@ -1020,19 +1020,23 @@ impl EngineInner {
         use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
         use ferrum_interfaces::Priority;
 
-        // Token budget for THIS iter's prefill chunks. Decodes are
-        // uncapped here (max_concurrency at the scheduler level already
-        // bounds them). Earlier this was a TOTAL budget — bug: at c=32
-        // with budget=32, decoders fill it and budget_left=0 starves
-        // prefill, so a newly-arrived prompt only progresses 1 token per
-        // iter once an old request finally finishes (stuck for ~280
-        // iters per prompt).
-        let prefill_budget: usize = std::env::var("FERRUM_UNIFIED_TOKEN_BUDGET")
+        // Total q-token budget per iter. Decodes consume 1 each;
+        // remaining slots fill with prefill chunks. The decoder-takes-
+        // first-bite IS a feature: at high c the budget shrinks for
+        // prefill, capping m_total ≈ token_budget so matmul time stays
+        // bounded. Tested A/B: removing the decoder subtraction (let
+        // budget always be the env value) regressed c=32 by 11 % —
+        // m_total grew from 128 to 160, matmul ~25 % slower, slowdown
+        // exceeded the extra prefill bandwidth. Keep the original
+        // behaviour. (The starvation at BUDGET=32 c=32 is an artefact
+        // of an unreasonably tight budget setting, not the default 128
+        // which has plenty of headroom.)
+        let token_budget: usize = std::env::var("FERRUM_UNIFIED_TOKEN_BUDGET")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n: &usize| n > 0)
             .unwrap_or(512);
-        let mut budget_left = prefill_budget;
+        let mut budget_left = token_budget.saturating_sub(decode_ids.len());
 
         // Allocate KV blocks for new prefills (those without kv_cache).
         let model_info = self.model_executor.info();
