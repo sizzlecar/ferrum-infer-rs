@@ -2651,7 +2651,8 @@ impl Backend for CudaBackend {
         use cudarc::driver::sys as cu;
         let mut entry_event: cu::CUevent = std::ptr::null_mut();
         unsafe {
-            cu::cuEventCreate(&mut entry_event, cu::CUevent_flags::CU_EVENT_DISABLE_TIMING.0);
+            // 2 = CU_EVENT_DISABLE_TIMING — fastest event create, we don't need timestamps.
+cu::cuEventCreate(&mut entry_event, 2);
             cu::cuEventRecord(entry_event, default_stream.cu_stream());
         }
         for stream in &pool {
@@ -2689,7 +2690,7 @@ impl Backend for CudaBackend {
         for stream in &pool {
             let mut ev: cu::CUevent = std::ptr::null_mut();
             unsafe {
-                cu::cuEventCreate(&mut ev, cu::CUevent_flags::CU_EVENT_DISABLE_TIMING.0);
+                cu::cuEventCreate(&mut ev, 2); // CU_EVENT_DISABLE_TIMING
                 cu::cuEventRecord(ev, stream.cu_stream());
             }
             exit_events.push(ev);
