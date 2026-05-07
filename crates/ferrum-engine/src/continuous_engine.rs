@@ -47,6 +47,10 @@ pub struct SequenceState {
     pub phase: RequestPhase,
     pub rng: StdRng,
     pub prefill_complete: bool,
+    /// Number of prompt tokens already consumed by prefill (chunked).
+    /// 0 = no prefill yet, == input_tokens.len() = ready to decode.
+    /// Used by the mixed-batch iter to slice the next prefill chunk.
+    pub prefill_pos: usize,
     pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
     pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
     pub start_time: Instant,
@@ -127,6 +131,7 @@ impl SequenceState {
             phase: RequestPhase::Waiting,
             rng: StdRng::seed_from_u64(seed),
             prefill_complete: false,
+            prefill_pos: 0,
             stream_sender: None,
             response_sender: None,
             start_time: Instant::now(),
@@ -392,6 +397,22 @@ impl EngineInner {
             }
         }
 
+        // FERRUM_MIXED_BATCH=1 routes prefills + decodes through one
+        // unified_decode call per iter, eliminating the prefill-blocks-
+        // decode bottleneck. Prefills are chunked to fit a per-iter token
+        // budget alongside in-flight decode tokens.
+        let mixed_batch = std::env::var("FERRUM_MIXED_BATCH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        if mixed_batch {
+            if let Err(e) = self.run_unified_iter(&prefill_ids, &decode_ids).await {
+                warn!("Mixed iter failed: {}", e);
+                // Best-effort error: don't fail all requests, scheduler will retry.
+            }
+            return Ok(());
+        }
+
         // Prefill new requests
         for rid in &prefill_ids {
             if let Err(e) = self.run_prefill(rid).await {
@@ -494,6 +515,7 @@ impl EngineInner {
                 seq.model_cache_id = None;
                 seq.generated_tokens.clear();
                 seq.prefill_complete = false;
+                seq.prefill_pos = 0;
                 seq.phase = RequestPhase::Waiting;
                 seq.tokens_this_iteration = 0;
                 seq.preemption_count += 1;
@@ -935,6 +957,287 @@ impl EngineInner {
                     emit_us,
                     stop_us,
                 );
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── mixed prefill+decode iter (vLLM-style chunked prefill) ─────────
+
+    /// Run one mixed iter that batches prefill chunks alongside decode
+    /// items in a single `unified_decode` call. Eliminates the
+    /// prefill-blocks-decode bottleneck where currently a 200ms prefill
+    /// stalls all 16 decoding sequences.
+    ///
+    /// Per-iter token budget (FERRUM_UNIFIED_TOKEN_BUDGET, default 512)
+    /// caps total q-tokens. Decode items each cost 1 token; remaining
+    /// budget is split across pending prefills (chunked into the largest
+    /// slice that fits).
+    ///
+    /// Gated on `FERRUM_MIXED_BATCH=1`. Fallback path is the legacy
+    /// `for prefill_id in prefill_ids: run_prefill` + `run_batch_decode`.
+    async fn run_unified_iter(
+        &self,
+        prefill_ids: &[RequestId],
+        decode_ids: &[RequestId],
+    ) -> Result<()> {
+        use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
+        use ferrum_interfaces::Priority;
+
+        let token_budget: usize = std::env::var("FERRUM_UNIFIED_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(512);
+
+        // Decode items always cost 1 token each; the rest is for prefill.
+        let mut budget_left = token_budget.saturating_sub(decode_ids.len());
+
+        // Allocate KV blocks for new prefills (those without kv_cache).
+        let model_info = self.model_executor.info();
+        for rid in prefill_ids {
+            let needs_alloc = {
+                let sequences = self.sequences.read();
+                sequences
+                    .get(rid)
+                    .map(|s| s.kv_cache.is_none())
+                    .unwrap_or(false)
+            };
+            if !needs_alloc {
+                continue;
+            }
+            let tokens_len = {
+                let sequences = self.sequences.read();
+                sequences.get(rid).map(|s| s.input_tokens.len()).unwrap_or(0)
+            };
+            if tokens_len == 0 {
+                continue;
+            }
+            let alloc_request = AllocationRequest {
+                request_id: rid.clone(),
+                initial_tokens: tokens_len,
+                max_sequence_length: model_info.max_sequence_length,
+                num_layers: model_info.num_layers,
+                num_heads: model_info.num_kv_heads,
+                head_dim: model_info.hidden_size / model_info.num_heads.max(1),
+                device: self.config.backend.device.clone(),
+                dtype: model_info.dtype,
+                priority: Priority::Normal,
+            };
+            let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
+                Ok(h) => h,
+                Err(_) => {
+                    if self.preempt_victim(rid).await {
+                        self.kv_cache.allocate(&alloc_request).await?
+                    } else {
+                        warn!("Mixed iter prefill alloc failed, no victim: {rid}");
+                        self.complete_request(rid, FinishReason::Error).await?;
+                        continue;
+                    }
+                }
+            };
+            let mut sequences = self.sequences.write();
+            if let Some(seq) = sequences.get_mut(rid) {
+                seq.kv_cache = Some(kv_handle);
+            }
+        }
+
+        // Build mixed batch.
+        let mut batch = UnifiedBatch::new();
+        // For each batch item, remember which seq it belongs to and how
+        // many KV slots we'll consume — used to bump pos_offset post-call.
+        let mut item_kinds: Vec<(RequestId, bool /*is_prefill*/, usize /*chunk_len*/)> =
+            Vec::with_capacity(prefill_ids.len() + decode_ids.len());
+
+        {
+            let sequences = self.sequences.read();
+            // 1. Decode items first (always 1 token each).
+            for rid in decode_ids {
+                let seq = match sequences.get(rid) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let kv_cache = match seq.kv_cache.clone() {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let last_token = seq
+                    .generated_tokens
+                    .last()
+                    .copied()
+                    .unwrap_or(TokenId::new(0));
+                let pos_offset = kv_cache.block_table().sequence_length;
+                let seq_id = seq
+                    .model_cache_id
+                    .clone()
+                    .unwrap_or_else(|| rid.to_string());
+                batch.items.push(UnifiedBatchItem {
+                    seq_id,
+                    q_tokens: vec![last_token.get()],
+                    kv_cache,
+                    pos_offset,
+                    is_final_chunk: true,
+                });
+                item_kinds.push((rid.clone(), false, 1));
+            }
+
+            // 2. Prefill chunks until budget exhausted.
+            for rid in prefill_ids {
+                if budget_left == 0 {
+                    break;
+                }
+                let seq = match sequences.get(rid) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let kv_cache = match seq.kv_cache.clone() {
+                    Some(h) => h,
+                    None => continue, // alloc failed earlier; already errored
+                };
+                let total = seq.input_tokens.len();
+                let already = seq.prefill_pos;
+                if already >= total {
+                    continue; // already done
+                }
+                let remaining = total - already;
+                let chunk_len = remaining.min(budget_left);
+                let q_tokens: Vec<u32> = seq.input_tokens[already..already + chunk_len]
+                    .iter()
+                    .map(|t| t.get())
+                    .collect();
+                let pos_offset = already;
+                let is_final = (already + chunk_len) == total;
+                let seq_id = seq
+                    .model_cache_id
+                    .clone()
+                    .unwrap_or_else(|| rid.to_string());
+                batch.items.push(UnifiedBatchItem {
+                    seq_id,
+                    q_tokens,
+                    kv_cache,
+                    pos_offset,
+                    is_final_chunk: is_final,
+                });
+                item_kinds.push((rid.clone(), true, chunk_len));
+                budget_left -= chunk_len;
+            }
+        }
+
+        if batch.items.is_empty() {
+            return Ok(());
+        }
+
+        let results = self.model_executor.unified_decode(&batch).await?;
+        if results.len() != item_kinds.len() {
+            return Err(FerrumError::internal(format!(
+                "unified_decode returned {} results for {} items",
+                results.len(),
+                item_kinds.len(),
+            )));
+        }
+
+        // Process per-item results: bump KV len, advance prefill_pos,
+        // sample for final-chunk items, stream tokens.
+        for ((rid, is_prefill, chunk_len), logits_opt) in
+            item_kinds.iter().zip(results.into_iter())
+        {
+            // Bump engine-side KV handle by chunk_len so the NEXT iter's
+            // pos_offset reflects what the model already consumed.
+            {
+                let mut sequences = self.sequences.write();
+                if let Some(seq) = sequences.get_mut(rid) {
+                    if let Some(h) = seq.kv_cache.take() {
+                        let new_len = h.block_table().sequence_length + chunk_len;
+                        seq.kv_cache = Some(self.make_kv_handle_with_seq(&h, new_len));
+                    }
+                    if *is_prefill {
+                        seq.prefill_pos += chunk_len;
+                        // is_final_chunk: rebuild logic inline (we don't
+                        // have direct access to the batch item here, but
+                        // logits_opt.is_some() is equivalent).
+                        let now_complete = logits_opt.is_some();
+                        if now_complete {
+                            seq.prefill_complete = true;
+                            seq.phase = RequestPhase::Decoding;
+                        }
+                    }
+                }
+            }
+
+            // Tell scheduler about prefill chunk progress.
+            if *is_prefill {
+                let total_tokens = {
+                    let sequences = self.sequences.read();
+                    sequences
+                        .get(rid)
+                        .map(|s| s.input_tokens.len())
+                        .unwrap_or(0)
+                };
+                if logits_opt.is_some() {
+                    self.scheduler.mark_prefill_complete(rid, total_tokens);
+                    self.total_prefill_tokens
+                        .fetch_add(total_tokens as u64, Ordering::Relaxed);
+                    counter!("ferrum.engine.prefill_tokens_total")
+                        .increment(total_tokens as u64);
+                    counter!("ferrum.engine.prefills_total").increment(1);
+                } else {
+                    self.scheduler.mark_prefill_chunk_processed(
+                        rid,
+                        total_tokens,
+                        *chunk_len,
+                    );
+                }
+            }
+
+            // Sample for final-chunk items (decode + completed prefill).
+            if let Some(mut logits) = logits_opt {
+                let next_token = {
+                    let mut sequences = self.sequences.write();
+                    let seq = sequences
+                        .get_mut(rid)
+                        .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+                    let token = seq.sample_with_processors(&mut logits)?;
+                    seq.generated_tokens.push(token);
+                    seq.tokens_this_iteration += 1;
+                    token
+                };
+
+                let generated_count = {
+                    let sequences = self.sequences.read();
+                    sequences
+                        .get(rid)
+                        .map(|s| s.generated_tokens.len())
+                        .unwrap_or(0)
+                };
+                self.scheduler.update_decode_progress(rid, generated_count);
+                self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+                counter!("ferrum.engine.decode_tokens_total").increment(1);
+
+                self.send_stream_update(rid, next_token).await;
+
+                let should_stop = {
+                    let sequences = self.sequences.read();
+                    sequences
+                        .get(rid)
+                        .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
+                };
+                if should_stop {
+                    let finish_reason = {
+                        let sequences = self.sequences.read();
+                        match sequences.get(rid) {
+                            Some(seq)
+                                if seq.generated_tokens.len()
+                                    >= seq.sampling_params.max_tokens =>
+                            {
+                                FinishReason::Length
+                            }
+                            Some(_) => FinishReason::EOS,
+                            None => FinishReason::Error,
+                        }
+                    };
+                    self.complete_request(rid, finish_reason).await?;
+                }
             }
         }
 
