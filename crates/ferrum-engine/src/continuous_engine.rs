@@ -1020,14 +1020,19 @@ impl EngineInner {
         use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
         use ferrum_interfaces::Priority;
 
-        let token_budget: usize = std::env::var("FERRUM_UNIFIED_TOKEN_BUDGET")
+        // Token budget for THIS iter's prefill chunks. Decodes are
+        // uncapped here (max_concurrency at the scheduler level already
+        // bounds them). Earlier this was a TOTAL budget — bug: at c=32
+        // with budget=32, decoders fill it and budget_left=0 starves
+        // prefill, so a newly-arrived prompt only progresses 1 token per
+        // iter once an old request finally finishes (stuck for ~280
+        // iters per prompt).
+        let prefill_budget: usize = std::env::var("FERRUM_UNIFIED_TOKEN_BUDGET")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n: &usize| n > 0)
             .unwrap_or(512);
-
-        // Decode items always cost 1 token each; the rest is for prefill.
-        let mut budget_left = token_budget.saturating_sub(decode_ids.len());
+        let mut budget_left = prefill_budget;
 
         // Allocate KV blocks for new prefills (those without kv_cache).
         let model_info = self.model_executor.info();
