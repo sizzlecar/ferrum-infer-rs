@@ -205,6 +205,9 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
     }
 
     /// Read a tensor as i32 (for GPTQ qweight / qzeros / g_idx).
+    /// Bulk memcpy from the LE-stored bytes (safetensors guarantees LE)
+    /// — the previous per-element `from_le_bytes` was 4 ms for a single
+    /// 768 KB tensor and dominated stacked-MoE load.
     fn read_i32(&self, name: &str) -> Result<(Vec<i32>, Vec<usize>)> {
         let shard_idx = *self
             .index
@@ -220,13 +223,20 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         }
         let bytes = view.data();
         debug_assert_eq!(bytes.len() % 4, 0);
-        let mut out = vec![0i32; bytes.len() / 4];
-        out.as_mut_slice()
-            .iter_mut()
-            .zip(bytes.chunks_exact(4))
-            .for_each(|(d, chunk)| {
-                *d = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-            });
+        let count = bytes.len() / 4;
+        let mut out = Vec::<i32>::with_capacity(count);
+        // SAFETY: Vec<i32>'s buffer is 4-byte aligned by allocator
+        // contract. `bytes` is a raw u8 slice; copy_nonoverlapping
+        // doesn't require src alignment. We're on x86_64 LE, and
+        // safetensors stores LE i32 — bit pattern is identical.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                out.as_mut_ptr() as *mut u8,
+                bytes.len(),
+            );
+            out.set_len(count);
+        }
         Ok((out, shape))
     }
 
@@ -894,32 +904,58 @@ fn dequantize_gptq_with_g_idx(
 fn dtype_to_f32(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => {
+            // Bulk memcpy from LE-stored bytes (safetensors is LE; we're
+            // on x86_64 LE). Per-element from_le_bytes was the bottleneck
+            // for stacked-MoE load (4-5 ms per call * 384 calls/layer *
+            // 48 layers = ~80 sec just for f32 reads).
             debug_assert_eq!(raw.len() % 4, 0);
             let n = raw.len() / 4;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bytes = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]];
-                out[i] = f32::from_le_bytes(bytes);
+            let mut out = Vec::<f32>::with_capacity(n);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    raw.as_ptr(),
+                    out.as_mut_ptr() as *mut u8,
+                    raw.len(),
+                );
+                out.set_len(n);
             }
             Ok(out)
         }
         Dtype::F16 => {
             debug_assert_eq!(raw.len() % 2, 0);
             let n = raw.len() / 2;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bytes = [raw[i * 2], raw[i * 2 + 1]];
-                out[i] = f16::from_le_bytes(bytes).to_f32();
+            // Reinterpret raw bytes as f16, then convert. This avoids
+            // the per-element from_le_bytes byte-array construction.
+            let mut tmp = Vec::<f16>::with_capacity(n);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    raw.as_ptr(),
+                    tmp.as_mut_ptr() as *mut u8,
+                    raw.len(),
+                );
+                tmp.set_len(n);
+            }
+            let mut out = Vec::with_capacity(n);
+            for h in &tmp {
+                out.push(h.to_f32());
             }
             Ok(out)
         }
         Dtype::BF16 => {
             debug_assert_eq!(raw.len() % 2, 0);
             let n = raw.len() / 2;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bytes = [raw[i * 2], raw[i * 2 + 1]];
-                out[i] = bf16::from_le_bytes(bytes).to_f32();
+            let mut tmp = Vec::<bf16>::with_capacity(n);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    raw.as_ptr(),
+                    tmp.as_mut_ptr() as *mut u8,
+                    raw.len(),
+                );
+                tmp.set_len(n);
+            }
+            let mut out = Vec::with_capacity(n);
+            for h in &tmp {
+                out.push(h.to_f32());
             }
             Ok(out)
         }
