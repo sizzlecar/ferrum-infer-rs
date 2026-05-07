@@ -501,6 +501,145 @@ impl<B: Backend> Qwen3MoeModel<B> {
         })
     }
 
+    /// Build from a HuggingFace safetensors model directory (GPTQ-INT4
+    /// expected). Mirrors [`Self::new`] but loads experts via the standard
+    /// `WeightLoader::load_linear` path — so each expert's `gate_proj +
+    /// up_proj` get auto-fused via the GPTQ shim in
+    /// `native_safetensors.rs::load_linear`, and `down_proj` loads the
+    /// usual way.
+    ///
+    /// `gate_stacked / up_stacked / down_stacked` stay `None` — the
+    /// MoE dispatch falls back to per-expert `Linear::forward` calls.
+    /// Slow at decode (top_k * Marlin GEMMs per token per layer) but
+    /// correct; the batched MoE Marlin kernel is a follow-up.
+    pub fn new_safetensors(
+        cfg: Qwen3MoeConfig,
+        loader: &dyn WeightLoader<B>,
+    ) -> Result<Self> {
+        {
+            let mut ctx = B::new_context();
+            B::reset_all_graphs(&mut ctx);
+        }
+        let rope = build_rope_cache::<B>(&cfg.base);
+        let scratch = Qwen3MoeScratch::alloc(&cfg, 1);
+        let embed = loader.load_tensor("model.embed_tokens.weight")?;
+        let mut attn_layers = Vec::with_capacity(cfg.base.num_layers);
+        let mut moe_layers = Vec::with_capacity(cfg.base.num_layers);
+        for li in 0..cfg.base.num_layers {
+            let prefix = format!("model.layers.{li}");
+            let input_ln_w =
+                loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
+            let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
+            let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
+            let post_ln_w =
+                loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let gate_up_proj: Box<dyn ferrum_quantization::Linear<B>> =
+                stub_linear::<B>(2 * cfg.expert_intermediate_size, cfg.base.hidden_size);
+            let down_proj: Box<dyn ferrum_quantization::Linear<B>> =
+                stub_linear::<B>(cfg.base.hidden_size, cfg.expert_intermediate_size);
+            let (q_norm_w, k_norm_w) = if cfg.base.has_qk_norm {
+                let q = loader
+                    .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
+                    .ok();
+                let k = loader
+                    .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
+                    .ok();
+                (q, k)
+            } else {
+                (None, None)
+            };
+            attn_layers.push(LlamaFamilyLayer {
+                input_ln_w,
+                qkv_proj,
+                q_norm_w,
+                k_norm_w,
+                o_proj,
+                post_ln_w,
+                gate_up_proj,
+                down_proj,
+            });
+
+            // Router: rank-2 linear, standard load.
+            let router = loader.load_linear(&format!("{prefix}.mlp.gate"))?;
+            if router.in_features() != cfg.base.hidden_size {
+                return Err(ferrum_types::FerrumError::model(format!(
+                    "router layer {li}: in_features {} != hidden {}",
+                    router.in_features(),
+                    cfg.base.hidden_size
+                )));
+            }
+            if router.out_features() != cfg.num_experts {
+                return Err(ferrum_types::FerrumError::model(format!(
+                    "router layer {li}: out_features {} != num_experts {}",
+                    router.out_features(),
+                    cfg.num_experts
+                )));
+            }
+
+            // Per-expert GPTQ Marlin Linears. The safetensors GPTQ shim
+            // auto-detects the `gate_up_proj` synthetic name and fuses
+            // gate_proj + up_proj host-side along the N dim.
+            let mut gate_up: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
+                Vec::with_capacity(cfg.num_experts);
+            let mut down: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
+                Vec::with_capacity(cfg.num_experts);
+            for e in 0..cfg.num_experts {
+                let g = loader.load_linear(&format!(
+                    "{prefix}.mlp.experts.{e}.gate_up_proj"
+                ))?;
+                let d = loader.load_linear(&format!(
+                    "{prefix}.mlp.experts.{e}.down_proj"
+                ))?;
+                gate_up.push(g);
+                down.push(d);
+            }
+            let experts = crate::moe::ExpertStack::<B> {
+                gate_up,
+                down,
+                gate_stacked: None,
+                up_stacked: None,
+                down_stacked: None,
+            };
+            moe_layers.push(Qwen3MoeLayerState { router, experts });
+
+            if li == 0 || li == cfg.base.num_layers - 1 {
+                tracing::info!(
+                    "Qwen3MoeModel safetensors: layer {li}/{} loaded \
+                     ({} experts × gate_up + down)",
+                    cfg.base.num_layers,
+                    cfg.num_experts,
+                );
+            }
+        }
+
+        let final_norm_w = loader.load_tensor("model.norm.weight")?;
+        let lm_head = if loader.has_tensor("lm_head.weight") {
+            loader.load_linear("lm_head")?
+        } else {
+            tracing::info!(
+                "Qwen3MoeModel safetensors: tied embeddings — using model.embed_tokens as lm_head"
+            );
+            loader.load_linear("model.embed_tokens")?
+        };
+
+        let runtime_cfg = cfg.base.to_runtime();
+        Ok(Self {
+            cfg,
+            runtime_cfg,
+            embed,
+            attn_layers,
+            moe_layers,
+            final_norm_w,
+            lm_head,
+            rope,
+            scratch,
+            kv_caches: HashMap::new(),
+            kv_free_pool: Vec::new(),
+            paged_pools: None,
+            paged_block_alloc: None,
+        })
+    }
+
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
         if self.scratch.max_tokens < tokens {
             {
