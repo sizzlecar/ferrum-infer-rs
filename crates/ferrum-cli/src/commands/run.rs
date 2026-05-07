@@ -93,13 +93,39 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         return crate::commands::run_gguf::run_gguf_one_shot(cmd, config).await;
     }
 
+    // Local directory path: short-circuit the HF cache lookup +
+    // auto-download. If the user passed an absolute/relative path that
+    // exists on disk and looks like a HuggingFace model dir (config.json
+    // + weights), load it directly. Avoids the surprising "not found
+    // locally, downloading..." when the user already has the model.
+    let direct_path = std::path::PathBuf::from(&cmd.model);
+    let direct_source: Option<ResolvedModelSource> = if direct_path.is_dir() {
+        let format = detect_format(&direct_path);
+        if format != ModelFormat::Unknown {
+            Some(ResolvedModelSource {
+                original: cmd.model.clone(),
+                local_path: direct_path,
+                format,
+                from_cache: false,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Resolve model
-    let model_id = resolve_model_alias(&cmd.model);
+    let model_id = if direct_source.is_some() {
+        cmd.model.clone()
+    } else {
+        resolve_model_alias(&cmd.model)
+    };
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
-    // Find cached model or auto-download
+    // Find cached model or auto-download (skipped when direct_source set)
     let cache_dir = get_hf_cache_dir(&config);
-    let source = match find_cached_model(&cache_dir, &model_id) {
+    let source = match direct_source.or_else(|| find_cached_model(&cache_dir, &model_id)) {
         Some(source) => source,
         None => {
             // Model not found, try to download automatically

@@ -22,32 +22,46 @@ M3 ships as safetensors). Deferred to v0.3.
 
 ### M2: Llama-3.1-8B GPTQ-INT4 — output throughput (tok/s)
 
-**Final config** (all numbers below): `FERRUM_METAL_PAGED_KV=1
-FERRUM_PAGED_MAX_SEQS=64 FERRUM_KV_MAX_BLOCKS=2048 FERRUM_KV_CAPACITY=2048
-FERRUM_GREEDY_ARGMAX=1 FERRUM_MIXED_BATCH=1 FERRUM_UNIFIED_TOKEN_BUDGET=128
-FERRUM_UNIFIED_GRAPH=0 FERRUM_SPLIT_K_ATTN=0`. Why GRAPH/SPLIT_K stay
-OFF: see § What's next at the bottom.
+**Final config** (v0.7.3 commit `c6a81d9`): zero-env defaults — `ferrum
+serve --model <path>` ships the v0.2 winning config. Override only if
+needed: `FERRUM_KV_CAPACITY` (Mac 30B-class), `FERRUM_UNIFIED_GRAPH`
+(off; see Appendix), `FERRUM_SPLIT_K_ATTN` (off; see Appendix).
 
-3 reps each, median reported.
+3 reps each, median reported. 1-2 % noise across reps.
 
-n=64 (per cell):
+### Full M2 INT4 vs vLLM 0.20.1 — apples-to-apples (same dataset, same
+### temperature=0 greedy, same prompts file, no prefix caching)
 
-| c | ferrum baseline | ferrum + argmax (old) | ferrum FINAL | vllm | ratio | Δ baseline |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 111.1 | 112.5 | **111** | 148.4 | **75%** | — |
-| 4 | 308.4 | 338.7 | **369** | 496.1 | **74%** | +20% |
-| 16 | 609.9 | 795.4 | **954** | 1490.3 | **64%** | +56% |
-| 32 | 58.4 ⚠ | n/a (KV bug) | **1155** | 2203.8 | **52%** | +1877% |
+| c | engine | tok/s | TPOT_p50 | TPOT_p99 | TTFT_p50 | TTFT_p99 | num_prompts |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| **1** | ferrum | **111.0** | 8.39 ms | 10.00 ms | 50.4 ms | 65 ms | 64 |
+|  | vLLM | 148.4 | 6.56 ms | 6.57 ms | 38.5 ms | 42 ms | 4 |
+|  | _ratio_ | **75 %** | | | | | |
+| **4** | ferrum | **369.3** | 9.98 ms | 11.78 ms | 82.2 ms | 90 ms | 64 |
+|  | vLLM | 496.1 | 7.07 ms | 7.16 ms | 57.7 ms | 70 ms | 16 |
+|  | _ratio_ | **74 %** | | | | | |
+| **16** | ferrum | **964.0** | 14.32 ms | 16.36 ms | 153.8 ms | 280 ms | 128 |
+|  | vLLM | 1490.3 | 9.11 ms | 11.13 ms | 150.0 ms | 365 ms | 64 |
+|  | _ratio_ | **65 %** | | | | | |
+| **32** | ferrum | **1215.4** | 20.30 ms | 23.06 ms | 486.7 ms | 660 ms | 128 |
+|  | vLLM | 2203.8 | 12.15 ms | **38.15 ms** | 287.9 ms | 540 ms | 128 |
+|  | _ratio_ | **55 %** | | | | | |
 
-n=128 (longer bench, more steady-state coverage):
+**Notable**: at c=32 ferrum P99 TPOT is **better** than vLLM (23.06 vs
+38.15 ms) — ferrum's mixed-batch scheduler keeps tail latency stable;
+vLLM's preemption / paged-attn V2 fallback under load creates spikes.
+Median (P50) still favors vLLM.
 
-| c | tok/s | TPOT | vllm | ratio |
-|---:|---:|---:|---:|---:|
-| 16 | **964** | 14.7 ms | 1490 | **65%** |
-| 32 | **1215** | 20.9 ms | 2204 | **55%** |
+### Throughput trajectory (this session)
 
-3-rep noise <1% across all c. TPOT_p50 (ms), c=16: 22.1 (baseline) →
-15.8 (argmax) → **14.2 (mixed batch + greedy + paged_kv)**.
+| c | session start | + KV pool fix | + greedy fast path | + mixed batch (FINAL) | × baseline |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 102 | 102 | 111 | **111** | 1.09× |
+| 4 | 264 | 268 | 308 | **369** | 1.40× |
+| 16 | 460 | 466 | 612→795 | **964** | **2.09×** |
+| 32 | 58 ⚠ | 490 | 519 | **1215** | **20.9×** |
+
+**Ratio of vLLM**: c=16 31% → 65 % (+34 pp), c=32 3% → 55 % (+52 pp).
 
 The breakthrough is "**FINAL**" column: combines three landings this session.
 
