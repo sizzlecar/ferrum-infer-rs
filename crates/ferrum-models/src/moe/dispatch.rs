@@ -767,6 +767,8 @@ pub fn moe_forward_bucketed<B: Backend>(
     // the packed input/output buffers via in_row_offset / out_row_offset.
     let gate_up_dim_per_expert = 2 * expert_intermediate;
     let down_n_per_expert = hidden_size;
+    // Phase 1: gate_up GEMM per active expert (offset GEMM into shared
+    // stacked Marlin store).
     for e in 0..num_experts {
         let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
         if m_e == 0 {
@@ -774,11 +776,6 @@ pub fn moe_forward_bucketed<B: Backend>(
         }
         let pair_off = plan.expert_offsets[e];
 
-        // gate_up via stacked Marlin: x_packed [m_e, hidden] →
-        // gate_up_packed [m_e, 2 * expert_inter]. The expert's column
-        // slice lives at column offset `e * gate_up_dim_per_expert` of
-        // the stacked store; the row range in the packed buffers is
-        // [pair_off, pair_off + m_e).
         if let Some(gu_store) = experts.gate_up_stacked_store(e) {
             B::gemm_gptq_with_offset_strided(
                 ctx,
@@ -803,21 +800,30 @@ pub fn moe_forward_bucketed<B: Backend>(
                  (load via Qwen3MoeModel::new_safetensors)",
             ));
         }
+    }
 
-        // SiLU(gate) * up: gate_up_packed [m_e, 2 * ei] →
-        // silu_packed [m_e, ei]. Row-strided.
-        B::fused_silu_mul_split_strided(
-            ctx,
-            gate_up_packed,
-            pair_off,
-            silu_packed,
-            pair_off,
-            m_e,
-            expert_intermediate,
-        );
+    // Phase 2: SiLU(gate) * up — single launch covering ALL active
+    // expert rows in the packed buffer. The unused rows (zeros from
+    // experts with m_e=0) just produce zeros that the combine step
+    // ignores via pairs_by_token. Saves num_active_experts-1 launches
+    // per layer.
+    let total_pairs_active = batch * top_k;
+    B::fused_silu_mul_split(
+        ctx,
+        gate_up_packed,
+        silu_packed,
+        total_pairs_active,
+        expert_intermediate,
+    );
 
-        // down via stacked Marlin: silu_packed [m_e, ei] →
-        // down_packed [m_e, hidden].
+    // Phase 3: down GEMM per active expert.
+    for e in 0..num_experts {
+        let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
+        if m_e == 0 {
+            continue;
+        }
+        let pair_off = plan.expert_offsets[e];
+
         if let Some(d_store) = experts.down_stacked_store(e) {
             B::gemm_gptq_with_offset_strided(
                 ctx,
