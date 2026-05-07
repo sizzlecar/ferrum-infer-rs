@@ -1301,7 +1301,27 @@ impl Backend for CudaBackend {
         b.arg(&mbps);
         b.arg(&bsi);
         b.arg(&scale);
-        let shared_bytes = (max_kv_len.max(1) as u32) * 4;
+        // CUDA graph capture freezes `shared_mem_bytes` at capture time;
+        // graph keys at the engine level are (m_total, num_seqs) — they
+        // do NOT distinguish kv_len buckets. So a graph captured at
+        // kv_len=300 (shared=300*4) replays unchanged at kv_len=600 →
+        // kernel writes scores[300..600] OOB into shared.
+        // compute-sanitizer caught it:
+        //   "Invalid __shared__ write of size 4 bytes at paged_varlen_attn_f16
+        //    Address 0x84c is out of bounds (in captured graph replay)".
+        //
+        // Allocate the worst-case kv slot length for ANY future decode
+        // iter that may replay this graph. FERRUM_KV_CAPACITY caps it
+        // (default 512, bench sets 2048). 8 KB shared = 2048 floats
+        // — well within Ada's 96 KB/SM and Hopper's 228 KB/SM budgets.
+        // For models with longer effective contexts the cap raises with
+        // capacity at the cost of one alloc, never per-launch.
+        let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+        let shared_bytes = (shared_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
