@@ -167,29 +167,37 @@ pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
     result.print_summary();
 
     // Pool sizing: pool_blocks = max_seqs × (KV_CAPACITY / 16).
-    // We want pool_blocks ≤ result.max_blocks (the budget) AND
-    // max_seqs ≥ 16 (so c=16 bench works). When the budget is tight
-    // (e.g. FP16 8B on 24 GB), shrink KV_CAPACITY first; if even
-    // that can't keep max_seqs ≥ 16, accept lower max_seqs (caps
-    // bench concurrency but at least lets the model run).
-    const TARGET_MAX_SEQS: usize = 32;
-    const MIN_MAX_SEQS: usize = 8;
-    const TARGET_KV_CAPACITY_BLOCKS: usize = 128; // 2048 tokens / 16
-
+    // Goal: keep max_seqs ≥ 16 (so c=16 bench works) by SHRINKING
+    // KV_CAPACITY first, then drop max_seqs only when budget is too
+    // tight even for KV_CAPACITY=512 at max_seqs=16.
+    //
+    // Picks the largest (max_seqs, KV_CAP) tuple from a fixed ladder
+    // whose pool fits the budget. Starts at the preferred default
+    // (32, 2048) and degrades stepwise.
+    const PRESETS: &[(usize, usize)] = &[
+        // (max_seqs, KV_CAPACITY tokens)
+        (32, 2048), // best — INT4 8B on 24 GB usually lands here
+        (32, 1024), // FP16 8B at util=1.0
+        (32, 512),  // FP16 8B at util=0.95
+        (16, 2048), // long-context narrow batch
+        (16, 1024),
+        (16, 512),  // last that supports c=16
+        (8, 1024),  // <c=16 only
+        (8, 512),
+    ];
     let (max_seqs_clamped, kv_capacity) = {
-        // First try: TARGET_MAX_SEQS at TARGET_KV_CAPACITY.
-        if TARGET_MAX_SEQS * TARGET_KV_CAPACITY_BLOCKS <= result.max_blocks {
-            (TARGET_MAX_SEQS, 0_usize) // 0 → don't override KV_CAPACITY
-        } else if MIN_MAX_SEQS * TARGET_KV_CAPACITY_BLOCKS <= result.max_blocks {
-            // Shrink max_seqs first.
-            let s = result.max_blocks / TARGET_KV_CAPACITY_BLOCKS;
-            (s.max(MIN_MAX_SEQS), 0)
+        let pick = PRESETS.iter().copied().find(|(seqs, cap_tokens)| {
+            let bps = (*cap_tokens / 16).max(1);
+            seqs * bps <= result.max_blocks
+        });
+        if let Some((seqs, cap)) = pick {
+            // Always override KV_CAPACITY explicitly so behaviour is
+            // independent of the static default in llama_family.rs.
+            (seqs, cap)
         } else {
-            // Budget too tight even for MIN_MAX_SEQS at full capacity.
-            // Pin max_seqs=MIN_MAX_SEQS, shrink KV_CAPACITY.
-            let blocks_per_seq = (result.max_blocks / MIN_MAX_SEQS).max(8);
-            let kv_cap_tokens = blocks_per_seq * 16;
-            (MIN_MAX_SEQS, kv_cap_tokens)
+            // Budget too tight for any preset — try min config.
+            let bps = (result.max_blocks / 8).max(8);
+            (8, bps * 16)
         }
     };
 
