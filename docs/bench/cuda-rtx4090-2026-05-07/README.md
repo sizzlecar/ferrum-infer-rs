@@ -22,7 +22,9 @@ M3 ships as safetensors). Deferred to v0.3.
 
 ### M2: Llama-3.1-8B GPTQ-INT4 — output throughput (tok/s)
 
-3 reps each, median reported. BUDGET=128, all optimizations on.
+3 reps each, median reported. All optimizations on.
+
+n=64 (per cell):
 
 | c | ferrum baseline | ferrum + argmax (old) | ferrum FINAL | vllm | ratio | Δ baseline |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -30,6 +32,13 @@ M3 ships as safetensors). Deferred to v0.3.
 | 4 | 308.4 | 338.7 | **369** | 496.1 | **74%** | +20% |
 | 16 | 609.9 | 795.4 | **954** | 1490.3 | **64%** | +56% |
 | 32 | 58.4 ⚠ | n/a (KV bug) | **1155** | 2203.8 | **52%** | +1877% |
+
+n=128 (longer bench, more steady-state coverage):
+
+| c | tok/s | TPOT | vllm | ratio |
+|---:|---:|---:|---:|---:|
+| 16 | **964** | 14.7 ms | 1490 | **65%** |
+| 32 | **1215** | 20.9 ms | 2204 | **55%** |
 
 3-rep noise <1% across all c. TPOT_p50 (ms), c=16: 22.1 (baseline) →
 15.8 (argmax) → **14.2 (mixed batch + greedy + paged_kv)**.
