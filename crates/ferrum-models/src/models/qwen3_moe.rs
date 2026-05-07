@@ -589,25 +589,54 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 )));
             }
 
-            // Per-expert GPTQ Marlin load. Stacked offset GEMM still
-            // produces wrong results (rel_err 0.49 even after the
-            // expert-major scales relayout — there's something else
-            // in Marlin's CUDA wrapper that uses a stride from the
-            // original full-N buffer). Per-expert is correct but
-            // slower at load time.
+            // Stacked GPTQ Marlin load. Now correct after fixing the
+            // Marlin C wrapper's b_gl_stride / s_gl_stride (commit
+            // adding prob_n_full param to marlin_cuda) — the kernel
+            // walks the full N stride for B/s while iterating only
+            // over the expert subset. Combined with the expert-major
+            // scales/qzeros layout (commit 21b0c78), the offset GEMM
+            // gives the same logits as a per-expert MarlinWeight.
+            let expert_prefix = format!("{prefix}.mlp.experts.{{e}}.");
+            let probe_split = loader.has_tensor(&format!(
+                "{prefix}.mlp.experts.0.gate_proj.qweight"
+            ));
+            let gate_up_projs: &[&str] = if probe_split {
+                &["gate_proj", "up_proj"]
+            } else {
+                &["gate_up_proj"]
+            };
+            let (gate_up_store, gate_up_n_per_expert, gate_up_k) = loader
+                .load_stacked_gptq_experts(
+                    &expert_prefix,
+                    cfg.num_experts,
+                    gate_up_projs,
+                )?;
+            let (down_store, down_n_per_expert, down_k) = loader
+                .load_stacked_gptq_experts(
+                    &expert_prefix,
+                    cfg.num_experts,
+                    &["down_proj"],
+                )?;
+            let gate_up_arc = std::sync::Arc::new(gate_up_store);
+            let down_arc = std::sync::Arc::new(down_store);
+
             let mut gate_up: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
                 Vec::with_capacity(cfg.num_experts);
             let mut down: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
                 Vec::with_capacity(cfg.num_experts);
             for e in 0..cfg.num_experts {
-                let g = loader.load_linear(&format!(
-                    "{prefix}.mlp.experts.{e}.gate_up_proj"
-                ))?;
-                let d = loader.load_linear(&format!(
-                    "{prefix}.mlp.experts.{e}.down_proj"
-                ))?;
-                gate_up.push(g);
-                down.push(d);
+                gate_up.push(Box::new(ferrum_quantization::StackedExpertLinear::<B>::new(
+                    gate_up_arc.clone(),
+                    e * gate_up_n_per_expert,
+                    gate_up_n_per_expert,
+                    gate_up_k,
+                )));
+                down.push(Box::new(ferrum_quantization::StackedExpertLinear::<B>::new(
+                    down_arc.clone(),
+                    e * down_n_per_expert,
+                    down_n_per_expert,
+                    down_k,
+                )));
             }
             let experts = crate::moe::ExpertStack::<B> {
                 gate_up,
@@ -615,17 +644,22 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 gate_stacked: None,
                 up_stacked: None,
                 down_stacked: None,
-                gate_up_gptq_stacked: None,
-                down_gptq_stacked: None,
+                gate_up_gptq_stacked: Some(gate_up_arc),
+                down_gptq_stacked: Some(down_arc),
             };
             moe_layers.push(Qwen3MoeLayerState { router, experts });
 
             if li == 0 || li.is_multiple_of(8) || li == cfg.base.num_layers - 1 {
                 tracing::info!(
                     "Qwen3MoeModel safetensors: layer {li}/{} loaded \
-                     (per-expert: {} experts)",
+                     (stacked: gate_up={}x{} k={}, down={}x{} k={})",
                     cfg.base.num_layers,
                     cfg.num_experts,
+                    gate_up_n_per_expert,
+                    gate_up_k,
+                    cfg.num_experts,
+                    down_n_per_expert,
+                    down_k,
                 );
             }
         }

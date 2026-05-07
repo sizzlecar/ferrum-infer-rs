@@ -28,6 +28,10 @@ extern "C" {
         thread_n: i32,
         sms: i32,
         max_par: i32,
+        // -1 ⇒ same as prob_n. For offset GEMM into a stacked B/s
+        // buffer, pass total_n so b_gl_stride and s_gl_stride see the
+        // full N width while iteration covers only the expert subset.
+        prob_n_full: i32,
     ) -> i32;
 }
 
@@ -108,6 +112,7 @@ pub fn marlin_gemm(
             -1, // auto thread_n
             -1, // auto sms
             16, // max_par
+            -1, // prob_n_full = prob_n (non-stacked)
         )
     };
 
@@ -233,6 +238,11 @@ pub fn marlin_gemm_with_offset(
             -1,
             -1,
             16,
+            // Stacked B/s: full N stride is weight.n. Iteration is
+            // expert_n. Without this, b_gl_stride / s_gl_stride
+            // would compute from prob_n=expert_n and walk the
+            // wrong number of cols between K-tile rows.
+            weight.n as i32,
         )
     };
     if ret != 0 {
@@ -347,6 +357,8 @@ pub fn marlin_gemm_with_offset_strided(
             -1,
             -1,
             16,
+            // Stacked B/s stride: weight.n. See marlin_gemm_with_offset.
+            weight.n as i32,
         )
     };
     if ret != 0 {
