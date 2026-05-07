@@ -218,6 +218,125 @@ fn cuda_vs_cpu() {
     );
 }
 
+/// CUDA offset GEMM parity vs per-expert dedicated GptqLinear.
+/// Builds N synthetic experts as a stacked store, runs each via
+/// `gemm_gptq_with_offset` on the stacked tile, and compares against
+/// the per-expert dedicated GptqLinear (which uses the unstrided
+/// `marlin_gemm`). Catches workspace mutex aliasing between experts —
+/// if the offset variant's per-expert workspace ranges overlap, this
+/// test will produce wrong results or hang.
+///
+/// Marlin tile constraints force k % 128 == 0, n % 64 == 0 per expert.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn cuda_stacked_offset_vs_per_expert() {
+    use ferrum_kernels::backend::cuda::CudaBackend;
+    use ferrum_kernels::backend::Backend;
+
+    let k = 256;
+    let n_per = 128;
+    let gs = 128;
+    let num_experts = 4;
+
+    // Build N independent experts.
+    let experts: Vec<SyntheticGptq> = (0..num_experts)
+        .map(|e| make_synthetic(k, n_per, gs, 0xCAFE0000 + e as u64))
+        .collect();
+
+    // Per-expert dedicated GptqLinears (each gets its own MarlinWeight).
+    let per_expert: Vec<GptqLinear<CudaBackend>> = experts
+        .iter()
+        .map(|syn| {
+            GptqLinear::<CudaBackend>::from_raw(
+                &syn.qweight,
+                &syn.scales,
+                &syn.qzeros,
+                None,
+                syn.bits,
+                syn.group_size,
+                syn.k,
+                syn.n,
+            )
+            .expect("per-expert load_gptq")
+        })
+        .collect();
+
+    // Stacked: row-major concat with expert-major ordering.
+    let total_n = num_experts * n_per;
+    let qw_rows = k / 8;
+    let sc_rows = k / gs;
+    let qz_rows = k / gs;
+    let total_n_zeros = num_experts * (n_per / 8);
+    let mut qw_acc = Vec::<i32>::with_capacity(qw_rows * total_n);
+    for r in 0..qw_rows {
+        for e in 0..num_experts {
+            qw_acc.extend_from_slice(&experts[e].qweight[r * n_per..(r + 1) * n_per]);
+        }
+    }
+    let mut sc_acc = Vec::<f32>::with_capacity(sc_rows * total_n);
+    for r in 0..sc_rows {
+        for e in 0..num_experts {
+            sc_acc.extend_from_slice(&experts[e].scales[r * n_per..(r + 1) * n_per]);
+        }
+    }
+    let mut qz_acc = Vec::<i32>::with_capacity(qz_rows * total_n_zeros);
+    for r in 0..qz_rows {
+        for e in 0..num_experts {
+            qz_acc.extend_from_slice(
+                &experts[e].qzeros[r * (n_per / 8)..(r + 1) * (n_per / 8)],
+            );
+        }
+    }
+    let stacked = <CudaBackend as Backend>::load_gptq(
+        &qw_acc, &sc_acc, &qz_acc, None, 4, gs, k, total_n,
+    )
+    .expect("stacked load_gptq");
+
+    let m = 2;
+    let input: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.0027).sin()).collect();
+    let mut ctx = <CudaBackend as Backend>::new_context();
+
+    // Run per-expert reference + offset variant for each expert; compare.
+    for (e, lin) in per_expert.iter().enumerate() {
+        let input_dev = CudaBackend::from_slice(&input);
+        let mut ref_out_dev = CudaBackend::alloc(m * n_per);
+        lin.forward(&mut ctx, &input_dev, &mut ref_out_dev, m);
+        <CudaBackend as Backend>::sync(&mut ctx);
+        let ref_out = CudaBackend::to_vec(&ref_out_dev, m * n_per);
+
+        let input_dev_off = CudaBackend::from_slice(&input);
+        let mut off_out_dev = CudaBackend::alloc(m * n_per);
+        <CudaBackend as Backend>::gemm_gptq_with_offset(
+            &mut ctx,
+            &input_dev_off,
+            &stacked,
+            e * n_per,
+            n_per,
+            &mut off_out_dev,
+            m,
+        )
+        .expect("gemm_gptq_with_offset");
+        <CudaBackend as Backend>::sync(&mut ctx);
+        let off_out = CudaBackend::to_vec(&off_out_dev, m * n_per);
+
+        let max_diff = ref_out
+            .iter()
+            .zip(&off_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let mag = ref_out.iter().map(|x| x.abs()).fold(0f32, f32::max).max(1e-6);
+        let rel = max_diff / mag;
+        eprintln!(
+            "expert {e}: per-expert vs offset: max|diff|={max_diff:.4} rel={rel:.4}"
+        );
+        assert!(
+            rel < 0.05,
+            "CUDA offset GEMM disagrees with per-expert (expert {e}): rel={rel}"
+        );
+    }
+}
+
 /// Stacked-vs-per-expert layout parity (CPU): build two synthetic
 /// "experts", run them as (a) two independent `GptqLinear`s, (b) one
 /// big stacked `GptqLinear` indexed by `gemm_gptq_with_offset`. Both
