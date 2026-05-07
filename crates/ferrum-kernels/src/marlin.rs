@@ -170,11 +170,20 @@ pub fn marlin_gemm_with_offset(
     }
     let raw_stream = stream.cu_stream();
 
-    // Zero only the expert's slice of the workspace (Marlin uses each entry
-    // as a mutex; safe to share when slices don't overlap, but we still
-    // zero before each call).
-    let ws_blocks = (expert_n / 128) as usize;
-    let ws_offset_bytes = ((expert_offset / 128) as usize) * std::mem::size_of::<i32>();
+    // Workspace layout is `[n_total/128, max_par]` flat i32, where
+    // max_par=16 (matches kernel arg below). For an expert that owns
+    // columns [expert_offset, expert_offset + expert_n), it owns the
+    // mutex slots
+    //
+    //   workspace[(expert_offset/128) * max_par .. (expert_offset/128 +
+    //                                              expert_n/128) * max_par]
+    //
+    // Zero that range before launch — Marlin uses these as atomic
+    // tile-completion locks and expects them initially zero.
+    const MAX_PAR: usize = 16;
+    let ws_blocks = (expert_n / 128) as usize * MAX_PAR;
+    let ws_offset_bytes =
+        (expert_offset / 128) as usize * MAX_PAR * std::mem::size_of::<i32>();
     {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
@@ -187,18 +196,8 @@ pub fn marlin_gemm_with_offset(
         }
     }
 
-    // Compute byte offsets for B (qweight) and scales:
-    //   qweight is [K/8 × N/16, 8 × 16] tile-major in Marlin layout. Each
-    //   tile is 16x16 ints × 8 (8 INT4 packed). The N dim's tile size is
-    //   16 — qweight stride per col = (K/16) × tile_words, so col offset
-    //   in i32s is (expert_offset / 16) * (K/16) * 16 × 4 bytes.
-    // Simpler observation: Marlin lays out qweight with N as the slowest
-    // axis (N-block-major). qweight.len() == K/8 × N i32 elements. So
-    // column offset in i32 elements = (expert_offset / 8) × K... wait
-    // Marlin tiles are 16×16 with INT4 packing. The col_dim_stride is
-    //   (K * tile_n) / 32  (8 INT4 per i32, n_tile = 16, packed 16 per i32)
-    // Empirically Marlin's repack stores N columns column-block-major, so
-    // a contiguous column-range is contiguous bytes. Use:
+    // Marlin's repack stores N columns N-block-major, so a contiguous
+    // column-range maps to contiguous bytes:
     //   bytes_per_col = qweight.len() * 4 / weight.n
     let qw_bytes_per_col = (weight.qweight.len() * 4) / weight.n;
     let qw_offset_bytes = expert_offset as usize * qw_bytes_per_col;
@@ -291,8 +290,11 @@ pub fn marlin_gemm_with_offset_strided(
     }
     let raw_stream = stream.cu_stream();
 
-    let ws_blocks = (expert_n / 128) as usize;
-    let ws_offset_bytes = ((expert_offset / 128) as usize) * std::mem::size_of::<i32>();
+    // Same workspace layout reasoning as in `marlin_gemm_with_offset`.
+    const MAX_PAR: usize = 16;
+    let ws_blocks = (expert_n / 128) as usize * MAX_PAR;
+    let ws_offset_bytes =
+        (expert_offset / 128) as usize * MAX_PAR * std::mem::size_of::<i32>();
     {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
