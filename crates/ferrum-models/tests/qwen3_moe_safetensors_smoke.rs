@@ -35,6 +35,14 @@ fn load_model() -> Qwen3MoeModel<CudaBackend> {
     let path = m3_path();
     eprintln!("Loading M3 from {}", path.display());
 
+    // CUDA's MoE prefill path defaults to paged_decode_attention which
+    // isn't implemented (only paged_varlen_attn is). Force paged-KV off
+    // so prefill takes the flash_attention path. Re-enable explicitly
+    // when the engine wires the varlen path through MoE forward.
+    if std::env::var("FERRUM_METAL_PAGED_KV").is_err() {
+        std::env::set_var("FERRUM_METAL_PAGED_KV", "0");
+    }
+
     // ConfigManager::load_from_path is async — spin a tiny runtime to keep
     // the test sync-friendly.
     let rt = tokio::runtime::Builder::new_current_thread()
