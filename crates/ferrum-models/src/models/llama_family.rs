@@ -3456,8 +3456,20 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // already snapshotted above into h/nh/etc — cfg is just for the
         // shape constants ensure_unified_scratch needs).
         let cfg_for_alloc = self.cfg.clone();
+        // Track whether the scratch grew this call; if so, ANY previously-
+        // captured CUDA graph holds stale pointers (old scratch buffers
+        // freed) and replay would fault with CUDA_ERROR_ILLEGAL_ADDRESS.
+        // Clear the capture cache so the next graph-eligible iter re-captures
+        // with the new buffers.
+        let prev_capacity = self.scratch.unified_capacity;
         self.scratch
             .ensure_unified_scratch(&cfg_for_alloc, m_total, max_seqs, max_blocks_per_seq);
+        if self.scratch.unified_capacity > prev_capacity && !self.unified_graph_keys_seen.is_empty()
+        {
+            self.unified_graph_keys_seen.clear();
+            self.unified_graph_warmup = 0;
+            self.unified_graph_failed = false;
+        }
 
         let mut ctx = B::new_context();
 
