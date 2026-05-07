@@ -7,6 +7,18 @@
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Cached `FERRUM_MARLIN_SKIP_WS_ZERO=1` flag. Read once on first
+/// access, cheap for hot paths (called per Marlin GEMM dispatch).
+fn skip_ws_zero() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FERRUM_MARLIN_SKIP_WS_ZERO")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
 
 // FFI declaration for the Marlin CUDA kernel.
 // Only linked when the "marlin" feature is enabled (requires nvcc + SM >= 8.0).
@@ -311,11 +323,9 @@ pub fn marlin_gemm_with_offset_strided(
     let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
     // Skip per-call workspace zeroing if env says so. Caller is then
     // responsible for bulk-zeroing the workspace before the batch
-    // (saves N-1 cuMemsetD32Async launches per phase).
-    let skip_ws_zero = std::env::var("FERRUM_MARLIN_SKIP_WS_ZERO")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !skip_ws_zero {
+    // (saves N-1 cuMemsetD32Async launches per phase). Cached on
+    // first access — std::env::var is too slow for the hot path.
+    if !skip_ws_zero() {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(
