@@ -425,27 +425,43 @@ impl EngineInner {
 
     // ── preemption ──────────────────────────────────────────────────────
 
-    /// Try to preempt a decoding request to free KV cache blocks.
+    /// Try to preempt a request to free KV cache blocks.
     ///
-    /// Picks the lowest-priority victim (ties broken by fewest generated
-    /// tokens — least work lost).  Frees the victim's KV cache, resets
-    /// its sequence state, and re-submits it to the scheduler so it will
-    /// be re-prefilled in a later iteration.
+    /// Selects any sequence (other than the requester) that holds KV
+    /// blocks. Eligibility was previously gated on `prefill_complete`,
+    /// but at high concurrency (e.g. c=32 with all requests racing on
+    /// the first prefill batch) NO seq has finished prefill yet — preempt
+    /// then returned no victim and the request failed with
+    /// "Resource exhausted: No blocks available and no request to preempt".
+    ///
+    /// Mid-prefill victims are now eligible: their state is reset, the
+    /// scheduler re-submits them, and they restart from scratch on a
+    /// later iter when blocks free up. Work loss is bounded by what was
+    /// already prefilled (a small fraction of the prompt).
+    ///
+    /// Tiebreak prefers MID-PREFILL victims over mid-decode (they have
+    /// less work to redo), then within each bucket prefers fewest
+    /// generated tokens, then lowest priority.
     ///
     /// Returns `true` if a victim was preempted.
     async fn preempt_victim(&self, exclude_id: &RequestId) -> bool {
-        // Select victim: any decoding sequence except the requester
         let victim_id = {
             let sequences = self.sequences.read();
             sequences
                 .iter()
-                .filter(|(id, s)| *id != exclude_id && s.prefill_complete && s.kv_cache.is_some())
+                .filter(|(id, s)| *id != exclude_id && s.kv_cache.is_some())
                 .min_by(|(_, a), (_, b)| {
-                    // Lowest priority first, then fewest generated tokens
-                    a.sampling_params
-                        .max_tokens // proxy for priority (TODO: use real priority)
-                        .cmp(&b.sampling_params.max_tokens)
+                    // Prefer mid-prefill (less work to redo) over mid-decode.
+                    let a_done = a.prefill_complete as u8;
+                    let b_done = b.prefill_complete as u8;
+                    a_done
+                        .cmp(&b_done)
+                        // Then fewest generated tokens (less to re-decode).
                         .then_with(|| a.generated_tokens.len().cmp(&b.generated_tokens.len()))
+                        // Finally, lowest priority by max_tokens proxy.
+                        .then_with(|| {
+                            a.sampling_params.max_tokens.cmp(&b.sampling_params.max_tokens)
+                        })
                 })
                 .map(|(id, _)| id.clone())
         };
