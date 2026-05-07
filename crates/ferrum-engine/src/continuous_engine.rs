@@ -1040,6 +1040,16 @@ impl EngineInner {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(rid) {
                 seq.kv_cache = Some(kv_handle);
+                // Mixed-path doesn't get a post-prefill kv_cache.cache_id()
+                // back from the model the way run_prefill_inner does. We
+                // pass the request UUID as the seq_id into UnifiedBatch,
+                // so the model creates its per-cache state under that key.
+                // Save it now so complete_request can release_cache(uuid)
+                // — otherwise we leak ~130KB/token of paged-pool state per
+                // completed request and OOM after ~50 requests.
+                if seq.model_cache_id.is_none() {
+                    seq.model_cache_id = Some(rid.to_string());
+                }
             }
         }
 

@@ -1,0 +1,15 @@
+--- rep 1 ---
+✓ model ready in 1.05s
+throughput: 27.2 tok/s (decode only)
+--- rep 2 ---
+✓ model ready in 1.01s
+throughput: 27.9 tok/s (decode only)
+--- rep 3 ---
+✓ model ready in 0.98s
+throughput: 27.1 tok/s (decode only)
+--- rep 4 ---
+✓ model ready in 0.99s
+throughput: 27.6 tok/s (decode only)
+--- rep 5 ---
+✓ model ready in 1.01s
+throughput: 27.7 tok/s (decode only)
