@@ -3625,6 +3625,35 @@ impl<B: Backend> LlamaFamilyModel<B> {
             self.unified_graph_warmup += 1;
         }
 
+        // Diagnostic: every 64 iters, print capture/replay/eager counts +
+        // distinct graph_keys seen so we can decide whether the graph
+        // path is dominated by capture overhead or replay benefit.
+        if graph_enabled && std::env::var("FERRUM_GRAPH_STATS").is_ok() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static REPLAYS: AtomicU64 = AtomicU64::new(0);
+            static CAPTURES: AtomicU64 = AtomicU64::new(0);
+            static EAGER: AtomicU64 = AtomicU64::new(0);
+            static TOTAL: AtomicU64 = AtomicU64::new(0);
+            if did_pure_replay {
+                REPLAYS.fetch_add(1, Ordering::Relaxed);
+            } else if should_capture {
+                CAPTURES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                EAGER.fetch_add(1, Ordering::Relaxed);
+            }
+            let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            if total.is_multiple_of(64) {
+                let r = REPLAYS.load(Ordering::Relaxed);
+                let c = CAPTURES.load(Ordering::Relaxed);
+                let e = EAGER.load(Ordering::Relaxed);
+                eprintln!(
+                    "[graph-stats] total={total} replay={r} ({:.1}%) capture={c} eager={e} keys_cached={}",
+                    100.0 * r as f64 / total as f64,
+                    self.unified_graph_keys_seen.len(),
+                );
+            }
+        }
+
         if should_capture {
             if let Err(e) = B::begin_graph_capture(&mut ctx) {
                 eprintln!("[unified-graph] begin_capture err: {e}");
