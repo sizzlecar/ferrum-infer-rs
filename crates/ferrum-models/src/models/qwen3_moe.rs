@@ -581,12 +581,24 @@ impl<B: Backend> Qwen3MoeModel<B> {
             // GPTQ tensors host-side, concat along N, single B::load_gptq.
             // Builds num_experts StackedExpertLinear views over one shared
             // Marlin store per role.
+            //
+            // Most HF GPTQ exports keep gate_proj + up_proj split per
+            // expert; some (autogptq with fused-mlp) emit a single
+            // gate_up_proj. Try split first; fall back to fused.
             let expert_prefix = format!("{prefix}.mlp.experts.{{e}}.");
+            let probe_split = loader.has_tensor(&format!(
+                "{prefix}.mlp.experts.0.gate_proj.qweight"
+            ));
+            let gate_up_projs: &[&str] = if probe_split {
+                &["gate_proj", "up_proj"]
+            } else {
+                &["gate_up_proj"]
+            };
             let (gate_up_store, gate_up_n_per_expert, gate_up_k) = loader
                 .load_stacked_gptq_experts(
                     &expert_prefix,
                     cfg.num_experts,
-                    &["gate_proj", "up_proj"],
+                    gate_up_projs,
                 )?;
             let (down_store, down_n_per_expert, down_k) = loader
                 .load_stacked_gptq_experts(

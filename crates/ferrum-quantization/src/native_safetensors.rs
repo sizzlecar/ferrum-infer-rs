@@ -353,12 +353,27 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 sc_parts.push((sc, sc_sh[1]));
                 qz_parts.push((qz, qz_sh[1]));
 
-                // g_idx is a permutation over K — same across experts in
-                // the same role for all GPTQ exports we've seen. Take the
-                // first one we encounter; ignore subsequent (they should
-                // match — Marlin assumes a single g_idx for the tile).
-                if g_idx_first.is_none() && self.has(&format!("{name}.g_idx")) {
-                    g_idx_first = Some(self.read_i32(&format!("{name}.g_idx"))?.0);
+                // g_idx is a permutation over K — Marlin assumes ONE g_idx
+                // for the whole stacked tile. Validate all experts share
+                // identical g_idx if any has it (which they should, since
+                // K = hidden_size is the same across experts and GPTQ's
+                // act-order is computed on the input distribution).
+                let g_key = format!("{name}.g_idx");
+                if self.has(&g_key) {
+                    let (gx, _) = self.read_i32(&g_key)?;
+                    match &g_idx_first {
+                        None => g_idx_first = Some(gx),
+                        Some(prev) => {
+                            if prev.len() != gx.len() || prev.iter().zip(&gx).any(|(a, b)| a != b)
+                            {
+                                return Err(FerrumError::model(format!(
+                                    "stacked GPTQ '{name}': g_idx mismatch with first \
+                                     expert — Marlin requires identical act-order across \
+                                     experts in the same stacked tile"
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             if e == 0 {
