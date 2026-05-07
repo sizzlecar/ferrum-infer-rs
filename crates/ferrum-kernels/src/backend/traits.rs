@@ -1486,6 +1486,42 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Batched paged decode attention — multi-seq, single token per seq.
+    /// Faster path for the unified_forward layer when m_total == num_seqs
+    /// (every item is a single-token decode). Skips the cu_seqlens_q
+    /// linear scan that `paged_varlen_attention` does in the fully-mixed
+    /// case.
+    ///
+    /// Layouts:
+    ///   q              : [num_seqs, num_q_heads, head_dim]
+    ///   k_pool/v_pool  : paged pool (same as paged_varlen)
+    ///   block_tables   : [num_seqs, max_num_blocks_per_seq]
+    ///   valid_kv_lens  : [num_seqs] — current kv_len per seq
+    ///   out            : [num_seqs, num_q_heads, head_dim]
+    ///
+    /// Default returns Err(unsupported); CUDA backend overrides.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_batched_decode_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _valid_kv_lens: &Self::Buffer,
+        _num_seqs: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_batched_decode_attention not implemented for this backend",
+        ))
+    }
+
     /// Allocate a u32 buffer of length `n` for paged-KV bookkeeping
     /// (block tables, context lens). Default uses the existing
     /// `from_slice_i32` route then bit-casts; backends with a faster

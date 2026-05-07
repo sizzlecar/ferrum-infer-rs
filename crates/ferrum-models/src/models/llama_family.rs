@@ -314,6 +314,10 @@ pub struct LlamaFamilyScratch<B: Backend> {
     pub unified_cu_seqlens_q: Option<B::Buffer>,
     pub unified_pos_offsets: Option<B::Buffer>,
     pub unified_block_tables: Option<B::Buffer>,
+    /// Per-seq `valid_kv_len = pos_offset + 1`. Used by the
+    /// pure-decode fast path's `paged_batched_decode_attention`. Sized
+    /// the same as pos_offsets (num_seqs).
+    pub unified_valid_kv_lens: Option<B::Buffer>,
     /// Packed last-token hidden states for is_final_chunk items
     /// (`[num_sampled, h]`). Used as input to lm_head.
     pub unified_packed_normed: Option<B::Buffer>,
@@ -397,6 +401,7 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             unified_cu_seqlens_q: None,
             unified_pos_offsets: None,
             unified_block_tables: None,
+            unified_valid_kv_lens: None,
             unified_packed_normed: None,
             unified_packed_logits: None,
             max_tokens: t,
@@ -439,6 +444,7 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             self.unified_cu_seqlens_q = Some(B::alloc_u32(max_seqs + 1));
             self.unified_pos_offsets = Some(B::alloc_u32(max_seqs));
             self.unified_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
+            self.unified_valid_kv_lens = Some(B::alloc_u32(max_seqs));
             self.unified_packed_normed = Some(B::alloc(max_seqs * h));
             self.unified_packed_logits = Some(B::alloc(max_seqs * v));
         }
@@ -3511,6 +3517,19 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .expect("unified_pos_offsets missing");
             B::write_u32(&mut ctx, po, &pos_offsets);
         }
+        // Pure-decode fast path needs valid_kv_lens[i] = pos_offsets[i] + 1
+        // (each q_token is the last in its seq when q_len==1). Always write
+        // — the layer kernel decides whether to use it.
+        let pure_decode = m_total == num_seqs;
+        if pure_decode {
+            let valid_kv_lens: Vec<u32> = pos_offsets.iter().map(|&p| p + 1).collect();
+            let kvl = self
+                .scratch
+                .unified_valid_kv_lens
+                .as_mut()
+                .expect("unified_valid_kv_lens missing");
+            B::write_u32(&mut ctx, kvl, &valid_kv_lens);
+        }
         // Stack per-seq block tables host-side, then upload.
         {
             let mut stacked: Vec<u32> = vec![0u32; num_seqs * max_blocks_per_seq];
@@ -3686,6 +3705,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     h,
                     eps,
                     qk_mode,
+                    pure_decode,
                 );
             }
         }
@@ -3904,6 +3924,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         h: usize,
         eps: f32,
         qk_mode: i32,
+        pure_decode: bool,
     ) {
         let layer = &self.layers[li];
         let dummy_w = &layer.input_ln_w;
@@ -4025,23 +4046,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .expect("paged unified: split_qkv_norm_rope_into_paged_cache_varlen");
         });
 
-        // 4. paged_varlen_attention: one call covering all M_total tokens.
+        // 4. paged attention: dispatch the q_len=1 batched fast path
+        //    when every item is a decode (m_total == num_seqs); else
+        //    fall back to the varlen kernel that handles arbitrary q_len.
         time_op!(ATTN_TIME_US, ATTN_CALLS, {
             let packed_q = self
                 .scratch
                 .unified_packed_q
                 .as_ref()
                 .expect("unified_packed_q missing");
-            let cu_seqlens_buf = self
-                .scratch
-                .unified_cu_seqlens_q
-                .as_ref()
-                .expect("unified_cu_seqlens_q missing");
-            let pos_offsets_buf = self
-                .scratch
-                .unified_pos_offsets
-                .as_ref()
-                .expect("unified_pos_offsets missing");
             let bt_buf = self
                 .scratch
                 .unified_block_tables
@@ -4052,25 +4065,97 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .unified_attn_out
                 .as_mut()
                 .expect("unified_attn_out missing");
-            B::paged_varlen_attention(
-                ctx,
-                packed_q,
-                pool_k,
-                pool_v,
-                attn_out,
-                cu_seqlens_buf,
-                pos_offsets_buf,
-                bt_buf,
-                num_seqs,
-                m_total,
-                max_kv_len,
-                nh,
-                nkv,
-                hd,
-                block_size,
-                max_blocks_per_seq,
-            )
-            .expect("paged_varlen_attention");
+            if pure_decode {
+                let kv_lens_buf = self
+                    .scratch
+                    .unified_valid_kv_lens
+                    .as_ref()
+                    .expect("unified_valid_kv_lens missing");
+                let r = B::paged_batched_decode_attention(
+                    ctx,
+                    packed_q,
+                    pool_k,
+                    pool_v,
+                    attn_out,
+                    bt_buf,
+                    kv_lens_buf,
+                    num_seqs,
+                    max_kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    block_size,
+                    max_blocks_per_seq,
+                );
+                if let Err(e) = r {
+                    // Backend may not implement; fall through to varlen.
+                    eprintln!("[unified] paged_batched_decode unsupported, falling back to varlen: {e}");
+                    let cu_seqlens_buf = self
+                        .scratch
+                        .unified_cu_seqlens_q
+                        .as_ref()
+                        .expect("unified_cu_seqlens_q missing");
+                    let pos_offsets_buf = self
+                        .scratch
+                        .unified_pos_offsets
+                        .as_ref()
+                        .expect("unified_pos_offsets missing");
+                    let attn_out_fb = self
+                        .scratch
+                        .unified_attn_out
+                        .as_mut()
+                        .expect("unified_attn_out missing");
+                    B::paged_varlen_attention(
+                        ctx,
+                        packed_q,
+                        pool_k,
+                        pool_v,
+                        attn_out_fb,
+                        cu_seqlens_buf,
+                        pos_offsets_buf,
+                        bt_buf,
+                        num_seqs,
+                        m_total,
+                        max_kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        block_size,
+                        max_blocks_per_seq,
+                    )
+                    .expect("paged_varlen_attention (fallback)");
+                }
+            } else {
+                let cu_seqlens_buf = self
+                    .scratch
+                    .unified_cu_seqlens_q
+                    .as_ref()
+                    .expect("unified_cu_seqlens_q missing");
+                let pos_offsets_buf = self
+                    .scratch
+                    .unified_pos_offsets
+                    .as_ref()
+                    .expect("unified_pos_offsets missing");
+                B::paged_varlen_attention(
+                    ctx,
+                    packed_q,
+                    pool_k,
+                    pool_v,
+                    attn_out,
+                    cu_seqlens_buf,
+                    pos_offsets_buf,
+                    bt_buf,
+                    num_seqs,
+                    m_total,
+                    max_kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("paged_varlen_attention");
+            }
         });
 
         // 5. o_proj (M_total): attn_out → o_proj_out

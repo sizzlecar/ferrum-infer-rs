@@ -1333,6 +1333,75 @@ impl Backend for CudaBackend {
         .map_err(|e| FerrumError::model(format!("paged_varlen_attn: {e}")))
     }
 
+    fn paged_batched_decode_attention(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        block_tables: &Self::Buffer,
+        valid_kv_lens: &Self::Buffer,
+        num_seqs: usize,
+        max_kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if num_seqs == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "paged_batched_decode_attn",
+            ptx::PAGED_DECODE_ATTENTION,
+            "paged_batched_decode_attn_f16",
+        );
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let stream = ctx.stream.clone();
+        let qv = q.slice(..);
+        let kp = k_pool.slice(..);
+        let vp = v_pool.slice(..);
+        let bt = block_tables.slice(..);
+        let kvl = valid_kv_lens.slice(..);
+        let nqi = num_heads as i32;
+        let nkvi = num_kv_heads as i32;
+        let hdi = head_dim as i32;
+        let mbps = max_blocks_per_seq as i32;
+        let bsi = block_size as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(&bt);
+        b.arg(&kvl);
+        b.arg(out);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mbps);
+        b.arg(&bsi);
+        b.arg(&scale);
+        // Same shared-mem sizing rationale as paged_varlen_attention
+        // (graph capture freezes shared_mem_bytes; size to
+        // FERRUM_KV_CAPACITY ceiling).
+        let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+        let shared_bytes = (shared_kv as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, num_seqs as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| FerrumError::model(format!("paged_batched_decode_attn: {e}")))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn split_qkv_norm_rope_into_paged_cache(
         ctx: &mut Self::Context,
