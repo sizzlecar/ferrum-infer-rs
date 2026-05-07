@@ -207,10 +207,13 @@ pub fn marlin_gemm_with_offset(
     let qw_bytes_per_col = (weight.qweight.len() * 4) / weight.n;
     let qw_offset_bytes = expert_offset as usize * qw_bytes_per_col;
 
-    let scales_per_col = weight.scales.len() / weight.n;
-    let scales_offset_bytes = expert_offset as usize
-        * scales_per_col
-        * std::mem::size_of::<half::f16>();
+    // Scales are GROUP-MAJOR after repack: layout [num_groups, total_n].
+    // Col `c` is at flat positions {0 + c, total_n + c, 2*total_n + c, ...}
+    // — first scale of col c is just `c` f16s in. Offset by expert_offset
+    // f16s; the kernel then strides by total_n (via prob_n_full =
+    // weight.n) for each group, picking up the right column of every
+    // group inside expert e.
+    let scales_offset_bytes = expert_offset as usize * std::mem::size_of::<half::f16>();
 
     let (a_ptr, _a_guard) = input.device_ptr(stream);
     let (b_ptr_full, _b_guard) = weight.qweight.device_ptr(stream);
@@ -320,9 +323,9 @@ pub fn marlin_gemm_with_offset_strided(
     let qw_bytes_per_col = (weight.qweight.len() * 4) / weight.n;
     let qw_offset_bytes = expert_offset as usize * qw_bytes_per_col;
 
-    let scales_per_col = weight.scales.len() / weight.n;
-    let scales_offset_bytes =
-        expert_offset as usize * scales_per_col * std::mem::size_of::<half::f16>();
+    // Group-major scales: offset by expert_offset f16s
+    // (see marlin_gemm_with_offset comment).
+    let scales_offset_bytes = expert_offset as usize * std::mem::size_of::<half::f16>();
 
     let in_offset_bytes =
         in_row_offset as usize * (k as usize) * std::mem::size_of::<half::f16>();
