@@ -122,6 +122,7 @@ rand_distr = "0.4.3"
 # Tensor operations
 ndarray = "0.15"
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+rayon = "1.11"
 
 # ML Framework - official candle from crates.io
 candle-core = "0.9.2"
