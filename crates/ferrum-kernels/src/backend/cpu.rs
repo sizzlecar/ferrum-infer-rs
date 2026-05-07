@@ -207,6 +207,77 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn gemm_gptq_with_offset_strided(
+        _ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        in_row_offset: usize,
+        weight: &Self::GptqStore,
+        expert_offset: usize,
+        expert_n: usize,
+        output: &mut Self::Buffer,
+        out_row_offset: usize,
+        m: usize,
+        k: usize,
+    ) -> Result<()> {
+        if expert_offset + expert_n > weight.n {
+            return Err(FerrumError::model(format!(
+                "gemm_gptq_with_offset_strided OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
+                weight.n
+            )));
+        }
+        if k != weight.k {
+            return Err(FerrumError::model(format!(
+                "gemm_gptq_with_offset_strided k mismatch: arg {k} vs weight.k {}",
+                weight.k
+            )));
+        }
+        // [m, K] input slice and [m, expert_n] output slice; weight
+        // [expert_n, K] taken from the column-slice of weight_f32.
+        let in_start = in_row_offset * k;
+        let in_end = (in_row_offset + m) * k;
+        let out_start = out_row_offset * expert_n;
+        let out_end = (out_row_offset + m) * expert_n;
+        let row_start = expert_offset * k;
+        let row_end = (expert_offset + expert_n) * k;
+        let weight_slice = weight.weight_f32[row_start..row_end].to_vec();
+        let in_slice = input[in_start..in_end].to_vec();
+        let mut out_slice = vec![0.0f32; m * expert_n];
+        let mut ctx_local = ();
+        Self::gemm(
+            &mut ctx_local,
+            &in_slice,
+            &weight_slice,
+            &mut out_slice,
+            m,
+            expert_n,
+            k,
+        );
+        output[out_start..out_end].copy_from_slice(&out_slice);
+        Ok(())
+    }
+
+    fn fused_silu_mul_split_strided(
+        _ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        in_row_offset: usize,
+        out: &mut Self::Buffer,
+        out_row_offset: usize,
+        tokens: usize,
+        intermediate: usize,
+    ) {
+        let in_per_row = 2 * intermediate;
+        let in_start = in_row_offset * in_per_row;
+        let out_start = out_row_offset * intermediate;
+        for r in 0..tokens {
+            for c in 0..intermediate {
+                let g = gate_up[in_start + r * in_per_row + c];
+                let u = gate_up[in_start + r * in_per_row + intermediate + c];
+                let silu = g / (1.0 + (-g).exp());
+                out[out_start + r * intermediate + c] = silu * u;
+            }
+        }
+    }
+
     fn load_quant(
         kind: super::GgufQuantType,
         bytes: &[u8],
