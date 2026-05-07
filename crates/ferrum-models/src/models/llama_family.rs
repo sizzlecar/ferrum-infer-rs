@@ -797,15 +797,14 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // swap). `FERRUM_KV_CAPACITY=N` overrides; clamp to the model's
         // declared max so we never lie to the model about its window.
         let model_max = self.cfg.max_seq_len;
-        // 512 in 0.7.2 — matches the value used in
-        // docs/bench/macos-2026-05-02 to get the published numbers.
-        // pre-0.7.2 default of 4096 was safe only because paged-KV was
-        // opt-in (pool wasn't allocated). With paged-KV now on by
-        // default + MAX_SEQS=32, the pool occupies physical memory:
-        // ~3 GB on Qwen3-30B-A3B Q4_K_M leaves 18 GB weights + 3 GB pool
-        // = 21 GB, fits comfortably on a 32 GB Mac. Long-context users
-        // can `FERRUM_KV_CAPACITY=4096` and accept lower max_seqs.
-        const DEFAULT_KV_CAPACITY: usize = 512;
+        // 2048 in v0.7.3+: covers ShareGPT prompts (~579 tok) +
+        // generated output (~256 tok) with headroom. Old 512 default
+        // panicked on real workloads with "KV cache overflow on layer 0:
+        // would write tokens [0..579) but capacity is 512". Mac users
+        // running 30B-class models can `FERRUM_KV_CAPACITY=512` to
+        // shrink the pool footprint (~3 GB at 512 vs ~12 GB at 2048
+        // on Qwen3-30B-A3B Q4_K_M).
+        const DEFAULT_KV_CAPACITY: usize = 2048;
         let max = std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -839,10 +838,13 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // use. Pool memory is `max_seqs × max_blocks_per_seq` total
         // blocks — we lowered DEFAULT_KV_CAPACITY to 2048 so this 2× max_seqs
         // bump keeps the pool footprint identical to the pre-0.7.2 default.
+        // 64 covers c=32 + a few prefill chunks safely. Old 32 would
+        // panic at c=32 once any prefill chunk arrived alongside the
+        // 32 active decoders. Override down for memory-tight cases.
         let max_seqs = std::env::var("FERRUM_PAGED_MAX_SEQS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(32);
+            .unwrap_or(64);
         let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
         let total_pool_blocks = max_seqs * max_blocks_per_seq;
 
@@ -3855,7 +3857,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // one-hot vec keeps `sample_with_processors` correct (greedy
             // picks the same token; non-greedy callers shouldn't enable
             // this flag).
-            if std::env::var("FERRUM_GREEDY_ARGMAX").map_or(false, |v| v == "1") {
+            // Default ON. Greedy fast-path emits 1-element token vec
+            // (engine sample_with_processors short-circuits when len==1
+            // and temperature=0). Bypass via FERRUM_GREEDY_ARGMAX=0.
+            if std::env::var("FERRUM_GREEDY_ARGMAX").map_or(true, |v| v != "0") {
                 let tokens = B::argmax_rows_to_u32(packed_logits, num_sampled, vocab);
                 // Compact format: 1-element vec carrying the token (as f32
                 // bit-cast). The engine's sample_with_processors fast-

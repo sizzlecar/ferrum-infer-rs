@@ -195,6 +195,15 @@ impl Backend for CudaBackend {
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
+    /// Default ON for CUDA. Mixed-batch unified_forward path requires
+    /// paged_pools; without it the engine's run_unified_iter falls back
+    /// to serial prefill that stalls in-flight decoders (~50% of bench
+    /// wall time at c=16). Override via FERRUM_METAL_PAGED_KV=0 if a
+    /// caller specifically wants legacy contig KV.
+    fn supports_paged_kv() -> bool {
+        true
+    }
+
     fn new_context() -> Self::Context {
         // Reuse the process-global stream populated by `default_stream()`.
         // Model constructors call `B::from_slice` thousands of times to

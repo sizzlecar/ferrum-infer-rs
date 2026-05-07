@@ -432,13 +432,14 @@ impl EngineInner {
             }
         }
 
-        // FERRUM_MIXED_BATCH=1 routes prefills + decodes through one
-        // unified_decode call per iter, eliminating the prefill-blocks-
-        // decode bottleneck. Prefills are chunked to fit a per-iter token
-        // budget alongside in-flight decode tokens.
+        // Default ON. Routes prefills + decodes through one unified_decode
+        // call per iter, eliminating the prefill-blocks-decode bottleneck.
+        // Verified +110% c=16 INT4 vs serial path. Disable via
+        // FERRUM_MIXED_BATCH=0 if a backend doesn't support paged_pools
+        // (executor falls back to per-item dispatch automatically).
         let mixed_batch = std::env::var("FERRUM_MIXED_BATCH")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
         if mixed_batch {
             if let Err(e) = self.run_unified_iter(&prefill_ids, &decode_ids).await {
@@ -1031,11 +1032,14 @@ impl EngineInner {
         // behaviour. (The starvation at BUDGET=32 c=32 is an artefact
         // of an unreasonably tight budget setting, not the default 128
         // which has plenty of headroom.)
+        // 128 default (was 512): A/B at c=16 showed 128 wins +1-2%
+        // because smaller mixed iters spread prefill overhead more
+        // evenly across iters. 512 still works; 32 starves.
         let token_budget: usize = std::env::var("FERRUM_UNIFIED_TOKEN_BUDGET")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n: &usize| n > 0)
-            .unwrap_or(512);
+            .unwrap_or(128);
         let mut budget_left = token_budget.saturating_sub(decode_ids.len());
 
         // Allocate KV blocks for new prefills (those without kv_cache).
