@@ -74,9 +74,30 @@ ferrum_start() {
   # not enough for c=32 ShareGPT prompts — ~32×500 tok/16 = 1000 blocks).
   # 2048 fits c=32 comfortably for INT4 models. M1 (FP16 8B) is OOM
   # regardless of this setting — its weights alone fill the 24 GB card.
+  # FERRUM_METAL_PAGED_KV=1 is critical on CUDA: backend defaults to
+  # supports_paged_kv()=false which means paged_pools never allocate
+  # and unified_forward returns Unsupported, falling back to serial
+  # prefill that stalls all in-flight decoders. WITH paged_kv=1 +
+  # MIXED_BATCH=1, c=16 INT4 throughput jumped 460 → 964 (+110%).
+  # FERRUM_PAGED_MAX_SEQS sizes the paged scratch buffers; 64 covers
+  # c=32 + a few prefill chunks safely.
+  # FERRUM_MIXED_BATCH=1 routes all prefills + decodes through one
+  # unified_decode call per iter (chunked-prefill style mixing).
+  # FERRUM_GREEDY_ARGMAX=1 keeps greedy-sampling argmax on device and
+  # short-circuits the engine sampler's vocab scan.
+  # FERRUM_UNIFIED_GRAPH stays OFF — known broken on the mixed-batch
+  # path (CUDA_ERROR_ILLEGAL_ADDRESS on graph replay; 2026-05-07 v0.2
+  # known issue, fix tracked separately).
   CUDA_VISIBLE_DEVICES=0 \
-  FERRUM_KV_CAPACITY=512 \
+  FERRUM_KV_CAPACITY=2048 \
   FERRUM_KV_MAX_BLOCKS=2048 \
+  FERRUM_PAGED_MAX_SEQS=64 \
+  FERRUM_METAL_PAGED_KV=1 \
+  FERRUM_MIXED_BATCH=1 \
+  FERRUM_UNIFIED_TOKEN_BUDGET=128 \
+  FERRUM_GREEDY_ARGMAX=1 \
+  FERRUM_UNIFIED_GRAPH=0 \
+  FERRUM_SPLIT_K_ATTN=0 \
   FERRUM_MAX_BATCH=4 \
     "$WORKSPACE/ferrum-infer-rs/target/release/ferrum" serve \
       --model "$model_dir" --port "$PORT" \
