@@ -545,6 +545,13 @@ pub struct LlamaFamilyModel<B: Backend> {
     unified_graph_warmup: usize,
     unified_graph_failed: bool,
     unified_graph_keys_seen: std::collections::HashSet<u64>,
+    /// Tracks the largest `m_total` ever submitted to unified_forward.
+    /// We pregrow Marlin gather scratch to THIS value (not the current
+    /// iter's m_total) so a captured graph never sees the scratch slot
+    /// reallocated mid-replay (which would dangle the captured kernel
+    /// pointers and trip CUDA_ERROR_ILLEGAL_ADDRESS on `cuGraphLaunch`'s
+    /// post-launch sync).
+    unified_max_m_total: usize,
 }
 
 impl<B: Backend> LlamaFamilyModel<B> {
@@ -657,6 +664,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             unified_graph_warmup: 0,
             unified_graph_failed: false,
             unified_graph_keys_seen: std::collections::HashSet::new(),
+            unified_max_m_total: 0,
         })
     }
 
@@ -740,6 +748,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
             unified_graph_warmup: 0,
             unified_graph_failed: false,
             unified_graph_keys_seen: std::collections::HashSet::new(),
+            unified_max_m_total: 0,
         })
     }
 
@@ -3558,7 +3567,27 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // `down_proj` has the largest k = intermediate_size, so
         // m_total * intermediate_size is the upper bound across all
         // 4 matmuls in the layer.
-        let max_marlin_required = m_total * im;
+        //
+        // Track max m_total ever seen and pre-grow to THAT — otherwise a
+        // captured graph for shape (m=16) holds Marlin scratch pointers
+        // that get FREED when a later (m=272) iter calls pregrow with
+        // a bigger size. Replay then trips CUDA_ERROR_ILLEGAL_ADDRESS
+        // on the captured kernel that referenced the old scratch.
+        // Pregrowing to the running max means after we've seen the
+        // largest workload once, subsequent pregrow calls find the slot
+        // already big enough (no realloc → captured pointers stay live).
+        if m_total > self.unified_max_m_total {
+            // Growing the watermark — clear graph cache so any captured
+            // graphs (referencing the smaller pre-growth scratch) get
+            // rebuilt against the new buffer.
+            if !self.unified_graph_keys_seen.is_empty() {
+                self.unified_graph_keys_seen.clear();
+                self.unified_graph_warmup = 0;
+                self.unified_graph_failed = false;
+            }
+            self.unified_max_m_total = m_total;
+        }
+        let max_marlin_required = self.unified_max_m_total * im;
         B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
 
         // Sync eager pre-work (write_u32 + embedding + scratch grow)
