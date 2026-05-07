@@ -166,6 +166,41 @@ impl SequenceState {
     pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
         use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
 
+        // Greedy fast path: temperature=0 with no penalties or guided
+        // processors means the answer is just argmax(logits). The
+        // GPU-argmax fast path (FERRUM_GREEDY_ARGMAX=1) already wrote a
+        // one-hot vec where exactly one position has value 1.0; scan for
+        // that to recover the token without paying for SamplingContext
+        // construction + RNG + frequency-table updates (which would
+        // otherwise add ~80us per item × c=16 = 1.3ms / iter).
+        // Falls back to the full chain if any non-greedy condition is met.
+        let is_greedy = self.sampling_params.temperature == 0.0
+            && self.sampling_params.repetition_penalty == 1.0
+            && self.sampling_params.frequency_penalty == 0.0
+            && self.sampling_params.presence_penalty == 0.0
+            && self.regex_processor.is_none()
+            && self.json_processor.is_none();
+        if is_greedy {
+            // Compact path: model's GPU-argmax fast path emits a 1-element
+            // vec where logits[0] is the token id bit-cast to f32. Recover
+            // it without scanning vocab. ~80us × c=16 = 1.3ms / iter saved.
+            let token = if logits.len() == 1 {
+                TokenId::new(logits[0].to_bits())
+            } else {
+                let mut best_idx = 0usize;
+                let mut best_val = f32::NEG_INFINITY;
+                for (i, &v) in logits.iter().enumerate() {
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = i;
+                    }
+                }
+                TokenId::new(best_idx as u32)
+            };
+            *self.token_frequencies.entry(token).or_insert(0) += 1;
+            return Ok(token);
+        }
+
         // Regex-guided mask runs FIRST: it's a hard constraint (sets invalid
         // tokens to -inf). Subsequent temperature / top-k / top-p stay
         // correct because -inf tokens can't make it through any softmax.

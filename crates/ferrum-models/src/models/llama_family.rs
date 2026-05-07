@@ -3767,13 +3767,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
             // this flag).
             if std::env::var("FERRUM_GREEDY_ARGMAX").map_or(false, |v| v == "1") {
                 let tokens = B::argmax_rows_to_u32(packed_logits, num_sampled, vocab);
+                // Compact format: 1-element vec carrying the token (as f32
+                // bit-cast). The engine's sample_with_processors fast-
+                // path detects logits.len() == 1 and skips the heavy
+                // SamplingContext path. Saves the 128k-float scan that
+                // even a "simple" argmax fast-path would otherwise pay
+                // (~80us × c=16 = 1.3ms / iter).
                 for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                    let mut row = vec![0.0_f32; vocab];
-                    let tok = tokens[j] as usize;
-                    if tok < vocab {
-                        row[tok] = 1.0;
-                    }
-                    out[orig_idx] = Some(row);
+                    let tok = tokens[j];
+                    out[orig_idx] = Some(vec![f32::from_bits(tok)]);
                 }
             } else {
                 let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
