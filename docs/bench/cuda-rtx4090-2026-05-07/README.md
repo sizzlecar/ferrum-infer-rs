@@ -22,21 +22,36 @@ M3 ships as safetensors). Deferred to v0.3.
 
 ### M2: Llama-3.1-8B GPTQ-INT4 — output throughput (tok/s)
 
-| c | ferrum baseline | ferrum + argmax (old) | ferrum + mixed batch + argmax | vllm | ratio (mixed) |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 111.1 | 112.5 | _TBD_ | 148.4 | _TBD_ |
-| 4 | 308.4 | 338.7 | **364** (+8%) | 496.1 | **73%** |
-| 16 | 609.9 | 795.4 | **947** (+19%) | 1490.3 | **64%** |
-| 32 | 58.4 ⚠ | n/a (KV bug) | **1175** (+48% over no-mixed 838) | 2203.8 | **53%** |
+3 reps each, median reported. BUDGET=128, all optimizations on.
 
-The "**mixed batch**" column adds `FERRUM_MIXED_BATCH=1` (this session's
-big landing): one `unified_decode` call per iter packs prefill chunks
-+ active decodes through a varlen attention kernel, eliminating the
-50% bench time previously lost to prefill iters that stalled all 16
-in-flight decoders. Plus the greedy fast path that skips the
-128k-float vocab scan in the engine sampler when temperature=0.
+| c | ferrum baseline | ferrum + argmax (old) | ferrum FINAL | vllm | ratio | Δ baseline |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 111.1 | 112.5 | **111** | 148.4 | **75%** | — |
+| 4 | 308.4 | 338.7 | **369** | 496.1 | **74%** | +20% |
+| 16 | 609.9 | 795.4 | **954** | 1490.3 | **64%** | +56% |
+| 32 | 58.4 ⚠ | n/a (KV bug) | **1155** | 2203.8 | **52%** | +1877% |
 
-TPOT_p50 (ms), c=16: 22.1 → 15.8 (argmax) → **14.3 (mixed batch)**.
+3-rep noise <1% across all c. TPOT_p50 (ms), c=16: 22.1 (baseline) →
+15.8 (argmax) → **14.2 (mixed batch + greedy + paged_kv)**.
+
+The breakthrough is "**FINAL**" column: combines three landings this session.
+
+1. **`FERRUM_MIXED_BATCH=1`** — one `unified_decode` call per iter packs
+   prefill chunks + active decodes through a varlen attention kernel.
+   Eliminates the 50% bench time previously lost to serial prefills
+   that stalled all in-flight decoders.
+
+2. **Greedy fast path** — model emits a 1-element vec carrying just the
+   token (instead of a synthesised 128k-float one-hot). Engine
+   `sample_with_processors` short-circuits when length==1, skipping the
+   vocab scan. ~1.4 ms/iter saved at c=16.
+
+3. **`FERRUM_METAL_PAGED_KV=1`** — required for unified_forward path
+   (CUDA backend defaults to off). Without it, `unified_decode` falls
+   back to per-item dispatch and mixed batch is a no-op.
+
+c=32 jump from 58 → 1155 = 20× — was the c=32 KV pool fix earlier
+this session (FERRUM_KV_MAX_BLOCKS=2048) PLUS the mixed batch unlock.
 
 The "**GPU argmax**" column uses `FERRUM_GREEDY_ARGMAX=1` — a new fast
 path landed in this branch (commit `5c2e030`). It replaces the heavy
