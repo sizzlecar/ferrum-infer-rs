@@ -36,3 +36,4 @@ docs/registry_pattern_explanation.md
 
 # Claude Code local settings
 .claude/
+bench_results/
