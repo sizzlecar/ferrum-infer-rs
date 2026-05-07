@@ -263,10 +263,10 @@ fn cuda_stacked_offset_vs_per_expert() {
         .collect();
 
     // Stacked layout (matches load_stacked_gptq_experts):
-    //   * qweight: row-major outer, expert-major within row.
-    //   * scales / qzeros: EXPERT-MAJOR outer, group-major within expert
-    //     — so each expert's [num_groups, n_per] slice is a contiguous
-    //     tile that Marlin can address via pointer offset + smaller-N.
+    // GROUP-MAJOR for ALL three. out[g * total_n + e * n_per + c].
+    // Marlin's kernel uses prob_n_full as stride for both qweight and
+    // scales; with this layout, group g of expert e at pointer offset
+    // (e * n_per * sizeof) lands at the right (group, expert, col).
     let total_n = num_experts * n_per;
     let qw_rows = k / 8;
     let sc_rows = k / gs;
@@ -277,21 +277,17 @@ fn cuda_stacked_offset_vs_per_expert() {
             qw_acc.extend_from_slice(&experts[e].qweight[r * n_per..(r + 1) * n_per]);
         }
     }
-    let mut sc_acc = vec![0.0f32; sc_rows * total_n];
-    for e in 0..num_experts {
-        let dst_off = e * sc_rows * n_per;
-        for r in 0..sc_rows {
-            sc_acc[dst_off + r * n_per..dst_off + (r + 1) * n_per]
-                .copy_from_slice(&experts[e].scales[r * n_per..(r + 1) * n_per]);
+    let mut sc_acc = Vec::<f32>::with_capacity(sc_rows * total_n);
+    for r in 0..sc_rows {
+        for e in 0..num_experts {
+            sc_acc.extend_from_slice(&experts[e].scales[r * n_per..(r + 1) * n_per]);
         }
     }
-    let mut qz_acc = vec![0i32; qz_rows * num_experts * (n_per / 8)];
-    for e in 0..num_experts {
-        let dst_off = e * qz_rows * (n_per / 8);
-        let cols = n_per / 8;
-        for r in 0..qz_rows {
-            qz_acc[dst_off + r * cols..dst_off + (r + 1) * cols]
-                .copy_from_slice(&experts[e].qzeros[r * cols..(r + 1) * cols]);
+    let mut qz_acc = Vec::<i32>::with_capacity(qz_rows * num_experts * (n_per / 8));
+    for r in 0..qz_rows {
+        for e in 0..num_experts {
+            let cols = n_per / 8;
+            qz_acc.extend_from_slice(&experts[e].qzeros[r * cols..(r + 1) * cols]);
         }
     }
     let stacked = <CudaBackend as Backend>::load_gptq(

@@ -454,11 +454,16 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         let pairs_per_expert = proj_count;
         debug_assert_eq!(total_pairs, num_experts * pairs_per_expert);
 
-        // qweight: row-major outer, expert-major within row.
-        // Layout: qw_acc[r * total_n + e * n_per_expert + ...]. Marlin's
-        // repack treats this as one [K/8, total_n] tile and tile-packs
-        // along the N axis; per-expert column-slicing then reduces to
-        // a pointer offset.
+        // GROUP-MAJOR layout for ALL THREE (qweight + scales + qzeros).
+        // Layout: out[g * total_n + e * n_per_expert + c]. Marlin's
+        // CUDA kernel uses prob_n_full as the stride for both b_gl_stride
+        // and s_gl_stride — i.e. the kernel walks `prob_n_full` cols
+        // between K-tile rows / between groups. With group-major,
+        // group g of expert e is at byte offset
+        // `(g * total_n + e * n_per) * sizeof`, exactly where the
+        // kernel reads when given pointer offset = `e * n_per * sizeof`
+        // and stride = `total_n`.
+        let _ = pairs_per_expert; // silence unused-var
         let mut qw_acc: Vec<i32> = Vec::with_capacity(qw_rows * total_n);
         for r in 0..qw_rows {
             for pair_idx in 0..total_pairs {
@@ -466,42 +471,18 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                 qw_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
             }
         }
-
-        // scales / qzeros: EXPERT-MAJOR outer, group-major within expert.
-        // Layout: sc_acc[e * (num_groups * n_per_expert) + g * n_per_expert + c].
-        //
-        // This is the layout Marlin's `scales[g*n + col]` indexing
-        // EXPECTS for an expert-slice GEMM (where `n` is the per-expert
-        // width). The previous group-major-outer layout produced
-        // `sc_acc[(e+g) * n_per_expert + col]` which mixed experts —
-        // caught by the cuda_stacked_offset_vs_per_expert parity test
-        // (rel_err ~ 0.62).
-        let mut sc_acc: Vec<f32> = vec![0.0f32; sc_rows * total_n_scales];
-        for e in 0..num_experts {
-            let dst_expert_off = e * sc_rows * n_per_expert_scales;
-            for j in 0..pairs_per_expert {
-                let pair_idx = e * pairs_per_expert + j;
+        let mut sc_acc: Vec<f32> = Vec::with_capacity(sc_rows * total_n_scales);
+        for r in 0..sc_rows {
+            for pair_idx in 0..total_pairs {
                 let (data, cols) = &sc_parts[pair_idx];
-                let dst_proj_off = j * cols;
-                for r in 0..sc_rows {
-                    let dst = dst_expert_off + r * n_per_expert_scales + dst_proj_off;
-                    sc_acc[dst..dst + cols]
-                        .copy_from_slice(&data[r * cols..(r + 1) * cols]);
-                }
+                sc_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
             }
         }
-        let mut qz_acc: Vec<i32> = vec![0i32; qz_rows * total_n_zeros];
-        for e in 0..num_experts {
-            let dst_expert_off = e * qz_rows * n_per_expert_zeros;
-            for j in 0..pairs_per_expert {
-                let pair_idx = e * pairs_per_expert + j;
+        let mut qz_acc: Vec<i32> = Vec::with_capacity(qz_rows * total_n_zeros);
+        for r in 0..qz_rows {
+            for pair_idx in 0..total_pairs {
                 let (data, cols) = &qz_parts[pair_idx];
-                let dst_proj_off = j * cols;
-                for r in 0..qz_rows {
-                    let dst = dst_expert_off + r * n_per_expert_zeros + dst_proj_off;
-                    qz_acc[dst..dst + cols]
-                        .copy_from_slice(&data[r * cols..(r + 1) * cols]);
-                }
+                qz_acc.extend_from_slice(&data[r * cols..r * cols + cols]);
             }
         }
 
