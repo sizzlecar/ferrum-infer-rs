@@ -107,6 +107,30 @@ const MAX_GRAPH_SLOTS: usize = 2 * super::MAX_LAYERS_FOR_GRAPH;
 const HOST_STAGING_TOTAL: usize = MAX_GRAPH_SLOTS * BATCHED_SCRATCH_CAP;
 
 impl CudaState {
+    /// Lazy-init the MoE stream pool on first access. Pool size is
+    /// 4 by default; override via FERRUM_MOE_STREAMS env (1 disables
+    /// multi-stream dispatch).
+    pub fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
+        if self.moe_streams.is_none() {
+            let n = std::env::var("FERRUM_MOE_STREAMS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4)
+                .max(1);
+            let mut pool = Vec::with_capacity(n);
+            for _ in 0..n {
+                let s = self
+                    .ctx
+                    .new_stream()
+                    .expect("CudaState::moe_stream_pool: new_stream failed");
+                pool.push(s);
+            }
+            tracing::info!("MoE stream pool initialized: {} streams", n);
+            self.moe_streams = Some(pool);
+        }
+        self.moe_streams.as_ref().unwrap()
+    }
+
     fn module(&mut self, key: &'static str, ptx_src: &str) -> Arc<CudaModule> {
         if let Some(m) = self.modules.get(key) {
             return m.clone();
@@ -261,30 +285,6 @@ impl Backend for CudaBackend {
             batched_host_cache_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
             moe_streams: None,
         }
-    }
-
-    /// Lazy-init the MoE stream pool on first access. Pool size is
-    /// 4 by default; override via FERRUM_MOE_STREAMS env (1 disables
-    /// multi-stream dispatch).
-    pub fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
-        if self.moe_streams.is_none() {
-            let n = std::env::var("FERRUM_MOE_STREAMS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4)
-                .max(1);
-            let mut pool = Vec::with_capacity(n);
-            for _ in 0..n {
-                let s = self
-                    .ctx
-                    .new_stream()
-                    .expect("CudaState::moe_stream_pool: new_stream failed");
-                pool.push(s);
-            }
-            tracing::info!("MoE stream pool initialized: {} streams", n);
-            self.moe_streams = Some(pool);
-        }
-        self.moe_streams.as_ref().unwrap()
     }
 
     fn alloc_u32(n: usize) -> Self::Buffer {
