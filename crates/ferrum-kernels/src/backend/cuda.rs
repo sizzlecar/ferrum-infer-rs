@@ -2609,16 +2609,19 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "triton-kernels"))]
         let mw: &crate::marlin::MarlinWeight = weight;
 
-        // Pull stream pool (lazy-init on first call). Clone Arcs to avoid
-        // borrow conflicts (mw and output need mutable access via the
-        // marlin function).
-        let pool: Vec<Arc<CudaStream>> = ctx.moe_stream_pool().to_vec();
-        let n_streams = pool.len();
+        // n_streams=1: serial dispatch on the DEFAULT context stream
+        // (avoids the cross-stream sync overhead and matches the
+        // pre-multi-stream path bit-for-bit).
+        let n_streams = std::env::var("FERRUM_MOE_STREAMS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
         if n_streams == 1 {
-            // No multi-stream win possible — serial fast path.
+            let default_stream = ctx.stream.clone();
             for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
                 crate::marlin::marlin_gemm_with_offset_strided(
-                    &pool[0],
+                    &default_stream,
                     input,
                     *in_row_offset as i32,
                     mw,
@@ -2630,13 +2633,36 @@ impl Backend for CudaBackend {
                 )
                 .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
             }
+            let _ = k;
             return Ok(());
         }
 
-        // Round-robin dispatches across stream pool. Each Marlin call
-        // owns disjoint workspace mutex slots (per-expert range), the
-        // input buffer is read-only, and outputs are written to
-        // disjoint rows — concurrent execution is race-free.
+        // n_streams ≥ 2: round-robin across the pool, then ALL streams
+        // wait for the default's prior work (cuStreamWaitEvent on an
+        // event recorded into default), and the default waits for ALL
+        // pool streams before returning. Without this cross-stream
+        // sync, silu_mul on default may run before pool GEMMs commit
+        // → races → junk output.
+        let pool: Vec<Arc<CudaStream>> = ctx.moe_stream_pool().to_vec();
+        let default_stream = ctx.stream.clone();
+        // Default → pool: emit a sync event on default so each pool
+        // stream waits for default's prior work (input buffer writes,
+        // workspace zero memset). Done via a cudaEvent.
+        use cudarc::driver::sys as cu;
+        let mut entry_event: cu::CUevent = std::ptr::null_mut();
+        unsafe {
+            cu::cuEventCreate(&mut entry_event, cu::CUevent_flags::CU_EVENT_DISABLE_TIMING.0);
+            cu::cuEventRecord(entry_event, default_stream.cu_stream());
+        }
+        for stream in &pool {
+            unsafe {
+                cu::cuStreamWaitEvent(stream.cu_stream(), entry_event, 0);
+            }
+        }
+        unsafe {
+            cu::cuEventDestroy_v2(entry_event);
+        }
+
         for (i, (expert_idx, in_row_offset, out_row_offset, m)) in
             dispatches.iter().enumerate()
         {
@@ -2655,14 +2681,28 @@ impl Backend for CudaBackend {
             .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
         }
 
-        // Sync all pool streams to the default before returning.
-        // This ensures subsequent ops on the default stream see all
-        // GEMM results. Lighter than cudaDeviceSynchronize.
-        let _ = k; // unused (Marlin reads k from weight.k)
+        // pool → default: each pool stream records an event after its
+        // GEMMs; default waits for all events. After return, default
+        // stream's next op (silu) will see all GEMM outputs.
+        let _ = k;
+        let mut exit_events: Vec<cu::CUevent> = Vec::with_capacity(pool.len());
         for stream in &pool {
-            stream
-                .synchronize()
-                .map_err(|e| FerrumError::model(format!("moe stream sync: {e}")))?;
+            let mut ev: cu::CUevent = std::ptr::null_mut();
+            unsafe {
+                cu::cuEventCreate(&mut ev, cu::CUevent_flags::CU_EVENT_DISABLE_TIMING.0);
+                cu::cuEventRecord(ev, stream.cu_stream());
+            }
+            exit_events.push(ev);
+        }
+        for ev in &exit_events {
+            unsafe {
+                cu::cuStreamWaitEvent(default_stream.cu_stream(), *ev, 0);
+            }
+        }
+        for ev in exit_events {
+            unsafe {
+                cu::cuEventDestroy_v2(ev);
+            }
         }
         Ok(())
     }
