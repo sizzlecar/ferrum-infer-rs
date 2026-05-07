@@ -1635,6 +1635,96 @@ pub trait Backend: Send + Sync + Sized + 'static {
         *dst = Self::from_slice(&dst_v);
     }
 
+    /// Variant of [`Backend::gemm_gptq_with_offset`] that also takes
+    /// row-offsets into the input and output buffers. Lets the bucketed
+    /// MoE dispatcher run an expert's column-slice GEMM against a
+    /// sub-range of the packed input/output buffers without needing a
+    /// buffer-view type.
+    ///
+    /// Default impl returns Err so backends without MoE batched dispatch
+    /// don't have to implement.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_gptq_with_offset_strided(
+        _ctx: &mut Self::Context,
+        _input: &Self::Buffer,
+        _in_row_offset: usize,
+        _weight: &Self::GptqStore,
+        _expert_offset: usize,
+        _expert_n: usize,
+        _output: &mut Self::Buffer,
+        _out_row_offset: usize,
+        _m: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "gemm_gptq_with_offset_strided not implemented for this backend",
+        ))
+    }
+
+    /// Strided variant of [`Backend::fused_silu_mul_split`] for the
+    /// bucketed MoE path: reads `gate_up` rows starting at
+    /// `in_row_offset`, writes `out` rows starting at `out_row_offset`.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_silu_mul_split_strided(
+        _ctx: &mut Self::Context,
+        _gate_up: &Self::Buffer,
+        _in_row_offset: usize,
+        _out: &mut Self::Buffer,
+        _out_row_offset: usize,
+        _tokens: usize,
+        _intermediate: usize,
+    ) {
+        unimplemented!("fused_silu_mul_split_strided default impl missing");
+    }
+
+    /// MoE combine: per-token weighted sum across `top_k` expert outputs.
+    ///
+    /// After the bucketed dispatch, `packed_down` holds `[total_pairs,
+    /// hidden]` with one row per (token, k_slot) pair in expert-bucketed
+    /// order. `pairs_by_token[b * top_k + k]` is the inverse map: which
+    /// row of `packed_down` carries the (b, k_slot) contribution. A row
+    /// index of `-1` means "skip" (unused slot).
+    ///
+    /// Computes:
+    ///
+    /// ```text
+    /// out[b, h] = sum_k pair_weights[b * top_k + k] *
+    ///                   packed_down[pairs_by_token[b * top_k + k], h]
+    /// ```
+    ///
+    /// Default impl round-trips via host memory — correct but slow.
+    /// CUDA backend launches a single fused kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_combine(
+        _ctx: &mut Self::Context,
+        packed_down: &Self::Buffer,
+        pairs_by_token: &[i32],
+        pair_weights: &[f32],
+        out: &mut Self::Buffer,
+        batch: usize,
+        hidden: usize,
+        top_k: usize,
+        total_pairs: usize,
+    ) {
+        let packed = Self::to_vec(packed_down, total_pairs * hidden);
+        let mut out_h = vec![0.0f32; batch * hidden];
+        for b in 0..batch {
+            for k in 0..top_k {
+                let pair_row = pairs_by_token[b * top_k + k];
+                if pair_row < 0 {
+                    continue;
+                }
+                let w = pair_weights[b * top_k + k];
+                let src = &packed[(pair_row as usize) * hidden..(pair_row as usize + 1) * hidden];
+                let dst = &mut out_h[b * hidden..(b + 1) * hidden];
+                for h in 0..hidden {
+                    dst[h] += w * src[h];
+                }
+            }
+        }
+        *out = Self::from_slice(&out_h);
+    }
+
     /// Broadcast bias add: `data[r, c] += bias[c]` for every row.
     /// Required by Bert / Clip / Whisper whose linear projections carry a bias.
     fn add_bias(

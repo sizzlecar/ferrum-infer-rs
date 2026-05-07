@@ -1918,6 +1918,142 @@ impl Backend for CudaBackend {
         .expect("add_inplace (residual_add_inplace) launch");
     }
 
+    #[cfg(feature = "marlin")]
+    fn gemm_gptq_with_offset_strided(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        in_row_offset: usize,
+        weight: &Self::GptqStore,
+        expert_offset: usize,
+        expert_n: usize,
+        output: &mut Self::Buffer,
+        out_row_offset: usize,
+        m: usize,
+        _k: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "gemm_gptq_with_offset_strided: Triton w4a16 store has no \
+                     stride-aware variant; load MoE via Marlin (default)",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+        let stream = ctx.stream.clone();
+        crate::marlin::marlin_gemm_with_offset_strided(
+            &stream,
+            input,
+            in_row_offset as i32,
+            mw,
+            output,
+            out_row_offset as i32,
+            m as i32,
+            expert_offset as i32,
+            expert_n as i32,
+        )
+        .map_err(|e| FerrumError::model(format!("marlin offset_strided gemm: {e}")))
+    }
+
+    fn fused_silu_mul_split_strided(
+        ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        in_row_offset: usize,
+        out: &mut Self::Buffer,
+        out_row_offset: usize,
+        tokens: usize,
+        intermediate: usize,
+    ) {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        // Same kernel as `fused_silu_mul_split`, but feed it adjusted
+        // device pointers so it operates on a row-range slice.
+        let func = ctx.func(
+            "fused_silu_mul",
+            ptx::FUSED_SILU_MUL,
+            "fused_silu_mul_interleaved_f16",
+        );
+        let im_i32 = intermediate as i32;
+        let total = tokens * intermediate;
+        let total_i32 = total as i32;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+
+        let stream = ctx.stream.clone();
+        let in_byte_off = in_row_offset * 2 * intermediate * std::mem::size_of::<half::f16>();
+        let out_byte_off = out_row_offset * intermediate * std::mem::size_of::<half::f16>();
+
+        let (gu_base, _g) = gate_up.device_ptr(&stream);
+        let (out_base, _g2) = out.device_ptr_mut(&stream);
+        let gu_ptr = gu_base + in_byte_off as u64;
+        let out_ptr = out_base + out_byte_off as u64;
+
+        let mut b = stream.launch_builder(&func);
+        b.arg(&gu_ptr);
+        b.arg(&out_ptr);
+        b.arg(&im_i32);
+        b.arg(&total_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("fused_silu_mul_split_strided launch");
+    }
+
+    fn moe_combine(
+        ctx: &mut Self::Context,
+        packed_down: &Self::Buffer,
+        pairs_by_token: &[i32],
+        pair_weights: &[f32],
+        out: &mut Self::Buffer,
+        batch: usize,
+        hidden: usize,
+        top_k: usize,
+        _total_pairs: usize,
+    ) {
+        debug_assert_eq!(pairs_by_token.len(), batch * top_k);
+        debug_assert_eq!(pair_weights.len(), batch * top_k);
+
+        let stream = ctx.stream.clone();
+        let pairs_dev = stream
+            .clone_htod(pairs_by_token)
+            .expect("moe_combine pairs htod");
+        let weights_dev = stream
+            .clone_htod(pair_weights)
+            .expect("moe_combine weights htod");
+
+        let func = ctx.func("moe_combine", ptx::MOE_COMBINE, "moe_combine_f16");
+        let batch_i32 = batch as i32;
+        let hidden_i32 = hidden as i32;
+        let top_k_i32 = top_k as i32;
+
+        let block = 256u32;
+        let grid_x = ((hidden as u32) + block - 1) / block;
+
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(packed_down);
+        b.arg(&pairs_dev);
+        b.arg(&weights_dev);
+        b.arg(out);
+        b.arg(&batch_i32);
+        b.arg(&hidden_i32);
+        b.arg(&top_k_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid_x, batch as u32, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("moe_combine launch");
+    }
+
     fn add_bias(
         ctx: &mut Self::Context,
         data: &mut Self::Buffer,

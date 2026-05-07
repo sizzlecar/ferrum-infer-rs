@@ -633,6 +633,8 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 gate_stacked: None,
                 up_stacked: None,
                 down_stacked: None,
+                gate_up_gptq_stacked: Some(gate_up_arc),
+                down_gptq_stacked: Some(down_arc),
             };
             moe_layers.push(Qwen3MoeLayerState { router, experts });
 

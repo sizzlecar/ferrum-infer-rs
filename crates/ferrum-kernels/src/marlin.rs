@@ -259,6 +259,122 @@ pub fn marlin_gemm_with_offset(
     ))
 }
 
+/// Same as [`marlin_gemm_with_offset`] but also strides the input and
+/// output buffers by row offsets. Used by the bucketed MoE dispatcher
+/// to run a single expert's column-slice GEMM against a sub-range of
+/// the packed input/output buffer without needing a buffer-view type.
+///
+/// `in_row_offset` rows of `K` f16 elements at the start of `input`
+/// are skipped; `out_row_offset` rows of `expert_n` f16 elements at
+/// the start of `output` are skipped.
+#[cfg(feature = "marlin")]
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_with_offset_strided(
+    stream: &Arc<CudaStream>,
+    input: &CudaSlice<half::f16>,
+    in_row_offset: i32,
+    weight: &MarlinWeight,
+    output: &mut CudaSlice<half::f16>,
+    out_row_offset: i32,
+    m: i32,
+    expert_offset: i32,
+    expert_n: i32,
+) -> candle_core::Result<()> {
+    use cudarc::driver::DevicePtr;
+    let n = expert_n;
+    let k = weight.k as i32;
+    if expert_offset < 0 || expert_n <= 0 || expert_offset + expert_n > weight.n as i32 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin offset out of range: offset={expert_offset} n={expert_n} stacked_n={}",
+            weight.n
+        )));
+    }
+    let raw_stream = stream.cu_stream();
+
+    let ws_blocks = (expert_n / 128) as usize;
+    let ws_offset_bytes = ((expert_offset / 128) as usize) * std::mem::size_of::<i32>();
+    {
+        let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(
+                ws_ptr + ws_offset_bytes as u64,
+                0,
+                ws_blocks,
+                raw_stream,
+            );
+        }
+    }
+
+    let qw_bytes_per_col = (weight.qweight.len() * 4) / weight.n;
+    let qw_offset_bytes = expert_offset as usize * qw_bytes_per_col;
+
+    let scales_per_col = weight.scales.len() / weight.n;
+    let scales_offset_bytes =
+        expert_offset as usize * scales_per_col * std::mem::size_of::<half::f16>();
+
+    let in_offset_bytes =
+        in_row_offset as usize * (k as usize) * std::mem::size_of::<half::f16>();
+    let out_offset_bytes =
+        out_row_offset as usize * (n as usize) * std::mem::size_of::<half::f16>();
+
+    let (a_ptr, _a_guard) = input.device_ptr(stream);
+    let (b_ptr_full, _b_guard) = weight.qweight.device_ptr(stream);
+    let (c_ptr, _c_guard) = output.device_ptr(stream);
+    let (s_ptr_full, _s_guard) = weight.scales.device_ptr(stream);
+    let (ws_ptr_full, _ws_guard) = weight.workspace.device_ptr(stream);
+    let a_ptr_off = a_ptr + in_offset_bytes as u64;
+    let b_ptr = b_ptr_full + qw_offset_bytes as u64;
+    let c_ptr_off = c_ptr + out_offset_bytes as u64;
+    let s_ptr = s_ptr_full + scales_offset_bytes as u64;
+    let ws_ptr = ws_ptr_full + ws_offset_bytes as u64;
+
+    let ret = unsafe {
+        marlin_cuda(
+            a_ptr_off as *const _,
+            b_ptr as *const _,
+            c_ptr_off as *mut _,
+            s_ptr as *const _,
+            m,
+            n,
+            k,
+            ws_ptr as *mut _,
+            weight.group_size,
+            0,
+            raw_stream,
+            -1,
+            -1,
+            -1,
+            16,
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin_cuda (offset_strided) failed ret={ret} m={m} n={n} k={k} \
+             expert_offset={expert_offset} in_row_offset={in_row_offset} \
+             out_row_offset={out_row_offset}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "marlin"))]
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_with_offset_strided(
+    _stream: &Arc<CudaStream>,
+    _input: &CudaSlice<half::f16>,
+    _in_row_offset: i32,
+    _weight: &MarlinWeight,
+    _output: &mut CudaSlice<half::f16>,
+    _out_row_offset: i32,
+    _m: i32,
+    _expert_offset: i32,
+    _expert_n: i32,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "Marlin kernel not available (compile with --features marlin)".into(),
+    ))
+}
+
 // ===================== Weight Repacking (GPTQ → Marlin) =====================
 
 /// Permute GPTQ INT4 qweight rows by `perm` (one-time, CPU work at load).
