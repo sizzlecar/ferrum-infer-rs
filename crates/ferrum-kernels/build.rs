@@ -128,6 +128,105 @@ fn main() {
     if env::var_os("CARGO_FEATURE_VLLM_MARLIN").is_some() {
         compile_vllm_marlin(&out_dir_clone);
     }
+
+    // vLLM moe_marlin_wna16 port (Stage 14). Vendored from
+    // vllm/csrc/moe/marlin_moe_wna16/ at v0.10.2. Single .cu file with
+    // many template instantiations via COMMON_GET_IF macros — compile
+    // time ~15-20 min on first build. Opt-in via `--features vllm-moe-marlin`.
+    if env::var_os("CARGO_FEATURE_VLLM_MOE_MARLIN").is_some() {
+        compile_vllm_moe_marlin(&out_dir_clone);
+    }
+}
+
+fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
+    let cu_files: &[&str] = &["kernels/vllm_marlin_moe/ops.cu"];
+    for f in cu_files {
+        println!("cargo:rerun-if-changed={f}");
+    }
+    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/kernel.h");
+    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/marlin_template.h");
+    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/vllm_torch_shim.h");
+    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/core/scalar_type.hpp");
+    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh");
+    println!(
+        "cargo:rerun-if-changed=kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh"
+    );
+    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h");
+
+    let cuda_root = cuda_root_from_env();
+    let nvcc = cuda_root
+        .as_ref()
+        .map(|r| r.join("bin").join("nvcc"))
+        .unwrap_or_else(|| PathBuf::from("nvcc"));
+    if !nvcc.exists() && cuda_root.is_some() {
+        eprintln!("nvcc not found at {nvcc:?}, skipping vllm-moe-marlin");
+        return;
+    }
+
+    let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
+
+    let mut object_files: Vec<PathBuf> = Vec::new();
+    for src in cu_files {
+        let stem = std::path::Path::new(src)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("cu filename");
+        let obj = out_dir.join(format!("vllm_moe_{stem}.o"));
+        eprintln!("[vllm-moe-marlin] compiling {src} -> {}", obj.display());
+
+        let status = std::process::Command::new(&nvcc)
+            .args(["-c", src, "-o"])
+            .arg(obj.to_str().unwrap())
+            .args([
+                &format!("-arch=sm_{compute_cap}"),
+                "-Ikernels/vllm_marlin_moe",
+                "-DMARLIN_NAMESPACE_NAME=marlin_moe_wna16",
+                "-std=c++17",
+                "-O3",
+                "--use_fast_math",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "-Xcompiler",
+                "-fPIC",
+                "--threads",
+                "0",
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("[vllm-moe-marlin] nvcc spawn failed for {src}: {e}"));
+        if !status.success() {
+            panic!(
+                "[vllm-moe-marlin] nvcc failed compiling {src}. \
+                 Disable with `--features vllm-moe-marlin` removed, \
+                 or fix CUDA setup."
+            );
+        }
+        object_files.push(obj);
+    }
+
+    let lib_file = out_dir.join("libvllm_moe_marlin.a");
+    let mut ar_args: Vec<String> = vec!["rcs".to_string(), lib_file.display().to_string()];
+    for o in &object_files {
+        ar_args.push(o.display().to_string());
+    }
+    let ar_status = std::process::Command::new("ar")
+        .args(&ar_args)
+        .status()
+        .unwrap_or_else(|e| panic!("[vllm-moe-marlin] ar spawn failed: {e}"));
+    if !ar_status.success() {
+        panic!("[vllm-moe-marlin] ar failed to bundle {lib_file:?}");
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=vllm_moe_marlin");
+    if let Some(ref cuda_root) = cuda_root {
+        let lib64 = cuda_root.join("lib64");
+        if lib64.exists() {
+            println!("cargo:rustc-link-search=native={}", lib64.display());
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    eprintln!("[vllm-moe-marlin] static lib built: {}", lib_file.display());
 }
 
 fn compile_vllm_marlin(out_dir: &PathBuf) {
