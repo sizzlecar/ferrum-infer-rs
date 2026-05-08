@@ -184,7 +184,7 @@ ferrum c=32 → 160.1 tok/s  (TPOT 178.45 ms)   ratio vs vLLM = 8.5%
 Most of the win came from sort (~2.2 ms GEMM time saved); cuEvents on
 their own contributed <1 ms (the `cuEvent*` driver calls are sub-µs each).
 
-## Cumulative session summary (Stages 1 → 7)
+## Cumulative session summary (Stages 1 → 9)
 
 Profile-mode (FERRUM_DECODE_OP_PROFILE=1, the breakdown above):
 
@@ -193,22 +193,24 @@ Profile-mode (FERRUM_DECODE_OP_PROFILE=1, the breakdown above):
 | 0 baseline (per-pair fallback)             | 9.4   | 203.4 ms | —       | —        |
 | 1-5 stacked Marlin + bucketed + multi-stream | 137.1 | 204.4 ms | +14.6×  | ~0       |
 | 6 alloc-free route + plan                  | 148.0 | 194.7 ms | +1.08×  | -10 ms   |
-| 7 cuEvent cache + dispatch sort            | **160.1** | **178.5 ms** | +1.08×  | -16 ms   |
+| 7 cuEvent cache + dispatch sort            | 160.1 | 178.5 ms | +1.08×  | -16 ms   |
+| 8 GPU-side route_topk_softmax              | (profile-only)  | (profile-only)   | —      | —        |
+| 9 paged-KV CUDA + KV_MAX_BLOCKS=4096       | **267.7 (clean)** | **110.1 ms (clean)** | +1.55× over 8 | -58 ms |
 
 **Production (no FERRUM_DECODE_OP_PROFILE — what users actually see)**:
 
-| c    | Stage 5 baseline | Stage 8 (this session) | Δ tok/s | vs vLLM |
-|------|------------------|------------------------|---------|---------|
-| 1    | 65.5             | **73.0**               | +11.5%  | 73.0  / 161.5  = 45.2% |
-| 8    | 118.0            | **136.1**              | +15.3%  | 136.1 / 413.1  = 32.9% |
-| 16   | 132.1            | **158.9**              | +20.3%  | 158.9 / 505.0  = 31.5% |
-| 32   | 137.1            | **172.7**              | +25.9%  | 172.7 / 1872.9 = 9.2%  |
+| c    | Stage 5 baseline | Stage 9 final | Δ tok/s | vs vLLM |
+|------|------------------|---------------|---------|---------|
+| 1    | 65.5             | **75.4**      | +15.1%  | 75.4  / 161.5  = 46.7% |
+| 8    | 118.0            | **178.1**     | +50.9%  | 178.1 / 413.1  = 43.1% |
+| 16   | 132.1            | **235.5**     | +78.3%  | 235.5 / 505.0  = 46.6% |
+| 32   | 137.1            | **267.7**     | +95.3%  | 267.7 / 1872.9 = 14.3% |
 
-Format: tok/s aggregate. Mean TPOTs at c=32 went 204.4 → 168.1 ms.
+Format: tok/s aggregate. Mean TPOTs at c=32 went 204.4 → 110.1 ms — halved.
 
-Total session: **9.4 → 172.7 tok/s at c=32 (18.4× over per-pair baseline,
-+25.9% over Stage 5 stacked-Marlin baseline)**. vLLM remains 10.8× ahead
-at 1873 tok/s — the gap is now firmly in the Marlin-GEMM-throughput
+Total session: **9.4 → 267.7 tok/s at c=32 (28.5× over per-pair baseline,
++95% over Stage 5 stacked-Marlin baseline)**. vLLM ratio improved
+7.3% → 14.3% at c=32. The gap is now firmly in the Marlin-GEMM-throughput
 regime; ~27 ms of every decode token is real Marlin compute.
 
 ## Stage 8 — GPU-side route_topk_softmax (CUDA)  ★ +6.2% at c=32
@@ -314,30 +316,51 @@ point was the gap.
    stream-ordered free / kernel race that was triggering
    `CUDA_ERROR_ILLEGAL_ADDRESS` mid-bench.
 
-**Production results (no FERRUM_DECODE_OP_PROFILE)**:
+**Production sweep (no FERRUM_DECODE_OP_PROFILE)**:
 
-| c    | paged_off | paged_on  | Δ tok/s | Stage 8 (no paged) | Δ vs S8 |
-|------|-----------|-----------|---------|---------------------|---------|
-| 16   | 154.8     | **230.1** | **+49%** | 158.9               | **+45%** |
-| 32   | 164.5     | (incomplete — see below) | — | 172.7 | — |
+| c    | Stage 5 baseline | Stage 8 (paged_off) | **Stage 9 (paged_on + blocks=4096)** | Δ from baseline | vs vLLM |
+|------|------------------|---------------------|--------------------------------------|-----------------|---------|
+| 1    | 65.5             | 73.0                | **75.4**                             | +15.1%          | 75.4 / 161.5  = 46.7% |
+| 8    | 118.0            | 136.1               | **178.1**                            | +50.9%          | 178.1 / 413.1 = 43.1% |
+| 16   | 132.1            | 158.9               | **235.5**                            | **+78.3%**      | 235.5 / 505.0 = 46.6% |
+| 32   | 137.1            | 172.7               | **267.7**                            | **+95.3%**      | 267.7 / 1872.9 = **14.3%** |
 
-vLLM ratio at c=16: 230.1 / 505.0 = **45.6%** (was 31.5% at Stage 8).
+vLLM ratio at c=32: **14.3%** (was 9.2% at Stage 8, 7.3% baseline). Mean
+TPOT at c=32: 204.4 → 168.1 → **110.1 ms** — halved from baseline.
 
-Mean TPOT at c=16: 91.75 → **63.36 ms** (-31%).
+### The c=32 OOB resolution
 
-**Known issue at c=32**: bench hangs at 96/128 prompts (75%) with
-`CUDA_ERROR_ILLEGAL_ADDRESS` from a `B::sync(ctx)` after some kernel.
-Pattern reproduces across re-runs (bench_v6 + v7). Hypothesis: pool
-block exhaustion or pos_offset edge case beyond a certain decode
-count. The cached scratch fix (commit 6558fd2) eliminated one race
-but the underlying issue remains. **Workaround**: keep
-`FERRUM_METAL_PAGED_KV=0` for c≥32 deployments until the c=32 bug
-is debugged separately.
+Stage 9's first ship (commit c846732) hit `CUDA_ERROR_ILLEGAL_ADDRESS`
+at c=32 / 128 prompts and was documented as a known issue. The
+diagnostic sweep (`m3_paged_c32_diag.sh`, 4 configs varying pool size
+× concurrency × prompt count) found:
 
-For Qwen3MoE under CUDA, the M3 production config now becomes:
+| config                     | result          |
+|----------------------------|-----------------|
+| c=32 blocks=2048 n=128     | hang at 75%     |
+| c=32 blocks=2048 n=64      | 270.3 tok/s ✓   |
+| c=24 blocks=2048 n=128     | 233.3 tok/s ✓   |
+| c=32 blocks=4096 n=128     | **259.0 tok/s ✓** ★ |
+| c=32 blocks=8192 n=128     | 257.2 tok/s ✓ (no extra benefit) |
+
+**Root cause**: the engine's `kv_cache.max_blocks` (set via
+`FERRUM_KV_MAX_BLOCKS`) was 2048 but the model's actual paged pool is
+`max_seqs * max_blocks_per_seq = 32 × 128 = 4096`. The scheduling
+budget was half the actual pool, leading to scheduler/pool drift that
+triggered the illegal access at high concurrency over many prompts.
+
+**Fix**: `FERRUM_KV_MAX_BLOCKS=4096`. Production config (commit 338b0e0):
+
 ```
-FERRUM_METAL_PAGED_KV=1   # safe at c≤16, +45% throughput
-FERRUM_METAL_PAGED_KV=0   # required at c≥32 until bug fixed
+FERRUM_KV_CAPACITY=2048
+FERRUM_KV_MAX_BLOCKS=4096        # was 2048; must match max_seqs × (capacity / 16)
+FERRUM_PAGED_MAX_SEQS=32
+FERRUM_METAL_PAGED_KV=1          # NOW SAFE at all c=1/8/16/32
+FERRUM_MIXED_BATCH=0
+FERRUM_GREEDY_ARGMAX=1
+FERRUM_MOE_BUCKETED=1
+FERRUM_MARLIN_SKIP_WS_ZERO=1
+FERRUM_MOE_STREAMS=4
 ```
 
 ## Failed experiments (don't re-try without code changes)
@@ -405,7 +428,7 @@ ea6637a perf(moe): multi-stream MoE GEMM dispatch — round-robin pool          
 d7d8e98 fix(moe): cross-stream sync for multi-stream MoE GEMM dispatch
 40c2cf1 fix(cuda): cuEventCreate flag is u32, not enum tuple variant
 
-# Stages 6-9 (137 → 172.7 c=32 / 230.1 c=16 tok/s):
+# Stages 6-9 (137.1 → 267.7 tok/s c=32 — +95% over baseline, 14.3% of vLLM):
 8d0f7dc perf(moe): per-phase profile counters for bucketed MoE forward
 d7c4fe1 bench(m3): phase-profile script for c=32 bucketed MoE breakdown
 652832c perf(moe): allocation-free route() + bucket plan reuse — saves ~10ms/token  ★ KEY
@@ -418,6 +441,8 @@ dad3da9 feat(cuda): paged_decode_attention dispatches q_len>1 prefill via paged_
 ea808df feat(cuda-paged): paged_decode_attention wrapper with prefill transposes
 bad2438 fix(cuda-paged): drop Q transpose — split_qkv_norm_rope writes Q token-major already  ★ KEY
 6558fd2 fix(cuda-paged): cache out_token_major scratch on CudaState
+0286a27 bench(m3): paged-KV c=32 OOB diagnostic — pool size × concurrency × prompt count
+338b0e0 fix(bench/m3): paged_on + KV_MAX_BLOCKS=4096 — closes Stage 9 c=32 OOB  ★ KEY
 ```
 
 Earlier exploration commits (debugged the offset-GEMM stride bug):
