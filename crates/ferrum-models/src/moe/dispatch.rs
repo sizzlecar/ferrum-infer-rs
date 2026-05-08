@@ -51,6 +51,19 @@ pub static MOE_COPY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MOE_HOST_TOPK_US: AtomicU64 = AtomicU64::new(0);
 pub static MOE_HOST_TOPK_CALLS: AtomicU64 = AtomicU64::new(0);
 
+// Bucketed-path per-phase timers. Drained by the model wrapper alongside
+// the per-pair counters above. Same `FERRUM_MOE_PROFILE=1` gate.
+pub static MOE_BUCKET_SYNC_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_D2H_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_ROUTE_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_PLAN_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_GATHER_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_GEMM1_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_SILU_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_GEMM3_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_COMBINE_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
+
 fn moe_profile_enabled() -> bool {
     std::env::var("FERRUM_MOE_PROFILE").is_ok()
 }
@@ -745,18 +758,48 @@ pub fn moe_forward_bucketed<B: Backend>(
         )));
     }
 
+    // Bucket profiling fires on either FERRUM_MOE_PROFILE=1 (legacy)
+    // or FERRUM_DECODE_OP_PROFILE=1 (the gate the print site uses).
+    let prof = moe_profile_enabled() || std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+    if prof {
+        MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
     // ── Routing on host (same as moe_forward) ──────────────────────────
+    let t_sync = if prof { Some(std::time::Instant::now()) } else { None };
     B::sync(ctx);
+    if let Some(t) = t_sync {
+        MOE_BUCKET_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    let t_d2h = if prof { Some(std::time::Instant::now()) } else { None };
     let logits_host = B::to_vec(router_logits, batch * num_experts);
+    if let Some(t) = t_d2h {
+        MOE_BUCKET_D2H_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    let t_route = if prof { Some(std::time::Instant::now()) } else { None };
     let route_out =
         crate::moe::router::route(&logits_host, batch, num_experts, top_k, norm_topk_prob);
+    if let Some(t) = t_route {
+        MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 
     // ── Build bucket plan host-side ────────────────────────────────────
+    let t_plan = if prof { Some(std::time::Instant::now()) } else { None };
     let plan = MoeBucketPlan::build(&route_out, batch, num_experts, top_k);
+    if let Some(t) = t_plan {
+        MOE_BUCKET_PLAN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 
     // ── Gather: x_packed[i] = x[plan.packed_token_idx[i]] ──────────────
     // embedding_lookup is byte-for-byte the gather we need.
+    let t_gather = if prof { Some(std::time::Instant::now()) } else { None };
     B::embedding_lookup(ctx, x, &plan.packed_token_idx, x_packed, hidden_size);
+    if let Some(t) = t_gather {
+        B::sync(ctx);
+        MOE_BUCKET_GATHER_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 
     // ── Per-expert dispatch: gate_up + down GEMMs at m=tokens_per_expert
     //
@@ -789,6 +832,7 @@ pub fn moe_forward_bucketed<B: Backend>(
         let pair_off = plan.expert_offsets[e];
         phase1_dispatches.push((e, pair_off, pair_off, m_e));
     }
+    let t_gemm1 = if prof { Some(std::time::Instant::now()) } else { None };
     B::moe_gemm_phase_batched(
         ctx,
         x_packed,
@@ -798,6 +842,10 @@ pub fn moe_forward_bucketed<B: Backend>(
         gate_up_packed,
         hidden_size,
     )?;
+    if let Some(t) = t_gemm1 {
+        B::sync(ctx);
+        MOE_BUCKET_GEMM1_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 
     // Phase 2: SiLU(gate) * up — single launch covering ALL active
     // expert rows in the packed buffer. The unused rows (zeros from
@@ -805,6 +853,7 @@ pub fn moe_forward_bucketed<B: Backend>(
     // ignores via pairs_by_token. Saves num_active_experts-1 launches
     // per layer.
     let total_pairs_active = batch * top_k;
+    let t_silu = if prof { Some(std::time::Instant::now()) } else { None };
     B::fused_silu_mul_split(
         ctx,
         gate_up_packed,
@@ -812,6 +861,10 @@ pub fn moe_forward_bucketed<B: Backend>(
         total_pairs_active,
         expert_intermediate,
     );
+    if let Some(t) = t_silu {
+        B::sync(ctx);
+        MOE_BUCKET_SILU_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 
     // Phase 3: down GEMM per active expert. Multi-stream batched.
     let d_store = experts.down_stacked_store(0).ok_or_else(|| {
@@ -831,6 +884,7 @@ pub fn moe_forward_bucketed<B: Backend>(
         let pair_off = plan.expert_offsets[e];
         phase3_dispatches.push((e, pair_off, pair_off, m_e));
     }
+    let t_gemm3 = if prof { Some(std::time::Instant::now()) } else { None };
     B::moe_gemm_phase_batched(
         ctx,
         silu_packed,
@@ -840,9 +894,14 @@ pub fn moe_forward_bucketed<B: Backend>(
         down_packed,
         expert_intermediate,
     )?;
+    if let Some(t) = t_gemm3 {
+        B::sync(ctx);
+        MOE_BUCKET_GEMM3_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 
     // ── Combine: out[b, h] = Σ_k weights[b,k] * down_packed[pairs_by_token[b,k], h]
     let total_pairs = batch * top_k;
+    let t_comb = if prof { Some(std::time::Instant::now()) } else { None };
     B::moe_combine(
         ctx,
         down_packed,
@@ -854,6 +913,10 @@ pub fn moe_forward_bucketed<B: Backend>(
         top_k,
         total_pairs,
     );
+    if let Some(t) = t_comb {
+        B::sync(ctx);
+        MOE_BUCKET_COMBINE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 
     Ok(())
 }

@@ -1747,6 +1747,28 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 sa_us / 1000, sa_n,
                 cp_us / 1000, cp_n,
             );
+
+            // Bucketed CUDA MoE per-phase breakdown (CUDA M3 path).
+            let bk_layers = MOE_BUCKET_LAYER_CALLS.swap(0, Ordering::Relaxed);
+            if bk_layers > 0 {
+                let bk_sync = MOE_BUCKET_SYNC_US.swap(0, Ordering::Relaxed);
+                let bk_d2h = MOE_BUCKET_D2H_US.swap(0, Ordering::Relaxed);
+                let bk_route = MOE_BUCKET_ROUTE_US.swap(0, Ordering::Relaxed);
+                let bk_plan = MOE_BUCKET_PLAN_US.swap(0, Ordering::Relaxed);
+                let bk_gather = MOE_BUCKET_GATHER_US.swap(0, Ordering::Relaxed);
+                let bk_g1 = MOE_BUCKET_GEMM1_US.swap(0, Ordering::Relaxed);
+                let bk_silu_us = MOE_BUCKET_SILU_US.swap(0, Ordering::Relaxed);
+                let bk_g3 = MOE_BUCKET_GEMM3_US.swap(0, Ordering::Relaxed);
+                let bk_comb = MOE_BUCKET_COMBINE_US.swap(0, Ordering::Relaxed);
+                let bk_total = bk_sync + bk_d2h + bk_route + bk_plan + bk_gather
+                    + bk_g1 + bk_silu_us + bk_g3 + bk_comb;
+                eprintln!(
+                    "[bucket-prof] layers={} bk_total={} ms | sync={} d2h={} host_route={} plan={} gather={} gemm1={} silu={} gemm3={} combine={} (us, summed across layers)",
+                    bk_layers, bk_total / 1000,
+                    bk_sync, bk_d2h, bk_route, bk_plan, bk_gather,
+                    bk_g1, bk_silu_us, bk_g3, bk_comb,
+                );
+            }
         }
 
         B::to_vec(&self.scratch.logits, vocab)
@@ -1865,6 +1887,30 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 moe_silu / 1000, moe_down / 1000, moe_wsum / 1000,
                 other / 1000, pct(other),
             );
+
+            // Bucketed CUDA MoE per-phase breakdown (FERRUM_MOE_PROFILE=1).
+            // Counters are summed across all layers in this decode step.
+            use crate::moe::dispatch::*;
+            let bk_layers = MOE_BUCKET_LAYER_CALLS.swap(0, Ordering::Relaxed);
+            if bk_layers > 0 {
+                let bk_sync = MOE_BUCKET_SYNC_US.swap(0, Ordering::Relaxed);
+                let bk_d2h = MOE_BUCKET_D2H_US.swap(0, Ordering::Relaxed);
+                let bk_route = MOE_BUCKET_ROUTE_US.swap(0, Ordering::Relaxed);
+                let bk_plan = MOE_BUCKET_PLAN_US.swap(0, Ordering::Relaxed);
+                let bk_gather = MOE_BUCKET_GATHER_US.swap(0, Ordering::Relaxed);
+                let bk_g1 = MOE_BUCKET_GEMM1_US.swap(0, Ordering::Relaxed);
+                let bk_silu = MOE_BUCKET_SILU_US.swap(0, Ordering::Relaxed);
+                let bk_g3 = MOE_BUCKET_GEMM3_US.swap(0, Ordering::Relaxed);
+                let bk_comb = MOE_BUCKET_COMBINE_US.swap(0, Ordering::Relaxed);
+                let bk_total = bk_sync + bk_d2h + bk_route + bk_plan + bk_gather
+                    + bk_g1 + bk_silu + bk_g3 + bk_comb;
+                eprintln!(
+                    "[bucket-prof] layers={} bk_total={} ms | sync={} d2h={} host_route={} plan={} gather={} gemm1={} silu={} gemm3={} combine={} (us, summed across layers)",
+                    bk_layers, bk_total / 1000,
+                    bk_sync, bk_d2h, bk_route, bk_plan, bk_gather,
+                    bk_g1, bk_silu, bk_g3, bk_comb,
+                );
+            }
         }
 
         (0..m)
