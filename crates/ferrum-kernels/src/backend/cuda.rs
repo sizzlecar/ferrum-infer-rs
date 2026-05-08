@@ -1543,26 +1543,24 @@ impl Backend for CudaBackend {
         let mut pos_offsets_buf = <Self as Backend>::alloc_u32(1);
         <Self as Backend>::write_u32(ctx, &mut pos_offsets_buf, &[pos_offset]);
 
-        // Q: [heads, q_len, hd] (head-major) → scratch [q_len, heads, hd]
-        // (token-major) for paged_varlen_attention.
+        // The caller's q buffer (despite being named `q_head_major` in
+        // Qwen3MoeModel) is ALREADY token-major in paged mode: the
+        // paged-write kernel split_qkv_norm_rope_into_paged_cache_f16
+        // writes `q_out[tok, head, hd]` (see kernel comment at
+        // kernels/split_qkv_norm_rope_into_paged_cache.cu:102). So
+        // paged_varlen_attention can read q directly. No Q transpose.
+        //
+        // Output, however, is written by paged_varlen as
+        // `[M_total, num_q_heads, head_dim]` token-major (kernel:16),
+        // while Qwen3MoeModel's downstream code does
+        // `transpose_head_to_token(attn_head_major_out → attn_flat)`,
+        // expecting head-major. We transpose token→head into `out`.
         let q_n = q_len * num_heads * head_dim;
-        let mut q_token_major = <Self as Backend>::alloc(q_n);
-        <Self as Backend>::transpose_head_to_token(
-            ctx,
-            q,
-            &mut q_token_major,
-            q_len,
-            num_heads,
-            head_dim,
-        );
-
-        // Output scratch: [q_len, heads, hd] token-major (varlen output
-        // shape). We transpose back into the caller's `out` after.
         let mut out_token_major = <Self as Backend>::alloc(q_n);
 
         Self::paged_varlen_attention(
             ctx,
-            &q_token_major,
+            q,
             k_pool,
             v_pool,
             &mut out_token_major,
