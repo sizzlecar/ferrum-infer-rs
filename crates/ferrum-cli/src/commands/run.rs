@@ -202,9 +202,25 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let device = select_device(&cmd.backend);
     eprintln!("{}", format!("Using {:?} backend", device).dimmed());
 
-    // Create engine
+    // Create engine. Big-model loads (15-60 GB safetensors) are slow on
+    // first run — print a hint so users don't think it's frozen. Per-
+    // layer INFO logs fire from the model loaders once parsing starts;
+    // utils::setup_logging whitelists them at INFO level.
+    eprintln!(
+        "{}",
+        "Loading weights to GPU... (30s+ for >10 GB models)".dimmed()
+    );
+    let load_start = std::time::Instant::now();
     let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
+    eprintln!(
+        "{}",
+        format!(
+            "Model loaded in {:.1}s.",
+            load_start.elapsed().as_secs_f64()
+        )
+        .dimmed()
+    );
 
     // Print ready message
     eprintln!();
