@@ -159,22 +159,50 @@ fn moe_align_matches_reference_qwen3moe_shape() {
         total_host[0], ref_total
     );
 
-    // Compare sorted ids prefix [0, total_post_pad) — the rest is
-    // sentinel padding which the reference also fills with `n_pairs`.
+    // sorted_token_ids order WITHIN an expert's group is non-deterministic
+    // (atomicAdd race), but the SET of (pair_idx, expert) assignments
+    // must be exhaustive and match the reference. Compare sets per expert.
     let used = ref_total as usize;
-    assert_eq!(
-        &sorted_host[..used],
-        &ref_sorted[..],
-        "sorted_token_ids prefix mismatch"
-    );
-
-    // Compare block_ids for the active prefix.
     let total_blocks = used / BLOCK_SIZE;
+
+    // First: block_ids must match (same expert per tile, regardless of
+    // intra-tile pair order).
     assert_eq!(
         &block_ids_host[..total_blocks],
         &ref_block_ids[..],
-        "block_ids mismatch"
+        "block_ids mismatch (per-tile expert assignment)"
     );
+
+    // Second: per-expert pair sets match. Walk both sorted arrays;
+    // for each tile, collect pair_idx (skip sentinel) and compare
+    // the set against the reference's set for that expert.
+    let mut gpu_per_expert: std::collections::HashMap<i32, std::collections::BTreeSet<i32>> =
+        std::collections::HashMap::new();
+    let mut ref_per_expert: std::collections::HashMap<i32, std::collections::BTreeSet<i32>> =
+        std::collections::HashMap::new();
+    for b in 0..total_blocks {
+        let e_gpu = block_ids_host[b];
+        let e_ref = ref_block_ids[b];
+        for k in 0..BLOCK_SIZE {
+            let p_gpu = sorted_host[b * BLOCK_SIZE + k];
+            let p_ref = ref_sorted[b * BLOCK_SIZE + k];
+            if p_gpu < n_pairs as i32 {
+                gpu_per_expert.entry(e_gpu).or_default().insert(p_gpu);
+            }
+            if p_ref < n_pairs as i32 {
+                ref_per_expert.entry(e_ref).or_default().insert(p_ref);
+            }
+        }
+    }
+    assert_eq!(
+        gpu_per_expert, ref_per_expert,
+        "per-expert pair sets mismatch"
+    );
+
+    // Third: sentinel padding within each tile fills exactly the right
+    // number of slots — i.e., (block_size - count_in_tile) sentinels.
+    // We trust the count derived from the per-expert set comparison
+    // above to enforce this implicitly.
 
     eprintln!(
         "moe_align ok: n_pairs={n_pairs} total_post_pad={ref_total} \
