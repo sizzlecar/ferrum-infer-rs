@@ -3392,16 +3392,12 @@ impl Backend for CudaBackend {
         use cudarc::driver::CudaSlice;
         use cudarc::driver::DevicePtr;
 
-        // Use persistent device-side buffers on ctx — single alloc per
-        // process (lazy + grow on shape change), then memcpy_htod into
-        // them per layer. Eliminates the per-layer alloc + leak that
-        // Stage 14a used.
+        // Clone stream FIRST (Arc clone, no borrow on ctx), then take
+        // &mut ctx to grow/get persistent routing buffers — keeps the
+        // borrow checker happy.
+        let stream = ctx.stream.clone();
         let cap = sorted_token_ids.len();
         let (st_dev, eid_dev, npp_dev) = ctx.vllm_moe_routing(cap);
-
-        // Async upload through the ctx stream. memcpy_htod is non-blocking
-        // and ordered with the subsequent kernel launch on the same stream.
-        let stream = ctx.stream.clone();
         stream
             .memcpy_htod(sorted_token_ids, st_dev)
             .map_err(|e| FerrumError::model(format!("htod sorted_token_ids: {e}")))?;
