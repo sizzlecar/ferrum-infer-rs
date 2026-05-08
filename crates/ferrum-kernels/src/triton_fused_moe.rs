@@ -34,6 +34,16 @@ pub const BN: i32 = 64;
 #[cfg_attr(not(feature = "triton-kernels"), allow(dead_code))]
 pub const BK: i32 = 32;
 
+/// PTX text for the kernel. Loaded via `cudarc::nvrtc::Ptx::from_src`.
+#[cfg(feature = "triton-kernels")]
+pub const FUSED_MOE_W4A16_PTX: &str = fused_moe_w4a16_f16_bm16::PTX;
+
+/// Kernel function name in the PTX module — must match `tt.func` name
+/// emitted by the DSL macro on `fused_moe_w4a16_typed`.
+pub fn fn_name() -> &'static str {
+    "fused_moe_w4a16_typed"
+}
+
 /// Stacked GPTQ INT4 weight in raw on-disk layout (no Marlin repack).
 /// Sized for `num_experts` experts of identical shape `(K, N)`.
 #[cfg(feature = "triton-kernels")]
@@ -79,10 +89,7 @@ pub fn load_stacked_gptq_raw(
         )));
     }
     let num_experts = qweights.len();
-    if num_experts == 0
-        || scales_f32.len() != num_experts
-        || qzeros.len() != num_experts
-    {
+    if num_experts == 0 || scales_f32.len() != num_experts || qzeros.len() != num_experts {
         return Err(candle_core::Error::Msg(format!(
             "TritonStackedGptqWeight: shape mismatch qw={} sc={} qz={}",
             num_experts,
@@ -127,8 +134,7 @@ pub fn load_stacked_gptq_raw(
     for qw in qweights {
         qw_flat.extend_from_slice(qw);
     }
-    let mut sc_flat_f16: Vec<half::f16> =
-        Vec::with_capacity(num_experts * sc_per);
+    let mut sc_flat_f16: Vec<half::f16> = Vec::with_capacity(num_experts * sc_per);
     for sc in scales_f32 {
         sc_flat_f16.extend(sc.iter().map(|&x| half::f16::from_f32(x)));
     }
