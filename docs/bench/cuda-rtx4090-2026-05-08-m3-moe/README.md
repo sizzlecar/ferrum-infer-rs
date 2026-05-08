@@ -258,6 +258,26 @@ Trait surgery: kept the existing Metal-targeted `route_topk_softmax`
 unchanged; added `try_gpu_route_topk_into_host` next to it. Default Err
 keeps non-CUDA backends on their current host paths.
 
+## Stream-pool size sweep (Stage 8, c=32)
+
+After Stage 8 (alloc-free route + cuEvents + sort + GPU route), we
+re-confirmed the s=4 optimum. The doc's earlier "s=4 = s=8" claim still
+holds — load is bandwidth-bound past 4 concurrent Marlin kernels:
+
+| s | tok/s | TPOT  | vs s=4 |
+|---|-------|-------|--------|
+| 1 | 133.7 | 212.76 ms | -21% |
+| 2 | 163.0 | 175.84 ms | -3.7% |
+| 4 | **169.3** | **171.45 ms** | baseline |
+| 8 | 167.3 | 173.55 ms | -1.2% |
+
+s=2 captures most of the parallelism (+22% over s=1); s=4 adds another
++3.9% vs s=2. s=8 regresses slightly — the extra cuEvent sync overhead
+outweighs the marginal SM-scheduling headroom. **Default stays at 4.**
+
+(Numbers slightly differ from Stage 8 clean bench's 172.7 tok/s — c=32
+runs vary ±3 tok/s between sessions on shared cloud GPUs.)
+
 ## Failed experiments (don't re-try without code changes)
 
 | Experiment | Outcome | Why it fails |
