@@ -728,6 +728,12 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
   // q_type = uint4b8 (GPTQ INT4 sym): hard-coded for our path.
   vllm::ScalarType const q_type = vllm::kU4B8;
   int num_groups = (group_size > 0) ? (prob_k / group_size) : 1;
+  // marlin_mm computes `blocks = sms * blocks_per_sm` — passing sms=-1
+  // gives a negative grid_dim and the kernel never launches. The vLLM
+  // torch wrapper detects sms via cudaDeviceGetAttribute first; replicate
+  // that here since our extern C entry point bypasses the wrapper.
+  int sms = -1;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   MARLIN_NAMESPACE_NAME::marlin_mm<half>(
       A, B, C, C_tmp,
       /*b_bias=*/nullptr,
@@ -750,7 +756,7 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
       /*is_k_full=*/true,
       /*has_zp=*/false,
       num_groups, group_size, dev, stream,
-      /*thread_k=*/-1, /*thread_n=*/-1, /*sms=*/-1,
+      /*thread_k=*/-1, /*thread_n=*/-1, sms,
       use_atomic_add != 0, use_fp32_reduce != 0,
       /*is_zp_float=*/false);
   // marlin_mm aborts on bad inputs; if we reach here the launch was issued.
