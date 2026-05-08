@@ -957,6 +957,57 @@ pub fn moe_forward_bucketed<B: Backend>(
     })?;
     let _ = B::marlin_zero_stacked_workspace(ctx, gu_store);
 
+    // Decide path: vLLM marlin_moe_wna16 fused or our per-expert bucketed
+    // GEMMs. The vLLM path needs (sorted_token_ids, expert_ids,
+    // num_tokens_past_padded) routing buffers — build them once on host
+    // from `plan.expert_offsets` and reuse across phase 1 and phase 3.
+    let use_vllm_moe = std::env::var("FERRUM_VLLM_MOE").map_or(false, |v| v == "1");
+    let total_pairs_active = batch * top_k;
+    const VLLM_MOE_BLOCK_SIZE: usize = 16;
+    let vllm_routing = if use_vllm_moe {
+        // total_padded = sum_e ceil(m_e / block) * block
+        let mut padded_offsets = Vec::with_capacity(num_experts + 1);
+        let mut acc = 0usize;
+        for e in 0..num_experts {
+            padded_offsets.push(acc);
+            let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
+            let pe = m_e.div_ceil(VLLM_MOE_BLOCK_SIZE) * VLLM_MOE_BLOCK_SIZE;
+            acc += pe;
+        }
+        padded_offsets.push(acc);
+        let total_padded = acc;
+        let total_blocks = total_padded / VLLM_MOE_BLOCK_SIZE;
+        let sentinel = total_pairs_active as i32;
+
+        let mut sorted_token_ids = vec![sentinel; total_padded];
+        let mut expert_ids = vec![0i32; total_blocks];
+        for e in 0..num_experts {
+            let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
+            if m_e == 0 {
+                continue;
+            }
+            let p_off = padded_offsets[e];
+            let real_off = plan.expert_offsets[e];
+            for i in 0..m_e {
+                sorted_token_ids[p_off + i] = (real_off + i) as i32;
+            }
+            let blocks_for_e = (padded_offsets[e + 1] - p_off) / VLLM_MOE_BLOCK_SIZE;
+            let block_start = p_off / VLLM_MOE_BLOCK_SIZE;
+            for b in 0..blocks_for_e {
+                expert_ids[block_start + b] = e as i32;
+            }
+        }
+        let num_tokens_past_padded = vec![total_padded as i32];
+        Some(B::upload_moe_routing(
+            ctx,
+            &sorted_token_ids,
+            &expert_ids,
+            &num_tokens_past_padded,
+        )?)
+    } else {
+        None
+    };
+
     // Build the dispatch list for phase 1. (expert_idx, in_row, out_row, m)
     // for each active expert. Send to the multi-stream batched dispatcher.
     //
@@ -982,15 +1033,36 @@ pub fn moe_forward_bucketed<B: Backend>(
     } else {
         None
     };
-    B::moe_gemm_phase_batched(
-        ctx,
-        x_packed,
-        gu_store,
-        &phase1_dispatches,
-        gate_up_dim_per_expert,
-        gate_up_packed,
-        hidden_size,
-    )?;
+    if let Some(routing) = &vllm_routing {
+        // fp32_reduce path: kernel writes C directly via global reduce,
+        // no caller-side zero needed (atomic_add fallback inside the
+        // wrapper would also self-zero under slice_count > 1 / slice_idx
+        // == 0; either way this is safe).
+        B::moe_gemm_phase_vllm(
+            ctx,
+            x_packed,
+            gu_store,
+            &routing.sorted_token_ids,
+            &routing.expert_ids,
+            &routing.num_tokens_past_padded,
+            gate_up_packed,
+            total_pairs_active,
+            gate_up_dim_per_expert,
+            hidden_size,
+            VLLM_MOE_BLOCK_SIZE,
+            1, // top_k=1: pre-gathered rows already index packed input directly
+        )?;
+    } else {
+        B::moe_gemm_phase_batched(
+            ctx,
+            x_packed,
+            gu_store,
+            &phase1_dispatches,
+            gate_up_dim_per_expert,
+            gate_up_packed,
+            hidden_size,
+        )?;
+    }
     if let Some(t) = t_gemm1 {
         B::sync(ctx);
         MOE_BUCKET_GEMM1_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1042,15 +1114,32 @@ pub fn moe_forward_bucketed<B: Backend>(
     } else {
         None
     };
-    B::moe_gemm_phase_batched(
-        ctx,
-        silu_packed,
-        d_store,
-        &phase3_dispatches,
-        down_n_per_expert,
-        down_packed,
-        expert_intermediate,
-    )?;
+    if let Some(routing) = &vllm_routing {
+        B::moe_gemm_phase_vllm(
+            ctx,
+            silu_packed,
+            d_store,
+            &routing.sorted_token_ids,
+            &routing.expert_ids,
+            &routing.num_tokens_past_padded,
+            down_packed,
+            total_pairs_active,
+            down_n_per_expert,
+            expert_intermediate,
+            VLLM_MOE_BLOCK_SIZE,
+            1,
+        )?;
+    } else {
+        B::moe_gemm_phase_batched(
+            ctx,
+            silu_packed,
+            d_store,
+            &phase3_dispatches,
+            down_n_per_expert,
+            down_packed,
+            expert_intermediate,
+        )?;
+    }
     if let Some(t) = t_gemm3 {
         B::sync(ctx);
         MOE_BUCKET_GEMM3_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);

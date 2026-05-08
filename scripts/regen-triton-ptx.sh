@@ -45,6 +45,7 @@ mkdir -p "$OUT_DIR"
 # Map: <triton-dsl example>:<output basename>:<MLIR func name>
 KERNELS=(
     "ferrum_rms_norm:rms_norm_f32:rms_norm_f32"
+    "ferrum_fused_moe_w4a16:fused_moe_w4a16_f16_bm16:fused_moe_w4a16_typed"
     # Add more here as kernels migrate. Each must have a triton-dsl example
     # and a matching ferrum-kernels Rust dispatcher.
 )
