@@ -1645,11 +1645,13 @@ impl Backend for CudaBackend {
             return Ok(());
         }
 
-        // Stage 13a: optional split-K path for batched paged decode. With
-        // num_seqs * num_q_heads ≥ sms (saturated grid), splitting kv adds
-        // launch overhead but improves pipelining at long kv_len. Default
-        // OFF (FERRUM_PAGED_FLASH unset) so existing path stays.
-        if std::env::var("FERRUM_PAGED_FLASH").map_or(false, |v| v == "1") {
+        // Stage 13a: split-K path for batched paged decode. Default ON;
+        // smart heuristic auto-tunes splits based on (num_seqs × num_heads)
+        // and kv_len, so it falls back to single-pass when grid already
+        // saturates SMs at low kv. Bench M3 c=1/8/16/32 across +21% / +3% /
+        // +3.5% / +10.8% over the single-pass kernel — every concurrency
+        // wins. Set FERRUM_PAGED_FLASH=0 to opt out.
+        if std::env::var("FERRUM_PAGED_FLASH").map_or(true, |v| v != "0") {
             return paged_batched_flash_dispatch(
                 ctx,
                 q,
@@ -3133,13 +3135,15 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "triton-kernels"))]
         let mw: &crate::marlin::MarlinWeight = weight;
 
-        // ── Stage 12: fused MoE Marlin path ─────────────────────────────
-        // FERRUM_MOE_FUSED=1 dispatches all experts in this phase as a
-        // small number of bucketed `marlin_gemm_moe` launches (one per
-        // thread_m_blocks bucket ∈ {1, 2, 3, 4}) instead of N round-robin
-        // calls. Eliminates per-expert launch overhead at c=32 (~100
-        // experts/layer → 1-4 launches/layer).
-        if std::env::var("FERRUM_MOE_FUSED").map_or(false, |v| v == "1") {
+        // ── Stage 12.1: fused MoE Marlin path (default ON) ──────────────
+        // Dispatches all experts in this phase as a small number of
+        // bucketed `marlin_gemm_moe` launches (one per thread_m_blocks
+        // bucket ∈ {1, 2, 3, 4}) instead of N round-robin calls. At c=32
+        // with ~100 active experts/layer this is 1-4 launches/layer
+        // instead of 100. Bench: +25% c=32, +35% c=16, +48% c=8 over
+        // the multi-stream per-expert path. Set FERRUM_MOE_FUSED=0 to
+        // opt out (fall back to multi-stream pool).
+        if std::env::var("FERRUM_MOE_FUSED").map_or(true, |v| v != "0") {
             return moe_gemm_phase_fused_impl(ctx, input, mw, dispatches, n_per_expert, output, k);
         }
 
