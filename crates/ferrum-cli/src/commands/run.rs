@@ -108,9 +108,15 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     {
         let direct_for_autosize = std::path::PathBuf::from(&cmd.model);
         if direct_for_autosize.is_dir() {
-            crate::gpu_mem_autosize::apply_auto_size(
+            // Chat profile: single user, multi-turn — long per-seq
+            // context beats wide batch. Without this, KV_CAPACITY
+            // defaults to 512 and Qwen3 thinking-mode overflows at
+            // the 4th turn. CLI users shouldn't have to set
+            // FERRUM_KV_CAPACITY by hand.
+            crate::gpu_mem_autosize::apply_auto_size_with_profile(
                 &direct_for_autosize,
                 cmd.gpu_memory_utilization,
+                crate::gpu_mem_autosize::AutoSizeProfile::Chat,
             );
         }
     }
