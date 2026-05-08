@@ -71,8 +71,7 @@ mod synth {
 #[test]
 #[ignore]
 fn cuda_marlin_moe_fused_vs_per_expert() {
-    use cudarc::driver::DevicePtr;
-    use ferrum_kernels::backend::cuda::{CudaBackend, GptqStoreCuda};
+    use ferrum_kernels::backend::cuda::CudaBackend;
     use ferrum_kernels::backend::Backend;
 
     // Marlin tile constraints: k % 128 == 0, n_per % 64 == 0, n_per % 256 ==
@@ -149,22 +148,23 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
     }
 
     // ── Fused: marlin_gemm_moe ONE call ──────────────────────────────────
-    // Need: a_dev (already), MarlinWeight (extract from stacked), c_dev,
-    //       a_row_offsets dev, tokens_per_expert dev.
-    let mw = match &stacked {
-        GptqStoreCuda::Marlin(mw) => mw,
-        _ => panic!("expected Marlin stacked store (no triton-kernels feature)"),
-    };
+    // Need: a_dev (already), MarlinWeight (= stacked when no triton-kernels),
+    //       c_dev, a_row_offsets dev, tokens_per_expert dev.
+    //
+    // Without `triton-kernels` feature, GptqStoreCuda is a transparent
+    // alias for MarlinWeight, so `stacked` IS the MarlinWeight directly
+    // (see crates/ferrum-kernels/src/backend/cuda.rs:279).
+    let mw: &ferrum_kernels::marlin::MarlinWeight = &stacked;
     let mut c_fused_dev = <CudaBackend as Backend>::alloc(total_tokens * n_per);
 
     // Upload offsets/tokens as i32. Use raw cudarc since the Backend's
     // typed buffer is f16-only.
     let stream = ctx.stream.clone();
     let row_off_dev = stream
-        .memcpy_stod(&a_row_offsets)
+        .clone_htod(&a_row_offsets)
         .expect("upload a_row_offsets");
     let tok_dev = stream
-        .memcpy_stod(
+        .clone_htod(
             &tokens_per_expert
                 .iter()
                 .map(|&x| x as i32)
