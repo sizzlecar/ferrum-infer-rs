@@ -19,7 +19,7 @@ fn vllm_gptq_marlin_repack_runs() {
 
     // Input: [K/8, N] i32. Random GPTQ on-disk packed.
     let qw_host: Vec<i32> = (0..(K as usize / 8) * N as usize)
-        .map(|i| (i as i32).wrapping_mul(0x9E3779B1))
+        .map(|i| (i as u32).wrapping_mul(0x9E3779B1) as i32)
         .collect();
     let qw_in: CudaSlice<i32> = stream.clone_htod(&qw_host).unwrap();
 
