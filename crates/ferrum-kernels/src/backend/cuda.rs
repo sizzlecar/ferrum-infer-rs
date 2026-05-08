@@ -3391,72 +3391,46 @@ impl Backend for CudaBackend {
         use cudarc::driver::CudaSlice;
         use cudarc::driver::DevicePtr;
 
-        // Clone stream FIRST (Arc clone), then take &mut ctx to get the
-        // persistent routing buffers. They're allocated worst-case once;
-        // no re-alloc happens on shape change.
+        // Per-call alloc + leak (matches Stage 14a / PR #101 behaviour
+        // that benched green at +37% c=16 / +19% c=32). Persistent
+        // routing buffers (the cleanup we wanted for graph capture) hit
+        // a CUDA_ERROR_INVALID_VALUE on subsequent memcpys that we
+        // couldn't pinpoint — revert keeps the perf wins intact.
+        use cudarc::driver::sys::CUdeviceptr;
+        use cudarc::driver::CudaSlice;
+        use cudarc::driver::DevicePtr;
         let stream = ctx.stream.clone();
-
-        // Early return for empty inputs — calling cuMemcpyHtoDAsync with
-        // byte_count=0 returns CUDA_ERROR_INVALID_VALUE on some driver
-        // versions. The kernel reads num_tokens_past_padded[0] / block
-        // entries, so an all-zero scenario should never invoke this, but
-        // guard anyway.
-        if sorted_token_ids.is_empty() || expert_ids.is_empty() {
-            return Err(FerrumError::model(format!(
-                "upload_moe_routing: empty inputs (sorted={}, eid={})",
-                sorted_token_ids.len(),
-                expert_ids.len()
-            )));
-        }
-
-        let (st_dev, eid_dev, npp_dev) = ctx.vllm_moe_routing();
-        eprintln!(
-            "DEBUG upload_moe_routing v2: sorted_len={} eid_len={} npp_len={} st_dev_len={} eid_dev_len={} npp_dev_len={}",
-            sorted_token_ids.len(),
-            expert_ids.len(),
-            num_tokens_past_padded.len(),
-            st_dev.len(),
-            eid_dev.len(),
-            npp_dev.len()
-        );
-
-        // Use raw cuMemcpyHtoDAsync_v2 with explicit byte count — host
-        // slices are smaller than the worst-case persistent buffers, so
-        // cudarc's memcpy_htod (which requires src.len() == dst.len()) is
-        // not usable. We only need to copy host_len bytes; the remaining
-        // tail of the persistent buffer is irrelevant (kernel reads
-        // exactly num_tokens_past_padded[0] / block_size entries).
-        unsafe {
-            use cudarc::driver::sys;
-            let s = stream.cu_stream();
-            let (st_ptr, _g0) = st_dev.device_ptr(&stream);
-            sys::cuMemcpyHtoDAsync_v2(
-                st_ptr,
-                sorted_token_ids.as_ptr() as *const _,
-                std::mem::size_of_val(sorted_token_ids),
-                s,
-            )
-            .result()
+        let st: CudaSlice<i32> = stream
+            .clone_htod(sorted_token_ids)
             .map_err(|e| FerrumError::model(format!("htod sorted_token_ids: {e}")))?;
-            let (eid_ptr, _g1) = eid_dev.device_ptr(&stream);
-            sys::cuMemcpyHtoDAsync_v2(
-                eid_ptr,
-                expert_ids.as_ptr() as *const _,
-                std::mem::size_of_val(expert_ids),
-                s,
-            )
-            .result()
+        let eid: CudaSlice<i32> = stream
+            .clone_htod(expert_ids)
             .map_err(|e| FerrumError::model(format!("htod expert_ids: {e}")))?;
-            let (npp_ptr, _g2) = npp_dev.device_ptr(&stream);
-            sys::cuMemcpyHtoDAsync_v2(
-                npp_ptr,
-                num_tokens_past_padded.as_ptr() as *const _,
-                std::mem::size_of_val(num_tokens_past_padded),
-                s,
-            )
-            .result()
+        let npp: CudaSlice<i32> = stream
+            .clone_htod(num_tokens_past_padded)
             .map_err(|e| FerrumError::model(format!("htod num_tokens_past_padded: {e}")))?;
-        }
+        let (st_ptr, eid_ptr, npp_ptr) = {
+            let (st_ptr, _g0) = st.device_ptr(&stream);
+            let (eid_ptr, _g1) = eid.device_ptr(&stream);
+            let (npp_ptr, _g2) = npp.device_ptr(&stream);
+            (st_ptr, eid_ptr, npp_ptr)
+        };
+        let st_f16: CudaSlice<f16> =
+            unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
+        let eid_f16: CudaSlice<f16> =
+            unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
+        let npp_f16: CudaSlice<f16> =
+            unsafe { stream.upgrade_device_ptr(npp_ptr as CUdeviceptr, 0) };
+        // Forget the i32 owning slices so the memory survives — the f16
+        // views above point at the same allocation. Acceptable leak: a
+        // few KB per layer × 48 layers/forward × forwards/sec = ~MB/s
+        // sustained, freed only at process exit. Not ideal but works.
+        // TODO(stage-13c-redo): re-attempt persistent buffers once we
+        // understand why memcpy_htod / cuMemcpyHtoDAsync rejects the
+        // 2nd call's params under our driver version.
+        std::mem::forget(st);
+        std::mem::forget(eid);
+        std::mem::forget(npp);
 
         // Reinterpret the persistent i32 buffers as f16 device handles
         // for the trait's Self::Buffer. The consumer (moe_gemm_phase_vllm)
