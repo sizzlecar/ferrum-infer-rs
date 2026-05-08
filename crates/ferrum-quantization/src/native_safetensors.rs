@@ -42,13 +42,26 @@ use crate::gptq::GptqLinear;
 use crate::loader::WeightLoader;
 use crate::traits::Linear;
 
-/// A single shard file: mmap + name→(shape, dtype, byte-offset-in-mmap).
+/// Tensor metadata extracted ONCE from the safetensors header at open time.
+/// Avoids the per-tensor `SafeTensors::deserialize(&mmap)` re-parse that
+/// previously dominated cold-load on stacked-MoE (>= 18 000 calls per
+/// model, ~30 ms each on a 7 000-tensor header → 9+ minutes of header
+/// re-parse alone).
+struct TensorMeta {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    /// Byte range in the shard's mmap that holds the raw tensor data.
+    data_start: usize,
+    data_end: usize,
+}
+
+/// A single shard file: mmap + name→TensorMeta cache.
 struct Shard {
     mmap: Mmap,
-    /// Parsed entries. Safetensors' `SafeTensors` type borrows from the mmap,
-    /// so we can't store it directly — instead we pre-extract name → metadata
-    /// and rebuild a `SafeTensors` view on demand via `SafeTensors::deserialize`.
     names: Vec<String>,
+    /// Pre-extracted tensor metadata. Looked up by name; no header
+    /// re-parse on every read.
+    meta: HashMap<String, TensorMeta>,
 }
 
 impl Shard {
@@ -57,19 +70,57 @@ impl Shard {
         let mmap = unsafe {
             Mmap::map(&file).map_err(|e| FerrumError::io(format!("mmap {path:?}: {e}")))?
         };
-        // Parse just to validate and extract names; the SafeTensors view is
-        // rebuilt on each read (cheap — it's a header reparse).
+        // Parse the header ONCE and cache (offset, len, dtype, shape) for
+        // every tensor — re-deriving the data slice from the cache is a
+        // simple `&mmap[start..end]` rather than a full header re-parse.
         let st = SafeTensors::deserialize(&mmap)
             .map_err(|e| FerrumError::model(format!("parse {path:?}: {e}")))?;
-        let names = st.names().iter().map(|s| s.to_string()).collect();
-        Ok(Self { mmap, names })
+        // SafeTensors stores: 8-byte little-endian header_len + header_json
+        // + data_blob. The TensorView's `data()` returns a slice into the
+        // data_blob region. We compute the data_blob base by reading the
+        // 8-byte header_len.
+        debug_assert!(mmap.len() >= 8, "safetensors smaller than 8 bytes");
+        let header_len = u64::from_le_bytes(
+            mmap[0..8]
+                .try_into()
+                .expect("8-byte header len read failed"),
+        ) as usize;
+        let data_base = 8 + header_len;
+        let names: Vec<String> = st.names().iter().map(|s| s.to_string()).collect();
+        let mut meta = HashMap::with_capacity(names.len());
+        for name in &names {
+            let view = st.tensor(name).map_err(|e| {
+                FerrumError::model(format!("tensor '{name}' missing during preindex: {e}"))
+            })?;
+            // TensorView::data() is &[u8] into the mmap; we recompute its
+            // [start, end) byte range relative to the mmap base via
+            // pointer arithmetic.
+            let view_data = view.data();
+            let start = view_data.as_ptr() as usize - mmap.as_ptr() as usize;
+            let end = start + view_data.len();
+            debug_assert!(start >= data_base);
+            meta.insert(
+                name.clone(),
+                TensorMeta {
+                    dtype: view.dtype(),
+                    shape: view.shape().to_vec(),
+                    data_start: start,
+                    data_end: end,
+                },
+            );
+        }
+        let _ = data_base;
+        Ok(Self { mmap, names, meta })
     }
 
-    fn get<'a>(&'a self, name: &str) -> Result<safetensors::tensor::TensorView<'a>> {
-        let st = SafeTensors::deserialize(&self.mmap)
-            .map_err(|e| FerrumError::model(format!("reparse: {e}")))?;
-        st.tensor(name)
-            .map_err(|e| FerrumError::model(format!("tensor '{name}': {e}")))
+    /// Returns (data_bytes, dtype, shape) for the named tensor without
+    /// re-parsing the safetensors header.
+    fn get_cached(&self, name: &str) -> Result<(&[u8], Dtype, &[usize])> {
+        let m = self
+            .meta
+            .get(name)
+            .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in shard")))?;
+        Ok((&self.mmap[m.data_start..m.data_end], m.dtype, &m.shape))
     }
 }
 
@@ -147,10 +198,9 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             .index
             .get(name)
             .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in index")))?;
-        let view = self.shards[shard_idx].get(name)?;
-        let shape = view.shape().to_vec();
-        let data = dtype_to_f32(view.dtype(), view.data())?;
-        Ok((data, shape))
+        let (data_bytes, dtype, shape) = self.shards[shard_idx].get_cached(name)?;
+        let data = dtype_to_f32(dtype, data_bytes)?;
+        Ok((data, shape.to_vec()))
     }
 
     /// Read the raw on-disk byte slice plus dtype and shape. Zero-copy into
@@ -161,10 +211,9 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
             .index
             .get(name)
             .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in index")))?;
-        let view = self.shards[shard_idx].get(name)?;
-        let shape = view.shape().to_vec();
-        let dtype = map_src_dtype(view.dtype())?;
-        Ok((view.data(), dtype, shape))
+        let (data_bytes, st_dtype, shape) = self.shards[shard_idx].get_cached(name)?;
+        let dtype = map_src_dtype(st_dtype)?;
+        Ok((data_bytes, dtype, shape.to_vec()))
     }
 
     /// Concatenate several tensors along dim 0 at the byte level. All parts
@@ -205,33 +254,260 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
     }
 
     /// Read a tensor as i32 (for GPTQ qweight / qzeros / g_idx).
+    /// Bulk memcpy from the LE-stored bytes (safetensors guarantees LE)
+    /// — the previous per-element `from_le_bytes` was 4 ms for a single
+    /// 768 KB tensor and dominated stacked-MoE load.
     fn read_i32(&self, name: &str) -> Result<(Vec<i32>, Vec<usize>)> {
         let shard_idx = *self
             .index
             .get(name)
             .ok_or_else(|| FerrumError::model(format!("tensor '{name}' not in index")))?;
-        let view = self.shards[shard_idx].get(name)?;
-        let shape = view.shape().to_vec();
-        if view.dtype() != Dtype::I32 {
+        let (bytes, dtype, shape) = self.shards[shard_idx].get_cached(name)?;
+        if dtype != Dtype::I32 {
             return Err(FerrumError::model(format!(
                 "'{name}': expected I32, got {:?}",
-                view.dtype()
+                dtype
             )));
         }
-        let bytes = view.data();
         debug_assert_eq!(bytes.len() % 4, 0);
-        let mut out = vec![0i32; bytes.len() / 4];
-        out.as_mut_slice()
-            .iter_mut()
-            .zip(bytes.chunks_exact(4))
-            .for_each(|(d, chunk)| {
-                *d = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-            });
-        Ok((out, shape))
+        let count = bytes.len() / 4;
+        let mut out = Vec::<i32>::with_capacity(count);
+        // SAFETY: Vec<i32>'s buffer is 4-byte aligned by allocator
+        // contract. `bytes` is a raw u8 slice; copy_nonoverlapping
+        // doesn't require src alignment. We're on x86_64 LE, and
+        // safetensors stores LE i32 — bit pattern is identical.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+            out.set_len(count);
+        }
+        Ok((out, shape.to_vec()))
     }
 
     fn has(&self, name: &str) -> bool {
         self.index.contains_key(name)
+    }
+
+    /// Read the four raw GPTQ tensors for a named projection without
+    /// triggering a Backend repack. Used by MoE batch loading: callers
+    /// stack many experts host-side then issue a single `B::load_gptq`,
+    /// avoiding the 12 288× per-expert Marlin repack overhead.
+    ///
+    /// Returns `(qweight, scales, qzeros, g_idx, k, n)`.
+    /// `g_idx` is `None` when desc_act=false (no act-order perm needed).
+    pub fn read_gptq_raw(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<i32>, Vec<f32>, Vec<i32>, Option<Vec<i32>>, usize, usize)> {
+        let (qweight, qw_shape) = self.read_i32(&format!("{name}.qweight"))?;
+        let (scales, _) = self.read_f32(&format!("{name}.scales"))?;
+        let (qzeros, _) = self.read_i32(&format!("{name}.qzeros"))?;
+        let g_idx = if self.has(&format!("{name}.g_idx")) {
+            Some(self.read_i32(&format!("{name}.g_idx"))?.0)
+        } else {
+            None
+        };
+        if qw_shape.len() != 2 {
+            return Err(FerrumError::model(format!(
+                "'{name}.qweight' expected 2D, got {qw_shape:?}"
+            )));
+        }
+        let k = qw_shape[0] * 8;
+        let n = qw_shape[1];
+        Ok((qweight, scales, qzeros, g_idx, k, n))
+    }
+
+    pub fn quant_config_ref(&self) -> Option<&crate::config::QuantConfig> {
+        self.quant_config.as_ref()
+    }
+
+    /// Load a STACKED GPTQ tile that concatenates `num_experts` experts'
+    /// raw GPTQ tensors along the N (column) axis and runs ONE backend
+    /// repack — instead of `num_experts × proj_names.len()` repacks.
+    ///
+    /// Layout: per row `r`, the cols are emitted in expert-major order:
+    /// `expert_0[proj_0|proj_1|...] | expert_1[...] | ... | expert_{N-1}[...]`.
+    /// Caller can therefore index expert `e` at column offset
+    /// `e * n_per_expert`, where `n_per_expert = Σ n(proj)` across the
+    /// `proj_names` for one expert.
+    ///
+    /// `expert_prefix_fmt` should be a closure-style `&str` that contains
+    /// `"{e}"` placeholder (replaced by the expert index) and ends *just
+    /// before* the proj name — e.g. `"model.layers.5.mlp.experts.{e}."`.
+    /// The full tensor name probed is `{expert_prefix}{proj}`.
+    ///
+    /// Returns `(store, n_per_expert, k)` where `n_per_expert` is the
+    /// per-expert column width and `k = in_features` (shared by all).
+    pub fn load_stacked_gptq_experts(
+        &self,
+        expert_prefix_fmt: &str,
+        num_experts: usize,
+        proj_names: &[&str],
+    ) -> Result<(B::GptqStore, usize, usize)> {
+        let qcfg = self.quant_config.as_ref().ok_or_else(|| {
+            FerrumError::model(
+                "load_stacked_gptq_experts requires quantize_config.json".to_string(),
+            )
+        })?;
+        if qcfg.method != QuantMethod::Gptq {
+            return Err(FerrumError::model(format!(
+                "stacked GPTQ load but quant_method={:?}",
+                qcfg.method
+            )));
+        }
+
+        let mut qw_rows = 0usize;
+        let mut sc_rows = 0usize;
+        let mut qz_rows = 0usize;
+        let mut n_per_expert = 0usize;
+        let mut n_per_expert_scales = 0usize;
+        let mut n_per_expert_zeros = 0usize;
+        let mut k_shared = 0usize;
+        let mut g_idx_first: Option<Vec<i32>> = None;
+
+        // Per (expert, proj) raw slices — row-major (rows × cols).
+        let total_pairs = num_experts * proj_names.len();
+        let mut qw_parts: Vec<(Vec<i32>, usize)> = Vec::with_capacity(total_pairs); // (data, cols)
+        let mut sc_parts: Vec<(Vec<f32>, usize)> = Vec::with_capacity(total_pairs);
+        let mut qz_parts: Vec<(Vec<i32>, usize)> = Vec::with_capacity(total_pairs);
+
+        for e in 0..num_experts {
+            let prefix = expert_prefix_fmt.replace("{e}", &e.to_string());
+            let mut e_n = 0usize;
+            let mut e_n_scales = 0usize;
+            let mut e_n_zeros = 0usize;
+            for proj in proj_names {
+                let name = format!("{prefix}{proj}");
+                let (qw, qw_sh) = self.read_i32(&format!("{name}.qweight"))?;
+                let (sc, sc_sh) = self.read_f32(&format!("{name}.scales"))?;
+                let (qz, qz_sh) = self.read_i32(&format!("{name}.qzeros"))?;
+                if qw_sh.len() != 2 || sc_sh.len() != 2 || qz_sh.len() != 2 {
+                    return Err(FerrumError::model(format!(
+                        "stacked GPTQ '{name}': expected 2D, got qw {qw_sh:?} sc {sc_sh:?} qz {qz_sh:?}"
+                    )));
+                }
+                if qw_rows == 0 {
+                    qw_rows = qw_sh[0];
+                    sc_rows = sc_sh[0];
+                    qz_rows = qz_sh[0];
+                    k_shared = qw_sh[0] * 8;
+                } else if qw_sh[0] != qw_rows || sc_sh[0] != sc_rows || qz_sh[0] != qz_rows {
+                    return Err(FerrumError::model(format!(
+                        "stacked GPTQ '{name}': row mismatch qw {} sc {} qz {} vs ref {qw_rows}/{sc_rows}/{qz_rows}",
+                        qw_sh[0], sc_sh[0], qz_sh[0]
+                    )));
+                }
+                e_n += qw_sh[1];
+                e_n_scales += sc_sh[1];
+                e_n_zeros += qz_sh[1];
+                qw_parts.push((qw, qw_sh[1]));
+                sc_parts.push((sc, sc_sh[1]));
+                qz_parts.push((qz, qz_sh[1]));
+
+                // g_idx is a permutation over K — Marlin assumes ONE g_idx
+                // for the whole stacked tile. Validate all experts share
+                // identical g_idx if any has it (which they should, since
+                // K = hidden_size is the same across experts and GPTQ's
+                // act-order is computed on the input distribution).
+                let g_key = format!("{name}.g_idx");
+                if self.has(&g_key) {
+                    let (gx, _) = self.read_i32(&g_key)?;
+                    match &g_idx_first {
+                        None => g_idx_first = Some(gx),
+                        Some(prev) => {
+                            if prev.len() != gx.len() || prev.iter().zip(&gx).any(|(a, b)| a != b) {
+                                return Err(FerrumError::model(format!(
+                                    "stacked GPTQ '{name}': g_idx mismatch with first \
+                                     expert — Marlin requires identical act-order across \
+                                     experts in the same stacked tile"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            if e == 0 {
+                n_per_expert = e_n;
+                n_per_expert_scales = e_n_scales;
+                n_per_expert_zeros = e_n_zeros;
+            } else if e_n != n_per_expert
+                || e_n_scales != n_per_expert_scales
+                || e_n_zeros != n_per_expert_zeros
+            {
+                return Err(FerrumError::model(format!(
+                    "stacked GPTQ expert {e} N mismatch: qw {e_n} sc {e_n_scales} qz {e_n_zeros} vs expert 0 {n_per_expert}/{n_per_expert_scales}/{n_per_expert_zeros}"
+                )));
+            }
+        }
+
+        let proj_count = proj_names.len();
+        let pairs_per_expert = proj_count;
+        debug_assert_eq!(total_pairs, num_experts * pairs_per_expert);
+
+        // PER-EXPERT layout: build num_experts independent
+        // `[K/8, n_per_expert]` qweight tiles + scales + qzeros, each
+        // a row-major concat of the proj_names within that expert.
+        // Hand them to `B::load_gptq_stacked` which repacks PER-EXPERT
+        // and concats the resulting Marlin-format tiles into one
+        // contiguous buffer. Each expert's packed bytes are then
+        // contiguous, so the offset GEMM dispatches correctly via
+        // pointer arithmetic alone.
+        //
+        // Without per-expert repack, a single concat-then-repack of
+        // the stacked tile mangles per-expert tile boundaries (Marlin
+        // permutes in K-tile-major order across the whole tile).
+        let mut per_expert_qw: Vec<Vec<i32>> = Vec::with_capacity(num_experts);
+        let mut per_expert_sc: Vec<Vec<f32>> = Vec::with_capacity(num_experts);
+        let mut per_expert_qz: Vec<Vec<i32>> = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let mut qw: Vec<i32> = Vec::with_capacity(qw_rows * n_per_expert);
+            let mut sc: Vec<f32> = Vec::with_capacity(sc_rows * n_per_expert_scales);
+            let mut qz: Vec<i32> = Vec::with_capacity(qz_rows * n_per_expert_zeros);
+            for r in 0..qw_rows {
+                for j in 0..pairs_per_expert {
+                    let pair_idx = e * pairs_per_expert + j;
+                    let (data, cols) = &qw_parts[pair_idx];
+                    qw.extend_from_slice(&data[r * cols..(r + 1) * cols]);
+                }
+            }
+            for r in 0..sc_rows {
+                for j in 0..pairs_per_expert {
+                    let pair_idx = e * pairs_per_expert + j;
+                    let (data, cols) = &sc_parts[pair_idx];
+                    sc.extend_from_slice(&data[r * cols..(r + 1) * cols]);
+                }
+            }
+            for r in 0..qz_rows {
+                for j in 0..pairs_per_expert {
+                    let pair_idx = e * pairs_per_expert + j;
+                    let (data, cols) = &qz_parts[pair_idx];
+                    qz.extend_from_slice(&data[r * cols..(r + 1) * cols]);
+                }
+            }
+            per_expert_qw.push(qw);
+            per_expert_sc.push(sc);
+            per_expert_qz.push(qz);
+        }
+
+        // Drop the original part buffers — we own copies in per_expert_*.
+        drop(qw_parts);
+        drop(sc_parts);
+        drop(qz_parts);
+
+        let qw_refs: Vec<&[i32]> = per_expert_qw.iter().map(|v| v.as_slice()).collect();
+        let sc_refs: Vec<&[f32]> = per_expert_sc.iter().map(|v| v.as_slice()).collect();
+        let qz_refs: Vec<&[i32]> = per_expert_qz.iter().map(|v| v.as_slice()).collect();
+
+        let store = B::load_gptq_stacked(
+            &qw_refs,
+            &sc_refs,
+            &qz_refs,
+            g_idx_first.as_deref(),
+            qcfg.bits,
+            qcfg.group_size,
+            k_shared,
+            n_per_expert,
+        )?;
+        Ok((store, n_per_expert, k_shared))
     }
 }
 
@@ -692,32 +968,46 @@ fn dequantize_gptq_with_g_idx(
 fn dtype_to_f32(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => {
+            // Bulk memcpy from LE-stored bytes (safetensors is LE; we're
+            // on x86_64 LE). Per-element from_le_bytes was the bottleneck
+            // for stacked-MoE load (4-5 ms per call * 384 calls/layer *
+            // 48 layers = ~80 sec just for f32 reads).
             debug_assert_eq!(raw.len() % 4, 0);
             let n = raw.len() / 4;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bytes = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]];
-                out[i] = f32::from_le_bytes(bytes);
+            let mut out = Vec::<f32>::with_capacity(n);
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, raw.len());
+                out.set_len(n);
             }
             Ok(out)
         }
         Dtype::F16 => {
             debug_assert_eq!(raw.len() % 2, 0);
             let n = raw.len() / 2;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bytes = [raw[i * 2], raw[i * 2 + 1]];
-                out[i] = f16::from_le_bytes(bytes).to_f32();
+            // Reinterpret raw bytes as f16, then convert. This avoids
+            // the per-element from_le_bytes byte-array construction.
+            let mut tmp = Vec::<f16>::with_capacity(n);
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), tmp.as_mut_ptr() as *mut u8, raw.len());
+                tmp.set_len(n);
+            }
+            let mut out = Vec::with_capacity(n);
+            for h in &tmp {
+                out.push(h.to_f32());
             }
             Ok(out)
         }
         Dtype::BF16 => {
             debug_assert_eq!(raw.len() % 2, 0);
             let n = raw.len() / 2;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bytes = [raw[i * 2], raw[i * 2 + 1]];
-                out[i] = bf16::from_le_bytes(bytes).to_f32();
+            let mut tmp = Vec::<bf16>::with_capacity(n);
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), tmp.as_mut_ptr() as *mut u8, raw.len());
+                tmp.set_len(n);
+            }
+            let mut out = Vec::with_capacity(n);
+            for h in &tmp {
+                out.push(h.to_f32());
             }
             Ok(out)
         }

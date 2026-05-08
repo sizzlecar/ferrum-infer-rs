@@ -51,6 +51,19 @@ pub static MOE_COPY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MOE_HOST_TOPK_US: AtomicU64 = AtomicU64::new(0);
 pub static MOE_HOST_TOPK_CALLS: AtomicU64 = AtomicU64::new(0);
 
+// Bucketed-path per-phase timers. Drained by the model wrapper alongside
+// the per-pair counters above. Same `FERRUM_MOE_PROFILE=1` gate.
+pub static MOE_BUCKET_SYNC_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_D2H_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_ROUTE_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_PLAN_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_GATHER_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_GEMM1_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_SILU_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_GEMM3_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_COMBINE_US: AtomicU64 = AtomicU64::new(0);
+pub static MOE_BUCKET_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
+
 fn moe_profile_enabled() -> bool {
     std::env::var("FERRUM_MOE_PROFILE").is_ok()
 }
@@ -83,6 +96,26 @@ pub struct ExpertStack<B: Backend> {
     pub gate_stacked: Option<B::QuantStore>,
     pub up_stacked: Option<B::QuantStore>,
     pub down_stacked: Option<B::QuantStore>,
+
+    /// Stacked GPTQ Marlin stores for the bucketed CUDA path. When both
+    /// are Some, [`moe_forward_bucketed`] dispatches expert GEMMs as
+    /// column-slices of these shared tiles via
+    /// `B::gemm_gptq_with_offset_strided`. None on CPU / Metal / GGUF.
+    pub gate_up_gptq_stacked: Option<std::sync::Arc<B::GptqStore>>,
+    pub down_gptq_stacked: Option<std::sync::Arc<B::GptqStore>>,
+}
+
+impl<B: Backend> ExpertStack<B> {
+    /// Returns the shared stacked GPTQ store for `gate_up` if loaded
+    /// via the bucketed/Marlin path. Used by [`moe_forward_bucketed`].
+    pub fn gate_up_stacked_store(&self, _expert_idx: usize) -> Option<&B::GptqStore> {
+        self.gate_up_gptq_stacked.as_deref()
+    }
+
+    /// Same for `down`.
+    pub fn down_stacked_store(&self, _expert_idx: usize) -> Option<&B::GptqStore> {
+        self.down_gptq_stacked.as_deref()
+    }
 }
 
 impl<B: Backend> ExpertStack<B> {
@@ -149,6 +182,8 @@ impl<B: Backend> ExpertStack<B> {
             gate_stacked: None,
             up_stacked: None,
             down_stacked: None,
+            gate_up_gptq_stacked: None,
+            down_gptq_stacked: None,
         })
     }
 
@@ -388,6 +423,8 @@ impl<B: Backend> ExpertStack<B> {
             gate_stacked,
             up_stacked,
             down_stacked,
+            gate_up_gptq_stacked: None,
+            down_gptq_stacked: None,
         }))
     }
 
@@ -610,6 +647,436 @@ pub fn moe_forward<B: Backend>(
             MOE_COPY_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             MOE_COPY_CALLS.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    Ok(())
+}
+
+/// Bucket plan: per-expert lists of which (token, k_slot) pairs route
+/// through that expert. Built host-side from the router output and used
+/// by [`moe_forward_bucketed`] to issue ONE m=tokens_per_expert Marlin
+/// GEMM per active expert instead of `batch * top_k` m=1 GEMMs.
+pub struct MoeBucketPlan {
+    /// `expert_offsets[e+1] - expert_offsets[e]` = tokens routed to expert e.
+    /// Length: `num_experts + 1`. `expert_offsets[num_experts]` = total_pairs
+    /// (always `batch * top_k`).
+    pub expert_offsets: Vec<usize>,
+    /// `[total_pairs]` flat: which input token each packed-row gathers
+    /// from. Index into `x[batch, hidden]`.
+    pub packed_token_idx: Vec<u32>,
+    /// `[batch, top_k]` row-major: for each (b, k_slot), which row of the
+    /// packed buffers carries that pair's contribution. Used by
+    /// `B::moe_combine` to scatter weighted sums back to `out[b]`.
+    pub pairs_by_token: Vec<i32>,
+    /// `[batch, top_k]` row-major: combine weight for the (b, k_slot)
+    /// pair, copied verbatim from the router output. Used by
+    /// `B::moe_combine`.
+    pub pair_weights: Vec<f32>,
+    /// Cached cursor scratch for [`Self::rebuild_into`] — sized to
+    /// `num_experts` on first build and reused (one alloc total instead
+    /// of one per call).
+    cursors: Vec<usize>,
+}
+
+impl MoeBucketPlan {
+    /// Empty plan with no allocation. Use [`Self::rebuild_into`] before
+    /// reuse — this is the cheap constructor for putting the plan in a
+    /// scratch struct.
+    pub fn empty() -> Self {
+        Self {
+            expert_offsets: Vec::new(),
+            packed_token_idx: Vec::new(),
+            pairs_by_token: Vec::new(),
+            pair_weights: Vec::new(),
+            cursors: Vec::new(),
+        }
+    }
+
+    /// Allocate a fresh plan. Convenience wrapper over [`Self::rebuild_into`]
+    /// for tests and code paths that don't care about reuse.
+    pub fn build(route: &RouterOutput, batch: usize, num_experts: usize, top_k: usize) -> Self {
+        let mut p = Self::empty();
+        p.rebuild_into(route, batch, num_experts, top_k);
+        p
+    }
+
+    /// Allocation-free rebuild. Reuses the existing `expert_offsets`,
+    /// `packed_token_idx`, `pairs_by_token`, `pair_weights` buffers via
+    /// `clear() + resize()`. Uses the trailing tail of `expert_offsets`
+    /// as the host-side cursor scratch (saves the per-call `cursors.clone()`).
+    pub fn rebuild_into(
+        &mut self,
+        route: &RouterOutput,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) {
+        debug_assert_eq!(route.expert_ids.len(), batch * top_k);
+        debug_assert_eq!(route.expert_weights.len(), batch * top_k);
+        let total_pairs = batch * top_k;
+
+        self.expert_offsets.clear();
+        self.expert_offsets.resize(num_experts + 1, 0);
+        self.packed_token_idx.clear();
+        self.packed_token_idx.resize(total_pairs, 0);
+        self.pairs_by_token.clear();
+        self.pairs_by_token.resize(total_pairs, -1);
+
+        // Pass 1: count pairs per expert. Stored into expert_offsets[1..]
+        // so the inclusive-prefix-sum in Pass 2 can run in place — no
+        // separate `counts` Vec.
+        for &eid in &route.expert_ids {
+            self.expert_offsets[eid as usize + 1] += 1;
+        }
+
+        // Pass 2: in-place inclusive prefix sum → expert_offsets[].
+        for e in 0..num_experts {
+            self.expert_offsets[e + 1] += self.expert_offsets[e];
+        }
+
+        // Pass 3: fill packed_token_idx + pairs_by_token by walking pairs
+        // in (b, k) order and bucketing. The `cursors` scratch tracks how
+        // many pairs each expert has already received; on first call it
+        // grows to `num_experts`, subsequent calls reuse the allocation.
+        self.cursors.clear();
+        self.cursors
+            .extend_from_slice(&self.expert_offsets[..num_experts]);
+
+        for b in 0..batch {
+            for k in 0..top_k {
+                let pair_flat = b * top_k + k;
+                let eid = route.expert_ids[pair_flat] as usize;
+                let slot = self.cursors[eid];
+                self.cursors[eid] += 1;
+                self.packed_token_idx[slot] = b as u32;
+                self.pairs_by_token[pair_flat] = slot as i32;
+            }
+        }
+
+        // Pair weights: replicate from RouterOutput. Reuse self's vector
+        // via clear() + extend rather than the per-call `clone()`.
+        self.pair_weights.clear();
+        self.pair_weights.extend_from_slice(&route.expert_weights);
+    }
+}
+
+/// Reusable host-side scratch for [`moe_forward_bucketed`]. Holds the
+/// router output, softmax scratch buffer, and bucket plan, all reused
+/// across layers so the inner MoE forward path is allocation-free.
+///
+/// At c=32 / Qwen3-MoE / 48 layers, the previous fresh-`Vec`-per-layer
+/// pattern accounted for ~10 ms / token of pure CPU softmax+sort+alloc
+/// (25% of MoE wallclock — see `docs/bench/cuda-rtx4090-2026-05-08-m3-moe`).
+pub struct MoeRouteScratch {
+    pub output: RouterOutput,
+    /// Softmax buffer reused across all rows of all layers — sized to
+    /// `num_experts` on first use.
+    pub probs: Vec<f32>,
+    pub plan: MoeBucketPlan,
+}
+
+impl MoeRouteScratch {
+    pub fn new() -> Self {
+        Self {
+            output: RouterOutput::empty(),
+            probs: Vec::new(),
+            plan: MoeBucketPlan::empty(),
+        }
+    }
+}
+
+impl Default for MoeRouteScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Bucketed MoE forward: gather → per-expert m=N Marlin GEMM → silu_mul →
+/// per-expert m=N Marlin GEMM → moe_combine.
+///
+/// Replaces the `batch × top_k` m=1 dispatch loop in [`moe_forward`] with
+/// `num_active_experts × 2` m=tokens_per_expert dispatches. For prefill
+/// (m=512+), this is a 30× reduction in GEMM launches AND each GEMM runs
+/// at a much more efficient m than the m=1 path. For decode (m=1), the
+/// number of dispatches is similar but we still benefit from the
+/// gather/combine kernel pattern (one launch each instead of 2 per pair).
+///
+/// **Requires**: scratch buffers `x_packed [total_pairs, hidden]`,
+/// `gate_up_packed [total_pairs, 2*expert_inter]`,
+/// `silu_packed [total_pairs, expert_inter]`, and
+/// `down_packed [total_pairs, hidden]` provisioned by the caller. The
+/// caller is responsible for sizing these to `batch * top_k` rows
+/// (worst-case all top_k pairs alive).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_forward_bucketed<B: Backend>(
+    ctx: &mut B::Context,
+    x: &B::Buffer,
+    router_logits: &B::Buffer,
+    out: &mut B::Buffer,
+    batch: usize,
+    hidden_size: usize,
+    expert_intermediate: usize,
+    num_experts: usize,
+    top_k: usize,
+    norm_topk_prob: bool,
+    experts: &ExpertStack<B>,
+    x_packed: &mut B::Buffer,
+    gate_up_packed: &mut B::Buffer,
+    silu_packed: &mut B::Buffer,
+    down_packed: &mut B::Buffer,
+    route_scratch: &mut MoeRouteScratch,
+) -> Result<()> {
+    if experts.num_experts() != num_experts {
+        return Err(FerrumError::model(format!(
+            "moe_forward_bucketed: experts {} != num_experts {num_experts}",
+            experts.num_experts()
+        )));
+    }
+
+    // Bucket profiling fires on either FERRUM_MOE_PROFILE=1 (legacy)
+    // or FERRUM_DECODE_OP_PROFILE=1 (the gate the print site uses).
+    let prof = moe_profile_enabled() || std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+    if prof {
+        MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Routing: try GPU fast-path first, fall back to host. ─────────
+    //
+    // The GPU path runs `route_topk_softmax_f16` on the device buffer
+    // and D2Hs only `[batch, top_k]` ids + weights (~1 KB at c=32) into
+    // the host RouterOutput vectors. The host path goes through the
+    // existing 16-KB router_logits D2H + softmax+topk in Rust.
+    //
+    // Default `try_gpu_route_topk_into_host` returns `Err(unsupported)`
+    // on backends that don't override (CPU / Metal / future), so this
+    // branch is a strict superset of the host path.
+    let t_route_total = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let gpu_route = B::try_gpu_route_topk_into_host(
+        ctx,
+        router_logits,
+        &mut route_scratch.output.expert_ids,
+        &mut route_scratch.output.expert_weights,
+        batch,
+        num_experts,
+        top_k,
+        norm_topk_prob,
+    );
+    if gpu_route.is_err() {
+        // Host fallback. Mirrors the per-phase profile wiring above so
+        // [bucket-prof] stays meaningful: t_sync wraps the explicit
+        // drain; t_d2h wraps the to_vec; t_route wraps route_into.
+        let t_sync = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        B::sync(ctx);
+        if let Some(t) = t_sync {
+            MOE_BUCKET_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let t_d2h = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let logits_host = B::to_vec(router_logits, batch * num_experts);
+        if let Some(t) = t_d2h {
+            MOE_BUCKET_D2H_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let t_route = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        crate::moe::router::route_into(
+            &logits_host,
+            batch,
+            num_experts,
+            top_k,
+            norm_topk_prob,
+            &mut route_scratch.output,
+            &mut route_scratch.probs,
+        );
+        if let Some(t) = t_route {
+            MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    } else if let Some(t) = t_route_total {
+        // GPU path: charge the whole route+D2H to the route bucket.
+        // (sync/d2h sub-buckets are 0 because the kernel + dtoh are
+        // fused into one stream synchronize.)
+        MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    // ── Build bucket plan host-side ────────────────────────────────────
+    let t_plan = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    route_scratch
+        .plan
+        .rebuild_into(&route_scratch.output, batch, num_experts, top_k);
+    let plan = &route_scratch.plan;
+    if let Some(t) = t_plan {
+        MOE_BUCKET_PLAN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    // ── Gather: x_packed[i] = x[plan.packed_token_idx[i]] ──────────────
+    // embedding_lookup is byte-for-byte the gather we need.
+    let t_gather = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    B::embedding_lookup(ctx, x, &plan.packed_token_idx, x_packed, hidden_size);
+    if let Some(t) = t_gather {
+        B::sync(ctx);
+        MOE_BUCKET_GATHER_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    // ── Per-expert dispatch: gate_up + down GEMMs at m=tokens_per_expert
+    //
+    // Uses the strided GPTQ + silu_mul methods so we can pump through
+    // the BIG packed buffers (allocated once at scratch alloc) without
+    // any per-expert copies. Each expert gets its column-slice of the
+    // shared stacked Marlin tile via expert_offset; the row-slice of
+    // the packed input/output buffers via in_row_offset / out_row_offset.
+    let gate_up_dim_per_expert = 2 * expert_intermediate;
+    let down_n_per_expert = hidden_size;
+    // Bulk-zero the gate_up workspace ONCE before phase 1. With
+    // FERRUM_MARLIN_SKIP_WS_ZERO=1, per-call workspace zero is skipped.
+    let gu_store = experts.gate_up_stacked_store(0).ok_or_else(|| {
+        FerrumError::model(
+            "moe_forward_bucketed requires stacked gate_up store \
+             (load via Qwen3MoeModel::new_safetensors)",
+        )
+    })?;
+    let _ = B::marlin_zero_stacked_workspace(ctx, gu_store);
+
+    // Build the dispatch list for phase 1. (expert_idx, in_row, out_row, m)
+    // for each active expert. Send to the multi-stream batched dispatcher.
+    //
+    // Sort by `m` descending so the round-robin pool feeds the longest
+    // GEMMs first — without this, an unlucky distribution could hand a
+    // bunch of m=1 calls to one stream while another stream is still
+    // running its m=4 tail, leaving the pool unbalanced. With sort,
+    // each stream pops the next-largest job and they all finish close
+    // together. Tied `m` keeps the original (expert-id ascending) order,
+    // which matters for any host-side determinism we care about.
+    let mut phase1_dispatches: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
+        if m_e == 0 {
+            continue;
+        }
+        let pair_off = plan.expert_offsets[e];
+        phase1_dispatches.push((e, pair_off, pair_off, m_e));
+    }
+    phase1_dispatches.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+    let t_gemm1 = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    B::moe_gemm_phase_batched(
+        ctx,
+        x_packed,
+        gu_store,
+        &phase1_dispatches,
+        gate_up_dim_per_expert,
+        gate_up_packed,
+        hidden_size,
+    )?;
+    if let Some(t) = t_gemm1 {
+        B::sync(ctx);
+        MOE_BUCKET_GEMM1_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    // Phase 2: SiLU(gate) * up — single launch covering ALL active
+    // expert rows in the packed buffer. The unused rows (zeros from
+    // experts with m_e=0) just produce zeros that the combine step
+    // ignores via pairs_by_token. Saves num_active_experts-1 launches
+    // per layer.
+    let total_pairs_active = batch * top_k;
+    let t_silu = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    B::fused_silu_mul_split(
+        ctx,
+        gate_up_packed,
+        silu_packed,
+        total_pairs_active,
+        expert_intermediate,
+    );
+    if let Some(t) = t_silu {
+        B::sync(ctx);
+        MOE_BUCKET_SILU_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    // Phase 3: down GEMM per active expert. Multi-stream batched.
+    let d_store = experts.down_stacked_store(0).ok_or_else(|| {
+        FerrumError::model(
+            "moe_forward_bucketed requires stacked down store \
+             (load via Qwen3MoeModel::new_safetensors)",
+        )
+    })?;
+    let _ = B::marlin_zero_stacked_workspace(ctx, d_store);
+    let mut phase3_dispatches: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
+        if m_e == 0 {
+            continue;
+        }
+        let pair_off = plan.expert_offsets[e];
+        phase3_dispatches.push((e, pair_off, pair_off, m_e));
+    }
+    phase3_dispatches.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+    let t_gemm3 = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    B::moe_gemm_phase_batched(
+        ctx,
+        silu_packed,
+        d_store,
+        &phase3_dispatches,
+        down_n_per_expert,
+        down_packed,
+        expert_intermediate,
+    )?;
+    if let Some(t) = t_gemm3 {
+        B::sync(ctx);
+        MOE_BUCKET_GEMM3_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    // ── Combine: out[b, h] = Σ_k weights[b,k] * down_packed[pairs_by_token[b,k], h]
+    let total_pairs = batch * top_k;
+    let t_comb = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    B::moe_combine(
+        ctx,
+        down_packed,
+        &plan.pairs_by_token,
+        &plan.pair_weights,
+        out,
+        batch,
+        hidden_size,
+        top_k,
+        total_pairs,
+    );
+    if let Some(t) = t_comb {
+        B::sync(ctx);
+        MOE_BUCKET_COMBINE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     Ok(())

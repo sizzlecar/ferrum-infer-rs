@@ -82,6 +82,43 @@ pub struct CudaState {
     batched_host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
     batched_host_kv_lens: Box<[i32; HOST_STAGING_TOTAL]>,
     batched_host_cache_lens: Box<[i32; HOST_STAGING_TOTAL]>,
+    /// Stream pool for parallel MoE expert dispatch. At c=32 with 128
+    /// active experts, ~256 sequential Marlin GEMMs/layer hit launch +
+    /// SM-allocation serialization. Round-robin across N streams lets
+    /// multiple Marlin kernels overlap; only valid for small-m where
+    /// each kernel uses a fraction of available SMs. Lazy-init on first
+    /// MoE call.
+    moe_streams: Option<Vec<Arc<CudaStream>>>,
+    /// Persistent cuEvents for `moe_gemm_phase_batched` cross-stream
+    /// sync. `moe_entry_event` is recorded on default → waited on each
+    /// pool stream; `moe_exit_events[i]` is recorded on pool stream i →
+    /// waited on default. Per-call reuse (record/wait only) replaces
+    /// the per-call create/destroy pair: at c=32 / 48 layers / 2 phases
+    /// that's ~960 driver calls saved per token. Lazy-init alongside
+    /// `moe_streams`.
+    ///
+    /// Stored as raw `CUevent` (= `*mut CUevent_st`); the pointer is
+    /// owned by CUDA's driver, not Rust's allocator, so we just hold
+    /// the handle and call `cuEventDestroy_v2` in `Drop`.
+    moe_entry_event: Option<usize>,
+    moe_exit_events: Option<Vec<usize>>,
+    /// GPU-side route output scratch. Device buffers sized to
+    /// `MAX_ROUTE_PAIRS` (= 32 batch × 8 top_k = 256 by default — covers
+    /// every Qwen3-MoE config we ship). Lazy-init on first
+    /// `try_gpu_route_topk_into_host` call. Kept as f16 storage since
+    /// `Buffer = CudaSlice<f16>`; the kernel writes raw int / float
+    /// bytes via reinterpret-cast.
+    moe_route_ids: Option<CudaSlice<f16>>,
+    moe_route_weights: Option<CudaSlice<f16>>,
+    /// Capacity hint — buffers grow if a larger (batch × top_k) shows
+    /// up. Reset on grow.
+    moe_route_capacity: usize,
+    /// Cached scratch for paged_decode_attention's prefill path: holds
+    /// the token-major attn output before transpose-back to head-major.
+    /// Lazy-grow on first use. Caching prevents per-call alloc churn
+    /// that triggered CUDA_ERROR_ILLEGAL_ADDRESS via stream-ordered free.
+    paged_attn_out_tm: Option<CudaSlice<f16>>,
+    paged_attn_out_tm_capacity: usize,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -100,6 +137,72 @@ const MAX_GRAPH_SLOTS: usize = 2 * super::MAX_LAYERS_FOR_GRAPH;
 const HOST_STAGING_TOTAL: usize = MAX_GRAPH_SLOTS * BATCHED_SCRATCH_CAP;
 
 impl CudaState {
+    /// Lazy-init the MoE stream pool on first access. Pool size is
+    /// 4 by default; override via FERRUM_MOE_STREAMS env (1 disables
+    /// multi-stream dispatch).
+    pub fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
+        if self.moe_streams.is_none() {
+            let n = std::env::var("FERRUM_MOE_STREAMS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4)
+                .max(1);
+            let mut pool = Vec::with_capacity(n);
+            for _ in 0..n {
+                let s = self
+                    .ctx
+                    .new_stream()
+                    .expect("CudaState::moe_stream_pool: new_stream failed");
+                pool.push(s);
+            }
+            tracing::info!("MoE stream pool initialized: {} streams", n);
+            self.moe_streams = Some(pool);
+        }
+        self.moe_streams.as_ref().unwrap()
+    }
+
+    /// Lazy-init the persistent cuEvents used by
+    /// `moe_gemm_phase_batched` for cross-stream sync. The (entry,
+    /// exits) tuple is stable across calls — events are only ever
+    /// recorded / waited on, never destroyed (until `Drop`).
+    pub fn moe_sync_events(
+        &mut self,
+    ) -> (
+        cudarc::driver::sys::CUevent,
+        Vec<cudarc::driver::sys::CUevent>,
+    ) {
+        use cudarc::driver::sys as cu;
+        if self.moe_entry_event.is_none() {
+            let n = self.moe_stream_pool().len();
+            let mut entry: cu::CUevent = std::ptr::null_mut();
+            unsafe {
+                // CU_EVENT_DISABLE_TIMING (= 2) — fastest event create,
+                // no GPU timestamp tracking. Required for sync only.
+                cu::cuEventCreate(&mut entry, 2);
+            }
+            let mut exits: Vec<usize> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let mut e: cu::CUevent = std::ptr::null_mut();
+                unsafe {
+                    cu::cuEventCreate(&mut e, 2);
+                }
+                exits.push(e as usize);
+            }
+            self.moe_entry_event = Some(entry as usize);
+            self.moe_exit_events = Some(exits);
+            tracing::info!("MoE sync events initialized: 1 entry + {} exits", n);
+        }
+        let entry = self.moe_entry_event.unwrap() as cu::CUevent;
+        let exits: Vec<cu::CUevent> = self
+            .moe_exit_events
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|&p| p as cu::CUevent)
+            .collect();
+        (entry, exits)
+    }
+
     fn module(&mut self, key: &'static str, ptx_src: &str) -> Arc<CudaModule> {
         if let Some(m) = self.modules.get(key) {
             return m.clone();
@@ -195,6 +298,15 @@ impl Backend for CudaBackend {
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
+    /// Default ON for CUDA. Mixed-batch unified_forward path requires
+    /// paged_pools; without it the engine's run_unified_iter falls back
+    /// to serial prefill that stalls in-flight decoders (~50% of bench
+    /// wall time at c=16). Override via FERRUM_METAL_PAGED_KV=0 if a
+    /// caller specifically wants legacy contig KV.
+    fn supports_paged_kv() -> bool {
+        true
+    }
+
     fn new_context() -> Self::Context {
         // Reuse the process-global stream populated by `default_stream()`.
         // Model constructors call `B::from_slice` thousands of times to
@@ -243,6 +355,14 @@ impl Backend for CudaBackend {
             batched_host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
             batched_host_kv_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
             batched_host_cache_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
+            moe_streams: None,
+            moe_entry_event: None,
+            moe_exit_events: None,
+            moe_route_ids: None,
+            moe_route_weights: None,
+            moe_route_capacity: 0,
+            paged_attn_out_tm: None,
+            paged_attn_out_tm_capacity: 0,
         }
     }
 
@@ -521,6 +641,46 @@ impl Backend for CudaBackend {
             stream.memcpy_dtoh(&view, &mut host).expect("cuda dtoh");
             stream.synchronize().expect("cuda dtoh sync");
             host.into_iter().map(|x| x.to_f32()).collect()
+        })
+    }
+
+    /// Greedy fast path: argmax on device, return n_rows u32 indices.
+    /// Replaces ~n_rows × vocab × 2 bytes DTOH + host argmax with a
+    /// single launch + n_rows × 4 bytes DTOH.
+    fn argmax_rows_to_u32(buf: &Self::Buffer, n_rows: usize, vocab: usize) -> Vec<u32> {
+        if n_rows == 0 {
+            return Vec::new();
+        }
+        with_stream(|stream| {
+            let ctx = stream.context();
+            let module = ensure_module(ctx, "argmax_rows", ptx::ARGMAX_ROWS);
+            let func = module
+                .load_function("argmax_rows_f16")
+                .expect("argmax_rows_f16 load_function");
+
+            let mut dev_out: cudarc::driver::CudaSlice<i32> = stream
+                .alloc_zeros::<i32>(n_rows)
+                .expect("argmax dev_out alloc");
+
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (n_rows as u32, 1, 1),
+                block_dim: (1024, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let view = buf.slice(0..(n_rows * vocab));
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(&view)
+                    .arg(&mut dev_out)
+                    .arg(&(n_rows as i32))
+                    .arg(&(vocab as i32))
+                    .launch(cfg)
+                    .expect("argmax launch");
+            }
+            stream.synchronize().expect("argmax sync");
+            let host_i32 = stream.memcpy_dtov(&dev_out).expect("argmax dtoh");
+            host_i32.into_iter().map(|x| x as u32).collect()
         })
     }
 
@@ -1199,6 +1359,40 @@ impl Backend for CudaBackend {
         if num_seqs == 0 || total_q_tokens == 0 {
             return Ok(());
         }
+
+        // Auto-tune: split-K helps under-occupied grids — low concurrency
+        // OR long context. Microbench (scripts/microbench_split_k.cu)
+        // shows c=1/kv=4096 9× speedup, c=4/kv=384 +103%, c=16/kv=384
+        // marginal/-2%. Heuristic gates split-K to regions where it wins.
+        // FERRUM_SPLIT_K_ATTN=1 forces on, FERRUM_SPLIT_K_ATTN=0 forces off.
+        let split_k_force = std::env::var("FERRUM_SPLIT_K_ATTN").ok();
+        let use_split_k = match split_k_force.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => num_seqs <= 4 || max_kv_len >= 768,
+        };
+
+        if use_split_k {
+            return paged_varlen_split_k_dispatch(
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                out,
+                cu_seqlens_q,
+                pos_offsets,
+                block_tables,
+                num_seqs,
+                total_q_tokens,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_blocks_per_seq,
+            );
+        }
+
         let func = ctx.func(
             "paged_varlen_attn",
             ptx::PAGED_VARLEN_ATTENTION,
@@ -1238,7 +1432,27 @@ impl Backend for CudaBackend {
         b.arg(&mbps);
         b.arg(&bsi);
         b.arg(&scale);
-        let shared_bytes = (max_kv_len.max(1) as u32) * 4;
+        // CUDA graph capture freezes `shared_mem_bytes` at capture time;
+        // graph keys at the engine level are (m_total, num_seqs) — they
+        // do NOT distinguish kv_len buckets. So a graph captured at
+        // kv_len=300 (shared=300*4) replays unchanged at kv_len=600 →
+        // kernel writes scores[300..600] OOB into shared.
+        // compute-sanitizer caught it:
+        //   "Invalid __shared__ write of size 4 bytes at paged_varlen_attn_f16
+        //    Address 0x84c is out of bounds (in captured graph replay)".
+        //
+        // Allocate the worst-case kv slot length for ANY future decode
+        // iter that may replay this graph. FERRUM_KV_CAPACITY caps it
+        // (default 512, bench sets 2048). 8 KB shared = 2048 floats
+        // — well within Ada's 96 KB/SM and Hopper's 228 KB/SM budgets.
+        // For models with longer effective contexts the cap raises with
+        // capacity at the cost of one alloc, never per-launch.
+        let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+        let shared_bytes = (shared_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
@@ -1248,6 +1462,236 @@ impl Backend for CudaBackend {
         }
         .map(|_| ())
         .map_err(|e| FerrumError::model(format!("paged_varlen_attn: {e}")))
+    }
+
+    /// Paged attention dispatcher (CUDA-only, replaces missing native
+    /// `paged_decode_attention`). Routes:
+    ///   - q_len==1 (decode for any num_seqs): paged_batched_decode_attention.
+    ///     The layouts coincide for q_len==1 — a [num_seqs, heads, dim]
+    ///     buffer is identical to [heads, num_seqs, dim] when seen as a
+    ///     single seq's contribution, so no transpose is needed.
+    ///   - q_len>1 (prefill, single-seq only): paged_varlen_attention.
+    ///     Caller's q is `[heads, q_len, dim]` (head-major) but varlen
+    ///     reads `[q_len, heads, dim]` (token-major), so we transpose
+    ///     in/out around the call. Cold path (prefill is rare per token).
+    #[allow(clippy::too_many_arguments)]
+    fn paged_decode_attention(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        block_tables: &Self::Buffer,
+        context_lens: &Self::Buffer,
+        num_seqs: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_num_blocks_per_seq: usize,
+        q_len: usize,
+    ) -> Result<()> {
+        let max_kv_len = block_size * max_num_blocks_per_seq;
+
+        if q_len == 1 {
+            return Self::paged_batched_decode_attention(
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                out,
+                block_tables,
+                context_lens,
+                num_seqs,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_num_blocks_per_seq,
+            );
+        }
+
+        // q_len > 1: prefill. Only single-seq is exercised — the only
+        // caller (Qwen3MoeModel::forward_layer) always passes num_seqs=1.
+        if num_seqs != 1 {
+            return Err(FerrumError::model(format!(
+                "paged_decode_attention(CUDA): q_len={q_len} num_seqs={num_seqs} \
+                 not supported (caller must split prefill into per-seq calls)"
+            )));
+        }
+
+        // Build cu_seqlens_q = [0, q_len] and pos_offsets = [final_kv_len - q_len].
+        // alloc_u32 + write_u32 (NOT from_slice_i32 — that default goes
+        // through f32→f16 and zeroes the bit pattern).
+        // Need final_kv_len from context_lens[0] — D2H 4 bytes (cold path).
+        let cl_host: Vec<u32> = {
+            let stream = ctx.stream.clone();
+            let view = unsafe {
+                context_lens
+                    .transmute::<u32>(1)
+                    .ok_or_else(|| FerrumError::model("context_lens transmute failed"))?
+            };
+            let mut h = vec![0u32; 1];
+            stream
+                .memcpy_dtoh(&view, h.as_mut_slice())
+                .map_err(|e| FerrumError::model(format!("dtoh context_lens: {e}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::model(format!("dtoh sync: {e}")))?;
+            h
+        };
+        let final_kv_len = cl_host[0] as usize;
+        if final_kv_len < q_len {
+            return Err(FerrumError::model(format!(
+                "paged_decode_attention(CUDA): final_kv_len={final_kv_len} < q_len={q_len}"
+            )));
+        }
+        let pos_offset = (final_kv_len - q_len) as u32;
+        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_u32(2);
+        <Self as Backend>::write_u32(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
+        let mut pos_offsets_buf = <Self as Backend>::alloc_u32(1);
+        <Self as Backend>::write_u32(ctx, &mut pos_offsets_buf, &[pos_offset]);
+
+        // The caller's q buffer (despite being named `q_head_major` in
+        // Qwen3MoeModel) is ALREADY token-major in paged mode: the
+        // paged-write kernel split_qkv_norm_rope_into_paged_cache_f16
+        // writes `q_out[tok, head, hd]` (see kernel comment at
+        // kernels/split_qkv_norm_rope_into_paged_cache.cu:102). So
+        // paged_varlen_attention can read q directly. No Q transpose.
+        //
+        // Output, however, is written by paged_varlen as
+        // `[M_total, num_q_heads, head_dim]` token-major (kernel:16),
+        // while Qwen3MoeModel's downstream code does
+        // `transpose_head_to_token(attn_head_major_out → attn_flat)`,
+        // expecting head-major. We transpose token→head into `out`.
+        let q_n = q_len * num_heads * head_dim;
+
+        // Lazy-grow the cached token-major output scratch. Stable
+        // address across calls — required to avoid stream-ordered
+        // free / kernel-still-running races at higher concurrency.
+        if ctx.paged_attn_out_tm_capacity < q_n {
+            let stream = ctx.stream.clone();
+            let n_grown = q_n.next_power_of_two().max(q_n);
+            ctx.paged_attn_out_tm = Some(
+                stream
+                    .alloc_zeros::<f16>(n_grown)
+                    .map_err(|e| FerrumError::model(format!("alloc paged_attn_out_tm: {e}")))?,
+            );
+            ctx.paged_attn_out_tm_capacity = n_grown;
+        }
+
+        // SAFETY: paged_varlen_attention only touches ctx.modules and
+        // ctx.stream (disjoint from paged_attn_out_tm). Same for
+        // transpose_token_to_head. We take a raw pointer to the cached
+        // buffer so we can pass it as a normal &mut/& while ctx is also
+        // borrowed by the kernel-call methods.
+        let out_tm_ptr: *mut CudaSlice<f16> =
+            ctx.paged_attn_out_tm
+                .as_mut()
+                .expect("paged_attn_out_tm allocated") as *mut _;
+        unsafe {
+            Self::paged_varlen_attention(
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                &mut *out_tm_ptr,
+                &cu_seqlens_q_buf,
+                &pos_offsets_buf,
+                block_tables,
+                1,
+                q_len,
+                final_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_num_blocks_per_seq,
+            )?;
+
+            // Restore head-major layout: [q_len, heads, hd] → [heads, q_len, hd]
+            // → caller's `out` buffer.
+            <Self as Backend>::transpose_token_to_head(
+                ctx,
+                &*out_tm_ptr,
+                out,
+                q_len,
+                num_heads,
+                head_dim,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn paged_batched_decode_attention(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        block_tables: &Self::Buffer,
+        valid_kv_lens: &Self::Buffer,
+        num_seqs: usize,
+        max_kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if num_seqs == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "paged_batched_decode_attn",
+            ptx::PAGED_DECODE_ATTENTION,
+            "paged_batched_decode_attn_f16",
+        );
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let stream = ctx.stream.clone();
+        let qv = q.slice(..);
+        let kp = k_pool.slice(..);
+        let vp = v_pool.slice(..);
+        let bt = block_tables.slice(..);
+        let kvl = valid_kv_lens.slice(..);
+        let nqi = num_heads as i32;
+        let nkvi = num_kv_heads as i32;
+        let hdi = head_dim as i32;
+        let mbps = max_blocks_per_seq as i32;
+        let bsi = block_size as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(&bt);
+        b.arg(&kvl);
+        b.arg(out);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mbps);
+        b.arg(&bsi);
+        b.arg(&scale);
+        // Same shared-mem sizing rationale as paged_varlen_attention
+        // (graph capture freezes shared_mem_bytes; size to
+        // FERRUM_KV_CAPACITY ceiling).
+        let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+        let shared_bytes = (shared_kv as u32) * 4;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, num_seqs as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| FerrumError::model(format!("paged_batched_decode_attn: {e}")))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1724,6 +2168,41 @@ impl Backend for CudaBackend {
         .expect("transpose_head_to_token launch");
     }
 
+    /// Inverse of `transpose_head_to_token`. Used by the CUDA paged
+    /// attention wrapper to convert paged_varlen_attention's token-major
+    /// output back to the head-major buffer Qwen3MoeModel expects.
+    fn transpose_token_to_head(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+    ) {
+        let func = ctx.func("transpose", ptx::TRANSPOSE, "transpose_token_to_head_f16");
+        let tokens_i32 = tokens as i32;
+        let heads_i32 = heads as i32;
+        let dim_i32 = dim as i32;
+        let total = tokens * heads * dim;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(src);
+        b.arg(dst);
+        b.arg(&tokens_i32);
+        b.arg(&heads_i32);
+        b.arg(&dim_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("transpose_token_to_head launch");
+    }
+
     // ── Element-wise ────────────────────────────────────────────────────
 
     fn add_inplace(
@@ -1755,6 +2234,361 @@ impl Backend for CudaBackend {
             })
         }
         .expect("add_inplace (residual_add_inplace) launch");
+    }
+
+    #[cfg(feature = "marlin")]
+    fn gemm_gptq_with_offset_strided(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        in_row_offset: usize,
+        weight: &Self::GptqStore,
+        expert_offset: usize,
+        expert_n: usize,
+        output: &mut Self::Buffer,
+        out_row_offset: usize,
+        m: usize,
+        _k: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "gemm_gptq_with_offset_strided: Triton w4a16 store has no \
+                     stride-aware variant; load MoE via Marlin (default)",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+        let stream = ctx.stream.clone();
+        crate::marlin::marlin_gemm_with_offset_strided(
+            &stream,
+            input,
+            in_row_offset as i32,
+            mw,
+            output,
+            out_row_offset as i32,
+            m as i32,
+            expert_offset as i32,
+            expert_n as i32,
+        )
+        .map_err(|e| FerrumError::model(format!("marlin offset_strided gemm: {e}")))
+    }
+
+    fn fused_silu_mul_split_strided(
+        ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        in_row_offset: usize,
+        out: &mut Self::Buffer,
+        out_row_offset: usize,
+        tokens: usize,
+        intermediate: usize,
+    ) {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        // Same kernel as `fused_silu_mul_split`, but feed it adjusted
+        // device pointers so it operates on a row-range slice.
+        let func = ctx.func(
+            "fused_silu_mul",
+            ptx::FUSED_SILU_MUL,
+            "fused_silu_mul_interleaved_f16",
+        );
+        let im_i32 = intermediate as i32;
+        let total = tokens * intermediate;
+        let total_i32 = total as i32;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+
+        let stream = ctx.stream.clone();
+        let in_byte_off = in_row_offset * 2 * intermediate * std::mem::size_of::<half::f16>();
+        let out_byte_off = out_row_offset * intermediate * std::mem::size_of::<half::f16>();
+
+        let (gu_base, _g) = gate_up.device_ptr(&stream);
+        let (out_base, _g2) = out.device_ptr_mut(&stream);
+        let gu_ptr = gu_base + in_byte_off as u64;
+        let out_ptr = out_base + out_byte_off as u64;
+
+        let mut b = stream.launch_builder(&func);
+        b.arg(&gu_ptr);
+        b.arg(&out_ptr);
+        b.arg(&im_i32);
+        b.arg(&total_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("fused_silu_mul_split_strided launch");
+    }
+
+    fn route_topk_softmax(
+        ctx: &mut Self::Context,
+        logits: &Self::Buffer,
+        out_ids: &mut Self::Buffer,
+        out_weights: &mut Self::Buffer,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+        norm_topk_prob: bool,
+    ) -> Result<()> {
+        // Block: one warp (32 threads), one block per row.
+        // Shared mem: num_experts × 4 bytes (per-row probability vector
+        // in fp32). At Qwen3-MoE num_experts=128 this is 512 bytes /
+        // block — far below the 48 KB / SM limit. Larger MoE configs
+        // (DeepSeek 256 experts) still only use 1 KB.
+        let func = ctx.func(
+            "moe_router_topk_softmax",
+            ptx::MOE_ROUTER,
+            "moe_router_topk_softmax_f16",
+        );
+        let batch_i32 = batch as i32;
+        let n_exp_i32 = num_experts as i32;
+        let top_k_i32 = top_k as i32;
+        let norm_i32 = if norm_topk_prob { 1i32 } else { 0i32 };
+        let smem_bytes = (num_experts as u32) * 4;
+
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(logits);
+        b.arg(out_ids);
+        b.arg(out_weights);
+        b.arg(&batch_i32);
+        b.arg(&n_exp_i32);
+        b.arg(&top_k_i32);
+        b.arg(&norm_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (batch as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: smem_bytes,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("moe_router launch: {e}")))?;
+        Ok(())
+    }
+
+    fn try_gpu_route_topk_into_host(
+        ctx: &mut Self::Context,
+        logits_dev: &Self::Buffer,
+        out_ids_host: &mut Vec<u32>,
+        out_weights_host: &mut Vec<f32>,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+        norm_topk_prob: bool,
+    ) -> Result<()> {
+        let total_pairs = batch * top_k;
+
+        // Lazy-init the scratch device buffers. Sized to total_pairs;
+        // grow if a larger shape shows up. i32 storage = 4*total_pairs
+        // bytes = 2*total_pairs f16 elements; f32 storage same (4 bytes
+        // per element).
+        if ctx.moe_route_capacity < total_pairs {
+            let stream = ctx.stream.clone();
+            // 2 × total_pairs because each i32 / f32 element needs 4
+            // bytes = 2 f16 slots in the underlying CudaSlice<f16>.
+            let nf16 = 2 * total_pairs;
+            ctx.moe_route_ids = Some(
+                stream
+                    .alloc_zeros::<f16>(nf16)
+                    .map_err(|e| FerrumError::model(format!("alloc moe_route_ids: {e}")))?,
+            );
+            ctx.moe_route_weights = Some(
+                stream
+                    .alloc_zeros::<f16>(nf16)
+                    .map_err(|e| FerrumError::model(format!("alloc moe_route_weights: {e}")))?,
+            );
+            ctx.moe_route_capacity = total_pairs;
+        }
+
+        // 1. Launch the kernel into the cached scratch. Scoped so the
+        // launch_builder (which moves the &mut buffer references) drops
+        // before we re-borrow them immutably for the D2H phase.
+        let func = ctx.func(
+            "moe_router_topk_softmax",
+            ptx::MOE_ROUTER,
+            "moe_router_topk_softmax_f16",
+        );
+        let batch_i32 = batch as i32;
+        let n_exp_i32 = num_experts as i32;
+        let top_k_i32 = top_k as i32;
+        let norm_i32 = if norm_topk_prob { 1i32 } else { 0i32 };
+        let smem_bytes = (num_experts as u32) * 4;
+
+        let stream = ctx.stream.clone();
+        {
+            let ids_dev = ctx
+                .moe_route_ids
+                .as_mut()
+                .expect("moe_route_ids should be allocated");
+            let weights_dev = ctx
+                .moe_route_weights
+                .as_mut()
+                .expect("moe_route_weights should be allocated");
+
+            let mut b = stream.launch_builder(&func);
+            b.arg(logits_dev);
+            b.arg(ids_dev);
+            b.arg(weights_dev);
+            b.arg(&batch_i32);
+            b.arg(&n_exp_i32);
+            b.arg(&top_k_i32);
+            b.arg(&norm_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (batch as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: smem_bytes,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("moe_router launch: {e}")))?;
+        }
+
+        // 2. D2H ids (i32) and weights (f32) into the host destinations.
+        out_ids_host.clear();
+        out_ids_host.resize(total_pairs, 0u32);
+        out_weights_host.clear();
+        out_weights_host.resize(total_pairs, 0.0f32);
+
+        let ids_dev = ctx
+            .moe_route_ids
+            .as_ref()
+            .expect("moe_route_ids should be allocated");
+        let weights_dev = ctx
+            .moe_route_weights
+            .as_ref()
+            .expect("moe_route_weights should be allocated");
+
+        // Reinterpret the f16-typed scratch as i32 / f32 views. transmute
+        // verifies byte-fit (returns None if undersized).
+        let ids_view = unsafe {
+            ids_dev
+                .transmute::<i32>(total_pairs)
+                .ok_or_else(|| FerrumError::model("ids transmute size mismatch"))?
+        };
+        let weights_view = unsafe {
+            weights_dev
+                .transmute::<f32>(total_pairs)
+                .ok_or_else(|| FerrumError::model("weights transmute size mismatch"))?
+        };
+
+        // out_ids_host is Vec<u32>; reinterpret as &mut [i32] for the
+        // memcpy. Same byte pattern.
+        let out_ids_i32: &mut [i32] = unsafe {
+            std::slice::from_raw_parts_mut(out_ids_host.as_mut_ptr() as *mut i32, total_pairs)
+        };
+        stream
+            .memcpy_dtoh(&ids_view, out_ids_i32)
+            .map_err(|e| FerrumError::model(format!("dtoh route ids: {e}")))?;
+        stream
+            .memcpy_dtoh(&weights_view, out_weights_host.as_mut_slice())
+            .map_err(|e| FerrumError::model(format!("dtoh route weights: {e}")))?;
+        // Synchronize so the host can read the results immediately.
+        stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("dtoh sync: {e}")))?;
+
+        Ok(())
+    }
+
+    fn moe_align_block_size(
+        ctx: &mut Self::Context,
+        expert_ids_per_pair: &Self::Buffer,
+        sorted_token_ids: &mut Self::Buffer,
+        block_ids: &mut Self::Buffer,
+        total_tokens_post_pad: &mut Self::Buffer,
+        batch_x_topk: usize,
+        num_experts: usize,
+        block_size: usize,
+        sorted_max_size: usize,
+    ) -> Result<()> {
+        if num_experts > 256 {
+            return Err(FerrumError::model(format!(
+                "moe_align_block_size: num_experts={num_experts} exceeds compile-time MAX_NUM_EXPERTS=256"
+            )));
+        }
+        let func = ctx.func(
+            "moe_align_block_size",
+            ptx::MOE_ALIGN_BLOCK_SIZE,
+            "moe_align_block_size_f32",
+        );
+        let n = batch_x_topk as i32;
+        let ne = num_experts as i32;
+        let bs = block_size as i32;
+        let smax = sorted_max_size as i32;
+        let stream = ctx.stream.clone();
+        // Single block — algorithm uses shared mem for counts + offsets,
+        // sized to MAX_NUM_EXPERTS=256. Use 256 threads to cover the
+        // ≤256-experts and ≤1024-pair Qwen3-MoE configs cleanly.
+        let mut b = stream.launch_builder(&func);
+        b.arg(expert_ids_per_pair);
+        b.arg(sorted_token_ids);
+        b.arg(block_ids);
+        b.arg(total_tokens_post_pad);
+        b.arg(&n);
+        b.arg(&ne);
+        b.arg(&bs);
+        b.arg(&smax);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("moe_align_block_size launch: {e}")))?;
+        Ok(())
+    }
+
+    fn moe_combine(
+        ctx: &mut Self::Context,
+        packed_down: &Self::Buffer,
+        pairs_by_token: &[i32],
+        pair_weights: &[f32],
+        out: &mut Self::Buffer,
+        batch: usize,
+        hidden: usize,
+        top_k: usize,
+        _total_pairs: usize,
+    ) {
+        debug_assert_eq!(pairs_by_token.len(), batch * top_k);
+        debug_assert_eq!(pair_weights.len(), batch * top_k);
+
+        let stream = ctx.stream.clone();
+        let pairs_dev = stream
+            .clone_htod(pairs_by_token)
+            .expect("moe_combine pairs htod");
+        let weights_dev = stream
+            .clone_htod(pair_weights)
+            .expect("moe_combine weights htod");
+
+        let func = ctx.func("moe_combine", ptx::MOE_COMBINE, "moe_combine_f16");
+        let batch_i32 = batch as i32;
+        let hidden_i32 = hidden as i32;
+        let top_k_i32 = top_k as i32;
+
+        let block = 256u32;
+        let grid_x = ((hidden as u32) + block - 1) / block;
+
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(packed_down);
+        b.arg(&pairs_dev);
+        b.arg(&weights_dev);
+        b.arg(out);
+        b.arg(&batch_i32);
+        b.arg(&hidden_i32);
+        b.arg(&top_k_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid_x, batch as u32, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("moe_combine launch");
     }
 
     fn add_bias(
@@ -1985,6 +2819,154 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn load_gptq_stacked(
+        qweights: &[&[i32]],
+        scales: &[&[f32]],
+        qzeros: &[&[i32]],
+        g_idx: Option<&[i32]>,
+        bits: u32,
+        group_size: usize,
+        k: usize,
+        n_per_expert: usize,
+    ) -> Result<Self::GptqStore> {
+        if bits != 4 {
+            return Err(FerrumError::unsupported(format!(
+                "CUDA GPTQ stacked: only bits=4 supported (got {bits})"
+            )));
+        }
+        let num_experts = qweights.len();
+        if num_experts == 0 {
+            return Err(FerrumError::model("load_gptq_stacked: 0 experts"));
+        }
+        if scales.len() != num_experts || qzeros.len() != num_experts {
+            return Err(FerrumError::model(format!(
+                "load_gptq_stacked length mismatch: qw={} sc={} qz={}",
+                num_experts,
+                scales.len(),
+                qzeros.len()
+            )));
+        }
+        let _ = qzeros; // Marlin doesn't read qzeros (sym=true)
+
+        // Triton path: would need a stacked variant — not implemented.
+        // Fall through to Marlin.
+        #[cfg(feature = "triton-kernels")]
+        if use_triton_int4() {
+            return Err(FerrumError::unsupported(
+                "load_gptq_stacked: Triton w4a16 path not implemented; \
+                 unset FERRUM_TRITON_INT4 to use Marlin",
+            ));
+        }
+
+        // desc_act perm-aware path: sample expert 0's g_idx (all experts
+        // share K-axis quantization, so g_idx is identical across experts).
+        let (perm_dev_opt, perm_for_repack): (Option<CudaSlice<i32>>, Option<Vec<usize>>) =
+            if let Some(gx) = g_idx {
+                let is_desc_act = gx
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &g)| g != (i as i32) / group_size as i32);
+                if is_desc_act {
+                    let mut perm: Vec<usize> = (0..k).collect();
+                    perm.sort_by_key(|&i| gx[i]);
+                    let perm_i32: Vec<i32> = perm.iter().map(|&p| p as i32).collect();
+                    let stream = default_stream();
+                    let perm_dev = stream
+                        .clone_htod(&perm_i32)
+                        .map_err(|e| FerrumError::model(format!("perm htod: {e}")))?;
+                    (Some(perm_dev), Some(perm))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+        // Per-expert repack in parallel via rayon. Each produces its
+        // own packed qweight + permuted scales tile. Concat in expert
+        // order — each expert's bytes are CONTIGUOUS in the output
+        // buffer, so an offset GEMM with prob_n=n_per_expert just
+        // walks the right slice.
+        use rayon::prelude::*;
+        let qw_per_expert_i32 = (n_per_expert * k) / 8;
+        let sc_per_expert_f16 = (k / group_size) * n_per_expert;
+
+        let mut packed_qw: Vec<i32> = vec![0i32; num_experts * qw_per_expert_i32];
+        let mut packed_sc: Vec<f16> = vec![f16::ZERO; num_experts * sc_per_expert_f16];
+
+        // Parallelize across experts: each writes to a disjoint output
+        // slice. Per-expert repack runs the inner-rayon-parallel
+        // 4-pass kernel — at num_experts > num_cores, outer parallelism
+        // wins; at smaller num_experts, inner parallelism wins. Rayon
+        // nests fine.
+        packed_qw
+            .par_chunks_mut(qw_per_expert_i32)
+            .zip(packed_sc.par_chunks_mut(sc_per_expert_f16))
+            .enumerate()
+            .for_each(|(e, (qw_out, sc_out))| {
+                let qw_in: Vec<i32> = if let Some(perm) = &perm_for_repack {
+                    crate::marlin::permute_gptq_qweight_rows(qweights[e], perm, k, n_per_expert)
+                } else {
+                    qweights[e].to_vec()
+                };
+                let qw_packed = crate::marlin::repack_gptq_to_marlin(&qw_in, k, n_per_expert);
+                qw_out.copy_from_slice(&qw_packed);
+
+                let sc_f16: Vec<f16> = scales[e].iter().map(|&x| f16::from_f32(x)).collect();
+                let sc_packed =
+                    crate::marlin::repack_scales_to_marlin(&sc_f16, k, n_per_expert, group_size);
+                sc_out.copy_from_slice(&sc_packed);
+            });
+
+        // Single htod upload of the concatenated packed buffer.
+        let stream = default_stream();
+        let qweight_dev = stream
+            .clone_htod(&packed_qw)
+            .map_err(|e| FerrumError::model(format!("stacked qweight htod: {e}")))?;
+        let scales_dev = stream
+            .clone_htod(&packed_sc)
+            .map_err(|e| FerrumError::model(format!("stacked scales htod: {e}")))?;
+
+        // Workspace: per-expert range concatenated. Each expert owns
+        // (n_per_expert/128) × max_par i32 mutex slots starting at
+        // its expert_idx * that_size.
+        let max_par = 16usize;
+        let ws_per_expert = (n_per_expert / 128).max(1) * max_par;
+        let ws_len = num_experts * ws_per_expert;
+        let workspace_dev = stream
+            .alloc_zeros::<i32>(ws_len)
+            .map_err(|e| FerrumError::model(format!("stacked ws alloc: {e}")))?;
+
+        // Total stacked N for downstream offset arithmetic. We store
+        // total_n in MarlinWeight.n so byte_per_col-style helpers see
+        // the full width; the offset GEMM uses per-expert stride
+        // (= n_per_expert) regardless of weight.n.
+        let total_n = num_experts * n_per_expert;
+        let marlin_weight = crate::marlin::MarlinWeight {
+            qweight: qweight_dev,
+            scales: scales_dev,
+            workspace: workspace_dev,
+            k,
+            n: total_n,
+            group_size: group_size as i32,
+            perm: perm_dev_opt,
+        };
+
+        tracing::info!(
+            "GPTQ stacked load: {} experts × N={n_per_expert} × K={k} (gs={group_size})",
+            num_experts
+        );
+
+        #[cfg(feature = "triton-kernels")]
+        {
+            Ok(GptqStoreCuda::Marlin(marlin_weight))
+        }
+        #[cfg(not(feature = "triton-kernels"))]
+        {
+            Ok(marlin_weight)
+        }
+    }
+
     #[cfg(feature = "marlin")]
     fn gemm_gptq(
         ctx: &mut Self::Context,
@@ -2060,6 +3042,189 @@ impl Backend for CudaBackend {
             "cargo features `marlin` and `triton-kernels` both disabled — \
              GPTQ not available",
         ))
+    }
+
+    /// MoE expert dispatch: GEMM over a column-slice of a stacked Marlin
+    /// store. Lets all 128 experts share one Marlin repack; the runtime
+    /// dispatch picks one expert by `expert_offset`.
+    ///
+    /// Currently Marlin-only (the Triton w4a16 variant doesn't support
+    /// strided access on the on-disk layout). When triton-kernels is on
+    /// and the store is Triton, returns Unsupported — caller should ensure
+    /// MoE models load through the Marlin path (default).
+    #[cfg(feature = "marlin")]
+    fn gemm_gptq_with_offset(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::GptqStore,
+        expert_offset: usize,
+        expert_n: usize,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "gemm_gptq_with_offset: Triton w4a16 store has no \
+                     stride-aware variant; load MoE via Marlin (default)",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+        let stream = ctx.stream.clone();
+        crate::marlin::marlin_gemm_with_offset(
+            &stream,
+            a,
+            mw,
+            out,
+            m as i32,
+            expert_offset as i32,
+            expert_n as i32,
+        )
+        .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
+    }
+
+    #[cfg(feature = "marlin")]
+    fn moe_gemm_phase_batched(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::GptqStore,
+        dispatches: &[(usize, usize, usize, usize)],
+        n_per_expert: usize,
+        output: &mut Self::Buffer,
+        k: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "moe_gemm_phase_batched: Triton w4a16 not supported",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+
+        // n_streams=1: serial dispatch on the DEFAULT context stream
+        // (avoids the cross-stream sync overhead and matches the
+        // pre-multi-stream path bit-for-bit).
+        let n_streams = std::env::var("FERRUM_MOE_STREAMS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
+        if n_streams == 1 {
+            let default_stream = ctx.stream.clone();
+            for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
+                crate::marlin::marlin_gemm_with_offset_strided(
+                    &default_stream,
+                    input,
+                    *in_row_offset as i32,
+                    mw,
+                    output,
+                    *out_row_offset as i32,
+                    *m as i32,
+                    (expert_idx * n_per_expert) as i32,
+                    n_per_expert as i32,
+                )
+                .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
+            }
+            let _ = k;
+            return Ok(());
+        }
+
+        // n_streams ≥ 2: round-robin across the pool, then ALL streams
+        // wait for the default's prior work (cuStreamWaitEvent on an
+        // event recorded into default), and the default waits for ALL
+        // pool streams before returning. Without this cross-stream
+        // sync, silu_mul on default may run before pool GEMMs commit
+        // → races → junk output.
+        //
+        // The 1 + N events are persistent on `CudaState` — re-recording
+        // an event silently overwrites the prior recording, so per-call
+        // create+destroy is replaced with record+wait only. At c=32 /
+        // 48 layers / 2 phases that's ~960 driver calls saved per token.
+        let (entry_event, exit_events) = ctx.moe_sync_events();
+        let pool: Vec<Arc<CudaStream>> = ctx.moe_stream_pool().to_vec();
+        let default_stream = ctx.stream.clone();
+        use cudarc::driver::sys as cu;
+        // Default → pool: record on default, each pool waits.
+        unsafe {
+            cu::cuEventRecord(entry_event, default_stream.cu_stream());
+        }
+        for stream in &pool {
+            unsafe {
+                cu::cuStreamWaitEvent(stream.cu_stream(), entry_event, 0);
+            }
+        }
+
+        for (i, (expert_idx, in_row_offset, out_row_offset, m)) in dispatches.iter().enumerate() {
+            let stream = &pool[i % n_streams];
+            crate::marlin::marlin_gemm_with_offset_strided(
+                stream,
+                input,
+                *in_row_offset as i32,
+                mw,
+                output,
+                *out_row_offset as i32,
+                *m as i32,
+                (expert_idx * n_per_expert) as i32,
+                n_per_expert as i32,
+            )
+            .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
+        }
+
+        // pool → default: each pool stream records its exit event;
+        // default waits for all of them. After return, default's next
+        // op (silu) will see all GEMM outputs committed.
+        let _ = k;
+        debug_assert_eq!(
+            exit_events.len(),
+            pool.len(),
+            "moe_sync_events exit count != pool size"
+        );
+        for (i, stream) in pool.iter().enumerate() {
+            unsafe {
+                cu::cuEventRecord(exit_events[i], stream.cu_stream());
+            }
+        }
+        for ev in &exit_events {
+            unsafe {
+                cu::cuStreamWaitEvent(default_stream.cu_stream(), *ev, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "marlin")]
+    fn marlin_zero_stacked_workspace(
+        ctx: &mut Self::Context,
+        weight: &Self::GptqStore,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "marlin_zero_stacked_workspace: not applicable to Triton store",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+        let stream = ctx.stream.clone();
+        let raw_stream = stream.cu_stream();
+        let (ws_ptr, _g) = mw.workspace.device_ptr(&stream);
+        let ws_len = mw.workspace.len();
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, ws_len, raw_stream);
+        }
+        Ok(())
     }
 
     // ── TP collectives ──────────────────────────────────────────────────
@@ -2655,6 +3820,197 @@ fn with_marlin_gather_scratch<R>(
     }
     let s = w.as_mut().expect("just allocated");
     body(&mut s.buf)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Paged-varlen split-K scratch + dispatch
+// ────────────────────────────────────────────────────────────────────────
+
+/// Process-global scratch for split-K phase1 outputs. Three buffers
+/// (partial_out f32, partial_m f32, partial_l f32) sized to the largest
+/// shape ever requested. Same lazy-grow pattern as Marlin gather scratch.
+struct SplitKScratch {
+    partial_out: CudaSlice<f32>, // [M_total * num_q_heads * num_splits * head_dim]
+    partial_m: CudaSlice<f32>,   // [M_total * num_q_heads * num_splits]
+    partial_l: CudaSlice<f32>,   // [M_total * num_q_heads * num_splits]
+    out_capacity: usize,
+    ml_capacity: usize,
+}
+unsafe impl Send for SplitKScratch {}
+unsafe impl Sync for SplitKScratch {}
+
+static SPLIT_K_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<SplitKScratch>>> =
+    std::sync::OnceLock::new();
+
+fn split_k_scratch_slot() -> &'static std::sync::RwLock<Option<SplitKScratch>> {
+    SPLIT_K_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn with_split_k_scratch<R>(
+    stream: &Arc<CudaStream>,
+    out_required: usize,
+    ml_required: usize,
+    body: impl FnOnce(&mut CudaSlice<f32>, &mut CudaSlice<f32>, &mut CudaSlice<f32>) -> R,
+) -> R {
+    let slot = split_k_scratch_slot();
+    {
+        let g = slot.read().expect("SPLIT_K_SCRATCH poisoned");
+        if let Some(ref s) = *g {
+            if s.out_capacity >= out_required && s.ml_capacity >= ml_required {
+                drop(g);
+                let mut w = slot.write().expect("SPLIT_K_SCRATCH poisoned");
+                let s = w.as_mut().expect("just observed Some");
+                return body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l);
+            }
+        }
+    }
+    let mut w = slot.write().expect("SPLIT_K_SCRATCH poisoned");
+    let need_new = match &*w {
+        Some(s) => s.out_capacity < out_required || s.ml_capacity < ml_required,
+        None => true,
+    };
+    if need_new {
+        let partial_out = unsafe { stream.alloc::<f32>(out_required) }
+            .expect("SPLIT_K_SCRATCH partial_out alloc");
+        let partial_m =
+            unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_m alloc");
+        let partial_l =
+            unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_l alloc");
+        *w = Some(SplitKScratch {
+            partial_out,
+            partial_m,
+            partial_l,
+            out_capacity: out_required,
+            ml_capacity: ml_required,
+        });
+    }
+    let s = w.as_mut().expect("just allocated");
+    body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paged_varlen_split_k_dispatch(
+    ctx: &mut CudaState,
+    q: &CudaSlice<f16>,
+    k_pool: &CudaSlice<f16>,
+    v_pool: &CudaSlice<f16>,
+    out: &mut CudaSlice<f16>,
+    cu_seqlens_q: &CudaSlice<f16>,
+    pos_offsets: &CudaSlice<f16>,
+    block_tables: &CudaSlice<f16>,
+    num_seqs: usize,
+    total_q_tokens: usize,
+    max_kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+) -> Result<()> {
+    // Pick num_splits based on kv_len. Microbench peak points:
+    //   kv ≤ 384  → N=2 (or skip if c≥16)
+    //   kv ≤ 1024 → N=4
+    //   kv ≤ 2048 → N=8
+    //   else      → N=16
+    let num_splits: usize = match max_kv_len {
+        kv if kv <= 384 => 2,
+        kv if kv <= 1024 => 4,
+        kv if kv <= 2048 => 8,
+        _ => 16,
+    };
+
+    let chunk = (max_kv_len + num_splits - 1) / num_splits;
+    let out_required = total_q_tokens * num_heads * num_splits * head_dim;
+    let ml_required = total_q_tokens * num_heads * num_splits;
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+    let stream = ctx.stream.clone();
+
+    let phase1 = ctx.func(
+        "paged_varlen_split_k_phase1",
+        ptx::PAGED_VARLEN_ATTENTION,
+        "paged_varlen_attn_split_k_phase1_f16",
+    );
+    let reduce = ctx.func(
+        "paged_varlen_split_k_reduce",
+        ptx::PAGED_VARLEN_ATTENTION,
+        "paged_varlen_split_k_reduce_f16",
+    );
+
+    with_split_k_scratch(
+        &stream,
+        out_required,
+        ml_required,
+        |partial_out, partial_m, partial_l| {
+            let qv = q.slice(..);
+            let kp = k_pool.slice(..);
+            let vp = v_pool.slice(..);
+            let csq = cu_seqlens_q.slice(..);
+            let po = pos_offsets.slice(..);
+            let bt = block_tables.slice(..);
+            let pout = partial_out.slice(..);
+            let pm = partial_m.slice(..);
+            let pl = partial_l.slice(..);
+            let ns = num_seqs as i32;
+            let nqi = num_heads as i32;
+            let nkvi = num_kv_heads as i32;
+            let hdi = head_dim as i32;
+            let mbps = max_blocks_per_seq as i32;
+            let bsi = block_size as i32;
+            let nsp = num_splits as i32;
+
+            // Phase 1: (num_heads, M_total, num_splits)
+            let mut b1 = stream.launch_builder(&phase1);
+            b1.arg(&qv);
+            b1.arg(&kp);
+            b1.arg(&vp);
+            b1.arg(&csq);
+            b1.arg(&po);
+            b1.arg(&bt);
+            b1.arg(&pout);
+            b1.arg(&pm);
+            b1.arg(&pl);
+            b1.arg(&ns);
+            b1.arg(&nqi);
+            b1.arg(&nkvi);
+            b1.arg(&hdi);
+            b1.arg(&mbps);
+            b1.arg(&bsi);
+            b1.arg(&scale);
+            b1.arg(&nsp);
+            let shmem1 = (chunk.max(1) as u32) * 4;
+            unsafe {
+                b1.launch(LaunchConfig {
+                    grid_dim: (num_heads as u32, total_q_tokens as u32, num_splits as u32),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: shmem1,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("paged_varlen_split_k_phase1: {e}")))?;
+
+            // Phase 2: (num_heads, M_total)
+            let pout2 = partial_out.slice(..);
+            let pm2 = partial_m.slice(..);
+            let pl2 = partial_l.slice(..);
+            let mut b2 = stream.launch_builder(&reduce);
+            b2.arg(&pout2);
+            b2.arg(&pm2);
+            b2.arg(&pl2);
+            b2.arg(out);
+            b2.arg(&nqi);
+            b2.arg(&hdi);
+            b2.arg(&nsp);
+            unsafe {
+                b2.launch(LaunchConfig {
+                    grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("paged_varlen_split_k_reduce: {e}")))?;
+
+            Ok::<(), FerrumError>(())
+        },
+    )
 }
 
 fn marlin_gemm_with_perm(

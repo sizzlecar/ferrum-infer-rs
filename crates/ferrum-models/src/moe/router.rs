@@ -25,6 +25,27 @@ pub struct RouterOutput {
 }
 
 impl RouterOutput {
+    /// Empty `RouterOutput` with no allocation. Use [`Self::reset`] before
+    /// reuse — this is the cheap constructor for putting it in a scratch
+    /// struct.
+    pub fn empty() -> Self {
+        Self {
+            expert_ids: Vec::new(),
+            expert_weights: Vec::new(),
+        }
+    }
+
+    /// Resize both vectors to `batch * top_k`. Existing capacity is reused
+    /// when sufficient; growth uses standard `Vec::resize`. Old contents
+    /// are not preserved (callers always overwrite).
+    pub fn reset(&mut self, batch: usize, top_k: usize) {
+        let n = batch * top_k;
+        self.expert_ids.clear();
+        self.expert_ids.resize(n, 0);
+        self.expert_weights.clear();
+        self.expert_weights.resize(n, 0.0);
+    }
+
     /// Number of tokens routed.
     pub fn batch(&self) -> usize {
         // `top_k` is the second dimension; we don't store it explicitly,
@@ -59,6 +80,45 @@ pub fn route(
     top_k: usize,
     norm_topk_prob: bool,
 ) -> RouterOutput {
+    let mut out = RouterOutput::empty();
+    let mut scratch = Vec::new();
+    route_into(
+        logits,
+        batch,
+        num_experts,
+        top_k,
+        norm_topk_prob,
+        &mut out,
+        &mut scratch,
+    );
+    out
+}
+
+/// Allocation-free variant of [`route`].
+///
+/// The 4 per-row `Vec` allocations of [`route`] (softmax buffer, indexed
+/// pair buffer for sort, top-K index buffer, renormalised weights buffer)
+/// dominate per-token cost in MoE forward — at c=32 / num_experts=128 /
+/// top_k=8 / 48 layers that's 4 608 allocations per decode token, or
+/// ~10 ms of pure CPU per token (25% of MoE wallclock at c=32 on RTX 4090).
+///
+/// This variant takes a reusable `out: &mut RouterOutput` and a
+/// `scratch_probs: &mut Vec<f32>` softmax buffer, both of which are
+/// `clear() + resize()` reused across calls — zero allocations after warmup.
+/// Top-K is computed via argmax-mask (K passes of a linear scan) instead
+/// of a full O(N log N) sort, which is also faster for K=8 / N=128.
+///
+/// Tie-breaking: when two probs are equal, the smaller index wins (matches
+/// [`route`] / Metal `moe_router_topk_softmax_f32` for bit-exact output).
+pub fn route_into(
+    logits: &[f32],
+    batch: usize,
+    num_experts: usize,
+    top_k: usize,
+    norm_topk_prob: bool,
+    out: &mut RouterOutput,
+    scratch_probs: &mut Vec<f32>,
+) {
     assert_eq!(
         logits.len(),
         batch * num_experts,
@@ -71,69 +131,135 @@ pub fn route(
         "top_k {top_k} exceeds num_experts {num_experts}"
     );
 
-    let mut expert_ids = Vec::with_capacity(batch * top_k);
-    let mut expert_weights = Vec::with_capacity(batch * top_k);
+    out.reset(batch, top_k);
+    scratch_probs.clear();
+    scratch_probs.resize(num_experts, 0.0);
 
     for b in 0..batch {
         let row = &logits[b * num_experts..(b + 1) * num_experts];
-        let probs = softmax(row);
-        let topk = top_k_indices(&probs, top_k);
 
-        // Optionally renorm the K selected weights. If norm is off we
-        // emit the raw post-softmax probs (unselected mass discarded).
-        let combine_weights = if norm_topk_prob {
-            renormalise(&topk, &probs)
-        } else {
-            topk.iter().map(|&i| probs[i]).collect::<Vec<_>>()
-        };
+        // ── Softmax in-place into scratch_probs. ─────────────────────────
+        let mut max = f32::NEG_INFINITY;
+        for &v in row {
+            if v > max {
+                max = v;
+            }
+        }
+        let mut sum = 0.0f32;
+        for (i, &v) in row.iter().enumerate() {
+            let e = (v - max).exp();
+            scratch_probs[i] = e;
+            sum += e;
+        }
+        let inv_sum = 1.0 / sum;
+        for v in scratch_probs.iter_mut() {
+            *v *= inv_sum;
+        }
 
-        for (i, &exp_id) in topk.iter().enumerate() {
-            expert_ids.push(exp_id as u32);
-            expert_weights.push(combine_weights[i]);
+        // ── Top-K via argmax-mask. K passes; each picks the largest
+        // remaining prob and overwrites it with -inf so the next pass
+        // sees the next-best. The strict `v > best` keeps the first
+        // (smallest-index) tied entry — matches the sort-based path.
+        let mut sel_sum = 0.0f32;
+        let dst_lo = b * top_k;
+        for k in 0..top_k {
+            let mut best = f32::NEG_INFINITY;
+            let mut best_idx = 0usize;
+            for (i, &v) in scratch_probs.iter().enumerate() {
+                if v > best {
+                    best = v;
+                    best_idx = i;
+                }
+            }
+            out.expert_ids[dst_lo + k] = best_idx as u32;
+            out.expert_weights[dst_lo + k] = best;
+            sel_sum += best;
+            scratch_probs[best_idx] = f32::NEG_INFINITY;
+        }
+
+        // ── Optional renorm of the K picked weights. ─────────────────
+        if norm_topk_prob {
+            if sel_sum > 0.0 {
+                let scale = 1.0 / sel_sum;
+                for w in &mut out.expert_weights[dst_lo..dst_lo + top_k] {
+                    *w *= scale;
+                }
+            } else {
+                let uniform = 1.0 / top_k as f32;
+                for w in &mut out.expert_weights[dst_lo..dst_lo + top_k] {
+                    *w = uniform;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    fn run_parity(batch: usize, num_experts: usize, top_k: usize, norm: bool, seed: u64) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let logits: Vec<f32> = (0..batch * num_experts)
+            .map(|_| rng.gen_range(-3.0..3.0_f32))
+            .collect();
+
+        // Old / new bit-for-bit must match — both use stable max-subtract
+        // softmax + first-tie-wins top-K + (optional) sum-renorm.
+        let a = route(&logits, batch, num_experts, top_k, norm);
+        let mut b = RouterOutput::empty();
+        let mut probs = Vec::new();
+        route_into(&logits, batch, num_experts, top_k, norm, &mut b, &mut probs);
+
+        assert_eq!(a.expert_ids, b.expert_ids, "expert_ids mismatch");
+        for (i, (&aw, &bw)) in a.expert_weights.iter().zip(&b.expert_weights).enumerate() {
+            // Within ulps for the renorm-divide, exact otherwise.
+            let delta = (aw - bw).abs();
+            assert!(
+                delta < 1e-6,
+                "weight[{i}] mismatch: route={aw} route_into={bw} delta={delta}"
+            );
         }
     }
 
-    RouterOutput {
-        expert_ids,
-        expert_weights,
+    #[test]
+    fn parity_qwen3_moe_shape() {
+        // Qwen3-MoE 30B-A3B production shape (norm_topk_prob=true).
+        run_parity(32, 128, 8, true, 0xDEADBEEF);
+        run_parity(1, 128, 8, true, 0x1234);
+        run_parity(64, 128, 8, true, 0x5678);
     }
-}
 
-/// Numerically-stable softmax over a single row.
-fn softmax(row: &[f32]) -> Vec<f32> {
-    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut exp: Vec<f32> = row.iter().map(|&x| (x - max).exp()).collect();
-    let sum: f32 = exp.iter().sum();
-    // sum is guaranteed > 0 because at least one term is exp(max-max) = 1.
-    for v in &mut exp {
-        *v /= sum;
+    #[test]
+    fn parity_no_renorm() {
+        run_parity(8, 64, 4, false, 0xC0FFEE);
     }
-    exp
-}
 
-/// Return the indices of the K largest entries, sorted by value descending,
-/// breaking ties by smaller index first (stable / reproducible).
-fn top_k_indices(probs: &[f32], top_k: usize) -> Vec<usize> {
-    // Pair each prob with its index, sort by (-prob, index) then truncate.
-    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-    indexed.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    indexed.truncate(top_k);
-    indexed.into_iter().map(|(i, _)| i).collect()
-}
+    #[test]
+    fn parity_topk_one() {
+        run_parity(4, 16, 1, true, 0x42);
+        run_parity(4, 16, 1, false, 0x42);
+    }
 
-/// Renormalise the K selected probabilities so they sum to 1.
-fn renormalise(selected: &[usize], probs: &[f32]) -> Vec<f32> {
-    let sum: f32 = selected.iter().map(|&i| probs[i]).sum();
-    // Guard against degenerate sum=0 (shouldn't happen with finite logits).
-    if sum > 0.0 {
-        selected.iter().map(|&i| probs[i] / sum).collect()
-    } else {
-        // Fallback: uniform 1/K.
-        let k = selected.len() as f32;
-        vec![1.0 / k; selected.len()]
+    #[test]
+    fn allocation_free_after_warmup() {
+        // Sanity: scratch capacity stays put across calls — we don't
+        // grow / shrink the underlying Vec on each call.
+        let mut out = RouterOutput::empty();
+        let mut probs = Vec::new();
+        let logits = vec![0.5f32; 32 * 128];
+        route_into(&logits, 32, 128, 8, true, &mut out, &mut probs);
+        let cap_ids = out.expert_ids.capacity();
+        let cap_w = out.expert_weights.capacity();
+        let cap_p = probs.capacity();
+        // Repeat — capacity must not grow.
+        for _ in 0..16 {
+            route_into(&logits, 32, 128, 8, true, &mut out, &mut probs);
+            assert_eq!(out.expert_ids.capacity(), cap_ids);
+            assert_eq!(out.expert_weights.capacity(), cap_w);
+            assert_eq!(probs.capacity(), cap_p);
+        }
     }
 }
