@@ -14,13 +14,22 @@ pub fn setup_logging(verbose: bool, quiet: bool) -> Result<()> {
         tracing::Level::WARN
     };
 
-    // Build filter: suppress noisy warnings unless verbose
+    // Build filter: suppress noisy warnings unless verbose. Default level
+    // is WARN, but the model-load and weight-loader namespaces stay at
+    // INFO so users see per-layer progress during the (10-60s) load.
+    // Without this, `ferrum run /path/to/30b-moe` looks frozen between
+    // "Loading..." and the first decode token.
     let filter = if verbose {
         EnvFilter::new(log_level.to_string())
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new(format!(
-                "{},ferrum_engine::metal::metal_executor=error,tokenizers=error",
+                "{},\
+                 ferrum_engine::metal::metal_executor=error,\
+                 tokenizers=error,\
+                 ferrum_models=info,\
+                 ferrum_quantization=info,\
+                 ferrum_engine::registry=info",
                 log_level
             ))
         })
