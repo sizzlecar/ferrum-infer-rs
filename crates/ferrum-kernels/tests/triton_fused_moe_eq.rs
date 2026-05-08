@@ -267,9 +267,7 @@ fn triton_fused_moe_matches_cpu_per_expert() {
         }
         row_start += m_e;
     }
-    eprintln!(
-        "── overall: max|diff|={all_max_abs:.4} max_rel={all_max_rel:.4}"
-    );
+    eprintln!("── overall: max|diff|={all_max_abs:.4} max_rel={all_max_rel:.4}");
     // Hard threshold: catch order-of-magnitude wrong layouts (rel ≈ 1).
     assert!(
         all_max_abs < 1.0,
