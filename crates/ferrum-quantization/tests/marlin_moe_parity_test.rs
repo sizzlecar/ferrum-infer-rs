@@ -139,7 +139,7 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
             e * n_per,
             n_per,
             &mut out_e_dev,
-            m_e as i32,
+            m_e,
         )
         .expect("gemm_gptq_with_offset");
         <CudaBackend as Backend>::sync(&mut ctx);
