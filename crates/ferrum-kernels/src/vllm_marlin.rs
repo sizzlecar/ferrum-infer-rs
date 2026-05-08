@@ -189,15 +189,15 @@ pub fn load_stacked_gptq_vllm_marlin(
 
     use cudarc::driver::DevicePtr;
     let raw_stream = stream.cu_stream();
-    for (e, qw_in_host) in qweights.iter().enumerate() {
-        if qw_in_host.len() != qw_per {
+    for e in 0..num_experts {
+        if qweights[e].len() != qw_per {
             return Err(candle_core::Error::Msg(format!(
                 "vLLM stacked Marlin: qweight[{e}].len()={} expected {qw_per}",
-                qw_in_host.len()
+                qweights[e].len()
             )));
         }
         let qw_in_dev: cudarc::driver::CudaSlice<i32> = stream
-            .clone_htod(qw_in_host)
+            .clone_htod(qweights[e])
             .map_err(|err| candle_core::Error::Msg(format!("htod qw[{e}]: {err}")))?;
 
         let (out_base_ptr, _g) = qw_out.device_ptr(stream);
@@ -224,17 +224,17 @@ pub fn load_stacked_gptq_vllm_marlin(
     }
 
     let mut sc_flat_f16: Vec<half::f16> = Vec::with_capacity(total_sc);
-    for (e, sc) in scales_f32.iter().enumerate() {
-        if sc.len() != sc_per {
+    for e in 0..num_experts {
+        if scales_f32[e].len() != sc_per {
             return Err(candle_core::Error::Msg(format!(
                 "vLLM stacked Marlin: scales[{e}].len()={} expected {sc_per}",
-                sc.len()
+                scales_f32[e].len()
             )));
         }
-        sc_flat_f16.extend(sc.iter().map(|&x| half::f16::from_f32(x)));
+        sc_flat_f16.extend(scales_f32[e].iter().map(|&x| half::f16::from_f32(x)));
     }
     let sc_dev: cudarc::driver::CudaSlice<half::f16> = stream
-        .clone_htod(&sc_flat_f16)
+        .clone_htod(sc_flat_f16.as_slice())
         .map_err(|err| candle_core::Error::Msg(format!("htod stacked scales: {err}")))?;
 
     // Workspace: stacked across experts. IST-DASLab uses ceil(N/min_thread_n=64) ×
