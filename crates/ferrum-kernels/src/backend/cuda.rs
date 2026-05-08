@@ -113,6 +113,12 @@ pub struct CudaState {
     /// Capacity hint — buffers grow if a larger (batch × top_k) shows
     /// up. Reset on grow.
     moe_route_capacity: usize,
+    /// Cached scratch for paged_decode_attention's prefill path: holds
+    /// the token-major attn output before transpose-back to head-major.
+    /// Lazy-grow on first use. Caching prevents per-call alloc churn
+    /// that triggered CUDA_ERROR_ILLEGAL_ADDRESS via stream-ordered free.
+    paged_attn_out_tm: Option<CudaSlice<f16>>,
+    paged_attn_out_tm_capacity: usize,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -353,6 +359,8 @@ impl Backend for CudaBackend {
             moe_route_ids: None,
             moe_route_weights: None,
             moe_route_capacity: 0,
+            paged_attn_out_tm: None,
+            paged_attn_out_tm_capacity: 0,
         }
     }
 
@@ -1556,44 +1564,61 @@ impl Backend for CudaBackend {
         // `transpose_head_to_token(attn_head_major_out → attn_flat)`,
         // expecting head-major. We transpose token→head into `out`.
         let q_n = q_len * num_heads * head_dim;
-        let mut out_token_major = <Self as Backend>::alloc(q_n);
 
-        Self::paged_varlen_attention(
-            ctx,
-            q,
-            k_pool,
-            v_pool,
-            &mut out_token_major,
-            &cu_seqlens_q_buf,
-            &pos_offsets_buf,
-            block_tables,
-            1,             // num_seqs
-            q_len,         // total_q_tokens
-            final_kv_len,  // max_kv_len
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            block_size,
-            max_num_blocks_per_seq,
-        )?;
+        // Lazy-grow the cached token-major output scratch. Stable
+        // address across calls — required to avoid stream-ordered
+        // free / kernel-still-running races at higher concurrency.
+        if ctx.paged_attn_out_tm_capacity < q_n {
+            let stream = ctx.stream.clone();
+            let n_grown = q_n.next_power_of_two().max(q_n);
+            ctx.paged_attn_out_tm = Some(
+                stream
+                    .alloc_zeros::<f16>(n_grown)
+                    .map_err(|e| FerrumError::model(format!("alloc paged_attn_out_tm: {e}")))?,
+            );
+            ctx.paged_attn_out_tm_capacity = n_grown;
+        }
 
-        // Restore head-major layout: [q_len, heads, hd] → [heads, q_len, hd]
-        // → caller's `out` buffer.
-        <Self as Backend>::transpose_token_to_head(
-            ctx,
-            &out_token_major,
-            out,
-            q_len,
-            num_heads,
-            head_dim,
-        );
+        // SAFETY: paged_varlen_attention only touches ctx.modules and
+        // ctx.stream (disjoint from paged_attn_out_tm). Same for
+        // transpose_token_to_head. We take a raw pointer to the cached
+        // buffer so we can pass it as a normal &mut/& while ctx is also
+        // borrowed by the kernel-call methods.
+        let out_tm_ptr: *mut CudaSlice<f16> = ctx
+            .paged_attn_out_tm
+            .as_mut()
+            .expect("paged_attn_out_tm allocated") as *mut _;
+        unsafe {
+            Self::paged_varlen_attention(
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                &mut *out_tm_ptr,
+                &cu_seqlens_q_buf,
+                &pos_offsets_buf,
+                block_tables,
+                1,
+                q_len,
+                final_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_num_blocks_per_seq,
+            )?;
 
-        // Synchronize so the scratch buffers can drop without freeing
-        // memory the kernel still references.
-        let stream = ctx.stream.clone();
-        stream
-            .synchronize()
-            .map_err(|e| FerrumError::model(format!("paged_decode_attention sync: {e}")))?;
+            // Restore head-major layout: [q_len, heads, hd] → [heads, q_len, hd]
+            // → caller's `out` buffer.
+            <Self as Backend>::transpose_token_to_head(
+                ctx,
+                &*out_tm_ptr,
+                out,
+                q_len,
+                num_heads,
+                head_dim,
+            );
+        }
 
         Ok(())
     }
