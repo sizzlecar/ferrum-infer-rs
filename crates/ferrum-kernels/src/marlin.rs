@@ -45,6 +45,34 @@ extern "C" {
         // full N width while iteration covers only the expert subset.
         prob_n_full: i32,
     ) -> i32;
+
+    // Stage 11: fused MoE Marlin. ONE launch processes all experts in a
+    // bucket. Caller pre-buckets experts by their thread_m_blocks need
+    // (prob_m here = 16 * thread_m_blocks). gridDim.y = expert_count.
+    fn marlin_cuda_moe(
+        A: *const std::ffi::c_void,
+        B: *const std::ffi::c_void,
+        C: *mut std::ffi::c_void,
+        s: *const std::ffi::c_void,
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        workspace: *mut std::ffi::c_void,
+        a_row_offsets: *const i32, // device [E_global] cumulative row offsets in A
+        tokens_per_expert: *const i32, // device [E_global]
+        active_expert_ids: *const i32, // device [expert_count] (or null for identity)
+        expert_count: i32,
+        b_int4_per_expert: i32,
+        s_int4_per_expert: i32,
+        locks_i32_per_expert: i32,
+        groupsize: i32,
+        dev: i32,
+        stream: cudarc::driver::sys::CUstream,
+        thread_k: i32,
+        thread_n: i32,
+        sms: i32,
+        prob_n_full: i32,
+    ) -> i32;
 }
 
 /// Check if Marlin kernel is available at compile time.
@@ -402,6 +430,140 @@ pub fn marlin_gemm_with_offset_strided(
     _m: i32,
     _expert_offset: i32,
     _expert_n: i32,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "Marlin kernel not available (compile with --features marlin)".into(),
+    ))
+}
+
+/// Stage 11 — fused MoE Marlin: ONE launch processes all experts in
+/// `active_expert_ids` (len = `expert_count`) by reading `expert_id =
+/// active_expert_ids[blockIdx.y]`, applying pointer offsets to the
+/// stacked B / s / workspace, and reading per-expert (m, A_row_offset)
+/// from the per-layer `tokens_per_expert` / `a_row_offsets` arrays.
+///
+/// `prob_m` is the bucket-wide max-m: every active expert MUST have
+/// `tokens_per_expert[e] ≤ prob_m`, and `prob_m` MUST be a multiple of
+/// 16. The kernel selects `thread_m_blocks = prob_m / 16` (1..=4); for
+/// experts with fewer tokens the kernel pads with zeros.
+///
+/// Caller is responsible for:
+///   - bucketing active experts by max-m (prob_m ∈ {16, 32, 48, 64})
+///   - pre-zeroing the bucketed workspace slots (or relying on
+///     `marlin_zero_stacked_workspace` having been called this iter)
+///   - ensuring all active experts share the same `prob_n`, `prob_k`,
+///     `group_size` (true for MoE — every expert in a layer has the
+///     same shape)
+#[cfg(feature = "marlin")]
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_moe(
+    stream: &Arc<CudaStream>,
+    input: &CudaSlice<half::f16>,
+    weight: &MarlinWeight,
+    output: &mut CudaSlice<half::f16>,
+    a_row_offsets: &CudaSlice<i32>,
+    tokens_per_expert: &CudaSlice<i32>,
+    active_expert_ids: Option<&CudaSlice<i32>>,
+    expert_count: i32,
+    prob_m: i32,
+    n_per_expert: i32,
+    num_experts_global: i32,
+) -> candle_core::Result<()> {
+    use cudarc::driver::DevicePtr;
+    if expert_count <= 0 {
+        return Ok(());
+    }
+    if prob_m <= 0 || prob_m > 64 || prob_m % 16 != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin_gemm_moe: prob_m must be in {{16, 32, 48, 64}}, got {prob_m}"
+        )));
+    }
+    let n = n_per_expert;
+    let k = weight.k as i32;
+    let n_per = n as usize;
+    let k_us = k as usize;
+    if n_per == 0 || (weight.n as i32) < num_experts_global * n {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin_gemm_moe: stacked weight N={} too small for E_global={num_experts_global} × n_per={n}",
+            weight.n
+        )));
+    }
+
+    // Stacked-tile strides (int4 elems = 16 bytes each).
+    // qweight per expert = (n_per * k) / 8 i32 = (n_per * k) / 32 int4
+    // scales per expert  = (k/group_size * n_per) f16 = (...)/8 int4
+    // workspace per expert = (n_per/128) * MAX_PAR i32
+    const MAX_PAR: usize = 16;
+    let b_int4_per_expert = ((n_per * k_us) / 32) as i32;
+    let groups = k_us / weight.group_size as usize;
+    let s_int4_per_expert = ((groups * n_per) / 8) as i32;
+    let locks_i32_per_expert = (((n_per / 128).max(1)) * MAX_PAR) as i32;
+
+    let raw_stream = stream.cu_stream();
+    let (a_ptr, _ag) = input.device_ptr(stream);
+    let (b_ptr, _bg) = weight.qweight.device_ptr(stream);
+    let (c_ptr, _cg) = output.device_ptr(stream);
+    let (s_ptr, _sg) = weight.scales.device_ptr(stream);
+    let (ws_ptr, _wg) = weight.workspace.device_ptr(stream);
+    let (off_ptr, _og) = a_row_offsets.device_ptr(stream);
+    let (tok_ptr, _tg) = tokens_per_expert.device_ptr(stream);
+    let act_ptr_opt = active_expert_ids.map(|s| s.device_ptr(stream));
+    let act_raw: u64 = match &act_ptr_opt {
+        Some((p, _)) => *p,
+        None => 0,
+    };
+
+    let ret = unsafe {
+        marlin_cuda_moe(
+            a_ptr as *const _,
+            b_ptr as *const _,
+            c_ptr as *mut _,
+            s_ptr as *const _,
+            prob_m,
+            n,
+            k,
+            ws_ptr as *mut _,
+            off_ptr as *const _,
+            tok_ptr as *const _,
+            act_raw as *const _,
+            expert_count,
+            b_int4_per_expert,
+            s_int4_per_expert,
+            locks_i32_per_expert,
+            weight.group_size,
+            0, // dev
+            raw_stream,
+            -1,
+            -1,
+            -1,
+            n, // prob_n_full = prob_n (per-expert contiguous stacking)
+        )
+    };
+
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin_cuda_moe failed: ret={ret} (prob_m={prob_m}, n={n}, k={k}, \
+             experts={expert_count}, gs={})",
+            weight.group_size
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "marlin"))]
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_moe(
+    _stream: &Arc<CudaStream>,
+    _input: &CudaSlice<half::f16>,
+    _weight: &MarlinWeight,
+    _output: &mut CudaSlice<half::f16>,
+    _a_row_offsets: &CudaSlice<i32>,
+    _tokens_per_expert: &CudaSlice<i32>,
+    _active_expert_ids: Option<&CudaSlice<i32>>,
+    _expert_count: i32,
+    _prob_m: i32,
+    _n_per_expert: i32,
+    _num_experts_global: i32,
 ) -> candle_core::Result<()> {
     Err(candle_core::Error::Msg(
         "Marlin kernel not available (compile with --features marlin)".into(),
