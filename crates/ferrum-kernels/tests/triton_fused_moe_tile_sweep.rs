@@ -56,8 +56,8 @@ fn make_random_gptq(k: usize, n: usize, seed: u64) -> (Vec<i32>, Vec<half::f16>,
 fn triton_fused_moe_tile_sweep() {
     use half::f16;
 
-    let tile = std::env::var("FERRUM_FUSED_MOE_TILE_BENCH")
-        .unwrap_or_else(|_| "16x64x32".to_string());
+    let tile =
+        std::env::var("FERRUM_FUSED_MOE_TILE_BENCH").unwrap_or_else(|_| "16x64x32".to_string());
     let parts: Vec<&str> = tile.split('x').collect();
     assert_eq!(parts.len(), 3, "tile format: BMxBNxBK");
     let bm: i32 = parts[0].parse().unwrap();
@@ -78,7 +78,10 @@ fn triton_fused_moe_tile_sweep() {
         .unwrap_or_else(|e| panic!("missing meta {meta_path}: {e}"));
     let num_warps: u32 = parse_meta_field(&meta_text, "num_warps").unwrap_or(4);
     let shared_mem: u32 = parse_meta_field(&meta_text, "shared_mem").unwrap_or(0);
-    eprintln!("loaded PTX ({} bytes) num_warps={num_warps} shared_mem={shared_mem}", ptx_text.len());
+    eprintln!(
+        "loaded PTX ({} bytes) num_warps={num_warps} shared_mem={shared_mem}",
+        ptx_text.len()
+    );
 
     let ctx = CudaContext::new(0).expect("CUDA context");
     let stream = ctx.default_stream();

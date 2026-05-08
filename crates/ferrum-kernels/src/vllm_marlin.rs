@@ -15,6 +15,31 @@ use cudarc::driver::sys::CUstream;
 use std::os::raw::{c_int, c_void};
 
 extern "C" {
+    /// GPTQ → vLLM-Marlin tile-format repack. Same total bytes as input
+    /// (size_k × size_n / pack_factor uint32), just a permutation. Single
+    /// expert per call; caller loops for stacked MoE.
+    ///
+    /// Returns 0 on success, non-zero on shape/config error.
+    ///
+    /// Output stride (in u32 elements): per expert = `(size_k / 16) *
+    /// (size_n * 16 / pack_factor) = size_k * size_n / pack_factor` —
+    /// same as input. So a stacked weight is `num_experts * (size_k *
+    /// size_n / pack_factor)` u32, expert e at offset `e * stride`.
+    ///
+    /// `has_perm = 0` for our path (sym=true GPTQ, no act-order).
+    /// Pass `perm = std::ptr::null()` when has_perm=0.
+    pub fn ferrum_vllm_gptq_marlin_repack(
+        qweight_in: *const c_void,
+        perm_in: *const c_void,
+        qweight_out: *mut c_void,
+        size_k: c_int,
+        size_n: c_int,
+        num_bits: c_int,
+        has_perm: c_int,
+        dev: c_int,
+        stream: CUstream,
+    ) -> c_int;
+
     /// Forwards to `marlin::marlin_mm` with fixed FP16+kU4B8+FP16+FP16
     /// dtype combo. See `vllm_marlin/marlin.cu` end-of-file for the
     /// wrapper. Caller ensures all device pointers are valid + on
@@ -118,4 +143,43 @@ pub unsafe fn launch_marlin_mm_f16_u4b8(
         use_atomic_add,
         use_fp32_reduce,
     );
+}
+
+/// Safe wrapper for the GPTQ → vLLM-Marlin repack. Allocates an output
+/// buffer the same size as the input (in u32 elements) and runs the
+/// repack kernel on `stream`.
+///
+/// `qweight_in_dev` MUST be a `[size_k / 8, size_n]` GPTQ-on-disk i32
+/// buffer (sym=true, no act-order). Caller is responsible for stream
+/// sync if they need to use the output before the kernel finishes.
+pub fn vllm_gptq_marlin_repack(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    qweight_in_dev: &cudarc::driver::CudaSlice<i32>,
+    qweight_out_dev: &mut cudarc::driver::CudaSlice<i32>,
+    size_k: i32,
+    size_n: i32,
+) -> candle_core::Result<()> {
+    use cudarc::driver::DevicePtr;
+    let raw_stream = stream.cu_stream();
+    let (in_ptr, _ig) = qweight_in_dev.device_ptr(stream);
+    let (out_ptr, _og) = qweight_out_dev.device_ptr(stream);
+    let ret = unsafe {
+        ferrum_vllm_gptq_marlin_repack(
+            in_ptr as *const _,
+            std::ptr::null(),
+            out_ptr as *mut _,
+            size_k,
+            size_n,
+            4, // num_bits — INT4 GPTQ
+            0, // has_perm — sym=true
+            0, // dev
+            raw_stream,
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "vllm gptq_marlin_repack failed: ret={ret} (size_k={size_k}, size_n={size_n})"
+        )));
+    }
+    Ok(())
 }
