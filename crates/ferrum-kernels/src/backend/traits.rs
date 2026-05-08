@@ -322,6 +322,39 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Load num_experts GPTQ weight tiles into ONE stacked store, with
+    /// the property that **each expert's packed bytes are contiguous**
+    /// in the resulting store. This is what the offset GEMM needs to
+    /// dispatch per expert via pointer offset alone.
+    ///
+    /// Why this is a separate API from `load_gptq` + post-hoc concat:
+    /// Marlin's repack permutes data in `[K-tile-row outer, N-tile inner]`
+    /// order. A single repack of `concat(all experts along N)` produces
+    /// a buffer where expert e's bytes are spread across K-tile-rows,
+    /// NOT contiguous. Per-expert repack-then-concat keeps each
+    /// expert's data in one contiguous block.
+    ///
+    /// `qweights[i] / scales[i] / qzeros[i]` are each expert's raw GPTQ
+    /// tensors. All share the same K + group_size + bits + g_idx.
+    ///
+    /// Default returns Err(unsupported); override on backends with a
+    /// per-expert MoE GPTQ path.
+    #[allow(clippy::too_many_arguments)]
+    fn load_gptq_stacked(
+        _qweights: &[&[i32]],
+        _scales: &[&[f32]],
+        _qzeros: &[&[i32]],
+        _g_idx: Option<&[i32]>,
+        _bits: u32,
+        _group_size: usize,
+        _k: usize,
+        _n_per_expert: usize,
+    ) -> Result<Self::GptqStore> {
+        Err(FerrumError::unsupported(
+            "load_gptq_stacked not implemented for this backend",
+        ))
+    }
+
     /// GEMM with pre-loaded GPTQ weights.
     /// `out[m, n] = a[m, k] @ dequant(weight)^T`
     fn gemm_gptq(
@@ -334,6 +367,86 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Err(FerrumError::unsupported(
             "gemm_gptq not implemented for this backend",
         ))
+    }
+
+    /// GEMM on a column-slice of a stacked GPTQ store. Used for MoE
+    /// expert dispatch where one big stacked weight tile holds all
+    /// experts' weights along N; per-expert calls process columns
+    /// `[expert_offset .. expert_offset + expert_n)` only.
+    ///
+    /// Output is written to `out[m, expert_n]` (NOT the full stacked N).
+    /// Caller is responsible for sizing `out` correctly.
+    ///
+    /// `expert_offset` and `expert_n` MUST be multiples of the backend's
+    /// natural N tile size (Marlin: 64). Default returns Err(unsupported).
+    fn gemm_gptq_with_offset(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::GptqStore,
+        _expert_offset: usize,
+        _expert_n: usize,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_gptq_with_offset not implemented for this backend",
+        ))
+    }
+
+    /// Bulk-zero the per-expert Marlin workspace mutex slots for a
+    /// stacked GptqStore. Call ONCE before a batch of
+    /// `gemm_gptq_with_offset_strided_no_ws_zero` calls — saves the
+    /// per-call cuMemsetD32Async (one launch each → one launch total).
+    ///
+    /// At c=32 with 128 active experts × 2 (gate_up + down) × 48 layers:
+    /// 12 288 memset launches/token. Bulk-zeroing brings that to 96.
+    fn marlin_zero_stacked_workspace(
+        _ctx: &mut Self::Context,
+        _weight: &Self::GptqStore,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "marlin_zero_stacked_workspace not implemented for this backend",
+        ))
+    }
+
+    /// Batched per-expert offset GEMM dispatch — runs N concurrent
+    /// Marlin calls across a stream pool to amortize launch overhead
+    /// and overlap small-m kernels that under-utilize SMs individually.
+    ///
+    /// `dispatches[i]`: (expert_idx, in_row_offset, out_row_offset, m).
+    /// All calls share the same `weight`, `input`, `output`, `n_per_expert`,
+    /// `k`. Caller is responsible for bulk-zeroing workspace before this
+    /// call (use `marlin_zero_stacked_workspace`).
+    ///
+    /// Default: serial fallback that loops calling
+    /// `gemm_gptq_with_offset_strided`. CUDA backend overrides with
+    /// round-robin streams + sync-all at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemm_phase_batched(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::GptqStore,
+        dispatches: &[(usize, usize, usize, usize)],
+        n_per_expert: usize,
+        output: &mut Self::Buffer,
+        k: usize,
+    ) -> Result<()> {
+        // Default impl: serial fallback. CUDA overrides with multi-stream.
+        for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
+            Self::gemm_gptq_with_offset_strided(
+                ctx,
+                input,
+                *in_row_offset,
+                weight,
+                expert_idx * n_per_expert,
+                n_per_expert,
+                output,
+                *out_row_offset,
+                *m,
+                k,
+            )?;
+        }
+        Ok(())
     }
 
     /// Load GGUF k-quant weights into the backend's preferred format.
@@ -475,6 +588,67 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "route_topk_softmax not implemented for this backend",
+        ))
+    }
+
+    /// GPU-side fast-path for the host route() leg of the bucketed
+    /// MoE forward (`moe_forward_bucketed` in ferrum-models). Replaces
+    /// the `B::sync(ctx) + B::to_vec(logits) + crate::moe::router::
+    /// route_into(...)` triple with a single GPU kernel + small D2H of
+    /// `[batch, top_k]` ids + weights.
+    ///
+    /// The backend allocates / reuses its own device-side scratch for
+    /// the kernel output; the caller only provides the host destination
+    /// vectors (resized + overwritten on each call). Default impl
+    /// returns `Err(unsupported)` so non-CUDA callers stay on the host
+    /// route_into() path with no behavior change.
+    #[allow(clippy::too_many_arguments)]
+    fn try_gpu_route_topk_into_host(
+        _ctx: &mut Self::Context,
+        _logits_dev: &Self::Buffer,
+        _out_ids_host: &mut Vec<u32>,
+        _out_weights_host: &mut Vec<f32>,
+        _batch: usize,
+        _num_experts: usize,
+        _top_k: usize,
+        _norm_topk_prob: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "try_gpu_route_topk_into_host not implemented for this backend",
+        ))
+    }
+
+    /// GPU-side moe_align_block_size — prep for a future fused MoE
+    /// Marlin kernel. Takes per-pair expert assignments (from
+    /// [`Self::route_topk_softmax`]) and produces:
+    ///   - `sorted_token_ids[N_padded]`: flat list of pair indices
+    ///     in [0, batch * top_k), sorted by their assigned expert and
+    ///     padded with sentinel `batch * top_k` inside each expert
+    ///     group up to a `block_size` boundary.
+    ///   - `block_ids[N_padded / block_size]`: which expert each
+    ///     `block_size`-row tile of `sorted_token_ids` belongs to.
+    ///   - `total_tokens_post_pad[1]`: actual padded token count.
+    ///
+    /// Layout matches vLLM's marlin_moe_wna16 kernel input
+    /// expectation. The fused Marlin kernel reads a row from
+    /// `a[sorted_token_ids[i] / top_k]` and weights from
+    /// `b[block_ids[blockIdx.y] * n_per_expert + ...]`.
+    ///
+    /// Default impl returns Err — only CUDA implements this.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_align_block_size(
+        _ctx: &mut Self::Context,
+        _expert_ids_per_pair: &Self::Buffer,
+        _sorted_token_ids: &mut Self::Buffer,
+        _block_ids: &mut Self::Buffer,
+        _total_tokens_post_pad: &mut Self::Buffer,
+        _batch_x_topk: usize,
+        _num_experts: usize,
+        _block_size: usize,
+        _sorted_max_size: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "moe_align_block_size not implemented for this backend",
         ))
     }
 
@@ -1486,6 +1660,42 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Batched paged decode attention — multi-seq, single token per seq.
+    /// Faster path for the unified_forward layer when m_total == num_seqs
+    /// (every item is a single-token decode). Skips the cu_seqlens_q
+    /// linear scan that `paged_varlen_attention` does in the fully-mixed
+    /// case.
+    ///
+    /// Layouts:
+    ///   q              : [num_seqs, num_q_heads, head_dim]
+    ///   k_pool/v_pool  : paged pool (same as paged_varlen)
+    ///   block_tables   : [num_seqs, max_num_blocks_per_seq]
+    ///   valid_kv_lens  : [num_seqs] — current kv_len per seq
+    ///   out            : [num_seqs, num_q_heads, head_dim]
+    ///
+    /// Default returns Err(unsupported); CUDA backend overrides.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_batched_decode_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _valid_kv_lens: &Self::Buffer,
+        _num_seqs: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_batched_decode_attention not implemented for this backend",
+        ))
+    }
+
     /// Allocate a u32 buffer of length `n` for paged-KV bookkeeping
     /// (block tables, context lens). Default uses the existing
     /// `from_slice_i32` route then bit-casts; backends with a faster
@@ -1541,6 +1751,23 @@ pub trait Backend: Send + Sync + Sized + 'static {
         dim: usize,
     );
 
+    /// Inverse of `transpose_head_to_token`: [tokens, heads, dim] →
+    /// [heads, tokens, dim]. Used by the CUDA `paged_decode_attention`
+    /// wrapper to convert `paged_varlen_attention`'s token-major output
+    /// back to the head-major layout that Qwen3MoeModel expects.
+    /// Default panics — backends without a paged-KV CUDA path don't
+    /// hit this code.
+    fn transpose_token_to_head(
+        _ctx: &mut Self::Context,
+        _src: &Self::Buffer,
+        _dst: &mut Self::Buffer,
+        _tokens: usize,
+        _heads: usize,
+        _dim: usize,
+    ) {
+        panic!("transpose_token_to_head not implemented for this backend");
+    }
+
     /// residual[i] += x[i] (in-place)
     fn add_inplace(
         ctx: &mut Self::Context,
@@ -1573,6 +1800,96 @@ pub trait Backend: Send + Sync + Sized + 'static {
         // because `Self::Buffer: Send + Sync` and the old buffer is
         // dropped here when overwritten.
         *dst = Self::from_slice(&dst_v);
+    }
+
+    /// Variant of [`Backend::gemm_gptq_with_offset`] that also takes
+    /// row-offsets into the input and output buffers. Lets the bucketed
+    /// MoE dispatcher run an expert's column-slice GEMM against a
+    /// sub-range of the packed input/output buffers without needing a
+    /// buffer-view type.
+    ///
+    /// Default impl returns Err so backends without MoE batched dispatch
+    /// don't have to implement.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_gptq_with_offset_strided(
+        _ctx: &mut Self::Context,
+        _input: &Self::Buffer,
+        _in_row_offset: usize,
+        _weight: &Self::GptqStore,
+        _expert_offset: usize,
+        _expert_n: usize,
+        _output: &mut Self::Buffer,
+        _out_row_offset: usize,
+        _m: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "gemm_gptq_with_offset_strided not implemented for this backend",
+        ))
+    }
+
+    /// Strided variant of [`Backend::fused_silu_mul_split`] for the
+    /// bucketed MoE path: reads `gate_up` rows starting at
+    /// `in_row_offset`, writes `out` rows starting at `out_row_offset`.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_silu_mul_split_strided(
+        _ctx: &mut Self::Context,
+        _gate_up: &Self::Buffer,
+        _in_row_offset: usize,
+        _out: &mut Self::Buffer,
+        _out_row_offset: usize,
+        _tokens: usize,
+        _intermediate: usize,
+    ) {
+        unimplemented!("fused_silu_mul_split_strided default impl missing");
+    }
+
+    /// MoE combine: per-token weighted sum across `top_k` expert outputs.
+    ///
+    /// After the bucketed dispatch, `packed_down` holds `[total_pairs,
+    /// hidden]` with one row per (token, k_slot) pair in expert-bucketed
+    /// order. `pairs_by_token[b * top_k + k]` is the inverse map: which
+    /// row of `packed_down` carries the (b, k_slot) contribution. A row
+    /// index of `-1` means "skip" (unused slot).
+    ///
+    /// Computes:
+    ///
+    /// ```text
+    /// out[b, h] = sum_k pair_weights[b * top_k + k] *
+    ///                   packed_down[pairs_by_token[b * top_k + k], h]
+    /// ```
+    ///
+    /// Default impl round-trips via host memory — correct but slow.
+    /// CUDA backend launches a single fused kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_combine(
+        _ctx: &mut Self::Context,
+        packed_down: &Self::Buffer,
+        pairs_by_token: &[i32],
+        pair_weights: &[f32],
+        out: &mut Self::Buffer,
+        batch: usize,
+        hidden: usize,
+        top_k: usize,
+        total_pairs: usize,
+    ) {
+        let packed = Self::to_vec(packed_down, total_pairs * hidden);
+        let mut out_h = vec![0.0f32; batch * hidden];
+        for b in 0..batch {
+            for k in 0..top_k {
+                let pair_row = pairs_by_token[b * top_k + k];
+                if pair_row < 0 {
+                    continue;
+                }
+                let w = pair_weights[b * top_k + k];
+                let src = &packed[(pair_row as usize) * hidden..(pair_row as usize + 1) * hidden];
+                let dst = &mut out_h[b * hidden..(b + 1) * hidden];
+                for h in 0..hidden {
+                    dst[h] += w * src[h];
+                }
+            }
+        }
+        *out = Self::from_slice(&out_h);
     }
 
     /// Broadcast bias add: `data[r, c] += bias[c]` for every row.
@@ -1609,6 +1926,36 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn alloc(len: usize) -> Self::Buffer;
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
     fn from_slice(data: &[f32]) -> Self::Buffer;
+
+    /// Greedy sampling fast path: argmax over rows of `buf` shaped
+    /// `[n_rows, vocab]` (row-major), returning `n_rows` u32 indices.
+    ///
+    /// Replaces the heavier `to_vec` + host-side argmax for the
+    /// `temperature=0` case. Saves the n_rows × vocab × dtype bytes
+    /// device-to-host transfer (~8 MB at c=16 vocab=128k f16) and the
+    /// per-iter sample loop on host.
+    ///
+    /// Default implementation falls back to `to_vec` + host argmax so
+    /// non-CUDA backends still produce correct tokens. CUDA overrides
+    /// this with a kernel-launched on-device argmax.
+    fn argmax_rows_to_u32(buf: &Self::Buffer, n_rows: usize, vocab: usize) -> Vec<u32> {
+        let host = Self::to_vec(buf, n_rows * vocab);
+        let mut out = Vec::with_capacity(n_rows);
+        for r in 0..n_rows {
+            let base = r * vocab;
+            let mut best_v = f32::NEG_INFINITY;
+            let mut best_i: u32 = 0;
+            for j in 0..vocab {
+                let v = host[base + j];
+                if v > best_v {
+                    best_v = v;
+                    best_i = j as u32;
+                }
+            }
+            out.push(best_i);
+        }
+        out
+    }
 
     /// Load a weight tensor straight from its on-disk byte representation,
     /// letting the backend pick its preferred storage dtype.

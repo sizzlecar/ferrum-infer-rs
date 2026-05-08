@@ -82,4 +82,49 @@ impl Qwen3MoeConfig {
     pub fn is_truly_sparse(&self) -> bool {
         self.num_experts_per_tok > 0 && self.num_experts_per_tok < self.num_experts
     }
+
+    /// Build from a parsed config.json (`ModelDefinition`). Same role as
+    /// `LlamaFamilyConfig::qwen3_from_def` but pulls the MoE-specific
+    /// fields (`num_experts`, `num_experts_per_tok`, `moe_intermediate_size`,
+    /// `norm_topk_prob`) from `def.extra_params`.
+    pub fn from_def(def: &crate::definition::ModelDefinition) -> ferrum_types::Result<Self> {
+        // Underlying Llama-family base — Qwen3-MoE shares the dense
+        // attention path (QK-norm on, rope_theta from checkpoint).
+        let mut base = crate::models::llama_family::LlamaFamilyConfig::qwen3_from_def(def);
+        // For MoE the per-layer FFN size is the *expert* size, not the
+        // dense intermediate. Stash the expert size in base.intermediate_size
+        // so any code reading base sees the right value (Qwen3MoeModel
+        // primarily reads `cfg.expert_intermediate_size` directly).
+        let extra = &def.extra_params;
+        let num_experts = extra
+            .get("num_experts")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::model("qwen3_moe config.json missing num_experts")
+            })? as usize;
+        let num_experts_per_tok = extra
+            .get("num_experts_per_tok")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8) as usize;
+        let expert_intermediate_size = extra
+            .get("moe_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::model(
+                    "qwen3_moe config.json missing moe_intermediate_size",
+                )
+            })? as usize;
+        let norm_topk_prob = extra
+            .get("norm_topk_prob")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        base.intermediate_size = expert_intermediate_size;
+        Ok(Self {
+            base,
+            num_experts,
+            num_experts_per_tok,
+            expert_intermediate_size,
+            norm_topk_prob,
+        })
+    }
 }

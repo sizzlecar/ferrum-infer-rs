@@ -28,7 +28,7 @@ pub mod traits;
 pub use dense::DenseLinear;
 pub use factory::DefaultLinearFactory;
 pub use gguf::{GgufFile, GgufLinear, GgufLoader};
-pub use gptq::GptqLinear;
+pub use gptq::{GptqLinear, StackedExpertLinear};
 pub use loader::{PrefixedLoader, WeightLoader};
 pub use native_safetensors::NativeSafetensorsLoader;
 pub use quant_linear::QuantLinear;

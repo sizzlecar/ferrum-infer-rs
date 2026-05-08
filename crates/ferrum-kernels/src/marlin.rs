@@ -7,6 +7,18 @@
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Cached `FERRUM_MARLIN_SKIP_WS_ZERO=1` flag. Read once on first
+/// access, cheap for hot paths (called per Marlin GEMM dispatch).
+fn skip_ws_zero() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FERRUM_MARLIN_SKIP_WS_ZERO")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
 
 // FFI declaration for the Marlin CUDA kernel.
 // Only linked when the "marlin" feature is enabled (requires nvcc + SM >= 8.0).
@@ -28,6 +40,10 @@ extern "C" {
         thread_n: i32,
         sms: i32,
         max_par: i32,
+        // -1 ⇒ same as prob_n. For offset GEMM into a stacked B/s
+        // buffer, pass total_n so b_gl_stride and s_gl_stride see the
+        // full N width while iteration covers only the expert subset.
+        prob_n_full: i32,
     ) -> i32;
 }
 
@@ -108,6 +124,7 @@ pub fn marlin_gemm(
             -1, // auto thread_n
             -1, // auto sms
             16, // max_par
+            -1, // prob_n_full = prob_n (non-stacked)
         )
     };
 
@@ -131,6 +148,260 @@ pub fn marlin_gemm(
     _weight: &MarlinWeight,
     _output: &mut CudaSlice<half::f16>,
     _m: i32,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "Marlin kernel not available (compile with --features marlin)".into(),
+    ))
+}
+
+/// Marlin GEMM on a column-slice of a stacked weight (used for MoE
+/// expert dispatch). The stacked `weight` holds num_experts × n_per_expert
+/// columns concatenated along N; this call processes columns
+/// `[expert_offset .. expert_offset + expert_n)` only.
+///
+/// `expert_offset` and `expert_n` MUST be multiples of Marlin's `tile_n`
+/// (typically 64). The repack laid out the whole N contiguously so a
+/// pointer offset lands on a tile boundary.
+///
+/// Workspace: shares the parent stacked workspace; we offset its pointer
+/// by `expert_offset / 128` ints so each expert uses its own mutex slot
+/// range.
+#[cfg(feature = "marlin")]
+pub fn marlin_gemm_with_offset(
+    stream: &Arc<CudaStream>,
+    input: &CudaSlice<half::f16>,
+    weight: &MarlinWeight,
+    output: &mut CudaSlice<half::f16>,
+    m: i32,
+    expert_offset: i32,
+    expert_n: i32,
+) -> candle_core::Result<()> {
+    use cudarc::driver::DevicePtr;
+    let n = expert_n;
+    let k = weight.k as i32;
+    if expert_offset < 0 || expert_n <= 0 || expert_offset + expert_n > weight.n as i32 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin offset out of range: offset={expert_offset} n={expert_n} stacked_n={}",
+            weight.n
+        )));
+    }
+    let raw_stream = stream.cu_stream();
+
+    // PER-EXPERT CONTIGUOUS LAYOUT (built by load_gptq_stacked):
+    // Each expert's packed bytes are CONTIGUOUS in the buffer.
+    // Buffer = [exp0_marlin_tile | exp1_marlin_tile | ...].
+    // expert_idx is implicit: expert_offset / expert_n.
+    //
+    // qweight: per-expert tile = (n_per_expert * k / 8) i32. Offset
+    //          by expert_idx × that_size i32.
+    // scales:  per-expert tile = (k/group_size * n_per_expert) f16.
+    //          Offset by expert_idx × that_size f16.
+    // workspace: per-expert range = (n_per_expert/128) * MAX_PAR i32.
+    //          Offset by expert_idx × that_size i32.
+    //
+    // Marlin sees a regular N=expert_n tile per call. prob_n =
+    // prob_n_full = expert_n (no stride decoupling needed).
+    let expert_idx = (expert_offset / expert_n) as usize;
+    let n_per = expert_n as usize;
+    let k_us = k as usize;
+
+    const MAX_PAR: usize = 16;
+    let ws_per_expert = (n_per / 128).max(1) * MAX_PAR;
+    let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
+    {
+        let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(
+                ws_ptr + ws_offset_bytes as u64,
+                0,
+                ws_per_expert,
+                raw_stream,
+            );
+        }
+    }
+
+    let qw_per_expert_i32 = (n_per * k_us) / 8;
+    let qw_offset_bytes = expert_idx * qw_per_expert_i32 * std::mem::size_of::<i32>();
+
+    let num_groups = k_us / weight.group_size as usize;
+    let sc_per_expert_f16 = num_groups * n_per;
+    let scales_offset_bytes = expert_idx * sc_per_expert_f16 * std::mem::size_of::<half::f16>();
+
+    let (a_ptr, _a_guard) = input.device_ptr(stream);
+    let (b_ptr_full, _b_guard) = weight.qweight.device_ptr(stream);
+    let (c_ptr, _c_guard) = output.device_ptr(stream);
+    let (s_ptr_full, _s_guard) = weight.scales.device_ptr(stream);
+    let (ws_ptr_full, _ws_guard) = weight.workspace.device_ptr(stream);
+    let b_ptr = b_ptr_full + qw_offset_bytes as u64;
+    let s_ptr = s_ptr_full + scales_offset_bytes as u64;
+    let ws_ptr = ws_ptr_full + ws_offset_bytes as u64;
+
+    let ret = unsafe {
+        marlin_cuda(
+            a_ptr as *const _,
+            b_ptr as *const _,
+            c_ptr as *mut _,
+            s_ptr as *const _,
+            m,
+            n,
+            k,
+            ws_ptr as *mut _,
+            weight.group_size,
+            0,
+            raw_stream,
+            -1,
+            -1,
+            -1,
+            16,
+            // Per-expert contiguous: stride == iteration width.
+            -1,
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin_cuda (offset) failed ret={ret} m={m} n={n} k={k} offset={expert_offset}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "marlin"))]
+pub fn marlin_gemm_with_offset(
+    _stream: &Arc<CudaStream>,
+    _input: &CudaSlice<half::f16>,
+    _weight: &MarlinWeight,
+    _output: &mut CudaSlice<half::f16>,
+    _m: i32,
+    _expert_offset: i32,
+    _expert_n: i32,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "Marlin kernel not available (compile with --features marlin)".into(),
+    ))
+}
+
+/// Same as [`marlin_gemm_with_offset`] but also strides the input and
+/// output buffers by row offsets. Used by the bucketed MoE dispatcher
+/// to run a single expert's column-slice GEMM against a sub-range of
+/// the packed input/output buffer without needing a buffer-view type.
+///
+/// `in_row_offset` rows of `K` f16 elements at the start of `input`
+/// are skipped; `out_row_offset` rows of `expert_n` f16 elements at
+/// the start of `output` are skipped.
+#[cfg(feature = "marlin")]
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_with_offset_strided(
+    stream: &Arc<CudaStream>,
+    input: &CudaSlice<half::f16>,
+    in_row_offset: i32,
+    weight: &MarlinWeight,
+    output: &mut CudaSlice<half::f16>,
+    out_row_offset: i32,
+    m: i32,
+    expert_offset: i32,
+    expert_n: i32,
+) -> candle_core::Result<()> {
+    use cudarc::driver::DevicePtr;
+    let n = expert_n;
+    let k = weight.k as i32;
+    if expert_offset < 0 || expert_n <= 0 || expert_offset + expert_n > weight.n as i32 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin offset out of range: offset={expert_offset} n={expert_n} stacked_n={}",
+            weight.n
+        )));
+    }
+    let raw_stream = stream.cu_stream();
+
+    // Per-expert contiguous layout, same offset arithmetic as
+    // marlin_gemm_with_offset.
+    let expert_idx = (expert_offset / expert_n) as usize;
+    let n_per = expert_n as usize;
+    let k_us = k as usize;
+
+    const MAX_PAR: usize = 16;
+    let ws_per_expert = (n_per / 128).max(1) * MAX_PAR;
+    let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
+    // Skip per-call workspace zeroing if env says so. Caller is then
+    // responsible for bulk-zeroing the workspace before the batch
+    // (saves N-1 cuMemsetD32Async launches per phase). Cached on
+    // first access — std::env::var is too slow for the hot path.
+    if !skip_ws_zero() {
+        let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(
+                ws_ptr + ws_offset_bytes as u64,
+                0,
+                ws_per_expert,
+                raw_stream,
+            );
+        }
+    }
+
+    let qw_per_expert_i32 = (n_per * k_us) / 8;
+    let qw_offset_bytes = expert_idx * qw_per_expert_i32 * std::mem::size_of::<i32>();
+
+    let num_groups = k_us / weight.group_size as usize;
+    let sc_per_expert_f16 = num_groups * n_per;
+    let scales_offset_bytes = expert_idx * sc_per_expert_f16 * std::mem::size_of::<half::f16>();
+
+    let in_offset_bytes = in_row_offset as usize * (k as usize) * std::mem::size_of::<half::f16>();
+    let out_offset_bytes =
+        out_row_offset as usize * (n as usize) * std::mem::size_of::<half::f16>();
+
+    let (a_ptr, _a_guard) = input.device_ptr(stream);
+    let (b_ptr_full, _b_guard) = weight.qweight.device_ptr(stream);
+    let (c_ptr, _c_guard) = output.device_ptr(stream);
+    let (s_ptr_full, _s_guard) = weight.scales.device_ptr(stream);
+    let (ws_ptr_full, _ws_guard) = weight.workspace.device_ptr(stream);
+    let a_ptr_off = a_ptr + in_offset_bytes as u64;
+    let b_ptr = b_ptr_full + qw_offset_bytes as u64;
+    let c_ptr_off = c_ptr + out_offset_bytes as u64;
+    let s_ptr = s_ptr_full + scales_offset_bytes as u64;
+    let ws_ptr = ws_ptr_full + ws_offset_bytes as u64;
+
+    let ret = unsafe {
+        marlin_cuda(
+            a_ptr_off as *const _,
+            b_ptr as *const _,
+            c_ptr_off as *mut _,
+            s_ptr as *const _,
+            m,
+            n,
+            k,
+            ws_ptr as *mut _,
+            weight.group_size,
+            0,
+            raw_stream,
+            -1,
+            -1,
+            -1,
+            16,
+            // Per-expert contiguous: stride == iteration.
+            -1,
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "marlin_cuda (offset_strided) failed ret={ret} m={m} n={n} k={k} \
+             expert_offset={expert_offset} in_row_offset={in_row_offset} \
+             out_row_offset={out_row_offset}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "marlin"))]
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_with_offset_strided(
+    _stream: &Arc<CudaStream>,
+    _input: &CudaSlice<half::f16>,
+    _in_row_offset: i32,
+    _weight: &MarlinWeight,
+    _output: &mut CudaSlice<half::f16>,
+    _out_row_offset: i32,
+    _m: i32,
+    _expert_offset: i32,
+    _expert_n: i32,
 ) -> candle_core::Result<()> {
     Err(candle_core::Error::Msg(
         "Marlin kernel not available (compile with --features marlin)".into(),
@@ -202,63 +473,81 @@ pub fn repack_gptq_to_marlin(
     k: usize,
     n: usize,
 ) -> Vec<i32> {
-    // Step 1: Unpack GPTQ [K/8, N] → individual INT4 values [K, N]
+    use rayon::prelude::*;
+
+    // Step 1: Unpack GPTQ [K/8, N] → individual INT4 values [K, N].
+    // Parallelize over packed_rows. Each packed row produces 8 output rows
+    // of `n` u8s — disjoint output slices, fully independent.
     let packed_rows = k / 8;
-    let mut kn = vec![0u8; k * n]; // [K, N] layout
-    for pr in 0..packed_rows {
-        for col in 0..n {
-            let packed = qweight_gptq[pr * n + col];
-            for i in 0..8 {
-                kn[(pr * 8 + i) * n + col] = ((packed >> (i * 4)) & 0xF) as u8;
+    let mut kn = vec![0u8; k * n];
+    kn.par_chunks_mut(8 * n)
+        .zip(qweight_gptq.par_chunks(n))
+        .for_each(|(kn_block, qw_row)| {
+            // qw_row is one packed row [n] i32; kn_block is 8 unpacked rows [8 * n] u8.
+            for col in 0..n {
+                let packed = qw_row[col];
+                for i in 0..8 {
+                    kn_block[i * n + col] = ((packed >> (i * 4)) & 0xF) as u8;
+                }
             }
-        }
-    }
+        });
 
-    // Step 2: Transpose [K, N] to get w = linear.weight.data.t() = [K, N]
-    // (GPTQ stores [K, N] already, so kn IS [K, N] — no transpose needed!)
-    // Marlin's pack() does: w = linear.weight.data.t() which gives [K, N].
-    // Our kn is already [K, N].
-
-    // Step 3: Tile [K, N] → [K/16, 16, N/16, 16] → permute(0,2,1,3) → [K/16, N*16]
+    // Step 2: Tile [K, N] → [K/16, N/16, 16, 16].
+    // tiled[tk * (n * tile) + tn * (tile*tile) + ik * tile + in_]
+    //                         = kn[(tk*tile + ik) * n + (tn*tile + in_)]
+    // Parallelize over tk (each tk owns a disjoint output range
+    // tiled[tk * (n * tile) .. (tk+1) * (n * tile)]).
     let tile = 16;
     let kt = k / tile;
     let nt = n / tile;
-    let mut tiled = vec![0u8; k * n]; // [K/16, N*16]
-    for tk in 0..kt {
-        for tn in 0..nt {
-            for ik in 0..tile {
-                for in_ in 0..tile {
-                    let src = (tk * tile + ik) * n + (tn * tile + in_);
-                    let dst = tk * (n * tile) + tn * (tile * tile) + ik * tile + in_;
-                    tiled[dst] = kn[src];
+    let mut tiled = vec![0u8; k * n];
+    tiled
+        .par_chunks_mut(n * tile)
+        .enumerate()
+        .for_each(|(tk, tile_block)| {
+            for tn in 0..nt {
+                for ik in 0..tile {
+                    for in_ in 0..tile {
+                        let src = (tk * tile + ik) * n + (tn * tile + in_);
+                        let dst = tn * (tile * tile) + ik * tile + in_;
+                        tile_block[dst] = kn[src];
+                    }
                 }
             }
-        }
-    }
+        });
+    // Drop kn early — its memory can be reused for permuted/result.
+    drop(kn);
 
-    // Step 4: Apply _perm in blocks of 1024
+    // Step 3: Apply _perm in blocks of 1024. Each block reads 1024 contiguous
+    // u8s from `tiled` and writes 1024 to `permuted` via the perm table.
+    // Blocks are disjoint in both src and dst → trivially parallel.
     let perm = build_marlin_perm();
     let total = k * n;
     let mut permuted = vec![0u8; total];
-    let num_blocks = total / 1024;
-    for blk in 0..num_blocks {
-        let base = blk * 1024;
-        for (dst, &src) in perm.iter().enumerate() {
-            permuted[base + dst] = tiled[base + src];
-        }
-    }
+    permuted
+        .par_chunks_mut(1024)
+        .zip(tiled.par_chunks(1024))
+        .for_each(|(out_blk, in_blk)| {
+            for (dst, &src) in perm.iter().enumerate() {
+                out_blk[dst] = in_blk[src];
+            }
+        });
+    drop(tiled);
 
-    // Step 4: Pack 8 INT4 values → int32, taking every 8th element
-    //         result shape: [N/16, K*16/8] = [N/16, K*2]
+    // Step 4: Pack 8 INT4 → i32, output shape [N/16, K*2].
+    // Each output i32 reads 8 contiguous u8s — independent.
     let packed_len = total / 8;
     let mut result = vec![0i32; packed_len];
-    for i in 0..packed_len {
-        let mut word = 0u32;
-        for j in 0..8 {
-            word |= (permuted[i * 8 + j] as u32) << (j * 4);
-        }
-        result[i] = word as i32;
-    }
+    result
+        .par_iter_mut()
+        .zip(permuted.par_chunks_exact(8))
+        .for_each(|(out, chunk)| {
+            let mut word = 0u32;
+            for (j, &b) in chunk.iter().enumerate() {
+                word |= (b as u32) << (j * 4);
+            }
+            *out = word as i32;
+        });
 
     result
 }

@@ -1,0 +1,33 @@
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.3
+
+Model: M1
+Path: /workspace/models/M1
+Device: CUDA(0)
+
+Initializing engine (continuous batching)...
+
+🚀 Server running at http://127.0.0.1:8800
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+
+
+thread 'tokio-runtime-worker' (44760) panicked at crates/ferrum-kernels/src/backend/cuda.rs:493:66:
+cuda alloc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -163,3 +163,212 @@ extern "C" __global__ void paged_varlen_attn_f16(
         out_ptr[d] = __float2half(acc);
     }
 }
+
+// ─── Split-K variant ─────────────────────────────────────────────────
+// Phase 1: each block scans 1/N of the kv_len for one (head, q_token, split).
+// Stores partial output (unnormalized) + local m + local l for online merge.
+//
+// Microbench (RTX 4090, scripts/microbench_split_k.cu) shows this wins
+// big at low concurrency (c=4 +103% kv_len=384, c=1 +801% kv_len=4096)
+// and modest at c=16+ long context (kv_len>=768 → +6-16%). Marginal/neg
+// at c=16 short kv_len.
+//
+// Output layout (caller-allocated):
+//   partial_out : [M_total, num_q_heads, num_splits, head_dim]  (float32)
+//   partial_m   : [M_total, num_q_heads, num_splits]            (float32)
+//   partial_l   : [M_total, num_q_heads, num_splits]            (float32)
+//
+// Grid:  (num_q_heads, M_total, num_splits)
+// Block: (256,)
+// Shared: ceil(kv_len / num_splits) * sizeof(float)
+extern "C" __global__ void paged_varlen_attn_split_k_phase1_f16(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_block_pool,
+    const __half* __restrict__ v_block_pool,
+    const int*    __restrict__ cu_seqlens_q,
+    const int*    __restrict__ pos_offsets,
+    const int*    __restrict__ block_tables,
+    float* __restrict__ partial_out,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
+    const int num_seqs,
+    const int num_q_heads,
+    const int num_kv_heads,
+    const int head_dim,
+    const int max_blocks_per_seq,
+    const int block_size,
+    const float scale,
+    const int num_splits
+) {
+    const int q_head = blockIdx.x;
+    const int token_global = blockIdx.y;
+    const int split_id = blockIdx.z;
+    const int kv_head = q_head / (num_q_heads / num_kv_heads);
+
+    int seq_idx = 0;
+    while (seq_idx + 1 < num_seqs &&
+           cu_seqlens_q[seq_idx + 1] <= token_global) {
+        seq_idx++;
+    }
+    const int local_idx = token_global - cu_seqlens_q[seq_idx];
+    const int abs_kv_pos = pos_offsets[seq_idx] + local_idx;
+    const int valid_kv_len = abs_kv_pos + 1;
+
+    const int chunk = (valid_kv_len + num_splits - 1) / num_splits;
+    const int split_start = split_id * chunk;
+    const int split_end = min(split_start + chunk, valid_kv_len);
+    const int my_len = split_end - split_start;
+
+    const int out_idx =
+        (token_global * num_q_heads + q_head) * num_splits + split_id;
+
+    if (my_len <= 0) {
+        if (threadIdx.x == 0) {
+            partial_m[out_idx] = -1e20f;
+            partial_l[out_idx] = 0.0f;
+        }
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            partial_out[out_idx * head_dim + d] = 0.0f;
+        }
+        return;
+    }
+
+    const int kv_stride = num_kv_heads * head_dim;
+    const int block_stride_val = block_size * kv_stride;
+    const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+    const __half* q_ptr =
+        q + ((size_t)token_global * num_q_heads + q_head) * head_dim;
+
+    extern __shared__ float smem[];
+
+    // Q into registers (warp-cooperative).
+    const int elems_per_thread = (head_dim + WARP_SIZE - 1) / WARP_SIZE;
+    float q_reg[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int d = (threadIdx.x % WARP_SIZE) + i * WARP_SIZE;
+        q_reg[i] = (i < elems_per_thread && d < head_dim)
+            ? __half2float(q_ptr[d]) : 0.0f;
+    }
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+
+    // Step 1: Q·K^T over our chunk.
+    for (int pos = warp_id; pos < my_len; pos += num_warps) {
+        int kv_pos = split_start + pos;
+        int logical_block = kv_pos / block_size;
+        int slot = kv_pos % block_size;
+        int physical_block = my_block_table[logical_block];
+        const __half* k_row =
+            k_block_pool + physical_block * block_stride_val
+                         + slot * kv_stride
+                         + kv_head * head_dim;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int d = lane_id + i * WARP_SIZE;
+            if (i < elems_per_thread && d < head_dim)
+                dot += q_reg[i] * __half2float(k_row[d]);
+        }
+        float score = warp_reduce_sum(dot) * scale;
+        if (lane_id == 0)
+            smem[pos] = score;
+    }
+    __syncthreads();
+
+    // Step 2: local max, exp, local sum.
+    float thread_max = -1e20f;
+    for (int i = threadIdx.x; i < my_len; i += blockDim.x)
+        thread_max = fmaxf(thread_max, smem[i]);
+    float local_max = block_reduce_max(thread_max);
+    __shared__ float s_max;
+    if (threadIdx.x == 0) s_max = local_max;
+    __syncthreads();
+    local_max = s_max;
+
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < my_len; i += blockDim.x) {
+        float v = expf(smem[i] - local_max);
+        smem[i] = v;
+        thread_sum += v;
+    }
+    __syncthreads();
+    float local_sum = block_reduce_sum(thread_sum);
+    __shared__ float s_sum;
+    if (threadIdx.x == 0) s_sum = local_sum;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        partial_m[out_idx] = local_max;
+        partial_l[out_idx] = s_sum;
+    }
+
+    // Step 3: weighted V sum (UNNORMALIZED — store sum_i exp(s_i - m_local) * v_i).
+    // The reduce kernel will normalize using the global max + global denom.
+    float* out_ptr_p = partial_out + out_idx * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < my_len; i++) {
+            int kv_pos = split_start + i;
+            int logical_block = kv_pos / block_size;
+            int slot = kv_pos % block_size;
+            int physical_block = my_block_table[logical_block];
+            const __half* v_row =
+                v_block_pool + physical_block * block_stride_val
+                             + slot * kv_stride
+                             + kv_head * head_dim;
+            acc += smem[i] * __half2float(v_row[d]);
+        }
+        out_ptr_p[d] = acc;
+    }
+}
+
+// Phase 2: merge num_splits partial outputs per (head, token) using online softmax.
+//
+// Grid:  (num_q_heads, M_total)
+// Block: (128,) — head_dim parallelism is enough.
+extern "C" __global__ void paged_varlen_split_k_reduce_f16(
+    const float* __restrict__ partial_out,
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    __half* __restrict__ output,
+    const int num_q_heads,
+    const int head_dim,
+    const int num_splits
+) {
+    const int q_head = blockIdx.x;
+    const int token = blockIdx.y;
+
+    // Global max across splits for stable softmax.
+    float gmax = -1e20f;
+    for (int s = 0; s < num_splits; s++) {
+        int idx = (token * num_q_heads + q_head) * num_splits + s;
+        gmax = fmaxf(gmax, partial_m[idx]);
+    }
+
+    // Global denominator: sum_s exp(m_s - gmax) * l_s.
+    float gden = 0.0f;
+    for (int s = 0; s < num_splits; s++) {
+        int idx = (token * num_q_heads + q_head) * num_splits + s;
+        gden += expf(partial_m[idx] - gmax) * partial_l[idx];
+    }
+    float inv_gden = 1.0f / gden;
+
+    // Merge weighted outputs.
+    // Each partial holds sum_i exp(s_i - m_local) * v_i — to merge into
+    // global softmax-weighted output, scale by exp(m_local - gmax) /
+    // gden, NOT by l_local separately (it's already absorbed in the
+    // unnormalized partial).
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < num_splits; s++) {
+            int idx = (token * num_q_heads + q_head) * num_splits + s;
+            float w = expf(partial_m[idx] - gmax) * inv_gden;
+            acc += w * partial_out[idx * head_dim + d];
+        }
+        output[((size_t)token * num_q_heads + q_head) * head_dim + d]
+            = __float2half(acc);
+    }
+}

@@ -22,6 +22,9 @@ pub enum Architecture {
     Llama,
     Qwen2,
     Qwen3,
+    /// Qwen3-MoE family (Qwen3-30B-A3B and friends). Distinct from Qwen3
+    /// because the FFN per layer is replaced by a router + N experts.
+    Qwen3Moe,
     Mistral,
     Phi,
     GPT2,
@@ -38,6 +41,7 @@ impl Architecture {
             "llama" | "llamaforcausallm" => Architecture::Llama,
             "qwen2" | "qwen2forcausallm" => Architecture::Qwen2,
             "qwen3" | "qwen3forcausallm" => Architecture::Qwen3,
+            "qwen3_moe" | "qwen3moe" | "qwen3moeforcausallm" => Architecture::Qwen3Moe,
             "mistral" | "mistralforcausallm" => Architecture::Mistral,
             "phi" | "phiforcausallm" => Architecture::Phi,
             "gpt2" | "gpt2lmheadmodel" => Architecture::GPT2,

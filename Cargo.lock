@@ -1383,6 +1383,7 @@ dependencies = [
  "ferrum-types",
  "half",
  "metal 0.31.0",
+ "rayon",
  "tracing",
 ]
 

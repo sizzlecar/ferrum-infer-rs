@@ -140,6 +140,130 @@ extern "C" __global__ void paged_decode_attention_f16(
     }
 }
 
+// ===================== Batched paged decode (multi-seq, q_len=1) =====================
+//
+// Same algorithm as `paged_decode_attention_f16` but handles multiple
+// sequences in a single kernel launch. Each block owns one (q_head,
+// seq_idx). Used by the unified-forward path when m_total == num_seqs
+// (every item is a single-token decode) — avoids the per-block
+// linear scan over `cu_seqlens_q` that `paged_varlen_attn_f16` does
+// to locate the owning seq.
+//
+// Layouts:
+//   q              : [num_seqs, num_q_heads, head_dim]              (token-major, q_len=1)
+//   block_tables   : [num_seqs, max_blocks_per_seq]                 (i32 stacked per seq)
+//   valid_kv_lens  : [num_seqs]                                     (i32 = pos_offset[i] + 1)
+//   output         : [num_seqs, num_q_heads, head_dim]
+//
+// Grid:  (num_q_heads, num_seqs)
+// Block: (256,)
+// Shared: max_kv_len * sizeof(float) — caller must size to the largest
+//         valid_kv_len across the batch (for graph-capture safety, size
+//         to FERRUM_KV_CAPACITY ceiling, not current iter's max).
+extern "C" __global__ void paged_batched_decode_attn_f16(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_block_pool,
+    const __half* __restrict__ v_block_pool,
+    const int*    __restrict__ block_tables,
+    const int*    __restrict__ valid_kv_lens,
+    __half* __restrict__ output,
+    const int num_q_heads,
+    const int num_kv_heads,
+    const int head_dim,
+    const int max_blocks_per_seq,
+    const int block_size,
+    const float scale
+) {
+    const int q_head = blockIdx.x;
+    const int seq_idx = blockIdx.y;
+    const int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const int valid_kv_len = valid_kv_lens[seq_idx];
+    if (valid_kv_len <= 0) return;
+
+    const int kv_stride = num_kv_heads * head_dim;
+    const int block_stride = block_size * kv_stride;
+    const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    // Q / output for this (seq, head). q is token-major: [seq, q_head, hd].
+    const __half* q_ptr =
+        q + ((size_t)seq_idx * num_q_heads + q_head) * head_dim;
+    __half* out_ptr =
+        output + ((size_t)seq_idx * num_q_heads + q_head) * head_dim;
+
+    extern __shared__ float s_scores[];
+
+    // Load Q into registers (warp-cooperative).
+    const int elems_per_thread = (head_dim + WARP_SIZE - 1) / WARP_SIZE;
+    float q_reg[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int d = (threadIdx.x % WARP_SIZE) + i * WARP_SIZE;
+        q_reg[i] = (i < elems_per_thread && d < head_dim)
+            ? __half2float(q_ptr[d]) : 0.0f;
+    }
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+
+    // ====== Step 1: Q·K^T (paged) ======
+    for (int kv_pos = warp_id; kv_pos < valid_kv_len; kv_pos += num_warps) {
+        const __half* k_row = paged_kv_ptr(
+            k_block_pool, my_block_table, kv_pos,
+            block_size, block_stride, kv_stride, kv_head, head_dim);
+        float dot = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int d = lane_id + i * WARP_SIZE;
+            if (i < elems_per_thread && d < head_dim)
+                dot += q_reg[i] * __half2float(k_row[d]);
+        }
+        float score = warp_reduce_sum(dot) * scale;
+        if (lane_id == 0)
+            s_scores[kv_pos] = score;
+    }
+    __syncthreads();
+
+    // ====== Step 2: Softmax ======
+    float thread_max = -1e20f;
+    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x)
+        thread_max = fmaxf(thread_max, s_scores[i]);
+    __shared__ float s_global_max;
+    float bmax = block_reduce_max(thread_max);
+    if (threadIdx.x == 0) s_global_max = bmax;
+    __syncthreads();
+    float global_max = s_global_max;
+
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x) {
+        float val = expf(s_scores[i] - global_max);
+        s_scores[i] = val;
+        thread_sum += val;
+    }
+    __syncthreads();
+    __shared__ float s_global_sum;
+    float bsum = block_reduce_sum(thread_sum);
+    if (threadIdx.x == 0) s_global_sum = bsum;
+    __syncthreads();
+    float inv_sum = 1.0f / s_global_sum;
+
+    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x)
+        s_scores[i] *= inv_sum;
+    __syncthreads();
+
+    // ====== Step 3: Weighted V sum (paged) ======
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int kv_pos = 0; kv_pos < valid_kv_len; kv_pos++) {
+            const __half* v_row = paged_kv_ptr(
+                v_block_pool, my_block_table, kv_pos,
+                block_size, block_stride, kv_stride, kv_head, head_dim);
+            acc += s_scores[kv_pos] * __half2float(v_row[d]);
+        }
+        out_ptr[d] = __float2half(acc);
+    }
+}
+
 // ===================== Flash Decode variant (split-K + paged) =====================
 
 #define MAX_SPLITS 32

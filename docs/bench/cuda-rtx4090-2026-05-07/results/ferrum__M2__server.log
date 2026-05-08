@@ -1,0 +1,255 @@
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.3
+
+Model: M2
+Path: /workspace/models/M2
+Device: CUDA(0)
+
+Initializing engine (continuous batching)...
+
+🚀 Server running at http://127.0.0.1:8800
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+
+[2m2026-05-06T19:29:03.957707Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 7d05e1db-bf80-4cf1-8820-5eaabeb57175 cancelled during decode
+[2m2026-05-06T19:29:03.986972Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request a272b1df-b806-48c2-a08e-005c2bf4b1f7 cancelled during decode
+[2m2026-05-06T19:29:03.986997Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for b9f7fe6b-74a1-4165-a0fa-01fe3d0b485f: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:03.987035Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 38998919-d6fe-4a5f-ba69-d543c30540e6 cancelled during decode
+[2m2026-05-06T19:29:04.017433Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 71de3957-7e7d-469c-94b1-c78bb1342275 cancelled during decode
+[2m2026-05-06T19:29:04.017456Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for f3f9ff5e-fb10-41e5-8fa1-fcc23ad1634f: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.017468Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:04.061204Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for 38998919-d6fe-4a5f-ba69-d543c30540e6: Internal error: No KV cache
+[2m2026-05-06T19:29:04.061218Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: 38998919-d6fe-4a5f-ba69-d543c30540e6
+[2m2026-05-06T19:29:04.061236Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request 38998919-d6fe-4a5f-ba69-d543c30540e6 not found in active queues
+[2m2026-05-06T19:29:04.091973Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request e4464589-0ce1-4ea9-ba0a-b43be5b9496e cancelled during decode
+[2m2026-05-06T19:29:04.092043Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 7d05e1db-bf80-4cf1-8820-5eaabeb57175: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.092087Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 1a0a72c5-c90c-4146-901b-1ea685fa19ee cancelled during decode
+[2m2026-05-06T19:29:04.157310Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request a272b1df-b806-48c2-a08e-005c2bf4b1f7 cancelled during decode
+[2m2026-05-06T19:29:04.185733Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 38998919-d6fe-4a5f-ba69-d543c30540e6 cancelled during decode
+[2m2026-05-06T19:29:04.185754Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 44ffd28d-a9d6-49f1-a5de-f8053e38b88d: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.185779Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 71de3957-7e7d-469c-94b1-c78bb1342275 cancelled during decode
+[2m2026-05-06T19:29:04.185793Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 291d3557-4668-440d-a65c-06ad3bf2e07c: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.185826Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:04.336874Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for 1a0a72c5-c90c-4146-901b-1ea685fa19ee: Internal error: No KV cache
+[2m2026-05-06T19:29:04.336887Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: 1a0a72c5-c90c-4146-901b-1ea685fa19ee
+[2m2026-05-06T19:29:04.336896Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request 1a0a72c5-c90c-4146-901b-1ea685fa19ee not found in active queues
+[2m2026-05-06T19:29:04.337025Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c4a43646-4cfe-4523-99f7-715966a19f58 cancelled during decode
+[2m2026-05-06T19:29:04.365112Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:04.559840Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for c4a43646-4cfe-4523-99f7-715966a19f58: Internal error: No KV cache
+[2m2026-05-06T19:29:04.559858Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: c4a43646-4cfe-4523-99f7-715966a19f58
+[2m2026-05-06T19:29:04.559867Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request c4a43646-4cfe-4523-99f7-715966a19f58 not found in active queues
+[2m2026-05-06T19:29:04.561279Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 7d42147d-c65f-4b8d-b4a0-d67c88ba4883 cancelled during decode
+[2m2026-05-06T19:29:04.561297Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for e4464589-0ce1-4ea9-ba0a-b43be5b9496e: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.561329Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c497e8f3-7fcf-45b1-aaeb-7e044fe93671 cancelled during decode
+[2m2026-05-06T19:29:04.561342Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 1a0a72c5-c90c-4146-901b-1ea685fa19ee: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.561371Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request f156c0a9-0050-4f77-bcb9-dbce7796dad1 cancelled during decode
+[2m2026-05-06T19:29:04.561385Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for dab8f046-95a4-4df6-a437-b32055e8b115: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.561421Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request ba02285d-34ec-43c8-9421-5415dbeb7722 cancelled during decode
+[2m2026-05-06T19:29:04.626411Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request a272b1df-b806-48c2-a08e-005c2bf4b1f7 cancelled during decode
+[2m2026-05-06T19:29:04.654825Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 38998919-d6fe-4a5f-ba69-d543c30540e6 cancelled during decode
+[2m2026-05-06T19:29:04.654845Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 7bd09981-a4b7-498b-983d-f42504462259: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.654871Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 71de3957-7e7d-469c-94b1-c78bb1342275 cancelled during decode
+[2m2026-05-06T19:29:04.654892Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 502ce6e7-7e81-491c-9067-408d15f1abfa: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.654904Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:04.806058Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for 7d42147d-c65f-4b8d-b4a0-d67c88ba4883: Internal error: No KV cache
+[2m2026-05-06T19:29:04.806072Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: 7d42147d-c65f-4b8d-b4a0-d67c88ba4883
+[2m2026-05-06T19:29:04.806081Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request 7d42147d-c65f-4b8d-b4a0-d67c88ba4883 not found in active queues
+[2m2026-05-06T19:29:04.806582Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 0123e8e3-97af-471f-a0e0-71529cc3bebf cancelled during decode
+[2m2026-05-06T19:29:04.838875Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c4a43646-4cfe-4523-99f7-715966a19f58 cancelled during decode
+[2m2026-05-06T19:29:04.838896Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 250165a6-58a1-472e-82af-c9e6ce32134e: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.838908Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:04.990134Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for 0123e8e3-97af-471f-a0e0-71529cc3bebf: Internal error: No KV cache
+[2m2026-05-06T19:29:04.990152Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: 0123e8e3-97af-471f-a0e0-71529cc3bebf
+[2m2026-05-06T19:29:04.990159Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request 0123e8e3-97af-471f-a0e0-71529cc3bebf not found in active queues
+[2m2026-05-06T19:29:04.990628Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 25cebba4-a370-4f31-92cf-779769018cd2 cancelled during decode
+[2m2026-05-06T19:29:04.990645Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 7d42147d-c65f-4b8d-b4a0-d67c88ba4883: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:04.990668Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request ba741178-e3f7-4d7b-8192-1b179461c7c4 cancelled during decode
+[2m2026-05-06T19:29:05.016313Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c497e8f3-7fcf-45b1-aaeb-7e044fe93671 cancelled during decode
+[2m2026-05-06T19:29:05.016333Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for f156c0a9-0050-4f77-bcb9-dbce7796dad1: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.016364Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request bdb4737d-47a9-439e-a3e0-edafa4ac90c7 cancelled during decode
+[2m2026-05-06T19:29:05.016378Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for ba02285d-34ec-43c8-9421-5415dbeb7722: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.016403Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 851a9c46-c9e8-4653-a9bd-c20db8f09ff8 cancelled during decode
+[2m2026-05-06T19:29:05.047226Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 9b8fa223-0a52-4641-af0f-233d15cfe834 cancelled during decode
+[2m2026-05-06T19:29:05.047256Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 9ceba724-87a2-47be-9788-3ecc6e63af3c: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.047286Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 1f98e455-ed18-48c0-9e1d-5a0e1e5dd526 cancelled during decode
+[2m2026-05-06T19:29:05.078051Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 8482ac03-59c2-4c1a-915c-f81f8165cfc9 cancelled during decode
+[2m2026-05-06T19:29:05.108348Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:05.170705Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for 1f98e455-ed18-48c0-9e1d-5a0e1e5dd526: Internal error: No KV cache
+[2m2026-05-06T19:29:05.170719Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: 1f98e455-ed18-48c0-9e1d-5a0e1e5dd526
+[2m2026-05-06T19:29:05.170726Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request 1f98e455-ed18-48c0-9e1d-5a0e1e5dd526 not found in active queues
+[2m2026-05-06T19:29:05.171284Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request a272b1df-b806-48c2-a08e-005c2bf4b1f7 cancelled during decode
+[2m2026-05-06T19:29:05.171302Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 38998919-d6fe-4a5f-ba69-d543c30540e6: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.171327Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 9a550ca4-14f7-421d-b76a-64958867fe6d cancelled during decode
+[2m2026-05-06T19:29:05.199759Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 71de3957-7e7d-469c-94b1-c78bb1342275 cancelled during decode
+[2m2026-05-06T19:29:05.225453Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c186e474-39e7-444f-b41b-c17cd00f328e cancelled during decode
+[2m2026-05-06T19:29:05.225472Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for b895ba52-2bb7-4220-abe4-a0b90cafc570: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.225500Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 6f8d348a-179b-41ab-828b-bbfa88c3e21e cancelled during decode
+[2m2026-05-06T19:29:05.262791Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 0123e8e3-97af-471f-a0e0-71529cc3bebf cancelled during decode
+[2m2026-05-06T19:29:05.262812Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 7d4a088e-fd88-44f5-85d1-dee3aebdc534: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.262849Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 864ae385-6fdf-4068-ac6e-8135ea75ec4f cancelled during decode
+[2m2026-05-06T19:29:05.295162Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c4a43646-4cfe-4523-99f7-715966a19f58 cancelled during decode
+[2m2026-05-06T19:29:05.295184Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 7340a36c-d731-4c27-b466-985669ef76c3: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.295201Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:05.357637Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for 9a550ca4-14f7-421d-b76a-64958867fe6d: Internal error: No KV cache
+[2m2026-05-06T19:29:05.357658Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: 9a550ca4-14f7-421d-b76a-64958867fe6d
+[2m2026-05-06T19:29:05.357666Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request 9a550ca4-14f7-421d-b76a-64958867fe6d not found in active queues
+[2m2026-05-06T19:29:05.357764Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request fa40e580-50aa-4755-ac3d-719b7226a001 cancelled during decode
+[2m2026-05-06T19:29:05.384236Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 25cebba4-a370-4f31-92cf-779769018cd2 cancelled during decode
+[2m2026-05-06T19:29:05.410482Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request ba741178-e3f7-4d7b-8192-1b179461c7c4 cancelled during decode
+[2m2026-05-06T19:29:05.410502Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for f1fa5a2d-fbce-4aad-a284-cffa0c306335: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.410535Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 415a3c71-e611-4193-8c5a-8102080d8534 cancelled during decode
+[2m2026-05-06T19:29:05.464949Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request bdb4737d-47a9-439e-a3e0-edafa4ac90c7 cancelled during decode
+[2m2026-05-06T19:29:05.464970Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 851a9c46-c9e8-4653-a9bd-c20db8f09ff8: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.464994Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c497e8f3-7fcf-45b1-aaeb-7e044fe93671 cancelled during decode
+[2m2026-05-06T19:29:05.465006Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 25cb4d65-5f9f-448e-b0ba-14af70101441: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.465033Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request ac2dee38-815d-4bf2-987e-34579ef3e592 cancelled during decode
+[2m2026-05-06T19:29:05.495951Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:05.549584Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for ac2dee38-815d-4bf2-987e-34579ef3e592: Internal error: No KV cache
+[2m2026-05-06T19:29:05.549596Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: ac2dee38-815d-4bf2-987e-34579ef3e592
+[2m2026-05-06T19:29:05.549603Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request ac2dee38-815d-4bf2-987e-34579ef3e592 not found in active queues
+[2m2026-05-06T19:29:05.550799Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 9b8fa223-0a52-4641-af0f-233d15cfe834 cancelled during decode
+[2m2026-05-06T19:29:05.550815Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 1f98e455-ed18-48c0-9e1d-5a0e1e5dd526: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.550839Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 21bcda1c-2e4d-46eb-9a69-4b31eccdc1fb cancelled during decode
+[2m2026-05-06T19:29:05.550853Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 9f4e7092-1b0f-4ba3-bc01-8a8821336493: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.550877Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request dd17b0b5-62a0-44ea-a83e-5758e95190b1 cancelled during decode
+[2m2026-05-06T19:29:05.581574Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 8482ac03-59c2-4c1a-915c-f81f8165cfc9 cancelled during decode
+[2m2026-05-06T19:29:05.581596Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 3c3782e5-40da-43f4-b0b4-3a29843d9ee0: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.581623Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request db59c30e-04ee-4e96-a1da-5151f8eac542 cancelled during decode
+[2m2026-05-06T19:29:05.611893Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request a272b1df-b806-48c2-a08e-005c2bf4b1f7 cancelled during decode
+[2m2026-05-06T19:29:05.611913Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 9a550ca4-14f7-421d-b76a-64958867fe6d: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.611938Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 549e239b-615a-460a-8623-c51b3b835eff cancelled during decode
+[2m2026-05-06T19:29:05.665956Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request d64cfbb8-811f-484d-8480-7475fc4378c3 cancelled during decode
+[2m2026-05-06T19:29:05.694502Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:05.721431Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for db59c30e-04ee-4e96-a1da-5151f8eac542: Internal error: No KV cache
+[2m2026-05-06T19:29:05.721443Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: db59c30e-04ee-4e96-a1da-5151f8eac542
+[2m2026-05-06T19:29:05.721451Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request db59c30e-04ee-4e96-a1da-5151f8eac542 not found in active queues
+[2m2026-05-06T19:29:05.721562Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 71de3957-7e7d-469c-94b1-c78bb1342275 cancelled during decode
+[2m2026-05-06T19:29:05.747300Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c186e474-39e7-444f-b41b-c17cd00f328e cancelled during decode
+[2m2026-05-06T19:29:05.747321Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 6f8d348a-179b-41ab-828b-bbfa88c3e21e: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.747351Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 8f84aa32-3a67-45d5-bd0e-83fcd9792f24 cancelled during decode
+[2m2026-05-06T19:29:05.747364Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 0123e8e3-97af-471f-a0e0-71529cc3bebf: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.747386Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request e0ac3016-b43c-4130-9585-b1eb4746c8c7 cancelled during decode
+[2m2026-05-06T19:29:05.747399Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 864ae385-6fdf-4068-ac6e-8135ea75ec4f: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.747426Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request d690c7e7-8fa6-412f-8bec-d79002d2206f cancelled during decode
+[2m2026-05-06T19:29:05.811930Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 8f2109a6-2a1e-4418-82cc-cd87a58000d1 cancelled during decode
+[2m2026-05-06T19:29:05.844417Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c4a43646-4cfe-4523-99f7-715966a19f58 cancelled during decode
+[2m2026-05-06T19:29:05.844444Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for f45d6122-dc10-4b11-ad65-78b6ab29b08e: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.844475Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 6719e8c6-2a78-4660-b5bc-23ea589f67c7 cancelled during decode
+[2m2026-05-06T19:29:05.844488Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 62e1e2b1-0ee5-49dd-9941-5d5ac55d5ab4: Resource exhausted: Block pool exhausted: 512/512 blocks allocated
+[2m2026-05-06T19:29:05.844495Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Batch decode failed, falling back to per-request: Internal error: No KV cache
+[2m2026-05-06T19:29:05.844497Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Decode failed for 6719e8c6-2a78-4660-b5bc-23ea589f67c7: Internal error: No KV cache
+[2m2026-05-06T19:29:05.844501Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Attempted to complete unknown request: 6719e8c6-2a78-4660-b5bc-23ea589f67c7
+[2m2026-05-06T19:29:05.844507Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Iteration error: Scheduler error: Request 6719e8c6-2a78-4660-b5bc-23ea589f67c7 not found in active queues
+[2m2026-05-06T19:29:05.844603Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for fa40e580-50aa-4755-ac3d-719b7226a001: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.844616Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 82c4e1b3-095e-45a7-bf9f-b552742a49eb: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.844633Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 25cebba4-a370-4f31-92cf-779769018cd2: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.844646Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for ba741178-e3f7-4d7b-8192-1b179461c7c4: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.844659Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 415a3c71-e611-4193-8c5a-8102080d8534: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.844671Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for fbee0cf1-7c57-455d-98b5-0f6966176753: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.844683Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for bdb4737d-47a9-439e-a3e0-edafa4ac90c7: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.844695Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for c497e8f3-7fcf-45b1-aaeb-7e044fe93671: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845246Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for ac2dee38-815d-4bf2-987e-34579ef3e592: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845260Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 83ee6bf1-554a-48e5-aa95-ddc9910768ae: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845272Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 5924f6de-0def-4d34-a2ff-c3fd07676db9: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845288Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 9b8fa223-0a52-4641-af0f-233d15cfe834: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845304Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 21bcda1c-2e4d-46eb-9a69-4b31eccdc1fb: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845316Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for dd17b0b5-62a0-44ea-a83e-5758e95190b1: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845328Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 4a87b634-90c5-41ef-874e-54b14e925e04: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845340Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 8482ac03-59c2-4c1a-915c-f81f8165cfc9: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845792Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for db59c30e-04ee-4e96-a1da-5151f8eac542: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845805Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 6f2777d4-1567-4030-adff-7716e3d3cd2f: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845817Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for a272b1df-b806-48c2-a08e-005c2bf4b1f7: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845837Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 549e239b-615a-460a-8623-c51b3b835eff: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845849Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 6179376a-a29d-4143-a34b-ee06b4dc6c5c: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845861Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for d64cfbb8-811f-484d-8480-7475fc4378c3: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845873Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 71de3957-7e7d-469c-94b1-c78bb1342275: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.845886Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for d3ba16f1-b49e-40cf-80b4-d4d1a5cd40df: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846028Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for c186e474-39e7-444f-b41b-c17cd00f328e: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846042Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 8f84aa32-3a67-45d5-bd0e-83fcd9792f24: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846058Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for e0ac3016-b43c-4130-9585-b1eb4746c8c7: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846070Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for d690c7e7-8fa6-412f-8bec-d79002d2206f: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846081Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 15d685a8-b797-4270-b614-85b2b5262d87: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846095Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 8f2109a6-2a1e-4418-82cc-cd87a58000d1: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846108Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 32f017eb-032c-4e08-8ed8-78e9765c46ed: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846130Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for c4a43646-4cfe-4523-99f7-715966a19f58: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.846494Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 6719e8c6-2a78-4660-b5bc-23ea589f67c7: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.865108Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for b4b007d8-283e-47b8-ab2a-3739fb51b3a5: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.876561Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 02b8e225-72f8-4667-b4ce-22d879d179b4: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.884853Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 7fc3947f-f114-41b6-818b-0af1b03becf1: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.884909Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 6f0896ac-8c21-470b-b27e-706a8a4e93b5: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.884941Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for fbea11d7-8b45-485c-a7b7-0f04460b569e: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.884969Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for cc95ec29-c865-4501-aab2-84471b061a66: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.889883Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 6ef0dfd7-afab-4ab2-9a0a-22f6f290cf56: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.889925Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 380f72fc-7705-4e1d-ad78-ebc39b3d36a4: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.889954Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for f1e7ce73-0eae-42c4-ac11-78c3c581751c: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.889978Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for cad3dab7-32ab-40c9-8ad2-9aa4270068da: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890005Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 0da089d9-8eba-4ebc-b905-c2d786978fd1: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890031Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 074396c5-fc8e-4256-a7b6-b0ebf7139e43: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890060Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for c8cfa82a-b44e-43a0-8d60-7f91ca2f91d0: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890099Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 716e17e2-48dc-444d-b71a-eb8c6a31d246: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890157Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 612a0aa3-ae59-4b3e-80f4-a44fb4a9f0f5: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890198Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 5392de01-df5c-4f6d-89e9-3a3f5e576127: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890242Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 93a8d4bb-361a-453a-b24e-13750ccdc992: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890268Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 3bf445dc-0ed4-48d0-b6bd-2b7556e3fc8d: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890296Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 2e03f1d2-4e83-46d1-b667-0a8470e15715: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890323Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 7fddb48f-270b-42d5-9a6c-b936f3ac49e3: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890351Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 5347597a-f3f6-471b-be58-0e89a45b1b95: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890379Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for b68a2a0c-1c5f-4f60-ab7b-5c8e685adeba: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890408Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 298d9c92-7674-4640-ae08-422877aede6c: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890436Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for f3880feb-03a0-40d4-8618-4fab36d0d53d: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890464Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 1c8d6021-e046-4973-b225-4d89d9e19f93: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890491Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for e88896a1-3eb9-43e0-a5a2-d47de7b0cd2f: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890518Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 3020ae8b-1e76-463c-90ff-ffd1d13cf0e4: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890546Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for b0ee76ec-f897-48cc-aad5-ba028a1c4f03: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890571Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 9755994c-711a-4607-96ff-02b88c3a5352: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890597Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 9cf7faa5-ed10-4e83-ba39-8fa316b76181: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890626Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 67485b01-f892-4b71-b551-d92af7a65723: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.890748Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for eb64fc31-1407-4750-818f-1bbd421e6bec: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.906582Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for aa63af06-ee52-4eb7-a679-17939ab73548: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.906657Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for d277f4aa-7ec7-484f-bafa-8dfcee1c7e5f: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.906703Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for fa594141-1625-4afb-a475-e91f31c39379: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.906729Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 494b533e-7267-4370-9391-195f29c9d1e0: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.906754Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 298cdaf8-d5b4-43df-b4be-b3ed25922eab: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.906780Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 1faa0955-eb57-4c28-8c87-7f250a31f4e5: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.906808Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for c065a017-738b-4c4a-ac9c-515bc2bff142: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.906841Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 6e04eb92-5d1f-4946-9f24-4e5140cf92bb: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.912438Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for b8ebd9f9-8f90-460f-acda-517dfc1f5d14: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.919820Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 5c3d207b-a594-49b8-a72d-2fdda5f55771: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.928880Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 29ed04fc-b5a7-4a1c-8e0b-76d5aeacad38: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.928930Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 8cb4595b-e140-4a5b-af55-2e96888617a2: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.928960Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for d82a461c-008f-4c13-969d-39f1c9a74ae5: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.928985Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 3d96462e-ffa8-4f3f-9894-a695d332dea0: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.947842Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 6b76c91a-6c4f-4e68-8096-ccd48b81431d: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.947921Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 8a106572-9827-4bfd-90f4-e769586ff977: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.947951Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 8b2dadf3-76d7-44b2-a435-980db9c6aada: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.947977Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 59e25392-9755-49b3-8708-3e0357bebd33: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948006Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for ab8f7108-b51a-40a1-bf44-498902a8786a: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948035Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for f61bd72b-b5c6-43d8-957e-bb1115f85d44: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948064Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 075732c5-69f4-43ea-89a5-b2514c59d648: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948106Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for ef6cc19a-24ae-4808-9b13-543a0c054505: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948132Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 56f51ba9-473a-4e18-bafa-2cfef60bb329: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948158Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 1adb2d1c-f1c0-4219-9b36-38a2ad613bda: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948188Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for f47ff1ca-3d29-4e7f-904b-b0757a0f78e6: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948214Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 91bdae39-9b65-4152-a1fc-5b5b6e04bbbe: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948242Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for cfca6cec-ebca-4a24-a437-da2a86d9e111: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948266Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 2e7077d4-d260-4d43-a615-b3fd7e60d2ea: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948291Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 61730569-91ab-48ee-ad0b-a9b9c3f48a5d: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948319Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 1af1e362-3f7d-41e1-bc76-5d4cf9f3b93b: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948343Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 5ce637a6-f751-4e8f-bb8a-05a91af2b17e: Resource exhausted: No blocks available and no request to preempt
+[2m2026-05-06T19:29:05.948449Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Prefill failed for 4f10c827-bf8b-4a0e-b6a2-4496b4efc385: Resource exhausted: No blocks available and no request to preempt

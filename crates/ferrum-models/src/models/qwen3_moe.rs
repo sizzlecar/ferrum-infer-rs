@@ -159,6 +159,16 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub silu_stacked: B::Buffer,
     /// `[max_tokens * top_k * hidden]` — down gemm output per pair.
     pub down_out_stacked: B::Buffer,
+
+    // ── Bucketed CUDA path scratch (shared with stacked Metal where
+    //    layout matches; used by `moe_forward_bucketed`).
+    /// `[max_tokens * top_k * hidden]` — input gather output: per-pair
+    /// row gathered from `x[batch, hidden]` via embedding_lookup.
+    pub x_packed_bucket: B::Buffer,
+    /// `[max_tokens * top_k * 2 * expert_inter]` — gate_up Marlin output
+    /// per pair (gate cols then up cols). Distinct from `gate_out_stacked`
+    /// + `up_out_stacked` which the Metal path keeps separate.
+    pub gate_up_packed_bucket: B::Buffer,
     /// `[top_k]` i32 expert IDs for the current token (decode reuses;
     /// prefill writes per-pair indices into `ids_2d` instead).
     pub ids_buf: B::Buffer,
@@ -232,6 +242,11 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub paged_max_blocks_per_seq: usize,
 
     pub max_tokens: usize,
+
+    /// Allocation-free host scratch for the bucketed MoE forward path.
+    /// Holds RouterOutput / softmax buffer / MoeBucketPlan reused across
+    /// every layer (~10 ms / token reclaimed at c=32 / Qwen3-MoE 30B-A3B).
+    pub moe_route_scratch: crate::moe::MoeRouteScratch,
 }
 
 impl<B: Backend> Qwen3MoeScratch<B> {
@@ -269,6 +284,8 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             up_out_stacked: B::alloc(t * cfg.num_experts_per_tok * inter),
             silu_stacked: B::alloc(t * cfg.num_experts_per_tok * inter),
             down_out_stacked: B::alloc(t * cfg.num_experts_per_tok * h),
+            x_packed_bucket: B::alloc(t * cfg.num_experts_per_tok * h),
+            gate_up_packed_bucket: B::alloc(t * cfg.num_experts_per_tok * 2 * inter),
             ids_buf: B::from_slice_i32(&vec![0i32; cfg.num_experts_per_tok]),
             weights_buf: B::from_slice(&vec![0.0f32; cfg.num_experts_per_tok]),
             selected_ids_buf: B::from_slice_i32(&vec![0i32; t * cfg.num_experts_per_tok]),
@@ -302,6 +319,7 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             paged_batch_context_lens: None,
             paged_max_blocks_per_seq: 0,
             max_tokens: t,
+            moe_route_scratch: crate::moe::MoeRouteScratch::new(),
         }
     }
 
@@ -479,6 +497,179 @@ impl<B: Backend> Qwen3MoeModel<B> {
             // Tied embeddings — same as dense path.
             tracing::info!(
                 "Qwen3MoeModel: tied embeddings — loading model.embed_tokens.weight as lm_head"
+            );
+            loader.load_linear("model.embed_tokens")?
+        };
+
+        let runtime_cfg = cfg.base.to_runtime();
+        Ok(Self {
+            cfg,
+            runtime_cfg,
+            embed,
+            attn_layers,
+            moe_layers,
+            final_norm_w,
+            lm_head,
+            rope,
+            scratch,
+            kv_caches: HashMap::new(),
+            kv_free_pool: Vec::new(),
+            paged_pools: None,
+            paged_block_alloc: None,
+        })
+    }
+
+    /// Build from a HuggingFace safetensors model directory (GPTQ-INT4
+    /// expected). Mirrors [`Self::new`] but with a STACKED expert loader:
+    /// reads all `num_experts` experts' raw GPTQ tensors per layer once,
+    /// concats along N host-side, single `B::load_gptq` repacks the
+    /// whole thing into one Marlin tile per (layer, role).
+    ///
+    /// 128 experts × 48 layers × 3 projs would otherwise trigger 18 432
+    /// per-call Marlin repacks (~30+ minute cold start at ~100 ms each
+    /// on Llama-MoE shapes). The stacked path drops that to 96 repacks
+    /// — one per (layer × {gate_up, down}) — and dispatch slices per
+    /// expert via `B::gemm_gptq_with_offset`.
+    pub fn new_safetensors(
+        cfg: Qwen3MoeConfig,
+        loader: &ferrum_quantization::NativeSafetensorsLoader<B>,
+    ) -> Result<Self> {
+        use ferrum_quantization::WeightLoader as _;
+        {
+            let mut ctx = B::new_context();
+            B::reset_all_graphs(&mut ctx);
+        }
+        let rope = build_rope_cache::<B>(&cfg.base);
+        let scratch = Qwen3MoeScratch::alloc(&cfg, 1);
+        let embed = loader.load_tensor("model.embed_tokens.weight")?;
+        let mut attn_layers = Vec::with_capacity(cfg.base.num_layers);
+        let mut moe_layers = Vec::with_capacity(cfg.base.num_layers);
+        for li in 0..cfg.base.num_layers {
+            let prefix = format!("model.layers.{li}");
+            let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
+            let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
+            let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
+            let post_ln_w =
+                loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let gate_up_proj: Box<dyn ferrum_quantization::Linear<B>> =
+                stub_linear::<B>(2 * cfg.expert_intermediate_size, cfg.base.hidden_size);
+            let down_proj: Box<dyn ferrum_quantization::Linear<B>> =
+                stub_linear::<B>(cfg.base.hidden_size, cfg.expert_intermediate_size);
+            let (q_norm_w, k_norm_w) = if cfg.base.has_qk_norm {
+                let q = loader
+                    .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
+                    .ok();
+                let k = loader
+                    .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
+                    .ok();
+                (q, k)
+            } else {
+                (None, None)
+            };
+            attn_layers.push(LlamaFamilyLayer {
+                input_ln_w,
+                qkv_proj,
+                q_norm_w,
+                k_norm_w,
+                o_proj,
+                post_ln_w,
+                gate_up_proj,
+                down_proj,
+            });
+
+            // Router: rank-2 linear, standard load.
+            let router = loader.load_linear(&format!("{prefix}.mlp.gate"))?;
+            if router.in_features() != cfg.base.hidden_size {
+                return Err(ferrum_types::FerrumError::model(format!(
+                    "router layer {li}: in_features {} != hidden {}",
+                    router.in_features(),
+                    cfg.base.hidden_size
+                )));
+            }
+            if router.out_features() != cfg.num_experts {
+                return Err(ferrum_types::FerrumError::model(format!(
+                    "router layer {li}: out_features {} != num_experts {}",
+                    router.out_features(),
+                    cfg.num_experts
+                )));
+            }
+
+            // Stacked GPTQ Marlin load via per-expert-repack-then-concat
+            // (B::load_gptq_stacked). Each expert's Marlin-packed bytes
+            // are contiguous in the GPU buffer, so offset GEMM
+            // dispatches via pointer offset alone — no stride magic.
+            let expert_prefix = format!("{prefix}.mlp.experts.{{e}}.");
+            let probe_split =
+                loader.has_tensor(&format!("{prefix}.mlp.experts.0.gate_proj.qweight"));
+            let gate_up_projs: &[&str] = if probe_split {
+                &["gate_proj", "up_proj"]
+            } else {
+                &["gate_up_proj"]
+            };
+            let (gate_up_store, gate_up_n_per_expert, gate_up_k) =
+                loader.load_stacked_gptq_experts(&expert_prefix, cfg.num_experts, gate_up_projs)?;
+            let (down_store, down_n_per_expert, down_k) = loader.load_stacked_gptq_experts(
+                &expert_prefix,
+                cfg.num_experts,
+                &["down_proj"],
+            )?;
+            let gate_up_arc = std::sync::Arc::new(gate_up_store);
+            let down_arc = std::sync::Arc::new(down_store);
+
+            let mut gate_up: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
+                Vec::with_capacity(cfg.num_experts);
+            let mut down: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
+                Vec::with_capacity(cfg.num_experts);
+            for e in 0..cfg.num_experts {
+                gate_up.push(Box::new(
+                    ferrum_quantization::StackedExpertLinear::<B>::new(
+                        gate_up_arc.clone(),
+                        e * gate_up_n_per_expert,
+                        gate_up_n_per_expert,
+                        gate_up_k,
+                    ),
+                ));
+                down.push(Box::new(
+                    ferrum_quantization::StackedExpertLinear::<B>::new(
+                        down_arc.clone(),
+                        e * down_n_per_expert,
+                        down_n_per_expert,
+                        down_k,
+                    ),
+                ));
+            }
+            let experts = crate::moe::ExpertStack::<B> {
+                gate_up,
+                down,
+                gate_stacked: None,
+                up_stacked: None,
+                down_stacked: None,
+                gate_up_gptq_stacked: Some(gate_up_arc),
+                down_gptq_stacked: Some(down_arc),
+            };
+            moe_layers.push(Qwen3MoeLayerState { router, experts });
+
+            if li == 0 || li.is_multiple_of(8) || li == cfg.base.num_layers - 1 {
+                tracing::info!(
+                    "Qwen3MoeModel safetensors: layer {li}/{} loaded \
+                     (stacked: gate_up={}x{} k={}, down={}x{} k={})",
+                    cfg.base.num_layers,
+                    cfg.num_experts,
+                    gate_up_n_per_expert,
+                    gate_up_k,
+                    cfg.num_experts,
+                    down_n_per_expert,
+                    down_k,
+                );
+            }
+        }
+
+        let final_norm_w = loader.load_tensor("model.norm.weight")?;
+        let lm_head = if loader.has_tensor("lm_head.weight") {
+            loader.load_linear("lm_head")?
+        } else {
+            tracing::info!(
+                "Qwen3MoeModel safetensors: tied embeddings — using model.embed_tokens as lm_head"
             );
             loader.load_linear("model.embed_tokens")?
         };
@@ -1073,6 +1264,12 @@ impl<B: Backend> Qwen3MoeModel<B> {
             && moe_layer.experts.up_stacked.is_some()
             && moe_layer.experts.down_stacked.is_some();
 
+        // CUDA Marlin bucketed path: shared GPTQ store per (gate_up, down)
+        // role + offset GEMMs per expert. Disabled with FERRUM_MOE_BUCKETED=0.
+        let bucketed_path_available = moe_layer.experts.gate_up_gptq_stacked.is_some()
+            && moe_layer.experts.down_gptq_stacked.is_some()
+            && std::env::var("FERRUM_MOE_BUCKETED").as_deref() != Ok("0");
+
         // Fast path for decode (tokens=1): the stacked decode impl
         // writes the weighted-sum result *directly* into `residual` via
         // `weighted_sum_residual_stacked`, skipping the moe_out scratch
@@ -1087,7 +1284,28 @@ impl<B: Backend> Qwen3MoeModel<B> {
         // skip its standalone rms_norm.
         let did_norm_fusion = decode_fast_path && next_layer_idx.is_some();
 
-        if stacked_path_available {
+        if bucketed_path_available {
+            // CUDA: gather → per-expert m=N Marlin → silu → per-expert
+            // m=N Marlin → moe_combine. Single-launch combine.
+            crate::moe::moe_forward_bucketed::<B>(
+                ctx,
+                &self.scratch.norm_out,
+                &self.scratch.router_logits,
+                &mut self.scratch.moe_out,
+                tokens,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts,
+                self.cfg.num_experts_per_tok,
+                self.cfg.norm_topk_prob,
+                &moe_layer.experts,
+                &mut self.scratch.x_packed_bucket,
+                &mut self.scratch.gate_up_packed_bucket,
+                &mut self.scratch.silu_stacked,
+                &mut self.scratch.down_out_stacked,
+                &mut self.scratch.moe_route_scratch,
+            )?;
+        } else if stacked_path_available {
             if tokens > 1 {
                 // Prefill: one batched 2-D mul_mm_id covers all
                 // (token, expert) pairs in parallel.
@@ -1533,6 +1751,35 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 sa_us / 1000, sa_n,
                 cp_us / 1000, cp_n,
             );
+
+            // Bucketed CUDA MoE per-phase breakdown (CUDA M3 path).
+            let bk_layers = MOE_BUCKET_LAYER_CALLS.swap(0, Ordering::Relaxed);
+            if bk_layers > 0 {
+                let bk_sync = MOE_BUCKET_SYNC_US.swap(0, Ordering::Relaxed);
+                let bk_d2h = MOE_BUCKET_D2H_US.swap(0, Ordering::Relaxed);
+                let bk_route = MOE_BUCKET_ROUTE_US.swap(0, Ordering::Relaxed);
+                let bk_plan = MOE_BUCKET_PLAN_US.swap(0, Ordering::Relaxed);
+                let bk_gather = MOE_BUCKET_GATHER_US.swap(0, Ordering::Relaxed);
+                let bk_g1 = MOE_BUCKET_GEMM1_US.swap(0, Ordering::Relaxed);
+                let bk_silu_us = MOE_BUCKET_SILU_US.swap(0, Ordering::Relaxed);
+                let bk_g3 = MOE_BUCKET_GEMM3_US.swap(0, Ordering::Relaxed);
+                let bk_comb = MOE_BUCKET_COMBINE_US.swap(0, Ordering::Relaxed);
+                let bk_total = bk_sync
+                    + bk_d2h
+                    + bk_route
+                    + bk_plan
+                    + bk_gather
+                    + bk_g1
+                    + bk_silu_us
+                    + bk_g3
+                    + bk_comb;
+                eprintln!(
+                    "[bucket-prof] layers={} bk_total={} ms | sync={} d2h={} host_route={} plan={} gather={} gemm1={} silu={} gemm3={} combine={} (us, summed across layers)",
+                    bk_layers, bk_total / 1000,
+                    bk_sync, bk_d2h, bk_route, bk_plan, bk_gather,
+                    bk_g1, bk_silu_us, bk_g3, bk_comb,
+                );
+            }
         }
 
         B::to_vec(&self.scratch.logits, vocab)
@@ -1651,6 +1898,37 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 moe_silu / 1000, moe_down / 1000, moe_wsum / 1000,
                 other / 1000, pct(other),
             );
+
+            // Bucketed CUDA MoE per-phase breakdown (FERRUM_MOE_PROFILE=1).
+            // Counters are summed across all layers in this decode step.
+            use crate::moe::dispatch::*;
+            let bk_layers = MOE_BUCKET_LAYER_CALLS.swap(0, Ordering::Relaxed);
+            if bk_layers > 0 {
+                let bk_sync = MOE_BUCKET_SYNC_US.swap(0, Ordering::Relaxed);
+                let bk_d2h = MOE_BUCKET_D2H_US.swap(0, Ordering::Relaxed);
+                let bk_route = MOE_BUCKET_ROUTE_US.swap(0, Ordering::Relaxed);
+                let bk_plan = MOE_BUCKET_PLAN_US.swap(0, Ordering::Relaxed);
+                let bk_gather = MOE_BUCKET_GATHER_US.swap(0, Ordering::Relaxed);
+                let bk_g1 = MOE_BUCKET_GEMM1_US.swap(0, Ordering::Relaxed);
+                let bk_silu = MOE_BUCKET_SILU_US.swap(0, Ordering::Relaxed);
+                let bk_g3 = MOE_BUCKET_GEMM3_US.swap(0, Ordering::Relaxed);
+                let bk_comb = MOE_BUCKET_COMBINE_US.swap(0, Ordering::Relaxed);
+                let bk_total = bk_sync
+                    + bk_d2h
+                    + bk_route
+                    + bk_plan
+                    + bk_gather
+                    + bk_g1
+                    + bk_silu
+                    + bk_g3
+                    + bk_comb;
+                eprintln!(
+                    "[bucket-prof] layers={} bk_total={} ms | sync={} d2h={} host_route={} plan={} gather={} gemm1={} silu={} gemm3={} combine={} (us, summed across layers)",
+                    bk_layers, bk_total / 1000,
+                    bk_sync, bk_d2h, bk_route, bk_plan, bk_gather,
+                    bk_g1, bk_silu, bk_g3, bk_comb,
+                );
+            }
         }
 
         (0..m)
@@ -2408,6 +2686,29 @@ impl<B: Backend> Qwen3MoeModel<B> {
                     h,
                 )?;
             }
+        } else if moe_layer.experts.gate_up_gptq_stacked.is_some()
+            && moe_layer.experts.down_gptq_stacked.is_some()
+            && std::env::var("FERRUM_MOE_BUCKETED").as_deref() != Ok("0")
+        {
+            // CUDA Marlin bucketed path (decode_batch m ≥ 1 entry).
+            crate::moe::moe_forward_bucketed::<B>(
+                ctx,
+                &self.scratch.norm_out,
+                &self.scratch.router_logits,
+                &mut self.scratch.moe_out,
+                m,
+                h,
+                self.cfg.expert_intermediate_size,
+                self.cfg.num_experts,
+                self.cfg.num_experts_per_tok,
+                self.cfg.norm_topk_prob,
+                &moe_layer.experts,
+                &mut self.scratch.x_packed_bucket,
+                &mut self.scratch.gate_up_packed_bucket,
+                &mut self.scratch.silu_stacked,
+                &mut self.scratch.down_out_stacked,
+                &mut self.scratch.moe_route_scratch,
+            )?;
         } else {
             // Backend without stacked variants — fall back to the legacy
             // per-(token, expert) host-routed path.

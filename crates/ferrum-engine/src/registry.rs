@@ -1001,6 +1001,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             arch @ (ferrum_models::Architecture::Llama
             | ferrum_models::Architecture::Qwen2
             | ferrum_models::Architecture::Qwen3
+            | ferrum_models::Architecture::Qwen3Moe
             | ferrum_models::Architecture::Mistral) => {
                 let _loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();
@@ -1024,6 +1025,58 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
 
                 // Per-architecture config constructor picks has_qk_norm +
                 // rope_theta defaults. Everything else is the same forward code.
+                // Qwen3-MoE goes through Qwen3MoeModel (different forward
+                // path — MoE router + per-expert FFN — but shares the
+                // dense attention path with Qwen3). Branch out early so the
+                // dense LlamaFamilyConfig parser doesn't try to read a
+                // moe_intermediate_size that doesn't fit its struct.
+                if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
+                    info!("Loading Qwen3-MoE via Qwen3MoeModel (safetensors GPTQ)");
+                    let mc = ferrum_models::moe_config::Qwen3MoeConfig::from_def(&model_def)?;
+                    let model_info =
+                        model_def.to_model_info(config.engine_config.model.model_id.to_string());
+                    let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match &config.device {
+                        Device::CPU => {
+                            info!("  Backend: CPU");
+                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
+                                ferrum_kernels::backend::cpu::CpuBackend,
+                            >::open(&model_path)?;
+                            Box::new(ferrum_models::models::Qwen3MoeModel::<
+                                ferrum_kernels::backend::cpu::CpuBackend,
+                            >::new_safetensors(
+                                mc, &weight_loader
+                            )?)
+                        }
+                        Device::CUDA(_) => {
+                            #[cfg(feature = "cuda")]
+                            {
+                                info!("  Backend: CUDA");
+                                let weight_loader =
+                                    ferrum_quantization::NativeSafetensorsLoader::<
+                                        ferrum_kernels::backend::cuda::CudaBackend,
+                                    >::open(&model_path)?;
+                                Box::new(ferrum_models::models::Qwen3MoeModel::<
+                                    ferrum_kernels::backend::cuda::CudaBackend,
+                                >::new_safetensors(
+                                    mc, &weight_loader
+                                )?)
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            {
+                                return Err(FerrumError::device(
+                                    "CUDA requested but 'cuda' feature not enabled",
+                                ));
+                            }
+                        }
+                        other => {
+                            return Err(FerrumError::device(format!(
+                                "Qwen3MoeModel does not support device {other:?}"
+                            )));
+                        }
+                    };
+                    return Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)));
+                }
+
                 let qcfg = match arch {
                     ferrum_models::Architecture::Qwen3 => {
                         info!("Loading Qwen3 via LlamaFamilyModel (QK-norm on)");

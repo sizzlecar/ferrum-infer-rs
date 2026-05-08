@@ -196,14 +196,17 @@ template <
   const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale
 >
 __global__ void Marlin(
-  const int4* __restrict__ A, // fp16 input matrix of shape mxk 
-  const int4* __restrict__ B, // 4bit quantized weight matrix of shape kxn 
+  const int4* __restrict__ A, // fp16 input matrix of shape mxk
+  const int4* __restrict__ B, // 4bit quantized weight matrix of shape kxn
         int4* __restrict__ C, // fp16 output buffer of shape mxn
-  const int4* __restrict__ s, // fp16 quantization scales of shape (k/groupsize)xn 
+  const int4* __restrict__ s, // fp16 quantization scales of shape (k/groupsize)xn
   int  prob_m, // batch dimension m
-  int  prob_n, // output dimension n
+  int  prob_n, // output dimension n (subset width to compute)
   int  prob_k, // reduction dimension k
-  int* locks // extra global storage for barrier synchronization 
+  int  prob_n_full, // full N stride of B + s buffers (≥ prob_n;
+                    // for stacked-MoE offset GEMM, stride is total_n
+                    // while iteration covers only expert_n cols)
+  int* locks // extra global storage for barrier synchronization
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the same size, which might involve multiple 
   // column "slices" (of width 16 * `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM example: 
@@ -290,7 +293,10 @@ __global__ void Marlin(
   constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks); // overall size of a tile
   constexpr int a_sh_wr_iters = ceildiv(a_sh_stage, a_sh_wr_delta); // number of shared write iterations for a tile
 
-  int b_gl_stride = 16 * prob_n / 32;
+  // Stride uses prob_n_full so an offset GEMM into a stacked B buffer
+  // walks the right number of cols between K-tile rows. For non-stacked
+  // calls, prob_n_full == prob_n and this is a no-op.
+  int b_gl_stride = 16 * prob_n_full / 32;
   constexpr int b_sh_stride = 32 * thread_n_blocks / 4;
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
   int b_gl_rd_delta_i = b_gl_stride * (threads / b_sh_stride);
@@ -299,7 +305,8 @@ __global__ void Marlin(
   constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
-  int s_gl_stride = prob_n / 8;
+  // scales stride likewise references the full N width.
+  int s_gl_stride = prob_n_full / 8;
   constexpr int s_sh_stride = 16 * thread_n_blocks / 8;
   constexpr int s_sh_stage = s_sh_stride;
   int s_gl_rd_delta = s_gl_stride;
@@ -721,7 +728,7 @@ const int SHARED_MEM = 96 * 1024; // max shared memory on compute capability 8.6
       THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS \
     ><<<blocks, THREADS, SHARED_MEM, stream>>>( \
       A_ptr, B_ptr, C_ptr, s_ptr, \
-      prob_m, prob_n, prob_k, \
+      prob_m, prob_n, prob_k, prob_n_full, \
       locks \
     ); \
   }
@@ -744,8 +751,11 @@ extern "C" int marlin_cuda(
   int thread_k = -1,
   int thread_n = -1,
   int sms = -1,
-  int max_par = 16
+  int max_par = 16,
+  int prob_n_full = -1  // -1 ⇒ same as prob_n (non-stacked case).
+                        // For offset GEMM into stacked B/s, pass total_n.
 ) {
+  if (prob_n_full < 0) prob_n_full = prob_n;
   int tot_m = prob_m;
   int tot_m_blocks = ceildiv(tot_m, 16);
   int pad = 16 * tot_m_blocks - tot_m;
