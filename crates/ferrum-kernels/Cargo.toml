@@ -28,9 +28,12 @@ marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)
 vllm-marlin = ["cuda"]  # vLLM gptq_marlin port (Phase 12). NOT enabled by default
                         # — opt-in until correctness + perf validated. Adds
                         # ~30 min to first build (compiles 19 .cu instantiations).
-vllm-moe-marlin = ["cuda"]  # vLLM marlin_moe_wna16 port (Stage 14). NOT enabled
-                        # by default — opt-in. Adds ~15 min to first build
-                        # (single .cu with many template instantiations).
+vllm-moe-marlin = ["cuda", "vllm-marlin"]  # vLLM marlin_moe_wna16 port (Stage
+                        # 14). NOT enabled by default — opt-in. Adds ~15 min to
+                        # first build (single .cu with many template
+                        # instantiations). Pulls in vllm-marlin because the
+                        # MoE path needs the gptq_marlin_repack helper to
+                        # convert GPTQ-on-disk → vLLM-Marlin tile layout.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

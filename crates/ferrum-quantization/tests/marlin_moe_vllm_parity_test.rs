@@ -89,21 +89,34 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         }
     }
 
-    // Stacked store (production loader path).
+    // ── Two stacked stores: ref path (IST-DASLab Marlin format) +
+    // vLLM path (vLLM Marlin format). They are NOT byte-compatible —
+    // different inner permutations even though the outer shape matches.
     let qw_refs: Vec<&[i32]> = experts.iter().map(|e| e.qweight.as_slice()).collect();
     let sc_refs: Vec<&[f32]> = experts.iter().map(|e| e.scales.as_slice()).collect();
     let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
     let stacked = <CudaBackend as Backend>::load_gptq_stacked(
         &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
-    .expect("stacked load_gptq");
-    let mw: &ferrum_kernels::marlin::MarlinWeight = &stacked;
+    .expect("stacked load_gptq (IST-DASLab format, ref path)");
 
     let a_data: Vec<f32> = (0..total_tokens * k)
         .map(|i| ((i as f32) * 0.0027).sin())
         .collect();
     let mut ctx = <CudaBackend as Backend>::new_context();
     let a_dev = CudaBackend::from_slice(&a_data);
+
+    // Build vLLM-format stacked weight on the test context's stream.
+    let stacked_vllm = ferrum_kernels::vllm_marlin::load_stacked_gptq_vllm_marlin(
+        &ctx.stream,
+        &qw_refs,
+        &sc_refs,
+        4,
+        gs,
+        k,
+        n_per,
+    )
+    .expect("stacked load_gptq (vLLM Marlin format)");
 
     // Reference: per-expert via existing path.
     let mut c_ref = vec![0f32; total_tokens * n_per];
@@ -191,12 +204,12 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         .clone_htod(&num_tokens_past_padded)
         .expect("upload num_tokens_past_padded");
 
-    let _ = <CudaBackend as Backend>::marlin_zero_stacked_workspace(&mut ctx, &stacked);
+    let _ = <CudaBackend as Backend>::marlin_zero_stacked_workspace(&mut ctx, &stacked_vllm);
 
     ferrum_kernels::marlin::marlin_gemm_moe_vllm(
         &stream,
         &a_dev,
-        mw,
+        &stacked_vllm,
         &mut c_vllm_dev,
         None, // c_tmp
         &st_dev,
