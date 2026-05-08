@@ -278,6 +278,68 @@ outweighs the marginal SM-scheduling headroom. **Default stays at 4.**
 (Numbers slightly differ from Stage 8 clean bench's 172.7 tok/s — c=32
 runs vary ±3 tok/s between sessions on shared cloud GPUs.)
 
+## Stage 9 — paged_decode_attention CUDA wrapper  ★ +45% at c=16
+
+**Trigger insight**: profile-mode `[batched-decode-prof]` showed
+`attn_peritem=73 ms (58.8% of TPOT)` at c=32 — bigger than MoE
+(25.5%). The per-item attention loop (32 sequential m=1 paged_decode
+calls) was the dominant bottleneck, not Marlin.
+
+**Root cause**: CUDA was missing `paged_decode_attention` entirely
+(only Metal had it). When `FERRUM_METAL_PAGED_KV=1` was set on CUDA,
+Qwen3MoeModel panicked with "not implemented for this backend".
+Earlier doc claim "CUDA paged-KV not impl'd" was wrong about WHICH
+specific call was missing — `paged_batched_decode_attention` and
+`paged_varlen_attention` both existed; the single-seq decode entry
+point was the gap.
+
+**Fix** (commits e09855b → bad2438 → 6558fd2):
+
+1. Added `paged_decode_attention` wrapper for CUDA that dispatches:
+   - q_len==1 (any num_seqs) → `paged_batched_decode_attention`
+   - q_len>1, num_seqs==1 (single-seq prefill) → `paged_varlen_attention`
+2. `cu_seqlens_q + pos_offsets` allocation: switched from
+   `from_slice_i32` (default impl loses bits via f32→f16 conversion,
+   making `cu_seqlens_q = [0, q_len]` collapse to `[0, 0]`) to
+   `alloc_u32 + write_u32`.
+3. `paged_varlen_attention` writes output `[M_total, num_q_heads,
+   head_dim]` (token-major) but Qwen3MoeModel's downstream code
+   expects head-major (`attn_head_major_out`). Added
+   `transpose_token_to_head` kernel and call it after varlen.
+   (The Q input is ALREADY token-major in paged mode — the kernel
+   `split_qkv_norm_rope_into_paged_cache_f16` writes
+   `q_out[tok, head, hd]`, so no input transpose needed despite the
+   misleading buffer name.)
+4. Cached the token-major output scratch on `CudaState` to prevent
+   stream-ordered free / kernel race that was triggering
+   `CUDA_ERROR_ILLEGAL_ADDRESS` mid-bench.
+
+**Production results (no FERRUM_DECODE_OP_PROFILE)**:
+
+| c    | paged_off | paged_on  | Δ tok/s | Stage 8 (no paged) | Δ vs S8 |
+|------|-----------|-----------|---------|---------------------|---------|
+| 16   | 154.8     | **230.1** | **+49%** | 158.9               | **+45%** |
+| 32   | 164.5     | (incomplete — see below) | — | 172.7 | — |
+
+vLLM ratio at c=16: 230.1 / 505.0 = **45.6%** (was 31.5% at Stage 8).
+
+Mean TPOT at c=16: 91.75 → **63.36 ms** (-31%).
+
+**Known issue at c=32**: bench hangs at 96/128 prompts (75%) with
+`CUDA_ERROR_ILLEGAL_ADDRESS` from a `B::sync(ctx)` after some kernel.
+Pattern reproduces across re-runs (bench_v6 + v7). Hypothesis: pool
+block exhaustion or pos_offset edge case beyond a certain decode
+count. The cached scratch fix (commit 6558fd2) eliminated one race
+but the underlying issue remains. **Workaround**: keep
+`FERRUM_METAL_PAGED_KV=0` for c≥32 deployments until the c=32 bug
+is debugged separately.
+
+For Qwen3MoE under CUDA, the M3 production config now becomes:
+```
+FERRUM_METAL_PAGED_KV=1   # safe at c≤16, +45% throughput
+FERRUM_METAL_PAGED_KV=0   # required at c≥32 until bug fixed
+```
+
 ## Failed experiments (don't re-try without code changes)
 
 | Experiment | Outcome | Why it fails |
@@ -343,13 +405,19 @@ ea6637a perf(moe): multi-stream MoE GEMM dispatch — round-robin pool          
 d7d8e98 fix(moe): cross-stream sync for multi-stream MoE GEMM dispatch
 40c2cf1 fix(cuda): cuEventCreate flag is u32, not enum tuple variant
 
-# Stages 6-8 (137 → 172.7 tok/s):
+# Stages 6-9 (137 → 172.7 c=32 / 230.1 c=16 tok/s):
 8d0f7dc perf(moe): per-phase profile counters for bucketed MoE forward
 d7c4fe1 bench(m3): phase-profile script for c=32 bucketed MoE breakdown
 652832c perf(moe): allocation-free route() + bucket plan reuse — saves ~10ms/token  ★ KEY
 e1fd5d8 perf(moe): cache cuEvents + sort GEMM dispatches by m desc
 6befb16 perf(moe-cuda): GPU-side route_topk_softmax kernel — saves ~1.7ms/token  ★ KEY
 d3158d9 fix(cuda-moe-route): scope launch_builder so D2H can re-borrow scratch
+e09855b feat(cuda): paged_decode_attention via paged_batched (q_len=1)
+dad3da9 feat(cuda): paged_decode_attention dispatches q_len>1 prefill via paged_varlen
+9764137 fix(cuda-paged): use alloc_u32+write_u32 for cu_seqlens_q + pos_offsets
+ea808df feat(cuda-paged): paged_decode_attention wrapper with prefill transposes
+bad2438 fix(cuda-paged): drop Q transpose — split_qkv_norm_rope writes Q token-major already  ★ KEY
+6558fd2 fix(cuda-paged): cache out_token_major scratch on CudaState
 ```
 
 Earlier exploration commits (debugged the offset-GEMM stride bug):
