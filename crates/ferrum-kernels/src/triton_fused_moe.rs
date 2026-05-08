@@ -50,6 +50,114 @@ pub struct TritonStackedGptqWeight {
     pub group_size: i32,
 }
 
+/// Build a `TritonStackedGptqWeight` from per-expert raw GPTQ tensors.
+///
+/// Skips Marlin repack — the Triton kernel reads the on-disk layout
+/// directly. All experts MUST share `(k, n_per_expert, group_size, bits)`.
+///
+/// CPU side:
+///   - qweights[e]: `[K/8, n_per_expert]` i32
+///   - scales[e]:   `[K/G, n_per_expert]` f32 (caller's GPTQ loader format)
+///   - qzeros[e]:   `[K/G, n_per_expert/8]` i32
+///
+/// Output buffers are concatenated per-expert with NO permutation —
+/// expert e's tile is at offset `e * per_expert_stride`.
+#[cfg(feature = "triton-kernels")]
+pub fn load_stacked_gptq_raw(
+    stream: &Arc<CudaStream>,
+    qweights: &[&[i32]],
+    scales_f32: &[&[f32]],
+    qzeros: &[&[i32]],
+    bits: u32,
+    group_size: usize,
+    k: usize,
+    n_per_expert: usize,
+) -> candle_core::Result<TritonStackedGptqWeight> {
+    if bits != 4 {
+        return Err(candle_core::Error::Msg(format!(
+            "TritonStackedGptqWeight: only bits=4 supported (got {bits})"
+        )));
+    }
+    let num_experts = qweights.len();
+    if num_experts == 0
+        || scales_f32.len() != num_experts
+        || qzeros.len() != num_experts
+    {
+        return Err(candle_core::Error::Msg(format!(
+            "TritonStackedGptqWeight: shape mismatch qw={} sc={} qz={}",
+            num_experts,
+            scales_f32.len(),
+            qzeros.len()
+        )));
+    }
+
+    let qw_per = (k / 8) * n_per_expert;
+    let groups = k / group_size;
+    let sc_per = groups * n_per_expert;
+    let qz_per = groups * (n_per_expert / 8);
+
+    // Validate per-expert sizes.
+    for (e, qw) in qweights.iter().enumerate() {
+        if qw.len() != qw_per {
+            return Err(candle_core::Error::Msg(format!(
+                "TritonStacked: qweight[{e}].len()={} expected {qw_per}",
+                qw.len()
+            )));
+        }
+    }
+    for (e, sc) in scales_f32.iter().enumerate() {
+        if sc.len() != sc_per {
+            return Err(candle_core::Error::Msg(format!(
+                "TritonStacked: scales[{e}].len()={} expected {sc_per}",
+                sc.len()
+            )));
+        }
+    }
+    for (e, qz) in qzeros.iter().enumerate() {
+        if qz.len() != qz_per {
+            return Err(candle_core::Error::Msg(format!(
+                "TritonStacked: qzeros[{e}].len()={} expected {qz_per}",
+                qz.len()
+            )));
+        }
+    }
+
+    // Concat host-side, then one h2d copy each.
+    let mut qw_flat: Vec<i32> = Vec::with_capacity(num_experts * qw_per);
+    for qw in qweights {
+        qw_flat.extend_from_slice(qw);
+    }
+    let mut sc_flat_f16: Vec<half::f16> =
+        Vec::with_capacity(num_experts * sc_per);
+    for sc in scales_f32 {
+        sc_flat_f16.extend(sc.iter().map(|&x| half::f16::from_f32(x)));
+    }
+    let mut qz_flat: Vec<i32> = Vec::with_capacity(num_experts * qz_per);
+    for qz in qzeros {
+        qz_flat.extend_from_slice(qz);
+    }
+
+    let qw_dev = stream
+        .clone_htod(&qw_flat)
+        .map_err(|e| candle_core::Error::Msg(format!("triton qw htod: {e}")))?;
+    let sc_dev = stream
+        .clone_htod(&sc_flat_f16)
+        .map_err(|e| candle_core::Error::Msg(format!("triton sc htod: {e}")))?;
+    let qz_dev = stream
+        .clone_htod(&qz_flat)
+        .map_err(|e| candle_core::Error::Msg(format!("triton qz htod: {e}")))?;
+
+    Ok(TritonStackedGptqWeight {
+        qweight: qw_dev,
+        scales: sc_dev,
+        qzeros: qz_dev,
+        num_experts,
+        k,
+        n: n_per_expert,
+        group_size: group_size as i32,
+    })
+}
+
 /// Launch the fused MoE Triton kernel. ONE launch covers all experts.
 ///
 /// `func` is a pre-loaded `CudaFunction` for `fused_moe_w4a16_typed`,
