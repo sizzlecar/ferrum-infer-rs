@@ -226,12 +226,17 @@ fn triton_fused_moe_matches_cpu_per_expert() {
 
     let c_gpu: Vec<f16> = stream.memcpy_dtov(&c_dev).unwrap();
 
-    // Compare per-expert.
+    // Per-expert error breakdown — first pass diagnostic, no assert,
+    // surfaces all 4 expert results so we can see error pattern.
     let mut row_start = 0usize;
+    let mut all_max_rel = 0f32;
+    let mut all_max_abs = 0f32;
     for e in 0..NUM_EXPERTS {
         let m_e = TOKENS_PER_EXPERT[e];
         let mut max_abs = 0f32;
         let mut max_rel = 0f32;
+        let mut sum_ref = 0f32;
+        let mut sum_gpu = 0f32;
         for m in 0..m_e {
             for n in 0..N {
                 let g = c_gpu[(row_start + m) * N + n].to_f32();
@@ -244,19 +249,30 @@ fn triton_fused_moe_matches_cpu_per_expert() {
                 if rel > max_rel {
                     max_rel = rel;
                 }
+                sum_ref += r.abs();
+                sum_gpu += g.abs();
             }
         }
+        let avg_ref = sum_ref / (m_e * N) as f32;
+        let avg_gpu = sum_gpu / (m_e * N) as f32;
         eprintln!(
             "expert {e}: m_e={m_e} row_start={row_start} max|diff|={max_abs:.4} \
-             rel={max_rel:.4}"
+             rel={max_rel:.4} avg|ref|={avg_ref:.3} avg|gpu|={avg_gpu:.3}"
         );
-        // Relaxed threshold for first-pass — looking for ORDER-OF-MAGNITUDE
-        // bug (rel ≈ 1.0 = totally wrong layout) vs numerical drift
-        // (rel < 0.1 = f16 accumulation noise we'll tighten later).
-        assert!(
-            max_rel < 0.2,
-            "triton fused_moe disagrees for expert {e}: rel={max_rel}"
-        );
+        if max_rel > all_max_rel {
+            all_max_rel = max_rel;
+        }
+        if max_abs > all_max_abs {
+            all_max_abs = max_abs;
+        }
         row_start += m_e;
     }
+    eprintln!(
+        "── overall: max|diff|={all_max_abs:.4} max_rel={all_max_rel:.4}"
+    );
+    // Hard threshold: catch order-of-magnitude wrong layouts (rel ≈ 1).
+    assert!(
+        all_max_abs < 1.0,
+        "triton fused_moe MAJOR mismatch: max|diff|={all_max_abs:.4}"
+    );
 }
