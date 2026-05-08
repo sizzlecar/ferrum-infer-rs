@@ -212,42 +212,47 @@ impl CudaState {
         self.vllm_moe_c_tmp_f32.as_mut().unwrap()
     }
 
-    /// Allocate exact-size persistent vLLM moe routing buffers — each
-    /// call resizes if `capacity` differs from the cached size. Caller
-    /// then memcpy_htods exactly `capacity` i32 elements into
-    /// sorted_token_ids and `capacity / block_size` (= capacity/16) i32
-    /// into expert_ids, both of which match the host slice lengths.
+    /// Persistent vLLM moe routing buffers. Allocated ONCE at worst-case
+    /// size on first call (num_experts × block_size = 128 × 16 = 2048 i32
+    /// for Qwen3-MoE; expert_ids = 128). Caller then uploads via
+    /// cuMemcpyHtoDAsync with explicit byte count — no re-allocation
+    /// happens between calls, so there's no stream-ordered / drop-time
+    /// race between the in-flight memcpy and the new buffer allocation.
     #[cfg(feature = "vllm-moe-marlin")]
     pub fn vllm_moe_routing(
         &mut self,
-        capacity: usize,
     ) -> (
         &mut CudaSlice<i32>,
         &mut CudaSlice<i32>,
         &mut CudaSlice<i32>,
     ) {
-        if self.vllm_moe_routing_capacity != capacity || self.vllm_moe_sorted_token_ids.is_none() {
+        if self.vllm_moe_sorted_token_ids.is_none() {
+            // Worst case: every expert gets at least one block at decode
+            // time. Qwen3-MoE has up to 128 experts; 16 = block_size.
+            // 2048 i32 = 8 KB; 128 i32 = 512 B; 1 i32 = 4 B. Trivial cost.
+            const WORST_SORTED_LEN: usize = 128 * 16;
+            const WORST_EID_LEN: usize = 128;
             self.vllm_moe_sorted_token_ids = Some(
                 self.stream
-                    .alloc_zeros::<i32>(capacity)
+                    .alloc_zeros::<i32>(WORST_SORTED_LEN)
                     .expect("alloc_zeros vllm_moe_sorted_token_ids"),
             );
-            // expert_ids count = capacity / block_size. block_size is 16
-            // for our Qwen3-MoE path.
-            let eid_cap = capacity / 16;
             self.vllm_moe_expert_ids = Some(
                 self.stream
-                    .alloc_zeros::<i32>(eid_cap)
+                    .alloc_zeros::<i32>(WORST_EID_LEN)
                     .expect("alloc_zeros vllm_moe_expert_ids"),
             );
-            if self.vllm_moe_num_tokens_past_padded.is_none() {
-                self.vllm_moe_num_tokens_past_padded = Some(
-                    self.stream
-                        .alloc_zeros::<i32>(1)
-                        .expect("alloc_zeros vllm_moe_num_tokens_past_padded"),
-                );
-            }
-            self.vllm_moe_routing_capacity = capacity;
+            self.vllm_moe_num_tokens_past_padded = Some(
+                self.stream
+                    .alloc_zeros::<i32>(1)
+                    .expect("alloc_zeros vllm_moe_num_tokens_past_padded"),
+            );
+            self.vllm_moe_routing_capacity = WORST_SORTED_LEN;
+            tracing::info!(
+                "vLLM moe routing buffers allocated (worst-case): \
+                 sorted_token_ids={WORST_SORTED_LEN} i32, \
+                 expert_ids={WORST_EID_LEN} i32, num_tokens_past_padded=1 i32"
+            );
         }
         (
             self.vllm_moe_sorted_token_ids.as_mut().unwrap(),
@@ -3386,30 +3391,49 @@ impl Backend for CudaBackend {
         use cudarc::driver::CudaSlice;
         use cudarc::driver::DevicePtr;
 
-        // Clone stream FIRST (Arc clone, no borrow on ctx), then take
-        // &mut ctx to grow/get persistent routing buffers.
+        // Clone stream FIRST (Arc clone), then take &mut ctx to get the
+        // persistent routing buffers. They're allocated worst-case once;
+        // no re-alloc happens on shape change.
         let stream = ctx.stream.clone();
-        let cap = sorted_token_ids.len();
-        let eid_host_len = expert_ids.len();
-        let npp_host_len = num_tokens_past_padded.len();
-        let (st_dev, eid_dev, npp_dev) = ctx.vllm_moe_routing(cap);
+        let (st_dev, eid_dev, npp_dev) = ctx.vllm_moe_routing();
 
-        eprintln!(
-            "DEBUG upload_moe_routing: cap={cap} eid_host={eid_host_len} npp_host={npp_host_len} st_dev_len={} eid_dev_len={} npp_dev_len={}",
-            st_dev.len(), eid_dev.len(), npp_dev.len()
-        );
-
-        // Persistent buffers now sized exactly to the host slices — use
-        // cudarc's memcpy_htod which validates src.len() == dst.len().
-        stream
-            .memcpy_htod(sorted_token_ids, st_dev)
-            .map_err(|e| FerrumError::model(format!("htod sorted_token_ids (cap={cap} dev_len={}): {e}", st_dev.len())))?;
-        stream
-            .memcpy_htod(expert_ids, eid_dev)
-            .map_err(|e| FerrumError::model(format!("htod expert_ids (host_len={eid_host_len} dev_len={}): {e}", eid_dev.len())))?;
-        stream
-            .memcpy_htod(num_tokens_past_padded, npp_dev)
+        // Use raw cuMemcpyHtoDAsync_v2 with explicit byte count — host
+        // slices are smaller than the worst-case persistent buffers, so
+        // cudarc's memcpy_htod (which requires src.len() == dst.len()) is
+        // not usable. We only need to copy host_len bytes; the remaining
+        // tail of the persistent buffer is irrelevant (kernel reads
+        // exactly num_tokens_past_padded[0] / block_size entries).
+        unsafe {
+            use cudarc::driver::sys;
+            let s = stream.cu_stream();
+            let (st_ptr, _g0) = st_dev.device_ptr(&stream);
+            sys::cuMemcpyHtoDAsync_v2(
+                st_ptr,
+                sorted_token_ids.as_ptr() as *const _,
+                std::mem::size_of_val(sorted_token_ids),
+                s,
+            )
+            .result()
+            .map_err(|e| FerrumError::model(format!("htod sorted_token_ids: {e}")))?;
+            let (eid_ptr, _g1) = eid_dev.device_ptr(&stream);
+            sys::cuMemcpyHtoDAsync_v2(
+                eid_ptr,
+                expert_ids.as_ptr() as *const _,
+                std::mem::size_of_val(expert_ids),
+                s,
+            )
+            .result()
+            .map_err(|e| FerrumError::model(format!("htod expert_ids: {e}")))?;
+            let (npp_ptr, _g2) = npp_dev.device_ptr(&stream);
+            sys::cuMemcpyHtoDAsync_v2(
+                npp_ptr,
+                num_tokens_past_padded.as_ptr() as *const _,
+                std::mem::size_of_val(num_tokens_past_padded),
+                s,
+            )
+            .result()
             .map_err(|e| FerrumError::model(format!("htod num_tokens_past_padded: {e}")))?;
+        }
 
         // Reinterpret the persistent i32 buffers as f16 device handles
         // for the trait's Self::Buffer. The consumer (moe_gemm_phase_vllm)
