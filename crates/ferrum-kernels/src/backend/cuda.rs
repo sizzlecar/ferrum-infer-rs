@@ -119,6 +119,13 @@ pub struct CudaState {
     /// that triggered CUDA_ERROR_ILLEGAL_ADDRESS via stream-ordered free.
     paged_attn_out_tm: Option<CudaSlice<f16>>,
     paged_attn_out_tm_capacity: usize,
+    /// fp32 reduce scratch for vLLM marlin_moe_wna16. Sized at the upper
+    /// bound vLLM uses internally: `sms * 4 * moe_block_size * max_thread_n`
+    /// (= 128 * 4 * 16 * 256 = 2M fp32 = 8MB on a 4090). Lazy-alloc; once
+    /// up the buffer is reused across all layers and forwards. Without
+    /// this scratch we fall back to atomic_add which is 1.3-1.5× slower.
+    #[cfg(feature = "vllm-moe-marlin")]
+    vllm_moe_c_tmp_f32: Option<CudaSlice<f32>>,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -159,6 +166,33 @@ impl CudaState {
             self.moe_streams = Some(pool);
         }
         self.moe_streams.as_ref().unwrap()
+    }
+
+    /// Lazy-alloc the fp32 reduce scratch buffer used by
+    /// `moe_gemm_phase_vllm`. Sized at vLLM's static upper bound:
+    /// `sms * 4 * moe_block_size * max_thread_n` (= 128 * 4 * 16 * 256 =
+    /// 2M fp32 = 8MB on RTX 4090). Once allocated it's reused for every
+    /// vLLM moe call — phase 1, phase 3, every layer, every forward.
+    #[cfg(feature = "vllm-moe-marlin")]
+    pub fn vllm_moe_c_tmp(&mut self) -> &CudaSlice<f32> {
+        if self.vllm_moe_c_tmp_f32.is_none() {
+            // Static upper bound: covers any (size_n, total_padded) pair
+            // we'd ever feed under our shapes (gate_up_dim ≤ 16k,
+            // total_padded ≤ num_experts * block_size = 128 * 16 = 2048).
+            // 2M f32 = 8 MB.
+            const C_TMP_SIZE_F32: usize = 2 * 1024 * 1024;
+            let buf = self
+                .stream
+                .alloc_zeros::<f32>(C_TMP_SIZE_F32)
+                .expect("alloc_zeros vllm_moe_c_tmp_f32");
+            self.vllm_moe_c_tmp_f32 = Some(buf);
+            tracing::info!(
+                "vLLM moe c_tmp scratch allocated: {} fp32 ({:.1} MB)",
+                C_TMP_SIZE_F32,
+                (C_TMP_SIZE_F32 * 4) as f32 / 1e6
+            );
+        }
+        self.vllm_moe_c_tmp_f32.as_ref().unwrap()
     }
 
     /// Lazy-init the persistent cuEvents used by
@@ -371,6 +405,8 @@ impl Backend for CudaBackend {
             moe_route_capacity: 0,
             paged_attn_out_tm: None,
             paged_attn_out_tm_capacity: 0,
+            #[cfg(feature = "vllm-moe-marlin")]
+            vllm_moe_c_tmp_f32: None,
         }
     }
 
@@ -3384,7 +3420,22 @@ impl Backend for CudaBackend {
         use cudarc::driver::sys::CUdeviceptr;
         use cudarc::driver::CudaSlice;
         use cudarc::driver::DevicePtr;
+
+        // Resolve c_tmp scratch (lazy-allocates 8 MB on first call). We
+        // pass &mut CudaSlice<f32> to marlin_gemm_moe_vllm so it can
+        // forward the device pointer; the kernel uses it as a global
+        // fp32 reduce scratch (use_fp32_reduce=1 path, ~1.3-1.5× faster
+        // than atomic_add).
+        let c_tmp_handle = ctx.vllm_moe_c_tmp() as *const CudaSlice<f32>;
+        // Re-borrow ctx to grab the stream after the &mut helper above.
         let stream = ctx.stream.clone();
+        // SAFETY: c_tmp lives on ctx, which outlives this function call.
+        // We need `&mut CudaSlice<f32>` for the wrapper; the wrapper only
+        // reads its device_ptr (no buffer mutation), so this aliasing is
+        // benign. We can't get &mut directly because we already borrowed
+        // ctx for stream above without dropping the &CudaSlice.
+        let c_tmp_mut: &mut CudaSlice<f32> = unsafe { &mut *(c_tmp_handle as *mut _) };
+
         let (st_ptr, _g0) = sorted_token_ids.device_ptr(&stream);
         let (eid_ptr, _g1) = expert_ids.device_ptr(&stream);
         let (npp_ptr, _g2) = num_tokens_past_padded.device_ptr(&stream);
@@ -3400,7 +3451,7 @@ impl Backend for CudaBackend {
             input,
             mw,
             output,
-            None, // c_tmp — atomic-add path
+            Some(c_tmp_mut), // fp32_reduce path (atomic_add fallback if None)
             &st_view,
             &eid_view,
             &npp_view,

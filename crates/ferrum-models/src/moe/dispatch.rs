@@ -1036,8 +1036,10 @@ pub fn moe_forward_bucketed<B: Backend>(
         None
     };
     if let Some(routing) = &vllm_routing {
-        // Atomic-add path requires C zeroed by caller.
-        B::zero_buffer(ctx, gate_up_packed, total_pairs_active * gate_up_dim_per_expert)?;
+        // fp32_reduce path: kernel writes C directly via global reduce,
+        // no caller-side zero needed (atomic_add fallback inside the
+        // wrapper would also self-zero under slice_count > 1 / slice_idx
+        // == 0; either way this is safe).
         B::moe_gemm_phase_vllm(
             ctx,
             x_packed,
@@ -1115,7 +1117,6 @@ pub fn moe_forward_bucketed<B: Backend>(
         None
     };
     if let Some(routing) = &vllm_routing {
-        B::zero_buffer(ctx, down_packed, total_pairs_active * down_n_per_expert)?;
         B::moe_gemm_phase_vllm(
             ctx,
             silu_packed,
