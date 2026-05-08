@@ -182,7 +182,7 @@ fn triton_fused_moe_matches_cpu_per_expert() {
     let mut row_start = 0usize;
     for e in 0..NUM_EXPERTS {
         let m_e = TOKENS_PER_EXPERT[e];
-        let pe = m_e.div_ceil(mb) * mb;
+        let pe = ((m_e + mb - 1) / mb) * mb;
         for i in 0..m_e {
             sorted_token_ids.push((row_start + i) as i32);
         }

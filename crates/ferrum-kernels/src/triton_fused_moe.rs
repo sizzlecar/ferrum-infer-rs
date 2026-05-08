@@ -256,7 +256,7 @@ pub fn launch_fused_moe_w4a16_triton(
     b.arg(&profile_scratch);
 
     let lp = launch_params();
-    let blocks_m = num_padded_tokens.div_ceil(BM) as u32;
+    let blocks_m = ((num_padded_tokens + BM - 1) / BM) as u32;
     let blocks_n = (n + BN - 1) / BN;
     unsafe {
         b.launch(LaunchConfig {
@@ -280,6 +280,6 @@ fn launch_params() -> LaunchParams {
     let meta = parse_meta(fused_moe_w4a16_f16_bm16::META).expect("parse fused_moe_w4a16 meta");
     LaunchParams {
         num_warps: meta.num_warps as u32,
-        shared_mem_bytes: meta.shared_mem_bytes as u32,
+        shared_mem_bytes: meta.shared_mem as u32,
     }
 }
