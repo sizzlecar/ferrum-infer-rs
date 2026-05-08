@@ -89,6 +89,19 @@ pub struct CudaState {
     /// each kernel uses a fraction of available SMs. Lazy-init on first
     /// MoE call.
     moe_streams: Option<Vec<Arc<CudaStream>>>,
+    /// Persistent cuEvents for `moe_gemm_phase_batched` cross-stream
+    /// sync. `moe_entry_event` is recorded on default → waited on each
+    /// pool stream; `moe_exit_events[i]` is recorded on pool stream i →
+    /// waited on default. Per-call reuse (record/wait only) replaces
+    /// the per-call create/destroy pair: at c=32 / 48 layers / 2 phases
+    /// that's ~960 driver calls saved per token. Lazy-init alongside
+    /// `moe_streams`.
+    ///
+    /// Stored as raw `CUevent` (= `*mut CUevent_st`); the pointer is
+    /// owned by CUDA's driver, not Rust's allocator, so we just hold
+    /// the handle and call `cuEventDestroy_v2` in `Drop`.
+    moe_entry_event: Option<usize>,
+    moe_exit_events: Option<Vec<usize>>,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -129,6 +142,46 @@ impl CudaState {
             self.moe_streams = Some(pool);
         }
         self.moe_streams.as_ref().unwrap()
+    }
+
+    /// Lazy-init the persistent cuEvents used by
+    /// `moe_gemm_phase_batched` for cross-stream sync. The (entry,
+    /// exits) tuple is stable across calls — events are only ever
+    /// recorded / waited on, never destroyed (until `Drop`).
+    pub fn moe_sync_events(&mut self) -> (cudarc::driver::sys::CUevent, Vec<cudarc::driver::sys::CUevent>) {
+        use cudarc::driver::sys as cu;
+        if self.moe_entry_event.is_none() {
+            let n = self.moe_stream_pool().len();
+            let mut entry: cu::CUevent = std::ptr::null_mut();
+            unsafe {
+                // CU_EVENT_DISABLE_TIMING (= 2) — fastest event create,
+                // no GPU timestamp tracking. Required for sync only.
+                cu::cuEventCreate(&mut entry, 2);
+            }
+            let mut exits: Vec<usize> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let mut e: cu::CUevent = std::ptr::null_mut();
+                unsafe {
+                    cu::cuEventCreate(&mut e, 2);
+                }
+                exits.push(e as usize);
+            }
+            self.moe_entry_event = Some(entry as usize);
+            self.moe_exit_events = Some(exits);
+            tracing::info!(
+                "MoE sync events initialized: 1 entry + {} exits",
+                n
+            );
+        }
+        let entry = self.moe_entry_event.unwrap() as cu::CUevent;
+        let exits: Vec<cu::CUevent> = self
+            .moe_exit_events
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|&p| p as cu::CUevent)
+            .collect();
+        (entry, exits)
     }
 
     fn module(&mut self, key: &'static str, ptx_src: &str) -> Arc<CudaModule> {
@@ -284,6 +337,8 @@ impl Backend for CudaBackend {
             batched_host_kv_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
             batched_host_cache_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
             moe_streams: None,
+            moe_entry_event: None,
+            moe_exit_events: None,
         }
     }
 
@@ -2649,25 +2704,23 @@ impl Backend for CudaBackend {
         // pool streams before returning. Without this cross-stream
         // sync, silu_mul on default may run before pool GEMMs commit
         // → races → junk output.
+        //
+        // The 1 + N events are persistent on `CudaState` — re-recording
+        // an event silently overwrites the prior recording, so per-call
+        // create+destroy is replaced with record+wait only. At c=32 /
+        // 48 layers / 2 phases that's ~960 driver calls saved per token.
+        let (entry_event, exit_events) = ctx.moe_sync_events();
         let pool: Vec<Arc<CudaStream>> = ctx.moe_stream_pool().to_vec();
         let default_stream = ctx.stream.clone();
-        // Default → pool: emit a sync event on default so each pool
-        // stream waits for default's prior work (input buffer writes,
-        // workspace zero memset). Done via a cudaEvent.
         use cudarc::driver::sys as cu;
-        let mut entry_event: cu::CUevent = std::ptr::null_mut();
+        // Default → pool: record on default, each pool waits.
         unsafe {
-            // 2 = CU_EVENT_DISABLE_TIMING — fastest event create, we don't need timestamps.
-            cu::cuEventCreate(&mut entry_event, 2);
             cu::cuEventRecord(entry_event, default_stream.cu_stream());
         }
         for stream in &pool {
             unsafe {
                 cu::cuStreamWaitEvent(stream.cu_stream(), entry_event, 0);
             }
-        }
-        unsafe {
-            cu::cuEventDestroy_v2(entry_event);
         }
 
         for (i, (expert_idx, in_row_offset, out_row_offset, m)) in dispatches.iter().enumerate() {
@@ -2686,27 +2739,23 @@ impl Backend for CudaBackend {
             .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
         }
 
-        // pool → default: each pool stream records an event after its
-        // GEMMs; default waits for all events. After return, default
-        // stream's next op (silu) will see all GEMM outputs.
+        // pool → default: each pool stream records its exit event;
+        // default waits for all of them. After return, default's next
+        // op (silu) will see all GEMM outputs committed.
         let _ = k;
-        let mut exit_events: Vec<cu::CUevent> = Vec::with_capacity(pool.len());
-        for stream in &pool {
-            let mut ev: cu::CUevent = std::ptr::null_mut();
+        debug_assert_eq!(
+            exit_events.len(),
+            pool.len(),
+            "moe_sync_events exit count != pool size"
+        );
+        for (i, stream) in pool.iter().enumerate() {
             unsafe {
-                cu::cuEventCreate(&mut ev, 2); // CU_EVENT_DISABLE_TIMING
-                cu::cuEventRecord(ev, stream.cu_stream());
+                cu::cuEventRecord(exit_events[i], stream.cu_stream());
             }
-            exit_events.push(ev);
         }
         for ev in &exit_events {
             unsafe {
                 cu::cuStreamWaitEvent(default_stream.cu_stream(), *ev, 0);
-            }
-        }
-        for ev in exit_events {
-            unsafe {
-                cu::cuEventDestroy_v2(ev);
             }
         }
         Ok(())

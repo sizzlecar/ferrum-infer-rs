@@ -927,6 +927,14 @@ pub fn moe_forward_bucketed<B: Backend>(
 
     // Build the dispatch list for phase 1. (expert_idx, in_row, out_row, m)
     // for each active expert. Send to the multi-stream batched dispatcher.
+    //
+    // Sort by `m` descending so the round-robin pool feeds the longest
+    // GEMMs first — without this, an unlucky distribution could hand a
+    // bunch of m=1 calls to one stream while another stream is still
+    // running its m=4 tail, leaving the pool unbalanced. With sort,
+    // each stream pops the next-largest job and they all finish close
+    // together. Tied `m` keeps the original (expert-id ascending) order,
+    // which matters for any host-side determinism we care about.
     let mut phase1_dispatches: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
         let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
@@ -936,6 +944,7 @@ pub fn moe_forward_bucketed<B: Backend>(
         let pair_off = plan.expert_offsets[e];
         phase1_dispatches.push((e, pair_off, pair_off, m_e));
     }
+    phase1_dispatches.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
     let t_gemm1 = if prof {
         Some(std::time::Instant::now())
     } else {
@@ -995,6 +1004,7 @@ pub fn moe_forward_bucketed<B: Backend>(
         let pair_off = plan.expert_offsets[e];
         phase3_dispatches.push((e, pair_off, pair_off, m_e));
     }
+    phase3_dispatches.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
     let t_gemm3 = if prof {
         Some(std::time::Instant::now())
     } else {
