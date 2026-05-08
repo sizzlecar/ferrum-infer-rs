@@ -55,6 +55,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/argmax_rows.cu");
     println!("cargo:rerun-if-changed=kernels/moe_combine.cu");
     println!("cargo:rerun-if-changed=kernels/moe_router.cu");
+    println!("cargo:rerun-if-changed=kernels/moe_align_block_size.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -94,6 +95,7 @@ fn main() {
             "kernels/argmax_rows.cu",
             "kernels/moe_combine.cu",
             "kernels/moe_router.cu",
+            "kernels/moe_align_block_size.cu",
         ])
         .out_dir(out_dir)
         .arg("-Ikernels") // for common.cuh

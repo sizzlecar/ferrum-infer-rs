@@ -618,6 +618,40 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// GPU-side moe_align_block_size — prep for a future fused MoE
+    /// Marlin kernel. Takes per-pair expert assignments (from
+    /// [`Self::route_topk_softmax`]) and produces:
+    ///   - `sorted_token_ids[N_padded]`: flat list of pair indices
+    ///     in [0, batch * top_k), sorted by their assigned expert and
+    ///     padded with sentinel `batch * top_k` inside each expert
+    ///     group up to a `block_size` boundary.
+    ///   - `block_ids[N_padded / block_size]`: which expert each
+    ///     `block_size`-row tile of `sorted_token_ids` belongs to.
+    ///   - `total_tokens_post_pad[1]`: actual padded token count.
+    ///
+    /// Layout matches vLLM's marlin_moe_wna16 kernel input
+    /// expectation. The fused Marlin kernel reads a row from
+    /// `a[sorted_token_ids[i] / top_k]` and weights from
+    /// `b[block_ids[blockIdx.y] * n_per_expert + ...]`.
+    ///
+    /// Default impl returns Err — only CUDA implements this.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_align_block_size(
+        _ctx: &mut Self::Context,
+        _expert_ids_per_pair: &Self::Buffer,
+        _sorted_token_ids: &mut Self::Buffer,
+        _block_ids: &mut Self::Buffer,
+        _total_tokens_post_pad: &mut Self::Buffer,
+        _batch_x_topk: usize,
+        _num_experts: usize,
+        _block_size: usize,
+        _sorted_max_size: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "moe_align_block_size not implemented for this backend",
+        ))
+    }
+
     /// GPU-side bucket sort: turn `[batch, top_k]` selected expert IDs
     /// (from [`Self::route_topk_softmax`]) into `tpe[num_experts]` /
     /// `ids[num_experts * row_stride]` arrays consumed by the batched

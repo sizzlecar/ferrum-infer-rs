@@ -2491,6 +2491,55 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn moe_align_block_size(
+        ctx: &mut Self::Context,
+        expert_ids_per_pair: &Self::Buffer,
+        sorted_token_ids: &mut Self::Buffer,
+        block_ids: &mut Self::Buffer,
+        total_tokens_post_pad: &mut Self::Buffer,
+        batch_x_topk: usize,
+        num_experts: usize,
+        block_size: usize,
+        sorted_max_size: usize,
+    ) -> Result<()> {
+        if num_experts > 256 {
+            return Err(FerrumError::model(format!(
+                "moe_align_block_size: num_experts={num_experts} exceeds compile-time MAX_NUM_EXPERTS=256"
+            )));
+        }
+        let func = ctx.func(
+            "moe_align_block_size",
+            ptx::MOE_ALIGN_BLOCK_SIZE,
+            "moe_align_block_size_f32",
+        );
+        let n = batch_x_topk as i32;
+        let ne = num_experts as i32;
+        let bs = block_size as i32;
+        let smax = sorted_max_size as i32;
+        let stream = ctx.stream.clone();
+        // Single block — algorithm uses shared mem for counts + offsets,
+        // sized to MAX_NUM_EXPERTS=256. Use 256 threads to cover the
+        // ≤256-experts and ≤1024-pair Qwen3-MoE configs cleanly.
+        let mut b = stream.launch_builder(&func);
+        b.arg(expert_ids_per_pair);
+        b.arg(sorted_token_ids);
+        b.arg(block_ids);
+        b.arg(total_tokens_post_pad);
+        b.arg(&n);
+        b.arg(&ne);
+        b.arg(&bs);
+        b.arg(&smax);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("moe_align_block_size launch: {e}")))?;
+        Ok(())
+    }
+
     fn moe_combine(
         ctx: &mut Self::Context,
         packed_down: &Self::Buffer,
