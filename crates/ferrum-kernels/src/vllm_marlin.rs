@@ -231,7 +231,19 @@ pub fn load_stacked_gptq_vllm_marlin(
                 scales_f32[e].len()
             )));
         }
-        sc_flat_f16.extend(scales_f32[e].iter().map(|&x| half::f16::from_f32(x)));
+        // Per-expert: convert to f16 then apply IST-DASLab Marlin scale
+        // permutation. The vLLM marlin_template.h kernel reads scales
+        // through a fragment-pattern shared-memory load (s_sh_rd) — same
+        // as IST-DASLab — so the on-disk row-major scales need the same
+        // host-side permute before the GEMM lines them up correctly with
+        // the dequant-loop output channel.
+        let sc_e_f16: Vec<half::f16> = scales_f32[e]
+            .iter()
+            .map(|&x| half::f16::from_f32(x))
+            .collect();
+        let sc_e_perm =
+            crate::marlin::repack_scales_to_marlin(&sc_e_f16, k, n_per_expert, group_size);
+        sc_flat_f16.extend(sc_e_perm);
     }
     let sc_dev: cudarc::driver::CudaSlice<half::f16> = stream
         .clone_htod(sc_flat_f16.as_slice())
