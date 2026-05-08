@@ -203,10 +203,16 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     }
     let num_tokens_past_padded = vec![total_padded as i32];
 
-    // Allocate output per vLLM contract: [size_m * top_k, n].
+    // Allocate output per vLLM contract: [size_m * top_k, n]. Must be
+    // zeroed before kernel launch when use_atomic_add=1 — the kernel only
+    // self-zeros C when slice_count > 1 && slice_idx == 0, otherwise it
+    // accumulates onto whatever was there. Backend::alloc doesn't zero.
     let size_m = total_tokens;
     let top_k = 1;
-    let mut c_vllm_dev = <CudaBackend as Backend>::alloc(size_m * top_k * n_per);
+    let mut c_vllm_dev = ctx
+        .stream
+        .alloc_zeros::<half::f16>(size_m * top_k * n_per)
+        .expect("alloc zeroed c_vllm");
 
     // Upload index buffers.
     let stream = ctx.stream.clone();
