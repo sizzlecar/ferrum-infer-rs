@@ -28,6 +28,14 @@
 // for the torch op binding (TORCH_LIBRARY_IMPL_EXPAND). We don't link torch.
 // #include "core/registration.h"
 
+// vendored for ferrum-infer-rs: pull in the kernel TEMPLATE BODY so the
+// implicit instantiations in get_marlin_kernel actually emit code. In
+// vLLM's upstream build, generate_kernels.py emits ~30 per-shape .cu
+// files that each include marlin_template.h and force-instantiate; we
+// instead compile the whole template universe into ONE .cu (longer
+// compile time but simpler).
+#include "marlin_template.h"
+
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
                     std::is_same<scalar_t, nv_bfloat16>::value, \
