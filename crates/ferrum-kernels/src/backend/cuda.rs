@@ -3296,13 +3296,16 @@ impl Backend for CudaBackend {
             .map_err(|e| FerrumError::model(format!("htod num_tokens_past_padded: {e}")))?;
 
         // Reinterpret the i32 slices as f16 device buffers (same memory)
-        // so they match the trait's Self::Buffer type. Slice element count
-        // doubles because each i32 is 4 bytes, f16 is 2 bytes — but the
-        // consumer (moe_gemm_phase_vllm) ignores .len() and reads via
-        // device_ptr + caller-known logical length.
-        let (st_ptr, _g0) = st.device_ptr(&stream);
-        let (eid_ptr, _g1) = eid.device_ptr(&stream);
-        let (npp_ptr, _g2) = npp.device_ptr(&stream);
+        // so they match the trait's Self::Buffer type. The consumer
+        // (moe_gemm_phase_vllm) ignores .len() and reads via device_ptr.
+        // Drop the lifetime guards in a scoped block so we can `forget`
+        // the owning slices afterwards.
+        let (st_ptr, eid_ptr, npp_ptr) = {
+            let (st_ptr, _g0) = st.device_ptr(&stream);
+            let (eid_ptr, _g1) = eid.device_ptr(&stream);
+            let (npp_ptr, _g2) = npp.device_ptr(&stream);
+            (st_ptr, eid_ptr, npp_ptr)
+        };
         let st_f16: CudaSlice<f16> =
             unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, sorted_token_ids.len() * 2) };
         let eid_f16: CudaSlice<f16> =
@@ -3313,11 +3316,10 @@ impl Backend for CudaBackend {
                 num_tokens_past_padded.len() * 2,
             )
         };
-        // Forget the i32 owning slices into a context-side Vec so they
-        // outlive the routing struct. We stash them on `ctx` (drop happens
-        // at ctx teardown). Simpler approach: leak via Box, with a Drop
-        // helper. Here we just std::mem::forget — leaks ~few KB per layer.
-        // TODO(perf-stage14b): add a context-side arena once benchmarked.
+        // Forget the i32 owning slices so the device memory survives —
+        // the f16 views above point at the same allocation.
+        // TODO(perf-stage14b): stash in a context-side arena instead of
+        // leaking ~few KB per layer.
         std::mem::forget(st);
         std::mem::forget(eid);
         std::mem::forget(npp);
