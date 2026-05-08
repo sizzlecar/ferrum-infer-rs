@@ -165,7 +165,12 @@ impl CudaState {
     /// `moe_gemm_phase_batched` for cross-stream sync. The (entry,
     /// exits) tuple is stable across calls — events are only ever
     /// recorded / waited on, never destroyed (until `Drop`).
-    pub fn moe_sync_events(&mut self) -> (cudarc::driver::sys::CUevent, Vec<cudarc::driver::sys::CUevent>) {
+    pub fn moe_sync_events(
+        &mut self,
+    ) -> (
+        cudarc::driver::sys::CUevent,
+        Vec<cudarc::driver::sys::CUevent>,
+    ) {
         use cudarc::driver::sys as cu;
         if self.moe_entry_event.is_none() {
             let n = self.moe_stream_pool().len();
@@ -185,10 +190,7 @@ impl CudaState {
             }
             self.moe_entry_event = Some(entry as usize);
             self.moe_exit_events = Some(exits);
-            tracing::info!(
-                "MoE sync events initialized: 1 entry + {} exits",
-                n
-            );
+            tracing::info!("MoE sync events initialized: 1 entry + {} exits", n);
         }
         let entry = self.moe_entry_event.unwrap() as cu::CUevent;
         let exits: Vec<cu::CUevent> = self
@@ -1584,10 +1586,10 @@ impl Backend for CudaBackend {
         // transpose_token_to_head. We take a raw pointer to the cached
         // buffer so we can pass it as a normal &mut/& while ctx is also
         // borrowed by the kernel-call methods.
-        let out_tm_ptr: *mut CudaSlice<f16> = ctx
-            .paged_attn_out_tm
-            .as_mut()
-            .expect("paged_attn_out_tm allocated") as *mut _;
+        let out_tm_ptr: *mut CudaSlice<f16> =
+            ctx.paged_attn_out_tm
+                .as_mut()
+                .expect("paged_attn_out_tm allocated") as *mut _;
         unsafe {
             Self::paged_varlen_attention(
                 ctx,

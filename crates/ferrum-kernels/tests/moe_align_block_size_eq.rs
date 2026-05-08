@@ -34,8 +34,8 @@ fn reference_align(
     }
     let mut counts_padded = vec![0i32; num_experts];
     for e in 0..num_experts {
-        counts_padded[e] = ((counts[e] + block_size as i32 - 1) / block_size as i32)
-            * block_size as i32;
+        counts_padded[e] =
+            ((counts[e] + block_size as i32 - 1) / block_size as i32) * block_size as i32;
     }
     let mut offsets = vec![0i32; num_experts + 1];
     for e in 0..num_experts {
@@ -85,8 +85,7 @@ fn moe_align_matches_reference_qwen3moe_shape() {
     // Sentinel padding = num_experts × ceil(n_pairs / block_size) × block_size
     // is the worst-case upper bound; in practice total_post_pad is much
     // smaller. We size to that upper bound.
-    let sorted_max =
-        num_experts_max_padded(n_pairs, NUM_EXPERTS, BLOCK_SIZE);
+    let sorted_max = num_experts_max_padded(n_pairs, NUM_EXPERTS, BLOCK_SIZE);
 
     let (ref_sorted, ref_block_ids, ref_total) =
         reference_align(&expert_ids_host, NUM_EXPERTS, BLOCK_SIZE);
@@ -105,11 +104,9 @@ fn moe_align_matches_reference_qwen3moe_shape() {
 
     let mut sorted_dev =
         <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_u32(sorted_max);
-    let mut block_ids_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_u32(
-        sorted_max / BLOCK_SIZE,
-    );
-    let mut total_dev =
-        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_u32(1);
+    let mut block_ids_dev =
+        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_u32(sorted_max / BLOCK_SIZE);
+    let mut total_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_u32(1);
 
     <ferrum_kernels::backend::cuda::CudaBackend as Backend>::moe_align_block_size(
         &mut ctx,
