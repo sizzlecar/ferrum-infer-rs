@@ -228,7 +228,9 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     <CudaBackend as Backend>::sync(&mut ctx);
     let c_vllm = CudaBackend::to_vec(&c_vllm_dev, size_m * top_k * n_per);
 
-    // Compare per-expert.
+    // Compare per-expert. Soft-mode first: print every expert's diagnostics
+    // even if expert 0 fails, then assert at the end.
+    let mut max_rel_overall = 0f32;
     for e in 0..num_experts {
         let m_e = tokens_per_expert[e];
         if m_e == 0 {
@@ -248,13 +250,29 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
             .fold(0f32, f32::max)
             .max(1e-6);
         let rel = max_diff / mag;
+        max_rel_overall = max_rel_overall.max(rel);
+
+        let avg_ref: f32 =
+            slice_ref.iter().map(|x| x.abs()).sum::<f32>() / slice_ref.len() as f32;
+        let avg_vllm: f32 =
+            slice_vllm.iter().map(|x| x.abs()).sum::<f32>() / slice_vllm.len() as f32;
+
         eprintln!(
             "expert {e}: m_e={m_e}, row_start={row_start}, \
-             per-expert vs vLLM: max|diff|={max_diff:.4} rel={rel:.4}"
+             max|diff|={max_diff:.4} rel={rel:.4} \
+             avg|ref|={avg_ref:.4} avg|vllm|={avg_vllm:.4}"
         );
-        assert!(
-            rel < 1e-2,
-            "vLLM marlin_moe_wna16 disagrees with per-expert (expert {e}): rel={rel}"
+        eprintln!(
+            "  ref[0..8] = {:?}",
+            &slice_ref[..8.min(slice_ref.len())]
+        );
+        eprintln!(
+            "  vllm[0..8] = {:?}",
+            &slice_vllm[..8.min(slice_vllm.len())]
         );
     }
+    assert!(
+        max_rel_overall < 1e-2,
+        "vLLM marlin_moe_wna16 disagrees: max rel across experts = {max_rel_overall}"
+    );
 }
