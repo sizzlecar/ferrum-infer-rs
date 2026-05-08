@@ -397,6 +397,62 @@ attn now sits comparable to MoE GEMM. Next levers (Stage 13+):
 Parity validated: `cuda_marlin_moe_fused_vs_per_expert` test passes
 with rel < 0.001 (4 experts × variable m_e ∈ {16, 8, 12, 4}).
 
+### Stage 13a — batched paged-decode flash split-K (PRs #96 + #98)
+
+After Stage 12.1 attn jumped to 31% of c=32 TPOT (was 14%). New batched
+flash-decode kernel: phase-1 splits each seq's KV across `num_splits`
+chunks (grid: num_q_heads × num_seqs × num_splits) + phase-2 reduce per
+(seq, head). Smart heuristic auto-tunes splits by `num_seqs × num_heads`
+saturation AND `kv_len`:
+
+- saturated grid: splits=1 if kv≤768 else 2-4
+- low concurrency: aggressive splits to fill SMs
+
+| c    | Stage 12.1 | **Stage 13a v2 (smart split-K)** | Δ vs Stage 12.1 | vs vLLM |
+|------|------------|----------------------------------|-----------------|---------|
+| 1    | 84.3       | **101.9**                        | **+21%** ★      | 63%     |
+| 8    | 254.8      | **262.5**                        | +3.0%           | —       |
+| 16   | 318.9      | **330.2**                        | +3.5%           | 65%     |
+| 32   | 320.6      | **355.1**                        | **+10.8%**      | **19.0%** |
+
+PR #98 flips `FERRUM_MOE_FUSED` and `FERRUM_PAGED_FLASH` defaults to
+ON so end-user CLI doesn't need any env var to get the fast path.
+Escape: `FERRUM_PAGED_FLASH=0` falls back to single-pass kernel;
+`FERRUM_MOE_FUSED=0` falls back to multi-stream pool.
+
+### Cumulative progress (this session, PRs #94 → #98)
+
+| Stage              | c=1   | c=8   | c=16  | c=32  | vs vLLM (c=32) |
+|--------------------|-------|-------|-------|-------|----------------|
+| pre-#94 baseline   | 9.7   | 9.7   | —     | 137.1 | 7.3%           |
+| #94 (Stages 6-10)  | 65.5  | 118.0 | 132.1 | 267.7 | 14.3%          |
+| #96 (Stages 11+12+12.1+13a) | 84.3 | 254.8 | 318.9 | 320.6 | 17.1%   |
+| **#98 (defaults ON, smart split-K)** | **101.9** | **262.5** | **330.2** | **355.1** | **19.0%** |
+
+c=32: 137 → **355 tok/s = 2.6×**. Mean TPOT 204 → **83 ms** (-59%).
+
+### Path to 80% of vLLM (~1500 tok/s)
+
+Current ratio 19% means another **4.2×** to hit 80%. Single-kernel
+tunes (tile size, gridDim shape, split-K heuristic) have been mined
+out — each remaining 5-10% gain is now diminishing. The big remaining
+levers all require larger work:
+
+- **vLLM-style fused MoE Marlin port** — sorted_token_ids + per-tile
+  expert routing. Eliminates the m=16 padding waste (m_e ∈ {1..3}
+  effective, 5-16× compute slack). ~4000 LoC port. Speculative gain
+  3-4× on the MoE GEMM phase.
+- **Marlin m<16 tile rewrite** — drop the m16n8k16 MMA, add m8n8k16
+  variants for tiny-m experts. Saves bandwidth waste (B/s tile is
+  loaded once per call regardless of actual m). Major surgery on the
+  IST-DASLab kernel internals.
+- **CUDA Graph capture for full decode iter** — vLLM uses parameterized
+  graphs (`cudaGraphExecKernelNodeSetParams`) so per-token routing
+  changes don't force re-record. ~+5-10% on launch overhead, not the
+  4× we'd need.
+
+### The c=32 OOB resolution
+
 ### The c=32 OOB resolution
 
 Stage 9's first ship (commit c846732) hit `CUDA_ERROR_ILLEGAL_ADDRESS`
