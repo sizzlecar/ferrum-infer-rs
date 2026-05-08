@@ -217,6 +217,35 @@ impl CudaState {
         m
     }
 
+    /// Lazy-grow the H2D scratch buffers to at least `n` u32-sized slots.
+    /// Buffers are allocated once at peak observed size and reused;
+    /// no shrink-back. Each buffer is sized so 1 logical slot = 2 f16
+    /// elements = 4 bytes (sufficient for u32 / i32 / f32 alike).
+    pub fn ensure_htod_cache(&mut self, n: usize) {
+        if self.htod_cache_capacity >= n {
+            return;
+        }
+        let n_grown = n.max(256).next_power_of_two();
+        let nf16 = 2 * n_grown;
+        let stream = self.stream.clone();
+        self.htod_cache_u32 = Some(
+            stream
+                .alloc_zeros::<f16>(nf16)
+                .expect("CudaState::ensure_htod_cache u32"),
+        );
+        self.htod_cache_i32 = Some(
+            stream
+                .alloc_zeros::<f16>(nf16)
+                .expect("CudaState::ensure_htod_cache i32"),
+        );
+        self.htod_cache_f32 = Some(
+            stream
+                .alloc_zeros::<f16>(nf16)
+                .expect("CudaState::ensure_htod_cache f32"),
+        );
+        self.htod_cache_capacity = n_grown;
+    }
+
     fn func(
         &mut self,
         module_key: &'static str,
@@ -368,35 +397,6 @@ impl Backend for CudaBackend {
             htod_cache_f32: None,
             htod_cache_capacity: 0,
         }
-    }
-
-    /// Lazy-grow the H2D scratch buffers to at least `n` u32-sized slots.
-    /// Buffers are allocated once at peak observed size and reused;
-    /// no shrink-back. Each buffer is sized so 1 logical slot = 2 f16
-    /// elements = 4 bytes (sufficient for u32 / i32 / f32 alike).
-    fn ensure_htod_cache(&mut self, n: usize) {
-        if self.htod_cache_capacity >= n {
-            return;
-        }
-        let n_grown = n.max(256).next_power_of_two();
-        let nf16 = 2 * n_grown;
-        let stream = self.stream.clone();
-        self.htod_cache_u32 = Some(
-            stream
-                .alloc_zeros::<f16>(nf16)
-                .expect("CudaState::ensure_htod_cache u32"),
-        );
-        self.htod_cache_i32 = Some(
-            stream
-                .alloc_zeros::<f16>(nf16)
-                .expect("CudaState::ensure_htod_cache i32"),
-        );
-        self.htod_cache_f32 = Some(
-            stream
-                .alloc_zeros::<f16>(nf16)
-                .expect("CudaState::ensure_htod_cache f32"),
-        );
-        self.htod_cache_capacity = n_grown;
     }
 
     fn alloc_u32(n: usize) -> Self::Buffer {
@@ -1070,7 +1070,7 @@ impl Backend for CudaBackend {
                 .htod_cache_u32
                 .as_mut()
                 .expect("htod_cache_u32 ensured above");
-            let dst_ptr: u64 = *ids_buf.device_ptr_mut();
+            let (dst_ptr, _g) = ids_buf.device_ptr_mut(&stream);
             unsafe {
                 cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                     dst_ptr,
@@ -2375,7 +2375,7 @@ impl Backend for CudaBackend {
                 .htod_cache_i32
                 .as_mut()
                 .expect("htod_cache_i32 ensured");
-            let dst_ptr: u64 = *pairs_buf.device_ptr_mut();
+            let (dst_ptr, _g) = pairs_buf.device_ptr_mut(&stream);
             unsafe {
                 cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                     dst_ptr,
@@ -2391,7 +2391,7 @@ impl Backend for CudaBackend {
                 .htod_cache_f32
                 .as_mut()
                 .expect("htod_cache_f32 ensured");
-            let dst_ptr: u64 = *weights_buf.device_ptr_mut();
+            let (dst_ptr, _g) = weights_buf.device_ptr_mut(&stream);
             unsafe {
                 cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                     dst_ptr,
