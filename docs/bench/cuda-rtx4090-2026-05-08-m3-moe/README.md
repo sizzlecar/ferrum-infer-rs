@@ -282,9 +282,11 @@ runs vary ±3 tok/s between sessions on shared cloud GPUs.)
 
 | Experiment | Outcome | Why it fails |
 |------------|---------|--------------|
-| `FERRUM_MIXED_BATCH=1` | Garbled output (`"2 + 2 +  2 +"`) | Mixed-batch `unified_decode` path doesn't go through `moe_forward_bucketed` — needs explicit code wire-up. |
-| `FERRUM_MOE_STREAMS=8` | Identical to s=4 (within noise) | 4 concurrent Marlin kernels already saturate small-m SM scheduling. |
+| `FERRUM_MIXED_BATCH=1` | Garbled output (`"2 + 2 +  2 +"`); -17% perf | Mixed-batch `unified_decode` path's per-item dispatch fallback corrupts KV state on Qwen3-MoE. Re-confirmed 2026-05-08 (mixed_off 165.7 / mixed_on 137.0 tok/s); needs unified_forward implementation, not a quick wire-up. |
+| `FERRUM_METAL_PAGED_KV=1` on CUDA | Garbled output (`".name(\"attenuation_type_comp\")..."`) | CUDA was missing `paged_decode_attention` impl entirely. Wrapper added (commits e09855b/dad3da9/9764137 — REVERTED at 3401599) routing q_len=1→`paged_batched_decode_attention`, q_len>1→`paged_varlen_attention`. Bit-pattern bug in `from_slice_i32` default impl found and fixed (loses bits via f16 conversion → use `alloc_u32+write_u32`). Output STILL garbled after fix — likely paged_varlen kernel's KV layout assumption mismatches `split_qkv_norm_rope_into_paged_cache`'s output, OR pos_offsets semantics differ. Needs element-wise comparison vs Metal reference. **Default = OFF for Qwen3-MoE on CUDA** until this is resolved. |
+| `FERRUM_MOE_STREAMS=8` | Identical to s=4 (within noise) | 4 concurrent Marlin kernels already saturate small-m SM scheduling (re-confirmed Stage 8: s=2 163, s=4 169, s=8 167 tok/s). |
 | `FERRUM_MARLIN_SKIP_WS_ZERO=1` standalone | ~0% change | `cuMemsetD32Async` overlaps with following Marlin kernel; per-call zero is essentially free in steady state. |
+| Cached htod scratch for embedding_lookup + moe_combine | -3.7% c=32 | `device_ptr_mut(&stream)` in cudarc 0.17.8 returns `SyncOnDrop::Sync` which calls `stream.synchronize()` on drop — forces sync H2D, killing async pipelining. Reverted at 686f062. |
 
 ## Remaining gap analysis (post-Stage-7)
 
