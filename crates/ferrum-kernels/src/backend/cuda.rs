@@ -3395,7 +3395,30 @@ impl Backend for CudaBackend {
         // persistent routing buffers. They're allocated worst-case once;
         // no re-alloc happens on shape change.
         let stream = ctx.stream.clone();
+
+        // Early return for empty inputs — calling cuMemcpyHtoDAsync with
+        // byte_count=0 returns CUDA_ERROR_INVALID_VALUE on some driver
+        // versions. The kernel reads num_tokens_past_padded[0] / block
+        // entries, so an all-zero scenario should never invoke this, but
+        // guard anyway.
+        if sorted_token_ids.is_empty() || expert_ids.is_empty() {
+            return Err(FerrumError::model(format!(
+                "upload_moe_routing: empty inputs (sorted={}, eid={})",
+                sorted_token_ids.len(),
+                expert_ids.len()
+            )));
+        }
+
         let (st_dev, eid_dev, npp_dev) = ctx.vllm_moe_routing();
+        eprintln!(
+            "DEBUG upload_moe_routing v2: sorted_len={} eid_len={} npp_len={} st_dev_len={} eid_dev_len={} npp_dev_len={}",
+            sorted_token_ids.len(),
+            expert_ids.len(),
+            num_tokens_past_padded.len(),
+            st_dev.len(),
+            eid_dev.len(),
+            npp_dev.len()
+        );
 
         // Use raw cuMemcpyHtoDAsync_v2 with explicit byte count — host
         // slices are smaller than the worst-case persistent buffers, so
