@@ -10,8 +10,7 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::{CudaContext, CudaSlice};
-use ferrum_kernels::backend::{cuda::CudaState, Backend};
+use ferrum_kernels::backend::Backend;
 
 const NUM_EXPERTS: usize = 128;
 const TOP_K: usize = 8;
@@ -71,13 +70,16 @@ fn reference_align(
 
 #[test]
 fn moe_align_matches_reference_qwen3moe_shape() {
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
-
-    let mut rng = StdRng::seed_from_u64(0xABCD);
+    // Deterministic per-pair expert assignment via SplitMix64 LCG.
+    // Avoids a rand dev-dependency.
     let n_pairs = BATCH * TOP_K;
     let expert_ids_host: Vec<i32> = (0..n_pairs)
-        .map(|_| rng.gen_range(0..NUM_EXPERTS as i32))
+        .map(|i| {
+            let mut z = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            ((z >> 32) as i32).rem_euclid(NUM_EXPERTS as i32)
+        })
         .collect();
 
     // Sentinel padding = num_experts × ceil(n_pairs / block_size) × block_size
