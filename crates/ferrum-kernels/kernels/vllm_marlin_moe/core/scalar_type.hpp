@@ -2,6 +2,12 @@
 
 // vendored for ferrum-infer-rs: replace <torch/library.h> with shim that
 // supplies only TORCH_CHECK (the single torch utility actually used here).
+// torch/library.h transitively pulls in <variant>, <cstdint>, <climits> —
+// pull those in directly so we don't depend on torch's umbrella include.
+#include <climits>
+#include <cstdint>
+#include <variant>
+
 #include "../vllm_torch_shim.h"
 
 namespace vllm {
