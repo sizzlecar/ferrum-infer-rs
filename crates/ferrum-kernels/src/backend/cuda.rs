@@ -1454,11 +1454,15 @@ impl Backend for CudaBackend {
         .map_err(|e| FerrumError::model(format!("paged_varlen_attn: {e}")))
     }
 
-    /// Single-batch paged decode attention. CUDA only has the batched
-    /// variant (`paged_batched_decode_attention`); this wrapper feeds
-    /// `num_seqs == 1, q_len == 1` through it. Used by Qwen3MoeModel's
-    /// per-item decode loop when `FERRUM_METAL_PAGED_KV=1` on CUDA.
-    /// Without this wrapper, paged-KV mode panics with "not implemented".
+    /// Paged attention dispatcher — routes to the right CUDA path:
+    ///   - q_len == 1 (decode for any num_seqs): paged_batched_decode_attention
+    ///   - q_len > 1, num_seqs == 1 (single-seq prefill): paged_varlen_attention
+    ///   - q_len > 1, num_seqs > 1: not supported (no caller uses this combo)
+    ///
+    /// CUDA never had `paged_decode_attention` natively; this wrapper
+    /// covers Qwen3MoeModel's per-item path (forward_layer line 1145)
+    /// AND its batched-decode path (forward_layer_batched_decode line
+    /// 2138) under one trait method.
     #[allow(clippy::too_many_arguments)]
     fn paged_decode_attention(
         ctx: &mut Self::Context,
@@ -1476,26 +1480,82 @@ impl Backend for CudaBackend {
         max_num_blocks_per_seq: usize,
         q_len: usize,
     ) -> Result<()> {
-        // Per-item decode path always has q_len == 1; the batched
-        // kernel assumes one query per seq. Refuse anything else
-        // rather than silently misroute.
-        if q_len != 1 {
+        let max_kv_len = block_size * max_num_blocks_per_seq;
+        if q_len == 1 {
+            // Decode: one query per seq. The batched kernel assumes this
+            // shape — feed num_seqs through unchanged.
+            return Self::paged_batched_decode_attention(
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                out,
+                block_tables,
+                context_lens,
+                num_seqs,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_num_blocks_per_seq,
+            );
+        }
+
+        // q_len > 1: prefill. Only single-seq supported (Qwen3MoeModel's
+        // forward_layer is the only caller, and it always passes
+        // num_seqs == 1).
+        if num_seqs != 1 {
             return Err(FerrumError::model(format!(
-                "paged_decode_attention(CUDA): q_len={q_len} unsupported (must be 1 — \
-                 use paged_varlen_attention for q_len > 1)"
+                "paged_decode_attention(CUDA): q_len={q_len} num_seqs={num_seqs} \
+                 unsupported (caller must split prefill into per-seq calls)"
             )));
         }
-        let max_kv_len = block_size * max_num_blocks_per_seq;
-        Self::paged_batched_decode_attention(
+
+        // Re-shape inputs for paged_varlen_attention:
+        //   cu_seqlens_q = [0, q_len]   (prefix sum, single-seq)
+        //   pos_offsets  = [final_kv_len - q_len]  (start kv pos for this q)
+        // We need final_kv_len from `context_lens[0]` — D2H 4 bytes.
+        // Cold path (prefill ~ms-scale), so the small sync is fine.
+        let cl_host: Vec<u32> = {
+            let stream = ctx.stream.clone();
+            let view = unsafe {
+                context_lens
+                    .transmute::<u32>(1)
+                    .ok_or_else(|| FerrumError::model("context_lens transmute failed"))?
+            };
+            let mut h = vec![0u32; 1];
+            stream
+                .memcpy_dtoh(&view, h.as_mut_slice())
+                .map_err(|e| FerrumError::model(format!("dtoh context_lens: {e}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::model(format!("dtoh sync: {e}")))?;
+            h
+        };
+        let final_kv_len = cl_host[0] as usize;
+        if final_kv_len < q_len {
+            return Err(FerrumError::model(format!(
+                "paged_decode_attention(CUDA): final_kv_len={final_kv_len} < q_len={q_len}"
+            )));
+        }
+        let pos_offset = (final_kv_len - q_len) as u32;
+        let cu_seqlens_q_buf =
+            <Self as Backend>::from_slice_i32(&[0, q_len as i32]);
+        let pos_offsets_buf = <Self as Backend>::from_slice_i32(&[pos_offset as i32]);
+
+        Self::paged_varlen_attention(
             ctx,
             q,
             k_pool,
             v_pool,
             out,
+            &cu_seqlens_q_buf,
+            &pos_offsets_buf,
             block_tables,
-            context_lens,
-            num_seqs,
-            max_kv_len,
+            1,             // num_seqs
+            q_len,         // total_q_tokens
+            final_kv_len,  // max_kv_len
             num_heads,
             num_kv_heads,
             head_dim,
