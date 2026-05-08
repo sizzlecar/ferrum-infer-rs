@@ -143,6 +143,20 @@ pub fn auto_size_kv_blocks(model_dir: &Path, gpu_util: f32) -> Option<AutoSizeRe
     })
 }
 
+/// CLI usage profile: which presets the autosizer should consider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoSizeProfile {
+    /// `ferrum serve` — many concurrent requests. Prioritise batch
+    /// width (max_seqs) over per-seq context length. Bench scripts
+    /// also use this profile.
+    Server,
+    /// `ferrum run` — single interactive user, multi-turn chat. Trade
+    /// max_seqs for KV_CAPACITY so a long conversation doesn't crash
+    /// after a few turns. With KV_CAPACITY=512 (server default), Qwen3
+    /// thinking-mode replies hit overflow at the 4th turn.
+    Chat,
+}
+
 /// Apply auto-sizing: read CLI flag, query nvidia-smi, set env vars.
 /// Sets BOTH `FERRUM_KV_MAX_BLOCKS` (engine-side BlockPool) and
 /// `FERRUM_PAGED_MAX_SEQS` (model-side paged_pools — sizes the GPU
@@ -154,7 +168,18 @@ pub fn auto_size_kv_blocks(model_dir: &Path, gpu_util: f32) -> Option<AutoSizeRe
 ///
 /// Idempotent — caller invokes once per CLI invocation before engine
 /// init. Respects user overrides (no clobber if env already set).
+///
+/// Defaults to `AutoSizeProfile::Server`. Use `apply_auto_size_with_profile`
+/// for chat (`ferrum run`) — it picks longer per-seq context.
 pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
+    apply_auto_size_with_profile(model_dir, gpu_util, AutoSizeProfile::Server);
+}
+
+/// Apply auto-sizing with explicit usage profile. The chat profile
+/// flips priority — long context per seq beats wide batch — because
+/// the CLI REPL only ever has one active sequence and multi-turn
+/// dialogues blow past the default 512-token cap fast.
+pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: AutoSizeProfile) {
     let kv_overridden = std::env::var("FERRUM_KV_MAX_BLOCKS").is_ok();
     let max_seqs_overridden = std::env::var("FERRUM_PAGED_MAX_SEQS").is_ok();
     if kv_overridden && max_seqs_overridden {
@@ -166,14 +191,11 @@ pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
     result.print_summary();
 
     // Pool sizing: pool_blocks = max_seqs × (KV_CAPACITY / 16).
-    // Goal: keep max_seqs ≥ 16 (so c=16 bench works) by SHRINKING
-    // KV_CAPACITY first, then drop max_seqs only when budget is too
-    // tight even for KV_CAPACITY=512 at max_seqs=16.
-    //
     // Picks the largest (max_seqs, KV_CAP) tuple from a fixed ladder
-    // whose pool fits the budget. Starts at the preferred default
-    // (32, 2048) and degrades stepwise.
-    const PRESETS: &[(usize, usize)] = &[
+    // whose pool fits the budget.
+    //   Server: prioritise wide batch (c=16/32) over context.
+    //   Chat:   single user, multi-turn — pile budget into context.
+    const SERVER_PRESETS: &[(usize, usize)] = &[
         // (max_seqs, KV_CAPACITY tokens)
         (32, 2048), // best — INT4 8B on 24 GB usually lands here
         (32, 1024), // FP16 8B at util=1.0
@@ -184,8 +206,24 @@ pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
         (8, 1024), // <c=16 only
         (8, 512),
     ];
+    // 16384 fits a long thinking-mode reply + ~20 conversation turns
+    // before /clear. max_seqs=2 leaves a slot for any internal use;
+    // single-user CLI never needs more.
+    const CHAT_PRESETS: &[(usize, usize)] = &[
+        (2, 16384),
+        (2, 8192),
+        (2, 4096),
+        (1, 16384),
+        (1, 8192),
+        (1, 4096),
+        (1, 2048),
+    ];
+    let presets: &[(usize, usize)] = match profile {
+        AutoSizeProfile::Server => SERVER_PRESETS,
+        AutoSizeProfile::Chat => CHAT_PRESETS,
+    };
     let (max_seqs_clamped, kv_capacity) = {
-        let pick = PRESETS.iter().copied().find(|(seqs, cap_tokens)| {
+        let pick = presets.iter().copied().find(|(seqs, cap_tokens)| {
             let bps = (*cap_tokens / 16).max(1);
             seqs * bps <= result.max_blocks
         });
