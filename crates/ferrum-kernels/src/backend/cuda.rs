@@ -1644,6 +1644,30 @@ impl Backend for CudaBackend {
         if num_seqs == 0 {
             return Ok(());
         }
+
+        // Stage 13a: optional split-K path for batched paged decode. With
+        // num_seqs * num_q_heads ≥ sms (saturated grid), splitting kv adds
+        // launch overhead but improves pipelining at long kv_len. Default
+        // OFF (FERRUM_PAGED_FLASH unset) so existing path stays.
+        if std::env::var("FERRUM_PAGED_FLASH").map_or(false, |v| v == "1") {
+            return paged_batched_flash_dispatch(
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                out,
+                block_tables,
+                valid_kv_lens,
+                num_seqs,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_blocks_per_seq,
+            );
+        }
+
         let func = ctx.func(
             "paged_batched_decode_attn",
             ptx::PAGED_DECODE_ATTENTION,
@@ -4021,6 +4045,225 @@ fn paged_varlen_split_k_dispatch(
             Ok::<(), FerrumError>(())
         },
     )
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Stage 13a — Batched paged-decode flash (split-K)
+//
+// Same idea as the varlen split-K path but for q_len=1 batched decode
+// (gridDim.y = num_seqs). Phase 1 splits each seq's kv across `num_splits`
+// chunks; phase 2 reduces partials per (seq, head).
+//
+// FERRUM_PAGED_FLASH=1 selects this over the single-pass kernel. Default
+// OFF.
+// ────────────────────────────────────────────────────────────────────────
+#[allow(clippy::too_many_arguments)]
+fn paged_batched_flash_dispatch(
+    ctx: &mut CudaState,
+    q: &CudaSlice<f16>,
+    k_pool: &CudaSlice<f16>,
+    v_pool: &CudaSlice<f16>,
+    out: &mut CudaSlice<f16>,
+    block_tables: &CudaSlice<f16>,
+    valid_kv_lens: &CudaSlice<f16>,
+    num_seqs: usize,
+    max_kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+) -> Result<()> {
+    // Pick num_splits. For batched decode the grid is already saturated
+    // (num_seqs * num_heads ≥ 1024 at c=32), so splits add cost. Only
+    // worth it when kv is long enough that split parallelism overcomes
+    // launch overhead.
+    let num_splits: usize = match max_kv_len {
+        kv if kv <= 256 => 1, // skip split-K — single pass faster
+        kv if kv <= 1024 => 2,
+        kv if kv <= 2048 => 4,
+        _ => 8,
+    };
+    if num_splits <= 1 {
+        // Caller's main path is the single-pass kernel.
+        // FERRUM_PAGED_FLASH=1 still routes here, so do the single-pass
+        // launch inline (avoids env-flag round-trip).
+        return paged_batched_decode_single_pass(
+            ctx,
+            q,
+            k_pool,
+            v_pool,
+            out,
+            block_tables,
+            valid_kv_lens,
+            num_seqs,
+            max_kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+        );
+    }
+
+    let chunk = (max_kv_len + num_splits - 1) / num_splits;
+    let total_qh = num_seqs * num_heads;
+    let out_required = total_qh * num_splits * head_dim;
+    let ml_required = total_qh * num_splits;
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+    let stream = ctx.stream.clone();
+
+    let phase1 = ctx.func(
+        "paged_batched_flash_attn",
+        ptx::PAGED_DECODE_ATTENTION,
+        "paged_batched_flash_decode_attn_f16",
+    );
+    let phase2 = ctx.func(
+        "paged_batched_flash_reduce",
+        ptx::PAGED_DECODE_ATTENTION,
+        "paged_batched_flash_decode_reduce_f16",
+    );
+
+    with_split_k_scratch(
+        &stream,
+        out_required,
+        ml_required,
+        |partial_out, partial_m, partial_l| {
+            let qv = q.slice(..);
+            let kp = k_pool.slice(..);
+            let vp = v_pool.slice(..);
+            let bt = block_tables.slice(..);
+            let kvl = valid_kv_lens.slice(..);
+            let pout = partial_out.slice(..);
+            let pm = partial_m.slice(..);
+            let pl = partial_l.slice(..);
+            let nqi = num_heads as i32;
+            let nkvi = num_kv_heads as i32;
+            let hdi = head_dim as i32;
+            let mbps = max_blocks_per_seq as i32;
+            let bsi = block_size as i32;
+            let nsp = num_splits as i32;
+
+            let mut b1 = stream.launch_builder(&phase1);
+            b1.arg(&qv);
+            b1.arg(&kp);
+            b1.arg(&vp);
+            b1.arg(&bt);
+            b1.arg(&kvl);
+            b1.arg(&pout);
+            b1.arg(&pm);
+            b1.arg(&pl);
+            b1.arg(&nqi);
+            b1.arg(&nkvi);
+            b1.arg(&hdi);
+            b1.arg(&mbps);
+            b1.arg(&bsi);
+            b1.arg(&scale);
+            b1.arg(&nsp);
+            // Match graph-capture sizing rationale used elsewhere — size
+            // shared to FERRUM_KV_CAPACITY ceiling, not current chunk.
+            let safe_kv: usize = std::env::var("FERRUM_KV_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(512);
+            let safe_chunk = (safe_kv + num_splits - 1) / num_splits;
+            let shmem1 = (safe_chunk.max(chunk).max(1) as u32) * 4;
+            unsafe {
+                b1.launch(LaunchConfig {
+                    grid_dim: (num_heads as u32, num_seqs as u32, num_splits as u32),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: shmem1,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("paged_batched_flash phase1: {e}")))?;
+
+            let pout2 = partial_out.slice(..);
+            let pm2 = partial_m.slice(..);
+            let pl2 = partial_l.slice(..);
+            let mut b2 = stream.launch_builder(&phase2);
+            b2.arg(&pout2);
+            b2.arg(&pm2);
+            b2.arg(&pl2);
+            b2.arg(out);
+            b2.arg(&nqi);
+            b2.arg(&hdi);
+            b2.arg(&nsp);
+            unsafe {
+                b2.launch(LaunchConfig {
+                    grid_dim: (num_heads as u32, num_seqs as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("paged_batched_flash phase2: {e}")))?;
+
+            Ok::<(), FerrumError>(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paged_batched_decode_single_pass(
+    ctx: &mut CudaState,
+    q: &CudaSlice<f16>,
+    k_pool: &CudaSlice<f16>,
+    v_pool: &CudaSlice<f16>,
+    out: &mut CudaSlice<f16>,
+    block_tables: &CudaSlice<f16>,
+    valid_kv_lens: &CudaSlice<f16>,
+    num_seqs: usize,
+    max_kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+) -> Result<()> {
+    let func = ctx.func(
+        "paged_batched_decode_attn",
+        ptx::PAGED_DECODE_ATTENTION,
+        "paged_batched_decode_attn_f16",
+    );
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+    let stream = ctx.stream.clone();
+    let qv = q.slice(..);
+    let kp = k_pool.slice(..);
+    let vp = v_pool.slice(..);
+    let bt = block_tables.slice(..);
+    let kvl = valid_kv_lens.slice(..);
+    let nqi = num_heads as i32;
+    let nkvi = num_kv_heads as i32;
+    let hdi = head_dim as i32;
+    let mbps = max_blocks_per_seq as i32;
+    let bsi = block_size as i32;
+    let mut b = stream.launch_builder(&func);
+    b.arg(&qv);
+    b.arg(&kp);
+    b.arg(&vp);
+    b.arg(&bt);
+    b.arg(&kvl);
+    b.arg(out);
+    b.arg(&nqi);
+    b.arg(&nkvi);
+    b.arg(&hdi);
+    b.arg(&mbps);
+    b.arg(&bsi);
+    b.arg(&scale);
+    let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+    let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+    let shared_bytes = (shared_kv as u32) * 4;
+    unsafe {
+        b.launch(LaunchConfig {
+            grid_dim: (num_heads as u32, num_seqs as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        })
+    }
+    .map(|_| ())
+    .map_err(|e| FerrumError::model(format!("paged_batched_decode_attn: {e}")))
 }
 
 // ────────────────────────────────────────────────────────────────────────
