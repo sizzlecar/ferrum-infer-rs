@@ -3432,21 +3432,6 @@ impl Backend for CudaBackend {
         std::mem::forget(eid);
         std::mem::forget(npp);
 
-        // Reinterpret the persistent i32 buffers as f16 device handles
-        // for the trait's Self::Buffer. The consumer (moe_gemm_phase_vllm)
-        // only reads device_ptr — len isn't consulted.
-        let (st_ptr, eid_ptr, npp_ptr) = {
-            let (st_ptr, _g0) = st_dev.device_ptr(&stream);
-            let (eid_ptr, _g1) = eid_dev.device_ptr(&stream);
-            let (npp_ptr, _g2) = npp_dev.device_ptr(&stream);
-            (st_ptr, eid_ptr, npp_ptr)
-        };
-        let st_f16: CudaSlice<f16> = unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
-        let eid_f16: CudaSlice<f16> =
-            unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
-        let npp_f16: CudaSlice<f16> =
-            unsafe { stream.upgrade_device_ptr(npp_ptr as CUdeviceptr, 0) };
-
         Ok(crate::backend::traits::MoeRouting {
             sorted_token_ids: st_f16,
             expert_ids: eid_f16,
