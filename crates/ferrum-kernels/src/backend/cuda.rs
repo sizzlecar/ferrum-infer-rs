@@ -174,7 +174,7 @@ impl CudaState {
     /// 2M fp32 = 8MB on RTX 4090). Once allocated it's reused for every
     /// vLLM moe call — phase 1, phase 3, every layer, every forward.
     #[cfg(feature = "vllm-moe-marlin")]
-    pub fn vllm_moe_c_tmp(&mut self) -> &CudaSlice<f32> {
+    pub fn vllm_moe_c_tmp(&mut self) -> &mut CudaSlice<f32> {
         if self.vllm_moe_c_tmp_f32.is_none() {
             // Static upper bound: covers any (size_n, total_padded) pair
             // we'd ever feed under our shapes (gate_up_dim ≤ 16k,
@@ -192,7 +192,7 @@ impl CudaState {
                 (C_TMP_SIZE_F32 * 4) as f32 / 1e6
             );
         }
-        self.vllm_moe_c_tmp_f32.as_ref().unwrap()
+        self.vllm_moe_c_tmp_f32.as_mut().unwrap()
     }
 
     /// Lazy-init the persistent cuEvents used by
@@ -3421,20 +3421,14 @@ impl Backend for CudaBackend {
         use cudarc::driver::CudaSlice;
         use cudarc::driver::DevicePtr;
 
-        // Resolve c_tmp scratch (lazy-allocates 8 MB on first call). We
-        // pass &mut CudaSlice<f32> to marlin_gemm_moe_vllm so it can
-        // forward the device pointer; the kernel uses it as a global
-        // fp32 reduce scratch (use_fp32_reduce=1 path, ~1.3-1.5× faster
-        // than atomic_add).
-        let c_tmp_handle = ctx.vllm_moe_c_tmp() as *const CudaSlice<f32>;
-        // Re-borrow ctx to grab the stream after the &mut helper above.
+        // Stream is Arc<CudaStream>, so cloning it doesn't borrow ctx and
+        // we can subsequently take &mut for the c_tmp helper.
         let stream = ctx.stream.clone();
-        // SAFETY: c_tmp lives on ctx, which outlives this function call.
-        // We need `&mut CudaSlice<f32>` for the wrapper; the wrapper only
-        // reads its device_ptr (no buffer mutation), so this aliasing is
-        // benign. We can't get &mut directly because we already borrowed
-        // ctx for stream above without dropping the &CudaSlice.
-        let c_tmp_mut: &mut CudaSlice<f32> = unsafe { &mut *(c_tmp_handle as *mut _) };
+        // Resolve c_tmp scratch (lazy-allocates 8 MB on first call). The
+        // wrapper takes &mut so it can forward the device pointer; the
+        // kernel uses c_tmp as a global fp32 reduce scratch
+        // (use_fp32_reduce=1 path, ~1.3-1.5× faster than atomic_add).
+        let c_tmp_mut: &mut CudaSlice<f32> = ctx.vllm_moe_c_tmp();
 
         let (st_ptr, _g0) = sorted_token_ids.device_ptr(&stream);
         let (eid_ptr, _g1) = expert_ids.device_ptr(&stream);
