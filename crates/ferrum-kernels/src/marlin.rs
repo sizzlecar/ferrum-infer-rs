@@ -692,8 +692,11 @@ pub fn marlin_gemm_moe_vllm(
             weight.group_size,
             0, // dev
             raw_stream,
-            0, // use_atomic_add (default off — fp32 reduce path)
-            1, // use_fp32_reduce (matches vLLM default)
+            // Atomic-add path when c_tmp is null (fp32-reduce needs the
+            // scratch buffer; passing it but having c_tmp=null makes the
+            // kernel deref a null pointer → NaN / OOB).
+            if c_tmp_ptr.is_null() { 1 } else { 0 }, // use_atomic_add
+            if c_tmp_ptr.is_null() { 0 } else { 1 }, // use_fp32_reduce
         )
     };
     if ret != 0 {
