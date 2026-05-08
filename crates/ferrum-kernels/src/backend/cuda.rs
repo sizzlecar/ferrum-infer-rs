@@ -3396,9 +3396,6 @@ impl Backend for CudaBackend {
         // routing buffers (the cleanup we wanted for graph capture) hit
         // a CUDA_ERROR_INVALID_VALUE on subsequent memcpys that we
         // couldn't pinpoint — revert keeps the perf wins intact.
-        use cudarc::driver::sys::CUdeviceptr;
-        use cudarc::driver::CudaSlice;
-        use cudarc::driver::DevicePtr;
         let stream = ctx.stream.clone();
         let st: CudaSlice<i32> = stream
             .clone_htod(sorted_token_ids)
