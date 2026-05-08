@@ -2197,16 +2197,9 @@ impl Backend for CudaBackend {
             ctx.moe_route_capacity = total_pairs;
         }
 
-        // 1. Launch the kernel into the cached scratch.
-        // We hand the kernel the i32-typed pointers; the underlying
-        // bytes are writable. Use a temporary `&mut Self::Buffer` view
-        // by taking the cached slice — same trick the rest of the
-        // backend uses (Buffer = CudaSlice<f16>).
-        //
-        // The kernel function call is identical to `route_topk_softmax`
-        // but goes through the CUDA-internal path instead of trait
-        // dispatch (avoids the borrow conflict of mutating ctx.moe_route_*
-        // while ctx is also passed to a generic Self::route_topk_softmax).
+        // 1. Launch the kernel into the cached scratch. Scoped so the
+        // launch_builder (which moves the &mut buffer references) drops
+        // before we re-borrow them immutably for the D2H phase.
         let func = ctx.func(
             "moe_router_topk_softmax",
             ptx::MOE_ROUTER,
@@ -2219,32 +2212,33 @@ impl Backend for CudaBackend {
         let smem_bytes = (num_experts as u32) * 4;
 
         let stream = ctx.stream.clone();
-        // Take mutable refs to the scratch buffers.
-        let ids_dev = ctx
-            .moe_route_ids
-            .as_mut()
-            .expect("moe_route_ids should be allocated");
-        let weights_dev = ctx
-            .moe_route_weights
-            .as_mut()
-            .expect("moe_route_weights should be allocated");
+        {
+            let ids_dev = ctx
+                .moe_route_ids
+                .as_mut()
+                .expect("moe_route_ids should be allocated");
+            let weights_dev = ctx
+                .moe_route_weights
+                .as_mut()
+                .expect("moe_route_weights should be allocated");
 
-        let mut b = stream.launch_builder(&func);
-        b.arg(logits_dev);
-        b.arg(ids_dev);
-        b.arg(weights_dev);
-        b.arg(&batch_i32);
-        b.arg(&n_exp_i32);
-        b.arg(&top_k_i32);
-        b.arg(&norm_i32);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (batch as u32, 1, 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: smem_bytes,
-            })
+            let mut b = stream.launch_builder(&func);
+            b.arg(logits_dev);
+            b.arg(ids_dev);
+            b.arg(weights_dev);
+            b.arg(&batch_i32);
+            b.arg(&n_exp_i32);
+            b.arg(&top_k_i32);
+            b.arg(&norm_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (batch as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: smem_bytes,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("moe_router launch: {e}")))?;
         }
-        .map_err(|e| FerrumError::model(format!("moe_router launch: {e}")))?;
 
         // 2. D2H ids (i32) and weights (f32) into the host destinations.
         out_ids_host.clear();
@@ -2252,8 +2246,17 @@ impl Backend for CudaBackend {
         out_weights_host.clear();
         out_weights_host.resize(total_pairs, 0.0f32);
 
+        let ids_dev = ctx
+            .moe_route_ids
+            .as_ref()
+            .expect("moe_route_ids should be allocated");
+        let weights_dev = ctx
+            .moe_route_weights
+            .as_ref()
+            .expect("moe_route_weights should be allocated");
+
         // Reinterpret the f16-typed scratch as i32 / f32 views. transmute
-        // verifies byte-fit (fails returning None if undersized).
+        // verifies byte-fit (returns None if undersized).
         let ids_view = unsafe {
             ids_dev
                 .transmute::<i32>(total_pairs)
