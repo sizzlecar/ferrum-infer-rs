@@ -284,6 +284,14 @@ fn use_triton_int4() -> bool {
     std::env::var("FERRUM_TRITON_INT4").map_or(false, |v| v == "1")
 }
 
+/// Read `FERRUM_VLLM_MOE` once. Returns true iff `=1`. Selects the
+/// vendored vLLM marlin_moe_wna16 path for stacked-MoE GPTQ INT4
+/// weights (load + dispatch pair must be enabled together).
+#[cfg(feature = "vllm-moe-marlin")]
+pub(crate) fn use_vllm_moe() -> bool {
+    std::env::var("FERRUM_VLLM_MOE").map_or(false, |v| v == "1")
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Backend impl
 // ────────────────────────────────────────────────────────────────────────
@@ -2874,6 +2882,30 @@ impl Backend for CudaBackend {
         }
         let _ = qzeros; // Marlin doesn't read qzeros (sym=true)
 
+        // vLLM marlin_moe_wna16 path: stacked weight in vLLM Marlin tile
+        // format (NOT IST-DASLab). Run gptq_marlin_repack per expert,
+        // permute scales with the same _scale_perm IST-DASLab uses.
+        // Opt-in via FERRUM_VLLM_MOE=1 — paired with the dispatch-side
+        // switch in moe_forward_bucketed.
+        #[cfg(feature = "vllm-moe-marlin")]
+        if use_vllm_moe() {
+            let stream = default_stream();
+            let store = crate::vllm_marlin::load_stacked_gptq_vllm_marlin(
+                &stream,
+                qweights,
+                scales,
+                bits,
+                group_size,
+                k,
+                n_per_expert,
+            )
+            .map_err(|e| FerrumError::model(format!("load_stacked_gptq_vllm_marlin: {e}")))?;
+            tracing::info!(
+                "GPTQ stacked load (vLLM marlin path): {num_experts} experts × N={n_per_expert} × K={k} (gs={group_size})",
+            );
+            return Ok(store);
+        }
+
         // Triton path: would need a stacked variant — not implemented.
         // Fall through to Marlin.
         #[cfg(feature = "triton-kernels")]
@@ -3236,6 +3268,155 @@ impl Backend for CudaBackend {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn upload_moe_routing(
+        ctx: &mut Self::Context,
+        sorted_token_ids: &[i32],
+        expert_ids: &[i32],
+        num_tokens_past_padded: &[i32],
+    ) -> Result<crate::backend::traits::MoeRouting<Self>> {
+        use cudarc::driver::sys::CUdeviceptr;
+        use cudarc::driver::CudaSlice;
+        use cudarc::driver::DevicePtr;
+        let stream = ctx.stream.clone();
+
+        // Upload as i32, then reinterpret as Self::Buffer (= CudaSlice<f16>).
+        // The byte count matches because we keep the i32 element count in
+        // both views (caller-known length).
+        let st: CudaSlice<i32> = stream
+            .clone_htod(sorted_token_ids)
+            .map_err(|e| FerrumError::model(format!("htod sorted_token_ids: {e}")))?;
+        let eid: CudaSlice<i32> = stream
+            .clone_htod(expert_ids)
+            .map_err(|e| FerrumError::model(format!("htod expert_ids: {e}")))?;
+        let npp: CudaSlice<i32> = stream
+            .clone_htod(num_tokens_past_padded)
+            .map_err(|e| FerrumError::model(format!("htod num_tokens_past_padded: {e}")))?;
+
+        // Reinterpret the i32 slices as f16 device buffers (same memory)
+        // so they match the trait's Self::Buffer type. Slice element count
+        // doubles because each i32 is 4 bytes, f16 is 2 bytes — but the
+        // consumer (moe_gemm_phase_vllm) ignores .len() and reads via
+        // device_ptr + caller-known logical length.
+        let (st_ptr, _g0) = st.device_ptr(&stream);
+        let (eid_ptr, _g1) = eid.device_ptr(&stream);
+        let (npp_ptr, _g2) = npp.device_ptr(&stream);
+        let st_f16: CudaSlice<f16> =
+            unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, sorted_token_ids.len() * 2) };
+        let eid_f16: CudaSlice<f16> =
+            unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, expert_ids.len() * 2) };
+        let npp_f16: CudaSlice<f16> = unsafe {
+            stream.upgrade_device_ptr(
+                npp_ptr as CUdeviceptr,
+                num_tokens_past_padded.len() * 2,
+            )
+        };
+        // Forget the i32 owning slices into a context-side Vec so they
+        // outlive the routing struct. We stash them on `ctx` (drop happens
+        // at ctx teardown). Simpler approach: leak via Box, with a Drop
+        // helper. Here we just std::mem::forget — leaks ~few KB per layer.
+        // TODO(perf-stage14b): add a context-side arena once benchmarked.
+        std::mem::forget(st);
+        std::mem::forget(eid);
+        std::mem::forget(npp);
+
+        Ok(crate::backend::traits::MoeRouting {
+            sorted_token_ids: st_f16,
+            expert_ids: eid_f16,
+            num_tokens_past_padded: npp_f16,
+        })
+    }
+
+    fn zero_buffer(ctx: &mut Self::Context, buf: &mut Self::Buffer, len: usize) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        let stream = ctx.stream.clone();
+        let (ptr, _g) = buf.device_ptr(&stream);
+        unsafe {
+            cudarc::driver::sys::cuMemsetD16Async(
+                ptr as cudarc::driver::sys::CUdeviceptr,
+                0,
+                len,
+                stream.cu_stream(),
+            )
+        }
+        .result()
+        .map_err(|e| FerrumError::model(format!("cuMemsetD16Async: {e}")))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn moe_gemm_phase_vllm(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::GptqStore,
+        sorted_token_ids: &Self::Buffer,
+        expert_ids: &Self::Buffer,
+        num_tokens_past_padded: &Self::Buffer,
+        output: &mut Self::Buffer,
+        prob_m: usize,
+        n_per_expert: usize,
+        k: usize,
+        moe_block_size: usize,
+        top_k: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "triton-kernels")]
+        let mw = match weight {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(FerrumError::unsupported(
+                    "moe_gemm_phase_vllm: Triton store unsupported",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = weight;
+
+        // sorted_token_ids / expert_ids / num_tokens_past_padded are i32
+        // device buffers handed in as Self::Buffer (= CudaSlice<f16>).
+        // The marlin_gemm_moe_vllm wrapper uses CudaSlice<i32>, so we
+        // reinterpret each view via upgrade_device_ptr. The view length
+        // is irrelevant — the kernel reads via raw device pointers — so
+        // we hand it `0` to make the leakage cost explicit.
+        use cudarc::driver::sys::CUdeviceptr;
+        use cudarc::driver::CudaSlice;
+        use cudarc::driver::DevicePtr;
+        let stream = ctx.stream.clone();
+        let (st_ptr, _g0) = sorted_token_ids.device_ptr(&stream);
+        let (eid_ptr, _g1) = expert_ids.device_ptr(&stream);
+        let (npp_ptr, _g2) = num_tokens_past_padded.device_ptr(&stream);
+        let st_view: CudaSlice<i32> =
+            unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
+        let eid_view: CudaSlice<i32> =
+            unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
+        let npp_view: CudaSlice<i32> =
+            unsafe { stream.upgrade_device_ptr(npp_ptr as CUdeviceptr, 0) };
+
+        let r = crate::marlin::marlin_gemm_moe_vllm(
+            &stream,
+            input,
+            mw,
+            output,
+            None, // c_tmp — atomic-add path
+            &st_view,
+            &eid_view,
+            &npp_view,
+            None, // topk_weights
+            moe_block_size as i32,
+            top_k as i32,
+            false, // mul_topk_weights
+            false, // is_ep
+            prob_m as i32,
+            n_per_expert as i32,
+            k as i32,
+        );
+        // Views borrow the original device allocations; forgetting prevents
+        // double-free at scope end.
+        std::mem::forget(st_view);
+        std::mem::forget(eid_view);
+        std::mem::forget(npp_view);
+        r.map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
     }
 
     #[cfg(feature = "marlin")]
