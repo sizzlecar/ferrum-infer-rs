@@ -277,18 +277,29 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         let avg_vllm: f32 =
             slice_vllm.iter().map(|x| x.abs()).sum::<f32>() / slice_vllm.len() as f32;
 
+        // Sorted-set test: are ref/vllm the same multiset (just permuted)?
+        let mut ref_sorted: Vec<f32> = slice_ref.to_vec();
+        let mut vllm_sorted: Vec<f32> = slice_vllm.to_vec();
+        ref_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        vllm_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let max_sorted_diff = ref_sorted
+            .iter()
+            .zip(vllm_sorted.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+
         eprintln!(
             "expert {e}: m_e={m_e}, row_start={row_start}, \
-             max|diff|={max_diff:.4} rel={rel:.4} \
+             max|diff|={max_diff:.4} rel={rel:.4} sorted-diff={max_sorted_diff:.4} \
              avg|ref|={avg_ref:.4} avg|vllm|={avg_vllm:.4}"
         );
         eprintln!(
-            "  ref[0..8] = {:?}",
-            &slice_ref[..8.min(slice_ref.len())]
+            "  ref[0..6] = {:?}",
+            &slice_ref[..6.min(slice_ref.len())]
         );
         eprintln!(
-            "  vllm[0..8] = {:?}",
-            &slice_vllm[..8.min(slice_vllm.len())]
+            "  vllm[0..6] = {:?}",
+            &slice_vllm[..6.min(slice_vllm.len())]
         );
     }
     assert!(
