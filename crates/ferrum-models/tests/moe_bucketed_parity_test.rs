@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kernels::backend::Backend;
-use ferrum_models::moe::{moe_forward, moe_forward_bucketed, ExpertStack};
+use ferrum_models::moe::{moe_forward, moe_forward_bucketed, ExpertStack, MoeRouteScratch};
 use ferrum_quantization::{Linear, StackedExpertLinear};
 
 /// Tiny PRNG (same as gptq_parity_test).
@@ -23,12 +23,7 @@ fn rnd_f32(state: &mut u64, lo: f32, hi: f32) -> f32 {
     lo + u * (hi - lo)
 }
 
-fn synth_gptq(
-    k: usize,
-    n: usize,
-    group_size: usize,
-    seed: u64,
-) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+fn synth_gptq(k: usize, n: usize, group_size: usize, seed: u64) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
     let mut rs = seed;
     let num_groups = k / group_size;
     let mut qweight = vec![0i32; (k / 8) * n];
@@ -73,17 +68,13 @@ fn build_stacked(
     let mut qw_acc = Vec::<i32>::with_capacity(qw_rows * total_n);
     for r in 0..qw_rows {
         for e in 0..num_experts {
-            qw_acc.extend_from_slice(
-                &parts[e].0[r * n_per_expert..(r + 1) * n_per_expert],
-            );
+            qw_acc.extend_from_slice(&parts[e].0[r * n_per_expert..(r + 1) * n_per_expert]);
         }
     }
     let mut sc_acc = Vec::<f32>::with_capacity(sc_rows * total_n);
     for r in 0..sc_rows {
         for e in 0..num_experts {
-            sc_acc.extend_from_slice(
-                &parts[e].1[r * n_per_expert..(r + 1) * n_per_expert],
-            );
+            sc_acc.extend_from_slice(&parts[e].1[r * n_per_expert..(r + 1) * n_per_expert]);
         }
     }
     let mut qz_acc = Vec::<i32>::with_capacity(qz_rows * total_n_zeros);
@@ -118,13 +109,15 @@ fn bucketed_matches_per_pair_dispatch() {
     // ExpertStack with both per-expert StackedExpertLinears AND the
     // shared stores (per-pair path uses the former; bucketed path uses
     // the latter).
-    let mut gate_up_per_expert: Vec<Box<dyn Linear<CpuBackend>>> =
-        Vec::with_capacity(num_experts);
+    let mut gate_up_per_expert: Vec<Box<dyn Linear<CpuBackend>>> = Vec::with_capacity(num_experts);
     let mut down_per_expert: Vec<Box<dyn Linear<CpuBackend>>> = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
-        gate_up_per_expert.push(Box::new(
-            StackedExpertLinear::<CpuBackend>::new(gate_up_arc.clone(), e * 2 * inter, 2 * inter, hidden),
-        ));
+        gate_up_per_expert.push(Box::new(StackedExpertLinear::<CpuBackend>::new(
+            gate_up_arc.clone(),
+            e * 2 * inter,
+            2 * inter,
+            hidden,
+        )));
         down_per_expert.push(Box::new(StackedExpertLinear::<CpuBackend>::new(
             down_arc.clone(),
             e * hidden,
@@ -144,7 +137,9 @@ fn bucketed_matches_per_pair_dispatch() {
 
     // Synthetic input + router logits.
     let mut rs = 0xC0FFEEu64;
-    let x: Vec<f32> = (0..batch * hidden).map(|_| rnd_f32(&mut rs, -1.0, 1.0)).collect();
+    let x: Vec<f32> = (0..batch * hidden)
+        .map(|_| rnd_f32(&mut rs, -1.0, 1.0))
+        .collect();
     let router_logits: Vec<f32> = (0..batch * num_experts)
         .map(|_| rnd_f32(&mut rs, -2.0, 2.0))
         .collect();
@@ -187,6 +182,7 @@ fn bucketed_matches_per_pair_dispatch() {
     let mut silu_packed = vec![0.0f32; total_pairs * inter];
     let mut down_packed = vec![0.0f32; total_pairs * hidden];
     let mut ctx_b = ();
+    let mut route_scratch = MoeRouteScratch::new();
     moe_forward_bucketed::<CpuBackend>(
         &mut ctx_b,
         &x,
@@ -203,6 +199,7 @@ fn bucketed_matches_per_pair_dispatch() {
         &mut gate_up_packed,
         &mut silu_packed,
         &mut down_packed,
+        &mut route_scratch,
     )
     .expect("bucketed forward");
 
@@ -214,9 +211,7 @@ fn bucketed_matches_per_pair_dispatch() {
         .fold(0f32, f32::max);
     let mag = out_a.iter().map(|x| x.abs()).fold(0f32, f32::max).max(1e-6);
     let rel = max_diff / mag;
-    eprintln!(
-        "moe_forward vs moe_forward_bucketed: max|diff|={max_diff:.6e} rel={rel:.4e}"
-    );
+    eprintln!("moe_forward vs moe_forward_bucketed: max|diff|={max_diff:.6e} rel={rel:.4e}");
     assert!(
         rel < 1e-4,
         "bucketed path drift too large: rel={rel:.4e}, max|diff|={max_diff:.6e}"

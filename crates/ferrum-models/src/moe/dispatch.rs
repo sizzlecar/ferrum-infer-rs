@@ -672,48 +672,122 @@ pub struct MoeBucketPlan {
     /// pair, copied verbatim from the router output. Used by
     /// `B::moe_combine`.
     pub pair_weights: Vec<f32>,
+    /// Cached cursor scratch for [`Self::rebuild_into`] — sized to
+    /// `num_experts` on first build and reused (one alloc total instead
+    /// of one per call).
+    cursors: Vec<usize>,
 }
 
 impl MoeBucketPlan {
+    /// Empty plan with no allocation. Use [`Self::rebuild_into`] before
+    /// reuse — this is the cheap constructor for putting the plan in a
+    /// scratch struct.
+    pub fn empty() -> Self {
+        Self {
+            expert_offsets: Vec::new(),
+            packed_token_idx: Vec::new(),
+            pairs_by_token: Vec::new(),
+            pair_weights: Vec::new(),
+            cursors: Vec::new(),
+        }
+    }
+
+    /// Allocate a fresh plan. Convenience wrapper over [`Self::rebuild_into`]
+    /// for tests and code paths that don't care about reuse.
     pub fn build(route: &RouterOutput, batch: usize, num_experts: usize, top_k: usize) -> Self {
+        let mut p = Self::empty();
+        p.rebuild_into(route, batch, num_experts, top_k);
+        p
+    }
+
+    /// Allocation-free rebuild. Reuses the existing `expert_offsets`,
+    /// `packed_token_idx`, `pairs_by_token`, `pair_weights` buffers via
+    /// `clear() + resize()`. Uses the trailing tail of `expert_offsets`
+    /// as the host-side cursor scratch (saves the per-call `cursors.clone()`).
+    pub fn rebuild_into(
+        &mut self,
+        route: &RouterOutput,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) {
         debug_assert_eq!(route.expert_ids.len(), batch * top_k);
         debug_assert_eq!(route.expert_weights.len(), batch * top_k);
         let total_pairs = batch * top_k;
 
-        // Pass 1: count pairs per expert.
-        let mut counts = vec![0usize; num_experts];
+        self.expert_offsets.clear();
+        self.expert_offsets.resize(num_experts + 1, 0);
+        self.packed_token_idx.clear();
+        self.packed_token_idx.resize(total_pairs, 0);
+        self.pairs_by_token.clear();
+        self.pairs_by_token.resize(total_pairs, -1);
+
+        // Pass 1: count pairs per expert. Stored into expert_offsets[1..]
+        // so the inclusive-prefix-sum in Pass 2 can run in place — no
+        // separate `counts` Vec.
         for &eid in &route.expert_ids {
-            counts[eid as usize] += 1;
+            self.expert_offsets[eid as usize + 1] += 1;
         }
 
-        // Pass 2: cumsum → expert_offsets.
-        let mut expert_offsets = vec![0usize; num_experts + 1];
+        // Pass 2: in-place inclusive prefix sum → expert_offsets[].
         for e in 0..num_experts {
-            expert_offsets[e + 1] = expert_offsets[e] + counts[e];
+            self.expert_offsets[e + 1] += self.expert_offsets[e];
         }
 
         // Pass 3: fill packed_token_idx + pairs_by_token by walking pairs
-        // in (b, k) order and bucketing.
-        let mut packed_token_idx = vec![0u32; total_pairs];
-        let mut pairs_by_token = vec![-1i32; total_pairs];
-        let mut cursors = expert_offsets.clone();
+        // in (b, k) order and bucketing. The `cursors` scratch tracks how
+        // many pairs each expert has already received; on first call it
+        // grows to `num_experts`, subsequent calls reuse the allocation.
+        self.cursors.clear();
+        self.cursors
+            .extend_from_slice(&self.expert_offsets[..num_experts]);
+
         for b in 0..batch {
             for k in 0..top_k {
                 let pair_flat = b * top_k + k;
                 let eid = route.expert_ids[pair_flat] as usize;
-                let slot = cursors[eid];
-                cursors[eid] += 1;
-                packed_token_idx[slot] = b as u32;
-                pairs_by_token[pair_flat] = slot as i32;
+                let slot = self.cursors[eid];
+                self.cursors[eid] += 1;
+                self.packed_token_idx[slot] = b as u32;
+                self.pairs_by_token[pair_flat] = slot as i32;
             }
         }
 
+        // Pair weights: replicate from RouterOutput. Reuse self's vector
+        // via clear() + extend rather than the per-call `clone()`.
+        self.pair_weights.clear();
+        self.pair_weights.extend_from_slice(&route.expert_weights);
+    }
+}
+
+/// Reusable host-side scratch for [`moe_forward_bucketed`]. Holds the
+/// router output, softmax scratch buffer, and bucket plan, all reused
+/// across layers so the inner MoE forward path is allocation-free.
+///
+/// At c=32 / Qwen3-MoE / 48 layers, the previous fresh-`Vec`-per-layer
+/// pattern accounted for ~10 ms / token of pure CPU softmax+sort+alloc
+/// (25% of MoE wallclock — see `docs/bench/cuda-rtx4090-2026-05-08-m3-moe`).
+pub struct MoeRouteScratch {
+    pub output: RouterOutput,
+    /// Softmax buffer reused across all rows of all layers — sized to
+    /// `num_experts` on first use.
+    pub probs: Vec<f32>,
+    pub plan: MoeBucketPlan,
+}
+
+impl MoeRouteScratch {
+    pub fn new() -> Self {
         Self {
-            expert_offsets,
-            packed_token_idx,
-            pairs_by_token,
-            pair_weights: route.expert_weights.clone(),
+            output: RouterOutput::empty(),
+            probs: Vec::new(),
+            plan: MoeBucketPlan::empty(),
         }
+    }
+}
+
+impl Default for MoeRouteScratch {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -750,6 +824,7 @@ pub fn moe_forward_bucketed<B: Backend>(
     gate_up_packed: &mut B::Buffer,
     silu_packed: &mut B::Buffer,
     down_packed: &mut B::Buffer,
+    route_scratch: &mut MoeRouteScratch,
 ) -> Result<()> {
     if experts.num_experts() != num_experts {
         return Err(FerrumError::model(format!(
@@ -766,35 +841,65 @@ pub fn moe_forward_bucketed<B: Backend>(
     }
 
     // ── Routing on host (same as moe_forward) ──────────────────────────
-    let t_sync = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_sync = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     B::sync(ctx);
     if let Some(t) = t_sync {
         MOE_BUCKET_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
-    let t_d2h = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_d2h = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let logits_host = B::to_vec(router_logits, batch * num_experts);
     if let Some(t) = t_d2h {
         MOE_BUCKET_D2H_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
-    let t_route = if prof { Some(std::time::Instant::now()) } else { None };
-    let route_out =
-        crate::moe::router::route(&logits_host, batch, num_experts, top_k, norm_topk_prob);
+    let t_route = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    crate::moe::router::route_into(
+        &logits_host,
+        batch,
+        num_experts,
+        top_k,
+        norm_topk_prob,
+        &mut route_scratch.output,
+        &mut route_scratch.probs,
+    );
     if let Some(t) = t_route {
         MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     // ── Build bucket plan host-side ────────────────────────────────────
-    let t_plan = if prof { Some(std::time::Instant::now()) } else { None };
-    let plan = MoeBucketPlan::build(&route_out, batch, num_experts, top_k);
+    let t_plan = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    route_scratch
+        .plan
+        .rebuild_into(&route_scratch.output, batch, num_experts, top_k);
+    let plan = &route_scratch.plan;
     if let Some(t) = t_plan {
         MOE_BUCKET_PLAN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     // ── Gather: x_packed[i] = x[plan.packed_token_idx[i]] ──────────────
     // embedding_lookup is byte-for-byte the gather we need.
-    let t_gather = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_gather = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     B::embedding_lookup(ctx, x, &plan.packed_token_idx, x_packed, hidden_size);
     if let Some(t) = t_gather {
         B::sync(ctx);
@@ -822,8 +927,7 @@ pub fn moe_forward_bucketed<B: Backend>(
 
     // Build the dispatch list for phase 1. (expert_idx, in_row, out_row, m)
     // for each active expert. Send to the multi-stream batched dispatcher.
-    let mut phase1_dispatches: Vec<(usize, usize, usize, usize)> =
-        Vec::with_capacity(num_experts);
+    let mut phase1_dispatches: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
         let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
         if m_e == 0 {
@@ -832,7 +936,11 @@ pub fn moe_forward_bucketed<B: Backend>(
         let pair_off = plan.expert_offsets[e];
         phase1_dispatches.push((e, pair_off, pair_off, m_e));
     }
-    let t_gemm1 = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_gemm1 = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     B::moe_gemm_phase_batched(
         ctx,
         x_packed,
@@ -853,7 +961,11 @@ pub fn moe_forward_bucketed<B: Backend>(
     // ignores via pairs_by_token. Saves num_active_experts-1 launches
     // per layer.
     let total_pairs_active = batch * top_k;
-    let t_silu = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_silu = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     B::fused_silu_mul_split(
         ctx,
         gate_up_packed,
@@ -874,8 +986,7 @@ pub fn moe_forward_bucketed<B: Backend>(
         )
     })?;
     let _ = B::marlin_zero_stacked_workspace(ctx, d_store);
-    let mut phase3_dispatches: Vec<(usize, usize, usize, usize)> =
-        Vec::with_capacity(num_experts);
+    let mut phase3_dispatches: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
         let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
         if m_e == 0 {
@@ -884,7 +995,11 @@ pub fn moe_forward_bucketed<B: Backend>(
         let pair_off = plan.expert_offsets[e];
         phase3_dispatches.push((e, pair_off, pair_off, m_e));
     }
-    let t_gemm3 = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_gemm3 = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     B::moe_gemm_phase_batched(
         ctx,
         silu_packed,
@@ -901,7 +1016,11 @@ pub fn moe_forward_bucketed<B: Backend>(
 
     // ── Combine: out[b, h] = Σ_k weights[b,k] * down_packed[pairs_by_token[b,k], h]
     let total_pairs = batch * top_k;
-    let t_comb = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_comb = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     B::moe_combine(
         ctx,
         down_packed,

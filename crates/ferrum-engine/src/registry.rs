@@ -1038,13 +1038,14 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                     let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match &config.device {
                         Device::CPU => {
                             info!("  Backend: CPU");
-                            let weight_loader =
-                                ferrum_quantization::NativeSafetensorsLoader::<
-                                    ferrum_kernels::backend::cpu::CpuBackend,
-                                >::open(&model_path)?;
+                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
+                                ferrum_kernels::backend::cpu::CpuBackend,
+                            >::open(&model_path)?;
                             Box::new(ferrum_models::models::Qwen3MoeModel::<
                                 ferrum_kernels::backend::cpu::CpuBackend,
-                            >::new_safetensors(mc, &weight_loader)?)
+                            >::new_safetensors(
+                                mc, &weight_loader
+                            )?)
                         }
                         Device::CUDA(_) => {
                             #[cfg(feature = "cuda")]
@@ -1056,7 +1057,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                                     >::open(&model_path)?;
                                 Box::new(ferrum_models::models::Qwen3MoeModel::<
                                     ferrum_kernels::backend::cuda::CudaBackend,
-                                >::new_safetensors(mc, &weight_loader)?)
+                                >::new_safetensors(
+                                    mc, &weight_loader
+                                )?)
                             }
                             #[cfg(not(feature = "cuda"))]
                             {

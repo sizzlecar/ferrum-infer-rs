@@ -1295,11 +1295,22 @@ impl Backend for CudaBackend {
 
         if use_split_k {
             return paged_varlen_split_k_dispatch(
-                ctx, q, k_pool, v_pool, out,
-                cu_seqlens_q, pos_offsets, block_tables,
-                num_seqs, total_q_tokens, max_kv_len,
-                num_heads, num_kv_heads, head_dim,
-                block_size, max_blocks_per_seq,
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                out,
+                cu_seqlens_q,
+                pos_offsets,
+                block_tables,
+                num_seqs,
+                total_q_tokens,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_blocks_per_seq,
             );
         }
 
@@ -2404,17 +2415,12 @@ impl Backend for CudaBackend {
                 } else {
                     qweights[e].to_vec()
                 };
-                let qw_packed =
-                    crate::marlin::repack_gptq_to_marlin(&qw_in, k, n_per_expert);
+                let qw_packed = crate::marlin::repack_gptq_to_marlin(&qw_in, k, n_per_expert);
                 qw_out.copy_from_slice(&qw_packed);
 
                 let sc_f16: Vec<f16> = scales[e].iter().map(|&x| f16::from_f32(x)).collect();
-                let sc_packed = crate::marlin::repack_scales_to_marlin(
-                    &sc_f16,
-                    k,
-                    n_per_expert,
-                    group_size,
-                );
+                let sc_packed =
+                    crate::marlin::repack_scales_to_marlin(&sc_f16, k, n_per_expert, group_size);
                 sc_out.copy_from_slice(&sc_packed);
             });
 
@@ -2652,7 +2658,7 @@ impl Backend for CudaBackend {
         let mut entry_event: cu::CUevent = std::ptr::null_mut();
         unsafe {
             // 2 = CU_EVENT_DISABLE_TIMING — fastest event create, we don't need timestamps.
-cu::cuEventCreate(&mut entry_event, 2);
+            cu::cuEventCreate(&mut entry_event, 2);
             cu::cuEventRecord(entry_event, default_stream.cu_stream());
         }
         for stream in &pool {
@@ -2664,9 +2670,7 @@ cu::cuEventCreate(&mut entry_event, 2);
             cu::cuEventDestroy_v2(entry_event);
         }
 
-        for (i, (expert_idx, in_row_offset, out_row_offset, m)) in
-            dispatches.iter().enumerate()
-        {
+        for (i, (expert_idx, in_row_offset, out_row_offset, m)) in dispatches.iter().enumerate() {
             let stream = &pool[i % n_streams];
             crate::marlin::marlin_gemm_with_offset_strided(
                 stream,
@@ -3338,11 +3342,11 @@ fn with_marlin_gather_scratch<R>(
 /// (partial_out f32, partial_m f32, partial_l f32) sized to the largest
 /// shape ever requested. Same lazy-grow pattern as Marlin gather scratch.
 struct SplitKScratch {
-    partial_out: CudaSlice<f32>,    // [M_total * num_q_heads * num_splits * head_dim]
-    partial_m:   CudaSlice<f32>,    // [M_total * num_q_heads * num_splits]
-    partial_l:   CudaSlice<f32>,    // [M_total * num_q_heads * num_splits]
+    partial_out: CudaSlice<f32>, // [M_total * num_q_heads * num_splits * head_dim]
+    partial_m: CudaSlice<f32>,   // [M_total * num_q_heads * num_splits]
+    partial_l: CudaSlice<f32>,   // [M_total * num_q_heads * num_splits]
     out_capacity: usize,
-    ml_capacity:  usize,
+    ml_capacity: usize,
 }
 unsafe impl Send for SplitKScratch {}
 unsafe impl Sync for SplitKScratch {}
@@ -3380,14 +3384,16 @@ fn with_split_k_scratch<R>(
     if need_new {
         let partial_out = unsafe { stream.alloc::<f32>(out_required) }
             .expect("SPLIT_K_SCRATCH partial_out alloc");
-        let partial_m = unsafe { stream.alloc::<f32>(ml_required) }
-            .expect("SPLIT_K_SCRATCH partial_m alloc");
-        let partial_l = unsafe { stream.alloc::<f32>(ml_required) }
-            .expect("SPLIT_K_SCRATCH partial_l alloc");
+        let partial_m =
+            unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_m alloc");
+        let partial_l =
+            unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_l alloc");
         *w = Some(SplitKScratch {
-            partial_out, partial_m, partial_l,
+            partial_out,
+            partial_m,
+            partial_l,
             out_capacity: out_required,
-            ml_capacity:  ml_required,
+            ml_capacity: ml_required,
         });
     }
     let s = w.as_mut().expect("just allocated");
@@ -3419,15 +3425,15 @@ fn paged_varlen_split_k_dispatch(
     //   kv ≤ 2048 → N=8
     //   else      → N=16
     let num_splits: usize = match max_kv_len {
-        kv if kv <= 384  => 2,
+        kv if kv <= 384 => 2,
         kv if kv <= 1024 => 4,
         kv if kv <= 2048 => 8,
-        _                => 16,
+        _ => 16,
     };
 
     let chunk = (max_kv_len + num_splits - 1) / num_splits;
     let out_required = total_q_tokens * num_heads * num_splits * head_dim;
-    let ml_required  = total_q_tokens * num_heads * num_splits;
+    let ml_required = total_q_tokens * num_heads * num_splits;
     let scale: f32 = 1.0 / (head_dim as f32).sqrt();
     let stream = ctx.stream.clone();
 
@@ -3442,76 +3448,81 @@ fn paged_varlen_split_k_dispatch(
         "paged_varlen_split_k_reduce_f16",
     );
 
-    with_split_k_scratch(&stream, out_required, ml_required, |partial_out, partial_m, partial_l| {
-        let qv = q.slice(..);
-        let kp = k_pool.slice(..);
-        let vp = v_pool.slice(..);
-        let csq = cu_seqlens_q.slice(..);
-        let po = pos_offsets.slice(..);
-        let bt = block_tables.slice(..);
-        let pout = partial_out.slice(..);
-        let pm   = partial_m.slice(..);
-        let pl   = partial_l.slice(..);
-        let ns   = num_seqs as i32;
-        let nqi  = num_heads as i32;
-        let nkvi = num_kv_heads as i32;
-        let hdi  = head_dim as i32;
-        let mbps = max_blocks_per_seq as i32;
-        let bsi  = block_size as i32;
-        let nsp  = num_splits as i32;
+    with_split_k_scratch(
+        &stream,
+        out_required,
+        ml_required,
+        |partial_out, partial_m, partial_l| {
+            let qv = q.slice(..);
+            let kp = k_pool.slice(..);
+            let vp = v_pool.slice(..);
+            let csq = cu_seqlens_q.slice(..);
+            let po = pos_offsets.slice(..);
+            let bt = block_tables.slice(..);
+            let pout = partial_out.slice(..);
+            let pm = partial_m.slice(..);
+            let pl = partial_l.slice(..);
+            let ns = num_seqs as i32;
+            let nqi = num_heads as i32;
+            let nkvi = num_kv_heads as i32;
+            let hdi = head_dim as i32;
+            let mbps = max_blocks_per_seq as i32;
+            let bsi = block_size as i32;
+            let nsp = num_splits as i32;
 
-        // Phase 1: (num_heads, M_total, num_splits)
-        let mut b1 = stream.launch_builder(&phase1);
-        b1.arg(&qv);
-        b1.arg(&kp);
-        b1.arg(&vp);
-        b1.arg(&csq);
-        b1.arg(&po);
-        b1.arg(&bt);
-        b1.arg(&pout);
-        b1.arg(&pm);
-        b1.arg(&pl);
-        b1.arg(&ns);
-        b1.arg(&nqi);
-        b1.arg(&nkvi);
-        b1.arg(&hdi);
-        b1.arg(&mbps);
-        b1.arg(&bsi);
-        b1.arg(&scale);
-        b1.arg(&nsp);
-        let shmem1 = (chunk.max(1) as u32) * 4;
-        unsafe {
-            b1.launch(LaunchConfig {
-                grid_dim: (num_heads as u32, total_q_tokens as u32, num_splits as u32),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: shmem1,
-            })
-        }
-        .map_err(|e| FerrumError::model(format!("paged_varlen_split_k_phase1: {e}")))?;
+            // Phase 1: (num_heads, M_total, num_splits)
+            let mut b1 = stream.launch_builder(&phase1);
+            b1.arg(&qv);
+            b1.arg(&kp);
+            b1.arg(&vp);
+            b1.arg(&csq);
+            b1.arg(&po);
+            b1.arg(&bt);
+            b1.arg(&pout);
+            b1.arg(&pm);
+            b1.arg(&pl);
+            b1.arg(&ns);
+            b1.arg(&nqi);
+            b1.arg(&nkvi);
+            b1.arg(&hdi);
+            b1.arg(&mbps);
+            b1.arg(&bsi);
+            b1.arg(&scale);
+            b1.arg(&nsp);
+            let shmem1 = (chunk.max(1) as u32) * 4;
+            unsafe {
+                b1.launch(LaunchConfig {
+                    grid_dim: (num_heads as u32, total_q_tokens as u32, num_splits as u32),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: shmem1,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("paged_varlen_split_k_phase1: {e}")))?;
 
-        // Phase 2: (num_heads, M_total)
-        let pout2 = partial_out.slice(..);
-        let pm2   = partial_m.slice(..);
-        let pl2   = partial_l.slice(..);
-        let mut b2 = stream.launch_builder(&reduce);
-        b2.arg(&pout2);
-        b2.arg(&pm2);
-        b2.arg(&pl2);
-        b2.arg(out);
-        b2.arg(&nqi);
-        b2.arg(&hdi);
-        b2.arg(&nsp);
-        unsafe {
-            b2.launch(LaunchConfig {
-                grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map_err(|e| FerrumError::model(format!("paged_varlen_split_k_reduce: {e}")))?;
+            // Phase 2: (num_heads, M_total)
+            let pout2 = partial_out.slice(..);
+            let pm2 = partial_m.slice(..);
+            let pl2 = partial_l.slice(..);
+            let mut b2 = stream.launch_builder(&reduce);
+            b2.arg(&pout2);
+            b2.arg(&pm2);
+            b2.arg(&pl2);
+            b2.arg(out);
+            b2.arg(&nqi);
+            b2.arg(&hdi);
+            b2.arg(&nsp);
+            unsafe {
+                b2.launch(LaunchConfig {
+                    grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("paged_varlen_split_k_reduce: {e}")))?;
 
-        Ok::<(), FerrumError>(())
-    })
+            Ok::<(), FerrumError>(())
+        },
+    )
 }
 
 fn marlin_gemm_with_perm(

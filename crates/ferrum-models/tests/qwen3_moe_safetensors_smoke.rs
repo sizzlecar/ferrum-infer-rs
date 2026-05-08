@@ -21,8 +21,8 @@
 
 use ferrum_kernels::backend::cuda::CudaBackend;
 use ferrum_models::common::DecoderOnlyLLM;
-use ferrum_models::moe_config::Qwen3MoeConfig;
 use ferrum_models::models::Qwen3MoeModel;
+use ferrum_models::moe_config::Qwen3MoeConfig;
 use ferrum_quantization::NativeSafetensorsLoader;
 
 fn m3_path() -> std::path::PathBuf {
@@ -57,8 +57,8 @@ fn load_model() -> Qwen3MoeModel<CudaBackend> {
     });
 
     let cfg = Qwen3MoeConfig::from_def(&model_def).expect("Qwen3MoeConfig::from_def");
-    let loader = NativeSafetensorsLoader::<CudaBackend>::open(&path)
-        .expect("NativeSafetensorsLoader::open");
+    let loader =
+        NativeSafetensorsLoader::<CudaBackend>::open(&path).expect("NativeSafetensorsLoader::open");
 
     let t0 = std::time::Instant::now();
     let model =
@@ -117,10 +117,7 @@ fn m3_decode_advances_kv() {
     for step in 0..5 {
         let pos = (prompt.len() + step) as u32;
         let logits = model.decode("seq1", 5 + step as u32, pos);
-        let bad = logits
-            .iter()
-            .filter(|v| !v.is_finite())
-            .count();
+        let bad = logits.iter().filter(|v| !v.is_finite()).count();
         assert_eq!(bad, 0, "step {step}: {bad} non-finite logits");
     }
 }

@@ -100,9 +100,7 @@ impl Qwen3MoeConfig {
             .get("num_experts")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
-                ferrum_types::FerrumError::model(
-                    "qwen3_moe config.json missing num_experts",
-                )
+                ferrum_types::FerrumError::model("qwen3_moe config.json missing num_experts")
             })? as usize;
         let num_experts_per_tok = extra
             .get("num_experts_per_tok")

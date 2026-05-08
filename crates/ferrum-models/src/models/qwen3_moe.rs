@@ -242,6 +242,11 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub paged_max_blocks_per_seq: usize,
 
     pub max_tokens: usize,
+
+    /// Allocation-free host scratch for the bucketed MoE forward path.
+    /// Holds RouterOutput / softmax buffer / MoeBucketPlan reused across
+    /// every layer (~10 ms / token reclaimed at c=32 / Qwen3-MoE 30B-A3B).
+    pub moe_route_scratch: crate::moe::MoeRouteScratch,
 }
 
 impl<B: Backend> Qwen3MoeScratch<B> {
@@ -314,6 +319,7 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             paged_batch_context_lens: None,
             paged_max_blocks_per_seq: 0,
             max_tokens: t,
+            moe_route_scratch: crate::moe::MoeRouteScratch::new(),
         }
     }
 
@@ -540,8 +546,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
         let mut moe_layers = Vec::with_capacity(cfg.base.num_layers);
         for li in 0..cfg.base.num_layers {
             let prefix = format!("model.layers.{li}");
-            let input_ln_w =
-                loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
+            let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
             let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
             let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
             let post_ln_w =
@@ -594,26 +599,20 @@ impl<B: Backend> Qwen3MoeModel<B> {
             // are contiguous in the GPU buffer, so offset GEMM
             // dispatches via pointer offset alone — no stride magic.
             let expert_prefix = format!("{prefix}.mlp.experts.{{e}}.");
-            let probe_split = loader.has_tensor(&format!(
-                "{prefix}.mlp.experts.0.gate_proj.qweight"
-            ));
+            let probe_split =
+                loader.has_tensor(&format!("{prefix}.mlp.experts.0.gate_proj.qweight"));
             let gate_up_projs: &[&str] = if probe_split {
                 &["gate_proj", "up_proj"]
             } else {
                 &["gate_up_proj"]
             };
-            let (gate_up_store, gate_up_n_per_expert, gate_up_k) = loader
-                .load_stacked_gptq_experts(
-                    &expert_prefix,
-                    cfg.num_experts,
-                    gate_up_projs,
-                )?;
-            let (down_store, down_n_per_expert, down_k) = loader
-                .load_stacked_gptq_experts(
-                    &expert_prefix,
-                    cfg.num_experts,
-                    &["down_proj"],
-                )?;
+            let (gate_up_store, gate_up_n_per_expert, gate_up_k) =
+                loader.load_stacked_gptq_experts(&expert_prefix, cfg.num_experts, gate_up_projs)?;
+            let (down_store, down_n_per_expert, down_k) = loader.load_stacked_gptq_experts(
+                &expert_prefix,
+                cfg.num_experts,
+                &["down_proj"],
+            )?;
             let gate_up_arc = std::sync::Arc::new(gate_up_store);
             let down_arc = std::sync::Arc::new(down_store);
 
@@ -622,18 +621,22 @@ impl<B: Backend> Qwen3MoeModel<B> {
             let mut down: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
                 Vec::with_capacity(cfg.num_experts);
             for e in 0..cfg.num_experts {
-                gate_up.push(Box::new(ferrum_quantization::StackedExpertLinear::<B>::new(
-                    gate_up_arc.clone(),
-                    e * gate_up_n_per_expert,
-                    gate_up_n_per_expert,
-                    gate_up_k,
-                )));
-                down.push(Box::new(ferrum_quantization::StackedExpertLinear::<B>::new(
-                    down_arc.clone(),
-                    e * down_n_per_expert,
-                    down_n_per_expert,
-                    down_k,
-                )));
+                gate_up.push(Box::new(
+                    ferrum_quantization::StackedExpertLinear::<B>::new(
+                        gate_up_arc.clone(),
+                        e * gate_up_n_per_expert,
+                        gate_up_n_per_expert,
+                        gate_up_k,
+                    ),
+                ));
+                down.push(Box::new(
+                    ferrum_quantization::StackedExpertLinear::<B>::new(
+                        down_arc.clone(),
+                        e * down_n_per_expert,
+                        down_n_per_expert,
+                        down_k,
+                    ),
+                ));
             }
             let experts = crate::moe::ExpertStack::<B> {
                 gate_up,
@@ -1300,6 +1303,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 &mut self.scratch.gate_up_packed_bucket,
                 &mut self.scratch.silu_stacked,
                 &mut self.scratch.down_out_stacked,
+                &mut self.scratch.moe_route_scratch,
             )?;
         } else if stacked_path_available {
             if tokens > 1 {
@@ -1760,8 +1764,15 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 let bk_silu_us = MOE_BUCKET_SILU_US.swap(0, Ordering::Relaxed);
                 let bk_g3 = MOE_BUCKET_GEMM3_US.swap(0, Ordering::Relaxed);
                 let bk_comb = MOE_BUCKET_COMBINE_US.swap(0, Ordering::Relaxed);
-                let bk_total = bk_sync + bk_d2h + bk_route + bk_plan + bk_gather
-                    + bk_g1 + bk_silu_us + bk_g3 + bk_comb;
+                let bk_total = bk_sync
+                    + bk_d2h
+                    + bk_route
+                    + bk_plan
+                    + bk_gather
+                    + bk_g1
+                    + bk_silu_us
+                    + bk_g3
+                    + bk_comb;
                 eprintln!(
                     "[bucket-prof] layers={} bk_total={} ms | sync={} d2h={} host_route={} plan={} gather={} gemm1={} silu={} gemm3={} combine={} (us, summed across layers)",
                     bk_layers, bk_total / 1000,
@@ -1902,8 +1913,15 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 let bk_silu = MOE_BUCKET_SILU_US.swap(0, Ordering::Relaxed);
                 let bk_g3 = MOE_BUCKET_GEMM3_US.swap(0, Ordering::Relaxed);
                 let bk_comb = MOE_BUCKET_COMBINE_US.swap(0, Ordering::Relaxed);
-                let bk_total = bk_sync + bk_d2h + bk_route + bk_plan + bk_gather
-                    + bk_g1 + bk_silu + bk_g3 + bk_comb;
+                let bk_total = bk_sync
+                    + bk_d2h
+                    + bk_route
+                    + bk_plan
+                    + bk_gather
+                    + bk_g1
+                    + bk_silu
+                    + bk_g3
+                    + bk_comb;
                 eprintln!(
                     "[bucket-prof] layers={} bk_total={} ms | sync={} d2h={} host_route={} plan={} gather={} gemm1={} silu={} gemm3={} combine={} (us, summed across layers)",
                     bk_layers, bk_total / 1000,
@@ -2689,6 +2707,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 &mut self.scratch.gate_up_packed_bucket,
                 &mut self.scratch.silu_stacked,
                 &mut self.scratch.down_out_stacked,
+                &mut self.scratch.moe_route_scratch,
             )?;
         } else {
             // Backend without stacked variants — fall back to the legacy

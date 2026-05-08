@@ -344,8 +344,7 @@ pub fn marlin_gemm_with_offset_strided(
     let sc_per_expert_f16 = num_groups * n_per;
     let scales_offset_bytes = expert_idx * sc_per_expert_f16 * std::mem::size_of::<half::f16>();
 
-    let in_offset_bytes =
-        in_row_offset as usize * (k as usize) * std::mem::size_of::<half::f16>();
+    let in_offset_bytes = in_row_offset as usize * (k as usize) * std::mem::size_of::<half::f16>();
     let out_offset_bytes =
         out_row_offset as usize * (n as usize) * std::mem::size_of::<half::f16>();
 

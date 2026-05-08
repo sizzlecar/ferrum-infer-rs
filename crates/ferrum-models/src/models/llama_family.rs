@@ -4096,7 +4096,9 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 );
                 if let Err(e) = r {
                     // Backend may not implement; fall through to varlen.
-                    eprintln!("[unified] paged_batched_decode unsupported, falling back to varlen: {e}");
+                    eprintln!(
+                        "[unified] paged_batched_decode unsupported, falling back to varlen: {e}"
+                    );
                     let cu_seqlens_buf = self
                         .scratch
                         .unified_cu_seqlens_q

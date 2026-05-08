@@ -517,7 +517,9 @@ impl EngineInner {
                         .then_with(|| a.generated_tokens.len().cmp(&b.generated_tokens.len()))
                         // Finally, lowest priority by max_tokens proxy.
                         .then_with(|| {
-                            a.sampling_params.max_tokens.cmp(&b.sampling_params.max_tokens)
+                            a.sampling_params
+                                .max_tokens
+                                .cmp(&b.sampling_params.max_tokens)
                         })
                 })
                 .map(|(id, _)| id.clone())
@@ -837,7 +839,11 @@ impl EngineInner {
         use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
 
         let prof_wall = std::env::var("FERRUM_ENGINE_WALL_PROF").is_ok();
-        let t_a = if prof_wall { Some(Instant::now()) } else { None };
+        let t_a = if prof_wall {
+            Some(Instant::now())
+        } else {
+            None
+        };
 
         let rids: Vec<RequestId> = request_ids.to_vec();
 
@@ -881,7 +887,11 @@ impl EngineInner {
             }
         }
 
-        let t_b = if prof_wall { Some(Instant::now()) } else { None };
+        let t_b = if prof_wall {
+            Some(Instant::now())
+        } else {
+            None
+        };
 
         let results = self.model_executor.unified_decode(&batch).await?;
         if results.len() != rids.len() {
@@ -892,7 +902,11 @@ impl EngineInner {
             )));
         }
 
-        let t_c = if prof_wall { Some(Instant::now()) } else { None };
+        let t_c = if prof_wall {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let mut sample_us: u128 = 0;
         let mut emit_us: u128 = 0;
         let mut stop_us: u128 = 0;
@@ -907,7 +921,11 @@ impl EngineInner {
                 ))
             })?;
 
-            let t_sample0 = if prof_wall { Some(Instant::now()) } else { None };
+            let t_sample0 = if prof_wall {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let next_token = {
                 let mut sequences = self.sequences.write();
                 let seq = sequences
@@ -943,13 +961,21 @@ impl EngineInner {
                 sample_us += t0.elapsed().as_micros();
             }
 
-            let t_emit0 = if prof_wall { Some(Instant::now()) } else { None };
+            let t_emit0 = if prof_wall {
+                Some(Instant::now())
+            } else {
+                None
+            };
             self.send_stream_update(rid, next_token).await;
             if let Some(t0) = t_emit0 {
                 emit_us += t0.elapsed().as_micros();
             }
 
-            let t_stop0 = if prof_wall { Some(Instant::now()) } else { None };
+            let t_stop0 = if prof_wall {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let should_stop = {
                 let sequences = self.sequences.read();
                 sequences
@@ -1057,7 +1083,10 @@ impl EngineInner {
             }
             let tokens_len = {
                 let sequences = self.sequences.read();
-                sequences.get(rid).map(|s| s.input_tokens.len()).unwrap_or(0)
+                sequences
+                    .get(rid)
+                    .map(|s| s.input_tokens.len())
+                    .unwrap_or(0)
             };
             if tokens_len == 0 {
                 continue;
@@ -1105,8 +1134,11 @@ impl EngineInner {
         let mut batch = UnifiedBatch::new();
         // For each batch item, remember which seq it belongs to and how
         // many KV slots we'll consume — used to bump pos_offset post-call.
-        let mut item_kinds: Vec<(RequestId, bool /*is_prefill*/, usize /*chunk_len*/)> =
-            Vec::with_capacity(prefill_ids.len() + decode_ids.len());
+        let mut item_kinds: Vec<(
+            RequestId,
+            bool,  /*is_prefill*/
+            usize, /*chunk_len*/
+        )> = Vec::with_capacity(prefill_ids.len() + decode_ids.len());
 
         {
             let sequences = self.sequences.read();
@@ -1197,8 +1229,7 @@ impl EngineInner {
 
         // Process per-item results: bump KV len, advance prefill_pos,
         // sample for final-chunk items, stream tokens.
-        for ((rid, is_prefill, chunk_len), logits_opt) in
-            item_kinds.iter().zip(results.into_iter())
+        for ((rid, is_prefill, chunk_len), logits_opt) in item_kinds.iter().zip(results.into_iter())
         {
             // Bump engine-side KV handle by chunk_len so the NEXT iter's
             // pos_offset reflects what the model already consumed.
@@ -1236,15 +1267,11 @@ impl EngineInner {
                     self.scheduler.mark_prefill_complete(rid, total_tokens);
                     self.total_prefill_tokens
                         .fetch_add(total_tokens as u64, Ordering::Relaxed);
-                    counter!("ferrum.engine.prefill_tokens_total")
-                        .increment(total_tokens as u64);
+                    counter!("ferrum.engine.prefill_tokens_total").increment(total_tokens as u64);
                     counter!("ferrum.engine.prefills_total").increment(1);
                 } else {
-                    self.scheduler.mark_prefill_chunk_processed(
-                        rid,
-                        total_tokens,
-                        *chunk_len,
-                    );
+                    self.scheduler
+                        .mark_prefill_chunk_processed(rid, total_tokens, *chunk_len);
                 }
             }
 
@@ -1285,8 +1312,7 @@ impl EngineInner {
                         let sequences = self.sequences.read();
                         match sequences.get(rid) {
                             Some(seq)
-                                if seq.generated_tokens.len()
-                                    >= seq.sampling_params.max_tokens =>
+                                if seq.generated_tokens.len() >= seq.sampling_params.max_tokens =>
                             {
                                 FinishReason::Length
                             }

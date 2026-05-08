@@ -277,11 +277,7 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
         // doesn't require src alignment. We're on x86_64 LE, and
         // safetensors stores LE i32 — bit pattern is identical.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                out.as_mut_ptr() as *mut u8,
-                bytes.len(),
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
             out.set_len(count);
         }
         Ok((out, shape.to_vec()))
@@ -394,10 +390,7 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                     sc_rows = sc_sh[0];
                     qz_rows = qz_sh[0];
                     k_shared = qw_sh[0] * 8;
-                } else if qw_sh[0] != qw_rows
-                    || sc_sh[0] != sc_rows
-                    || qz_sh[0] != qz_rows
-                {
+                } else if qw_sh[0] != qw_rows || sc_sh[0] != sc_rows || qz_sh[0] != qz_rows {
                     return Err(FerrumError::model(format!(
                         "stacked GPTQ '{name}': row mismatch qw {} sc {} qz {} vs ref {qw_rows}/{sc_rows}/{qz_rows}",
                         qw_sh[0], sc_sh[0], qz_sh[0]
@@ -421,8 +414,7 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
                     match &g_idx_first {
                         None => g_idx_first = Some(gx),
                         Some(prev) => {
-                            if prev.len() != gx.len() || prev.iter().zip(&gx).any(|(a, b)| a != b)
-                            {
+                            if prev.len() != gx.len() || prev.iter().zip(&gx).any(|(a, b)| a != b) {
                                 return Err(FerrumError::model(format!(
                                     "stacked GPTQ '{name}': g_idx mismatch with first \
                                      expert — Marlin requires identical act-order across \
@@ -984,11 +976,7 @@ fn dtype_to_f32(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {
             let n = raw.len() / 4;
             let mut out = Vec::<f32>::with_capacity(n);
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    raw.as_ptr(),
-                    out.as_mut_ptr() as *mut u8,
-                    raw.len(),
-                );
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, raw.len());
                 out.set_len(n);
             }
             Ok(out)
@@ -1000,11 +988,7 @@ fn dtype_to_f32(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {
             // the per-element from_le_bytes byte-array construction.
             let mut tmp = Vec::<f16>::with_capacity(n);
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    raw.as_ptr(),
-                    tmp.as_mut_ptr() as *mut u8,
-                    raw.len(),
-                );
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), tmp.as_mut_ptr() as *mut u8, raw.len());
                 tmp.set_len(n);
             }
             let mut out = Vec::with_capacity(n);
@@ -1018,11 +1002,7 @@ fn dtype_to_f32(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {
             let n = raw.len() / 2;
             let mut tmp = Vec::<bf16>::with_capacity(n);
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    raw.as_ptr(),
-                    tmp.as_mut_ptr() as *mut u8,
-                    raw.len(),
-                );
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), tmp.as_mut_ptr() as *mut u8, raw.len());
                 tmp.set_len(n);
             }
             let mut out = Vec::with_capacity(n);

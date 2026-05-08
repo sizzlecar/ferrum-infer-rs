@@ -127,8 +127,7 @@ pub fn auto_size_kv_blocks(model_dir: &Path, gpu_util: f32) -> Option<AutoSizeRe
 
     // KV per block: num_layers × num_kv_heads × block_size × head_dim
     //              × 2 (K and V) × dtype_bytes
-    let block_bytes =
-        num_layers * num_kv_heads * PAGED_BLOCK_SIZE * head_dim * 2 * KV_DTYPE_BYTES;
+    let block_bytes = num_layers * num_kv_heads * PAGED_BLOCK_SIZE * head_dim * 2 * KV_DTYPE_BYTES;
     if block_bytes == 0 {
         return None;
     }
@@ -181,8 +180,8 @@ pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
         (32, 512),  // FP16 8B at util=0.95
         (16, 2048), // long-context narrow batch
         (16, 1024),
-        (16, 512),  // last that supports c=16
-        (8, 1024),  // <c=16 only
+        (16, 512), // last that supports c=16
+        (8, 1024), // <c=16 only
         (8, 512),
     ];
     let (max_seqs_clamped, kv_capacity) = {
@@ -205,28 +204,27 @@ pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
     // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
     unsafe {
         if !kv_overridden {
-            std::env::set_var(
-                "FERRUM_KV_MAX_BLOCKS",
-                result.max_blocks.to_string(),
-            );
+            std::env::set_var("FERRUM_KV_MAX_BLOCKS", result.max_blocks.to_string());
         }
         if !max_seqs_overridden {
-            std::env::set_var(
-                "FERRUM_PAGED_MAX_SEQS",
-                max_seqs_clamped.to_string(),
-            );
+            std::env::set_var("FERRUM_PAGED_MAX_SEQS", max_seqs_clamped.to_string());
         }
         if kv_capacity > 0 && !kv_capacity_overridden {
-            std::env::set_var(
-                "FERRUM_KV_CAPACITY",
-                kv_capacity.to_string(),
-            );
+            std::env::set_var("FERRUM_KV_CAPACITY", kv_capacity.to_string());
         }
     }
     eprintln!(
         "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={}",
-        if kv_overridden { "<user>".to_string() } else { result.max_blocks.to_string() },
-        if max_seqs_overridden { "<user>".to_string() } else { max_seqs_clamped.to_string() },
+        if kv_overridden {
+            "<user>".to_string()
+        } else {
+            result.max_blocks.to_string()
+        },
+        if max_seqs_overridden {
+            "<user>".to_string()
+        } else {
+            max_seqs_clamped.to_string()
+        },
         if kv_capacity_overridden {
             "<user>".to_string()
         } else if kv_capacity > 0 {

@@ -305,11 +305,13 @@ fn cuda_stacked_offset_vs_per_expert() {
             .zip(&off_out)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        let mag = ref_out.iter().map(|x| x.abs()).fold(0f32, f32::max).max(1e-6);
+        let mag = ref_out
+            .iter()
+            .map(|x| x.abs())
+            .fold(0f32, f32::max)
+            .max(1e-6);
         let rel = max_diff / mag;
-        eprintln!(
-            "expert {e}: per-expert vs offset: max|diff|={max_diff:.4} rel={rel:.4}"
-        );
+        eprintln!("expert {e}: per-expert vs offset: max|diff|={max_diff:.4} rel={rel:.4}");
         assert!(
             rel < 0.05,
             "CUDA offset GEMM disagrees with per-expert (expert {e}): rel={rel}"
@@ -387,23 +389,13 @@ fn cpu_stacked_vs_per_expert_parity() {
     let mut qz_acc = Vec::<i32>::with_capacity(qz_rows * total_n_zeros);
     for r in 0..qz_rows {
         for e in 0..num_experts {
-            qz_acc.extend_from_slice(
-                &experts[e].qzeros[r * (n_per / 8)..(r + 1) * (n_per / 8)],
-            );
+            qz_acc.extend_from_slice(&experts[e].qzeros[r * (n_per / 8)..(r + 1) * (n_per / 8)]);
         }
     }
 
-    let stacked_store = <CpuBackend as Backend>::load_gptq(
-        &qw_acc,
-        &sc_acc,
-        &qz_acc,
-        None,
-        4,
-        gs,
-        k,
-        total_n,
-    )
-    .expect("stacked load_gptq");
+    let stacked_store =
+        <CpuBackend as Backend>::load_gptq(&qw_acc, &sc_acc, &qz_acc, None, 4, gs, k, total_n)
+            .expect("stacked load_gptq");
 
     // Slice-and-compare: for each expert, `gemm_gptq_with_offset` on
     // the stacked store must equal the per-expert dedicated GEMM.
