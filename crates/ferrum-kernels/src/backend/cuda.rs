@@ -126,6 +126,23 @@ pub struct CudaState {
     /// this scratch we fall back to atomic_add which is 1.3-1.5× slower.
     #[cfg(feature = "vllm-moe-marlin")]
     vllm_moe_c_tmp_f32: Option<CudaSlice<f32>>,
+    /// Persistent device-side routing buffers for vLLM marlin_moe. Moves
+    /// the per-layer `vec! + clone_htod + std::mem::forget` pattern off
+    /// the hot path: every layer reuses the same allocation, fills it
+    /// via memcpy_htod, and re-launches. This is also the foundation for
+    /// Stage 13c full-forward CUDA Graph capture — the kernel takes its
+    /// inputs from stable device pointers, so a captured graph can be
+    /// replayed many times after re-uploading routing.
+    ///
+    /// Sized to a worst-case upper bound; grow lazily.
+    #[cfg(feature = "vllm-moe-marlin")]
+    vllm_moe_sorted_token_ids: Option<CudaSlice<i32>>,
+    #[cfg(feature = "vllm-moe-marlin")]
+    vllm_moe_expert_ids: Option<CudaSlice<i32>>,
+    #[cfg(feature = "vllm-moe-marlin")]
+    vllm_moe_num_tokens_past_padded: Option<CudaSlice<i32>>,
+    #[cfg(feature = "vllm-moe-marlin")]
+    vllm_moe_routing_capacity: usize,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -193,6 +210,56 @@ impl CudaState {
             );
         }
         self.vllm_moe_c_tmp_f32.as_mut().unwrap()
+    }
+
+    /// Get or grow the persistent vLLM moe routing buffers. `capacity`
+    /// is the upper bound on `total_padded` (= sum of per-expert padded
+    /// rows, ≤ num_experts * moe_block_size when each expert holds at
+    /// least one row). Returns `&mut` to all three buffers + the
+    /// num_tokens_past_padded[1] buffer. Grow re-allocates and zeros.
+    #[cfg(feature = "vllm-moe-marlin")]
+    pub fn vllm_moe_routing(
+        &mut self,
+        capacity: usize,
+    ) -> (
+        &mut CudaSlice<i32>,
+        &mut CudaSlice<i32>,
+        &mut CudaSlice<i32>,
+    ) {
+        if self.vllm_moe_routing_capacity < capacity {
+            // Round up to next 256 to amortise growth.
+            let new_cap = ((capacity + 255) / 256) * 256;
+            self.vllm_moe_sorted_token_ids = Some(
+                self.stream
+                    .alloc_zeros::<i32>(new_cap)
+                    .expect("alloc_zeros vllm_moe_sorted_token_ids"),
+            );
+            self.vllm_moe_expert_ids = Some(
+                self.stream
+                    .alloc_zeros::<i32>(new_cap / 16) // n_blocks = capacity / block_size; block_size=16 max
+                    .expect("alloc_zeros vllm_moe_expert_ids"),
+            );
+            // num_tokens_past_padded is just a single i32 — alloc once.
+            if self.vllm_moe_num_tokens_past_padded.is_none() {
+                self.vllm_moe_num_tokens_past_padded = Some(
+                    self.stream
+                        .alloc_zeros::<i32>(1)
+                        .expect("alloc_zeros vllm_moe_num_tokens_past_padded"),
+                );
+            }
+            self.vllm_moe_routing_capacity = new_cap;
+            tracing::info!(
+                "vLLM moe routing buffers grown to capacity {} (sorted_token_ids: {} i32, expert_ids: {} i32)",
+                new_cap,
+                new_cap,
+                new_cap / 16,
+            );
+        }
+        (
+            self.vllm_moe_sorted_token_ids.as_mut().unwrap(),
+            self.vllm_moe_expert_ids.as_mut().unwrap(),
+            self.vllm_moe_num_tokens_past_padded.as_mut().unwrap(),
+        )
     }
 
     /// Lazy-init the persistent cuEvents used by
@@ -407,6 +474,14 @@ impl Backend for CudaBackend {
             paged_attn_out_tm_capacity: 0,
             #[cfg(feature = "vllm-moe-marlin")]
             vllm_moe_c_tmp_f32: None,
+            #[cfg(feature = "vllm-moe-marlin")]
+            vllm_moe_sorted_token_ids: None,
+            #[cfg(feature = "vllm-moe-marlin")]
+            vllm_moe_expert_ids: None,
+            #[cfg(feature = "vllm-moe-marlin")]
+            vllm_moe_num_tokens_past_padded: None,
+            #[cfg(feature = "vllm-moe-marlin")]
+            vllm_moe_routing_capacity: 0,
         }
     }
 
@@ -3316,49 +3391,42 @@ impl Backend for CudaBackend {
         use cudarc::driver::sys::CUdeviceptr;
         use cudarc::driver::CudaSlice;
         use cudarc::driver::DevicePtr;
-        let stream = ctx.stream.clone();
 
-        // Upload as i32, then reinterpret as Self::Buffer (= CudaSlice<f16>).
-        // The byte count matches because we keep the i32 element count in
-        // both views (caller-known length).
-        let st: CudaSlice<i32> = stream
-            .clone_htod(sorted_token_ids)
+        // Use persistent device-side buffers on ctx — single alloc per
+        // process (lazy + grow on shape change), then memcpy_htod into
+        // them per layer. Eliminates the per-layer alloc + leak that
+        // Stage 14a used.
+        let cap = sorted_token_ids.len();
+        let (st_dev, eid_dev, npp_dev) = ctx.vllm_moe_routing(cap);
+
+        // Async upload through the ctx stream. memcpy_htod is non-blocking
+        // and ordered with the subsequent kernel launch on the same stream.
+        let stream = ctx.stream.clone();
+        stream
+            .memcpy_htod(sorted_token_ids, st_dev)
             .map_err(|e| FerrumError::model(format!("htod sorted_token_ids: {e}")))?;
-        let eid: CudaSlice<i32> = stream
-            .clone_htod(expert_ids)
+        stream
+            .memcpy_htod(expert_ids, eid_dev)
             .map_err(|e| FerrumError::model(format!("htod expert_ids: {e}")))?;
-        let npp: CudaSlice<i32> = stream
-            .clone_htod(num_tokens_past_padded)
+        stream
+            .memcpy_htod(num_tokens_past_padded, npp_dev)
             .map_err(|e| FerrumError::model(format!("htod num_tokens_past_padded: {e}")))?;
 
-        // Reinterpret the i32 slices as f16 device buffers (same memory)
-        // so they match the trait's Self::Buffer type. The consumer
-        // (moe_gemm_phase_vllm) ignores .len() and reads via device_ptr.
-        // Drop the lifetime guards in a scoped block so we can `forget`
-        // the owning slices afterwards.
+        // Reinterpret the persistent i32 buffers as f16 device handles
+        // for the trait's Self::Buffer. The consumer (moe_gemm_phase_vllm)
+        // only reads device_ptr — len isn't consulted.
         let (st_ptr, eid_ptr, npp_ptr) = {
-            let (st_ptr, _g0) = st.device_ptr(&stream);
-            let (eid_ptr, _g1) = eid.device_ptr(&stream);
-            let (npp_ptr, _g2) = npp.device_ptr(&stream);
+            let (st_ptr, _g0) = st_dev.device_ptr(&stream);
+            let (eid_ptr, _g1) = eid_dev.device_ptr(&stream);
+            let (npp_ptr, _g2) = npp_dev.device_ptr(&stream);
             (st_ptr, eid_ptr, npp_ptr)
         };
         let st_f16: CudaSlice<f16> =
-            unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, sorted_token_ids.len() * 2) };
+            unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
         let eid_f16: CudaSlice<f16> =
-            unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, expert_ids.len() * 2) };
-        let npp_f16: CudaSlice<f16> = unsafe {
-            stream.upgrade_device_ptr(
-                npp_ptr as CUdeviceptr,
-                num_tokens_past_padded.len() * 2,
-            )
-        };
-        // Forget the i32 owning slices so the device memory survives —
-        // the f16 views above point at the same allocation.
-        // TODO(perf-stage14b): stash in a context-side arena instead of
-        // leaking ~few KB per layer.
-        std::mem::forget(st);
-        std::mem::forget(eid);
-        std::mem::forget(npp);
+            unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
+        let npp_f16: CudaSlice<f16> =
+            unsafe { stream.upgrade_device_ptr(npp_ptr as CUdeviceptr, 0) };
 
         Ok(crate::backend::traits::MoeRouting {
             sorted_token_ids: st_f16,
