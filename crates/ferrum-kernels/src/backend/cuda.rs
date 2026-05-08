@@ -4074,16 +4074,45 @@ fn paged_batched_flash_dispatch(
     block_size: usize,
     max_blocks_per_seq: usize,
 ) -> Result<()> {
-    // Pick num_splits. For batched decode the grid is already saturated
-    // (num_seqs * num_heads ≥ 1024 at c=32), so splits add cost. Only
-    // worth it when kv is long enough that split parallelism overcomes
-    // launch overhead.
-    let num_splits: usize = match max_kv_len {
-        kv if kv <= 256 => 1, // skip split-K — single pass faster
-        kv if kv <= 1024 => 2,
-        kv if kv <= 2048 => 4,
-        _ => 8,
-    };
+    // Pick num_splits. Heuristic combines two effects:
+    //   1. SM occupancy: a (num_q_heads, num_seqs, splits) grid wants
+    //      total blocks ≳ 2 × SM count for full pipelining. When the
+    //      base grid (num_seqs × num_heads) already saturates SMs,
+    //      splits ≥ 2 just add launch + reduce overhead.
+    //   2. kv_len: longer kv → more inherent serial work in step 3 →
+    //      split-K helps even at moderate occupancy.
+    //
+    // Bench (RTX 4090, M3, 32 q_heads):
+    //   c=1  splits=8 → +22% (grid was 1/4 wave, splits saturate)
+    //   c=16 splits=2 → -3.7% (grid already 4 waves)
+    //   c=32 splits=2 → +5% (grid 8 waves, kv split still helps)
+    // Override via FERRUM_PAGED_FLASH_SPLITS for tuning.
+    let force_splits = std::env::var("FERRUM_PAGED_FLASH_SPLITS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    // 128 SMs on Ada/Hopper-class; conservative under-estimate.
+    const SM_TARGET: usize = 128;
+    let base_grid = num_seqs * num_heads;
+    let saturated = base_grid >= 2 * SM_TARGET;
+    let num_splits: usize = force_splits.unwrap_or_else(|| {
+        if saturated {
+            // Only split when kv is so long that the V loop dominates.
+            match max_kv_len {
+                kv if kv <= 768 => 1,
+                kv if kv <= 2048 => 2,
+                _ => 4,
+            }
+        } else {
+            // Low concurrency: aggressive splits to fill SMs.
+            let needed = (SM_TARGET + base_grid - 1) / base_grid;
+            let by_kv = match max_kv_len {
+                kv if kv <= 256 => 4,
+                kv if kv <= 1024 => 8,
+                _ => 16,
+            };
+            needed.max(1).min(by_kv).min(16)
+        }
+    });
     if num_splits <= 1 {
         // Caller's main path is the single-pass kernel.
         // FERRUM_PAGED_FLASH=1 still routes here, so do the single-pass
