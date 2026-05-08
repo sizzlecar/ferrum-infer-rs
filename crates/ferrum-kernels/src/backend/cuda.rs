@@ -3390,16 +3390,23 @@ impl Backend for CudaBackend {
         // &mut ctx to grow/get persistent routing buffers.
         let stream = ctx.stream.clone();
         let cap = sorted_token_ids.len();
+        let eid_host_len = expert_ids.len();
+        let npp_host_len = num_tokens_past_padded.len();
         let (st_dev, eid_dev, npp_dev) = ctx.vllm_moe_routing(cap);
+
+        eprintln!(
+            "DEBUG upload_moe_routing: cap={cap} eid_host={eid_host_len} npp_host={npp_host_len} st_dev_len={} eid_dev_len={} npp_dev_len={}",
+            st_dev.len(), eid_dev.len(), npp_dev.len()
+        );
 
         // Persistent buffers now sized exactly to the host slices — use
         // cudarc's memcpy_htod which validates src.len() == dst.len().
         stream
             .memcpy_htod(sorted_token_ids, st_dev)
-            .map_err(|e| FerrumError::model(format!("htod sorted_token_ids: {e}")))?;
+            .map_err(|e| FerrumError::model(format!("htod sorted_token_ids (cap={cap} dev_len={}): {e}", st_dev.len())))?;
         stream
             .memcpy_htod(expert_ids, eid_dev)
-            .map_err(|e| FerrumError::model(format!("htod expert_ids: {e}")))?;
+            .map_err(|e| FerrumError::model(format!("htod expert_ids (host_len={eid_host_len} dev_len={}): {e}", eid_dev.len())))?;
         stream
             .memcpy_htod(num_tokens_past_padded, npp_dev)
             .map_err(|e| FerrumError::model(format!("htod num_tokens_past_padded: {e}")))?;
