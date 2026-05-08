@@ -133,9 +133,7 @@ fn bench_paged_decode_attn() {
     // RTX 4090 peak DRAM: 1008 GB/s
     const PEAK_GBS: f64 = 1008.0;
 
-    eprintln!(
-        "── paged_decode_attn @ Qwen3-MoE c={NUM_SEQS} kv_len={KV_LEN} ──"
-    );
+    eprintln!("── paged_decode_attn @ Qwen3-MoE c={NUM_SEQS} kv_len={KV_LEN} ──");
     eprintln!(
         "  shape: heads={NUM_HEADS} kv_heads={NUM_KV_HEADS} dim={HEAD_DIM} block={BLOCK_SIZE}"
     );

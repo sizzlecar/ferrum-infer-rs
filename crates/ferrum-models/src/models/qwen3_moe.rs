@@ -239,6 +239,14 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub paged_batch_o: Option<B::Buffer>,
     pub paged_batch_block_tables: Option<B::Buffer>,
     pub paged_batch_context_lens: Option<B::Buffer>,
+    /// Per-seq pos_offset buffer for the batched
+    /// `split_qkv_norm_rope_into_paged_cache_varlen` path. Eliminates the
+    /// per-item dispatch loop in `forward_layer_batched_decode`.
+    pub paged_batch_pos_offsets: Option<B::Buffer>,
+    /// `[0, 1, 2, ..., max_seqs]` — pre-filled cumulative seq-len array
+    /// for batched decode where every seq contributes q_len=1. Constant
+    /// across the lifetime of the scratch.
+    pub paged_batch_cu_seqlens_q: Option<B::Buffer>,
     pub paged_max_blocks_per_seq: usize,
 
     pub max_tokens: usize,
@@ -317,6 +325,8 @@ impl<B: Backend> Qwen3MoeScratch<B> {
             paged_batch_o: None,
             paged_batch_block_tables: None,
             paged_batch_context_lens: None,
+            paged_batch_pos_offsets: None,
+            paged_batch_cu_seqlens_q: None,
             paged_max_blocks_per_seq: 0,
             max_tokens: t,
             moe_route_scratch: crate::moe::MoeRouteScratch::new(),
@@ -339,6 +349,12 @@ impl<B: Backend> Qwen3MoeScratch<B> {
         self.paged_batch_o = Some(B::alloc(max_seqs * q_dim));
         self.paged_batch_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
         self.paged_batch_context_lens = Some(B::alloc_u32(max_seqs));
+        self.paged_batch_pos_offsets = Some(B::alloc_u32(max_seqs));
+        // cu_seqlens_q is constant [0, 1, 2, ..., max_seqs] for batched
+        // decode (q_len=1 per seq) — pre-fill once via a "context" we can
+        // borrow temporarily; if the writer needs ctx, we lazy-init at
+        // first call instead.
+        self.paged_batch_cu_seqlens_q = Some(B::alloc_u32(max_seqs + 1));
         self.paged_max_blocks_per_seq = max_blocks_per_seq;
     }
 
@@ -2029,12 +2045,12 @@ impl<B: Backend> Qwen3MoeModel<B> {
             let block_size = 16; // matches PAGED_BLOCK_SIZE in ensure_kv
             let qkv_stride = q_dim + 2 * kv_dim;
 
-            // Step 1: per-item paged write. Read each item's qkv out of
-            // the batched qkv_out buffer; write its head-major Q into
-            // paged_batch_q[i*q_dim ..]; write its K/V into the pool at
-            // its allocated blocks via block_table.
+            // Step 1: gather per-seq metadata on host (cache.len before
+            // append, full block_tables stack, post-append context_lens),
+            // bump cache.len, build cu_seqlens_q.
             let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
-            let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+            let _qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
+            let _ = q_head_major_size_bytes; // unused in batched path
             let pool_ptr = {
                 let pools = self.paged_pools.as_mut().unwrap();
                 (
@@ -2044,71 +2060,30 @@ impl<B: Backend> Qwen3MoeModel<B> {
             };
             // SAFETY: pools allocated-once, see paged_pools field comment.
             let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
-            for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
-                let pos_i = *pos as usize;
-                let caches = self
-                    .kv_caches
-                    .get(cache_id)
-                    .expect("paged batched: cache not present");
-                let cache = &caches[li];
-                let bt = cache
-                    .block_table
-                    .as_ref()
-                    .expect("paged batched: block_table missing");
-                let cache_len_before = cache.len;
-                let bt_ptr = bt as *const B::Buffer;
-                // SAFETY: bt is read-only during the dispatch; we don't
-                // touch self.kv_caches between this raw deref and the
-                // call below.
-                let bt_safe: &B::Buffer = unsafe { &*bt_ptr };
-                B::split_qkv_norm_rope_into_paged_cache(
-                    ctx,
-                    &self.scratch.qkv_out,
-                    (i as u64) * qkv_stride_bytes,
-                    q_norm_w,
-                    k_norm_w,
-                    &self.rope.cos,
-                    &self.rope.sin,
-                    self.scratch
-                        .paged_batch_q
-                        .as_mut()
-                        .expect("paged_batch_q missing"),
-                    (i as u64) * q_head_major_size_bytes,
-                    pool_k,
-                    pool_v,
-                    bt_safe,
-                    1,
-                    nh,
-                    nkv,
-                    hd,
-                    pos_i,
-                    eps,
-                    qk_mode,
-                    cache_len_before,
-                    block_size,
-                    max_blocks_per_seq,
-                )
-                .expect("split_qkv_norm_rope_into_paged_cache (batched)");
-            }
 
-            // Step 2: bump cache.len and stack block_tables + context_lens
-            // host-side, then upload to device scratch.
             let mut stacked_bt: Vec<u32> = vec![0u32; m * max_blocks_per_seq];
             let mut stacked_cl: Vec<u32> = vec![0u32; m];
+            let mut pos_offsets_host: Vec<u32> = vec![0u32; m];
+            let mut cu_seqlens_host: Vec<u32> = vec![0u32; m + 1];
+            for i in 0..=m {
+                cu_seqlens_host[i] = i as u32;
+            }
             for (i, (cache_id, _, _)) in batch.iter().enumerate() {
                 let caches = self
                     .kv_caches
                     .get_mut(cache_id)
                     .expect("paged batched: cache not present");
                 let cache = &mut caches[li];
-                cache.len += 1;
-                let len = cache.len as u32;
-                stacked_cl[i] = len;
+                pos_offsets_host[i] = cache.len as u32; // RoPE position = pre-append cache len
                 let blocks = &cache.paged_block_indices;
                 let n_to_copy = blocks.len().min(max_blocks_per_seq);
                 stacked_bt[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
                     .copy_from_slice(&blocks[..n_to_copy]);
+                cache.len += 1;
+                stacked_cl[i] = cache.len as u32;
             }
+
+            // Step 2: upload all per-seq metadata.
             let bt_buf = self
                 .scratch
                 .paged_batch_block_tables
@@ -2121,6 +2096,59 @@ impl<B: Backend> Qwen3MoeModel<B> {
                 .as_mut()
                 .expect("paged_batch_context_lens missing");
             B::write_u32(ctx, cl_buf, &stacked_cl);
+            let pos_buf = self
+                .scratch
+                .paged_batch_pos_offsets
+                .as_mut()
+                .expect("paged_batch_pos_offsets missing");
+            B::write_u32(ctx, pos_buf, &pos_offsets_host);
+            let cu_buf = self
+                .scratch
+                .paged_batch_cu_seqlens_q
+                .as_mut()
+                .expect("paged_batch_cu_seqlens_q missing");
+            B::write_u32(ctx, cu_buf, &cu_seqlens_host);
+
+            // Step 3: ONE batched split_qkv_norm_rope_into_paged_cache_varlen
+            // dispatch — replaces the m=batch per-seq loop. Saves
+            // (m-1) × launch_overhead per layer × num_layers.
+            let bt_ptr_raw =
+                self.scratch.paged_batch_block_tables.as_ref().unwrap() as *const B::Buffer;
+            let pos_ptr_raw =
+                self.scratch.paged_batch_pos_offsets.as_ref().unwrap() as *const B::Buffer;
+            let cu_ptr_raw =
+                self.scratch.paged_batch_cu_seqlens_q.as_ref().unwrap() as *const B::Buffer;
+            let q_buf_ptr_raw = self.scratch.paged_batch_q.as_mut().unwrap() as *mut B::Buffer;
+            // SAFETY: scratch buffers are independent of qkv_out / norm
+            // weights / rope and are not re-borrowed by the called fn.
+            let bt_safe: &B::Buffer = unsafe { &*bt_ptr_raw };
+            let pos_safe: &B::Buffer = unsafe { &*pos_ptr_raw };
+            let cu_safe: &B::Buffer = unsafe { &*cu_ptr_raw };
+            let q_buf_safe: &mut B::Buffer = unsafe { &mut *q_buf_ptr_raw };
+            B::split_qkv_norm_rope_into_paged_cache_varlen(
+                ctx,
+                &self.scratch.qkv_out,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                q_buf_safe,
+                pool_k,
+                pool_v,
+                cu_safe,
+                pos_safe,
+                bt_safe,
+                m, // num_seqs
+                m, // m_total — q_len=1 each, so m_total = m
+                nh,
+                nkv,
+                hd,
+                eps,
+                qk_mode,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("split_qkv_norm_rope_into_paged_cache_varlen (batched)");
 
             // Step 3: one batched paged_decode_attention(num_seqs=m).
             let bt_ptr =
@@ -2153,17 +2181,18 @@ impl<B: Backend> Qwen3MoeModel<B> {
             )
             .expect("paged batched decode");
 
-            // Step 4: per-item copy paged_batch_o[i] → attn_flat[i*q_dim].
-            for i in 0..m {
-                B::copy_slice(
-                    ctx,
-                    self.scratch.paged_batch_o.as_ref().unwrap(),
-                    i * q_dim,
-                    &mut self.scratch.attn_flat,
-                    i * q_dim,
-                    q_dim,
-                );
-            }
+            // Step 4: ONE batched copy paged_batch_o[0..m*q_dim] →
+            // attn_flat[0..m*q_dim]. Layouts match (both head-major,
+            // contiguous m × q_dim), so a single copy replaces the m
+            // per-item launches.
+            B::copy_slice(
+                ctx,
+                self.scratch.paged_batch_o.as_ref().unwrap(),
+                0,
+                &mut self.scratch.attn_flat,
+                0,
+                m * q_dim,
+            );
 
             stage_end(attn_t0, ctx, &BD_ATTN_PERITEM_US);
         } else {
