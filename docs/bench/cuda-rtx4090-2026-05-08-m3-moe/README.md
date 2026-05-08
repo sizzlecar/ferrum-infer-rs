@@ -122,6 +122,82 @@ FERRUM_MOE_STREAMS=4
     --port 8800 --gpu-memory-utilization 0.95
 ```
 
+## Stage 6 — allocation-free host route() + plan reuse  ★ +8.3%
+
+**Date**: 2026-05-08 (later same day)
+
+Profile data with the new `[bucket-prof]` instrumentation (PR adds per-phase
+microsecond counters around sync / D2H / host_route / plan / gather / gemm1 /
+silu / gemm3 / combine — drained per decode step) confirmed the host-side
+softmax+top-k+sort was the biggest non-GEMM cost:
+
+```
+[bucket-prof] layers=48 bk_total=41 ms | sync=103 d2h=857 host_route=10210 plan=97
+              gather=678 gemm1=14719 silu=384 gemm3=14065 combine=825 (us, summed)
+```
+
+`host_route` was 10.2 ms / decode token = 25% of MoE wallclock. Cause: per-row
+`Vec` allocations × 32 rows × 48 layers = 4 608 fresh allocations. The fix:
+
+- `route_into(logits, ..., &mut RouterOutput, &mut Vec<f32>)` — reusable
+  scratch + softmax-in-place + argmax-mask top-K (K passes of linear scan
+  vs O(N log N) sort).
+- `MoeBucketPlan::rebuild_into(&mut self, ...)` — clear+resize in place,
+  cursor scratch on the plan struct (one alloc on first call).
+- `MoeRouteScratch { output, probs, plan }` lives on `Qwen3MoeScratch`.
+
+Verified bit-exact vs the original `route()` via 4 unit tests
+(`parity_qwen3_moe_shape`, etc).
+
+```
+host_route 10.2 ms → 1.8 ms  (5.7×)
+plan       97 us  →  97 us   (~unchanged in steady state — random skewed routing)
+bk_total   41 ms  → 32 ms
+
+ferrum c=32 → 148.0 tok/s  (TPOT 194.74 ms)   ratio vs vLLM = 7.9%
+```
+
+## Stage 7 — cuEvent cache + GEMM dispatch sort by m desc  ★ +8.1%
+
+Two further changes layered on Stage 6:
+
+**Persistent cuEvents** in `CudaState`. `moe_gemm_phase_batched` was creating
++ destroying 1 entry + 4 exit events per call. At c=32 / 48 layers / 2 phases
+that's ~960 `cuEvent*` driver calls per token. CUDA semantics let us re-record
+an event silently overwriting the prior recording, so we just hold 5 events
+on the long-lived `CudaState` and call `record` / `wait_event` only.
+
+**Sort dispatches by m descending**. Round-robin pool was feeding streams
+in expert-id order. With sort, the longest GEMMs go first so each stream
+pops the next-largest job and they finish close together — no stream
+sitting idle while another tails out an m=4 call. Tied `m` keeps
+expert-id ascending order for host-side determinism.
+
+```
+gemm1   14719 us → 13449 us  (-1270 us)
+gemm3   14065 us → 12865 us  (-1200 us)
+bk_total   32 ms →    30 ms
+
+ferrum c=32 → 160.1 tok/s  (TPOT 178.45 ms)   ratio vs vLLM = 8.5%
+```
+
+Most of the win came from sort (~2.2 ms GEMM time saved); cuEvents on
+their own contributed <1 ms (the `cuEvent*` driver calls are sub-µs each).
+
+## Cumulative session summary (Stages 1 → 7)
+
+| Stage | tok/s | TPOT  | Δ tok/s | Δ TPOT  |
+|-------|-------|-------|---------|---------|
+| 0 baseline (per-pair fallback)             | 9.4   | 203.4 ms | —       | —        |
+| 1-5 stacked Marlin + bucketed + multi-stream | 137.1 | 204.4 ms | +14.6×  | ~0       |
+| 6 alloc-free route + plan                  | 148.0 | 194.7 ms | +1.08×  | -10 ms   |
+| 7 cuEvent cache + dispatch sort            | **160.1** | **178.5 ms** | +1.08×  | -16 ms   |
+
+Total session: **9.4 → 160.1 tok/s (17.0× over the per-pair baseline,
++17.2% over Stage 5 stacked-Marlin baseline)**. vLLM remains 11.7× ahead
+at 1873 tok/s — the gap is now firmly in the Marlin-GEMM-throughput
+regime; ~26 ms of every decode token is real Marlin compute.
+
 ## Failed experiments (don't re-try without code changes)
 
 | Experiment | Outcome | Why it fails |
@@ -130,23 +206,52 @@ FERRUM_MOE_STREAMS=4
 | `FERRUM_MOE_STREAMS=8` | Identical to s=4 (within noise) | 4 concurrent Marlin kernels already saturate small-m SM scheduling. |
 | `FERRUM_MARLIN_SKIP_WS_ZERO=1` standalone | ~0% change | `cuMemsetD32Async` overlaps with following Marlin kernel; per-call zero is essentially free in steady state. |
 
-## Remaining gap analysis
+## Remaining gap analysis (post-Stage-7)
 
-**c=32 ratio 7.3% (137 vs 1873) is the biggest gap. Decomposition**:
+**c=32 ratio is now 8.5% (160 vs 1873). Decomposition** (steady-state per
+decode token at c=32, summed across 48 layers):
 
-- ferrum per-layer = 5.4 ms = ~256 sequential Marlin calls (per pool stream) × ~5 us launch + ~1.5 us small-m bandwidth
-- vLLM per-layer = 0.3 ms = ONE `fused_moe_marlin` kernel (~150 us) + CUDA Graph replay (essentially zero per-launch overhead)
+```
+gemm1 + gemm3   ≈ 26 ms   (88% of MoE wallclock — Marlin compute)
+host_route      ≈ 1.8 ms  (post-allocation-free softmax+topk)
+d2h router      ≈ 0.9 ms  (32 batch × 128 experts × 2 bytes / layer × 48)
+gather (gpu)    ≈ 0.7 ms
+combine (gpu)   ≈ 0.8 ms
+silu (gpu)      ≈ 0.4 ms
+plan, sync etc  ≈ 0.3 ms
+─────────────────────────
+bk_total        ≈ 30 ms
+```
 
-Two missing components:
+**The remaining gap to vLLM is almost entirely Marlin compute throughput.**
+The two big-effort levers from the original analysis still apply:
 
-1. **`fused_moe_marlin.cu` port** (~1500 LoC): one kernel processes ALL (token, expert) pairs per layer. Cuts per-layer Marlin launch count from ~256 to ~3 (gate_up + silu + down).
-2. **CUDA Graph capture for MoE forward**: requires moving the host-side `route()` (top-k softmax) and bucket-plan computation onto GPU so the entire decode step is graph-capturable. ~1 day of work assuming top-k + counting kernels are straightforward.
+1. **`fused_moe_marlin.cu` port** (~1500 LoC): cuts per-layer Marlin launch
+   count from ~256 to ~3 (gate_up + silu + down). Largest single lever.
+2. **CUDA Graph capture for MoE forward**: requires moving `route()` and
+   bucket plan computation to GPU so the decode step is graph-capturable.
+   Trait stubs for `route_topk_softmax` / `compute_ids_tpe_gpu` already
+   exist (Metal-implemented); CUDA `.cu` ports + plumbing is the work.
+   Saves the remaining ~3 ms of host-side overhead AND the launch
+   overhead (≈ 5 µs × 200 launches/layer × 48 layers = 1.4 ms / token).
 
-Without these, ferrum will saturate around 140-150 tok/s on M3 at c=32 — 13× behind vLLM. With both, expected 600-1000 tok/s based on per-layer accounting (still likely 2-3× behind because vLLM uses a more aggressive Marlin tile and torch.compile-driven kernel fusion in the attention path).
+Cheap wins still on the table (each <2% TPOT):
+
+- Cache `embedding_lookup` ids buffer + `moe_combine` pairs/weights buffers
+  in `CudaState` instead of `clone_htod` per call — saves the per-call
+  `cuMemAllocAsync` (~1-2 µs each × 3 calls × 48 layers = ~250 µs / token).
+- Pin host buffer for `to_vec(router_logits)` D2H — turns the implicit
+  sync H2D into actual async; minor win since the route() function reads
+  the host data immediately anyway.
+
+Without `fused_moe_marlin.cu` ferrum is likely to saturate around
+180-200 tok/s on M3 at c=32 — 9-10× behind vLLM. With it ported,
+600-1000 tok/s is plausible based on per-layer accounting.
 
 ## Commits this session (chronological)
 
 ```
+# Stages 1-5 (147 → 137 tok/s journey):
 1b567be fix(stacked-marlin): per-expert repack + concat — Marlin tile is K-major not N-major  ★ KEY
 9624a11 perf(moe): single silu call covering all packed rows — saves N-1 launches/layer
 da8e50e perf(moe): bulk-zero Marlin workspace per phase — saves N-1 memsets
@@ -155,6 +260,12 @@ ea6637a perf(moe): multi-stream MoE GEMM dispatch — round-robin pool          
 0854431 fix(cuda): move moe_stream_pool to impl CudaState
 d7d8e98 fix(moe): cross-stream sync for multi-stream MoE GEMM dispatch
 40c2cf1 fix(cuda): cuEventCreate flag is u32, not enum tuple variant
+
+# Stages 6-7 (137 → 160 tok/s):
+8d0f7dc perf(moe): per-phase profile counters for bucketed MoE forward
+d7c4fe1 bench(m3): phase-profile script for c=32 bucketed MoE breakdown
+652832c perf(moe): allocation-free route() + bucket plan reuse — saves ~10ms/token  ★ KEY
+e1fd5d8 perf(moe): cache cuEvents + sort GEMM dispatches by m desc
 ```
 
 Earlier exploration commits (debugged the offset-GEMM stride bug):
