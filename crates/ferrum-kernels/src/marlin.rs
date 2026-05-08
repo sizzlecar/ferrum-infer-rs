@@ -478,7 +478,7 @@ pub fn repack_gptq_to_marlin(
     // Step 1: Unpack GPTQ [K/8, N] → individual INT4 values [K, N].
     // Parallelize over packed_rows. Each packed row produces 8 output rows
     // of `n` u8s — disjoint output slices, fully independent.
-    let packed_rows = k / 8;
+    let _packed_rows = k / 8;
     let mut kn = vec![0u8; k * n];
     kn.par_chunks_mut(8 * n)
         .zip(qweight_gptq.par_chunks(n))
@@ -498,7 +498,7 @@ pub fn repack_gptq_to_marlin(
     // Parallelize over tk (each tk owns a disjoint output range
     // tiled[tk * (n * tile) .. (tk+1) * (n * tile)]).
     let tile = 16;
-    let kt = k / tile;
+    let _kt = k / tile;
     let nt = n / tile;
     let mut tiled = vec![0u8; k * n];
     tiled

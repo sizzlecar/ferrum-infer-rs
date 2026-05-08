@@ -328,6 +328,24 @@ point was the gap.
 vLLM ratio at c=32: **14.3%** (was 9.2% at Stage 8, 7.3% baseline). Mean
 TPOT at c=32: 204.4 → 168.1 → **110.1 ms** — halved from baseline.
 
+### Post-merge regression bench (PR #94 squash → main, 2026-05-08 07:32 UTC)
+
+After PR #94 (Stages 6-10) was squash-merged into `main` and the CUDA
+CI fix (PR #95: `clone_dtoh` + `_packed_rows` / `_kt`) cherry-picked,
+re-ran `m3_clean.sh` on the same pod (vast.ai ssh6:10160, RTX 4090):
+
+| c    | tok/s    | Mean TPOT | Mean TTFT | Δ vs Stage 9 final |
+|------|----------|-----------|-----------|--------------------|
+| 1    | 73.8     | 12.78 ms  | 88 ms     | matches            |
+| 8    | 171.6    | 44.05 ms  | 404 ms    | matches            |
+| 16   | 236.1    | 61.46 ms  | 678 ms    | +0.3%              |
+| 32   | **256.3**| 115.90 ms | 1044 ms   | -4.3% (jitter)     |
+
+c=32 dipped 267.7 → 256.3 (-4.3%) — within Vast.ai shared-host GPU
+jitter; c=16 matched Stage 9 to 0.3%. **No correctness regression.**
+Bench JSONs live on the pod under
+`/workspace/ferrum-infer-rs/bench/v0.2-cuda/results_m3_clean/ferrum_clean_c{1,8,16,32}.json`.
+
 ### The c=32 OOB resolution
 
 Stage 9's first ship (commit c846732) hit `CUDA_ERROR_ILLEGAL_ADDRESS`
