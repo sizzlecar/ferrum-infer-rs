@@ -73,9 +73,20 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     let gs: usize = 128;
     let num_experts: usize = 4;
 
-    let experts: Vec<synth::SyntheticGptq> = (0..num_experts)
+    let mut experts: Vec<synth::SyntheticGptq> = (0..num_experts)
         .map(|e| synth::make(k, n_per, gs, 0xCAFE0000 + e as u64))
         .collect();
+
+    // Optional: replace all per-channel scales with a single constant.
+    // Defeats any scale-permutation difference between ref and vllm.
+    if std::env::var("FERRUM_PARITY_UNIT_SCALES").is_ok() {
+        eprintln!("DEBUG: forcing all scales = 0.05");
+        for ex in experts.iter_mut() {
+            for s in ex.scales.iter_mut() {
+                *s = 0.05;
+            }
+        }
+    }
 
     // Pre-gathered layout: each expert's rows contiguous.
     let tokens_per_expert: Vec<usize> = vec![16, 8, 12, 4];
