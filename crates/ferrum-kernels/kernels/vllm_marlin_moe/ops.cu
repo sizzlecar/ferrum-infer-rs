@@ -436,7 +436,13 @@ MarlinFuncPtr get_marlin_kernel(const vllm::ScalarType q_type,
 
   ACT_GET_IF(vllm::kU4B8)
   ACT_GET_IF(vllm::kU8B128)
-  if (std::is_same<scalar_t, nv_bfloat16>::value) {
+  // vendored for ferrum-infer-rs: was `if (std::is_same<...>::value)`, but
+  // that's a runtime branch — the compiler still instantiates Marlin<half,
+  // kFE2M1f.id(), kFE8M0fnu.id(), ...> in the half path, which references
+  // an undefined dequant_fp8_scales<half2, kFE8M0fnu.id()> specialization
+  // (MXFP4 is bfloat16-only in vLLM). `if constexpr` elides the body
+  // entirely for scalar_t != nv_bfloat16.
+  if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
     if (false) {
     }
     MXFP4_GET_IF(vllm::kFE2M1f)
