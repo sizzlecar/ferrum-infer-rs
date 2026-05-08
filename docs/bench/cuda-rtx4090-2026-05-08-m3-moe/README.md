@@ -346,6 +346,57 @@ jitter; c=16 matched Stage 9 to 0.3%. **No correctness regression.**
 Bench JSONs live on the pod under
 `/workspace/ferrum-infer-rs/bench/v0.2-cuda/results_m3_clean/ferrum_clean_c{1,8,16,32}.json`.
 
+### Stages 11 + 12 + 12.1 — fused MoE Marlin (2026-05-08, PR #96)
+
+Three sequential CUDA kernel changes, all gated on `FERRUM_MOE_FUSED=1`.
+
+**Stage 11** — `marlin_cuda_moe` host entrypoint + `Marlin<...>` kernel
+pre-amble. ONE launch processes all experts in a bucket via gridDim.y
+indirection. Adds 7 optional MoE kernel args (default nullptr/0); when
+non-null, kernel reads `e_local = blockIdx.y`, applies pointer offsets
+to A/B/C/s/locks, overrides prob_m. Existing single-expert path
+unchanged.
+
+**Stage 12** — wire fused kernel into `moe_forward_bucketed`. Bucket
+experts by `ceil(m/16)` ∈ {1,2,3,4}, fire ONE call per bucket via
+`moe_gemm_phase_fused_impl`. c=32 alone gave +5% over Stage 9 — fused
+launches don't help when each block does only 0.5M FLOPs but pays 3 µs
+setup. Profile showed 80% of TPOT still in Marlin GEMM.
+
+**Stage 12.1 ★** — `gridDim.x = n_tiles` (NOT sms). Original Marlin uses
+gridDim.x = 128 cooperating blocks per GEMM. With Stage 12's
+gridDim.y = num_experts, total = 12800 blocks → ~100 waves on 128 SMs,
+each block doing 1 tile (0.5M FLOP) with 3 µs setup → setup dominates.
+Setting `blocks = n_tiles` (=3 for Qwen3-MoE) means each block
+processes ALL k-tiles for one n-tile — per-block work scales 32×, setup
+amortises. Total grid: (3, 100) = 300 blocks → 2.3 waves.
+
+| c    | Stage 9 final | **Stage 12.1**     | Δ vs Stage 9 | TPOT (Stage 9 → 12.1) | vs vLLM |
+|------|---------------|--------------------|--------------|-----------------------|---------|
+| 1    | 73.8          | **84.3**           | +14%         | 12.78 → 11.28 ms      | —       |
+| 8    | 171.6         | **254.8**          | +48%         | 44.05 → 28.59 ms      | —       |
+| 16   | 236.1         | **318.9**          | +35%         | 61.46 → 45.04 ms      | 63%     |
+| 32   | 256.3         | **320.6**          | +25%         | 115.90 → 92.74 ms     | **17.1%** |
+
+Re-profile at c=32 confirms `bk_total` halved (33 → 16 ms across 48
+layers); `gemm1` 17 → 8.8 ms (-48%), `gemm3` 13 → 4.8 ms (-63%). New
+distribution at c=32 (steady state, profile-mode):
+
+```
+TPOT 13 ms = attn 4 ms (31%) + moe 7 ms (54%) + other 1 ms (9%)
+```
+
+attn now sits comparable to MoE GEMM. Next levers (Stage 13+):
+
+1. **Strategy B (sorted_token_ids)** — per-tile expert routing eliminates
+   the padding waste (m_e ∈ {1..3} but kernel runs prob_m=16). Predicted
+   +50-100% on the GEMM phase.
+2. **Attn split-K / prefetch tuning** — paged_decode_attention is now
+   31% of TPOT, was 14% pre-12.1.
+
+Parity validated: `cuda_marlin_moe_fused_vs_per_expert` test passes
+with rel < 0.001 (4 experts × variable m_e ∈ {16, 8, 12, 4}).
+
 ### The c=32 OOB resolution
 
 Stage 9's first ship (commit c846732) hit `CUDA_ERROR_ILLEGAL_ADDRESS`
