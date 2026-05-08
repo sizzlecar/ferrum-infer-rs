@@ -20,7 +20,7 @@ use ferrum_types::{
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -47,10 +47,6 @@ pub struct SequenceState {
     pub phase: RequestPhase,
     pub rng: StdRng,
     pub prefill_complete: bool,
-    /// Number of prompt tokens already consumed by prefill (chunked).
-    /// 0 = no prefill yet, == input_tokens.len() = ready to decode.
-    /// Used by the mixed-batch iter to slice the next prefill chunk.
-    pub prefill_pos: usize,
     pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
     pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
     pub start_time: Instant,
@@ -131,7 +127,6 @@ impl SequenceState {
             phase: RequestPhase::Waiting,
             rng: StdRng::seed_from_u64(seed),
             prefill_complete: false,
-            prefill_pos: 0,
             stream_sender: None,
             response_sender: None,
             start_time: Instant::now(),
@@ -165,41 +160,6 @@ impl SequenceState {
     /// repetition penalty, JSON mode, regex-guided mask).
     pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
         use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
-
-        // Greedy fast path: temperature=0 with no penalties or guided
-        // processors means the answer is just argmax(logits). The
-        // GPU-argmax fast path (FERRUM_GREEDY_ARGMAX=1) already wrote a
-        // one-hot vec where exactly one position has value 1.0; scan for
-        // that to recover the token without paying for SamplingContext
-        // construction + RNG + frequency-table updates (which would
-        // otherwise add ~80us per item × c=16 = 1.3ms / iter).
-        // Falls back to the full chain if any non-greedy condition is met.
-        let is_greedy = self.sampling_params.temperature == 0.0
-            && self.sampling_params.repetition_penalty == 1.0
-            && self.sampling_params.frequency_penalty == 0.0
-            && self.sampling_params.presence_penalty == 0.0
-            && self.regex_processor.is_none()
-            && self.json_processor.is_none();
-        if is_greedy {
-            // Compact path: model's GPU-argmax fast path emits a 1-element
-            // vec where logits[0] is the token id bit-cast to f32. Recover
-            // it without scanning vocab. ~80us × c=16 = 1.3ms / iter saved.
-            let token = if logits.len() == 1 {
-                TokenId::new(logits[0].to_bits())
-            } else {
-                let mut best_idx = 0usize;
-                let mut best_val = f32::NEG_INFINITY;
-                for (i, &v) in logits.iter().enumerate() {
-                    if v > best_val {
-                        best_val = v;
-                        best_idx = i;
-                    }
-                }
-                TokenId::new(best_idx as u32)
-            };
-            *self.token_frequencies.entry(token).or_insert(0) += 1;
-            return Ok(token);
-        }
 
         // Regex-guided mask runs FIRST: it's a hard constraint (sets invalid
         // tokens to -inf). Subsequent temperature / top-k / top-p stay
@@ -286,10 +246,6 @@ struct EngineInner {
     /// driver task (16 streaming requests = 16 drivers thrashing on
     /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
     bg_loop_spawned: AtomicBool,
-    /// Wall-clock end of the previous run_iteration. Touched only when
-    /// FERRUM_ENGINE_WALL_PROF=1 is set; serialized by iteration_lock so
-    /// the Mutex contention is uncontended.
-    last_iter_end: Mutex<Option<Instant>>,
 }
 
 impl EngineInner {
@@ -328,20 +284,7 @@ impl EngineInner {
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
         counter!("ferrum.engine.iterations_total").increment(1);
         let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
-        let prof_wall = std::env::var("FERRUM_ENGINE_WALL_PROF").is_ok();
-        let any_prof = prof || prof_wall;
-        let t_iter_start = if any_prof { Some(Instant::now()) } else { None };
-
-        let inter_iter_gap_us = if prof_wall {
-            let mut guard = self.last_iter_end.lock();
-            let gap = guard
-                .map(|t| t_iter_start.unwrap().duration_since(t).as_micros())
-                .unwrap_or(0);
-            *guard = None;
-            gap
-        } else {
-            0
-        };
+        let t_iter_start = if prof { Some(Instant::now()) } else { None };
 
         let hint = ferrum_interfaces::BatchHint {
             max_batch_size: self.config.batching.max_batch_size,
@@ -358,7 +301,7 @@ impl EngineInner {
                 return Ok(());
             }
         };
-        let t_after_sched = if any_prof { Some(Instant::now()) } else { None };
+        let t_after_sched = if prof { Some(Instant::now()) } else { None };
 
         debug!(
             "Iteration {}: batch with {} requests",
@@ -367,36 +310,20 @@ impl EngineInner {
         );
 
         let r = self.process_batch(&batch).await;
-        let t_iter_end = if any_prof { Some(Instant::now()) } else { None };
-        if prof_wall {
-            *self.last_iter_end.lock() = t_iter_end;
-        }
-        if let (Some(t0), Some(ts), Some(te)) = (t_iter_start, t_after_sched, t_iter_end) {
+        if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
             let n = self.iteration_count.load(Ordering::Relaxed);
             if n.is_multiple_of(32) {
-                let total = te.duration_since(t0).as_micros();
+                let total = t0.elapsed().as_micros();
                 let sched = ts.duration_since(t0).as_micros();
-                let proc = te.duration_since(ts).as_micros();
-                if prof_wall {
-                    eprintln!(
-                        "[engine-wall] iter#{} batch={} | total={}us | gap_to_prev={}us | sched={}us | process={}us",
-                        iteration,
-                        batch.size(),
-                        total,
-                        inter_iter_gap_us,
-                        sched,
-                        proc,
-                    );
-                } else {
-                    eprintln!(
-                        "[iter-prof] iter#{} total={}us sched={}us process={}us batch_size={}",
-                        iteration,
-                        total,
-                        sched,
-                        proc,
-                        batch.size()
-                    );
-                }
+                let proc = ts.elapsed().as_micros();
+                eprintln!(
+                    "[iter-prof] iter#{} total={}us sched={}us process={}us batch_size={}",
+                    iteration,
+                    total,
+                    sched,
+                    proc,
+                    batch.size()
+                );
             }
         }
         r
@@ -432,23 +359,6 @@ impl EngineInner {
             }
         }
 
-        // Default ON. Routes prefills + decodes through one unified_decode
-        // call per iter, eliminating the prefill-blocks-decode bottleneck.
-        // Verified +110% c=16 INT4 vs serial path. Disable via
-        // FERRUM_MIXED_BATCH=0 if a backend doesn't support paged_pools
-        // (executor falls back to per-item dispatch automatically).
-        let mixed_batch = std::env::var("FERRUM_MIXED_BATCH")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-
-        if mixed_batch {
-            if let Err(e) = self.run_unified_iter(&prefill_ids, &decode_ids).await {
-                warn!("Mixed iter failed: {}", e);
-                // Best-effort error: don't fail all requests, scheduler will retry.
-            }
-            return Ok(());
-        }
-
         // Prefill new requests
         for rid in &prefill_ids {
             if let Err(e) = self.run_prefill(rid).await {
@@ -482,45 +392,27 @@ impl EngineInner {
 
     // ── preemption ──────────────────────────────────────────────────────
 
-    /// Try to preempt a request to free KV cache blocks.
+    /// Try to preempt a decoding request to free KV cache blocks.
     ///
-    /// Selects any sequence (other than the requester) that holds KV
-    /// blocks. Eligibility was previously gated on `prefill_complete`,
-    /// but at high concurrency (e.g. c=32 with all requests racing on
-    /// the first prefill batch) NO seq has finished prefill yet — preempt
-    /// then returned no victim and the request failed with
-    /// "Resource exhausted: No blocks available and no request to preempt".
-    ///
-    /// Mid-prefill victims are now eligible: their state is reset, the
-    /// scheduler re-submits them, and they restart from scratch on a
-    /// later iter when blocks free up. Work loss is bounded by what was
-    /// already prefilled (a small fraction of the prompt).
-    ///
-    /// Tiebreak prefers MID-PREFILL victims over mid-decode (they have
-    /// less work to redo), then within each bucket prefers fewest
-    /// generated tokens, then lowest priority.
+    /// Picks the lowest-priority victim (ties broken by fewest generated
+    /// tokens — least work lost).  Frees the victim's KV cache, resets
+    /// its sequence state, and re-submits it to the scheduler so it will
+    /// be re-prefilled in a later iteration.
     ///
     /// Returns `true` if a victim was preempted.
     async fn preempt_victim(&self, exclude_id: &RequestId) -> bool {
+        // Select victim: any decoding sequence except the requester
         let victim_id = {
             let sequences = self.sequences.read();
             sequences
                 .iter()
-                .filter(|(id, s)| *id != exclude_id && s.kv_cache.is_some())
+                .filter(|(id, s)| *id != exclude_id && s.prefill_complete && s.kv_cache.is_some())
                 .min_by(|(_, a), (_, b)| {
-                    // Prefer mid-prefill (less work to redo) over mid-decode.
-                    let a_done = a.prefill_complete as u8;
-                    let b_done = b.prefill_complete as u8;
-                    a_done
-                        .cmp(&b_done)
-                        // Then fewest generated tokens (less to re-decode).
+                    // Lowest priority first, then fewest generated tokens
+                    a.sampling_params
+                        .max_tokens // proxy for priority (TODO: use real priority)
+                        .cmp(&b.sampling_params.max_tokens)
                         .then_with(|| a.generated_tokens.len().cmp(&b.generated_tokens.len()))
-                        // Finally, lowest priority by max_tokens proxy.
-                        .then_with(|| {
-                            a.sampling_params
-                                .max_tokens
-                                .cmp(&b.sampling_params.max_tokens)
-                        })
                 })
                 .map(|(id, _)| id.clone())
         };
@@ -553,7 +445,6 @@ impl EngineInner {
                 seq.model_cache_id = None;
                 seq.generated_tokens.clear();
                 seq.prefill_complete = false;
-                seq.prefill_pos = 0;
                 seq.phase = RequestPhase::Waiting;
                 seq.tokens_this_iteration = 0;
                 seq.preemption_count += 1;
@@ -838,13 +729,6 @@ impl EngineInner {
     async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
         use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
 
-        let prof_wall = std::env::var("FERRUM_ENGINE_WALL_PROF").is_ok();
-        let t_a = if prof_wall {
-            Some(Instant::now())
-        } else {
-            None
-        };
-
         let rids: Vec<RequestId> = request_ids.to_vec();
 
         // Build the unified batch from sequence state.
@@ -887,12 +771,6 @@ impl EngineInner {
             }
         }
 
-        let t_b = if prof_wall {
-            Some(Instant::now())
-        } else {
-            None
-        };
-
         let results = self.model_executor.unified_decode(&batch).await?;
         if results.len() != rids.len() {
             return Err(FerrumError::internal(format!(
@@ -901,15 +779,6 @@ impl EngineInner {
                 rids.len(),
             )));
         }
-
-        let t_c = if prof_wall {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        let mut sample_us: u128 = 0;
-        let mut emit_us: u128 = 0;
-        let mut stop_us: u128 = 0;
 
         // Per-item post-processing: sample, update sequence state, stream
         // the new token, check stop conditions. Decode-only items always
@@ -921,11 +790,6 @@ impl EngineInner {
                 ))
             })?;
 
-            let t_sample0 = if prof_wall {
-                Some(Instant::now())
-            } else {
-                None
-            };
             let next_token = {
                 let mut sequences = self.sequences.write();
                 let seq = sequences
@@ -957,25 +821,9 @@ impl EngineInner {
             self.scheduler.update_decode_progress(rid, generated_count);
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
-            if let Some(t0) = t_sample0 {
-                sample_us += t0.elapsed().as_micros();
-            }
 
-            let t_emit0 = if prof_wall {
-                Some(Instant::now())
-            } else {
-                None
-            };
             self.send_stream_update(rid, next_token).await;
-            if let Some(t0) = t_emit0 {
-                emit_us += t0.elapsed().as_micros();
-            }
 
-            let t_stop0 = if prof_wall {
-                Some(Instant::now())
-            } else {
-                None
-            };
             let should_stop = {
                 let sequences = self.sequences.read();
                 sequences
@@ -996,332 +844,6 @@ impl EngineInner {
                     }
                 };
                 self.complete_request(rid, finish_reason).await?;
-            }
-            if let Some(t0) = t_stop0 {
-                stop_us += t0.elapsed().as_micros();
-            }
-        }
-
-        if let (Some(ta), Some(tb), Some(tc)) = (t_a, t_b, t_c) {
-            let n = self.iteration_count.load(Ordering::Relaxed);
-            if n.is_multiple_of(32) {
-                let build_us = tb.duration_since(ta).as_micros();
-                let model_us = tc.duration_since(tb).as_micros();
-                let total_us = ta.elapsed().as_micros();
-                eprintln!(
-                    "[batch-decode-wall] iter#{} m={} | total={}us | build={}us | model={}us | sample={}us | emit={}us | stop={}us",
-                    n,
-                    rids.len(),
-                    total_us,
-                    build_us,
-                    model_us,
-                    sample_us,
-                    emit_us,
-                    stop_us,
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    // ── mixed prefill+decode iter (vLLM-style chunked prefill) ─────────
-
-    /// Run one mixed iter that batches prefill chunks alongside decode
-    /// items in a single `unified_decode` call. Eliminates the
-    /// prefill-blocks-decode bottleneck where currently a 200ms prefill
-    /// stalls all 16 decoding sequences.
-    ///
-    /// Per-iter token budget (FERRUM_UNIFIED_TOKEN_BUDGET, default 512)
-    /// caps total q-tokens. Decode items each cost 1 token; remaining
-    /// budget is split across pending prefills (chunked into the largest
-    /// slice that fits).
-    ///
-    /// Gated on `FERRUM_MIXED_BATCH=1`. Fallback path is the legacy
-    /// `for prefill_id in prefill_ids: run_prefill` + `run_batch_decode`.
-    async fn run_unified_iter(
-        &self,
-        prefill_ids: &[RequestId],
-        decode_ids: &[RequestId],
-    ) -> Result<()> {
-        use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
-        use ferrum_interfaces::Priority;
-
-        // Total q-token budget per iter. Decodes consume 1 each;
-        // remaining slots fill with prefill chunks. The decoder-takes-
-        // first-bite IS a feature: at high c the budget shrinks for
-        // prefill, capping m_total ≈ token_budget so matmul time stays
-        // bounded. Tested A/B: removing the decoder subtraction (let
-        // budget always be the env value) regressed c=32 by 11 % —
-        // m_total grew from 128 to 160, matmul ~25 % slower, slowdown
-        // exceeded the extra prefill bandwidth. Keep the original
-        // behaviour. (The starvation at BUDGET=32 c=32 is an artefact
-        // of an unreasonably tight budget setting, not the default 128
-        // which has plenty of headroom.)
-        // 128 default (was 512): A/B at c=16 showed 128 wins +1-2%
-        // because smaller mixed iters spread prefill overhead more
-        // evenly across iters. 512 still works; 32 starves.
-        let token_budget: usize = std::env::var("FERRUM_UNIFIED_TOKEN_BUDGET")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n > 0)
-            .unwrap_or(128);
-        let mut budget_left = token_budget.saturating_sub(decode_ids.len());
-
-        // Allocate KV blocks for new prefills (those without kv_cache).
-        let model_info = self.model_executor.info();
-        for rid in prefill_ids {
-            let needs_alloc = {
-                let sequences = self.sequences.read();
-                sequences
-                    .get(rid)
-                    .map(|s| s.kv_cache.is_none())
-                    .unwrap_or(false)
-            };
-            if !needs_alloc {
-                continue;
-            }
-            let tokens_len = {
-                let sequences = self.sequences.read();
-                sequences
-                    .get(rid)
-                    .map(|s| s.input_tokens.len())
-                    .unwrap_or(0)
-            };
-            if tokens_len == 0 {
-                continue;
-            }
-            let alloc_request = AllocationRequest {
-                request_id: rid.clone(),
-                initial_tokens: tokens_len,
-                max_sequence_length: model_info.max_sequence_length,
-                num_layers: model_info.num_layers,
-                num_heads: model_info.num_kv_heads,
-                head_dim: model_info.hidden_size / model_info.num_heads.max(1),
-                device: self.config.backend.device.clone(),
-                dtype: model_info.dtype,
-                priority: Priority::Normal,
-            };
-            let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
-                Ok(h) => h,
-                Err(_) => {
-                    if self.preempt_victim(rid).await {
-                        self.kv_cache.allocate(&alloc_request).await?
-                    } else {
-                        warn!("Mixed iter prefill alloc failed, no victim: {rid}");
-                        self.complete_request(rid, FinishReason::Error).await?;
-                        continue;
-                    }
-                }
-            };
-            let mut sequences = self.sequences.write();
-            if let Some(seq) = sequences.get_mut(rid) {
-                seq.kv_cache = Some(kv_handle);
-                // Mixed-path doesn't get a post-prefill kv_cache.cache_id()
-                // back from the model the way run_prefill_inner does. We
-                // pass the request UUID as the seq_id into UnifiedBatch,
-                // so the model creates its per-cache state under that key.
-                // Save it now so complete_request can release_cache(uuid)
-                // — otherwise we leak ~130KB/token of paged-pool state per
-                // completed request and OOM after ~50 requests.
-                if seq.model_cache_id.is_none() {
-                    seq.model_cache_id = Some(rid.to_string());
-                }
-            }
-        }
-
-        // Build mixed batch.
-        let mut batch = UnifiedBatch::new();
-        // For each batch item, remember which seq it belongs to and how
-        // many KV slots we'll consume — used to bump pos_offset post-call.
-        let mut item_kinds: Vec<(
-            RequestId,
-            bool,  /*is_prefill*/
-            usize, /*chunk_len*/
-        )> = Vec::with_capacity(prefill_ids.len() + decode_ids.len());
-
-        {
-            let sequences = self.sequences.read();
-            // 1. Decode items first (always 1 token each).
-            for rid in decode_ids {
-                let seq = match sequences.get(rid) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let kv_cache = match seq.kv_cache.clone() {
-                    Some(h) => h,
-                    None => continue,
-                };
-                let last_token = seq
-                    .generated_tokens
-                    .last()
-                    .copied()
-                    .unwrap_or(TokenId::new(0));
-                let pos_offset = kv_cache.block_table().sequence_length;
-                let seq_id = seq
-                    .model_cache_id
-                    .clone()
-                    .unwrap_or_else(|| rid.to_string());
-                batch.items.push(UnifiedBatchItem {
-                    seq_id,
-                    q_tokens: vec![last_token.get()],
-                    kv_cache,
-                    pos_offset,
-                    is_final_chunk: true,
-                });
-                item_kinds.push((rid.clone(), false, 1));
-            }
-
-            // 2. Prefill chunks until budget exhausted.
-            for rid in prefill_ids {
-                if budget_left == 0 {
-                    break;
-                }
-                let seq = match sequences.get(rid) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let kv_cache = match seq.kv_cache.clone() {
-                    Some(h) => h,
-                    None => continue, // alloc failed earlier; already errored
-                };
-                let total = seq.input_tokens.len();
-                let already = seq.prefill_pos;
-                if already >= total {
-                    continue; // already done
-                }
-                let remaining = total - already;
-                let chunk_len = remaining.min(budget_left);
-                let q_tokens: Vec<u32> = seq.input_tokens[already..already + chunk_len]
-                    .iter()
-                    .map(|t| t.get())
-                    .collect();
-                let pos_offset = already;
-                let is_final = (already + chunk_len) == total;
-                let seq_id = seq
-                    .model_cache_id
-                    .clone()
-                    .unwrap_or_else(|| rid.to_string());
-                batch.items.push(UnifiedBatchItem {
-                    seq_id,
-                    q_tokens,
-                    kv_cache,
-                    pos_offset,
-                    is_final_chunk: is_final,
-                });
-                item_kinds.push((rid.clone(), true, chunk_len));
-                budget_left -= chunk_len;
-            }
-        }
-
-        if batch.items.is_empty() {
-            return Ok(());
-        }
-
-        let results = self.model_executor.unified_decode(&batch).await?;
-        if results.len() != item_kinds.len() {
-            return Err(FerrumError::internal(format!(
-                "unified_decode returned {} results for {} items",
-                results.len(),
-                item_kinds.len(),
-            )));
-        }
-
-        // Process per-item results: bump KV len, advance prefill_pos,
-        // sample for final-chunk items, stream tokens.
-        for ((rid, is_prefill, chunk_len), logits_opt) in item_kinds.iter().zip(results.into_iter())
-        {
-            // Bump engine-side KV handle by chunk_len so the NEXT iter's
-            // pos_offset reflects what the model already consumed.
-            {
-                let mut sequences = self.sequences.write();
-                if let Some(seq) = sequences.get_mut(rid) {
-                    if let Some(h) = seq.kv_cache.take() {
-                        let new_len = h.block_table().sequence_length + chunk_len;
-                        seq.kv_cache = Some(self.make_kv_handle_with_seq(&h, new_len));
-                    }
-                    if *is_prefill {
-                        seq.prefill_pos += chunk_len;
-                        // is_final_chunk: rebuild logic inline (we don't
-                        // have direct access to the batch item here, but
-                        // logits_opt.is_some() is equivalent).
-                        let now_complete = logits_opt.is_some();
-                        if now_complete {
-                            seq.prefill_complete = true;
-                            seq.phase = RequestPhase::Decoding;
-                        }
-                    }
-                }
-            }
-
-            // Tell scheduler about prefill chunk progress.
-            if *is_prefill {
-                let total_tokens = {
-                    let sequences = self.sequences.read();
-                    sequences
-                        .get(rid)
-                        .map(|s| s.input_tokens.len())
-                        .unwrap_or(0)
-                };
-                if logits_opt.is_some() {
-                    self.scheduler.mark_prefill_complete(rid, total_tokens);
-                    self.total_prefill_tokens
-                        .fetch_add(total_tokens as u64, Ordering::Relaxed);
-                    counter!("ferrum.engine.prefill_tokens_total").increment(total_tokens as u64);
-                    counter!("ferrum.engine.prefills_total").increment(1);
-                } else {
-                    self.scheduler
-                        .mark_prefill_chunk_processed(rid, total_tokens, *chunk_len);
-                }
-            }
-
-            // Sample for final-chunk items (decode + completed prefill).
-            if let Some(mut logits) = logits_opt {
-                let next_token = {
-                    let mut sequences = self.sequences.write();
-                    let seq = sequences
-                        .get_mut(rid)
-                        .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                    let token = seq.sample_with_processors(&mut logits)?;
-                    seq.generated_tokens.push(token);
-                    seq.tokens_this_iteration += 1;
-                    token
-                };
-
-                let generated_count = {
-                    let sequences = self.sequences.read();
-                    sequences
-                        .get(rid)
-                        .map(|s| s.generated_tokens.len())
-                        .unwrap_or(0)
-                };
-                self.scheduler.update_decode_progress(rid, generated_count);
-                self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
-                counter!("ferrum.engine.decode_tokens_total").increment(1);
-
-                self.send_stream_update(rid, next_token).await;
-
-                let should_stop = {
-                    let sequences = self.sequences.read();
-                    sequences
-                        .get(rid)
-                        .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
-                };
-                if should_stop {
-                    let finish_reason = {
-                        let sequences = self.sequences.read();
-                        match sequences.get(rid) {
-                            Some(seq)
-                                if seq.generated_tokens.len() >= seq.sampling_params.max_tokens =>
-                            {
-                                FinishReason::Length
-                            }
-                            Some(_) => FinishReason::EOS,
-                            None => FinishReason::Error,
-                        }
-                    };
-                    self.complete_request(rid, finish_reason).await?;
-                }
             }
         }
 
@@ -1838,7 +1360,6 @@ impl ContinuousBatchEngine {
                 total_preemptions: AtomicU64::new(0),
                 prefix_cache_hits: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
-                last_iter_end: Mutex::new(None),
             }),
         }
     }

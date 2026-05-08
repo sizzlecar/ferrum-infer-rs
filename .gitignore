@@ -36,4 +36,11 @@ docs/registry_pattern_explanation.md
 
 # Claude Code local settings
 .claude/
+
+# Profiling output — Xcode Instruments traces, xctrace dumps, raw
+# shader / kernel timeline XMLs. These are 10s-100s of MB binaries
+# and don't belong in source control. The distilled findings live in
+# the corresponding `docs/bench/*.md` reports.
 bench_results/
+**/*.trace/
+**/xctrace/

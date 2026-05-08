@@ -1,0 +1,49 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8783",
+    "model": "Qwen3-8B",
+    "num_prompts": 16,
+    "max_concurrency": 4,
+    "request_rate": Infinity,
+    "max_tokens": 64
+  },
+  "completed": 8,
+  "failed": 8,
+  "wall_time_s": 21.534922207999998,
+  "request_throughput_rps": 0.37148961685257836,
+  "input_throughput_tok_s": 6.733249305452983,
+  "output_throughput_tok_s": 23.775335478565015,
+  "total_input_tokens": 145,
+  "total_output_tokens": 512,
+  "ttft_ms": {
+    "mean": 587.3035468749999,
+    "median": 525.100958,
+    "p99": 1061.4920838799999,
+    "max": 1079.2543329999999
+  },
+  "tpot_ms": {
+    "mean": 141.07611491468253,
+    "median": 141.92995403968257,
+    "p99": 144.97862797206346,
+    "max": 145.01235649206347
+  },
+  "itl_ms": {
+    "mean": 141.07549859126985,
+    "median": 138.4552499999998,
+    "p99": 279.6473862600001,
+    "max": 361.5366670000001
+  },
+  "e2e_ms": {
+    "mean": 9475.0987865,
+    "median": 9467.597,
+    "p99": 9553.27693419,
+    "max": 9557.688375
+  },
+  "error_samples": [
+    "ClientPayloadError: Response payload is not completed: <TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'>",
+    "ClientPayloadError: Response payload is not completed: <TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'>",
+    "ClientPayloadError: Response payload is not completed: <TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'>",
+    "ClientPayloadError: Response payload is not completed: <TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'>",
+    "ClientConnectorError: Cannot connect to host 127.0.0.1:8783 ssl:default [Connect call failed ('127.0.0.1', 8783)]"
+  ]
+}

@@ -314,10 +314,6 @@ pub struct LlamaFamilyScratch<B: Backend> {
     pub unified_cu_seqlens_q: Option<B::Buffer>,
     pub unified_pos_offsets: Option<B::Buffer>,
     pub unified_block_tables: Option<B::Buffer>,
-    /// Per-seq `valid_kv_len = pos_offset + 1`. Used by the
-    /// pure-decode fast path's `paged_batched_decode_attention`. Sized
-    /// the same as pos_offsets (num_seqs).
-    pub unified_valid_kv_lens: Option<B::Buffer>,
     /// Packed last-token hidden states for is_final_chunk items
     /// (`[num_sampled, h]`). Used as input to lm_head.
     pub unified_packed_normed: Option<B::Buffer>,
@@ -401,7 +397,6 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             unified_cu_seqlens_q: None,
             unified_pos_offsets: None,
             unified_block_tables: None,
-            unified_valid_kv_lens: None,
             unified_packed_normed: None,
             unified_packed_logits: None,
             max_tokens: t,
@@ -444,7 +439,6 @@ impl<B: Backend> LlamaFamilyScratch<B> {
             self.unified_cu_seqlens_q = Some(B::alloc_u32(max_seqs + 1));
             self.unified_pos_offsets = Some(B::alloc_u32(max_seqs));
             self.unified_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
-            self.unified_valid_kv_lens = Some(B::alloc_u32(max_seqs));
             self.unified_packed_normed = Some(B::alloc(max_seqs * h));
             self.unified_packed_logits = Some(B::alloc(max_seqs * v));
         }
@@ -551,13 +545,6 @@ pub struct LlamaFamilyModel<B: Backend> {
     unified_graph_warmup: usize,
     unified_graph_failed: bool,
     unified_graph_keys_seen: std::collections::HashSet<u64>,
-    /// Tracks the largest `m_total` ever submitted to unified_forward.
-    /// We pregrow Marlin gather scratch to THIS value (not the current
-    /// iter's m_total) so a captured graph never sees the scratch slot
-    /// reallocated mid-replay (which would dangle the captured kernel
-    /// pointers and trip CUDA_ERROR_ILLEGAL_ADDRESS on `cuGraphLaunch`'s
-    /// post-launch sync).
-    unified_max_m_total: usize,
 }
 
 impl<B: Backend> LlamaFamilyModel<B> {
@@ -670,7 +657,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
             unified_graph_warmup: 0,
             unified_graph_failed: false,
             unified_graph_keys_seen: std::collections::HashSet::new(),
-            unified_max_m_total: 0,
         })
     }
 
@@ -754,7 +740,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
             unified_graph_warmup: 0,
             unified_graph_failed: false,
             unified_graph_keys_seen: std::collections::HashSet::new(),
-            unified_max_m_total: 0,
         })
     }
 
@@ -797,12 +782,15 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // swap). `FERRUM_KV_CAPACITY=N` overrides; clamp to the model's
         // declared max so we never lie to the model about its window.
         let model_max = self.cfg.max_seq_len;
-        // 1024 default: covers ShareGPT prompts (~579 tok) plus typical
-        // 256-tok output. Old 512 panicked on >512-tok prompts; 2048
-        // was too generous and combined with paged_max_seqs=32 it
-        // needed an 8 GB pool, OOMing on FP16 8B-class models. 1024
-        // halves that. Long-context users can FERRUM_KV_CAPACITY=4096.
-        const DEFAULT_KV_CAPACITY: usize = 1024;
+        // 512 in 0.7.2 — matches the value used in
+        // docs/bench/macos-2026-05-02 to get the published numbers.
+        // pre-0.7.2 default of 4096 was safe only because paged-KV was
+        // opt-in (pool wasn't allocated). With paged-KV now on by
+        // default + MAX_SEQS=32, the pool occupies physical memory:
+        // ~3 GB on Qwen3-30B-A3B Q4_K_M leaves 18 GB weights + 3 GB pool
+        // = 21 GB, fits comfortably on a 32 GB Mac. Long-context users
+        // can `FERRUM_KV_CAPACITY=4096` and accept lower max_seqs.
+        const DEFAULT_KV_CAPACITY: usize = 512;
         let max = std::env::var("FERRUM_KV_CAPACITY")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -836,13 +824,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // use. Pool memory is `max_seqs × max_blocks_per_seq` total
         // blocks — we lowered DEFAULT_KV_CAPACITY to 2048 so this 2× max_seqs
         // bump keeps the pool footprint identical to the pre-0.7.2 default.
-        // 32 default keeps the GPU paged pool sane on consumer 24 GB
-        // cards (pool ~ max_seqs × 128 × 2 MB = 8 GB at 32). Bumping
-        // to 64 was too aggressive — combined with KV_CAPACITY=2048 it
-        // demanded a 16 GB pool, OOMing weight load on Llama-8B FP16.
-        // Bench scripts override to 64 explicitly when they know the
-        // workload fits; CLI's --gpu-memory-utilization auto-sizes
-        // higher when there's headroom.
         let max_seqs = std::env::var("FERRUM_PAGED_MAX_SEQS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -3475,20 +3456,8 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // already snapshotted above into h/nh/etc — cfg is just for the
         // shape constants ensure_unified_scratch needs).
         let cfg_for_alloc = self.cfg.clone();
-        // Track whether the scratch grew this call; if so, ANY previously-
-        // captured CUDA graph holds stale pointers (old scratch buffers
-        // freed) and replay would fault with CUDA_ERROR_ILLEGAL_ADDRESS.
-        // Clear the capture cache so the next graph-eligible iter re-captures
-        // with the new buffers.
-        let prev_capacity = self.scratch.unified_capacity;
         self.scratch
             .ensure_unified_scratch(&cfg_for_alloc, m_total, max_seqs, max_blocks_per_seq);
-        if self.scratch.unified_capacity > prev_capacity && !self.unified_graph_keys_seen.is_empty()
-        {
-            self.unified_graph_keys_seen.clear();
-            self.unified_graph_warmup = 0;
-            self.unified_graph_failed = false;
-        }
 
         let mut ctx = B::new_context();
 
@@ -3520,19 +3489,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .as_mut()
                 .expect("unified_pos_offsets missing");
             B::write_u32(&mut ctx, po, &pos_offsets);
-        }
-        // Pure-decode fast path needs valid_kv_lens[i] = pos_offsets[i] + 1
-        // (each q_token is the last in its seq when q_len==1). Always write
-        // — the layer kernel decides whether to use it.
-        let pure_decode = m_total == num_seqs;
-        if pure_decode {
-            let valid_kv_lens: Vec<u32> = pos_offsets.iter().map(|&p| p + 1).collect();
-            let kvl = self
-                .scratch
-                .unified_valid_kv_lens
-                .as_mut()
-                .expect("unified_valid_kv_lens missing");
-            B::write_u32(&mut ctx, kvl, &valid_kv_lens);
         }
         // Stack per-seq block tables host-side, then upload.
         {
@@ -3590,27 +3546,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
         // `down_proj` has the largest k = intermediate_size, so
         // m_total * intermediate_size is the upper bound across all
         // 4 matmuls in the layer.
-        //
-        // Track max m_total ever seen and pre-grow to THAT — otherwise a
-        // captured graph for shape (m=16) holds Marlin scratch pointers
-        // that get FREED when a later (m=272) iter calls pregrow with
-        // a bigger size. Replay then trips CUDA_ERROR_ILLEGAL_ADDRESS
-        // on the captured kernel that referenced the old scratch.
-        // Pregrowing to the running max means after we've seen the
-        // largest workload once, subsequent pregrow calls find the slot
-        // already big enough (no realloc → captured pointers stay live).
-        if m_total > self.unified_max_m_total {
-            // Growing the watermark — clear graph cache so any captured
-            // graphs (referencing the smaller pre-growth scratch) get
-            // rebuilt against the new buffer.
-            if !self.unified_graph_keys_seen.is_empty() {
-                self.unified_graph_keys_seen.clear();
-                self.unified_graph_warmup = 0;
-                self.unified_graph_failed = false;
-            }
-            self.unified_max_m_total = m_total;
-        }
-        let max_marlin_required = self.unified_max_m_total * im;
+        let max_marlin_required = m_total * im;
         B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
 
         // Sync eager pre-work (write_u32 + embedding + scratch grow)
@@ -3648,35 +3584,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
             self.unified_graph_warmup += 1;
         }
 
-        // Diagnostic: every 64 iters, print capture/replay/eager counts +
-        // distinct graph_keys seen so we can decide whether the graph
-        // path is dominated by capture overhead or replay benefit.
-        if graph_enabled && std::env::var("FERRUM_GRAPH_STATS").is_ok() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static REPLAYS: AtomicU64 = AtomicU64::new(0);
-            static CAPTURES: AtomicU64 = AtomicU64::new(0);
-            static EAGER: AtomicU64 = AtomicU64::new(0);
-            static TOTAL: AtomicU64 = AtomicU64::new(0);
-            if did_pure_replay {
-                REPLAYS.fetch_add(1, Ordering::Relaxed);
-            } else if should_capture {
-                CAPTURES.fetch_add(1, Ordering::Relaxed);
-            } else {
-                EAGER.fetch_add(1, Ordering::Relaxed);
-            }
-            let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-            if total.is_multiple_of(64) {
-                let r = REPLAYS.load(Ordering::Relaxed);
-                let c = CAPTURES.load(Ordering::Relaxed);
-                let e = EAGER.load(Ordering::Relaxed);
-                eprintln!(
-                    "[graph-stats] total={total} replay={r} ({:.1}%) capture={c} eager={e} keys_cached={}",
-                    100.0 * r as f64 / total as f64,
-                    self.unified_graph_keys_seen.len(),
-                );
-            }
-        }
-
         if should_capture {
             if let Err(e) = B::begin_graph_capture(&mut ctx) {
                 eprintln!("[unified-graph] begin_capture err: {e}");
@@ -3709,7 +3616,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
                     h,
                     eps,
                     qk_mode,
-                    pure_decode,
                 );
             }
         }
@@ -3850,36 +3756,10 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .unified_packed_logits
                 .as_ref()
                 .expect("unified_packed_logits missing");
-
-            // Greedy fast-path: with FERRUM_GREEDY_ARGMAX=1, do argmax on
-            // device + return one-hot Vec<f32>. Cuts the DTOH transfer
-            // from `num_sampled * vocab * 2 bytes` (≈ 8 MB at c=16,
-            // vocab=128k, f16) to `num_sampled * 4 bytes` and skips the
-            // host argmax in the engine's sample loop. The synthetic
-            // one-hot vec keeps `sample_with_processors` correct (greedy
-            // picks the same token; non-greedy callers shouldn't enable
-            // this flag).
-            // Default ON. Greedy fast-path emits 1-element token vec
-            // (engine sample_with_processors short-circuits when len==1
-            // and temperature=0). Bypass via FERRUM_GREEDY_ARGMAX=0.
-            if std::env::var("FERRUM_GREEDY_ARGMAX").map_or(true, |v| v != "0") {
-                let tokens = B::argmax_rows_to_u32(packed_logits, num_sampled, vocab);
-                // Compact format: 1-element vec carrying the token (as f32
-                // bit-cast). The engine's sample_with_processors fast-
-                // path detects logits.len() == 1 and skips the heavy
-                // SamplingContext path. Saves the 128k-float scan that
-                // even a "simple" argmax fast-path would otherwise pay
-                // (~80us × c=16 = 1.3ms / iter).
-                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                    let tok = tokens[j];
-                    out[orig_idx] = Some(vec![f32::from_bits(tok)]);
-                }
-            } else {
-                let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
-                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                    let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
-                    out[orig_idx] = Some(row);
-                }
+            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
+                out[orig_idx] = Some(row);
             }
         }
 
@@ -3931,7 +3811,6 @@ impl<B: Backend> LlamaFamilyModel<B> {
         h: usize,
         eps: f32,
         qk_mode: i32,
-        pure_decode: bool,
     ) {
         let layer = &self.layers[li];
         let dummy_w = &layer.input_ln_w;
@@ -4053,15 +3932,23 @@ impl<B: Backend> LlamaFamilyModel<B> {
             .expect("paged unified: split_qkv_norm_rope_into_paged_cache_varlen");
         });
 
-        // 4. paged attention: dispatch the q_len=1 batched fast path
-        //    when every item is a decode (m_total == num_seqs); else
-        //    fall back to the varlen kernel that handles arbitrary q_len.
+        // 4. paged_varlen_attention: one call covering all M_total tokens.
         time_op!(ATTN_TIME_US, ATTN_CALLS, {
             let packed_q = self
                 .scratch
                 .unified_packed_q
                 .as_ref()
                 .expect("unified_packed_q missing");
+            let cu_seqlens_buf = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_ref()
+                .expect("unified_cu_seqlens_q missing");
+            let pos_offsets_buf = self
+                .scratch
+                .unified_pos_offsets
+                .as_ref()
+                .expect("unified_pos_offsets missing");
             let bt_buf = self
                 .scratch
                 .unified_block_tables
@@ -4072,99 +3959,25 @@ impl<B: Backend> LlamaFamilyModel<B> {
                 .unified_attn_out
                 .as_mut()
                 .expect("unified_attn_out missing");
-            if pure_decode {
-                let kv_lens_buf = self
-                    .scratch
-                    .unified_valid_kv_lens
-                    .as_ref()
-                    .expect("unified_valid_kv_lens missing");
-                let r = B::paged_batched_decode_attention(
-                    ctx,
-                    packed_q,
-                    pool_k,
-                    pool_v,
-                    attn_out,
-                    bt_buf,
-                    kv_lens_buf,
-                    num_seqs,
-                    max_kv_len,
-                    nh,
-                    nkv,
-                    hd,
-                    block_size,
-                    max_blocks_per_seq,
-                );
-                if let Err(e) = r {
-                    // Backend may not implement; fall through to varlen.
-                    eprintln!(
-                        "[unified] paged_batched_decode unsupported, falling back to varlen: {e}"
-                    );
-                    let cu_seqlens_buf = self
-                        .scratch
-                        .unified_cu_seqlens_q
-                        .as_ref()
-                        .expect("unified_cu_seqlens_q missing");
-                    let pos_offsets_buf = self
-                        .scratch
-                        .unified_pos_offsets
-                        .as_ref()
-                        .expect("unified_pos_offsets missing");
-                    let attn_out_fb = self
-                        .scratch
-                        .unified_attn_out
-                        .as_mut()
-                        .expect("unified_attn_out missing");
-                    B::paged_varlen_attention(
-                        ctx,
-                        packed_q,
-                        pool_k,
-                        pool_v,
-                        attn_out_fb,
-                        cu_seqlens_buf,
-                        pos_offsets_buf,
-                        bt_buf,
-                        num_seqs,
-                        m_total,
-                        max_kv_len,
-                        nh,
-                        nkv,
-                        hd,
-                        block_size,
-                        max_blocks_per_seq,
-                    )
-                    .expect("paged_varlen_attention (fallback)");
-                }
-            } else {
-                let cu_seqlens_buf = self
-                    .scratch
-                    .unified_cu_seqlens_q
-                    .as_ref()
-                    .expect("unified_cu_seqlens_q missing");
-                let pos_offsets_buf = self
-                    .scratch
-                    .unified_pos_offsets
-                    .as_ref()
-                    .expect("unified_pos_offsets missing");
-                B::paged_varlen_attention(
-                    ctx,
-                    packed_q,
-                    pool_k,
-                    pool_v,
-                    attn_out,
-                    cu_seqlens_buf,
-                    pos_offsets_buf,
-                    bt_buf,
-                    num_seqs,
-                    m_total,
-                    max_kv_len,
-                    nh,
-                    nkv,
-                    hd,
-                    block_size,
-                    max_blocks_per_seq,
-                )
-                .expect("paged_varlen_attention");
-            }
+            B::paged_varlen_attention(
+                ctx,
+                packed_q,
+                pool_k,
+                pool_v,
+                attn_out,
+                cu_seqlens_buf,
+                pos_offsets_buf,
+                bt_buf,
+                num_seqs,
+                m_total,
+                max_kv_len,
+                nh,
+                nkv,
+                hd,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("paged_varlen_attention");
         });
 
         // 5. o_proj (M_total): attn_out → o_proj_out
