@@ -1000,7 +1000,24 @@ extern "C" int marlin_cuda_moe(
   }
   int thread_m_blocks = tot_m_blocks;
 
-  int blocks = sms;  // gridDim.x
+  // ── gridDim.x = n_tiles_per_expert (NOT sms) — Stage 12.1 ────────────
+  // Original Marlin uses gridDim.x = sms cooperating blocks per GEMM,
+  // each doing 1 tile. Setup overhead per block (~3 µs) >> per-tile work
+  // when m=16. Stage 12 inherited that → 100 active experts × 128
+  // blocks/expert = 12800 blocks/launch, 96 do work, 32 idle. Setup
+  // dominates.
+  //
+  // For MoE-fused with gridDim.y = num_experts, we already get parallelism
+  // across experts. Within one expert, n_tiles=3 is enough — pick blocks
+  // = n_tiles so each block processes ALL k-tiles for one n-tile. Per-
+  // block work scales 32×, setup amortizes. Total grid = (3, 100) =
+  // 300 blocks → 2.3 waves on 128 SMs vs 100 waves before.
+  //
+  // Cooperating-block barriers are bypassed: slice_count=1 so locks
+  // are never read/written. Existing kernel logic handles this case.
+  int n_tiles = prob_n / (16 * thread_n_blocks);
+  if (n_tiles <= 0) n_tiles = 1;
+  int blocks = n_tiles;
   int* locks = (int*) workspace;
   const int4* A_ptr = (const int4*) A;
   const int4* B_ptr = (const int4*) B;
