@@ -1,9 +1,10 @@
 #pragma once
 
-#include <torch/all.h>
-
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+// vendored for ferrum-infer-rs: drop torch and ATen headers; only stdlib
+// types are actually used in this header.
+// #include <torch/all.h>
+// #include <ATen/cuda/CUDAContext.h>
+// #include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
