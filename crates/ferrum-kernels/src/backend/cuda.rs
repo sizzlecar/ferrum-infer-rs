@@ -1644,6 +1644,30 @@ impl Backend for CudaBackend {
         if num_seqs == 0 {
             return Ok(());
         }
+
+        // Stage 13a: optional split-K path for batched paged decode. With
+        // num_seqs * num_q_heads ≥ sms (saturated grid), splitting kv adds
+        // launch overhead but improves pipelining at long kv_len. Default
+        // OFF (FERRUM_PAGED_FLASH unset) so existing path stays.
+        if std::env::var("FERRUM_PAGED_FLASH").map_or(false, |v| v == "1") {
+            return paged_batched_flash_dispatch(
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                out,
+                block_tables,
+                valid_kv_lens,
+                num_seqs,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_blocks_per_seq,
+            );
+        }
+
         let func = ctx.func(
             "paged_batched_decode_attn",
             ptx::PAGED_DECODE_ATTENTION,
@@ -3109,6 +3133,16 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "triton-kernels"))]
         let mw: &crate::marlin::MarlinWeight = weight;
 
+        // ── Stage 12: fused MoE Marlin path ─────────────────────────────
+        // FERRUM_MOE_FUSED=1 dispatches all experts in this phase as a
+        // small number of bucketed `marlin_gemm_moe` launches (one per
+        // thread_m_blocks bucket ∈ {1, 2, 3, 4}) instead of N round-robin
+        // calls. Eliminates per-expert launch overhead at c=32 (~100
+        // experts/layer → 1-4 launches/layer).
+        if std::env::var("FERRUM_MOE_FUSED").map_or(false, |v| v == "1") {
+            return moe_gemm_phase_fused_impl(ctx, input, mw, dispatches, n_per_expert, output, k);
+        }
+
         // n_streams=1: serial dispatch on the DEFAULT context stream
         // (avoids the cross-stream sync overhead and matches the
         // pre-multi-stream path bit-for-bit).
@@ -4011,6 +4045,360 @@ fn paged_varlen_split_k_dispatch(
             Ok::<(), FerrumError>(())
         },
     )
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Stage 13a — Batched paged-decode flash (split-K)
+//
+// Same idea as the varlen split-K path but for q_len=1 batched decode
+// (gridDim.y = num_seqs). Phase 1 splits each seq's kv across `num_splits`
+// chunks; phase 2 reduces partials per (seq, head).
+//
+// FERRUM_PAGED_FLASH=1 selects this over the single-pass kernel. Default
+// OFF.
+// ────────────────────────────────────────────────────────────────────────
+#[allow(clippy::too_many_arguments)]
+fn paged_batched_flash_dispatch(
+    ctx: &mut CudaState,
+    q: &CudaSlice<f16>,
+    k_pool: &CudaSlice<f16>,
+    v_pool: &CudaSlice<f16>,
+    out: &mut CudaSlice<f16>,
+    block_tables: &CudaSlice<f16>,
+    valid_kv_lens: &CudaSlice<f16>,
+    num_seqs: usize,
+    max_kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+) -> Result<()> {
+    // Pick num_splits. Heuristic combines two effects:
+    //   1. SM occupancy: a (num_q_heads, num_seqs, splits) grid wants
+    //      total blocks ≳ 2 × SM count for full pipelining. When the
+    //      base grid (num_seqs × num_heads) already saturates SMs,
+    //      splits ≥ 2 just add launch + reduce overhead.
+    //   2. kv_len: longer kv → more inherent serial work in step 3 →
+    //      split-K helps even at moderate occupancy.
+    //
+    // Bench (RTX 4090, M3, 32 q_heads):
+    //   c=1  splits=8 → +22% (grid was 1/4 wave, splits saturate)
+    //   c=16 splits=2 → -3.7% (grid already 4 waves)
+    //   c=32 splits=2 → +5% (grid 8 waves, kv split still helps)
+    // Override via FERRUM_PAGED_FLASH_SPLITS for tuning.
+    let force_splits = std::env::var("FERRUM_PAGED_FLASH_SPLITS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    // 128 SMs on Ada/Hopper-class; conservative under-estimate.
+    const SM_TARGET: usize = 128;
+    let base_grid = num_seqs * num_heads;
+    let saturated = base_grid >= 2 * SM_TARGET;
+    let num_splits: usize = force_splits.unwrap_or_else(|| {
+        if saturated {
+            // Only split when kv is so long that the V loop dominates.
+            match max_kv_len {
+                kv if kv <= 768 => 1,
+                kv if kv <= 2048 => 2,
+                _ => 4,
+            }
+        } else {
+            // Low concurrency: aggressive splits to fill SMs.
+            let needed = (SM_TARGET + base_grid - 1) / base_grid;
+            let by_kv = match max_kv_len {
+                kv if kv <= 256 => 4,
+                kv if kv <= 1024 => 8,
+                _ => 16,
+            };
+            needed.max(1).min(by_kv).min(16)
+        }
+    });
+    if num_splits <= 1 {
+        // Caller's main path is the single-pass kernel.
+        // FERRUM_PAGED_FLASH=1 still routes here, so do the single-pass
+        // launch inline (avoids env-flag round-trip).
+        return paged_batched_decode_single_pass(
+            ctx,
+            q,
+            k_pool,
+            v_pool,
+            out,
+            block_tables,
+            valid_kv_lens,
+            num_seqs,
+            max_kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+        );
+    }
+
+    let chunk = (max_kv_len + num_splits - 1) / num_splits;
+    let total_qh = num_seqs * num_heads;
+    let out_required = total_qh * num_splits * head_dim;
+    let ml_required = total_qh * num_splits;
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+    let stream = ctx.stream.clone();
+
+    let phase1 = ctx.func(
+        "paged_batched_flash_attn",
+        ptx::PAGED_DECODE_ATTENTION,
+        "paged_batched_flash_decode_attn_f16",
+    );
+    let phase2 = ctx.func(
+        "paged_batched_flash_reduce",
+        ptx::PAGED_DECODE_ATTENTION,
+        "paged_batched_flash_decode_reduce_f16",
+    );
+
+    with_split_k_scratch(
+        &stream,
+        out_required,
+        ml_required,
+        |partial_out, partial_m, partial_l| {
+            let qv = q.slice(..);
+            let kp = k_pool.slice(..);
+            let vp = v_pool.slice(..);
+            let bt = block_tables.slice(..);
+            let kvl = valid_kv_lens.slice(..);
+            let pout = partial_out.slice(..);
+            let pm = partial_m.slice(..);
+            let pl = partial_l.slice(..);
+            let nqi = num_heads as i32;
+            let nkvi = num_kv_heads as i32;
+            let hdi = head_dim as i32;
+            let mbps = max_blocks_per_seq as i32;
+            let bsi = block_size as i32;
+            let nsp = num_splits as i32;
+
+            let mut b1 = stream.launch_builder(&phase1);
+            b1.arg(&qv);
+            b1.arg(&kp);
+            b1.arg(&vp);
+            b1.arg(&bt);
+            b1.arg(&kvl);
+            b1.arg(&pout);
+            b1.arg(&pm);
+            b1.arg(&pl);
+            b1.arg(&nqi);
+            b1.arg(&nkvi);
+            b1.arg(&hdi);
+            b1.arg(&mbps);
+            b1.arg(&bsi);
+            b1.arg(&scale);
+            b1.arg(&nsp);
+            // Match graph-capture sizing rationale used elsewhere — size
+            // shared to FERRUM_KV_CAPACITY ceiling, not current chunk.
+            let safe_kv: usize = std::env::var("FERRUM_KV_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(512);
+            let safe_chunk = (safe_kv + num_splits - 1) / num_splits;
+            let shmem1 = (safe_chunk.max(chunk).max(1) as u32) * 4;
+            unsafe {
+                b1.launch(LaunchConfig {
+                    grid_dim: (num_heads as u32, num_seqs as u32, num_splits as u32),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: shmem1,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("paged_batched_flash phase1: {e}")))?;
+
+            let pout2 = partial_out.slice(..);
+            let pm2 = partial_m.slice(..);
+            let pl2 = partial_l.slice(..);
+            let mut b2 = stream.launch_builder(&phase2);
+            b2.arg(&pout2);
+            b2.arg(&pm2);
+            b2.arg(&pl2);
+            b2.arg(out);
+            b2.arg(&nqi);
+            b2.arg(&hdi);
+            b2.arg(&nsp);
+            unsafe {
+                b2.launch(LaunchConfig {
+                    grid_dim: (num_heads as u32, num_seqs as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("paged_batched_flash phase2: {e}")))?;
+
+            Ok::<(), FerrumError>(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paged_batched_decode_single_pass(
+    ctx: &mut CudaState,
+    q: &CudaSlice<f16>,
+    k_pool: &CudaSlice<f16>,
+    v_pool: &CudaSlice<f16>,
+    out: &mut CudaSlice<f16>,
+    block_tables: &CudaSlice<f16>,
+    valid_kv_lens: &CudaSlice<f16>,
+    num_seqs: usize,
+    max_kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+) -> Result<()> {
+    let func = ctx.func(
+        "paged_batched_decode_attn",
+        ptx::PAGED_DECODE_ATTENTION,
+        "paged_batched_decode_attn_f16",
+    );
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+    let stream = ctx.stream.clone();
+    let qv = q.slice(..);
+    let kp = k_pool.slice(..);
+    let vp = v_pool.slice(..);
+    let bt = block_tables.slice(..);
+    let kvl = valid_kv_lens.slice(..);
+    let nqi = num_heads as i32;
+    let nkvi = num_kv_heads as i32;
+    let hdi = head_dim as i32;
+    let mbps = max_blocks_per_seq as i32;
+    let bsi = block_size as i32;
+    let mut b = stream.launch_builder(&func);
+    b.arg(&qv);
+    b.arg(&kp);
+    b.arg(&vp);
+    b.arg(&bt);
+    b.arg(&kvl);
+    b.arg(out);
+    b.arg(&nqi);
+    b.arg(&nkvi);
+    b.arg(&hdi);
+    b.arg(&mbps);
+    b.arg(&bsi);
+    b.arg(&scale);
+    let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+    let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+    let shared_bytes = (shared_kv as u32) * 4;
+    unsafe {
+        b.launch(LaunchConfig {
+            grid_dim: (num_heads as u32, num_seqs as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        })
+    }
+    .map(|_| ())
+    .map_err(|e| FerrumError::model(format!("paged_batched_decode_attn: {e}")))
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Stage 12 — Fused MoE Marlin: bucket dispatches by max-m, fire one
+// `marlin_gemm_moe` per bucket. ONE launch per bucket replaces N round-
+// robin calls of the multi-stream path.
+//
+// Buckets are by ceil(m / 16) ∈ {1, 2, 3, 4}. Caller's dispatch list
+// (built by moe_forward_bucketed) gives (expert_idx, in_row, out_row, m)
+// per active expert. Inactive experts (m=0) are not in the list.
+//
+// Per-call uploads: one i32 array of size num_experts_used (active
+// experts in this dispatch list) for active_expert_ids, and one
+// indexed-by-active-position array for tokens + a_row_offsets. Total
+// staging is ~3 × num_active × 4 bytes ≈ 1 KB at c=32 — htod cost is
+// O(1) per phase, dwarfed by the launch savings.
+//
+// Workspace: caller already calls `marlin_zero_stacked_workspace` per
+// phase; the fused kernel reuses the same per-expert workspace ranges.
+// ────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "marlin")]
+fn moe_gemm_phase_fused_impl(
+    ctx: &mut CudaState,
+    input: &CudaSlice<f16>,
+    weight: &crate::marlin::MarlinWeight,
+    dispatches: &[(usize, usize, usize, usize)],
+    n_per_expert: usize,
+    output: &mut CudaSlice<f16>,
+    _k: usize,
+) -> Result<()> {
+    if dispatches.is_empty() {
+        return Ok(());
+    }
+    let num_active = dispatches.len();
+
+    // Bucket by ceil(m / 16). All 4 buckets share the same per-active
+    // tokens + a_row_offsets layout (indexed by active position, NOT
+    // global expert id) — the kernel's `tokens_per_expert[e]` and
+    // `A_row_offsets[e]` use the bucket-local index `e_local`. Caller's
+    // `active_expert_ids[e_local]` maps that to the global expert id.
+    //
+    // The kernel reads:
+    //   int e_local = blockIdx.y;
+    //   int e_global = active_expert_ids[e_local];
+    //   int row_start = A_row_offsets[e_global];
+    //   int m_e       = tokens_per_expert[e_global];
+    // So `tokens_per_expert` and `A_row_offsets` MUST be sized to the
+    // global expert id space and indexed by the global id.
+    //
+    // We don't know num_experts_global directly from the dispatch list,
+    // but max(expert_idx) + 1 is a safe lower bound. Real production
+    // usage at c=32 has num_experts_global ≤ 256 (Qwen3-MoE: 128).
+    let max_global_e = dispatches.iter().map(|d| d.0).max().unwrap();
+    let num_experts_global = max_global_e + 1;
+
+    // Build the per-global-expert index arrays. Both default to 0; only
+    // active experts are populated. Inactive experts won't be referenced
+    // by active_expert_ids[] so their tokens=0 / row=0 values are dead.
+    let mut tokens_global = vec![0i32; num_experts_global];
+    let mut row_offsets_global = vec![0i32; num_experts_global];
+    let mut bucket_active_ids: [Vec<i32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for &(e_idx, in_row, _out_row, m_e) in dispatches {
+        debug_assert!(m_e > 0);
+        debug_assert!(m_e <= 64);
+        tokens_global[e_idx] = m_e as i32;
+        row_offsets_global[e_idx] = in_row as i32;
+        let bucket = ((m_e + 15) / 16).clamp(1, 4) - 1;
+        bucket_active_ids[bucket].push(e_idx as i32);
+    }
+
+    // Upload the global per-expert arrays once.
+    let stream = ctx.stream.clone();
+    let row_off_dev = stream
+        .clone_htod(&row_offsets_global)
+        .map_err(|e| FerrumError::model(format!("htod row_offsets: {e}")))?;
+    let tok_dev = stream
+        .clone_htod(&tokens_global)
+        .map_err(|e| FerrumError::model(format!("htod tokens: {e}")))?;
+
+    // Fire one launch per non-empty bucket.
+    for (b, ids) in bucket_active_ids.iter().enumerate() {
+        if ids.is_empty() {
+            continue;
+        }
+        let prob_m_bucket = ((b + 1) * 16) as i32;
+        let active_dev = stream
+            .clone_htod(ids)
+            .map_err(|e| FerrumError::model(format!("htod active_ids[b={b}]: {e}")))?;
+        crate::marlin::marlin_gemm_moe(
+            &stream,
+            input,
+            weight,
+            output,
+            &row_off_dev,
+            &tok_dev,
+            Some(&active_dev),
+            ids.len() as i32,
+            prob_m_bucket,
+            n_per_expert as i32,
+            num_experts_global as i32,
+        )
+        .map_err(|e| FerrumError::model(format!("marlin_gemm_moe (bucket={b}): {e}")))?;
+    }
+
+    let _ = num_active;
+    Ok(())
 }
 
 fn marlin_gemm_with_perm(
