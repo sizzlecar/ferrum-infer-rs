@@ -118,6 +118,8 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     )
     .expect("stacked load_gptq (vLLM Marlin format)");
 
+    let force_expert0 = std::env::var("FERRUM_PARITY_FORCE_EXPERT0").is_ok();
+
     // Reference: per-expert via existing path.
     let mut c_ref = vec![0f32; total_tokens * n_per];
     for e in 0..num_experts {
@@ -129,11 +131,15 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         let a_e: Vec<f32> = a_data[row_start * k..(row_start + m_e) * k].to_vec();
         let a_e_dev = CudaBackend::from_slice(&a_e);
         let mut out_e_dev = CudaBackend::alloc(m_e * n_per);
+        // In force-expert0 mode the vLLM path will route every block to
+        // expert 0, so the reference must also use expert 0 weights for
+        // all rows (same offset for every expert).
+        let weight_expert = if force_expert0 { 0 } else { e };
         <CudaBackend as Backend>::gemm_gptq_with_offset(
             &mut ctx,
             &a_e_dev,
             &stacked,
-            e * n_per,
+            weight_expert * n_per,
             n_per,
             &mut out_e_dev,
             m_e,
@@ -185,6 +191,14 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         let block_start = padded_offsets[e] / mb;
         for b in 0..blocks_for_e {
             expert_ids[block_start + b] = e as i32;
+        }
+    }
+    // Optional debug override: route every block to expert 0 to isolate
+    // per-expert stride bugs from kernel-config bugs.
+    if std::env::var("FERRUM_PARITY_FORCE_EXPERT0").is_ok() {
+        eprintln!("DEBUG: forcing expert_ids = [0; total_blocks]");
+        for b in 0..total_blocks {
+            expert_ids[b] = 0;
         }
     }
     let num_tokens_past_padded = vec![total_padded as i32];
