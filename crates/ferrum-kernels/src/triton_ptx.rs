@@ -128,3 +128,12 @@ pub mod w4a16_gptq_f16 {
     pub const PTX: &str = include_str!("../triton_ptx/w4a16_gptq_f16.ptx");
     pub const META: &str = include_str!("../triton_ptx/w4a16_gptq_f16.json");
 }
+
+// Stage 15: fused MoE GPTQ INT4×FP16 GEMM with per-tile expert routing
+// (sorted_token_ids + expert_ids). Tile <BM=16, BN=64, BK=32>; BM=16 matches
+// vLLM's standard moe_block_size for INT4 paths. ONE launch processes all
+// (token, expert) pairs of one MoE phase.
+pub mod fused_moe_w4a16_f16_bm16 {
+    pub const PTX: &str = include_str!("../triton_ptx/fused_moe_w4a16_f16_bm16.ptx");
+    pub const META: &str = include_str!("../triton_ptx/fused_moe_w4a16_f16_bm16.json");
+}

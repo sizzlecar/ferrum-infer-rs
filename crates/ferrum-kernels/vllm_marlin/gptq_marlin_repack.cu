@@ -361,3 +361,56 @@ torch::Tensor gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm,
   return out;
 }
 #endif  // closes #if false (disabled torch::Tensor gptq_marlin_repack wrapper)
+
+// =============================================================================
+// ferrum-infer-rs: extern "C" wrapper for the GPTQ → vLLM-Marlin repack.
+// Single expert per call; caller loops over num_experts and concatenates.
+// Input  qweight_in: [size_k / pack_factor, size_n] u32   (GPTQ on-disk)
+// Output qweight_out: [size_k / 16, size_n * 16 / pack_factor] u32
+//                  = (size_k / 16) × (size_n × 2) u32 for INT4
+// Same total bytes as input — just a permutation.
+//
+// has_perm = false (sym=true GPTQ; we don't ship perm). For has_perm=true
+// pass perm_in (size_k u32). For our path leave perm_in nullptr.
+// num_bits = 4 (only path validated for INT4 GPTQ models).
+// is_a_8bit = false (GPTQ activations stay fp16).
+// =============================================================================
+extern "C" int ferrum_vllm_gptq_marlin_repack(
+    const void* qweight_in,
+    const void* perm_in,
+    void* qweight_out,
+    int size_k,
+    int size_n,
+    int num_bits,
+    int has_perm,
+    int dev,
+    cudaStream_t stream
+) {
+  if (size_k % marlin::tile_k_size != 0) return 1;
+  if (size_n % marlin::tile_n_size != 0) return 2;
+  if (num_bits != 4 && num_bits != 8) return 3;
+
+  uint32_t const* b_q_weight_ptr = reinterpret_cast<uint32_t const*>(qweight_in);
+  uint32_t const* perm_ptr = reinterpret_cast<uint32_t const*>(perm_in);
+  uint32_t* out_ptr = reinterpret_cast<uint32_t*>(qweight_out);
+
+  int blocks;
+  cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, dev);
+  int max_shared_mem = 0;
+  cudaDeviceGetAttribute(&max_shared_mem,
+                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  if (max_shared_mem <= 0) return 4;
+
+  bool hp = has_perm != 0;
+  bool is_a_8bit = false;
+
+  if (false) {}
+  CALL_IF(4, false, false)
+  CALL_IF(4, true, false)
+  CALL_IF(8, false, false)
+  CALL_IF(8, true, false)
+  else {
+    return 5;
+  }
+  return 0;
+}

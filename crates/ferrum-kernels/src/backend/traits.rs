@@ -197,6 +197,16 @@ pub struct KvCache<B: Backend> {
 ///
 /// `layer_forward` passes the context through all ops in a layer.
 /// `ModelRunner` calls `sync()` only when it needs results (e.g., reading logits).
+/// Routing buffers consumed by `moe_gemm_phase_vllm` — held by the
+/// caller across phase 1 and phase 3 of one MoE forward. All three
+/// fields are i32 device tensors in disguise (`Self::Buffer = fp16` on
+/// CUDA; the backend reinterprets the underlying device pointer).
+pub struct MoeRouting<B: Backend + ?Sized> {
+    pub sorted_token_ids: B::Buffer,
+    pub expert_ids: B::Buffer,
+    pub num_tokens_past_padded: B::Buffer,
+}
+
 pub trait Backend: Send + Sync + Sized + 'static {
     type Buffer: Send + Sync;
 
@@ -447,6 +457,67 @@ pub trait Backend: Send + Sync + Sized + 'static {
             )?;
         }
         Ok(())
+    }
+
+    /// Routing inputs for `moe_gemm_phase_vllm` — host-built i32 arrays
+    /// uploaded once per layer (or per token, depending on caller cadence).
+    /// Matches the shape contract of `moe_align_block_size` outputs but is
+    /// usable on backends that build the indices on host.
+    ///
+    /// Buffers are typed Self::Buffer (= fp16 on CUDA) for trait-object
+    /// reasons; backends reinterpret as i32. Default returns unsupported.
+    fn upload_moe_routing(
+        _ctx: &mut Self::Context,
+        _sorted_token_ids: &[i32],
+        _expert_ids: &[i32],
+        _num_tokens_past_padded: &[i32],
+    ) -> Result<MoeRouting<Self>> {
+        Err(FerrumError::unsupported(
+            "upload_moe_routing not implemented for this backend",
+        ))
+    }
+
+    /// Zero the first `len` elements of a Self::Buffer. CUDA path uses
+    /// cuMemsetD16Async; default returns unsupported.
+    fn zero_buffer(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "zero_buffer not implemented for this backend",
+        ))
+    }
+
+    /// vLLM marlin_moe_wna16 phase GEMM. Replaces the per-expert loop in
+    /// `moe_gemm_phase_batched` with a single fused launch that routes
+    /// per-block via `expert_ids`. Caller responsibilities:
+    ///
+    /// - `weight` was loaded via the vLLM stacked-Marlin path (i.e.
+    ///   `Self::load_gptq_stacked` invoked under `FERRUM_VLLM_MOE=1`).
+    ///   Feeding an IST-DASLab-format weight here yields silent garbage.
+    /// - `output` MUST be pre-zeroed (the kernel's atomic-add path does
+    ///   not self-zero the global tile).
+    /// - `sorted_token_ids` / `expert_ids` / `num_tokens_past_padded`
+    ///   come from `moe_align_block_size` or an equivalent host build.
+    /// - `prob_m` is the unique-token count (we feed pre-gathered rows
+    ///   with `top_k=1` so it equals `total_pairs`).
+    ///
+    /// Default: returns unsupported. CUDA overrides on `vllm-moe-marlin`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemm_phase_vllm(
+        _ctx: &mut Self::Context,
+        _input: &Self::Buffer,
+        _weight: &Self::GptqStore,
+        _sorted_token_ids: &Self::Buffer,
+        _expert_ids: &Self::Buffer,
+        _num_tokens_past_padded: &Self::Buffer,
+        _output: &mut Self::Buffer,
+        _prob_m: usize,
+        _n_per_expert: usize,
+        _k: usize,
+        _moe_block_size: usize,
+        _top_k: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "moe_gemm_phase_vllm not implemented for this backend",
+        ))
     }
 
     /// Load GGUF k-quant weights into the backend's preferred format.
