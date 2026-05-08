@@ -197,19 +197,66 @@ Profile-mode (FERRUM_DECODE_OP_PROFILE=1, the breakdown above):
 
 **Production (no FERRUM_DECODE_OP_PROFILE — what users actually see)**:
 
-| c    | Stage 5 baseline | Stage 7 (this session) | Δ tok/s | vs vLLM |
+| c    | Stage 5 baseline | Stage 8 (this session) | Δ tok/s | vs vLLM |
 |------|------------------|------------------------|---------|---------|
-| 1    | 65.5             | **73.9**               | +12.8%  | 73.9  / 161.5  = 45.8% |
-| 8    | 118.0            | **127.4**              | +8.0%   | 127.4 / 413.1  = 30.8% |
-| 16   | 132.1            | **148.2**              | +12.2%  | 148.2 / 505.0  = 29.3% |
-| 32   | 137.1            | **162.6**              | +18.6%  | 162.6 / 1872.9 = 8.7%  |
+| 1    | 65.5             | **73.0**               | +11.5%  | 73.0  / 161.5  = 45.2% |
+| 8    | 118.0            | **136.1**              | +15.3%  | 136.1 / 413.1  = 32.9% |
+| 16   | 132.1            | **158.9**              | +20.3%  | 158.9 / 505.0  = 31.5% |
+| 32   | 137.1            | **172.7**              | +25.9%  | 172.7 / 1872.9 = 9.2%  |
 
-Format: tok/s aggregate. Mean TPOTs at c=32 went 204.4 → 177.07 ms.
+Format: tok/s aggregate. Mean TPOTs at c=32 went 204.4 → 168.1 ms.
 
-Total session: **9.4 → 162.6 tok/s at c=32 (17.3× over per-pair baseline,
-+18.6% over Stage 5 stacked-Marlin baseline)**. vLLM remains 11.5× ahead
+Total session: **9.4 → 172.7 tok/s at c=32 (18.4× over per-pair baseline,
++25.9% over Stage 5 stacked-Marlin baseline)**. vLLM remains 10.8× ahead
 at 1873 tok/s — the gap is now firmly in the Marlin-GEMM-throughput
-regime; ~26 ms of every decode token is real Marlin compute.
+regime; ~27 ms of every decode token is real Marlin compute.
+
+## Stage 8 — GPU-side route_topk_softmax (CUDA)  ★ +6.2% at c=32
+
+Port of the Metal `moe_router_topk_softmax_f32` kernel to `.cu`, plus a
+new Backend trait method `try_gpu_route_topk_into_host` that fuses the
+host-side `B::sync(ctx) + B::to_vec(router_logits) + crate::moe::router::
+route_into(...)` triple into one GPU launch + small (~1 KB) D2H of
+[batch, top_k] ids and weights.
+
+Algorithm mirrors Metal: cooperative softmax → K passes of argmax-mask
+top-K → optional renorm. Block: 1 warp (32 threads), 1 block per row.
+Shared mem: `num_experts × 4 B` (512 B at Qwen3-MoE 128 experts).
+Tie-break: smaller index wins → bit-exact with the host `route_into`.
+
+Caller (`moe_forward_bucketed`) tries the GPU path first and falls back
+to the existing host path on `Err(unsupported)`. The default trait impl
+returns `Err`, so non-CUDA backends are unchanged.
+
+```
+host_route 1850 us → 988 us   (-862 us; the residual is the cuStreamSynchronize
+                                wait for the kernel + D2H to commit, since the
+                                bucket-plan rebuild needs the host data.)
+bk_total      30 ms →   29 ms
+
+ferrum c=32 → 172.7 tok/s  (TPOT 168.12 ms)   ratio vs vLLM = 9.2%
+```
+
+**Cumulative production sweep (no FERRUM_DECODE_OP_PROFILE)**:
+
+| c    | Stage 5 baseline | Stage 7 alloc-free + sort | Stage 8 GPU route | total Δ |
+|------|------------------|---------------------------|-------------------|---------|
+| 1    | 65.5             | 73.9                      | 73.0              | +11.5%  |
+| 8    | 118.0            | 127.4                     | **136.1**         | +15.3%  |
+| 16   | 132.1            | 148.2                     | **158.9**         | +20.3%  |
+| 32   | 137.1            | 162.6                     | **172.7**         | **+25.9%** |
+
+Mean TPOT at c=32 went 204.4 → 178.5 → **168.1 ms**.
+
+c=1 dropped -1.2% (Stage 8) — an explicit `cuStreamSynchronize` after the
+kernel costs more than the host softmax+topk it replaces when there's
+only one sequence and the GPU is otherwise idle. Fixable by pipelining
+the synchronize with the next layer's router gemv, but only impacts
+single-batch latency — c≥8 universally wins.
+
+Trait surgery: kept the existing Metal-targeted `route_topk_softmax`
+unchanged; added `try_gpu_route_topk_into_host` next to it. Default Err
+keeps non-CUDA backends on their current host paths.
 
 ## Failed experiments (don't re-try without code changes)
 
@@ -274,11 +321,13 @@ ea6637a perf(moe): multi-stream MoE GEMM dispatch — round-robin pool          
 d7d8e98 fix(moe): cross-stream sync for multi-stream MoE GEMM dispatch
 40c2cf1 fix(cuda): cuEventCreate flag is u32, not enum tuple variant
 
-# Stages 6-7 (137 → 160 tok/s):
+# Stages 6-8 (137 → 172.7 tok/s):
 8d0f7dc perf(moe): per-phase profile counters for bucketed MoE forward
 d7c4fe1 bench(m3): phase-profile script for c=32 bucketed MoE breakdown
 652832c perf(moe): allocation-free route() + bucket plan reuse — saves ~10ms/token  ★ KEY
 e1fd5d8 perf(moe): cache cuEvents + sort GEMM dispatches by m desc
+6befb16 perf(moe-cuda): GPU-side route_topk_softmax kernel — saves ~1.7ms/token  ★ KEY
+d3158d9 fix(cuda-moe-route): scope launch_builder so D2H can re-borrow scratch
 ```
 
 Earlier exploration commits (debugged the offset-GEMM stride bug):
