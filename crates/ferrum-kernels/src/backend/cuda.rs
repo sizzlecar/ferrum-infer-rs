@@ -1454,56 +1454,6 @@ impl Backend for CudaBackend {
         .map_err(|e| FerrumError::model(format!("paged_varlen_attn: {e}")))
     }
 
-    /// Single-batch paged decode attention. CUDA only has the batched
-    /// variant (`paged_batched_decode_attention`); this wrapper feeds
-    /// `num_seqs == 1, q_len == 1` through it. Used by Qwen3MoeModel's
-    /// per-item decode loop when `FERRUM_METAL_PAGED_KV=1` on CUDA.
-    /// Without this wrapper, paged-KV mode panics with "not implemented".
-    #[allow(clippy::too_many_arguments)]
-    fn paged_decode_attention(
-        ctx: &mut Self::Context,
-        q: &Self::Buffer,
-        k_pool: &Self::Buffer,
-        v_pool: &Self::Buffer,
-        out: &mut Self::Buffer,
-        block_tables: &Self::Buffer,
-        context_lens: &Self::Buffer,
-        num_seqs: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        block_size: usize,
-        max_num_blocks_per_seq: usize,
-        q_len: usize,
-    ) -> Result<()> {
-        // Per-item decode path always has q_len == 1; the batched
-        // kernel assumes one query per seq. Refuse anything else
-        // rather than silently misroute.
-        if q_len != 1 {
-            return Err(FerrumError::model(format!(
-                "paged_decode_attention(CUDA): q_len={q_len} unsupported (must be 1 — \
-                 use paged_varlen_attention for q_len > 1)"
-            )));
-        }
-        let max_kv_len = block_size * max_num_blocks_per_seq;
-        Self::paged_batched_decode_attention(
-            ctx,
-            q,
-            k_pool,
-            v_pool,
-            out,
-            block_tables,
-            context_lens,
-            num_seqs,
-            max_kv_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            block_size,
-            max_num_blocks_per_seq,
-        )
-    }
-
     fn paged_batched_decode_attention(
         ctx: &mut Self::Context,
         q: &Self::Buffer,
