@@ -1540,13 +1540,9 @@ impl Backend for CudaBackend {
             )));
         }
         let pos_offset = (final_kv_len - q_len) as u32;
-        // Allocate via alloc_u32 (4 bytes/slot) NOT from_slice_i32 — the
-        // default from_slice_i32 routes through from_slice which f32→f16
-        // converts and zeroes any non-zero bit pattern.
-        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_u32(2);
-        <Self as Backend>::write_u32(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
-        let mut pos_offsets_buf = <Self as Backend>::alloc_u32(1);
-        <Self as Backend>::write_u32(ctx, &mut pos_offsets_buf, &[pos_offset]);
+        let cu_seqlens_q_buf =
+            <Self as Backend>::from_slice_i32(&[0, q_len as i32]);
+        let pos_offsets_buf = <Self as Backend>::from_slice_i32(&[pos_offset as i32]);
 
         Self::paged_varlen_attention(
             ctx,
