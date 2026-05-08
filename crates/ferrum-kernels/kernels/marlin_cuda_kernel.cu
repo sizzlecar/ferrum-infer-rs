@@ -206,17 +206,64 @@ __global__ void Marlin(
   int  prob_n_full, // full N stride of B + s buffers (≥ prob_n;
                     // for stacked-MoE offset GEMM, stride is total_n
                     // while iteration covers only expert_n cols)
-  int* locks // extra global storage for barrier synchronization
+  int* locks, // extra global storage for barrier synchronization
+  // ── MoE-fused dispatch (Stage 11) ────────────────────────────────────
+  // When all four pointers are non-null and `expert_count > 0`, the
+  // kernel reads `e_local = blockIdx.y` (∈ [0, expert_count)), maps it
+  // to a real expert id `e = active_expert_ids[e_local]`, and adjusts
+  // A/B/C/s/locks pointers + prob_m so this block processes that
+  // expert's column-slice GEMM. gridDim.y must equal `expert_count`;
+  // gridDim.x stays `sms` (cooperating blocks per expert).
+  //
+  // Layout assumptions (built by `load_gptq_stacked` + caller):
+  //   A: pre-gathered `[total_pairs, prob_k]` fp16, expert e's rows
+  //      live at `[A_row_offsets[e], A_row_offsets[e] + tokens_per_expert[e])`.
+  //   B / s: stacked per-expert with stride `b_int4_per_expert` /
+  //      `s_int4_per_expert` int4 elements between experts.
+  //   locks: stacked per-expert with stride `locks_i32_per_expert`
+  //      int32 elements between experts.
+  //
+  // When any of these pointers is null OR expert_count == 0, the kernel
+  // runs as the original single-GEMM path (existing call sites).
+  const int* __restrict__ A_row_offsets        = nullptr,
+  const int* __restrict__ tokens_per_expert    = nullptr,
+  const int* __restrict__ active_expert_ids    = nullptr,
+  int        expert_count                      = 0,
+  int        b_int4_per_expert                 = 0,
+  int        s_int4_per_expert                 = 0,
+  int        locks_i32_per_expert              = 0
 ) {
-  // Each threadblock processes one "stripe" of the B matrix with (roughly) the same size, which might involve multiple 
-  // column "slices" (of width 16 * `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM example: 
-  //   0 1 3 
+  // Each threadblock processes one "stripe" of the B matrix with (roughly) the same size, which might involve multiple
+  // column "slices" (of width 16 * `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM example:
+  //   0 1 3
   //   0 2 3
   //   1 2 4
   // While this kind of partitioning makes things somewhat more complicated, it ensures good utilization of all SMs
-  // for many kinds of shape and GPU configurations, while requiring as few slow global cross-threadblock reductions as 
+  // for many kinds of shape and GPU configurations, while requiring as few slow global cross-threadblock reductions as
   // possible.
-  
+
+  // ── MoE pre-amble: pointer + prob_m fixup before any other logic ─────
+  // After this block, the rest of the kernel sees the same args as if
+  // it had been launched with this expert's per-GEMM parameters. The
+  // existing slice-distribution logic (uses gridDim.x / blockIdx.x) is
+  // unchanged — gridDim.y just selects which expert this block handles.
+  if (A_row_offsets != nullptr && expert_count > 0) {
+    int e_local = blockIdx.y;
+    int e = (active_expert_ids != nullptr) ? active_expert_ids[e_local] : e_local;
+    int row_start = A_row_offsets[e];
+    int m_e = tokens_per_expert[e];
+    if (m_e <= 0) return;  // expert with zero tokens — skip cleanly
+    prob_m = m_e;
+    // Each row of A is `prob_k / 8` int4; each row of C is `prob_n / 8`
+    // int4 (here prob_n is the per-expert output width, equal to
+    // prob_n_full when bucket members all have the same N tile).
+    A += (long long)row_start * (prob_k / 8);
+    C += (long long)row_start * (prob_n / 8);
+    B += (long long)e * (long long)b_int4_per_expert;
+    s += (long long)e * (long long)s_int4_per_expert;
+    locks += (long long)e * (long long)locks_i32_per_expert;
+  }
+
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a better partitioning with less reductions
   int parallel = 1;
   if (prob_m > 16 * thread_m_blocks) {
@@ -729,7 +776,35 @@ const int SHARED_MEM = 96 * 1024; // max shared memory on compute capability 8.6
     ><<<blocks, THREADS, SHARED_MEM, stream>>>( \
       A_ptr, B_ptr, C_ptr, s_ptr, \
       prob_m, prob_n, prob_k, prob_n_full, \
-      locks \
+      locks, \
+      nullptr, nullptr, nullptr, 0, 0, 0, 0 \
+    ); \
+  }
+
+// MoE-fused launch: gridDim.y = expert_count, each block handles one expert.
+// thread_m_blocks here is the BUCKET-WIDE worst-case (= ceil(max_tokens_per_expert_in_bucket / 16)),
+// which means experts with fewer tokens get the kernel's existing pad-with-zero
+// path engaged. This is ~1.5× wasted compute for under-filled experts but
+// eliminates the per-expert launch overhead (~5µs each).
+#define CALL_IF_MOE(THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, GROUP_BLOCKS) \
+  else if ( \
+    thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS && thread_k_blocks == THREAD_K_BLOCKS && \
+    group_blocks == GROUP_BLOCKS \
+  ) { \
+    cudaFuncSetAttribute( \
+      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS>, \
+      cudaFuncAttributeMaxDynamicSharedMemorySize, \
+      SHARED_MEM \
+    ); \
+    dim3 grid_dim(blocks, expert_count, 1); \
+    Marlin< \
+      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS \
+    ><<<grid_dim, THREADS, SHARED_MEM, stream>>>( \
+      A_ptr, B_ptr, C_ptr, s_ptr, \
+      prob_m, prob_n, prob_k, prob_n_full, \
+      locks, \
+      A_row_offsets, tokens_per_expert, active_expert_ids, \
+      expert_count, b_int4_per_expert, s_int4_per_expert, locks_i32_per_expert \
     ); \
   }
 
@@ -835,6 +910,134 @@ extern "C" int marlin_cuda(
     A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par;
     C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par;
   }
+
+  return ret;
+}
+
+
+// ────────────────────────────────────────────────────────────────────────
+// Stage 11 — Fused MoE Marlin: ONE launch processes all experts in a
+// bucket via gridDim.y indirection. Caller pre-buckets experts by their
+// thread_m_blocks selection (≤ 4) and fires one call per bucket.
+//
+// Layout assumptions (built by `load_gptq_stacked` + caller):
+//   A: pre-gathered `[total_pairs, prob_k]` fp16. Row range
+//      [A_row_offsets[e], A_row_offsets[e] + tokens_per_expert[e]) holds
+//      expert e's input rows.
+//   B: stacked, expert e at int4 offset `e * b_int4_per_expert`.
+//   s: stacked, expert e at int4 offset `e * s_int4_per_expert`.
+//   workspace: stacked, expert e at int32 offset `e * locks_i32_per_expert`.
+//   C: pre-allocated `[total_pairs, prob_n]` fp16, same row range as A.
+//
+// `active_expert_ids[i]` (i ∈ [0, expert_count)) gives the global expert
+// id for bucket slot i; can be NULL for identity (all experts in bucket
+// order [0..expert_count)). Caller is responsible for ensuring all
+// experts in this call share the same prob_n, prob_k, group_size.
+//
+// Returns 0 on success, ERR_PROB_SHAPE / ERR_KERN_SHAPE otherwise.
+// ────────────────────────────────────────────────────────────────────────
+extern "C" int marlin_cuda_moe(
+  const void* A,                 // pre-gathered [total_pairs, prob_k] fp16
+  const void* B,                 // stacked [E, n_per_expert, k/8 i32]
+        void* C,                 // [total_pairs, prob_n] fp16
+        void* s,                 // stacked [E, k/group_size, n_per_expert] fp16
+  int prob_m,                    // bucket-wide max-m (= 16 * thread_m_blocks bucket choice)
+  int prob_n,                    // per-expert N (uniform within bucket)
+  int prob_k,                    // K (uniform across all experts)
+  void* workspace,               // stacked [E, locks_i32_per_expert] i32 (caller pre-zeroed)
+  const int* A_row_offsets,      // device [E] cumulative row offset of expert e in A
+  const int* tokens_per_expert,  // device [E] m for expert e (0 = skip)
+  const int* active_expert_ids,  // device [expert_count] bucket→global; or NULL for identity
+  int expert_count,              // experts in this bucket
+  int b_int4_per_expert,         // = (n_per_expert * k) / 32 int4
+  int s_int4_per_expert,         // = (k/group_size * n_per_expert) / 8 int4
+  int locks_i32_per_expert,      // = (n_per_expert / 128) * MAX_PAR
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int prob_n_full = -1
+) {
+  if (expert_count <= 0) return 0;
+  if (prob_n_full < 0) prob_n_full = prob_n;
+  if (sms == -1) cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+
+  if (thread_k == -1 || thread_n == -1) {
+    if (prob_m <= 16) {
+      thread_k = 128;
+      thread_n = 128;
+    } else {
+      thread_k = 64;
+      thread_n = 256;
+    }
+    const char* env = std::getenv("FERRUM_MARLIN_TILE");
+    if (env != nullptr) {
+      if (strcmp(env, "64x256") == 0) { thread_k = 64;  thread_n = 256; }
+      else if (strcmp(env, "128x128") == 0) { thread_k = 128; thread_n = 128; }
+      else if (strcmp(env, "64x128") == 0) { thread_k = 64;  thread_n = 128; }
+      else if (strcmp(env, "128x64") == 0) { thread_k = 128; thread_n = 64;  }
+    }
+  }
+
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
+  int group_blocks = (groupsize == -1) ? -1 : groupsize / 16;
+
+  if (prob_n % thread_n != 0 || prob_k % thread_k != 0 ||
+      (group_blocks != -1 && prob_k % group_blocks != 0)) {
+    return ERR_PROB_SHAPE;
+  }
+  if (prob_n == 0 || prob_k == 0 || prob_m == 0) return 0;
+
+  // Bucket choice: thread_m_blocks ∈ {1, 2, 3, 4} based on prob_m
+  // (= 16 × thread_m_blocks for a properly bucketed call).
+  int tot_m_blocks = ceildiv(prob_m, 16);
+  if (tot_m_blocks <= 0 || tot_m_blocks > 4) {
+    // Caller must split bucket if max m > 64.
+    return ERR_PROB_SHAPE;
+  }
+  int thread_m_blocks = tot_m_blocks;
+
+  // ── gridDim.x = n_tiles_per_expert (NOT sms) — Stage 12.1 ────────────
+  // Original Marlin uses gridDim.x = sms cooperating blocks per GEMM,
+  // each doing 1 tile. Setup overhead per block (~3 µs) >> per-tile work
+  // when m=16. Stage 12 inherited that → 100 active experts × 128
+  // blocks/expert = 12800 blocks/launch, 96 do work, 32 idle. Setup
+  // dominates.
+  //
+  // For MoE-fused with gridDim.y = num_experts, we already get parallelism
+  // across experts. Within one expert, n_tiles=3 is enough — pick blocks
+  // = n_tiles so each block processes ALL k-tiles for one n-tile. Per-
+  // block work scales 32×, setup amortizes. Total grid = (3, 100) =
+  // 300 blocks → 2.3 waves on 128 SMs vs 100 waves before.
+  //
+  // Cooperating-block barriers are bypassed: slice_count=1 so locks
+  // are never read/written. Existing kernel logic handles this case.
+  int n_tiles = prob_n / (16 * thread_n_blocks);
+  if (n_tiles <= 0) n_tiles = 1;
+  int blocks = n_tiles;
+  int* locks = (int*) workspace;
+  const int4* A_ptr = (const int4*) A;
+  const int4* B_ptr = (const int4*) B;
+  int4* C_ptr = (int4*) C;
+  const int4* s_ptr = (const int4*) s;
+
+  int ret = 0;
+  if (false) {}
+  CALL_IF_MOE(1,  8,  8, -1)
+  CALL_IF_MOE(1,  8,  8,  8)
+  CALL_IF_MOE(1, 16,  4, -1)
+  CALL_IF_MOE(1, 16,  4,  8)
+  CALL_IF_MOE(2, 16,  4, -1)
+  CALL_IF_MOE(2, 16,  4,  8)
+  CALL_IF_MOE(3, 16,  4, -1)
+  CALL_IF_MOE(3, 16,  4,  8)
+  CALL_IF_MOE(4, 16,  4, -1)
+  CALL_IF_MOE(4, 16,  4,  8)
+  else
+    ret = ERR_KERN_SHAPE;
 
   return ret;
 }
