@@ -283,8 +283,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         let rel = max_diff / mag;
         max_rel_overall = max_rel_overall.max(rel);
 
-        let avg_ref: f32 =
-            slice_ref.iter().map(|x| x.abs()).sum::<f32>() / slice_ref.len() as f32;
+        let avg_ref: f32 = slice_ref.iter().map(|x| x.abs()).sum::<f32>() / slice_ref.len() as f32;
         let avg_vllm: f32 =
             slice_vllm.iter().map(|x| x.abs()).sum::<f32>() / slice_vllm.len() as f32;
 
@@ -304,10 +303,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
              max|diff|={max_diff:.4} rel={rel:.4} sorted-diff={max_sorted_diff:.4} \
              avg|ref|={avg_ref:.4} avg|vllm|={avg_vllm:.4}"
         );
-        eprintln!(
-            "  ref[0..6] = {:?}",
-            &slice_ref[..6.min(slice_ref.len())]
-        );
+        eprintln!("  ref[0..6] = {:?}", &slice_ref[..6.min(slice_ref.len())]);
         eprintln!(
             "  vllm[0..6] = {:?}",
             &slice_vllm[..6.min(slice_vllm.len())]

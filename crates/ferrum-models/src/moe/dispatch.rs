@@ -961,8 +961,7 @@ pub fn moe_forward_bucketed<B: Backend>(
     // GEMMs. The vLLM path needs (sorted_token_ids, expert_ids,
     // num_tokens_past_padded) routing buffers — build them once on host
     // from `plan.expert_offsets` and reuse across phase 1 and phase 3.
-    let use_vllm_moe =
-        std::env::var("FERRUM_VLLM_MOE").map_or(false, |v| v == "1");
+    let use_vllm_moe = std::env::var("FERRUM_VLLM_MOE").map_or(false, |v| v == "1");
     let total_pairs_active = batch * top_k;
     const VLLM_MOE_BLOCK_SIZE: usize = 16;
     let vllm_routing = if use_vllm_moe {
@@ -992,8 +991,7 @@ pub fn moe_forward_bucketed<B: Backend>(
             for i in 0..m_e {
                 sorted_token_ids[p_off + i] = (real_off + i) as i32;
             }
-            let blocks_for_e =
-                (padded_offsets[e + 1] - p_off) / VLLM_MOE_BLOCK_SIZE;
+            let blocks_for_e = (padded_offsets[e + 1] - p_off) / VLLM_MOE_BLOCK_SIZE;
             let block_start = p_off / VLLM_MOE_BLOCK_SIZE;
             for b in 0..blocks_for_e {
                 expert_ids[block_start + b] = e as i32;

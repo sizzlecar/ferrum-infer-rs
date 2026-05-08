@@ -3417,8 +3417,7 @@ impl Backend for CudaBackend {
             let (npp_ptr, _g2) = npp_dev.device_ptr(&stream);
             (st_ptr, eid_ptr, npp_ptr)
         };
-        let st_f16: CudaSlice<f16> =
-            unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
+        let st_f16: CudaSlice<f16> = unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
         let eid_f16: CudaSlice<f16> =
             unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
         let npp_f16: CudaSlice<f16> =
