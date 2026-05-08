@@ -1717,6 +1717,23 @@ pub trait Backend: Send + Sync + Sized + 'static {
         dim: usize,
     );
 
+    /// Inverse of `transpose_head_to_token`: [tokens, heads, dim] →
+    /// [heads, tokens, dim]. Used by the CUDA `paged_decode_attention`
+    /// wrapper to convert `paged_varlen_attention`'s token-major output
+    /// back to the head-major layout that Qwen3MoeModel expects.
+    /// Default panics — backends without a paged-KV CUDA path don't
+    /// hit this code.
+    fn transpose_token_to_head(
+        _ctx: &mut Self::Context,
+        _src: &Self::Buffer,
+        _dst: &mut Self::Buffer,
+        _tokens: usize,
+        _heads: usize,
+        _dim: usize,
+    ) {
+        panic!("transpose_token_to_head not implemented for this backend");
+    }
+
     /// residual[i] += x[i] (in-place)
     fn add_inplace(
         ctx: &mut Self::Context,

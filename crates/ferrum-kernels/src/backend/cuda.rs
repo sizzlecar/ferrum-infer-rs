@@ -1454,6 +1454,152 @@ impl Backend for CudaBackend {
         .map_err(|e| FerrumError::model(format!("paged_varlen_attn: {e}")))
     }
 
+    /// Paged attention dispatcher (CUDA-only, replaces missing native
+    /// `paged_decode_attention`). Routes:
+    ///   - q_len==1 (decode for any num_seqs): paged_batched_decode_attention.
+    ///     The layouts coincide for q_len==1 — a [num_seqs, heads, dim]
+    ///     buffer is identical to [heads, num_seqs, dim] when seen as a
+    ///     single seq's contribution, so no transpose is needed.
+    ///   - q_len>1 (prefill, single-seq only): paged_varlen_attention.
+    ///     Caller's q is `[heads, q_len, dim]` (head-major) but varlen
+    ///     reads `[q_len, heads, dim]` (token-major), so we transpose
+    ///     in/out around the call. Cold path (prefill is rare per token).
+    #[allow(clippy::too_many_arguments)]
+    fn paged_decode_attention(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        block_tables: &Self::Buffer,
+        context_lens: &Self::Buffer,
+        num_seqs: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_num_blocks_per_seq: usize,
+        q_len: usize,
+    ) -> Result<()> {
+        let max_kv_len = block_size * max_num_blocks_per_seq;
+
+        if q_len == 1 {
+            return Self::paged_batched_decode_attention(
+                ctx,
+                q,
+                k_pool,
+                v_pool,
+                out,
+                block_tables,
+                context_lens,
+                num_seqs,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_num_blocks_per_seq,
+            );
+        }
+
+        // q_len > 1: prefill. Only single-seq is exercised — the only
+        // caller (Qwen3MoeModel::forward_layer) always passes num_seqs=1.
+        if num_seqs != 1 {
+            return Err(FerrumError::model(format!(
+                "paged_decode_attention(CUDA): q_len={q_len} num_seqs={num_seqs} \
+                 not supported (caller must split prefill into per-seq calls)"
+            )));
+        }
+
+        // Build cu_seqlens_q = [0, q_len] and pos_offsets = [final_kv_len - q_len].
+        // alloc_u32 + write_u32 (NOT from_slice_i32 — that default goes
+        // through f32→f16 and zeroes the bit pattern).
+        // Need final_kv_len from context_lens[0] — D2H 4 bytes (cold path).
+        let cl_host: Vec<u32> = {
+            let stream = ctx.stream.clone();
+            let view = unsafe {
+                context_lens
+                    .transmute::<u32>(1)
+                    .ok_or_else(|| FerrumError::model("context_lens transmute failed"))?
+            };
+            let mut h = vec![0u32; 1];
+            stream
+                .memcpy_dtoh(&view, h.as_mut_slice())
+                .map_err(|e| FerrumError::model(format!("dtoh context_lens: {e}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::model(format!("dtoh sync: {e}")))?;
+            h
+        };
+        let final_kv_len = cl_host[0] as usize;
+        if final_kv_len < q_len {
+            return Err(FerrumError::model(format!(
+                "paged_decode_attention(CUDA): final_kv_len={final_kv_len} < q_len={q_len}"
+            )));
+        }
+        let pos_offset = (final_kv_len - q_len) as u32;
+        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_u32(2);
+        <Self as Backend>::write_u32(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
+        let mut pos_offsets_buf = <Self as Backend>::alloc_u32(1);
+        <Self as Backend>::write_u32(ctx, &mut pos_offsets_buf, &[pos_offset]);
+
+        // Q: [heads, q_len, hd] (head-major) → scratch [q_len, heads, hd]
+        // (token-major) for paged_varlen_attention.
+        let q_n = q_len * num_heads * head_dim;
+        let mut q_token_major = <Self as Backend>::alloc(q_n);
+        <Self as Backend>::transpose_head_to_token(
+            ctx,
+            q,
+            &mut q_token_major,
+            q_len,
+            num_heads,
+            head_dim,
+        );
+
+        // Output scratch: [q_len, heads, hd] token-major (varlen output
+        // shape). We transpose back into the caller's `out` after.
+        let mut out_token_major = <Self as Backend>::alloc(q_n);
+
+        Self::paged_varlen_attention(
+            ctx,
+            &q_token_major,
+            k_pool,
+            v_pool,
+            &mut out_token_major,
+            &cu_seqlens_q_buf,
+            &pos_offsets_buf,
+            block_tables,
+            1,             // num_seqs
+            q_len,         // total_q_tokens
+            final_kv_len,  // max_kv_len
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_num_blocks_per_seq,
+        )?;
+
+        // Restore head-major layout: [q_len, heads, hd] → [heads, q_len, hd]
+        // → caller's `out` buffer.
+        <Self as Backend>::transpose_token_to_head(
+            ctx,
+            &out_token_major,
+            out,
+            q_len,
+            num_heads,
+            head_dim,
+        );
+
+        // Synchronize so the scratch buffers can drop without freeing
+        // memory the kernel still references.
+        let stream = ctx.stream.clone();
+        stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("paged_decode_attention sync: {e}")))?;
+
+        Ok(())
+    }
+
     fn paged_batched_decode_attention(
         ctx: &mut Self::Context,
         q: &Self::Buffer,
@@ -1995,6 +2141,41 @@ impl Backend for CudaBackend {
             })
         }
         .expect("transpose_head_to_token launch");
+    }
+
+    /// Inverse of `transpose_head_to_token`. Used by the CUDA paged
+    /// attention wrapper to convert paged_varlen_attention's token-major
+    /// output back to the head-major buffer Qwen3MoeModel expects.
+    fn transpose_token_to_head(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+    ) {
+        let func = ctx.func("transpose", ptx::TRANSPOSE, "transpose_token_to_head_f16");
+        let tokens_i32 = tokens as i32;
+        let heads_i32 = heads as i32;
+        let dim_i32 = dim as i32;
+        let total = tokens * heads * dim;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(src);
+        b.arg(dst);
+        b.arg(&tokens_i32);
+        b.arg(&heads_i32);
+        b.arg(&dim_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("transpose_token_to_head launch");
     }
 
     // ── Element-wise ────────────────────────────────────────────────────
