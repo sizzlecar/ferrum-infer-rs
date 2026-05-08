@@ -679,7 +679,7 @@ impl Backend for CudaBackend {
                     .expect("argmax launch");
             }
             stream.synchronize().expect("argmax sync");
-            let host_i32 = stream.memcpy_dtov(&dev_out).expect("argmax dtoh");
+            let host_i32 = stream.clone_dtoh(&dev_out).expect("argmax dtoh");
             host_i32.into_iter().map(|x| x as u32).collect()
         })
     }
