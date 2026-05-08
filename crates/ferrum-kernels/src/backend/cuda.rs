@@ -3109,6 +3109,16 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "triton-kernels"))]
         let mw: &crate::marlin::MarlinWeight = weight;
 
+        // ── Stage 12: fused MoE Marlin path ─────────────────────────────
+        // FERRUM_MOE_FUSED=1 dispatches all experts in this phase as a
+        // small number of bucketed `marlin_gemm_moe` launches (one per
+        // thread_m_blocks bucket ∈ {1, 2, 3, 4}) instead of N round-robin
+        // calls. Eliminates per-expert launch overhead at c=32 (~100
+        // experts/layer → 1-4 launches/layer).
+        if std::env::var("FERRUM_MOE_FUSED").map_or(false, |v| v == "1") {
+            return moe_gemm_phase_fused_impl(ctx, input, mw, dispatches, n_per_expert, output, k);
+        }
+
         // n_streams=1: serial dispatch on the DEFAULT context stream
         // (avoids the cross-stream sync overhead and matches the
         // pre-multi-stream path bit-for-bit).
@@ -4011,6 +4021,112 @@ fn paged_varlen_split_k_dispatch(
             Ok::<(), FerrumError>(())
         },
     )
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Stage 12 — Fused MoE Marlin: bucket dispatches by max-m, fire one
+// `marlin_gemm_moe` per bucket. ONE launch per bucket replaces N round-
+// robin calls of the multi-stream path.
+//
+// Buckets are by ceil(m / 16) ∈ {1, 2, 3, 4}. Caller's dispatch list
+// (built by moe_forward_bucketed) gives (expert_idx, in_row, out_row, m)
+// per active expert. Inactive experts (m=0) are not in the list.
+//
+// Per-call uploads: one i32 array of size num_experts_used (active
+// experts in this dispatch list) for active_expert_ids, and one
+// indexed-by-active-position array for tokens + a_row_offsets. Total
+// staging is ~3 × num_active × 4 bytes ≈ 1 KB at c=32 — htod cost is
+// O(1) per phase, dwarfed by the launch savings.
+//
+// Workspace: caller already calls `marlin_zero_stacked_workspace` per
+// phase; the fused kernel reuses the same per-expert workspace ranges.
+// ────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "marlin")]
+fn moe_gemm_phase_fused_impl(
+    ctx: &mut CudaState,
+    input: &CudaSlice<f16>,
+    weight: &crate::marlin::MarlinWeight,
+    dispatches: &[(usize, usize, usize, usize)],
+    n_per_expert: usize,
+    output: &mut CudaSlice<f16>,
+    _k: usize,
+) -> Result<()> {
+    if dispatches.is_empty() {
+        return Ok(());
+    }
+    let num_active = dispatches.len();
+
+    // Bucket by ceil(m / 16). All 4 buckets share the same per-active
+    // tokens + a_row_offsets layout (indexed by active position, NOT
+    // global expert id) — the kernel's `tokens_per_expert[e]` and
+    // `A_row_offsets[e]` use the bucket-local index `e_local`. Caller's
+    // `active_expert_ids[e_local]` maps that to the global expert id.
+    //
+    // The kernel reads:
+    //   int e_local = blockIdx.y;
+    //   int e_global = active_expert_ids[e_local];
+    //   int row_start = A_row_offsets[e_global];
+    //   int m_e       = tokens_per_expert[e_global];
+    // So `tokens_per_expert` and `A_row_offsets` MUST be sized to the
+    // global expert id space and indexed by the global id.
+    //
+    // We don't know num_experts_global directly from the dispatch list,
+    // but max(expert_idx) + 1 is a safe lower bound. Real production
+    // usage at c=32 has num_experts_global ≤ 256 (Qwen3-MoE: 128).
+    let max_global_e = dispatches.iter().map(|d| d.0).max().unwrap();
+    let num_experts_global = max_global_e + 1;
+
+    // Build the per-global-expert index arrays. Both default to 0; only
+    // active experts are populated. Inactive experts won't be referenced
+    // by active_expert_ids[] so their tokens=0 / row=0 values are dead.
+    let mut tokens_global = vec![0i32; num_experts_global];
+    let mut row_offsets_global = vec![0i32; num_experts_global];
+    let mut bucket_active_ids: [Vec<i32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for &(e_idx, in_row, _out_row, m_e) in dispatches {
+        debug_assert!(m_e > 0);
+        debug_assert!(m_e <= 64);
+        tokens_global[e_idx] = m_e as i32;
+        row_offsets_global[e_idx] = in_row as i32;
+        let bucket = ((m_e + 15) / 16).clamp(1, 4) - 1;
+        bucket_active_ids[bucket].push(e_idx as i32);
+    }
+
+    // Upload the global per-expert arrays once.
+    let stream = ctx.stream.clone();
+    let row_off_dev = stream
+        .clone_htod(&row_offsets_global)
+        .map_err(|e| FerrumError::model(format!("htod row_offsets: {e}")))?;
+    let tok_dev = stream
+        .clone_htod(&tokens_global)
+        .map_err(|e| FerrumError::model(format!("htod tokens: {e}")))?;
+
+    // Fire one launch per non-empty bucket.
+    for (b, ids) in bucket_active_ids.iter().enumerate() {
+        if ids.is_empty() {
+            continue;
+        }
+        let prob_m_bucket = ((b + 1) * 16) as i32;
+        let active_dev = stream
+            .clone_htod(ids)
+            .map_err(|e| FerrumError::model(format!("htod active_ids[b={b}]: {e}")))?;
+        crate::marlin::marlin_gemm_moe(
+            &stream,
+            input,
+            weight,
+            output,
+            &row_off_dev,
+            &tok_dev,
+            Some(&active_dev),
+            ids.len() as i32,
+            prob_m_bucket,
+            n_per_expert as i32,
+            num_experts_global as i32,
+        )
+        .map_err(|e| FerrumError::model(format!("marlin_gemm_moe (bucket={b}): {e}")))?;
+    }
+
+    let _ = num_active;
+    Ok(())
 }
 
 fn marlin_gemm_with_perm(
