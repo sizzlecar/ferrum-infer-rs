@@ -102,6 +102,17 @@ pub struct CudaState {
     /// the handle and call `cuEventDestroy_v2` in `Drop`.
     moe_entry_event: Option<usize>,
     moe_exit_events: Option<Vec<usize>>,
+    /// GPU-side route output scratch. Device buffers sized to
+    /// `MAX_ROUTE_PAIRS` (= 32 batch × 8 top_k = 256 by default — covers
+    /// every Qwen3-MoE config we ship). Lazy-init on first
+    /// `try_gpu_route_topk_into_host` call. Kept as f16 storage since
+    /// `Buffer = CudaSlice<f16>`; the kernel writes raw int / float
+    /// bytes via reinterpret-cast.
+    moe_route_ids: Option<CudaSlice<f16>>,
+    moe_route_weights: Option<CudaSlice<f16>>,
+    /// Capacity hint — buffers grow if a larger (batch × top_k) shows
+    /// up. Reset on grow.
+    moe_route_capacity: usize,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -339,6 +350,9 @@ impl Backend for CudaBackend {
             moe_streams: None,
             moe_entry_event: None,
             moe_exit_events: None,
+            moe_route_ids: None,
+            moe_route_weights: None,
+            moe_route_capacity: 0,
         }
     }
 
@@ -2101,6 +2115,173 @@ impl Backend for CudaBackend {
             })
         }
         .expect("fused_silu_mul_split_strided launch");
+    }
+
+    fn route_topk_softmax(
+        ctx: &mut Self::Context,
+        logits: &Self::Buffer,
+        out_ids: &mut Self::Buffer,
+        out_weights: &mut Self::Buffer,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+        norm_topk_prob: bool,
+    ) -> Result<()> {
+        // Block: one warp (32 threads), one block per row.
+        // Shared mem: num_experts × 4 bytes (per-row probability vector
+        // in fp32). At Qwen3-MoE num_experts=128 this is 512 bytes /
+        // block — far below the 48 KB / SM limit. Larger MoE configs
+        // (DeepSeek 256 experts) still only use 1 KB.
+        let func = ctx.func(
+            "moe_router_topk_softmax",
+            ptx::MOE_ROUTER,
+            "moe_router_topk_softmax_f16",
+        );
+        let batch_i32 = batch as i32;
+        let n_exp_i32 = num_experts as i32;
+        let top_k_i32 = top_k as i32;
+        let norm_i32 = if norm_topk_prob { 1i32 } else { 0i32 };
+        let smem_bytes = (num_experts as u32) * 4;
+
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(logits);
+        b.arg(out_ids);
+        b.arg(out_weights);
+        b.arg(&batch_i32);
+        b.arg(&n_exp_i32);
+        b.arg(&top_k_i32);
+        b.arg(&norm_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (batch as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: smem_bytes,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("moe_router launch: {e}")))?;
+        Ok(())
+    }
+
+    fn try_gpu_route_topk_into_host(
+        ctx: &mut Self::Context,
+        logits_dev: &Self::Buffer,
+        out_ids_host: &mut Vec<u32>,
+        out_weights_host: &mut Vec<f32>,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+        norm_topk_prob: bool,
+    ) -> Result<()> {
+        let total_pairs = batch * top_k;
+
+        // Lazy-init the scratch device buffers. Sized to total_pairs;
+        // grow if a larger shape shows up. i32 storage = 4*total_pairs
+        // bytes = 2*total_pairs f16 elements; f32 storage same (4 bytes
+        // per element).
+        if ctx.moe_route_capacity < total_pairs {
+            let stream = ctx.stream.clone();
+            // 2 × total_pairs because each i32 / f32 element needs 4
+            // bytes = 2 f16 slots in the underlying CudaSlice<f16>.
+            let nf16 = 2 * total_pairs;
+            ctx.moe_route_ids = Some(
+                stream
+                    .alloc_zeros::<f16>(nf16)
+                    .map_err(|e| FerrumError::model(format!("alloc moe_route_ids: {e}")))?,
+            );
+            ctx.moe_route_weights = Some(
+                stream
+                    .alloc_zeros::<f16>(nf16)
+                    .map_err(|e| FerrumError::model(format!("alloc moe_route_weights: {e}")))?,
+            );
+            ctx.moe_route_capacity = total_pairs;
+        }
+
+        // 1. Launch the kernel into the cached scratch.
+        // We hand the kernel the i32-typed pointers; the underlying
+        // bytes are writable. Use a temporary `&mut Self::Buffer` view
+        // by taking the cached slice — same trick the rest of the
+        // backend uses (Buffer = CudaSlice<f16>).
+        //
+        // The kernel function call is identical to `route_topk_softmax`
+        // but goes through the CUDA-internal path instead of trait
+        // dispatch (avoids the borrow conflict of mutating ctx.moe_route_*
+        // while ctx is also passed to a generic Self::route_topk_softmax).
+        let func = ctx.func(
+            "moe_router_topk_softmax",
+            ptx::MOE_ROUTER,
+            "moe_router_topk_softmax_f16",
+        );
+        let batch_i32 = batch as i32;
+        let n_exp_i32 = num_experts as i32;
+        let top_k_i32 = top_k as i32;
+        let norm_i32 = if norm_topk_prob { 1i32 } else { 0i32 };
+        let smem_bytes = (num_experts as u32) * 4;
+
+        let stream = ctx.stream.clone();
+        // Take mutable refs to the scratch buffers.
+        let ids_dev = ctx
+            .moe_route_ids
+            .as_mut()
+            .expect("moe_route_ids should be allocated");
+        let weights_dev = ctx
+            .moe_route_weights
+            .as_mut()
+            .expect("moe_route_weights should be allocated");
+
+        let mut b = stream.launch_builder(&func);
+        b.arg(logits_dev);
+        b.arg(ids_dev);
+        b.arg(weights_dev);
+        b.arg(&batch_i32);
+        b.arg(&n_exp_i32);
+        b.arg(&top_k_i32);
+        b.arg(&norm_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (batch as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: smem_bytes,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("moe_router launch: {e}")))?;
+
+        // 2. D2H ids (i32) and weights (f32) into the host destinations.
+        out_ids_host.clear();
+        out_ids_host.resize(total_pairs, 0u32);
+        out_weights_host.clear();
+        out_weights_host.resize(total_pairs, 0.0f32);
+
+        // Reinterpret the f16-typed scratch as i32 / f32 views. transmute
+        // verifies byte-fit (fails returning None if undersized).
+        let ids_view = unsafe {
+            ids_dev
+                .transmute::<i32>(total_pairs)
+                .ok_or_else(|| FerrumError::model("ids transmute size mismatch"))?
+        };
+        let weights_view = unsafe {
+            weights_dev
+                .transmute::<f32>(total_pairs)
+                .ok_or_else(|| FerrumError::model("weights transmute size mismatch"))?
+        };
+
+        // out_ids_host is Vec<u32>; reinterpret as &mut [i32] for the
+        // memcpy. Same byte pattern.
+        let out_ids_i32: &mut [i32] = unsafe {
+            std::slice::from_raw_parts_mut(out_ids_host.as_mut_ptr() as *mut i32, total_pairs)
+        };
+        stream
+            .memcpy_dtoh(&ids_view, out_ids_i32)
+            .map_err(|e| FerrumError::model(format!("dtoh route ids: {e}")))?;
+        stream
+            .memcpy_dtoh(&weights_view, out_weights_host.as_mut_slice())
+            .map_err(|e| FerrumError::model(format!("dtoh route weights: {e}")))?;
+        // Synchronize so the host can read the results immediately.
+        stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("dtoh sync: {e}")))?;
+
+        Ok(())
     }
 
     fn moe_combine(

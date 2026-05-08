@@ -591,6 +591,33 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// GPU-side fast-path for the host route() leg of the bucketed
+    /// MoE forward (`moe_forward_bucketed` in ferrum-models). Replaces
+    /// the `B::sync(ctx) + B::to_vec(logits) + crate::moe::router::
+    /// route_into(...)` triple with a single GPU kernel + small D2H of
+    /// `[batch, top_k]` ids + weights.
+    ///
+    /// The backend allocates / reuses its own device-side scratch for
+    /// the kernel output; the caller only provides the host destination
+    /// vectors (resized + overwritten on each call). Default impl
+    /// returns `Err(unsupported)` so non-CUDA callers stay on the host
+    /// route_into() path with no behavior change.
+    #[allow(clippy::too_many_arguments)]
+    fn try_gpu_route_topk_into_host(
+        _ctx: &mut Self::Context,
+        _logits_dev: &Self::Buffer,
+        _out_ids_host: &mut Vec<u32>,
+        _out_weights_host: &mut Vec<f32>,
+        _batch: usize,
+        _num_experts: usize,
+        _top_k: usize,
+        _norm_topk_prob: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "try_gpu_route_topk_into_host not implemented for this backend",
+        ))
+    }
+
     /// GPU-side bucket sort: turn `[batch, top_k]` selected expert IDs
     /// (from [`Self::route_topk_softmax`]) into `tpe[num_experts]` /
     /// `ids[num_experts * row_stride]` arrays consumed by the batched

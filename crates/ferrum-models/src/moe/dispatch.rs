@@ -840,42 +840,74 @@ pub fn moe_forward_bucketed<B: Backend>(
         MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── Routing on host (same as moe_forward) ──────────────────────────
-    let t_sync = if prof {
+    // ── Routing: try GPU fast-path first, fall back to host. ─────────
+    //
+    // The GPU path runs `route_topk_softmax_f16` on the device buffer
+    // and D2Hs only `[batch, top_k]` ids + weights (~1 KB at c=32) into
+    // the host RouterOutput vectors. The host path goes through the
+    // existing 16-KB router_logits D2H + softmax+topk in Rust.
+    //
+    // Default `try_gpu_route_topk_into_host` returns `Err(unsupported)`
+    // on backends that don't override (CPU / Metal / future), so this
+    // branch is a strict superset of the host path.
+    let t_route_total = if prof {
         Some(std::time::Instant::now())
     } else {
         None
     };
-    B::sync(ctx);
-    if let Some(t) = t_sync {
-        MOE_BUCKET_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    }
-
-    let t_d2h = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let logits_host = B::to_vec(router_logits, batch * num_experts);
-    if let Some(t) = t_d2h {
-        MOE_BUCKET_D2H_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    }
-
-    let t_route = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    crate::moe::router::route_into(
-        &logits_host,
+    let gpu_route = B::try_gpu_route_topk_into_host(
+        ctx,
+        router_logits,
+        &mut route_scratch.output.expert_ids,
+        &mut route_scratch.output.expert_weights,
         batch,
         num_experts,
         top_k,
         norm_topk_prob,
-        &mut route_scratch.output,
-        &mut route_scratch.probs,
     );
-    if let Some(t) = t_route {
+    if gpu_route.is_err() {
+        // Host fallback. Mirrors the per-phase profile wiring above so
+        // [bucket-prof] stays meaningful: t_sync wraps the explicit
+        // drain; t_d2h wraps the to_vec; t_route wraps route_into.
+        let t_sync = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        B::sync(ctx);
+        if let Some(t) = t_sync {
+            MOE_BUCKET_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let t_d2h = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let logits_host = B::to_vec(router_logits, batch * num_experts);
+        if let Some(t) = t_d2h {
+            MOE_BUCKET_D2H_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let t_route = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        crate::moe::router::route_into(
+            &logits_host,
+            batch,
+            num_experts,
+            top_k,
+            norm_topk_prob,
+            &mut route_scratch.output,
+            &mut route_scratch.probs,
+        );
+        if let Some(t) = t_route {
+            MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    } else if let Some(t) = t_route_total {
+        // GPU path: charge the whole route+D2H to the route bucket.
+        // (sync/d2h sub-buckets are 0 because the kernel + dtoh are
+        // fused into one stream synchronize.)
         MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
