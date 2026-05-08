@@ -3393,20 +3393,46 @@ impl Backend for CudaBackend {
         use cudarc::driver::DevicePtr;
 
         // Clone stream FIRST (Arc clone, no borrow on ctx), then take
-        // &mut ctx to grow/get persistent routing buffers — keeps the
-        // borrow checker happy.
+        // &mut ctx to grow/get persistent routing buffers.
         let stream = ctx.stream.clone();
         let cap = sorted_token_ids.len();
         let (st_dev, eid_dev, npp_dev) = ctx.vllm_moe_routing(cap);
-        stream
-            .memcpy_htod(sorted_token_ids, st_dev)
+
+        // Use raw cuMemcpyHtoDAsync_v2 with explicit byte count — the
+        // persistent buffers are sized to a rounded capacity ≥ the host
+        // slice, so cudarc's memcpy_htod (which requires src.len() ==
+        // dst.len()) fails. We only need to copy `host.len()` bytes.
+        unsafe {
+            use cudarc::driver::sys;
+            let s = stream.cu_stream();
+            let (st_ptr, _g0) = st_dev.device_ptr(&stream);
+            sys::cuMemcpyHtoDAsync_v2(
+                st_ptr,
+                sorted_token_ids.as_ptr() as *const _,
+                std::mem::size_of_val(sorted_token_ids),
+                s,
+            )
+            .result()
             .map_err(|e| FerrumError::model(format!("htod sorted_token_ids: {e}")))?;
-        stream
-            .memcpy_htod(expert_ids, eid_dev)
+            let (eid_ptr, _g1) = eid_dev.device_ptr(&stream);
+            sys::cuMemcpyHtoDAsync_v2(
+                eid_ptr,
+                expert_ids.as_ptr() as *const _,
+                std::mem::size_of_val(expert_ids),
+                s,
+            )
+            .result()
             .map_err(|e| FerrumError::model(format!("htod expert_ids: {e}")))?;
-        stream
-            .memcpy_htod(num_tokens_past_padded, npp_dev)
+            let (npp_ptr, _g2) = npp_dev.device_ptr(&stream);
+            sys::cuMemcpyHtoDAsync_v2(
+                npp_ptr,
+                num_tokens_past_padded.as_ptr() as *const _,
+                std::mem::size_of_val(num_tokens_past_padded),
+                s,
+            )
+            .result()
             .map_err(|e| FerrumError::model(format!("htod num_tokens_past_padded: {e}")))?;
+        }
 
         // Reinterpret the persistent i32 buffers as f16 device handles
         // for the trait's Self::Buffer. The consumer (moe_gemm_phase_vllm)
