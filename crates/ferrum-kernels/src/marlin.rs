@@ -75,6 +75,39 @@ extern "C" {
     ) -> i32;
 }
 
+// vLLM marlin_moe_wna16 port (Stage 14). Vendored kernel under
+// `crates/ferrum-kernels/kernels/vllm_marlin_moe/`. Single fused
+// (sorted_token_ids, expert_ids) launch — eliminates the m=16 padding
+// waste of our Stage 12.1 path. Linked statically only when the
+// `vllm-moe-marlin` feature is built in.
+#[cfg(feature = "vllm-moe-marlin")]
+extern "C" {
+    fn ferrum_vllm_marlin_moe_f16(
+        a: *const std::ffi::c_void,        // [size_m, size_k] fp16
+        b: *const std::ffi::c_void,        // [num_experts, k/16, n*pack/16] i32 marlin-packed
+        c: *mut std::ffi::c_void,          // [size_m * top_k, size_n] fp16
+        c_tmp: *mut std::ffi::c_void,      // fp32 scratch (or null)
+        b_scales: *const std::ffi::c_void, // [num_experts, num_groups, size_n] fp16
+        workspace: *mut std::ffi::c_void,  // [N/128 * sms * 4] i32
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_past_padded: *const i32,
+        topk_weights: *const f32, // (or null when mul_topk_weights=0)
+        moe_block_size: i32,      // 8 / 16 / 32 / 48 / 64
+        top_k: i32,
+        mul_topk_weights: i32, // 0 or 1
+        is_ep: i32,            // 0 or 1
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        group_size: i32, // 128 typically
+        dev: i32,
+        stream: cudarc::driver::sys::CUstream,
+        use_atomic_add: i32,
+        use_fp32_reduce: i32,
+    ) -> i32;
+}
+
 /// Check if Marlin kernel is available at compile time.
 pub fn is_available() -> bool {
     cfg!(feature = "marlin")
@@ -567,6 +600,132 @@ pub fn marlin_gemm_moe(
 ) -> candle_core::Result<()> {
     Err(candle_core::Error::Msg(
         "Marlin kernel not available (compile with --features marlin)".into(),
+    ))
+}
+
+// ===================== Stage 14: vLLM marlin_moe_wna16 port =====================
+
+/// Stage 14 — fused MoE Marlin via the vendored vLLM marlin_moe_wna16
+/// kernel. Replaces our Stage 12.1 bucketed `marlin_gemm_moe` with a
+/// single launch that processes ALL `(token, expert)` pairs of a layer
+/// in one go using vLLM's `(sorted_token_ids, expert_ids)` indirection.
+///
+/// vLLM's design eliminates the m=16 padding waste of our Stage 12.1
+/// path: each output tile reads its expert id from the per-tile
+/// `expert_ids[block_idx]` array, gathers its 16 input rows via
+/// `sorted_token_ids[block_idx*moe_block_size .. ]`, and accumulates
+/// directly. Inactive (sentinel) rows are masked out without compute.
+///
+/// Caller must:
+/// - Run `B::moe_align_block_size` first to build sorted_token_ids,
+///   expert_ids, num_tokens_past_padded.
+/// - Allocate output `c[size_m * top_k, size_n]` fp16.
+/// - Provide a stacked Marlin-packed weight tile (the same one our
+///   per-expert `marlin_gemm_with_offset` consumes).
+/// - Pre-zero the workspace (or rely on `marlin_zero_stacked_workspace`).
+///
+/// `prob_m = size_m` (number of original input tokens), `prob_n` =
+/// per-expert n, `prob_k` = k. Inputs are flat across all experts; the
+/// kernel routes per-tile via expert_ids.
+///
+/// Only available with `--features vllm-moe-marlin`.
+#[cfg(feature = "vllm-moe-marlin")]
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_moe_vllm(
+    stream: &Arc<CudaStream>,
+    input: &CudaSlice<half::f16>,
+    weight: &MarlinWeight,
+    output: &mut CudaSlice<half::f16>,
+    c_tmp: Option<&mut CudaSlice<f32>>,
+    sorted_token_ids: &CudaSlice<i32>,
+    expert_ids: &CudaSlice<i32>,
+    num_tokens_past_padded: &CudaSlice<i32>,
+    topk_weights: Option<&CudaSlice<f32>>,
+    moe_block_size: i32,
+    top_k: i32,
+    mul_topk_weights: bool,
+    is_ep: bool,
+    prob_m: i32,
+    prob_n: i32,
+    prob_k: i32,
+) -> candle_core::Result<()> {
+    use cudarc::driver::DevicePtr;
+    let raw_stream = stream.cu_stream();
+
+    let (a_ptr, _ag) = input.device_ptr(stream);
+    let (b_ptr, _bg) = weight.qweight.device_ptr(stream);
+    let (c_ptr, _cg) = output.device_ptr(stream);
+    let (s_ptr, _sg) = weight.scales.device_ptr(stream);
+    let (ws_ptr, _wg) = weight.workspace.device_ptr(stream);
+    let (st_ptr, _stg) = sorted_token_ids.device_ptr(stream);
+    let (eid_ptr, _eidg) = expert_ids.device_ptr(stream);
+    let (npp_ptr, _nppg) = num_tokens_past_padded.device_ptr(stream);
+
+    let c_tmp_ptr = match c_tmp.as_ref() {
+        Some(c) => c.device_ptr(stream).0 as *mut std::ffi::c_void,
+        None => std::ptr::null_mut(),
+    };
+    let topk_w_ptr = match topk_weights {
+        Some(w) => w.device_ptr(stream).0 as *const f32,
+        None => std::ptr::null(),
+    };
+
+    let ret = unsafe {
+        ferrum_vllm_marlin_moe_f16(
+            a_ptr as *const _,
+            b_ptr as *const _,
+            c_ptr as *mut _,
+            c_tmp_ptr,
+            s_ptr as *const _,
+            ws_ptr as *mut _,
+            st_ptr as *const _,
+            eid_ptr as *const _,
+            npp_ptr as *const _,
+            topk_w_ptr,
+            moe_block_size,
+            top_k,
+            if mul_topk_weights { 1 } else { 0 },
+            if is_ep { 1 } else { 0 },
+            prob_m,
+            prob_n,
+            prob_k,
+            weight.group_size,
+            0, // dev
+            raw_stream,
+            0, // use_atomic_add (default off — fp32 reduce path)
+            1, // use_fp32_reduce (matches vLLM default)
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "ferrum_vllm_marlin_moe_f16 failed: ret={ret} (m={prob_m}, n={prob_n}, k={prob_k})"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vllm-moe-marlin"))]
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_moe_vllm(
+    _stream: &Arc<CudaStream>,
+    _input: &CudaSlice<half::f16>,
+    _weight: &MarlinWeight,
+    _output: &mut CudaSlice<half::f16>,
+    _c_tmp: Option<&mut CudaSlice<f32>>,
+    _sorted_token_ids: &CudaSlice<i32>,
+    _expert_ids: &CudaSlice<i32>,
+    _num_tokens_past_padded: &CudaSlice<i32>,
+    _topk_weights: Option<&CudaSlice<f32>>,
+    _moe_block_size: i32,
+    _top_k: i32,
+    _mul_topk_weights: bool,
+    _is_ep: bool,
+    _prob_m: i32,
+    _prob_n: i32,
+    _prob_k: i32,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "vLLM marlin_moe_wna16 not built — compile with --features vllm-moe-marlin".into(),
     ))
 }
 
