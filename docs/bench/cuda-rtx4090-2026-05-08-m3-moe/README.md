@@ -186,6 +186,8 @@ their own contributed <1 ms (the `cuEvent*` driver calls are sub-µs each).
 
 ## Cumulative session summary (Stages 1 → 7)
 
+Profile-mode (FERRUM_DECODE_OP_PROFILE=1, the breakdown above):
+
 | Stage | tok/s | TPOT  | Δ tok/s | Δ TPOT  |
 |-------|-------|-------|---------|---------|
 | 0 baseline (per-pair fallback)             | 9.4   | 203.4 ms | —       | —        |
@@ -193,8 +195,19 @@ their own contributed <1 ms (the `cuEvent*` driver calls are sub-µs each).
 | 6 alloc-free route + plan                  | 148.0 | 194.7 ms | +1.08×  | -10 ms   |
 | 7 cuEvent cache + dispatch sort            | **160.1** | **178.5 ms** | +1.08×  | -16 ms   |
 
-Total session: **9.4 → 160.1 tok/s (17.0× over the per-pair baseline,
-+17.2% over Stage 5 stacked-Marlin baseline)**. vLLM remains 11.7× ahead
+**Production (no FERRUM_DECODE_OP_PROFILE — what users actually see)**:
+
+| c    | Stage 5 baseline | Stage 7 (this session) | Δ tok/s | vs vLLM |
+|------|------------------|------------------------|---------|---------|
+| 1    | 65.5             | **73.9**               | +12.8%  | 73.9  / 161.5  = 45.8% |
+| 8    | 118.0            | **127.4**              | +8.0%   | 127.4 / 413.1  = 30.8% |
+| 16   | 132.1            | **148.2**              | +12.2%  | 148.2 / 505.0  = 29.3% |
+| 32   | 137.1            | **162.6**              | +18.6%  | 162.6 / 1872.9 = 8.7%  |
+
+Format: tok/s aggregate. Mean TPOTs at c=32 went 204.4 → 177.07 ms.
+
+Total session: **9.4 → 162.6 tok/s at c=32 (17.3× over per-pair baseline,
++18.6% over Stage 5 stacked-Marlin baseline)**. vLLM remains 11.5× ahead
 at 1873 tok/s — the gap is now firmly in the Marlin-GEMM-throughput
 regime; ~26 ms of every decode token is real Marlin compute.
 
