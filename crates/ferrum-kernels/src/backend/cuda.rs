@@ -126,23 +126,6 @@ pub struct CudaState {
     /// this scratch we fall back to atomic_add which is 1.3-1.5× slower.
     #[cfg(feature = "vllm-moe-marlin")]
     vllm_moe_c_tmp_f32: Option<CudaSlice<f32>>,
-    /// Persistent device-side routing buffers for vLLM marlin_moe. Moves
-    /// the per-layer `vec! + clone_htod + std::mem::forget` pattern off
-    /// the hot path: every layer reuses the same allocation, fills it
-    /// via memcpy_htod, and re-launches. This is also the foundation for
-    /// Stage 13c full-forward CUDA Graph capture — the kernel takes its
-    /// inputs from stable device pointers, so a captured graph can be
-    /// replayed many times after re-uploading routing.
-    ///
-    /// Sized to a worst-case upper bound; grow lazily.
-    #[cfg(feature = "vllm-moe-marlin")]
-    vllm_moe_sorted_token_ids: Option<CudaSlice<i32>>,
-    #[cfg(feature = "vllm-moe-marlin")]
-    vllm_moe_expert_ids: Option<CudaSlice<i32>>,
-    #[cfg(feature = "vllm-moe-marlin")]
-    vllm_moe_num_tokens_past_padded: Option<CudaSlice<i32>>,
-    #[cfg(feature = "vllm-moe-marlin")]
-    vllm_moe_routing_capacity: usize,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -210,55 +193,6 @@ impl CudaState {
             );
         }
         self.vllm_moe_c_tmp_f32.as_mut().unwrap()
-    }
-
-    /// Persistent vLLM moe routing buffers. Allocated ONCE at worst-case
-    /// size on first call (num_experts × block_size = 128 × 16 = 2048 i32
-    /// for Qwen3-MoE; expert_ids = 128). Caller then uploads via
-    /// cuMemcpyHtoDAsync with explicit byte count — no re-allocation
-    /// happens between calls, so there's no stream-ordered / drop-time
-    /// race between the in-flight memcpy and the new buffer allocation.
-    #[cfg(feature = "vllm-moe-marlin")]
-    pub fn vllm_moe_routing(
-        &mut self,
-    ) -> (
-        &mut CudaSlice<i32>,
-        &mut CudaSlice<i32>,
-        &mut CudaSlice<i32>,
-    ) {
-        if self.vllm_moe_sorted_token_ids.is_none() {
-            // Worst case: every expert gets at least one block at decode
-            // time. Qwen3-MoE has up to 128 experts; 16 = block_size.
-            // 2048 i32 = 8 KB; 128 i32 = 512 B; 1 i32 = 4 B. Trivial cost.
-            const WORST_SORTED_LEN: usize = 128 * 16;
-            const WORST_EID_LEN: usize = 128;
-            self.vllm_moe_sorted_token_ids = Some(
-                self.stream
-                    .alloc_zeros::<i32>(WORST_SORTED_LEN)
-                    .expect("alloc_zeros vllm_moe_sorted_token_ids"),
-            );
-            self.vllm_moe_expert_ids = Some(
-                self.stream
-                    .alloc_zeros::<i32>(WORST_EID_LEN)
-                    .expect("alloc_zeros vllm_moe_expert_ids"),
-            );
-            self.vllm_moe_num_tokens_past_padded = Some(
-                self.stream
-                    .alloc_zeros::<i32>(1)
-                    .expect("alloc_zeros vllm_moe_num_tokens_past_padded"),
-            );
-            self.vllm_moe_routing_capacity = WORST_SORTED_LEN;
-            tracing::info!(
-                "vLLM moe routing buffers allocated (worst-case): \
-                 sorted_token_ids={WORST_SORTED_LEN} i32, \
-                 expert_ids={WORST_EID_LEN} i32, num_tokens_past_padded=1 i32"
-            );
-        }
-        (
-            self.vllm_moe_sorted_token_ids.as_mut().unwrap(),
-            self.vllm_moe_expert_ids.as_mut().unwrap(),
-            self.vllm_moe_num_tokens_past_padded.as_mut().unwrap(),
-        )
     }
 
     /// Lazy-init the persistent cuEvents used by
@@ -473,14 +407,6 @@ impl Backend for CudaBackend {
             paged_attn_out_tm_capacity: 0,
             #[cfg(feature = "vllm-moe-marlin")]
             vllm_moe_c_tmp_f32: None,
-            #[cfg(feature = "vllm-moe-marlin")]
-            vllm_moe_sorted_token_ids: None,
-            #[cfg(feature = "vllm-moe-marlin")]
-            vllm_moe_expert_ids: None,
-            #[cfg(feature = "vllm-moe-marlin")]
-            vllm_moe_num_tokens_past_padded: None,
-            #[cfg(feature = "vllm-moe-marlin")]
-            vllm_moe_routing_capacity: 0,
         }
     }
 
@@ -3391,11 +3317,10 @@ impl Backend for CudaBackend {
         use cudarc::driver::CudaSlice;
         use cudarc::driver::DevicePtr;
 
-        // Per-call alloc + leak (matches Stage 14a / PR #101 behaviour
-        // that benched green at +37% c=16 / +19% c=32). Persistent
-        // routing buffers (the cleanup we wanted for graph capture) hit
-        // a CUDA_ERROR_INVALID_VALUE on subsequent memcpys that we
-        // couldn't pinpoint — revert keeps the perf wins intact.
+        // Per-call alloc + leak. Persistent buffers (one-alloc + reuse)
+        // were attempted as Stage 13c-1 but hit a CUDA driver edge case
+        // — leaving the bench-validated path in place for now.
+        // TODO(stage-13c-redo): retry with stream sync between forwards.
         let stream = ctx.stream.clone();
         let st: CudaSlice<i32> = stream
             .clone_htod(sorted_token_ids)
@@ -3412,8 +3337,7 @@ impl Backend for CudaBackend {
             let (npp_ptr, _g2) = npp.device_ptr(&stream);
             (st_ptr, eid_ptr, npp_ptr)
         };
-        let st_f16: CudaSlice<f16> =
-            unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
+        let st_f16: CudaSlice<f16> = unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
         let eid_f16: CudaSlice<f16> =
             unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
         let npp_f16: CudaSlice<f16> =
