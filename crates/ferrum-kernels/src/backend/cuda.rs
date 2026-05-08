@@ -113,6 +113,16 @@ pub struct CudaState {
     /// Capacity hint — buffers grow if a larger (batch × top_k) shows
     /// up. Reset on grow.
     moe_route_capacity: usize,
+    /// Reusable scratch for tiny H2D transfers (embedding_lookup ids,
+    /// moe_combine pairs / weights). Replaces per-call `clone_htod`
+    /// (~5 µs alloc overhead each) with `cuMemcpyHtoDAsync` into a
+    /// stable buffer. At c=32 / 48 layers / 3 calls per layer that's
+    /// ~144 alloc round-trips eliminated per decode token. Sized in
+    /// f16 elements; underlying byte count is 2× nominal slot count.
+    htod_cache_u32: Option<CudaSlice<f16>>,
+    htod_cache_i32: Option<CudaSlice<f16>>,
+    htod_cache_f32: Option<CudaSlice<f16>>,
+    htod_cache_capacity: usize,
 }
 
 const BATCHED_SCRATCH_CAP: usize = 64;
@@ -353,7 +363,40 @@ impl Backend for CudaBackend {
             moe_route_ids: None,
             moe_route_weights: None,
             moe_route_capacity: 0,
+            htod_cache_u32: None,
+            htod_cache_i32: None,
+            htod_cache_f32: None,
+            htod_cache_capacity: 0,
         }
+    }
+
+    /// Lazy-grow the H2D scratch buffers to at least `n` u32-sized slots.
+    /// Buffers are allocated once at peak observed size and reused;
+    /// no shrink-back. Each buffer is sized so 1 logical slot = 2 f16
+    /// elements = 4 bytes (sufficient for u32 / i32 / f32 alike).
+    fn ensure_htod_cache(&mut self, n: usize) {
+        if self.htod_cache_capacity >= n {
+            return;
+        }
+        let n_grown = n.max(256).next_power_of_two();
+        let nf16 = 2 * n_grown;
+        let stream = self.stream.clone();
+        self.htod_cache_u32 = Some(
+            stream
+                .alloc_zeros::<f16>(nf16)
+                .expect("CudaState::ensure_htod_cache u32"),
+        );
+        self.htod_cache_i32 = Some(
+            stream
+                .alloc_zeros::<f16>(nf16)
+                .expect("CudaState::ensure_htod_cache i32"),
+        );
+        self.htod_cache_f32 = Some(
+            stream
+                .alloc_zeros::<f16>(nf16)
+                .expect("CudaState::ensure_htod_cache f32"),
+        );
+        self.htod_cache_capacity = n_grown;
     }
 
     fn alloc_u32(n: usize) -> Self::Buffer {
@@ -1018,8 +1061,25 @@ impl Backend for CudaBackend {
         }
 
         let batch = ids.len();
+        // H2D the ids into the cached scratch (no per-call malloc).
+        ctx.ensure_htod_cache(batch);
         let stream = ctx.stream.clone();
-        let ids_dev = stream.clone_htod(ids).expect("embedding_lookup ids htod");
+        {
+            use cudarc::driver::DevicePtrMut;
+            let ids_buf = ctx
+                .htod_cache_u32
+                .as_mut()
+                .expect("htod_cache_u32 ensured above");
+            let dst_ptr: u64 = *ids_buf.device_ptr_mut();
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    dst_ptr,
+                    ids.as_ptr() as *const _,
+                    batch * std::mem::size_of::<u32>(),
+                    stream.cu_stream(),
+                );
+            }
+        }
 
         let func = ctx.func(
             "embedding_lookup",
@@ -1028,9 +1088,13 @@ impl Backend for CudaBackend {
         );
         let batch_i32 = batch as i32;
         let stream = ctx.stream.clone();
+        let ids_buf = ctx
+            .htod_cache_u32
+            .as_ref()
+            .expect("htod_cache_u32 ensured");
         let mut b = stream.launch_builder(&func);
         b.arg(table);
-        b.arg(&ids_dev);
+        b.arg(ids_buf);
         b.arg(out);
         b.arg(&batch_i32);
         b.arg(&dim_i32);
@@ -2301,13 +2365,42 @@ impl Backend for CudaBackend {
         debug_assert_eq!(pairs_by_token.len(), batch * top_k);
         debug_assert_eq!(pair_weights.len(), batch * top_k);
 
+        // H2D both arrays into cached scratch (no per-call malloc).
+        let n = batch * top_k;
+        ctx.ensure_htod_cache(n);
         let stream = ctx.stream.clone();
-        let pairs_dev = stream
-            .clone_htod(pairs_by_token)
-            .expect("moe_combine pairs htod");
-        let weights_dev = stream
-            .clone_htod(pair_weights)
-            .expect("moe_combine weights htod");
+        {
+            use cudarc::driver::DevicePtrMut;
+            let pairs_buf = ctx
+                .htod_cache_i32
+                .as_mut()
+                .expect("htod_cache_i32 ensured");
+            let dst_ptr: u64 = *pairs_buf.device_ptr_mut();
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    dst_ptr,
+                    pairs_by_token.as_ptr() as *const _,
+                    n * std::mem::size_of::<i32>(),
+                    stream.cu_stream(),
+                );
+            }
+        }
+        {
+            use cudarc::driver::DevicePtrMut;
+            let weights_buf = ctx
+                .htod_cache_f32
+                .as_mut()
+                .expect("htod_cache_f32 ensured");
+            let dst_ptr: u64 = *weights_buf.device_ptr_mut();
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    dst_ptr,
+                    pair_weights.as_ptr() as *const _,
+                    n * std::mem::size_of::<f32>(),
+                    stream.cu_stream(),
+                );
+            }
+        }
 
         let func = ctx.func("moe_combine", ptx::MOE_COMBINE, "moe_combine_f16");
         let batch_i32 = batch as i32;
@@ -2318,10 +2411,12 @@ impl Backend for CudaBackend {
         let grid_x = ((hidden as u32) + block - 1) / block;
 
         let stream = ctx.stream.clone();
+        let pairs_buf = ctx.htod_cache_i32.as_ref().expect("htod_cache_i32");
+        let weights_buf = ctx.htod_cache_f32.as_ref().expect("htod_cache_f32");
         let mut b = stream.launch_builder(&func);
         b.arg(packed_down);
-        b.arg(&pairs_dev);
-        b.arg(&weights_dev);
+        b.arg(pairs_buf);
+        b.arg(weights_buf);
         b.arg(out);
         b.arg(&batch_i32);
         b.arg(&hidden_i32);
