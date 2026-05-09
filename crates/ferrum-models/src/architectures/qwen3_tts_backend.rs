@@ -15,6 +15,7 @@
 
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
+    LlmBackend, MoeLlmBackend,
 };
 use ferrum_quantization::loader::WeightLoader;
 use ferrum_quantization::traits::Linear;
@@ -37,9 +38,7 @@ use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
 ///   codec_ids → codec_embed → mixed_embeds
 ///   mixed_embeds → backbone.{prefill,decode}_from_embed → hidden
 ///   hidden → final_norm (via backbone.final_norm_w) → codec_head → logits
-pub struct Qwen3TtsTalker<
-    B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
-> {
+pub struct Qwen3TtsTalker<B: MoeLlmBackend> {
     pub cfg: TalkerConfig,
 
     /// Transformer backbone — only `layers`, `final_norm_w`, `scratch`,
@@ -69,10 +68,7 @@ pub struct Qwen3TtsTalker<
     positions: HashMap<String, u32>,
 }
 
-impl<
-        B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
-    > Qwen3TtsTalker<B>
-{
+impl<B: MoeLlmBackend> Qwen3TtsTalker<B> {
     /// Build a Qwen3-TTS Talker from weights. Uses `PrefixedLoader` with
     /// `"talker."` prefix internally so the backbone can reuse its standard
     /// `model.layers.{i}.*` / `model.norm.weight` lookups.
@@ -291,9 +287,7 @@ impl<
 // embedding. Has per-codebook embedding tables and per-codebook output
 // heads (N-1 of each).
 
-pub struct Qwen3TtsSubTalker<
-    B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
-> {
+pub struct Qwen3TtsSubTalker<B: MoeLlmBackend> {
     pub cfg: TalkerConfig,
 
     /// Backbone — 4-5 layer Qwen3 with `code_predictor_*` dims.
@@ -312,10 +306,7 @@ pub struct Qwen3TtsSubTalker<
     pub lm_heads: Vec<Box<dyn Linear<B>>>,
 }
 
-impl<
-        B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
-    > Qwen3TtsSubTalker<B>
-{
+impl<B: MoeLlmBackend> Qwen3TtsSubTalker<B> {
     pub fn new(cfg: TalkerConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
         let cp_h = cfg.code_predictor_hidden_size;
         let cp_im = cp_h * 3; // ~3072 for 1024 hidden; matches existing impl

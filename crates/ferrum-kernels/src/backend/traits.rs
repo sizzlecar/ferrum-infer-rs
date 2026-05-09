@@ -2118,3 +2118,29 @@ pub trait BackendMoeFused: Backend {
         *out = Self::from_slice(&out_h);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Capability bundles — readable type aliases over the supertrait set
+// ════════════════════════════════════════════════════════════════════════
+//
+// Models declare what they need via these bundles instead of spelling out
+// every supertrait. Rust auto-derives the impl via blanket impls below,
+// so any backend that satisfies the underlying supertraits automatically
+// becomes a `LlmBackend` / `QuantLlmBackend` / `MoeLlmBackend`.
+
+/// Minimum capability set for a decoder-only LLM: the core compute trait
+/// plus paged-KV cache + graph-capture support. Every concrete backend
+/// (CUDA / Metal / CPU) satisfies this.
+pub trait LlmBackend: Backend + BackendGraph + BackendPagedKv {}
+impl<T> LlmBackend for T where T: Backend + BackendGraph + BackendPagedKv {}
+
+/// LLM backend that also supports quantized weight loading (GPTQ Marlin
+/// for CUDA; GGUF k-quant for Metal). Required by models that hold
+/// `Box<dyn Linear<B>>` where the Linear impl might be a quant variant.
+pub trait QuantLlmBackend: LlmBackend + BackendQuantMarlin + BackendQuantGguf {}
+impl<T> QuantLlmBackend for T where T: LlmBackend + BackendQuantMarlin + BackendQuantGguf {}
+
+/// MoE-capable LLM backend: adds the fused MoE routing + post-op kernels
+/// to the quant LLM bundle. Required by Qwen3-MoE / future MoE models.
+pub trait MoeLlmBackend: QuantLlmBackend + BackendMoeFused {}
+impl<T> MoeLlmBackend for T where T: QuantLlmBackend + BackendMoeFused {}
