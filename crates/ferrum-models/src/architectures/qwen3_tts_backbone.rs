@@ -14,7 +14,9 @@
 //! `Qwen3TTSTalker` keeps its embeddings / projection / codec_head, and
 //! swaps only the transformer stack.
 
-use ferrum_kernels::backend::{Backend, BackendGraph, BackendQuantGguf, BackendQuantMarlin};
+use ferrum_kernels::backend::{
+    Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
+};
 use ferrum_quantization::loader::WeightLoader;
 use ferrum_quantization::PrefixedLoader;
 use ferrum_types::Result;
@@ -36,13 +38,18 @@ pub trait TalkerBackboneForward: Send + Sync {
 
 /// Backbone adapter — wraps `LlamaFamilyModel<B>` loaded as a backbone-only
 /// (no embed / no lm_head) plus a per-sequence position counter.
-pub struct TalkerBackboneBackend<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> {
+pub struct TalkerBackboneBackend<
+    B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
+> {
     backbone: LlamaFamilyModel<B>,
     cache_id: String,
     pos: usize,
 }
 
-impl<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> TalkerBackboneBackend<B> {
+impl<
+        B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
+    > TalkerBackboneBackend<B>
+{
     /// Build from a TTS model-directory loader. Uses `PrefixedLoader`
     /// with `"talker."` so `LlamaFamilyModel::new_backbone_only` picks up
     /// `talker.model.layers.*` and `talker.model.norm.weight`.
@@ -104,8 +111,9 @@ impl<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> TalkerBackboneBack
     }
 }
 
-impl<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> TalkerBackboneForward
-    for TalkerBackboneBackend<B>
+impl<
+        B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
+    > TalkerBackboneForward for TalkerBackboneBackend<B>
 {
     fn forward(&mut self, input_f32: &[f32], seq_len: usize) -> Vec<f32> {
         let h = self.backbone.cfg.hidden_size;

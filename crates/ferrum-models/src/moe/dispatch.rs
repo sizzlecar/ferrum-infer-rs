@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result as CandleResult};
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kernels::backend::{Backend, BackendQuantGguf, BackendQuantMarlin, GgufQuantType};
+use ferrum_kernels::backend::{
+    Backend, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin, GgufQuantType,
+};
 use ferrum_kernels::Linear;
 use ferrum_quantization::gguf::GgufFile;
 use ferrum_quantization::{DenseLinear, QuantLinear};
@@ -76,7 +78,9 @@ fn moe_profile_enabled() -> bool {
 /// over backend, but Phase 2's only consumer (`moe_forward_cpu`) is CPU-
 /// only — generic `moe_forward<B>` is deferred until the trait gains
 /// scaled-accumulate + cheap buffer slicing.
-pub struct ExpertStack<B: Backend + BackendQuantMarlin + BackendQuantGguf> {
+pub struct ExpertStack<
+    B: Backend + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
+> {
     /// Fused `[gate; up]` projection per expert. Output shape per token:
     /// `[2 * expert_intermediate]` — the lower half is gate, upper is up.
     pub gate_up: Vec<Box<dyn Linear<B>>>,
@@ -105,7 +109,9 @@ pub struct ExpertStack<B: Backend + BackendQuantMarlin + BackendQuantGguf> {
     pub down_gptq_stacked: Option<std::sync::Arc<B::GptqStore>>,
 }
 
-impl<B: Backend + BackendQuantMarlin + BackendQuantGguf> ExpertStack<B> {
+impl<B: Backend + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused>
+    ExpertStack<B>
+{
     /// Returns the shared stacked GPTQ store for `gate_up` if loaded
     /// via the bucketed/Marlin path. Used by [`moe_forward_bucketed`].
     pub fn gate_up_stacked_store(&self, _expert_idx: usize) -> Option<&B::GptqStore> {
@@ -118,7 +124,9 @@ impl<B: Backend + BackendQuantMarlin + BackendQuantGguf> ExpertStack<B> {
     }
 }
 
-impl<B: Backend + BackendQuantMarlin + BackendQuantGguf> ExpertStack<B> {
+impl<B: Backend + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused>
+    ExpertStack<B>
+{
     /// Build from raw fp32 stacked tensors (test helper). Caller has
     /// already dequantised and laid out the data:
     ///   `gate_stack`: `[num_experts * expert_inter * hidden]`
@@ -503,7 +511,9 @@ impl<B: Backend + BackendQuantMarlin + BackendQuantGguf> ExpertStack<B> {
 ///   8×5 + 2 = 42 dispatches/layer × 48 ≈ 2k/token (vs. ~3.5k in the
 ///   pre-PR scheme that round-tripped through `out` per pair).
 #[allow(clippy::too_many_arguments)]
-pub fn moe_forward<B: Backend + BackendQuantMarlin + BackendQuantGguf>(
+pub fn moe_forward<
+    B: Backend + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
+>(
     ctx: &mut B::Context,
     x: &B::Buffer,
     router_logits: &B::Buffer,
@@ -808,7 +818,9 @@ impl Default for MoeRouteScratch {
 /// caller is responsible for sizing these to `batch * top_k` rows
 /// (worst-case all top_k pairs alive).
 #[allow(clippy::too_many_arguments)]
-pub fn moe_forward_bucketed<B: Backend + BackendQuantMarlin + BackendQuantGguf>(
+pub fn moe_forward_bucketed<
+    B: Backend + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
+>(
     ctx: &mut B::Context,
     x: &B::Buffer,
     router_logits: &B::Buffer,

@@ -259,264 +259,11 @@ pub trait Backend: Send + Sync + Sized + 'static {
     // holds whatever backend-specific format is fastest; caller code
     // (GptqLinear) is dtype-agnostic.
 
-    /// Routing inputs for `moe_gemm_phase_vllm` — host-built i32 arrays
-    /// uploaded once per layer (or per token, depending on caller cadence).
-    /// Matches the shape contract of `moe_align_block_size` outputs but is
-    /// usable on backends that build the indices on host.
-    ///
-    /// Buffers are typed Self::Buffer (= fp16 on CUDA) for trait-object
-    /// reasons; backends reinterpret as i32. Default returns unsupported.
-    fn upload_moe_routing(
-        _ctx: &mut Self::Context,
-        _sorted_token_ids: &[i32],
-        _expert_ids: &[i32],
-        _num_tokens_past_padded: &[i32],
-    ) -> Result<MoeRouting<Self>> {
-        Err(FerrumError::unsupported(
-            "upload_moe_routing not implemented for this backend",
-        ))
-    }
-
     /// Zero the first `len` elements of a Self::Buffer. CUDA path uses
     /// cuMemsetD16Async; default returns unsupported.
     fn zero_buffer(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize) -> Result<()> {
         Err(FerrumError::unsupported(
             "zero_buffer not implemented for this backend",
-        ))
-    }
-
-    /// GPU-side MoE router: `[batch, num_experts]` logits → `[batch, top_k]`
-    /// expert IDs (i32) + `[batch, top_k]` combine weights (f32).
-    ///
-    /// Replaces the per-layer `B::sync + B::to_vec(router_logits) + host route()`
-    /// round trip. The output buffers stay device-side for downstream
-    /// `gemv_quant_moe_id` / `gemm_quant_moe_id` consumption — no host
-    /// pipeline drain in the inner loop.
-    ///
-    /// `norm_topk_prob`: if true, divide each row's K weights by their
-    /// sum so they total 1.0 (Qwen3-MoE / Mixtral default).
-    #[allow(clippy::too_many_arguments)]
-    fn route_topk_softmax(
-        _ctx: &mut Self::Context,
-        _logits: &Self::Buffer,
-        _out_ids: &mut Self::Buffer,
-        _out_weights: &mut Self::Buffer,
-        _batch: usize,
-        _num_experts: usize,
-        _top_k: usize,
-        _norm_topk_prob: bool,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "route_topk_softmax not implemented for this backend",
-        ))
-    }
-
-    /// GPU-side fast-path for the host route() leg of the bucketed
-    /// MoE forward (`moe_forward_bucketed` in ferrum-models). Replaces
-    /// the `B::sync(ctx) + B::to_vec(logits) + crate::moe::router::
-    /// route_into(...)` triple with a single GPU kernel + small D2H of
-    /// `[batch, top_k]` ids + weights.
-    ///
-    /// The backend allocates / reuses its own device-side scratch for
-    /// the kernel output; the caller only provides the host destination
-    /// vectors (resized + overwritten on each call). Default impl
-    /// returns `Err(unsupported)` so non-CUDA callers stay on the host
-    /// route_into() path with no behavior change.
-    #[allow(clippy::too_many_arguments)]
-    fn try_gpu_route_topk_into_host(
-        _ctx: &mut Self::Context,
-        _logits_dev: &Self::Buffer,
-        _out_ids_host: &mut Vec<u32>,
-        _out_weights_host: &mut Vec<f32>,
-        _batch: usize,
-        _num_experts: usize,
-        _top_k: usize,
-        _norm_topk_prob: bool,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "try_gpu_route_topk_into_host not implemented for this backend",
-        ))
-    }
-
-    /// GPU-side moe_align_block_size — prep for a future fused MoE
-    /// Marlin kernel. Takes per-pair expert assignments (from
-    /// [`Self::route_topk_softmax`]) and produces:
-    ///   - `sorted_token_ids[N_padded]`: flat list of pair indices
-    ///     in [0, batch * top_k), sorted by their assigned expert and
-    ///     padded with sentinel `batch * top_k` inside each expert
-    ///     group up to a `block_size` boundary.
-    ///   - `block_ids[N_padded / block_size]`: which expert each
-    ///     `block_size`-row tile of `sorted_token_ids` belongs to.
-    ///   - `total_tokens_post_pad[1]`: actual padded token count.
-    ///
-    /// Layout matches vLLM's marlin_moe_wna16 kernel input
-    /// expectation. The fused Marlin kernel reads a row from
-    /// `a[sorted_token_ids[i] / top_k]` and weights from
-    /// `b[block_ids[blockIdx.y] * n_per_expert + ...]`.
-    ///
-    /// Default impl returns Err — only CUDA implements this.
-    #[allow(clippy::too_many_arguments)]
-    fn moe_align_block_size(
-        _ctx: &mut Self::Context,
-        _expert_ids_per_pair: &Self::Buffer,
-        _sorted_token_ids: &mut Self::Buffer,
-        _block_ids: &mut Self::Buffer,
-        _total_tokens_post_pad: &mut Self::Buffer,
-        _batch_x_topk: usize,
-        _num_experts: usize,
-        _block_size: usize,
-        _sorted_max_size: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "moe_align_block_size not implemented for this backend",
-        ))
-    }
-
-    /// GPU-side bucket sort: turn `[batch, top_k]` selected expert IDs
-    /// (from [`Self::route_topk_softmax`]) into `tpe[num_experts]` /
-    /// `ids[num_experts * row_stride]` arrays consumed by the batched
-    /// MoE GEMM, and emit indirect-dispatch args for the consumer GEMM.
-    ///
-    /// The `ids` buffer's row stride is `batch * top_k` (worst case);
-    /// only the first `tpe[e]` entries of each row are populated. The
-    /// consumer GEMM kernel early-exits at `r1 >= tpe[e]`, so the over-
-    /// strided indices cost nothing in the inner loop. The grid size,
-    /// however, would still be worst-case unless we tighten it — this
-    /// is what the `gate_up_args` / `down_args` outputs do: a 12-byte
-    /// `(grid_x, grid_y, grid_z)` u32 triple per shape, ready for
-    /// `dispatch_thread_groups_indirect`. `grid_x` is shared (depends
-    /// only on `max(tpe[e])`); `grid_y` differs because gate/up has
-    /// `M = m_gate_up` while down has `M = m_down`.
-    ///
-    /// All five output buffers are written in one kernel; no host
-    /// roundtrip and no per-layer pipeline drain.
-    #[allow(clippy::too_many_arguments)]
-    fn compute_ids_tpe_gpu(
-        _ctx: &mut Self::Context,
-        _selected_ids: &Self::Buffer,
-        _tpe: &mut Self::Buffer,
-        _ids: &mut Self::Buffer,
-        _gate_up_args: &mut Self::Buffer,
-        _down_args: &mut Self::Buffer,
-        _batch: usize,
-        _num_experts: usize,
-        _top_k: usize,
-        _m_gate_up: usize,
-        _m_down: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "compute_ids_tpe_gpu not implemented for this backend",
-        ))
-    }
-
-    /// Stacked SiLU·gate over `[batch * top_k, ffn]` rows (prefill version
-    /// of `silu_mul_stacked`).
-    fn silu_mul_batched(
-        _ctx: &mut Self::Context,
-        _gate: &Self::Buffer,
-        _up: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _total_pairs: usize,
-        _ffn: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "silu_mul_batched not implemented for this backend",
-        ))
-    }
-
-    /// Fused weighted-sum + residual-add: `residual[i] += Σ_k weights[k] · slots[k, i]`.
-    /// Single dispatch replaces the (weighted_sum → moe_out) +
-    /// (add_inplace residual += moe_out) pair on the decode hot path.
-    fn weighted_sum_residual_stacked(
-        _ctx: &mut Self::Context,
-        _slots: &Self::Buffer,
-        _weights: &Self::Buffer,
-        _residual: &mut Self::Buffer,
-        _n_slots: usize,
-        _hidden: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "weighted_sum_residual_stacked not implemented for this backend",
-        ))
-    }
-
-    /// Fused weighted-sum-residual + RMSNorm: combines this layer's
-    /// `weighted_sum_residual_stacked` with the next layer's leading
-    /// `rms_norm` into a single dispatch.
-    ///
-    /// Computes
-    ///   `residual[i] += Σ_s w[s] · slots[s, i]`
-    ///   `normed_out[i] = residual[i] · (1 / sqrt(Σ residual² / hidden + eps)) · next_norm_w[i]`
-    ///
-    /// Caller is responsible for skipping the next layer's standalone
-    /// `rms_norm` — `normed_out` IS that layer's `norm_out` input.
-    /// Default returns Unsupported.
-    #[allow(clippy::too_many_arguments)]
-    fn weighted_sum_residual_norm_stacked(
-        _ctx: &mut Self::Context,
-        _slots: &Self::Buffer,
-        _weights: &Self::Buffer,
-        _residual: &mut Self::Buffer,
-        _next_norm_w: &Self::Buffer,
-        _normed_out: &mut Self::Buffer,
-        _n_slots: usize,
-        _hidden: usize,
-        _eps: f32,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "weighted_sum_residual_norm_stacked not implemented for this backend",
-        ))
-    }
-
-    /// Per-batch weighted sum: `out[b, h] = Σ_k weights[b, k] · slots[b, k, h]`.
-    /// Single dispatch covers the whole batch (prefill version of
-    /// `weighted_sum_stacked` which only handled one token).
-    fn weighted_sum_batched(
-        _ctx: &mut Self::Context,
-        _slots: &Self::Buffer,
-        _weights: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _batch: usize,
-        _top_k: usize,
-        _hidden: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "weighted_sum_batched not implemented for this backend",
-        ))
-    }
-
-    /// Offset-aware variant of [`Self::weighted_sum_batched`] —
-    /// `weights` reads from `weights_offset` (in elements, points at
-    /// the start of `[batch, top_k]`), `out` writes from `out_offset`
-    /// (in elements, points at start of `[batch, hidden]`). Used by
-    /// the per-item batched-decode path to skip `copy_slice` round-trips.
-    /// Default falls back to the non-offset variant via two copies.
-    #[allow(clippy::too_many_arguments)]
-    fn weighted_sum_batched_offset(
-        ctx: &mut Self::Context,
-        slots: &Self::Buffer,
-        weights: &Self::Buffer,
-        weights_offset: usize,
-        out: &mut Self::Buffer,
-        out_offset: usize,
-        batch: usize,
-        top_k: usize,
-        hidden: usize,
-    ) -> Result<()> {
-        // Default: stage through scratch — backends override for zero-copy.
-        let _ = (
-            ctx,
-            slots,
-            weights,
-            weights_offset,
-            out,
-            out_offset,
-            batch,
-            top_k,
-            hidden,
-        );
-        Err(FerrumError::unsupported(
-            "weighted_sum_batched_offset not implemented for this backend",
         ))
     }
 
@@ -552,74 +299,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// run.
     fn write_f32_into(buf: &mut Self::Buffer, data: &[f32]) {
         *buf = Self::from_slice(data);
-    }
-
-    /// Stacked SiLU·gate over `[n_slots, ffn]` rows.
-    ///
-    /// Computes `out[s, i] = silu(gate[s, i]) * up[s, i]` for each slot
-    /// `s`, element `i`. Single dispatch covers all slots — cuts the
-    /// MoE decode silu staging from `top_k * (3 copy_slice + 1 silu)`
-    /// = 32 dispatches per layer to 1.
-    fn silu_mul_stacked(
-        _ctx: &mut Self::Context,
-        _gate: &Self::Buffer,
-        _up: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _n_slots: usize,
-        _ffn: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "silu_mul_stacked not implemented for this backend",
-        ))
-    }
-
-    /// Capability probe for [`Self::gemv_quant_moe_id_gate_up_silu`].
-    ///
-    /// `true` ⇒ the fused kernel is wired in and the caller should
-    /// prefer it on the MoE decode hot path. `false` ⇒ caller must use
-    /// the 3-dispatch fallback (gate gemv + up gemv + silu_mul_stacked).
-    /// Lets callers branch without paying the cost of an `Err(Unsupported)`
-    /// allocation per (layer, step).
-    fn supports_fused_moe_gate_up_silu() -> bool {
-        false
-    }
-
-    /// Capability probe for [`Self::gemv_quant_moe_id_batched`].
-    fn supports_batched_moe_gemv() -> bool {
-        false
-    }
-
-    /// Whether this backend has a paged-KV decode path
-    /// (`paged_decode_attention` etc.). Currently true for Metal, false
-    /// for CPU. Used to decide the default of `FERRUM_METAL_PAGED_KV` —
-    /// the `serve` path should opt in automatically when supported so
-    /// users get the bench-quality concurrent-decode numbers without
-    /// having to learn the flag.
-    fn supports_paged_kv() -> bool {
-        false
-    }
-
-    /// Capability probe for [`Self::gemv_quant_moe_id_gate_up_silu_batched`].
-    fn supports_batched_moe_gate_up_silu() -> bool {
-        false
-    }
-
-    /// Weighted sum across `n_slots` rows of `[hidden]`.
-    ///
-    /// Computes `out[i] = Σ_s weights[s] * slots[s, i]`. Single
-    /// dispatch replaces the per-slot `(copy_slice + scaled_add)`
-    /// loop in the MoE decode path (16 dispatches per layer → 1).
-    fn weighted_sum_stacked(
-        _ctx: &mut Self::Context,
-        _slots: &Self::Buffer,
-        _weights: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _n_slots: usize,
-        _hidden: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "weighted_sum_stacked not implemented for this backend",
-        ))
     }
 
     // ── GEMM ────────────────────────────────────────────────────────────
@@ -791,32 +470,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         eps: f32,
         mode: i32,
     );
-
-    /// Pre-populate the per-slot device-pointer scratch arrays used by
-    /// the batched kernels (`kv_cache_append_batched_per_cache` and
-    /// `flash_attention_batched_per_cache`). Required by the CUDA-graph
-    /// capture path: the captured graph contains only kernel launches
-    /// (no captured `memcpy_htod`), so the device scratch must be fresh
-    /// when the graph replays.
-    ///
-    /// Caller passes flat layer-major slices: `k_caches[li * m + i]` and
-    /// `v_caches[li * m + i]`. Backend extracts each cache's device
-    /// pointer and writes into its corresponding slot in the device
-    /// scratch via SYNCHRONOUS memcpy (not captured by stream capture).
-    ///
-    /// CUDA-only; other backends fall through to the default
-    /// `unsupported` and the caller skips the population call.
-    fn populate_batched_pointers(
-        _ctx: &mut Self::Context,
-        _k_caches: &[&Self::Buffer],
-        _v_caches: &[&Self::Buffer],
-        _num_layers: usize,
-        _m: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "populate_batched_pointers not implemented for this backend",
-        ))
-    }
 
     /// Batched kv_cache_append across M caches in one launch. Each item
     /// writes its (head-major) K-or-V row into its own cache at offset
@@ -996,224 +649,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
-    /// Paged-KV variant of [`Self::split_qkv_norm_rope_into_cache`].
-    ///
-    /// Same fused split + qk-norm + RoPE, but K/V are written into a
-    /// paged pool `[num_blocks, kv_heads, block_size, head_dim]`
-    /// indexed via `block_table[logical_block]` → physical_block.
-    /// Q still goes to head-major scratch.
-    ///
-    /// Default returns Unsupported. Backends that lack a paged kernel
-    /// keep using the contiguous variant.
-    /// `qkv_byte_offset` / `q_out_byte_offset` let the caller pass a
-    /// slice of a larger batched buffer (used by the multi-seq paged
-    /// path in `decode_batch_internal`). For single-seq dispatch they
-    /// should be 0.
-    #[allow(clippy::too_many_arguments)]
-    fn split_qkv_norm_rope_into_paged_cache(
-        _ctx: &mut Self::Context,
-        _qkv: &Self::Buffer,
-        _qkv_byte_offset: u64,
-        _q_norm_w: &Self::Buffer,
-        _k_norm_w: &Self::Buffer,
-        _cos: &Self::Buffer,
-        _sin: &Self::Buffer,
-        _q_out: &mut Self::Buffer,
-        _q_out_byte_offset: u64,
-        _cache_k: &mut Self::Buffer,
-        _cache_v: &mut Self::Buffer,
-        _block_table: &Self::Buffer,
-        _tokens: usize,
-        _q_heads: usize,
-        _kv_heads: usize,
-        _head_dim: usize,
-        _pos_offset: usize,
-        _eps: f32,
-        _qk_mode: i32,
-        _cache_len: usize,
-        _block_size: usize,
-        _max_num_blocks_per_seq: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "split_qkv_norm_rope_into_paged_cache not implemented for this backend",
-        ))
-    }
-
-    /// Paged-KV variant of [`Self::flash_attention`].
-    ///
-    /// Decode (`q_len == 1`):
-    ///   `q`/`out`: `[num_seqs, num_heads, head_dim]` (token-major)
-    ///
-    /// Causal prefill (`q_len > 1`, single seq):
-    ///   `q`/`out`: `[num_heads, q_len, head_dim]` (head-major — the
-    ///              layout produced by `split_qkv_norm_rope_into_paged_cache`)
-    ///   The kernel applies a per-q-token causal mask using
-    ///   `context_lens[seq]` as the FINAL kv_len (= `pos_offset + q_len`):
-    ///   token i sees positions `[0, context_lens - q_len + 1 + i)`.
-    ///
-    /// Common to both:
-    ///   `k_pool`/`v_pool`: `[num_blocks, num_kv_heads, block_size, head_dim]`
-    ///   `block_tables`: `[num_seqs, max_num_blocks_per_seq]` u32
-    ///   `context_lens`: `[num_seqs]` u32
-    ///
-    /// Backends without a paged kernel return Unsupported; callers are
-    /// expected to fall back to contiguous KV.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_decode_attention(
-        _ctx: &mut Self::Context,
-        _q: &Self::Buffer,
-        _k_pool: &Self::Buffer,
-        _v_pool: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _block_tables: &Self::Buffer,
-        _context_lens: &Self::Buffer,
-        _num_seqs: usize,
-        _num_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _block_size: usize,
-        _max_num_blocks_per_seq: usize,
-        _q_len: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "paged_decode_attention not implemented for this backend",
-        ))
-    }
-
-    /// Capability: does this backend implement
-    /// `split_qkv_norm_rope_into_paged_cache_varlen` and
-    /// `paged_varlen_attention`? Required by the unified mixed-batch
-    /// forward path used by `LlamaFamilyModel::unified_forward`. Default
-    /// false; backends that ship the varlen kernels override.
-    fn supports_varlen_qkv() -> bool {
-        false
-    }
-
-    /// Varlen variant of [`Self::split_qkv_norm_rope_into_paged_cache`].
-    ///
-    /// Single launch covering ALL sequences in the batch. Reads
-    /// `pos_offsets[seq]`, `cu_seqlens_q[seq]`, and the per-seq
-    /// block_table from device buffers — graph-capturable (the per-iter
-    /// state is in buffers, not kernel scalars). Replaces the per-item
-    /// dispatch loop in `unified_forward_layer` with one call.
-    ///
-    /// Layouts:
-    /// - `qkv`: `[m_total, q_dim + 2 * kv_dim]` token-major
-    /// - `q_out`: `[m_total, q_heads, head_dim]` token-major (matches
-    ///   what `paged_varlen_attention` reads)
-    /// - `cache_k` / `cache_v`: paged pool same as `paged_varlen_attention`
-    /// - `cu_seqlens_q`: `[num_seqs + 1]` u32 prefix sum
-    /// - `pos_offsets`: `[num_seqs]` u32, starting kv_pos per seq
-    /// - `block_tables`: `[num_seqs, max_blocks_per_seq]` i32 stacked
-    #[allow(clippy::too_many_arguments)]
-    fn split_qkv_norm_rope_into_paged_cache_varlen(
-        _ctx: &mut Self::Context,
-        _qkv: &Self::Buffer,
-        _q_norm_w: &Self::Buffer,
-        _k_norm_w: &Self::Buffer,
-        _cos: &Self::Buffer,
-        _sin: &Self::Buffer,
-        _q_out: &mut Self::Buffer,
-        _cache_k: &mut Self::Buffer,
-        _cache_v: &mut Self::Buffer,
-        _cu_seqlens_q: &Self::Buffer,
-        _pos_offsets: &Self::Buffer,
-        _block_tables: &Self::Buffer,
-        _num_seqs: usize,
-        _m_total: usize,
-        _q_heads: usize,
-        _kv_heads: usize,
-        _head_dim: usize,
-        _eps: f32,
-        _qk_mode: i32,
-        _block_size: usize,
-        _max_blocks_per_seq: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend",
-        ))
-    }
-
-    /// Variable-length paged attention with GQA + causal mask.
-    ///
-    /// Supports a unified mixed batch where each sequence contributes
-    /// 1 (decode) or N (prefill chunk) query tokens — the workhorse for
-    /// chunked-prefill. See `kernels/paged_varlen_attention.cu` for the
-    /// kernel itself.
-    ///
-    /// Layouts:
-    /// - `q` / `out`: `[total_q_tokens, num_heads, head_dim]` (token-
-    ///   major, FP16). `total_q_tokens` = `cu_seqlens_q[num_seqs]`.
-    /// - `k_pool` / `v_pool`: paged block pool, layout matches
-    ///   `paged_decode_attention`.
-    /// - `cu_seqlens_q`: `[num_seqs + 1]` u32 prefix sum, with
-    ///   `cu_seqlens_q[0] = 0` and `cu_seqlens_q[num_seqs] = total_q_tokens`.
-    /// - `pos_offsets`: `[num_seqs]` u32, the starting absolute KV
-    ///   position of each seq's first q token (= prior `kv_len`).
-    /// - `block_tables`: `[num_seqs, max_num_blocks_per_seq]` i32 grid.
-    ///
-    /// Each query token attends causally to all KV positions
-    /// `[0, pos_offsets[s] + local_idx]`.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_varlen_attention(
-        _ctx: &mut Self::Context,
-        _q: &Self::Buffer,
-        _k_pool: &Self::Buffer,
-        _v_pool: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _cu_seqlens_q: &Self::Buffer,
-        _pos_offsets: &Self::Buffer,
-        _block_tables: &Self::Buffer,
-        _num_seqs: usize,
-        _total_q_tokens: usize,
-        _max_kv_len: usize,
-        _num_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _block_size: usize,
-        _max_num_blocks_per_seq: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "paged_varlen_attention not implemented for this backend",
-        ))
-    }
-
-    /// Batched paged decode attention — multi-seq, single token per seq.
-    /// Faster path for the unified_forward layer when m_total == num_seqs
-    /// (every item is a single-token decode). Skips the cu_seqlens_q
-    /// linear scan that `paged_varlen_attention` does in the fully-mixed
-    /// case.
-    ///
-    /// Layouts:
-    ///   q              : [num_seqs, num_q_heads, head_dim]
-    ///   k_pool/v_pool  : paged pool (same as paged_varlen)
-    ///   block_tables   : [num_seqs, max_num_blocks_per_seq]
-    ///   valid_kv_lens  : [num_seqs] — current kv_len per seq
-    ///   out            : [num_seqs, num_q_heads, head_dim]
-    ///
-    /// Default returns Err(unsupported); CUDA backend overrides.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_batched_decode_attention(
-        _ctx: &mut Self::Context,
-        _q: &Self::Buffer,
-        _k_pool: &Self::Buffer,
-        _v_pool: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _block_tables: &Self::Buffer,
-        _valid_kv_lens: &Self::Buffer,
-        _num_seqs: usize,
-        _max_kv_len: usize,
-        _num_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _block_size: usize,
-        _max_num_blocks_per_seq: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "paged_batched_decode_attention not implemented for this backend",
-        ))
-    }
-
     /// Allocate a u32 buffer of length `n` for paged-KV bookkeeping
     /// (block tables, context lens). Default uses the existing
     /// `from_slice_i32` route then bit-casts; backends with a faster
@@ -1334,54 +769,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         _intermediate: usize,
     ) {
         unimplemented!("fused_silu_mul_split_strided default impl missing");
-    }
-
-    /// MoE combine: per-token weighted sum across `top_k` expert outputs.
-    ///
-    /// After the bucketed dispatch, `packed_down` holds `[total_pairs,
-    /// hidden]` with one row per (token, k_slot) pair in expert-bucketed
-    /// order. `pairs_by_token[b * top_k + k]` is the inverse map: which
-    /// row of `packed_down` carries the (b, k_slot) contribution. A row
-    /// index of `-1` means "skip" (unused slot).
-    ///
-    /// Computes:
-    ///
-    /// ```text
-    /// out[b, h] = sum_k pair_weights[b * top_k + k] *
-    ///                   packed_down[pairs_by_token[b * top_k + k], h]
-    /// ```
-    ///
-    /// Default impl round-trips via host memory — correct but slow.
-    /// CUDA backend launches a single fused kernel.
-    #[allow(clippy::too_many_arguments)]
-    fn moe_combine(
-        _ctx: &mut Self::Context,
-        packed_down: &Self::Buffer,
-        pairs_by_token: &[i32],
-        pair_weights: &[f32],
-        out: &mut Self::Buffer,
-        batch: usize,
-        hidden: usize,
-        top_k: usize,
-        total_pairs: usize,
-    ) {
-        let packed = Self::to_vec(packed_down, total_pairs * hidden);
-        let mut out_h = vec![0.0f32; batch * hidden];
-        for b in 0..batch {
-            for k in 0..top_k {
-                let pair_row = pairs_by_token[b * top_k + k];
-                if pair_row < 0 {
-                    continue;
-                }
-                let w = pair_weights[b * top_k + k];
-                let src = &packed[(pair_row as usize) * hidden..(pair_row as usize + 1) * hidden];
-                let dst = &mut out_h[b * hidden..(b + 1) * hidden];
-                for h in 0..hidden {
-                    dst[h] += w * src[h];
-                }
-            }
-        }
-        *out = Self::from_slice(&out_h);
     }
 
     /// Broadcast bias add: `data[r, c] += bias[c]` for every row.
@@ -2114,5 +1501,620 @@ pub trait BackendQuantGguf: Backend {
         Err(FerrumError::unsupported(
             "gemv_quant_moe_id_gate_up_silu_batched not implemented for this backend",
         ))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// BackendPagedKv capability (vLLM-style paged KV cache + paged attention)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Paged KV pool with block-table indirection, plus the paged attention
+// kernel variants that read through that indirection. CUDA + Metal both
+// implement the real kernels; CPU `impl BackendPagedKv for CpuBackend {}`
+// inherits unsupported defaults.
+
+/// Capability-trait for backends that support paged KV cache + paged attention.
+pub trait BackendPagedKv: Backend {
+    /// Whether this backend has a paged-KV decode path
+    /// (`paged_decode_attention` etc.). Currently true for Metal, false
+    /// for CPU. Used to decide the default of `FERRUM_METAL_PAGED_KV` —
+    /// the `serve` path should opt in automatically when supported so
+    /// users get the bench-quality concurrent-decode numbers without
+    /// having to learn the flag.
+    fn supports_paged_kv() -> bool {
+        false
+    }
+    /// Pre-populate the per-slot device-pointer scratch arrays used by
+    /// the batched kernels (`kv_cache_append_batched_per_cache` and
+    /// `flash_attention_batched_per_cache`). Required by the CUDA-graph
+    /// capture path: the captured graph contains only kernel launches
+    /// (no captured `memcpy_htod`), so the device scratch must be fresh
+    /// when the graph replays.
+    ///
+    /// Caller passes flat layer-major slices: `k_caches[li * m + i]` and
+    /// `v_caches[li * m + i]`. Backend extracts each cache's device
+    /// pointer and writes into its corresponding slot in the device
+    /// scratch via SYNCHRONOUS memcpy (not captured by stream capture).
+    ///
+    /// CUDA-only; other backends fall through to the default
+    /// `unsupported` and the caller skips the population call.
+    fn populate_batched_pointers(
+        _ctx: &mut Self::Context,
+        _k_caches: &[&Self::Buffer],
+        _v_caches: &[&Self::Buffer],
+        _num_layers: usize,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "populate_batched_pointers not implemented for this backend",
+        ))
+    }
+    /// Paged-KV variant of [`Self::split_qkv_norm_rope_into_cache`].
+    ///
+    /// Same fused split + qk-norm + RoPE, but K/V are written into a
+    /// paged pool `[num_blocks, kv_heads, block_size, head_dim]`
+    /// indexed via `block_table[logical_block]` → physical_block.
+    /// Q still goes to head-major scratch.
+    ///
+    /// Default returns Unsupported. Backends that lack a paged kernel
+    /// keep using the contiguous variant.
+    /// `qkv_byte_offset` / `q_out_byte_offset` let the caller pass a
+    /// slice of a larger batched buffer (used by the multi-seq paged
+    /// path in `decode_batch_internal`). For single-seq dispatch they
+    /// should be 0.
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _qkv_byte_offset: u64,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _q_out_byte_offset: u64,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _block_table: &Self::Buffer,
+        _tokens: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _pos_offset: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _cache_len: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope_into_paged_cache not implemented for this backend",
+        ))
+    }
+    /// Paged-KV variant of [`Self::flash_attention`].
+    ///
+    /// Decode (`q_len == 1`):
+    ///   `q`/`out`: `[num_seqs, num_heads, head_dim]` (token-major)
+    ///
+    /// Causal prefill (`q_len > 1`, single seq):
+    ///   `q`/`out`: `[num_heads, q_len, head_dim]` (head-major — the
+    ///              layout produced by `split_qkv_norm_rope_into_paged_cache`)
+    ///   The kernel applies a per-q-token causal mask using
+    ///   `context_lens[seq]` as the FINAL kv_len (= `pos_offset + q_len`):
+    ///   token i sees positions `[0, context_lens - q_len + 1 + i)`.
+    ///
+    /// Common to both:
+    ///   `k_pool`/`v_pool`: `[num_blocks, num_kv_heads, block_size, head_dim]`
+    ///   `block_tables`: `[num_seqs, max_num_blocks_per_seq]` u32
+    ///   `context_lens`: `[num_seqs]` u32
+    ///
+    /// Backends without a paged kernel return Unsupported; callers are
+    /// expected to fall back to contiguous KV.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_decode_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _context_lens: &Self::Buffer,
+        _num_seqs: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+        _q_len: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_decode_attention not implemented for this backend",
+        ))
+    }
+    /// Capability: does this backend implement
+    /// `split_qkv_norm_rope_into_paged_cache_varlen` and
+    /// `paged_varlen_attention`? Required by the unified mixed-batch
+    /// forward path used by `LlamaFamilyModel::unified_forward`. Default
+    /// false; backends that ship the varlen kernels override.
+    fn supports_varlen_qkv() -> bool {
+        false
+    }
+    /// Varlen variant of [`Self::split_qkv_norm_rope_into_paged_cache`].
+    ///
+    /// Single launch covering ALL sequences in the batch. Reads
+    /// `pos_offsets[seq]`, `cu_seqlens_q[seq]`, and the per-seq
+    /// block_table from device buffers — graph-capturable (the per-iter
+    /// state is in buffers, not kernel scalars). Replaces the per-item
+    /// dispatch loop in `unified_forward_layer` with one call.
+    ///
+    /// Layouts:
+    /// - `qkv`: `[m_total, q_dim + 2 * kv_dim]` token-major
+    /// - `q_out`: `[m_total, q_heads, head_dim]` token-major (matches
+    ///   what `paged_varlen_attention` reads)
+    /// - `cache_k` / `cache_v`: paged pool same as `paged_varlen_attention`
+    /// - `cu_seqlens_q`: `[num_seqs + 1]` u32 prefix sum
+    /// - `pos_offsets`: `[num_seqs]` u32, starting kv_pos per seq
+    /// - `block_tables`: `[num_seqs, max_blocks_per_seq]` i32 stacked
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache_varlen(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _m_total: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _block_size: usize,
+        _max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend",
+        ))
+    }
+    /// Variable-length paged attention with GQA + causal mask.
+    ///
+    /// Supports a unified mixed batch where each sequence contributes
+    /// 1 (decode) or N (prefill chunk) query tokens — the workhorse for
+    /// chunked-prefill. See `kernels/paged_varlen_attention.cu` for the
+    /// kernel itself.
+    ///
+    /// Layouts:
+    /// - `q` / `out`: `[total_q_tokens, num_heads, head_dim]` (token-
+    ///   major, FP16). `total_q_tokens` = `cu_seqlens_q[num_seqs]`.
+    /// - `k_pool` / `v_pool`: paged block pool, layout matches
+    ///   `paged_decode_attention`.
+    /// - `cu_seqlens_q`: `[num_seqs + 1]` u32 prefix sum, with
+    ///   `cu_seqlens_q[0] = 0` and `cu_seqlens_q[num_seqs] = total_q_tokens`.
+    /// - `pos_offsets`: `[num_seqs]` u32, the starting absolute KV
+    ///   position of each seq's first q token (= prior `kv_len`).
+    /// - `block_tables`: `[num_seqs, max_num_blocks_per_seq]` i32 grid.
+    ///
+    /// Each query token attends causally to all KV positions
+    /// `[0, pos_offsets[s] + local_idx]`.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_varlen_attention not implemented for this backend",
+        ))
+    }
+    /// Batched paged decode attention — multi-seq, single token per seq.
+    /// Faster path for the unified_forward layer when m_total == num_seqs
+    /// (every item is a single-token decode). Skips the cu_seqlens_q
+    /// linear scan that `paged_varlen_attention` does in the fully-mixed
+    /// case.
+    ///
+    /// Layouts:
+    ///   q              : [num_seqs, num_q_heads, head_dim]
+    ///   k_pool/v_pool  : paged pool (same as paged_varlen)
+    ///   block_tables   : [num_seqs, max_num_blocks_per_seq]
+    ///   valid_kv_lens  : [num_seqs] — current kv_len per seq
+    ///   out            : [num_seqs, num_q_heads, head_dim]
+    ///
+    /// Default returns Err(unsupported); CUDA backend overrides.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_batched_decode_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _valid_kv_lens: &Self::Buffer,
+        _num_seqs: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_batched_decode_attention not implemented for this backend",
+        ))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// BackendMoeFused capability (MoE routing + post-ops kernels)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Backend-specific MoE infrastructure: routing index buffers, expert
+// dispatch align, weighted sum / silu/mul fused ops, top-k softmax.
+// CUDA + Metal both implement (they're the real MoE backends);
+// CPU inherits unsupported defaults.
+
+/// Capability-trait for backends that natively dispatch MoE post-ops + routing.
+pub trait BackendMoeFused: Backend {
+    /// Routing inputs for `moe_gemm_phase_vllm` — host-built i32 arrays
+    /// uploaded once per layer (or per token, depending on caller cadence).
+    /// Matches the shape contract of `moe_align_block_size` outputs but is
+    /// usable on backends that build the indices on host.
+    ///
+    /// Buffers are typed Self::Buffer (= fp16 on CUDA) for trait-object
+    /// reasons; backends reinterpret as i32. Default returns unsupported.
+    fn upload_moe_routing(
+        _ctx: &mut Self::Context,
+        _sorted_token_ids: &[i32],
+        _expert_ids: &[i32],
+        _num_tokens_past_padded: &[i32],
+    ) -> Result<MoeRouting<Self>> {
+        Err(FerrumError::unsupported(
+            "upload_moe_routing not implemented for this backend",
+        ))
+    }
+    /// GPU-side MoE router: `[batch, num_experts]` logits → `[batch, top_k]`
+    /// expert IDs (i32) + `[batch, top_k]` combine weights (f32).
+    ///
+    /// Replaces the per-layer `B::sync + B::to_vec(router_logits) + host route()`
+    /// round trip. The output buffers stay device-side for downstream
+    /// `gemv_quant_moe_id` / `gemm_quant_moe_id` consumption — no host
+    /// pipeline drain in the inner loop.
+    ///
+    /// `norm_topk_prob`: if true, divide each row's K weights by their
+    /// sum so they total 1.0 (Qwen3-MoE / Mixtral default).
+    #[allow(clippy::too_many_arguments)]
+    fn route_topk_softmax(
+        _ctx: &mut Self::Context,
+        _logits: &Self::Buffer,
+        _out_ids: &mut Self::Buffer,
+        _out_weights: &mut Self::Buffer,
+        _batch: usize,
+        _num_experts: usize,
+        _top_k: usize,
+        _norm_topk_prob: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "route_topk_softmax not implemented for this backend",
+        ))
+    }
+    /// GPU-side fast-path for the host route() leg of the bucketed
+    /// MoE forward (`moe_forward_bucketed` in ferrum-models). Replaces
+    /// the `B::sync(ctx) + B::to_vec(logits) + crate::moe::router::
+    /// route_into(...)` triple with a single GPU kernel + small D2H of
+    /// `[batch, top_k]` ids + weights.
+    ///
+    /// The backend allocates / reuses its own device-side scratch for
+    /// the kernel output; the caller only provides the host destination
+    /// vectors (resized + overwritten on each call). Default impl
+    /// returns `Err(unsupported)` so non-CUDA callers stay on the host
+    /// route_into() path with no behavior change.
+    #[allow(clippy::too_many_arguments)]
+    fn try_gpu_route_topk_into_host(
+        _ctx: &mut Self::Context,
+        _logits_dev: &Self::Buffer,
+        _out_ids_host: &mut Vec<u32>,
+        _out_weights_host: &mut Vec<f32>,
+        _batch: usize,
+        _num_experts: usize,
+        _top_k: usize,
+        _norm_topk_prob: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "try_gpu_route_topk_into_host not implemented for this backend",
+        ))
+    }
+    /// GPU-side moe_align_block_size — prep for a future fused MoE
+    /// Marlin kernel. Takes per-pair expert assignments (from
+    /// [`Self::route_topk_softmax`]) and produces:
+    ///   - `sorted_token_ids[N_padded]`: flat list of pair indices
+    ///     in [0, batch * top_k), sorted by their assigned expert and
+    ///     padded with sentinel `batch * top_k` inside each expert
+    ///     group up to a `block_size` boundary.
+    ///   - `block_ids[N_padded / block_size]`: which expert each
+    ///     `block_size`-row tile of `sorted_token_ids` belongs to.
+    ///   - `total_tokens_post_pad[1]`: actual padded token count.
+    ///
+    /// Layout matches vLLM's marlin_moe_wna16 kernel input
+    /// expectation. The fused Marlin kernel reads a row from
+    /// `a[sorted_token_ids[i] / top_k]` and weights from
+    /// `b[block_ids[blockIdx.y] * n_per_expert + ...]`.
+    ///
+    /// Default impl returns Err — only CUDA implements this.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_align_block_size(
+        _ctx: &mut Self::Context,
+        _expert_ids_per_pair: &Self::Buffer,
+        _sorted_token_ids: &mut Self::Buffer,
+        _block_ids: &mut Self::Buffer,
+        _total_tokens_post_pad: &mut Self::Buffer,
+        _batch_x_topk: usize,
+        _num_experts: usize,
+        _block_size: usize,
+        _sorted_max_size: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "moe_align_block_size not implemented for this backend",
+        ))
+    }
+    /// GPU-side bucket sort: turn `[batch, top_k]` selected expert IDs
+    /// (from [`Self::route_topk_softmax`]) into `tpe[num_experts]` /
+    /// `ids[num_experts * row_stride]` arrays consumed by the batched
+    /// MoE GEMM, and emit indirect-dispatch args for the consumer GEMM.
+    ///
+    /// The `ids` buffer's row stride is `batch * top_k` (worst case);
+    /// only the first `tpe[e]` entries of each row are populated. The
+    /// consumer GEMM kernel early-exits at `r1 >= tpe[e]`, so the over-
+    /// strided indices cost nothing in the inner loop. The grid size,
+    /// however, would still be worst-case unless we tighten it — this
+    /// is what the `gate_up_args` / `down_args` outputs do: a 12-byte
+    /// `(grid_x, grid_y, grid_z)` u32 triple per shape, ready for
+    /// `dispatch_thread_groups_indirect`. `grid_x` is shared (depends
+    /// only on `max(tpe[e])`); `grid_y` differs because gate/up has
+    /// `M = m_gate_up` while down has `M = m_down`.
+    ///
+    /// All five output buffers are written in one kernel; no host
+    /// roundtrip and no per-layer pipeline drain.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_ids_tpe_gpu(
+        _ctx: &mut Self::Context,
+        _selected_ids: &Self::Buffer,
+        _tpe: &mut Self::Buffer,
+        _ids: &mut Self::Buffer,
+        _gate_up_args: &mut Self::Buffer,
+        _down_args: &mut Self::Buffer,
+        _batch: usize,
+        _num_experts: usize,
+        _top_k: usize,
+        _m_gate_up: usize,
+        _m_down: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "compute_ids_tpe_gpu not implemented for this backend",
+        ))
+    }
+    /// Stacked SiLU·gate over `[batch * top_k, ffn]` rows (prefill version
+    /// of `silu_mul_stacked`).
+    fn silu_mul_batched(
+        _ctx: &mut Self::Context,
+        _gate: &Self::Buffer,
+        _up: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _total_pairs: usize,
+        _ffn: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "silu_mul_batched not implemented for this backend",
+        ))
+    }
+    /// Fused weighted-sum + residual-add: `residual[i] += Σ_k weights[k] · slots[k, i]`.
+    /// Single dispatch replaces the (weighted_sum → moe_out) +
+    /// (add_inplace residual += moe_out) pair on the decode hot path.
+    fn weighted_sum_residual_stacked(
+        _ctx: &mut Self::Context,
+        _slots: &Self::Buffer,
+        _weights: &Self::Buffer,
+        _residual: &mut Self::Buffer,
+        _n_slots: usize,
+        _hidden: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "weighted_sum_residual_stacked not implemented for this backend",
+        ))
+    }
+    /// Fused weighted-sum-residual + RMSNorm: combines this layer's
+    /// `weighted_sum_residual_stacked` with the next layer's leading
+    /// `rms_norm` into a single dispatch.
+    ///
+    /// Computes
+    ///   `residual[i] += Σ_s w[s] · slots[s, i]`
+    ///   `normed_out[i] = residual[i] · (1 / sqrt(Σ residual² / hidden + eps)) · next_norm_w[i]`
+    ///
+    /// Caller is responsible for skipping the next layer's standalone
+    /// `rms_norm` — `normed_out` IS that layer's `norm_out` input.
+    /// Default returns Unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn weighted_sum_residual_norm_stacked(
+        _ctx: &mut Self::Context,
+        _slots: &Self::Buffer,
+        _weights: &Self::Buffer,
+        _residual: &mut Self::Buffer,
+        _next_norm_w: &Self::Buffer,
+        _normed_out: &mut Self::Buffer,
+        _n_slots: usize,
+        _hidden: usize,
+        _eps: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "weighted_sum_residual_norm_stacked not implemented for this backend",
+        ))
+    }
+    /// Per-batch weighted sum: `out[b, h] = Σ_k weights[b, k] · slots[b, k, h]`.
+    /// Single dispatch covers the whole batch (prefill version of
+    /// `weighted_sum_stacked` which only handled one token).
+    fn weighted_sum_batched(
+        _ctx: &mut Self::Context,
+        _slots: &Self::Buffer,
+        _weights: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _batch: usize,
+        _top_k: usize,
+        _hidden: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "weighted_sum_batched not implemented for this backend",
+        ))
+    }
+    /// Offset-aware variant of [`Self::weighted_sum_batched`] —
+    /// `weights` reads from `weights_offset` (in elements, points at
+    /// the start of `[batch, top_k]`), `out` writes from `out_offset`
+    /// (in elements, points at start of `[batch, hidden]`). Used by
+    /// the per-item batched-decode path to skip `copy_slice` round-trips.
+    /// Default falls back to the non-offset variant via two copies.
+    #[allow(clippy::too_many_arguments)]
+    fn weighted_sum_batched_offset(
+        ctx: &mut Self::Context,
+        slots: &Self::Buffer,
+        weights: &Self::Buffer,
+        weights_offset: usize,
+        out: &mut Self::Buffer,
+        out_offset: usize,
+        batch: usize,
+        top_k: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        // Default: stage through scratch — backends override for zero-copy.
+        let _ = (
+            ctx,
+            slots,
+            weights,
+            weights_offset,
+            out,
+            out_offset,
+            batch,
+            top_k,
+            hidden,
+        );
+        Err(FerrumError::unsupported(
+            "weighted_sum_batched_offset not implemented for this backend",
+        ))
+    }
+    /// Stacked SiLU·gate over `[n_slots, ffn]` rows.
+    ///
+    /// Computes `out[s, i] = silu(gate[s, i]) * up[s, i]` for each slot
+    /// `s`, element `i`. Single dispatch covers all slots — cuts the
+    /// MoE decode silu staging from `top_k * (3 copy_slice + 1 silu)`
+    /// = 32 dispatches per layer to 1.
+    fn silu_mul_stacked(
+        _ctx: &mut Self::Context,
+        _gate: &Self::Buffer,
+        _up: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _n_slots: usize,
+        _ffn: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "silu_mul_stacked not implemented for this backend",
+        ))
+    }
+    /// Capability probe for [`Self::gemv_quant_moe_id_gate_up_silu`].
+    ///
+    /// `true` ⇒ the fused kernel is wired in and the caller should
+    /// prefer it on the MoE decode hot path. `false` ⇒ caller must use
+    /// the 3-dispatch fallback (gate gemv + up gemv + silu_mul_stacked).
+    /// Lets callers branch without paying the cost of an `Err(Unsupported)`
+    /// allocation per (layer, step).
+    fn supports_fused_moe_gate_up_silu() -> bool {
+        false
+    }
+    /// Capability probe for [`Self::gemv_quant_moe_id_batched`].
+    fn supports_batched_moe_gemv() -> bool {
+        false
+    }
+    /// Capability probe for [`Self::gemv_quant_moe_id_gate_up_silu_batched`].
+    fn supports_batched_moe_gate_up_silu() -> bool {
+        false
+    }
+    /// Weighted sum across `n_slots` rows of `[hidden]`.
+    ///
+    /// Computes `out[i] = Σ_s weights[s] * slots[s, i]`. Single
+    /// dispatch replaces the per-slot `(copy_slice + scaled_add)`
+    /// loop in the MoE decode path (16 dispatches per layer → 1).
+    fn weighted_sum_stacked(
+        _ctx: &mut Self::Context,
+        _slots: &Self::Buffer,
+        _weights: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _n_slots: usize,
+        _hidden: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "weighted_sum_stacked not implemented for this backend",
+        ))
+    }
+    /// MoE combine: per-token weighted sum across `top_k` expert outputs.
+    ///
+    /// After the bucketed dispatch, `packed_down` holds `[total_pairs,
+    /// hidden]` with one row per (token, k_slot) pair in expert-bucketed
+    /// order. `pairs_by_token[b * top_k + k]` is the inverse map: which
+    /// row of `packed_down` carries the (b, k_slot) contribution. A row
+    /// index of `-1` means "skip" (unused slot).
+    ///
+    /// Computes:
+    ///
+    /// ```text
+    /// out[b, h] = sum_k pair_weights[b * top_k + k] *
+    ///                   packed_down[pairs_by_token[b * top_k + k], h]
+    /// ```
+    ///
+    /// Default impl round-trips via host memory — correct but slow.
+    /// CUDA backend launches a single fused kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_combine(
+        _ctx: &mut Self::Context,
+        packed_down: &Self::Buffer,
+        pairs_by_token: &[i32],
+        pair_weights: &[f32],
+        out: &mut Self::Buffer,
+        batch: usize,
+        hidden: usize,
+        top_k: usize,
+        total_pairs: usize,
+    ) {
+        let packed = Self::to_vec(packed_down, total_pairs * hidden);
+        let mut out_h = vec![0.0f32; batch * hidden];
+        for b in 0..batch {
+            for k in 0..top_k {
+                let pair_row = pairs_by_token[b * top_k + k];
+                if pair_row < 0 {
+                    continue;
+                }
+                let w = pair_weights[b * top_k + k];
+                let src = &packed[(pair_row as usize) * hidden..(pair_row as usize + 1) * hidden];
+                let dst = &mut out_h[b * hidden..(b + 1) * hidden];
+                for h in 0..hidden {
+                    dst[h] += w * src[h];
+                }
+            }
+        }
+        *out = Self::from_slice(&out_h);
     }
 }

@@ -21,7 +21,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle_core::Device;
-use ferrum_kernels::backend::{Backend, BackendQuantGguf, BackendQuantMarlin};
+use ferrum_kernels::backend::{
+    Backend, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
+};
 use ferrum_types::{FerrumError, Result};
 
 use crate::config::QuantConfig;

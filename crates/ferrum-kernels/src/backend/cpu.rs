@@ -866,3 +866,9 @@ impl crate::backend::BackendQuantGguf for CpuBackend {
         }
     }
 }
+
+// CPU has no paged-KV path; inherit unsupported defaults.
+impl crate::backend::BackendPagedKv for CpuBackend {}
+
+// CPU has no native MoE dispatch; inherit unsupported defaults.
+impl crate::backend::BackendMoeFused for CpuBackend {}

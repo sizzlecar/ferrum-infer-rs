@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use ferrum_kernels::backend::{Backend, BackendQuantMarlin, SrcDtype};
+use ferrum_kernels::backend::{
+    Backend, BackendMoeFused, BackendPagedKv, BackendQuantMarlin, SrcDtype,
+};
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
