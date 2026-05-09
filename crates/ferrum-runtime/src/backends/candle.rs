@@ -7,7 +7,7 @@ use crate::{
     TensorRef,
 };
 use async_trait::async_trait;
-use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus, KernelExecutor};
+use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus};
 use ferrum_interfaces::kernel_ops::KernelOps;
 use ferrum_types::{DataType, Device, Result};
 use std::any::Any;
@@ -634,10 +634,6 @@ impl ComputeBackend for CandleBackend {
 
     fn memory_manager(&self) -> &dyn DeviceMemoryManager {
         &self.memory_manager
-    }
-
-    fn kernel_executor(&self) -> Option<&dyn KernelExecutor> {
-        None // MVP: no custom kernels
     }
 
     fn kernel_ops(&self) -> Option<&dyn KernelOps> {

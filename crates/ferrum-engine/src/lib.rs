@@ -37,15 +37,6 @@
 //!     .await?;
 //! ```
 //!
-//! ### Using the Factory
-//!
-//! ```rust,ignore
-//! use ferrum_engine::{DefaultEngineFactory, EngineConfig};
-//!
-//! let factory = DefaultEngineFactory::new();
-//! let engine = factory.create_engine(config).await?;
-//! ```
-//!
 //! ### Registering Custom Components
 //!
 //! ```rust,ignore
@@ -59,7 +50,6 @@ pub mod builder;
 pub mod continuous_engine;
 pub mod embedding_engine;
 pub mod engine;
-pub mod factory;
 pub mod parallel;
 pub mod pipeline;
 pub mod registry;
@@ -95,11 +85,8 @@ pub use pipeline::{
     ChunkedPrefillConfig, ChunkedPrefillExecutor, ExecutionPhase, PipelineConfig, PipelineExecutor,
 };
 
-// Re-exports of factory
-pub use factory::{DefaultEngineFactory, RegistryBasedEngineFactory};
-
 // Re-exports of builder
-pub use builder::{create_engine, create_engine_with_registry, EngineBuilder};
+pub use builder::{create_engine, EngineBuilder};
 
 // Re-exports of registry
 pub use registry::{
@@ -171,16 +158,6 @@ mod integration_tests {
             .with_executor("stub")
             .build()
             .await;
-
-        assert!(engine.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_create_engine_via_factory() {
-        let config = simple_engine_config("test-model", ferrum_types::Device::CPU);
-
-        let factory = DefaultEngineFactory::new();
-        let engine = factory.create_engine(config).await;
 
         assert!(engine.is_ok());
     }

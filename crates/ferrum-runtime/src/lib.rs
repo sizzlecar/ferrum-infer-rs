@@ -4,8 +4,7 @@
 
 // Re-export traits from ferrum-interfaces
 pub use ferrum_interfaces::{
-    backend::KernelExecutor, ComputeBackend, DeviceMemoryManager, TensorFactory, TensorLike,
-    TensorOps, TensorRef,
+    ComputeBackend, DeviceMemoryManager, TensorFactory, TensorLike, TensorOps, TensorRef,
 };
 
 // Re-export types from ferrum-types
