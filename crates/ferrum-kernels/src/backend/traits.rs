@@ -2004,7 +2004,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
     // `gemm_quant(QuantStore)` pair earlier in this trait — same idea,
     // but the store hides the per-kind buffer layout so callers don't
     // have to construct a per-kind `QuantWeights<'_, Self>` packet.)
-
 }
 
 // ════════════════════════════════════════════════════════════════════════

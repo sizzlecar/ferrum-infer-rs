@@ -466,7 +466,6 @@ impl Backend for CudaBackend {
         }
     }
 
-
     fn sync(ctx: &mut Self::Context) {
         ctx.stream.synchronize().expect("CudaBackend: stream sync");
     }
@@ -3303,7 +3302,6 @@ impl Backend for CudaBackend {
         }
         Ok(())
     }
-
 }
 
 impl BackendCollective for CudaBackend {
