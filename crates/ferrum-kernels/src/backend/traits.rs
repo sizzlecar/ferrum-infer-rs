@@ -259,156 +259,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
     // holds whatever backend-specific format is fastest; caller code
     // (GptqLinear) is dtype-agnostic.
 
-    /// Repack raw GPTQ tensors into the backend's preferred format.
-    /// Called once per layer at model load time.
-    ///
-    /// Inputs are host-side slices (CPU memory) — the loader reads from
-    /// safetensors and hands them off; each backend uploads + repacks
-    /// per its own strategy. `bits` is typically 4; `group_size` is
-    /// typically 128.
-    #[allow(clippy::too_many_arguments)]
-    fn load_gptq(
-        _qweight: &[i32],
-        _scales: &[f32],
-        _qzeros: &[i32],
-        _g_idx: Option<&[i32]>,
-        _bits: u32,
-        _group_size: usize,
-        _k: usize,
-        _n: usize,
-    ) -> Result<Self::GptqStore> {
-        Err(FerrumError::unsupported(
-            "load_gptq not implemented for this backend",
-        ))
-    }
-
-    /// Load num_experts GPTQ weight tiles into ONE stacked store, with
-    /// the property that **each expert's packed bytes are contiguous**
-    /// in the resulting store. This is what the offset GEMM needs to
-    /// dispatch per expert via pointer offset alone.
-    ///
-    /// Why this is a separate API from `load_gptq` + post-hoc concat:
-    /// Marlin's repack permutes data in `[K-tile-row outer, N-tile inner]`
-    /// order. A single repack of `concat(all experts along N)` produces
-    /// a buffer where expert e's bytes are spread across K-tile-rows,
-    /// NOT contiguous. Per-expert repack-then-concat keeps each
-    /// expert's data in one contiguous block.
-    ///
-    /// `qweights[i] / scales[i] / qzeros[i]` are each expert's raw GPTQ
-    /// tensors. All share the same K + group_size + bits + g_idx.
-    ///
-    /// Default returns Err(unsupported); override on backends with a
-    /// per-expert MoE GPTQ path.
-    #[allow(clippy::too_many_arguments)]
-    fn load_gptq_stacked(
-        _qweights: &[&[i32]],
-        _scales: &[&[f32]],
-        _qzeros: &[&[i32]],
-        _g_idx: Option<&[i32]>,
-        _bits: u32,
-        _group_size: usize,
-        _k: usize,
-        _n_per_expert: usize,
-    ) -> Result<Self::GptqStore> {
-        Err(FerrumError::unsupported(
-            "load_gptq_stacked not implemented for this backend",
-        ))
-    }
-
-    /// GEMM with pre-loaded GPTQ weights.
-    /// `out[m, n] = a[m, k] @ dequant(weight)^T`
-    fn gemm_gptq(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::GptqStore,
-        _out: &mut Self::Buffer,
-        _m: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemm_gptq not implemented for this backend",
-        ))
-    }
-
-    /// GEMM on a column-slice of a stacked GPTQ store. Used for MoE
-    /// expert dispatch where one big stacked weight tile holds all
-    /// experts' weights along N; per-expert calls process columns
-    /// `[expert_offset .. expert_offset + expert_n)` only.
-    ///
-    /// Output is written to `out[m, expert_n]` (NOT the full stacked N).
-    /// Caller is responsible for sizing `out` correctly.
-    ///
-    /// `expert_offset` and `expert_n` MUST be multiples of the backend's
-    /// natural N tile size (Marlin: 64). Default returns Err(unsupported).
-    fn gemm_gptq_with_offset(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::GptqStore,
-        _expert_offset: usize,
-        _expert_n: usize,
-        _out: &mut Self::Buffer,
-        _m: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemm_gptq_with_offset not implemented for this backend",
-        ))
-    }
-
-    /// Bulk-zero the per-expert Marlin workspace mutex slots for a
-    /// stacked GptqStore. Call ONCE before a batch of
-    /// `gemm_gptq_with_offset_strided_no_ws_zero` calls — saves the
-    /// per-call cuMemsetD32Async (one launch each → one launch total).
-    ///
-    /// At c=32 with 128 active experts × 2 (gate_up + down) × 48 layers:
-    /// 12 288 memset launches/token. Bulk-zeroing brings that to 96.
-    fn marlin_zero_stacked_workspace(
-        _ctx: &mut Self::Context,
-        _weight: &Self::GptqStore,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "marlin_zero_stacked_workspace not implemented for this backend",
-        ))
-    }
-
-    /// Batched per-expert offset GEMM dispatch — runs N concurrent
-    /// Marlin calls across a stream pool to amortize launch overhead
-    /// and overlap small-m kernels that under-utilize SMs individually.
-    ///
-    /// `dispatches[i]`: (expert_idx, in_row_offset, out_row_offset, m).
-    /// All calls share the same `weight`, `input`, `output`, `n_per_expert`,
-    /// `k`. Caller is responsible for bulk-zeroing workspace before this
-    /// call (use `marlin_zero_stacked_workspace`).
-    ///
-    /// Default: serial fallback that loops calling
-    /// `gemm_gptq_with_offset_strided`. CUDA backend overrides with
-    /// round-robin streams + sync-all at the end.
-    #[allow(clippy::too_many_arguments)]
-    fn moe_gemm_phase_batched(
-        ctx: &mut Self::Context,
-        input: &Self::Buffer,
-        weight: &Self::GptqStore,
-        dispatches: &[(usize, usize, usize, usize)],
-        n_per_expert: usize,
-        output: &mut Self::Buffer,
-        k: usize,
-    ) -> Result<()> {
-        // Default impl: serial fallback. CUDA overrides with multi-stream.
-        for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
-            Self::gemm_gptq_with_offset_strided(
-                ctx,
-                input,
-                *in_row_offset,
-                weight,
-                expert_idx * n_per_expert,
-                n_per_expert,
-                output,
-                *out_row_offset,
-                *m,
-                k,
-            )?;
-        }
-        Ok(())
-    }
-
     /// Routing inputs for `moe_gemm_phase_vllm` — host-built i32 arrays
     /// uploaded once per layer (or per token, depending on caller cadence).
     /// Matches the shape contract of `moe_align_block_size` outputs but is
@@ -432,157 +282,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn zero_buffer(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize) -> Result<()> {
         Err(FerrumError::unsupported(
             "zero_buffer not implemented for this backend",
-        ))
-    }
-
-    /// vLLM marlin_moe_wna16 phase GEMM. Replaces the per-expert loop in
-    /// `moe_gemm_phase_batched` with a single fused launch that routes
-    /// per-block via `expert_ids`. Caller responsibilities:
-    ///
-    /// - `weight` was loaded via the vLLM stacked-Marlin path (i.e.
-    ///   `Self::load_gptq_stacked` invoked under `FERRUM_VLLM_MOE=1`).
-    ///   Feeding an IST-DASLab-format weight here yields silent garbage.
-    /// - `output` MUST be pre-zeroed (the kernel's atomic-add path does
-    ///   not self-zero the global tile).
-    /// - `sorted_token_ids` / `expert_ids` / `num_tokens_past_padded`
-    ///   come from `moe_align_block_size` or an equivalent host build.
-    /// - `prob_m` is the unique-token count (we feed pre-gathered rows
-    ///   with `top_k=1` so it equals `total_pairs`).
-    ///
-    /// Default: returns unsupported. CUDA overrides on `vllm-moe-marlin`.
-    #[allow(clippy::too_many_arguments)]
-    fn moe_gemm_phase_vllm(
-        _ctx: &mut Self::Context,
-        _input: &Self::Buffer,
-        _weight: &Self::GptqStore,
-        _sorted_token_ids: &Self::Buffer,
-        _expert_ids: &Self::Buffer,
-        _num_tokens_past_padded: &Self::Buffer,
-        _output: &mut Self::Buffer,
-        _prob_m: usize,
-        _n_per_expert: usize,
-        _k: usize,
-        _moe_block_size: usize,
-        _top_k: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "moe_gemm_phase_vllm not implemented for this backend",
-        ))
-    }
-
-    /// Load GGUF k-quant weights into the backend's preferred format.
-    ///
-    /// `kind` discriminates Q4_K / Q5_K / Q6_K / Q8_0 etc. The CPU path
-    /// typically eager-dequants to fp32; the Metal path keeps raw block
-    /// bytes in MTLBuffer and dequants per matmul into a transient fp16
-    /// buffer. Adding a new k-quant flavour is a matched pair of
-    /// `QuantStore` variant + `match` arm, not a new trait method.
-    ///
-    /// `bytes`: contiguous on-disk payload — `n_blocks × block_size`.
-    /// `n_rows`: out_features. `n_cols`: in_features. The block count
-    /// is derived per-kind from these dims.
-    fn load_quant(
-        _kind: GgufQuantType,
-        _bytes: &[u8],
-        _n_rows: usize,
-        _n_cols: usize,
-    ) -> Result<Self::QuantStore> {
-        Err(FerrumError::unsupported(
-            "load_quant not implemented for this backend",
-        ))
-    }
-
-    /// Build a fused `QuantStore` from multiple `(kind, bytes, n_rows)`
-    /// parts that share `n_cols`. Used by `GgufLoader::load_fused` when
-    /// parts have heterogeneous quant kinds (e.g. Qwen3 qkv_proj where
-    /// q+k are Q4_K but v is Q6_K) — byte-concatenation isn't possible,
-    /// so each part stays as its own QuantStore and the gemm dispatches
-    /// one matvec per part with output offsets.
-    ///
-    /// Default: not supported. Backends that have a `Fused`-like variant
-    /// override.
-    fn load_quant_fused(
-        _parts: &[(GgufQuantType, &[u8], usize)],
-        _n_cols: usize,
-    ) -> Result<Self::QuantStore> {
-        Err(FerrumError::unsupported(
-            "load_quant_fused not implemented for this backend",
-        ))
-    }
-
-    /// GEMM with k-quant weights. Mirrors `gemm` / `gemm_gptq` shape:
-    /// `out[m, n] = a[m, k] @ dequant(weight)^T`. The dispatch on the
-    /// quant flavour happens inside the backend's `QuantStore` enum.
-    fn gemm_quant(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::QuantStore,
-        _out: &mut Self::Buffer,
-        _m: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemm_quant not implemented for this backend",
-        ))
-    }
-
-    /// Build a stacked-experts `QuantStore` from a contiguous 3-D weight
-    /// payload `[num_experts, n_rows, n_cols/256]` super-blocks.
-    /// Used for the MoE indirect-dispatch fast path; backends without
-    /// such a kernel return `Err(unsupported)` and the model code falls
-    /// back to the per-expert loop.
-    ///
-    /// Default: not supported. Override on backends with batched MoE
-    /// kernels (e.g. Metal `gemv_q*kw_moe_id_f32`).
-    fn load_quant_experts(
-        _kind: GgufQuantType,
-        _bytes: &[u8],
-        _num_experts: usize,
-        _n_rows: usize,
-        _n_cols: usize,
-    ) -> Result<Self::QuantStore> {
-        Err(FerrumError::unsupported(
-            "load_quant_experts not implemented for this backend",
-        ))
-    }
-
-    /// MoE 2-D indirect-dispatch GEMM (prefill m > 1).
-    ///
-    /// Computes per (token, expert_slot) pair, batched across all
-    /// experts in one launch:
-    ///
-    ///   `out[token, slot, :] = a[token, slot_or_0, :] @ dequant(weight[expert(token, slot), :])^T`
-    ///
-    /// `ids[expert][slot] = pair_id` encodes `(token_idx, slot_within_token)`
-    /// so the kernel reads activations indirectly (src1 row for the
-    /// pair) and writes outputs directly to the natural
-    /// `[batch, top_k, M]` layout. `tpe[expert]` gives the count of
-    /// pairs assigned to each expert — threadgroups past `tpe[e]`
-    /// early-exit.
-    ///
-    /// `ne11` selects the src1 inner-batch shape:
-    /// - `1` for `gate` / `up` (broadcast — all slots read the same
-    ///   activation row per token).
-    /// - `top_k` for `down` (per-slot — each pair reads its own row in
-    ///   the upstream silu·gate output).
-    ///
-    /// Closes the prefill MoE gap: the per-token gemv loop becomes one
-    /// batched gemm where each expert's slab handles m ≈ batch·top_k /
-    /// num_experts pairs in parallel via simdgroup_half8x8 matmul.
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_quant_moe_id(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::QuantStore,
-        _ids: &Self::Buffer,
-        _tpe: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _ne11: usize,
-        _top_k: usize,
-        _max_per_expert: usize,
-        _batch: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemm_quant_moe_id not implemented for this backend",
         ))
     }
 
@@ -710,33 +409,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
-    /// Indirect-dispatch variant of `gemm_quant_moe_id`.
-    ///
-    /// Identical inputs except the grid is read from `args_buf` (a 12-
-    /// byte u32 triple written by `compute_ids_tpe_gpu`) instead of
-    /// being computed from `max_per_expert`. `max_per_expert` is still
-    /// the kernel parameter used as the row stride for `ids` indexing
-    /// (= `batch * top_k`, worst case); only the dispatched grid
-    /// shrinks to cover `max(tpe[e])` columns.
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_quant_moe_id_indirect(
-        _ctx: &mut Self::Context,
-        _src1: &Self::Buffer,
-        _weights: &Self::QuantStore,
-        _ids: &Self::Buffer,
-        _tpe: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _args_buf: &Self::Buffer,
-        _ne11: usize,
-        _top_k: usize,
-        _max_per_expert: usize,
-        _batch: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemm_quant_moe_id_indirect not implemented for this backend",
-        ))
-    }
-
     /// Stacked SiLU·gate over `[batch * top_k, ffn]` rows (prefill version
     /// of `silu_mul_stacked`).
     fn silu_mul_batched(
@@ -848,70 +520,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
-    /// MoE indirect-dispatch GEMV: `out[i, :] = a[i, :] @ dequant(weight[ids[i], :])^T`
-    /// for each `i ∈ [0, n_selected)`. Single backend dispatch covers
-    /// all selected (token, expert) pairs.
-    ///
-    /// `weight` must be a stacked-experts variant produced by
-    /// [`Self::load_quant_experts`]. `ids` is a backend-side buffer of
-    /// `n_selected` i32 expert IDs. `out` is sized `[n_selected, n_rows]`.
-    /// `src1_stride` is the per-slot activation stride in **elements**:
-    /// `0` ⇒ every slot reads the same activation row (broadcast — for
-    /// `gate` / `up` projections); `n_cols` ⇒ each slot reads its own
-    /// activation row (for `down` projections, where each expert
-    /// consumes its own silu(gate)·up output).
-    fn gemv_quant_moe_id(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::QuantStore,
-        _ids: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _n_selected: usize,
-        _src1_stride: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemv_quant_moe_id not implemented for this backend",
-        ))
-    }
-
-    /// Offset-aware variant of [`Self::gemv_quant_moe_id`] — reads `a`
-    /// from `a_offset` (in elements; meaningful only when src1_stride=0
-    /// for the broadcast case, or as the start of an `n_selected × K`
-    /// strided read when src1_stride≥K), reads `ids` from `ids_offset`
-    /// (the i-th `top_k` block in a stacked-batch `[M, top_k]` ids
-    /// buffer), and writes `out` from offset 0 (output stays per-iter
-    /// scratch). Used by the per-item batched-decode path so the M=N
-    /// concurrent decodes can read directly from the M-batch
-    /// `selected_ids_buf` / `norm_out` without materialising
-    /// per-iteration copies.
-    #[allow(clippy::too_many_arguments)]
-    fn gemv_quant_moe_id_offset(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        a_offset: usize,
-        weight: &Self::QuantStore,
-        ids: &Self::Buffer,
-        ids_offset: usize,
-        out: &mut Self::Buffer,
-        n_selected: usize,
-        src1_stride: usize,
-    ) -> Result<()> {
-        let _ = (
-            ctx,
-            a,
-            a_offset,
-            weight,
-            ids,
-            ids_offset,
-            out,
-            n_selected,
-            src1_stride,
-        );
-        Err(FerrumError::unsupported(
-            "gemv_quant_moe_id_offset not implemented for this backend",
-        ))
-    }
-
     /// Allocate a backend buffer of i32-typed values for kernels that
     /// need integer indices (MoE expert IDs, scatter indices, etc.).
     ///
@@ -965,42 +573,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
-    /// Fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
-    ///
-    /// Folds the three back-to-back dispatches that the stacked MoE
-    /// FFN decode path emitted per layer:
-    ///   1. `gemv_quant_moe_id` (gate) → gate_out_stacked
-    ///   2. `gemv_quant_moe_id` (up)   → up_out_stacked
-    ///   3. `silu_mul_stacked`         → silu_stacked
-    /// into a single dispatch that writes `silu_stacked` directly.
-    /// Saves 2 dispatches per layer plus the entire round-trip through
-    /// the gate_out / up_out scratch buffers (≈4× `[top_k, ffn]` of
-    /// intermediate traffic). The activation read is also halved
-    /// because the inner Q4_K reduction reuses one register-file load
-    /// across both weight matrices.
-    ///
-    /// Both `gate_w` and `up_w` must be `Q4KExperts` stacks with
-    /// matching `(num_experts, n_rows, n_cols)` (true for Qwen3-MoE
-    /// GGUFs). Backends without the fused kernel can fall back to the
-    /// 3-dispatch path; callers should gate via
-    /// [`Self::supports_fused_moe_gate_up_silu`] to avoid the
-    /// `Unsupported` String-allocating error round trip on the decode
-    /// hot path.
-    #[allow(clippy::too_many_arguments)]
-    fn gemv_quant_moe_id_gate_up_silu(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _gate_w: &Self::QuantStore,
-        _up_w: &Self::QuantStore,
-        _ids: &Self::Buffer,
-        _silu_out: &mut Self::Buffer,
-        _n_selected: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemv_quant_moe_id_gate_up_silu not implemented for this backend",
-        ))
-    }
-
     /// Capability probe for [`Self::gemv_quant_moe_id_gate_up_silu`].
     ///
     /// `true` ⇒ the fused kernel is wired in and the caller should
@@ -1010,49 +582,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// allocation per (layer, step).
     fn supports_fused_moe_gate_up_silu() -> bool {
         false
-    }
-
-    /// Batched MoE indirect-dispatch GEMV — one Metal launch covers
-    /// **all** `m * top_k` (token, expert) pairs at once.
-    ///
-    /// This is the symmetric counterpart of
-    /// [`Self::gemv_quant_moe_id`]: same Q4_K decode loop, same
-    /// per-pair output, but the grid Z-axis spans `m * top_k` instead
-    /// of just `top_k`. Eliminates the engine-level per-token outer
-    /// loop that emits ~16× the dispatches llama.cpp emits at c=16
-    /// (their `kernel_mul_mv_id` already handles the M batch in one
-    /// dispatch).
-    ///
-    /// `a`           : activation buffer; pair `p` reads
-    ///                 `(p / top_k) * src1_outer_stride
-    ///                  + (p % top_k) * src1_inner_stride` floats.
-    ///                 gate / up:  src1 = `norm_out [m, K]`,
-    ///                              outer = K, inner = 0
-    ///                              (slots within a token broadcast).
-    ///                 down:       src1 = `silu_stacked [m, top_k, K]`,
-    ///                              outer = top_k * K, inner = K.
-    /// `weight`      : Q4KExperts stacked weights, common across
-    ///                 selected experts.
-    /// `ids`         : flat `[m * top_k]` selected-expert IDs (i32).
-    /// `out`         : `[m * top_k, n_rows]` outputs.
-    /// `m`           : token batch size.
-    /// `top_k`       : selected experts per token.
-    /// `src1_outer_stride`, `src1_inner_stride`: in **floats**.
-    #[allow(clippy::too_many_arguments)]
-    fn gemv_quant_moe_id_batched(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::QuantStore,
-        _ids: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _m: usize,
-        _top_k: usize,
-        _src1_outer_stride: usize,
-        _src1_inner_stride: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemv_quant_moe_id_batched not implemented for this backend",
-        ))
     }
 
     /// Capability probe for [`Self::gemv_quant_moe_id_batched`].
@@ -1068,47 +597,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// having to learn the flag.
     fn supports_paged_kv() -> bool {
         false
-    }
-
-    /// Pre-grow any backend-internal scratch slots whose size depends
-    /// on `m_total * intermediate_size` (the largest matmul fan-in
-    /// inside `unified_forward_internal`). Default no-op. CUDA
-    /// implements this to grow the perm-aware Marlin gather scratch
-    /// EAGERLY before the caller enters a CUDA-graph capture region —
-    /// `cuLaunchKernel` after a runtime alloc inside a captured
-    /// stream returns `CUDA_ERROR_INVALID_VALUE`.
-    fn pregrow_marlin_gather_scratch(_ctx: &mut Self::Context, _required: usize) {
-        // default: no scratch to pre-grow
-    }
-
-    /// Batched fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
-    ///
-    /// Counterpart of [`Self::gemv_quant_moe_id_gate_up_silu`] for the
-    /// batched-decode path: same in-register fusion, but the grid Z
-    /// dimension covers all `m * top_k` (token, expert) pairs in one
-    /// dispatch. Folds the three batched MoE FFN dispatches per layer
-    /// (gate gemv + up gemv + silu_mul_batched) into one — the missing
-    /// fusion that left the m≥2 batched-decode path slower than the
-    /// per-token loop (which already had this fusion at m=1).
-    ///
-    /// Both `gate_w` and `up_w` must be `Q4KExperts` stacks with
-    /// matching `(num_experts, n_rows, n_cols)`.
-    #[allow(clippy::too_many_arguments)]
-    fn gemv_quant_moe_id_gate_up_silu_batched(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _gate_w: &Self::QuantStore,
-        _up_w: &Self::QuantStore,
-        _ids: &Self::Buffer,
-        _silu_out: &mut Self::Buffer,
-        _m: usize,
-        _top_k: usize,
-        _src1_outer_stride: usize,
-        _src1_inner_stride: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemv_quant_moe_id_gate_up_silu_batched not implemented for this backend",
-        ))
     }
 
     /// Capability probe for [`Self::gemv_quant_moe_id_gate_up_silu_batched`].
@@ -1832,32 +1320,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
         *dst = Self::from_slice(&dst_v);
     }
 
-    /// Variant of [`Backend::gemm_gptq_with_offset`] that also takes
-    /// row-offsets into the input and output buffers. Lets the bucketed
-    /// MoE dispatcher run an expert's column-slice GEMM against a
-    /// sub-range of the packed input/output buffers without needing a
-    /// buffer-view type.
-    ///
-    /// Default impl returns Err so backends without MoE batched dispatch
-    /// don't have to implement.
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_gptq_with_offset_strided(
-        _ctx: &mut Self::Context,
-        _input: &Self::Buffer,
-        _in_row_offset: usize,
-        _weight: &Self::GptqStore,
-        _expert_offset: usize,
-        _expert_n: usize,
-        _output: &mut Self::Buffer,
-        _out_row_offset: usize,
-        _m: usize,
-        _k: usize,
-    ) -> Result<()> {
-        Err(ferrum_types::FerrumError::unsupported(
-            "gemm_gptq_with_offset_strided not implemented for this backend",
-        ))
-    }
-
     /// Strided variant of [`Backend::fused_silu_mul_split`] for the
     /// bucketed MoE path: reads `gate_up` rows starting at
     /// `in_row_offset`, writes `out` rows starting at `out_row_offset`.
@@ -2104,5 +1566,553 @@ pub trait BackendCollective: Backend {
     }
     fn broadcast(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _src_rank: usize) {
         // single-rank: no-op
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// BackendQuantMarlin capability (CUDA Marlin INT4 / GPTQ)
+// ════════════════════════════════════════════════════════════════════════
+//
+// CUDA-specific INT4 GEMM via Marlin tile kernels (Tensor Core required).
+// Metal/CPU don't have Marlin; they `impl BackendQuantMarlin for X {}` empty
+// and inherit `unsupported` Err defaults. GPTQ models targeting non-CUDA
+// backends are loaded via the dequant-fallback path in the Linear impls.
+
+/// Capability-trait for backends that natively support Marlin INT4 GEMM.
+/// CUDA wires this to the Marlin (or vLLM marlin_moe_wna16) tile kernels;
+/// other backends inherit defaults that error or no-op.
+pub trait BackendQuantMarlin: Backend {
+    /// Repack raw GPTQ tensors into the backend's preferred format.
+    /// Called once per layer at model load time.
+    ///
+    /// Inputs are host-side slices (CPU memory) — the loader reads from
+    /// safetensors and hands them off; each backend uploads + repacks
+    /// per its own strategy. `bits` is typically 4; `group_size` is
+    /// typically 128.
+    #[allow(clippy::too_many_arguments)]
+    fn load_gptq(
+        _qweight: &[i32],
+        _scales: &[f32],
+        _qzeros: &[i32],
+        _g_idx: Option<&[i32]>,
+        _bits: u32,
+        _group_size: usize,
+        _k: usize,
+        _n: usize,
+    ) -> Result<Self::GptqStore> {
+        Err(FerrumError::unsupported(
+            "load_gptq not implemented for this backend",
+        ))
+    }
+    /// Load num_experts GPTQ weight tiles into ONE stacked store, with
+    /// the property that **each expert's packed bytes are contiguous**
+    /// in the resulting store. This is what the offset GEMM needs to
+    /// dispatch per expert via pointer offset alone.
+    ///
+    /// Why this is a separate API from `load_gptq` + post-hoc concat:
+    /// Marlin's repack permutes data in `[K-tile-row outer, N-tile inner]`
+    /// order. A single repack of `concat(all experts along N)` produces
+    /// a buffer where expert e's bytes are spread across K-tile-rows,
+    /// NOT contiguous. Per-expert repack-then-concat keeps each
+    /// expert's data in one contiguous block.
+    ///
+    /// `qweights[i] / scales[i] / qzeros[i]` are each expert's raw GPTQ
+    /// tensors. All share the same K + group_size + bits + g_idx.
+    ///
+    /// Default returns Err(unsupported); override on backends with a
+    /// per-expert MoE GPTQ path.
+    #[allow(clippy::too_many_arguments)]
+    fn load_gptq_stacked(
+        _qweights: &[&[i32]],
+        _scales: &[&[f32]],
+        _qzeros: &[&[i32]],
+        _g_idx: Option<&[i32]>,
+        _bits: u32,
+        _group_size: usize,
+        _k: usize,
+        _n_per_expert: usize,
+    ) -> Result<Self::GptqStore> {
+        Err(FerrumError::unsupported(
+            "load_gptq_stacked not implemented for this backend",
+        ))
+    }
+    /// GEMM with pre-loaded GPTQ weights.
+    /// `out[m, n] = a[m, k] @ dequant(weight)^T`
+    fn gemm_gptq(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::GptqStore,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_gptq not implemented for this backend",
+        ))
+    }
+    /// GEMM on a column-slice of a stacked GPTQ store. Used for MoE
+    /// expert dispatch where one big stacked weight tile holds all
+    /// experts' weights along N; per-expert calls process columns
+    /// `[expert_offset .. expert_offset + expert_n)` only.
+    ///
+    /// Output is written to `out[m, expert_n]` (NOT the full stacked N).
+    /// Caller is responsible for sizing `out` correctly.
+    ///
+    /// `expert_offset` and `expert_n` MUST be multiples of the backend's
+    /// natural N tile size (Marlin: 64). Default returns Err(unsupported).
+    fn gemm_gptq_with_offset(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::GptqStore,
+        _expert_offset: usize,
+        _expert_n: usize,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_gptq_with_offset not implemented for this backend",
+        ))
+    }
+    /// Bulk-zero the per-expert Marlin workspace mutex slots for a
+    /// stacked GptqStore. Call ONCE before a batch of
+    /// `gemm_gptq_with_offset_strided_no_ws_zero` calls — saves the
+    /// per-call cuMemsetD32Async (one launch each → one launch total).
+    ///
+    /// At c=32 with 128 active experts × 2 (gate_up + down) × 48 layers:
+    /// 12 288 memset launches/token. Bulk-zeroing brings that to 96.
+    fn marlin_zero_stacked_workspace(
+        _ctx: &mut Self::Context,
+        _weight: &Self::GptqStore,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "marlin_zero_stacked_workspace not implemented for this backend",
+        ))
+    }
+    /// Batched per-expert offset GEMM dispatch — runs N concurrent
+    /// Marlin calls across a stream pool to amortize launch overhead
+    /// and overlap small-m kernels that under-utilize SMs individually.
+    ///
+    /// `dispatches[i]`: (expert_idx, in_row_offset, out_row_offset, m).
+    /// All calls share the same `weight`, `input`, `output`, `n_per_expert`,
+    /// `k`. Caller is responsible for bulk-zeroing workspace before this
+    /// call (use `marlin_zero_stacked_workspace`).
+    ///
+    /// Default: serial fallback that loops calling
+    /// `gemm_gptq_with_offset_strided`. CUDA backend overrides with
+    /// round-robin streams + sync-all at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemm_phase_batched(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::GptqStore,
+        dispatches: &[(usize, usize, usize, usize)],
+        n_per_expert: usize,
+        output: &mut Self::Buffer,
+        k: usize,
+    ) -> Result<()> {
+        // Default impl: serial fallback. CUDA overrides with multi-stream.
+        for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
+            Self::gemm_gptq_with_offset_strided(
+                ctx,
+                input,
+                *in_row_offset,
+                weight,
+                expert_idx * n_per_expert,
+                n_per_expert,
+                output,
+                *out_row_offset,
+                *m,
+                k,
+            )?;
+        }
+        Ok(())
+    }
+    /// vLLM marlin_moe_wna16 phase GEMM. Replaces the per-expert loop in
+    /// `moe_gemm_phase_batched` with a single fused launch that routes
+    /// per-block via `expert_ids`. Caller responsibilities:
+    ///
+    /// - `weight` was loaded via the vLLM stacked-Marlin path (i.e.
+    ///   `Self::load_gptq_stacked` invoked under `FERRUM_VLLM_MOE=1`).
+    ///   Feeding an IST-DASLab-format weight here yields silent garbage.
+    /// - `output` MUST be pre-zeroed (the kernel's atomic-add path does
+    ///   not self-zero the global tile).
+    /// - `sorted_token_ids` / `expert_ids` / `num_tokens_past_padded`
+    ///   come from `moe_align_block_size` or an equivalent host build.
+    /// - `prob_m` is the unique-token count (we feed pre-gathered rows
+    ///   with `top_k=1` so it equals `total_pairs`).
+    ///
+    /// Default: returns unsupported. CUDA overrides on `vllm-moe-marlin`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemm_phase_vllm(
+        _ctx: &mut Self::Context,
+        _input: &Self::Buffer,
+        _weight: &Self::GptqStore,
+        _sorted_token_ids: &Self::Buffer,
+        _expert_ids: &Self::Buffer,
+        _num_tokens_past_padded: &Self::Buffer,
+        _output: &mut Self::Buffer,
+        _prob_m: usize,
+        _n_per_expert: usize,
+        _k: usize,
+        _moe_block_size: usize,
+        _top_k: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "moe_gemm_phase_vllm not implemented for this backend",
+        ))
+    }
+    /// Pre-grow any backend-internal scratch slots whose size depends
+    /// on `m_total * intermediate_size` (the largest matmul fan-in
+    /// inside `unified_forward_internal`). Default no-op. CUDA
+    /// implements this to grow the perm-aware Marlin gather scratch
+    /// EAGERLY before the caller enters a CUDA-graph capture region —
+    /// `cuLaunchKernel` after a runtime alloc inside a captured
+    /// stream returns `CUDA_ERROR_INVALID_VALUE`.
+    fn pregrow_marlin_gather_scratch(_ctx: &mut Self::Context, _required: usize) {
+        // default: no scratch to pre-grow
+    }
+    /// Variant of [`Backend::gemm_gptq_with_offset`] that also takes
+    /// row-offsets into the input and output buffers. Lets the bucketed
+    /// MoE dispatcher run an expert's column-slice GEMM against a
+    /// sub-range of the packed input/output buffers without needing a
+    /// buffer-view type.
+    ///
+    /// Default impl returns Err so backends without MoE batched dispatch
+    /// don't have to implement.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_gptq_with_offset_strided(
+        _ctx: &mut Self::Context,
+        _input: &Self::Buffer,
+        _in_row_offset: usize,
+        _weight: &Self::GptqStore,
+        _expert_offset: usize,
+        _expert_n: usize,
+        _output: &mut Self::Buffer,
+        _out_row_offset: usize,
+        _m: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "gemm_gptq_with_offset_strided not implemented for this backend",
+        ))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// BackendQuantGguf capability (Metal GGUF Q4_K / Q6_K / Q8_0)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Metal-specific GGUF k-quant GEMM/GEMV via simdgroup_matmul shaders.
+// CUDA/CPU don't ship GGUF kernels; they `impl BackendQuantGguf for X {}`
+// empty and inherit unsupported defaults. GGUF models targeting non-Metal
+// backends are loaded via dequant-fallback in the Linear impls.
+
+/// Capability-trait for backends that natively dispatch GGUF k-quant
+/// GEMM / GEMV. Metal wires its q4k/q6k shaders here; CUDA/CPU inherit
+/// defaults that error.
+pub trait BackendQuantGguf: Backend {
+    /// Load GGUF k-quant weights into the backend's preferred format.
+    ///
+    /// `kind` discriminates Q4_K / Q5_K / Q6_K / Q8_0 etc. The CPU path
+    /// typically eager-dequants to fp32; the Metal path keeps raw block
+    /// bytes in MTLBuffer and dequants per matmul into a transient fp16
+    /// buffer. Adding a new k-quant flavour is a matched pair of
+    /// `QuantStore` variant + `match` arm, not a new trait method.
+    ///
+    /// `bytes`: contiguous on-disk payload — `n_blocks × block_size`.
+    /// `n_rows`: out_features. `n_cols`: in_features. The block count
+    /// is derived per-kind from these dims.
+    fn load_quant(
+        _kind: GgufQuantType,
+        _bytes: &[u8],
+        _n_rows: usize,
+        _n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        Err(FerrumError::unsupported(
+            "load_quant not implemented for this backend",
+        ))
+    }
+    /// Build a fused `QuantStore` from multiple `(kind, bytes, n_rows)`
+    /// parts that share `n_cols`. Used by `GgufLoader::load_fused` when
+    /// parts have heterogeneous quant kinds (e.g. Qwen3 qkv_proj where
+    /// q+k are Q4_K but v is Q6_K) — byte-concatenation isn't possible,
+    /// so each part stays as its own QuantStore and the gemm dispatches
+    /// one matvec per part with output offsets.
+    ///
+    /// Default: not supported. Backends that have a `Fused`-like variant
+    /// override.
+    fn load_quant_fused(
+        _parts: &[(GgufQuantType, &[u8], usize)],
+        _n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        Err(FerrumError::unsupported(
+            "load_quant_fused not implemented for this backend",
+        ))
+    }
+    /// GEMM with k-quant weights. Mirrors `gemm` / `gemm_gptq` shape:
+    /// `out[m, n] = a[m, k] @ dequant(weight)^T`. The dispatch on the
+    /// quant flavour happens inside the backend's `QuantStore` enum.
+    fn gemm_quant(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::QuantStore,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_quant not implemented for this backend",
+        ))
+    }
+    /// Build a stacked-experts `QuantStore` from a contiguous 3-D weight
+    /// payload `[num_experts, n_rows, n_cols/256]` super-blocks.
+    /// Used for the MoE indirect-dispatch fast path; backends without
+    /// such a kernel return `Err(unsupported)` and the model code falls
+    /// back to the per-expert loop.
+    ///
+    /// Default: not supported. Override on backends with batched MoE
+    /// kernels (e.g. Metal `gemv_q*kw_moe_id_f32`).
+    fn load_quant_experts(
+        _kind: GgufQuantType,
+        _bytes: &[u8],
+        _num_experts: usize,
+        _n_rows: usize,
+        _n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        Err(FerrumError::unsupported(
+            "load_quant_experts not implemented for this backend",
+        ))
+    }
+    /// MoE 2-D indirect-dispatch GEMM (prefill m > 1).
+    ///
+    /// Computes per (token, expert_slot) pair, batched across all
+    /// experts in one launch:
+    ///
+    ///   `out[token, slot, :] = a[token, slot_or_0, :] @ dequant(weight[expert(token, slot), :])^T`
+    ///
+    /// `ids[expert][slot] = pair_id` encodes `(token_idx, slot_within_token)`
+    /// so the kernel reads activations indirectly (src1 row for the
+    /// pair) and writes outputs directly to the natural
+    /// `[batch, top_k, M]` layout. `tpe[expert]` gives the count of
+    /// pairs assigned to each expert — threadgroups past `tpe[e]`
+    /// early-exit.
+    ///
+    /// `ne11` selects the src1 inner-batch shape:
+    /// - `1` for `gate` / `up` (broadcast — all slots read the same
+    ///   activation row per token).
+    /// - `top_k` for `down` (per-slot — each pair reads its own row in
+    ///   the upstream silu·gate output).
+    ///
+    /// Closes the prefill MoE gap: the per-token gemv loop becomes one
+    /// batched gemm where each expert's slab handles m ≈ batch·top_k /
+    /// num_experts pairs in parallel via simdgroup_half8x8 matmul.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_quant_moe_id(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _tpe: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _ne11: usize,
+        _top_k: usize,
+        _max_per_expert: usize,
+        _batch: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_quant_moe_id not implemented for this backend",
+        ))
+    }
+    /// Indirect-dispatch variant of `gemm_quant_moe_id`.
+    ///
+    /// Identical inputs except the grid is read from `args_buf` (a 12-
+    /// byte u32 triple written by `compute_ids_tpe_gpu`) instead of
+    /// being computed from `max_per_expert`. `max_per_expert` is still
+    /// the kernel parameter used as the row stride for `ids` indexing
+    /// (= `batch * top_k`, worst case); only the dispatched grid
+    /// shrinks to cover `max(tpe[e])` columns.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_quant_moe_id_indirect(
+        _ctx: &mut Self::Context,
+        _src1: &Self::Buffer,
+        _weights: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _tpe: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _args_buf: &Self::Buffer,
+        _ne11: usize,
+        _top_k: usize,
+        _max_per_expert: usize,
+        _batch: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemm_quant_moe_id_indirect not implemented for this backend",
+        ))
+    }
+    /// MoE indirect-dispatch GEMV: `out[i, :] = a[i, :] @ dequant(weight[ids[i], :])^T`
+    /// for each `i ∈ [0, n_selected)`. Single backend dispatch covers
+    /// all selected (token, expert) pairs.
+    ///
+    /// `weight` must be a stacked-experts variant produced by
+    /// [`Self::load_quant_experts`]. `ids` is a backend-side buffer of
+    /// `n_selected` i32 expert IDs. `out` is sized `[n_selected, n_rows]`.
+    /// `src1_stride` is the per-slot activation stride in **elements**:
+    /// `0` ⇒ every slot reads the same activation row (broadcast — for
+    /// `gate` / `up` projections); `n_cols` ⇒ each slot reads its own
+    /// activation row (for `down` projections, where each expert
+    /// consumes its own silu(gate)·up output).
+    fn gemv_quant_moe_id(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _n_selected: usize,
+        _src1_stride: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id not implemented for this backend",
+        ))
+    }
+    /// Offset-aware variant of [`Self::gemv_quant_moe_id`] — reads `a`
+    /// from `a_offset` (in elements; meaningful only when src1_stride=0
+    /// for the broadcast case, or as the start of an `n_selected × K`
+    /// strided read when src1_stride≥K), reads `ids` from `ids_offset`
+    /// (the i-th `top_k` block in a stacked-batch `[M, top_k]` ids
+    /// buffer), and writes `out` from offset 0 (output stays per-iter
+    /// scratch). Used by the per-item batched-decode path so the M=N
+    /// concurrent decodes can read directly from the M-batch
+    /// `selected_ids_buf` / `norm_out` without materialising
+    /// per-iteration copies.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_quant_moe_id_offset(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        a_offset: usize,
+        weight: &Self::QuantStore,
+        ids: &Self::Buffer,
+        ids_offset: usize,
+        out: &mut Self::Buffer,
+        n_selected: usize,
+        src1_stride: usize,
+    ) -> Result<()> {
+        let _ = (
+            ctx,
+            a,
+            a_offset,
+            weight,
+            ids,
+            ids_offset,
+            out,
+            n_selected,
+            src1_stride,
+        );
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id_offset not implemented for this backend",
+        ))
+    }
+    /// Fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
+    ///
+    /// Folds the three back-to-back dispatches that the stacked MoE
+    /// FFN decode path emitted per layer:
+    ///   1. `gemv_quant_moe_id` (gate) → gate_out_stacked
+    ///   2. `gemv_quant_moe_id` (up)   → up_out_stacked
+    ///   3. `silu_mul_stacked`         → silu_stacked
+    /// into a single dispatch that writes `silu_stacked` directly.
+    /// Saves 2 dispatches per layer plus the entire round-trip through
+    /// the gate_out / up_out scratch buffers (≈4× `[top_k, ffn]` of
+    /// intermediate traffic). The activation read is also halved
+    /// because the inner Q4_K reduction reuses one register-file load
+    /// across both weight matrices.
+    ///
+    /// Both `gate_w` and `up_w` must be `Q4KExperts` stacks with
+    /// matching `(num_experts, n_rows, n_cols)` (true for Qwen3-MoE
+    /// GGUFs). Backends without the fused kernel can fall back to the
+    /// 3-dispatch path; callers should gate via
+    /// [`Self::supports_fused_moe_gate_up_silu`] to avoid the
+    /// `Unsupported` String-allocating error round trip on the decode
+    /// hot path.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_quant_moe_id_gate_up_silu(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _gate_w: &Self::QuantStore,
+        _up_w: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _silu_out: &mut Self::Buffer,
+        _n_selected: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id_gate_up_silu not implemented for this backend",
+        ))
+    }
+    /// Batched MoE indirect-dispatch GEMV — one Metal launch covers
+    /// **all** `m * top_k` (token, expert) pairs at once.
+    ///
+    /// This is the symmetric counterpart of
+    /// [`Self::gemv_quant_moe_id`]: same Q4_K decode loop, same
+    /// per-pair output, but the grid Z-axis spans `m * top_k` instead
+    /// of just `top_k`. Eliminates the engine-level per-token outer
+    /// loop that emits ~16× the dispatches llama.cpp emits at c=16
+    /// (their `kernel_mul_mv_id` already handles the M batch in one
+    /// dispatch).
+    ///
+    /// `a`           : activation buffer; pair `p` reads
+    ///                 `(p / top_k) * src1_outer_stride
+    ///                  + (p % top_k) * src1_inner_stride` floats.
+    ///                 gate / up:  src1 = `norm_out [m, K]`,
+    ///                              outer = K, inner = 0
+    ///                              (slots within a token broadcast).
+    ///                 down:       src1 = `silu_stacked [m, top_k, K]`,
+    ///                              outer = top_k * K, inner = K.
+    /// `weight`      : Q4KExperts stacked weights, common across
+    ///                 selected experts.
+    /// `ids`         : flat `[m * top_k]` selected-expert IDs (i32).
+    /// `out`         : `[m * top_k, n_rows]` outputs.
+    /// `m`           : token batch size.
+    /// `top_k`       : selected experts per token.
+    /// `src1_outer_stride`, `src1_inner_stride`: in **floats**.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_quant_moe_id_batched(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _weight: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _m: usize,
+        _top_k: usize,
+        _src1_outer_stride: usize,
+        _src1_inner_stride: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id_batched not implemented for this backend",
+        ))
+    }
+    /// Batched fused gate+up MoE GEMV with in-register `SiLU(gate) * up`.
+    ///
+    /// Counterpart of [`Self::gemv_quant_moe_id_gate_up_silu`] for the
+    /// batched-decode path: same in-register fusion, but the grid Z
+    /// dimension covers all `m * top_k` (token, expert) pairs in one
+    /// dispatch. Folds the three batched MoE FFN dispatches per layer
+    /// (gate gemv + up gemv + silu_mul_batched) into one — the missing
+    /// fusion that left the m≥2 batched-decode path slower than the
+    /// per-token loop (which already had this fusion at m=1).
+    ///
+    /// Both `gate_w` and `up_w` must be `Q4KExperts` stacks with
+    /// matching `(num_experts, n_rows, n_cols)`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_quant_moe_id_gate_up_silu_batched(
+        _ctx: &mut Self::Context,
+        _a: &Self::Buffer,
+        _gate_w: &Self::QuantStore,
+        _up_w: &Self::QuantStore,
+        _ids: &Self::Buffer,
+        _silu_out: &mut Self::Buffer,
+        _m: usize,
+        _top_k: usize,
+        _src1_outer_stride: usize,
+        _src1_inner_stride: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gemv_quant_moe_id_gate_up_silu_batched not implemented for this backend",
+        ))
     }
 }

@@ -122,140 +122,6 @@ impl Backend for CpuBackend {
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
 
-    fn load_gptq(
-        qweight: &[i32],
-        scales: &[f32],
-        qzeros: &[i32],
-        _g_idx: Option<&[i32]>,
-        bits: u32,
-        group_size: usize,
-        k: usize,
-        n: usize,
-    ) -> Result<Self::GptqStore> {
-        if bits != 4 {
-            return Err(FerrumError::unsupported(format!(
-                "CPU GPTQ: only bits=4 supported (got {bits})"
-            )));
-        }
-        let num_groups = k / group_size;
-        // Unpack GPTQ [K/8, N] i32 → int4 values, dequantize per-group:
-        //   w_f16 = (q - zero) * scale
-        // Write to [n, k] row-major (matches DenseLinear convention).
-        let mut w = vec![0.0f32; n * k];
-        let packed_rows = k / 8;
-        for pr in 0..packed_rows {
-            for col in 0..n {
-                let packed = qweight[pr * n + col] as u32;
-                for bi in 0..8 {
-                    let ki = pr * 8 + bi;
-                    let q = ((packed >> (bi * 4)) & 0xF) as i32;
-                    let grp = ki / group_size;
-                    let scale = scales[grp * n + col];
-                    // qzeros [num_groups, N/8] i32 packs 8 zero-values per int32
-                    let z_packed = qzeros[grp * (n / 8) + (col / 8)] as u32;
-                    let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
-                    let val = (q - zero) as f32 * scale;
-                    w[col * k + ki] = val;
-                }
-            }
-        }
-        let _ = num_groups; // informational only
-        Ok(CpuGptqStore {
-            weight_f32: w,
-            k,
-            n,
-        })
-    }
-
-    fn gemm_gptq(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::GptqStore,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        // Just run normal GEMM with dequantized weights.
-        // out[m, n] = a[m, k] @ w[n, k]^T — same contract as B::gemm.
-        Self::gemm(ctx, a, &weight.weight_f32, out, m, weight.n, weight.k);
-        Ok(())
-    }
-
-    fn gemm_gptq_with_offset(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::GptqStore,
-        expert_offset: usize,
-        expert_n: usize,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        if expert_offset + expert_n > weight.n {
-            return Err(FerrumError::model(format!(
-                "gemm_gptq_with_offset OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
-                weight.n
-            )));
-        }
-        // weight_f32 layout is [N, K] row-major; copy the
-        // [expert_offset .. expert_offset + expert_n) row range into
-        // a Vec (CPU path isn't perf-critical for MoE — Marlin owns
-        // that on CUDA).
-        let k = weight.k;
-        let row_start = expert_offset * k;
-        let row_end = (expert_offset + expert_n) * k;
-        let slice = weight.weight_f32[row_start..row_end].to_vec();
-        Self::gemm(ctx, a, &slice, out, m, expert_n, k);
-        Ok(())
-    }
-
-    fn gemm_gptq_with_offset_strided(
-        _ctx: &mut Self::Context,
-        input: &Self::Buffer,
-        in_row_offset: usize,
-        weight: &Self::GptqStore,
-        expert_offset: usize,
-        expert_n: usize,
-        output: &mut Self::Buffer,
-        out_row_offset: usize,
-        m: usize,
-        k: usize,
-    ) -> Result<()> {
-        if expert_offset + expert_n > weight.n {
-            return Err(FerrumError::model(format!(
-                "gemm_gptq_with_offset_strided OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
-                weight.n
-            )));
-        }
-        if k != weight.k {
-            return Err(FerrumError::model(format!(
-                "gemm_gptq_with_offset_strided k mismatch: arg {k} vs weight.k {}",
-                weight.k
-            )));
-        }
-        // [m, K] input slice and [m, expert_n] output slice; weight
-        // [expert_n, K] taken from the column-slice of weight_f32.
-        let in_start = in_row_offset * k;
-        let in_end = (in_row_offset + m) * k;
-        let out_start = out_row_offset * expert_n;
-        let out_end = (out_row_offset + m) * expert_n;
-        let row_start = expert_offset * k;
-        let row_end = (expert_offset + expert_n) * k;
-        let weight_slice = weight.weight_f32[row_start..row_end].to_vec();
-        let in_slice = input[in_start..in_end].to_vec();
-        let mut out_slice = vec![0.0f32; m * expert_n];
-        let mut ctx_local = ();
-        Self::gemm(
-            &mut ctx_local,
-            &in_slice,
-            &weight_slice,
-            &mut out_slice,
-            m,
-            expert_n,
-            k,
-        );
-        output[out_start..out_end].copy_from_slice(&out_slice);
-        Ok(())
-    }
-
     fn fused_silu_mul_split_strided(
         _ctx: &mut Self::Context,
         gate_up: &Self::Buffer,
@@ -274,61 +140,6 @@ impl Backend for CpuBackend {
                 let u = gate_up[in_start + r * in_per_row + intermediate + c];
                 let silu = g / (1.0 + (-g).exp());
                 out[out_start + r * intermediate + c] = silu * u;
-            }
-        }
-    }
-
-    fn load_quant(
-        kind: super::GgufQuantType,
-        bytes: &[u8],
-        n_rows: usize,
-        n_cols: usize,
-    ) -> Result<Self::QuantStore> {
-        use super::GgufQuantType;
-        match kind {
-            GgufQuantType::Q4K => {
-                let total_elems = n_rows * n_cols;
-                if total_elems % Q4_K_QK != 0 {
-                    return Err(FerrumError::model(format!(
-                        "load_quant Q4K: elements {total_elems} not a multiple of {Q4_K_QK}"
-                    )));
-                }
-                let n_blocks = total_elems / Q4_K_QK;
-                let expected = n_blocks * Q4_K_BLOCK_BYTES;
-                if bytes.len() != expected {
-                    return Err(FerrumError::model(format!(
-                        "load_quant Q4K: bytes {} != expected {} ({n_blocks} × {Q4_K_BLOCK_BYTES})",
-                        bytes.len(),
-                        expected
-                    )));
-                }
-                Ok(CpuQuantStore::Q4K {
-                    weights: dequant_q4_k_cpu(bytes, n_blocks),
-                    n_rows,
-                    n_cols,
-                })
-            }
-            other => Err(FerrumError::unsupported(format!(
-                "CPU load_quant: {other:?} not yet implemented"
-            ))),
-        }
-    }
-
-    fn gemm_quant(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::QuantStore,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        match weight {
-            CpuQuantStore::Q4K {
-                weights,
-                n_rows,
-                n_cols,
-            } => {
-                Self::gemm(ctx, a, weights, out, m, *n_rows, *n_cols);
-                Ok(())
             }
         }
     }
@@ -866,3 +677,192 @@ impl crate::backend::BackendGraph for CpuBackend {}
 
 // CPU has no multi-rank collectives; inherit BackendCollective defaults.
 impl crate::backend::BackendCollective for CpuBackend {}
+
+impl crate::backend::BackendQuantMarlin for CpuBackend {
+    fn load_gptq(
+        qweight: &[i32],
+        scales: &[f32],
+        qzeros: &[i32],
+        _g_idx: Option<&[i32]>,
+        bits: u32,
+        group_size: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Self::GptqStore> {
+        if bits != 4 {
+            return Err(FerrumError::unsupported(format!(
+                "CPU GPTQ: only bits=4 supported (got {bits})"
+            )));
+        }
+        let num_groups = k / group_size;
+        // Unpack GPTQ [K/8, N] i32 → int4 values, dequantize per-group:
+        //   w_f16 = (q - zero) * scale
+        // Write to [n, k] row-major (matches DenseLinear convention).
+        let mut w = vec![0.0f32; n * k];
+        let packed_rows = k / 8;
+        for pr in 0..packed_rows {
+            for col in 0..n {
+                let packed = qweight[pr * n + col] as u32;
+                for bi in 0..8 {
+                    let ki = pr * 8 + bi;
+                    let q = ((packed >> (bi * 4)) & 0xF) as i32;
+                    let grp = ki / group_size;
+                    let scale = scales[grp * n + col];
+                    // qzeros [num_groups, N/8] i32 packs 8 zero-values per int32
+                    let z_packed = qzeros[grp * (n / 8) + (col / 8)] as u32;
+                    let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
+                    let val = (q - zero) as f32 * scale;
+                    w[col * k + ki] = val;
+                }
+            }
+        }
+        let _ = num_groups; // informational only
+        Ok(CpuGptqStore {
+            weight_f32: w,
+            k,
+            n,
+        })
+    }
+    fn gemm_gptq(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::GptqStore,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        // Just run normal GEMM with dequantized weights.
+        // out[m, n] = a[m, k] @ w[n, k]^T — same contract as B::gemm.
+        Self::gemm(ctx, a, &weight.weight_f32, out, m, weight.n, weight.k);
+        Ok(())
+    }
+    fn gemm_gptq_with_offset(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::GptqStore,
+        expert_offset: usize,
+        expert_n: usize,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        if expert_offset + expert_n > weight.n {
+            return Err(FerrumError::model(format!(
+                "gemm_gptq_with_offset OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
+                weight.n
+            )));
+        }
+        // weight_f32 layout is [N, K] row-major; copy the
+        // [expert_offset .. expert_offset + expert_n) row range into
+        // a Vec (CPU path isn't perf-critical for MoE — Marlin owns
+        // that on CUDA).
+        let k = weight.k;
+        let row_start = expert_offset * k;
+        let row_end = (expert_offset + expert_n) * k;
+        let slice = weight.weight_f32[row_start..row_end].to_vec();
+        Self::gemm(ctx, a, &slice, out, m, expert_n, k);
+        Ok(())
+    }
+    fn gemm_gptq_with_offset_strided(
+        _ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        in_row_offset: usize,
+        weight: &Self::GptqStore,
+        expert_offset: usize,
+        expert_n: usize,
+        output: &mut Self::Buffer,
+        out_row_offset: usize,
+        m: usize,
+        k: usize,
+    ) -> Result<()> {
+        if expert_offset + expert_n > weight.n {
+            return Err(FerrumError::model(format!(
+                "gemm_gptq_with_offset_strided OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
+                weight.n
+            )));
+        }
+        if k != weight.k {
+            return Err(FerrumError::model(format!(
+                "gemm_gptq_with_offset_strided k mismatch: arg {k} vs weight.k {}",
+                weight.k
+            )));
+        }
+        // [m, K] input slice and [m, expert_n] output slice; weight
+        // [expert_n, K] taken from the column-slice of weight_f32.
+        let in_start = in_row_offset * k;
+        let in_end = (in_row_offset + m) * k;
+        let out_start = out_row_offset * expert_n;
+        let out_end = (out_row_offset + m) * expert_n;
+        let row_start = expert_offset * k;
+        let row_end = (expert_offset + expert_n) * k;
+        let weight_slice = weight.weight_f32[row_start..row_end].to_vec();
+        let in_slice = input[in_start..in_end].to_vec();
+        let mut out_slice = vec![0.0f32; m * expert_n];
+        let mut ctx_local = ();
+        Self::gemm(
+            &mut ctx_local,
+            &in_slice,
+            &weight_slice,
+            &mut out_slice,
+            m,
+            expert_n,
+            k,
+        );
+        output[out_start..out_end].copy_from_slice(&out_slice);
+        Ok(())
+    }
+}
+
+impl crate::backend::BackendQuantGguf for CpuBackend {
+    fn load_quant(
+        kind: super::GgufQuantType,
+        bytes: &[u8],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Self::QuantStore> {
+        use super::GgufQuantType;
+        match kind {
+            GgufQuantType::Q4K => {
+                let total_elems = n_rows * n_cols;
+                if total_elems % Q4_K_QK != 0 {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q4K: elements {total_elems} not a multiple of {Q4_K_QK}"
+                    )));
+                }
+                let n_blocks = total_elems / Q4_K_QK;
+                let expected = n_blocks * Q4_K_BLOCK_BYTES;
+                if bytes.len() != expected {
+                    return Err(FerrumError::model(format!(
+                        "load_quant Q4K: bytes {} != expected {} ({n_blocks} × {Q4_K_BLOCK_BYTES})",
+                        bytes.len(),
+                        expected
+                    )));
+                }
+                Ok(CpuQuantStore::Q4K {
+                    weights: dequant_q4_k_cpu(bytes, n_blocks),
+                    n_rows,
+                    n_cols,
+                })
+            }
+            other => Err(FerrumError::unsupported(format!(
+                "CPU load_quant: {other:?} not yet implemented"
+            ))),
+        }
+    }
+    fn gemm_quant(
+        ctx: &mut Self::Context,
+        a: &Self::Buffer,
+        weight: &Self::QuantStore,
+        out: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        match weight {
+            CpuQuantStore::Q4K {
+                weights,
+                n_rows,
+                n_cols,
+            } => {
+                Self::gemm(ctx, a, weights, out, m, *n_rows, *n_cols);
+                Ok(())
+            }
+        }
+    }
+}
