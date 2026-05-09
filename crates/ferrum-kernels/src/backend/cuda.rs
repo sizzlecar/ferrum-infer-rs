@@ -349,6 +349,10 @@ impl Backend for CudaBackend {
         true
     }
 
+    fn supports_varlen_qkv() -> bool {
+        true
+    }
+
     fn new_context() -> Self::Context {
         // Reuse the process-global stream populated by `default_stream()`.
         // Model constructors call `B::from_slice` thousands of times to

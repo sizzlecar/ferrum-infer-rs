@@ -64,6 +64,10 @@ pub async fn run_gguf_one_shot(cmd: RunCommand, _config: CliConfig) -> Result<()
         // Paged-KV's win is multi-seq batching at the attention kernel.
         // m=1 single-user run sees zero benefit and pays pool-allocation
         // overhead. Force off here.
+        //
+        // KNOWN: Qwen3-MoE GGUF on Metal at m=1 currently outputs garbage
+        // + ~0.1 tok/s under both paged-KV ON and OFF (separate bug,
+        // tracked in TODO). Switching the default doesn't fix it.
         std::env::set_var("FERRUM_METAL_PAGED_KV", "0");
     }
 
