@@ -57,21 +57,52 @@ pub async fn run_gguf_one_shot(cmd: RunCommand, _config: CliConfig) -> Result<()
     // + 512 max_new = ~530 > 512). Override here for run mode only;
     // `serve` keeps the concurrent defaults. Users who want a specific
     // value still win — we only set the var if it isn't already set.
+    let gguf_path = PathBuf::from(&cmd.model);
+
+    // Sniff MoE arch BEFORE setting envs — the right defaults differ
+    // dramatically. Dense Qwen3 / Llama at m=1 wants paged-KV off (the
+    // pool's overhead is pure cost). Qwen3-MoE at m=1 needs the FULL
+    // batched-MoE config or it falls back to a slow path that produces
+    // ~0.1 tok/s of garbage on Metal — see docs/bench/macos-2026-05-02.
+    let is_moe_arch = match GgufFile::open(&gguf_path) {
+        Ok(g) => g.architecture().map(|s| s.contains("moe")).unwrap_or(false),
+        Err(_) => false,
+    };
+
     if std::env::var_os("FERRUM_KV_CAPACITY").is_none() {
-        std::env::set_var("FERRUM_KV_CAPACITY", "8192");
+        // Dense REPL needs ≥ prompt + max_tokens (~530); MoE caps at
+        // 512 to match the published bench config and the paged pool
+        // sizing (32 GB unified RAM doesn't tolerate larger).
+        std::env::set_var(
+            "FERRUM_KV_CAPACITY",
+            if is_moe_arch { "512" } else { "8192" },
+        );
     }
     if std::env::var_os("FERRUM_METAL_PAGED_KV").is_none() {
-        // Paged-KV's win is multi-seq batching at the attention kernel.
-        // m=1 single-user run sees zero benefit and pays pool-allocation
-        // overhead. Force off here.
-        //
-        // KNOWN: Qwen3-MoE GGUF on Metal at m=1 currently outputs garbage
-        // + ~0.1 tok/s under both paged-KV ON and OFF (separate bug,
-        // tracked in TODO). Switching the default doesn't fix it.
-        std::env::set_var("FERRUM_METAL_PAGED_KV", "0");
+        // Dense m=1: paged off (pool overhead, no batching to amortise).
+        // MoE m=1: paged ON — the GPU expert dispatch path requires it
+        // (off-path emits garbage at ~0.1 tok/s).
+        std::env::set_var("FERRUM_METAL_PAGED_KV", if is_moe_arch { "1" } else { "0" });
+    }
+    if is_moe_arch {
+        // Match docs/bench/macos-2026-05-02 c=1 30B-A3B → 42 tok/s.
+        // Without these the Qwen3MoeModel decode falls back to a slow
+        // legacy loop and emits garbage. CLI users shouldn't have to
+        // copy-paste seven env vars from the README to get a working
+        // default.
+        for (k, v) in [
+            ("FERRUM_PAGED_MAX_SEQS", "2"),
+            ("FERRUM_MAX_BATCH", "1"),
+            ("FERRUM_MOE_BATCHED", "1"),
+            ("FERRUM_MOE_BATCHED_DECODE", "1"),
+            ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
+        ] {
+            if std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
     }
 
-    let gguf_path = PathBuf::from(&cmd.model);
     let backend_kind = resolve_backend(&cmd.backend)?;
 
     eprintln!("{} backend: {}", "→".cyan(), backend_kind.label().bold());
