@@ -66,7 +66,7 @@ mod synth {
 #[ignore]
 fn cuda_marlin_moe_vllm_vs_per_expert() {
     use ferrum_kernels::backend::cuda::CudaBackend;
-    use ferrum_kernels::backend::Backend;
+    use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 
     let k: usize = 256;
     let n_per: usize = 256;
@@ -106,7 +106,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     let qw_refs: Vec<&[i32]> = experts.iter().map(|e| e.qweight.as_slice()).collect();
     let sc_refs: Vec<&[f32]> = experts.iter().map(|e| e.scales.as_slice()).collect();
     let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
-    let stacked = <CudaBackend as Backend>::load_gptq_stacked(
+    let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked(
         &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
     .expect("stacked load_gptq (IST-DASLab format, ref path)");
@@ -146,7 +146,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         // expert 0, so the reference must also use expert 0 weights for
         // all rows (same offset for every expert).
         let weight_expert = if force_expert0 { 0 } else { e };
-        <CudaBackend as Backend>::gemm_gptq_with_offset(
+        <CudaBackend as BackendQuantMarlin>::gemm_gptq_with_offset(
             &mut ctx,
             &a_e_dev,
             &stacked,
@@ -235,7 +235,8 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         .clone_htod(&num_tokens_past_padded)
         .expect("upload num_tokens_past_padded");
 
-    let _ = <CudaBackend as Backend>::marlin_zero_stacked_workspace(&mut ctx, &stacked_vllm);
+    let _ =
+        <CudaBackend as BackendQuantMarlin>::marlin_zero_stacked_workspace(&mut ctx, &stacked_vllm);
 
     ferrum_kernels::marlin::marlin_gemm_moe_vllm(
         &stream,
