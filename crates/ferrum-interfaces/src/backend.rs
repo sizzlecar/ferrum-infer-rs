@@ -29,9 +29,6 @@ pub trait ComputeBackend: Send + Sync {
     /// Get memory manager for this backend
     fn memory_manager(&self) -> &dyn crate::DeviceMemoryManager;
 
-    /// Get kernel executor (if backend supports custom kernels)
-    fn kernel_executor(&self) -> Option<&dyn KernelExecutor>;
-
     /// Get LLM-specific kernel operations (if backend provides optimized impls).
     ///
     /// Returns `None` by default — existing backends compile unchanged.
@@ -349,76 +346,6 @@ pub struct BackendStatus {
     pub last_error: Option<String>,
     /// Backend-specific status information
     pub backend_specific: HashMap<String, serde_json::Value>,
-}
-
-/// Kernel executor for custom GPU kernels
-#[async_trait]
-pub trait KernelExecutor: Send + Sync {
-    /// Load kernel from source code
-    async fn load_kernel(&self, source: &str, name: &str, device: &Device) -> Result<KernelHandle>;
-
-    /// Execute kernel with arguments
-    async fn execute_kernel(
-        &self,
-        handle: KernelHandle,
-        grid_size: (u32, u32, u32),
-        block_size: (u32, u32, u32),
-        args: &[KernelArg],
-    ) -> Result<()>;
-
-    /// Get kernel information
-    fn get_kernel_info(&self, handle: KernelHandle) -> Option<KernelInfo>;
-
-    /// Unload kernel
-    async fn unload_kernel(&self, handle: KernelHandle) -> Result<()>;
-}
-
-/// Handle for loaded kernel
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KernelHandle(pub u64);
-
-/// Kernel argument types
-#[derive(Debug, Clone)]
-pub enum KernelArg {
-    /// Tensor reference
-    Tensor(TensorRef),
-    /// Raw memory buffer
-    Buffer { ptr: *const u8, size: usize },
-    /// Scalar value
-    Scalar(ScalarValue),
-    /// Local/shared memory allocation
-    LocalMemory(usize),
-}
-
-/// Scalar values for kernel arguments
-#[derive(Debug, Clone)]
-pub enum ScalarValue {
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    F32(f32),
-    F64(f64),
-    Bool(bool),
-}
-
-/// Kernel information and metadata
-#[derive(Debug, Clone)]
-pub struct KernelInfo {
-    /// Kernel name
-    pub name: String,
-    /// Maximum threads per block
-    pub max_threads_per_block: u32,
-    /// Shared memory size required
-    pub shared_memory_size: usize,
-    /// Register count per thread
-    pub registers_per_thread: u32,
-    /// Preferred block size
-    pub preferred_block_size: (u32, u32, u32),
 }
 
 /// Backend factory for creating backend instances

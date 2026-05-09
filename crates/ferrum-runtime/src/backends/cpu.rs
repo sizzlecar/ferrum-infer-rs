@@ -479,10 +479,6 @@ impl ComputeBackend for CpuBackend {
         self.memory_manager.as_ref()
     }
 
-    fn kernel_executor(&self) -> Option<&dyn crate::KernelExecutor> {
-        None
-    }
-
     async fn initialize(&mut self, _device: &Device) -> Result<()> {
         Ok(())
     }
