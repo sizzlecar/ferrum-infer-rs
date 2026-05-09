@@ -82,12 +82,6 @@ impl EngineBuilder {
         self
     }
 
-    /// Set a pre-created backend
-    pub fn with_custom_backend(mut self, backend: Arc<dyn ComputeBackend>) -> Self {
-        self.custom_backend = Some(backend);
-        self
-    }
-
     /// Set the tokenizer to use by name
     pub fn with_tokenizer(mut self, name: impl Into<String>) -> Self {
         self.tokenizer_name = Some(name.into());
@@ -452,14 +446,6 @@ impl EngineBuilder {
 /// Create an engine with the default configuration and registry
 pub async fn create_engine(config: EngineConfig) -> Result<Box<dyn InferenceEngine + Send + Sync>> {
     EngineBuilder::new(config).build().await
-}
-
-/// Create an engine with a custom registry
-pub async fn create_engine_with_registry(
-    config: EngineConfig,
-    registry: Arc<ComponentRegistry>,
-) -> Result<Box<dyn InferenceEngine + Send + Sync>> {
-    EngineBuilder::with_registry(config, registry).build().await
 }
 
 // ============================================================================
