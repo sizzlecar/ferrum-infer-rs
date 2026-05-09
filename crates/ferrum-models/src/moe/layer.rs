@@ -8,7 +8,8 @@
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kernels::backend::{
-    Backend, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
+    Backend, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin, LlmBackend,
+    QuantLlmBackend,
 };
 use ferrum_kernels::Linear;
 use ferrum_quantization::gguf::{GgufFile, GgufLinear};
@@ -22,9 +23,7 @@ use crate::moe_config::Qwen3MoeConfig;
 ///
 /// Construct with [`Self::load_from_gguf`] (or its convenience wrappers).
 /// Call [`Self::forward_cpu`] to run one MoE layer's forward pass.
-pub struct Qwen3MoeLayer<
-    B: Backend + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
-> {
+pub struct Qwen3MoeLayer<B: QuantLlmBackend + BackendMoeFused> {
     /// Gating linear: `[hidden] → [num_experts]` per token.
     pub router: Box<dyn Linear<B>>,
     /// Per-expert MLP weights.
@@ -42,9 +41,7 @@ pub struct Qwen3MoeLayer<
     pub num_experts: usize,
 }
 
-impl<B: Backend + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused>
-    Qwen3MoeLayer<B>
-{
+impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeLayer<B> {
     /// Load both router and expert weights for layer `layer_idx` from a
     /// GGUF file. Convenience wrapper around the lower-level GGUF reader
     /// + `ExpertStack::load_from_gguf` + manual router construction.

@@ -16,6 +16,7 @@
 
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
+    LlmBackend, MoeLlmBackend,
 };
 use ferrum_quantization::loader::WeightLoader;
 use ferrum_quantization::PrefixedLoader;
@@ -38,18 +39,13 @@ pub trait TalkerBackboneForward: Send + Sync {
 
 /// Backbone adapter — wraps `LlamaFamilyModel<B>` loaded as a backbone-only
 /// (no embed / no lm_head) plus a per-sequence position counter.
-pub struct TalkerBackboneBackend<
-    B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
-> {
+pub struct TalkerBackboneBackend<B: MoeLlmBackend> {
     backbone: LlamaFamilyModel<B>,
     cache_id: String,
     pos: usize,
 }
 
-impl<
-        B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
-    > TalkerBackboneBackend<B>
-{
+impl<B: MoeLlmBackend> TalkerBackboneBackend<B> {
     /// Build from a TTS model-directory loader. Uses `PrefixedLoader`
     /// with `"talker."` so `LlamaFamilyModel::new_backbone_only` picks up
     /// `talker.model.layers.*` and `talker.model.norm.weight`.
@@ -111,10 +107,7 @@ impl<
     }
 }
 
-impl<
-        B: BackendGraph + BackendQuantMarlin + BackendQuantGguf + BackendPagedKv + BackendMoeFused,
-    > TalkerBackboneForward for TalkerBackboneBackend<B>
-{
+impl<B: MoeLlmBackend> TalkerBackboneForward for TalkerBackboneBackend<B> {
     fn forward(&mut self, input_f32: &[f32], seq_len: usize) -> Vec<f32> {
         let h = self.backbone.cfg.hidden_size;
         assert_eq!(
