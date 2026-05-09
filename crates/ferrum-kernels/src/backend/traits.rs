@@ -1642,6 +1642,15 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Capability: does this backend implement
+    /// `split_qkv_norm_rope_into_paged_cache_varlen` and
+    /// `paged_varlen_attention`? Required by the unified mixed-batch
+    /// forward path used by `LlamaFamilyModel::unified_forward`. Default
+    /// false; backends that ship the varlen kernels override.
+    fn supports_varlen_qkv() -> bool {
+        false
+    }
+
     /// Varlen variant of [`Self::split_qkv_norm_rope_into_paged_cache`].
     ///
     /// Single launch covering ALL sequences in the batch. Reads

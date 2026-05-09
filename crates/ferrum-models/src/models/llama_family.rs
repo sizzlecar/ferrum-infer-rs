@@ -4153,6 +4153,16 @@ impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        // Backend capability gate: unified path requires varlen QKV +
+        // paged_varlen_attention. Backends without them (Metal as of
+        // 2026-05-09, CPU) should drop back to per-item dispatch via
+        // forward_layer / decode_batch_internal.
+        if !B::supports_varlen_qkv() {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "LlamaFamilyModel::unified_forward: backend lacks varlen \
+                 QKV kernels. Engine will fall back to per-item dispatch.",
+            ));
+        }
         // Touch the first item's KV cache so `ensure_kv` lazily allocates
         // `paged_pools` when paged is enabled (env or backend default).
         self.ensure_kv(&items[0].0);

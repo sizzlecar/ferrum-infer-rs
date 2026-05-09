@@ -100,9 +100,24 @@ impl BertModelExecutor {
                 .map_err(|e| FerrumError::model(format!("Failed to load weights: {}", e)))?
         };
 
+        // Some BERT checkpoints prefix every tensor with `bert.` (the
+        // canonical google-bert / bert-base-chinese layout); others
+        // (sentence-transformers, MiniLM, etc.) drop the prefix. Probe
+        // and hand candle's BertModel::load the correct `pp(...)` view.
+        //
+        // KNOWN: google-bert / bert-base-chinese also uses TF-style
+        // `LayerNorm.gamma` / `.beta` instead of PyTorch's `weight` /
+        // `bias` — candle BertModel::load doesn't auto-rename them, so
+        // those checkpoints still error after this prefix fix. Tracked
+        // separately; sentence-transformers / MiniLM-style checkpoints
+        // (no prefix, weight/bias names) work end-to-end.
+        let vb = if vb.contains_tensor("bert.embeddings.word_embeddings.weight") {
+            vb.pp("bert")
+        } else {
+            vb
+        };
+
         // Create model from config.json
-        // Note: Some models have "bert." prefix, some don't.
-        // sentence-transformers models typically don't have the prefix.
         let config_path = path.join("config.json");
         let model = BertModelWrapper::from_config_json(vb, &config_path, device.clone(), dtype)?;
 

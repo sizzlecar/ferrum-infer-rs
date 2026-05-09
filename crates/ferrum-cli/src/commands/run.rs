@@ -222,6 +222,74 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .dimmed()
     );
 
+    // One-shot mode: --prompt supplied → run a single request and exit.
+    // Matches the GGUF run_gguf_one_shot UX. Previously cmd.prompt was
+    // documented as "one-shot for non-interactive runs" but the alias
+    // path ignored it and dropped into REPL, which exits silently when
+    // stdin is not a TTY.
+    if let Some(one_shot) = cmd.prompt.clone() {
+        let chat_prompt = build_chat_prompt(&[], &one_shot, cmd.system.as_deref(), &model_id);
+        let model_lower = model_id.to_lowercase();
+        let (default_top_p, default_top_k) = if model_lower.contains("qwen3") {
+            (0.8, Some(20))
+        } else {
+            (0.9, None)
+        };
+        let request = InferenceRequest {
+            id: RequestId(Uuid::new_v4()),
+            model_id: ferrum_types::ModelId(model_id.clone()),
+            prompt: chat_prompt,
+            sampling_params: SamplingParams {
+                max_tokens: cmd.max_tokens as usize,
+                temperature: cmd.temperature,
+                top_p: default_top_p,
+                top_k: default_top_k,
+                repetition_penalty: 1.1,
+                stop_sequences: vec![
+                    "<|im_end|>".to_string(),
+                    "</s>".to_string(),
+                    "<|endoftext|>".to_string(),
+                ],
+                ..Default::default()
+            },
+            stream: true,
+            priority: Priority::Normal,
+            client_id: None,
+            session_id: None,
+            created_at: Utc::now(),
+            metadata: HashMap::new(),
+        };
+        let mut stream = engine.infer_stream(request).await?;
+        let start = std::time::Instant::now();
+        let mut tokens = 0usize;
+        while let Some(chunk) = stream.next().await {
+            if let Ok(c) = chunk {
+                if !cmd.bench_mode {
+                    print!("{}", c.text);
+                    io::stdout().flush().ok();
+                }
+                tokens += 1;
+                if c.finish_reason.is_some() {
+                    break;
+                }
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let tps = if elapsed > 0.0 {
+            tokens as f64 / elapsed
+        } else {
+            0.0
+        };
+        if !cmd.bench_mode {
+            println!();
+        }
+        eprintln!(
+            "{}",
+            format!("[{tokens} tokens, {tps:.1} tok/s, {elapsed:.1}s]").dimmed()
+        );
+        return Ok(());
+    }
+
     // Print ready message
     eprintln!();
     eprintln!("{}", "Ready. Type your message and press Enter.".green());
