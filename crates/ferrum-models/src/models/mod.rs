@@ -20,3 +20,4 @@ pub mod qwen3_moe;
 
 pub use llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
 pub use qwen3_moe::Qwen3MoeModel;
+pub mod llama_family_forward_batched;

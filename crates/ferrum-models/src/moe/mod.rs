@@ -14,6 +14,7 @@
 //! against reference impls before committing to a backend-specific path.
 
 pub mod dispatch;
+pub mod forward;
 pub mod layer;
 pub mod router;
 
