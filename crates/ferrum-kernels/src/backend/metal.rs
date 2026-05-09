@@ -2663,3 +2663,6 @@ impl Backend for MetalBackend {
 
 // Metal has no graph-capture analogue; inherit BackendGraph defaults.
 impl crate::backend::BackendGraph for MetalBackend {}
+
+// Metal has no multi-GPU collectives; inherit BackendCollective single-rank defaults.
+impl crate::backend::BackendCollective for MetalBackend {}

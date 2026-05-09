@@ -3304,6 +3304,9 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+}
+
+impl BackendCollective for CudaBackend {
     // ── TP collectives ──────────────────────────────────────────────────
     //
     // World size / rank come from env vars (FERRUM_TP, FERRUM_RANK).

@@ -2005,34 +2005,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
     // but the store hides the per-kind buffer layout so callers don't
     // have to construct a per-kind `QuantWeights<'_, Self>` packet.)
 
-    // ── TP collective ops (Phase A3 stubs) ──────────────────────────────
-    //
-    // Default impl is single-rank no-op: `world_size = 1`, `rank = 0`, and
-    // the collective ops are identity. Multi-GPU backends (future
-    // CudaBackend + NCCL) override these. Model code can call
-    // `B::all_reduce_sum(...)` unconditionally; single-GPU paths pay zero.
-
-    fn world_size(_ctx: &Self::Context) -> usize {
-        1
-    }
-    fn rank(_ctx: &Self::Context) -> usize {
-        0
-    }
-    fn all_reduce(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _op: ReduceOp) {
-        // single-rank: no-op
-    }
-    fn all_gather(
-        _ctx: &mut Self::Context,
-        _local: &Self::Buffer,
-        _global: &mut Self::Buffer,
-        _local_len: usize,
-    ) {
-        // single-rank: no-op (caller is expected to handle the degenerate
-        // case or arrange for `local == global`)
-    }
-    fn broadcast(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _src_rank: usize) {
-        // single-rank: no-op
-    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2097,4 +2069,41 @@ pub trait BackendGraph: Backend {
 
     /// Drop ALL cached graphs — used by hard reset paths.
     fn reset_all_graphs(_ctx: &mut Self::Context) {}
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// BackendCollective capability (NCCL / RCCL multi-rank ops)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Tensor-parallel multi-GPU collective ops. CUDA wires these to NCCL via
+// `crate::nccl_comm::NcclRank`; AMD would wire to RCCL similarly. CPU and
+// Metal `impl BackendCollective for X {}` with empty bodies, inheriting
+// single-rank no-ops (world_size=1, rank=0, ops are identity).
+
+/// Capability-trait for backends that support multi-rank collective ops.
+/// Single-GPU backends inherit the no-op defaults: `world_size = 1`,
+/// `rank = 0`, and the collective ops are identity. Multi-rank backends
+/// (CUDA + NCCL today, AMD + RCCL in the future) override these.
+pub trait BackendCollective: Backend {
+    fn world_size(_ctx: &Self::Context) -> usize {
+        1
+    }
+    fn rank(_ctx: &Self::Context) -> usize {
+        0
+    }
+    fn all_reduce(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _op: ReduceOp) {
+        // single-rank: no-op
+    }
+    fn all_gather(
+        _ctx: &mut Self::Context,
+        _local: &Self::Buffer,
+        _global: &mut Self::Buffer,
+        _local_len: usize,
+    ) {
+        // single-rank: no-op (caller is expected to handle the degenerate
+        // case or arrange for `local == global`)
+    }
+    fn broadcast(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _src_rank: usize) {
+        // single-rank: no-op
+    }
 }

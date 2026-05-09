@@ -863,3 +863,6 @@ fn libm_erf(x: f32) -> f32 {
 
 // CPU has no graph-capture analogue; inherit BackendGraph defaults.
 impl crate::backend::BackendGraph for CpuBackend {}
+
+// CPU has no multi-rank collectives; inherit BackendCollective defaults.
+impl crate::backend::BackendCollective for CpuBackend {}
