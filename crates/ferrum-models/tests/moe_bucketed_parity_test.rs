@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 use ferrum_models::moe::{moe_forward, moe_forward_bucketed, ExpertStack, MoeRouteScratch};
 use ferrum_quantization::{Linear, StackedExpertLinear};
 
@@ -85,7 +85,7 @@ fn build_stacked(
             );
         }
     }
-    let store = <CpuBackend as Backend>::load_gptq(
+    let store = <CpuBackend as BackendQuantMarlin>::load_gptq(
         &qw_acc, &sc_acc, &qz_acc, None, 4, group_size, k, total_n,
     )
     .expect("CPU stacked load_gptq");

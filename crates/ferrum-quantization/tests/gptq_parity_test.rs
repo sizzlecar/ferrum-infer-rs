@@ -14,6 +14,8 @@
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kernels::backend::Backend;
+#[cfg(feature = "cuda")]
+use ferrum_kernels::backend::BackendQuantMarlin;
 use ferrum_kernels::Linear;
 use ferrum_quantization::GptqLinear;
 
@@ -232,7 +234,7 @@ fn cuda_vs_cpu() {
 #[ignore]
 fn cuda_stacked_offset_vs_per_expert() {
     use ferrum_kernels::backend::cuda::CudaBackend;
-    use ferrum_kernels::backend::Backend;
+    use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 
     let k = 256;
     let n_per = 128;
@@ -268,7 +270,7 @@ fn cuda_stacked_offset_vs_per_expert() {
     let qw_refs: Vec<&[i32]> = experts.iter().map(|e| e.qweight.as_slice()).collect();
     let sc_refs: Vec<&[f32]> = experts.iter().map(|e| e.scales.as_slice()).collect();
     let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
-    let stacked = <CudaBackend as Backend>::load_gptq_stacked(
+    let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked(
         &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
     .expect("stacked load_gptq");
@@ -287,7 +289,7 @@ fn cuda_stacked_offset_vs_per_expert() {
 
         let input_dev_off = CudaBackend::from_slice(&input);
         let mut off_out_dev = CudaBackend::alloc(m * n_per);
-        <CudaBackend as Backend>::gemm_gptq_with_offset(
+        <CudaBackend as BackendQuantMarlin>::gemm_gptq_with_offset(
             &mut ctx,
             &input_dev_off,
             &stacked,
@@ -330,7 +332,7 @@ fn cuda_stacked_offset_vs_per_expert() {
 #[test]
 fn cpu_stacked_vs_per_expert_parity() {
     use ferrum_kernels::backend::cpu::CpuBackend;
-    use ferrum_kernels::backend::Backend;
+    use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 
     let k = 256;
     let n_per = 128; // per expert
@@ -393,16 +395,17 @@ fn cpu_stacked_vs_per_expert_parity() {
         }
     }
 
-    let stacked_store =
-        <CpuBackend as Backend>::load_gptq(&qw_acc, &sc_acc, &qz_acc, None, 4, gs, k, total_n)
-            .expect("stacked load_gptq");
+    let stacked_store = <CpuBackend as BackendQuantMarlin>::load_gptq(
+        &qw_acc, &sc_acc, &qz_acc, None, 4, gs, k, total_n,
+    )
+    .expect("stacked load_gptq");
 
     // Slice-and-compare: for each expert, `gemm_gptq_with_offset` on
     // the stacked store must equal the per-expert dedicated GEMM.
     for (e, ref_out) in per_expert_outs.iter().enumerate() {
         let mut stacked_out = vec![0.0f32; m * n_per];
         let mut ctx = <CpuBackend as Backend>::new_context();
-        <CpuBackend as Backend>::gemm_gptq_with_offset(
+        <CpuBackend as BackendQuantMarlin>::gemm_gptq_with_offset(
             &mut ctx,
             &input,
             &stacked_store,

@@ -18,7 +18,7 @@
 //! `GgufLinear`'s eager-dequant path; the loader's split-fusion logic
 //! already concatenates the dequanted parts into one dense weight.
 
-use ferrum_kernels::backend::{Backend, GgufQuantType};
+use ferrum_kernels::backend::{Backend, BackendQuantGguf, GgufQuantType};
 use ferrum_kernels::Linear;
 use ferrum_types::Result;
 
@@ -33,13 +33,13 @@ use ferrum_types::Result;
 /// Future k-quant flavours (Q5_K, Q6_K, Q8_0) plug in via the
 /// [`GgufQuantType`] discriminator passed to the constructor — no new
 /// `QuantLinear` type required.
-pub struct QuantLinear<B: Backend> {
+pub struct QuantLinear<B: Backend + BackendQuantGguf> {
     store: B::QuantStore,
     in_features: usize,
     out_features: usize,
 }
 
-impl<B: Backend> QuantLinear<B> {
+impl<B: Backend + BackendQuantGguf> QuantLinear<B> {
     /// Build from raw GGUF block bytes.
     ///
     /// `kind`: which k-quant flavour the bytes encode (Q4_K, Q5_K, …).
@@ -92,7 +92,7 @@ impl<B: Backend> QuantLinear<B> {
     }
 }
 
-impl<B: Backend> Linear<B> for QuantLinear<B> {
+impl<B: Backend + BackendQuantGguf> Linear<B> for QuantLinear<B> {
     fn in_features(&self) -> usize {
         self.in_features
     }

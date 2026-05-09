@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use ferrum_kernels::backend::{Backend, SrcDtype};
+use ferrum_kernels::backend::{Backend, BackendQuantMarlin, SrcDtype};
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
@@ -126,7 +126,7 @@ impl Shard {
 
 /// Native safetensors loader. Generic over `Backend` so every tensor is
 /// materialised directly into backend-native buffers.
-pub struct NativeSafetensorsLoader<B: Backend> {
+pub struct NativeSafetensorsLoader<B: Backend + BackendQuantMarlin> {
     /// All shards keyed by file; each tensor's name maps to its shard here.
     shards: Vec<Shard>,
     /// Name → shard index. Populated once at construction.
@@ -136,7 +136,7 @@ pub struct NativeSafetensorsLoader<B: Backend> {
     _m: std::marker::PhantomData<B>,
 }
 
-impl<B: Backend> NativeSafetensorsLoader<B> {
+impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
     /// Discover shards under `model_dir` and build the name → shard index.
     pub fn open(model_dir: impl AsRef<Path>) -> Result<Self> {
         let dir = model_dir.as_ref();
@@ -511,7 +511,7 @@ impl<B: Backend> NativeSafetensorsLoader<B> {
     }
 }
 
-impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
+impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoader<B> {
     fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
         // Route through `from_weight_bytes` so fp16-preferring backends can
         // materialise big tensors (embed table) directly as half-precision
@@ -605,7 +605,7 @@ impl<B: Backend> WeightLoader<B> for NativeSafetensorsLoader<B> {
     }
 }
 
-impl<B: Backend> NativeSafetensorsLoader<B> {
+impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
     /// Load a GPTQ-packed linear projection: reads `<name>.qweight`,
     /// `<name>.scales`, `<name>.qzeros`, optionally `<name>.g_idx`, and
     /// hands the raw host-side tensors to `Backend::load_gptq` which

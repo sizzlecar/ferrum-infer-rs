@@ -60,7 +60,12 @@ fn load_talker_config(model_dir: &PathBuf) -> TalkerConfig {
 /// 4 decode steps, then exercise SubTalker.predict_greedy. Returns
 /// `(first_5_codec_tokens, subtalker_tokens)` for caller to compare
 /// across backends.
-fn run_full_chain<B: ferrum_kernels::backend::Backend + ferrum_kernels::backend::BackendGraph>(
+fn run_full_chain<
+    B: ferrum_kernels::backend::Backend
+        + ferrum_kernels::backend::BackendGraph
+        + ferrum_kernels::backend::BackendQuantMarlin
+        + ferrum_kernels::backend::BackendQuantGguf,
+>(
     dir: &PathBuf,
     cfg: &TalkerConfig,
     tag: &str,
@@ -181,7 +186,12 @@ fn cuda_smoke() {
 /// argmax codec tokens to `/tmp/tts_smoke_<backend>.tokens`. Diffing the
 /// CPU and CUDA outputs pinpoints the first step where precision drift
 /// flips a codec selection (if it happens at all).
-fn run_long_decode<B: ferrum_kernels::backend::Backend + ferrum_kernels::backend::BackendGraph>(
+fn run_long_decode<
+    B: ferrum_kernels::backend::Backend
+        + ferrum_kernels::backend::BackendGraph
+        + ferrum_kernels::backend::BackendQuantMarlin
+        + ferrum_kernels::backend::BackendQuantGguf,
+>(
     dir: &PathBuf,
     cfg: &TalkerConfig,
     tag: &str,

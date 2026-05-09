@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle_core::Device;
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, BackendQuantGguf, BackendQuantMarlin};
 use ferrum_types::{FerrumError, Result};
 
 use crate::config::QuantConfig;
@@ -36,7 +36,7 @@ use crate::traits::Linear;
 /// Build with [`GgufLoader::open`]. The underlying file stays mmap'd for
 /// the lifetime of the loader so per-tensor reads only do byte slicing,
 /// not file I/O.
-pub struct GgufLoader<B: Backend> {
+pub struct GgufLoader<B: Backend + BackendQuantGguf + BackendQuantMarlin> {
     gguf: Arc<GgufFile>,
     /// Decode device for `QTensor::dequantize`. We always use CPU here:
     /// the dequant is followed by `B::from_slice`, which uploads to the
@@ -46,7 +46,7 @@ pub struct GgufLoader<B: Backend> {
     _marker: std::marker::PhantomData<B>,
 }
 
-impl<B: Backend> GgufLoader<B> {
+impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     /// Open and parse a `.gguf` file. Tensor payloads stay on disk (mmap'd)
     /// until each `load_tensor` / `load_linear` call.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -382,7 +382,7 @@ impl<B: Backend> GgufLoader<B> {
     }
 }
 
-impl<B: Backend> WeightLoader<B> for GgufLoader<B> {
+impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for GgufLoader<B> {
     fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
         let gguf_name = self.locate(name)?;
         let raw = self.read_dequant(&gguf_name)?;

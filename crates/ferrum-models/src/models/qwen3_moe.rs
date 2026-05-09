@@ -28,7 +28,9 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::OnceLock;
 
-use ferrum_kernels::backend::{Backend, BackendGraph, KvCache};
+use ferrum_kernels::backend::{
+    Backend, BackendGraph, BackendQuantGguf, BackendQuantMarlin, KvCache,
+};
 use ferrum_quantization::WeightLoader;
 use ferrum_types::{FerrumError, Result};
 
@@ -93,7 +95,7 @@ static BD_MOE_US: AtomicU64 = AtomicU64::new(0); // router + MoE FFN + residual 
 static BD_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.
-pub struct Qwen3MoeLayerState<B: Backend> {
+pub struct Qwen3MoeLayerState<B: Backend + BackendQuantMarlin + BackendQuantGguf> {
     /// Router projection `[hidden] → [num_experts]` — tiny, never sparse,
     /// always runs the full GEMV.
     pub router: Box<dyn ferrum_quantization::Linear<B>>,
@@ -104,7 +106,7 @@ pub struct Qwen3MoeLayerState<B: Backend> {
 
 /// Reusable scratch buffers for the MoE forward path. All sized at
 /// allocation time and reused across layers / forward calls.
-pub struct Qwen3MoeScratch<B: Backend> {
+pub struct Qwen3MoeScratch<B: Backend + BackendQuantMarlin + BackendQuantGguf> {
     /// See [`crate::models::llama_family::LlamaFamilyScratch`] for the
     /// attention scratch — we re-use those names verbatim.
     pub residual: Option<B::Buffer>,
@@ -257,7 +259,7 @@ pub struct Qwen3MoeScratch<B: Backend> {
     pub moe_route_scratch: crate::moe::MoeRouteScratch,
 }
 
-impl<B: Backend> Qwen3MoeScratch<B> {
+impl<B: Backend + BackendQuantMarlin + BackendQuantGguf> Qwen3MoeScratch<B> {
     fn alloc(cfg: &Qwen3MoeConfig, max_tokens: usize) -> Self {
         let h = cfg.base.hidden_size;
         let q_dim = cfg.base.num_heads * cfg.base.head_dim;
@@ -383,7 +385,7 @@ impl<B: Backend> Qwen3MoeScratch<B> {
 /// expert dispatch, and weighted combine all happen inside
 /// [`moe_forward`]; this struct only owns the storage and orchestrates
 /// the per-layer call sequence.
-pub struct Qwen3MoeModel<B: BackendGraph> {
+pub struct Qwen3MoeModel<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> {
     pub cfg: Qwen3MoeConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -410,7 +412,7 @@ pub struct Qwen3MoeModel<B: BackendGraph> {
     pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
 }
 
-impl<B: BackendGraph> Qwen3MoeModel<B> {
+impl<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> Qwen3MoeModel<B> {
     /// Build a Qwen3-MoE model from a generic `WeightLoader<B>` plus a
     /// GGUF reader for the experts (which `WeightLoader` doesn't model
     /// directly — its API is rank-2 only).
@@ -2772,7 +2774,7 @@ impl<B: BackendGraph> Qwen3MoeModel<B> {
     }
 }
 
-impl<B: BackendGraph> DecoderOnlyLLM for Qwen3MoeModel<B> {
+impl<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> DecoderOnlyLLM for Qwen3MoeModel<B> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -2921,7 +2923,7 @@ impl<B: BackendGraph> DecoderOnlyLLM for Qwen3MoeModel<B> {
 /// Free function (not a method) so the caller can split the borrow on
 /// `self` between `moe_layers[li]` (immutable) and `scratch` (mutable).
 #[allow(clippy::too_many_arguments)]
-fn moe_forward_stacked_decode_impl<B: Backend>(
+fn moe_forward_stacked_decode_impl<B: Backend + BackendQuantMarlin + BackendQuantGguf>(
     ctx: &mut B::Context,
     moe_layer: &Qwen3MoeLayerState<B>,
     scratch: &mut Qwen3MoeScratch<B>,
@@ -3131,7 +3133,7 @@ fn moe_forward_stacked_decode_impl<B: Backend>(
 /// Free function so the caller can split the borrow on `self` between
 /// `moe_layers[li]` (immutable) and `scratch` (mutable).
 #[allow(clippy::too_many_arguments)]
-fn moe_forward_batched_prefill_impl<B: Backend>(
+fn moe_forward_batched_prefill_impl<B: Backend + BackendQuantMarlin + BackendQuantGguf>(
     ctx: &mut B::Context,
     moe_layer: &Qwen3MoeLayerState<B>,
     scratch: &mut Qwen3MoeScratch<B>,
@@ -3388,7 +3390,7 @@ fn moe_forward_batched_prefill_impl<B: Backend>(
 /// Per-layer dispatch budget: 5 (independent of m). At c=16 / 48 layers
 /// that's 240 dispatches per decode step vs the per-token loop's ~3,840.
 #[allow(clippy::too_many_arguments)]
-fn moe_forward_batched_decode_impl<B: Backend>(
+fn moe_forward_batched_decode_impl<B: Backend + BackendQuantMarlin + BackendQuantGguf>(
     ctx: &mut B::Context,
     moe_layer: &Qwen3MoeLayerState<B>,
     scratch: &mut Qwen3MoeScratch<B>,
@@ -3540,7 +3542,7 @@ fn moe_forward_batched_decode_impl<B: Backend>(
 /// for MoE models — those slots are never invoked because the MoE FFN
 /// path runs through `moe_layer.experts` instead. The stub's only purpose
 /// is to satisfy the struct's type signature with minimal memory cost.
-fn stub_linear<B: Backend>(
+fn stub_linear<B: Backend + BackendQuantMarlin + BackendQuantGguf>(
     out_features: usize,
     in_features: usize,
 ) -> Box<dyn ferrum_quantization::Linear<B>> {
@@ -3555,7 +3557,9 @@ fn stub_linear<B: Backend>(
     ))
 }
 
-fn build_rope_cache<B: Backend>(cfg: &LlamaFamilyConfig) -> RopeCache<B> {
+fn build_rope_cache<B: Backend + BackendQuantMarlin + BackendQuantGguf>(
+    cfg: &LlamaFamilyConfig,
+) -> RopeCache<B> {
     let hd = cfg.head_dim;
     let half = hd / 2;
     let max = cfg.max_seq_len;

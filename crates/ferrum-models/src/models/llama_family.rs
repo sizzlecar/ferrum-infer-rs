@@ -19,7 +19,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_kernels::backend::{Backend, BackendGraph, KvCache, MAX_LAYERS_FOR_GRAPH};
+use ferrum_kernels::backend::{
+    Backend, BackendGraph, BackendQuantGguf, BackendQuantMarlin, KvCache, MAX_LAYERS_FOR_GRAPH,
+};
 
 /// Graph cache key for the single-item decode path (`decode_internal`).
 /// Distinct from any `m_padded`-based key used by the batched path.
@@ -171,7 +173,7 @@ struct LlamaFamilyConfigBase {
 
 /// Per-layer weights. `Box<dyn Linear<B>>` means each projection can be
 /// Dense / GPTQ / AWQ / GGUF without the surrounding code caring.
-pub struct LlamaFamilyLayer<B: Backend> {
+pub struct LlamaFamilyLayer<B: Backend + BackendQuantMarlin + BackendQuantGguf> {
     pub input_ln_w: B::Buffer,
     pub qkv_proj: Box<dyn Linear<B>>,
     /// QK-norm weight per head: `[head_dim]`. Optional for non-Qwen3 derivatives.
@@ -184,7 +186,7 @@ pub struct LlamaFamilyLayer<B: Backend> {
 }
 
 /// Precomputed RoPE cos/sin tables (shape `[max_seq, head_dim / 2]` each).
-pub struct RopeCache<B: Backend> {
+pub struct RopeCache<B: Backend + BackendQuantMarlin + BackendQuantGguf> {
     pub cos: B::Buffer,
     pub sin: B::Buffer,
 }
@@ -194,7 +196,7 @@ pub struct RopeCache<B: Backend> {
 ///
 /// Sized lazily on first use so tiny decode steps don't pay for prefill-sized
 /// buffers. Grows monotonically when a larger prefill arrives.
-pub struct LlamaFamilyScratch<B: Backend> {
+pub struct LlamaFamilyScratch<B: Backend + BackendQuantMarlin + BackendQuantGguf> {
     /// Residual stream — wrapped in Option so decode_internal can
     /// `.take()` it without needing an alloc placeholder.
     ///
@@ -331,7 +333,7 @@ pub struct LlamaFamilyScratch<B: Backend> {
     pub max_tokens: usize,
 }
 
-impl<B: Backend> LlamaFamilyScratch<B> {
+impl<B: Backend + BackendQuantMarlin + BackendQuantGguf> LlamaFamilyScratch<B> {
     fn alloc(cfg: &LlamaFamilyConfig, max_tokens: usize) -> Self {
         let h = cfg.hidden_size;
         let im = cfg.intermediate_size;
@@ -471,10 +473,10 @@ impl<B: Backend> LlamaFamilyScratch<B> {
 ///
 /// Holds all parameters, scratch space, RoPE cache, and per-sequence KV caches.
 ///
-/// `B: BackendGraph` because the decode hot path uses CUDA Graph capture/replay
+/// `B: BackendGraph + BackendQuantMarlin + BackendQuantGguf` because the decode hot path uses CUDA Graph capture/replay
 /// when the backend supports it; non-graph backends (Metal/CPU) inherit no-op
 /// defaults, so this bound is satisfied by every concrete `Backend`.
-pub struct LlamaFamilyModel<B: BackendGraph> {
+pub struct LlamaFamilyModel<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> {
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -551,7 +553,7 @@ pub struct LlamaFamilyModel<B: BackendGraph> {
     unified_graph_keys_seen: std::collections::HashSet<u64>,
 }
 
-impl<B: BackendGraph> LlamaFamilyModel<B> {
+impl<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> LlamaFamilyModel<B> {
     /// Build a Qwen3 model from weights provided by the loader.
     ///
     /// The loader decides per-projection whether to instantiate DenseLinear,
@@ -4083,7 +4085,9 @@ impl<B: BackendGraph> LlamaFamilyModel<B> {
     }
 }
 
-impl<B: BackendGraph> DecoderOnlyLLM for LlamaFamilyModel<B> {
+impl<B: BackendGraph + BackendQuantMarlin + BackendQuantGguf> DecoderOnlyLLM
+    for LlamaFamilyModel<B>
+{
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -4281,7 +4285,9 @@ impl<B: BackendGraph> DecoderOnlyLLM for LlamaFamilyModel<B> {
     }
 }
 
-fn build_rope_cache<B: Backend>(cfg: &LlamaFamilyConfig) -> RopeCache<B> {
+fn build_rope_cache<B: Backend + BackendQuantMarlin + BackendQuantGguf>(
+    cfg: &LlamaFamilyConfig,
+) -> RopeCache<B> {
     let hd = cfg.head_dim;
     let half = hd / 2;
     let max = cfg.max_seq_len;

@@ -13,18 +13,18 @@
 //! needs (CUDA: Marlin-repacked tiles; CPU: dequantized f32 weights;
 //! Metal: unsupported).
 
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 use ferrum_kernels::Linear;
 use ferrum_types::Result;
 
-pub struct GptqLinear<B: Backend> {
+pub struct GptqLinear<B: Backend + BackendQuantMarlin> {
     store: B::GptqStore,
     bias: Option<B::Buffer>,
     in_features: usize,
     out_features: usize,
 }
 
-impl<B: Backend> GptqLinear<B> {
+impl<B: Backend + BackendQuantMarlin> GptqLinear<B> {
     /// Build from raw host-side GPTQ tensors. The Backend repacks into
     /// its preferred format once; inference uses the repacked store.
     ///
@@ -88,7 +88,7 @@ impl<B: Backend> GptqLinear<B> {
     }
 }
 
-impl<B: Backend> Linear<B> for GptqLinear<B> {
+impl<B: Backend + BackendQuantMarlin> Linear<B> for GptqLinear<B> {
     fn in_features(&self) -> usize {
         self.in_features
     }
@@ -114,7 +114,7 @@ impl<B: Backend> Linear<B> for GptqLinear<B> {
 ///
 /// The store itself is `Arc<B::GptqStore>` so cloning a view is cheap;
 /// dropping all views drops the underlying store.
-pub struct StackedExpertLinear<B: Backend> {
+pub struct StackedExpertLinear<B: Backend + BackendQuantMarlin> {
     pub store: std::sync::Arc<B::GptqStore>,
     pub expert_offset: usize,
     pub expert_n: usize,
@@ -122,7 +122,7 @@ pub struct StackedExpertLinear<B: Backend> {
     pub bias: Option<B::Buffer>,
 }
 
-impl<B: Backend> StackedExpertLinear<B> {
+impl<B: Backend + BackendQuantMarlin> StackedExpertLinear<B> {
     pub fn new(
         store: std::sync::Arc<B::GptqStore>,
         expert_offset: usize,
@@ -139,7 +139,7 @@ impl<B: Backend> StackedExpertLinear<B> {
     }
 }
 
-impl<B: Backend> Linear<B> for StackedExpertLinear<B> {
+impl<B: Backend + BackendQuantMarlin> Linear<B> for StackedExpertLinear<B> {
     fn in_features(&self) -> usize {
         self.k
     }
