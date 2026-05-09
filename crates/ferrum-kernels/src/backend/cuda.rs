@@ -21,7 +21,10 @@
 
 #![allow(unused_variables, dead_code, unused_imports, unused_mut)]
 
-use super::{AttnConfig, Backend, QuantKind, QuantWeights, ReduceOp};
+use super::{
+    AttnConfig, Backend, BackendCollective, BackendGraph, BackendQuantGguf, BackendQuantMarlin,
+    QuantKind, QuantWeights, ReduceOp,
+};
 use crate::ptx;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{
@@ -2509,24 +2512,11 @@ impl Backend for CudaBackend {
     // is already production-grade (112 tok/s on RTX PRO 6000 per pre-v2
     // benchmarks); wiring is a structural concern, not a kernel concern.
 
-    // Trait signature was tightened (`Self::QuantStore` instead of the
-    // historical 8-param `QuantWeights` shape). The CUDA path no longer
-    // dispatches through this entry — INT4 goes through `gemm_gptq +
-    // GptqStore`, k-quants stay on Metal/CPU. Stub kept so the trait
-    // is satisfied and the cuda feature builds on Linux.
-    fn gemm_quant(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::QuantStore,
-        _out: &mut Self::Buffer,
-        _m: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "CudaBackend::gemm_quant deprecated — use gemm_gptq + GptqStore",
-        ))
-    }
-
     // ── GPTQ INT4 dispatch (Marlin default; Triton-rs alt via env) ──────
+    //
+    // gemm_quant moved to `impl BackendQuantGguf for CudaBackend {}`
+    // (empty — CUDA inherits the unsupported default; INT4 goes through
+    // gemm_gptq + GptqStore).
 
     #[cfg(feature = "vllm-moe-marlin")]
     fn upload_moe_routing(
