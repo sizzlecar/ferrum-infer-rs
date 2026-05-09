@@ -13,7 +13,7 @@
 //! needs (CUDA: Marlin-repacked tiles; CPU: dequantized f32 weights;
 //! Metal: unsupported).
 
-use ferrum_kernels::backend::{Backend, BackendMoeFused, BackendPagedKv, BackendQuantMarlin};
+use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 use ferrum_kernels::Linear;
 use ferrum_types::Result;
 
