@@ -1,9 +1,9 @@
 //! Kernel backend abstraction layer for LLM-specific fused operations.
 //!
-//! This module defines a mid-level abstraction between raw `KernelExecutor`
-//! (too low-level: grid/block sizes) and `TensorOps` (too high-level: no
-//! LLM-specific fused ops). It enables pluggable CUDA/Metal/CPU backends
-//! through six focused sub-traits composed into one umbrella `KernelOps`.
+//! This module defines a mid-level abstraction sitting above `TensorOps`
+//! (too high-level: no LLM-specific fused ops). It enables pluggable
+//! CUDA/Metal/CPU backends through focused sub-traits composed into one
+//! umbrella `KernelOps`.
 
 use crate::TensorRef;
 use ferrum_types::Result;
