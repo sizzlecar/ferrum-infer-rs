@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_kernels::backend::{Backend, KvCache, MAX_LAYERS_FOR_GRAPH};
+use ferrum_kernels::backend::{Backend, BackendGraph, KvCache, MAX_LAYERS_FOR_GRAPH};
 
 /// Graph cache key for the single-item decode path (`decode_internal`).
 /// Distinct from any `m_padded`-based key used by the batched path.
@@ -470,7 +470,11 @@ impl<B: Backend> LlamaFamilyScratch<B> {
 /// Qwen3 model — decoder-only LLM, one per (backend, weights) combination.
 ///
 /// Holds all parameters, scratch space, RoPE cache, and per-sequence KV caches.
-pub struct LlamaFamilyModel<B: Backend> {
+///
+/// `B: BackendGraph` because the decode hot path uses CUDA Graph capture/replay
+/// when the backend supports it; non-graph backends (Metal/CPU) inherit no-op
+/// defaults, so this bound is satisfied by every concrete `Backend`.
+pub struct LlamaFamilyModel<B: BackendGraph> {
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -547,7 +551,7 @@ pub struct LlamaFamilyModel<B: Backend> {
     unified_graph_keys_seen: std::collections::HashSet<u64>,
 }
 
-impl<B: Backend> LlamaFamilyModel<B> {
+impl<B: BackendGraph> LlamaFamilyModel<B> {
     /// Build a Qwen3 model from weights provided by the loader.
     ///
     /// The loader decides per-projection whether to instantiate DenseLinear,
@@ -4079,7 +4083,7 @@ impl<B: Backend> LlamaFamilyModel<B> {
     }
 }
 
-impl<B: Backend> DecoderOnlyLLM for LlamaFamilyModel<B> {
+impl<B: BackendGraph> DecoderOnlyLLM for LlamaFamilyModel<B> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }

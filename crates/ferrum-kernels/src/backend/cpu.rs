@@ -860,3 +860,6 @@ fn libm_erf(x: f32) -> f32 {
             * (-x * x).exp();
     sign * y
 }
+
+// CPU has no graph-capture analogue; inherit BackendGraph defaults.
+impl crate::backend::BackendGraph for CpuBackend {}
