@@ -466,193 +466,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn set_decode_state(ctx: &mut Self::Context, token: u32, step: u32) {
-        let valid_kv = (step as i32) + 1;
-        let step_i = step as i32;
-        let stream = ctx.stream.clone();
-        let mut w = decode_state_slot().write().expect("DECODE_STATE poisoned");
-        let bufs = w.as_mut().expect("DecodeStateBufs not initialised");
-        stream
-            .memcpy_htod(&[token], &mut bufs.token)
-            .expect("token_buf memcpy");
-        stream
-            .memcpy_htod(&[step_i], &mut bufs.pos)
-            .expect("pos_buf memcpy");
-        stream
-            .memcpy_htod(&[valid_kv], &mut bufs.kv)
-            .expect("kv_buf memcpy");
-    }
-
-    fn set_dev_state_mode(ctx: &mut Self::Context, enable: bool) {
-        ctx.use_dev_state = enable;
-    }
-
-    fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
-        use cudarc::driver::sys::CUstreamCaptureMode;
-        // Event tracking already disabled globally in default_stream; begin
-        // capture directly in relaxed mode. Bare-Rust cudarc reproducer
-        // confirms this configuration works on Blackwell + CUDA 13
-        // (`cudarc_graph_no_event_tracking` test). The full ferrum bench
-        // path still SIGSEGVs though — remaining delta is likely one of
-        // PTX module load timing, cuBLAS workspace interaction, or a
-        // specific kernel's use of constant memory that doesn't survive
-        // capture. See `docs/phase-e-cuda-status.md` graph section.
-        ctx.stream
-            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-            .map_err(|e| FerrumError::unsupported(format!("begin_capture: {e}")))?;
-        ctx.capture_in_flight = true;
-        Ok(())
-    }
-
-    fn end_graph_capture(ctx: &mut Self::Context, key: u64) -> Result<()> {
-        use cudarc::driver::sys;
-        if !ctx.capture_in_flight {
-            return Err(FerrumError::unsupported("end_capture without begin"));
-        }
-        ctx.capture_in_flight = false;
-
-        // Bypass cudarc's end_capture — it does cuStreamEndCapture +
-        // cuGraphInstantiateWithFlags in one call, and one of those corrupts
-        // the context on Blackwell. Call them separately so we can see which.
-        ctx.ctx
-            .bind_to_thread()
-            .map_err(|e| FerrumError::unsupported(format!("bind pre-end: {e}")))?;
-
-        let cu_stream = ctx.stream.cu_stream();
-        let mut cu_graph: sys::CUgraph = std::ptr::null_mut();
-        let st1 = unsafe { sys::cuStreamEndCapture(cu_stream, &mut cu_graph) };
-        if st1 != sys::CUresult::CUDA_SUCCESS {
-            return Err(FerrumError::unsupported(format!(
-                "cuStreamEndCapture failed: {st1:?}"
-            )));
-        }
-        if cu_graph.is_null() {
-            return Err(FerrumError::unsupported(
-                "cuStreamEndCapture returned null graph",
-            ));
-        }
-
-        // flags=0: no AUTO_FREE_ON_LAUNCH. The captured graph contains
-        // only kernel launches (memcpys are sync via cuMemcpyHtoD_v2
-        // outside capture, see populate_batched_pointers), so
-        // AUTO_FREE has nothing to free. With AUTO_FREE on, replays
-        // worked for ~14 iters then SIGSEGV — likely device-side
-        // launch resources getting freed mid-launch sequence.
-        let flags = 0u64;
-        let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
-        let st2 = unsafe { sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, flags) };
-        if st2 != sys::CUresult::CUDA_SUCCESS {
-            unsafe {
-                sys::cuGraphDestroy(cu_graph);
-            }
-            return Err(FerrumError::unsupported(format!(
-                "cuGraphInstantiate failed: {st2:?}"
-            )));
-        }
-
-        // Upload graph to GPU before first launch. Without this, the first
-        // cuGraphLaunch does lazy JIT + resource upload while the stream
-        // still has pending ops — libcuda dereferences not-yet-uploaded
-        // graph state and SIGSEGVs on Blackwell + CUDA 13.
-        let st3 = unsafe { sys::cuGraphUpload(cu_graph_exec, cu_stream) };
-        if st3 != sys::CUresult::CUDA_SUCCESS {
-            unsafe {
-                sys::cuGraphExecDestroy(cu_graph_exec);
-                sys::cuGraphDestroy(cu_graph);
-            }
-            return Err(FerrumError::unsupported(format!(
-                "cuGraphUpload failed: {st3:?}"
-            )));
-        }
-
-        // Install into the multi-slot cache keyed by `key`. Replaces any
-        // existing graph for the same key; the old GraphSlotRaw drops
-        // (cuCtxSync + cuGraphExecDestroy + cuGraphDestroy in its Drop
-        // impl) before the new one takes its place.
-        install_decode_graph_raw(key, cu_graph, cu_graph_exec, ctx.stream.clone());
-        Ok(())
-    }
-
-    fn reset_graph(_ctx: &mut Self::Context, key: u64) {
-        invalidate_decode_graph(key);
-    }
-
-    fn reset_all_graphs(_ctx: &mut Self::Context) {
-        invalidate_all_decode_graphs();
-    }
-
-    fn replay_graph(ctx: &mut Self::Context, key: u64) -> Result<bool> {
-        use cudarc::driver::sys;
-        let cu_stream = ctx.stream.cu_stream();
-        ctx.ctx
-            .bind_to_thread()
-            .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
-        with_decode_graph(key, |g_opt| {
-            if let Some(g) = g_opt {
-                let prof = std::env::var("FERRUM_GRAPH_PROF").is_ok();
-                let t_pre = if prof {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                // Re-upload before each launch. Without it, c=4 throughput
-                // drops 257→178 tok/s (post-Phase-8 measurement). The
-                // graph instantiate-then-upload-once design didn't pan out
-                // empirically; keep the per-replay upload until we
-                // understand why removing it slows things down.
-                let skip_upload =
-                    std::env::var("FERRUM_GRAPH_SKIP_UPLOAD").map_or(false, |v| v == "1");
-                if !skip_upload {
-                    let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
-                    if st_up != sys::CUresult::CUDA_SUCCESS {
-                        return Err(FerrumError::unsupported(format!(
-                            "cuGraphUpload: {st_up:?}"
-                        )));
-                    }
-                }
-                let t_after_upload = if prof {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
-                if st != sys::CUresult::CUDA_SUCCESS {
-                    return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
-                }
-                let t_after_launch = if prof {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                let skip_sync = std::env::var("FERRUM_GRAPH_SKIP_SYNC").map_or(false, |v| v == "1");
-                if !skip_sync {
-                    let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
-                    if st_sync != sys::CUresult::CUDA_SUCCESS {
-                        return Err(FerrumError::unsupported(format!(
-                            "post-launch sync: {st_sync:?}"
-                        )));
-                    }
-                }
-                if let (Some(t0), Some(t1), Some(t2)) = (t_pre, t_after_upload, t_after_launch) {
-                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n.is_multiple_of(64) {
-                        let upload = t1.duration_since(t0).as_micros();
-                        let launch = t2.duration_since(t1).as_micros();
-                        let sync = t2.elapsed().as_micros();
-                        eprintln!(
-                            "[graph-prof] call#{n} upload={upload}us launch={launch}us sync={sync}us total={}us",
-                            t0.elapsed().as_micros()
-                        );
-                    }
-                }
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })
-    }
-
     fn sync(ctx: &mut Self::Context) {
         ctx.stream.synchronize().expect("CudaBackend: stream sync");
     }
@@ -3489,7 +3302,9 @@ impl Backend for CudaBackend {
         }
         Ok(())
     }
+}
 
+impl BackendCollective for CudaBackend {
     // ── TP collectives ──────────────────────────────────────────────────
     //
     // World size / rank come from env vars (FERRUM_TP, FERRUM_RANK).
@@ -3547,6 +3362,195 @@ impl Backend for CudaBackend {
 
     fn broadcast(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize, _src_rank: usize) {
         // Phase E-TP: no NCCL wrapper for broadcast yet.
+    }
+}
+
+impl BackendGraph for CudaBackend {
+    fn set_decode_state(ctx: &mut Self::Context, token: u32, step: u32) {
+        let valid_kv = (step as i32) + 1;
+        let step_i = step as i32;
+        let stream = ctx.stream.clone();
+        let mut w = decode_state_slot().write().expect("DECODE_STATE poisoned");
+        let bufs = w.as_mut().expect("DecodeStateBufs not initialised");
+        stream
+            .memcpy_htod(&[token], &mut bufs.token)
+            .expect("token_buf memcpy");
+        stream
+            .memcpy_htod(&[step_i], &mut bufs.pos)
+            .expect("pos_buf memcpy");
+        stream
+            .memcpy_htod(&[valid_kv], &mut bufs.kv)
+            .expect("kv_buf memcpy");
+    }
+
+    fn set_dev_state_mode(ctx: &mut Self::Context, enable: bool) {
+        ctx.use_dev_state = enable;
+    }
+
+    fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
+        use cudarc::driver::sys::CUstreamCaptureMode;
+        // Event tracking already disabled globally in default_stream; begin
+        // capture directly in relaxed mode. Bare-Rust cudarc reproducer
+        // confirms this configuration works on Blackwell + CUDA 13
+        // (`cudarc_graph_no_event_tracking` test). The full ferrum bench
+        // path still SIGSEGVs though — remaining delta is likely one of
+        // PTX module load timing, cuBLAS workspace interaction, or a
+        // specific kernel's use of constant memory that doesn't survive
+        // capture. See `docs/phase-e-cuda-status.md` graph section.
+        ctx.stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .map_err(|e| FerrumError::unsupported(format!("begin_capture: {e}")))?;
+        ctx.capture_in_flight = true;
+        Ok(())
+    }
+
+    fn end_graph_capture(ctx: &mut Self::Context, key: u64) -> Result<()> {
+        use cudarc::driver::sys;
+        if !ctx.capture_in_flight {
+            return Err(FerrumError::unsupported("end_capture without begin"));
+        }
+        ctx.capture_in_flight = false;
+
+        // Bypass cudarc's end_capture — it does cuStreamEndCapture +
+        // cuGraphInstantiateWithFlags in one call, and one of those corrupts
+        // the context on Blackwell. Call them separately so we can see which.
+        ctx.ctx
+            .bind_to_thread()
+            .map_err(|e| FerrumError::unsupported(format!("bind pre-end: {e}")))?;
+
+        let cu_stream = ctx.stream.cu_stream();
+        let mut cu_graph: sys::CUgraph = std::ptr::null_mut();
+        let st1 = unsafe { sys::cuStreamEndCapture(cu_stream, &mut cu_graph) };
+        if st1 != sys::CUresult::CUDA_SUCCESS {
+            return Err(FerrumError::unsupported(format!(
+                "cuStreamEndCapture failed: {st1:?}"
+            )));
+        }
+        if cu_graph.is_null() {
+            return Err(FerrumError::unsupported(
+                "cuStreamEndCapture returned null graph",
+            ));
+        }
+
+        // flags=0: no AUTO_FREE_ON_LAUNCH. The captured graph contains
+        // only kernel launches (memcpys are sync via cuMemcpyHtoD_v2
+        // outside capture, see populate_batched_pointers), so
+        // AUTO_FREE has nothing to free. With AUTO_FREE on, replays
+        // worked for ~14 iters then SIGSEGV — likely device-side
+        // launch resources getting freed mid-launch sequence.
+        let flags = 0u64;
+        let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
+        let st2 = unsafe { sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, flags) };
+        if st2 != sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                sys::cuGraphDestroy(cu_graph);
+            }
+            return Err(FerrumError::unsupported(format!(
+                "cuGraphInstantiate failed: {st2:?}"
+            )));
+        }
+
+        // Upload graph to GPU before first launch. Without this, the first
+        // cuGraphLaunch does lazy JIT + resource upload while the stream
+        // still has pending ops — libcuda dereferences not-yet-uploaded
+        // graph state and SIGSEGVs on Blackwell + CUDA 13.
+        let st3 = unsafe { sys::cuGraphUpload(cu_graph_exec, cu_stream) };
+        if st3 != sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                sys::cuGraphExecDestroy(cu_graph_exec);
+                sys::cuGraphDestroy(cu_graph);
+            }
+            return Err(FerrumError::unsupported(format!(
+                "cuGraphUpload failed: {st3:?}"
+            )));
+        }
+
+        // Install into the multi-slot cache keyed by `key`. Replaces any
+        // existing graph for the same key; the old GraphSlotRaw drops
+        // (cuCtxSync + cuGraphExecDestroy + cuGraphDestroy in its Drop
+        // impl) before the new one takes its place.
+        install_decode_graph_raw(key, cu_graph, cu_graph_exec, ctx.stream.clone());
+        Ok(())
+    }
+
+    fn reset_graph(_ctx: &mut Self::Context, key: u64) {
+        invalidate_decode_graph(key);
+    }
+
+    fn reset_all_graphs(_ctx: &mut Self::Context) {
+        invalidate_all_decode_graphs();
+    }
+
+    fn replay_graph(ctx: &mut Self::Context, key: u64) -> Result<bool> {
+        use cudarc::driver::sys;
+        let cu_stream = ctx.stream.cu_stream();
+        ctx.ctx
+            .bind_to_thread()
+            .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
+        with_decode_graph(key, |g_opt| {
+            if let Some(g) = g_opt {
+                let prof = std::env::var("FERRUM_GRAPH_PROF").is_ok();
+                let t_pre = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                // Re-upload before each launch. Without it, c=4 throughput
+                // drops 257→178 tok/s (post-Phase-8 measurement). The
+                // graph instantiate-then-upload-once design didn't pan out
+                // empirically; keep the per-replay upload until we
+                // understand why removing it slows things down.
+                let skip_upload =
+                    std::env::var("FERRUM_GRAPH_SKIP_UPLOAD").map_or(false, |v| v == "1");
+                if !skip_upload {
+                    let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
+                    if st_up != sys::CUresult::CUDA_SUCCESS {
+                        return Err(FerrumError::unsupported(format!(
+                            "cuGraphUpload: {st_up:?}"
+                        )));
+                    }
+                }
+                let t_after_upload = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let st = unsafe { sys::cuGraphLaunch(g.cu_graph_exec, cu_stream) };
+                if st != sys::CUresult::CUDA_SUCCESS {
+                    return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
+                }
+                let t_after_launch = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let skip_sync = std::env::var("FERRUM_GRAPH_SKIP_SYNC").map_or(false, |v| v == "1");
+                if !skip_sync {
+                    let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
+                    if st_sync != sys::CUresult::CUDA_SUCCESS {
+                        return Err(FerrumError::unsupported(format!(
+                            "post-launch sync: {st_sync:?}"
+                        )));
+                    }
+                }
+                if let (Some(t0), Some(t1), Some(t2)) = (t_pre, t_after_upload, t_after_launch) {
+                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n.is_multiple_of(64) {
+                        let upload = t1.duration_since(t0).as_micros();
+                        let launch = t2.duration_since(t1).as_micros();
+                        let sync = t2.elapsed().as_micros();
+                        eprintln!(
+                            "[graph-prof] call#{n} upload={upload}us launch={launch}us sync={sync}us total={}us",
+                            t0.elapsed().as_micros()
+                        );
+                    }
+                }
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
     }
 }
 
