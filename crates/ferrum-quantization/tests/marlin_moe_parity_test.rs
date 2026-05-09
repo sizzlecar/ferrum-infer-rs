@@ -72,7 +72,7 @@ mod synth {
 #[ignore]
 fn cuda_marlin_moe_fused_vs_per_expert() {
     use ferrum_kernels::backend::cuda::CudaBackend;
-    use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
+    use ferrum_kernels::backend::{Backend, BackendMoeFused, BackendPagedKv, BackendQuantMarlin};
 
     // Marlin tile constraints: k % 128 == 0, n_per % 64 == 0, n_per % 256 ==
     // 0 for some specs. Use a shape Qwen3-30B-A3B-like: k=2048 hidden,

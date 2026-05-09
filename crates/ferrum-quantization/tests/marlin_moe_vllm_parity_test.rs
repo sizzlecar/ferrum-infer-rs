@@ -66,7 +66,7 @@ mod synth {
 #[ignore]
 fn cuda_marlin_moe_vllm_vs_per_expert() {
     use ferrum_kernels::backend::cuda::CudaBackend;
-    use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
+    use ferrum_kernels::backend::{Backend, BackendMoeFused, BackendPagedKv, BackendQuantMarlin};
 
     let k: usize = 256;
     let n_per: usize = 256;
