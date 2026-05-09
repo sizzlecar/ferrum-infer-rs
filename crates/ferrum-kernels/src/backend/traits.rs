@@ -249,59 +249,9 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// CPU: no-op. Metal: commit + waitUntilCompleted. CUDA: stream sync.
     fn sync(ctx: &mut Self::Context);
 
-    // ── Graph capture / replay (CUDA only) ──────────────────────────────
-    //
-    // Decode-loop optimization: eliminate per-kernel launch overhead by
-    // capturing the full step as a CUDA graph and replaying. CPU/Metal
-    // have no equivalent — defaults return `unsupported`.
-    //
-    // Flow per decode step:
-    //   1. Caller: `set_decode_state(ctx, token, step)` — memcpy to dev bufs
-    //   2. Try `replay_last_graph(ctx)`:
-    //        - Ok(true):  graph replayed, skip eager forward
-    //        - Ok(false): no captured graph yet, run eager
-    //        - Err(_):    not supported, run eager
-    //   3. If running eager and in capture window:
-    //      - `set_dev_state_mode(ctx, true)` so kernels use _dyn variants
-    //      - `begin_graph_capture(ctx)`
-    //      - run forward
-    //      - `end_graph_capture(ctx)` — stores graph on ctx internally
-    //      - `set_dev_state_mode(ctx, false)` — restore scalar kernels
-
-    /// Update per-step dynamic state (token id, step/pos). Fast (3x memcpy).
-    fn set_decode_state(_ctx: &mut Self::Context, _token: u32, _step: u32) {}
-
-    /// Toggle between scalar-arg kernels (normal) and `_dyn` kernels that
-    /// read their dynamic scalar args from device memory (graph-friendly).
-    fn set_dev_state_mode(_ctx: &mut Self::Context, _enable: bool) {}
-
-    /// Begin stream capture. Subsequent kernel launches are recorded into
-    /// a pending graph instead of executing eagerly.
-    fn begin_graph_capture(_ctx: &mut Self::Context) -> Result<()> {
-        Err(FerrumError::unsupported("graph capture not supported"))
-    }
-
-    /// End stream capture and install the captured graph keyed by
-    /// `_key` (opaque caller-chosen u64; the model uses `m_padded` so
-    /// that different batch shapes don't thrash a single slot).
-    fn end_graph_capture(_ctx: &mut Self::Context, _key: u64) -> Result<()> {
-        Err(FerrumError::unsupported("graph capture not supported"))
-    }
-
-    /// Replay the captured graph for `_key`. Returns `Ok(false)` if no
-    /// graph is cached for that key; caller should run eager.
-    fn replay_graph(_ctx: &mut Self::Context, _key: u64) -> Result<bool> {
-        Ok(false)
-    }
-
-    /// Drop the cached graph for `_key` — required when its kernel-arg
-    /// pointers (KV cache, scratch) might no longer be valid. Use
-    /// `reset_all_graphs` when EVERY cached graph should be evicted
-    /// (hard model reload / scratch realloc).
-    fn reset_graph(_ctx: &mut Self::Context, _key: u64) {}
-
-    /// Drop ALL cached graphs — used by hard reset paths.
-    fn reset_all_graphs(_ctx: &mut Self::Context) {}
+    // Graph capability moved to the `BackendGraph` supertrait at the end
+    // of this file. CUDA implements its overrides; Metal/CPU inherit
+    // unsupported defaults via empty `impl BackendGraph for X {}` blocks.
 
     // ── GPTQ (INT4 quantization) ────────────────────────────────────────
     //
@@ -2054,14 +2004,86 @@ pub trait Backend: Send + Sync + Sized + 'static {
     // `gemm_quant(QuantStore)` pair earlier in this trait — same idea,
     // but the store hides the per-kind buffer layout so callers don't
     // have to construct a per-kind `QuantWeights<'_, Self>` packet.)
+}
 
-    // ── TP collective ops (Phase A3 stubs) ──────────────────────────────
-    //
-    // Default impl is single-rank no-op: `world_size = 1`, `rank = 0`, and
-    // the collective ops are identity. Multi-GPU backends (future
-    // CudaBackend + NCCL) override these. Model code can call
-    // `B::all_reduce_sum(...)` unconditionally; single-GPU paths pay zero.
+// ════════════════════════════════════════════════════════════════════════
+// BackendGraph capability (CUDA Graph capture/replay)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Decode-loop optimization: eliminate per-kernel launch overhead by
+// capturing the full step as a CUDA graph and replaying. CPU/Metal have
+// no equivalent — they `impl BackendGraph for X {}` with empty bodies and
+// inherit the unsupported / no-op defaults below.
+//
+// Flow per decode step:
+//   1. Caller: `set_decode_state(ctx, token, step)` — memcpy to dev bufs
+//   2. Try `replay_graph(ctx, key)`:
+//        - Ok(true):  graph replayed, skip eager forward
+//        - Ok(false): no captured graph yet, run eager
+//        - Err(_):    not supported, run eager
+//   3. If running eager and in capture window:
+//      - `set_dev_state_mode(ctx, true)` so kernels use _dyn variants
+//      - `begin_graph_capture(ctx)`
+//      - run forward
+//      - `end_graph_capture(ctx, key)` — stores graph on ctx internally
+//      - `set_dev_state_mode(ctx, false)` — restore scalar kernels
 
+/// Capability-trait for backends that can capture and replay execution as
+/// a graph (CUDA Graph). Models that call these methods bound their
+/// generic on `B: BackendGraph`; backends without graph support
+/// (Metal, CPU) impl this trait with an empty body and inherit
+/// no-op / `unsupported` defaults.
+pub trait BackendGraph: Backend {
+    /// Update per-step dynamic state (token id, step/pos). Fast (3x memcpy).
+    fn set_decode_state(_ctx: &mut Self::Context, _token: u32, _step: u32) {}
+
+    /// Toggle between scalar-arg kernels (normal) and `_dyn` kernels that
+    /// read their dynamic scalar args from device memory (graph-friendly).
+    fn set_dev_state_mode(_ctx: &mut Self::Context, _enable: bool) {}
+
+    /// Begin stream capture. Subsequent kernel launches are recorded into
+    /// a pending graph instead of executing eagerly.
+    fn begin_graph_capture(_ctx: &mut Self::Context) -> Result<()> {
+        Err(FerrumError::unsupported("graph capture not supported"))
+    }
+
+    /// End stream capture and install the captured graph keyed by
+    /// `_key` (opaque caller-chosen u64; the model uses `m_padded` so
+    /// that different batch shapes don't thrash a single slot).
+    fn end_graph_capture(_ctx: &mut Self::Context, _key: u64) -> Result<()> {
+        Err(FerrumError::unsupported("graph capture not supported"))
+    }
+
+    /// Replay the captured graph for `_key`. Returns `Ok(false)` if no
+    /// graph is cached for that key; caller should run eager.
+    fn replay_graph(_ctx: &mut Self::Context, _key: u64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Drop the cached graph for `_key` — required when its kernel-arg
+    /// pointers (KV cache, scratch) might no longer be valid. Use
+    /// `reset_all_graphs` when EVERY cached graph should be evicted
+    /// (hard model reload / scratch realloc).
+    fn reset_graph(_ctx: &mut Self::Context, _key: u64) {}
+
+    /// Drop ALL cached graphs — used by hard reset paths.
+    fn reset_all_graphs(_ctx: &mut Self::Context) {}
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// BackendCollective capability (NCCL / RCCL multi-rank ops)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Tensor-parallel multi-GPU collective ops. CUDA wires these to NCCL via
+// `crate::nccl_comm::NcclRank`; AMD would wire to RCCL similarly. CPU and
+// Metal `impl BackendCollective for X {}` with empty bodies, inheriting
+// single-rank no-ops (world_size=1, rank=0, ops are identity).
+
+/// Capability-trait for backends that support multi-rank collective ops.
+/// Single-GPU backends inherit the no-op defaults: `world_size = 1`,
+/// `rank = 0`, and the collective ops are identity. Multi-rank backends
+/// (CUDA + NCCL today, AMD + RCCL in the future) override these.
+pub trait BackendCollective: Backend {
     fn world_size(_ctx: &Self::Context) -> usize {
         1
     }

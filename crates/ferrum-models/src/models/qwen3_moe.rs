@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::OnceLock;
 
-use ferrum_kernels::backend::{Backend, KvCache};
+use ferrum_kernels::backend::{Backend, BackendGraph, KvCache};
 use ferrum_quantization::WeightLoader;
 use ferrum_types::{FerrumError, Result};
 
@@ -383,7 +383,7 @@ impl<B: Backend> Qwen3MoeScratch<B> {
 /// expert dispatch, and weighted combine all happen inside
 /// [`moe_forward`]; this struct only owns the storage and orchestrates
 /// the per-layer call sequence.
-pub struct Qwen3MoeModel<B: Backend> {
+pub struct Qwen3MoeModel<B: BackendGraph> {
     pub cfg: Qwen3MoeConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -410,7 +410,7 @@ pub struct Qwen3MoeModel<B: Backend> {
     pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
 }
 
-impl<B: Backend> Qwen3MoeModel<B> {
+impl<B: BackendGraph> Qwen3MoeModel<B> {
     /// Build a Qwen3-MoE model from a generic `WeightLoader<B>` plus a
     /// GGUF reader for the experts (which `WeightLoader` doesn't model
     /// directly — its API is rank-2 only).
@@ -2772,7 +2772,7 @@ impl<B: Backend> Qwen3MoeModel<B> {
     }
 }
 
-impl<B: Backend> DecoderOnlyLLM for Qwen3MoeModel<B> {
+impl<B: BackendGraph> DecoderOnlyLLM for Qwen3MoeModel<B> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
