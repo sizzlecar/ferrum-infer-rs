@@ -78,6 +78,7 @@ Three gates — ALL must pass before the refactor is considered done:
 | [#128](https://github.com/sizzlecar/ferrum-infer-rs/pull/128) | PR C | Merge `ferrum-attention` into `ferrum-kernels::attention`. The crate's only consumers were `ferrum-kernels::backend::metal` and `ferrum-models` (Qwen3-TTS); merging removes a duplicated metal feature pass-through and the cudarc-0.12 stub. Two-cudarc-version workspace gone. |
 | [#129](https://github.com/sizzlecar/ferrum-infer-rs/pull/129) | cleanup | Drop dead `LinearFactory` trait + `DefaultLinearFactory` (zero callers anywhere). |
 | [#131](https://github.com/sizzlecar/ferrum-infer-rs/pull/131) | Dim 5 INT8 KV step 1 | CUDA INT8 KV kernels: `paged_decode_attention_int8` (read INT8 + per-token FP16 scale, dequantize on the fly) and `int8_kv_cache_append` (FP16 → per-(token, kv_head) symmetric INT8 + scale). Rust launchers in `ferrum-kernels::int8_kv`. `BackendKvDtype<KvInt8>` marker on `CudaBackend`. Host-reference parity test: cosine 0.99999 vs FP32 ref. |
+| [#132](https://github.com/sizzlecar/ferrum-infer-rs/pull/132) | Dim 5 INT8 KV test | End-to-end append→decode composition test. FP16 K/V → `int8_kv_cache_append` → `paged_decode_attention_int8` → compare against FP32 host reference. Cosine 0.99999, validates the kernel pair composes cleanly with no storage / scale convention drift. |
 
 ### Backend trait shrinkage
 
@@ -222,8 +223,21 @@ Marlin INT4 improvement comes from the Phase 3e/2 cutover — LTO inlines
 `#[cfg]`-branched trait method body. Metal locally: Qwen3-0.6B Q4_K_M
 60.3 tok/s, matches pre-consolidation reading.
 
-**Acceptance gate 3 passes.** Functionality + performance preserved
-through PRs #126-#129. Only Dim 5 INT8 KV kernel work remains.
+**Acceptance gate 3 passes** through PRs #126-#129.
+
+### Post-INT8-KV rerun (Vast 4090, main @ `1d3f3af` after PR #131)
+
+Verifies that adding the INT8 KV kernels did not regress the existing
+FP16 paths (PR #131 is purely additive — new files + one marker impl).
+
+| Model | Path | tok/s e2e (now) | Δ vs post-cleanup | TPOT |
+|---|---|---|---|---|
+| Qwen3-0.6B | FP16 | 81.3 | -0.6% ✅ | 12.30 ms |
+| Llama-3.1-8B-Instruct | GPTQ-Int4 (Marlin) | 62.1 | -1.4% ✅ | 16.09 ms |
+| Qwen3-30B-A3B | GPTQ-Int4 (vLLM Marlin moe, c=4) | 54.4 | -0.9% ✅ | 70.08 ms |
+
+All within ±3% drift (thermal / scheduler noise floor). Functionality
++ performance preserved through Dim 5 step 1.
 
 ## References
 
