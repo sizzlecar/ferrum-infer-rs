@@ -50,6 +50,7 @@ pub mod builder;
 pub mod continuous_engine;
 pub mod embedding_engine;
 pub mod engine;
+pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;
 pub mod registry;
