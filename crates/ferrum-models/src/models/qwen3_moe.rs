@@ -2548,9 +2548,6 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
             let top_k = self.cfg.num_experts_per_tok;
             let n_exp = self.cfg.num_experts;
             let norm_topk_prob = self.cfg.norm_topk_prob;
-            let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
-            let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
-            let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
 
             // Single batched router pass: writes selected_ids_buf [M, top_k]
             // and weights_2d [M, top_k]. Replaces M individual route calls.
@@ -2569,7 +2566,7 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
             // the 4 copy_slice round-trips per iteration that the
             // earlier implementation needed (ids, weights, x_single,
             // moe_out). At c=16 / 48 layers that's ~3,072 dispatches
-            // saved per token. Uses `gemv_quant_moe_id_offset` to read
+            // saved per token. Uses `gemv_*_offset` to read
             // `selected_ids_buf` at the i-th `top_k` block and
             // `norm_out` at the i-th hidden row directly. Falls back
             // to copy_slice path if backend doesn't support offsets.
@@ -2581,11 +2578,10 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
 
                 // Stacked gate / up gemvs — broadcast item i's row of
                 // norm_out across top_k slots, read item i's ids.
-                let gate_res = B::gemv_quant_moe_id_offset(
+                let gate_res = moe_layer.experts.gemv_gate_offset(
                     ctx,
                     &self.scratch.norm_out,
                     activation_offset,
-                    gate_stacked,
                     &self.scratch.selected_ids_buf,
                     ids_offset,
                     &mut self.scratch.gate_out_stacked,
@@ -2619,23 +2615,19 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
                         0,
                         h,
                     );
-                    B::gemv_quant_moe_id(
+                    moe_layer.experts.gemv_gate(
                         ctx,
                         &self.scratch.x_single,
-                        gate_stacked,
                         &self.scratch.ids_buf,
                         &mut self.scratch.gate_out_stacked,
                         top_k,
-                        0,
                     )?;
-                    B::gemv_quant_moe_id(
+                    moe_layer.experts.gemv_up(
                         ctx,
                         &self.scratch.x_single,
-                        up_stacked,
                         &self.scratch.ids_buf,
                         &mut self.scratch.up_out_stacked,
                         top_k,
-                        0,
                     )?;
                     B::silu_mul_stacked(
                         ctx,
@@ -2645,10 +2637,9 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
                         top_k,
                         inter,
                     )?;
-                    B::gemv_quant_moe_id(
+                    moe_layer.experts.gemv_down(
                         ctx,
                         &self.scratch.silu_stacked,
-                        down_stacked,
                         &self.scratch.ids_buf,
                         &mut self.scratch.down_out_stacked,
                         top_k,
@@ -2674,11 +2665,10 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
                     continue;
                 }
                 // Fast path: offset-aware all the way through.
-                B::gemv_quant_moe_id_offset(
+                moe_layer.experts.gemv_up_offset(
                     ctx,
                     &self.scratch.norm_out,
                     activation_offset,
-                    up_stacked,
                     &self.scratch.selected_ids_buf,
                     ids_offset,
                     &mut self.scratch.up_out_stacked,
@@ -2693,11 +2683,10 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
                     top_k,
                     inter,
                 )?;
-                B::gemv_quant_moe_id_offset(
+                moe_layer.experts.gemv_down_offset(
                     ctx,
                     &self.scratch.silu_stacked,
                     0, // silu_stacked itself stays at offset 0 each iter
-                    down_stacked,
                     &self.scratch.selected_ids_buf,
                     ids_offset,
                     &mut self.scratch.down_out_stacked,
