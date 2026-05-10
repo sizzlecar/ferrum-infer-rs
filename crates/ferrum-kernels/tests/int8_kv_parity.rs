@@ -467,3 +467,135 @@ fn int8_kv_append_then_decode_e2e() {
     let rel_to_mag = max_abs / max_mag.max(1e-6);
     assert!(rel_to_mag < 0.02, "rel-to-max-mag too high: {rel_to_mag}");
 }
+
+/// Same flow as `int8_kv_append_then_decode_e2e` but driven through
+/// the `KvCacheQuant<CudaBackend, KvInt8>` abstraction (constructor +
+/// typed buffers). This is what a model decode loop would use — it
+/// no longer touches cudarc primitives directly.
+#[test]
+#[ignore]
+fn kv_cache_quant_int8_e2e() {
+    use ferrum_kernels::backend::{KvCacheQuant, KvInt8};
+
+    const NUM_HEADS: usize = 8;
+    const NUM_KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 128;
+    const BLOCK_SIZE: usize = 16;
+    const VALID_KV_LEN: usize = 64;
+    const MAX_BLOCKS: usize = 8;
+
+    let mut rng = 0xCAFE_FACEu64;
+
+    // Random Q + K/V tokens (FP16 inputs).
+    let q_n = NUM_HEADS * HEAD_DIM;
+    let q_data: Vec<f32> = (0..q_n).map(|_| rnd(&mut rng) * 0.5).collect();
+    let kv_in_n = VALID_KV_LEN * NUM_KV_HEADS * HEAD_DIM;
+    let k_in_data: Vec<f32> = (0..kv_in_n).map(|_| rnd(&mut rng) * 0.3).collect();
+    let v_in_data: Vec<f32> = (0..kv_in_n).map(|_| rnd(&mut rng) * 0.3).collect();
+
+    let slot_mapping: Vec<i32> = (0..VALID_KV_LEN as i32).collect();
+
+    // Block table: identity (logical i → physical i) for the first
+    // ceil(VALID_KV_LEN/BLOCK_SIZE) blocks.
+    let block_table: Vec<i32> = (0..MAX_BLOCKS as i32).collect();
+
+    // Host reference (FP32, no quant).
+    let pool_tokens = MAX_BLOCKS * BLOCK_SIZE;
+    let mut k_pool_ref = vec![0f32; pool_tokens * NUM_KV_HEADS * HEAD_DIM];
+    let mut v_pool_ref = vec![0f32; pool_tokens * NUM_KV_HEADS * HEAD_DIM];
+    for t in 0..VALID_KV_LEN {
+        let slot = slot_mapping[t] as usize;
+        for h in 0..NUM_KV_HEADS {
+            for d in 0..HEAD_DIM {
+                let in_off = (t * NUM_KV_HEADS + h) * HEAD_DIM + d;
+                let pool_off = slot * NUM_KV_HEADS * HEAD_DIM + h * HEAD_DIM + d;
+                k_pool_ref[pool_off] = k_in_data[in_off];
+                v_pool_ref[pool_off] = v_in_data[in_off];
+            }
+        }
+    }
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let out_ref = host_ref_paged_decode(
+        &q_data,
+        &k_pool_ref,
+        &v_pool_ref,
+        &block_table,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        VALID_KV_LEN,
+        BLOCK_SIZE,
+        scale,
+    );
+
+    // Drive the GPU side through the high-level KvCacheQuant cache.
+    let mut cache: KvCacheQuant<CudaBackend, KvInt8> =
+        KvCacheQuant::new_paged_cuda(MAX_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM);
+
+    let ctx_handle = CudaContext::new(0).expect("CUDA context");
+    let stream = ctx_handle.default_stream();
+
+    // Upload the FP16 K/V tokens + Q + slot mapping + block table.
+    let q_dev = CudaBackend::from_slice(&q_data);
+    let k_in_dev = CudaBackend::from_slice(&k_in_data);
+    let v_in_dev = CudaBackend::from_slice(&v_in_data);
+    let slot_dev = stream.memcpy_stod(&slot_mapping).unwrap();
+    let bt_dev = stream.memcpy_stod(&block_table).unwrap();
+
+    // Append.
+    launch_int8_kv_cache_append(
+        &ctx_handle,
+        &k_in_dev,
+        &v_in_dev,
+        cache.k.buffer_mut(),
+        cache.v.buffer_mut(),
+        cache.k_scales.buffer_mut(),
+        cache.v_scales.buffer_mut(),
+        &slot_dev,
+        VALID_KV_LEN,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+    )
+    .expect("kv append (cache)");
+
+    // Decode.
+    let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
+    launch_int8_paged_decode_attention(
+        &ctx_handle,
+        &q_dev,
+        cache.k.buffer(),
+        cache.v.buffer(),
+        cache.k_scales.buffer(),
+        cache.v_scales.buffer(),
+        &bt_dev,
+        &mut out_dev,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        VALID_KV_LEN,
+        BLOCK_SIZE,
+        scale,
+    )
+    .expect("int8 paged decode (cache)");
+    stream.synchronize().unwrap();
+
+    let out_int8: Vec<f32> = CudaBackend::to_vec(&out_dev, NUM_HEADS * HEAD_DIM);
+
+    let mut sum_a = 0f64;
+    let mut sum_b = 0f64;
+    let mut dot = 0f64;
+    let mut max_abs = 0f32;
+    let mut max_mag = 0f32;
+    for i in 0..out_ref.len() {
+        max_abs = max_abs.max((out_int8[i] - out_ref[i]).abs());
+        max_mag = max_mag.max(out_ref[i].abs());
+        sum_a += (out_ref[i] as f64) * (out_ref[i] as f64);
+        sum_b += (out_int8[i] as f64) * (out_int8[i] as f64);
+        dot += (out_ref[i] as f64) * (out_int8[i] as f64);
+    }
+    let cosine = dot / (sum_a.sqrt() * sum_b.sqrt() + 1e-12);
+    eprintln!(
+        "KvCacheQuant<CudaBackend, KvInt8> e2e: cos={cosine:.5} max|diff|={max_abs:.5} (mag={max_mag:.4})"
+    );
+    assert!(cosine > 0.999, "cosine similarity too low: {cosine}");
+}
