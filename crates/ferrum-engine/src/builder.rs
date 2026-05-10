@@ -11,8 +11,8 @@
 use crate::registry::{ComponentConfig, ComponentRegistry};
 use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_interfaces::{
-    ComputeBackend, KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler,
-    TensorFactory, Tokenizer,
+    KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, TensorFactory,
+    Tokenizer,
 };
 use ferrum_types::{EngineConfig, FerrumError, Result, SchedulingPolicy};
 use std::sync::Arc;
@@ -36,8 +36,6 @@ pub struct EngineBuilder {
     kv_cache_name: Option<String>,
     /// Override: custom executor name
     executor_name: Option<String>,
-    /// Pre-created backend (skip factory)
-    custom_backend: Option<Arc<dyn ComputeBackend>>,
     /// Pre-created tokenizer (skip factory)
     custom_tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
     /// Pre-created sampler (skip factory)
@@ -67,7 +65,6 @@ impl EngineBuilder {
             scheduler_name: None,
             kv_cache_name: None,
             executor_name: None,
-            custom_backend: None,
             custom_tokenizer: None,
             custom_sampler: None,
             custom_scheduler: None,
@@ -140,28 +137,6 @@ impl EngineBuilder {
     pub fn with_custom_executor(mut self, executor: Arc<dyn ModelExecutor + Send + Sync>) -> Self {
         self.custom_executor = Some(executor);
         self
-    }
-
-    /// Determine which backend to use based on config and overrides
-    fn resolve_backend_name(&self) -> String {
-        if let Some(ref name) = self.backend_name {
-            return name.clone();
-        }
-
-        // Derive from config
-        match self.config.backend.backend_type {
-            ferrum_types::BackendType::Candle => "candle".to_string(),
-            ferrum_types::BackendType::OnnxRuntime => "onnx".to_string(),
-            ferrum_types::BackendType::TensorRT => "tensorrt".to_string(),
-            ferrum_types::BackendType::Custom => self
-                .config
-                .backend
-                .backend_options
-                .get("backend_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("candle")
-                .to_string(),
-        }
     }
 
     /// Determine which tokenizer to use based on config and overrides
@@ -239,7 +214,6 @@ impl EngineBuilder {
         );
 
         // Pre-compute all component names before consuming self
-        let backend_name = self.resolve_backend_name();
         let tokenizer_name = self.resolve_tokenizer_name();
         let sampler_name = self.resolve_sampler_name();
         let scheduler_name = self.resolve_scheduler_name();
@@ -252,26 +226,16 @@ impl EngineBuilder {
         let registry = self.registry.clone();
         let config = self.config;
 
-        // Extract custom components
-        let custom_backend = self.custom_backend;
+        // Extract custom components. Phase 3e+ deleted the legacy
+        // `ComputeBackend` trait, so there's no "backend" component to
+        // build here — real GPU dispatch goes through `Backend<B>` in
+        // `ferrum-kernels`. The stub executor now wires
+        // `CandleTensorFactory` directly from the registry.
         let custom_tokenizer = self.custom_tokenizer;
         let custom_sampler = self.custom_sampler;
         let custom_scheduler = self.custom_scheduler;
         let custom_kv_cache = self.custom_kv_cache;
         let custom_executor = self.custom_executor;
-
-        // 1. Create or use provided backend (not used directly but may be needed for executor)
-        let _backend = if let Some(backend) = custom_backend {
-            debug!("Using custom backend");
-            Some(backend)
-        } else {
-            debug!("Creating backend: {}", backend_name);
-            Some(
-                registry
-                    .create_backend(&backend_name, &component_config)
-                    .await?,
-            )
-        };
 
         // 2. Create or use provided tokenizer
         let tokenizer = if let Some(tokenizer) = custom_tokenizer {
@@ -482,7 +446,6 @@ mod tests {
         let config = EngineConfig::default();
         let builder = EngineBuilder::new(config);
 
-        assert_eq!(builder.resolve_backend_name(), "candle");
         assert_eq!(builder.resolve_sampler_name(), "multinomial");
         // Default SchedulerConfig uses Priority policy
         assert_eq!(builder.resolve_scheduler_name(), "priority");

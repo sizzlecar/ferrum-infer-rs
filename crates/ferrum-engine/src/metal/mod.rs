@@ -16,8 +16,6 @@ mod context;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 mod error;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub mod metal_kernel_ops;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_model;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod quantization;
@@ -34,8 +32,6 @@ pub use compute_pipeline::*;
 pub use context::MetalContext;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use error::MetalError;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub use metal_kernel_ops::MetalKernelOps;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_model::*;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]

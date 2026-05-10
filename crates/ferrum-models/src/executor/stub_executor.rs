@@ -6,7 +6,7 @@ use ferrum_interfaces::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
         ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
     },
-    BlockTable, ComputeBackend, KvCacheHandle, ModelExecutor,
+    BlockTable, KvCacheHandle, ModelExecutor, TensorFactory,
 };
 use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use std::sync::Arc;
@@ -17,14 +17,14 @@ use tracing::debug;
 /// Returns dummy outputs to allow pipeline testing without real models.
 pub struct StubModelExecutor {
     info: ModelInfo,
-    compute_backend: Arc<dyn ComputeBackend>,
+    tensor_factory: Arc<dyn TensorFactory>,
 }
 
 impl StubModelExecutor {
     pub fn new(
         model_id: impl Into<ferrum_types::ModelId>,
         vocab_size: usize,
-        compute_backend: Arc<dyn ComputeBackend>,
+        tensor_factory: Arc<dyn TensorFactory>,
     ) -> Self {
         let info = ModelInfo {
             model_id: model_id.into(),
@@ -47,7 +47,7 @@ impl StubModelExecutor {
 
         Self {
             info,
-            compute_backend,
+            tensor_factory,
         }
     }
 }
@@ -66,8 +66,7 @@ impl ModelExecutor for StubModelExecutor {
         debug!("Stub prefill: batch={}, seq_len={}", batch_size, seq_len);
 
         // Create dummy logits
-        let factory = self.compute_backend.tensor_factory();
-        let logits = factory.zeros(
+        let logits = self.tensor_factory.zeros(
             &[batch_size, seq_len, vocab_size],
             DataType::FP32,
             &self.info.device,
@@ -89,8 +88,7 @@ impl ModelExecutor for StubModelExecutor {
 
         debug!("Stub decode: batch={}", batch_size);
 
-        let factory = self.compute_backend.tensor_factory();
-        let logits = factory.zeros(&[batch_size, vocab_size], DataType::FP32, &self.info.device)?;
+        let logits = self.tensor_factory.zeros(&[batch_size, vocab_size], DataType::FP32, &self.info.device)?;
 
         Ok(DecodeOutput::new(logits, input.kv_cache.clone()))
     }

@@ -10,7 +10,7 @@
 
 #![cfg(feature = "cuda")]
 
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, BackendMoeFused};
 
 const NUM_EXPERTS: usize = 128;
 const TOP_K: usize = 8;
@@ -108,7 +108,7 @@ fn moe_align_matches_reference_qwen3moe_shape() {
         <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_u32(sorted_max / BLOCK_SIZE);
     let mut total_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_u32(1);
 
-    <ferrum_kernels::backend::cuda::CudaBackend as Backend>::moe_align_block_size(
+    <ferrum_kernels::backend::cuda::CudaBackend as BackendMoeFused>::moe_align_block_size(
         &mut ctx,
         &expert_ids_dev,
         &mut sorted_dev,

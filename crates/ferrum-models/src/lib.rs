@@ -18,7 +18,6 @@
 
 pub mod architectures;
 pub mod audio_processor;
-pub mod builder;
 pub mod common;
 pub mod definition;
 pub mod executor;
@@ -36,10 +35,8 @@ pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;
 pub mod tokenizer;
-pub mod weights;
 
 pub use architectures::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
-pub use builder::{DefaultModelBuilderFactory, SimpleModelBuilder};
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
@@ -58,9 +55,8 @@ pub use source::{
 };
 pub use tensor_wrapper::CandleTensorWrapper;
 pub use tokenizer::{TokenizerFactory, TokenizerHandle};
-pub use weights::{default_weight_loader, StubWeightLoader, WeightLoaderHandle};
 
-pub use ferrum_interfaces::{ModelBuilder, ModelExecutor, WeightLoader};
+pub use ferrum_interfaces::ModelExecutor;
 pub use ferrum_types::{
     Activation, AttentionConfig, ModelConfig, ModelInfo, ModelType, NormType, Result, RopeScaling,
 };

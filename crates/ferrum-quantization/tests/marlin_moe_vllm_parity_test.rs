@@ -67,6 +67,9 @@ mod synth {
 fn cuda_marlin_moe_vllm_vs_per_expert() {
     use ferrum_kernels::backend::cuda::CudaBackend;
     use ferrum_kernels::backend::{Backend, BackendMoeFused, BackendPagedKv, BackendQuantMarlin};
+    use ferrum_quantization::gptq::StackedExpertLinear;
+    use ferrum_quantization::Linear;
+    use std::sync::Arc;
 
     let k: usize = 256;
     let n_per: usize = 256;
@@ -110,6 +113,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
     .expect("stacked load_gptq (IST-DASLab format, ref path)");
+    let stacked = Arc::new(stacked);
 
     let a_data: Vec<f32> = (0..total_tokens * k)
         .map(|i| ((i as f32) * 0.0027).sin())
@@ -146,16 +150,16 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         // expert 0, so the reference must also use expert 0 weights for
         // all rows (same offset for every expert).
         let weight_expert = if force_expert0 { 0 } else { e };
-        <CudaBackend as BackendQuantMarlin>::gemm_gptq_with_offset(
-            &mut ctx,
-            &a_e_dev,
-            &stacked,
+        // Phase 3e/2 deleted gemm_gptq_with_offset; the per-expert
+        // reference now goes through the StackedExpertLinear view.
+        let view = StackedExpertLinear::<CudaBackend>::new(
+            stacked.clone(),
             weight_expert * n_per,
             n_per,
-            &mut out_e_dev,
-            m_e,
+            k,
         )
-        .expect("gemm_gptq_with_offset");
+        .expect("StackedExpertLinear::new");
+        view.forward(&mut ctx, &a_e_dev, &mut out_e_dev, m_e);
         <CudaBackend as Backend>::sync(&mut ctx);
         let out_e = CudaBackend::to_vec(&out_e_dev, m_e * n_per);
         c_ref[row_start * n_per..(row_start + m_e) * n_per].copy_from_slice(&out_e);

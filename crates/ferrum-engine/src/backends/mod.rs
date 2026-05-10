@@ -1,13 +1,9 @@
-//! Candle-tied `ComputeBackend` implementations.
-//!
-//! Moved from the (deleted) `ferrum-runtime` crate in Phase 5b/2. Only
-//! the candle path stays here — the legacy CPU `ComputeBackend` impl
-//! had no consumers and was dropped with the move. New backends should
-//! implement `ferrum_kernels::backend::Backend<B>` (the production
-//! abstraction), not `ComputeBackend`.
+//! Candle-tied tensor factory used by the registry's stub-executor
+//! factory. Phase 3e+ deleted the legacy `ComputeBackend` trait, so the
+//! once-bigger `CandleBackend` shrank to just the `CandleTensorFactory`
+//! that mints dummy logits. Real GPU dispatch goes through
+//! `ferrum_kernels::backend::Backend<B>`.
 
 pub mod candle;
-pub mod candle_kernel_ops;
 
-pub use self::candle::{CandleBackend, CandleTensor, CandleTensorFactory, CandleTensorOps};
-pub use self::candle_kernel_ops::CandleKernelOps;
+pub use self::candle::{CandleTensor, CandleTensorFactory, CandleTensorOps};
