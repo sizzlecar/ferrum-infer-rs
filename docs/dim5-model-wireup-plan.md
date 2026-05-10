@@ -154,29 +154,31 @@ After PR C lands, FP8 follows the same pattern:
 ## Roll-out timeline
 
 ```
-this session (done):
-  PR A — WeightFormat enum + factory rename (#141)
-
-next session 1:
-  PR B — model K parameter, FP16-only (1 day)
-  Validates: structural change is safe (zero behavior change)
-
-next session 2:
-  PR C — INT8 KV model integration (1-2 days)
-  Validates: INT8 path runs, parity holds, VRAM savings measurable
+2026-05-10 (landed):
+  PR A — WeightFormat enum + factory rename (#141) ✅
+  PR B — model K parameter, FP16-only (#143) ✅
+         CUDA Qwen3-0.6B FP16 +0.5%, 30B-A3B GPTQ-Int4 c=4 -1.6% — within 3%.
+  PR C — INT8 KV model integration (#144) ✅
+         + KvLayer<B>: KvDtypeKind trait pivot (replaced LayerKvCache enum)
+         + DecoderOnlyLLM impl split (K=KvFp16 full / K=KvInt8 minimal)
+         + CLI source_resolver (run/serve/bench unified)
+         INT8 functional on CUDA: Qwen3-0.6B 43.6 tok/s, TPOT 22.89ms.
 
 session 3+ (deferred):
-  PR D — FP8 KV (2-3 days)
-  Optional, only when FP8 deployment hardware (SM ≥ 8.9) is available
+  PR D — perf + FP8 KV
+  - INT8 TPOT within 5% of FP16 (currently 49% of FP16; gap is in
+    `int8_paged_decode_attention.cu` per-token dequant on the read path —
+    needs a tiled / shmem-cached version closer to vLLM's INT8 KV attn).
+  - INT8 batched + unified forward paths (currently sequential-only;
+    engine falls back to per-item).
+  - INT8 perplexity ≤ 1% delta vs FP16 on wikitext-8doc (not measured).
+  - FP8 KV (KvFp8 KvLayer impl, SM ≥ 8.9 kernels).
+  - `run_gguf_one_shot` 1089-line bypass removal (REPL/sampling helpers
+    onto engine path).
 ```
 
 ## What completion means
 
-Dim 5 status moves from `🟡 structural done, model wire-up pending` to `✅ done` when **all four** of:
+Dim 5 status moves from `🟡 structural done, model wire-up pending` to `🟢 functional done, perf parity pending` after PR #144. The INT8 KV CUDA path runs end-to-end and the `apply_kv_dtype_override` Int8 reject branch is gone. The remaining gates — INT8 TPOT within 5% of FP16 and perplexity ≤ 1% — are open under PR D.
 
-1. PR B + PR C land
-2. CUDA Qwen3 / Llama bench passes with `--kv-dtype int8` end-to-end
-3. INT8 perplexity ≤ 1% delta vs FP16 on wikitext-8doc eval
-4. The `apply_kv_dtype_override` Int8 reject branch is gone
-
-PR D (FP8) is a nice-to-have, not part of the Dim 5 closure criterion (FP8 needs newer hardware than the validated Dim 5 INT8 CUDA path).
+PR D (FP8) is a nice-to-have separate from the INT8 perf closure; it needs newer hardware (SM ≥ 8.9) than the validated Dim 5 INT8 CUDA path.
