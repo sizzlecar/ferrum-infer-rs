@@ -90,13 +90,16 @@ pub use builder::{create_engine, EngineBuilder};
 
 // Re-exports of registry
 pub use registry::{
-    global_registry, set_global_registry, CandleExecutorFactory,
-    ComponentConfig, ComponentFactory, ComponentMetadata, ComponentRegistry,
-    ContinuousBatchSchedulerFactory, DefaultKvCacheFactory, FifoSchedulerFactory, GreedySampler,
-    GreedySamplerFactory, HuggingFaceTokenizerFactory, MultinomialSamplerFactory,
-    PagedKvCacheFactory, PrioritySchedulerFactory, StubExecutorFactory, StubTokenizer,
-    StubTokenizerFactory,
+    global_registry, set_global_registry, ComponentConfig, ComponentFactory, ComponentMetadata,
+    ComponentRegistry, ContinuousBatchSchedulerFactory, DefaultKvCacheFactory,
+    FifoSchedulerFactory, GreedySampler, GreedySamplerFactory, HuggingFaceTokenizerFactory,
+    LlmExecutorFactory, MultinomialSamplerFactory, PagedKvCacheFactory, PrioritySchedulerFactory,
+    StubExecutorFactory, StubTokenizer, StubTokenizerFactory,
 };
+
+// Back-compat alias for the renamed factory (PR A).
+#[allow(deprecated)]
+pub use registry::CandleExecutorFactory;
 
 // Re-exports of parallel module
 pub use parallel::{

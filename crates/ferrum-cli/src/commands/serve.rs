@@ -89,7 +89,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // an alias resolving to a GGUF (e.g. `qwen3:8b-q4_k_m`), look up the
     // file in the HF cache (or accept the path) and skip
     // `ConfigManager::load_from_path` (which expects an HF safetensors
-    // directory). The engine's CandleExecutorFactory +
+    // directory). The engine's LlmExecutorFactory +
     // HuggingFaceTokenizerFactory both detect `.gguf` and route to
     // GgufLoader + sibling-tokenizer auto-discovery.
     let cache_dir_for_gguf = get_hf_cache_dir(&config);
@@ -239,7 +239,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // Detect architecture to choose engine type. For GGUF we skip
     // ConfigManager::load_from_path (which expects HF safetensors layout)
     // and route directly to the continuous-batching LLM engine — the
-    // engine's CandleExecutorFactory branches to GgufLoader internally.
+    // engine's LlmExecutorFactory uses WeightFormat::detect() to route GGUF.
     println!();
     let arch_for_dispatch: Option<ferrum_models::Architecture> = if gguf_path.is_some() {
         None

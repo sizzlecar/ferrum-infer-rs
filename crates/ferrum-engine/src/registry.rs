@@ -169,7 +169,7 @@ impl ComponentRegistry {
 
         // Executor factories
         self.register_executor_factory("stub", Arc::new(StubExecutorFactory));
-        self.register_executor_factory("candle", Arc::new(CandleExecutorFactory));
+        self.register_executor_factory("llm", Arc::new(LlmExecutorFactory));
 
         debug!(
             "Registered factories - tokenizers: {:?}, samplers: {:?}, schedulers: {:?}, kv_caches: {:?}, executors: {:?}",
@@ -834,15 +834,33 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
 }
 
 /// Candle executor factory
-pub struct CandleExecutorFactory;
+/// Builds a [`ModelExecutor`] from a resolved model path. Despite the
+/// historical "candle" name (PR #127 deleted the legacy `CandleBackend`
+/// trait), this factory now produces real `Backend<B>`-based executors
+/// for LLMs (LlamaFamilyModel / Qwen3MoeModel) and candle-based
+/// executors for embedding / multimodal / ASR (Bert, CLIP, Whisper).
+///
+/// The factory dispatches over Dim 1 (architecture) and Dim 3
+/// (weight format = safetensors vs gguf). Dim 4 (device) and Dim 5 (kv
+/// dtype) currently match by `match config.device { ... }` arms inside
+/// the per-architecture branches; flattening those into a single
+/// `(device, kv_dtype) → build_llm::<B, K>` cascade lands in PR B
+/// alongside the model-side `K: KvDtypeKind` parameter.
+pub struct LlmExecutorFactory;
+
+/// Back-compat alias; retained so external test fixtures referencing
+/// the old name continue to compile while we sweep call sites.
+#[deprecated(note = "use `LlmExecutorFactory` (renamed PR A — Dim 1/3 cleanup)")]
+pub type CandleExecutorFactory = LlmExecutorFactory;
 
 #[async_trait]
-impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFactory {
+impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFactory {
     async fn create(
         &self,
         config: &ComponentConfig,
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
         use candle_core::{DType, Device as CandleDevice};
+        use ferrum_models::weight_format::WeightFormat;
 
         // Try to load model from path
         let model_path = config
@@ -857,25 +875,34 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
             }
         };
 
-        info!("Loading Candle model from: {}", model_path);
+        // Dim 3 dispatch — peer-level enum (no GGUF special-case at the
+        // top of an architecture cascade). Adding a new format (AWQ /
+        // EXL2 / HQQ) means a new `WeightFormat` variant + a matching
+        // `WeightLoader<B>` impl in `ferrum-quantization`.
+        let weight_fmt = WeightFormat::detect(std::path::Path::new(&model_path))?;
+        info!(
+            "Loading model from {} (format: {})",
+            model_path,
+            weight_fmt.label()
+        );
 
-        // GGUF fast path — `model_path` points directly at a `.gguf` file.
-        // Bypass the safetensors `ConfigManager::load_from_path` (which
-        // expects an HF directory layout) and route through ferrum's own
-        // GgufLoader to build a `LlamaFamilyModel` / `Qwen3MoeModel`. The
-        // resulting `DecoderOnlyLLM` plugs into `LlmExecutor` exactly like
-        // the safetensors path, so the rest of the engine is unchanged.
-        if ferrum_models::gguf_engine_loader::is_gguf_path(&model_path) {
-            info!("  Detected GGUF file — using GgufLoader path");
+        if let WeightFormat::Gguf { ref path } = weight_fmt {
+            // GGUF goes through its own loader — single-file format with
+            // architecture + tokenizer baked in, no separate config.json
+            // step. Output is a `Box<dyn DecoderOnlyLLM>` that plugs into
+            // the same LlmExecutor as the safetensors path, so the rest of
+            // the engine is unchanged.
             let (llm, model_info) = ferrum_models::gguf_engine_loader::load_gguf_decoder_with_info(
-                std::path::Path::new(&model_path),
+                path,
                 &config.device,
                 config.engine_config.model.model_id.clone(),
             )?;
             return Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)));
         }
 
-        // Load model definition
+        // Safetensors path — re-use ConfigManager to extract Architecture
+        // + dims from `config.json`, then dispatch over Dim 1 (arch) +
+        // Dim 4 (device) below.
         let mut config_manager = ferrum_models::ConfigManager::new();
         let model_def = config_manager
             .load_from_path(std::path::Path::new(&model_path))
@@ -1144,15 +1171,24 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
 
     fn metadata(&self) -> ComponentMetadata {
         ComponentMetadata {
-            name: "candle".to_string(),
-            version: "0.1.0".to_string(),
-            description: "Candle-based model executor".to_string(),
+            name: "llm".to_string(),
+            version: "0.2.0".to_string(),
+            description:
+                "LLM executor (LlamaFamily / Qwen3MoE via Backend<B>; \
+                 BERT / CLIP / Whisper via candle)"
+                    .to_string(),
             supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec![
                 "llama".to_string(),
                 "qwen2".to_string(),
                 "qwen3".to_string(),
+                "qwen3_moe".to_string(),
+                "mistral".to_string(),
+                "bert".to_string(),
                 "clip".to_string(),
+                "whisper".to_string(),
+                "safetensors".to_string(),
+                "gguf".to_string(),
                 "fp16".to_string(),
                 "fp32".to_string(),
             ],
