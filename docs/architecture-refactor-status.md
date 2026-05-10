@@ -81,6 +81,9 @@ Three gates — ALL must pass before the refactor is considered done:
 | [#132](https://github.com/sizzlecar/ferrum-infer-rs/pull/132) | Dim 5 INT8 KV test | End-to-end append→decode composition test. FP16 K/V → `int8_kv_cache_append` → `paged_decode_attention_int8` → compare against FP32 host reference. Cosine 0.99999, validates the kernel pair composes cleanly with no storage / scale convention drift. |
 | [#134](https://github.com/sizzlecar/ferrum-infer-rs/pull/134) | Dim 5 type system | `BackendKvDtype<K>` gains `type KvBuffer` + `type KvScales` associated types; for K=KvFp16 they resolve to `Self::Buffer` / `()` (zero-cost), for K=KvInt8 on CudaBackend they resolve to `OptionalCudaInt8` / `OptionalCudaScalesF16`. New parallel `KvCacheQuant<B, K>` struct uses the associated types — leaves the FP16 `KvCache<B, K>` field shape unchanged (no callsite churn). |
 | [#135](https://github.com/sizzlecar/ferrum-infer-rs/pull/135) | Dim 5 INT8 cache abstraction | `KvCacheQuant<CudaBackend, KvInt8>::new_paged_cuda(...)` one-call constructor: K/V int8 pool + FP16 scales + block_table + context_lens. New e2e parity test `kv_cache_quant_int8_e2e` drives append→decode through the cache abstraction (no direct cudarc allocs) — cos 0.99999. |
+| [#137](https://github.com/sizzlecar/ferrum-infer-rs/pull/137) | post-audit polish | Rename `ferrum-engine/src/backends/` → `tensor_factory/`. After PR #127 the directory contained only `CandleTensorFactory`; the old name mis-suggested engine-level backend dispatch lives there (real dispatch is in `ferrum-kernels::backend`). |
+| [#138](https://github.com/sizzlecar/ferrum-infer-rs/pull/138) | post-audit polish | Drop dead `EngineBuilder::backend_name` field + `with_backend()` (zero callers after the resolve_backend_name delete). Reword stale "Phase D/E" comments in `registry.rs` to reflect the current state — TP>1 is the only remaining unsupported feature, framed as a feature port not a "Phase" stage. |
+| [#139](https://github.com/sizzlecar/ferrum-infer-rs/pull/139) | Dim 5 CLI scaffolding | `ferrum_types::config::KvCacheDtype` enum (Fp16/Bf16/Int8/Fp8) + `KvCacheConfig.dtype` field. `--kv-dtype DTYPE` flag on `run` / `serve` / `bench` + `FERRUM_KV_DTYPE` env. `apply_kv_dtype_override` helper rejects Int8 / Fp8 with a helpful message until model wire-up ships. Hand-tested on Metal: fp16 runs, int8 errors cleanly, bad value rejects with options listed. |
 
 ### Backend trait shrinkage
 
@@ -93,11 +96,25 @@ Three gates — ALL must pass before the refactor is considered done:
 | 3e/2 (#123) | ~30 | -2 (gemm_gptq + gemm_gptq_with_offset; +make_stacked_expert_linear) |
 | 3e/3 (#124) | ~29 | -1 (gemm_quant; load_quant return type changed) |
 
+### CLI / serve startup → 5-dim implementation matching
+
+`ferrum run / serve / bench <model>` boots through
+`CandleExecutorFactory::create()` (see `ferrum-engine/src/registry.rs`).
+That function performs the 5-dim selection in one cascaded match:
+
+| Dim | Match site | Status |
+|---|---|---|
+| 1. Model arch | `match model_def.architecture` (Llama / Qwen2 / Qwen3 / Qwen3Moe / Mistral) → `LlamaFamilyModel<B>` or `Qwen3MoeModel<B>` | ✅ wired |
+| 2. Compute precision | implicit via `Linear<B>` polymorphism. The loader's `load_linear()` returns the right impl (Dense f16 vs Marlin int4 vs GGUF q4_k) per tensor metadata. | ✅ wired |
+| 3. Weight format | `is_gguf_path(&model_path)` → `GgufLoader<B>`; else `NativeSafetensorsLoader<B>` (which auto-detects `.qweight` → `B::load_gptq`) | ✅ wired |
+| 4. Inference device | `match config.device` → CPU/CUDA/Metal → static `<B>` type parameter | ✅ wired |
+| 5. KV cache precision | `engine_config.kv_cache.dtype` field is in place (PR #139); CLI/env override plumbed. The factory currently only constructs `KvCache<B, KvFp16>` paths — Int8/Fp8 rejected at the CLI layer with a clear error pointing at the pending wire-up. | 🟡 config plumbed, model wire-up pending |
+
 ### Remaining work (feature, not architecture)
 
 | Phase | Scope | Risk | Estimate |
 |---|---|---|---|
-| INT8 KV — model integration | Generic `LlamaFamilyModel<B, K>` over `K: KvDtypeKind`, hold `KvCacheQuant<B, KvInt8>` when K=KvInt8, branch the append + paged-decode call sites in the per-layer forward on K. Behind `FERRUM_INT8_KV=1` env var. Parity bench against FP16 baseline. | Low (kernels + cache + tests all validated) | 1 day. |
+| INT8 KV — model integration | Generic `LlamaFamilyModel<B, K>` over `K: KvDtypeKind`, hold `KvCacheQuant<B, KvInt8>` when K=KvInt8 (or use a `Vec<InternalKvCache<B>>` enum sidestep), branch the append + paged-decode call sites in the per-layer forward on K. Read `engine_config.kv_cache.dtype` in `CandleExecutorFactory` to pick the K. Drop the Int8 reject branch in `apply_kv_dtype_override`. Parity bench against FP16 baseline. | Medium (touches model struct + per-layer forward across 4 model files) | 1 day. |
 | FP8 KV | Add `paged_decode_attention_fp8` + `fp8_kv_cache_append` mirroring the INT8 pair (use `__nv_fp8_e4m3` storage and per-token f8 scale). Marker impl `BackendKvDtype<KvFp8>` on CudaBackend. | Medium (FP8 needs SM ≥ 8.9) | 1-2 days. |
 
 ## GPU testing workflow (Vast.ai 4090)
