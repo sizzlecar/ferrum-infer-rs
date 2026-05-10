@@ -347,7 +347,7 @@ impl EngineBuilder {
 
         // Create TensorFactory for the configured device
         let tensor_factory: Arc<dyn TensorFactory> = Arc::new(
-            crate::backends::candle::CandleTensorFactory::new(config.backend.device.clone()),
+            crate::tensor_factory::candle::CandleTensorFactory::new(config.backend.device.clone()),
         );
 
         // Opt-in speculative decoding: set FERRUM_SPEC_DRAFT=<model_path>

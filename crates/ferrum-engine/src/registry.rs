@@ -809,7 +809,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         // tensor factory directly without the legacy `ComputeBackend`
         // wrapper.
         let tensor_factory: Arc<dyn ferrum_interfaces::TensorFactory> =
-            Arc::new(crate::backends::candle::CandleTensorFactory::new(
+            Arc::new(crate::tensor_factory::candle::CandleTensorFactory::new(
                 config.device.clone(),
             ));
 
