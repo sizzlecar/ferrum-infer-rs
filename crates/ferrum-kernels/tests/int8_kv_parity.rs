@@ -318,3 +318,152 @@ fn int8_paged_decode_parity_vs_host_ref() {
     assert!(cosine > 0.999, "cosine similarity too low: {cosine}");
     assert!(rel_to_mag < 0.02, "max abs / max mag too high: {rel_to_mag}");
 }
+
+/// End-to-end kernel composition test that mirrors how a model decode
+/// loop would use INT8 KV: take FP16 K/V tokens, run `int8_kv_cache_append`
+/// to populate the INT8 paged pool, then run `paged_decode_attention_int8`
+/// reading from that pool. Compare to a pure FP32 host reference computed
+/// directly from the original FP16 K/V (no quantization step in the
+/// reference). Cosine similarity should still be ~0.999 — the only loss
+/// is the INT8 round-trip.
+#[test]
+#[ignore]
+fn int8_kv_append_then_decode_e2e() {
+    const NUM_HEADS: usize = 8;
+    const NUM_KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 128;
+    const BLOCK_SIZE: usize = 16;
+    const VALID_KV_LEN: usize = 64; // 4 blocks
+    const MAX_BLOCKS: usize = 8;
+
+    let mut rng = 0xBEEF_F00Du64;
+
+    // Q
+    let q_n = NUM_HEADS * HEAD_DIM;
+    let q_data: Vec<f32> = (0..q_n).map(|_| rnd(&mut rng) * 0.5).collect();
+
+    // FP16 K/V tokens that will be appended into the INT8 pool. One
+    // token at a time mirrors a decode-loop append; here we batch all
+    // VALID_KV_LEN tokens in a single launch (the kernel handles
+    // multi-token batches via the (token, kv_head) grid).
+    let kv_in_n = VALID_KV_LEN * NUM_KV_HEADS * HEAD_DIM;
+    let k_in_data: Vec<f32> = (0..kv_in_n).map(|_| rnd(&mut rng) * 0.3).collect();
+    let v_in_data: Vec<f32> = (0..kv_in_n).map(|_| rnd(&mut rng) * 0.3).collect();
+
+    // Slot mapping: append into slots 0..VALID_KV_LEN (contiguous, simplest case).
+    let slot_mapping: Vec<i32> = (0..VALID_KV_LEN as i32).collect();
+
+    // Block table: identity (logical i → physical i).
+    let block_table: Vec<i32> = (0..MAX_BLOCKS as i32).collect();
+
+    // Host reference: build a paged pool laid out exactly as the
+    // append kernel would produce, then run the FP32 reference.
+    let pool_tokens = MAX_BLOCKS * BLOCK_SIZE;
+    let mut k_pool_ref = vec![0f32; pool_tokens * NUM_KV_HEADS * HEAD_DIM];
+    let mut v_pool_ref = vec![0f32; pool_tokens * NUM_KV_HEADS * HEAD_DIM];
+    for t in 0..VALID_KV_LEN {
+        let slot = slot_mapping[t] as usize;
+        for h in 0..NUM_KV_HEADS {
+            for d in 0..HEAD_DIM {
+                let in_off = (t * NUM_KV_HEADS + h) * HEAD_DIM + d;
+                let pool_off = slot * NUM_KV_HEADS * HEAD_DIM + h * HEAD_DIM + d;
+                k_pool_ref[pool_off] = k_in_data[in_off];
+                v_pool_ref[pool_off] = v_in_data[in_off];
+            }
+        }
+    }
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let out_ref = host_ref_paged_decode(
+        &q_data,
+        &k_pool_ref,
+        &v_pool_ref,
+        &block_table,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        VALID_KV_LEN,
+        BLOCK_SIZE,
+        scale,
+    );
+
+    // GPU path: append → decode.
+    let ctx = CudaContext::new(0).expect("CUDA context");
+    let stream = ctx.default_stream();
+
+    let q_dev = CudaBackend::from_slice(&q_data);
+    let k_in_dev = CudaBackend::from_slice(&k_in_data);
+    let v_in_dev = CudaBackend::from_slice(&v_in_data);
+    let mut k_pool: cudarc::driver::CudaSlice<i8> = stream
+        .alloc_zeros::<i8>(pool_tokens * NUM_KV_HEADS * HEAD_DIM)
+        .unwrap();
+    let mut v_pool: cudarc::driver::CudaSlice<i8> = stream
+        .alloc_zeros::<i8>(pool_tokens * NUM_KV_HEADS * HEAD_DIM)
+        .unwrap();
+    let mut k_scales: cudarc::driver::CudaSlice<f16> = stream
+        .alloc_zeros::<f16>(pool_tokens * NUM_KV_HEADS)
+        .unwrap();
+    let mut v_scales: cudarc::driver::CudaSlice<f16> = stream
+        .alloc_zeros::<f16>(pool_tokens * NUM_KV_HEADS)
+        .unwrap();
+    let slot_dev = stream.memcpy_stod(&slot_mapping).unwrap();
+    let bt_dev = stream.memcpy_stod(&block_table).unwrap();
+
+    launch_int8_kv_cache_append(
+        &ctx,
+        &k_in_dev,
+        &v_in_dev,
+        &mut k_pool,
+        &mut v_pool,
+        &mut k_scales,
+        &mut v_scales,
+        &slot_dev,
+        VALID_KV_LEN,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+    )
+    .expect("kv append");
+
+    let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
+    launch_int8_paged_decode_attention(
+        &ctx,
+        &q_dev,
+        &k_pool,
+        &v_pool,
+        &k_scales,
+        &v_scales,
+        &bt_dev,
+        &mut out_dev,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        VALID_KV_LEN,
+        BLOCK_SIZE,
+        scale,
+    )
+    .expect("int8 paged decode");
+    stream.synchronize().unwrap();
+
+    let out_int8: Vec<f32> = CudaBackend::to_vec(&out_dev, NUM_HEADS * HEAD_DIM);
+
+    let mut sum_a = 0f64;
+    let mut sum_b = 0f64;
+    let mut dot = 0f64;
+    let mut max_abs = 0f32;
+    let mut max_mag = 0f32;
+    for i in 0..out_ref.len() {
+        max_abs = max_abs.max((out_int8[i] - out_ref[i]).abs());
+        max_mag = max_mag.max(out_ref[i].abs());
+        sum_a += (out_ref[i] as f64) * (out_ref[i] as f64);
+        sum_b += (out_int8[i] as f64) * (out_int8[i] as f64);
+        dot += (out_ref[i] as f64) * (out_int8[i] as f64);
+    }
+    let cosine = dot / (sum_a.sqrt() * sum_b.sqrt() + 1e-12);
+    eprintln!(
+        "append→decode e2e: max|diff|={max_abs:.5} cos={cosine:.5} (max output mag={max_mag:.4})"
+    );
+    // Same noise floor as the standalone decode parity test — the
+    // kernel pair composes cleanly.
+    assert!(cosine > 0.999, "cosine similarity too low: {cosine}");
+    let rel_to_mag = max_abs / max_mag.max(1e-6);
+    assert!(rel_to_mag < 0.02, "rel-to-max-mag too high: {rel_to_mag}");
+}
