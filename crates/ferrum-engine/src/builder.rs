@@ -191,7 +191,7 @@ impl EngineBuilder {
 
         // If model path is set, try candle executor
         if std::env::var("FERRUM_MODEL_PATH").is_ok() {
-            return "candle".to_string();
+            return "llm".to_string();
         }
 
         "stub".to_string()
