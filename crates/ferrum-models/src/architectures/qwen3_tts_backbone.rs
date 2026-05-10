@@ -39,13 +39,13 @@ pub trait TalkerBackboneForward: Send + Sync {
 
 /// Backbone adapter — wraps `LlamaFamilyModel<B>` loaded as a backbone-only
 /// (no embed / no lm_head) plus a per-sequence position counter.
-pub struct TalkerBackboneBackend<B: MoeLlmBackend + ferrum_kernels::backend::BackendInt8KvOps> {
+pub struct TalkerBackboneBackend<B: MoeLlmBackend> {
     backbone: LlamaFamilyModel<B>,
     cache_id: String,
     pos: usize,
 }
 
-impl<B: MoeLlmBackend + ferrum_kernels::backend::BackendInt8KvOps> TalkerBackboneBackend<B> {
+impl<B: MoeLlmBackend> TalkerBackboneBackend<B> {
     /// Build from a TTS model-directory loader. Uses `PrefixedLoader`
     /// with `"talker."` so `LlamaFamilyModel::new_backbone_only` picks up
     /// `talker.model.layers.*` and `talker.model.norm.weight`.
@@ -107,7 +107,7 @@ impl<B: MoeLlmBackend + ferrum_kernels::backend::BackendInt8KvOps> TalkerBackbon
     }
 }
 
-impl<B: MoeLlmBackend + ferrum_kernels::backend::BackendInt8KvOps> TalkerBackboneForward for TalkerBackboneBackend<B> {
+impl<B: MoeLlmBackend> TalkerBackboneForward for TalkerBackboneBackend<B> {
     fn forward(&mut self, input_f32: &[f32], seq_len: usize) -> Vec<f32> {
         let h = self.backbone.cfg.hidden_size;
         assert_eq!(

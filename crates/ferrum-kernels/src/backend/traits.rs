@@ -2294,10 +2294,8 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
     }
 }
 
-// CPU/Metal: stub impls so the trait bound is satisfied for any
-// `B: MoeLlmBackend`. Default trait methods return `Unsupported`;
-// these stubs never actually get called because the factory cascade
-// rejects (CPU/Metal, Int8).
-impl BackendInt8KvOps for crate::backend::cpu::CpuBackend {}
-#[cfg(feature = "metal")]
-impl BackendInt8KvOps for crate::backend::metal::MetalBackend {}
+// Cpu/Metal NOT impl `BackendInt8KvOps` — the trait pivot to
+// `KvLayer<B>` means `KvInt8: KvLayer<B>` only holds where
+// `B: BackendInt8KvOps`, so `LlamaFamilyModel<CpuBackend, KvInt8>` is a
+// compile error (no INT8 KvLayer impl satisfies it). Type system
+// enforces the constraint without runtime stubs.

@@ -19,162 +19,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
+use ferrum_interfaces::kv_dtype::{KvFp16, KvInt8};
 use ferrum_kernels::backend::{
-    Backend, BackendGraph, BackendInt8KvOps, BackendKvDtype, BackendMoeFused, BackendPagedKv,
-    BackendQuantGguf, BackendQuantMarlin, KvCache, KvCacheQuant, LlmBackend, MoeLlmBackend,
-    QuantLlmBackend, MAX_LAYERS_FOR_GRAPH,
+    Backend, BackendGraph, BackendInt8KvOps, BackendMoeFused, BackendPagedKv, BackendQuantGguf,
+    BackendQuantMarlin, KvCache, KvLayer, LlmBackend, MoeLlmBackend, QuantLlmBackend,
+    MAX_LAYERS_FOR_GRAPH,
 };
-
-/// Per-layer KV cache element (Dim 5).
-///
-/// Wraps both the FP16 (`KvCache<B, KvFp16>`) and INT8
-/// (`KvCacheQuant<B, KvInt8>`) cache layouts so a single model struct
-/// can carry either depending on the model's `K` type marker.
-///
-/// `K` is *not* on the enum: every `LlamaFamilyModel<B, K>` instance
-/// only ever constructs **one** variant for the lifetime of the model,
-/// chosen by `K::NAME` in `ensure_kv`. Carrying an actual `K` parameter
-/// here would force `K = KvInt8` for the `Int8` variant and force
-/// every `K` value to satisfy `BackendKvDtype<K>` for the `Fp16` arm —
-/// painful for callers that just have a `K: KvDtypeKind` bound. Instead
-/// the variants name concrete dtypes; the `B: BackendKvDtype<KvInt8>`
-/// bound is satisfied by stub impls on CpuBackend/MetalBackend so the
-/// enum type is well-formed everywhere.
-pub enum LayerKvCache<B: MoeLlmBackend + BackendInt8KvOps> {
-    Fp16(KvCache<B, KvFp16>),
-    Int8(KvCacheQuant<B, KvInt8>),
-}
-
-impl<B: MoeLlmBackend + BackendInt8KvOps> LayerKvCache<B> {
-    pub fn len(&self) -> usize {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.len,
-            LayerKvCache::Int8(kv) => kv.len,
-        }
-    }
-
-    pub fn set_len(&mut self, new_len: usize) {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.len = new_len,
-            LayerKvCache::Int8(kv) => kv.len = new_len,
-        }
-    }
-
-    pub fn capacity(&self) -> usize {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.capacity,
-            LayerKvCache::Int8(kv) => kv.capacity,
-        }
-    }
-
-    pub fn block_size(&self) -> usize {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.block_size,
-            LayerKvCache::Int8(kv) => kv.block_size,
-        }
-    }
-
-    pub fn num_kv_heads(&self) -> usize {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.num_kv_heads,
-            LayerKvCache::Int8(kv) => kv.num_kv_heads,
-        }
-    }
-
-    pub fn head_dim(&self) -> usize {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.head_dim,
-            LayerKvCache::Int8(kv) => kv.head_dim,
-        }
-    }
-
-    pub fn block_table(&self) -> Option<&B::Buffer> {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.block_table.as_ref(),
-            LayerKvCache::Int8(kv) => kv.block_table.as_ref(),
-        }
-    }
-
-    pub fn context_lens(&self) -> Option<&B::Buffer> {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.context_lens.as_ref(),
-            LayerKvCache::Int8(kv) => kv.context_lens.as_ref(),
-        }
-    }
-
-    pub fn context_lens_mut(&mut self) -> Option<&mut B::Buffer> {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.context_lens.as_mut(),
-            LayerKvCache::Int8(kv) => kv.context_lens.as_mut(),
-        }
-    }
-
-    pub fn paged_block_indices(&self) -> &[u32] {
-        match self {
-            LayerKvCache::Fp16(kv) => &kv.paged_block_indices,
-            LayerKvCache::Int8(kv) => &kv.paged_block_indices,
-        }
-    }
-
-    pub fn paged_block_indices_mut(&mut self) -> &mut Vec<u32> {
-        match self {
-            LayerKvCache::Fp16(kv) => &mut kv.paged_block_indices,
-            LayerKvCache::Int8(kv) => &mut kv.paged_block_indices,
-        }
-    }
-
-    pub fn block_table_mut(&mut self) -> Option<&mut B::Buffer> {
-        match self {
-            LayerKvCache::Fp16(kv) => kv.block_table.as_mut(),
-            LayerKvCache::Int8(kv) => kv.block_table.as_mut(),
-        }
-    }
-
-    /// Whether this cache is in paged mode (`block_size > 0`).
-    pub fn is_paged(&self) -> bool {
-        self.block_size() > 0
-    }
-
-    /// Borrow the FP16 cache (panics if this is the INT8 variant). Used
-    /// by paths that haven't been generalized to the enum yet — caller
-    /// must guarantee the model's `K = KvFp16`.
-    pub fn as_fp16_mut(&mut self) -> &mut KvCache<B, KvFp16> {
-        match self {
-            LayerKvCache::Fp16(kv) => kv,
-            LayerKvCache::Int8(_) => {
-                panic!("LayerKvCache::as_fp16_mut called on Int8 variant")
-            }
-        }
-    }
-
-    pub fn as_fp16(&self) -> &KvCache<B, KvFp16> {
-        match self {
-            LayerKvCache::Fp16(kv) => kv,
-            LayerKvCache::Int8(_) => {
-                panic!("LayerKvCache::as_fp16 called on Int8 variant")
-            }
-        }
-    }
-
-    pub fn as_int8_mut(&mut self) -> &mut KvCacheQuant<B, KvInt8> {
-        match self {
-            LayerKvCache::Int8(kv) => kv,
-            LayerKvCache::Fp16(_) => {
-                panic!("LayerKvCache::as_int8_mut called on Fp16 variant")
-            }
-        }
-    }
-
-    pub fn as_int8(&self) -> &KvCacheQuant<B, KvInt8> {
-        match self {
-            LayerKvCache::Int8(kv) => kv,
-            LayerKvCache::Fp16(_) => {
-                panic!("LayerKvCache::as_int8 called on Fp16 variant")
-            }
-        }
-    }
-}
 
 /// Graph cache key for the single-item decode path (`decode_internal`).
 /// Distinct from any `m_padded`-based key used by the batched path.
@@ -636,7 +486,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
 /// `B: BackendKvDtype<KvInt8>` bound is structurally required by the
 /// enum and is satisfied by all backends via stub impls (Cpu/Metal) or
 /// the real impl (CUDA).
-pub struct LlamaFamilyModel<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind = KvFp16> {
+pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -660,16 +510,12 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind 
     /// - **Paged mode** (`FERRUM_METAL_PAGED_KV=1`): k/v are unused
     ///   placeholders; the real K/V live in [`Self::paged_pools`] and
     ///   the cache's `block_table` + `context_lens` index into them.
-    pub kv_caches: HashMap<String, Vec<LayerKvCache<B>>>,
+    pub kv_caches: HashMap<String, Vec<K::Layer>>,
     /// Free pool of pre-allocated KV cache slots. Released caches return
     /// here instead of being dropped, so their device pointers stay valid
     /// across requests — critical for graph capture (pointers baked into
     /// the captured graph would otherwise dangle).
-    kv_free_pool: Vec<Vec<LayerKvCache<B>>>,
-    /// Phantom marker — selects which `LayerKvCache` variant `ensure_kv`
-    /// constructs. `K::NAME` is checked at runtime but folds to a const
-    /// after monomorphization.
-    _kv_dtype: std::marker::PhantomData<K>,
+    kv_free_pool: Vec<Vec<K::Layer>>,
 
     // ── Paged-KV multi-seq state (Phase 4) ─────────────────────────────
     //
@@ -691,23 +537,23 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind 
     // ── Graph capture state (CUDA only; harmless no-op on other backends) ──
     /// Count of eager decode steps run so far. After `GRAPH_WARMUP`, the
     /// next step captures the decode flow as a graph.
-    graph_warmup: usize,
+    pub(crate) graph_warmup: usize,
     /// True if capture was attempted but failed (e.g. backend doesn't
     /// support graph capture). Stops further attempts, falls back to eager.
-    graph_capture_failed: bool,
+    pub(crate) graph_capture_failed: bool,
     /// Same warmup counter for the batched-decode path.
-    batched_graph_warmup: usize,
+    pub(crate) batched_graph_warmup: usize,
     /// True if batched graph capture failed.
-    batched_graph_failed: bool,
+    pub(crate) batched_graph_failed: bool,
     /// Set of `m_padded` values (as u64 graph keys) for which a batched
     /// graph has been captured. Multi-slot via cuda.rs's HashMap-keyed
     /// graph cache — different batch shapes don't thrash a single slot.
-    batched_graph_keys_seen: std::collections::HashSet<u64>,
+    pub(crate) batched_graph_keys_seen: std::collections::HashSet<u64>,
     /// Cache IDs for which device-pointer scratch is currently populated.
     /// Populate only re-runs when the batch composition changes (new
     /// requests joined / requests finished). Hot-path optimization:
     /// avoids 3 sync cuMemcpyHtoD_v2's per decode token (~5% TPOT).
-    batched_pointers_for: Option<Vec<String>>,
+    pub(crate) batched_pointers_for: Option<Vec<String>>,
     /// CUDA-graph state for the unified_forward path. Mirrors the
     /// `batched_graph_*` triple but keyed on `(m_total, num_seqs)`
     /// so different concurrency levels each get their own cached
@@ -717,7 +563,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind 
     pub(crate) unified_graph_keys_seen: std::collections::HashSet<u64>,
 }
 
-impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K> {
+impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// Build a Qwen3 model from weights provided by the loader.
     ///
     /// The loader decides per-projection whether to instantiate DenseLinear,
@@ -816,7 +662,6 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
-            _kv_dtype: std::marker::PhantomData,
             paged_pools: None,
             paged_block_alloc: None,
             graph_warmup: 0,
@@ -900,7 +745,6 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
-            _kv_dtype: std::marker::PhantomData,
             paged_pools: None,
             paged_block_alloc: None,
             graph_warmup: 0,
@@ -1033,66 +877,17 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
         // Try pool first — reused buffers have stable device pointers,
         // so a captured decode graph can be replayed for this request too.
         // K::NAME selects which `LayerKvCache` variant to construct:
-        //   - "fp16" → FP16 path (existing).
-        //   - "int8" → INT8 paged path; requires paged=true and
-        //     `B: BackendInt8KvOps` (the factory cascade only routes
-        //     `(CUDA, Int8)` here so this branch only ever runs on CUDA).
+        // K-aware allocation: K::alloc_paged / K::alloc_contig pick the
+        // right cache layout (FP16 → KvCache, INT8 → KvCacheQuant) per the
+        // model's K marker. INT8 supports paged mode only — KvInt8::alloc_contig
+        // panics, surfacing the misconfiguration here at first ensure_kv.
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
             (0..self.cfg.num_layers)
                 .map(|_| {
-                    if K::NAME == "int8" {
-                        if !paged {
-                            panic!(
-                                "INT8 KV requires paged mode; set FERRUM_METAL_PAGED_KV=1 \
-                                 (cross-backend env var) or use FP16 KV"
-                            );
-                        }
-                        // INT8 paged layer: K/V/scales pools allocated
-                        // by the backend; block_table mirrors the FP16
-                        // path (alloc_u32 on Self::Buffer to match the
-                        // u32-as-f16 storage trick).
-                        LayerKvCache::Int8(B::alloc_paged_int8_layer(
-                            max_blocks_per_seq,
-                            PAGED_BLOCK_SIZE,
-                            nkv,
-                            hd,
-                        ))
-                    } else if paged {
-                        // FP16 paged: cache holds metadata only. K/V
-                        // are 1-element placeholders. Real data lives
-                        // in `self.paged_pools[li].{k,v}`.
-                        let block_table = B::alloc_u32(max_blocks_per_seq);
-                        let mut context_lens = B::alloc_u32(1);
-                        let mut bt_ctx = B::new_context();
-                        B::write_u32(&mut bt_ctx, &mut context_lens, &[0u32]);
-                        B::sync(&mut bt_ctx);
-                        LayerKvCache::Fp16(KvCache {
-                            k: B::alloc(1),
-                            v: B::alloc(1),
-                            len: 0,
-                            capacity: max_blocks_per_seq * PAGED_BLOCK_SIZE,
-                            num_kv_heads: nkv,
-                            head_dim: hd,
-                            block_size: PAGED_BLOCK_SIZE,
-                            block_table: Some(block_table),
-                            context_lens: Some(context_lens),
-                            paged_block_indices: Vec::new(),
-                            _kv_dtype: std::marker::PhantomData,
-                        })
+                    if paged {
+                        K::alloc_paged(max_blocks_per_seq, PAGED_BLOCK_SIZE, nkv, hd)
                     } else {
-                        LayerKvCache::Fp16(KvCache {
-                            k: B::alloc(nkv * max * hd),
-                            v: B::alloc(nkv * max * hd),
-                            len: 0,
-                            capacity: max,
-                            num_kv_heads: nkv,
-                            head_dim: hd,
-                            block_size: 0,
-                            block_table: None,
-                            context_lens: None,
-                            paged_block_indices: Vec::new(),
-                            _kv_dtype: std::marker::PhantomData,
-                        })
+                        K::alloc_contig(max, nkv, hd)
                     }
                 })
                 .collect()
@@ -1140,10 +935,10 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             padded.resize(max_blocks_per_seq, 0);
             let mut ctx_tmp = B::new_context();
             for c in caches.iter_mut() {
-                if let Some(bt) = c.block_table_mut() {
+                if let Some(bt) = K::block_table_mut(c) {
                     B::write_u32(&mut ctx_tmp, bt, &padded);
                 }
-                *c.paged_block_indices_mut() = block_indices.clone();
+                *K::paged_block_indices_mut(c) = block_indices.clone();
             }
             B::sync(&mut ctx_tmp);
         }
@@ -1152,8 +947,8 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
         // the kv_cache_append writes new K/V in place, and attention only
         // reads up to `cache_len`.
         for c in caches.iter_mut() {
-            c.set_len(0);
-            if let Some(cl) = c.context_lens_mut() {
+            K::set_len(c, 0);
+            if let Some(cl) = K::context_lens_mut(c) {
                 let mut ctx_tmp = B::new_context();
                 B::write_u32(&mut ctx_tmp, cl, &[0u32]);
                 B::sync(&mut ctx_tmp);
@@ -1274,9 +1069,9 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             .expect("ensure_kv must be called before forward_layer");
         // Read shared metadata (variant-agnostic) once. The K-aware
         // attn section below re-borrows the right enum variant.
-        let cache_len_before = caches[li].len();
-        let cache_capacity = caches[li].capacity();
-        let cache_block_size = caches[li].block_size();
+        let cache_len_before = K::len(&caches[li]);
+        let cache_capacity = K::capacity(&caches[li]);
+        let cache_block_size = K::block_size(&caches[li]);
 
         // Defense in depth: refuse to write past the KV buffer. The
         // graceful path is the caller pre-checking via `kv_capacity()`
@@ -1290,19 +1085,21 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             );
         }
 
-        // INT8 KV path (Dim 5): paged-only, requires `B: BackendInt8KvOps`.
-        // Splits qkv → FP16 head-major scratch, then quantizes + paged-
-        // append into the INT8 pool, then runs `int8_paged_decode_attention`.
-        // The rest of forward_layer (rms_norm, qkv_proj, scratches, o_proj,
-        // post_norm, MLP) is K-agnostic and lives outside this branch.
-        if K::NAME == "int8" {
-            assert!(
-                cache_block_size > 0,
-                "INT8 KV requires paged mode; non-paged INT8 not supported"
-            );
-            // Step 1: split QKV + qk-norm + RoPE into FP16 head-major scratch.
-            let _ = B::split_qkv_norm_rope(
+        // Paged path: K::paged_write fuses split_qkv_norm_rope + cache append
+        // (FP16: into_paged_cache; INT8: split_qkv_norm_rope + int8_kv_append_paged).
+        // K::paged_decode_attention reads from layer-local INT8 buffers or the
+        // shared FP16 pool depending on K. Then K-agnostic post-attn tail.
+        if cache_block_size > 0 {
+            let (pool_k_ptr, pool_v_ptr) = paged_pool_ptr
+                .expect("paged_pools must be allocated when block_size > 0");
+            // SAFETY: paged_pools is allocated once and never resized; the
+            // raw pointers don't outlive this method scope.
+            let pool_k = unsafe { &mut *pool_k_ptr };
+            let pool_v = unsafe { &mut *pool_v_ptr };
+
+            K::paged_write(
                 ctx,
+                &mut caches[li],
                 &self.scratch.qkv_out,
                 q_norm_w,
                 k_norm_w,
@@ -1311,6 +1108,8 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
                 &mut self.scratch.q_head_major,
                 &mut self.scratch.k_head_major,
                 &mut self.scratch.v_head_major,
+                pool_k,
+                pool_v,
                 tokens,
                 nh,
                 nkv,
@@ -1318,247 +1117,64 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
                 pos_offset,
                 eps,
                 qk_mode,
-            );
-
-            // Step 2: quantize FP16 K/V into the paged INT8 pool.
-            let cache_int8 = caches[li].as_int8_mut();
-            let block_table_buf = cache_int8
-                .block_table
-                .as_ref()
-                .expect("INT8 paged cache missing block_table")
-                as *const B::Buffer;
-            // SAFETY: block_table is allocated once at ensure_kv and not
-            // touched concurrently. Take a raw pointer here so we can
-            // pass an immutable borrow alongside the mutable cache borrow
-            // — the trait method requires both.
-            let block_table = unsafe { &*block_table_buf };
-            B::int8_kv_append_paged(
-                ctx,
-                &self.scratch.k_head_major,
-                &self.scratch.v_head_major,
-                &mut cache_int8.k,
-                &mut cache_int8.v,
-                &mut cache_int8.k_scales,
-                &mut cache_int8.v_scales,
-                block_table,
-                cache_len_before,
-                tokens,
-                cache_int8.block_size,
-                nkv,
-                hd,
             )
-            .expect("int8_kv_append_paged");
+            .expect("K::paged_write");
 
-            // Step 3: bump the cache length, write context_lens for the
-            // attention kernel, then run paged INT8 decode attention.
-            cache_int8.len += tokens;
-            let final_kv_len = cache_int8.len as u32;
-            let cl_buf = cache_int8
-                .context_lens
-                .as_mut()
-                .expect("INT8 paged cache missing context_lens");
-            B::write_u32(ctx, cl_buf, &[final_kv_len]);
+            let new_len = cache_len_before + tokens;
+            K::set_len(&mut caches[li], new_len);
 
-            let block_size_int8 = cache_int8.block_size;
-            let kv_len_int8 = cache_int8.len;
-            // Re-borrow as immutable for the attention read.
-            let cache_int8 = caches[li].as_int8();
-            let bt = cache_int8
-                .block_table
-                .as_ref()
-                .expect("INT8 paged cache missing block_table");
-            let scale = (hd as f32).sqrt().recip();
-            B::int8_paged_decode_attention(
+            let pool_k_imm = unsafe { &*pool_k_ptr };
+            let pool_v_imm = unsafe { &*pool_v_ptr };
+            K::paged_decode_attention(
                 ctx,
+                &mut caches[li],
                 &self.scratch.q_head_major,
-                &cache_int8.k,
-                &cache_int8.v,
-                &cache_int8.k_scales,
-                &cache_int8.v_scales,
-                bt,
+                pool_k_imm,
+                pool_v_imm,
                 &mut self.scratch.attn_head_major_out,
                 nh,
                 nkv,
                 hd,
-                kv_len_int8,
-                block_size_int8,
-                scale,
+                new_len,
+                tokens,
             )
-            .expect("int8_paged_decode_attention");
+            .expect("K::paged_decode_attention");
 
-            // Drop the cache borrow before the K-agnostic tail (o_proj +
-            // MLP) re-borrows scratches.
-            let _ = bt;
-            // Skip the legacy FP16 attention block; jump straight to o_proj.
             return self.forward_layer_post_attn(ctx, li, residual, tokens);
         }
 
-        // K=KvFp16 path: re-borrow the FP16 cache. K=KvInt8 took the
-        // early return above, so as_fp16_mut() is safe here.
-        let cache = caches[li].as_fp16_mut();
-
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+        // Non-paged (contig) path. INT8 path doesn't reach here:
+        // KvInt8::alloc_contig panics in ensure_kv.
+        let _qkr_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
             None
         };
-        // Paged-KV path: when the cache was allocated with paged
-        // metadata (`block_size > 0`), use the paged write kernel
-        // which fans out into the block pool via `block_table`.
-        // Falls back to contiguous if Backend doesn't implement it.
-        let used_qkv_into_cache = if cache.block_size > 0 {
-            let bt = cache
-                .block_table
-                .as_ref()
-                .expect("paged cache missing block_table");
-            let num_blocks_per_seq = cache.capacity / cache.block_size;
-            // Paged mode: K/V live in the shared pool, not cache.k/.v.
-            let (pool_k_ptr, pool_v_ptr) =
-                paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
-            // SAFETY: paged_pools is allocated once and never resized;
-            // we do not touch self.paged_pools concurrently.
-            let pool_k = unsafe { &mut *pool_k_ptr };
-            let pool_v = unsafe { &mut *pool_v_ptr };
-            B::split_qkv_norm_rope_into_paged_cache(
-                ctx,
-                &self.scratch.qkv_out,
-                0, // qkv_byte_offset: single-seq dispatch reads from start
-                q_norm_w,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.q_head_major,
-                0, // q_out_byte_offset: writes to start of head-major scratch
-                pool_k,
-                pool_v,
-                bt,
-                tokens,
-                nh,
-                nkv,
-                hd,
-                pos_offset,
-                eps,
-                qk_mode,
-                cache_len_before,
-                cache.block_size,
-                num_blocks_per_seq,
-            )
-            .is_ok()
-        } else {
-            B::split_qkv_norm_rope_into_cache(
-                ctx,
-                &self.scratch.qkv_out,
-                q_norm_w,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.q_head_major,
-                &mut cache.k,
-                &mut cache.v,
-                tokens,
-                nh,
-                nkv,
-                hd,
-                pos_offset,
-                eps,
-                qk_mode,
-                cache_len_before,
-                cache_capacity,
-            )
-            .is_ok()
-        };
-        if !used_qkv_into_cache {
-            // Fallback 1: fused split-QKV-norm-rope to head-major scratch
-            // (PR #47 path).
-            let used_fused_qkv = B::split_qkv_norm_rope(
-                ctx,
-                &self.scratch.qkv_out,
-                q_norm_w,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.q_head_major,
-                &mut self.scratch.k_head_major,
-                &mut self.scratch.v_head_major,
-                tokens,
-                nh,
-                nkv,
-                hd,
-                pos_offset,
-                eps,
-                qk_mode,
-            )
-            .is_ok();
-            if !used_fused_qkv {
-                // Fallback 2: original four-launch chain.
-                B::split_qkv(
-                    ctx,
-                    &self.scratch.qkv_out,
-                    &mut self.scratch.q_buf,
-                    &mut self.scratch.k_buf,
-                    &mut self.scratch.v_buf,
-                    tokens,
-                    q_dim,
-                    kv_dim,
-                );
-                B::qk_norm_rope(
-                    ctx,
-                    &self.scratch.q_buf,
-                    q_norm_w,
-                    &self.rope.cos,
-                    &self.rope.sin,
-                    &mut self.scratch.q_head_major,
-                    tokens,
-                    nh,
-                    hd,
-                    pos_offset,
-                    eps,
-                    qk_mode,
-                );
-                B::qk_norm_rope(
-                    ctx,
-                    &self.scratch.k_buf,
-                    k_norm_w,
-                    &self.rope.cos,
-                    &self.rope.sin,
-                    &mut self.scratch.k_head_major,
-                    tokens,
-                    nkv,
-                    hd,
-                    pos_offset,
-                    eps,
-                    qk_mode,
-                );
-                B::qk_norm_rope(
-                    ctx,
-                    &self.scratch.v_buf,
-                    dummy,
-                    &self.rope.cos,
-                    &self.rope.sin,
-                    &mut self.scratch.v_head_major,
-                    tokens,
-                    nkv,
-                    hd,
-                    pos_offset,
-                    eps,
-                    0,
-                );
-            }
-            B::kv_cache_append_head_major(
-                ctx,
-                &mut cache.k,
-                &mut cache.v,
-                cache.len,
-                cache.capacity,
-                &self.scratch.k_head_major,
-                &self.scratch.v_head_major,
-                tokens,
-                nkv,
-                hd,
-            );
-        }
-        if let Some(t0) = _t0 {
+        K::contig_write(
+            ctx,
+            &mut caches[li],
+            &self.scratch.qkv_out,
+            q_norm_w,
+            k_norm_w,
+            &self.rope.cos,
+            &self.rope.sin,
+            &mut self.scratch.q_head_major,
+            &mut self.scratch.k_head_major,
+            &mut self.scratch.v_head_major,
+            &mut self.scratch.q_buf,
+            &mut self.scratch.k_buf,
+            &mut self.scratch.v_buf,
+            tokens,
+            nh,
+            nkv,
+            hd,
+            pos_offset,
+            eps,
+            qk_mode,
+        )
+        .expect("K::contig_write");
+        if let Some(t0) = _qkr_t0 {
             B::sync(ctx);
             QKR_TIME_US.fetch_add(
                 t0.elapsed().as_micros() as u64,
@@ -1566,89 +1182,38 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             );
             QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        cache.len += tokens;
-        let kv_len = cache.len;
-        let kv_stride = cache.capacity;
+        let new_len = cache_len_before + tokens;
+        K::set_len(&mut caches[li], new_len);
+        let kv_stride = cache_capacity;
 
-        // 6. Flash attention.
-        //    Paged path: when the cache uses block layout, dispatch the
-        //    paged_decode_attention kernel; for q_len > 1 (prefill),
-        //    iterate token-by-token (kernel only handles q_len=1 right
-        //    now — Phase 4 will add a paged Q-tiled path).
-        //    Contiguous path: existing flash_attention dispatch.
         let _attn_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
             None
         };
-        if cache.block_size > 0 {
-            let bt = cache
-                .block_table
-                .as_ref()
-                .expect("paged cache missing block_table");
-            let cl_buf = cache
-                .context_lens
-                .as_mut()
-                .expect("paged cache missing context_lens");
-            let num_blocks_per_seq = cache.capacity / cache.block_size;
-            // Paged mode: K/V come from the shared pool.
-            let (pool_k_ptr, pool_v_ptr) =
-                paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
-            // SAFETY: same as the write-side above; pool buffers are
-            // allocated-once and never moved while we hold the pointer.
-            let pool_k = unsafe { &*pool_k_ptr };
-            let pool_v = unsafe { &*pool_v_ptr };
-            // Single dispatch handles both decode (q_len=1) and causal
-            // prefill (q_len>1). The kernel computes per-token causal
-            // limit as `context_lens[seq] - (q_len - 1 - q_token_idx)`,
-            // so we set context_lens to the FINAL kv_len after this
-            // batch's writes.
-            let final_kv_len = cache.len as u32;
-            B::write_u32(ctx, cl_buf, &[final_kv_len]);
-            B::paged_decode_attention(
-                ctx,
-                &self.scratch.q_head_major,
-                pool_k,
-                pool_v,
-                &mut self.scratch.attn_head_major_out,
-                bt,
-                cl_buf,
-                1, // num_seqs (single-seq dispatch; multi-seq is fan-in via forward_layer_batched, Phase 4b)
-                nh,
-                nkv,
-                hd,
-                cache.block_size,
-                num_blocks_per_seq,
-                tokens, // q_len
-            )
-            .expect("paged_decode_attention");
-        } else {
-            //    `causal` is always true for decoder-only LLMs — every query must
-            //    mask out future tokens. Sliding-window models (Mistral v0.1) narrow
-            //    the lower bound via `sliding_window`.
-            let attn_cfg = ferrum_kernels::backend::AttnConfig {
-                num_heads: nh,
-                num_kv_heads: nkv,
-                head_dim: hd,
-                causal: true,
-                scale: 1.0 / (hd as f32).sqrt(),
-                kv_seq_stride: kv_stride,
-                sliding_window: cfg.sliding_window,
-            };
-            B::flash_attention(
-                ctx,
-                &self.scratch.q_head_major,
-                &cache.k,
-                &cache.v,
-                &mut self.scratch.attn_head_major_out,
-                1,
-                tokens,
-                kv_len,
-                pos_offset,
-                &attn_cfg,
-            );
-        }
+        let attn_cfg = ferrum_kernels::backend::AttnConfig {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            causal: true,
+            scale: 1.0 / (hd as f32).sqrt(),
+            kv_seq_stride: kv_stride,
+            sliding_window: cfg.sliding_window,
+        };
+        K::contig_decode_attention(
+            ctx,
+            &caches[li],
+            &self.scratch.q_head_major,
+            &mut self.scratch.attn_head_major_out,
+            attn_cfg,
+            tokens,
+            pos_offset,
+        )
+        .expect("K::contig_decode_attention");
+        let _ = q_dim;
+        let _ = kv_dim;
+        let _ = dummy;
         if let Some(t0) = _attn_t0 {
             B::sync(ctx);
             ATTN_TIME_US.fetch_add(
@@ -1658,170 +1223,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 7. Untranspose head-major → token-major for O-proj input.
-        //
-        // For tokens=1 the head-major and token-major layouts collapse
-        // to the same flat [heads * head_dim] vector, so the dispatch is
-        // an identity memcpy — skip it and point o_proj at the
-        // head-major buffer directly.
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let attn_token_major = if tokens == 1 {
-            &self.scratch.attn_head_major_out
-        } else {
-            B::transpose_head_to_token(
-                ctx,
-                &self.scratch.attn_head_major_out,
-                &mut self.scratch.attn_flat,
-                tokens,
-                nh,
-                hd,
-            );
-            &self.scratch.attn_flat
-        };
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 8. O projection
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        layer
-            .o_proj
-            .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 9. Fused residual-add + post-attention RMSNorm.
-        //    Writes the new residual back into `residual` and the normed
-        //    value into `norm_out`.
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::fused_add_rms_norm(
-            ctx,
-            residual,
-            &self.scratch.o_proj_out,
-            &layer.post_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
-            tokens,
-            h,
-        );
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            NORM_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 10. Fused gate+up projection
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        layer.gate_up_proj.forward(
-            ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.gate_up_out,
-            tokens,
-        );
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 11. SwiGLU: silu(gate) * up
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::fused_silu_mul_split(
-            ctx,
-            &self.scratch.gate_up_out,
-            &mut self.scratch.silu_out,
-            tokens,
-            im,
-        );
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 12. Down projection
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        layer.down_proj.forward(
-            ctx,
-            &self.scratch.silu_out,
-            &mut self.scratch.mlp_out,
-            tokens,
-        );
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 13. Final residual add
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.forward_layer_post_attn(ctx, li, residual, tokens);
     }
 
     /// Post-attention tail of `forward_layer`: untranspose Q (if needed),
@@ -1928,7 +1330,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             .kv_caches
             .get(cache_id)
             .and_then(|layers| layers.first())
-            .map(|c| c.len())
+            .map(|c| K::len(c))
             .unwrap_or(0);
 
         let mut ctx = B::new_context();
@@ -1998,7 +1400,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             .kv_caches
             .get(cache_id)
             .and_then(|layers| layers.first())
-            .map(|c| c.len())
+            .map(|c| K::len(c))
             .unwrap_or(0);
 
         let h = self.cfg.hidden_size;
@@ -2507,339 +1909,30 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
         self.scratch.residual = Some(residual);
         B::to_vec(&self.scratch.last_normed, h)
     }
-
-    /// Batched decode: process M concurrent requests at potentially different
-    /// positions in one forward pass. GEMM-heavy ops (qkv_proj, o_proj,
-    /// gate_up, down) run with m=M for natural batching; rope + KV append +
-    /// attention loop per-item (each has its own KV cache at a different
-    /// kv_len, and potentially different pos).
-    ///
-    /// Returns M logit vectors in the same order as `batch`.
-    pub fn decode_batch_internal(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
-        let m = batch.len();
-        if m == 0 {
-            return Vec::new();
-        }
-        if m == 1 {
-            let (cid, tok, pos) = &batch[0];
-            return vec![self.decode_internal(cid, *tok, *pos)];
-        }
-
-        // Ensure all caches exist and scratch is sized for M tokens.
-        for (cid, _, _) in batch {
-            self.ensure_kv(cid);
-        }
-        self.ensure_scratch(m);
-        // Phase 4b: when paged mode is on, ensure_kv has already
-        // populated the batched scratch buffers (paged_batch_q etc.).
-        // The forward path branches on `paged_pools.is_some()` inside
-        // each layer.
-
-        let h = self.cfg.hidden_size;
-        let vocab = self.cfg.vocab_size;
-        let num_layers = self.cfg.num_layers;
-        let mut ctx = B::new_context();
-
-        // Pre-step state (positions, kv_lens_pre, kv_lens_post). All
-        // 32 layers' batched kernels read these from scratch device
-        // buffers — written ONCE here, NEVER inside the layer loop, so
-        // the captured graph below replays with stable buffer addresses
-        // and the next step's content update reaches the kernels.
-        let positions: Vec<u32> = batch.iter().map(|(_, _, p)| *p as u32).collect();
-        let tokens: Vec<u32> = batch.iter().map(|(_, t, _)| *t).collect();
-        let kv_pre: Vec<u32> = batch
-            .iter()
-            .map(|(cid, _, _)| self.kv_caches.get(cid).expect("kv_caches missing")[0].len() as u32)
-            .collect();
-        let kv_post: Vec<u32> = kv_pre.iter().map(|&x| x + 1).collect();
-        B::write_u32(&mut ctx, &mut self.scratch.batch_positions, &positions);
-        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
-        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
-
-        // Pre-populate per-slot device-pointer scratch for the batched
-        // kernels (kv_cache_append_batched, flash_attention_batched).
-        // Done OUTSIDE any captured forward — sync memcpy on the legacy
-        // null stream is not captured by stream capture, so the captured
-        // graph contains only kernel launches. Without this, the
-        // captured `stream.memcpy_htod` records host pointers and the
-        // 2nd pure-replay reads stale/corrupted data → ILLEGAL_ADDRESS.
-        //
-        // populate_batched_pointers was intended to support
-        // FERRUM_BATCHED_GRAPH=1 (Phase 4d graph capture) by pre-filling
-        // device scratch outside the captured forward. Phase 4d is
-        // shelved (CUDA driver state accumulates and SIGSEGVs after
-        // ~14 launches even with all the right knobs), so the populate
-        // call adds overhead with no benefit on the OFF path. Skip it —
-        // the kv_cache_append / flash_attn batched impls fall back to
-        // their inline captured memcpy when scratch isn't pre-populated.
-        // batched_pointers_for kept for future use; revisit when we
-        // either (a) get graph capture working, or (b) move scratch to
-        // process-global static.
-        let _ = &self.batched_pointers_for;
-
-        // 0. Embed all M tokens into residual [M, H]. Eager, OUTSIDE
-        //    any captured graph (host tokens slice; embedding_lookup_dyn
-        //    is single-item only).
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
-        let embed = self
-            .embed
-            .as_ref()
-            .expect("decode_batch_internal called on backbone-only model (no embed)");
-        B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
-
-        // ── Phase 4d: CUDA-graph replay path ─────────────────────────
-        // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
-        // graph support (begin_graph_capture returns Err).
-        let graph_enabled = std::env::var("FERRUM_BATCHED_GRAPH")
-            .map(|v| v != "0")
-            .unwrap_or(false);
-        let m_padded = m.next_power_of_two();
-        // Per-m_padded graph cache: each batch shape gets its own
-        // captured graph instead of thrashing a single slot. Native
-        // CUDA microbench (graph_upload_bench) confirmed multi-slot
-        // replay is stable.
-        let graph_key = m_padded as u64;
-        let cache_has_key = self.batched_graph_keys_seen.contains(&graph_key);
-
-        let mut did_pure_replay = false;
-        if graph_enabled && cache_has_key && !self.batched_graph_failed {
-            // Sync stream first so embedding_lookup (just queued) plus
-            // any null-stream cuMemcpyHtoD_v2's from write_u32 are all
-            // settled before cuGraphLaunch.
-            B::sync(&mut ctx);
-            match B::replay_graph(&mut ctx, graph_key) {
-                Ok(true) => {
-                    did_pure_replay = true;
-                    BATCHED_GRAPH_REPLAY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    self.batched_graph_failed = true;
-                    eprintln!("[batched-trace] replay err: {}", e);
-                }
-            }
-        }
-        if graph_enabled && !did_pure_replay {
-            BATCHED_GRAPH_EAGER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        // Periodic stats (every 256 calls).
-        let total = BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-            + BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        if graph_enabled && total > 0 && total.is_multiple_of(256) {
-            eprintln!(
-                "[batched-graph-stats] m={m} m_padded={m_padded} replays={} eagers={} keys_seen={:?}",
-                BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                self.batched_graph_keys_seen,
-            );
-        }
-
-        if !did_pure_replay {
-            const BATCHED_GRAPH_WARMUP: usize = 3;
-            let should_capture = graph_enabled
-                && !self.batched_graph_failed
-                && self.batched_graph_warmup >= BATCHED_GRAPH_WARMUP;
-            if should_capture {
-                tracing::debug!("[batched-graph] BEGIN CAPTURE m_padded={m_padded}");
-                if let Err(e) = B::begin_graph_capture(&mut ctx) {
-                    eprintln!("[batched-trace] begin_capture err: {}", e);
-                    self.batched_graph_failed = true;
-                }
-            }
-            self.batched_graph_warmup += 1;
-
-            // Trace mode (env): sync after each major op so that the
-            // first panicking sync localises which kernel/section faulted.
-            // Off by default (adds 32 syncs per token = pipeline serialisation).
-            let trace = std::env::var("FERRUM_BATCHED_TRACE").is_ok();
-            macro_rules! tracesync {
-                ($label:expr) => {
-                    if trace {
-                        B::sync(&mut ctx);
-                        eprintln!("[trace-batched] {}", $label);
-                    }
-                };
-            }
-            tracesync!("entry-after-writes-and-embed");
-
-            // Op-profile: time the entire batched forward (eager only —
-            // pure replay short-circuits above and does not increment
-            // the per-op counters since the wrapped ops aren't executed
-            // by the Rust dispatch path).
-            let batched_profile = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
-            let batched_iter_t0 = if batched_profile {
-                // Drain shared counters first so this iter's print isn't
-                // contaminated by prior prefill/single-decode contributions.
-                ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                B::sync(&mut ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-
-            // Eager forward (records into graph if capture is active).
-            for li in 0..num_layers {
-                self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
-                tracesync!(format!("after layer {}", li));
-            }
-            let _t0_norm = if batched_profile {
-                B::sync(&mut ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            B::rms_norm(
-                &mut ctx,
-                &residual,
-                &self.final_norm_w,
-                self.cfg.rms_norm_eps,
-                &mut self.scratch.norm_out,
-                m,
-                h,
-            );
-            if let Some(t0) = _t0_norm {
-                B::sync(&mut ctx);
-                NORM_TIME_US.fetch_add(
-                    t0.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            tracesync!("after final rms_norm");
-            let lm_head = self
-                .lm_head
-                .as_ref()
-                .expect("decode_batch_internal called on backbone-only model (no lm_head)");
-            let _t0_lm = if batched_profile {
-                B::sync(&mut ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            lm_head.forward(
-                &mut ctx,
-                &self.scratch.norm_out,
-                &mut self.scratch.batch_logits,
-                m,
-            );
-            if let Some(t0) = _t0_lm {
-                B::sync(&mut ctx);
-                MATMUL_TIME_US.fetch_add(
-                    t0.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            tracesync!("after lm_head");
-
-            if let Some(t0) = batched_iter_t0 {
-                B::sync(&mut ctx);
-                let total_us = t0.elapsed().as_micros() as u64;
-                let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let wrapped_us = attn_us + qkr_us + mm_us + norm_us + other_us;
-                let unwrapped_us = total_us.saturating_sub(wrapped_us);
-                eprintln!(
-                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({})  unwrapped={}us",
-                    m,
-                    total_us,
-                    mm_us, mm_n,
-                    attn_us, attn_n,
-                    qkr_us, qkr_n,
-                    norm_us, norm_n,
-                    other_us, other_n,
-                    unwrapped_us,
-                );
-            }
-
-            if should_capture && !self.batched_graph_failed {
-                if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
-                    eprintln!("[batched-trace] end_capture err: {}", e);
-                    self.batched_graph_failed = true;
-                } else {
-                    self.batched_graph_keys_seen.insert(graph_key);
-                    if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
-                        eprintln!("[batched-trace] post-capture replay err: {}", e);
-                        self.batched_graph_failed = true;
-                    }
-                }
-            }
-        }
-
-        // Bump cache.len for all (m × num_layers) caches. forward_layer
-        // no longer bumps (so a graph replay's lack of Rust execution
-        // doesn't desync it). One central bump covers eager and replay.
-        for (cid, _, _) in batch.iter() {
-            let caches = self.kv_caches.get_mut(cid).expect("kv_caches missing");
-            for li in 0..num_layers {
-                let new_len = caches[li].len() + 1;
-                caches[li].set_len(new_len);
-            }
-        }
-
-        // Sync before to_vec (Metal: no internal sync on buffer read).
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-
-        // Extract M logit vectors from the flat buffer.
-        let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
-        (0..m)
-            .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
-            .collect()
-    }
 }
 
-impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
-    for LlamaFamilyModel<B, K>
-{
+// FP16 DecoderOnlyLLM impl — full path with batched + unified-forward overrides.
+impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
 
     fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
-        // Eager scratch + KV cache grow + a 1-token forward warmup —
-        // see the Qwen3MoeModel::prepare comment for the rationale.
-        // Without the warmup forward, the first real prefill pays
-        // Metal pipeline first-bind costs inside the timer window.
         self.ensure_scratch(max_tokens);
         self.ensure_kv(cache_id);
 
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
-        // Release via the same path as `release` so paged blocks
-        // return to the shared allocator. Otherwise warmup leaks
-        // 256 blocks (the full per-seq quota) into the pool.
         if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices().is_empty() {
-                        alloc.free(c0.paged_block_indices());
+                    if !c0.paged_block_indices.is_empty() {
+                        alloc.free(&c0.paged_block_indices);
                     }
                 }
                 for c in caches.iter_mut() {
-                    c.paged_block_indices_mut().clear();
+                    c.paged_block_indices.clear();
                 }
             }
             self.kv_free_pool.push(caches);
@@ -2847,7 +1940,6 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
     }
 
     fn kv_capacity(&self) -> usize {
-        // Mirror the bound `ensure_kv` will use when allocating the cache.
         let model_max = self.cfg.max_seq_len;
         const DEFAULT_KV_CAPACITY: usize = 512;
         std::env::var("FERRUM_KV_CAPACITY")
@@ -2869,16 +1961,6 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
         self.decode_batch_internal(batch)
     }
 
-    /// Unified mixed-batch forward (chunked-prefill API).
-    ///
-    /// When paged KV is on, dispatches to `unified_forward_internal`
-    /// which runs ONE `[M_total, hidden]` forward through the layer
-    /// loop + `paged_varlen_attention` kernel — the chunked-prefill
-    /// perf path.
-    ///
-    /// On the contig-KV path (CUDA default, no paged pool), returns
-    /// `Err(unsupported)` so the executor's fallback handles each item
-    /// via existing `prefill()` / `decode_batch()`.
     fn unified_forward(
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
@@ -2886,18 +1968,12 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        // Backend capability gate: unified path requires varlen QKV +
-        // paged_varlen_attention. Backends without them (Metal as of
-        // 2026-05-09, CPU) should drop back to per-item dispatch via
-        // forward_layer / decode_batch_internal.
         if !B::supports_varlen_qkv() {
             return Err(ferrum_types::FerrumError::unsupported(
                 "LlamaFamilyModel::unified_forward: backend lacks varlen \
                  QKV kernels. Engine will fall back to per-item dispatch.",
             ));
         }
-        // Touch the first item's KV cache so `ensure_kv` lazily allocates
-        // `paged_pools` when paged is enabled (env or backend default).
         self.ensure_kv(&items[0].0);
         if self.paged_pools.is_none() {
             return Err(ferrum_types::FerrumError::unsupported(
@@ -2906,11 +1982,6 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
                  Engine will fall back to per-item dispatch.",
             ));
         }
-        // ensure_kv all items up front and surface pool-exhaust as a clean
-        // per-request error (`ResourceExhausted`) instead of panicking
-        // inside `unified_forward_internal` — a panic kills the tokio
-        // worker and dangles every cache_id still in flight, which then
-        // permanently exhausts the pool.
         for (cid, _, _, _) in items {
             self.ensure_kv(cid);
             if !self.kv_caches.contains_key(cid) {
@@ -2923,22 +1994,17 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
     }
 
     fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
-        // Delegate to the inherent implementation on LlamaFamilyModel.
-        LlamaFamilyModel::<B, K>::forward_verify(self, cache_id, tokens)
+        LlamaFamilyModel::<B, KvFp16>::forward_verify(self, cache_id, tokens)
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
         if let Some(caches) = self.kv_caches.get_mut(cache_id) {
             for c in caches.iter_mut() {
-                if new_len < c.len() {
-                    c.set_len(new_len);
+                if new_len < c.len {
+                    c.len = new_len;
                 }
             }
         }
-        // Single-item graph captures kv-cache pointers directly; truncate
-        // doesn't change pointer but the captured kv_len-bumping pattern
-        // is fragile against state walks. Force single-item re-capture;
-        // batched path is layout-agnostic (per-call cache_lens write).
         let mut ctx = B::new_context();
         B::reset_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY);
         self.graph_warmup = 0;
@@ -2946,48 +2012,20 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
     }
 
     fn release(&mut self, cache_id: &str) {
-        // KV buffers go to kv_free_pool (not dropped) → captured graph's
-        // pointer args stay valid. Batched graph reads cache pointers from
-        // BATCHED_SCRATCH populated per-call, freed cache_ids drop out
-        // naturally. Drain in-flight kernels, then DON'T invalidate the
-        // graph slot — keeping it across releases avoids the thrashing
-        // pattern (every request completion = forced re-capture) that
-        // killed graph mode performance at c=16.
-        //
-        // Phase 4d earlier hit a multi-replay SIGSEGV when keeping the
-        // slot alive; Phase 8 (perm-aware Marlin) replaced cuBLAS dense
-        // GEMMs with Marlin in the captured path, which appears to have
-        // resolved the underlying instability. Verified 2026-05-04: c=4
-        // graph mode 16/16 ok with slot kept alive across releases (was
-        // 0/16 before Phase 8).
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        // Single-item path captures kv-cache pointers directly into the
-        // graph; force re-capture if the next request's pool-recycled
-        // buffer differs. Batched path uses BATCHED_SCRATCH indirection
-        // and survives buffer reuse without re-capture.
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
-
-        // Return the cache's buffers to the free pool instead of dropping.
-        // Pointers stay stable for the next request's captured graph.
-        // Paged mode: also free the cache's blocks back to the shared
-        // allocator so other sequences can reuse them.
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                // All caches share the same block_indices set (one per
-                // cache_id), so freeing once via the first layer's cache
-                // is enough.
                 if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices().is_empty() {
-                        alloc.free(c0.paged_block_indices());
+                    if !c0.paged_block_indices.is_empty() {
+                        alloc.free(&c0.paged_block_indices);
                     }
                 }
-                // Clear the host-side mirror on every layer so a
-                // free-pool reuse re-allocates fresh blocks.
                 for c in caches.iter_mut() {
-                    c.paged_block_indices_mut().clear();
+                    c.paged_block_indices.clear();
                 }
             }
             self.kv_free_pool.push(caches);
@@ -2995,7 +2033,6 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
     }
 
     fn reset(&mut self) {
-        // Hard reset: drop all caches AND the pool, invalidate ALL graphs.
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
         B::reset_all_graphs(&mut ctx);
@@ -3005,6 +2042,107 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
         self.batched_graph_keys_seen.clear();
         self.batched_graph_warmup = 0;
         self.batched_graph_failed = false;
+        self.kv_caches.clear();
+        self.kv_free_pool.clear();
+    }
+}
+
+// INT8 DecoderOnlyLLM impl — minimal: no batched / unified-forward overrides
+// (default trait impl falls back to per-item decode). PR D will add INT8
+// batched paths once the kernels stabilize.
+impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
+    fn config(&self) -> &LlmRuntimeConfig {
+        &self.runtime_cfg
+    }
+
+    fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
+        self.ensure_scratch(max_tokens);
+        self.ensure_kv(cache_id);
+
+        const WARMUP_CACHE: &str = "__ferrum_warmup__";
+        let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
+        if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
+            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(c0) = caches.first() {
+                    if !c0.paged_block_indices.is_empty() {
+                        alloc.free(&c0.paged_block_indices);
+                    }
+                }
+                for c in caches.iter_mut() {
+                    c.paged_block_indices.clear();
+                }
+            }
+            self.kv_free_pool.push(caches);
+        }
+    }
+
+    fn kv_capacity(&self) -> usize {
+        let model_max = self.cfg.max_seq_len;
+        const DEFAULT_KV_CAPACITY: usize = 512;
+        std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|cap| cap.min(model_max))
+            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
+    }
+
+    fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        self.prefill_internal(cache_id, tokens)
+    }
+
+    fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
+        self.decode_internal(cache_id, token, pos)
+    }
+
+    // decode_batch + unified_forward use trait defaults (per-item fallback).
+
+    fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        LlamaFamilyModel::<B, KvInt8>::forward_verify(self, cache_id, tokens)
+    }
+
+    fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
+        if let Some(caches) = self.kv_caches.get_mut(cache_id) {
+            for c in caches.iter_mut() {
+                if new_len < c.len {
+                    c.len = new_len;
+                }
+            }
+        }
+        let mut ctx = B::new_context();
+        B::reset_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY);
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
+    }
+
+    fn release(&mut self, cache_id: &str) {
+        let mut ctx = B::new_context();
+        B::sync(&mut ctx);
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
+        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
+            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(c0) = caches.first() {
+                    if !c0.paged_block_indices.is_empty() {
+                        alloc.free(&c0.paged_block_indices);
+                    }
+                }
+                for c in caches.iter_mut() {
+                    c.paged_block_indices.clear();
+                }
+            }
+            self.kv_free_pool.push(caches);
+        }
+    }
+
+    fn reset(&mut self) {
+        let mut ctx = B::new_context();
+        B::sync(&mut ctx);
+        B::reset_all_graphs(&mut ctx);
+        B::sync(&mut ctx);
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
         self.kv_caches.clear();
         self.kv_free_pool.clear();
     }

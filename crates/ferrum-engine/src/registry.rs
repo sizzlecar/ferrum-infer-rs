@@ -868,8 +868,9 @@ fn build_llm<B, K>(
     model_path: &str,
 ) -> Result<Box<dyn ferrum_models::common::DecoderOnlyLLM>>
 where
-    B: ferrum_kernels::backend::MoeLlmBackend + ferrum_kernels::backend::BackendInt8KvOps,
-    K: ferrum_interfaces::kv_dtype::KvDtypeKind,
+    B: ferrum_kernels::backend::MoeLlmBackend,
+    K: ferrum_kernels::backend::KvLayer<B>,
+    ferrum_models::models::LlamaFamilyModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
 {
     let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
     if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
