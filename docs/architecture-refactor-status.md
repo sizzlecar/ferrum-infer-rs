@@ -205,6 +205,24 @@ Then check periodically with `ssh ... 'tail /tmp/build_bench.log'`.
 Note: c=4 isn't in the historical bench tables (`docs/bench/cuda-rtx4090-2026-05-09-pr-101-102/` only logged c=1/8/16/32). Treat
 these as new baselines.
 
+### Post-consolidation rerun (Vast 4090, main @ `44a87d0` after PRs #126-#129)
+
+Acceptance gate 3 — same model, same comparison method, ≤ 3% drift.
+
+| Model | Path | tok/s e2e (now) | Δ vs baseline | TPOT | Δ TPOT |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | FP16 (safetensors) | 81.8 | -1.4% (within 3%) ✅ | 12.16 ms | +2.4% |
+| Llama-3.1-8B-Instruct | GPTQ-Int4 (Marlin) | 63.0 | **+4.3% improvement** ✅ | 15.86 ms | -4.2% |
+| Qwen3-30B-A3B | GPTQ-Int4 (vLLM Marlin moe, c=4) | 54.9 | +1.3% ✅ | 69.34 ms | -0.9% |
+
+Marlin INT4 improvement comes from the Phase 3e/2 cutover — LTO inlines
+`Box<dyn Linear<B>>` dispatch better than the previous
+`#[cfg]`-branched trait method body. Metal locally: Qwen3-0.6B Q4_K_M
+60.3 tok/s, matches pre-consolidation reading.
+
+**Acceptance gate 3 passes.** Functionality + performance preserved
+through PRs #126-#129. Only Dim 5 INT8 KV kernel work remains.
+
 ## References
 
 - Audit memory: `~/.claude/projects/-Users-chejinxuan-rust-ws-ferrum-infer-rs/memory/project_arch_audit_2026_05_09.md`
