@@ -416,19 +416,19 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
             pos_offset, eps, qk_mode,
         )?;
         // 2. quantize FP16 → INT8 + per-token scales, paged append.
+        // `paged_block_indices` is the host-side mirror populated at
+        // `ensure_kv` time — passing it directly avoids the D2H + sync
+        // barrier that would otherwise dominate per-token overhead.
         let cache_len_before = layer.len;
         let block_size = layer.block_size;
-        let bt_ptr = layer
-            .block_table
-            .as_ref()
-            .ok_or_else(|| FerrumError::model("INT8 paged_write: missing block_table"))?
-            as *const B::Buffer;
-        let block_table = unsafe { &*bt_ptr };
+        // Clone the host indices (small Vec<u32>) so we don't hold a
+        // borrow on `layer` while passing &mut layer.k/v/scales below.
+        let paged_indices: Vec<u32> = layer.paged_block_indices.clone();
         B::int8_kv_append_paged(
             ctx, k_scratch, v_scratch,
             &mut layer.k, &mut layer.v,
             &mut layer.k_scales, &mut layer.v_scales,
-            block_table,
+            &paged_indices,
             cache_len_before, tokens, block_size,
             num_kv_heads, head_dim,
         )

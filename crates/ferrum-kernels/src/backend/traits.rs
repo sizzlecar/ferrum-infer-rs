@@ -2242,12 +2242,15 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
     }
 
     /// Append `tokens` FP16 K/V values into the paged INT8 pool.
-    /// `block_table` is the per-seq logical→physical block index array
-    /// (u32 values, addressed via `Self::Buffer`); `cache_len_before` is
-    /// the current number of valid tokens in the cache (for slot-mapping
-    /// computation). Backend computes the slot mapping, quantizes FP16 →
-    /// INT8 with per-(token, kv-head) FP16 scale, and writes both into
-    /// the layer's INT8/scale buffers.
+    /// `paged_block_indices` is the host-side mirror of the per-seq
+    /// logical→physical block table (already populated at `ensure_kv` time
+    /// — see `KvCacheQuant::paged_block_indices`). Passing the host slice
+    /// avoids a per-token D2H + sync barrier; backend computes the slot
+    /// mapping host-side, async-H2D's it, and chains the append kernel
+    /// on the same stream — fully overlapping with prior work.
+    /// `cache_len_before` is the current number of valid tokens; the
+    /// backend quantizes FP16 → INT8 with per-(token, kv-head) FP16 scale
+    /// and writes both into the layer's INT8 / scale buffers.
     fn int8_kv_append_paged(
         _ctx: &mut Self::Context,
         _k_in: &Self::Buffer,
@@ -2256,7 +2259,7 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
         _layer_v: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
         _layer_k_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
         _layer_v_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
-        _block_table: &Self::Buffer,
+        _paged_block_indices: &[u32],
         _cache_len_before: usize,
         _tokens: usize,
         _block_size: usize,

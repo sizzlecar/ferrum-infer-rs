@@ -4846,7 +4846,7 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         layer_v: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
         layer_k_scales: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
         layer_v_scales: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
-        block_table: &Self::Buffer,
+        paged_block_indices: &[u32],
         cache_len_before: usize,
         tokens: usize,
         block_size: usize,
@@ -4856,33 +4856,19 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         if tokens == 0 {
             return Ok(());
         }
-        // Read block_table host-side to compute the per-token slot mapping
-        // expected by `launch_int8_kv_cache_append`. block_table is stored
-        // as `CudaSlice<f16>` (Self::Buffer) but actually holds u32 indices
-        // — alloc_u32 over-allocates exactly so the byte layout matches.
-        let last_block = (cache_len_before + tokens - 1) / block_size;
-        let n_blocks_to_read = last_block + 1;
-        let stream = ctx.stream.clone();
-        let bt_u32_view = unsafe {
-            block_table
-                .transmute::<u32>(n_blocks_to_read)
-                .ok_or_else(|| FerrumError::model("block_table transmute<u32> failed"))?
-        };
-        let mut block_indices = vec![0u32; n_blocks_to_read];
-        stream
-            .memcpy_dtoh(&bt_u32_view, &mut block_indices)
-            .map_err(|e| FerrumError::model(format!("dtoh block_table: {e}")))?;
-        stream
-            .synchronize()
-            .map_err(|e| FerrumError::model(format!("sync after block_table dtoh: {e}")))?;
-
         // Compute flat slot indices: physical_block * block_size + slot.
+        // Reads `paged_block_indices` directly (host mirror populated at
+        // `ensure_kv`), avoiding the per-token D2H + sync barrier the
+        // earlier version paid. H2D for the resulting `slot_mapping` uses
+        // `cuMemcpyHtoDAsync` on the stream (no host wait), so the cost
+        // collapses to the cudarc enqueue overhead.
+        let stream = ctx.stream.clone();
         let mut slot_mapping_host = vec![0i32; tokens];
         for t in 0..tokens {
             let global_pos = cache_len_before + t;
             let block_logical = global_pos / block_size;
             let slot_in_block = global_pos % block_size;
-            let block_physical = block_indices[block_logical] as usize;
+            let block_physical = paged_block_indices[block_logical] as usize;
             slot_mapping_host[t] = (block_physical * block_size + slot_in_block) as i32;
         }
         let slot_mapping = stream
