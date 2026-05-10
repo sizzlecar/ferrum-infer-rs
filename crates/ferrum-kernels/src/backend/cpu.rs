@@ -906,3 +906,15 @@ impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CpuBackend {
     type KvBuffer = <Self as crate::backend::Backend>::Buffer;
     type KvScales = ();
 }
+
+// CPU: stub `BackendKvDtype<KvInt8>` impl. The CUDA-only INT8 KV path
+// (Dim 5) routes through the `LayerKvCache::Int8` enum variant, which
+// requires every `B: MoeLlmBackend` to also implement
+// `BackendKvDtype<KvInt8>` so the enum type is valid in any
+// `LlamaFamilyModel<B, K>` instantiation. The factory cascade in
+// `ferrum-engine::registry` rejects `(Device::CPU, KvCacheDtype::Int8)`,
+// so this stub is never constructed at runtime.
+impl crate::backend::BackendKvDtype<crate::backend::KvInt8> for CpuBackend {
+    type KvBuffer = ();
+    type KvScales = ();
+}

@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 
 use ferrum_interfaces::kv_dtype::KvDtypeKind;
 use ferrum_kernels::backend::{
-    Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
-    KvCache, MoeLlmBackend, MAX_LAYERS_FOR_GRAPH,
+    Backend, BackendGraph, BackendInt8KvOps, BackendMoeFused, BackendPagedKv, BackendQuantGguf,
+    BackendQuantMarlin, KvCache, MoeLlmBackend, MAX_LAYERS_FOR_GRAPH,
 };
 use ferrum_quantization::Linear;
 use ferrum_types::Result;
@@ -22,7 +22,7 @@ use super::llama_family::{
     OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US, SINGLE_ITEM_GRAPH_KEY,
 };
 
-impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
+impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K> {
     /// One transformer layer over M items, GEMMs batched + per-item attention.
     pub(crate) fn forward_layer_batched_decode(
         &mut self,
@@ -135,7 +135,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                     .kv_caches
                     .get(cache_id)
                     .expect("ensure_kv must be called before forward_layer_batched");
-                let cache = &caches[li];
+                let cache = caches[li].as_fp16();
                 item_state.push((cache.len as u32, cache.paged_block_indices.clone()));
             }
 
@@ -163,7 +163,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                     .kv_caches
                     .get(cache_id)
                     .expect("paged batched: cache not present");
-                let cache = &caches[li];
+                let cache = caches[li].as_fp16();
                 let bt = cache
                     .block_table
                     .as_ref()
@@ -221,7 +221,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                     .kv_caches
                     .get_mut(cache_id)
                     .expect("paged batched: cache not present");
-                let cache = &mut caches[li];
+                let cache = caches[li].as_fp16_mut();
                 cache.len += 1;
                 let len = cache.len as u32;
                 stacked_cl[i] = len;
@@ -445,7 +445,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                     .kv_caches
                     .get(cache_id)
                     .expect("kv_caches must be present");
-                let cache = &caches[li];
+                let cache = caches[li].as_fp16();
                 k_caches_ref.push(&cache.k);
                 v_caches_ref.push(&cache.v);
                 pre_append_lens.push(cache.len as u32);
@@ -621,7 +621,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                 .kv_caches
                 .get_mut(cache_id)
                 .expect("ensure_kv must be called before forward_layer_batched");
-            let cache = &mut caches[li];
+            let cache = caches[li].as_fp16_mut();
             B::kv_cache_append_head_major(
                 ctx,
                 &mut cache.k,
@@ -697,7 +697,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                     .kv_caches
                     .get(cache_id)
                     .expect("kv_caches must be present");
-                let cache = &caches[li];
+                let cache = caches[li].as_fp16();
                 k_caches_ref.push(&cache.k);
                 v_caches_ref.push(&cache.v);
                 // POST-append valid_kv_len: kv_cache_append_batched_per_cache
@@ -777,7 +777,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                         .kv_caches
                         .get(cache_id)
                         .expect("kv_caches must be present");
-                    let cache = &caches[li];
+                    let cache = caches[li].as_fp16();
                     let kv_stride = cache.capacity;
                     let attn_cfg = ferrum_kernels::backend::AttnConfig {
                         num_heads: nh,
@@ -1096,7 +1096,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                     .kv_caches
                     .get(cid)
                     .expect("kv cache missing for unified item");
-                let cache0 = &caches[0];
+                let cache0 = caches[0].as_fp16();
                 let blocks = &cache0.paged_block_indices;
                 let n_to_copy = blocks.len().min(max_blocks_per_seq);
                 stacked[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
@@ -1370,7 +1370,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                 .get_mut(cid)
                 .expect("kv cache missing for unified item post-loop");
             for c in caches.iter_mut() {
-                c.len += q_lens[i];
+                let new_len = c.len() + q_lens[i];
+                c.set_len(new_len);
             }
         }
 

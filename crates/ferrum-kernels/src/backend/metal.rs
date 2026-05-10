@@ -2691,3 +2691,13 @@ impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for MetalBackend {
     type KvBuffer = <Self as crate::backend::Backend>::Buffer;
     type KvScales = ();
 }
+
+// Metal: stub `BackendKvDtype<KvInt8>` impl. Same rationale as CpuBackend
+// — the `LayerKvCache::Int8` enum variant requires every backend to
+// satisfy `BackendKvDtype<KvInt8>` for the enum type to be expressible.
+// Factory cascade rejects `(Device::Metal, KvCacheDtype::Int8)` so this
+// stub is never constructed.
+impl crate::backend::BackendKvDtype<crate::backend::KvInt8> for MetalBackend {
+    type KvBuffer = ();
+    type KvScales = ();
+}

@@ -19,11 +19,162 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16};
+use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 use ferrum_kernels::backend::{
-    Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
-    KvCache, LlmBackend, MoeLlmBackend, QuantLlmBackend, MAX_LAYERS_FOR_GRAPH,
+    Backend, BackendGraph, BackendInt8KvOps, BackendKvDtype, BackendMoeFused, BackendPagedKv,
+    BackendQuantGguf, BackendQuantMarlin, KvCache, KvCacheQuant, LlmBackend, MoeLlmBackend,
+    QuantLlmBackend, MAX_LAYERS_FOR_GRAPH,
 };
+
+/// Per-layer KV cache element (Dim 5).
+///
+/// Wraps both the FP16 (`KvCache<B, KvFp16>`) and INT8
+/// (`KvCacheQuant<B, KvInt8>`) cache layouts so a single model struct
+/// can carry either depending on the model's `K` type marker.
+///
+/// `K` is *not* on the enum: every `LlamaFamilyModel<B, K>` instance
+/// only ever constructs **one** variant for the lifetime of the model,
+/// chosen by `K::NAME` in `ensure_kv`. Carrying an actual `K` parameter
+/// here would force `K = KvInt8` for the `Int8` variant and force
+/// every `K` value to satisfy `BackendKvDtype<K>` for the `Fp16` arm —
+/// painful for callers that just have a `K: KvDtypeKind` bound. Instead
+/// the variants name concrete dtypes; the `B: BackendKvDtype<KvInt8>`
+/// bound is satisfied by stub impls on CpuBackend/MetalBackend so the
+/// enum type is well-formed everywhere.
+pub enum LayerKvCache<B: MoeLlmBackend + BackendInt8KvOps> {
+    Fp16(KvCache<B, KvFp16>),
+    Int8(KvCacheQuant<B, KvInt8>),
+}
+
+impl<B: MoeLlmBackend + BackendInt8KvOps> LayerKvCache<B> {
+    pub fn len(&self) -> usize {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.len,
+            LayerKvCache::Int8(kv) => kv.len,
+        }
+    }
+
+    pub fn set_len(&mut self, new_len: usize) {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.len = new_len,
+            LayerKvCache::Int8(kv) => kv.len = new_len,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.capacity,
+            LayerKvCache::Int8(kv) => kv.capacity,
+        }
+    }
+
+    pub fn block_size(&self) -> usize {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.block_size,
+            LayerKvCache::Int8(kv) => kv.block_size,
+        }
+    }
+
+    pub fn num_kv_heads(&self) -> usize {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.num_kv_heads,
+            LayerKvCache::Int8(kv) => kv.num_kv_heads,
+        }
+    }
+
+    pub fn head_dim(&self) -> usize {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.head_dim,
+            LayerKvCache::Int8(kv) => kv.head_dim,
+        }
+    }
+
+    pub fn block_table(&self) -> Option<&B::Buffer> {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.block_table.as_ref(),
+            LayerKvCache::Int8(kv) => kv.block_table.as_ref(),
+        }
+    }
+
+    pub fn context_lens(&self) -> Option<&B::Buffer> {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.context_lens.as_ref(),
+            LayerKvCache::Int8(kv) => kv.context_lens.as_ref(),
+        }
+    }
+
+    pub fn context_lens_mut(&mut self) -> Option<&mut B::Buffer> {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.context_lens.as_mut(),
+            LayerKvCache::Int8(kv) => kv.context_lens.as_mut(),
+        }
+    }
+
+    pub fn paged_block_indices(&self) -> &[u32] {
+        match self {
+            LayerKvCache::Fp16(kv) => &kv.paged_block_indices,
+            LayerKvCache::Int8(kv) => &kv.paged_block_indices,
+        }
+    }
+
+    pub fn paged_block_indices_mut(&mut self) -> &mut Vec<u32> {
+        match self {
+            LayerKvCache::Fp16(kv) => &mut kv.paged_block_indices,
+            LayerKvCache::Int8(kv) => &mut kv.paged_block_indices,
+        }
+    }
+
+    pub fn block_table_mut(&mut self) -> Option<&mut B::Buffer> {
+        match self {
+            LayerKvCache::Fp16(kv) => kv.block_table.as_mut(),
+            LayerKvCache::Int8(kv) => kv.block_table.as_mut(),
+        }
+    }
+
+    /// Whether this cache is in paged mode (`block_size > 0`).
+    pub fn is_paged(&self) -> bool {
+        self.block_size() > 0
+    }
+
+    /// Borrow the FP16 cache (panics if this is the INT8 variant). Used
+    /// by paths that haven't been generalized to the enum yet — caller
+    /// must guarantee the model's `K = KvFp16`.
+    pub fn as_fp16_mut(&mut self) -> &mut KvCache<B, KvFp16> {
+        match self {
+            LayerKvCache::Fp16(kv) => kv,
+            LayerKvCache::Int8(_) => {
+                panic!("LayerKvCache::as_fp16_mut called on Int8 variant")
+            }
+        }
+    }
+
+    pub fn as_fp16(&self) -> &KvCache<B, KvFp16> {
+        match self {
+            LayerKvCache::Fp16(kv) => kv,
+            LayerKvCache::Int8(_) => {
+                panic!("LayerKvCache::as_fp16 called on Int8 variant")
+            }
+        }
+    }
+
+    pub fn as_int8_mut(&mut self) -> &mut KvCacheQuant<B, KvInt8> {
+        match self {
+            LayerKvCache::Int8(kv) => kv,
+            LayerKvCache::Fp16(_) => {
+                panic!("LayerKvCache::as_int8_mut called on Fp16 variant")
+            }
+        }
+    }
+
+    pub fn as_int8(&self) -> &KvCacheQuant<B, KvInt8> {
+        match self {
+            LayerKvCache::Int8(kv) => kv,
+            LayerKvCache::Fp16(_) => {
+                panic!("LayerKvCache::as_int8 called on Fp16 variant")
+            }
+        }
+    }
+}
 
 /// Graph cache key for the single-item decode path (`decode_internal`).
 /// Distinct from any `m_padded`-based key used by the batched path.
@@ -480,10 +631,12 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
 /// defaults, so this bound is satisfied by every concrete `Backend`.
 ///
 /// `K: KvDtypeKind = KvFp16` (Dim 5): selects the KV cache element type.
-/// Default `KvFp16` matches the original `KvCache<B>` layout, so existing
-/// call sites keep working unchanged. INT8 / FP8 wire-up lives in PR C
-/// (see `docs/dim5-model-wireup-plan.md`).
-pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
+/// `K = KvFp16` constructs only `LayerKvCache::Fp16(...)` variants;
+/// `K = KvInt8` constructs only `LayerKvCache::Int8(...)` variants. The
+/// `B: BackendKvDtype<KvInt8>` bound is structurally required by the
+/// enum and is satisfied by all backends via stub impls (Cpu/Metal) or
+/// the real impl (CUDA).
+pub struct LlamaFamilyModel<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind = KvFp16> {
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -507,12 +660,16 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     /// - **Paged mode** (`FERRUM_METAL_PAGED_KV=1`): k/v are unused
     ///   placeholders; the real K/V live in [`Self::paged_pools`] and
     ///   the cache's `block_table` + `context_lens` index into them.
-    pub kv_caches: HashMap<String, Vec<KvCache<B, K>>>,
+    pub kv_caches: HashMap<String, Vec<LayerKvCache<B>>>,
     /// Free pool of pre-allocated KV cache slots. Released caches return
     /// here instead of being dropped, so their device pointers stay valid
     /// across requests — critical for graph capture (pointers baked into
     /// the captured graph would otherwise dangle).
-    kv_free_pool: Vec<Vec<KvCache<B, K>>>,
+    kv_free_pool: Vec<Vec<LayerKvCache<B>>>,
+    /// Phantom marker — selects which `LayerKvCache` variant `ensure_kv`
+    /// constructs. `K::NAME` is checked at runtime but folds to a const
+    /// after monomorphization.
+    _kv_dtype: std::marker::PhantomData<K>,
 
     // ── Paged-KV multi-seq state (Phase 4) ─────────────────────────────
     //
@@ -560,7 +717,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     pub(crate) unified_graph_keys_seen: std::collections::HashSet<u64>,
 }
 
-impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
+impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K> {
     /// Build a Qwen3 model from weights provided by the loader.
     ///
     /// The loader decides per-projection whether to instantiate DenseLinear,
@@ -659,6 +816,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
+            _kv_dtype: std::marker::PhantomData,
             paged_pools: None,
             paged_block_alloc: None,
             graph_warmup: 0,
@@ -742,6 +900,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
+            _kv_dtype: std::marker::PhantomData,
             paged_pools: None,
             paged_block_alloc: None,
             graph_warmup: 0,
@@ -873,21 +1032,41 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
 
         // Try pool first — reused buffers have stable device pointers,
         // so a captured decode graph can be replayed for this request too.
+        // K::NAME selects which `LayerKvCache` variant to construct:
+        //   - "fp16" → FP16 path (existing).
+        //   - "int8" → INT8 paged path; requires paged=true and
+        //     `B: BackendInt8KvOps` (the factory cascade only routes
+        //     `(CUDA, Int8)` here so this branch only ever runs on CUDA).
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
             (0..self.cfg.num_layers)
                 .map(|_| {
-                    if paged {
-                        // Paged mode: cache holds metadata only. K/V
-                        // are 1-element placeholders (allocated cheaply
-                        // since Backend::alloc requires a non-zero
-                        // size on most backends). The real data lives
+                    if K::NAME == "int8" {
+                        if !paged {
+                            panic!(
+                                "INT8 KV requires paged mode; set FERRUM_METAL_PAGED_KV=1 \
+                                 (cross-backend env var) or use FP16 KV"
+                            );
+                        }
+                        // INT8 paged layer: K/V/scales pools allocated
+                        // by the backend; block_table mirrors the FP16
+                        // path (alloc_u32 on Self::Buffer to match the
+                        // u32-as-f16 storage trick).
+                        LayerKvCache::Int8(B::alloc_paged_int8_layer(
+                            max_blocks_per_seq,
+                            PAGED_BLOCK_SIZE,
+                            nkv,
+                            hd,
+                        ))
+                    } else if paged {
+                        // FP16 paged: cache holds metadata only. K/V
+                        // are 1-element placeholders. Real data lives
                         // in `self.paged_pools[li].{k,v}`.
-                        let mut block_table = B::alloc_u32(max_blocks_per_seq);
+                        let block_table = B::alloc_u32(max_blocks_per_seq);
                         let mut context_lens = B::alloc_u32(1);
                         let mut bt_ctx = B::new_context();
                         B::write_u32(&mut bt_ctx, &mut context_lens, &[0u32]);
                         B::sync(&mut bt_ctx);
-                        KvCache {
+                        LayerKvCache::Fp16(KvCache {
                             k: B::alloc(1),
                             v: B::alloc(1),
                             len: 0,
@@ -899,9 +1078,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                             context_lens: Some(context_lens),
                             paged_block_indices: Vec::new(),
                             _kv_dtype: std::marker::PhantomData,
-                        }
+                        })
                     } else {
-                        KvCache {
+                        LayerKvCache::Fp16(KvCache {
                             k: B::alloc(nkv * max * hd),
                             v: B::alloc(nkv * max * hd),
                             len: 0,
@@ -913,7 +1092,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                             context_lens: None,
                             paged_block_indices: Vec::new(),
                             _kv_dtype: std::marker::PhantomData,
-                        }
+                        })
                     }
                 })
                 .collect()
@@ -961,10 +1140,10 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
             padded.resize(max_blocks_per_seq, 0);
             let mut ctx_tmp = B::new_context();
             for c in caches.iter_mut() {
-                if let Some(bt) = c.block_table.as_mut() {
+                if let Some(bt) = c.block_table_mut() {
                     B::write_u32(&mut ctx_tmp, bt, &padded);
                 }
-                c.paged_block_indices = block_indices.clone();
+                *c.paged_block_indices_mut() = block_indices.clone();
             }
             B::sync(&mut ctx_tmp);
         }
@@ -973,8 +1152,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
         // the kv_cache_append writes new K/V in place, and attention only
         // reads up to `cache_len`.
         for c in caches.iter_mut() {
-            c.len = 0;
-            if let Some(cl) = c.context_lens.as_mut() {
+            c.set_len(0);
+            if let Some(cl) = c.context_lens_mut() {
                 let mut ctx_tmp = B::new_context();
                 B::write_u32(&mut ctx_tmp, cl, &[0u32]);
                 B::sync(&mut ctx_tmp);
@@ -1093,7 +1272,12 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
             .kv_caches
             .get_mut(cache_id)
             .expect("ensure_kv must be called before forward_layer");
-        let cache = &mut caches[li];
+        // K=KvFp16 path uses the existing fused launchers that work over
+        // `KvCache<B, KvFp16>`; INT8 forwards through this method are
+        // re-routed at the public entry (`prefill_internal` / `decode_internal`)
+        // before reaching here. `as_fp16_mut` panics on the Int8 variant —
+        // that's a contract bug if it ever fires here.
+        let cache = caches[li].as_fp16_mut();
         let cache_len_before = cache.len;
         let cache_capacity = cache.capacity;
 
@@ -1560,7 +1744,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
             .kv_caches
             .get(cache_id)
             .and_then(|layers| layers.first())
-            .map(|c| c.len)
+            .map(|c| c.len())
             .unwrap_or(0);
 
         let mut ctx = B::new_context();
@@ -1630,7 +1814,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
             .kv_caches
             .get(cache_id)
             .and_then(|layers| layers.first())
-            .map(|c| c.len)
+            .map(|c| c.len())
             .unwrap_or(0);
 
         let h = self.cfg.hidden_size;
@@ -2181,7 +2365,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
         let tokens: Vec<u32> = batch.iter().map(|(_, t, _)| *t).collect();
         let kv_pre: Vec<u32> = batch
             .iter()
-            .map(|(cid, _, _)| self.kv_caches.get(cid).expect("kv_caches missing")[0].len as u32)
+            .map(|(cid, _, _)| self.kv_caches.get(cid).expect("kv_caches missing")[0].len() as u32)
             .collect();
         let kv_post: Vec<u32> = kv_pre.iter().map(|&x| x + 1).collect();
         B::write_u32(&mut ctx, &mut self.scratch.batch_positions, &positions);
@@ -2425,7 +2609,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
         for (cid, _, _) in batch.iter() {
             let caches = self.kv_caches.get_mut(cid).expect("kv_caches missing");
             for li in 0..num_layers {
-                caches[li].len += 1;
+                let new_len = caches[li].len() + 1;
+                caches[li].set_len(new_len);
             }
         }
 
@@ -2441,7 +2626,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
     }
 }
 
-impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for LlamaFamilyModel<B, K> {
+impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> DecoderOnlyLLM
+    for LlamaFamilyModel<B, K>
+{
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -2463,12 +2650,12 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for LlamaFamilyModel<B, K>
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
+                    if !c0.paged_block_indices().is_empty() {
+                        alloc.free(c0.paged_block_indices());
                     }
                 }
                 for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
+                    c.paged_block_indices_mut().clear();
                 }
             }
             self.kv_free_pool.push(caches);
@@ -2559,8 +2746,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for LlamaFamilyModel<B, K>
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
         if let Some(caches) = self.kv_caches.get_mut(cache_id) {
             for c in caches.iter_mut() {
-                if new_len < c.len {
-                    c.len = new_len;
+                if new_len < c.len() {
+                    c.set_len(new_len);
                 }
             }
         }
@@ -2609,14 +2796,14 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for LlamaFamilyModel<B, K>
                 // cache_id), so freeing once via the first layer's cache
                 // is enough.
                 if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
+                    if !c0.paged_block_indices().is_empty() {
+                        alloc.free(c0.paged_block_indices());
                     }
                 }
                 // Clear the host-side mirror on every layer so a
                 // free-pool reuse re-allocates fresh blocks.
                 for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
+                    c.paged_block_indices_mut().clear();
                 }
             }
             self.kv_free_pool.push(caches);

@@ -4766,6 +4766,151 @@ impl OptionalCudaScalesF16 {
     }
 }
 
+// Implement INT8 KV launchers as Backend trait methods so the model
+// layer can dispatch via `B::int8_kv_append_paged(...)` /
+// `B::int8_paged_decode_attention(...)` without reaching into
+// cudarc primitives directly.
+impl crate::backend::BackendInt8KvOps for CudaBackend {
+    fn alloc_paged_int8_layer(
+        max_blocks_per_seq: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> crate::backend::KvCacheQuant<Self, crate::backend::KvInt8> {
+        crate::backend::KvCacheQuant::<CudaBackend, crate::backend::KvInt8>::new_paged_cuda(
+            max_blocks_per_seq,
+            block_size,
+            num_kv_heads,
+            head_dim,
+        )
+    }
+
+    fn int8_kv_append_paged(
+        ctx: &mut Self::Context,
+        k_in: &Self::Buffer,
+        v_in: &Self::Buffer,
+        layer_k: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
+        layer_v: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
+        layer_k_scales: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
+        layer_v_scales: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
+        block_table: &Self::Buffer,
+        cache_len_before: usize,
+        tokens: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        // Read block_table host-side to compute the per-token slot mapping
+        // expected by `launch_int8_kv_cache_append`. block_table is stored
+        // as `CudaSlice<f16>` (Self::Buffer) but actually holds u32 indices
+        // — alloc_u32 over-allocates exactly so the byte layout matches.
+        let last_block = (cache_len_before + tokens - 1) / block_size;
+        let n_blocks_to_read = last_block + 1;
+        let stream = ctx.stream.clone();
+        let bt_u32_view = unsafe {
+            block_table
+                .transmute::<u32>(n_blocks_to_read)
+                .ok_or_else(|| FerrumError::model("block_table transmute<u32> failed"))?
+        };
+        let mut block_indices = vec![0u32; n_blocks_to_read];
+        stream
+            .memcpy_dtoh(&bt_u32_view, &mut block_indices)
+            .map_err(|e| FerrumError::model(format!("dtoh block_table: {e}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| FerrumError::model(format!("sync after block_table dtoh: {e}")))?;
+
+        // Compute flat slot indices: physical_block * block_size + slot.
+        let mut slot_mapping_host = vec![0i32; tokens];
+        for t in 0..tokens {
+            let global_pos = cache_len_before + t;
+            let block_logical = global_pos / block_size;
+            let slot_in_block = global_pos % block_size;
+            let block_physical = block_indices[block_logical] as usize;
+            slot_mapping_host[t] = (block_physical * block_size + slot_in_block) as i32;
+        }
+        let slot_mapping = stream
+            .memcpy_stod(&slot_mapping_host)
+            .map_err(|e| FerrumError::model(format!("htod slot_mapping: {e}")))?;
+
+        // Lazily alloc INT8 buffers + scales on first call (the constructor
+        // populates them already, but defensive in case callers clear).
+        if layer_k.0.is_none() {
+            return Err(FerrumError::model(
+                "int8_kv_append_paged: layer_k not allocated",
+            ));
+        }
+        if layer_v.0.is_none() || layer_k_scales.0.is_none() || layer_v_scales.0.is_none() {
+            return Err(FerrumError::model(
+                "int8_kv_append_paged: layer_v / scales not allocated",
+            ));
+        }
+
+        crate::int8_kv::launch_int8_kv_cache_append(
+            &ctx.ctx,
+            k_in,
+            v_in,
+            layer_k.buffer_mut(),
+            layer_v.buffer_mut(),
+            layer_k_scales.buffer_mut(),
+            layer_v_scales.buffer_mut(),
+            &slot_mapping,
+            tokens,
+            num_kv_heads,
+            head_dim,
+        )
+        .map_err(|e| FerrumError::model(format!("launch_int8_kv_cache_append: {e}")))?;
+        Ok(())
+    }
+
+    fn int8_paged_decode_attention(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        layer_k: &<Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
+        layer_v: &<Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
+        layer_k_scales: &<Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
+        layer_v_scales: &<Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
+        block_table: &Self::Buffer,
+        output: &mut Self::Buffer,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        valid_kv_len: usize,
+        block_size: usize,
+        scale: f32,
+    ) -> Result<()> {
+        // block_table is stored as f16 but holds i32 (alloc_u32 doubles
+        // bytes). Reinterpret to i32 view of length max_blocks_per_seq.
+        let n_blocks = valid_kv_len.div_ceil(block_size).max(1);
+        let bt_i32_view = unsafe {
+            block_table
+                .transmute::<i32>(n_blocks)
+                .ok_or_else(|| FerrumError::model("block_table transmute<i32> failed"))?
+        };
+        crate::int8_kv::launch_int8_paged_decode_attention(
+            &ctx.ctx,
+            q,
+            layer_k.buffer(),
+            layer_v.buffer(),
+            layer_k_scales.buffer(),
+            layer_v_scales.buffer(),
+            &bt_i32_view,
+            output,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            valid_kv_len,
+            block_size,
+            scale,
+        )
+        .map_err(|e| FerrumError::model(format!("launch_int8_paged_decode_attention: {e}")))?;
+        Ok(())
+    }
+}
+
 // Convenience constructor for paged INT8 KV caches on CUDA.
 impl crate::backend::KvCacheQuant<CudaBackend, crate::backend::KvInt8> {
     /// Allocate a paged INT8 KV cache for one sequence.
