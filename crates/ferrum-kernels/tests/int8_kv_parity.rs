@@ -285,21 +285,36 @@ fn int8_paged_decode_parity_vs_host_ref() {
 
     let out_int8: Vec<f32> = CudaBackend::to_vec(&out_dev, NUM_HEADS * HEAD_DIM);
 
+    // Compare via cosine similarity + max absolute error against the
+    // full output max — per-element relative error is meaningless when
+    // outputs are near zero (16% rel on a 0.0002 abs diff is fine if
+    // the max output magnitude is 0.06).
     let mut max_abs = 0f32;
-    let mut max_rel = 0f32;
+    let mut sse = 0f64;
+    let mut sum_a = 0f64;
+    let mut sum_b = 0f64;
+    let mut dot = 0f64;
     let mut max_mag = 0f32;
     for i in 0..out_ref.len() {
         let diff = (out_int8[i] - out_ref[i]).abs();
         max_abs = max_abs.max(diff);
-        let mag = out_ref[i].abs().max(1e-3);
-        max_rel = max_rel.max(diff / mag);
+        sse += (diff as f64) * (diff as f64);
         max_mag = max_mag.max(out_ref[i].abs());
+        sum_a += (out_ref[i] as f64) * (out_ref[i] as f64);
+        sum_b += (out_int8[i] as f64) * (out_int8[i] as f64);
+        dot += (out_ref[i] as f64) * (out_int8[i] as f64);
     }
+    let rmse = (sse / out_ref.len() as f64).sqrt() as f32;
+    let cosine = dot / (sum_a.sqrt() * sum_b.sqrt() + 1e-12);
+    let rel_to_mag = max_abs / max_mag.max(1e-6);
     eprintln!(
-        "int8 vs host-ref: max|diff|={max_abs:.5} max rel={max_rel:.4} (max output mag={max_mag:.4})"
+        "int8 vs host-ref: max|diff|={max_abs:.5} rmse={rmse:.5} cos={cosine:.5} \
+         rel-to-max-mag={rel_to_mag:.4} (max output mag={max_mag:.4})"
     );
-    // INT8 sym-quant per token-head + FP16 Q/output induces a few-%
-    // relative error on attention output for benign random inputs.
-    assert!(max_abs < 0.05, "abs diff too high: {max_abs}");
-    assert!(max_rel < 0.10, "rel diff too high: {max_rel}");
+    // Cosine ≈ 1 means INT8 reproduces the FP32 reference vector
+    // direction nearly perfectly. The remaining absolute error is the
+    // INT8 quantization noise floor (~max(|K|)/127 propagated through
+    // attention, ≈ 0.0003 at this shape).
+    assert!(cosine > 0.999, "cosine similarity too low: {cosine}");
+    assert!(rel_to_mag < 0.02, "max abs / max mag too high: {rel_to_mag}");
 }
