@@ -2687,4 +2687,7 @@ impl crate::backend::BackendMoeFused for MetalBackend {
 }
 
 // Metal: existing KV cache path is FP16.
-impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for MetalBackend {}
+impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for MetalBackend {
+    type KvBuffer = <Self as crate::backend::Backend>::Buffer;
+    type KvScales = ();
+}

@@ -199,6 +199,38 @@ pub struct KvCache<B: Backend, K: KvDtypeKind = KvFp16> {
     pub _kv_dtype: std::marker::PhantomData<K>,
 }
 
+/// Quantized-KV cache (Dim 5 INT8 / future FP8 paths). Sibling of
+/// [`KvCache`] for backends that store K/V in a non-FP16 element type
+/// plus per-token per-kv-head scales.
+///
+/// Why a separate struct: the FP16 `KvCache<B, K>` uses `B::Buffer`
+/// uniformly, which is FP16 on every concrete backend. Stuffing INT8
+/// storage into that buffer would require unsafe transmutes; making
+/// the FP16 struct generic over the storage type would force every
+/// existing call site (4 model files, ~20 functions) to pick up an
+/// equality-bound on the associated type. Keeping a parallel struct
+/// for INT8 is the cheaper trade — the kernel launchers in
+/// [`crate::int8_kv`] take cudarc primitives directly anyway.
+///
+/// `KStorage` and `ScaleStorage` come from `BackendKvDtype<K>::KvBuffer`
+/// and `BackendKvDtype<K>::KvScales`. On CUDA they wrap `CudaSlice<i8>`
+/// and `CudaSlice<f16>`.
+pub struct KvCacheQuant<B: BackendKvDtype<K>, K: KvDtypeKind> {
+    pub k: <B as BackendKvDtype<K>>::KvBuffer,
+    pub v: <B as BackendKvDtype<K>>::KvBuffer,
+    pub k_scales: <B as BackendKvDtype<K>>::KvScales,
+    pub v_scales: <B as BackendKvDtype<K>>::KvScales,
+    pub len: usize,
+    pub capacity: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub block_size: usize,
+    pub block_table: Option<B::Buffer>,
+    pub context_lens: Option<B::Buffer>,
+    pub paged_block_indices: Vec<u32>,
+    pub _kv_dtype: std::marker::PhantomData<K>,
+}
+
 /// The core abstraction over CUDA / Metal / CPU.
 ///
 /// Key design: operations take a `&mut Self::Context` which accumulates work.
@@ -2160,10 +2192,23 @@ impl<T> MoeLlmBackend for T where T: QuantLlmBackend + BackendMoeFused {}
 pub use ferrum_interfaces::kv_dtype::{KvBf16, KvDtypeKind, KvFp16, KvFp8, KvInt8};
 
 /// Capability-trait for backends that can store + read a KV cache of
-/// type `K`. Methods come in a follow-up PR; today this is a marker
-/// that gates the (model, KV-dtype) combination at compile time.
+/// type `K`.
 ///
-/// Models that want INT8 KV will eventually look like:
-///   `where B: BackendCore + BackendPagedKv + BackendKvDtype<KvInt8>`
-/// instead of the current implicit FP16 assumption.
-pub trait BackendKvDtype<K: KvDtypeKind>: BackendPagedKv {}
+/// The two associated types carry the K-specific storage shape:
+///   - `KvBuffer`: per-layer K/V element storage. For `K = KvFp16` it
+///     is the backend's normal `Self::Buffer` (FP16). For `K = KvInt8`
+///     it is the backend's INT8 buffer (e.g. `CudaSlice<i8>` on CUDA).
+///   - `KvScales`: per-token-per-kv-head scales. For `K = KvFp16` this
+///     is the unit type `()` (no scales). For `K = KvInt8` / `KvFp8`
+///     it is a backend-specific FP16 buffer.
+///
+/// Models that want INT8 KV use:
+///   `where B: BackendKvDtype<KvInt8>`
+/// — the buffers in `KvCache<B, KvInt8>` are then `CudaSlice<i8>` and
+/// `CudaSlice<f16>`, distinct from the FP16 path's `Self::Buffer`.
+pub trait BackendKvDtype<K: KvDtypeKind>: BackendPagedKv {
+    /// Per-layer K/V element storage.
+    type KvBuffer: Send + Sync;
+    /// Per-token per-kv-head scale storage. `()` for FP16 (no scales).
+    type KvScales: Send + Sync + Default;
+}
