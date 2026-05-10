@@ -54,6 +54,13 @@ pub struct ServeCommand {
     /// Set 1.0 for an exclusive GPU; lower if you share the card.
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
+
+    /// KV cache element dtype (Dim 5 polymorphism point). Accepts
+    /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
+    /// require model wire-up; today only the kernel + type layer ships.
+    /// Override via `FERRUM_KV_DTYPE` env var.
+    #[arg(long, value_name = "DTYPE")]
+    pub kv_dtype: Option<String>,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -66,6 +73,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         spec_draft,
         spec_tokens,
         gpu_memory_utilization,
+        kv_dtype,
     } = cmd;
 
     // Print banner
@@ -314,6 +322,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
+            super::run::apply_kv_dtype_override(&mut engine_config, kv_dtype.as_deref())?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
                 Arc::from(ferrum_engine::create_default_engine(engine_config).await?);
             AxumServer::from_llm(engine)
