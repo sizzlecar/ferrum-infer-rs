@@ -2,7 +2,7 @@
 //! Compares Metal output against CPU reference.
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-use ferrum_attention::{attention_cpu, metal, AttentionParams};
+use ferrum_kernels::attention::{attention_cpu, metal, AttentionParams};
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn assert_close(a: &[f32], b: &[f32], atol: f32, label: &str) {

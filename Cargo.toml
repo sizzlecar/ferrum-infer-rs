@@ -10,11 +10,9 @@ members = [
     "crates/ferrum-sampler",
     "crates/ferrum-kv",
     
-    # Unified compute kernels (CUDA/Metal/CPU)
+    # Unified compute kernels (CUDA/Metal/CPU) — Backend<B> trait stack
+    # plus the fused-transformer module (formerly ferrum-attention).
     "crates/ferrum-kernels",
-
-    # Attention kernel crate (to be merged into ferrum-kernels)
-    "crates/ferrum-attention",
 
     # Weight-format abstraction (Dense / GPTQ / AWQ / GGUF)
     "crates/ferrum-quantization",

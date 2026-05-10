@@ -9,7 +9,7 @@
 
 pub mod transformer;
 
-use crate::AttentionParams;
+use crate::attention::AttentionParams;
 
 // ── BLAS binding ────────────────────────────────────────────────────��───
 

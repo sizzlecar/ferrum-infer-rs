@@ -11,6 +11,8 @@ pub use linear::Linear;
 
 pub mod quant_linear;
 
+pub mod attention;
+
 pub mod moe_host;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

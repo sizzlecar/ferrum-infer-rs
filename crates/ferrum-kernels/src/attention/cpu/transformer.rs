@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use crate::{AttentionParams, LayerWeights, TransformerConfig};
+use crate::attention::{AttentionParams, LayerWeights, TransformerConfig};
 
 pub struct CpuKvCache {
     pub k: Vec<f32>,

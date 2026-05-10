@@ -22,8 +22,8 @@
 //! forward pass that accumulates encodes; `sync()` commits and waits.
 
 use super::{AttnConfig, Backend, SrcDtype};
-use ferrum_attention::metal::pipelines::MetalPipelines;
-use ferrum_attention::AttentionParams;
+use crate::attention::metal::pipelines::MetalPipelines;
+use crate::attention::AttentionParams;
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use metal::{Device, MTLResourceOptions};
@@ -2404,9 +2404,9 @@ impl crate::backend::BackendPagedKv for MetalBackend {
         // q_len>1 (prefill): scratch.q_head_major is `[num_heads, q_len,
         // head_dim]` head-major from `split_qkv_norm_rope_into_paged_cache`.
         let q_layout = if q_len == 1 {
-            ferrum_attention::metal::pipelines::PagedAttnQLayout::TokenMajor
+            crate::attention::metal::pipelines::PagedAttnQLayout::TokenMajor
         } else {
-            ferrum_attention::metal::pipelines::PagedAttnQLayout::HeadMajor
+            crate::attention::metal::pipelines::PagedAttnQLayout::HeadMajor
         };
         st().pipes.paged_decode_attention_on_encoder(
             enc,
@@ -2416,7 +2416,7 @@ impl crate::backend::BackendPagedKv for MetalBackend {
             out,
             bt,
             cl,
-            &ferrum_attention::metal::pipelines::PagedAttnDispatchParams {
+            &crate::attention::metal::pipelines::PagedAttnDispatchParams {
                 num_seqs,
                 num_heads,
                 num_kv_heads,

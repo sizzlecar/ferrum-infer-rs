@@ -6,7 +6,7 @@
 pub mod pipelines;
 pub mod transformer;
 
-use crate::AttentionParams;
+use crate::attention::AttentionParams;
 use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 use std::sync::OnceLock;

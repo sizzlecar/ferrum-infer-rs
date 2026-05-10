@@ -16,7 +16,6 @@ tracing = { workspace = true }
 rayon = { workspace = true }
 cudarc = { version = "0.19", default-features = false, features = ["driver", "cublas", "f16", "nvrtc"], optional = true }
 metal = { version = "0.31", optional = true }
-ferrum-attention = { path = "../ferrum-attention", version = "0.7.0", optional = true }
 
 [build-dependencies]
 bindgen_cuda = "0.1.6"
@@ -24,7 +23,7 @@ bindgen_cuda = "0.1.6"
 [features]
 default = []
 cuda = ["candle-core/cuda", "dep:cudarc", "marlin", "cudarc?/nccl"]
-metal = ["dep:metal", "dep:ferrum-attention", "ferrum-attention/metal"]  # Metal backend (macOS)
+metal = ["dep:metal"]  # Metal backend (macOS) — also gates the fused-transformer Metal pipelines
 marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)
 vllm-marlin = ["cuda"]  # vLLM gptq_marlin port (Phase 12). NOT enabled by default
                         # — opt-in until correctness + perf validated. Adds

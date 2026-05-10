@@ -516,7 +516,7 @@ impl DecoderBlock {
 
 // ── Vocoder Pre-Transformer (FusedTransformer with layer_scale) ─────────
 //
-// Uses ferrum_attention::FusedTransformer for Metal/CPU acceleration.
+// Uses ferrum_kernels::attention::FusedTransformer for Metal/CPU acceleration.
 // 8 layers, hidden=512, heads=16 (no GQA), head_dim=64, intermediate=1024.
 // Includes layer_scale (learnable per-sublayer scalar weights).
 
@@ -527,7 +527,7 @@ struct VocoderPreTransformer {
     input_proj_b: Vec<f32>,  // [512]
     output_proj_w: Vec<f32>, // [1024, 512]
     output_proj_b: Vec<f32>, // [1024]
-    fused: ferrum_attention::FusedTransformer,
+    fused: ferrum_kernels::attention::FusedTransformer,
     hidden: usize,
     latent: usize,
 }
@@ -564,7 +564,7 @@ impl VocoderPreTransformer {
             let mv = lv.pp("mlp");
             let attn_scale = to_vec(&lv.pp("self_attn_layer_scale").get(h, "scale")?)?;
             let mlp_scale = to_vec(&lv.pp("mlp_layer_scale").get(h, "scale")?)?;
-            fused_layers.push(ferrum_attention::LayerWeights {
+            fused_layers.push(ferrum_kernels::attention::LayerWeights {
                 input_ln_w: get_w(&lv.pp("input_layernorm"), h.into(), "weight")?,
                 q_proj_w: get_w(&av.pp("q_proj"), (nh * hd, h).into(), "weight")?,
                 k_proj_w: get_w(&av.pp("k_proj"), (nh * hd, h).into(), "weight")?,
@@ -594,8 +594,8 @@ impl VocoderPreTransformer {
         }
         let norm_w = get_w(&vb.pp("norm"), h.into(), "weight")?;
 
-        let fused = ferrum_attention::FusedTransformer::new(
-            ferrum_attention::TransformerConfig {
+        let fused = ferrum_kernels::attention::FusedTransformer::new(
+            ferrum_kernels::attention::TransformerConfig {
                 hidden_size: h,
                 intermediate_size: cfg.intermediate_size,
                 num_heads: nh,

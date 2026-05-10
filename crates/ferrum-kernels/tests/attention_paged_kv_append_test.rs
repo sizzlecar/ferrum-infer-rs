@@ -10,7 +10,7 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
-use ferrum_attention::metal::pipelines::MetalPipelines;
+use ferrum_kernels::attention::metal::pipelines::MetalPipelines;
 use metal::{Device, MTLResourceOptions};
 use std::ffi::c_void;
 

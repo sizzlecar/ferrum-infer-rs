@@ -161,7 +161,7 @@ impl TtsModelExecutor {
         };
 
         // Install a Backend<B>-backed transformer for the Talker/SubTalker
-        // when running on CUDA. The legacy `ferrum_attention::FusedTransformer`
+        // when running on CUDA. The legacy `ferrum_kernels::attention::FusedTransformer`
         // CUDA module is a stub and its Linux CPU fallback uses naive fp64
         // matmul — the CUDA-only voice-clone regression traces back to that
         // path accumulating precision drift through the 20-layer decoder.

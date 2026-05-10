@@ -1,5 +1,5 @@
 //! Qwen3-TTS Talker using the `Backend<B>` trait — the Model-as-Code port
-//! that replaces `ferrum_attention::FusedTransformer` for Phase F.
+//! that replaces `ferrum_kernels::attention::FusedTransformer` for Phase F.
 //!
 //! Why this exists: the old `qwen3_tts.rs` uses `FusedTransformer` which
 //! only has Metal + CPU backends. Its CUDA module is a stub that falls back

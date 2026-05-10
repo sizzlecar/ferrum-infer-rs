@@ -9,7 +9,7 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
-use ferrum_attention::metal::pipelines::{
+use ferrum_kernels::attention::metal::pipelines::{
     MetalPipelines, PagedAttnDispatchParams, PagedAttnQLayout,
 };
 use metal::{Device, MTLResourceOptions};

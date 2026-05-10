@@ -1019,7 +1019,7 @@ impl MetalPipelines {
         k: &Buffer,
         v: &Buffer,
         o: &Buffer,
-        params: &crate::AttentionParams,
+        params: &crate::attention::AttentionParams,
         kv_seq_stride: usize,
     ) {
         #[repr(C)]
@@ -1140,7 +1140,7 @@ impl MetalPipelines {
         k: &Buffer,
         v: &Buffer,
         o: &Buffer,
-        params: &crate::AttentionParams,
+        params: &crate::attention::AttentionParams,
     ) {
         self.flash_attn_v2(cmd, q, k, v, o, params, 0);
     }

@@ -568,7 +568,7 @@ pub struct Qwen3TTSTalker {
     config: TalkerConfig,
     device: CandleDevice,
     tokens_generated: usize,
-    fused: ferrum_attention::FusedTransformer,
+    fused: ferrum_kernels::attention::FusedTransformer,
     /// Optional Backend<B> transformer stack. When set, `forward_step`
     /// routes through this instead of `fused`. Used on Linux + CUDA where
     /// `fused` would silently fall back to a broken naive-fp64 CPU matmul.
@@ -643,7 +643,7 @@ impl Qwen3TTSTalker {
             let lv = model_vb.pp(format!("layers.{i}"));
             let av = lv.pp("self_attn");
             let mv = lv.pp("mlp");
-            fused_layers.push(ferrum_attention::LayerWeights {
+            fused_layers.push(ferrum_kernels::attention::LayerWeights {
                 input_ln_w: get_w(&lv.pp("input_layernorm"), cfg.hidden_size.into(), "weight")?,
                 q_proj_w: get_w(
                     &av.pp("q_proj"),
@@ -694,8 +694,8 @@ impl Qwen3TTSTalker {
         let norm_w =
             to_cpu_vec(&norm.weight).map_err(|e| FerrumError::model(format!("norm_w: {e}")))?;
 
-        let fused = ferrum_attention::FusedTransformer::new(
-            ferrum_attention::TransformerConfig {
+        let fused = ferrum_kernels::attention::FusedTransformer::new(
+            ferrum_kernels::attention::TransformerConfig {
                 hidden_size: cfg.hidden_size,
                 intermediate_size: cfg.intermediate_size,
                 num_heads: cfg.num_attention_heads,
@@ -894,7 +894,7 @@ pub struct SubTalker {
     num_code_groups: usize,
     tokens_generated: usize,
     /// Fused transformer (bypasses candle for precision)
-    fused: ferrum_attention::FusedTransformer,
+    fused: ferrum_kernels::attention::FusedTransformer,
     fused_hidden_size: usize,
     /// Optional Backend<B> transformer stack that supersedes `fused` on
     /// CUDA. Same motivation as `Qwen3TTSTalker::backend_override`.
@@ -1001,7 +1001,7 @@ impl SubTalker {
             let lv = model_vb.pp(format!("layers.{i}"));
             let av = lv.pp("self_attn");
             let mv = lv.pp("mlp");
-            fused_layers.push(ferrum_attention::LayerWeights {
+            fused_layers.push(ferrum_kernels::attention::LayerWeights {
                 input_ln_w: get_w(&lv.pp("input_layernorm"), st_h.into(), "weight")?,
                 q_proj_w: get_w(&av.pp("q_proj"), (st_nh * st_hd, st_h).into(), "weight")?,
                 k_proj_w: get_w(&av.pp("k_proj"), (st_nkv * st_hd, st_h).into(), "weight")?,
@@ -1020,8 +1020,8 @@ impl SubTalker {
         let st_norm_w =
             to_cpu_vec(&norm.weight).map_err(|e| FerrumError::model(format!("st norm_w: {e}")))?;
 
-        let fused = ferrum_attention::FusedTransformer::new(
-            ferrum_attention::TransformerConfig {
+        let fused = ferrum_kernels::attention::FusedTransformer::new(
+            ferrum_kernels::attention::TransformerConfig {
                 hidden_size: st_h,
                 intermediate_size: st_im,
                 num_heads: st_nh,
