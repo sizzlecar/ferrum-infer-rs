@@ -840,13 +840,53 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
 /// for LLMs (LlamaFamilyModel / Qwen3MoeModel) and candle-based
 /// executors for embedding / multimodal / ASR (Bert, CLIP, Whisper).
 ///
-/// The factory dispatches over Dim 1 (architecture) and Dim 3
-/// (weight format = safetensors vs gguf). Dim 4 (device) and Dim 5 (kv
-/// dtype) currently match by `match config.device { ... }` arms inside
-/// the per-architecture branches; flattening those into a single
-/// `(device, kv_dtype) → build_llm::<B, K>` cascade lands in PR B
-/// alongside the model-side `K: KvDtypeKind` parameter.
+/// The factory dispatches over four axes:
+///   - Dim 1 (architecture): LlamaFamilyModel vs Qwen3MoeModel — runtime
+///     value, decided inside [`build_llm`].
+///   - Dim 3 (weight format): safetensors vs GGUF — runtime branch on
+///     `WeightFormat::detect()` at the top of [`Self::create`].
+///   - Dim 4 (device): CpuBackend / MetalBackend / CudaBackend — type
+///     parameter `B`, picked by the `(device, kv_dtype)` cascade below.
+///   - Dim 5 (kv dtype): KvFp16 / KvInt8 / KvFp8 — type parameter `K`,
+///     same cascade. Only `KvFp16` is wired today; `KvInt8` lands in
+///     PR C (see `docs/dim5-model-wireup-plan.md`).
 pub struct LlmExecutorFactory;
+
+/// Generic LLM construction helper. Picks the model type (LlamaFamilyModel
+/// or Qwen3MoeModel) by `arch`, opens a `NativeSafetensorsLoader<B>`, and
+/// returns a `Box<dyn DecoderOnlyLLM>` ready to be wrapped in `LlmExecutor`.
+///
+/// Generic over both Dim 4 (`B`: hardware backend) and Dim 5 (`K`: KV
+/// element type). Adding INT8 KV in PR C means adding the
+/// `(Device::CUDA, KvCacheDtype::Int8) => build_llm::<CudaBackend, KvInt8>(...)`
+/// arm to the cascade — this helper already accepts `K` so the callers
+/// don't need to be touched again.
+fn build_llm<B, K>(
+    arch: ferrum_models::Architecture,
+    qcfg: ferrum_models::models::LlamaFamilyConfig,
+    moe_cfg: Option<ferrum_models::moe_config::Qwen3MoeConfig>,
+    model_path: &str,
+) -> Result<Box<dyn ferrum_models::common::DecoderOnlyLLM>>
+where
+    B: ferrum_kernels::backend::MoeLlmBackend,
+    K: ferrum_interfaces::kv_dtype::KvDtypeKind,
+{
+    let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
+    if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
+        let mc = moe_cfg.ok_or_else(|| {
+            FerrumError::internal(
+                "Qwen3Moe arch reached build_llm without Qwen3MoeConfig (caller bug)",
+            )
+        })?;
+        Ok(Box::new(
+            ferrum_models::models::Qwen3MoeModel::<B, K>::new_safetensors(mc, &weight_loader)?,
+        ))
+    } else {
+        Ok(Box::new(
+            ferrum_models::models::LlamaFamilyModel::<B, K>::new(qcfg, &weight_loader)?,
+        ))
+    }
+}
 
 /// Back-compat alias; retained so external test fixtures referencing
 /// the old name continue to compile while we sweep call sites.
@@ -995,95 +1035,78 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 // explicitly listed a quantization method.
                 let _ = ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path);
 
-                // Per-architecture config constructor picks has_qk_norm +
-                // rope_theta defaults. Everything else is the same forward code.
-                // Qwen3-MoE goes through Qwen3MoeModel (different forward
-                // path — MoE router + per-expert FFN — but shares the
-                // dense attention path with Qwen3). Branch out early so the
-                // dense LlamaFamilyConfig parser doesn't try to read a
-                // moe_intermediate_size that doesn't fit its struct.
-                if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
-                    info!("Loading Qwen3-MoE via Qwen3MoeModel (safetensors GPTQ)");
-                    let mc = ferrum_models::moe_config::Qwen3MoeConfig::from_def(&model_def)?;
-                    let model_info =
-                        model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                    let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match &config.device {
-                        Device::CPU => {
-                            info!("  Backend: CPU");
-                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
-                                ferrum_kernels::backend::cpu::CpuBackend,
-                            >::open(&model_path)?;
-                            Box::new(ferrum_models::models::Qwen3MoeModel::<
-                                ferrum_kernels::backend::cpu::CpuBackend,
-                            >::new_safetensors(
-                                mc, &weight_loader
-                            )?)
-                        }
-                        Device::CUDA(_) => {
-                            #[cfg(feature = "cuda")]
-                            {
-                                info!("  Backend: CUDA");
-                                let weight_loader =
-                                    ferrum_quantization::NativeSafetensorsLoader::<
-                                        ferrum_kernels::backend::cuda::CudaBackend,
-                                    >::open(&model_path)?;
-                                Box::new(ferrum_models::models::Qwen3MoeModel::<
-                                    ferrum_kernels::backend::cuda::CudaBackend,
-                                >::new_safetensors(
-                                    mc, &weight_loader
-                                )?)
-                            }
-                            #[cfg(not(feature = "cuda"))]
-                            {
-                                return Err(FerrumError::device(
-                                    "CUDA requested but 'cuda' feature not enabled",
-                                ));
-                            }
-                        }
-                        other => {
-                            return Err(FerrumError::device(format!(
-                                "Qwen3MoeModel does not support device {other:?}"
-                            )));
-                        }
-                    };
-                    return Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)));
-                }
-
-                let qcfg = match arch {
+                // Resolve the architecture-specific config in one place.
+                // Qwen3-MoE needs both `LlamaFamilyConfig` (dense attention
+                // shares the Llama path) AND `Qwen3MoeConfig` (router +
+                // experts); other arches only need `LlamaFamilyConfig`.
+                let (qcfg, moe_cfg): (
+                    ferrum_models::models::LlamaFamilyConfig,
+                    Option<ferrum_models::moe_config::Qwen3MoeConfig>,
+                ) = match arch {
+                    ferrum_models::Architecture::Qwen3Moe => {
+                        info!("Loading Qwen3-MoE via Qwen3MoeModel (safetensors GPTQ)");
+                        let mc = ferrum_models::moe_config::Qwen3MoeConfig::from_def(&model_def)?;
+                        // dense attention reuses the Qwen3 dense config —
+                        // build_llm only consumes `qcfg` on the LlamaFamily
+                        // arm, so passing the MoE's `base` is fine.
+                        (mc.base.clone(), Some(mc))
+                    }
                     ferrum_models::Architecture::Qwen3 => {
                         info!("Loading Qwen3 via LlamaFamilyModel (QK-norm on)");
-                        ferrum_models::models::LlamaFamilyConfig::qwen3_from_def(&model_def)
+                        (
+                            ferrum_models::models::LlamaFamilyConfig::qwen3_from_def(&model_def),
+                            None,
+                        )
                     }
                     ferrum_models::Architecture::Qwen2 => {
                         info!("Loading Qwen2 via LlamaFamilyModel");
-                        ferrum_models::models::LlamaFamilyConfig::qwen2_from_def(&model_def)
+                        (
+                            ferrum_models::models::LlamaFamilyConfig::qwen2_from_def(&model_def),
+                            None,
+                        )
                     }
                     ferrum_models::Architecture::Mistral => {
                         info!("Loading Mistral via LlamaFamilyModel (sliding_window from config)");
-                        ferrum_models::models::LlamaFamilyConfig::mistral_from_def(&model_def)
+                        (
+                            ferrum_models::models::LlamaFamilyConfig::mistral_from_def(&model_def),
+                            None,
+                        )
                     }
                     _ => {
                         info!("Loading Llama via LlamaFamilyModel");
-                        ferrum_models::models::LlamaFamilyConfig::llama_from_def(&model_def)
+                        (
+                            ferrum_models::models::LlamaFamilyConfig::llama_from_def(&model_def),
+                            None,
+                        )
                     }
                 };
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
 
-                // Native safetensors loader, no candle on the LLM hot path.
-                let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match &config.device {
-                    Device::CPU => {
-                        info!("  Backend: CPU");
-                        let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
-                            ferrum_kernels::backend::cpu::CpuBackend,
-                        >::open(&model_path)?;
-                        Box::new(ferrum_models::models::LlamaFamilyModel::<
-                            ferrum_kernels::backend::cpu::CpuBackend,
-                        >::new(qcfg, &weight_loader)?)
+                // (Dim 4, Dim 5) cascade: pick `B` from device, `K` from
+                // kv-dtype, and dispatch to the generic `build_llm` helper.
+                // PR C will extend this with `(CUDA, Int8) => build_llm::<CudaBackend, KvInt8>(...)`
+                // — model wire-up already accepts `K`, so adding INT8 only
+                // touches this match.
+                use ferrum_interfaces::kv_dtype::KvFp16;
+                use ferrum_types::KvCacheDtype;
+                let kv_dtype = config.engine_config.kv_cache.dtype;
+                let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match (
+                    &config.device,
+                    kv_dtype,
+                ) {
+                    (Device::CPU, KvCacheDtype::Fp16) => {
+                        info!("  Backend: CPU, KV: fp16");
+                        build_llm::<ferrum_kernels::backend::cpu::CpuBackend, KvFp16>(
+                            arch,
+                            qcfg,
+                            moe_cfg,
+                            &model_path,
+                        )?
                     }
                     #[cfg(any(target_os = "macos", target_os = "ios"))]
-                    Device::Metal => {
+                    (Device::Metal, KvCacheDtype::Fp16) => {
                         #[cfg(feature = "metal")]
                         {
                             // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
@@ -1091,13 +1114,13 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                             // recommended for 4B+ models on 16 GB Macs.
                             let dtype_hint = std::env::var("FERRUM_METAL_DTYPE")
                                 .unwrap_or_else(|_| "f32".to_string());
-                            info!("  Backend: Metal (weights {})", dtype_hint);
-                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
-                                ferrum_kernels::backend::metal::MetalBackend,
-                            >::open(&model_path)?;
-                            Box::new(ferrum_models::models::LlamaFamilyModel::<
-                                ferrum_kernels::backend::metal::MetalBackend,
-                            >::new(qcfg, &weight_loader)?)
+                            info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
+                            build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
+                                arch,
+                                qcfg,
+                                moe_cfg,
+                                &model_path,
+                            )?
                         }
                         #[cfg(not(feature = "metal"))]
                         {
@@ -1106,16 +1129,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                             ));
                         }
                     }
-                    Device::CUDA(_) => {
+                    (Device::CUDA(_), KvCacheDtype::Fp16) => {
                         #[cfg(feature = "cuda")]
                         {
-                            info!("  Backend: CUDA");
-                            let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<
-                                ferrum_kernels::backend::cuda::CudaBackend,
-                            >::open(&model_path)?;
-                            Box::new(ferrum_models::models::LlamaFamilyModel::<
-                                ferrum_kernels::backend::cuda::CudaBackend,
-                            >::new(qcfg, &weight_loader)?)
+                            info!("  Backend: CUDA, KV: fp16");
+                            build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvFp16>(
+                                arch,
+                                qcfg,
+                                moe_cfg,
+                                &model_path,
+                            )?
                         }
                         #[cfg(not(feature = "cuda"))]
                         {
@@ -1124,9 +1147,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                             ));
                         }
                     }
-                    other => {
-                        return Err(FerrumError::device(format!(
-                            "LlamaFamilyModel does not support device {other:?}"
+                    (dev, dt) => {
+                        return Err(FerrumError::unsupported(format!(
+                            "(device={dev:?}, kv_dtype={dt:?}) not implemented — \
+                             see docs/dim5-model-wireup-plan.md"
                         )));
                     }
                 };

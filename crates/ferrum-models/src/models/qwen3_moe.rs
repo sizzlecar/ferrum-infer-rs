@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::OnceLock;
 
+use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16};
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
     KvCache, LlmBackend, MoeLlmBackend, QuantLlmBackend,
@@ -386,7 +387,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
 /// expert dispatch, and weighted combine all happen inside
 /// [`moe_forward`]; this struct only owns the storage and orchestrates
 /// the per-layer call sequence.
-pub struct Qwen3MoeModel<B: MoeLlmBackend> {
+pub struct Qwen3MoeModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     pub cfg: Qwen3MoeConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -401,8 +402,8 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend> {
     pub rope: RopeCache<B>,
     pub scratch: Qwen3MoeScratch<B>,
 
-    pub kv_caches: HashMap<String, Vec<KvCache<B>>>,
-    kv_free_pool: Vec<Vec<KvCache<B>>>,
+    pub kv_caches: HashMap<String, Vec<KvCache<B, K>>>,
+    kv_free_pool: Vec<Vec<KvCache<B, K>>>,
 
     // ── Paged-KV multi-seq state ────────────────────────────────────────
     //
@@ -413,7 +414,7 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend> {
     pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
 }
 
-impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
+impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
     /// Build a Qwen3-MoE model from a generic `WeightLoader<B>` plus a
     /// GGUF reader for the experts (which `WeightLoader` doesn't model
     /// directly — its API is rank-2 only).
@@ -2766,7 +2767,7 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
     }
 }
 
-impl<B: MoeLlmBackend> DecoderOnlyLLM for Qwen3MoeModel<B> {
+impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }

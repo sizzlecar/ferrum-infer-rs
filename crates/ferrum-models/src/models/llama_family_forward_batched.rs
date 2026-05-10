@@ -8,6 +8,7 @@
 
 use std::sync::atomic::Ordering;
 
+use ferrum_interfaces::kv_dtype::KvDtypeKind;
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
     KvCache, MoeLlmBackend, MAX_LAYERS_FOR_GRAPH,
@@ -21,7 +22,7 @@ use super::llama_family::{
     OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US, SINGLE_ITEM_GRAPH_KEY,
 };
 
-impl<B: MoeLlmBackend> LlamaFamilyModel<B> {
+impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
     /// One transformer layer over M items, GEMMs batched + per-item attention.
     pub(crate) fn forward_layer_batched_decode(
         &mut self,
