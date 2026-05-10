@@ -5,7 +5,7 @@
 //! Uses the same mock-executor pattern as other correctness tests — no
 //! GPU required.
 
-use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     ConfigurableModelExecutor, MockKvCacheManager, MockSampler, MockTensorFactory, MockTokenizer,

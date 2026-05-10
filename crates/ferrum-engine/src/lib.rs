@@ -63,6 +63,7 @@ pub mod tts_engine;
 pub mod metal;
 
 // Re-exports of interfaces
+pub use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 pub use ferrum_interfaces::{
     IncrementalTokenizer, InferenceEngine as InferenceEngineInterface, KvCacheManager,
     ModelBuilder, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer, WeightLoader,
@@ -111,7 +112,7 @@ pub use parallel::{
 /// This is a convenience function that uses the default registry.
 pub async fn create_default_engine(
     config: EngineConfig,
-) -> Result<Box<dyn InferenceEngineInterface + Send + Sync>> {
+) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
     create_engine(config).await
 }
 

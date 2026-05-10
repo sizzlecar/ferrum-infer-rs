@@ -2,7 +2,7 @@
 //! Verifies end-to-end paged KV cache usage: block allocation, K/V storage,
 //! cross-block attention, and deallocation.
 
-use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface, KvCacheManager};
+use ferrum_engine::{ContinuousBatchEngine, KvCacheManager, LlmInferenceEngine};
 use ferrum_kv::managers::paged::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{

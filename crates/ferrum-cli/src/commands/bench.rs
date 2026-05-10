@@ -210,7 +210,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
 // ── Sequential benchmark (existing behavior) ────────────────────────
 
 async fn run_sequential_bench(
-    engine: &(dyn ferrum_interfaces::InferenceEngine + Send + Sync),
+    engine: &(dyn ferrum_interfaces::engine::LlmInferenceEngine + Send + Sync),
     model_id: &str,
     prompt: &str,
     cmd: &BenchCommand,
@@ -263,7 +263,7 @@ async fn run_sequential_bench(
 // ── Concurrent benchmark (tests batch decode) ───────────────────────
 
 async fn run_concurrent_bench(
-    engine: &(dyn ferrum_interfaces::InferenceEngine + Send + Sync),
+    engine: &(dyn ferrum_interfaces::engine::LlmInferenceEngine + Send + Sync),
     model_id: &str,
     prompt: &str,
     cmd: &BenchCommand,
@@ -455,7 +455,7 @@ fn make_request(model_id: &str, prompt: &str, max_tokens: u32) -> InferenceReque
 }
 
 async fn run_single(
-    engine: &(dyn ferrum_interfaces::InferenceEngine + Send + Sync),
+    engine: &(dyn ferrum_interfaces::engine::LlmInferenceEngine + Send + Sync),
     model_id: &str,
     prompt: &str,
     max_tokens: u32,

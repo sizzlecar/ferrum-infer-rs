@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use ferrum_engine::{
-    speculative::SpeculativeDecodingConfig, ContinuousBatchEngine, InferenceEngineInterface,
+    speculative::SpeculativeDecodingConfig, ContinuousBatchEngine, LlmInferenceEngine,
 };
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{

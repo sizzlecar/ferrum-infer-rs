@@ -10,9 +10,10 @@
 
 use crate::registry::{ComponentConfig, ComponentRegistry};
 use crate::DefaultInferenceEngine;
+use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_interfaces::{
-    ComputeBackend, InferenceEngine, KvCacheManager, ModelExecutor, Sampler,
-    SchedulerInterface as Scheduler, TensorFactory, Tokenizer,
+    ComputeBackend, KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler,
+    TensorFactory, Tokenizer,
 };
 use ferrum_types::{EngineConfig, FerrumError, Result, SchedulingPolicy};
 use std::sync::Arc;
@@ -232,7 +233,7 @@ impl EngineBuilder {
     }
 
     /// Build the inference engine
-    pub async fn build(self) -> Result<Box<dyn InferenceEngine + Send + Sync>> {
+    pub async fn build(self) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
         info!(
             "Building inference engine for model: {}",
             self.config.model.model_id
@@ -444,7 +445,9 @@ impl EngineBuilder {
 }
 
 /// Create an engine with the default configuration and registry
-pub async fn create_engine(config: EngineConfig) -> Result<Box<dyn InferenceEngine + Send + Sync>> {
+pub async fn create_engine(
+    config: EngineConfig,
+) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config).build().await
 }
 

@@ -7,7 +7,7 @@
 //! and engine overhead, not model computation.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,

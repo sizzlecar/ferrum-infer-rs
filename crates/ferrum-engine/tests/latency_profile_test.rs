@@ -3,7 +3,7 @@
 //! Runs a batch of requests and reports TTFT, TPOT, and percentile latencies.
 //! Uses mock components with configurable latency to simulate realistic timing.
 
-use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,

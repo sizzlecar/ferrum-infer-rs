@@ -12,10 +12,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use ferrum_interfaces::engine::InferenceEngine;
+use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
-    FerrumError as Error, FinishReason, InferenceRequest, ModelId, Priority, RequestId,
-    SamplingParams,
+    EngineMetrics, EngineStatus, FerrumError as Error, FinishReason, InferenceRequest, ModelId,
+    Priority, RequestId, SamplingParams,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -44,26 +44,49 @@ pub fn init_prometheus_recorder() {
     });
 }
 
-/// Axum-based server implementation
+/// Axum-based server implementation.
+///
+/// The server is built around [`AppState`], which holds an optional
+/// engine per modality. Handlers fault to 501 when the modality they
+/// need isn't loaded, instead of running stub error logic.
 pub struct AxumServer {
-    engine: Arc<dyn InferenceEngine + Send + Sync>,
+    state: AppState,
     config: ServerConfig,
 }
 
 impl AxumServer {
-    /// Create a new Axum server
-    pub fn new(engine: Arc<dyn InferenceEngine + Send + Sync>) -> Self {
+    /// Create a server with a fully populated AppState.
+    pub fn from_state(state: AppState) -> Self {
         Self {
-            engine,
+            state,
             config: ServerConfig::default(),
         }
     }
 
+    /// Convenience constructor for an LLM-only server (chat / completions).
+    pub fn from_llm(engine: Arc<dyn LlmInferenceEngine + Send + Sync>) -> Self {
+        Self::from_state(AppState::default().with_llm(engine))
+    }
+
+    /// Convenience constructor for an embedding-only server (`/v1/embeddings`).
+    pub fn from_embed(engine: Arc<dyn EmbedEngine + Send + Sync>) -> Self {
+        Self::from_state(AppState::default().with_embed(engine))
+    }
+
+    /// Convenience constructor for a transcription-only server
+    /// (`/v1/audio/transcriptions`).
+    pub fn from_transcribe(engine: Arc<dyn TranscribeEngine + Send + Sync>) -> Self {
+        Self::from_state(AppState::default().with_transcribe(engine))
+    }
+
+    /// Convenience constructor for a TTS-only server (`/v1/audio/speech`).
+    pub fn from_tts(engine: Arc<dyn TtsEngine + Send + Sync>) -> Self {
+        Self::from_state(AppState::default().with_tts(engine))
+    }
+
     /// Build the router with all routes
     fn build_router(&self) -> Router {
-        let app_state = AppState {
-            engine: self.engine.clone(),
-        };
+        let app_state = self.state.clone();
 
         Router::new()
             // OpenAI API routes
@@ -87,10 +110,98 @@ impl AxumServer {
     }
 }
 
-/// Application state shared across handlers
-#[derive(Clone)]
-struct AppState {
-    engine: Arc<dyn InferenceEngine + Send + Sync>,
+/// Application state shared across handlers — one optional engine per
+/// modality. Handlers reach into the field they need and 501 when it's
+/// not loaded.
+#[derive(Clone, Default)]
+pub struct AppState {
+    pub llm: Option<Arc<dyn LlmInferenceEngine + Send + Sync>>,
+    pub embed: Option<Arc<dyn EmbedEngine + Send + Sync>>,
+    pub transcribe: Option<Arc<dyn TranscribeEngine + Send + Sync>>,
+    pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
+}
+
+impl AppState {
+    pub fn with_llm(mut self, engine: Arc<dyn LlmInferenceEngine + Send + Sync>) -> Self {
+        self.llm = Some(engine);
+        self
+    }
+    pub fn with_embed(mut self, engine: Arc<dyn EmbedEngine + Send + Sync>) -> Self {
+        self.embed = Some(engine);
+        self
+    }
+    pub fn with_transcribe(mut self, engine: Arc<dyn TranscribeEngine + Send + Sync>) -> Self {
+        self.transcribe = Some(engine);
+        self
+    }
+    pub fn with_tts(mut self, engine: Arc<dyn TtsEngine + Send + Sync>) -> Self {
+        self.tts = Some(engine);
+        self
+    }
+
+    /// Async aggregated status across whichever modality is loaded.
+    /// In single-modality deployments (current CLI), exactly one is Some.
+    async fn status(&self) -> EngineStatus {
+        if let Some(e) = &self.llm {
+            return e.status().await;
+        }
+        if let Some(e) = &self.embed {
+            return e.status().await;
+        }
+        if let Some(e) = &self.transcribe {
+            return e.status().await;
+        }
+        if let Some(e) = &self.tts {
+            return e.status().await;
+        }
+        EngineStatus {
+            is_ready: false,
+            loaded_models: vec![],
+            active_requests: 0,
+            queued_requests: 0,
+            memory_usage: ferrum_types::MemoryUsage {
+                total_bytes: 0,
+                used_bytes: 0,
+                free_bytes: 0,
+                gpu_memory_bytes: None,
+                cpu_memory_bytes: None,
+                cache_memory_bytes: 0,
+                utilization_percent: 0.0,
+            },
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    fn metrics(&self) -> EngineMetrics {
+        if let Some(e) = &self.llm {
+            return e.metrics();
+        }
+        if let Some(e) = &self.embed {
+            return e.metrics();
+        }
+        if let Some(e) = &self.transcribe {
+            return e.metrics();
+        }
+        if let Some(e) = &self.tts {
+            return e.metrics();
+        }
+        EngineMetrics {
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            avg_request_latency_ms: 0.0,
+            p95_request_latency_ms: 0.0,
+            p99_request_latency_ms: 0.0,
+            throughput_rps: 0.0,
+            tokens_per_second: 0.0,
+            queue_metrics: Default::default(),
+            resource_utilization: Default::default(),
+            error_stats: Default::default(),
+            performance_breakdown: Default::default(),
+        }
+    }
 }
 
 #[async_trait]
@@ -203,7 +314,9 @@ async fn handle_chat_completions_stream(
     let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Event, axum::Error>>();
 
     // Spawn task to generate tokens
-    let engine = state.engine.clone();
+    let engine = state.llm.clone().ok_or_else(|| {
+        ServerError::NotImplemented("LLM engine not loaded; chat unavailable".into())
+    })?;
     let request_id = Uuid::new_v4().to_string();
     let prompt_tokens = inference_request.prompt.split_whitespace().count() as u32;
 
@@ -324,7 +437,10 @@ async fn handle_chat_completions_sync(
     info!("Processing non-streaming chat completion");
 
     let prompt_tokens = inference_request.prompt.split_whitespace().count() as u32;
-    match state.engine.infer(inference_request).await {
+    let engine = state.llm.clone().ok_or_else(|| {
+        ServerError::NotImplemented("LLM engine not loaded; chat unavailable".into())
+    })?;
+    match engine.infer(inference_request).await {
         Ok(output) => {
             let response = ChatCompletionsResponse {
                 id: Uuid::new_v4().to_string(),
@@ -450,17 +566,18 @@ async fn embeddings_handler(
     let mut data = Vec::with_capacity(items.len());
     let mut total_tokens = 0u32;
 
+    let engine = state.embed.as_ref().ok_or_else(|| {
+        ServerError::NotImplemented("Embed engine not loaded; embeddings unavailable".into())
+    })?;
     for (idx, item) in items.iter().enumerate() {
         let embedding = if let Some(ref image) = item.image {
-            state
-                .engine
+            engine
                 .embed_image(image)
                 .await
                 .map_err(|e| ServerError::InternalError(format!("embed_image: {e}")))?
         } else if let Some(ref text) = item.text {
             total_tokens += text.len() as u32;
-            state
-                .engine
+            engine
                 .embed_text(text)
                 .await
                 .map_err(|e| ServerError::InternalError(format!("embed_text: {e}")))?
@@ -526,8 +643,10 @@ async fn transcriptions_handler(
 
     let data = file_data.ok_or_else(|| ServerError::BadRequest("missing 'file' field".into()))?;
 
-    let text = state
-        .engine
+    let engine = state.transcribe.as_ref().ok_or_else(|| {
+        ServerError::NotImplemented("Transcribe engine not loaded; ASR unavailable".into())
+    })?;
+    let text = engine
         .transcribe_bytes(&data, language.as_deref())
         .await
         .map_err(|e| ServerError::InternalError(format!("transcribe: {e}")))?;
@@ -550,14 +669,17 @@ async fn speech_handler(
     };
 
     let chunk_frames = 10usize;
-    let sample_rate = state.engine.tts_sample_rate();
+    let tts = state.tts.as_ref().ok_or_else(|| {
+        ServerError::NotImplemented("TTS engine not loaded; speech unavailable".into())
+    })?;
+    let sample_rate = tts.tts_sample_rate();
 
     if request.stream {
         // Streaming: chunked transfer encoding with WAV audio
         let (tx, rx) =
             mpsc::unbounded_channel::<std::result::Result<axum::body::Bytes, std::io::Error>>();
 
-        let engine = state.engine.clone();
+        let engine = tts.clone();
         let text = request.input.clone();
         let lang = request.language.clone();
 
@@ -592,8 +714,7 @@ async fn speech_handler(
             .unwrap())
     } else {
         // Non-streaming: return complete WAV
-        let chunks = state
-            .engine
+        let chunks = tts
             .synthesize_speech(&request.input, language, chunk_frames)
             .await
             .map_err(|e| ServerError::InternalError(format!("TTS: {e}")))?;
@@ -643,7 +764,7 @@ fn pcm_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 async fn models_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
-    let status = state.engine.status().await;
+    let status = state.status().await;
     let now = chrono::Utc::now().timestamp() as u64;
     let data = status
         .loaded_models
@@ -670,8 +791,8 @@ async fn models_handler(
 async fn health_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
-    let engine_status = state.engine.status().await;
-    let scheduler_metrics = state.engine.metrics();
+    let engine_status = state.status().await;
+    let scheduler_metrics = state.metrics();
 
     let health = serde_json::json!({
         "status": "healthy",

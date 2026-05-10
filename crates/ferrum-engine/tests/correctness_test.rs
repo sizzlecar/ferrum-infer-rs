@@ -2,7 +2,7 @@
 //!
 //! All use mock/configurable executors — no GPU required.
 
-use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     ConfigurableModelExecutor, MockKvCacheManager, MockModelExecutor, MockSampler,

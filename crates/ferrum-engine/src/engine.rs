@@ -1,6 +1,7 @@
 //! Main inference engine - MVP implementation
 
 use async_trait::async_trait;
+use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_interfaces::sampler::{SamplingConfigBuilder, SamplingContext};
 use ferrum_interfaces::{
     engine::InferenceEngine, AllocationRequest, BatchHint, KvCacheHandle, KvCacheManager,
@@ -474,7 +475,7 @@ impl DefaultInferenceEngine {
 }
 
 #[async_trait]
-impl InferenceEngine for DefaultInferenceEngine {
+impl LlmInferenceEngine for DefaultInferenceEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
         request.sampling_params.validate()?;
         let _inflight_guard = self.acquire_inflight_guard().await?;
@@ -716,7 +717,10 @@ impl InferenceEngine for DefaultInferenceEngine {
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
+}
 
+#[async_trait]
+impl InferenceEngine for DefaultInferenceEngine {
     async fn status(&self) -> EngineStatus {
         EngineStatus {
             is_ready: true,
