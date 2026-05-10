@@ -35,6 +35,7 @@ pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;
 pub mod tokenizer;
+pub mod weight_format;
 
 pub use architectures::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
