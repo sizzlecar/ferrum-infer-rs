@@ -55,7 +55,35 @@ extern "C" __global__ void paged_decode_attention_int8(
     const __half* q_ptr = q + q_head * head_dim;
     __half* out_ptr = output + q_head * head_dim;
 
-    extern __shared__ float s_scores[];
+    // Dynamic shmem layout (caller allocates 3 × valid_kv_len floats):
+    //   [0 .. valid_kv_len)             — s_scores  (Q·K^T → softmax → weights)
+    //   [valid_kv_len .. 2*valid_kv_len) — s_k_scales (per-(token, kv_head) FP16 scale, broadcast across head_dim threads in Step 1)
+    //   [2*valid_kv_len .. 3*valid_kv_len) — s_v_scales (same broadcast pattern in Step 3)
+    //
+    // Why preload scales: Step 3 has 256 threads × valid_kv_len global
+    // loads of `v_scales_pool[scale_offset]` — same value across the
+    // 256 threads of a (q_head, kv_head) block. With shmem cache the
+    // 256-way broadcast collapses into 1 shmem read per kv_pos. Step 1
+    // sees a similar (smaller) win.
+    extern __shared__ float s_dyn[];
+    float* s_scores   = s_dyn;
+    float* s_k_scales = s_dyn + valid_kv_len;
+    float* s_v_scales = s_dyn + 2 * valid_kv_len;
+
+    // Block-cooperative prologue: one-shot load of all per-(token, kv_head)
+    // K/V scales into shmem. The (kv_head) component is the same for the
+    // whole block — only the (token) varies — so we need one load per
+    // kv_pos. Coalesces well: consecutive threads load consecutive kv_pos.
+    for (int kv_pos = threadIdx.x; kv_pos < valid_kv_len; kv_pos += blockDim.x) {
+        int logical_block  = kv_pos / block_size;
+        int slot           = kv_pos % block_size;
+        int physical_block = block_table[logical_block];
+        int scale_offset   = physical_block * scale_block_stride
+                           + slot * scale_kv_stride
+                           + kv_head;
+        s_k_scales[kv_pos] = __half2float(k_scales_pool[scale_offset]);
+        s_v_scales[kv_pos] = __half2float(v_scales_pool[scale_offset]);
+    }
 
     // Load Q into registers (warp-cooperative).
     const int elems_per_thread = (head_dim + WARP_SIZE - 1) / WARP_SIZE;
@@ -70,6 +98,7 @@ extern "C" __global__ void paged_decode_attention_int8(
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
     int num_warps = blockDim.x / WARP_SIZE;
+    __syncthreads();  // wait for s_k_scales / s_v_scales to be visible
 
     // ====== Step 1: Q·K^T (dequantizing K on the fly) ======
     for (int kv_pos = warp_id; kv_pos < valid_kv_len; kv_pos += num_warps) {
@@ -81,11 +110,7 @@ extern "C" __global__ void paged_decode_attention_int8(
             + physical_block * block_stride
             + slot * kv_stride
             + kv_head * head_dim;
-        const __half k_scale_h = k_scales_pool[
-            physical_block * scale_block_stride
-            + slot * scale_kv_stride
-            + kv_head];
-        const float k_scale = __half2float(k_scale_h);
+        const float k_scale = s_k_scales[kv_pos];  // shmem read (was per-warp global)
 
         float dot = 0.0f;
         #pragma unroll
@@ -132,6 +157,16 @@ extern "C" __global__ void paged_decode_attention_int8(
     __syncthreads();
 
     // ====== Step 3: Weighted V sum (dequantizing V on the fly) ======
+    // Pre-fold v_scale into the score: weight[kv_pos] = s_scores[kv_pos] * s_v_scales[kv_pos].
+    // This collapses Step 3's inner-loop ops to (1 shmem + 1 INT8 load + 1 cast + 1 fma)
+    // vs the original (1 shmem + 1 global v_scale + 1 cast + 2 fma + scalar mul).
+    // The fold uses s_scores in-place — safe because no thread re-reads
+    // the un-folded values after Step 2's softmax.
+    for (int kv_pos = threadIdx.x; kv_pos < valid_kv_len; kv_pos += blockDim.x) {
+        s_scores[kv_pos] *= s_v_scales[kv_pos];
+    }
+    __syncthreads();
+
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int kv_pos = 0; kv_pos < valid_kv_len; kv_pos++) {
@@ -143,13 +178,8 @@ extern "C" __global__ void paged_decode_attention_int8(
                 + physical_block * block_stride
                 + slot * kv_stride
                 + kv_head * head_dim;
-            const __half v_scale_h = v_scales_pool[
-                physical_block * scale_block_stride
-                + slot * scale_kv_stride
-                + kv_head];
-            const float v_scale = __half2float(v_scale_h);
 
-            acc += s_scores[kv_pos] * v_scale * (float)v_row[d];
+            acc += s_scores[kv_pos] * (float)v_row[d];
         }
         out_ptr[d] = __float2half(acc);
     }

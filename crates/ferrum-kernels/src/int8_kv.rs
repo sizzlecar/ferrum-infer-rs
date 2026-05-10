@@ -75,7 +75,11 @@ pub fn launch_int8_paged_decode_attention(
     b.arg(&bs);
     b.arg(&scale);
 
-    let shared_bytes = (valid_kv_len as u32) * 4;
+    // Dynamic shmem: 3 × valid_kv_len × sizeof(float)
+    //   s_scores   (Q·K^T → softmax → folded weight)
+    //   s_k_scales (preloaded for Step 1)
+    //   s_v_scales (preloaded for Step 3, folded into s_scores)
+    let shared_bytes = (valid_kv_len as u32) * 12;
     let cfg = LaunchConfig {
         grid_dim: (num_q_heads as u32, 1, 1),
         block_dim: (256, 1, 1),
