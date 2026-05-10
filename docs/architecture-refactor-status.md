@@ -38,17 +38,17 @@ Three gates — ALL must pass before the refactor is considered done:
    reorganization to identical machine code; thermals are the noise
    floor).
 
-## Progress (as of 2026-05-10)
+## Progress (as of 2026-05-10, end of late session)
 
 ### Dim status
 
 | Dim | Status | Notes |
 |---|---|---|
 | 1. Model architecture | ✅ done | Architecture v2 (historical, pre-audit) |
-| 2. Compute precision | 🟡 partial | Backend trait still owns Marlin/GGUF method bodies; `Linear<B>` exists as polymorphism point but kernel dispatch hasn't moved into impls yet (Phase 3e/3f) |
-| 3. Weight format | 🟡 partial | `WeightLoader<B>` + `Linear<B>` infra in place; same Phase 3e/3f gap as dim 2 |
+| 2. Compute precision | 🟡 partial | Backend trait still owns Marlin/GGUF method bodies; `Linear<B>` exists as polymorphism point but kernel dispatch hasn't moved into impls yet (Phase 3e) |
+| 3. Weight format | 🟡 partial | `WeightLoader<B>` + `Linear<B>` infra in place; same Phase 3e gap as dim 2 |
 | 4. **Inference device** | ✅ done | Backend → 5 supertraits + 3 capability bundles (#107-#110) |
-| 5. KV cache precision | 🟢 scaffolding | `KvDtypeKind` + `BackendKvDtype<K>` traits exist (#112); kernel impls + `KvCache<B, K>` wire-up pending |
+| 5. KV cache precision | 🟡 partial | `KvDtypeKind` + `BackendKvDtype<K>` traits (#112) + `KvCache<B, K = KvFp16>` type param (#119); INT8/FP8 kernel impls still pending |
 
 ### PRs landed (in order)
 
@@ -60,14 +60,14 @@ Three gates — ALL must pass before the refactor is considered done:
 | [#109](https://github.com/sizzlecar/ferrum-infer-rs/pull/109) | 2.4 | Extract `BackendPagedKv` + `BackendMoeFused` supertraits |
 | [#110](https://github.com/sizzlecar/ferrum-infer-rs/pull/110) | 2.5 | `LlmBackend` + `QuantLlmBackend` + `MoeLlmBackend` capability bundles |
 | [#111](https://github.com/sizzlecar/ferrum-infer-rs/pull/111) | 3a + 3b | Split `qwen3_moe.rs` (3579 → 2950) + `llama_family.rs` (4305 → 2652); -2282 lines combined in two largest files |
-
-### PRs in flight
-
-| PR | Phase | Status |
-|---|---|---|
-| [#112](https://github.com/sizzlecar/ferrum-infer-rs/pull/112) | 4 | KV-dtype scaffolding (Metal +1.0%) |
+| [#112](https://github.com/sizzlecar/ferrum-infer-rs/pull/112) | 4 | KV-dtype scaffolding (`KvDtypeKind` + `BackendKvDtype<K>` traits, Metal +1.0%) |
 | [#113](https://github.com/sizzlecar/ferrum-infer-rs/pull/113) | 3c | `ExpertStack::gemv_*` methods replace 4 `B::gemv_quant_moe_id*` call sites in stacked-decode path (Metal +2.5%) |
 | [#114](https://github.com/sizzlecar/ferrum-infer-rs/pull/114) | 5a step 1 | Extract `modality_stubs` helper for the 3 fake engines (-39 lines copy-paste, +59 shared) |
+| [#116](https://github.com/sizzlecar/ferrum-infer-rs/pull/116) | 3d | `ExpertStack::gemm_*` + `gemv_*_batched/offset` wrappers replace remaining 16 `B::*_moe_id*` call sites in `moe/forward.rs` + `qwen3_moe.rs` decode path. **Vast 4090: Llama-8B INT4 +0.3%, Qwen3-30B-A3B vLLM Marlin c=4 +3.1% (55.9 vs 54.2 tok/s)**. |
+| [#117](https://github.com/sizzlecar/ferrum-infer-rs/pull/117) | 5a step 2 | Split `InferenceEngine` mega-trait into lifecycle base + 4 modality supertraits (`LlmInferenceEngine`/`EmbedEngine`/`TranscribeEngine`/`TtsEngine`). `AppState` 4 fields; handlers 501 when missing. The 3 fake engines now impl only the modality trait their executor serves. |
+| [#118](https://github.com/sizzlecar/ferrum-infer-rs/pull/118) | 5b/1 | Delete `DefaultInferenceEngine` (1217 lines net). Builder always returns `ContinuousBatchEngine`. Unblocks the `ferrum-runtime` crate delete (5b/2). |
+| [#119](https://github.com/sizzlecar/ferrum-infer-rs/pull/119) | 4 wire-up | `KvCache<B, K = KvFp16>` type-param + PhantomData. **Vast 4090: Qwen3-0.6B 82.9 tok/s (baseline 83.0, perf-neutral ✅)**. |
+| [#121](https://github.com/sizzlecar/ferrum-infer-rs/pull/121) | 5b/2 | Delete the `ferrum-runtime` crate; move `CandleBackend` + memory pool into `ferrum-engine/src/backends/`. Drops the legacy CPU `ComputeBackend` impl (no consumers). |
 
 ### Backend trait shrinkage
 
@@ -82,11 +82,8 @@ Three gates — ALL must pass before the refactor is considered done:
 
 | Phase | Scope | Risk | Estimate |
 |---|---|---|---|
-| 3d | Convert remaining `B::gemm_quant_moe_id*` and `B::gemv_quant_moe_id_offset/batched/etc.` calls in `moe_forward_batched_prefill_impl` + `moe_forward_batched_decode_impl` to `ExpertStack` methods | Low | half-day |
-| **3e** | Move CudaBackend Marlin (~700 lines) + MetalBackend GGUF (~700 lines) impl bodies INTO `Linear<B>` impls in ferrum-kernels (NOT ferrum-quantization to avoid cudarc/metal dep cycle); delete `BackendQuantMarlin/Gguf` traits | Medium | 1-2 days; needs careful design |
-| 4 wire-up | Add `K: KvDtypeKind` type parameter to `KvCache<B>`; thread through `LlamaFamilyModel<B, K = KvFp16>`; implement `BackendKvDtype<KvInt8>` for CUDA (vLLM-style) | Medium | 1 day for type plumbing + 1-2 days for INT8 KV kernel work |
-| **5a step 2** | Split `InferenceEngine` into per-modality traits (`LlmInferenceEngine` + `EmbedEngine` + `TranscribeEngine` + `TtsEngine`); change `AppState` to hold `Option<Arc<dyn ModalityTrait>>` per modality; delete the 3 fake engine wrappers | Medium | half-day |
-| 5b | Delete `ferrum-runtime` crate (legacy `ComputeBackend` impls); delete `DefaultInferenceEngine` after CLI migrates to `ContinuousBatchEngine`; clean up registry | Medium | 1 day |
+| **3e** | Move CudaBackend Marlin (~700 lines) + MetalBackend GGUF (~700 lines) impl bodies INTO `Linear<B>` impls in ferrum-kernels. Cleanest design: `BackendQuantMarlin::load_gptq` returns `Box<dyn Linear<Self>>` directly (so `Backend::gemm_gptq` goes away), with concrete `MarlinGptqLinear` in ferrum-kernels owning the cudarc kernel calls; ferrum-quantization shrinks to weight parsers. Closes Dim 2+3. | Medium | 1-2 days; gate on same-pod Marlin baseline (Llama-8B INT4 = 60.6 tok/s, 30B-A3B c=4 = 55.9 tok/s on this Vast pod) for perf-neutral. |
+| 4 INT8 KV | Implement `BackendKvDtype<KvInt8>` for CUDA (vLLM-style scale-per-token); add the actual quant KV kernels (rope / kv-append / paged attention read INT8 cache). Closes Dim 5. | Medium | 1-2 days. |
 
 ## GPU testing workflow (Vast.ai 4090)
 
