@@ -5,7 +5,6 @@ pub mod embed;
 pub mod list;
 pub mod pull;
 pub mod run;
-pub mod run_gguf;
 pub mod serve;
 pub mod stop;
 pub mod transcribe;

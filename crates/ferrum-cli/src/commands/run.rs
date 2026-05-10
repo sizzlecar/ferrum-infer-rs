@@ -101,17 +101,14 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
-    // GGUF fast path — no HF download, no candle weight loader, just hand
-    // the file to the GGUF runtime. Kept as a separate entry until
-    // `run_gguf_one_shot`'s REPL helpers (sampling, chat templates,
-    // repetition tracking) finish migrating onto the engine path.
-    if crate::source_resolver::looks_like_gguf_path(&cmd.model) {
-        return crate::commands::run_gguf::run_gguf_one_shot(cmd, config).await;
-    }
-
-    // Resolve the model through the central source resolver:
-    //   local dir → HF cache → HF download (auto), with chat-profile
-    //   GPU autosize applied once on the resolved snapshot.
+    // Resolve the model through the central source resolver. Handles
+    // .gguf paths, local model dirs, HF cache hits, and HF download in
+    // one entry; runs the chat-profile GPU autosize + (for GGUF) sets
+    // the per-arch KV / MoE env-var defaults that `ferrum run` needs
+    // for a single-user multi-turn REPL. The engine then picks up
+    // either the safetensors path (via NativeSafetensorsLoader) or the
+    // GGUF path (via gguf_engine_loader, routed by
+    // `WeightFormat::detect()` inside `LlmExecutorFactory`).
     let cache_dir = get_hf_cache_dir(&config);
     let resolved = crate::source_resolver::resolve_model_source(
         &cmd.model,
