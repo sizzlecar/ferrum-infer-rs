@@ -9,6 +9,8 @@ pub mod backend;
 pub mod linear;
 pub use linear::Linear;
 
+pub mod quant_linear;
+
 pub mod moe_host;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

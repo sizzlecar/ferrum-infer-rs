@@ -2927,7 +2927,12 @@ fn moe_gemm_phase_fused_impl(
     Ok(())
 }
 
-fn marlin_gemm_with_perm(
+/// Marlin GEMM dispatcher that handles act-order permutation if present.
+///
+/// Made `pub` in Phase 3e/1 so the new `CudaMarlinLinear` impl can call
+/// it from outside the trait method body. Same dispatch logic the
+/// `BackendQuantMarlin::gemm_gptq` impl used to wrap.
+pub fn marlin_gemm_with_perm(
     ctx: &mut CudaState,
     a: &CudaSlice<f16>,
     weight: &crate::marlin::MarlinWeight,
@@ -2984,7 +2989,7 @@ fn marlin_gemm_with_perm(
 }
 
 #[cfg(feature = "vllm-marlin")]
-fn launch_vllm_marlin(
+pub fn launch_vllm_marlin(
     stream: &Arc<cudarc::driver::CudaStream>,
     a: &CudaSlice<f16>,
     weight: &crate::marlin::MarlinWeight,
