@@ -31,7 +31,9 @@ impl TtsService {
     /// Create with a single executor (backward compatible).
     pub fn new(executor: TtsModelExecutor, model_id: ModelId) -> Self {
         let sr = executor.sample_rate() as u32;
-        let config = crate::simple_engine_config(model_id, ferrum_types::Device::CPU);
+        let mut config = ferrum_types::EngineConfig::default();
+        config.model.model_id = model_id;
+        config.backend.device = ferrum_types::Device::CPU;
         Self {
             slots: vec![Arc::new(Mutex::new(executor))],
             semaphore: tokio::sync::Semaphore::new(1),
@@ -48,7 +50,9 @@ impl TtsService {
             .first()
             .map(|e| e.sample_rate() as u32)
             .unwrap_or(24000);
-        let config = crate::simple_engine_config(model_id, ferrum_types::Device::CPU);
+        let mut config = ferrum_types::EngineConfig::default();
+        config.model.model_id = model_id;
+        config.backend.device = ferrum_types::Device::CPU;
         let slots: Vec<_> = executors
             .into_iter()
             .map(|e| Arc::new(Mutex::new(e)))

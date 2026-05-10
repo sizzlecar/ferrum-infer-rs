@@ -259,7 +259,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 candle_core::DType::F32,
             )?;
             let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
-            let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+            let mut engine_config = ferrum_types::EngineConfig::default();
+            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            engine_config.backend.device = device;
             let engine: Arc<dyn ferrum_engine::EmbedEngine + Send + Sync> = Arc::new(
                 ferrum_engine::embedding_engine::EmbeddingEngine::new(executor, engine_config)
                     .with_tokenizer(tokenizer),
@@ -274,7 +276,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 candle_device,
                 candle_core::DType::F32,
             )?;
-            let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+            let mut engine_config = ferrum_types::EngineConfig::default();
+            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            engine_config.backend.device = device;
             let engine: Arc<dyn ferrum_engine::TranscribeEngine + Send + Sync> = Arc::new(
                 ferrum_engine::transcription_engine::TranscriptionEngine::new(
                     executor,
@@ -319,7 +323,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "{}",
                 "Initializing engine (continuous batching)...".dimmed()
             );
-            let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+            let mut engine_config = ferrum_types::EngineConfig::default();
+            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            engine_config.backend.device = device;
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
             super::run::apply_kv_dtype_override(&mut engine_config, kv_dtype.as_deref())?;

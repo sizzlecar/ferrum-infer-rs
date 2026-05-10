@@ -1,6 +1,6 @@
-use ferrum_engine::{create_default_engine, simple_engine_config};
+use ferrum_engine::create_default_engine;
 use ferrum_interfaces::engine::LlmInferenceEngine;
-use ferrum_types::{Device, InferenceRequest, SamplingParams};
+use ferrum_types::{Device, EngineConfig, InferenceRequest, ModelId, SamplingParams};
 use std::{path::Path, sync::Arc, time::Duration};
 
 const DEFAULT_QWEN_05B_PATH: &str = "/Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775";
@@ -25,7 +25,9 @@ async fn qwen_25_05b_requests_are_serialized_for_correctness() {
         std::env::set_var("FERRUM_MODEL_PATH", &model_path);
     }
 
-    let mut config = simple_engine_config(QWEN_MODEL_ID, Device::CPU);
+    let mut config = EngineConfig::default();
+    config.model.model_id = ModelId::new(QWEN_MODEL_ID);
+    config.backend.device = Device::CPU;
     config.scheduler.max_running_requests = 4;
 
     let engine: Arc<dyn LlmInferenceEngine + Send + Sync> =

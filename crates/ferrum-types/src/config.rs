@@ -58,7 +58,7 @@ impl Default for SchedulerConfig {
         Self {
             policy: SchedulingPolicy::Priority,
             max_waiting_requests: 1000,
-            max_running_requests: 256,
+            max_running_requests: 32,
             enable_preemption: true,
             enable_load_balancing: false,
             fair_share_weights: HashMap::new(),
@@ -115,11 +115,21 @@ pub struct KvCacheConfig {
 
 impl Default for KvCacheConfig {
     fn default() -> Self {
+        // 2048 blocks covers c=32 ShareGPT prompts (~32×500/16 = 1000
+        // blocks). The previous 1024 floor crashed at c≥16 on real
+        // workloads with "Block pool exhausted". `FERRUM_KV_MAX_BLOCKS`
+        // is set by the GPU autosizer (`ferrum-cli::gpu_mem_autosize`)
+        // before engine construction; honour it here so the autosizer
+        // is the single source of truth for memory-budgeted runs.
+        let max_blocks = std::env::var("FERRUM_KV_MAX_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048);
         Self {
             cache_type: KvCacheType::Contiguous,
             dtype: KvCacheDtype::default(),
             block_size: 16,
-            max_blocks: 1024,
+            max_blocks,
             enable_compression: false,
             compression_ratio: 0.5,
             enable_multi_level: true,
@@ -433,7 +443,7 @@ pub struct BatchConfig {
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
-            max_batch_size: 16,
+            max_batch_size: 32,
             max_wait_ms: 8,
             enable_dynamic: true,
             enable_continuous: false,
