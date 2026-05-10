@@ -807,6 +807,7 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
                             block_table: Some(block_table),
                             context_lens: Some(context_lens),
                             paged_block_indices: Vec::new(),
+                            _kv_dtype: std::marker::PhantomData,
                         }
                     } else {
                         KvCache {
@@ -820,6 +821,7 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
                             block_table: None,
                             context_lens: None,
                             paged_block_indices: Vec::new(),
+                            _kv_dtype: std::marker::PhantomData,
                         }
                     }
                 })

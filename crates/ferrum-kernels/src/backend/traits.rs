@@ -156,7 +156,10 @@ impl Default for AttnConfig {
 // model can carry exactly the architecture parameters it cares about.
 // Backend trait stays model-agnostic.
 
-/// Per-layer KV cache. Each model owns its own `Vec<KvCache<B>>` per sequence.
+/// Per-layer KV cache. Each model owns its own `Vec<KvCache<B, K>>` per
+/// sequence. The `K: KvDtypeKind` parameter selects the cache element
+/// type — defaults to [`KvFp16`] so existing call sites that wrote
+/// `KvCache<B>` keep compiling unchanged.
 ///
 /// Two layouts are supported, selected at allocation time:
 /// 1. **Contiguous** (default): `k`/`v` are `[num_kv_heads, capacity, head_dim]`
@@ -169,7 +172,13 @@ impl Default for AttnConfig {
 ///    (`u32[1]` single-seq for now) are populated. Multi-seq sharing
 ///    is a Phase 4 concern; today every paged cache_id has its own
 ///    pool but the kernel-level indirection works.
-pub struct KvCache<B: Backend> {
+///
+/// The `K` parameter is currently a phantom-type marker — the buffer
+/// fields stay `B::Buffer` regardless. Future PRs will switch backends
+/// to `BackendKvDtype<KvInt8>` etc. and the kernel dispatch will read
+/// `K::NAME` / `K::BYTES_PER_ELEM` to pick the right append / attention
+/// kernel without any `KvCache` struct change.
+pub struct KvCache<B: Backend, K: KvDtypeKind = KvFp16> {
     pub k: B::Buffer,
     pub v: B::Buffer,
     pub len: usize,
@@ -186,6 +195,8 @@ pub struct KvCache<B: Backend> {
     /// this cache. Lets the model's release path return blocks to the
     /// shared allocator without reading them back from device.
     pub paged_block_indices: Vec<u32>,
+    /// Marker — KV cache element type. Zero-sized.
+    pub _kv_dtype: std::marker::PhantomData<K>,
 }
 
 /// The core abstraction over CUDA / Metal / CPU.
