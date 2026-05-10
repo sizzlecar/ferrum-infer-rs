@@ -4905,63 +4905,6 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         Ok(())
     }
 
-    fn fused_split_qkv_norm_rope_into_int8_paged_cache(
-        ctx: &mut Self::Context,
-        qkv: &Self::Buffer,
-        q_norm_w: &Self::Buffer,
-        k_norm_w: &Self::Buffer,
-        cos: &Self::Buffer,
-        sin: &Self::Buffer,
-        q_out: &mut Self::Buffer,
-        layer_k: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
-        layer_v: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
-        layer_k_scales: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
-        layer_v_scales: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
-        block_table: &Self::Buffer,
-        tokens: usize,
-        q_heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        pos_offset: usize,
-        eps: f32,
-        qk_mode: i32,
-        cache_len_before: usize,
-        block_size: usize,
-    ) -> Result<()> {
-        // Reinterpret block_table (CudaSlice<f16> with u32-as-f16 storage)
-        // as i32 view — same trick used by int8_paged_decode_attention.
-        let n_blocks = (cache_len_before + tokens).div_ceil(block_size).max(1);
-        let bt_i32_view = unsafe {
-            block_table
-                .transmute::<i32>(n_blocks)
-                .ok_or_else(|| FerrumError::model("block_table transmute<i32> failed"))?
-        };
-        crate::int8_kv::launch_split_qkv_norm_rope_into_int8_paged_cache(
-            &ctx.ctx,
-            qkv,
-            q_norm_w,
-            k_norm_w,
-            cos,
-            sin,
-            q_out,
-            layer_k.buffer_mut(),
-            layer_v.buffer_mut(),
-            layer_k_scales.buffer_mut(),
-            layer_v_scales.buffer_mut(),
-            &bt_i32_view,
-            tokens,
-            q_heads,
-            kv_heads,
-            head_dim,
-            pos_offset,
-            eps,
-            qk_mode,
-            cache_len_before,
-            block_size,
-        )
-        .map_err(|e| FerrumError::model(format!("fused_split_qkv_norm_rope_into_int8_paged_cache: {e}")))
-    }
-
     fn int8_paged_decode_attention(
         ctx: &mut Self::Context,
         q: &Self::Buffer,

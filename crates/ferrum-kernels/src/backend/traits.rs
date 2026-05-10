@@ -2271,42 +2271,6 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
         ))
     }
 
-    /// Fused split-QKV → norm → RoPE → quantize → INT8 paged write.
-    /// Single launch replacement for the 4-kernel chain
-    /// (`split_qkv` + `qk_norm_rope`×3 + `int8_kv_append_paged`) used by
-    /// the decode hot path. Q lands in FP16 head-major scratch; K/V are
-    /// quantized per-(token, kv_head) with FP16 scales and written into
-    /// the layer's paged INT8 buffers. Backend uses
-    /// `block_table` + `cache_len_before` to compute the per-token slot
-    /// addresses inline (no slot_mapping H2D).
-    fn fused_split_qkv_norm_rope_into_int8_paged_cache(
-        _ctx: &mut Self::Context,
-        _qkv: &Self::Buffer,
-        _q_norm_w: &Self::Buffer,
-        _k_norm_w: &Self::Buffer,
-        _cos: &Self::Buffer,
-        _sin: &Self::Buffer,
-        _q_out: &mut Self::Buffer,
-        _layer_k: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_v: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_k_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
-        _layer_v_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
-        _block_table: &Self::Buffer,
-        _tokens: usize,
-        _q_heads: usize,
-        _kv_heads: usize,
-        _head_dim: usize,
-        _pos_offset: usize,
-        _eps: f32,
-        _qk_mode: i32,
-        _cache_len_before: usize,
-        _block_size: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "fused_split_qkv_norm_rope_into_int8_paged_cache not implemented for this backend",
-        ))
-    }
-
     /// Run paged decode attention reading from an INT8 cache. Q is FP16,
     /// output is FP16; the kernel dequantizes K/V on the fly using the
     /// per-token scales. `valid_kv_len` is the post-append cache length

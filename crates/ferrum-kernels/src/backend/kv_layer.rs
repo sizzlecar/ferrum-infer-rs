@@ -396,8 +396,8 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         cos: &B::Buffer,
         sin: &B::Buffer,
         q_out: &mut B::Buffer,
-        _k_scratch: &mut B::Buffer,
-        _v_scratch: &mut B::Buffer,
+        k_scratch: &mut B::Buffer,
+        v_scratch: &mut B::Buffer,
         _pool_k: &mut B::Buffer,
         _pool_v: &mut B::Buffer,
         tokens: usize,
@@ -408,42 +408,29 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         eps: f32,
         qk_mode: i32,
     ) -> Result<()> {
-        // Single fused launch: split-QKV + norm + RoPE + INT8 quantize +
-        // paged-pool write. Replaces the 4-kernel chain (split_qkv +
-        // qk_norm_rope×3 + int8_kv_append_paged) used by the legacy path.
-        // Backend computes slot addresses inline from `block_table` +
-        // `cache_len_before` — no slot_mapping H2D.
+        // 1. split + norm + RoPE → FP16 head-major scratch (k/v_scratch).
+        B::split_qkv_norm_rope(
+            ctx, qkv, q_norm_w, k_norm_w, cos, sin,
+            q_out, k_scratch, v_scratch,
+            tokens, num_q_heads, num_kv_heads, head_dim,
+            pos_offset, eps, qk_mode,
+        )?;
+        // 2. quantize FP16 → INT8 + per-token scales, paged append.
+        // `paged_block_indices` is the host-side mirror populated at
+        // `ensure_kv` time — passing it directly avoids the D2H + sync
+        // barrier that would otherwise dominate per-token overhead.
         let cache_len_before = layer.len;
         let block_size = layer.block_size;
-        let bt_ptr = layer
-            .block_table
-            .as_ref()
-            .ok_or_else(|| FerrumError::model("INT8 paged_write: missing block_table"))?
-            as *const B::Buffer;
-        // SAFETY: block_table outlives this call; no concurrent access.
-        let block_table = unsafe { &*bt_ptr };
-        B::fused_split_qkv_norm_rope_into_int8_paged_cache(
-            ctx,
-            qkv,
-            q_norm_w,
-            k_norm_w,
-            cos,
-            sin,
-            q_out,
-            &mut layer.k,
-            &mut layer.v,
-            &mut layer.k_scales,
-            &mut layer.v_scales,
-            block_table,
-            tokens,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            pos_offset,
-            eps,
-            qk_mode,
-            cache_len_before,
-            block_size,
+        // Clone the host indices (small Vec<u32>) so we don't hold a
+        // borrow on `layer` while passing &mut layer.k/v/scales below.
+        let paged_indices: Vec<u32> = layer.paged_block_indices.clone();
+        B::int8_kv_append_paged(
+            ctx, k_scratch, v_scratch,
+            &mut layer.k, &mut layer.v,
+            &mut layer.k_scales, &mut layer.v_scales,
+            &paged_indices,
+            cache_len_before, tokens, block_size,
+            num_kv_heads, head_dim,
         )
     }
 
