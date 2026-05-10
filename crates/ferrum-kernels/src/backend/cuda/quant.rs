@@ -25,12 +25,16 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DeviceRepr, DeviceSlice, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
+    PushKernelArg,
+};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 
 use super::{default_stream, ensure_module, CudaBackend, CudaState};
 use crate::backend::{Backend, BackendQuantGguf, BackendQuantMarlin};
+use crate::ptx;
 
 // ────────────────────────────────────────────────────────────────────────
 // GPTQ store dispatch — Marlin (default) vs Triton-rs (FERRUM_TRITON_INT4=1)
