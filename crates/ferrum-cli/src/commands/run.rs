@@ -146,7 +146,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         "Loading weights to GPU... (30s+ for >10 GB models)".dimmed()
     );
     let load_start = std::time::Instant::now();
-    let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    let mut engine_config = ferrum_types::EngineConfig::default();
+    engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+    engine_config.backend.device = device;
     apply_kv_dtype_override(&mut engine_config, cmd.kv_dtype.as_deref())?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
     eprintln!(
