@@ -678,88 +678,125 @@ impl crate::backend::BackendGraph for CpuBackend {}
 // CPU has no multi-rank collectives; inherit BackendCollective defaults.
 impl crate::backend::BackendCollective for CpuBackend {}
 
+/// Dequant raw GPTQ tensors → row-major `[n, k]` f32. Shared between
+/// the per-tensor `load_gptq` and the MoE `load_gptq_stacked` impls.
+fn cpu_dequant_gptq(
+    qweight: &[i32],
+    scales: &[f32],
+    qzeros: &[i32],
+    bits: u32,
+    group_size: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    if bits != 4 {
+        return Err(FerrumError::unsupported(format!(
+            "CPU GPTQ: only bits=4 supported (got {bits})"
+        )));
+    }
+    let mut w = vec![0.0f32; n * k];
+    let packed_rows = k / 8;
+    for pr in 0..packed_rows {
+        for col in 0..n {
+            let packed = qweight[pr * n + col] as u32;
+            for bi in 0..8 {
+                let ki = pr * 8 + bi;
+                let q = ((packed >> (bi * 4)) & 0xF) as i32;
+                let grp = ki / group_size;
+                let scale = scales[grp * n + col];
+                let z_packed = qzeros[grp * (n / 8) + (col / 8)] as u32;
+                let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
+                let val = (q - zero) as f32 * scale;
+                w[col * k + ki] = val;
+            }
+        }
+    }
+    Ok(w)
+}
+
 impl crate::backend::BackendQuantMarlin for CpuBackend {
     fn load_gptq(
         qweight: &[i32],
         scales: &[f32],
         qzeros: &[i32],
         _g_idx: Option<&[i32]>,
+        bias_host: Option<&[f32]>,
         bits: u32,
         group_size: usize,
         k: usize,
         n: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        let w = cpu_dequant_gptq(qweight, scales, qzeros, bits, group_size, k, n)?;
+        // Phase 3e/2: dequantized weights become a CpuGptqLinear that
+        // owns the (out_features, in_features) f32 matrix and runs
+        // through the existing Self::gemm CPU path.
+        Ok(Box::new(crate::quant_linear::cpu_dequant::CpuGptqLinear {
+            weight_f32: w,
+            bias: bias_host.map(|b| b.to_vec()),
+            in_features: k,
+            out_features: n,
+        }))
+    }
+    fn load_gptq_stacked(
+        qweights: &[&[i32]],
+        scales: &[&[f32]],
+        qzeros: &[&[i32]],
+        _g_idx: Option<&[i32]>,
+        bits: u32,
+        group_size: usize,
+        k: usize,
+        n_per_expert: usize,
     ) -> Result<Self::GptqStore> {
-        if bits != 4 {
-            return Err(FerrumError::unsupported(format!(
-                "CPU GPTQ: only bits=4 supported (got {bits})"
+        // Phase 3e/2 addition: dequant each expert independently, concat
+        // along N (rows in [n, k] layout). Used by MoE parity tests.
+        let num_experts = qweights.len();
+        if scales.len() != num_experts || qzeros.len() != num_experts {
+            return Err(FerrumError::model(format!(
+                "load_gptq_stacked: input slice lengths disagree (qw {num_experts}, sc {}, qz {})",
+                scales.len(),
+                qzeros.len()
             )));
         }
-        let num_groups = k / group_size;
-        // Unpack GPTQ [K/8, N] i32 → int4 values, dequantize per-group:
-        //   w_f16 = (q - zero) * scale
-        // Write to [n, k] row-major (matches DenseLinear convention).
-        let mut w = vec![0.0f32; n * k];
-        let packed_rows = k / 8;
-        for pr in 0..packed_rows {
-            for col in 0..n {
-                let packed = qweight[pr * n + col] as u32;
-                for bi in 0..8 {
-                    let ki = pr * 8 + bi;
-                    let q = ((packed >> (bi * 4)) & 0xF) as i32;
-                    let grp = ki / group_size;
-                    let scale = scales[grp * n + col];
-                    // qzeros [num_groups, N/8] i32 packs 8 zero-values per int32
-                    let z_packed = qzeros[grp * (n / 8) + (col / 8)] as u32;
-                    let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
-                    let val = (q - zero) as f32 * scale;
-                    w[col * k + ki] = val;
-                }
-            }
+        let total_n = num_experts * n_per_expert;
+        let mut all_w = Vec::with_capacity(total_n * k);
+        for ((qw_e, sc_e), qz_e) in qweights.iter().zip(scales.iter()).zip(qzeros.iter()) {
+            let w_e = cpu_dequant_gptq(qw_e, sc_e, qz_e, bits, group_size, k, n_per_expert)?;
+            all_w.extend_from_slice(&w_e);
         }
-        let _ = num_groups; // informational only
         Ok(CpuGptqStore {
-            weight_f32: w,
+            weight_f32: all_w,
             k,
-            n,
+            n: total_n,
         })
     }
-    fn gemm_gptq(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::GptqStore,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        // Just run normal GEMM with dequantized weights.
-        // out[m, n] = a[m, k] @ w[n, k]^T — same contract as B::gemm.
-        Self::gemm(ctx, a, &weight.weight_f32, out, m, weight.n, weight.k);
-        Ok(())
-    }
-    fn gemm_gptq_with_offset(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::GptqStore,
+    fn make_stacked_expert_linear(
+        store: std::sync::Arc<Self::GptqStore>,
         expert_offset: usize,
         expert_n: usize,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        if expert_offset + expert_n > weight.n {
+        k: usize,
+        bias_host: Option<&[f32]>,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        if expert_offset + expert_n > store.n {
             return Err(FerrumError::model(format!(
-                "gemm_gptq_with_offset OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
-                weight.n
+                "make_stacked_expert_linear OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
+                store.n
             )));
         }
-        // weight_f32 layout is [N, K] row-major; copy the
-        // [expert_offset .. expert_offset + expert_n) row range into
-        // a Vec (CPU path isn't perf-critical for MoE — Marlin owns
-        // that on CUDA).
-        let k = weight.k;
+        if k != store.k {
+            return Err(FerrumError::model(format!(
+                "make_stacked_expert_linear k mismatch: arg {k} vs store.k {}",
+                store.k
+            )));
+        }
         let row_start = expert_offset * k;
         let row_end = (expert_offset + expert_n) * k;
-        let slice = weight.weight_f32[row_start..row_end].to_vec();
-        Self::gemm(ctx, a, &slice, out, m, expert_n, k);
-        Ok(())
+        let slice = store.weight_f32[row_start..row_end].to_vec();
+        Ok(Box::new(crate::quant_linear::cpu_dequant::CpuGptqLinear {
+            weight_f32: slice,
+            bias: bias_host.map(|b| b.to_vec()),
+            in_features: k,
+            out_features: expert_n,
+        }))
     }
     fn gemm_gptq_with_offset_strided(
         _ctx: &mut Self::Context,

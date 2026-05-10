@@ -1,141 +1,109 @@
-//! GPTQ linear projection.
+//! GPTQ linear projection — thin factory wrapper.
 //!
-//! GPTQ packs f16 weights as int4 groups, each group sharing a scale +
-//! zero_point. On-disk layout from AutoGPTQ / gptq-for-llama:
-//!
-//!   qweight:  `[in_features / 8, out_features]`  i32 — 8 int4s per int32
-//!   qzeros:   `[in_features / group_size, out_features / 8]`  i32
-//!   scales:   `[in_features / group_size, out_features]`      f16
-//!   g_idx:    `[in_features]` i32 — per-row scale-group map (desc_act only)
-//!
-//! `GptqLinear<B>` stores a backend-specific `B::GptqStore` produced by
-//! `Backend::load_gptq`. The store holds whatever format the backend
-//! needs (CUDA: Marlin-repacked tiles; CPU: dequantized f32 weights;
-//! Metal: unsupported).
+//! Phase 3e/2: the actual kernel dispatch lives inside the boxed
+//! `Linear<B>` returned by `B::load_gptq` (`CudaMarlinLinear` on
+//! CUDA, `CpuGptqLinear` on CPU). This module just re-exposes the
+//! historical constructor names so callers don't have to switch.
 
 use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 use ferrum_kernels::Linear;
 use ferrum_types::Result;
+use std::sync::Arc;
 
+/// GPTQ-format Linear projection, polymorphic over backend.
+///
+/// Holds a boxed backend-specific `Linear<B>` produced by `B::load_gptq`.
+/// `forward()` delegates straight through.
 pub struct GptqLinear<B: Backend + BackendQuantMarlin> {
-    store: B::GptqStore,
-    bias: Option<B::Buffer>,
-    in_features: usize,
-    out_features: usize,
+    inner: Box<dyn Linear<B> + Send + Sync>,
 }
 
 impl<B: Backend + BackendQuantMarlin> GptqLinear<B> {
     /// Build from raw host-side GPTQ tensors. The Backend repacks into
-    /// its preferred format once; inference uses the repacked store.
+    /// its preferred format once (Marlin tiles on CUDA, dequant on CPU)
+    /// and returns a boxed Linear; inference uses the boxed forward.
     ///
     /// `qweight`: `[k/8, n]` i32 (packed int4)
     /// `scales`:  `[k/group_size, n]` f32 (converted from f16 by caller)
     /// `qzeros`:  `[k/group_size, n/8]` i32
     /// `g_idx`:   `[k]` i32 — optional, only used for desc_act=true
+    /// `bias`:    `[n]` f32 — optional fused bias (Qwen2.5 attention)
     #[allow(clippy::too_many_arguments)]
     pub fn from_raw(
         qweight: &[i32],
         scales: &[f32],
         qzeros: &[i32],
         g_idx: Option<&[i32]>,
+        bias: Option<&[f32]>,
         bits: u32,
         group_size: usize,
         in_features: usize,
         out_features: usize,
     ) -> Result<Self> {
-        let store = B::load_gptq(
+        let inner = B::load_gptq(
             qweight,
             scales,
             qzeros,
             g_idx,
+            bias,
             bits,
             group_size,
             in_features,
             out_features,
         )?;
-        Ok(Self {
-            store,
-            bias: None,
-            in_features,
-            out_features,
-        })
-    }
-
-    /// Construct directly from a pre-built backend store (e.g. tests).
-    pub fn from_store(store: B::GptqStore, in_features: usize, out_features: usize) -> Self {
-        Self {
-            store,
-            bias: None,
-            in_features,
-            out_features,
-        }
-    }
-
-    /// Attach a bias vector (`[out_features]` f32 on host, uploaded to backend).
-    /// Qwen2.5 / Llama-with-bias variants require this.
-    pub fn with_bias(mut self, bias: &[f32]) -> Self {
-        debug_assert_eq!(
-            bias.len(),
-            self.out_features,
-            "GptqLinear bias length mismatch"
-        );
-        self.bias = Some(B::from_slice(bias));
-        self
-    }
-
-    pub fn store(&self) -> &B::GptqStore {
-        &self.store
+        Ok(Self { inner })
     }
 }
 
 impl<B: Backend + BackendQuantMarlin> Linear<B> for GptqLinear<B> {
     fn in_features(&self) -> usize {
-        self.in_features
+        self.inner.in_features()
     }
 
     fn out_features(&self) -> usize {
-        self.out_features
+        self.inner.out_features()
     }
 
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
-        B::gemm_gptq(ctx, input, &self.store, out, m)
-            .unwrap_or_else(|e| panic!("GPTQ forward failed: {e}"));
-        if let Some(bias) = &self.bias {
-            B::add_bias(ctx, out, bias, m, self.out_features);
-        }
+        self.inner.forward(ctx, input, out, m);
     }
 }
 
 /// View into a single column-slice of a shared stacked GPTQ store.
-/// All MoE experts in a layer share one big repacked Marlin tile that
-/// concatenates `num_experts × n_per_expert` columns; each
-/// `StackedExpertLinear` knows its expert's offset and width and
-/// dispatches to `B::gemm_gptq_with_offset` at forward time.
 ///
-/// The store itself is `Arc<B::GptqStore>` so cloning a view is cheap;
-/// dropping all views drops the underlying store.
+/// Phase 3e/2: backed by a `Box<dyn Linear<B>>` produced by
+/// `B::make_stacked_expert_linear` (CUDA: `CudaMarlinStackedExpertLinear`;
+/// CPU: `CpuGptqLinear` over a sliced row range). The store itself is
+/// `Arc<B::GptqStore>` so cloning a view is cheap; dropping all views
+/// drops the underlying store.
 pub struct StackedExpertLinear<B: Backend + BackendQuantMarlin> {
-    pub store: std::sync::Arc<B::GptqStore>,
-    pub expert_offset: usize,
-    pub expert_n: usize,
-    pub k: usize,
-    pub bias: Option<B::Buffer>,
+    inner: Box<dyn Linear<B> + Send + Sync>,
+    /// Kept for in_features() reporting.
+    k: usize,
+    /// Kept for out_features() reporting.
+    expert_n: usize,
 }
 
 impl<B: Backend + BackendQuantMarlin> StackedExpertLinear<B> {
     pub fn new(
-        store: std::sync::Arc<B::GptqStore>,
+        store: Arc<B::GptqStore>,
         expert_offset: usize,
         expert_n: usize,
         k: usize,
-    ) -> Self {
-        Self {
-            store,
-            expert_offset,
-            expert_n,
-            k,
-            bias: None,
-        }
+    ) -> Result<Self> {
+        let inner = B::make_stacked_expert_linear(store, expert_offset, expert_n, k, None)?;
+        Ok(Self { inner, k, expert_n })
+    }
+
+    pub fn new_with_bias(
+        store: Arc<B::GptqStore>,
+        expert_offset: usize,
+        expert_n: usize,
+        k: usize,
+        bias: &[f32],
+    ) -> Result<Self> {
+        let inner = B::make_stacked_expert_linear(store, expert_offset, expert_n, k, Some(bias))?;
+        Ok(Self { inner, k, expert_n })
     }
 }
 
@@ -143,22 +111,12 @@ impl<B: Backend + BackendQuantMarlin> Linear<B> for StackedExpertLinear<B> {
     fn in_features(&self) -> usize {
         self.k
     }
+
     fn out_features(&self) -> usize {
         self.expert_n
     }
+
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
-        B::gemm_gptq_with_offset(
-            ctx,
-            input,
-            &self.store,
-            self.expert_offset,
-            self.expert_n,
-            out,
-            m,
-        )
-        .unwrap_or_else(|e| panic!("StackedExpert forward failed: {e}"));
-        if let Some(bias) = &self.bias {
-            B::add_bias(ctx, out, bias, m, self.expert_n);
-        }
+        self.inner.forward(ctx, input, out, m);
     }
 }

@@ -646,7 +646,7 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
                         e * gate_up_n_per_expert,
                         gate_up_n_per_expert,
                         gate_up_k,
-                    ),
+                    )?,
                 ));
                 down.push(Box::new(
                     ferrum_quantization::StackedExpertLinear::<B>::new(
@@ -654,7 +654,7 @@ impl<B: MoeLlmBackend> Qwen3MoeModel<B> {
                         e * down_n_per_expert,
                         down_n_per_expert,
                         down_k,
-                    ),
+                    )?,
                 ));
             }
             let experts = crate::moe::ExpertStack::<B> {

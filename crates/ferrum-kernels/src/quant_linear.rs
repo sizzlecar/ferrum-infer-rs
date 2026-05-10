@@ -12,5 +12,7 @@
 //! → quantization → kernels). ferrum-quantization stays as the
 //! weight-format parser layer; backend-specific Linear impls live here.
 
+pub mod cpu_dequant;
+
 #[cfg(feature = "cuda")]
 pub mod cuda_marlin;
