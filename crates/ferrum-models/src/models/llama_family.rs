@@ -1272,14 +1272,11 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             .kv_caches
             .get_mut(cache_id)
             .expect("ensure_kv must be called before forward_layer");
-        // K=KvFp16 path uses the existing fused launchers that work over
-        // `KvCache<B, KvFp16>`; INT8 forwards through this method are
-        // re-routed at the public entry (`prefill_internal` / `decode_internal`)
-        // before reaching here. `as_fp16_mut` panics on the Int8 variant —
-        // that's a contract bug if it ever fires here.
-        let cache = caches[li].as_fp16_mut();
-        let cache_len_before = cache.len;
-        let cache_capacity = cache.capacity;
+        // Read shared metadata (variant-agnostic) once. The K-aware
+        // attn section below re-borrows the right enum variant.
+        let cache_len_before = caches[li].len();
+        let cache_capacity = caches[li].capacity();
+        let cache_block_size = caches[li].block_size();
 
         // Defense in depth: refuse to write past the KV buffer. The
         // graceful path is the caller pre-checking via `kv_capacity()`
@@ -1292,6 +1289,113 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
                 cache_len_before + tokens
             );
         }
+
+        // INT8 KV path (Dim 5): paged-only, requires `B: BackendInt8KvOps`.
+        // Splits qkv → FP16 head-major scratch, then quantizes + paged-
+        // append into the INT8 pool, then runs `int8_paged_decode_attention`.
+        // The rest of forward_layer (rms_norm, qkv_proj, scratches, o_proj,
+        // post_norm, MLP) is K-agnostic and lives outside this branch.
+        if K::NAME == "int8" {
+            assert!(
+                cache_block_size > 0,
+                "INT8 KV requires paged mode; non-paged INT8 not supported"
+            );
+            // Step 1: split QKV + qk-norm + RoPE into FP16 head-major scratch.
+            let _ = B::split_qkv_norm_rope(
+                ctx,
+                &self.scratch.qkv_out,
+                q_norm_w,
+                k_norm_w,
+                &self.rope.cos,
+                &self.rope.sin,
+                &mut self.scratch.q_head_major,
+                &mut self.scratch.k_head_major,
+                &mut self.scratch.v_head_major,
+                tokens,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                eps,
+                qk_mode,
+            );
+
+            // Step 2: quantize FP16 K/V into the paged INT8 pool.
+            let cache_int8 = caches[li].as_int8_mut();
+            let block_table_buf = cache_int8
+                .block_table
+                .as_ref()
+                .expect("INT8 paged cache missing block_table")
+                as *const B::Buffer;
+            // SAFETY: block_table is allocated once at ensure_kv and not
+            // touched concurrently. Take a raw pointer here so we can
+            // pass an immutable borrow alongside the mutable cache borrow
+            // — the trait method requires both.
+            let block_table = unsafe { &*block_table_buf };
+            B::int8_kv_append_paged(
+                ctx,
+                &self.scratch.k_head_major,
+                &self.scratch.v_head_major,
+                &mut cache_int8.k,
+                &mut cache_int8.v,
+                &mut cache_int8.k_scales,
+                &mut cache_int8.v_scales,
+                block_table,
+                cache_len_before,
+                tokens,
+                cache_int8.block_size,
+                nkv,
+                hd,
+            )
+            .expect("int8_kv_append_paged");
+
+            // Step 3: bump the cache length, write context_lens for the
+            // attention kernel, then run paged INT8 decode attention.
+            cache_int8.len += tokens;
+            let final_kv_len = cache_int8.len as u32;
+            let cl_buf = cache_int8
+                .context_lens
+                .as_mut()
+                .expect("INT8 paged cache missing context_lens");
+            B::write_u32(ctx, cl_buf, &[final_kv_len]);
+
+            let block_size_int8 = cache_int8.block_size;
+            let kv_len_int8 = cache_int8.len;
+            // Re-borrow as immutable for the attention read.
+            let cache_int8 = caches[li].as_int8();
+            let bt = cache_int8
+                .block_table
+                .as_ref()
+                .expect("INT8 paged cache missing block_table");
+            let scale = (hd as f32).sqrt().recip();
+            B::int8_paged_decode_attention(
+                ctx,
+                &self.scratch.q_head_major,
+                &cache_int8.k,
+                &cache_int8.v,
+                &cache_int8.k_scales,
+                &cache_int8.v_scales,
+                bt,
+                &mut self.scratch.attn_head_major_out,
+                nh,
+                nkv,
+                hd,
+                kv_len_int8,
+                block_size_int8,
+                scale,
+            )
+            .expect("int8_paged_decode_attention");
+
+            // Drop the cache borrow before the K-agnostic tail (o_proj +
+            // MLP) re-borrows scratches.
+            let _ = bt;
+            // Skip the legacy FP16 attention block; jump straight to o_proj.
+            return self.forward_layer_post_attn(ctx, li, residual, tokens);
+        }
+
+        // K=KvFp16 path: re-borrow the FP16 cache. K=KvInt8 took the
+        // early return above, so as_fp16_mut() is safe here.
+        let cache = caches[li].as_fp16_mut();
 
         let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
             B::sync(ctx);
@@ -1718,6 +1822,86 @@ impl<B: MoeLlmBackend + BackendInt8KvOps, K: KvDtypeKind> LlamaFamilyModel<B, K>
             );
             OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Post-attention tail of `forward_layer`: untranspose Q (if needed),
+    /// O-proj, fused residual+post_norm, gate_up_proj, SwiGLU, down_proj,
+    /// final residual add. K-agnostic — reads `self.scratch.attn_head_major_out`
+    /// which both the FP16 and INT8 attn paths populate.
+    pub(crate) fn forward_layer_post_attn(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        residual: &mut B::Buffer,
+        tokens: usize,
+    ) {
+        let layer = &self.layers[li];
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let nh = cfg.num_heads;
+        let hd = cfg.head_dim;
+        let im = cfg.intermediate_size;
+        let eps = cfg.rms_norm_eps;
+
+        // 7. Untranspose head-major → token-major for O-proj input.
+        let attn_token_major = if tokens == 1 {
+            &self.scratch.attn_head_major_out
+        } else {
+            B::transpose_head_to_token(
+                ctx,
+                &self.scratch.attn_head_major_out,
+                &mut self.scratch.attn_flat,
+                tokens,
+                nh,
+                hd,
+            );
+            &self.scratch.attn_flat
+        };
+
+        // 8. O projection.
+        layer
+            .o_proj
+            .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
+
+        // 9. Fused residual-add + post-attention RMSNorm.
+        B::fused_add_rms_norm(
+            ctx,
+            residual,
+            &self.scratch.o_proj_out,
+            &layer.post_ln_w,
+            eps,
+            &mut self.scratch.norm_out,
+            tokens,
+            h,
+        );
+
+        // 10. Fused gate+up projection.
+        layer.gate_up_proj.forward(
+            ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.gate_up_out,
+            tokens,
+        );
+
+        // 11. SwiGLU: silu(gate) * up.
+        B::fused_silu_mul_split(
+            ctx,
+            &self.scratch.gate_up_out,
+            &mut self.scratch.silu_out,
+            tokens,
+            im,
+        );
+
+        // 12. Down projection.
+        layer.down_proj.forward(
+            ctx,
+            &self.scratch.silu_out,
+            &mut self.scratch.mlp_out,
+            tokens,
+        );
+
+        // 13. Final residual add.
+        B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
     }
 
     /// Multi-position decode-verify: run one forward pass over `tokens`
