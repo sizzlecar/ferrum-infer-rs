@@ -17,7 +17,6 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod dense;
-pub mod factory;
 pub mod gguf;
 pub mod gptq;
 pub mod loader;
@@ -26,13 +25,12 @@ pub mod quant_linear;
 pub mod traits;
 
 pub use dense::DenseLinear;
-pub use factory::DefaultLinearFactory;
 pub use gguf::{GgufFile, GgufLinear, GgufLoader};
 pub use gptq::{GptqLinear, StackedExpertLinear};
 pub use loader::{PrefixedLoader, WeightLoader};
 pub use native_safetensors::NativeSafetensorsLoader;
 pub use quant_linear::QuantLinear;
-pub use traits::{Linear, LinearFactory};
+pub use traits::Linear;
 
 // Quant config types — populated from safetensors metadata or GGUF header.
 pub mod config;
