@@ -13,7 +13,6 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 
 # Implementation crates
-ferrum-runtime = { workspace = true }
 ferrum-scheduler = { workspace = true }
 ferrum-tokenizer = { workspace = true }
 ferrum-sampler = { workspace = true }
@@ -62,7 +61,12 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 half = { workspace = true }
 ndarray = { version = "0.16.1", optional = true }
+once_cell = { workspace = true }
 smallvec = "1.11"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+pin-project = "1.1"
+bytesize = "1.3"
 
 # HTTP client for manual downloads
 reqwest = { workspace = true }

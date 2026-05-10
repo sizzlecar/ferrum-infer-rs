@@ -46,9 +46,11 @@
 //! registry.register_backend_factory("my_backend", Arc::new(MyBackendFactory));
 //! ```
 
+pub mod backends;
 pub mod builder;
 pub mod continuous_engine;
 pub mod embedding_engine;
+pub mod memory;
 pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;
@@ -74,7 +76,7 @@ pub use ferrum_types::{
 };
 
 // Re-exports from implementation crates
-pub use ferrum_runtime::ComputeBackend;
+pub use ferrum_interfaces::ComputeBackend;
 pub use ferrum_scheduler::BatchPlan;
 
 // Re-exports of engine implementation
