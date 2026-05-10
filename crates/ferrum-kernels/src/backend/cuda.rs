@@ -4724,6 +4724,93 @@ impl crate::backend::BackendKvDtype<crate::backend::KvInt8> for CudaBackend {
 #[derive(Default)]
 pub struct OptionalCudaInt8(pub Option<cudarc::driver::CudaSlice<i8>>);
 
+impl OptionalCudaInt8 {
+    /// Allocate `len` zeroed `int8_t` elements on the default CUDA stream.
+    pub fn alloc(len: usize) -> Self {
+        let stream = default_stream();
+        let buf = stream
+            .alloc_zeros::<i8>(len)
+            .expect("alloc int8 KV buffer");
+        Self(Some(buf))
+    }
+
+    pub fn buffer(&self) -> &cudarc::driver::CudaSlice<i8> {
+        self.0.as_ref().expect("OptionalCudaInt8 not allocated")
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut cudarc::driver::CudaSlice<i8> {
+        self.0.as_mut().expect("OptionalCudaInt8 not allocated")
+    }
+}
+
 /// Lazily-allocated INT8 scales buffer (FP16 storage on CUDA).
 #[derive(Default)]
 pub struct OptionalCudaScalesF16(pub Option<cudarc::driver::CudaSlice<half::f16>>);
+
+impl OptionalCudaScalesF16 {
+    /// Allocate `len` zeroed FP16 scales on the default CUDA stream.
+    pub fn alloc(len: usize) -> Self {
+        let stream = default_stream();
+        let buf = stream
+            .alloc_zeros::<half::f16>(len)
+            .expect("alloc int8 KV scales");
+        Self(Some(buf))
+    }
+
+    pub fn buffer(&self) -> &cudarc::driver::CudaSlice<half::f16> {
+        self.0.as_ref().expect("OptionalCudaScalesF16 not allocated")
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut cudarc::driver::CudaSlice<half::f16> {
+        self.0.as_mut().expect("OptionalCudaScalesF16 not allocated")
+    }
+}
+
+// Convenience constructor for paged INT8 KV caches on CUDA.
+impl crate::backend::KvCacheQuant<CudaBackend, crate::backend::KvInt8> {
+    /// Allocate a paged INT8 KV cache for one sequence.
+    ///
+    /// - `max_blocks_per_seq` × `block_size` = capacity in tokens
+    /// - K/V pool size: `max_blocks_per_seq * block_size * num_kv_heads * head_dim` int8 elems
+    /// - scales pool size: `max_blocks_per_seq * block_size * num_kv_heads` FP16 elems
+    /// - `block_table` is allocated as u32[max_blocks_per_seq] via `B::alloc_u32`
+    /// - `context_lens` is allocated as u32[1] (single seq for now)
+    pub fn new_paged_cuda(
+        max_blocks_per_seq: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        use crate::backend::Backend;
+        let pool_tokens = max_blocks_per_seq * block_size;
+        let elem_count = pool_tokens * num_kv_heads * head_dim;
+        let scale_count = pool_tokens * num_kv_heads;
+        let block_table = <CudaBackend as Backend>::alloc_u32(max_blocks_per_seq);
+        let mut context_lens = <CudaBackend as Backend>::alloc_u32(1);
+        let mut bt_ctx = <CudaBackend as Backend>::new_context();
+        <CudaBackend as Backend>::write_u32(&mut bt_ctx, &mut context_lens, &[0u32]);
+        <CudaBackend as Backend>::sync(&mut bt_ctx);
+
+        // Re-cast typed u32 buffer to the trait's Buffer (FP16) — same
+        // pattern the FP16 paged path uses for block_table/context_lens
+        // (they are u32 device tensors written through alloc_u32).
+        let bt_buf = block_table;
+        let cl_buf = context_lens;
+
+        crate::backend::KvCacheQuant {
+            k: OptionalCudaInt8::alloc(elem_count),
+            v: OptionalCudaInt8::alloc(elem_count),
+            k_scales: OptionalCudaScalesF16::alloc(scale_count),
+            v_scales: OptionalCudaScalesF16::alloc(scale_count),
+            len: 0,
+            capacity: pool_tokens,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            block_table: Some(bt_buf),
+            context_lens: Some(cl_buf),
+            paged_block_indices: Vec::new(),
+            _kv_dtype: std::marker::PhantomData,
+        }
+    }
+}
