@@ -57,6 +57,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/moe_router.cu");
     println!("cargo:rerun-if-changed=kernels/moe_align_block_size.cu");
     println!("cargo:rerun-if-changed=kernels/int8_paged_decode_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_int8_paged_cache.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -98,6 +99,7 @@ fn main() {
             "kernels/moe_router.cu",
             "kernels/moe_align_block_size.cu",
             "kernels/int8_paged_decode_attention.cu",
+            "kernels/split_qkv_norm_rope_into_int8_paged_cache.cu",
         ])
         .out_dir(out_dir)
         .arg("-Ikernels") // for common.cuh
