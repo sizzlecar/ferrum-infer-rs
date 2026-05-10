@@ -13,7 +13,7 @@
 
 use cudarc::driver::CudaContext;
 use ferrum_kernels::backend::cuda::CudaBackend;
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, BackendPagedKv};
 use std::time::Instant;
 
 #[test]
@@ -77,7 +77,7 @@ fn bench_paged_decode_attn() {
 
     // Warmup
     for _ in 0..N_WARMUP {
-        <CudaBackend as Backend>::paged_decode_attention(
+        <CudaBackend as BackendPagedKv>::paged_decode_attention(
             &mut ctx,
             &q,
             &k_pool,
@@ -100,7 +100,7 @@ fn bench_paged_decode_attn() {
     // Measured run
     let t0 = Instant::now();
     for _ in 0..N_ITERS {
-        <CudaBackend as Backend>::paged_decode_attention(
+        <CudaBackend as BackendPagedKv>::paged_decode_attention(
             &mut ctx,
             &q,
             &k_pool,

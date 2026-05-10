@@ -73,6 +73,9 @@ mod synth {
 fn cuda_marlin_moe_fused_vs_per_expert() {
     use ferrum_kernels::backend::cuda::CudaBackend;
     use ferrum_kernels::backend::{Backend, BackendMoeFused, BackendPagedKv, BackendQuantMarlin};
+    use ferrum_quantization::gptq::StackedExpertLinear;
+    use ferrum_quantization::Linear;
+    use std::sync::Arc;
 
     // Marlin tile constraints: k % 128 == 0, n_per % 64 == 0, n_per % 256 ==
     // 0 for some specs. Use a shape Qwen3-30B-A3B-like: k=2048 hidden,
@@ -108,6 +111,7 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
         &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
     .expect("stacked load_gptq");
+    let stacked = Arc::new(stacked);
 
     // Synthetic A_packed [total_tokens, k] f32 (CudaBackend stores f16
     // internally — `from_slice` does the f32→f16 convert).
@@ -117,11 +121,10 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
     let mut ctx = <CudaBackend as Backend>::new_context();
     let a_dev = CudaBackend::from_slice(&a_data);
 
-    // ── Reference: per-expert gemm_gptq_with_offset ──────────────────────
-    // Each expert e's input rows = a_dev[a_row_offsets[e] .. + tokens_per_expert[e]],
-    // output rows = c_ref[a_row_offsets[e] .. + tokens_per_expert[e]].
-    // The Backend gemm_gptq_with_offset takes a single contiguous input
-    // slice (not strided), so we extract per-expert sub-buffers.
+    // ── Reference: per-expert StackedExpertLinear ────────────────────────
+    // Phase 3e/2 deleted the raw `gemm_gptq_with_offset` trait method.
+    // Each expert is now a `StackedExpertLinear<CudaBackend>` view into
+    // the shared store; `Linear::forward` performs the per-expert GEMM.
     let mut c_ref = vec![0f32; total_tokens * n_per];
     for e in 0..num_experts {
         let m_e = tokens_per_expert[e];
@@ -132,16 +135,9 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
         let a_e: Vec<f32> = a_data[row_start * k..(row_start + m_e) * k].to_vec();
         let a_e_dev = CudaBackend::from_slice(&a_e);
         let mut out_e_dev = CudaBackend::alloc(m_e * n_per);
-        <CudaBackend as BackendQuantMarlin>::gemm_gptq_with_offset(
-            &mut ctx,
-            &a_e_dev,
-            &stacked,
-            e * n_per,
-            n_per,
-            &mut out_e_dev,
-            m_e,
-        )
-        .expect("gemm_gptq_with_offset");
+        let view = StackedExpertLinear::<CudaBackend>::new(stacked.clone(), e * n_per, n_per, k)
+            .expect("StackedExpertLinear::new");
+        view.forward(&mut ctx, &a_e_dev, &mut out_e_dev, m_e);
         <CudaBackend as Backend>::sync(&mut ctx);
         let out_e = CudaBackend::to_vec(&out_e_dev, m_e * n_per);
         c_ref[row_start * n_per..(row_start + m_e) * n_per].copy_from_slice(&out_e);
@@ -154,7 +150,7 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
     // Without `triton-kernels` feature, GptqStoreCuda is a transparent
     // alias for MarlinWeight, so `stacked` IS the MarlinWeight directly
     // (see crates/ferrum-kernels/src/backend/cuda.rs:279).
-    let mw: &ferrum_kernels::marlin::MarlinWeight = &stacked;
+    let mw: &ferrum_kernels::marlin::MarlinWeight = &*stacked;
     let mut c_fused_dev = <CudaBackend as Backend>::alloc(total_tokens * n_per);
 
     // Upload offsets/tokens as i32. Use raw cudarc since the Backend's
@@ -173,7 +169,8 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
         .expect("upload tokens_per_expert");
 
     // Pre-zero stacked workspace (mirrors production).
-    let _ = <CudaBackend as BackendQuantMarlin>::marlin_zero_stacked_workspace(&mut ctx, &stacked);
+    let _ =
+        <CudaBackend as BackendQuantMarlin>::marlin_zero_stacked_workspace(&mut ctx, &*stacked);
 
     ferrum_kernels::marlin::marlin_gemm_moe(
         &stream,
