@@ -38,7 +38,7 @@ Three gates — ALL must pass before the refactor is considered done:
    reorganization to identical machine code; thermals are the noise
    floor).
 
-## Progress (as of 2026-05-10, completed dims 1-4)
+## Progress (as of 2026-05-10, completed dims 1-4 + crate consolidation)
 
 ### Dim status
 
@@ -73,6 +73,10 @@ Three gates — ALL must pass before the refactor is considered done:
 | [#122](https://github.com/sizzlecar/ferrum-infer-rs/pull/122) | 3e/1 | Add concrete `CudaMarlinLinear` + `CudaMarlinStackedExpertLinear` in `ferrum-kernels::quant_linear/cuda_marlin.rs`. Make `marlin_gemm_with_perm` + `launch_vllm_marlin` public so the new types can dispatch the kernel without a trait method. Additive — no behaviour change. |
 | [#123](https://github.com/sizzlecar/ferrum-infer-rs/pull/123) | 3e/2 | **Marlin cutover.** `BackendQuantMarlin::load_gptq` returns `Box<dyn Linear<Self>>`; `make_stacked_expert_linear` factory replaces `gemm_gptq_with_offset`. Both `gemm_gptq*` trait methods deleted. `GptqLinear<B>` / `StackedExpertLinear<B>` shrink to delegating wrappers. CPU side gains `load_gptq_stacked` + `make_stacked_expert_linear` for parity tests. |
 | [#124](https://github.com/sizzlecar/ferrum-infer-rs/pull/124) | 3e/3 | **GGUF cutover (closes Dim 2/3).** `BackendQuantGguf::load_quant` / `load_quant_fused` return `Box<dyn Linear<Self>>`. `gemm_quant` trait method deleted; the 209-line Metal body extracted into `pub fn metal_gemm_quant_dispatch`. New `MetalGgufLinear` + `CpuGgufLinear` in `ferrum-kernels::quant_linear/`. `QuantLinear<B>` shrinks to wrapper. |
+| [#126](https://github.com/sizzlecar/ferrum-infer-rs/pull/126) | Dim 5 cleanup | Move `KvDtypeKind` + the four marker structs out of ferrum-kernels into ferrum-interfaces (no GPU deps). |
+| [#127](https://github.com/sizzlecar/ferrum-infer-rs/pull/127) | PR B | Delete the legacy `ComputeBackend` / `KernelOps` / `model_builder` / memory modules from ferrum-interfaces (had no implementations after Phase 3e). Drop the dead `MetalKernelOps` shell, the `ferrum-engine::backends::candle` `ComputeBackend` impl, the dead `custom_backend` builder field, and `ferrum-models::{builder,weights}`. |
+| [#128](https://github.com/sizzlecar/ferrum-infer-rs/pull/128) | PR C | Merge `ferrum-attention` into `ferrum-kernels::attention`. The crate's only consumers were `ferrum-kernels::backend::metal` and `ferrum-models` (Qwen3-TTS); merging removes a duplicated metal feature pass-through and the cudarc-0.12 stub. Two-cudarc-version workspace gone. |
+| [#129](https://github.com/sizzlecar/ferrum-infer-rs/pull/129) | cleanup | Drop dead `LinearFactory` trait + `DefaultLinearFactory` (zero callers anywhere). |
 
 ### Backend trait shrinkage
 
@@ -200,6 +204,24 @@ Then check periodically with `ssh ... 'tail /tmp/build_bench.log'`.
 
 Note: c=4 isn't in the historical bench tables (`docs/bench/cuda-rtx4090-2026-05-09-pr-101-102/` only logged c=1/8/16/32). Treat
 these as new baselines.
+
+### Post-consolidation rerun (Vast 4090, main @ `44a87d0` after PRs #126-#129)
+
+Acceptance gate 3 — same model, same comparison method, ≤ 3% drift.
+
+| Model | Path | tok/s e2e (now) | Δ vs baseline | TPOT | Δ TPOT |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | FP16 (safetensors) | 81.8 | -1.4% (within 3%) ✅ | 12.16 ms | +2.4% |
+| Llama-3.1-8B-Instruct | GPTQ-Int4 (Marlin) | 63.0 | **+4.3% improvement** ✅ | 15.86 ms | -4.2% |
+| Qwen3-30B-A3B | GPTQ-Int4 (vLLM Marlin moe, c=4) | 54.9 | +1.3% ✅ | 69.34 ms | -0.9% |
+
+Marlin INT4 improvement comes from the Phase 3e/2 cutover — LTO inlines
+`Box<dyn Linear<B>>` dispatch better than the previous
+`#[cfg]`-branched trait method body. Metal locally: Qwen3-0.6B Q4_K_M
+60.3 tok/s, matches pre-consolidation reading.
+
+**Acceptance gate 3 passes.** Functionality + performance preserved
+through PRs #126-#129. Only Dim 5 INT8 KV kernel work remains.
 
 ## References
 
