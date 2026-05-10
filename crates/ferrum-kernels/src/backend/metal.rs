@@ -2691,3 +2691,4 @@ impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for MetalBackend {
     type KvBuffer = <Self as crate::backend::Backend>::Buffer;
     type KvScales = ();
 }
+

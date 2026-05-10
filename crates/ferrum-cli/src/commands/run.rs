@@ -5,7 +5,6 @@ use chrono::Utc;
 use clap::Args;
 use colored::*;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
-use ferrum_models::HfDownloader;
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -103,98 +102,30 @@ pub struct RunCommand {
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // GGUF fast path — no HF download, no candle weight loader, just hand
-    // the file to candle-transformers' quantized loaders.
-    if looks_like_gguf_path(&cmd.model) {
+    // the file to the GGUF runtime. Kept as a separate entry until
+    // `run_gguf_one_shot`'s REPL helpers (sampling, chat templates,
+    // repetition tracking) finish migrating onto the engine path.
+    if crate::source_resolver::looks_like_gguf_path(&cmd.model) {
         return crate::commands::run_gguf::run_gguf_one_shot(cmd, config).await;
     }
 
-    // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
-    // KV pool + 4 GB scratch reserve fit in `total_gpu_mem * gpu_util`.
-    // No-op on Mac / when nvidia-smi is missing; respected by user
-    // explicit FERRUM_KV_MAX_BLOCKS override.
-    {
-        let direct_for_autosize = std::path::PathBuf::from(&cmd.model);
-        if direct_for_autosize.is_dir() {
-            // Chat profile: single user, multi-turn — long per-seq
-            // context beats wide batch. Without this, KV_CAPACITY
-            // defaults to 512 and Qwen3 thinking-mode overflows at
-            // the 4th turn. CLI users shouldn't have to set
-            // FERRUM_KV_CAPACITY by hand.
-            crate::gpu_mem_autosize::apply_auto_size_with_profile(
-                &direct_for_autosize,
-                cmd.gpu_memory_utilization,
-                crate::gpu_mem_autosize::AutoSizeProfile::Chat,
-            );
-        }
-    }
-
-    // Local directory path: short-circuit the HF cache lookup +
-    // auto-download. If the user passed an absolute/relative path that
-    // exists on disk and looks like a HuggingFace model dir (config.json
-    // + weights), load it directly. Avoids the surprising "not found
-    // locally, downloading..." when the user already has the model.
-    let direct_path = std::path::PathBuf::from(&cmd.model);
-    let direct_source: Option<ResolvedModelSource> = if direct_path.is_dir() {
-        let format = detect_format(&direct_path);
-        if format != ModelFormat::Unknown {
-            Some(ResolvedModelSource {
-                original: cmd.model.clone(),
-                local_path: direct_path,
-                format,
-                from_cache: false,
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Resolve model
-    let model_id = if direct_source.is_some() {
-        cmd.model.clone()
-    } else {
-        resolve_model_alias(&cmd.model)
-    };
-    eprintln!("{}", format!("Loading {}...", model_id).dimmed());
-
-    // Find cached model or auto-download (skipped when direct_source set)
+    // Resolve the model through the central source resolver:
+    //   local dir → HF cache → HF download (auto), with chat-profile
+    //   GPU autosize applied once on the resolved snapshot.
     let cache_dir = get_hf_cache_dir(&config);
-    let source = match direct_source.or_else(|| find_cached_model(&cache_dir, &model_id)) {
-        Some(source) => source,
-        None => {
-            // Model not found, try to download automatically
-            eprintln!(
-                "{} Model '{}' not found locally, downloading...",
-                "📥".cyan(),
-                model_id
-            );
-
-            // Get HF token from environment
-            let token = std::env::var("HF_TOKEN")
-                .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
-                .ok();
-
-            // Create downloader and download
-            let downloader = HfDownloader::new(cache_dir.clone(), token)?;
-            let snapshot_path = downloader.download(&model_id, None).await?;
-
-            // Now find the downloaded model
-            let format = detect_format(&snapshot_path);
-            if format == ModelFormat::Unknown {
-                return Err(ferrum_types::FerrumError::model(
-                    "Downloaded model has unknown format",
-                ));
-            }
-
-            ResolvedModelSource {
-                original: model_id.clone(),
-                local_path: snapshot_path,
-                format,
-                from_cache: false,
-            }
-        }
-    };
+    let resolved = crate::source_resolver::resolve_model_source(
+        &cmd.model,
+        &cache_dir,
+        crate::source_resolver::DownloadPolicy::AutoDownload,
+        Some((
+            crate::gpu_mem_autosize::AutoSizeProfile::Chat,
+            cmd.gpu_memory_utilization,
+        )),
+    )
+    .await?;
+    let source = resolved.source;
+    let model_id = source.original.clone();
+    eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
     // Set model path for engine
     // NOTE: std::env::set_var is unsafe on Rust 2024; keep it minimal and explicit.
@@ -784,14 +715,16 @@ pub fn apply_kv_dtype_override(
             engine_config.kv_cache.dtype = KvCacheDtype::Fp16;
             Ok(())
         }
-        KvCacheDtype::Int8 => Err(ferrum_types::FerrumError::unsupported(
-            "INT8 KV cache: kernels and KvCacheQuant<B, KvInt8> have landed \
-             (PR #131 / #134 / #135), but the model decode loop hasn't been \
-             generic'd over K: KvDtypeKind yet. Re-run with --kv-dtype=fp16 \
-             (or omit the flag) until the model wire-up ships.",
-        )),
+        KvCacheDtype::Int8 => {
+            // Dim 5 PR C: end-to-end INT8 KV path on CUDA via
+            // LlamaFamilyModel<CudaBackend, KvInt8>. Registry rejects
+            // (CPU/Metal, Int8) and (CUDA Qwen3-MoE, Int8) with helpful
+            // messages.
+            engine_config.kv_cache.dtype = KvCacheDtype::Int8;
+            Ok(())
+        }
         KvCacheDtype::Fp8 => Err(ferrum_types::FerrumError::unsupported(
-            "FP8 KV cache: kernels not yet implemented. Tracked as a future PR.",
+            "FP8 KV cache: kernels not yet implemented. Tracked as PR D.",
         )),
         KvCacheDtype::Bf16 => Err(ferrum_types::FerrumError::unsupported(
             "BF16 KV cache: marker only, no backend impl ships yet.",

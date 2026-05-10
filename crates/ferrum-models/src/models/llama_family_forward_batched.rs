@@ -8,7 +8,7 @@
 
 use std::sync::atomic::Ordering;
 
-use ferrum_interfaces::kv_dtype::KvDtypeKind;
+use ferrum_interfaces::kv_dtype::KvFp16;
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
     KvCache, MoeLlmBackend, MAX_LAYERS_FOR_GRAPH,
@@ -22,7 +22,12 @@ use super::llama_family::{
     OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US, SINGLE_ITEM_GRAPH_KEY,
 };
 
-impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
+// Batched / unified-forward paths are FP16-only. Pinning the impl to
+// K = KvFp16 lets us access `KvCache<B, KvFp16>` fields directly without
+// trait-method indirection. K = KvInt8 falls back to per-item decode at
+// the engine level (DecoderOnlyLLM::decode_batch + unified_forward report
+// Unsupported in the K=KvInt8 specialization).
+impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
     /// One transformer layer over M items, GEMMs batched + per-item attention.
     pub(crate) fn forward_layer_batched_decode(
         &mut self,
@@ -1674,5 +1679,304 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
                 .expect("unified_mlp_out missing");
             B::add_inplace(ctx, residual, mlp_out, m_total * h);
         });
+    }
+    /// Batched decode: process M concurrent requests at potentially different
+    /// positions in one forward pass. GEMM-heavy ops (qkv_proj, o_proj,
+    /// gate_up, down) run with m=M for natural batching; rope + KV append +
+    /// attention loop per-item (each has its own KV cache at a different
+    /// kv_len, and potentially different pos).
+    ///
+    /// Returns M logit vectors in the same order as `batch`.
+    pub fn decode_batch_internal(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        let m = batch.len();
+        if m == 0 {
+            return Vec::new();
+        }
+        if m == 1 {
+            let (cid, tok, pos) = &batch[0];
+            return vec![self.decode_internal(cid, *tok, *pos)];
+        }
+
+        // Ensure all caches exist and scratch is sized for M tokens.
+        for (cid, _, _) in batch {
+            self.ensure_kv(cid);
+        }
+        self.ensure_scratch(m);
+        // Phase 4b: when paged mode is on, ensure_kv has already
+        // populated the batched scratch buffers (paged_batch_q etc.).
+        // The forward path branches on `paged_pools.is_some()` inside
+        // each layer.
+
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        let num_layers = self.cfg.num_layers;
+        let mut ctx = B::new_context();
+
+        // Pre-step state (positions, kv_lens_pre, kv_lens_post). All
+        // 32 layers' batched kernels read these from scratch device
+        // buffers — written ONCE here, NEVER inside the layer loop, so
+        // the captured graph below replays with stable buffer addresses
+        // and the next step's content update reaches the kernels.
+        let positions: Vec<u32> = batch.iter().map(|(_, _, p)| *p as u32).collect();
+        let tokens: Vec<u32> = batch.iter().map(|(_, t, _)| *t).collect();
+        let kv_pre: Vec<u32> = batch
+            .iter()
+            .map(|(cid, _, _)| self.kv_caches.get(cid).expect("kv_caches missing")[0].len as u32)
+            .collect();
+        let kv_post: Vec<u32> = kv_pre.iter().map(|&x| x + 1).collect();
+        B::write_u32(&mut ctx, &mut self.scratch.batch_positions, &positions);
+        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
+        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
+
+        // Pre-populate per-slot device-pointer scratch for the batched
+        // kernels (kv_cache_append_batched, flash_attention_batched).
+        // Done OUTSIDE any captured forward — sync memcpy on the legacy
+        // null stream is not captured by stream capture, so the captured
+        // graph contains only kernel launches. Without this, the
+        // captured `stream.memcpy_htod` records host pointers and the
+        // 2nd pure-replay reads stale/corrupted data → ILLEGAL_ADDRESS.
+        //
+        // populate_batched_pointers was intended to support
+        // FERRUM_BATCHED_GRAPH=1 (Phase 4d graph capture) by pre-filling
+        // device scratch outside the captured forward. Phase 4d is
+        // shelved (CUDA driver state accumulates and SIGSEGVs after
+        // ~14 launches even with all the right knobs), so the populate
+        // call adds overhead with no benefit on the OFF path. Skip it —
+        // the kv_cache_append / flash_attn batched impls fall back to
+        // their inline captured memcpy when scratch isn't pre-populated.
+        // batched_pointers_for kept for future use; revisit when we
+        // either (a) get graph capture working, or (b) move scratch to
+        // process-global static.
+        let _ = &self.batched_pointers_for;
+
+        // 0. Embed all M tokens into residual [M, H]. Eager, OUTSIDE
+        //    any captured graph (host tokens slice; embedding_lookup_dyn
+        //    is single-item only).
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("decode_batch_internal called on backbone-only model (no embed)");
+        B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
+
+        // ── Phase 4d: CUDA-graph replay path ─────────────────────────
+        // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
+        // graph support (begin_graph_capture returns Err).
+        let graph_enabled = std::env::var("FERRUM_BATCHED_GRAPH")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let m_padded = m.next_power_of_two();
+        // Per-m_padded graph cache: each batch shape gets its own
+        // captured graph instead of thrashing a single slot. Native
+        // CUDA microbench (graph_upload_bench) confirmed multi-slot
+        // replay is stable.
+        let graph_key = m_padded as u64;
+        let cache_has_key = self.batched_graph_keys_seen.contains(&graph_key);
+
+        let mut did_pure_replay = false;
+        if graph_enabled && cache_has_key && !self.batched_graph_failed {
+            // Sync stream first so embedding_lookup (just queued) plus
+            // any null-stream cuMemcpyHtoD_v2's from write_u32 are all
+            // settled before cuGraphLaunch.
+            B::sync(&mut ctx);
+            match B::replay_graph(&mut ctx, graph_key) {
+                Ok(true) => {
+                    did_pure_replay = true;
+                    BATCHED_GRAPH_REPLAY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    self.batched_graph_failed = true;
+                    eprintln!("[batched-trace] replay err: {}", e);
+                }
+            }
+        }
+        if graph_enabled && !did_pure_replay {
+            BATCHED_GRAPH_EAGER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Periodic stats (every 256 calls).
+        let total = BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+            + BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        if graph_enabled && total > 0 && total.is_multiple_of(256) {
+            eprintln!(
+                "[batched-graph-stats] m={m} m_padded={m_padded} replays={} eagers={} keys_seen={:?}",
+                BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                self.batched_graph_keys_seen,
+            );
+        }
+
+        if !did_pure_replay {
+            const BATCHED_GRAPH_WARMUP: usize = 3;
+            let should_capture = graph_enabled
+                && !self.batched_graph_failed
+                && self.batched_graph_warmup >= BATCHED_GRAPH_WARMUP;
+            if should_capture {
+                tracing::debug!("[batched-graph] BEGIN CAPTURE m_padded={m_padded}");
+                if let Err(e) = B::begin_graph_capture(&mut ctx) {
+                    eprintln!("[batched-trace] begin_capture err: {}", e);
+                    self.batched_graph_failed = true;
+                }
+            }
+            self.batched_graph_warmup += 1;
+
+            // Trace mode (env): sync after each major op so that the
+            // first panicking sync localises which kernel/section faulted.
+            // Off by default (adds 32 syncs per token = pipeline serialisation).
+            let trace = std::env::var("FERRUM_BATCHED_TRACE").is_ok();
+            macro_rules! tracesync {
+                ($label:expr) => {
+                    if trace {
+                        B::sync(&mut ctx);
+                        eprintln!("[trace-batched] {}", $label);
+                    }
+                };
+            }
+            tracesync!("entry-after-writes-and-embed");
+
+            // Op-profile: time the entire batched forward (eager only —
+            // pure replay short-circuits above and does not increment
+            // the per-op counters since the wrapped ops aren't executed
+            // by the Rust dispatch path).
+            let batched_profile = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+            let batched_iter_t0 = if batched_profile {
+                // Drain shared counters first so this iter's print isn't
+                // contaminated by prior prefill/single-decode contributions.
+                ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            // Eager forward (records into graph if capture is active).
+            for li in 0..num_layers {
+                self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+                tracesync!(format!("after layer {}", li));
+            }
+            let _t0_norm = if batched_profile {
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            B::rms_norm(
+                &mut ctx,
+                &residual,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.norm_out,
+                m,
+                h,
+            );
+            if let Some(t0) = _t0_norm {
+                B::sync(&mut ctx);
+                NORM_TIME_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tracesync!("after final rms_norm");
+            let lm_head = self
+                .lm_head
+                .as_ref()
+                .expect("decode_batch_internal called on backbone-only model (no lm_head)");
+            let _t0_lm = if batched_profile {
+                B::sync(&mut ctx);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            lm_head.forward(
+                &mut ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.batch_logits,
+                m,
+            );
+            if let Some(t0) = _t0_lm {
+                B::sync(&mut ctx);
+                MATMUL_TIME_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tracesync!("after lm_head");
+
+            if let Some(t0) = batched_iter_t0 {
+                B::sync(&mut ctx);
+                let total_us = t0.elapsed().as_micros() as u64;
+                let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let wrapped_us = attn_us + qkr_us + mm_us + norm_us + other_us;
+                let unwrapped_us = total_us.saturating_sub(wrapped_us);
+                eprintln!(
+                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({})  unwrapped={}us",
+                    m,
+                    total_us,
+                    mm_us, mm_n,
+                    attn_us, attn_n,
+                    qkr_us, qkr_n,
+                    norm_us, norm_n,
+                    other_us, other_n,
+                    unwrapped_us,
+                );
+            }
+
+            if should_capture && !self.batched_graph_failed {
+                if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
+                    eprintln!("[batched-trace] end_capture err: {}", e);
+                    self.batched_graph_failed = true;
+                } else {
+                    self.batched_graph_keys_seen.insert(graph_key);
+                    if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
+                        eprintln!("[batched-trace] post-capture replay err: {}", e);
+                        self.batched_graph_failed = true;
+                    }
+                }
+            }
+        }
+
+        // Bump cache.len for all (m × num_layers) caches. forward_layer
+        // no longer bumps (so a graph replay's lack of Rust execution
+        // doesn't desync it). One central bump covers eager and replay.
+        for (cid, _, _) in batch.iter() {
+            let caches = self.kv_caches.get_mut(cid).expect("kv_caches missing");
+            for li in 0..num_layers {
+                caches[li].len += 1;
+            }
+        }
+
+        // Sync before to_vec (Metal: no internal sync on buffer read).
+        B::sync(&mut ctx);
+        self.scratch.residual = Some(residual);
+
+        // Extract M logit vectors from the flat buffer.
+        let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+        (0..m)
+            .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
+            .collect()
     }
 }
