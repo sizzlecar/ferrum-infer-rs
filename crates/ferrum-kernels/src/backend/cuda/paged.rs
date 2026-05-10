@@ -28,7 +28,7 @@ use cudarc::driver::{
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 
-use super::{CudaBackend, CudaState};
+use super::{CudaBackend, CudaState, BATCHED_SCRATCH_CAP, HOST_STAGING_TOTAL};
 use crate::backend::{Backend, BackendPagedKv};
 use crate::ptx;
 

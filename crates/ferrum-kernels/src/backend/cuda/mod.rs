@@ -41,6 +41,9 @@ pub mod graph;
 pub mod int8_kv;
 pub mod paged;
 pub mod quant;
+// Re-export so submodules (paged, etc.) can reach the constant via
+// `super::MAX_LAYERS_FOR_GRAPH` like the original mod.rs code did.
+pub(super) use super::MAX_LAYERS_FOR_GRAPH;
 pub use int8_kv::{OptionalCudaInt8, OptionalCudaScalesF16};
 // Preserve historical `crate::backend::cuda::*` paths used by external
 // callers (`quant_linear::cuda_marlin`, parity tests).
@@ -158,7 +161,7 @@ pub struct CudaState {
     vllm_moe_c_tmp_f32: Option<CudaSlice<f32>>,
 }
 
-const BATCHED_SCRATCH_CAP: usize = 64;
+pub(super) const BATCHED_SCRATCH_CAP: usize = 64;
 /// Number of distinct call sites per token-step that may be captured
 /// inside one CUDA graph: `cache_ptrs` is shared by K-append AND V-append
 /// calls (so 2 × MAX_LAYERS_FOR_GRAPH); `k_ptrs`/`v_ptrs` are used once
@@ -171,7 +174,7 @@ const BATCHED_SCRATCH_CAP: usize = 64;
 /// `cudarc_graph_shared_host_array_multi_memcpy`).
 const MAX_GRAPH_SLOTS: usize = 2 * super::MAX_LAYERS_FOR_GRAPH;
 /// Total size of the per-call host staging arrays for graph capture.
-const HOST_STAGING_TOTAL: usize = MAX_GRAPH_SLOTS * BATCHED_SCRATCH_CAP;
+pub(super) const HOST_STAGING_TOTAL: usize = MAX_GRAPH_SLOTS * BATCHED_SCRATCH_CAP;
 
 impl CudaState {
     /// Lazy-init the MoE stream pool on first access. Pool size is
