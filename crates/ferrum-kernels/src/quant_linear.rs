@@ -13,6 +13,10 @@
 //! weight-format parser layer; backend-specific Linear impls live here.
 
 pub mod cpu_dequant;
+pub mod cpu_gguf;
 
 #[cfg(feature = "cuda")]
 pub mod cuda_marlin;
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod metal_gguf;

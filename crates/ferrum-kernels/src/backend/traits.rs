@@ -1220,40 +1220,26 @@ pub trait BackendQuantGguf: Backend {
         _bytes: &[u8],
         _n_rows: usize,
         _n_cols: usize,
-    ) -> Result<Self::QuantStore> {
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
         Err(FerrumError::unsupported(
             "load_quant not implemented for this backend",
         ))
     }
-    /// Build a fused `QuantStore` from multiple `(kind, bytes, n_rows)`
+    /// Build a fused linear from multiple `(kind, bytes, n_rows)`
     /// parts that share `n_cols`. Used by `GgufLoader::load_fused` when
     /// parts have heterogeneous quant kinds (e.g. Qwen3 qkv_proj where
     /// q+k are Q4_K but v is Q6_K) — byte-concatenation isn't possible,
     /// so each part stays as its own QuantStore and the gemm dispatches
     /// one matvec per part with output offsets.
     ///
-    /// Default: not supported. Backends that have a `Fused`-like variant
-    /// override.
+    /// Phase 3e/3: returns `Box<dyn Linear<Self>>` directly (Metal:
+    /// `MetalGgufLinear` over a `Fused` MetalQuantStore variant).
     fn load_quant_fused(
         _parts: &[(GgufQuantType, &[u8], usize)],
         _n_cols: usize,
-    ) -> Result<Self::QuantStore> {
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
         Err(FerrumError::unsupported(
             "load_quant_fused not implemented for this backend",
-        ))
-    }
-    /// GEMM with k-quant weights. Mirrors `gemm` / `gemm_gptq` shape:
-    /// `out[m, n] = a[m, k] @ dequant(weight)^T`. The dispatch on the
-    /// quant flavour happens inside the backend's `QuantStore` enum.
-    fn gemm_quant(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::QuantStore,
-        _out: &mut Self::Buffer,
-        _m: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemm_quant not implemented for this backend",
         ))
     }
     /// Build a stacked-experts `QuantStore` from a contiguous 3-D weight

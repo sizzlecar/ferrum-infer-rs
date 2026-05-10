@@ -854,9 +854,9 @@ impl crate::backend::BackendQuantGguf for CpuBackend {
         bytes: &[u8],
         n_rows: usize,
         n_cols: usize,
-    ) -> Result<Self::QuantStore> {
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
         use super::GgufQuantType;
-        match kind {
+        let store = match kind {
             GgufQuantType::Q4K => {
                 let total_elems = n_rows * n_cols;
                 if total_elems % Q4_K_QK != 0 {
@@ -873,34 +873,25 @@ impl crate::backend::BackendQuantGguf for CpuBackend {
                         expected
                     )));
                 }
-                Ok(CpuQuantStore::Q4K {
+                CpuQuantStore::Q4K {
                     weights: dequant_q4_k_cpu(bytes, n_blocks),
                     n_rows,
                     n_cols,
-                })
+                }
             }
-            other => Err(FerrumError::unsupported(format!(
-                "CPU load_quant: {other:?} not yet implemented"
-            ))),
-        }
-    }
-    fn gemm_quant(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::QuantStore,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        match weight {
-            CpuQuantStore::Q4K {
-                weights,
-                n_rows,
-                n_cols,
-            } => {
-                Self::gemm(ctx, a, weights, out, m, *n_rows, *n_cols);
-                Ok(())
+            other => {
+                return Err(FerrumError::unsupported(format!(
+                    "CPU load_quant: {other:?} not yet implemented"
+                )));
             }
-        }
+        };
+        // Phase 3e/3: dispatch via CpuGgufLinear::forward instead of
+        // a trait method.
+        Ok(Box::new(crate::quant_linear::cpu_gguf::CpuGgufLinear {
+            store,
+            in_features: n_cols,
+            out_features: n_rows,
+        }))
     }
 }
 
