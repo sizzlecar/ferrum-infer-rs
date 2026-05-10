@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
+use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16};
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
     KvCache, LlmBackend, MoeLlmBackend, QuantLlmBackend, MAX_LAYERS_FOR_GRAPH,
@@ -477,7 +478,12 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
 /// `B: BackendGraph + BackendQuantMarlin + BackendQuantGguf` because the decode hot path uses CUDA Graph capture/replay
 /// when the backend supports it; non-graph backends (Metal/CPU) inherit no-op
 /// defaults, so this bound is satisfied by every concrete `Backend`.
-pub struct LlamaFamilyModel<B: MoeLlmBackend> {
+///
+/// `K: KvDtypeKind = KvFp16` (Dim 5): selects the KV cache element type.
+/// Default `KvFp16` matches the original `KvCache<B>` layout, so existing
+/// call sites keep working unchanged. INT8 / FP8 wire-up lives in PR C
+/// (see `docs/dim5-model-wireup-plan.md`).
+pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -501,12 +507,12 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend> {
     /// - **Paged mode** (`FERRUM_METAL_PAGED_KV=1`): k/v are unused
     ///   placeholders; the real K/V live in [`Self::paged_pools`] and
     ///   the cache's `block_table` + `context_lens` index into them.
-    pub kv_caches: HashMap<String, Vec<KvCache<B>>>,
+    pub kv_caches: HashMap<String, Vec<KvCache<B, K>>>,
     /// Free pool of pre-allocated KV cache slots. Released caches return
     /// here instead of being dropped, so their device pointers stay valid
     /// across requests — critical for graph capture (pointers baked into
     /// the captured graph would otherwise dangle).
-    kv_free_pool: Vec<Vec<KvCache<B>>>,
+    kv_free_pool: Vec<Vec<KvCache<B, K>>>,
 
     // ── Paged-KV multi-seq state (Phase 4) ─────────────────────────────
     //
@@ -554,7 +560,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend> {
     pub(crate) unified_graph_keys_seen: std::collections::HashSet<u64>,
 }
 
-impl<B: MoeLlmBackend> LlamaFamilyModel<B> {
+impl<B: MoeLlmBackend, K: KvDtypeKind> LlamaFamilyModel<B, K> {
     /// Build a Qwen3 model from weights provided by the loader.
     ///
     /// The loader decides per-projection whether to instantiate DenseLinear,
@@ -2435,7 +2441,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B> {
     }
 }
 
-impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B> {
+impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for LlamaFamilyModel<B, K> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -2547,7 +2553,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B> {
 
     fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         // Delegate to the inherent implementation on LlamaFamilyModel.
-        LlamaFamilyModel::<B>::forward_verify(self, cache_id, tokens)
+        LlamaFamilyModel::<B, K>::forward_verify(self, cache_id, tokens)
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
