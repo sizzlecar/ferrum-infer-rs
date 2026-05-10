@@ -38,17 +38,19 @@ Three gates — ALL must pass before the refactor is considered done:
    reorganization to identical machine code; thermals are the noise
    floor).
 
-## Progress (as of 2026-05-10, end of late session)
+## Progress (as of 2026-05-10, completed dims 1-4)
 
 ### Dim status
 
 | Dim | Status | Notes |
 |---|---|---|
 | 1. Model architecture | ✅ done | Architecture v2 (historical, pre-audit) |
-| 2. Compute precision | 🟡 partial | Backend trait still owns Marlin/GGUF method bodies; `Linear<B>` exists as polymorphism point but kernel dispatch hasn't moved into impls yet (Phase 3e) |
-| 3. Weight format | 🟡 partial | `WeightLoader<B>` + `Linear<B>` infra in place; same Phase 3e gap as dim 2 |
+| 2. Compute precision | ✅ done | Phase 3e cutover complete (#123 Marlin, #124 GGUF). All quant kernel dispatch lives in `Linear<B>` impls in `ferrum-kernels::quant_linear/`. `BackendQuantMarlin::gemm_gptq*` and `BackendQuantGguf::gemm_quant` deleted. |
+| 3. Weight format | ✅ done | `Linear<B>` polymorphism point owns the kernel call; new format = new `Linear<B>` impl in ferrum-kernels (no Backend trait change). |
 | 4. **Inference device** | ✅ done | Backend → 5 supertraits + 3 capability bundles (#107-#110) |
 | 5. KV cache precision | 🟡 partial | `KvDtypeKind` + `BackendKvDtype<K>` traits (#112) + `KvCache<B, K = KvFp16>` type param (#119); INT8/FP8 kernel impls still pending |
+
+**4 of 5 dims complete.** The remaining gap is Dim 5 INT8 KV kernel work — the type-system shape is there, just need the actual quant KV kernels.
 
 ### PRs landed (in order)
 
@@ -68,6 +70,9 @@ Three gates — ALL must pass before the refactor is considered done:
 | [#118](https://github.com/sizzlecar/ferrum-infer-rs/pull/118) | 5b/1 | Delete `DefaultInferenceEngine` (1217 lines net). Builder always returns `ContinuousBatchEngine`. Unblocks the `ferrum-runtime` crate delete (5b/2). |
 | [#119](https://github.com/sizzlecar/ferrum-infer-rs/pull/119) | 4 wire-up | `KvCache<B, K = KvFp16>` type-param + PhantomData. **Vast 4090: Qwen3-0.6B 82.9 tok/s (baseline 83.0, perf-neutral ✅)**. |
 | [#121](https://github.com/sizzlecar/ferrum-infer-rs/pull/121) | 5b/2 | Delete the `ferrum-runtime` crate; move `CandleBackend` + memory pool into `ferrum-engine/src/backends/`. Drops the legacy CPU `ComputeBackend` impl (no consumers). |
+| [#122](https://github.com/sizzlecar/ferrum-infer-rs/pull/122) | 3e/1 | Add concrete `CudaMarlinLinear` + `CudaMarlinStackedExpertLinear` in `ferrum-kernels::quant_linear/cuda_marlin.rs`. Make `marlin_gemm_with_perm` + `launch_vllm_marlin` public so the new types can dispatch the kernel without a trait method. Additive — no behaviour change. |
+| [#123](https://github.com/sizzlecar/ferrum-infer-rs/pull/123) | 3e/2 | **Marlin cutover.** `BackendQuantMarlin::load_gptq` returns `Box<dyn Linear<Self>>`; `make_stacked_expert_linear` factory replaces `gemm_gptq_with_offset`. Both `gemm_gptq*` trait methods deleted. `GptqLinear<B>` / `StackedExpertLinear<B>` shrink to delegating wrappers. CPU side gains `load_gptq_stacked` + `make_stacked_expert_linear` for parity tests. |
+| [#124](https://github.com/sizzlecar/ferrum-infer-rs/pull/124) | 3e/3 | **GGUF cutover (closes Dim 2/3).** `BackendQuantGguf::load_quant` / `load_quant_fused` return `Box<dyn Linear<Self>>`. `gemm_quant` trait method deleted; the 209-line Metal body extracted into `pub fn metal_gemm_quant_dispatch`. New `MetalGgufLinear` + `CpuGgufLinear` in `ferrum-kernels::quant_linear/`. `QuantLinear<B>` shrinks to wrapper. |
 
 ### Backend trait shrinkage
 
@@ -77,13 +82,14 @@ Three gates — ALL must pass before the refactor is considered done:
 | 2.1 + 2.2 (#107) | ~82 | -12 |
 | 2.3 (#108) | ~62 | -20 |
 | 2.4 (#109) | ~32 | -30 |
+| 3e/2 (#123) | ~30 | -2 (gemm_gptq + gemm_gptq_with_offset; +make_stacked_expert_linear) |
+| 3e/3 (#124) | ~29 | -1 (gemm_quant; load_quant return type changed) |
 
-### Remaining work for full "完全体"
+### Remaining work
 
 | Phase | Scope | Risk | Estimate |
 |---|---|---|---|
-| **3e** | Move CudaBackend Marlin (~700 lines) + MetalBackend GGUF (~700 lines) impl bodies INTO `Linear<B>` impls in ferrum-kernels. Cleanest design: `BackendQuantMarlin::load_gptq` returns `Box<dyn Linear<Self>>` directly (so `Backend::gemm_gptq` goes away), with concrete `MarlinGptqLinear` in ferrum-kernels owning the cudarc kernel calls; ferrum-quantization shrinks to weight parsers. Closes Dim 2+3. | Medium | 1-2 days; gate on same-pod Marlin baseline (Llama-8B INT4 = 60.6 tok/s, 30B-A3B c=4 = 55.9 tok/s on this Vast pod) for perf-neutral. |
-| 4 INT8 KV | Implement `BackendKvDtype<KvInt8>` for CUDA (vLLM-style scale-per-token); add the actual quant KV kernels (rope / kv-append / paged attention read INT8 cache). Closes Dim 5. | Medium | 1-2 days. |
+| 4 INT8 KV | Implement `BackendKvDtype<KvInt8>` for CUDA (vLLM-style scale-per-token); add the actual quant KV kernels (rope / kv-append / paged attention read INT8 cache). **Closes Dim 5.** | Medium | 1-2 days. |
 
 ## GPU testing workflow (Vast.ai 4090)
 
