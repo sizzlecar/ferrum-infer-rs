@@ -533,6 +533,12 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// `Mutex` because the engine can call `ensure_kv` / `release_kv`
     /// from multiple threads in concurrent serving.
     pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
+    /// Paged-batch dispatch dimensions `(max_seqs, max_blocks_per_seq)`,
+    /// pinned at the first `ensure_kv` when paged-KV is on. Stored on
+    /// the model (not on scratch) so `ensure_scratch`'s realloc can
+    /// re-call `enable_paged_batch` after wiping scratch's
+    /// `paged_batch_block_tables` / `paged_batch_q` etc.
+    pub paged_dims: Option<(usize, usize)>,
 
     // ── Graph capture state (CUDA only; harmless no-op on other backends) ──
     /// Count of eager decode steps run so far. After `GRAPH_WARMUP`, the
@@ -664,6 +670,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             kv_free_pool: Vec::new(),
             paged_pools: None,
             paged_block_alloc: None,
+            paged_dims: None,
             graph_warmup: 0,
             graph_capture_failed: false,
             batched_graph_warmup: 0,
@@ -747,6 +754,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             kv_free_pool: Vec::new(),
             paged_pools: None,
             paged_block_alloc: None,
+            paged_dims: None,
             graph_warmup: 0,
             graph_capture_failed: false,
             batched_graph_warmup: 0,
@@ -779,6 +787,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             self.unified_graph_keys_seen.clear();
             self.unified_graph_warmup = 0;
             self.unified_graph_failed = false;
+            // Realloc wiped paged_batch_*. Re-enable using the dims
+            // pinned at first ensure_kv. Without this, the next
+            // `forward_layer_batched_decode` panics on
+            // `paged_batch_block_tables missing`.
+            if let Some((max_seqs, max_blocks_per_seq)) = self.paged_dims {
+                self.scratch
+                    .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+            }
         }
     }
 
@@ -872,6 +888,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         if paged {
             self.scratch
                 .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+            // Pin dims on the model so `ensure_scratch`'s realloc can
+            // re-init paged_batch_* after wiping scratch.
+            self.paged_dims = Some((max_seqs, max_blocks_per_seq));
         }
 
         // Try pool first — reused buffers have stable device pointers,

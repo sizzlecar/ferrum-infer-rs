@@ -412,6 +412,14 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     // views (block_table + context_lens) into the shared `paged_pools`.
     pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
     pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
+    // Paged-batch dispatch dimensions. Pinned at the first `ensure_kv`
+    // when paged-KV is on. Stored on the model (not on scratch) so
+    // `ensure_scratch`'s realloc — which wipes scratch's
+    // `paged_batch_block_tables`/`paged_batch_q`/etc. — can re-call
+    // `enable_paged_batch` with the same dims afterwards. Without this
+    // re-init the next forward enters `forward_layer_batched_decode`
+    // and panics on `paged_batch_block_tables missing`.
+    pub paged_dims: Option<(usize, usize)>, // (max_seqs, max_blocks_per_seq)
 }
 
 impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
@@ -536,6 +544,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             kv_free_pool: Vec::new(),
             paged_pools: None,
             paged_block_alloc: None,
+            paged_dims: None,
         })
     }
 
@@ -709,6 +718,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             kv_free_pool: Vec::new(),
             paged_pools: None,
             paged_block_alloc: None,
+            paged_dims: None,
         })
     }
 
@@ -719,6 +729,16 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 B::reset_all_graphs(&mut ctx);
             }
             self.scratch = Qwen3MoeScratch::alloc(&self.cfg, tokens);
+            // Realloc wiped paged_batch_*. Re-enable using the dims
+            // pinned at first ensure_kv. Without this, the next
+            // `forward_layer_batched_decode` panics on
+            // `paged_batch_block_tables missing` (regression manifests
+            // at c≥16 when batch growth triggers scratch realloc
+            // between `ensure_kv` and the batched-decode entry point).
+            if let Some((max_seqs, max_blocks_per_seq)) = self.paged_dims {
+                self.scratch
+                    .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+            }
         }
     }
 
@@ -782,6 +802,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         if paged {
             self.scratch
                 .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+            // Pin dims on the model so `ensure_scratch`'s realloc can
+            // re-call `enable_paged_batch` after wiping scratch.
+            self.paged_dims = Some((max_seqs, max_blocks_per_seq));
         }
 
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
