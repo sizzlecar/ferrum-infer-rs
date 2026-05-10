@@ -872,3 +872,6 @@ impl crate::backend::BackendPagedKv for CpuBackend {}
 
 // CPU has no native MoE dispatch; inherit unsupported defaults.
 impl crate::backend::BackendMoeFused for CpuBackend {}
+
+// CPU: existing KV cache path treats fp16 buffer as f32 internally; mark as KvFp16 for compatibility.
+impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CpuBackend {}

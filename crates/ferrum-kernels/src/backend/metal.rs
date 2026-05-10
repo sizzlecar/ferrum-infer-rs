@@ -2652,3 +2652,6 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         Ok(())
     }
 }
+
+// Metal: existing KV cache path is FP16.
+impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for MetalBackend {}
