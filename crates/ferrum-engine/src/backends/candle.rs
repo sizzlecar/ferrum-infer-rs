@@ -2,18 +2,10 @@
 //!
 //! Provides basic Candle tensor operations for CPU and GPU devices.
 
-use crate::memory::MemoryPool;
-use async_trait::async_trait;
-use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus};
-use ferrum_interfaces::kernel_ops::KernelOps;
-use ferrum_interfaces::{
-    ComputeBackend, DeviceMemoryManager, TensorFactory, TensorLike, TensorOps, TensorRef,
-};
+use ferrum_interfaces::{TensorFactory, TensorLike, TensorOps, TensorRef};
 use ferrum_types::{DataType, Device, Result};
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::debug;
 
 /// Candle tensor wrapper
 pub struct CandleTensor {
@@ -539,147 +531,6 @@ impl TensorOps for CandleTensorOps {
     }
 }
 
-/// Candle backend
-pub struct CandleBackend {
-    device: Device,
-    tensor_factory: CandleTensorFactory,
-    tensor_ops: CandleTensorOps,
-    kernel_ops: super::candle_kernel_ops::CandleKernelOps,
-    memory_manager: MemoryPool,
-}
-
-impl std::fmt::Debug for CandleBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CandleBackend")
-            .field("device", &self.device)
-            .finish()
-    }
-}
-
-impl CandleBackend {
-    pub async fn new(device: Device) -> Result<Self> {
-        debug!("Initializing Candle backend for: {:?}", device);
-
-        let tensor_factory = CandleTensorFactory::new(device.clone());
-        let tensor_ops = CandleTensorOps;
-        let kernel_ops = super::candle_kernel_ops::CandleKernelOps::new();
-        let memory_manager = MemoryPool::new(
-            device.clone(),
-            crate::memory::InternalMemoryPoolConfig {
-                initial_size: 1024 * 1024 * 1024, // 1GB
-                max_size: 4 * 1024 * 1024 * 1024, // 4GB
-                growth_factor: 1.5,
-                enable_defragmentation: true,
-                min_pooled_size: 256,
-                max_pooled_size: 1024 * 1024, // 1MB
-                size_buckets: 32,
-            },
-        );
-
-        Ok(Self {
-            device,
-            tensor_factory,
-            tensor_ops,
-            kernel_ops,
-            memory_manager,
-        })
-    }
-}
-
-#[async_trait]
-impl ComputeBackend for CandleBackend {
-    fn name(&self) -> &str {
-        "candle"
-    }
-
-    fn capabilities(&self) -> BackendCapabilities {
-        let supported_devices = {
-            #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-            {
-                vec![Device::CPU, Device::CUDA(0), Device::Metal]
-            }
-            #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
-            {
-                vec![Device::CPU, Device::CUDA(0)]
-            }
-        };
-
-        BackendCapabilities {
-            supported_dtypes: vec![DataType::FP32, DataType::FP16, DataType::BF16],
-            supported_devices,
-            max_tensor_dims: 8,
-            supports_fp16: true,
-            supports_bf16: true,
-            supports_int8: false,
-            supports_flash_attention: false,
-            supports_paged_attention: false,
-            supports_tensor_parallelism: false,
-            supports_pipeline_parallelism: false,
-            max_batch_size: 32,
-            max_sequence_length: 4096,
-            memory_alignment: 256,
-            supports_custom_kernels: false,
-            supports_cuda_graphs: false,
-            extra_capabilities: HashMap::new(),
-        }
-    }
-
-    fn tensor_ops(&self) -> &dyn TensorOps {
-        &self.tensor_ops
-    }
-
-    fn tensor_factory(&self) -> &dyn TensorFactory {
-        &self.tensor_factory
-    }
-
-    fn memory_manager(&self) -> &dyn DeviceMemoryManager {
-        &self.memory_manager
-    }
-
-    fn kernel_ops(&self) -> Option<&dyn KernelOps> {
-        Some(&self.kernel_ops)
-    }
-
-    async fn initialize(&mut self, _device: &Device) -> Result<()> {
-        // Already initialized in new()
-        Ok(())
-    }
-
-    fn supports_device(&self, device: &Device) -> bool {
-        match device {
-            Device::CPU | Device::CUDA(_) => true,
-            Device::ROCm(_) => false,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            Device::Metal => cfg!(feature = "metal"),
-        }
-    }
-
-    fn version(&self) -> String {
-        env!("CARGO_PKG_VERSION").to_string()
-    }
-
-    async fn synchronize(&self, _device: &Device) -> Result<()> {
-        // MVP: no-op for CPU, would need actual sync for GPU
-        Ok(())
-    }
-
-    fn status(&self) -> BackendStatus {
-        BackendStatus {
-            is_initialized: true,
-            is_ready: true,
-            active_devices: vec![self.device.clone()],
-            memory_usage: HashMap::new(),
-            operations_completed: 0,
-            last_error: None,
-            backend_specific: HashMap::new(),
-        }
-    }
-
-    async fn shutdown(&mut self) -> Result<()> {
-        debug!("Shutting down Candle backend");
-        Ok(())
-    }
-}
 
 // ============================================================================
 // Helper Functions
@@ -800,33 +651,6 @@ mod tests {
         let candle_device = ferrum_device_to_candle(ferrum_device.clone()).unwrap();
         let back_device = candle_device_to_ferrum(&candle_device).unwrap();
         assert_eq!(back_device, Device::CPU);
-    }
-
-    #[tokio::test]
-    async fn test_candle_backend_creation() {
-        let backend = CandleBackend::new(Device::CPU).await;
-        assert!(backend.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_candle_backend_name() {
-        let backend = CandleBackend::new(Device::CPU).await.unwrap();
-        assert_eq!(backend.name(), "candle");
-    }
-
-    #[tokio::test]
-    async fn test_candle_backend_capabilities() {
-        let backend = CandleBackend::new(Device::CPU).await.unwrap();
-        let caps = backend.capabilities();
-
-        assert!(caps.supported_dtypes.contains(&DataType::FP32));
-        assert!(caps.max_tensor_dims > 0);
-    }
-
-    #[tokio::test]
-    async fn test_candle_backend_supports_cpu() {
-        let backend = CandleBackend::new(Device::CPU).await.unwrap();
-        assert!(backend.supports_device(&Device::CPU));
     }
 
     #[test]
