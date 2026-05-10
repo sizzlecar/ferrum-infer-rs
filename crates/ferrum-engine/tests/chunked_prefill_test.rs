@@ -5,7 +5,7 @@
 //! advancing the scheduler's chunk offset, and that the final generated
 //! token sequence matches the non-chunked baseline.
 
-use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     ConfigurableModelExecutor, MockKvCacheManager, MockSampler, MockTensorFactory, MockTokenizer,

@@ -1,5 +1,5 @@
 use ferrum_engine::{create_default_engine, simple_engine_config};
-use ferrum_interfaces::InferenceEngine;
+use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_types::{Device, InferenceRequest, SamplingParams};
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -28,7 +28,7 @@ async fn qwen_25_05b_requests_are_serialized_for_correctness() {
     let mut config = simple_engine_config(QWEN_MODEL_ID, Device::CPU);
     config.scheduler.max_running_requests = 4;
 
-    let engine: Arc<dyn InferenceEngine + Send + Sync> =
+    let engine: Arc<dyn LlmInferenceEngine + Send + Sync> =
         Arc::from(create_default_engine(config).await.expect("create engine"));
 
     let monitor_engine = engine.clone();

@@ -3,7 +3,6 @@
 use crate::config::CliConfig;
 use clap::Args;
 use colored::*;
-use ferrum_interfaces::InferenceEngine;
 use ferrum_models::source::ModelFormat;
 use ferrum_server::{AxumServer, HttpServer, ServerConfig};
 use ferrum_types::Result;
@@ -242,7 +241,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         Some(model_def.architecture)
     };
 
-    let engine: Arc<dyn InferenceEngine + Send + Sync> = match arch_for_dispatch {
+    let server = match arch_for_dispatch {
         Some(ferrum_models::Architecture::Clip) => {
             println!("{}", "Initializing CLIP embedding engine...".dimmed());
             let candle_device = candle_core::Device::Cpu;
@@ -253,10 +252,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             )?;
             let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
             let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
-            Arc::new(
+            let engine: Arc<dyn ferrum_engine::EmbedEngine + Send + Sync> = Arc::new(
                 ferrum_engine::embedding_engine::EmbeddingEngine::new(executor, engine_config)
                     .with_tokenizer(tokenizer),
-            )
+            );
+            AxumServer::from_embed(engine)
         }
         Some(ferrum_models::Architecture::Whisper) => {
             println!("{}", "Initializing Whisper ASR engine...".dimmed());
@@ -267,12 +267,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 candle_core::DType::F32,
             )?;
             let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
-            Arc::new(
+            let engine: Arc<dyn ferrum_engine::TranscribeEngine + Send + Sync> = Arc::new(
                 ferrum_engine::transcription_engine::TranscriptionEngine::new(
                     executor,
                     engine_config,
                 ),
-            )
+            );
+            AxumServer::from_transcribe(engine)
         }
         Some(ferrum_models::Architecture::Qwen3TTS) => {
             let n_slots = tts_slots.max(1);
@@ -298,10 +299,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 }
                 executors.push(executor);
             }
-            Arc::new(ferrum_engine::tts_engine::TtsEngine::new_multi(
-                executors,
-                ferrum_types::ModelId(model_id.clone()),
-            ))
+            let engine: Arc<dyn ferrum_engine::TtsEngine + Send + Sync> =
+                Arc::new(ferrum_engine::tts_engine::TtsService::new_multi(
+                    executors,
+                    ferrum_types::ModelId(model_id.clone()),
+                ));
+            AxumServer::from_tts(engine)
         }
         _ => {
             println!(
@@ -311,8 +314,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
-            let engine = ferrum_engine::create_default_engine(engine_config).await?;
-            Arc::from(engine)
+            let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
+                Arc::from(ferrum_engine::create_default_engine(engine_config).await?);
+            AxumServer::from_llm(engine)
         }
     };
 
@@ -322,9 +326,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         port,
         ..Default::default()
     };
-
-    // Create server with engine
-    let server = AxumServer::new(engine);
 
     println!();
     println!(

@@ -7,8 +7,10 @@
 
 use async_trait::async_trait;
 use ferrum_interfaces::{
-    engine::InferenceEngine, kv_cache::AllocationRequest, KvCacheHandle, KvCacheManager,
-    ModelExecutor, Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
+    engine::{InferenceEngine, LlmInferenceEngine},
+    kv_cache::AllocationRequest,
+    KvCacheHandle, KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler,
+    TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
@@ -1431,7 +1433,7 @@ impl ContinuousBatchEngine {
 }
 
 #[async_trait]
-impl InferenceEngine for ContinuousBatchEngine {
+impl LlmInferenceEngine for ContinuousBatchEngine {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
         let request_id = request.id.clone();
         let infer_start = Instant::now();
@@ -1515,7 +1517,10 @@ impl InferenceEngine for ContinuousBatchEngine {
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
+}
 
+#[async_trait]
+impl InferenceEngine for ContinuousBatchEngine {
     async fn status(&self) -> EngineStatus {
         let metrics = self.inner.scheduler.metrics();
         EngineStatus {
