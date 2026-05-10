@@ -49,7 +49,6 @@
 pub mod builder;
 pub mod continuous_engine;
 pub mod embedding_engine;
-pub mod engine;
 pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;
@@ -80,7 +79,6 @@ pub use ferrum_scheduler::BatchPlan;
 
 // Re-exports of engine implementation
 pub use continuous_engine::{ContinuousBatchEngine, SequenceState};
-pub use engine::*;
 
 // Re-exports of pipeline
 pub use pipeline::{

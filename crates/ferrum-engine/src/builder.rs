@@ -9,7 +9,6 @@
 //! - Validation before engine creation
 
 use crate::registry::{ComponentConfig, ComponentRegistry};
-use crate::DefaultInferenceEngine;
 use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_interfaces::{
     ComputeBackend, KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler,
@@ -369,78 +368,70 @@ impl EngineBuilder {
             }
         };
 
-        // 7. Create the engine
-        info!("All components created, building engine");
+        // 7. Create the engine — always ContinuousBatchEngine.
+        info!("All components created, building ContinuousBatchEngine");
 
-        if matches!(config.scheduler.policy, SchedulingPolicy::ContinuousBatch) {
-            info!("Using ContinuousBatchEngine with iteration-level scheduling");
+        // The registry-resolved scheduler from steps 4 was used by the
+        // legacy DefaultInferenceEngine path that Phase 5b deleted; the
+        // ContinuousBatchEngine needs a concrete ContinuousBatchScheduler.
+        let _ = scheduler;
+        let cb_scheduler = Arc::new(
+            ferrum_scheduler::implementations::ContinuousBatchScheduler::new(
+                config.scheduler.clone(),
+            ),
+        );
 
-            // Create ContinuousBatchScheduler directly (needs concrete type)
-            let cb_scheduler = Arc::new(
-                ferrum_scheduler::implementations::ContinuousBatchScheduler::new(
-                    config.scheduler.clone(),
-                ),
-            );
+        // Create TensorFactory for the configured device
+        let tensor_factory: Arc<dyn TensorFactory> =
+            Arc::new(ferrum_runtime::backends::candle::CandleTensorFactory::new(
+                config.backend.device.clone(),
+            ));
 
-            // Create TensorFactory for the configured device
-            let tensor_factory: Arc<dyn TensorFactory> =
-                Arc::new(ferrum_runtime::backends::candle::CandleTensorFactory::new(
-                    config.backend.device.clone(),
-                ));
-
-            // Opt-in speculative decoding: set FERRUM_SPEC_DRAFT=<model_path>
-            // (absolute path to a HF snapshot dir) to load a second smaller
-            // model as the draft. The draft must use the same tokenizer +
-            // vocab as the target (same family e.g. Qwen3).
-            let (draft_executor, spec_config) = match std::env::var("FERRUM_SPEC_DRAFT").ok() {
-                Some(draft_path) if !draft_path.is_empty() => {
-                    info!("Speculative decoding: loading draft model from {draft_path}");
-                    let n = std::env::var("FERRUM_SPEC_N")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .unwrap_or(4);
-                    let mut draft_cfg = component_config.clone();
-                    draft_cfg.component_options.insert(
-                        "model_path".to_string(),
-                        serde_json::Value::String(draft_path.clone()),
-                    );
-                    match registry.create_executor(&executor_name, &draft_cfg).await {
-                        Ok(draft) => (
-                            Some(draft),
-                            Some(crate::speculative::SpeculativeDecodingConfig {
-                                num_speculative_tokens: n,
-                                temperature: 1.0,
-                            }),
-                        ),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Speculative decoding disabled — draft load failed: {e}"
-                            );
-                            (None, None)
-                        }
+        // Opt-in speculative decoding: set FERRUM_SPEC_DRAFT=<model_path>
+        // (absolute path to a HF snapshot dir) to load a second smaller
+        // model as the draft. The draft must use the same tokenizer +
+        // vocab as the target (same family e.g. Qwen3).
+        let (draft_executor, spec_config) = match std::env::var("FERRUM_SPEC_DRAFT").ok() {
+            Some(draft_path) if !draft_path.is_empty() => {
+                info!("Speculative decoding: loading draft model from {draft_path}");
+                let n = std::env::var("FERRUM_SPEC_N")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                let mut draft_cfg = component_config.clone();
+                draft_cfg.component_options.insert(
+                    "model_path".to_string(),
+                    serde_json::Value::String(draft_path.clone()),
+                );
+                match registry.create_executor(&executor_name, &draft_cfg).await {
+                    Ok(draft) => (
+                        Some(draft),
+                        Some(crate::speculative::SpeculativeDecodingConfig {
+                            num_speculative_tokens: n,
+                            temperature: 1.0,
+                        }),
+                    ),
+                    Err(e) => {
+                        tracing::warn!("Speculative decoding disabled — draft load failed: {e}");
+                        (None, None)
                     }
                 }
-                _ => (None, None),
-            };
+            }
+            _ => (None, None),
+        };
 
-            let engine = crate::ContinuousBatchEngine::new_with_speculation(
-                config,
-                cb_scheduler,
-                tokenizer,
-                sampler,
-                kv_cache,
-                executor,
-                tensor_factory,
-                draft_executor,
-                spec_config,
-            );
-            Ok(Box::new(engine))
-        } else {
-            let engine = DefaultInferenceEngine::new(
-                config, scheduler, tokenizer, sampler, kv_cache, executor,
-            );
-            Ok(Box::new(engine))
-        }
+        let engine = crate::ContinuousBatchEngine::new_with_speculation(
+            config,
+            cb_scheduler,
+            tokenizer,
+            sampler,
+            kv_cache,
+            executor,
+            tensor_factory,
+            draft_executor,
+            spec_config,
+        );
+        Ok(Box::new(engine))
     }
 }
 
