@@ -48,6 +48,11 @@ pub struct BenchCommand {
     /// Long-context mode: use a ~2k token prompt (tests flash decode / paged KV)
     #[arg(long)]
     pub long_context: bool,
+
+    /// KV cache element dtype (Dim 5). Accepts `fp16`, `bf16`, `int8`, `fp8`.
+    /// Default `fp16`. Override via `FERRUM_KV_DTYPE` env var.
+    #[arg(long, value_name = "DTYPE")]
+    pub kv_dtype: Option<String>,
 }
 
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
@@ -165,6 +170,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     // DefaultInferenceEngine (Priority) has stream lifecycle issues with bench.
     let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
+    super::run::apply_kv_dtype_override(&mut engine_config, cmd.kv_dtype.as_deref())?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
 
     let prompt = if cmd.long_context {

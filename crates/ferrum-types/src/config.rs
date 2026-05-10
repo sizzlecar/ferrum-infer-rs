@@ -89,6 +89,12 @@ pub enum SchedulingPolicy {
 pub struct KvCacheConfig {
     /// Cache implementation type
     pub cache_type: KvCacheType,
+    /// Element dtype (Dim 5 polymorphism point). FP16 is the
+    /// validated production path; INT8 / FP8 require a backend impl
+    /// of `BackendKvDtype<KvInt8>` / `BackendKvDtype<KvFp8>` and a
+    /// model wired through `KvCacheQuant<B, K>`.
+    #[serde(default)]
+    pub dtype: KvCacheDtype,
     /// Block size for paged attention
     pub block_size: usize,
     /// Maximum number of blocks
@@ -111,6 +117,7 @@ impl Default for KvCacheConfig {
     fn default() -> Self {
         Self {
             cache_type: KvCacheType::Contiguous,
+            dtype: KvCacheDtype::default(),
             block_size: 16,
             max_blocks: 1024,
             enable_compression: false,
@@ -132,6 +139,53 @@ pub enum KvCacheType {
     Paged,
     /// Tree-based cache for prefix sharing
     Tree,
+}
+
+/// KV Cache element dtype (Dim 5 polymorphism point).
+///
+/// Mirrors `ferrum_interfaces::kv_dtype::KvDtypeKind` markers but
+/// lives here because `KvCacheConfig` is part of the user-facing
+/// `EngineConfig` and needs `Serialize` / `Deserialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvCacheDtype {
+    /// FP16 K/V — the validated production path on every backend.
+    #[default]
+    Fp16,
+    /// BF16 K/V — same memory cost as FP16, slightly different precision.
+    /// Marker only; no backend impl ships yet.
+    Bf16,
+    /// INT8 K/V with per-token per-kv-head FP16 scale (vLLM-style).
+    /// Halves KV memory at small (<1%) accuracy hit. CUDA kernels
+    /// land via `BackendKvDtype<KvInt8>` (PR #131); model wire-up
+    /// (`KvCacheQuant<B, KvInt8>` through the model decode loop) is
+    /// the only remaining step.
+    Int8,
+    /// FP8 (E4M3) K/V. Marker only; CUDA kernels pending.
+    Fp8,
+}
+
+impl KvCacheDtype {
+    /// Parse from a CLI / env-var string. Accepts fp16/f16/bf16/int8/fp8/f8e4m3.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fp16" | "f16" | "float16" => Some(Self::Fp16),
+            "bf16" | "bfloat16" => Some(Self::Bf16),
+            "int8" | "i8" => Some(Self::Int8),
+            "fp8" | "f8" | "f8e4m3" | "e4m3" => Some(Self::Fp8),
+            _ => None,
+        }
+    }
+
+    /// Short label for display + telemetry.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fp16 => "fp16",
+            Self::Bf16 => "bf16",
+            Self::Int8 => "int8",
+            Self::Fp8 => "fp8",
+        }
+    }
 }
 
 /// Memory management configuration
