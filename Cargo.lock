@@ -1383,6 +1383,7 @@ dependencies = [
  "candle-core",
  "cudarc 0.19.4",
  "ferrum-attention",
+ "ferrum-interfaces",
  "ferrum-types",
  "half",
  "metal 0.31.0",

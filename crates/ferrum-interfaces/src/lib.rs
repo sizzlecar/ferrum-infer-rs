@@ -18,6 +18,7 @@ pub mod backend;
 pub mod engine;
 pub mod kernel_ops;
 pub mod kv_cache;
+pub mod kv_dtype;
 pub mod memory;
 pub mod model_builder;
 pub mod model_executor;
@@ -33,6 +34,7 @@ pub use engine::InferenceEngine;
 pub use kv_cache::{
     AllocationRequest, BlockTable, CacheHandleStats, KvCacheHandle, KvCacheManager,
 };
+pub use kv_dtype::{KvBf16, KvDtypeKind, KvFp16, KvFp8, KvInt8};
 pub use memory::{DeviceMemoryManager, MemoryHandle, StreamHandle};
 pub use model_builder::{BuildOptions, ModelBuilder};
 pub use model_executor::{DecodeInput, DecodeOutput, ModelExecutor, PrefillInput, PrefillOutput};
