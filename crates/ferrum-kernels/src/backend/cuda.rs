@@ -1265,6 +1265,59 @@ impl Backend for CudaBackend {
         drop(dec_guard);
     }
 
+    /// Split QKV + qk-norm + RoPE into FP16 head-major scratch buffers.
+    /// Implemented as a chain over the existing primitives: `split_qkv` →
+    /// 3× `qk_norm_rope` (Q/K with their respective norms; V with mode=0).
+    /// Used by the INT8 KV path's `KvLayer<KvInt8>::paged_write` to
+    /// materialize FP16 K/V before quantizing into the INT8 paged pool.
+    /// FP16 paths use the fused `split_qkv_norm_rope_into_paged_cache`
+    /// directly and never hit this method.
+    fn split_qkv_norm_rope(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q_norm_w: &Self::Buffer,
+        k_norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        k_out: &mut Self::Buffer,
+        v_out: &mut Self::Buffer,
+        tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        qk_mode: i32,
+    ) -> Result<()> {
+        // Lazy scratch — split_qkv writes into per-token-major buffers.
+        // We allocate just-in-time; the caller's `q_out/k_out/v_out` are
+        // head-major after the chain.
+        let q_dim = q_heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+        let q_buf_size = tokens * q_dim;
+        let kv_buf_size = tokens * kv_dim;
+        let mut q_buf = <Self as Backend>::alloc(q_buf_size);
+        let mut k_buf = <Self as Backend>::alloc(kv_buf_size);
+        let mut v_buf = <Self as Backend>::alloc(kv_buf_size);
+        Self::split_qkv(ctx, qkv, &mut q_buf, &mut k_buf, &mut v_buf, tokens, q_dim, kv_dim);
+        Self::qk_norm_rope(
+            ctx, &q_buf, q_norm_w, cos, sin, q_out,
+            tokens, q_heads, head_dim, pos_offset, eps, qk_mode,
+        );
+        Self::qk_norm_rope(
+            ctx, &k_buf, k_norm_w, cos, sin, k_out,
+            tokens, kv_heads, head_dim, pos_offset, eps, qk_mode,
+        );
+        // V: no norm + RoPE-only (qk_mode=0); pass q_norm_w as a dummy
+        // (kernel ignores it when mode=0).
+        Self::qk_norm_rope(
+            ctx, &v_buf, q_norm_w, cos, sin, v_out,
+            tokens, kv_heads, head_dim, pos_offset, eps, 0,
+        );
+        Ok(())
+    }
+
     fn kv_cache_append_head_major(
         ctx: &mut Self::Context,
         cache_k: &mut Self::Buffer,
