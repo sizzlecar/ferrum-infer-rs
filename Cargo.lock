@@ -915,15 +915,6 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
-dependencies = [
- "libloading 0.8.9",
-]
-
-[[package]]
-name = "cudarc"
 version = "0.17.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf99ab37ee7072d64d906aa2dada9a3422f1d975cdf8c8055a573bc84897ed8"
@@ -1249,18 +1240,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrum-attention"
-version = "0.7.3"
-dependencies = [
- "cudarc 0.12.1",
- "half",
- "metal 0.31.0",
- "objc2",
- "objc2-foundation",
- "tracing",
-]
-
-[[package]]
 name = "ferrum-cli"
 version = "0.7.3"
 dependencies = [
@@ -1382,7 +1361,6 @@ dependencies = [
  "bindgen_cuda",
  "candle-core",
  "cudarc 0.19.4",
- "ferrum-attention",
  "ferrum-interfaces",
  "ferrum-types",
  "half",
@@ -1426,7 +1404,6 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "dirs 5.0.1",
- "ferrum-attention",
  "ferrum-interfaces",
  "ferrum-kernels",
  "ferrum-quantization",

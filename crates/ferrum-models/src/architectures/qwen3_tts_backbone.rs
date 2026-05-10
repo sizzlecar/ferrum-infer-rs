@@ -1,9 +1,9 @@
 //! `TalkerBackboneBackend<B>` — trait-object-ready wrapper that routes the
 //! Qwen3-TTS Talker transformer stack through `Backend<B>` kernels instead
-//! of `ferrum_attention::FusedTransformer`.
+//! of `ferrum_kernels::attention::FusedTransformer`.
 //!
 //! Why this exists: on Linux with `--features cuda` (no Metal),
-//! `ferrum_attention::FusedTransformer`'s CUDA module is a stub and its
+//! `ferrum_kernels::attention::FusedTransformer`'s CUDA module is a stub and its
 //! CPU fallback uses naive fp64 O(n³) matmul — produces wrong codec tokens
 //! (YouTube-outro garbage) after 20 layers × ~128 decode steps. Routing
 //! through `LlamaFamilyModel<B>` fixes both perf and correctness; CUDA

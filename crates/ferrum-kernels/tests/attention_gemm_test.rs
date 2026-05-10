@@ -2,7 +2,7 @@
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod gemm_tests {
-    use ferrum_attention::metal::pipelines::MetalPipelines;
+    use ferrum_kernels::attention::metal::pipelines::MetalPipelines;
     use metal::Device;
 
     extern "C" {

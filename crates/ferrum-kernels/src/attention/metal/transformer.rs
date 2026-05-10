@@ -2,7 +2,7 @@
 //! GEMM via simdgroup_multiply_accumulate (64x32 tiles), all ops on GPU.
 
 use super::pipelines::MetalPipelines;
-use crate::AttentionParams;
+use crate::attention::AttentionParams;
 use metal::*;
 
 pub struct MetalLayerWeights {

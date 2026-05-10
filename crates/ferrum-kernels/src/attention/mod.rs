@@ -10,15 +10,10 @@ pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
 
-#[cfg(feature = "cuda")]
-pub mod cuda;
-
 /// Opaque GPU buffer type.
 #[cfg(feature = "metal")]
 pub type GpuBuffer = ::metal::Buffer;
-#[cfg(all(feature = "cuda", not(feature = "metal")))]
-pub type GpuBuffer = cudarc::driver::CudaSlice<f32>;
-#[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
+#[cfg(not(feature = "metal"))]
 pub type GpuBuffer = Vec<f32>;
 
 /// Attention configuration.
@@ -44,13 +39,6 @@ pub fn attention_cpu(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], params: &
 
 /// Run fused attention on best available backend.
 pub fn attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], params: &AttentionParams) {
-    #[cfg(feature = "cuda")]
-    {
-        if cuda::is_available() {
-            cuda::fused_attention(q, k, v, out, params);
-            return;
-        }
-    }
     #[cfg(feature = "metal")]
     {
         if metal::is_available() {
@@ -267,12 +255,7 @@ impl FusedTransformer {
                 cfg.hidden_size
             );
         }
-        #[cfg(all(not(feature = "metal"), feature = "cuda"))]
-        tracing::info!(
-            "FusedTransformer: backend=CUDA, hidden={}, layers={n}",
-            cfg.hidden_size
-        );
-        #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
+        #[cfg(not(feature = "metal"))]
         tracing::info!(
             "FusedTransformer: backend=CPU, hidden={}, layers={n}",
             cfg.hidden_size
@@ -834,13 +817,7 @@ impl FusedTransformer {
             let ms = self.metal_state.as_ref()?;
             Some(ms.pipes.buffer_from_data(data))
         }
-        #[cfg(feature = "cuda")]
-        {
-            // TODO: allocate CudaSlice and copy data
-            let _ = data;
-            return None;
-        }
-        #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
+        #[cfg(not(feature = "metal"))]
         {
             Some(data.to_vec())
         }

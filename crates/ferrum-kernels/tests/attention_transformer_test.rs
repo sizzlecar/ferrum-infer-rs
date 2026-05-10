@@ -2,8 +2,8 @@
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_transformer_tests {
-    use ferrum_attention::metal::pipelines::MetalPipelines;
-    use ferrum_attention::metal::transformer::*;
+    use ferrum_kernels::attention::metal::pipelines::MetalPipelines;
+    use ferrum_kernels::attention::metal::transformer::*;
     use metal::Device;
 
     fn random_weights(
