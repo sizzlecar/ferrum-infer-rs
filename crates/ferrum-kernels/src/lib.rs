@@ -61,6 +61,9 @@ pub(crate) mod ptx {
 }
 
 #[cfg(feature = "cuda")]
+pub mod int8_kv;
+
+#[cfg(feature = "cuda")]
 mod fused_add_rms_norm;
 #[cfg(feature = "cuda")]
 pub use fused_add_rms_norm::fused_add_rms_norm;
