@@ -22,8 +22,8 @@
 #![allow(clippy::needless_range_loop, dead_code)]
 
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_models::architectures::qwen3_tts::TalkerConfig;
-use ferrum_models::architectures::qwen3_tts_backend::{Qwen3TtsSubTalker, Qwen3TtsTalker};
+use ferrum_models::multimodal::qwen3_tts::TalkerConfig;
+use ferrum_models::multimodal::qwen3_tts_backend::{Qwen3TtsSubTalker, Qwen3TtsTalker};
 use ferrum_quantization::NativeSafetensorsLoader;
 use std::path::PathBuf;
 
