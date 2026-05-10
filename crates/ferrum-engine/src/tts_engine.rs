@@ -1,32 +1,33 @@
-//! TTS Engine — concurrent slot-based serving of TtsModelExecutor.
+//! TTS service — concurrent slot-based serving of TtsModelExecutor.
 //!
-//! Multiple TTS requests can be processed in parallel, each on its own executor slot.
-//! Slots share nothing (each has its own model weights + KV cache).
-//! Future: Phase 2 will share weights across slots to reduce memory.
+//! Multiple TTS requests can be processed in parallel, each on its own
+//! executor slot. Slots share nothing (each has its own model weights +
+//! KV cache). Future: Phase 2 will share weights across slots to reduce
+//! memory.
+//!
+//! The struct is named `TtsService` to free the `TtsEngine` identifier
+//! for the trait of the same name in `ferrum-interfaces`.
 
 use async_trait::async_trait;
-use ferrum_interfaces::engine::InferenceEngine;
+use ferrum_interfaces::engine::{InferenceEngine, TtsEngine};
 use ferrum_models::executor::tts_executor::TtsModelExecutor;
-use ferrum_types::{
-    EngineConfig, EngineMetrics, EngineStatus, FerrumError, InferenceRequest, InferenceResponse,
-    ModelId, Result, StreamChunk,
-};
-use futures::Stream;
+use ferrum_types::{EngineConfig, EngineMetrics, EngineStatus, FerrumError, ModelId, Result};
 use parking_lot::Mutex;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-pub struct TtsEngine {
+/// Concurrent TTS service. Implements [`TtsEngine`] (the modality trait)
+/// and [`InferenceEngine`] (lifecycle).
+pub struct TtsService {
     slots: Vec<Arc<Mutex<TtsModelExecutor>>>,
-    /// Semaphore to limit concurrent slot usage
+    /// Semaphore to limit concurrent slot usage.
     semaphore: tokio::sync::Semaphore,
     config: EngineConfig,
     sample_rate: u32,
     active_requests: AtomicUsize,
 }
 
-impl TtsEngine {
+impl TtsService {
     /// Create with a single executor (backward compatible).
     pub fn new(executor: TtsModelExecutor, model_id: ModelId) -> Self {
         let sr = executor.sample_rate() as u32;
@@ -68,22 +69,7 @@ impl TtsEngine {
 }
 
 #[async_trait]
-impl InferenceEngine for TtsEngine {
-    async fn infer(&self, _request: InferenceRequest) -> Result<InferenceResponse> {
-        Err(FerrumError::model(
-            "TTS model. Use /v1/audio/speech instead.",
-        ))
-    }
-
-    async fn infer_stream(
-        &self,
-        _request: InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        Err(FerrumError::model(
-            "TTS model. Use /v1/audio/speech instead.",
-        ))
-    }
-
+impl InferenceEngine for TtsService {
     async fn status(&self) -> EngineStatus {
         EngineStatus {
             is_ready: true,
@@ -120,14 +106,17 @@ impl InferenceEngine for TtsEngine {
     async fn health_check(&self) -> ferrum_types::HealthStatus {
         crate::modality_stubs::inert_health()
     }
+}
 
+#[async_trait]
+impl TtsEngine for TtsService {
     async fn synthesize_speech(
         &self,
         text: &str,
         language: Option<&str>,
         chunk_frames: usize,
     ) -> Result<Vec<Vec<f32>>> {
-        // Acquire a slot (waits if all slots busy)
+        // Acquire a slot (waits if all slots busy).
         let _permit = self
             .semaphore
             .acquire()
@@ -136,7 +125,7 @@ impl InferenceEngine for TtsEngine {
 
         self.active_requests.fetch_add(1, Ordering::Relaxed);
 
-        // Find an unlocked slot (semaphore guarantees at least one is available)
+        // Find an unlocked slot (semaphore guarantees at least one is available).
         let slot = self
             .slots
             .iter()
@@ -148,7 +137,7 @@ impl InferenceEngine for TtsEngine {
         let lang = language.unwrap_or("auto").to_string();
         let _active = &self.active_requests;
 
-        // Run TTS on blocking thread (model forward is CPU/GPU bound)
+        // Run TTS on blocking thread (model forward is CPU/GPU bound).
         let result = tokio::task::spawn_blocking(move || {
             let mut executor = slot.lock();
             executor.synthesize_streaming(&text, &lang, chunk_frames, |_, _| {})

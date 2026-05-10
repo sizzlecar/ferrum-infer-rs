@@ -2,7 +2,7 @@
 //!
 //! Uses mock executor with zero latency for fast execution.
 
-use ferrum_engine::{ContinuousBatchEngine, InferenceEngineInterface};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,

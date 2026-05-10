@@ -1,18 +1,14 @@
 //! Lightweight engine for embedding models (CLIP, BERT, etc.).
 //!
-//! Unlike the full inference engine, this doesn't need scheduling,
-//! KV cache management, or token generation. It just wraps an executor
-//! and provides embed_text / embed_image via the InferenceEngine trait.
+//! Wraps a `ClipModelExecutor` and implements `EmbedEngine` directly —
+//! no LLM-method stubs, no fake `InferenceEngine::infer` impls. The
+//! `InferenceEngine` supertrait covers lifecycle/status; the modality
+//! itself goes through `EmbedEngine`.
 
 use async_trait::async_trait;
-use ferrum_interfaces::engine::InferenceEngine;
+use ferrum_interfaces::engine::{EmbedEngine, InferenceEngine};
 use ferrum_models::ClipModelExecutor;
-use ferrum_types::{
-    EngineConfig, EngineMetrics, EngineStatus, FerrumError, InferenceRequest, InferenceResponse,
-    Result, StreamChunk,
-};
-use futures::Stream;
-use std::pin::Pin;
+use ferrum_types::{EngineConfig, EngineMetrics, EngineStatus, FerrumError, Result};
 use std::sync::Arc;
 
 /// Embedding-only engine wrapping a ClipModelExecutor.
@@ -40,40 +36,8 @@ impl EmbeddingEngine {
 
 #[async_trait]
 impl InferenceEngine for EmbeddingEngine {
-    async fn infer(&self, _request: InferenceRequest) -> Result<InferenceResponse> {
-        Err(FerrumError::model(
-            "Embedding models don't support text generation. Use /v1/embeddings instead.",
-        ))
-    }
-
-    async fn infer_stream(
-        &self,
-        _request: InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        Err(FerrumError::model(
-            "Embedding models don't support streaming. Use /v1/embeddings instead.",
-        ))
-    }
-
     async fn status(&self) -> EngineStatus {
-        EngineStatus {
-            is_ready: true,
-            loaded_models: vec![],
-            active_requests: 0,
-            queued_requests: 0,
-            memory_usage: ferrum_types::MemoryUsage {
-                total_bytes: 0,
-                used_bytes: 0,
-                free_bytes: 0,
-                gpu_memory_bytes: None,
-                cpu_memory_bytes: None,
-                cache_memory_bytes: 0,
-                utilization_percent: 0.0,
-            },
-            uptime_seconds: 0,
-            last_heartbeat: chrono::Utc::now(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        }
+        crate::modality_stubs::inert_status()
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -91,7 +55,10 @@ impl InferenceEngine for EmbeddingEngine {
     async fn health_check(&self) -> ferrum_types::HealthStatus {
         crate::modality_stubs::inert_health()
     }
+}
 
+#[async_trait]
+impl EmbedEngine for EmbeddingEngine {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         let tokenizer = self
             .tokenizer
