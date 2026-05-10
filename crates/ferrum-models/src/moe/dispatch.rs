@@ -119,6 +119,84 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
     pub fn down_stacked_store(&self, _expert_idx: usize) -> Option<&B::GptqStore> {
         self.down_gptq_stacked.as_deref()
     }
+
+    // ── MoE GEMV dispatch (hides B::QuantStore + in_stride from callers) ──
+    //
+    // These wrap `B::gemv_quant_moe_id*` so the MoE forward path goes
+    // through the ExpertStack abstraction instead of reaching into
+    // `self.gate_stacked` / `self.up_stacked` / `self.down_stacked`
+    // directly. The weight + correct in_stride are picked from `self`,
+    // so callers only pass activations + routing + scratch out.
+
+    /// Gate projection: `out_stacked[k] = gate_weight[expert_id[k]] · input`,
+    /// broadcast input across all top_k slots.
+    pub fn gemv_gate(
+        &self,
+        ctx: &mut B::Context,
+        input: &B::Buffer,
+        ids: &B::Buffer,
+        out: &mut B::Buffer,
+        top_k: usize,
+    ) -> Result<()> {
+        let weight = self.gate_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_gate: gate_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id(ctx, input, weight, ids, out, top_k, 0)
+    }
+
+    /// Up projection: same shape as gate, broadcast input.
+    pub fn gemv_up(
+        &self,
+        ctx: &mut B::Context,
+        input: &B::Buffer,
+        ids: &B::Buffer,
+        out: &mut B::Buffer,
+        top_k: usize,
+    ) -> Result<()> {
+        let weight = self.up_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_up: up_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id(ctx, input, weight, ids, out, top_k, 0)
+    }
+
+    /// Down projection: per-slot input via `in_stride = expert_intermediate`.
+    /// Caller's `input` is the SiLU-mul stacked output (`top_k × inter` floats).
+    pub fn gemv_down(
+        &self,
+        ctx: &mut B::Context,
+        input: &B::Buffer,
+        ids: &B::Buffer,
+        out: &mut B::Buffer,
+        top_k: usize,
+        expert_intermediate: usize,
+    ) -> Result<()> {
+        let weight = self.down_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_down: down_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id(ctx, input, weight, ids, out, top_k, expert_intermediate)
+    }
+
+    /// Fused gate + up + SiLU·gate: replaces 3 separate dispatches with 1.
+    /// Backend must support the fused path
+    /// (`B::supports_fused_moe_gate_up_silu()`); caller checks first.
+    pub fn gemv_gate_up_silu_fused(
+        &self,
+        ctx: &mut B::Context,
+        input: &B::Buffer,
+        ids: &B::Buffer,
+        out_silu_stacked: &mut B::Buffer,
+        top_k: usize,
+    ) -> Result<()> {
+        let gate = self.gate_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported(
+                "ExpertStack::gemv_gate_up_silu_fused: gate_stacked not loaded",
+            )
+        })?;
+        let up = self.up_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_gate_up_silu_fused: up_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id_gate_up_silu(ctx, input, gate, up, ids, out_silu_stacked, top_k)
+    }
 }
 
 impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
