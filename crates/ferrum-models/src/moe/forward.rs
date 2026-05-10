@@ -343,75 +343,39 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         max_per_expert
     };
 
-    let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
-    let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
-    let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
-
     // 1. Batched gate gemm — one launch covers all (token, expert) pairs.
     //    src1 layout: [batch, ne11=1, K] (broadcast: each pair reads its
     //    token's row, slot index ignored).
     //    dst layout:  [batch, top_k, expert_inter] — natural.
+    let gate_up_args = use_indirect_dispatch.then_some(&scratch.gate_up_args_buf);
+    let down_args = use_indirect_dispatch.then_some(&scratch.down_args_buf);
     let t0 = stage_t0();
-    if use_indirect_dispatch {
-        B::gemm_quant_moe_id_indirect(
-            ctx,
-            &scratch.norm_out,
-            gate_stacked,
-            &scratch.ids_2d,
-            &scratch.tpe_buf,
-            &mut scratch.gate_out_stacked,
-            &scratch.gate_up_args_buf,
-            1, // ne11 = 1: broadcast
-            top_k,
-            max_per_expert,
-            tokens,
-        )?;
-    } else {
-        B::gemm_quant_moe_id(
-            ctx,
-            &scratch.norm_out,
-            gate_stacked,
-            &scratch.ids_2d,
-            &scratch.tpe_buf,
-            &mut scratch.gate_out_stacked,
-            1,
-            top_k,
-            max_per_expert,
-            tokens,
-        )?;
-    }
+    moe_layer.experts.gemm_gate(
+        ctx,
+        &scratch.norm_out,
+        &scratch.ids_2d,
+        &scratch.tpe_buf,
+        &mut scratch.gate_out_stacked,
+        gate_up_args,
+        top_k,
+        max_per_expert,
+        tokens,
+    )?;
     stage_end(t0, ctx, &MOE_PREFILL_GATE_US, &MOE_PREFILL_GATE_CALLS);
 
     // 2. Batched up gemm — same shape as gate.
     let t0 = stage_t0();
-    if use_indirect_dispatch {
-        B::gemm_quant_moe_id_indirect(
-            ctx,
-            &scratch.norm_out,
-            up_stacked,
-            &scratch.ids_2d,
-            &scratch.tpe_buf,
-            &mut scratch.up_out_stacked,
-            &scratch.gate_up_args_buf,
-            1,
-            top_k,
-            max_per_expert,
-            tokens,
-        )?;
-    } else {
-        B::gemm_quant_moe_id(
-            ctx,
-            &scratch.norm_out,
-            up_stacked,
-            &scratch.ids_2d,
-            &scratch.tpe_buf,
-            &mut scratch.up_out_stacked,
-            1,
-            top_k,
-            max_per_expert,
-            tokens,
-        )?;
-    }
+    moe_layer.experts.gemm_up(
+        ctx,
+        &scratch.norm_out,
+        &scratch.ids_2d,
+        &scratch.tpe_buf,
+        &mut scratch.up_out_stacked,
+        gate_up_args,
+        top_k,
+        max_per_expert,
+        tokens,
+    )?;
     stage_end(t0, ctx, &MOE_PREFILL_UP_US, &MOE_PREFILL_UP_CALLS);
 
     // 3. SiLU·gate over [tokens * top_k, expert_inter] flat layout.
@@ -430,34 +394,17 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
     // 4. Batched down gemm — src1 is [batch, top_k, expert_inter] from
     //    silu_stacked. ne11 = top_k → each pair reads its own row.
     let t0 = stage_t0();
-    if use_indirect_dispatch {
-        B::gemm_quant_moe_id_indirect(
-            ctx,
-            &scratch.silu_stacked,
-            down_stacked,
-            &scratch.ids_2d,
-            &scratch.tpe_buf,
-            &mut scratch.down_out_stacked,
-            &scratch.down_args_buf,
-            top_k, // ne11 = top_k: per-slot
-            top_k,
-            max_per_expert,
-            tokens,
-        )?;
-    } else {
-        B::gemm_quant_moe_id(
-            ctx,
-            &scratch.silu_stacked,
-            down_stacked,
-            &scratch.ids_2d,
-            &scratch.tpe_buf,
-            &mut scratch.down_out_stacked,
-            top_k,
-            top_k,
-            max_per_expert,
-            tokens,
-        )?;
-    }
+    moe_layer.experts.gemm_down(
+        ctx,
+        &scratch.silu_stacked,
+        &scratch.ids_2d,
+        &scratch.tpe_buf,
+        &mut scratch.down_out_stacked,
+        down_args,
+        top_k,
+        max_per_expert,
+        tokens,
+    )?;
     stage_end(t0, ctx, &MOE_PREFILL_DOWN_US, &MOE_PREFILL_DOWN_CALLS);
 
     // 5. Per-batch weighted sum: moe_out[b, h] = Σ_k w[b,k] · down[b,k,h]
@@ -542,20 +489,14 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
     )?;
     stage_end(t0, ctx, &MOE_BATCHED_DECODE_ROUTE_US);
 
-    let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
-    let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
-    let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
-
     // 2+3+4. Fused gate+up+silu — single Metal dispatch covers all
     // m*top_k pairs. Falls back to the 3-dispatch sequence on backends
     // that don't have the fused-batched kernel.
     if B::supports_batched_moe_gate_up_silu() {
         let t0 = stage_t0();
-        B::gemv_quant_moe_id_gate_up_silu_batched(
+        moe_layer.experts.gemv_gate_up_silu_batched_fused(
             ctx,
             &scratch.norm_out,
-            gate_stacked,
-            up_stacked,
             &scratch.selected_ids_buf,
             &mut scratch.silu_stacked,
             tokens,
@@ -569,10 +510,9 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
     } else {
         // 2. Batched gate gemv — one launch covers all m*top_k pairs.
         let t0 = stage_t0();
-        B::gemv_quant_moe_id_batched(
+        moe_layer.experts.gemv_gate_batched(
             ctx,
             &scratch.norm_out,
-            gate_stacked,
             &scratch.selected_ids_buf,
             &mut scratch.gate_out_stacked,
             tokens,
@@ -584,10 +524,9 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
 
         // 3. Batched up gemv.
         let t0 = stage_t0();
-        B::gemv_quant_moe_id_batched(
+        moe_layer.experts.gemv_up_batched(
             ctx,
             &scratch.norm_out,
-            up_stacked,
             &scratch.selected_ids_buf,
             &mut scratch.up_out_stacked,
             tokens,
@@ -613,10 +552,9 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
     // 5. Batched down gemv — src1 = silu_stacked [m, top_k, ffn]: each
     //    pair has its own row, outer = top_k * ffn, inner = ffn.
     let t0 = stage_t0();
-    B::gemv_quant_moe_id_batched(
+    moe_layer.experts.gemv_down_batched(
         ctx,
         &scratch.silu_stacked,
-        down_stacked,
         &scratch.selected_ids_buf,
         &mut scratch.down_out_stacked,
         tokens,

@@ -197,6 +197,381 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
         })?;
         B::gemv_quant_moe_id_gate_up_silu(ctx, input, gate, up, ids, out_silu_stacked, top_k)
     }
+
+    // ── Prefill GEMM dispatch (Phase 3d) ──
+    //
+    // Same role as the gemv wrappers above, but for the m>1 path that
+    // emits batched mul_mm_id instead of per-pair gemv. `args_buf`
+    // toggles between direct (`gemm_quant_moe_id`) and indirect-grid
+    // (`gemm_quant_moe_id_indirect`) dispatch — the indirect form lets
+    // `compute_ids_tpe_gpu` produce a tighter grid sized to `max(tpe[e])`.
+    //
+    // ne11 is fixed by role: gate/up = 1 (broadcast across slots),
+    // down = top_k (per-slot src1 read). Callers no longer pass it.
+
+    /// Gate prefill GEMM. `dst` shape: `[batch, top_k, expert_inter]`.
+    /// `args_buf=Some` triggers indirect-grid dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate(
+        &self,
+        ctx: &mut B::Context,
+        src1: &B::Buffer,
+        ids: &B::Buffer,
+        tpe: &B::Buffer,
+        dst: &mut B::Buffer,
+        args_buf: Option<&B::Buffer>,
+        top_k: usize,
+        max_per_expert: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let weight = self.gate_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemm_gate: gate_stacked not loaded")
+        })?;
+        match args_buf {
+            Some(args) => B::gemm_quant_moe_id_indirect(
+                ctx,
+                src1,
+                weight,
+                ids,
+                tpe,
+                dst,
+                args,
+                1,
+                top_k,
+                max_per_expert,
+                tokens,
+            ),
+            None => B::gemm_quant_moe_id(
+                ctx,
+                src1,
+                weight,
+                ids,
+                tpe,
+                dst,
+                1,
+                top_k,
+                max_per_expert,
+                tokens,
+            ),
+        }
+    }
+
+    /// Up prefill GEMM. Same shape contract as [`Self::gemm_gate`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_up(
+        &self,
+        ctx: &mut B::Context,
+        src1: &B::Buffer,
+        ids: &B::Buffer,
+        tpe: &B::Buffer,
+        dst: &mut B::Buffer,
+        args_buf: Option<&B::Buffer>,
+        top_k: usize,
+        max_per_expert: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let weight = self.up_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemm_up: up_stacked not loaded")
+        })?;
+        match args_buf {
+            Some(args) => B::gemm_quant_moe_id_indirect(
+                ctx,
+                src1,
+                weight,
+                ids,
+                tpe,
+                dst,
+                args,
+                1,
+                top_k,
+                max_per_expert,
+                tokens,
+            ),
+            None => B::gemm_quant_moe_id(
+                ctx,
+                src1,
+                weight,
+                ids,
+                tpe,
+                dst,
+                1,
+                top_k,
+                max_per_expert,
+                tokens,
+            ),
+        }
+    }
+
+    /// Down prefill GEMM. `dst` shape: `[batch, top_k, hidden]`.
+    /// ne11=top_k (per-slot src1 read from `silu_stacked[batch, top_k, inter]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_down(
+        &self,
+        ctx: &mut B::Context,
+        src1: &B::Buffer,
+        ids: &B::Buffer,
+        tpe: &B::Buffer,
+        dst: &mut B::Buffer,
+        args_buf: Option<&B::Buffer>,
+        top_k: usize,
+        max_per_expert: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let weight = self.down_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemm_down: down_stacked not loaded")
+        })?;
+        match args_buf {
+            Some(args) => B::gemm_quant_moe_id_indirect(
+                ctx,
+                src1,
+                weight,
+                ids,
+                tpe,
+                dst,
+                args,
+                top_k,
+                top_k,
+                max_per_expert,
+                tokens,
+            ),
+            None => B::gemm_quant_moe_id(
+                ctx,
+                src1,
+                weight,
+                ids,
+                tpe,
+                dst,
+                top_k,
+                top_k,
+                max_per_expert,
+                tokens,
+            ),
+        }
+    }
+
+    // ── Batched-decode GEMV dispatch (Phase 3d) ──
+    //
+    // For the small-m batched-decode range (c=2..32). Single Metal
+    // launch covers all m*top_k (token, expert) pairs.
+
+    /// Gate batched gemv: `dst[m * top_k]` with broadcast input
+    /// (slots within a token share the activation row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_gate_batched(
+        &self,
+        ctx: &mut B::Context,
+        input: &B::Buffer,
+        ids: &B::Buffer,
+        dst: &mut B::Buffer,
+        m: usize,
+        top_k: usize,
+        src1_outer_stride: usize,
+        src1_inner_stride: usize,
+    ) -> Result<()> {
+        let weight = self.gate_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_gate_batched: gate_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id_batched(
+            ctx,
+            input,
+            weight,
+            ids,
+            dst,
+            m,
+            top_k,
+            src1_outer_stride,
+            src1_inner_stride,
+        )
+    }
+
+    /// Up batched gemv: same shape as [`Self::gemv_gate_batched`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_up_batched(
+        &self,
+        ctx: &mut B::Context,
+        input: &B::Buffer,
+        ids: &B::Buffer,
+        dst: &mut B::Buffer,
+        m: usize,
+        top_k: usize,
+        src1_outer_stride: usize,
+        src1_inner_stride: usize,
+    ) -> Result<()> {
+        let weight = self.up_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_up_batched: up_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id_batched(
+            ctx,
+            input,
+            weight,
+            ids,
+            dst,
+            m,
+            top_k,
+            src1_outer_stride,
+            src1_inner_stride,
+        )
+    }
+
+    /// Down batched gemv: src1 = `silu_stacked[m, top_k, inter]` per-slot read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_down_batched(
+        &self,
+        ctx: &mut B::Context,
+        input: &B::Buffer,
+        ids: &B::Buffer,
+        dst: &mut B::Buffer,
+        m: usize,
+        top_k: usize,
+        src1_outer_stride: usize,
+        src1_inner_stride: usize,
+    ) -> Result<()> {
+        let weight = self.down_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_down_batched: down_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id_batched(
+            ctx,
+            input,
+            weight,
+            ids,
+            dst,
+            m,
+            top_k,
+            src1_outer_stride,
+            src1_inner_stride,
+        )
+    }
+
+    /// Fused batched gate + up + SiLU·gate. Single dispatch over `m * top_k`
+    /// pairs. Caller gates on `B::supports_batched_moe_gate_up_silu()` first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_gate_up_silu_batched_fused(
+        &self,
+        ctx: &mut B::Context,
+        input: &B::Buffer,
+        ids: &B::Buffer,
+        silu_out: &mut B::Buffer,
+        m: usize,
+        top_k: usize,
+        src1_outer_stride: usize,
+        src1_inner_stride: usize,
+    ) -> Result<()> {
+        let gate = self.gate_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported(
+                "ExpertStack::gemv_gate_up_silu_batched_fused: gate_stacked not loaded",
+            )
+        })?;
+        let up = self.up_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported(
+                "ExpertStack::gemv_gate_up_silu_batched_fused: up_stacked not loaded",
+            )
+        })?;
+        B::gemv_quant_moe_id_gate_up_silu_batched(
+            ctx,
+            input,
+            gate,
+            up,
+            ids,
+            silu_out,
+            m,
+            top_k,
+            src1_outer_stride,
+            src1_inner_stride,
+        )
+    }
+
+    // ── Per-item offset GEMV (Phase 3d, qwen3_moe.rs decode path) ──
+    //
+    // Used by the per-item batched-decode loop in `Qwen3MoeModel::forward`
+    // when offset variants are supported. Reads `src1` at `src1_offset`
+    // floats and `ids` at `ids_offset` ids, writes `dst` from offset 0.
+
+    /// Gate offset gemv. `src1_stride=0` → broadcast.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_gate_offset(
+        &self,
+        ctx: &mut B::Context,
+        src1: &B::Buffer,
+        src1_offset: usize,
+        ids: &B::Buffer,
+        ids_offset: usize,
+        dst: &mut B::Buffer,
+        top_k: usize,
+        src1_stride: usize,
+    ) -> Result<()> {
+        let weight = self.gate_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_gate_offset: gate_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id_offset(
+            ctx,
+            src1,
+            src1_offset,
+            weight,
+            ids,
+            ids_offset,
+            dst,
+            top_k,
+            src1_stride,
+        )
+    }
+
+    /// Up offset gemv.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_up_offset(
+        &self,
+        ctx: &mut B::Context,
+        src1: &B::Buffer,
+        src1_offset: usize,
+        ids: &B::Buffer,
+        ids_offset: usize,
+        dst: &mut B::Buffer,
+        top_k: usize,
+        src1_stride: usize,
+    ) -> Result<()> {
+        let weight = self.up_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_up_offset: up_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id_offset(
+            ctx,
+            src1,
+            src1_offset,
+            weight,
+            ids,
+            ids_offset,
+            dst,
+            top_k,
+            src1_stride,
+        )
+    }
+
+    /// Down offset gemv.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_down_offset(
+        &self,
+        ctx: &mut B::Context,
+        src1: &B::Buffer,
+        src1_offset: usize,
+        ids: &B::Buffer,
+        ids_offset: usize,
+        dst: &mut B::Buffer,
+        top_k: usize,
+        src1_stride: usize,
+    ) -> Result<()> {
+        let weight = self.down_stacked.as_ref().ok_or_else(|| {
+            FerrumError::unsupported("ExpertStack::gemv_down_offset: down_stacked not loaded")
+        })?;
+        B::gemv_quant_moe_id_offset(
+            ctx,
+            src1,
+            src1_offset,
+            weight,
+            ids,
+            ids_offset,
+            dst,
+            top_k,
+            src1_stride,
+        )
+    }
 }
 
 impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
