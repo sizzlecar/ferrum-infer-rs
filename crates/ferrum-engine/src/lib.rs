@@ -117,33 +117,6 @@ pub async fn create_default_engine(
     create_engine(config).await
 }
 
-/// Create a simple engine config from minimal parameters
-pub fn simple_engine_config(
-    model_id: impl Into<ferrum_types::ModelId>,
-    device: ferrum_types::Device,
-) -> EngineConfig {
-    use ferrum_types::*;
-
-    let mut config = EngineConfig::default();
-    config.model.model_id = model_id.into();
-    config.backend.device = device;
-
-    // Set reasonable defaults for MVP
-    config.batching.max_batch_size = 32;
-    config.kv_cache.block_size = 16;
-    // Default 2048 blocks: covers c=32 ShareGPT prompts (~32×500/16
-    // = 1000 blocks). The previous 512 floor crashed at c≥16 on real
-    // workloads with "Block pool exhausted". Override via
-    // FERRUM_KV_MAX_BLOCKS for tighter memory budgets.
-    config.kv_cache.max_blocks = std::env::var("FERRUM_KV_MAX_BLOCKS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2048);
-    config.scheduler.max_running_requests = 32;
-
-    config
-}
-
 // ============================================================================
 // Integration Tests
 // ============================================================================
@@ -152,11 +125,16 @@ pub fn simple_engine_config(
 mod integration_tests {
     use super::*;
 
+    fn test_config() -> EngineConfig {
+        let mut config = EngineConfig::default();
+        config.model.model_id = ferrum_types::ModelId::new("test-model");
+        config.backend.device = ferrum_types::Device::CPU;
+        config
+    }
+
     #[tokio::test]
     async fn test_create_engine_via_builder() {
-        let config = simple_engine_config("test-model", ferrum_types::Device::CPU);
-
-        let engine = EngineBuilder::new(config)
+        let engine = EngineBuilder::new(test_config())
             .with_tokenizer("stub")
             .with_executor("stub")
             .build()
@@ -167,8 +145,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_create_engine_convenience() {
-        let config = simple_engine_config("test-model", ferrum_types::Device::CPU);
-        let engine = create_default_engine(config).await;
+        let engine = create_default_engine(test_config()).await;
 
         assert!(engine.is_ok());
     }
