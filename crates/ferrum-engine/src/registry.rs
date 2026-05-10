@@ -12,8 +12,7 @@
 
 use async_trait::async_trait;
 use ferrum_interfaces::{
-    ComputeBackend, KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler,
-    Tokenizer,
+    KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
 use ferrum_types::{Device, EngineConfig, FerrumError, Result};
 use parking_lot::RwLock;
@@ -116,7 +115,6 @@ fn cpu_cuda_and_optional_metal_devices() -> Vec<Device> {
 
 /// Global component registry for managing component factories
 pub struct ComponentRegistry {
-    backend_factories: RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn ComputeBackend>>>>>,
     tokenizer_factories:
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Tokenizer + Send + Sync>>>>>,
     sampler_factories:
@@ -133,7 +131,6 @@ impl ComponentRegistry {
     /// Create a new empty registry
     pub fn new() -> Self {
         Self {
-            backend_factories: RwLock::new(HashMap::new()),
             tokenizer_factories: RwLock::new(HashMap::new()),
             sampler_factories: RwLock::new(HashMap::new()),
             scheduler_factories: RwLock::new(HashMap::new()),
@@ -152,9 +149,6 @@ impl ComponentRegistry {
     /// Register all default component factories
     pub fn register_defaults(&self) {
         info!("Registering default component factories");
-
-        // Backend factories
-        self.register_backend_factory("candle", Arc::new(CandleBackendFactory));
 
         // Tokenizer factories
         self.register_tokenizer_factory("huggingface", Arc::new(HuggingFaceTokenizerFactory));
@@ -178,8 +172,7 @@ impl ComponentRegistry {
         self.register_executor_factory("candle", Arc::new(CandleExecutorFactory));
 
         debug!(
-            "Registered factories - backends: {:?}, tokenizers: {:?}, samplers: {:?}, schedulers: {:?}, kv_caches: {:?}, executors: {:?}",
-            self.list_backends(),
+            "Registered factories - tokenizers: {:?}, samplers: {:?}, schedulers: {:?}, kv_caches: {:?}, executors: {:?}",
             self.list_tokenizers(),
             self.list_samplers(),
             self.list_schedulers(),
@@ -191,17 +184,6 @@ impl ComponentRegistry {
     // ========================================================================
     // Registration methods
     // ========================================================================
-
-    /// Register a backend factory
-    pub fn register_backend_factory(
-        &self,
-        name: impl Into<String>,
-        factory: Arc<dyn ComponentFactory<Arc<dyn ComputeBackend>>>,
-    ) {
-        let name = name.into();
-        debug!("Registering backend factory: {}", name);
-        self.backend_factories.write().insert(name, factory);
-    }
 
     /// Register a tokenizer factory
     pub fn register_tokenizer_factory(
@@ -262,14 +244,6 @@ impl ComponentRegistry {
     // Lookup methods
     // ========================================================================
 
-    /// Get a backend factory by name
-    pub fn get_backend_factory(
-        &self,
-        name: &str,
-    ) -> Option<Arc<dyn ComponentFactory<Arc<dyn ComputeBackend>>>> {
-        self.backend_factories.read().get(name).cloned()
-    }
-
     /// Get a tokenizer factory by name
     pub fn get_tokenizer_factory(
         &self,
@@ -314,11 +288,6 @@ impl ComponentRegistry {
     // List methods
     // ========================================================================
 
-    /// List all registered backend names
-    pub fn list_backends(&self) -> Vec<String> {
-        self.backend_factories.read().keys().cloned().collect()
-    }
-
     /// List all registered tokenizer names
     pub fn list_tokenizers(&self) -> Vec<String> {
         self.tokenizer_factories.read().keys().cloned().collect()
@@ -347,22 +316,6 @@ impl ComponentRegistry {
     // ========================================================================
     // Convenience creation methods
     // ========================================================================
-
-    /// Create a backend by name
-    pub async fn create_backend(
-        &self,
-        name: &str,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn ComputeBackend>> {
-        let factory = self.get_backend_factory(name).ok_or_else(|| {
-            FerrumError::backend(format!(
-                "Backend '{}' not found. Available: {:?}",
-                name,
-                self.list_backends()
-            ))
-        })?;
-        factory.create(config).await
-    }
 
     /// Create a tokenizer by name
     pub async fn create_tokenizer(
@@ -454,7 +407,6 @@ impl Default for ComponentRegistry {
 impl std::fmt::Debug for ComponentRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComponentRegistry")
-            .field("backends", &self.list_backends())
             .field("tokenizers", &self.list_tokenizers())
             .field("samplers", &self.list_samplers())
             .field("schedulers", &self.list_schedulers())
@@ -472,28 +424,11 @@ impl std::fmt::Debug for ComponentRegistry {
 // Backend Factories
 // ----------------------------------------------------------------------------
 
-/// Candle backend factory
-pub struct CandleBackendFactory;
-
-#[async_trait]
-impl ComponentFactory<Arc<dyn ComputeBackend>> for CandleBackendFactory {
-    async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn ComputeBackend>> {
-        use crate::backends::candle::CandleBackend;
-        info!("Creating Candle backend for device: {:?}", config.device);
-        let backend = CandleBackend::new(config.device.clone()).await?;
-        Ok(Arc::new(backend))
-    }
-
-    fn metadata(&self) -> ComponentMetadata {
-        ComponentMetadata {
-            name: "candle".to_string(),
-            version: "0.1.0".to_string(),
-            description: "Candle compute backend for CPU/GPU inference".to_string(),
-            supported_devices: cpu_cuda_and_optional_metal_devices(),
-            capabilities: vec!["fp16".to_string(), "fp32".to_string(), "bf16".to_string()],
-        }
-    }
-}
+// CandleBackendFactory deleted in Phase: legacy `ComputeBackend` trait
+// gone; the registry's component graph never produced a runtime backend
+// (`_backend` in builder.rs was unused). The stub-executor factory now
+// constructs `CandleTensorFactory` directly when it needs to mint dummy
+// logits; everything else dispatches via `Backend<B>` in ferrum-kernels.
 
 // ----------------------------------------------------------------------------
 // Tokenizer Factories
@@ -869,13 +804,19 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
             config.engine_config.model.model_id
         );
 
-        // Create a stub compute backend for the executor
-        let backend = crate::backends::candle::CandleBackend::new(config.device.clone()).await?;
+        // The stub executor only needs a `TensorFactory` to mint dummy
+        // logits — no real backend dispatch involved. Wire the candle
+        // tensor factory directly without the legacy `ComputeBackend`
+        // wrapper.
+        let tensor_factory: Arc<dyn ferrum_interfaces::TensorFactory> =
+            Arc::new(crate::backends::candle::CandleTensorFactory::new(
+                config.device.clone(),
+            ));
 
         let executor = ferrum_models::StubModelExecutor::new(
             config.engine_config.model.model_id.clone(),
             vocab_size,
-            Arc::new(backend),
+            tensor_factory,
         );
 
         Ok(Arc::new(executor))
@@ -1339,14 +1280,12 @@ mod tests {
     #[test]
     fn test_registry_creation() {
         let registry = ComponentRegistry::new();
-        assert!(registry.list_backends().is_empty());
         assert!(registry.list_tokenizers().is_empty());
     }
 
     #[test]
     fn test_registry_with_defaults() {
         let registry = ComponentRegistry::with_defaults();
-        assert!(registry.list_backends().contains(&"candle".to_string()));
         assert!(registry.list_tokenizers().contains(&"stub".to_string()));
         assert!(registry
             .list_samplers()
@@ -1397,12 +1336,4 @@ mod tests {
         assert_eq!(token.get(), 3); // Index of 0.9
     }
 
-    #[tokio::test]
-    async fn test_factory_metadata() {
-        let factory = CandleBackendFactory;
-        let metadata = factory.metadata();
-
-        assert_eq!(metadata.name, "candle");
-        assert!(!metadata.supported_devices.is_empty());
-    }
 }

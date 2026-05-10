@@ -1,54 +1,34 @@
 //! Core interface definitions for the Ferrum inference framework
 //!
-//! This crate defines all the stable trait interfaces that different components
-//! of Ferrum implement. It provides a clean abstraction layer that allows for
-//! pluggable implementations of tokenizers, model executors, schedulers,
-//! cache managers, and other core components.
-//!
-//! The interfaces are designed following the principles outlined in the
-//! refactoring documentation:
-//! - Single responsibility with stable boundaries
-//! - Zero-copy and handle semantics
-//! - Capability discovery driven
-//! - Performance-first API design
+//! This crate carries the stable, GPU-free trait contracts shared across
+//! the workspace: model execution, scheduling, KV cache management,
+//! tokenization, sampling, and the lifecycle/modality engine traits.
+//! Hardware backends live in `ferrum-kernels` (the `Backend<B>` trait
+//! and its supertraits); only types that compile without GPU features
+//! belong here.
 
 #![allow(async_fn_in_trait)]
 
-pub mod backend;
 pub mod engine;
-pub mod kernel_ops;
 pub mod kv_cache;
 pub mod kv_dtype;
-pub mod memory;
-pub mod model_builder;
 pub mod model_executor;
 pub mod sampler;
 pub mod scheduler;
 pub mod tensor;
 pub mod tokenizer;
-pub mod transformer;
 
 // Re-export core traits and important types
-pub use backend::{BackendCapabilities, ComputeBackend, WeightLoader};
 pub use engine::InferenceEngine;
 pub use kv_cache::{
     AllocationRequest, BlockTable, CacheHandleStats, KvCacheHandle, KvCacheManager,
 };
 pub use kv_dtype::{KvBf16, KvDtypeKind, KvFp16, KvFp8, KvInt8};
-pub use memory::{DeviceMemoryManager, MemoryHandle, StreamHandle};
-pub use model_builder::{BuildOptions, ModelBuilder};
 pub use model_executor::{DecodeInput, DecodeOutput, ModelExecutor, PrefillInput, PrefillOutput};
 pub use sampler::{LogitsProcessor, Sampler, SamplingConfig, SamplingContext};
 pub use scheduler::{BatchHint, BatchPlan, Scheduler as SchedulerInterface};
 pub use tensor::{TensorFactory, TensorLike, TensorOps, TensorRef};
 pub use tokenizer::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo};
-pub use transformer::{TransformerConfig, TransformerWeights};
-
-// Kernel ops re-exports
-pub use kernel_ops::{
-    ActivationOps, AttentionOps, AttentionParams, KernelOps, KernelOpsDispatch, LinearOps, NormOps,
-    PositionOps, QuantScheme, RoPEConfig, SamplingOps, SamplingParams as KernelSamplingParams,
-};
 
 // Re-export types from ferrum-types, avoiding conflicts
 pub use ferrum_types::{

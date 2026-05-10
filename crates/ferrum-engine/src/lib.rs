@@ -50,7 +50,6 @@ pub mod backends;
 pub mod builder;
 pub mod continuous_engine;
 pub mod embedding_engine;
-pub mod memory;
 pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;
@@ -67,7 +66,7 @@ pub mod metal;
 pub use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 pub use ferrum_interfaces::{
     IncrementalTokenizer, InferenceEngine as InferenceEngineInterface, KvCacheManager,
-    ModelBuilder, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer, WeightLoader,
+    ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
 
 pub use ferrum_types::{
@@ -76,7 +75,6 @@ pub use ferrum_types::{
 };
 
 // Re-exports from implementation crates
-pub use ferrum_interfaces::ComputeBackend;
 pub use ferrum_scheduler::BatchPlan;
 
 // Re-exports of engine implementation
@@ -92,7 +90,7 @@ pub use builder::{create_engine, EngineBuilder};
 
 // Re-exports of registry
 pub use registry::{
-    global_registry, set_global_registry, CandleBackendFactory, CandleExecutorFactory,
+    global_registry, set_global_registry, CandleExecutorFactory,
     ComponentConfig, ComponentFactory, ComponentMetadata, ComponentRegistry,
     ContinuousBatchSchedulerFactory, DefaultKvCacheFactory, FifoSchedulerFactory, GreedySampler,
     GreedySamplerFactory, HuggingFaceTokenizerFactory, MultinomialSamplerFactory,
@@ -177,7 +175,6 @@ mod integration_tests {
         let registry = global_registry();
 
         // Should have default factories
-        assert!(registry.list_backends().contains(&"candle".to_string()));
         assert!(registry.list_tokenizers().contains(&"stub".to_string()));
         assert!(registry
             .list_samplers()
@@ -187,9 +184,9 @@ mod integration_tests {
     #[test]
     fn test_custom_registry() {
         let registry = ComponentRegistry::new();
-        assert!(registry.list_backends().is_empty());
+        assert!(registry.list_tokenizers().is_empty());
 
         registry.register_defaults();
-        assert!(!registry.list_backends().is_empty());
+        assert!(!registry.list_tokenizers().is_empty());
     }
 }
