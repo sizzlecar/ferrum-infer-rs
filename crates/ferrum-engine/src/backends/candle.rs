@@ -2,13 +2,13 @@
 //!
 //! Provides basic Candle tensor operations for CPU and GPU devices.
 
-use crate::{
-    ComputeBackend, DeviceMemoryManager, MemoryPool, TensorFactory, TensorLike, TensorOps,
-    TensorRef,
-};
+use crate::memory::MemoryPool;
 use async_trait::async_trait;
 use ferrum_interfaces::backend::{BackendCapabilities, BackendStatus};
 use ferrum_interfaces::kernel_ops::KernelOps;
+use ferrum_interfaces::{
+    ComputeBackend, DeviceMemoryManager, TensorFactory, TensorLike, TensorOps, TensorRef,
+};
 use ferrum_types::{DataType, Device, Result};
 use std::any::Any;
 use std::collections::HashMap;

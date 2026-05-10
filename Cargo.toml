@@ -5,8 +5,7 @@ members = [
     "crates/ferrum-interfaces",
     
     # Implementation crates
-    "crates/ferrum-runtime",
-    "crates/ferrum-scheduler", 
+    "crates/ferrum-scheduler",
     "crates/ferrum-tokenizer",
     "crates/ferrum-sampler",
     "crates/ferrum-kv",
@@ -136,7 +135,6 @@ ferrum-types = { path = "crates/ferrum-types", version = "0.7.3" }
 ferrum-interfaces = { path = "crates/ferrum-interfaces", version = "0.7.3" }
 
 # Internal crates - Implementation crates
-ferrum-runtime = { path = "crates/ferrum-runtime", version = "0.7.3" }
 ferrum-scheduler = { path = "crates/ferrum-scheduler", version = "0.7.3" }
 ferrum-tokenizer = { path = "crates/ferrum-tokenizer", version = "0.7.3" }
 ferrum-sampler = { path = "crates/ferrum-sampler", version = "0.7.3" }
