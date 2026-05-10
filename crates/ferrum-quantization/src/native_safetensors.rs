@@ -686,28 +686,33 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             )));
         }
 
-        let mut linear = GptqLinear::<B>::from_raw(
-            &qweight,
-            &scales_f32,
-            &qzeros,
-            g_idx.as_deref(),
-            qcfg.bits,
-            qcfg.group_size,
-            in_features,
-            out_features,
-        )?;
-
-        // Bias (Qwen2.5 attention projections, some Llama variants).
+        // Read optional bias FIRST (Qwen2.5 attention projections, some
+        // Llama variants). Phase 3e/2: load_gptq takes the bias eagerly
+        // because the boxed Linear bakes it in.
         let bias_key = format!("{name}.bias");
-        if self.has(&bias_key) {
+        let bias_vec = if self.has(&bias_key) {
             let (bias, bias_shape) = self.read_f32(&bias_key)?;
             if bias_shape != [out_features] {
                 return Err(FerrumError::model(format!(
                     "'{bias_key}' {bias_shape:?} != [{out_features}]"
                 )));
             }
-            linear = linear.with_bias(&bias);
-        }
+            Some(bias)
+        } else {
+            None
+        };
+
+        let linear = GptqLinear::<B>::from_raw(
+            &qweight,
+            &scales_f32,
+            &qzeros,
+            g_idx.as_deref(),
+            bias_vec.as_deref(),
+            qcfg.bits,
+            qcfg.group_size,
+            in_features,
+            out_features,
+        )?;
         Ok(Box::new(linear))
     }
 
@@ -849,19 +854,9 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         #[cfg(feature = "cuda")]
         let _ = is_desc_act;
 
-        let mut linear = GptqLinear::<B>::from_raw(
-            &qw_acc,
-            &sc_acc,
-            &qz_acc,
-            g_idx.as_deref(),
-            qcfg.bits,
-            qcfg.group_size,
-            in_features,
-            out_features,
-        )?;
-
-        // Biases: concatenate `<part>.bias` across parts in the same order as
-        // qweights. All-or-none; if any part has a bias, all must.
+        // Biases: concatenate `<part>.bias` across parts in the same
+        // order as qweights. All-or-none; if any part has a bias, all
+        // must. Phase 3e/2: read first, pass into load_gptq.
         let bias_keys: Vec<String> = parts.iter().map(|p| format!("{p}.bias")).collect();
         let any = bias_keys.iter().any(|k| self.has(k));
         let all = bias_keys.iter().all(|k| self.has(k));
@@ -870,7 +865,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 "GPTQ fusion: inconsistent bias presence across parts".to_string(),
             ));
         }
-        if all {
+        let fused_bias = if all {
             let mut fused: Vec<f32> = Vec::with_capacity(out_features);
             for k in &bias_keys {
                 let (b, _) = self.read_f32(k)?;
@@ -882,8 +877,23 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                     fused.len()
                 )));
             }
-            linear = linear.with_bias(&fused);
-        }
+            Some(fused)
+        } else {
+            None
+        };
+
+        let linear = GptqLinear::<B>::from_raw(
+            &qw_acc,
+            &sc_acc,
+            &qz_acc,
+            g_idx.as_deref(),
+            fused_bias.as_deref(),
+            qcfg.bits,
+            qcfg.group_size,
+            in_features,
+            out_features,
+        )?;
+
         Ok(Box::new(linear))
     }
 
