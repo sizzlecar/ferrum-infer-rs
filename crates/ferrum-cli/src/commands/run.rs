@@ -92,6 +92,13 @@ pub struct RunCommand {
     /// exclusive GPU; leave at 0.9 if other processes share the card.
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
+
+    /// KV cache element dtype (Dim 5 polymorphism point). Accepts
+    /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
+    /// require model wire-up; today only the kernel + type layer ships.
+    /// Override via `FERRUM_KV_DTYPE` env var.
+    #[arg(long, value_name = "DTYPE")]
+    pub kv_dtype: Option<String>,
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
@@ -211,7 +218,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         "Loading weights to GPU... (30s+ for >10 GB models)".dimmed()
     );
     let load_start = std::time::Instant::now();
-    let engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    let mut engine_config = ferrum_engine::simple_engine_config(model_id.clone(), device);
+    apply_kv_dtype_override(&mut engine_config, cmd.kv_dtype.as_deref())?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
     eprintln!(
         "{}",
@@ -746,5 +754,47 @@ fn build_chat_prompt(
         }
         prompt.push_str(&format!("<|user|>\n{}</s>\n<|assistant|>\n", user_input));
         prompt
+    }
+}
+
+/// Apply the `--kv-dtype` CLI flag (or `FERRUM_KV_DTYPE` env override)
+/// to an engine config, validating early. Default is FP16 (the
+/// production-validated path on every backend); selecting INT8 / FP8
+/// is rejected with a helpful message until model integration ships.
+pub fn apply_kv_dtype_override(
+    engine_config: &mut ferrum_types::EngineConfig,
+    cli_arg: Option<&str>,
+) -> ferrum_types::Result<()> {
+    use ferrum_types::KvCacheDtype;
+    let raw = cli_arg
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("FERRUM_KV_DTYPE").ok());
+    let Some(raw) = raw else {
+        // No override → keep config default (FP16).
+        return Ok(());
+    };
+    let parsed = KvCacheDtype::parse(&raw).ok_or_else(|| {
+        ferrum_types::FerrumError::config(format!(
+            "Unknown --kv-dtype value '{}'. Accepts: fp16, bf16, int8, fp8.",
+            raw
+        ))
+    })?;
+    match parsed {
+        KvCacheDtype::Fp16 => {
+            engine_config.kv_cache.dtype = KvCacheDtype::Fp16;
+            Ok(())
+        }
+        KvCacheDtype::Int8 => Err(ferrum_types::FerrumError::unsupported(
+            "INT8 KV cache: kernels and KvCacheQuant<B, KvInt8> have landed \
+             (PR #131 / #134 / #135), but the model decode loop hasn't been \
+             generic'd over K: KvDtypeKind yet. Re-run with --kv-dtype=fp16 \
+             (or omit the flag) until the model wire-up ships.",
+        )),
+        KvCacheDtype::Fp8 => Err(ferrum_types::FerrumError::unsupported(
+            "FP8 KV cache: kernels not yet implemented. Tracked as a future PR.",
+        )),
+        KvCacheDtype::Bf16 => Err(ferrum_types::FerrumError::unsupported(
+            "BF16 KV cache: marker only, no backend impl ships yet.",
+        )),
     }
 }
