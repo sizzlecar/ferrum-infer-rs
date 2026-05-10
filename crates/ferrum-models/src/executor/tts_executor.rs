@@ -22,11 +22,11 @@ use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, Result};
 use tracing::info;
 
 use super::common;
-use crate::architectures::qwen3_tts::{Qwen3TTSTalker, SubTalker, TalkerConfig};
-use crate::architectures::qwen3_tts_backbone::TalkerBackboneBackend;
-use crate::architectures::qwen3_tts_vocoder::{Qwen3TTSVocoder, VocoderConfig};
-use crate::architectures::speaker_encoder::{mel_spectrogram_speaker_encoder, SpeakerEncoder};
-use crate::architectures::speech_tokenizer_encoder::SpeechTokenizerEncoder;
+use crate::multimodal::qwen3_tts::{Qwen3TTSTalker, SubTalker, TalkerConfig};
+use crate::multimodal::qwen3_tts_backbone::TalkerBackboneBackend;
+use crate::multimodal::qwen3_tts_vocoder::{Qwen3TTSVocoder, VocoderConfig};
+use crate::multimodal::speaker_encoder::{mel_spectrogram_speaker_encoder, SpeakerEncoder};
+use crate::multimodal::speech_tokenizer_encoder::SpeechTokenizerEncoder;
 use ferrum_quantization::NativeSafetensorsLoader;
 
 /// Install `Qwen3TtsTalker`/`SubTalker` Backend<CudaBackend> overrides so

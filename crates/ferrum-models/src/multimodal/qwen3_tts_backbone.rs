@@ -22,7 +22,7 @@ use ferrum_quantization::loader::WeightLoader;
 use ferrum_quantization::PrefixedLoader;
 use ferrum_types::Result;
 
-use crate::architectures::qwen3_tts::TalkerConfig;
+use crate::multimodal::qwen3_tts::TalkerConfig;
 use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
 
 /// Object-safe trait so the candle-based talker can hold

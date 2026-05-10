@@ -76,9 +76,10 @@ fn moe_profile_enabled() -> bool {
 /// fused `[gate; up]` projection or its `down` projection.
 ///
 /// `B::Buffer` is hidden behind `Linear<B>` so this struct is generic
-/// over backend, but Phase 2's only consumer (`moe_forward_cpu`) is CPU-
-/// only — generic `moe_forward<B>` is deferred until the trait gains
-/// scaled-accumulate + cheap buffer slicing.
+/// over backend. Production (`Qwen3MoeModel::forward`) dispatches through
+/// the generic [`moe_forward<B>`] (this file, line ~960) and
+/// [`moe_forward_bucketed<B>`]; the CPU-only `moe_forward_cpu` is the
+/// reference path used by parity tests + `Qwen3MoeLayer::forward_cpu`.
 pub struct ExpertStack<B: QuantLlmBackend + BackendMoeFused> {
     /// Fused `[gate; up]` projection per expert. Output shape per token:
     /// `[2 * expert_intermediate]` — the lower half is gate, upper is up.

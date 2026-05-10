@@ -16,7 +16,7 @@
     unused_assignments
 )]
 
-pub mod architectures;
+pub mod multimodal;
 pub mod audio_processor;
 pub mod common;
 pub mod definition;
@@ -37,7 +37,7 @@ pub mod tensor_wrapper;
 pub mod tokenizer;
 pub mod weight_format;
 
-pub use architectures::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
+pub use multimodal::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{

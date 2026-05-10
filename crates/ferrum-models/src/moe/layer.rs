@@ -1,10 +1,13 @@
 //! `Qwen3MoeLayer` — bundles the three pieces a single MoE layer needs
 //! (router linear, expert weight stack, top-K configuration) into a
-//! struct with one ergonomic `forward()` method. Drop-in replacement for
-//! a dense MLP layer in the wider transformer body.
+//! struct with one ergonomic `forward()` method.
 //!
-//! Phase 2 ships a CPU-only forward via [`moe_forward_cpu`]. Generic
-//! `Backend<B>` support is deferred (see `dispatch.rs` for why).
+//! **Test-only.** Production goes through `models::qwen3_moe::Qwen3MoeLayerState`
+//! plus the generic dispatcher `crate::moe::moe_forward<B>` (see
+//! `dispatch.rs` line 962) which has been backend-generic since Phase 3.
+//! `Qwen3MoeLayer<CpuBackend>::forward_cpu` is kept for the parity tests
+//! in `tests/moe_layer_test.rs` — they use it as a simple reference
+//! alongside the `moe_forward_cpu` building block.
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kernels::backend::{

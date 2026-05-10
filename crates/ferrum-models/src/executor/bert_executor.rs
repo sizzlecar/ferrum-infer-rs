@@ -18,7 +18,7 @@ use ferrum_interfaces::{
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, Result};
 use tracing::{debug, info};
 
-use crate::architectures::bert::BertModelWrapper;
+use crate::multimodal::bert::BertModelWrapper;
 use crate::tensor_wrapper::CandleTensorWrapper;
 
 /// BERT Executor for embedding tasks
