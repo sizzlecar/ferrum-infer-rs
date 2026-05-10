@@ -59,6 +59,64 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
         && p.is_file()
 }
 
+/// `ferrum run <gguf>` chat-profile env-var defaults. Sniffs the GGUF
+/// arch (dense vs MoE) and sets:
+///
+///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 512 MoE
+///   - `FERRUM_METAL_PAGED_KV`  — 0 dense / 1 MoE (paged-KV is a hard
+///     requirement for the Qwen3-MoE GPU dispatch path; without it
+///     decode emits ~0.1 tok/s of garbage on Metal)
+///   - `FERRUM_PAGED_MAX_SEQS=2`, `FERRUM_MAX_BATCH=1`,
+///     `FERRUM_MOE_BATCHED=1`, `FERRUM_MOE_BATCHED_DECODE=1`,
+///     `FERRUM_MOE_BATCH_THRESHOLD=2` — MoE only. Match the published
+///     `docs/bench/macos-2026-05-02` c=1 30B-A3B → 42 tok/s defaults.
+///
+/// Idempotent: if a user explicitly sets one of these env vars before
+/// invoking `ferrum run`, that value wins (we only set when unset).
+/// Called automatically by `resolve_model_source` when the resolved
+/// source is GGUF and the autosize profile is `Chat`. Server/bench
+/// callers don't get these defaults — they don't fit the multi-turn
+/// REPL pattern this profile is tuned for.
+pub fn apply_gguf_chat_profile_env(gguf_path: &Path) {
+    use ferrum_quantization::gguf::GgufFile;
+
+    let is_moe = match GgufFile::open(gguf_path) {
+        Ok(g) => g
+            .architecture()
+            .map(|s| s.contains("moe"))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+
+    // SAFETY: std::env::set_var is unsafe on Rust 2024+. We only call
+    // this once at CLI startup before any other thread spawns.
+    if std::env::var_os("FERRUM_KV_CAPACITY").is_none() {
+        std::env::set_var(
+            "FERRUM_KV_CAPACITY",
+            if is_moe { "512" } else { "8192" },
+        );
+    }
+    if std::env::var_os("FERRUM_METAL_PAGED_KV").is_none() {
+        std::env::set_var(
+            "FERRUM_METAL_PAGED_KV",
+            if is_moe { "1" } else { "0" },
+        );
+    }
+    if is_moe {
+        for (k, v) in [
+            ("FERRUM_PAGED_MAX_SEQS", "2"),
+            ("FERRUM_MAX_BATCH", "1"),
+            ("FERRUM_MOE_BATCHED", "1"),
+            ("FERRUM_MOE_BATCHED_DECODE", "1"),
+            ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
+        ] {
+            if std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
+    }
+}
+
 /// Look up `model_id` in the HF cache (`hub/models--owner--repo/snapshots/<rev>`).
 /// Returns the resolved snapshot path + detected format, or `None` if not cached.
 pub fn find_cached_model(cache_dir: &Path, model_id: &str) -> Option<ResolvedModelSource> {
@@ -155,6 +213,13 @@ pub async fn resolve_model_source(
         if let Some((profile, gpu_util)) = autosize {
             apply_auto_size_with_profile(&local_path, gpu_util, profile);
             autosized = true;
+            // Chat profile + GGUF: also set the run-mode KV / MoE
+            // env-var defaults that `run_gguf_one_shot` used to set
+            // inline. Server / bench callers (profile=Server or
+            // autosize=None) don't get these.
+            if profile == AutoSizeProfile::Chat {
+                apply_gguf_chat_profile_env(&local_path);
+            }
         }
         return Ok(Resolved {
             source: ResolvedModelSource {
