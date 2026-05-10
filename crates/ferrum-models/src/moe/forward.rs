@@ -94,10 +94,6 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
     )?;
     stage_end(t0, ctx, &DEC_ROUTE_US);
 
-    let gate_stacked = moe_layer.experts.gate_stacked.as_ref().unwrap();
-    let up_stacked = moe_layer.experts.up_stacked.as_ref().unwrap();
-    let down_stacked = moe_layer.experts.down_stacked.as_ref().unwrap();
-
     // moe_forward_stacked_decode_impl is only called when `tokens == 1`
     // (the branch in `forward_layer` routes prefill m>1 through
     // `moe_forward_batched_prefill_impl` instead). The for-b loop and
@@ -134,11 +130,9 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
         if use_fused {
             // 1+2+3 fused: silu_stacked = SiLU(gate · norm_out) * (up · norm_out)
             let t0 = stage_t0();
-            B::gemv_quant_moe_id_gate_up_silu(
+            moe_layer.experts.gemv_gate_up_silu_fused(
                 ctx,
                 &scratch.norm_out,
-                gate_stacked,
-                up_stacked,
                 &scratch.ids_buf,
                 &mut scratch.silu_stacked,
                 top_k,
@@ -146,30 +140,24 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
             stage_end(t0, ctx, &DEC_SILU_US);
         } else {
             // 1. Batched gate gemv — broadcast input across top_k slots.
-            //    src1 = norm_out (which has hidden floats at offset 0),
-            //    src1_stride=0 → all slots read the same row.
             let t0 = stage_t0();
-            B::gemv_quant_moe_id(
+            moe_layer.experts.gemv_gate(
                 ctx,
                 &scratch.norm_out,
-                gate_stacked,
                 &scratch.ids_buf,
                 &mut scratch.gate_out_stacked,
                 top_k,
-                0, // broadcast
             )?;
             stage_end(t0, ctx, &DEC_GATE_US);
 
             // 2. Batched up gemv — also broadcast.
             let t0 = stage_t0();
-            B::gemv_quant_moe_id(
+            moe_layer.experts.gemv_up(
                 ctx,
                 &scratch.norm_out,
-                up_stacked,
                 &scratch.ids_buf,
                 &mut scratch.up_out_stacked,
                 top_k,
-                0,
             )?;
             stage_end(t0, ctx, &DEC_UP_US);
 
@@ -188,13 +176,12 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
             stage_end(t0, ctx, &DEC_SILU_US);
         }
 
-        // 4. Batched down gemv — per-slot input via src1_stride = inter.
+        // 4. Batched down gemv — per-slot input via in_stride = inter.
         //    silu_stacked[k * inter ..] is the activation row for slot k.
         let t0 = stage_t0();
-        B::gemv_quant_moe_id(
+        moe_layer.experts.gemv_down(
             ctx,
             &scratch.silu_stacked,
-            down_stacked,
             &scratch.ids_buf,
             &mut scratch.down_out_stacked,
             top_k,
