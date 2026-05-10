@@ -85,24 +85,11 @@ impl InferenceEngine for EmbeddingEngine {
     }
 
     fn metrics(&self) -> EngineMetrics {
-        EngineMetrics {
-            total_requests: 0,
-            successful_requests: 0,
-            failed_requests: 0,
-            avg_request_latency_ms: 0.0,
-            p95_request_latency_ms: 0.0,
-            p99_request_latency_ms: 0.0,
-            throughput_rps: 0.0,
-            tokens_per_second: 0.0,
-            queue_metrics: Default::default(),
-            resource_utilization: Default::default(),
-            error_stats: Default::default(),
-            performance_breakdown: Default::default(),
-        }
+        crate::modality_stubs::inert_metrics()
     }
 
     async fn health_check(&self) -> ferrum_types::HealthStatus {
-        ferrum_types::HealthStatus::healthy()
+        crate::modality_stubs::inert_health()
     }
 
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
