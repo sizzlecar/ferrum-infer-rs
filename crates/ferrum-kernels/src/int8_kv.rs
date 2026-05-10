@@ -19,7 +19,7 @@
 //! integration (`BackendKvDtype<KvInt8>` for `CudaBackend`) lands in a
 //! follow-up PR alongside model wire-up.
 
-use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaSlice, CudaView, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
 use crate::ptx;
@@ -37,7 +37,7 @@ pub fn launch_int8_paged_decode_attention(
     v_pool: &CudaSlice<i8>,
     k_scales_pool: &CudaSlice<half::f16>,
     v_scales_pool: &CudaSlice<half::f16>,
-    block_table: &CudaSlice<i32>,
+    block_table: &CudaView<'_, i32>,
     output: &mut CudaSlice<half::f16>,
     num_q_heads: usize,
     num_kv_heads: usize,

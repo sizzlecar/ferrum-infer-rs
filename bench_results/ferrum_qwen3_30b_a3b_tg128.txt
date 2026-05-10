@@ -1,0 +1,19 @@
+## qwen3_30b_a3b / tg128
+→ backend: Metal
+✓ GGUF parsed in 0.03s — MoE arch detected, 48 layers, hidden=2048, kv_heads=4, experts=128, top_k=8, expert_inter=768
+→ tokenizer: /Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json
+→ loading weights into Metal (arch: qwen3moe) ...
+✓ model ready in 48.32s
+→ prompt: 1 tokens
+✓ prefill: 1 tok in 3.430s (0.3 tok/s)
+
+────────────────────────────────────────────────────────────
+tokens: 1 prompt + 128 generated tok
+time: 3.430s prefill + 5.372s decode
+throughput: 23.6 tok/s (decode only)
+latency: 42.30ms / token
+rep=1 p_n=1 p_s=4.660 d_n=128 d_s=18.415
+rep=2 p_n=1 p_s=4.149 d_n=128 d_s=6.445
+rep=3 p_n=1 p_s=6.672 d_n=128 d_s=7.465
+rep=4 p_n=1 p_s=3.497 d_n=128 d_s=23.143
+rep=5 p_n=1 p_s=3.396 d_n=128 d_s=6.734

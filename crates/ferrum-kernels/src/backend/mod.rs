@@ -8,6 +8,9 @@
 mod traits;
 pub use traits::*;
 
+mod kv_layer;
+pub use kv_layer::*;
+
 pub mod cpu;
 
 #[cfg(feature = "metal")]

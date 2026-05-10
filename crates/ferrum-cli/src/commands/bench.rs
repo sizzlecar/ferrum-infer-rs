@@ -11,7 +11,6 @@ use crate::config::CliConfig;
 use chrono::Utc;
 use clap::Args;
 use colored::*;
-use ferrum_models::HfDownloader;
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -56,29 +55,22 @@ pub struct BenchCommand {
 }
 
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
-    // GGUF short-circuit: skip alias resolution + HF cache lookup when the
-    // model arg is already a `.gguf` path OR a registered GGUF alias
-    // (e.g. `qwen3:8b-q4_k_m`). The engine's executor factory
-    // (registry.rs) detects `.gguf` and routes to GgufLoader. Tokenizer is
-    // auto-discovered next to the gguf file.
-    let cache_dir_for_gguf = super::run::get_hf_cache_dir(&config);
-    let resolved_gguf_path: Option<PathBuf> = if super::run::looks_like_gguf_path(&cmd.model) {
-        Some(PathBuf::from(&cmd.model))
-    } else if let Some((repo, filename)) = super::run::resolve_gguf_alias(&cmd.model) {
-        match super::run::find_cached_gguf(&cache_dir_for_gguf, &repo, &filename) {
-            Some(p) => Some(p),
-            None => {
+    // GGUF alias short-circuit (kept here because aliases like
+    // `qwen3:8b-q4_k_m` map to a sibling .gguf file in the cache,
+    // which `source_resolver` doesn't yet resolve directly).
+    let cache_dir = super::run::get_hf_cache_dir(&config);
+    let (model_id, source) = if let Some((repo, filename)) =
+        super::run::resolve_gguf_alias(&cmd.model)
+    {
+        let gguf_path = super::run::find_cached_gguf(&cache_dir, &repo, &filename).ok_or_else(
+            || {
                 eprintln!(
                     "GGUF alias '{}' not in cache. Run: ferrum pull {}",
                     cmd.model, cmd.model
                 );
-                return Err(ferrum_types::FerrumError::model("GGUF model not found"));
-            }
-        }
-    } else {
-        None
-    };
-    let (model_id, source) = if let Some(gguf_path) = resolved_gguf_path {
+                ferrum_types::FerrumError::model("GGUF model not found")
+            },
+        )?;
         let id = gguf_path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -86,32 +78,23 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         let src = ferrum_models::source::ResolvedModelSource {
             original: cmd.model.clone(),
             local_path: gguf_path,
-            format: ferrum_models::source::ModelFormat::Unknown,
+            format: ferrum_models::source::ModelFormat::GGUF,
             from_cache: true,
         };
         (id, src)
     } else {
-        let id = super::run::resolve_model_alias(&cmd.model);
-        let cache_dir = super::run::get_hf_cache_dir(&config);
-        let src = match super::run::find_cached_model(&cache_dir, &id) {
-            Some(source) => source,
-            None => {
-                eprintln!("Downloading model...");
-                let token = std::env::var("HF_TOKEN")
-                    .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
-                    .ok();
-                let downloader = HfDownloader::new(cache_dir.clone(), token)?;
-                let snapshot_path = downloader.download(&id, None).await?;
-                let format = super::run::detect_format(&snapshot_path);
-                ferrum_models::source::ResolvedModelSource {
-                    original: id.clone(),
-                    local_path: snapshot_path,
-                    format,
-                    from_cache: false,
-                }
-            }
-        };
-        (id, src)
+        // Single-entry resolver covers .gguf path / local dir / HF cache /
+        // HF download. bench skips the chat-profile autosize — bench
+        // sizing comes from --max-tokens / --concurrency directly.
+        let resolved = crate::source_resolver::resolve_model_source(
+            &cmd.model,
+            &cache_dir,
+            crate::source_resolver::DownloadPolicy::AutoDownload,
+            None,
+        )
+        .await?;
+        let id = resolved.source.original.clone();
+        (id, resolved.source)
     };
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());

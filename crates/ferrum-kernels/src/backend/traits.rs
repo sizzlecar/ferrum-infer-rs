@@ -2212,3 +2212,93 @@ pub trait BackendKvDtype<K: KvDtypeKind>: BackendPagedKv {
     /// Per-token per-kv-head scale storage. `()` for FP16 (no scales).
     type KvScales: Send + Sync + Default;
 }
+
+/// INT8 KV cache operations (Dim 5).
+///
+/// `BackendKvDtype<KvInt8>` only declares the storage types; it does not
+/// know how to write INT8 K/V into a paged pool or run paged decode
+/// attention against an INT8 cache. Those launchers live here so the
+/// model layer can call them through a single `B: BackendInt8KvOps` bound
+/// without dropping into backend-specific code.
+///
+/// Today only `CudaBackend` provides a real implementation (delegating to
+/// [`crate::int8_kv::launch_int8_kv_cache_append`] and
+/// [`crate::int8_kv::launch_int8_paged_decode_attention`]). Other backends
+/// inherit the default `unimplemented!()` body — the registry factory
+/// rejects `(Device::CPU/Metal, KvCacheDtype::Int8)` before the model
+/// gets a chance to call into these.
+#[allow(clippy::too_many_arguments)]
+pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
+    /// Allocate the per-layer INT8 paged cache for one sequence.
+    /// Default panics — backends without INT8 support never reach this
+    /// path (factory rejects (Cpu/Metal, Int8) before ensure_kv runs).
+    fn alloc_paged_int8_layer(
+        _max_blocks_per_seq: usize,
+        _block_size: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+    ) -> KvCacheQuant<Self, KvInt8> {
+        unimplemented!("alloc_paged_int8_layer not supported on this backend")
+    }
+
+    /// Append `tokens` FP16 K/V values into the paged INT8 pool.
+    /// `paged_block_indices` is the host-side mirror of the per-seq
+    /// logical→physical block table (already populated at `ensure_kv` time
+    /// — see `KvCacheQuant::paged_block_indices`). Passing the host slice
+    /// avoids a per-token D2H + sync barrier; backend computes the slot
+    /// mapping host-side, async-H2D's it, and chains the append kernel
+    /// on the same stream — fully overlapping with prior work.
+    /// `cache_len_before` is the current number of valid tokens; the
+    /// backend quantizes FP16 → INT8 with per-(token, kv-head) FP16 scale
+    /// and writes both into the layer's INT8 / scale buffers.
+    fn int8_kv_append_paged(
+        _ctx: &mut Self::Context,
+        _k_in: &Self::Buffer,
+        _v_in: &Self::Buffer,
+        _layer_k: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
+        _layer_v: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
+        _layer_k_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
+        _layer_v_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
+        _paged_block_indices: &[u32],
+        _cache_len_before: usize,
+        _tokens: usize,
+        _block_size: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "int8_kv_append_paged not implemented for this backend",
+        ))
+    }
+
+    /// Run paged decode attention reading from an INT8 cache. Q is FP16,
+    /// output is FP16; the kernel dequantizes K/V on the fly using the
+    /// per-token scales. `valid_kv_len` is the post-append cache length
+    /// (i.e. the kernel attends over `[0, valid_kv_len)` tokens).
+    fn int8_paged_decode_attention(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _layer_k: &<Self as BackendKvDtype<KvInt8>>::KvBuffer,
+        _layer_v: &<Self as BackendKvDtype<KvInt8>>::KvBuffer,
+        _layer_k_scales: &<Self as BackendKvDtype<KvInt8>>::KvScales,
+        _layer_v_scales: &<Self as BackendKvDtype<KvInt8>>::KvScales,
+        _block_table: &Self::Buffer,
+        _output: &mut Self::Buffer,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _valid_kv_len: usize,
+        _block_size: usize,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "int8_paged_decode_attention not implemented for this backend",
+        ))
+    }
+}
+
+// Cpu/Metal NOT impl `BackendInt8KvOps` — the trait pivot to
+// `KvLayer<B>` means `KvInt8: KvLayer<B>` only holds where
+// `B: BackendInt8KvOps`, so `LlamaFamilyModel<CpuBackend, KvInt8>` is a
+// compile error (no INT8 KvLayer impl satisfies it). Type system
+// enforces the constraint without runtime stubs.

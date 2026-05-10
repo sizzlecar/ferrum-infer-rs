@@ -176,7 +176,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     } else {
         // Find cached model
         let cache_dir = get_hf_cache_dir(&config);
-        match find_cached_model(&cache_dir, &model_id) {
+        match crate::source_resolver::find_cached_model(&cache_dir, &model_id) {
             Some(source) => {
                 println!("{} {}", "Path:".dimmed(), source.local_path.display());
                 source
@@ -211,7 +211,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         let draft_id = resolve_model_alias(draft_name);
         println!("{} {}", "Draft model:".dimmed(), draft_id.cyan());
         let cache_dir = get_hf_cache_dir(&config);
-        let draft_source = find_cached_model(&cache_dir, &draft_id).ok_or_else(|| {
+        let draft_source = crate::source_resolver::find_cached_model(&cache_dir, &draft_id).ok_or_else(|| {
             eprintln!(
                 "{} Draft model '{}' not in HF cache. Run: ferrum pull {}",
                 "Error:".red().bold(),
@@ -429,66 +429,11 @@ fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
     PathBuf::from(configured)
 }
 
-fn find_cached_model(
-    cache_dir: &PathBuf,
-    model_id: &str,
-) -> Option<ferrum_models::source::ResolvedModelSource> {
-    let repo_dir = cache_dir
-        .join("hub")
-        .join(format!("models--{}", model_id.replace('/', "--")));
-    let snapshots_dir = repo_dir.join("snapshots");
-
-    // Try refs/main first
-    let ref_main = repo_dir.join("refs").join("main");
-    if let Ok(rev) = std::fs::read_to_string(&ref_main) {
-        let rev = rev.trim();
-        if !rev.is_empty() {
-            let snapshot = snapshots_dir.join(rev);
-            if snapshot.exists() {
-                let format = detect_format(&snapshot);
-                if format != ModelFormat::Unknown {
-                    return Some(ferrum_models::source::ResolvedModelSource {
-                        original: model_id.to_string(),
-                        local_path: snapshot,
-                        format,
-                        from_cache: true,
-                    });
-                }
-            }
-        }
-    }
-
-    // Fallback: first snapshot directory
-    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let format = detect_format(&path);
-                if format != ModelFormat::Unknown {
-                    return Some(ferrum_models::source::ResolvedModelSource {
-                        original: model_id.to_string(),
-                        local_path: path,
-                        format,
-                        from_cache: true,
-                    });
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn detect_format(path: &PathBuf) -> ModelFormat {
-    if path.join("model.safetensors").exists() || path.join("model.safetensors.index.json").exists()
-    {
-        ModelFormat::SafeTensors
-    } else if path.join("pytorch_model.bin").exists() {
-        ModelFormat::PyTorchBin
-    } else {
-        ModelFormat::Unknown
-    }
-}
+// `find_cached_model` and `detect_format` previously lived here as forks
+// of the `run.rs` versions. They moved to `crate::source_resolver` so the
+// HF cache walk + format detection have a single source of truth across
+// `run` / `serve` / `bench`. Use `crate::source_resolver::find_cached_model`
+// / `crate::source_resolver::detect_format` directly.
 
 fn select_device() -> ferrum_types::Device {
     #[cfg(all(target_os = "macos", feature = "metal"))]
