@@ -46,8 +46,9 @@ fn synth_gptq(k: usize, n: usize, group_size: usize, seed: u64) -> (Vec<i32>, Ve
 }
 
 /// Build a stacked GPTQ store covering `num_experts` experts × N cols
-/// each, row-major-concatenated along the N dimension (expert-major
-/// like load_stacked_gptq_experts).
+/// each. Phase 3e/2: uses the proper `BackendQuantMarlin::load_gptq_stacked`
+/// API (which CpuBackend now implements) instead of abusing `load_gptq`
+/// on a hand-concatenated tensor.
 fn build_stacked(
     k: usize,
     n_per_expert: usize,
@@ -58,37 +59,20 @@ fn build_stacked(
     let parts: Vec<_> = (0..num_experts)
         .map(|e| synth_gptq(k, n_per_expert, group_size, base_seed + e as u64))
         .collect();
-
-    let total_n = num_experts * n_per_expert;
-    let qw_rows = k / 8;
-    let sc_rows = k / group_size;
-    let qz_rows = k / group_size;
-    let total_n_zeros = num_experts * (n_per_expert / 8);
-
-    let mut qw_acc = Vec::<i32>::with_capacity(qw_rows * total_n);
-    for r in 0..qw_rows {
-        for e in 0..num_experts {
-            qw_acc.extend_from_slice(&parts[e].0[r * n_per_expert..(r + 1) * n_per_expert]);
-        }
-    }
-    let mut sc_acc = Vec::<f32>::with_capacity(sc_rows * total_n);
-    for r in 0..sc_rows {
-        for e in 0..num_experts {
-            sc_acc.extend_from_slice(&parts[e].1[r * n_per_expert..(r + 1) * n_per_expert]);
-        }
-    }
-    let mut qz_acc = Vec::<i32>::with_capacity(qz_rows * total_n_zeros);
-    for r in 0..qz_rows {
-        for e in 0..num_experts {
-            qz_acc.extend_from_slice(
-                &parts[e].2[r * (n_per_expert / 8)..(r + 1) * (n_per_expert / 8)],
-            );
-        }
-    }
-    let store = <CpuBackend as BackendQuantMarlin>::load_gptq(
-        &qw_acc, &sc_acc, &qz_acc, None, 4, group_size, k, total_n,
+    let qweights: Vec<&[i32]> = parts.iter().map(|p| p.0.as_slice()).collect();
+    let scales: Vec<&[f32]> = parts.iter().map(|p| p.1.as_slice()).collect();
+    let qzeros: Vec<&[i32]> = parts.iter().map(|p| p.2.as_slice()).collect();
+    let store = <CpuBackend as BackendQuantMarlin>::load_gptq_stacked(
+        &qweights,
+        &scales,
+        &qzeros,
+        None,
+        4,
+        group_size,
+        k,
+        n_per_expert,
     )
-    .expect("CPU stacked load_gptq");
+    .expect("CPU stacked load_gptq_stacked");
     Arc::new(store)
 }
 
@@ -112,18 +96,19 @@ fn bucketed_matches_per_pair_dispatch() {
     let mut gate_up_per_expert: Vec<Box<dyn Linear<CpuBackend>>> = Vec::with_capacity(num_experts);
     let mut down_per_expert: Vec<Box<dyn Linear<CpuBackend>>> = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
-        gate_up_per_expert.push(Box::new(StackedExpertLinear::<CpuBackend>::new(
-            gate_up_arc.clone(),
-            e * 2 * inter,
-            2 * inter,
-            hidden,
-        )));
-        down_per_expert.push(Box::new(StackedExpertLinear::<CpuBackend>::new(
-            down_arc.clone(),
-            e * hidden,
-            hidden,
-            inter,
-        )));
+        gate_up_per_expert.push(Box::new(
+            StackedExpertLinear::<CpuBackend>::new(
+                gate_up_arc.clone(),
+                e * 2 * inter,
+                2 * inter,
+                hidden,
+            )
+            .expect("gate_up StackedExpertLinear"),
+        ));
+        down_per_expert.push(Box::new(
+            StackedExpertLinear::<CpuBackend>::new(down_arc.clone(), e * hidden, hidden, inter)
+                .expect("down StackedExpertLinear"),
+        ));
     }
     let experts = ExpertStack::<CpuBackend> {
         gate_up: gate_up_per_expert,

@@ -3150,11 +3150,12 @@ impl BackendQuantMarlin for CudaBackend {
         scales: &[f32],
         qzeros: &[i32],
         g_idx: Option<&[i32]>,
+        bias_host: Option<&[f32]>,
         bits: u32,
         group_size: usize,
         k: usize,
         n: usize,
-    ) -> Result<Self::GptqStore> {
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
         if bits != 4 {
             return Err(FerrumError::unsupported(format!(
                 "CUDA GPTQ: only bits=4 supported (got {bits})"
@@ -3179,14 +3180,21 @@ impl BackendQuantMarlin for CudaBackend {
                 .clone_htod(qzeros)
                 .map_err(|e| FerrumError::model(format!("triton qzeros htod: {e}")))?;
             tracing::info!("GPTQ load (triton-rs w4a16): K={k}, N={n}, gs={group_size}");
-            return Ok(GptqStoreCuda::Triton(
-                crate::triton_w4a16::TritonGptqWeight {
-                    qweight: qweight_dev,
-                    scales: scales_dev,
-                    qzeros: qzeros_dev,
-                    k,
-                    n,
-                    group_size: group_size as i32,
+            let store = GptqStoreCuda::Triton(crate::triton_w4a16::TritonGptqWeight {
+                qweight: qweight_dev,
+                scales: scales_dev,
+                qzeros: qzeros_dev,
+                k,
+                n,
+                group_size: group_size as i32,
+            });
+            let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
+            return Ok(Box::new(
+                crate::quant_linear::cuda_marlin::CudaMarlinLinear {
+                    store,
+                    bias,
+                    in_features: k,
+                    out_features: n,
                 },
             ));
         }
@@ -3260,15 +3268,23 @@ impl BackendQuantMarlin for CudaBackend {
             perm: perm_dev_opt,
         };
 
-        // Wrap in the Marlin variant (or pass through, depending on cfg).
+        // Wrap in the Marlin variant (or pass through, depending on cfg)
+        // and box as a Linear<Self>. Phase 3e/2: kernel dispatch lives
+        // inside CudaMarlinLinear::forward, not the trait method.
         #[cfg(feature = "triton-kernels")]
-        {
-            Ok(GptqStoreCuda::Marlin(marlin_weight))
-        }
+        let store = GptqStoreCuda::Marlin(marlin_weight);
         #[cfg(not(feature = "triton-kernels"))]
-        {
-            Ok(marlin_weight)
-        }
+        let store: GptqStoreCuda = marlin_weight;
+
+        let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
+        Ok(Box::new(
+            crate::quant_linear::cuda_marlin::CudaMarlinLinear {
+                store,
+                bias,
+                in_features: k,
+                out_features: n,
+            },
+        ))
     }
     fn load_gptq_stacked(
         qweights: &[&[i32]],
@@ -3441,121 +3457,23 @@ impl BackendQuantMarlin for CudaBackend {
             Ok(marlin_weight)
         }
     }
-    #[cfg(feature = "marlin")]
-    fn gemm_gptq(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::GptqStore,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        // Branch on store variant (only present when triton-kernels is on).
-        #[cfg(feature = "triton-kernels")]
-        match weight {
-            GptqStoreCuda::Marlin(mw) => marlin_gemm_with_perm(ctx, a, mw, out, m),
-            GptqStoreCuda::Triton(tw) => {
-                // Pre-load (and cache) the CudaFunction once per CudaState.
-                // Subsequent calls hit the HashMap and skip the PTX parse.
-                let func = ctx.func(
-                    "triton_w4a16_gptq",
-                    crate::triton_ptx::w4a16_gptq_f16::PTX,
-                    crate::triton_w4a16::fn_name(),
-                );
-                let stream = ctx.stream.clone();
-                crate::triton_w4a16::launch_w4a16_gptq_triton(&stream, &func, a, tw, out, m as i32)
-                    .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
-            }
-        }
-        #[cfg(not(feature = "triton-kernels"))]
-        {
-            marlin_gemm_with_perm(ctx, a, weight, out, m)
-        }
-    }
-    #[cfg(all(not(feature = "marlin"), feature = "triton-kernels"))]
-    fn gemm_gptq(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::GptqStore,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        // Marlin compiled out → only Triton path is callable. The Marlin
-        // variant should never be constructed in this configuration
-        // (load_gptq currently still builds a MarlinWeight even with
-        // triton-kernels — but its `gemm_gptq` would have nothing to call,
-        // so we error explicitly for traceability instead of silently
-        // failing inside the FFI stub).
-        match weight {
-            GptqStoreCuda::Marlin(_) => Err(FerrumError::unsupported(
-                "cargo feature `marlin` disabled — Marlin variant unusable; \
-                 set FERRUM_TRITON_INT4=1 to force the triton path",
-            )),
-            GptqStoreCuda::Triton(tw) => {
-                let func = ctx.func(
-                    "triton_w4a16_gptq",
-                    crate::triton_ptx::w4a16_gptq_f16::PTX,
-                    crate::triton_w4a16::fn_name(),
-                );
-                let stream = ctx.stream.clone();
-                crate::triton_w4a16::launch_w4a16_gptq_triton(&stream, &func, a, tw, out, m as i32)
-                    .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
-            }
-        }
-    }
-    #[cfg(all(not(feature = "marlin"), not(feature = "triton-kernels")))]
-    fn gemm_gptq(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::GptqStore,
-        _out: &mut Self::Buffer,
-        _m: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "cargo features `marlin` and `triton-kernels` both disabled — \
-             GPTQ not available",
-        ))
-    }
-    /// MoE expert dispatch: GEMM over a column-slice of a stacked Marlin
-    /// store. Lets all 128 experts share one Marlin repack; the runtime
-    /// dispatch picks one expert by `expert_offset`.
-    ///
-    /// Currently Marlin-only (the Triton w4a16 variant doesn't support
-    /// strided access on the on-disk layout). When triton-kernels is on
-    /// and the store is Triton, returns Unsupported — caller should ensure
-    /// MoE models load through the Marlin path (default).
-    #[cfg(feature = "marlin")]
-    fn gemm_gptq_with_offset(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::GptqStore,
+    fn make_stacked_expert_linear(
+        store: std::sync::Arc<Self::GptqStore>,
         expert_offset: usize,
         expert_n: usize,
-        out: &mut Self::Buffer,
-        m: usize,
-    ) -> Result<()> {
-        #[cfg(feature = "triton-kernels")]
-        let mw = match weight {
-            GptqStoreCuda::Marlin(mw) => mw,
-            GptqStoreCuda::Triton(_) => {
-                return Err(FerrumError::unsupported(
-                    "gemm_gptq_with_offset: Triton w4a16 store has no \
-                     stride-aware variant; load MoE via Marlin (default)",
-                ));
-            }
-        };
-        #[cfg(not(feature = "triton-kernels"))]
-        let mw: &crate::marlin::MarlinWeight = weight;
-        let stream = ctx.stream.clone();
-        crate::marlin::marlin_gemm_with_offset(
-            &stream,
-            a,
-            mw,
-            out,
-            m as i32,
-            expert_offset as i32,
-            expert_n as i32,
-        )
-        .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
+        k: usize,
+        bias_host: Option<&[f32]>,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
+        Ok(Box::new(
+            crate::quant_linear::cuda_marlin::CudaMarlinStackedExpertLinear {
+                store,
+                expert_offset,
+                expert_n,
+                k,
+                bias,
+            },
+        ))
     }
     #[cfg(feature = "marlin")]
     fn moe_gemm_phase_batched(

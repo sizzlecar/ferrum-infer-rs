@@ -980,24 +980,31 @@ pub trait BackendCollective: Backend {
 /// CUDA wires this to the Marlin (or vLLM marlin_moe_wna16) tile kernels;
 /// other backends inherit defaults that error or no-op.
 pub trait BackendQuantMarlin: Backend {
-    /// Repack raw GPTQ tensors into the backend's preferred format.
+    /// Repack raw GPTQ tensors into a backend-specific `Linear<Self>` impl.
     /// Called once per layer at model load time.
     ///
     /// Inputs are host-side slices (CPU memory) — the loader reads from
     /// safetensors and hands them off; each backend uploads + repacks
     /// per its own strategy. `bits` is typically 4; `group_size` is
-    /// typically 128.
+    /// typically 128. `bias_host` is optional `[out_features]` f32 (when
+    /// the model has fused bias, e.g. Qwen2.5 attention projections).
+    ///
+    /// Phase 3e/2: returns `Box<dyn Linear<Self>>` directly (CUDA:
+    /// `CudaMarlinLinear`, CPU: `CpuGptqLinear`). Kernel dispatch lives
+    /// inside the boxed Linear's `forward` — the old `gemm_gptq` trait
+    /// method is gone.
     #[allow(clippy::too_many_arguments)]
     fn load_gptq(
         _qweight: &[i32],
         _scales: &[f32],
         _qzeros: &[i32],
         _g_idx: Option<&[i32]>,
+        _bias_host: Option<&[f32]>,
         _bits: u32,
         _group_size: usize,
         _k: usize,
         _n: usize,
-    ) -> Result<Self::GptqStore> {
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
         Err(FerrumError::unsupported(
             "load_gptq not implemented for this backend",
         ))
@@ -1034,40 +1041,29 @@ pub trait BackendQuantMarlin: Backend {
             "load_gptq_stacked not implemented for this backend",
         ))
     }
-    /// GEMM with pre-loaded GPTQ weights.
-    /// `out[m, n] = a[m, k] @ dequant(weight)^T`
-    fn gemm_gptq(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::GptqStore,
-        _out: &mut Self::Buffer,
-        _m: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "gemm_gptq not implemented for this backend",
-        ))
-    }
-    /// GEMM on a column-slice of a stacked GPTQ store. Used for MoE
-    /// expert dispatch where one big stacked weight tile holds all
-    /// experts' weights along N; per-expert calls process columns
-    /// `[expert_offset .. expert_offset + expert_n)` only.
-    ///
-    /// Output is written to `out[m, expert_n]` (NOT the full stacked N).
-    /// Caller is responsible for sizing `out` correctly.
+    /// Build a per-expert column-slice `Linear<Self>` view on top of a
+    /// stacked GPTQ store. The store concatenates all experts' weights
+    /// along N; this factory selects columns
+    /// `[expert_offset .. expert_offset + expert_n)` for one expert.
     ///
     /// `expert_offset` and `expert_n` MUST be multiples of the backend's
-    /// natural N tile size (Marlin: 64). Default returns Err(unsupported).
-    fn gemm_gptq_with_offset(
-        _ctx: &mut Self::Context,
-        _a: &Self::Buffer,
-        _weight: &Self::GptqStore,
+    /// natural N tile size (Marlin: 64). `bias_host` is per-expert.
+    /// Default returns Err(unsupported).
+    ///
+    /// Phase 3e/2: replaces the old `gemm_gptq_with_offset` trait
+    /// method dispatched from `StackedExpertLinear<B>::forward`. The
+    /// kernel call now lives inside the returned boxed Linear's
+    /// `forward` (CUDA: `CudaMarlinStackedExpertLinear`).
+    #[allow(clippy::too_many_arguments)]
+    fn make_stacked_expert_linear(
+        _store: std::sync::Arc<Self::GptqStore>,
         _expert_offset: usize,
         _expert_n: usize,
-        _out: &mut Self::Buffer,
-        _m: usize,
-    ) -> Result<()> {
+        _k: usize,
+        _bias_host: Option<&[f32]>,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
         Err(FerrumError::unsupported(
-            "gemm_gptq_with_offset not implemented for this backend",
+            "make_stacked_expert_linear not implemented for this backend",
         ))
     }
     /// Bulk-zero the per-expert Marlin workspace mutex slots for a
