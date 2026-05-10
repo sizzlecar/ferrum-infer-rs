@@ -9,6 +9,7 @@ readme = "../../README.md"
 
 [dependencies]
 ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
 candle-core = { workspace = true }
 half = { workspace = true }
 tracing = { workspace = true }
