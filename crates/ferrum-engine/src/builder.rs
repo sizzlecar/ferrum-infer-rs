@@ -24,8 +24,6 @@ pub struct EngineBuilder {
     registry: Arc<ComponentRegistry>,
     /// Engine configuration
     config: EngineConfig,
-    /// Override: custom backend name
-    backend_name: Option<String>,
     /// Override: custom tokenizer name
     tokenizer_name: Option<String>,
     /// Override: custom sampler name
@@ -59,7 +57,6 @@ impl EngineBuilder {
         Self {
             registry,
             config,
-            backend_name: None,
             tokenizer_name: None,
             sampler_name: None,
             scheduler_name: None,
@@ -71,12 +68,6 @@ impl EngineBuilder {
             custom_kv_cache: None,
             custom_executor: None,
         }
-    }
-
-    /// Set the backend to use by name
-    pub fn with_backend(mut self, name: impl Into<String>) -> Self {
-        self.backend_name = Some(name.into());
-        self
     }
 
     /// Set the tokenizer to use by name
@@ -418,7 +409,6 @@ mod tests {
         let config = EngineConfig::default();
         let builder = EngineBuilder::new(config);
 
-        assert!(builder.backend_name.is_none());
         assert!(builder.tokenizer_name.is_none());
     }
 
@@ -426,14 +416,12 @@ mod tests {
     fn test_builder_with_overrides() {
         let config = EngineConfig::default();
         let builder = EngineBuilder::new(config)
-            .with_backend("custom_backend")
             .with_tokenizer("custom_tokenizer")
             .with_sampler("greedy")
             .with_scheduler("priority")
             .with_kv_cache("paged")
             .with_executor("custom_executor");
 
-        assert_eq!(builder.backend_name, Some("custom_backend".to_string()));
         assert_eq!(builder.tokenizer_name, Some("custom_tokenizer".to_string()));
         assert_eq!(builder.sampler_name, Some("greedy".to_string()));
         assert_eq!(builder.scheduler_name, Some("priority".to_string()));

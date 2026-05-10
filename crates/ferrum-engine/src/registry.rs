@@ -947,21 +947,25 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for CandleExecutorFa
                 let _loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();
 
-                // TP and GPTQ still pending on the new path (Phase D/E).
+                // Tensor parallelism (FERRUM_TP>1) was wired against the
+                // pre-Architecture-v2 CandleBackend and hasn't been ported
+                // to the Backend<B> trait stack. Reject explicitly so users
+                // don't get a silent single-GPU fallback.
                 let tp_size: usize = std::env::var("FERRUM_TP")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
                 if tp_size > 1 {
                     return Err(FerrumError::unsupported(
-                        "FERRUM_TP>1 temporarily unsupported during \
-                         architecture-v2 migration (Phase D/E).",
+                        "FERRUM_TP>1 not supported on the Backend<B> path. \
+                         Run with FERRUM_TP=1 (default) for single-GPU inference.",
                     ));
                 }
-                // NOTE: GPTQ is now wired through NativeSafetensorsLoader's
-                // load_linear path (Phase E-GPTQ). The loader auto-detects
-                // `<name>.qweight` tensors and constructs GptqLinear via
-                // Backend::load_gptq; no legacy opt-out here.
+                // GPTQ is loaded via NativeSafetensorsLoader's load_linear:
+                // it auto-detects `<name>.qweight` tensors and constructs
+                // a GptqLinear via Backend::load_gptq. The QuantizeConfig
+                // probe is kept for back-compat with old configs that
+                // explicitly listed a quantization method.
                 let _ = ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path);
 
                 // Per-architecture config constructor picks has_qk_norm +
