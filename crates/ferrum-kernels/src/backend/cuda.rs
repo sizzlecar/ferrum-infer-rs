@@ -4697,13 +4697,33 @@ impl BackendMoeFused for CudaBackend {
     }
 }
 // CUDA: existing KV cache path is FP16.
-impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {}
+impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {
+    type KvBuffer = <Self as crate::backend::Backend>::Buffer;
+    type KvScales = ();
+}
 
 // CUDA: INT8 KV cache (vLLM-style scale-per-token symmetric quantization).
 // Kernel-side dispatch is exposed via [`crate::int8_kv::launch_int8_paged_decode_attention`]
-// and [`crate::int8_kv::launch_int8_kv_cache_append`]. The trait itself is
-// currently a marker (no methods); model wire-up that switches a
-// `KvCache<B, KvInt8>` to call those launchers is a follow-up that
-// belongs in `ferrum-models`. See `tests/int8_kv_parity.rs` for a
-// host-reference parity check (cos sim ≈ 0.99999 vs FP32 ref).
-impl crate::backend::BackendKvDtype<crate::backend::KvInt8> for CudaBackend {}
+// and [`crate::int8_kv::launch_int8_kv_cache_append`]. See
+// `tests/int8_kv_parity.rs` for a host-reference parity check
+// (cos sim ≈ 0.99999 vs FP32 ref). With the associated types declared
+// here, `KvCache<CudaBackend, KvInt8>` carries `CudaSlice<i8>` for K/V
+// and `CudaSlice<f16>` for scales — distinct types from the FP16 path.
+//
+// Note: `KvScales = OptionalCudaScalesF16` rather than a bare
+// `CudaSlice<f16>` so the `Default` bound on `KvScales` can be
+// satisfied without holding a CUDA stream at struct-default time.
+impl crate::backend::BackendKvDtype<crate::backend::KvInt8> for CudaBackend {
+    type KvBuffer = OptionalCudaInt8;
+    type KvScales = OptionalCudaScalesF16;
+}
+
+/// Lazily-allocated INT8 KV buffer. `Default` produces an empty
+/// placeholder; the real allocation happens via the `init` method
+/// once a CUDA stream is in scope.
+#[derive(Default)]
+pub struct OptionalCudaInt8(pub Option<cudarc::driver::CudaSlice<i8>>);
+
+/// Lazily-allocated INT8 scales buffer (FP16 storage on CUDA).
+#[derive(Default)]
+pub struct OptionalCudaScalesF16(pub Option<cudarc::driver::CudaSlice<half::f16>>);
