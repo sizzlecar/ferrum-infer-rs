@@ -572,9 +572,9 @@ pub struct Qwen3TTSTalker {
     /// Optional Backend<B> transformer stack. When set, `forward_step`
     /// routes through this instead of `fused`. Used on Linux + CUDA where
     /// `fused` would silently fall back to a broken naive-fp64 CPU matmul.
-    /// See `architectures::qwen3_tts_backbone`.
+    /// See `multimodal::qwen3_tts_backbone`.
     backend_override:
-        Option<Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>>,
+        Option<Box<dyn crate::multimodal::qwen3_tts_backbone::TalkerBackboneForward>>,
 }
 
 impl Qwen3TTSTalker {
@@ -734,7 +734,7 @@ impl Qwen3TTSTalker {
     /// the executor on CUDA where `fused`'s fallback is broken.
     pub fn set_backend_override(
         &mut self,
-        backend: Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>,
+        backend: Box<dyn crate::multimodal::qwen3_tts_backbone::TalkerBackboneForward>,
     ) {
         self.backend_override = Some(backend);
         self.tokens_generated = 0;
@@ -899,7 +899,7 @@ pub struct SubTalker {
     /// Optional Backend<B> transformer stack that supersedes `fused` on
     /// CUDA. Same motivation as `Qwen3TTSTalker::backend_override`.
     backend_override:
-        Option<Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>>,
+        Option<Box<dyn crate::multimodal::qwen3_tts_backbone::TalkerBackboneForward>>,
 }
 
 impl SubTalker {
@@ -1114,7 +1114,7 @@ impl SubTalker {
     /// fp64 naive matmul. Mirrors `Qwen3TTSTalker::set_backend_override`.
     pub fn set_backend_override(
         &mut self,
-        backend: Box<dyn crate::architectures::qwen3_tts_backbone::TalkerBackboneForward>,
+        backend: Box<dyn crate::multimodal::qwen3_tts_backbone::TalkerBackboneForward>,
     ) {
         self.backend_override = Some(backend);
         self.tokens_generated = 0;

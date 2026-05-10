@@ -22,7 +22,7 @@ use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, Result};
 use tracing::info;
 
 use super::common;
-use crate::architectures::whisper::WhisperModelWrapper;
+use crate::multimodal::whisper::WhisperModelWrapper;
 use crate::audio_processor;
 
 // ── Token constants ─────────────────────────────────────────────────────
