@@ -48,9 +48,9 @@ Three gates — ALL must pass before the refactor is considered done:
 | 2. Compute precision | ✅ done | Phase 3e cutover complete (#123 Marlin, #124 GGUF). All quant kernel dispatch lives in `Linear<B>` impls in `ferrum-kernels::quant_linear/`. `BackendQuantMarlin::gemm_gptq*` and `BackendQuantGguf::gemm_quant` deleted. |
 | 3. Weight format | ✅ done | `Linear<B>` polymorphism point owns the kernel call; new format = new `Linear<B>` impl in ferrum-kernels (no Backend trait change). |
 | 4. **Inference device** | ✅ done | Backend → 5 supertraits + 3 capability bundles (#107-#110) |
-| 5. KV cache precision | 🟡 partial | `KvDtypeKind` + `BackendKvDtype<K>` traits (#112) + `KvCache<B, K = KvFp16>` type param (#119); INT8/FP8 kernel impls still pending |
+| 5. KV cache precision | 🟡 mostly done | Type system (#112, #119): `KvDtypeKind` + `BackendKvDtype<K>` + `KvCache<B, K = KvFp16>`. CUDA INT8 KV kernels + `BackendKvDtype<KvInt8> for CudaBackend` marker landed (`paged_decode_attention_int8`, `int8_kv_cache_append`, host-ref cosine parity 0.99999). Model-side wire-up that flips a path to `KvCache<B, KvInt8>` + the int8 launchers is the only remaining step. FP8 KV is a separate future PR. |
 
-**4 of 5 dims complete.** The remaining gap is Dim 5 INT8 KV kernel work — the type-system shape is there, just need the actual quant KV kernels.
+**5 of 5 dims structurally complete.** CUDA INT8 KV kernels are validated against an FP32 host reference (cos sim 0.99999, max abs / max output ≈ 0.36%). Closing the last 5% requires only model integration — not kernel work.
 
 ### PRs landed (in order)
 
@@ -77,6 +77,7 @@ Three gates — ALL must pass before the refactor is considered done:
 | [#127](https://github.com/sizzlecar/ferrum-infer-rs/pull/127) | PR B | Delete the legacy `ComputeBackend` / `KernelOps` / `model_builder` / memory modules from ferrum-interfaces (had no implementations after Phase 3e). Drop the dead `MetalKernelOps` shell, the `ferrum-engine::backends::candle` `ComputeBackend` impl, the dead `custom_backend` builder field, and `ferrum-models::{builder,weights}`. |
 | [#128](https://github.com/sizzlecar/ferrum-infer-rs/pull/128) | PR C | Merge `ferrum-attention` into `ferrum-kernels::attention`. The crate's only consumers were `ferrum-kernels::backend::metal` and `ferrum-models` (Qwen3-TTS); merging removes a duplicated metal feature pass-through and the cudarc-0.12 stub. Two-cudarc-version workspace gone. |
 | [#129](https://github.com/sizzlecar/ferrum-infer-rs/pull/129) | cleanup | Drop dead `LinearFactory` trait + `DefaultLinearFactory` (zero callers anywhere). |
+| [#131](https://github.com/sizzlecar/ferrum-infer-rs/pull/131) | Dim 5 INT8 KV step 1 | CUDA INT8 KV kernels: `paged_decode_attention_int8` (read INT8 + per-token FP16 scale, dequantize on the fly) and `int8_kv_cache_append` (FP16 → per-(token, kv_head) symmetric INT8 + scale). Rust launchers in `ferrum-kernels::int8_kv`. `BackendKvDtype<KvInt8>` marker on `CudaBackend`. Host-reference parity test: cosine 0.99999 vs FP32 ref. |
 
 ### Backend trait shrinkage
 
@@ -93,7 +94,8 @@ Three gates — ALL must pass before the refactor is considered done:
 
 | Phase | Scope | Risk | Estimate |
 |---|---|---|---|
-| 4 INT8 KV | Implement `BackendKvDtype<KvInt8>` for CUDA (vLLM-style scale-per-token); add the actual quant KV kernels (rope / kv-append / paged attention read INT8 cache). **Closes Dim 5.** | Medium | 1-2 days. |
+| 4 INT8 KV — model wire-up | Switch a model's `KvCache<B>` to `KvCache<B, KvInt8>` behind an env var (`FERRUM_INT8_KV=1`), call the INT8 launchers from `ferrum-kernels::int8_kv` in the decode/append path, run a parity bench against FP16 (Llama-8B INT4 + INT8 KV vs FP16 KV). | Low (kernels already validated) | 1 day. |
+| FP8 KV | Add `paged_decode_attention_fp8` + `fp8_kv_cache_append` mirroring the INT8 pair (use `__nv_fp8_e4m3` storage and per-token f8 scale). Marker impl `BackendKvDtype<KvFp8>` on CudaBackend. | Medium (FP8 needs SM ≥ 8.9) | 1-2 days. |
 
 ## GPU testing workflow (Vast.ai 4090)
 

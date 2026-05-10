@@ -4698,3 +4698,12 @@ impl BackendMoeFused for CudaBackend {
 }
 // CUDA: existing KV cache path is FP16.
 impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {}
+
+// CUDA: INT8 KV cache (vLLM-style scale-per-token symmetric quantization).
+// Kernel-side dispatch is exposed via [`crate::int8_kv::launch_int8_paged_decode_attention`]
+// and [`crate::int8_kv::launch_int8_kv_cache_append`]. The trait itself is
+// currently a marker (no methods); model wire-up that switches a
+// `KvCache<B, KvInt8>` to call those launchers is a follow-up that
+// belongs in `ferrum-models`. See `tests/int8_kv_parity.rs` for a
+// host-reference parity check (cos sim ≈ 0.99999 vs FP32 ref).
+impl crate::backend::BackendKvDtype<crate::backend::KvInt8> for CudaBackend {}
