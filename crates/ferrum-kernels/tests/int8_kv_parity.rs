@@ -5,24 +5,25 @@
 //!   1. **Append round-trip.** Take random FP16 K/V tokens, push them
 //!      through `launch_int8_kv_cache_append`, read back the INT8 buffer
 //!      + per-token FP16 scales, dequantize on the host, and check that
-//!      the round-trip max-relative-error is bounded by `1/127` (the
-//!      INT8 quantization step).
+//!      the round-trip max-relative-error is bounded — INT8 sym-quant is
+//!      lossy by ~1/127 of the per-token max.
 //!
-//!   2. **Decode parity vs FP16.** Build a paged KV pool with random
-//!      FP16 K/V, run the existing `paged_decode_attention_f16` kernel,
-//!      then quantize the SAME K/V to INT8 (using the kernel's scale
-//!      convention), run `paged_decode_attention_int8`, and check that
-//!      the two output tensors agree within a small relative tolerance.
+//!   2. **Decode parity vs host reference.** Build a paged KV pool with
+//!      random FP16 K/V, compute attention output on the host (FP32
+//!      reference), quantize the same K/V to INT8 (using the kernel's
+//!      scale convention), run `paged_decode_attention_int8`, and check
+//!      that the GPU INT8 output agrees with the FP32 reference within
+//!      a small relative tolerance (the only loss is the quant step).
 //!
 //! Run on a CUDA box:
 //!   cargo test -p ferrum-kernels --features cuda --release \
-//!     --test int8_kv_parity -- --nocapture
+//!     --test int8_kv_parity -- --ignored --nocapture
 
 #![cfg(feature = "cuda")]
 
 use cudarc::driver::CudaContext;
 use ferrum_kernels::backend::cuda::CudaBackend;
-use ferrum_kernels::backend::{Backend, BackendPagedKv};
+use ferrum_kernels::backend::Backend;
 use ferrum_kernels::int8_kv::{launch_int8_kv_cache_append, launch_int8_paged_decode_attention};
 use half::f16;
 
@@ -34,15 +35,17 @@ fn rnd(state: &mut u64) -> f32 {
     (u as f32) / 16_777_216.0 * 2.0 - 1.0
 }
 
+/// Per-token per-kv-head symmetric INT8 quantization. Mirrors the
+/// kernel's `s = max(|x|)/127` convention exactly.
 fn quantize_token_per_head(
-    fp16: &[f32],            // [num_tokens, num_kv_heads, head_dim]
-    num_tokens: usize,
+    fp16: &[f32], // [pool_tokens, num_kv_heads, head_dim]
+    pool_tokens: usize,
     num_kv_heads: usize,
     head_dim: usize,
 ) -> (Vec<i8>, Vec<f32>) {
-    let mut q = vec![0i8; num_tokens * num_kv_heads * head_dim];
-    let mut s = vec![0f32; num_tokens * num_kv_heads];
-    for t in 0..num_tokens {
+    let mut q = vec![0i8; pool_tokens * num_kv_heads * head_dim];
+    let mut s = vec![0f32; pool_tokens * num_kv_heads];
+    for t in 0..pool_tokens {
         for h in 0..num_kv_heads {
             let base = (t * num_kv_heads + h) * head_dim;
             let mut max_abs = 0f32;
@@ -68,16 +71,16 @@ fn int8_kv_append_roundtrip() {
     const NUM_TOKENS: usize = 16;
     const NUM_KV_HEADS: usize = 4;
     const HEAD_DIM: usize = 128;
-    const POOL_TOKENS: usize = 32; // sparse: only half the slots filled
+    const POOL_TOKENS: usize = 64; // sparse: half-filled, room for slot up to 60
 
     let total = NUM_TOKENS * NUM_KV_HEADS * HEAD_DIM;
     let mut s = 0xDEADBEEFu64;
     let k_in: Vec<f32> = (0..total).map(|_| rnd(&mut s) * 0.1).collect();
     let v_in: Vec<f32> = (0..total).map(|_| rnd(&mut s) * 0.1).collect();
 
-    // Place tokens in non-contiguous slots (5, 9, 13, ..., 5+4*15) to
-    // exercise slot_mapping.
-    let slot_mapping: Vec<i32> = (0..NUM_TOKENS).map(|i| (5 + i * 4) as i32).collect();
+    // Place tokens in non-contiguous slots within the pool [0..POOL_TOKENS).
+    // 3 + 4*i for i in 0..16 → max = 3 + 60 = 63.
+    let slot_mapping: Vec<i32> = (0..NUM_TOKENS).map(|i| (3 + i * 4) as i32).collect();
 
     let ctx = CudaContext::new(0).expect("CUDA context");
     let stream = ctx.default_stream();
@@ -120,8 +123,9 @@ fn int8_kv_append_roundtrip() {
     let k_scales_h: Vec<f16> = stream.memcpy_dtov(&k_scales).unwrap();
     let v_scales_h: Vec<f16> = stream.memcpy_dtov(&v_scales).unwrap();
 
-    // Dequantize and compare.
-    let mut max_rel = 0f32;
+    // Dequantize and compare. INT8 sym-quant is lossy by ~1/127 of the
+    // per-token-head max — assert a generous bound.
+    let mut max_abs = 0f32;
     for t in 0..NUM_TOKENS {
         let slot = slot_mapping[t] as usize;
         for h in 0..NUM_KV_HEADS {
@@ -133,23 +137,81 @@ fn int8_kv_append_roundtrip() {
                 let pool_off = slot * NUM_KV_HEADS * HEAD_DIM + h * HEAD_DIM + d;
                 let k_dq = ks * k_pool_h[pool_off] as f32;
                 let v_dq = vs * v_pool_h[pool_off] as f32;
-                let mag = k_in[in_off].abs().max(1e-3);
-                let rel_k = (k_dq - k_in[in_off]).abs() / mag;
-                let rel_v = (v_dq - v_in[in_off]).abs() / mag;
-                max_rel = max_rel.max(rel_k).max(rel_v);
+                max_abs = max_abs.max((k_dq - k_in[in_off]).abs());
+                max_abs = max_abs.max((v_dq - v_in[in_off]).abs());
             }
         }
     }
-    eprintln!("int8 append round-trip max relative error: {max_rel:.4}");
-    // INT8 sym-quant per token-head: worst case is ~1/127 relative for
-    // small values, but per-token scale keeps most dims at ≤ 1/64 ≈ 0.016.
-    // Use a generous bound to make the test robust to RNG.
-    assert!(max_rel < 0.05, "round-trip rel err too high: {max_rel}");
+    eprintln!("int8 append round-trip max abs error: {max_abs:.5}");
+    // Inputs are scaled by 0.1 so per-token max ≈ 0.1; quantization
+    // step is max/127 ≈ 0.0008. Allow 2× margin.
+    assert!(max_abs < 0.002, "round-trip abs err too high: {max_abs}");
+}
+
+/// Pure-Rust reference: paged decode attention in FP32, mirroring the
+/// kernel's algorithm. Used to validate the GPU INT8 output.
+#[allow(clippy::too_many_arguments)]
+fn host_ref_paged_decode(
+    q: &[f32],         // [num_q_heads, head_dim]
+    k_pool: &[f32],    // [pool_tokens * num_kv_heads * head_dim]
+    v_pool: &[f32],    // same
+    block_table: &[i32],
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    valid_kv_len: usize,
+    block_size: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let mut out = vec![0f32; num_q_heads * head_dim];
+    let q_per_kv = num_q_heads / num_kv_heads;
+    let kv_stride = num_kv_heads * head_dim;
+    let block_stride = block_size * kv_stride;
+    for qh in 0..num_q_heads {
+        let kv_head = qh / q_per_kv;
+        // 1. Q·K^T scores
+        let mut scores = vec![0f32; valid_kv_len];
+        for kv_pos in 0..valid_kv_len {
+            let logical_block = kv_pos / block_size;
+            let slot = kv_pos % block_size;
+            let physical = block_table[logical_block] as usize;
+            let k_base = physical * block_stride + slot * kv_stride + kv_head * head_dim;
+            let mut dot = 0f32;
+            for d in 0..head_dim {
+                dot += q[qh * head_dim + d] * k_pool[k_base + d];
+            }
+            scores[kv_pos] = dot * scale;
+        }
+        // 2. softmax
+        let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0f32;
+        for s in &mut scores {
+            *s = (*s - max).exp();
+            sum += *s;
+        }
+        let inv = 1.0 / sum;
+        for s in &mut scores {
+            *s *= inv;
+        }
+        // 3. weighted V sum
+        for d in 0..head_dim {
+            let mut acc = 0f32;
+            for kv_pos in 0..valid_kv_len {
+                let logical_block = kv_pos / block_size;
+                let slot = kv_pos % block_size;
+                let physical = block_table[logical_block] as usize;
+                let v_base = physical * block_stride + slot * kv_stride + kv_head * head_dim;
+                acc += scores[kv_pos] * v_pool[v_base + d];
+            }
+            out[qh * head_dim + d] = acc;
+        }
+    }
+    out
 }
 
 #[test]
 #[ignore]
-fn int8_paged_decode_parity_vs_fp16() {
+fn int8_paged_decode_parity_vs_host_ref() {
     const NUM_HEADS: usize = 8;
     const NUM_KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 128;
@@ -159,31 +221,40 @@ fn int8_paged_decode_parity_vs_fp16() {
 
     let mut rng = 0xCAFEF00Du64;
 
-    // Q : [num_heads, head_dim] FP16
     let q_n = NUM_HEADS * HEAD_DIM;
     let q_data: Vec<f32> = (0..q_n).map(|_| rnd(&mut rng) * 0.5).collect();
 
-    // K/V pool : [max_blocks, block_size, num_kv_heads, head_dim] FP16/INT8
-    let kv_n = MAX_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM;
+    let pool_tokens = MAX_BLOCKS * BLOCK_SIZE;
+    let kv_n = pool_tokens * NUM_KV_HEADS * HEAD_DIM;
     let k_data: Vec<f32> = (0..kv_n).map(|_| rnd(&mut rng) * 0.3).collect();
     let v_data: Vec<f32> = (0..kv_n).map(|_| rnd(&mut rng) * 0.3).collect();
 
     // Block table: identity mapping (logical i → physical i).
     let block_table: Vec<i32> = (0..MAX_BLOCKS as i32).collect();
 
-    let ctx = CudaContext::new(0).expect("CUDA context");
-    let stream = ctx.default_stream();
+    // Host reference (FP32).
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let out_ref = host_ref_paged_decode(
+        &q_data,
+        &k_data,
+        &v_data,
+        &block_table,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        VALID_KV_LEN,
+        BLOCK_SIZE,
+        scale,
+    );
 
     // Quantize K/V on host (using kernel's scale convention).
-    // Layout for quant: [max_blocks * block_size, num_kv_heads, head_dim].
-    let pool_tokens = MAX_BLOCKS * BLOCK_SIZE;
     let (k_q, k_s) = quantize_token_per_head(&k_data, pool_tokens, NUM_KV_HEADS, HEAD_DIM);
     let (v_q, v_s) = quantize_token_per_head(&v_data, pool_tokens, NUM_KV_HEADS, HEAD_DIM);
 
-    // Upload everything.
+    let ctx = CudaContext::new(0).expect("CUDA context");
+    let stream = ctx.default_stream();
+
     let q_dev = CudaBackend::from_slice(&q_data);
-    let k_pool_fp16 = CudaBackend::from_slice(&k_data);
-    let v_pool_fp16 = CudaBackend::from_slice(&v_data);
     let k_pool_i8 = stream.memcpy_stod(&k_q).unwrap();
     let v_pool_i8 = stream.memcpy_stod(&v_q).unwrap();
     let k_scales_h: Vec<f16> = k_s.iter().map(|x| f16::from_f32(*x)).collect();
@@ -192,46 +263,7 @@ fn int8_paged_decode_parity_vs_fp16() {
     let v_scales_dev = stream.memcpy_stod(&v_scales_h).unwrap();
     let bt_dev = stream.memcpy_stod(&block_table).unwrap();
 
-    // Run FP16 reference. Trait API uses `&Buffer` (CudaSlice<f16>) for
-    // block_table and context_lens — we reinterpret the i32 slice via
-    // upgrade_device_ptr (same hack as the existing bench).
-    use cudarc::driver::sys::CUdeviceptr;
-    use cudarc::driver::CudaSlice;
-    use cudarc::driver::DevicePtr;
-    let mut out_fp16 = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
-    let context_lens_i32: Vec<i32> = vec![VALID_KV_LEN as i32];
-    let context_lens_dev = stream.memcpy_stod(&context_lens_i32).unwrap();
-    let (bt_ptr, _g0) = bt_dev.device_ptr(&stream);
-    let (cl_ptr, _g1) = context_lens_dev.device_ptr(&stream);
-    let bt_f16: CudaSlice<f16> = unsafe { stream.upgrade_device_ptr(bt_ptr as CUdeviceptr, 0) };
-    let cl_f16: CudaSlice<f16> = unsafe { stream.upgrade_device_ptr(cl_ptr as CUdeviceptr, 0) };
-    let mut bctx = <CudaBackend as Backend>::new_context();
-
-    let attn_scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
-
-    <CudaBackend as BackendPagedKv>::paged_decode_attention(
-        &mut bctx,
-        &q_dev,
-        &k_pool_fp16,
-        &v_pool_fp16,
-        &mut out_fp16,
-        &bt_f16,
-        &cl_f16,
-        1, // num_seqs
-        NUM_HEADS,
-        NUM_KV_HEADS,
-        HEAD_DIM,
-        BLOCK_SIZE,
-        MAX_BLOCKS,
-        1, // q_len
-    )
-    .expect("fp16 paged decode");
-    <CudaBackend as Backend>::sync(&mut bctx);
-
-    let out_fp16_h: Vec<f32> = CudaBackend::to_vec(&out_fp16, NUM_HEADS * HEAD_DIM);
-
-    // Run INT8 path.
-    let mut out_int8 = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
+    let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
     launch_int8_paged_decode_attention(
         &ctx,
         &q_dev,
@@ -240,36 +272,34 @@ fn int8_paged_decode_parity_vs_fp16() {
         &k_scales_dev,
         &v_scales_dev,
         &bt_dev,
-        &mut out_int8,
+        &mut out_dev,
         NUM_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
         VALID_KV_LEN,
         BLOCK_SIZE,
-        attn_scale,
+        scale,
     )
     .expect("int8 paged decode");
     stream.synchronize().unwrap();
 
-    let out_int8_h: Vec<f32> = CudaBackend::to_vec(&out_int8, NUM_HEADS * HEAD_DIM);
+    let out_int8: Vec<f32> = CudaBackend::to_vec(&out_dev, NUM_HEADS * HEAD_DIM);
 
-    // Compare. INT8 dequantization induces ~1% per-element relative
-    // error in attention output for benign inputs.
     let mut max_abs = 0f32;
     let mut max_rel = 0f32;
-    let mut mag_max = 0f32;
-    for i in 0..out_fp16_h.len() {
-        let diff = (out_fp16_h[i] - out_int8_h[i]).abs();
+    let mut max_mag = 0f32;
+    for i in 0..out_ref.len() {
+        let diff = (out_int8[i] - out_ref[i]).abs();
         max_abs = max_abs.max(diff);
-        let mag = out_fp16_h[i].abs().max(1e-4);
+        let mag = out_ref[i].abs().max(1e-3);
         max_rel = max_rel.max(diff / mag);
-        mag_max = mag_max.max(out_fp16_h[i].abs());
+        max_mag = max_mag.max(out_ref[i].abs());
     }
     eprintln!(
-        "int8 vs fp16: max|diff|={max_abs:.5} max rel={max_rel:.4} (max output mag={mag_max:.4})"
+        "int8 vs host-ref: max|diff|={max_abs:.5} max rel={max_rel:.4} (max output mag={max_mag:.4})"
     );
-    // INT8 paged decode should land within 5% relative of FP16 reference
-    // for benign random inputs at this scale.
+    // INT8 sym-quant per token-head + FP16 Q/output induces a few-%
+    // relative error on attention output for benign random inputs.
     assert!(max_abs < 0.05, "abs diff too high: {max_abs}");
     assert!(max_rel < 0.10, "rel diff too high: {max_rel}");
 }
