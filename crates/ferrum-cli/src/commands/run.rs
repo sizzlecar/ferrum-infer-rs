@@ -784,14 +784,16 @@ pub fn apply_kv_dtype_override(
             engine_config.kv_cache.dtype = KvCacheDtype::Fp16;
             Ok(())
         }
-        KvCacheDtype::Int8 => Err(ferrum_types::FerrumError::unsupported(
-            "INT8 KV cache: kernels and KvCacheQuant<B, KvInt8> have landed \
-             (PR #131 / #134 / #135), but the model decode loop hasn't been \
-             generic'd over K: KvDtypeKind yet. Re-run with --kv-dtype=fp16 \
-             (or omit the flag) until the model wire-up ships.",
-        )),
+        KvCacheDtype::Int8 => {
+            // Dim 5 PR C: end-to-end INT8 KV path on CUDA via
+            // LlamaFamilyModel<CudaBackend, KvInt8>. Registry rejects
+            // (CPU/Metal, Int8) and (CUDA Qwen3-MoE, Int8) with helpful
+            // messages.
+            engine_config.kv_cache.dtype = KvCacheDtype::Int8;
+            Ok(())
+        }
         KvCacheDtype::Fp8 => Err(ferrum_types::FerrumError::unsupported(
-            "FP8 KV cache: kernels not yet implemented. Tracked as a future PR.",
+            "FP8 KV cache: kernels not yet implemented. Tracked as PR D.",
         )),
         KvCacheDtype::Bf16 => Err(ferrum_types::FerrumError::unsupported(
             "BF16 KV cache: marker only, no backend impl ships yet.",

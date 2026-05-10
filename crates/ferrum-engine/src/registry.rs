@@ -1089,7 +1089,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 // PR C will extend this with `(CUDA, Int8) => build_llm::<CudaBackend, KvInt8>(...)`
                 // — model wire-up already accepts `K`, so adding INT8 only
                 // touches this match.
-                use ferrum_interfaces::kv_dtype::KvFp16;
+                use ferrum_interfaces::kv_dtype::{KvFp16, KvInt8};
                 use ferrum_types::KvCacheDtype;
                 let kv_dtype = config.engine_config.kv_cache.dtype;
                 let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match (
@@ -1134,6 +1134,37 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         {
                             info!("  Backend: CUDA, KV: fp16");
                             build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvFp16>(
+                                arch,
+                                qcfg,
+                                moe_cfg,
+                                &model_path,
+                            )?
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            return Err(FerrumError::device(
+                                "CUDA requested but 'cuda' feature not enabled",
+                            ));
+                        }
+                    }
+                    (Device::CUDA(_), KvCacheDtype::Int8) => {
+                        #[cfg(feature = "cuda")]
+                        {
+                            // Dim 5 PR C: only CudaBackend implements
+                            // BackendInt8KvOps with real launchers; LlamaFamilyModel<B, KvInt8>
+                            // uses LayerKvCache::Int8 + paged INT8 KV. Qwen3-MoE
+                            // INT8 KV is a follow-up — reject here so users
+                            // see a clear error instead of a panic at
+                            // alloc_paged_int8_layer time.
+                            if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
+                                return Err(FerrumError::unsupported(
+                                    "INT8 KV cache is not yet wired through Qwen3MoeModel \
+                                     (LlamaFamilyModel-only in PR C). Use --kv-dtype fp16 \
+                                     for MoE models or wait for the follow-up PR.",
+                                ));
+                            }
+                            info!("  Backend: CUDA, KV: int8 (paged, vLLM-style)");
+                            build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvInt8>(
                                 arch,
                                 qcfg,
                                 moe_cfg,
