@@ -13,7 +13,6 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 
 # Optional runtime dependency for device memory operations
-ferrum-runtime = { workspace = true, optional = true }
 
 # Async
 async-trait = { workspace = true }
@@ -44,8 +43,6 @@ half = { workspace = true }
 
 [features]
 default = []
-# Enable integration with ferrum-runtime for device memory
-runtime = ["dep:ferrum-runtime"]
 # Enable compression support
 compression = []
 # Enable detailed metrics and profiling

@@ -478,7 +478,7 @@ pub struct CandleBackendFactory;
 #[async_trait]
 impl ComponentFactory<Arc<dyn ComputeBackend>> for CandleBackendFactory {
     async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn ComputeBackend>> {
-        use ferrum_runtime::backends::CandleBackend;
+        use crate::backends::candle::CandleBackend;
         info!("Creating Candle backend for device: {:?}", config.device);
         let backend = CandleBackend::new(config.device.clone()).await?;
         Ok(Arc::new(backend))
@@ -870,7 +870,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         );
 
         // Create a stub compute backend for the executor
-        let backend = ferrum_runtime::backends::CandleBackend::new(config.device.clone()).await?;
+        let backend = crate::backends::candle::CandleBackend::new(config.device.clone()).await?;
 
         let executor = ferrum_models::StubModelExecutor::new(
             config.engine_config.model.model_id.clone(),

@@ -13,7 +13,6 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 
 # Optional runtime dependency for loading weights
-ferrum-runtime = { workspace = true, optional = true }
 
 # Async
 async-trait = { workspace = true }
@@ -83,7 +82,6 @@ ferrum-testkit = { workspace = true }
 [features]
 default = []
 # Enable runtime integration for weight loading
-runtime = ["dep:ferrum-runtime"]
 # Enable CUDA FlashAttention-2 and fused custom kernels
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 metal = ["ferrum-attention/metal", "ferrum-kernels/metal"]

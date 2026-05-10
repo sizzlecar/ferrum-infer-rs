@@ -17,7 +17,6 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-engine = { workspace = true }
 ferrum-models = { workspace = true }
-ferrum-runtime = { workspace = true }
 ferrum-scheduler = { workspace = true }
 ferrum-server = { workspace = true }
 ferrum-kernels = { workspace = true }

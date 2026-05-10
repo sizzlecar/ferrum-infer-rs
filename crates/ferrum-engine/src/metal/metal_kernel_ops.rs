@@ -6,6 +6,7 @@
 //! kernel delegate to candle tensor ops, which candle dispatches to the Metal
 //! GPU automatically when tensors reside on a Metal device.
 
+use crate::backends::candle::CandleTensor;
 use crate::metal::compute_pipeline::{Q4_0MatvecPipeline, RmsNormPipeline};
 use crate::metal::sampling_ops::MetalSamplingOps as RawMetalSamplingOps;
 use crate::metal::MetalContext;
@@ -14,7 +15,6 @@ use ferrum_interfaces::kernel_ops::{
     QuantScheme, SamplingOps, SamplingParams,
 };
 use ferrum_interfaces::TensorRef;
-use ferrum_runtime::backends::CandleTensor;
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 use std::sync::Arc;
