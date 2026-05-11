@@ -290,14 +290,12 @@ impl BackendMoeFused for CudaBackend {
         expert_ids: &[i32],
         num_tokens_past_padded: &[i32],
     ) -> Result<crate::backend::traits::MoeRouting<Self>> {
-        use cudarc::driver::sys::CUdeviceptr;
         use cudarc::driver::CudaSlice;
-        use cudarc::driver::DevicePtr;
 
-        // Per-call alloc + leak. Persistent buffers (one-alloc + reuse)
-        // were attempted as Stage 13c-1 but hit a CUDA driver edge case
-        // — leaving the bench-validated path in place for now.
-        // TODO(stage-13c-redo): retry with stream sync between forwards.
+        // Phase D step 2+3: B::Buffer is now CudaBuf (typed enum),
+        // so we can store the i32 routing buffers directly in
+        // CudaBuf::I32 instead of leaking through f16 upgrade_device_ptr.
+        // No more mem::forget leak — the I32 slices own their memory.
         let stream = ctx.stream.clone();
         let st: CudaSlice<i32> = stream
             .clone_htod(sorted_token_ids)
@@ -308,32 +306,11 @@ impl BackendMoeFused for CudaBackend {
         let npp: CudaSlice<i32> = stream
             .clone_htod(num_tokens_past_padded)
             .map_err(|e| FerrumError::model(format!("htod num_tokens_past_padded: {e}")))?;
-        let (st_ptr, eid_ptr, npp_ptr) = {
-            let (st_ptr, _g0) = st.device_ptr(&stream);
-            let (eid_ptr, _g1) = eid.device_ptr(&stream);
-            let (npp_ptr, _g2) = npp.device_ptr(&stream);
-            (st_ptr, eid_ptr, npp_ptr)
-        };
-        let st_f16: CudaSlice<f16> = unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
-        let eid_f16: CudaSlice<f16> =
-            unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
-        let npp_f16: CudaSlice<f16> =
-            unsafe { stream.upgrade_device_ptr(npp_ptr as CUdeviceptr, 0) };
-        // Forget the i32 owning slices so the memory survives — the f16
-        // views above point at the same allocation. Acceptable leak: a
-        // few KB per layer × 48 layers/forward × forwards/sec = ~MB/s
-        // sustained, freed only at process exit. Not ideal but works.
-        // TODO(stage-13c-redo): re-attempt persistent buffers once we
-        // understand why memcpy_htod / cuMemcpyHtoDAsync rejects the
-        // 2nd call's params under our driver version.
-        std::mem::forget(st);
-        std::mem::forget(eid);
-        std::mem::forget(npp);
 
         Ok(crate::backend::traits::MoeRouting {
-            sorted_token_ids: st_f16,
-            expert_ids: eid_f16,
-            num_tokens_past_padded: npp_f16,
+            sorted_token_ids: crate::backend::CudaBuf::from_i32(st),
+            expert_ids: crate::backend::CudaBuf::from_i32(eid),
+            num_tokens_past_padded: crate::backend::CudaBuf::from_i32(npp),
         })
     }
 }
