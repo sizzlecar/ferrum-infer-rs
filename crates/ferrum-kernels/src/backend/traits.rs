@@ -1083,75 +1083,11 @@ pub trait BackendQuantMarlin: Backend {
     /// Marlin calls across a stream pool to amortize launch overhead
     /// and overlap small-m kernels that under-utilize SMs individually.
     ///
-    /// `dispatches[i]`: (expert_idx, in_row_offset, out_row_offset, m).
-    /// All calls share the same `weight`, `input`, `output`, `n_per_expert`,
-    /// `k`. Caller is responsible for bulk-zeroing workspace before this
-    /// call (use `marlin_zero_stacked_workspace`).
-    ///
-    /// Default: serial fallback that loops calling
-    /// `gemm_gptq_with_offset_strided`. CUDA backend overrides with
-    /// round-robin streams + sync-all at the end.
-    #[allow(clippy::too_many_arguments)]
-    fn moe_gemm_phase_batched(
-        ctx: &mut Self::Context,
-        input: &Self::Buffer,
-        weight: &Self::GptqStore,
-        dispatches: &[(usize, usize, usize, usize)],
-        n_per_expert: usize,
-        output: &mut Self::Buffer,
-        k: usize,
-    ) -> Result<()> {
-        // Default impl: serial fallback. CUDA overrides with multi-stream.
-        for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
-            Self::gemm_gptq_with_offset_strided(
-                ctx,
-                input,
-                *in_row_offset,
-                weight,
-                expert_idx * n_per_expert,
-                n_per_expert,
-                output,
-                *out_row_offset,
-                *m,
-                k,
-            )?;
-        }
-        Ok(())
-    }
-    /// vLLM marlin_moe_wna16 phase GEMM. Replaces the per-expert loop in
-    /// `moe_gemm_phase_batched` with a single fused launch that routes
-    /// per-block via `expert_ids`. Caller responsibilities:
-    ///
-    /// - `weight` was loaded via the vLLM stacked-Marlin path (i.e.
-    ///   `Self::load_gptq_stacked` invoked under `FERRUM_VLLM_MOE=1`).
-    ///   Feeding an IST-DASLab-format weight here yields silent garbage.
-    /// - `output` MUST be pre-zeroed (the kernel's atomic-add path does
-    ///   not self-zero the global tile).
-    /// - `sorted_token_ids` / `expert_ids` / `num_tokens_past_padded`
-    ///   come from `moe_align_block_size` or an equivalent host build.
-    /// - `prob_m` is the unique-token count (we feed pre-gathered rows
-    ///   with `top_k=1` so it equals `total_pairs`).
-    ///
-    /// Default: returns unsupported. CUDA overrides on `vllm-moe-marlin`.
-    #[allow(clippy::too_many_arguments)]
-    fn moe_gemm_phase_vllm(
-        _ctx: &mut Self::Context,
-        _input: &Self::Buffer,
-        _weight: &Self::GptqStore,
-        _sorted_token_ids: &Self::Buffer,
-        _expert_ids: &Self::Buffer,
-        _num_tokens_past_padded: &Self::Buffer,
-        _output: &mut Self::Buffer,
-        _prob_m: usize,
-        _n_per_expert: usize,
-        _k: usize,
-        _moe_block_size: usize,
-        _top_k: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "moe_gemm_phase_vllm not implemented for this backend",
-        ))
-    }
+    // Phase C step 4c+4d: BackendQuantMarlin::moe_gemm_phase_batched
+    // and moe_gemm_phase_vllm removed — their bodies are now inlined
+    // into MarlinExpertStack::gemm_phase_batched / gemm_phase_vllm
+    // (concrete impls in quant_linear/{cuda,cpu}_marlin_stack.rs).
+    // Callers reach them via `store.gemm_phase_*(ctx, ...)`.
     /// Pre-grow any backend-internal scratch slots whose size depends
     /// on `m_total * intermediate_size` (the largest matmul fan-in
     /// inside `unified_forward_internal`). Default no-op. CUDA

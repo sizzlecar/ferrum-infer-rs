@@ -90,9 +90,12 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         output: &mut <CudaBackend as crate::backend::Backend>::Buffer,
         k: usize,
     ) -> Result<()> {
+        // Phase C step 4c: delegates to the moved-out free function in
+        // cuda/quant.rs (previously the body of BackendQuantMarlin::
+        // moe_gemm_phase_batched, now deleted from the trait).
         #[cfg(feature = "marlin")]
         {
-            <CudaBackend as crate::backend::BackendQuantMarlin>::moe_gemm_phase_batched(
+            crate::backend::cuda::quant::moe_gemm_phase_batched_impl(
                 ctx,
                 input,
                 &self.store,
@@ -106,7 +109,7 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         {
             let _ = (ctx, input, dispatches, output, k);
             Err(ferrum_types::FerrumError::unsupported(
-                "moe_gemm_phase_batched: cargo feature `marlin` disabled",
+                "gemm_phase_batched: cargo feature `marlin` disabled",
             ))
         }
     }
@@ -123,20 +126,41 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         moe_block_size: usize,
         top_k: usize,
     ) -> Result<()> {
-        <CudaBackend as crate::backend::BackendQuantMarlin>::moe_gemm_phase_vllm(
-            ctx,
-            input,
-            &self.store,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_past_padded,
-            output,
-            prob_m,
-            self.n_per_expert,
-            self.k,
-            moe_block_size,
-            top_k,
-        )
+        // Phase C step 4d: delegates to the moved-out free function.
+        #[cfg(feature = "vllm-moe-marlin")]
+        {
+            crate::backend::cuda::quant::moe_gemm_phase_vllm_impl(
+                ctx,
+                input,
+                &self.store,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_past_padded,
+                output,
+                prob_m,
+                self.n_per_expert,
+                self.k,
+                moe_block_size,
+                top_k,
+            )
+        }
+        #[cfg(not(feature = "vllm-moe-marlin"))]
+        {
+            let _ = (
+                ctx,
+                input,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_past_padded,
+                output,
+                prob_m,
+                moe_block_size,
+                top_k,
+            );
+            Err(ferrum_types::FerrumError::unsupported(
+                "gemm_phase_vllm: cargo feature `vllm-moe-marlin` disabled",
+            ))
+        }
     }
 
     fn make_expert_linear(

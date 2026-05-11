@@ -67,15 +67,24 @@ impl MarlinExpertStack<CpuBackend> for CpuMarlinExpertStack {
         output: &mut <CpuBackend as crate::backend::Backend>::Buffer,
         k: usize,
     ) -> Result<()> {
-        <CpuBackend as crate::backend::BackendQuantMarlin>::moe_gemm_phase_batched(
-            ctx,
-            input,
-            &self.store,
-            dispatches,
-            self.n_per_expert,
-            output,
-            k,
-        )
+        // Phase C step 4c: inlined from the default
+        // BackendQuantMarlin::moe_gemm_phase_batched impl — serial loop
+        // calling gemm_gptq_with_offset_strided per active expert.
+        for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
+            <CpuBackend as crate::backend::BackendQuantMarlin>::gemm_gptq_with_offset_strided(
+                ctx,
+                input,
+                *in_row_offset,
+                &self.store,
+                expert_idx * self.n_per_expert,
+                self.n_per_expert,
+                output,
+                *out_row_offset,
+                *m,
+                k,
+            )?;
+        }
+        Ok(())
     }
 
     fn make_expert_linear(
