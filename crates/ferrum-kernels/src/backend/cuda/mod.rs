@@ -331,7 +331,6 @@ impl Backend for CudaBackend {
     type Buffer = CudaSlice<f16>;
     type Context = CudaState;
     type GptqStore = GptqStoreCuda;
-    type QuantStore = (); // not yet wired on CUDA — load_quant / gemm_quant return unsupported
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
