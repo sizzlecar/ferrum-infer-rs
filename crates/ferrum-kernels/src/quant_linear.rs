@@ -20,3 +20,6 @@ pub mod cuda_marlin;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal_gguf;
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod metal_gguf_moe;

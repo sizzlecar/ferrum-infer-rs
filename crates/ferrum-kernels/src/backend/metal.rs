@@ -54,8 +54,8 @@ struct MetalMmapEntry {
     _keeper: Arc<dyn std::any::Any + Send + Sync>,
 }
 
-struct MetalState {
-    pipes: MetalPipelines,
+pub(crate) struct MetalState {
+    pub(crate) pipes: MetalPipelines,
     /// Registered mmap regions wrapped as zero-copy Metal buffers. Looked
     /// up at `load_quant*` time so weight tensors that already live in a
     /// registered mmap can reuse the big buffer with an offset instead of
@@ -63,7 +63,7 @@ struct MetalState {
     mmaps: Mutex<Vec<MetalMmapEntry>>,
 }
 static METAL_STATE: OnceLock<MetalState> = OnceLock::new();
-fn st() -> &'static MetalState {
+pub(crate) fn st() -> &'static MetalState {
     METAL_STATE.get_or_init(|| MetalState {
         pipes: MetalPipelines::new(&Device::system_default().unwrap()),
         mmaps: Mutex::new(Vec::new()),
@@ -233,9 +233,9 @@ impl Dtype {
 /// different types for shader selection. `n` is the number of logical
 /// elements; `raw.length()` is `n * dtype.bytes_per_elem()`.
 pub struct MetalBuf {
-    raw: metal::Buffer,
-    dtype: Dtype,
-    n: usize,
+    pub(crate) raw: metal::Buffer,
+    pub(crate) dtype: Dtype,
+    pub(crate) n: usize,
 }
 
 impl MetalBuf {
@@ -259,7 +259,7 @@ impl MetalBuf {
     }
 
     #[inline]
-    fn expect_f32<'a>(&'a self, what: &str) -> &'a metal::Buffer {
+    pub(crate) fn expect_f32<'a>(&'a self, what: &str) -> &'a metal::Buffer {
         debug_assert!(
             matches!(self.dtype, Dtype::F32),
             "{what}: expected F32 buffer, got {:?}",
@@ -268,7 +268,7 @@ impl MetalBuf {
         &self.raw
     }
     #[inline]
-    fn expect_f32_mut<'a>(&'a mut self, what: &str) -> &'a mut metal::Buffer {
+    pub(crate) fn expect_f32_mut<'a>(&'a mut self, what: &str) -> &'a mut metal::Buffer {
         debug_assert!(
             matches!(self.dtype, Dtype::F32),
             "{what}: expected F32 buffer, got {:?}",
@@ -329,7 +329,7 @@ impl MetalContext {
     /// buffer if there isn't already one. Subsequent calls during the
     /// same window return the same encoder — set the pipeline state
     /// before each dispatch.
-    fn compute_encoder(&mut self) -> &'static metal::ComputeCommandEncoderRef {
+    pub(crate) fn compute_encoder(&mut self) -> &'static metal::ComputeCommandEncoderRef {
         if let Some(enc) = self.encoder {
             return enc;
         }
@@ -943,7 +943,6 @@ impl Backend for MetalBackend {
     type Buffer = MetalBuf;
     type Context = MetalContext;
     type GptqStore = (); // Metal GPTQ not yet wired; load_gptq/gemm_gptq return unsupported.
-    type QuantStore = MetalQuantStore;
 
     fn new_context() -> Self::Context {
         MetalContext {
@@ -1641,426 +1640,20 @@ impl crate::backend::BackendQuantGguf for MetalBackend {
         num_experts: usize,
         n_rows: usize,
         n_cols: usize,
-    ) -> Result<Self::QuantStore> {
+    ) -> Result<Box<dyn crate::StackedExpertGgufLinear<Self>>> {
         use super::GgufQuantType;
-        match kind {
-            GgufQuantType::Q4K => load_q4k_experts(bytes, num_experts, n_rows, n_cols),
-            GgufQuantType::Q6K => load_q6k_experts(bytes, num_experts, n_rows, n_cols),
-            other => Err(FerrumError::unsupported(format!(
-                "Metal load_quant_experts: {other:?} not implemented (only Q4K / Q6K)"
-            ))),
-        }
-    }
-    fn gemv_quant_moe_id(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::QuantStore,
-        ids: &Self::Buffer,
-        out: &mut Self::Buffer,
-        n_selected: usize,
-        src1_stride: usize,
-    ) -> Result<()> {
-        let a_buf = a.expect_f32("gemv_quant_moe_id a");
-        let ids_buf = &ids.raw;
-        let out_buf = out.expect_f32_mut("gemv_quant_moe_id out");
-        let enc = ctx.compute_encoder();
-        dispatch_gemv_moe_id(
-            enc,
-            a_buf,
-            weight,
-            ids_buf,
-            out_buf,
-            n_selected,
-            src1_stride,
-        )
-    }
-    fn gemv_quant_moe_id_gate_up_silu_batched(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        gate_w: &Self::QuantStore,
-        up_w: &Self::QuantStore,
-        ids: &Self::Buffer,
-        silu_out: &mut Self::Buffer,
-        m: usize,
-        top_k: usize,
-        src1_outer_stride: usize,
-        src1_inner_stride: usize,
-    ) -> Result<()> {
-        let (gate_blocks, gate_byte_offset, gate_n_rows, gate_n_cols) = match gate_w {
-            MetalQuantStore::Q4KExperts {
-                blocks,
-                byte_offset,
-                n_rows,
-                n_cols,
-                ..
-            } => (blocks, *byte_offset, *n_rows, *n_cols),
-            _ => {
-                return Err(FerrumError::model(
-                    "gemv_quant_moe_id_gate_up_silu_batched: gate_w must be Q4KExperts".to_string(),
-                ));
+        let store = match kind {
+            GgufQuantType::Q4K => load_q4k_experts(bytes, num_experts, n_rows, n_cols)?,
+            GgufQuantType::Q6K => load_q6k_experts(bytes, num_experts, n_rows, n_cols)?,
+            other => {
+                return Err(FerrumError::unsupported(format!(
+                    "Metal load_quant_experts: {other:?} not implemented (only Q4K / Q6K)"
+                )));
             }
         };
-        let (up_blocks, up_byte_offset, up_n_rows, up_n_cols) = match up_w {
-            MetalQuantStore::Q4KExperts {
-                blocks,
-                byte_offset,
-                n_rows,
-                n_cols,
-                ..
-            } => (blocks, *byte_offset, *n_rows, *n_cols),
-            _ => {
-                return Err(FerrumError::model(
-                    "gemv_quant_moe_id_gate_up_silu_batched: up_w must be Q4KExperts".to_string(),
-                ));
-            }
-        };
-        if gate_n_rows != up_n_rows || gate_n_cols != up_n_cols {
-            return Err(FerrumError::model(format!(
-                "gemv_quant_moe_id_gate_up_silu_batched: gate/up shape mismatch — \
-                 gate=({gate_n_rows}, {gate_n_cols}) up=({up_n_rows}, {up_n_cols})"
-            )));
-        }
-
-        let a_buf = a.expect_f32("gemv_quant_moe_id_gate_up_silu_batched a");
-        let ids_buf = &ids.raw;
-        let out_buf = silu_out.expect_f32_mut("gemv_quant_moe_id_gate_up_silu_batched silu_out");
-        let enc = ctx.compute_encoder();
-        crate::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
-            &st().pipes.device,
-            enc,
-            a_buf,
-            gate_blocks,
-            gate_byte_offset,
-            up_blocks,
-            up_byte_offset,
-            ids_buf,
-            out_buf,
-            gate_n_rows,
-            gate_n_cols,
-            m,
-            top_k,
-            src1_outer_stride,
-            src1_inner_stride,
-        );
-        Ok(())
-    }
-    fn gemv_quant_moe_id_batched(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::QuantStore,
-        ids: &Self::Buffer,
-        out: &mut Self::Buffer,
-        m: usize,
-        top_k: usize,
-        src1_outer_stride: usize,
-        src1_inner_stride: usize,
-    ) -> Result<()> {
-        let a_buf = a.expect_f32("gemv_quant_moe_id_batched a");
-        let ids_buf = &ids.raw;
-        let out_buf = out.expect_f32_mut("gemv_quant_moe_id_batched out");
-        let enc = ctx.compute_encoder();
-        match weight {
-            MetalQuantStore::Q4KExperts {
-                blocks,
-                byte_offset,
-                n_rows,
-                n_cols,
-                ..
-            } => {
-                crate::q4_k_moe_id_gemv_batched::dispatch_gemv_q4k_moe_id_batched_on_encoder(
-                    &st().pipes.device,
-                    enc,
-                    a_buf,
-                    blocks,
-                    *byte_offset,
-                    ids_buf,
-                    out_buf,
-                    *n_rows,
-                    *n_cols,
-                    m,
-                    top_k,
-                    src1_outer_stride,
-                    src1_inner_stride,
-                );
-                Ok(())
-            }
-            MetalQuantStore::Q6KExperts {
-                blocks,
-                byte_offset,
-                n_rows,
-                n_cols,
-                ..
-            } => {
-                crate::q6_k_moe_id_gemv_batched::dispatch_gemv_q6k_moe_id_batched_on_encoder(
-                    &st().pipes.device,
-                    enc,
-                    a_buf,
-                    blocks,
-                    *byte_offset,
-                    ids_buf,
-                    out_buf,
-                    *n_rows,
-                    *n_cols,
-                    m,
-                    top_k,
-                    src1_outer_stride,
-                    src1_inner_stride,
-                );
-                Ok(())
-            }
-            _ => Err(FerrumError::model(
-                "gemv_quant_moe_id_batched: weight must be Q4KExperts or Q6KExperts".to_string(),
-            )),
-        }
-    }
-    fn gemv_quant_moe_id_offset(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        a_offset: usize,
-        weight: &Self::QuantStore,
-        ids: &Self::Buffer,
-        ids_offset: usize,
-        out: &mut Self::Buffer,
-        n_selected: usize,
-        src1_stride: usize,
-    ) -> Result<()> {
-        let a_buf = a.expect_f32("gemv_quant_moe_id_offset a");
-        let ids_buf = &ids.raw;
-        let out_buf = out.expect_f32_mut("gemv_quant_moe_id_offset out");
-        let enc = ctx.compute_encoder();
-        // a_offset is in floats (a is f32), ids_offset in i32s (ids is i32).
-        // Both kernels read with 4-byte stride, so byte offset = elem * 4.
-        let a_byte_offset = (a_offset * std::mem::size_of::<f32>()) as u64;
-        let ids_byte_offset = (ids_offset * std::mem::size_of::<i32>()) as u64;
-        dispatch_gemv_moe_id_offset(
-            enc,
-            a_buf,
-            a_byte_offset,
-            weight,
-            ids_buf,
-            ids_byte_offset,
-            out_buf,
-            n_selected,
-            src1_stride,
-        )
-    }
-    fn gemm_quant_moe_id(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::QuantStore,
-        ids: &Self::Buffer,
-        tpe: &Self::Buffer,
-        out: &mut Self::Buffer,
-        ne11: usize,
-        top_k: usize,
-        max_per_expert: usize,
-        batch: usize,
-    ) -> Result<()> {
-        let a_buf = a.expect_f32("gemm_quant_moe_id a");
-        let ids_buf = &ids.raw;
-        let tpe_buf = &tpe.raw;
-        let out_buf = out.expect_f32_mut("gemm_quant_moe_id out");
-        let enc = ctx.compute_encoder();
-        match weight {
-            MetalQuantStore::Q4KExperts {
-                blocks,
-                byte_offset,
-                num_experts,
-                n_rows,
-                n_cols,
-            } => {
-                crate::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_on_encoder(
-                    &st().pipes.device,
-                    enc,
-                    blocks,
-                    *byte_offset,
-                    a_buf,
-                    ids_buf,
-                    tpe_buf,
-                    out_buf,
-                    *num_experts,
-                    *n_rows,
-                    *n_cols,
-                    ne11,
-                    top_k,
-                    max_per_expert,
-                    batch,
-                );
-                Ok(())
-            }
-            MetalQuantStore::Q6KExperts {
-                blocks,
-                byte_offset,
-                num_experts,
-                n_rows,
-                n_cols,
-            } => {
-                crate::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_on_encoder(
-                    &st().pipes.device,
-                    enc,
-                    blocks,
-                    *byte_offset,
-                    a_buf,
-                    ids_buf,
-                    tpe_buf,
-                    out_buf,
-                    *num_experts,
-                    *n_rows,
-                    *n_cols,
-                    ne11,
-                    top_k,
-                    max_per_expert,
-                    batch,
-                );
-                Ok(())
-            }
-            _ => Err(FerrumError::model(
-                "gemm_quant_moe_id: weight must be Q4KExperts or Q6KExperts".to_string(),
-            )),
-        }
-    }
-    fn gemm_quant_moe_id_indirect(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        weight: &Self::QuantStore,
-        ids: &Self::Buffer,
-        tpe: &Self::Buffer,
-        out: &mut Self::Buffer,
-        args_buf: &Self::Buffer,
-        ne11: usize,
-        top_k: usize,
-        max_per_expert: usize,
-        batch: usize,
-    ) -> Result<()> {
-        let a_buf = a.expect_f32("gemm_quant_moe_id_indirect a");
-        let ids_buf = &ids.raw;
-        let tpe_buf = &tpe.raw;
-        let out_buf = out.expect_f32_mut("gemm_quant_moe_id_indirect out");
-        let args = &args_buf.raw;
-        let enc = ctx.compute_encoder();
-        match weight {
-            MetalQuantStore::Q4KExperts {
-                blocks,
-                byte_offset,
-                num_experts,
-                n_rows,
-                n_cols,
-            } => {
-                crate::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_indirect_on_encoder(
-                    &st().pipes.device,
-                    enc,
-                    blocks,
-                    *byte_offset,
-                    a_buf,
-                    ids_buf,
-                    tpe_buf,
-                    out_buf,
-                    args,
-                    *num_experts,
-                    *n_rows,
-                    *n_cols,
-                    ne11,
-                    top_k,
-                    max_per_expert,
-                    batch,
-                );
-                Ok(())
-            }
-            MetalQuantStore::Q6KExperts {
-                blocks,
-                byte_offset,
-                num_experts,
-                n_rows,
-                n_cols,
-            } => {
-                crate::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_indirect_on_encoder(
-                    &st().pipes.device,
-                    enc,
-                    blocks,
-                    *byte_offset,
-                    a_buf,
-                    ids_buf,
-                    tpe_buf,
-                    out_buf,
-                    args,
-                    *num_experts,
-                    *n_rows,
-                    *n_cols,
-                    ne11,
-                    top_k,
-                    max_per_expert,
-                    batch,
-                );
-                Ok(())
-            }
-            _ => Err(FerrumError::model(
-                "gemm_quant_moe_id_indirect: weight must be Q4KExperts or Q6KExperts".to_string(),
-            )),
-        }
-    }
-    fn gemv_quant_moe_id_gate_up_silu(
-        ctx: &mut Self::Context,
-        a: &Self::Buffer,
-        gate_w: &Self::QuantStore,
-        up_w: &Self::QuantStore,
-        ids: &Self::Buffer,
-        silu_out: &mut Self::Buffer,
-        n_selected: usize,
-    ) -> Result<()> {
-        let (gate_blocks, gate_byte_offset, gate_n_rows, gate_n_cols) = match gate_w {
-            MetalQuantStore::Q4KExperts {
-                blocks,
-                byte_offset,
-                n_rows,
-                n_cols,
-                ..
-            } => (blocks, *byte_offset, *n_rows, *n_cols),
-            _ => {
-                return Err(FerrumError::model(
-                    "gemv_quant_moe_id_gate_up_silu: gate_w must be Q4KExperts".to_string(),
-                ));
-            }
-        };
-        let (up_blocks, up_byte_offset, up_n_rows, up_n_cols) = match up_w {
-            MetalQuantStore::Q4KExperts {
-                blocks,
-                byte_offset,
-                n_rows,
-                n_cols,
-                ..
-            } => (blocks, *byte_offset, *n_rows, *n_cols),
-            _ => {
-                return Err(FerrumError::model(
-                    "gemv_quant_moe_id_gate_up_silu: up_w must be Q4KExperts".to_string(),
-                ));
-            }
-        };
-        if gate_n_rows != up_n_rows || gate_n_cols != up_n_cols {
-            return Err(FerrumError::model(format!(
-                "gemv_quant_moe_id_gate_up_silu: gate/up shape mismatch — \
-                 gate=({gate_n_rows}, {gate_n_cols}) up=({up_n_rows}, {up_n_cols})"
-            )));
-        }
-
-        let a_buf = a.expect_f32("gemv_quant_moe_id_gate_up_silu a");
-        let ids_buf = &ids.raw;
-        let out_buf = silu_out.expect_f32_mut("gemv_quant_moe_id_gate_up_silu silu_out");
-        let enc = ctx.compute_encoder();
-        crate::q4_k_moe_id_gate_up_silu::dispatch_gemv_q4k_moe_id_gate_up_silu_on_encoder(
-            &st().pipes.device,
-            enc,
-            a_buf,
-            gate_blocks,
-            gate_byte_offset,
-            up_blocks,
-            up_byte_offset,
-            ids_buf,
-            out_buf,
-            gate_n_rows,
-            gate_n_cols,
-            n_selected,
-        );
-        Ok(())
+        Ok(Box::new(
+            crate::quant_linear::metal_gguf_moe::MetalStackedExpertGgufLinear::new(store)?,
+        ))
     }
     fn load_quant_fused(
         parts: &[(super::GgufQuantType, &[u8], usize)],
@@ -2103,7 +1696,7 @@ impl crate::backend::BackendQuantGguf for MetalBackend {
 pub fn metal_gemm_quant_dispatch(
     ctx: &mut <MetalBackend as crate::backend::Backend>::Context,
     a: &<MetalBackend as crate::backend::Backend>::Buffer,
-    weight: &<MetalBackend as crate::backend::Backend>::QuantStore,
+    weight: &MetalQuantStore,
     out: &mut <MetalBackend as crate::backend::Backend>::Buffer,
     m: usize,
 ) -> Result<()> {
