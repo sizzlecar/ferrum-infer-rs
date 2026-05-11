@@ -1072,6 +1072,27 @@ pub trait BackendQuantMarlin: Backend {
             "make_stacked_expert_linear not implemented for this backend",
         ))
     }
+
+    /// Phase C step 3: wrap a raw `Arc<Self::GptqStore>` into the
+    /// trait-object `MarlinExpertStack<Self>`. Lets callers go through
+    /// `store.gemm_phase_*` / `store.zero_workspace()` instead of
+    /// reaching into the per-backend `moe_gemm_phase_*` methods —
+    /// the eventual goal is to drop `type GptqStore` from this trait.
+    ///
+    /// Default returns unsupported. CUDA overrides with
+    /// `CudaMarlinExpertStack`. Backends without a stacked Marlin path
+    /// don't implement this; their model code falls back to per-expert
+    /// `Linear<B>` dispatch.
+    fn make_marlin_expert_stack(
+        _store: std::sync::Arc<Self::GptqStore>,
+        _num_experts: usize,
+        _n_per_expert: usize,
+        _k: usize,
+    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
+        Err(FerrumError::unsupported(
+            "make_marlin_expert_stack not implemented for this backend",
+        ))
+    }
     /// Bulk-zero the per-expert Marlin workspace mutex slots for a
     /// stacked GptqStore. Call ONCE before a batch of
     /// `gemm_gptq_with_offset_strided_no_ws_zero` calls — saves the

@@ -110,14 +110,31 @@ fn bucketed_matches_per_pair_dispatch() {
                 .expect("down StackedExpertLinear"),
         ));
     }
+    // Phase C step 3: ExpertStack now holds trait-object MarlinExpertStack
+    // (was Arc<B::GptqStore>). Build via the Backend constructor so the
+    // dispatch path goes through `store.gemm_phase_*` / `store.zero_workspace`.
+    let gate_up_stack = <CpuBackend as BackendQuantMarlin>::make_marlin_expert_stack(
+        gate_up_arc.clone(),
+        num_experts,
+        2 * inter,
+        hidden,
+    )
+    .expect("make_marlin_expert_stack gate_up");
+    let down_stack = <CpuBackend as BackendQuantMarlin>::make_marlin_expert_stack(
+        down_arc.clone(),
+        num_experts,
+        hidden,
+        inter,
+    )
+    .expect("make_marlin_expert_stack down");
     let experts = ExpertStack::<CpuBackend> {
         gate_up: gate_up_per_expert,
         down: down_per_expert,
         gate_stacked: None,
         up_stacked: None,
         down_stacked: None,
-        gate_up_gptq_stacked: Some(gate_up_arc.clone()),
-        down_gptq_stacked: Some(down_arc.clone()),
+        gate_up_marlin_stack: Some(gate_up_stack),
+        down_marlin_stack: Some(down_stack),
     };
 
     // Synthetic input + router logits.

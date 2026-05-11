@@ -823,6 +823,22 @@ impl BackendQuantMarlin for CudaBackend {
             },
         ))
     }
+
+    fn make_marlin_expert_stack(
+        store: std::sync::Arc<Self::GptqStore>,
+        num_experts: usize,
+        n_per_expert: usize,
+        k: usize,
+    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
+        Ok(std::sync::Arc::new(
+            crate::quant_linear::cuda_marlin_stack::CudaMarlinExpertStack::new(
+                store,
+                num_experts,
+                n_per_expert,
+                k,
+            ),
+        ))
+    }
     #[cfg(feature = "marlin")]
     fn moe_gemm_phase_batched(
         ctx: &mut Self::Context,
