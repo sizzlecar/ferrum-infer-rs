@@ -255,4 +255,79 @@ impl CudaBuf {
     pub fn from_i8(s: cudarc::driver::CudaSlice<i8>) -> Self {
         CudaBuf::I8(s)
     }
+
+    /// Forwarders that assume F16 — the common case for the existing
+    /// CUDA kernel call sites. Each panics on a non-F16 variant; the
+    /// migration to per-dtype-aware callsites is the rest of Phase B-2.
+    pub fn slice<R: std::ops::RangeBounds<usize>>(
+        &self,
+        range: R,
+    ) -> cudarc::driver::CudaView<'_, f16> {
+        self.as_f16().slice(range)
+    }
+    pub fn slice_mut<R: std::ops::RangeBounds<usize>>(
+        &mut self,
+        range: R,
+    ) -> cudarc::driver::CudaViewMut<'_, f16> {
+        self.as_f16_mut().slice_mut(range)
+    }
+    /// Forward to inner CudaSlice's device_ptr — only valid for F16
+    /// variant (panic otherwise). Used by kernel launch sites that
+    /// need a raw `(u64, _guard)` device pointer pair.
+    pub fn device_ptr<'a>(
+        &'a self,
+        stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> (u64, cudarc::driver::SyncOnDrop<'a>) {
+        use cudarc::driver::DevicePtr;
+        self.as_f16().device_ptr(stream)
+    }
+    pub fn device_ptr_mut<'a>(
+        &'a mut self,
+        stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> (u64, cudarc::driver::SyncOnDrop<'a>) {
+        use cudarc::driver::DevicePtrMut;
+        self.as_f16_mut().device_ptr_mut(stream)
+    }
+    /// Reinterpret the F16 buffer as another type. Used by paged_kv +
+    /// quant_linear code that allocates a `CudaSlice<f16>` and
+    /// reinterprets it (e.g. as i32 block tables before we had a typed
+    /// API). Phase B-2 keeps this so the migration is incremental;
+    /// future cleanup deletes callers that no longer need it.
+    pub unsafe fn transmute<T>(&self, len: usize) -> Option<cudarc::driver::CudaView<'_, T>> {
+        unsafe { self.as_f16().transmute(len) }
+    }
+}
+
+// Implement `PushKernelArg<&CudaBuf>` / `<&mut CudaBuf>` so existing
+// `launch_builder.arg(&buf)` callsites compile without changing each
+// to `.arg(buf.as_f16())`. Delegates to the inner CudaSlice's existing
+// `PushKernelArg<&CudaSlice<T>>` impl, dispatched on variant.
+#[cfg(feature = "cuda")]
+unsafe impl<'a, 'b: 'a> cudarc::driver::PushKernelArg<&'b CudaBuf>
+    for cudarc::driver::LaunchArgs<'a>
+{
+    fn arg(&mut self, arg: &'b CudaBuf) -> &mut Self {
+        match arg {
+            CudaBuf::F16(s) => self.arg(s),
+            CudaBuf::F32(s) => self.arg(s),
+            CudaBuf::U32(s) => self.arg(s),
+            CudaBuf::I32(s) => self.arg(s),
+            CudaBuf::I8(s) => self.arg(s),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl<'a, 'b: 'a> cudarc::driver::PushKernelArg<&'b mut CudaBuf>
+    for cudarc::driver::LaunchArgs<'a>
+{
+    fn arg(&mut self, arg: &'b mut CudaBuf) -> &mut Self {
+        match arg {
+            CudaBuf::F16(s) => self.arg(s),
+            CudaBuf::F32(s) => self.arg(s),
+            CudaBuf::U32(s) => self.arg(s),
+            CudaBuf::I32(s) => self.arg(s),
+            CudaBuf::I8(s) => self.arg(s),
+        }
+    }
 }
