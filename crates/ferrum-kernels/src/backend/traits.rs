@@ -844,36 +844,6 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
     fn from_slice(data: &[f32]) -> Self::Buffer;
 
-    /// Greedy sampling fast path: argmax over rows of `buf` shaped
-    /// `[n_rows, vocab]` (row-major), returning `n_rows` u32 indices.
-    ///
-    /// Replaces the heavier `to_vec` + host-side argmax for the
-    /// `temperature=0` case. Saves the n_rows × vocab × dtype bytes
-    /// device-to-host transfer (~8 MB at c=16 vocab=128k f16) and the
-    /// per-iter sample loop on host.
-    ///
-    /// Default implementation falls back to `to_vec` + host argmax so
-    /// non-CUDA backends still produce correct tokens. CUDA overrides
-    /// this with a kernel-launched on-device argmax.
-    fn argmax_rows_to_u32(buf: &Self::Buffer, n_rows: usize, vocab: usize) -> Vec<u32> {
-        let host = Self::to_vec(buf, n_rows * vocab);
-        let mut out = Vec::with_capacity(n_rows);
-        for r in 0..n_rows {
-            let base = r * vocab;
-            let mut best_v = f32::NEG_INFINITY;
-            let mut best_i: u32 = 0;
-            for j in 0..vocab {
-                let v = host[base + j];
-                if v > best_v {
-                    best_v = v;
-                    best_i = j as u32;
-                }
-            }
-            out.push(best_i);
-        }
-        out
-    }
-
     /// Load a weight tensor straight from its on-disk byte representation,
     /// letting the backend pick its preferred storage dtype.
     ///

@@ -52,7 +52,6 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/gelu.cu");
     println!("cargo:rerun-if-changed=kernels/decode_attention_hm.cu");
     println!("cargo:rerun-if-changed=kernels/gather_columns.cu");
-    println!("cargo:rerun-if-changed=kernels/argmax_rows.cu");
     println!("cargo:rerun-if-changed=kernels/moe_combine.cu");
     println!("cargo:rerun-if-changed=kernels/moe_router.cu");
     println!("cargo:rerun-if-changed=kernels/moe_align_block_size.cu");
@@ -93,7 +92,6 @@ fn main() {
             "kernels/gelu.cu",
             "kernels/decode_attention_hm.cu",
             "kernels/gather_columns.cu",
-            "kernels/argmax_rows.cu",
             "kernels/moe_combine.cu",
             "kernels/moe_router.cu",
             "kernels/moe_align_block_size.cu",

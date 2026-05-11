@@ -11,6 +11,9 @@ pub use traits::*;
 mod kv_layer;
 pub use kv_layer::*;
 
+pub mod dtype;
+pub use dtype::Dtype;
+
 pub mod cpu;
 
 #[cfg(feature = "metal")]

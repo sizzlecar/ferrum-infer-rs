@@ -212,20 +212,10 @@ pub fn end_frame_capture() {
 /// Element storage type for a [`MetalBuf`]. Same shape generalises to INT8
 /// / bf16 etc. when their shaders land — just add a variant + wire it in
 /// the op dispatches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Dtype {
-    F32,
-    F16,
-}
-
-impl Dtype {
-    pub const fn bytes_per_elem(self) -> usize {
-        match self {
-            Dtype::F32 => 4,
-            Dtype::F16 => 2,
-        }
-    }
-}
+// Phase A: Dtype moved to `crate::backend::dtype::Dtype` (shared across
+// CPU/CUDA/Metal). Re-export here so existing `metal::Dtype` users keep
+// working without touching them.
+pub use super::dtype::Dtype;
 
 /// Metal device buffer with a runtime dtype tag and logical element count.
 ///
@@ -1028,6 +1018,14 @@ impl Backend for MetalBackend {
                     st().pipes.gemm_v2(enc, a_buf, &b.raw, out_buf, m, n, k);
                 }
             }
+            // Phase A: integer dtypes are reserved for the upcoming typed-
+            // buffer migration (alloc_u32 / write_u32 / from_slice_i32 →
+            // typed-buffer alloc + write). No caller creates an integer
+            // MetalBuf yet, so reaching this arm = caller bug.
+            other => panic!(
+                "MetalBackend::gemm: b.dtype = {} unsupported (only F16 / F32)",
+                other.name()
+            ),
         }
     }
 
@@ -1168,6 +1166,10 @@ impl Backend for MetalBackend {
                         }
                     }
                 }
+                other => panic!(
+                    "MetalBackend::embedding_lookup: table.dtype = {} unsupported",
+                    other.name()
+                ),
             }
         }
     }
@@ -1474,6 +1476,10 @@ impl Backend for MetalBackend {
                 let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
                 slice.iter().map(|h| h.to_f32()).collect()
             }
+            other => panic!(
+                "MetalBackend::to_vec: buf.dtype = {} unsupported (expected F32 or F16)",
+                other.name()
+            ),
         }
     }
 
