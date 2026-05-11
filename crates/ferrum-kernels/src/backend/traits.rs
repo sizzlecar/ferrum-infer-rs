@@ -701,12 +701,21 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// [`Self::alloc_u32`]. Used for live block_tables / context_lens
     /// updates between decode steps.
     ///
-    /// Default: reads back, mutates host-side, writes back. Metal
-    /// backend overrides with a direct memcpy on the StorageModeShared
-    /// buffer.
-    fn write_u32(_ctx: &mut Self::Context, _dst: &mut Self::Buffer, _data: &[u32]) {
-        // No-op default — most backends won't exercise this path until
-        // they implement paged_decode_attention.
+    /// Default: **panics** — backends MUST override if they support
+    /// paged-KV / batched decode (any path that writes block tables,
+    /// context lens, pos offsets, expert ids, or other u32 scratch).
+    /// The old no-op default was a silent-failure footgun: a backend
+    /// that forgot to override would have callers writing into a
+    /// buffer that stayed zero-initialised, producing garbage output
+    /// at the next read with NO error surfaced. Today CUDA and Metal
+    /// both override; CPU doesn't (CPU has no paged-KV impl either).
+    fn write_u32(_ctx: &mut Self::Context, _dst: &mut Self::Buffer, data: &[u32]) {
+        panic!(
+            "Backend::write_u32 default invoked for backend `{}` — data.len()={} would silently \
+             not be written. Backends that allocate u32 scratch via `alloc_u32` MUST override.",
+            std::any::type_name::<Self>(),
+            data.len()
+        );
     }
 
     /// Append new K/V into a pre-allocated head-major cache buffer.
