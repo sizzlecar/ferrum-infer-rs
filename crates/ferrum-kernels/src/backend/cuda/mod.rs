@@ -487,10 +487,16 @@ impl Backend for CudaBackend {
             return;
         }
         let stream = ctx.stream.clone();
-        // Route through cudarc's stream.memcpy_htod on ctx.stream +
-        // synchronize: stream-ordered against subsequent kernel launches
-        // (the cuMemcpyHtoD_v2-on-NULL-stream race that bit us during
-        // B-2 is fixed here too).
+        // memcpy_htod is enqueued on ctx.stream — stream-ordered against
+        // subsequent kernel launches on the same stream. No explicit
+        // synchronize: (1) cudarc's stream_synced_slice handles host-Vec
+        // lifetime so we can drop `data` immediately, and (2) explicit
+        // sync inside a CUDA-graph capture region raises
+        // CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED — must not call it here
+        // when callers are inside `B::begin_graph_capture()`. The earlier
+        // sync was belt-and-suspenders for the kv_cache_append parity
+        // test; that test's actual fix was switching off the legacy
+        // NULL-stream cuMemcpyHtoD_v2, not the sync.
         match T::DTYPE {
             Dtype::U32 => {
                 let host: &[u32] = unsafe {
@@ -528,7 +534,6 @@ impl Backend for CudaBackend {
                 stream.memcpy_htod(host, d).expect("cuda write_typed i8");
             }
         }
-        stream.synchronize().expect("cuda sync after write_typed");
     }
 
     fn sync(ctx: &mut Self::Context) {
