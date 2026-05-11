@@ -105,9 +105,13 @@ fn paged_varlen_split_k_dispatch(
     k_pool: &CudaSlice<f16>,
     v_pool: &CudaSlice<f16>,
     out: &mut CudaSlice<f16>,
-    cu_seqlens_q: &CudaSlice<f16>,
-    pos_offsets: &CudaSlice<f16>,
-    block_tables: &CudaSlice<f16>,
+    // Integer scratch: post-B-2 these come from `alloc_u32` → typed
+    // `CudaSlice<u32>` storage. Old signature was `&CudaSlice<f16>`
+    // (bit-tunnel through the f16-typed buffer) — kernels read these
+    // as `int*` regardless, so the wire-level behavior is unchanged.
+    cu_seqlens_q: &CudaSlice<u32>,
+    pos_offsets: &CudaSlice<u32>,
+    block_tables: &CudaSlice<u32>,
     num_seqs: usize,
     total_q_tokens: usize,
     max_kv_len: usize,
@@ -240,8 +244,10 @@ fn paged_batched_flash_dispatch(
     k_pool: &CudaSlice<f16>,
     v_pool: &CudaSlice<f16>,
     out: &mut CudaSlice<f16>,
-    block_tables: &CudaSlice<f16>,
-    valid_kv_lens: &CudaSlice<f16>,
+    // See paged_varlen_split_k_dispatch — block_tables / valid_kv_lens
+    // are u32 storage after B-2 (was f16-bit-tunneled).
+    block_tables: &CudaSlice<u32>,
+    valid_kv_lens: &CudaSlice<u32>,
     num_seqs: usize,
     max_kv_len: usize,
     num_heads: usize,
@@ -644,9 +650,9 @@ impl BackendPagedKv for CudaBackend {
                 k_pool.as_f16(),
                 v_pool.as_f16(),
                 out.as_f16_mut(),
-                cu_seqlens_q.as_f16(),
-                pos_offsets.as_f16(),
-                block_tables.as_f16(),
+                cu_seqlens_q.as_u32(),
+                pos_offsets.as_u32(),
+                block_tables.as_u32(),
                 num_seqs,
                 total_q_tokens,
                 max_kv_len,
@@ -665,17 +671,17 @@ impl BackendPagedKv for CudaBackend {
         );
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
-        // CudaBackend::Buffer is monomorphic CudaSlice<f16>; i32 data
+        // After B-2 typed-buffer migration: integer scratch
         // (cu_seqlens_q / pos_offsets / block_tables) is stored in
-        // f16-typed buffers via `from_slice_i32` + matching alloc, the
-        // kernel reads them as `int*`. Same pattern as kv_lens in
-        // `flash_attention_batched_per_cache`.
+        // CudaBuf::U32, the kernel reads them as `int*` — same wire-level
+        // behavior as the prior f16-bit-tunneled layout but with a
+        // dtype tag that prevents byte-count miscalculation.
         let qv = q.slice(..);
         let kp = k_pool.slice(..);
         let vp = v_pool.slice(..);
-        let csq = cu_seqlens_q.slice(..);
-        let po = pos_offsets.slice(..);
-        let bt = block_tables.slice(..);
+        let csq = cu_seqlens_q.as_u32().slice(..);
+        let po = pos_offsets.as_u32().slice(..);
+        let bt = block_tables.as_u32().slice(..);
         let ns = num_seqs as i32;
         let nqi = num_heads as i32;
         let nkvi = num_kv_heads as i32;
@@ -920,8 +926,8 @@ impl BackendPagedKv for CudaBackend {
                 k_pool.as_f16(),
                 v_pool.as_f16(),
                 out.as_f16_mut(),
-                block_tables.as_f16(),
-                valid_kv_lens.as_f16(),
+                block_tables.as_u32(),
+                valid_kv_lens.as_u32(),
                 num_seqs,
                 max_kv_len,
                 num_heads,
@@ -942,8 +948,10 @@ impl BackendPagedKv for CudaBackend {
         let qv = q.slice(..);
         let kp = k_pool.slice(..);
         let vp = v_pool.slice(..);
-        let bt = block_tables.slice(..);
-        let kvl = valid_kv_lens.slice(..);
+        // block_tables / valid_kv_lens are CudaBuf::U32 (typed since B-2);
+        // slice the U32 variant to give the kernel an int* it can read.
+        let bt = block_tables.as_u32().slice(..);
+        let kvl = valid_kv_lens.as_u32().slice(..);
         let nqi = num_heads as i32;
         let nkvi = num_kv_heads as i32;
         let hdi = head_dim as i32;

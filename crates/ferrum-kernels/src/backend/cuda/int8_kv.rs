@@ -187,8 +187,10 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         block_size: usize,
         scale: f32,
     ) -> Result<()> {
-        // block_table is stored as f16 but holds i32 (alloc_u32 doubles
-        // bytes). Reinterpret to i32 view of length max_blocks_per_seq.
+        // block_table is CudaBuf::U32 (typed since B-2). The launch
+        // function takes `&CudaView<i32>` — same byte pattern, signed
+        // view; transmute on CudaBuf dispatches to the U32 variant's
+        // CudaSlice::transmute which reinterprets u32→i32 1:1.
         let n_blocks = valid_kv_len.div_ceil(block_size).max(1);
         let bt_i32_view = unsafe {
             block_table
