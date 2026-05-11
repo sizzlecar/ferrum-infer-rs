@@ -823,105 +823,70 @@ impl BackendQuantMarlin for CudaBackend {
             ),
         ))
     }
-    #[cfg(feature = "marlin")]
-    fn moe_gemm_phase_batched(
-        ctx: &mut Self::Context,
-        input: &Self::Buffer,
-        weight: &Self::GptqStore,
-        dispatches: &[(usize, usize, usize, usize)],
-        n_per_expert: usize,
-        output: &mut Self::Buffer,
-        k: usize,
-    ) -> Result<()> {
-        #[cfg(feature = "triton-kernels")]
-        let mw = match weight {
-            GptqStoreCuda::Marlin(mw) => mw,
-            GptqStoreCuda::Triton(_) => {
-                return Err(FerrumError::unsupported(
-                    "moe_gemm_phase_batched: Triton w4a16 not supported",
-                ));
-            }
-        };
-        #[cfg(not(feature = "triton-kernels"))]
-        let mw: &crate::marlin::MarlinWeight = weight;
+    // Phase C step 4a: marlin_zero_stacked_workspace inlined into
+    // CudaMarlinExpertStack::zero_workspace (quant_linear/cuda_marlin_stack.rs).
+    // Phase C step 4c/4d: moe_gemm_phase_batched / moe_gemm_phase_vllm
+    // moved to free functions below + inlined into the trait-object impl.
+}
 
-        // ── Stage 12.1: fused MoE Marlin path (default ON) ──────────────
-        // Dispatches all experts in this phase as a small number of
-        // bucketed `marlin_gemm_moe` launches (one per thread_m_blocks
-        // bucket ∈ {1, 2, 3, 4}) instead of N round-robin calls. At c=32
-        // with ~100 active experts/layer this is 1-4 launches/layer
-        // instead of 100. Bench: +25% c=32, +35% c=16, +48% c=8 over
-        // the multi-stream per-expert path. Set FERRUM_MOE_FUSED=0 to
-        // opt out (fall back to multi-stream pool).
-        if std::env::var("FERRUM_MOE_FUSED").map_or(true, |v| v != "0") {
-            return moe_gemm_phase_fused_impl(
-                ctx,
-                input.as_f16(),
-                mw,
-                dispatches,
-                n_per_expert,
-                output.as_f16_mut(),
-                k,
-            );
+/// Free-function moved out of `BackendQuantMarlin::moe_gemm_phase_batched`
+/// (Phase C step 4c). Bucketed/multi-stream per-expert Marlin GEMM
+/// dispatch. Called by `CudaMarlinExpertStack::gemm_phase_batched`.
+#[cfg(feature = "marlin")]
+pub(crate) fn moe_gemm_phase_batched_impl(
+    ctx: &mut CudaState,
+    input: &<CudaBackend as crate::backend::Backend>::Buffer,
+    weight: &GptqStoreCuda,
+    dispatches: &[(usize, usize, usize, usize)],
+    n_per_expert: usize,
+    output: &mut <CudaBackend as crate::backend::Backend>::Buffer,
+    k: usize,
+) -> Result<()> {
+    #[cfg(feature = "triton-kernels")]
+    let mw = match weight {
+        GptqStoreCuda::Marlin(mw) => mw,
+        GptqStoreCuda::Triton(_) => {
+            return Err(FerrumError::unsupported(
+                "moe_gemm_phase_batched: Triton w4a16 not supported",
+            ));
         }
+    };
+    #[cfg(not(feature = "triton-kernels"))]
+    let mw: &crate::marlin::MarlinWeight = weight;
 
-        // n_streams=1: serial dispatch on the DEFAULT context stream
-        // (avoids the cross-stream sync overhead and matches the
-        // pre-multi-stream path bit-for-bit).
-        let n_streams = std::env::var("FERRUM_MOE_STREAMS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(4)
-            .max(1);
-        if n_streams == 1 {
-            let default_stream = ctx.stream.clone();
-            for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
-                crate::marlin::marlin_gemm_with_offset_strided(
-                    &default_stream,
-                    input.as_f16(),
-                    *in_row_offset as i32,
-                    mw,
-                    output.as_f16_mut(),
-                    *out_row_offset as i32,
-                    *m as i32,
-                    (expert_idx * n_per_expert) as i32,
-                    n_per_expert as i32,
-                )
-                .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
-            }
-            let _ = k;
-            return Ok(());
-        }
+    // ── Stage 12.1: fused MoE Marlin path (default ON) ──────────────
+    // Dispatches all experts in this phase as a small number of
+    // bucketed `marlin_gemm_moe` launches (one per thread_m_blocks
+    // bucket ∈ {1, 2, 3, 4}) instead of N round-robin calls. At c=32
+    // with ~100 active experts/layer this is 1-4 launches/layer
+    // instead of 100. Bench: +25% c=32, +35% c=16, +48% c=8 over
+    // the multi-stream per-expert path. Set FERRUM_MOE_FUSED=0 to
+    // opt out (fall back to multi-stream pool).
+    if std::env::var("FERRUM_MOE_FUSED").map_or(true, |v| v != "0") {
+        return moe_gemm_phase_fused_impl(
+            ctx,
+            input.as_f16(),
+            mw,
+            dispatches,
+            n_per_expert,
+            output.as_f16_mut(),
+            k,
+        );
+    }
 
-        // n_streams ≥ 2: round-robin across the pool, then ALL streams
-        // wait for the default's prior work (cuStreamWaitEvent on an
-        // event recorded into default), and the default waits for ALL
-        // pool streams before returning. Without this cross-stream
-        // sync, silu_mul on default may run before pool GEMMs commit
-        // → races → junk output.
-        //
-        // The 1 + N events are persistent on `CudaState` — re-recording
-        // an event silently overwrites the prior recording, so per-call
-        // create+destroy is replaced with record+wait only. At c=32 /
-        // 48 layers / 2 phases that's ~960 driver calls saved per token.
-        let (entry_event, exit_events) = ctx.moe_sync_events();
-        let pool: Vec<Arc<CudaStream>> = ctx.moe_stream_pool().to_vec();
+    // n_streams=1: serial dispatch on the DEFAULT context stream
+    // (avoids the cross-stream sync overhead and matches the
+    // pre-multi-stream path bit-for-bit).
+    let n_streams = std::env::var("FERRUM_MOE_STREAMS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1);
+    if n_streams == 1 {
         let default_stream = ctx.stream.clone();
-        use cudarc::driver::sys as cu;
-        // Default → pool: record on default, each pool waits.
-        unsafe {
-            cu::cuEventRecord(entry_event, default_stream.cu_stream());
-        }
-        for stream in &pool {
-            unsafe {
-                cu::cuStreamWaitEvent(stream.cu_stream(), entry_event, 0);
-            }
-        }
-
-        for (i, (expert_idx, in_row_offset, out_row_offset, m)) in dispatches.iter().enumerate() {
-            let stream = &pool[i % n_streams];
+        for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
             crate::marlin::marlin_gemm_with_offset_strided(
-                stream,
+                &default_stream,
                 input.as_f16(),
                 *in_row_offset as i32,
                 mw,
@@ -933,111 +898,136 @@ impl BackendQuantMarlin for CudaBackend {
             )
             .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
         }
-
-        // pool → default: each pool stream records its exit event;
-        // default waits for all of them. After return, default's next
-        // op (silu) will see all GEMM outputs committed.
         let _ = k;
-        debug_assert_eq!(
-            exit_events.len(),
-            pool.len(),
-            "moe_sync_events exit count != pool size"
-        );
-        for (i, stream) in pool.iter().enumerate() {
-            unsafe {
-                cu::cuEventRecord(exit_events[i], stream.cu_stream());
-            }
-        }
-        for ev in &exit_events {
-            unsafe {
-                cu::cuStreamWaitEvent(default_stream.cu_stream(), *ev, 0);
-            }
-        }
-        Ok(())
+        return Ok(());
     }
-    #[cfg(feature = "vllm-moe-marlin")]
-    fn moe_gemm_phase_vllm(
-        ctx: &mut Self::Context,
-        input: &Self::Buffer,
-        weight: &Self::GptqStore,
-        sorted_token_ids: &Self::Buffer,
-        expert_ids: &Self::Buffer,
-        num_tokens_past_padded: &Self::Buffer,
-        output: &mut Self::Buffer,
-        prob_m: usize,
-        n_per_expert: usize,
-        k: usize,
-        moe_block_size: usize,
-        top_k: usize,
-    ) -> Result<()> {
-        #[cfg(feature = "triton-kernels")]
-        let mw = match weight {
-            GptqStoreCuda::Marlin(mw) => mw,
-            GptqStoreCuda::Triton(_) => {
-                return Err(FerrumError::unsupported(
-                    "moe_gemm_phase_vllm: Triton store unsupported",
-                ));
-            }
-        };
-        #[cfg(not(feature = "triton-kernels"))]
-        let mw: &crate::marlin::MarlinWeight = weight;
 
-        // sorted_token_ids / expert_ids / num_tokens_past_padded are i32
-        // device buffers handed in as Self::Buffer (= CudaSlice<f16>).
-        // The marlin_gemm_moe_vllm wrapper uses CudaSlice<i32>, so we
-        // reinterpret each view via upgrade_device_ptr. The view length
-        // is irrelevant — the kernel reads via raw device pointers — so
-        // we hand it `0` to make the leakage cost explicit.
-        use cudarc::driver::sys::CUdeviceptr;
-        use cudarc::driver::CudaSlice;
-        use cudarc::driver::DevicePtr;
+    // n_streams ≥ 2: round-robin across the pool, then ALL streams
+    // wait for the default's prior work (cuStreamWaitEvent on an
+    // event recorded into default), and the default waits for ALL
+    // pool streams before returning. Without this cross-stream
+    // sync, silu_mul on default may run before pool GEMMs commit
+    // → races → junk output.
+    //
+    // The 1 + N events are persistent on `CudaState` — re-recording
+    // an event silently overwrites the prior recording, so per-call
+    // create+destroy is replaced with record+wait only. At c=32 /
+    // 48 layers / 2 phases that's ~960 driver calls saved per token.
+    let (entry_event, exit_events) = ctx.moe_sync_events();
+    let pool: Vec<Arc<CudaStream>> = ctx.moe_stream_pool().to_vec();
+    let default_stream = ctx.stream.clone();
+    use cudarc::driver::sys as cu;
+    // Default → pool: record on default, each pool waits.
+    unsafe {
+        cu::cuEventRecord(entry_event, default_stream.cu_stream());
+    }
+    for stream in &pool {
+        unsafe {
+            cu::cuStreamWaitEvent(stream.cu_stream(), entry_event, 0);
+        }
+    }
 
-        // Stream is Arc<CudaStream>, so cloning it doesn't borrow ctx and
-        // we can subsequently take &mut for the c_tmp helper.
-        let stream = ctx.stream.clone();
-        // Resolve c_tmp scratch (lazy-allocates 8 MB on first call). The
-        // wrapper takes &mut so it can forward the device pointer; the
-        // kernel uses c_tmp as a global fp32 reduce scratch
-        // (use_fp32_reduce=1 path, ~1.3-1.5× faster than atomic_add).
-        let c_tmp_mut: &mut CudaSlice<f32> = ctx.vllm_moe_c_tmp();
-
-        let (st_ptr, _g0) = sorted_token_ids.device_ptr(&stream);
-        let (eid_ptr, _g1) = expert_ids.device_ptr(&stream);
-        let (npp_ptr, _g2) = num_tokens_past_padded.device_ptr(&stream);
-        let st_view: CudaSlice<i32> =
-            unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
-        let eid_view: CudaSlice<i32> =
-            unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
-        let npp_view: CudaSlice<i32> =
-            unsafe { stream.upgrade_device_ptr(npp_ptr as CUdeviceptr, 0) };
-
-        let r = crate::marlin::marlin_gemm_moe_vllm(
-            &stream,
-            input,
+    for (i, (expert_idx, in_row_offset, out_row_offset, m)) in dispatches.iter().enumerate() {
+        let stream = &pool[i % n_streams];
+        crate::marlin::marlin_gemm_with_offset_strided(
+            stream,
+            input.as_f16(),
+            *in_row_offset as i32,
             mw,
-            output,
-            Some(c_tmp_mut), // fp32_reduce path (atomic_add fallback if None)
-            &st_view,
-            &eid_view,
-            &npp_view,
-            None, // topk_weights
-            moe_block_size as i32,
-            top_k as i32,
-            false, // mul_topk_weights
-            false, // is_ep
-            prob_m as i32,
+            output.as_f16_mut(),
+            *out_row_offset as i32,
+            *m as i32,
+            (expert_idx * n_per_expert) as i32,
             n_per_expert as i32,
-            k as i32,
-        );
-        // Views borrow the original device allocations; forgetting prevents
-        // double-free at scope end.
-        std::mem::forget(st_view);
-        std::mem::forget(eid_view);
-        std::mem::forget(npp_view);
-        r.map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
+        )
+        .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
     }
-    // Phase C step 4a: marlin_zero_stacked_workspace inlined into
-    // CudaMarlinExpertStack::zero_workspace (quant_linear/cuda_marlin_stack.rs).
+
+    let _ = k;
+    debug_assert_eq!(
+        exit_events.len(),
+        pool.len(),
+        "moe_sync_events exit count != pool size"
+    );
+    for (i, stream) in pool.iter().enumerate() {
+        unsafe {
+            cu::cuEventRecord(exit_events[i], stream.cu_stream());
+        }
+    }
+    for ev in &exit_events {
+        unsafe {
+            cu::cuStreamWaitEvent(default_stream.cu_stream(), *ev, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Free-function moved out of `BackendQuantMarlin::moe_gemm_phase_vllm`
+/// (Phase C step 4d). Fused vLLM `marlin_moe_wna16` dispatch.
+/// Called by `CudaMarlinExpertStack::gemm_phase_vllm`.
+#[cfg(feature = "vllm-moe-marlin")]
+pub(crate) fn moe_gemm_phase_vllm_impl(
+    ctx: &mut CudaState,
+    input: &<CudaBackend as crate::backend::Backend>::Buffer,
+    weight: &GptqStoreCuda,
+    sorted_token_ids: &<CudaBackend as crate::backend::Backend>::Buffer,
+    expert_ids: &<CudaBackend as crate::backend::Backend>::Buffer,
+    num_tokens_past_padded: &<CudaBackend as crate::backend::Backend>::Buffer,
+    output: &mut <CudaBackend as crate::backend::Backend>::Buffer,
+    prob_m: usize,
+    n_per_expert: usize,
+    k: usize,
+    moe_block_size: usize,
+    top_k: usize,
+) -> Result<()> {
+    #[cfg(feature = "triton-kernels")]
+    let mw = match weight {
+        GptqStoreCuda::Marlin(mw) => mw,
+        GptqStoreCuda::Triton(_) => {
+            return Err(FerrumError::unsupported(
+                "moe_gemm_phase_vllm: Triton store unsupported",
+            ));
+        }
+    };
+    #[cfg(not(feature = "triton-kernels"))]
+    let mw: &crate::marlin::MarlinWeight = weight;
+
+    use cudarc::driver::sys::CUdeviceptr;
+    use cudarc::driver::CudaSlice;
+    use cudarc::driver::DevicePtr;
+
+    let stream = ctx.stream.clone();
+    let c_tmp_mut: &mut CudaSlice<f32> = ctx.vllm_moe_c_tmp();
+
+    let (st_ptr, _g0) = sorted_token_ids.device_ptr(&stream);
+    let (eid_ptr, _g1) = expert_ids.device_ptr(&stream);
+    let (npp_ptr, _g2) = num_tokens_past_padded.device_ptr(&stream);
+    let st_view: CudaSlice<i32> = unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
+    let eid_view: CudaSlice<i32> = unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
+    let npp_view: CudaSlice<i32> = unsafe { stream.upgrade_device_ptr(npp_ptr as CUdeviceptr, 0) };
+
+    let r = crate::marlin::marlin_gemm_moe_vllm(
+        &stream,
+        input,
+        mw,
+        output,
+        Some(c_tmp_mut),
+        &st_view,
+        &eid_view,
+        &npp_view,
+        None,
+        moe_block_size as i32,
+        top_k as i32,
+        false,
+        false,
+        prob_m as i32,
+        n_per_expert as i32,
+        k as i32,
+    );
+    std::mem::forget(st_view);
+    std::mem::forget(eid_view);
+    std::mem::forget(npp_view);
+    r.map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
 }
 // CUDA does not ship GGUF k-quant kernels; inherit unsupported defaults.
 impl BackendQuantGguf for CudaBackend {}
