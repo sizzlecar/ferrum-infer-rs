@@ -298,17 +298,17 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
             down_out_stacked: B::alloc(t * cfg.num_experts_per_tok * h),
             x_packed_bucket: B::alloc(t * cfg.num_experts_per_tok * h),
             gate_up_packed_bucket: B::alloc(t * cfg.num_experts_per_tok * 2 * inter),
-            ids_buf: B::from_slice_i32(&vec![0i32; cfg.num_experts_per_tok]),
+            ids_buf: B::from_slice_typed::<i32>(&vec![0i32; cfg.num_experts_per_tok]),
             weights_buf: B::from_slice(&vec![0.0f32; cfg.num_experts_per_tok]),
-            selected_ids_buf: B::from_slice_i32(&vec![0i32; t * cfg.num_experts_per_tok]),
+            selected_ids_buf: B::from_slice_typed::<i32>(&vec![0i32; t * cfg.num_experts_per_tok]),
             // 3 u32s per indirect args buffer; allocated as 3 i32s so we
             // can reuse `from_slice_i32`. The kernel writes them as
             // `device uint *` and the bit pattern is consumed by
             // `dispatch_thread_groups_indirect`.
-            gate_up_args_buf: B::from_slice_i32(&[0i32, 0, 0]),
-            down_args_buf: B::from_slice_i32(&[0i32, 0, 0]),
-            ids_2d: B::from_slice_i32(&vec![0i32; n_exp * t * cfg.num_experts_per_tok]),
-            tpe_buf: B::from_slice_i32(&vec![0i32; n_exp]),
+            gate_up_args_buf: B::from_slice_typed::<i32>(&[0i32, 0, 0]),
+            down_args_buf: B::from_slice_typed::<i32>(&[0i32, 0, 0]),
+            ids_2d: B::from_slice_typed::<i32>(&vec![0i32; n_exp * t * cfg.num_experts_per_tok]),
+            tpe_buf: B::from_slice_typed::<i32>(&vec![0i32; n_exp]),
             weights_2d: B::from_slice(&vec![0.0f32; t * cfg.num_experts_per_tok]),
             last_hidden: B::alloc(h),
             last_normed: B::alloc(h),
@@ -351,14 +351,14 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
         let q_dim = cfg.base.num_heads * cfg.base.head_dim;
         self.paged_batch_q = Some(B::alloc(max_seqs * q_dim));
         self.paged_batch_o = Some(B::alloc(max_seqs * q_dim));
-        self.paged_batch_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
-        self.paged_batch_context_lens = Some(B::alloc_u32(max_seqs));
-        self.paged_batch_pos_offsets = Some(B::alloc_u32(max_seqs));
+        self.paged_batch_block_tables = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs * max_blocks_per_seq));
+        self.paged_batch_context_lens = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs));
+        self.paged_batch_pos_offsets = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs));
         // cu_seqlens_q is constant [0, 1, 2, ..., max_seqs] for batched
         // decode (q_len=1 per seq) — pre-fill once via a "context" we can
         // borrow temporarily; if the writer needs ctx, we lazy-init at
         // first call instead.
-        self.paged_batch_cu_seqlens_q = Some(B::alloc_u32(max_seqs + 1));
+        self.paged_batch_cu_seqlens_q = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs + 1));
         self.paged_max_blocks_per_seq = max_blocks_per_seq;
     }
 
@@ -821,11 +821,11 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                         // Paged mode: cache holds metadata only. K/V are
                         // 1-element placeholders. Real data lives in
                         // `self.paged_pools[li].{k,v}`.
-                        let mut block_table = B::alloc_u32(max_blocks_per_seq);
+                        let mut block_table = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
                         let _ = &mut block_table; // suppress unused-mut on backends that no-op write_u32
-                        let mut context_lens = B::alloc_u32(1);
+                        let mut context_lens = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, 1);
                         let mut bt_ctx = B::new_context();
-                        B::write_u32(&mut bt_ctx, &mut context_lens, &[0u32]);
+                        B::write_typed::<u32>(&mut bt_ctx, &mut context_lens, &[0u32]);
                         B::sync(&mut bt_ctx);
                         KvCache {
                             k: B::alloc(1),
@@ -885,7 +885,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let mut ctx_tmp = B::new_context();
             for c in caches.iter_mut() {
                 if let Some(bt) = c.block_table.as_mut() {
-                    B::write_u32(&mut ctx_tmp, bt, &padded);
+                    B::write_typed::<u32>(&mut ctx_tmp, bt, &padded);
                 }
                 c.paged_block_indices = block_indices.clone();
             }
@@ -896,7 +896,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             c.len = 0;
             if let Some(cl) = c.context_lens.as_mut() {
                 let mut ctx_tmp = B::new_context();
-                B::write_u32(&mut ctx_tmp, cl, &[0u32]);
+                B::write_typed::<u32>(&mut ctx_tmp, cl, &[0u32]);
                 B::sync(&mut ctx_tmp);
             }
         }
@@ -1193,7 +1193,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let pool_k = unsafe { &*pool_k_ptr };
             let pool_v = unsafe { &*pool_v_ptr };
             let final_kv_len = cache.len as u32;
-            B::write_u32(ctx, cl_buf, &[final_kv_len]);
+            B::write_typed::<u32>(ctx, cl_buf, &[final_kv_len]);
             B::paged_decode_attention(
                 ctx,
                 &self.scratch.q_head_major,
@@ -2125,25 +2125,25 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 .paged_batch_block_tables
                 .as_mut()
                 .expect("paged_batch_block_tables missing");
-            B::write_u32(ctx, bt_buf, &stacked_bt);
+            B::write_typed::<u32>(ctx, bt_buf, &stacked_bt);
             let cl_buf = self
                 .scratch
                 .paged_batch_context_lens
                 .as_mut()
                 .expect("paged_batch_context_lens missing");
-            B::write_u32(ctx, cl_buf, &stacked_cl);
+            B::write_typed::<u32>(ctx, cl_buf, &stacked_cl);
             let pos_buf = self
                 .scratch
                 .paged_batch_pos_offsets
                 .as_mut()
                 .expect("paged_batch_pos_offsets missing");
-            B::write_u32(ctx, pos_buf, &pos_offsets_host);
+            B::write_typed::<u32>(ctx, pos_buf, &pos_offsets_host);
             let cu_buf = self
                 .scratch
                 .paged_batch_cu_seqlens_q
                 .as_mut()
                 .expect("paged_batch_cu_seqlens_q missing");
-            B::write_u32(ctx, cu_buf, &cu_seqlens_host);
+            B::write_typed::<u32>(ctx, cu_buf, &cu_seqlens_host);
 
             // Step 3: write K/V into the shared pool + RoPE'd Q into
             // paged_batch_q at offset i × q_dim. Two code paths:

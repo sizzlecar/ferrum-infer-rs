@@ -97,8 +97,8 @@ fn flash_attn_batched_matches_per_item() {
 
     // Batched: 1 call for m items
     let kv_lens_h: Vec<u32> = vec![VALID_KV as u32; M];
-    let mut kv_lens_dev = CudaBackend::alloc_u32(M);
-    CudaBackend::write_u32(&mut ctx, &mut kv_lens_dev, &kv_lens_h);
+    let mut kv_lens_dev = CudaBackend::alloc_typed(ferrum_kernels::backend::Dtype::U32, M);
+    CudaBackend::write_typed::<u32>(&mut ctx, &mut kv_lens_dev, &kv_lens_h);
     let mut out_batched_dev = CudaBackend::alloc(M * NH * HD);
     let k_caches: Vec<&_> = vec![&k0_dev, &k1_dev];
     let v_caches: Vec<&_> = vec![&v0_dev, &v1_dev];

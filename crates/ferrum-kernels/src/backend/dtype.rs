@@ -55,3 +55,31 @@ impl Dtype {
         }
     }
 }
+
+/// Marker trait connecting a host element type `T` to its runtime
+/// `Dtype` tag. Used by the typed Backend allocator + uploader so the
+/// trait surface has ONE `alloc_typed(Dtype, n)` /
+/// `from_slice_typed<T>(&[T])` / `write_typed<T>(buf, &[T])` instead
+/// of the per-dtype-named family (`alloc_u32`, `from_slice_i32`,
+/// `write_i32_into`, `write_f32_into`, ...).
+///
+/// Implemented for all dtypes that backends store in `Self::Buffer`.
+pub trait HostDtype: Copy + Send + Sync + 'static {
+    const DTYPE: Dtype;
+}
+
+impl HostDtype for u32 {
+    const DTYPE: Dtype = Dtype::U32;
+}
+impl HostDtype for i32 {
+    const DTYPE: Dtype = Dtype::I32;
+}
+impl HostDtype for f32 {
+    const DTYPE: Dtype = Dtype::F32;
+}
+impl HostDtype for half::f16 {
+    const DTYPE: Dtype = Dtype::F16;
+}
+impl HostDtype for i8 {
+    const DTYPE: Dtype = Dtype::I8;
+}
