@@ -404,57 +404,131 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn alloc_u32(n: usize) -> Self::Buffer {
-        // With typed CudaBuf, the legacy under-allocation hazard (f16
-        // backing for u32 data) goes away — store as `CudaBuf::U32`
-        // and callers' `.as_u32_mut()` / typed writes hit the right
-        // bytes. Pre-typed-buffer code allocated `2*n` f16 elements
-        // to hit `n*4` bytes; the U32 variant is `n` slots and the
-        // discriminant carries the dtype.
+    /// Phase D step 2+3 unified typed allocator. Replaces alloc_u32 and
+    /// the per-dtype family (alloc_typed_i32 / etc. were never needed).
+    fn alloc_typed(dtype: crate::backend::Dtype, n: usize) -> Self::Buffer {
+        use crate::backend::{CudaBuf, Dtype};
         let n = n.max(1);
-        with_stream(|stream| {
-            crate::backend::CudaBuf::from_u32(
+        with_stream(|stream| match dtype {
+            Dtype::F32 => CudaBuf::from_f32(
+                stream
+                    .alloc_zeros::<f32>(n)
+                    .expect("CudaBackend::alloc_typed: alloc_zeros<f32>"),
+            ),
+            Dtype::F16 => CudaBuf::from_f16(
+                stream
+                    .alloc_zeros::<f16>(n)
+                    .expect("CudaBackend::alloc_typed: alloc_zeros<f16>"),
+            ),
+            Dtype::U32 => CudaBuf::from_u32(
                 stream
                     .alloc_zeros::<u32>(n)
-                    .expect("CudaBackend::alloc_u32: alloc_zeros<u32>"),
-            )
+                    .expect("CudaBackend::alloc_typed: alloc_zeros<u32>"),
+            ),
+            Dtype::I32 => CudaBuf::from_i32(
+                stream
+                    .alloc_zeros::<i32>(n)
+                    .expect("CudaBackend::alloc_typed: alloc_zeros<i32>"),
+            ),
+            Dtype::I8 => CudaBuf::from_i8(
+                stream
+                    .alloc_zeros::<i8>(n)
+                    .expect("CudaBackend::alloc_typed: alloc_zeros<i8>"),
+            ),
         })
     }
 
-    fn write_u32(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
-        // Synchronous host→device write of u32 values. Used to populate
-        // device-side scratch buffers (positions, kv_lens, cu_seqlens,
-        // ...) BEFORE a kernel launch or CUDA-graph replay so the
-        // buffer contents are current when the kernel reads them.
-        //
-        // We route through cudarc's `stream.memcpy_htod` + explicit
-        // `stream.synchronize()` instead of raw `cuMemcpyHtoD_v2` so:
-        //   1. `bind_to_thread` is handled inside cudarc (no early-
-        //      return-on-failure that silently leaves the buffer at
-        //      its alloc_zeros default — that was the cause of the
-        //      kv_cache_append_batched_per_item parity diff).
-        //   2. The copy happens on `ctx.stream` so it is ordered with
-        //      subsequent kernel launches on the same stream — no
-        //      cross-stream visibility hazard.
-        //   3. `synchronize()` blocks the host until the copy lands,
-        //      preserving the original sync semantics (host_i32 Vec
-        //      can be dropped, captured graphs see fresh contents).
+    /// Phase D step 2+3 unified typed uploader. Dispatches on
+    /// `T::DTYPE` to select the right CudaBuf variant. Replaces
+    /// `from_slice_i32` + ad-hoc `from_u32` helpers.
+    fn from_slice_typed<T: crate::backend::HostDtype>(data: &[T]) -> Self::Buffer {
+        use crate::backend::{CudaBuf, Dtype};
+        with_stream(|stream| match T::DTYPE {
+            Dtype::F32 => {
+                // SAFETY: T::DTYPE = F32 implies T = f32 (HostDtype is
+                // sealed by trait coherence on concrete primitives).
+                let host: &[f32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()) };
+                CudaBuf::from_f32(stream.clone_htod(host).expect("cuda htod f32"))
+            }
+            Dtype::F16 => {
+                let host: &[f16] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f16, data.len()) };
+                CudaBuf::from_f16(stream.clone_htod(host).expect("cuda htod f16"))
+            }
+            Dtype::U32 => {
+                let host: &[u32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len()) };
+                CudaBuf::from_u32(stream.clone_htod(host).expect("cuda htod u32"))
+            }
+            Dtype::I32 => {
+                let host: &[i32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len()) };
+                CudaBuf::from_i32(stream.clone_htod(host).expect("cuda htod i32"))
+            }
+            Dtype::I8 => {
+                let host: &[i8] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i8, data.len()) };
+                CudaBuf::from_i8(stream.clone_htod(host).expect("cuda htod i8"))
+            }
+        })
+    }
+
+    /// Phase D step 2+3 unified typed in-place write. Buffer dtype
+    /// must match `T::DTYPE` (panic otherwise via `.as_<T>_mut()`).
+    /// Replaces write_u32 / write_i32_into / write_f32_into.
+    fn write_typed<T: crate::backend::HostDtype>(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        data: &[T],
+    ) {
+        use crate::backend::Dtype;
         if data.is_empty() {
             return;
         }
-        // Legacy callers feed signed values masquerading as u32 (e.g.
-        // -1 sentinel for "no expert"); bit-cast preserves the pattern
-        // the kernels read.
-        let host_u32: Vec<u32> = data.to_vec();
         let stream = ctx.stream.clone();
-        let dst_slice = dst.as_u32_mut();
-        if let Err(e) = stream.memcpy_htod(host_u32.as_slice(), dst_slice) {
-            eprintln!("write_u32 memcpy_htod failed: {e}");
-            return;
+        // Route through cudarc's stream.memcpy_htod on ctx.stream +
+        // synchronize: stream-ordered against subsequent kernel launches
+        // (the cuMemcpyHtoD_v2-on-NULL-stream race that bit us during
+        // B-2 is fixed here too).
+        match T::DTYPE {
+            Dtype::U32 => {
+                let host: &[u32] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len())
+                };
+                let d = dst.as_u32_mut();
+                stream.memcpy_htod(host, d).expect("cuda write_typed u32");
+            }
+            Dtype::I32 => {
+                let host: &[i32] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len())
+                };
+                let d = dst.as_i32_mut();
+                stream.memcpy_htod(host, d).expect("cuda write_typed i32");
+            }
+            Dtype::F32 => {
+                let host: &[f32] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len())
+                };
+                let d = dst.as_f32_mut();
+                stream.memcpy_htod(host, d).expect("cuda write_typed f32");
+            }
+            Dtype::F16 => {
+                let host: &[f16] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const f16, data.len())
+                };
+                let d = dst.as_f16_mut();
+                stream.memcpy_htod(host, d).expect("cuda write_typed f16");
+            }
+            Dtype::I8 => {
+                let host: &[i8] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const i8, data.len())
+                };
+                let d = dst.as_i8_mut();
+                stream.memcpy_htod(host, d).expect("cuda write_typed i8");
+            }
         }
-        if let Err(e) = stream.synchronize() {
-            eprintln!("write_u32 synchronize failed: {e}");
-        }
+        stream.synchronize().expect("cuda sync after write_typed");
     }
 
     fn sync(ctx: &mut Self::Context) {

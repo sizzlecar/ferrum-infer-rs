@@ -298,39 +298,28 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
-    /// Allocate a backend buffer of i32-typed values for kernels that
-    /// need integer indices (MoE expert IDs, scatter indices, etc.).
-    ///
-    /// Default impl bit-casts the i32s to f32s and uploads via
-    /// `from_slice` — useful on backends where the buffer type is type-
-    /// erased (CPU's `Vec<f32>`, Metal's untyped MTLBuffer). Backends
-    /// that use a strongly-typed buffer override.
-    fn from_slice_i32(data: &[i32]) -> Self::Buffer {
-        let f: Vec<f32> = data.iter().map(|&i| f32::from_bits(i as u32)).collect();
-        Self::from_slice(&f)
-    }
+    /// Phase D step 2+3: unified typed allocator. Replaces per-dtype
+    /// `alloc_u32` / `alloc_typed_i32` / etc. The buffer is dtype-
+    /// tagged at the wrapper level (`CudaBuf::U32`, `MetalBuf` with
+    /// `Dtype::U32`, `CpuBuf::U32`), so reads/writes through `.as_<T>()`
+    /// accessors get the correct byte count automatically.
+    fn alloc_typed(dtype: super::Dtype, n: usize) -> Self::Buffer;
 
-    /// Overwrite an existing i32 buffer's contents in place. Used on
-    /// the MoE decode hot path: per-layer expert-id updates do an
-    /// in-place memcpy instead of allocating a fresh device buffer
-    /// (48 layers × 128 tokens = 6144 fresh allocations per decode
-    /// run otherwise — allocator pressure dominates the secondary cost).
-    ///
-    /// Default impl falls back to `from_slice_i32` + drop. Backends
-    /// with shared CPU↔GPU memory (Metal `StorageModeShared`, CPU's
-    /// `Vec<f32>`) override with a direct write.
-    fn write_i32_into(buf: &mut Self::Buffer, data: &[i32]) {
-        *buf = Self::from_slice_i32(data);
-    }
+    /// Upload typed host data — replaces `from_slice_i32` /
+    /// `from_slice_u32` etc. The host element type `T` carries its
+    /// `Dtype` via the `HostDtype` marker so dispatch in the impl
+    /// is a one-line `match T::DTYPE`.
+    fn from_slice_typed<T: super::HostDtype>(data: &[T]) -> Self::Buffer;
 
-    /// Overwrite an existing f32 buffer's contents in place. Counterpart
-    /// to `write_i32_into` for f32 data — used to update the per-token
-    /// MoE combine weights into a pre-allocated scratch buffer instead
-    /// of allocating a fresh `from_slice` buffer 6144 times per decode
-    /// run.
-    fn write_f32_into(buf: &mut Self::Buffer, data: &[f32]) {
-        *buf = Self::from_slice(data);
-    }
+    /// In-place typed write — replaces `write_u32` / `write_i32_into`
+    /// / `write_f32_into`. The buffer must already be dtype-tagged
+    /// matching `T::DTYPE` (typically alloc'd via `alloc_typed` or
+    /// `from_slice_typed`).
+    fn write_typed<T: super::HostDtype>(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        data: &[T],
+    );
 
     // ── GEMM ────────────────────────────────────────────────────────────
 
@@ -680,36 +669,9 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
-    /// Allocate a u32 buffer of length `n` for paged-KV bookkeeping
-    /// (block tables, context lens). Default uses the existing
-    /// `from_slice_i32` route then bit-casts; backends with a faster
-    /// path can override.
-    fn alloc_u32(n: usize) -> Self::Buffer {
-        // Reinterpret as i32 — same 4-byte word; the kernel reads
-        // bytes via `device const uint32_t *`.
-        Self::from_slice_i32(&vec![0i32; n])
-    }
-
-    /// Write a u32 slice into a buffer previously allocated via
-    /// [`Self::alloc_u32`]. Used for live block_tables / context_lens
-    /// updates between decode steps.
-    ///
-    /// Default: **panics** — backends MUST override if they support
-    /// paged-KV / batched decode (any path that writes block tables,
-    /// context lens, pos offsets, expert ids, or other u32 scratch).
-    /// The old no-op default was a silent-failure footgun: a backend
-    /// that forgot to override would have callers writing into a
-    /// buffer that stayed zero-initialised, producing garbage output
-    /// at the next read with NO error surfaced. Today CUDA and Metal
-    /// both override; CPU doesn't (CPU has no paged-KV impl either).
-    fn write_u32(_ctx: &mut Self::Context, _dst: &mut Self::Buffer, data: &[u32]) {
-        panic!(
-            "Backend::write_u32 default invoked for backend `{}` — data.len()={} would silently \
-             not be written. Backends that allocate u32 scratch via `alloc_u32` MUST override.",
-            std::any::type_name::<Self>(),
-            data.len()
-        );
-    }
+    // Phase D step 2: alloc_u32 / write_u32 deleted. Callers use the
+    // unified `alloc_typed(Dtype::U32, n)` + `write_typed(&[u32])` API
+    // declared above.
 
     /// Append new K/V into a pre-allocated head-major cache buffer.
     ///

@@ -138,13 +138,13 @@ impl<B: Backend> PagedSeqState<B> {
     /// blocks. The allocator isn't touched here — the first call to
     /// [`Self::ensure_capacity`] does the real work.
     pub fn new(block_size: usize, max_blocks_per_seq: usize) -> Self {
-        let block_table_buf = B::alloc_u32(max_blocks_per_seq);
-        let context_lens_buf = B::alloc_u32(1);
+        let block_table_buf = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
+        let context_lens_buf = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, 1);
         // Initialise context_lens to 0 so a forward dispatched before
         // any token has been written sees an empty context.
         let mut ctx = B::new_context();
         let mut cl = context_lens_buf;
-        B::write_u32(&mut ctx, &mut cl, &[0u32]);
+        B::write_typed::<u32>(&mut ctx, &mut cl, &[0u32]);
         B::sync(&mut ctx);
         Self {
             blocks: Vec::with_capacity(max_blocks_per_seq),
@@ -183,7 +183,7 @@ impl<B: Backend> PagedSeqState<B> {
         // keeps the buffer's content predictable.
         let mut padded = self.blocks.clone();
         padded.resize(self.max_blocks_per_seq, 0);
-        B::write_u32(ctx, &mut self.block_table_buf, &padded);
+        B::write_typed::<u32>(ctx, &mut self.block_table_buf, &padded);
         Ok(())
     }
 
@@ -191,7 +191,7 @@ impl<B: Backend> PagedSeqState<B> {
     /// Call this after [`Self::ensure_capacity`] but before dispatching
     /// the paged attention kernel for this seq.
     pub fn sync_context_len(&mut self, ctx: &mut B::Context) {
-        B::write_u32(ctx, &mut self.context_lens_buf, &[self.len as u32]);
+        B::write_typed::<u32>(ctx, &mut self.context_lens_buf, &[self.len as u32]);
     }
 
     /// Release all blocks back to the allocator. Buffers are kept (cheap

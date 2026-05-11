@@ -87,8 +87,8 @@ fn run_eq(mode: i32, label: &str) {
 
     // Positions buffer (device i32 / u32 wire-compatible).
     let positions_h: Vec<u32> = vec![POSITION as u32; M];
-    let mut positions_dev = CudaBackend::alloc_u32(M);
-    CudaBackend::write_u32(&mut ctx, &mut positions_dev, &positions_h);
+    let mut positions_dev = CudaBackend::alloc_typed(ferrum_kernels::backend::Dtype::U32, M);
+    CudaBackend::write_typed::<u32>(&mut ctx, &mut positions_dev, &positions_h);
 
     // ── Per-item: m calls, each with tokens=1, copying item i's slice ─
     let mut per_item_scratch = CudaBackend::alloc(HEADS * HD);

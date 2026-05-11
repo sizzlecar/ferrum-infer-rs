@@ -818,10 +818,16 @@ impl BackendPagedKv for CudaBackend {
             )));
         }
         let pos_offset = (final_kv_len - q_len) as u32;
-        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_u32(2);
-        <Self as Backend>::write_u32(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
-        let mut pos_offsets_buf = <Self as Backend>::alloc_u32(1);
-        <Self as Backend>::write_u32(ctx, &mut pos_offsets_buf, &[pos_offset]);
+        let mut cu_seqlens_q_buf =
+            <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 2);
+        <Self as Backend>::write_typed::<u32>(
+            ctx,
+            &mut cu_seqlens_q_buf,
+            &[0u32, q_len as u32],
+        );
+        let mut pos_offsets_buf =
+            <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
+        <Self as Backend>::write_typed::<u32>(ctx, &mut pos_offsets_buf, &[pos_offset]);
 
         // The caller's q buffer (despite being named `q_head_major` in
         // Qwen3MoeModel) is ALREADY token-major in paged mode: the

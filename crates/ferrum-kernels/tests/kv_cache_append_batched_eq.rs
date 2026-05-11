@@ -105,8 +105,8 @@ fn kv_append_batched_matches_per_item_head_major() {
         .collect();
 
     let cache_lens_h: Vec<u32> = vec![CACHE_LEN as u32; M];
-    let mut cache_lens_dev = CudaBackend::alloc_u32(M);
-    CudaBackend::write_u32(&mut ctx, &mut cache_lens_dev, &cache_lens_h);
+    let mut cache_lens_dev = CudaBackend::alloc_typed(ferrum_kernels::backend::Dtype::U32, M);
+    CudaBackend::write_typed::<u32>(&mut ctx, &mut cache_lens_dev, &cache_lens_h);
 
     let cache_refs: Vec<&_> = batched_caches.iter().collect();
     CudaBackend::kv_cache_append_batched_per_cache(

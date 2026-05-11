@@ -331,9 +331,9 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         let route = crate::moe::router::route(&logits_host, tokens, n_exp, top_k, norm_topk_prob);
         let (tpe_host, ids_host, max_per_expert) =
             compute_ids_tpe(&route.expert_ids, n_exp, tokens, top_k);
-        B::write_i32_into(&mut scratch.tpe_buf, &tpe_host);
-        B::write_i32_into(&mut scratch.ids_2d, &ids_host);
-        B::write_f32_into(&mut scratch.weights_2d, &route.expert_weights);
+        B::write_typed::<i32>(ctx, &mut scratch.tpe_buf, &tpe_host);
+        B::write_typed::<i32>(ctx, &mut scratch.ids_2d, &ids_host);
+        B::write_typed::<f32>(ctx, &mut scratch.weights_2d, &route.expert_weights);
         stage_end(
             t0,
             ctx,

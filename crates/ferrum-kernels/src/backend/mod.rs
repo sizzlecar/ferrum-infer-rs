@@ -12,7 +12,7 @@ mod kv_layer;
 pub use kv_layer::*;
 
 pub mod dtype;
-pub use dtype::Dtype;
+pub use dtype::{Dtype, HostDtype};
 
 pub mod buffer;
 pub use buffer::CpuBuf;

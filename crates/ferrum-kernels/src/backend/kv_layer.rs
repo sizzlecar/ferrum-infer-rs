@@ -152,10 +152,10 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Self::Layer {
-        let block_table = B::alloc_u32(max_blocks_per_seq);
-        let mut context_lens = B::alloc_u32(1);
+        let block_table = B::alloc_typed(crate::backend::Dtype::U32, max_blocks_per_seq);
+        let mut context_lens = B::alloc_typed(crate::backend::Dtype::U32, 1);
         let mut bt_ctx = B::new_context();
-        B::write_u32(&mut bt_ctx, &mut context_lens, &[0u32]);
+        B::write_typed::<u32>(&mut bt_ctx, &mut context_lens, &[0u32]);
         B::sync(&mut bt_ctx);
         KvCache {
             k: B::alloc(1),
@@ -303,7 +303,7 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
             .context_lens
             .as_mut()
             .ok_or_else(|| FerrumError::model("FP16 paged_decode: missing context_lens"))?;
-        B::write_u32(ctx, cl_buf, &[final_kv_len as u32]);
+        B::write_typed::<u32>(ctx, cl_buf, &[final_kv_len as u32]);
         // SAFETY: block_table outlives the call.
         let bt = unsafe { &*bt_ptr };
         let cl = layer.context_lens.as_ref().unwrap();
@@ -612,7 +612,7 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
             .context_lens
             .as_mut()
             .ok_or_else(|| FerrumError::model("INT8 paged_decode: missing context_lens"))?;
-        B::write_u32(ctx, cl_buf, &[final_kv_len as u32]);
+        B::write_typed::<u32>(ctx, cl_buf, &[final_kv_len as u32]);
         let bt = layer
             .block_table
             .as_ref()

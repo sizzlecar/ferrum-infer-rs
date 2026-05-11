@@ -122,6 +122,56 @@ impl Backend for CpuBackend {
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
 
+    /// Phase D step 2+3: typed alloc. CPU Buffer is Vec<f32> — bytes
+    /// are dtype-erased, so we size the underlying Vec to hold `n`
+    /// elements of `dtype` (bit-cast at read/write time).
+    fn alloc_typed(dtype: crate::backend::Dtype, n: usize) -> Self::Buffer {
+        // f32 storage; for i8 we round up to 4-byte boundary so the
+        // Vec<f32> length covers all i8 elements.
+        let bytes = n * dtype.bytes_per_elem();
+        let f32_len = bytes.div_ceil(4);
+        vec![0.0f32; f32_len]
+    }
+
+    /// Phase D step 2+3: typed upload. Bit-cast host data into f32
+    /// words (CPU buffer is dtype-erased Vec<f32>, see alloc_typed).
+    fn from_slice_typed<T: crate::backend::HostDtype>(data: &[T]) -> Self::Buffer {
+        let bytes = data.len() * std::mem::size_of::<T>();
+        let f32_len = bytes.div_ceil(4);
+        let mut out = vec![0.0f32; f32_len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                out.as_mut_ptr() as *mut u8,
+                bytes,
+            );
+        }
+        out
+    }
+
+    /// Phase D step 2+3: typed in-place write. Bit-cast bytes into
+    /// the dtype-erased f32 storage.
+    fn write_typed<T: crate::backend::HostDtype>(
+        _ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        data: &[T],
+    ) {
+        let bytes = data.len() * std::mem::size_of::<T>();
+        debug_assert!(
+            bytes <= dst.len() * 4,
+            "CpuBackend::write_typed: src bytes {} > dst bytes {}",
+            bytes,
+            dst.len() * 4
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                dst.as_mut_ptr() as *mut u8,
+                bytes,
+            );
+        }
+    }
+
     fn fused_silu_mul_split_strided(
         _ctx: &mut Self::Context,
         gate_up: &Self::Buffer,
