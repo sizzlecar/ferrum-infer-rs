@@ -154,8 +154,8 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
 
         crate::int8_kv::launch_int8_kv_cache_append(
             &ctx.ctx,
-            k_in,
-            v_in,
+            k_in.as_f16(),
+            v_in.as_f16(),
             layer_k.buffer_mut(),
             layer_v.buffer_mut(),
             layer_k_scales.buffer_mut(),
@@ -195,13 +195,13 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         };
         crate::int8_kv::launch_int8_paged_decode_attention(
             &ctx.ctx,
-            q,
+            q.as_f16(),
             layer_k.buffer(),
             layer_v.buffer(),
             layer_k_scales.buffer(),
             layer_v_scales.buffer(),
             &bt_i32_view,
-            output,
+            output.as_f16_mut(),
             num_q_heads,
             num_kv_heads,
             head_dim,

@@ -11,6 +11,7 @@
 //! trait methods are now redundant and will be deleted in 3e/2.
 
 use crate::backend::cuda::{CudaBackend, GptqStoreCuda};
+use crate::backend::CudaBuf;
 use crate::Linear;
 use cudarc::driver::CudaSlice;
 use ferrum_types::{FerrumError, Result};
@@ -25,7 +26,7 @@ use std::sync::Arc;
 /// or to the Triton w4a16 launcher when the store is `Triton(_)`.
 pub struct CudaMarlinLinear {
     pub store: GptqStoreCuda,
-    pub bias: Option<CudaSlice<f16>>,
+    pub bias: Option<CudaBuf>,
     pub in_features: usize,
     pub out_features: usize,
 }
@@ -55,9 +56,13 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
                 #[cfg(feature = "triton-kernels")]
                 {
                     match &self.store {
-                        GptqStoreCuda::Marlin(mw) => {
-                            crate::backend::cuda::marlin_gemm_with_perm(ctx, input, mw, out, m)
-                        }
+                        GptqStoreCuda::Marlin(mw) => crate::backend::cuda::marlin_gemm_with_perm(
+                            ctx,
+                            input.as_f16(),
+                            mw,
+                            out.as_f16_mut(),
+                            m,
+                        ),
                         GptqStoreCuda::Triton(tw) => {
                             let func = ctx.func(
                                 "triton_w4a16_gptq",
@@ -66,7 +71,12 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
                             );
                             let stream = ctx.stream.clone();
                             crate::triton_w4a16::launch_w4a16_gptq_triton(
-                                &stream, &func, input, tw, out, m as i32,
+                                &stream,
+                                &func,
+                                input.as_f16(),
+                                tw,
+                                out.as_f16_mut(),
+                                m as i32,
                             )
                             .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
                         }
@@ -74,7 +84,13 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
                 }
                 #[cfg(not(feature = "triton-kernels"))]
                 {
-                    crate::backend::cuda::marlin_gemm_with_perm(ctx, input, &self.store, out, m)
+                    crate::backend::cuda::marlin_gemm_with_perm(
+                        ctx,
+                        input.as_f16(),
+                        &self.store,
+                        out.as_f16_mut(),
+                        m,
+                    )
                 }
             }
             #[cfg(all(not(feature = "marlin"), feature = "triton-kernels"))]
@@ -92,7 +108,12 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
                         );
                         let stream = ctx.stream.clone();
                         crate::triton_w4a16::launch_w4a16_gptq_triton(
-                            &stream, &func, input, tw, out, m as i32,
+                            &stream,
+                            &func,
+                            input.as_f16(),
+                            tw,
+                            out.as_f16_mut(),
+                            m as i32,
                         )
                         .map_err(|e| FerrumError::model(format!("triton w4a16: {e}")))
                     }
@@ -131,7 +152,7 @@ pub struct CudaMarlinStackedExpertLinear {
     pub expert_offset: usize,
     pub expert_n: usize,
     pub k: usize,
-    pub bias: Option<CudaSlice<f16>>,
+    pub bias: Option<CudaBuf>,
 }
 
 impl Linear<CudaBackend> for CudaMarlinStackedExpertLinear {
@@ -170,9 +191,9 @@ impl Linear<CudaBackend> for CudaMarlinStackedExpertLinear {
                 let stream = ctx.stream.clone();
                 crate::marlin::marlin_gemm_with_offset(
                     &stream,
-                    input,
+                    input.as_f16(),
                     mw,
-                    out,
+                    out.as_f16_mut(),
                     m as i32,
                     self.expert_offset as i32,
                     self.expert_n as i32,

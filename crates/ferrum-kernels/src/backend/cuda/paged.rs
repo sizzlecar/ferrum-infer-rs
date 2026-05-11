@@ -640,13 +640,13 @@ impl BackendPagedKv for CudaBackend {
         if use_split_k {
             return paged_varlen_split_k_dispatch(
                 ctx,
-                q,
-                k_pool,
-                v_pool,
-                out,
-                cu_seqlens_q,
-                pos_offsets,
-                block_tables,
+                q.as_f16(),
+                k_pool.as_f16(),
+                v_pool.as_f16(),
+                out.as_f16_mut(),
+                cu_seqlens_q.as_f16(),
+                pos_offsets.as_f16(),
+                block_tables.as_f16(),
                 num_seqs,
                 total_q_tokens,
                 max_kv_len,
@@ -837,11 +837,11 @@ impl BackendPagedKv for CudaBackend {
         if ctx.paged_attn_out_tm_capacity < q_n {
             let stream = ctx.stream.clone();
             let n_grown = q_n.next_power_of_two().max(q_n);
-            ctx.paged_attn_out_tm = Some(
+            ctx.paged_attn_out_tm = Some(crate::backend::CudaBuf::from_f16(
                 stream
                     .alloc_zeros::<f16>(n_grown)
                     .map_err(|e| FerrumError::model(format!("alloc paged_attn_out_tm: {e}")))?,
-            );
+            ));
             ctx.paged_attn_out_tm_capacity = n_grown;
         }
 
@@ -850,7 +850,7 @@ impl BackendPagedKv for CudaBackend {
         // transpose_token_to_head. We take a raw pointer to the cached
         // buffer so we can pass it as a normal &mut/& while ctx is also
         // borrowed by the kernel-call methods.
-        let out_tm_ptr: *mut CudaSlice<f16> =
+        let out_tm_ptr: *mut crate::backend::CudaBuf =
             ctx.paged_attn_out_tm
                 .as_mut()
                 .expect("paged_attn_out_tm allocated") as *mut _;
@@ -917,12 +917,12 @@ impl BackendPagedKv for CudaBackend {
         if std::env::var("FERRUM_PAGED_FLASH").map_or(true, |v| v != "0") {
             return paged_batched_flash_dispatch(
                 ctx,
-                q,
-                k_pool,
-                v_pool,
-                out,
-                block_tables,
-                valid_kv_lens,
+                q.as_f16(),
+                k_pool.as_f16(),
+                v_pool.as_f16(),
+                out.as_f16_mut(),
+                block_tables.as_f16(),
+                valid_kv_lens.as_f16(),
                 num_seqs,
                 max_kv_len,
                 num_heads,

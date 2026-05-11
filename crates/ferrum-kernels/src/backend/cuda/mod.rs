@@ -157,7 +157,7 @@ pub struct CudaState {
     /// the token-major attn output before transpose-back to head-major.
     /// Lazy-grow on first use. Caching prevents per-call alloc churn
     /// that triggered CUDA_ERROR_ILLEGAL_ADDRESS via stream-ordered free.
-    paged_attn_out_tm: Option<CudaSlice<f16>>,
+    paged_attn_out_tm: Option<crate::backend::CudaBuf>,
     paged_attn_out_tm_capacity: usize,
     /// fp32 reduce scratch for vLLM marlin_moe_wna16. Sized at the upper
     /// bound vLLM uses internally: `sms * 4 * moe_block_size * max_thread_n`
@@ -404,22 +404,24 @@ impl Backend for CudaBackend {
     }
 
     fn alloc_u32(n: usize) -> Self::Buffer {
-        // Buffer storage is f16 (2 bytes per element). For n u32 slots
-        // we need n*4 bytes = 2*n f16 elements. The trait default
-        // collapses f32→f16 one-for-one which under-allocates (buffer
-        // is HALF the bytes the kernel expects), causing writes into
-        // un-mapped pool memory and CUDA_ERROR_MISALIGNED_ADDRESS at
-        // sync. Override to allocate the right byte count.
+        // With typed CudaBuf, the legacy under-allocation hazard (f16
+        // backing for u32 data) goes away — store as `CudaBuf::U32`
+        // and callers' `.as_u32_mut()` / typed writes hit the right
+        // bytes. Pre-typed-buffer code allocated `2*n` f16 elements
+        // to hit `n*4` bytes; the U32 variant is `n` slots and the
+        // discriminant carries the dtype.
         let n = n.max(1);
         with_stream(|stream| {
-            stream
-                .alloc_zeros::<f16>(2 * n)
-                .expect("CudaBackend::alloc_u32: alloc_zeros<f16>")
+            crate::backend::CudaBuf::from_u32(
+                stream
+                    .alloc_zeros::<u32>(n)
+                    .expect("CudaBackend::alloc_u32: alloc_zeros<u32>"),
+            )
         })
     }
 
     fn write_u32(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
-        // Synchronous host→device write of int32 values. Used by callers
+        // Synchronous host→device write of u32 values. Used by callers
         // to populate device-side scratch buffers (positions, kv_lens)
         // BEFORE a CUDA-graph replay so the buffer's contents are
         // current when the replay re-runs the kernels that read them.
@@ -440,9 +442,12 @@ impl Backend for CudaBackend {
             return;
         }
         let stream = ctx.stream.clone();
+        // Legacy callers feed signed values masquerading as u32 (e.g.
+        // -1 sentinel for "no expert"); convert through i32 to preserve
+        // the bit pattern the kernels read.
         let host_i32: Vec<i32> = data.iter().map(|&x| x as i32).collect();
         use cudarc::driver::DevicePtrMut;
-        let (dst_ptr, _g) = dst.device_ptr_mut(&stream);
+        let (dst_ptr, _g) = dst.as_u32_mut().device_ptr_mut(&stream);
         unsafe {
             let st = cudarc::driver::sys::cuMemcpyHtoD_v2(
                 dst_ptr,
@@ -460,12 +465,18 @@ impl Backend for CudaBackend {
     }
 
     fn alloc(len: usize) -> Self::Buffer {
-        with_stream(|stream| unsafe { stream.alloc::<f16>(len) }.expect("cuda alloc"))
+        with_stream(|stream| {
+            crate::backend::CudaBuf::from_f16(
+                unsafe { stream.alloc::<f16>(len) }.expect("cuda alloc"),
+            )
+        })
     }
 
     fn from_slice(data: &[f32]) -> Self::Buffer {
         let host: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
-        with_stream(|stream| stream.clone_htod(&host).expect("cuda htod"))
+        with_stream(|stream| {
+            crate::backend::CudaBuf::from_f16(stream.clone_htod(&host).expect("cuda htod"))
+        })
     }
 
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
