@@ -220,4 +220,39 @@ impl CudaBuf {
             _ => panic!("CudaBuf::as_i8 on dtype {}", self.dtype().name()),
         }
     }
+    pub fn as_i8_mut(&mut self) -> &mut cudarc::driver::CudaSlice<i8> {
+        match self {
+            CudaBuf::I8(s) => s,
+            _ => panic!("CudaBuf::as_i8_mut on dtype {}", self.dtype().name()),
+        }
+    }
+    pub fn as_f32_mut(&mut self) -> &mut cudarc::driver::CudaSlice<f32> {
+        match self {
+            CudaBuf::F32(s) => s,
+            _ => panic!("CudaBuf::as_f32_mut on dtype {}", self.dtype().name()),
+        }
+    }
+    pub fn as_i32_mut(&mut self) -> &mut cudarc::driver::CudaSlice<i32> {
+        match self {
+            CudaBuf::I32(s) => s,
+            _ => panic!("CudaBuf::as_i32_mut on dtype {}", self.dtype().name()),
+        }
+    }
+
+    /// Constructors — used by `Backend::alloc` etc.
+    pub fn from_f16(s: cudarc::driver::CudaSlice<f16>) -> Self {
+        CudaBuf::F16(s)
+    }
+    pub fn from_f32(s: cudarc::driver::CudaSlice<f32>) -> Self {
+        CudaBuf::F32(s)
+    }
+    pub fn from_u32(s: cudarc::driver::CudaSlice<u32>) -> Self {
+        CudaBuf::U32(s)
+    }
+    pub fn from_i32(s: cudarc::driver::CudaSlice<i32>) -> Self {
+        CudaBuf::I32(s)
+    }
+    pub fn from_i8(s: cudarc::driver::CudaSlice<i8>) -> Self {
+        CudaBuf::I8(s)
+    }
 }

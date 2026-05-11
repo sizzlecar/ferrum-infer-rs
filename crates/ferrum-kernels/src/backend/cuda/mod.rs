@@ -328,7 +328,15 @@ unsafe impl DeviceRepr for FlashAttnParams {}
 pub struct CudaBackend;
 
 impl Backend for CudaBackend {
-    type Buffer = CudaSlice<f16>;
+    // Phase B-2: typed-buffer migration. `CudaBuf` is an enum over
+    // `CudaSlice<{f16,f32,u32,i32,i8}>` — Phase B-1 added the wrapper,
+    // this PR switches `Self::Buffer` to use it. Existing
+    // `CudaSlice<f16>` ops migrate via `.as_f16()` / `.as_f16_mut()`
+    // accessors on the wrapper. Integer storage (block tables,
+    // expert ids, ...) gets a proper typed dtype tag instead of the
+    // old i32-bit-cast-through-f16 type tunnel that under-allocated
+    // by half (`alloc_u32` default was wrong on CUDA).
+    type Buffer = crate::backend::CudaBuf;
     type Context = CudaState;
     type GptqStore = GptqStoreCuda;
 
