@@ -46,7 +46,6 @@
 //! registry.register_backend_factory("my_backend", Arc::new(MyBackendFactory));
 //! ```
 
-pub mod tensor_factory;
 pub mod builder;
 pub mod continuous_engine;
 pub mod embedding_engine;
@@ -55,6 +54,7 @@ pub mod parallel;
 pub mod pipeline;
 pub mod registry;
 pub mod speculative;
+pub mod tensor_factory;
 pub mod transcription_engine;
 pub mod tts_engine;
 

@@ -2196,10 +2196,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 // FP32 on CPU. The Metal MoE path lives on FP16 buffers
                 // (`half::f16`), matching what llama_family's batched-
                 // decode path uses.
-                let qkv_stride_bytes =
-                    (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
-                let q_head_major_size_bytes =
-                    (q_dim * std::mem::size_of::<half::f16>()) as u64;
+                let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
+                let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
                 for (i, (cache_id, _, _)) in batch.iter().enumerate() {
                     let caches = self
                         .kv_caches

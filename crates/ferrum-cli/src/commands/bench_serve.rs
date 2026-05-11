@@ -103,18 +103,12 @@ struct RequestResult {
 /// the tokenizer's vocab. We pick mid-range tokens (skip special
 /// tokens at low IDs) and decode to a UTF-8 string the server can
 /// re-tokenize back to ~the same length.
-fn gen_random_prompt(
-    tok: &tokenizers::Tokenizer,
-    n_tokens: usize,
-    rng: &mut impl Rng,
-) -> String {
+fn gen_random_prompt(tok: &tokenizers::Tokenizer, n_tokens: usize, rng: &mut impl Rng) -> String {
     let vocab_size = tok.get_vocab_size(false) as u32;
     // Skip the first 256 IDs (typically special tokens / control chars).
     let lo: u32 = 256.min(vocab_size.saturating_sub(1));
     let hi: u32 = vocab_size.saturating_sub(1);
-    let ids: Vec<u32> = (0..n_tokens)
-        .map(|_| rng.random_range(lo..=hi))
-        .collect();
+    let ids: Vec<u32> = (0..n_tokens).map(|_| rng.random_range(lo..=hi)).collect();
     tok.decode(&ids, false)
         .unwrap_or_else(|_| "hello world ".repeat(n_tokens / 2))
 }
@@ -309,10 +303,16 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         .filter(|r| r.output_tokens >= 2)
         .map(|r| (r.e2e_ms - r.ttft_ms) / (r.output_tokens - 1) as f64)
         .collect();
-    let mean_ttft =
-        if ttfts.is_empty() { 0.0 } else { ttfts.iter().sum::<f64>() / ttfts.len() as f64 };
-    let mean_tpot =
-        if tpots.is_empty() { 0.0 } else { tpots.iter().sum::<f64>() / tpots.len() as f64 };
+    let mean_ttft = if ttfts.is_empty() {
+        0.0
+    } else {
+        ttfts.iter().sum::<f64>() / ttfts.len() as f64
+    };
+    let mean_tpot = if tpots.is_empty() {
+        0.0
+    } else {
+        tpots.iter().sum::<f64>() / tpots.len() as f64
+    };
     let p99_ttft = pct(&mut ttfts, 0.99);
     let p99_tpot = pct(&mut tpots, 0.99);
 

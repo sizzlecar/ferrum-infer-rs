@@ -482,10 +482,10 @@ impl BackendQuantMarlin for CudaBackend {
         let stream = ctx.stream.clone();
         crate::marlin::marlin_gemm_with_offset_strided(
             &stream,
-            input,
+            input.as_f16(),
             in_row_offset as i32,
             mw,
-            output,
+            output.as_f16_mut(),
             out_row_offset as i32,
             m as i32,
             expert_offset as i32,
@@ -854,7 +854,15 @@ impl BackendQuantMarlin for CudaBackend {
         // the multi-stream per-expert path. Set FERRUM_MOE_FUSED=0 to
         // opt out (fall back to multi-stream pool).
         if std::env::var("FERRUM_MOE_FUSED").map_or(true, |v| v != "0") {
-            return moe_gemm_phase_fused_impl(ctx, input, mw, dispatches, n_per_expert, output, k);
+            return moe_gemm_phase_fused_impl(
+                ctx,
+                input.as_f16(),
+                mw,
+                dispatches,
+                n_per_expert,
+                output.as_f16_mut(),
+                k,
+            );
         }
 
         // n_streams=1: serial dispatch on the DEFAULT context stream
@@ -870,10 +878,10 @@ impl BackendQuantMarlin for CudaBackend {
             for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
                 crate::marlin::marlin_gemm_with_offset_strided(
                     &default_stream,
-                    input,
+                    input.as_f16(),
                     *in_row_offset as i32,
                     mw,
-                    output,
+                    output.as_f16_mut(),
                     *out_row_offset as i32,
                     *m as i32,
                     (expert_idx * n_per_expert) as i32,
@@ -914,10 +922,10 @@ impl BackendQuantMarlin for CudaBackend {
             let stream = &pool[i % n_streams];
             crate::marlin::marlin_gemm_with_offset_strided(
                 stream,
-                input,
+                input.as_f16(),
                 *in_row_offset as i32,
                 mw,
-                output,
+                output.as_f16_mut(),
                 *out_row_offset as i32,
                 *m as i32,
                 (expert_idx * n_per_expert) as i32,
