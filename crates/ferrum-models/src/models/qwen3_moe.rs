@@ -2138,46 +2138,114 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 .expect("paged_batch_cu_seqlens_q missing");
             B::write_u32(ctx, cu_buf, &cu_seqlens_host);
 
-            // Step 3: ONE batched split_qkv_norm_rope_into_paged_cache_varlen
-            // dispatch — replaces the m=batch per-seq loop. Saves
-            // (m-1) × launch_overhead per layer × num_layers.
-            let bt_ptr_raw =
-                self.scratch.paged_batch_block_tables.as_ref().unwrap() as *const B::Buffer;
-            let pos_ptr_raw =
-                self.scratch.paged_batch_pos_offsets.as_ref().unwrap() as *const B::Buffer;
-            let cu_ptr_raw =
-                self.scratch.paged_batch_cu_seqlens_q.as_ref().unwrap() as *const B::Buffer;
+            // Step 3: write K/V into the shared pool + RoPE'd Q into
+            // paged_batch_q at offset i × q_dim. Two code paths:
+            //
+            //   - CUDA (`B::supports_varlen_qkv() == true`): ONE batched
+            //     `split_qkv_norm_rope_into_paged_cache_varlen` dispatch
+            //     — saves (m-1) × launch_overhead per layer × num_layers.
+            //   - Metal (no varlen kernel — would panic): per-item loop
+            //     of `split_qkv_norm_rope_into_paged_cache` with
+            //     `qkv_byte_offset = i * qkv_stride * 2` (FP16). Mirrors
+            //     the pattern in `llama_family_forward_batched.rs:182`.
+            //     Each call is m=1 so loses the (m-1)x batched-launch
+            //     amortization, but Metal's per-item kernel is what
+            //     the historical PR #81 bench at c=16 = 79 tok/s used.
             let q_buf_ptr_raw = self.scratch.paged_batch_q.as_mut().unwrap() as *mut B::Buffer;
             // SAFETY: scratch buffers are independent of qkv_out / norm
             // weights / rope and are not re-borrowed by the called fn.
-            let bt_safe: &B::Buffer = unsafe { &*bt_ptr_raw };
-            let pos_safe: &B::Buffer = unsafe { &*pos_ptr_raw };
-            let cu_safe: &B::Buffer = unsafe { &*cu_ptr_raw };
             let q_buf_safe: &mut B::Buffer = unsafe { &mut *q_buf_ptr_raw };
-            B::split_qkv_norm_rope_into_paged_cache_varlen(
-                ctx,
-                &self.scratch.qkv_out,
-                q_norm_w,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                q_buf_safe,
-                pool_k,
-                pool_v,
-                cu_safe,
-                pos_safe,
-                bt_safe,
-                m, // num_seqs
-                m, // m_total — q_len=1 each, so m_total = m
-                nh,
-                nkv,
-                hd,
-                eps,
-                qk_mode,
-                block_size,
-                max_blocks_per_seq,
-            )
-            .expect("split_qkv_norm_rope_into_paged_cache_varlen (batched)");
+
+            if B::supports_varlen_qkv() {
+                let bt_ptr_raw =
+                    self.scratch.paged_batch_block_tables.as_ref().unwrap() as *const B::Buffer;
+                let pos_ptr_raw =
+                    self.scratch.paged_batch_pos_offsets.as_ref().unwrap() as *const B::Buffer;
+                let cu_ptr_raw =
+                    self.scratch.paged_batch_cu_seqlens_q.as_ref().unwrap() as *const B::Buffer;
+                let bt_safe: &B::Buffer = unsafe { &*bt_ptr_raw };
+                let pos_safe: &B::Buffer = unsafe { &*pos_ptr_raw };
+                let cu_safe: &B::Buffer = unsafe { &*cu_ptr_raw };
+                B::split_qkv_norm_rope_into_paged_cache_varlen(
+                    ctx,
+                    &self.scratch.qkv_out,
+                    q_norm_w,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    q_buf_safe,
+                    pool_k,
+                    pool_v,
+                    cu_safe,
+                    pos_safe,
+                    bt_safe,
+                    m, // num_seqs
+                    m, // m_total — q_len=1 each, so m_total = m
+                    nh,
+                    nkv,
+                    hd,
+                    eps,
+                    qk_mode,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("split_qkv_norm_rope_into_paged_cache_varlen (batched)");
+            } else {
+                // Per-item fallback. Element size for qkv / Q output is the
+                // backend's `Buffer` payload type — FP16 on CUDA / Metal,
+                // FP32 on CPU. The Metal MoE path lives on FP16 buffers
+                // (`half::f16`), matching what llama_family's batched-
+                // decode path uses.
+                let qkv_stride_bytes =
+                    (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
+                let q_head_major_size_bytes =
+                    (q_dim * std::mem::size_of::<half::f16>()) as u64;
+                for (i, (cache_id, _, _)) in batch.iter().enumerate() {
+                    let caches = self
+                        .kv_caches
+                        .get(cache_id)
+                        .expect("paged batched: cache not present (per-item fallback)");
+                    let cache = &caches[li];
+                    let bt = cache
+                        .block_table
+                        .as_ref()
+                        .expect("paged batched: cache.block_table missing");
+                    // pos_offsets_host[i] is pre-append cache.len (captured
+                    // before the increment in step 1). The per-item kernel
+                    // uses it for BOTH RoPE position AND K/V write offset.
+                    let pos_i = pos_offsets_host[i] as usize;
+                    let bt_raw = bt as *const B::Buffer;
+                    // SAFETY: bt is read-only in the dispatch; we don't
+                    // mutate self.kv_caches between this raw deref and
+                    // the call.
+                    let bt_safe: &B::Buffer = unsafe { &*bt_raw };
+                    B::split_qkv_norm_rope_into_paged_cache(
+                        ctx,
+                        &self.scratch.qkv_out,
+                        (i as u64) * qkv_stride_bytes,
+                        q_norm_w,
+                        k_norm_w,
+                        &self.rope.cos,
+                        &self.rope.sin,
+                        q_buf_safe,
+                        (i as u64) * q_head_major_size_bytes,
+                        pool_k,
+                        pool_v,
+                        bt_safe,
+                        1, // tokens (one per seq for decode)
+                        nh,
+                        nkv,
+                        hd,
+                        pos_i,
+                        eps,
+                        qk_mode,
+                        pos_i, // cache_len = pre-append
+                        block_size,
+                        max_blocks_per_seq,
+                    )
+                    .expect("split_qkv_norm_rope_into_paged_cache (per-item fallback)");
+                }
+            }
 
             // Step 3: one batched paged_decode_attention(num_seqs=m).
             let bt_ptr =
