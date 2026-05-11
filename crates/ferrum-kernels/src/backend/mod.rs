@@ -14,6 +14,11 @@ pub use kv_layer::*;
 pub mod dtype;
 pub use dtype::Dtype;
 
+pub mod buffer;
+#[cfg(feature = "cuda")]
+pub use buffer::CudaBuf;
+pub use buffer::CpuBuf;
+
 pub mod cpu;
 
 #[cfg(feature = "metal")]
