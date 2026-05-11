@@ -421,43 +421,38 @@ impl Backend for CudaBackend {
     }
 
     fn write_u32(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
-        // Synchronous host→device write of u32 values. Used by callers
-        // to populate device-side scratch buffers (positions, kv_lens)
-        // BEFORE a CUDA-graph replay so the buffer's contents are
-        // current when the replay re-runs the kernels that read them.
+        // Synchronous host→device write of u32 values. Used to populate
+        // device-side scratch buffers (positions, kv_lens, cu_seqlens,
+        // ...) BEFORE a kernel launch or CUDA-graph replay so the
+        // buffer contents are current when the kernel reads them.
         //
-        // - Synchronous (`cuMemcpyHtoD_v2`, not `..Async`) so the local
-        //   host Vec stays alive across the copy. Async memcpy on a
-        //   captured stream would record a stale host pointer.
-        // - `bind_to_thread` is best-effort: tokio shifts decode batches
-        //   across worker threads, so re-binding on each call keeps the
-        //   driver context current on the calling thread. A failure here
-        //   used to early-return without writing (silent data-corruption
-        //   on test threads that hadn't yet bound) — now we log and
-        //   still attempt the memcpy, which is more robust on the test
-        //   path where the context is already current.
+        // We route through cudarc's `stream.memcpy_htod` + explicit
+        // `stream.synchronize()` instead of raw `cuMemcpyHtoD_v2` so:
+        //   1. `bind_to_thread` is handled inside cudarc (no early-
+        //      return-on-failure that silently leaves the buffer at
+        //      its alloc_zeros default — that was the cause of the
+        //      kv_cache_append_batched_per_item parity diff).
+        //   2. The copy happens on `ctx.stream` so it is ordered with
+        //      subsequent kernel launches on the same stream — no
+        //      cross-stream visibility hazard.
+        //   3. `synchronize()` blocks the host until the copy lands,
+        //      preserving the original sync semantics (host_i32 Vec
+        //      can be dropped, captured graphs see fresh contents).
         if data.is_empty() {
             return;
         }
-        if let Err(e) = ctx.ctx.bind_to_thread() {
-            eprintln!("write_u32 bind_to_thread failed (continuing): {e}");
-        }
-        let stream = ctx.stream.clone();
         // Legacy callers feed signed values masquerading as u32 (e.g.
-        // -1 sentinel for "no expert"); convert through i32 to preserve
-        // the bit pattern the kernels read.
-        let host_i32: Vec<i32> = data.iter().map(|&x| x as i32).collect();
-        use cudarc::driver::DevicePtrMut;
-        let (dst_ptr, _g) = dst.as_u32_mut().device_ptr_mut(&stream);
-        unsafe {
-            let st = cudarc::driver::sys::cuMemcpyHtoD_v2(
-                dst_ptr,
-                host_i32.as_ptr() as *const std::ffi::c_void,
-                host_i32.len() * std::mem::size_of::<i32>(),
-            );
-            if st != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("write_u32 cuMemcpyHtoD failed: {st:?}");
-            }
+        // -1 sentinel for "no expert"); bit-cast preserves the pattern
+        // the kernels read.
+        let host_u32: Vec<u32> = data.to_vec();
+        let stream = ctx.stream.clone();
+        let dst_slice = dst.as_u32_mut();
+        if let Err(e) = stream.memcpy_htod(host_u32.as_slice(), dst_slice) {
+            eprintln!("write_u32 memcpy_htod failed: {e}");
+            return;
+        }
+        if let Err(e) = stream.synchronize() {
+            eprintln!("write_u32 synchronize failed: {e}");
         }
     }
 
