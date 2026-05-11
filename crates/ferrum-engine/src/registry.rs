@@ -1089,7 +1089,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 // PR C will extend this with `(CUDA, Int8) => build_llm::<CudaBackend, KvInt8>(...)`
                 // — model wire-up already accepts `K`, so adding INT8 only
                 // touches this match.
-                use ferrum_interfaces::kv_dtype::{KvFp16, KvInt8};
+                use ferrum_interfaces::kv_dtype::KvFp16;
+                #[cfg(feature = "cuda")]
+                use ferrum_interfaces::kv_dtype::KvInt8;
                 use ferrum_types::KvCacheDtype;
                 let kv_dtype = config.engine_config.kv_cache.dtype;
                 let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> =

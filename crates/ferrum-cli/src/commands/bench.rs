@@ -14,7 +14,6 @@ use colored::*;
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
 
