@@ -948,11 +948,10 @@ impl Backend for MetalBackend {
 
     // ── Q4_K_M ────────────────────────────────────────────────────────
 
-    fn from_slice_i32(data: &[i32]) -> Self::Buffer {
-        // Encode i32s as a Metal buffer. We tag dtype as F32 since the
-        // raw bytes are 4-byte aligned and the kernel reinterprets them
-        // as int32_t internally. `n` records the element count.
-        let bytes = data.len() * std::mem::size_of::<i32>();
+    /// Phase D step 2+3: unified typed uploader. Replaces from_slice_i32 +
+    /// the legacy `from_slice` (which is kept as f32-default convenience).
+    fn from_slice_typed<T: crate::backend::HostDtype>(data: &[T]) -> Self::Buffer {
+        let bytes = data.len() * std::mem::size_of::<T>();
         let raw = st().pipes.device.new_buffer_with_data(
             data.as_ptr() as *const c_void,
             bytes as u64,
@@ -960,25 +959,28 @@ impl Backend for MetalBackend {
         );
         MetalBuf {
             raw,
-            dtype: Dtype::F32,
+            dtype: T::DTYPE,
             n: data.len(),
         }
     }
 
-    fn write_i32_into(buf: &mut Self::Buffer, data: &[i32]) {
-        // StorageModeShared = unified memory on Apple Silicon, so the
-        // CPU can write directly into the buffer's contents pointer
-        // without involving a blit encoder. Avoids allocating a fresh
-        // MTLBuffer on every per-layer expert-id update.
-        let dst = buf.raw.contents() as *mut i32;
-        let n = data.len().min(buf.n);
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
-        }
-    }
-
-    fn write_f32_into(buf: &mut Self::Buffer, data: &[f32]) {
-        let dst = buf.raw.contents() as *mut f32;
+    /// Phase D step 2+3: unified typed in-place write. Replaces
+    /// write_i32_into + write_f32_into. Unified memory on Apple
+    /// Silicon means CPU writes the buffer's contents pointer
+    /// directly — no blit encoder.
+    fn write_typed<T: crate::backend::HostDtype>(
+        _ctx: &mut Self::Context,
+        buf: &mut Self::Buffer,
+        data: &[T],
+    ) {
+        debug_assert_eq!(
+            buf.dtype,
+            T::DTYPE,
+            "Metal write_typed: buf.dtype {:?} != T::DTYPE {:?}",
+            buf.dtype,
+            T::DTYPE
+        );
+        let dst = buf.raw.contents() as *mut T;
         let n = data.len().min(buf.n);
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
@@ -1319,26 +1321,14 @@ impl Backend for MetalBackend {
         Ok(())
     }
 
-    fn alloc_u32(n: usize) -> Self::Buffer {
-        let bytes = (n * std::mem::size_of::<u32>()) as u64;
+    /// Phase D step 2+3 unified typed allocator. Replaces alloc_u32.
+    fn alloc_typed(dtype: Dtype, n: usize) -> Self::Buffer {
+        let bytes = (n * dtype.bytes_per_elem()) as u64;
         let raw = st()
             .pipes
             .device
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
-        MetalBuf {
-            raw,
-            dtype: Dtype::F32, // F32 tag — same word size, the kernel reads via `uint32_t*`.
-            n,
-        }
-    }
-
-    fn write_u32(_ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
-        debug_assert!(data.len() <= dst.n, "write_u32: src too long");
-        // StorageModeShared: write directly to the buffer's CPU mapping.
-        unsafe {
-            let ptr = dst.raw.contents() as *mut u32;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
+        MetalBuf { raw, dtype, n }
     }
 
     fn kv_cache_append_head_major(

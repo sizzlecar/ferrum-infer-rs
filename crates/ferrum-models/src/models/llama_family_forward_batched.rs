@@ -240,13 +240,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .paged_batch_block_tables
                 .as_mut()
                 .expect("paged_batch_block_tables missing");
-            B::write_u32(ctx, bt_buf, &stacked_bt);
+            B::write_typed::<u32>(ctx, bt_buf, &stacked_bt);
             let cl_buf = self
                 .scratch
                 .paged_batch_context_lens
                 .as_mut()
                 .expect("paged_batch_context_lens missing");
-            B::write_u32(ctx, cl_buf, &stacked_cl);
+            B::write_typed::<u32>(ctx, cl_buf, &stacked_cl);
 
             // Step 3: one batched paged_decode_attention(num_seqs=m).
             let bt_ptr =
@@ -1083,7 +1083,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_cu_seqlens_q
                 .as_mut()
                 .expect("unified_cu_seqlens_q missing");
-            B::write_u32(&mut ctx, csq, &cu_seqlens_q);
+            B::write_typed::<u32>(&mut ctx, csq, &cu_seqlens_q);
         }
         {
             let po = self
@@ -1091,7 +1091,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_pos_offsets
                 .as_mut()
                 .expect("unified_pos_offsets missing");
-            B::write_u32(&mut ctx, po, &pos_offsets);
+            B::write_typed::<u32>(&mut ctx, po, &pos_offsets);
         }
         // Stack per-seq block tables host-side, then upload.
         {
@@ -1112,7 +1112,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_block_tables
                 .as_mut()
                 .expect("unified_block_tables missing");
-            B::write_u32(&mut ctx, bt, &stacked);
+            B::write_typed::<u32>(&mut ctx, bt, &stacked);
         }
 
         // ── CUDA-graph capture/replay control ────────────────────────
@@ -1724,9 +1724,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .map(|(cid, _, _)| self.kv_caches.get(cid).expect("kv_caches missing")[0].len as u32)
             .collect();
         let kv_post: Vec<u32> = kv_pre.iter().map(|&x| x + 1).collect();
-        B::write_u32(&mut ctx, &mut self.scratch.batch_positions, &positions);
-        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
-        B::write_u32(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
+        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_positions, &positions);
+        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
+        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
 
         // Pre-populate per-slot device-pointer scratch for the batched
         // kernels (kv_cache_append_batched, flash_attention_batched).

@@ -382,10 +382,10 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             paged_batch_context_lens: None,
             paged_max_blocks_per_seq: 0,
             paged_max_seqs: 0,
-            batch_positions: B::alloc_u32(t.max(1)),
-            batch_tokens: B::alloc_u32(t.max(1)),
-            batch_kv_lens_pre: B::alloc_u32(t.max(1)),
-            batch_kv_lens_post: B::alloc_u32(t.max(1)),
+            batch_positions: B::alloc_typed(ferrum_kernels::backend::Dtype::U32, t.max(1)),
+            batch_tokens: B::alloc_typed(ferrum_kernels::backend::Dtype::U32, t.max(1)),
+            batch_kv_lens_pre: B::alloc_typed(ferrum_kernels::backend::Dtype::U32, t.max(1)),
+            batch_kv_lens_post: B::alloc_typed(ferrum_kernels::backend::Dtype::U32, t.max(1)),
             q_normed_batched: B::alloc(t * q_dim),
             k_normed_batched: B::alloc(t * kv_dim),
             v_normed_batched: B::alloc(t * kv_dim),
@@ -441,9 +441,9 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         self.unified_silu_out = Some(B::alloc(cap * im));
         self.unified_mlp_out = Some(B::alloc(cap * h));
         if self.unified_cu_seqlens_q.is_none() {
-            self.unified_cu_seqlens_q = Some(B::alloc_u32(max_seqs + 1));
-            self.unified_pos_offsets = Some(B::alloc_u32(max_seqs));
-            self.unified_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
+            self.unified_cu_seqlens_q = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs + 1));
+            self.unified_pos_offsets = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs));
+            self.unified_block_tables = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs * max_blocks_per_seq));
             self.unified_packed_normed = Some(B::alloc(max_seqs * h));
             self.unified_packed_logits = Some(B::alloc(max_seqs * v));
         }
@@ -465,8 +465,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let q_dim = cfg.num_heads * cfg.head_dim;
         self.paged_batch_q = Some(B::alloc(max_seqs * q_dim));
         self.paged_batch_o = Some(B::alloc(max_seqs * q_dim));
-        self.paged_batch_block_tables = Some(B::alloc_u32(max_seqs * max_blocks_per_seq));
-        self.paged_batch_context_lens = Some(B::alloc_u32(max_seqs));
+        self.paged_batch_block_tables = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs * max_blocks_per_seq));
+        self.paged_batch_context_lens = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs));
         self.paged_max_blocks_per_seq = max_blocks_per_seq;
         self.paged_max_seqs = max_seqs;
     }
@@ -955,7 +955,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let mut ctx_tmp = B::new_context();
             for c in caches.iter_mut() {
                 if let Some(bt) = K::block_table_mut(c) {
-                    B::write_u32(&mut ctx_tmp, bt, &padded);
+                    B::write_typed::<u32>(&mut ctx_tmp, bt, &padded);
                 }
                 *K::paged_block_indices_mut(c) = block_indices.clone();
             }
@@ -969,7 +969,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             K::set_len(c, 0);
             if let Some(cl) = K::context_lens_mut(c) {
                 let mut ctx_tmp = B::new_context();
-                B::write_u32(&mut ctx_tmp, cl, &[0u32]);
+                B::write_typed::<u32>(&mut ctx_tmp, cl, &[0u32]);
                 B::sync(&mut ctx_tmp);
             }
         }
