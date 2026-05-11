@@ -294,13 +294,19 @@ fn cuda_stacked_offset_vs_per_expert() {
 
         let input_dev_off = CudaBackend::from_slice(&input);
         let mut off_out_dev = CudaBackend::alloc(m * n_per);
-        // Phase 3e/2: gemm_gptq_with_offset is gone; per-expert dispatch
-        // lives inside StackedExpertLinear<CudaBackend>::forward.
-        let off_lin = ferrum_quantization::StackedExpertLinear::<CudaBackend>::new(
+        // Phase C step 4b: StackedExpertLinear takes a MarlinExpertStack
+        // trait object. Wrap the raw GptqStoreCuda first.
+        let off_stack = <CudaBackend as ferrum_kernels::backend::BackendQuantMarlin>::make_marlin_expert_stack(
             stacked_arc.clone(),
-            e * n_per,
+            num_experts,
             n_per,
             k,
+        )
+        .expect("make_marlin_expert_stack");
+        let off_lin = ferrum_quantization::StackedExpertLinear::<CudaBackend>::new(
+            off_stack,
+            e * n_per,
+            n_per,
         )
         .expect("StackedExpertLinear::new");
         ferrum_kernels::Linear::<CudaBackend>::forward(
@@ -394,14 +400,23 @@ fn cpu_stacked_vs_per_expert_parity() {
     // must equal the per-expert dedicated GEMM. Phase 3e/2: per-expert
     // dispatch goes through `StackedExpertLinear<CpuBackend>::forward`.
     let stacked_arc = std::sync::Arc::new(stacked_store);
+    // Phase C step 4b: wrap the raw GptqStore in a MarlinExpertStack
+    // trait object first; StackedExpertLinear::new takes the stack
+    // directly (no longer routes through B::make_stacked_expert_linear).
+    let stacked_stack = <CpuBackend as ferrum_kernels::backend::BackendQuantMarlin>::make_marlin_expert_stack(
+        stacked_arc.clone(),
+        num_experts,
+        n_per,
+        k,
+    )
+    .expect("make_marlin_expert_stack");
     for (e, ref_out) in per_expert_outs.iter().enumerate() {
         let mut stacked_out = vec![0.0f32; m * n_per];
         let mut ctx = <CpuBackend as Backend>::new_context();
         let stacked_lin = ferrum_quantization::StackedExpertLinear::<CpuBackend>::new(
-            stacked_arc.clone(),
+            stacked_stack.clone(),
             e * n_per,
             n_per,
-            k,
         )
         .expect("StackedExpertLinear::new");
         ferrum_kernels::Linear::<CpuBackend>::forward(

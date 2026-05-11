@@ -805,24 +805,8 @@ impl BackendQuantMarlin for CudaBackend {
             Ok(marlin_weight)
         }
     }
-    fn make_stacked_expert_linear(
-        store: std::sync::Arc<Self::GptqStore>,
-        expert_offset: usize,
-        expert_n: usize,
-        k: usize,
-        bias_host: Option<&[f32]>,
-    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
-        let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
-        Ok(Box::new(
-            crate::quant_linear::cuda_marlin::CudaMarlinStackedExpertLinear {
-                store,
-                expert_offset,
-                expert_n,
-                k,
-                bias,
-            },
-        ))
-    }
+    // Phase C step 4b: make_stacked_expert_linear inlined into
+    // CudaMarlinExpertStack::make_expert_linear.
 
     fn make_marlin_expert_stack(
         store: std::sync::Arc<Self::GptqStore>,
@@ -1052,32 +1036,8 @@ impl BackendQuantMarlin for CudaBackend {
         std::mem::forget(npp_view);
         r.map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
     }
-    #[cfg(feature = "marlin")]
-    fn marlin_zero_stacked_workspace(
-        ctx: &mut Self::Context,
-        weight: &Self::GptqStore,
-    ) -> Result<()> {
-        use cudarc::driver::DevicePtr;
-        #[cfg(feature = "triton-kernels")]
-        let mw = match weight {
-            GptqStoreCuda::Marlin(mw) => mw,
-            GptqStoreCuda::Triton(_) => {
-                return Err(FerrumError::unsupported(
-                    "marlin_zero_stacked_workspace: not applicable to Triton store",
-                ));
-            }
-        };
-        #[cfg(not(feature = "triton-kernels"))]
-        let mw: &crate::marlin::MarlinWeight = weight;
-        let stream = ctx.stream.clone();
-        let raw_stream = stream.cu_stream();
-        let (ws_ptr, _g) = mw.workspace.device_ptr(&stream);
-        let ws_len = mw.workspace.len();
-        unsafe {
-            cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, ws_len, raw_stream);
-        }
-        Ok(())
-    }
+    // Phase C step 4a: marlin_zero_stacked_workspace inlined into
+    // CudaMarlinExpertStack::zero_workspace (quant_linear/cuda_marlin_stack.rs).
 }
 // CUDA does not ship GGUF k-quant kernels; inherit unsupported defaults.
 impl BackendQuantGguf for CudaBackend {}

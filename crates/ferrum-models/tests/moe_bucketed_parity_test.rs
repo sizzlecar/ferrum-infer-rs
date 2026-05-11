@@ -90,29 +90,8 @@ fn bucketed_matches_per_pair_dispatch() {
     let gate_up_arc = build_stacked(hidden, 2 * inter, num_experts, group_size, 0xA);
     let down_arc = build_stacked(inter, hidden, num_experts, group_size, 0xB);
 
-    // ExpertStack with both per-expert StackedExpertLinears AND the
-    // shared stores (per-pair path uses the former; bucketed path uses
-    // the latter).
-    let mut gate_up_per_expert: Vec<Box<dyn Linear<CpuBackend>>> = Vec::with_capacity(num_experts);
-    let mut down_per_expert: Vec<Box<dyn Linear<CpuBackend>>> = Vec::with_capacity(num_experts);
-    for e in 0..num_experts {
-        gate_up_per_expert.push(Box::new(
-            StackedExpertLinear::<CpuBackend>::new(
-                gate_up_arc.clone(),
-                e * 2 * inter,
-                2 * inter,
-                hidden,
-            )
-            .expect("gate_up StackedExpertLinear"),
-        ));
-        down_per_expert.push(Box::new(
-            StackedExpertLinear::<CpuBackend>::new(down_arc.clone(), e * hidden, hidden, inter)
-                .expect("down StackedExpertLinear"),
-        ));
-    }
-    // Phase C step 3: ExpertStack now holds trait-object MarlinExpertStack
-    // (was Arc<B::GptqStore>). Build via the Backend constructor so the
-    // dispatch path goes through `store.gemm_phase_*` / `store.zero_workspace`.
+    // Phase C step 3: build trait-object MarlinExpertStack first;
+    // step 4b: StackedExpertLinear::new takes the stack directly.
     let gate_up_stack = <CpuBackend as BackendQuantMarlin>::make_marlin_expert_stack(
         gate_up_arc.clone(),
         num_experts,
@@ -127,6 +106,21 @@ fn bucketed_matches_per_pair_dispatch() {
         inter,
     )
     .expect("make_marlin_expert_stack down");
+
+    // Per-expert StackedExpertLinear views built from the trait-object
+    // stack (Phase C step 4b). Used by per-pair dispatch path.
+    let mut gate_up_per_expert: Vec<Box<dyn Linear<CpuBackend>>> = Vec::with_capacity(num_experts);
+    let mut down_per_expert: Vec<Box<dyn Linear<CpuBackend>>> = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        gate_up_per_expert.push(Box::new(
+            StackedExpertLinear::<CpuBackend>::new(gate_up_stack.clone(), e * 2 * inter, 2 * inter)
+                .expect("gate_up StackedExpertLinear"),
+        ));
+        down_per_expert.push(Box::new(
+            StackedExpertLinear::<CpuBackend>::new(down_stack.clone(), e * hidden, hidden)
+                .expect("down StackedExpertLinear"),
+        ));
+    }
     let experts = ExpertStack::<CpuBackend> {
         gate_up: gate_up_per_expert,
         down: down_per_expert,

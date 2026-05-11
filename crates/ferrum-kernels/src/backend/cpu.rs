@@ -768,35 +768,8 @@ impl crate::backend::BackendQuantMarlin for CpuBackend {
             n: total_n,
         })
     }
-    fn make_stacked_expert_linear(
-        store: std::sync::Arc<Self::GptqStore>,
-        expert_offset: usize,
-        expert_n: usize,
-        k: usize,
-        bias_host: Option<&[f32]>,
-    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
-        if expert_offset + expert_n > store.n {
-            return Err(FerrumError::model(format!(
-                "make_stacked_expert_linear OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
-                store.n
-            )));
-        }
-        if k != store.k {
-            return Err(FerrumError::model(format!(
-                "make_stacked_expert_linear k mismatch: arg {k} vs store.k {}",
-                store.k
-            )));
-        }
-        let row_start = expert_offset * k;
-        let row_end = (expert_offset + expert_n) * k;
-        let slice = store.weight_f32[row_start..row_end].to_vec();
-        Ok(Box::new(crate::quant_linear::cpu_dequant::CpuGptqLinear {
-            weight_f32: slice,
-            bias: bias_host.map(|b| b.to_vec()),
-            in_features: k,
-            out_features: expert_n,
-        }))
-    }
+    // Phase C step 4b: make_stacked_expert_linear inlined into
+    // CpuMarlinExpertStack::make_expert_linear.
 
     fn make_marlin_expert_stack(
         store: std::sync::Arc<Self::GptqStore>,

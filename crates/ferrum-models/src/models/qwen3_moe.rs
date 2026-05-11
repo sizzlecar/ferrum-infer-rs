@@ -645,28 +645,6 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let gate_up_arc = std::sync::Arc::new(gate_up_store);
             let down_arc = std::sync::Arc::new(down_store);
 
-            let mut gate_up: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
-                Vec::with_capacity(cfg.num_experts);
-            let mut down: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
-                Vec::with_capacity(cfg.num_experts);
-            for e in 0..cfg.num_experts {
-                gate_up.push(Box::new(
-                    ferrum_quantization::StackedExpertLinear::<B>::new(
-                        gate_up_arc.clone(),
-                        e * gate_up_n_per_expert,
-                        gate_up_n_per_expert,
-                        gate_up_k,
-                    )?,
-                ));
-                down.push(Box::new(
-                    ferrum_quantization::StackedExpertLinear::<B>::new(
-                        down_arc.clone(),
-                        e * down_n_per_expert,
-                        down_n_per_expert,
-                        down_k,
-                    )?,
-                ));
-            }
             // Wrap raw Marlin tile stores in trait objects (Phase C step 3) —
             // dispatch goes through `gu_store.gemm_phase_*` / `zero_workspace`
             // instead of `B::moe_gemm_phase_*` / `B::marlin_zero_stacked_workspace`.
@@ -684,6 +662,33 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                     down_n_per_expert,
                     down_k,
                 )?;
+
+            // Per-expert Linear views — used by code paths that go
+            // through `ExpertStack::gate_up[i]` / `down[i]` (single
+            // expert, non-bucketed). StackedExpertLinear wraps the
+            // MarlinExpertStack trait object and dispatches via
+            // `stack.make_expert_linear(...)` per Phase C step 4b.
+            let mut gate_up: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
+                Vec::with_capacity(cfg.num_experts);
+            let mut down: Vec<Box<dyn ferrum_quantization::Linear<B>>> =
+                Vec::with_capacity(cfg.num_experts);
+            for e in 0..cfg.num_experts {
+                gate_up.push(Box::new(
+                    ferrum_quantization::StackedExpertLinear::<B>::new(
+                        gate_up_marlin.clone(),
+                        e * gate_up_n_per_expert,
+                        gate_up_n_per_expert,
+                    )?,
+                ));
+                down.push(Box::new(
+                    ferrum_quantization::StackedExpertLinear::<B>::new(
+                        down_marlin.clone(),
+                        e * down_n_per_expert,
+                        down_n_per_expert,
+                    )?,
+                ));
+            }
+
             let experts = crate::moe::ExpertStack::<B> {
                 gate_up,
                 down,

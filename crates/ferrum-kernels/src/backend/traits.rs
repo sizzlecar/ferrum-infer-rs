@@ -1047,31 +1047,12 @@ pub trait BackendQuantMarlin: Backend {
             "load_gptq_stacked not implemented for this backend",
         ))
     }
-    /// Build a per-expert column-slice `Linear<Self>` view on top of a
-    /// stacked GPTQ store. The store concatenates all experts' weights
-    /// along N; this factory selects columns
-    /// `[expert_offset .. expert_offset + expert_n)` for one expert.
-    ///
-    /// `expert_offset` and `expert_n` MUST be multiples of the backend's
-    /// natural N tile size (Marlin: 64). `bias_host` is per-expert.
-    /// Default returns Err(unsupported).
-    ///
-    /// Phase 3e/2: replaces the old `gemm_gptq_with_offset` trait
-    /// method dispatched from `StackedExpertLinear<B>::forward`. The
-    /// kernel call now lives inside the returned boxed Linear's
-    /// `forward` (CUDA: `CudaMarlinStackedExpertLinear`).
-    #[allow(clippy::too_many_arguments)]
-    fn make_stacked_expert_linear(
-        _store: std::sync::Arc<Self::GptqStore>,
-        _expert_offset: usize,
-        _expert_n: usize,
-        _k: usize,
-        _bias_host: Option<&[f32]>,
-    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
-        Err(FerrumError::unsupported(
-            "make_stacked_expert_linear not implemented for this backend",
-        ))
-    }
+    // Phase C step 4b: BackendQuantMarlin::make_stacked_expert_linear
+    // was removed — its body is now inlined into
+    // `MarlinExpertStack::make_expert_linear` (concrete impls in
+    // `quant_linear/{cuda,cpu}_marlin_stack.rs`). Callers reach
+    // single-expert Linear views via
+    // `store.clone().make_expert_linear(offset, n, bias)`.
 
     /// Phase C step 3: wrap a raw `Arc<Self::GptqStore>` into the
     /// trait-object `MarlinExpertStack<Self>`. Lets callers go through
@@ -1093,21 +1074,11 @@ pub trait BackendQuantMarlin: Backend {
             "make_marlin_expert_stack not implemented for this backend",
         ))
     }
-    /// Bulk-zero the per-expert Marlin workspace mutex slots for a
-    /// stacked GptqStore. Call ONCE before a batch of
-    /// `gemm_gptq_with_offset_strided_no_ws_zero` calls — saves the
-    /// per-call cuMemsetD32Async (one launch each → one launch total).
-    ///
-    /// At c=32 with 128 active experts × 2 (gate_up + down) × 48 layers:
-    /// 12 288 memset launches/token. Bulk-zeroing brings that to 96.
-    fn marlin_zero_stacked_workspace(
-        _ctx: &mut Self::Context,
-        _weight: &Self::GptqStore,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "marlin_zero_stacked_workspace not implemented for this backend",
-        ))
-    }
+    // Phase C step 4a: BackendQuantMarlin::marlin_zero_stacked_workspace
+    // was removed — its body is now inlined into
+    // `MarlinExpertStack::zero_workspace` (concrete impls in
+    // `quant_linear/{cuda,cpu}_marlin_stack.rs`). Callers reach the
+    // workspace-zero op via `store.zero_workspace(ctx)` instead.
     /// Batched per-expert offset GEMM dispatch — runs N concurrent
     /// Marlin calls across a stream pool to amortize launch overhead
     /// and overlap small-m kernels that under-utilize SMs individually.
