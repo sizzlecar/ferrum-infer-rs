@@ -102,24 +102,37 @@ pub struct ExpertStack<B: QuantLlmBackend + BackendMoeFused> {
     pub up_stacked: Option<Box<dyn StackedExpertGgufLinear<B>>>,
     pub down_stacked: Option<Box<dyn StackedExpertGgufLinear<B>>>,
 
-    /// Stacked GPTQ Marlin stores for the bucketed CUDA path. When both
-    /// are Some, [`moe_forward_bucketed`] dispatches expert GEMMs as
-    /// column-slices of these shared tiles via
-    /// `B::gemm_gptq_with_offset_strided`. None on CPU / Metal / GGUF.
-    pub gate_up_gptq_stacked: Option<std::sync::Arc<B::GptqStore>>,
-    pub down_gptq_stacked: Option<std::sync::Arc<B::GptqStore>>,
+    /// Stacked Marlin GPTQ expert tiles for the bucketed CUDA path.
+    /// When both are Some, [`moe_forward_bucketed`] dispatches expert
+    /// GEMMs through trait-object methods (`store.gemm_phase_*` /
+    /// `store.zero_workspace`). None on CPU / Metal / GGUF.
+    ///
+    /// Phase C step 3: replaces `Option<Arc<B::GptqStore>>` with a
+    /// `Box<dyn MarlinExpertStack<B>>` trait object — kills the
+    /// `type GptqStore` leak through the model layer.
+    pub gate_up_marlin_stack:
+        Option<std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>>,
+    pub down_marlin_stack:
+        Option<std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>>,
 }
 
 impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
-    /// Returns the shared stacked GPTQ store for `gate_up` if loaded
-    /// via the bucketed/Marlin path. Used by [`moe_forward_bucketed`].
-    pub fn gate_up_stacked_store(&self, _expert_idx: usize) -> Option<&B::GptqStore> {
-        self.gate_up_gptq_stacked.as_deref()
+    /// Returns the shared stacked Marlin expert tile for `gate_up` if
+    /// loaded via the bucketed/Marlin path. Used by
+    /// [`moe_forward_bucketed`].
+    pub fn gate_up_stacked_store(
+        &self,
+        _expert_idx: usize,
+    ) -> Option<&std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>> {
+        self.gate_up_marlin_stack.as_ref()
     }
 
     /// Same for `down`.
-    pub fn down_stacked_store(&self, _expert_idx: usize) -> Option<&B::GptqStore> {
-        self.down_gptq_stacked.as_deref()
+    pub fn down_stacked_store(
+        &self,
+        _expert_idx: usize,
+    ) -> Option<&std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>> {
+        self.down_marlin_stack.as_ref()
     }
 
     // ── MoE GEMV dispatch (hides B::QuantStore + in_stride from callers) ──
@@ -607,8 +620,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
             gate_stacked: None,
             up_stacked: None,
             down_stacked: None,
-            gate_up_gptq_stacked: None,
-            down_gptq_stacked: None,
+            gate_up_marlin_stack: None,
+            down_marlin_stack: None,
         })
     }
 
@@ -848,8 +861,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
             gate_stacked,
             up_stacked,
             down_stacked,
-            gate_up_gptq_stacked: None,
-            down_gptq_stacked: None,
+            gate_up_marlin_stack: None,
+            down_marlin_stack: None,
         }))
     }
 
@@ -1380,7 +1393,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
              (load via Qwen3MoeModel::new_safetensors)",
         )
     })?;
-    let _ = B::marlin_zero_stacked_workspace(ctx, gu_store);
+    let _ = gu_store.zero_workspace(ctx);
 
     // Decide path: vLLM marlin_moe_wna16 fused or our per-expert bucketed
     // GEMMs. The vLLM path needs (sorted_token_ids, expert_ids,
@@ -1463,27 +1476,22 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         // no caller-side zero needed (atomic_add fallback inside the
         // wrapper would also self-zero under slice_count > 1 / slice_idx
         // == 0; either way this is safe).
-        B::moe_gemm_phase_vllm(
+        gu_store.gemm_phase_vllm(
             ctx,
             x_packed,
-            gu_store,
             &routing.sorted_token_ids,
             &routing.expert_ids,
             &routing.num_tokens_past_padded,
             gate_up_packed,
             total_pairs_active,
-            gate_up_dim_per_expert,
-            hidden_size,
             VLLM_MOE_BLOCK_SIZE,
             1, // top_k=1: pre-gathered rows already index packed input directly
         )?;
     } else {
-        B::moe_gemm_phase_batched(
+        gu_store.gemm_phase_batched(
             ctx,
             x_packed,
-            gu_store,
             &phase1_dispatches,
-            gate_up_dim_per_expert,
             gate_up_packed,
             hidden_size,
         )?;
@@ -1523,7 +1531,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
              (load via Qwen3MoeModel::new_safetensors)",
         )
     })?;
-    let _ = B::marlin_zero_stacked_workspace(ctx, d_store);
+    let _ = d_store.zero_workspace(ctx);
     let mut phase3_dispatches: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
         let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
@@ -1540,27 +1548,22 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         None
     };
     if let Some(routing) = &vllm_routing {
-        B::moe_gemm_phase_vllm(
+        d_store.gemm_phase_vllm(
             ctx,
             silu_packed,
-            d_store,
             &routing.sorted_token_ids,
             &routing.expert_ids,
             &routing.num_tokens_past_padded,
             down_packed,
             total_pairs_active,
-            down_n_per_expert,
-            expert_intermediate,
             VLLM_MOE_BLOCK_SIZE,
             1,
         )?;
     } else {
-        B::moe_gemm_phase_batched(
+        d_store.gemm_phase_batched(
             ctx,
             silu_packed,
-            d_store,
             &phase3_dispatches,
-            down_n_per_expert,
             down_packed,
             expert_intermediate,
         )?;

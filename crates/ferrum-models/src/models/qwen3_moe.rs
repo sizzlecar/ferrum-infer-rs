@@ -667,14 +667,31 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                     )?,
                 ));
             }
+            // Wrap raw Marlin tile stores in trait objects (Phase C step 3) —
+            // dispatch goes through `gu_store.gemm_phase_*` / `zero_workspace`
+            // instead of `B::moe_gemm_phase_*` / `B::marlin_zero_stacked_workspace`.
+            let gate_up_marlin =
+                <B as ferrum_kernels::backend::BackendQuantMarlin>::make_marlin_expert_stack(
+                    gate_up_arc,
+                    cfg.num_experts,
+                    gate_up_n_per_expert,
+                    gate_up_k,
+                )?;
+            let down_marlin =
+                <B as ferrum_kernels::backend::BackendQuantMarlin>::make_marlin_expert_stack(
+                    down_arc,
+                    cfg.num_experts,
+                    down_n_per_expert,
+                    down_k,
+                )?;
             let experts = crate::moe::ExpertStack::<B> {
                 gate_up,
                 down,
                 gate_stacked: None,
                 up_stacked: None,
                 down_stacked: None,
-                gate_up_gptq_stacked: Some(gate_up_arc),
-                down_gptq_stacked: Some(down_arc),
+                gate_up_marlin_stack: Some(gate_up_marlin),
+                down_marlin_stack: Some(down_marlin),
             };
             moe_layers.push(Qwen3MoeLayerState { router, experts });
 
@@ -1311,8 +1328,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
 
         // CUDA Marlin bucketed path: shared GPTQ store per (gate_up, down)
         // role + offset GEMMs per expert. Disabled with FERRUM_MOE_BUCKETED=0.
-        let bucketed_path_available = moe_layer.experts.gate_up_gptq_stacked.is_some()
-            && moe_layer.experts.down_gptq_stacked.is_some()
+        let bucketed_path_available = moe_layer.experts.gate_up_marlin_stack.is_some()
+            && moe_layer.experts.down_marlin_stack.is_some()
             && std::env::var("FERRUM_MOE_BUCKETED").as_deref() != Ok("0");
 
         // Fast path for decode (tokens=1): the stacked decode impl
@@ -2799,8 +2816,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                     h,
                 )?;
             }
-        } else if moe_layer.experts.gate_up_gptq_stacked.is_some()
-            && moe_layer.experts.down_gptq_stacked.is_some()
+        } else if moe_layer.experts.gate_up_marlin_stack.is_some()
+            && moe_layer.experts.down_marlin_stack.is_some()
             && std::env::var("FERRUM_MOE_BUCKETED").as_deref() != Ok("0")
         {
             // CUDA Marlin bucketed path (decode_batch m ≥ 1 entry).
