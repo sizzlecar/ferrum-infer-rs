@@ -635,33 +635,18 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             } else {
                 &["gate_up_proj"]
             };
-            let (gate_up_store, gate_up_n_per_expert, gate_up_k) =
+            // Phase C step 4e: load_stacked_gptq_experts returns the
+            // trait-object MarlinExpertStack directly (no intermediate
+            // GptqStore type). The loader internally calls
+            // B::load_gptq_stacked which now returns
+            // Arc<dyn MarlinExpertStack<B>>.
+            let (gate_up_marlin, gate_up_n_per_expert, gate_up_k) =
                 loader.load_stacked_gptq_experts(&expert_prefix, cfg.num_experts, gate_up_projs)?;
-            let (down_store, down_n_per_expert, down_k) = loader.load_stacked_gptq_experts(
+            let (down_marlin, down_n_per_expert, down_k) = loader.load_stacked_gptq_experts(
                 &expert_prefix,
                 cfg.num_experts,
                 &["down_proj"],
             )?;
-            let gate_up_arc = std::sync::Arc::new(gate_up_store);
-            let down_arc = std::sync::Arc::new(down_store);
-
-            // Wrap raw Marlin tile stores in trait objects (Phase C step 3) —
-            // dispatch goes through `gu_store.gemm_phase_*` / `zero_workspace`
-            // instead of `B::moe_gemm_phase_*` / `B::marlin_zero_stacked_workspace`.
-            let gate_up_marlin =
-                <B as ferrum_kernels::backend::BackendQuantMarlin>::make_marlin_expert_stack(
-                    gate_up_arc,
-                    cfg.num_experts,
-                    gate_up_n_per_expert,
-                    gate_up_k,
-                )?;
-            let down_marlin =
-                <B as ferrum_kernels::backend::BackendQuantMarlin>::make_marlin_expert_stack(
-                    down_arc,
-                    cfg.num_experts,
-                    down_n_per_expert,
-                    down_k,
-                )?;
 
             // Per-expert Linear views — used by code paths that go
             // through `ExpertStack::gate_up[i]` / `down[i]` (single
