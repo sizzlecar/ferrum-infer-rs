@@ -103,8 +103,8 @@ fn int8_kv_append_roundtrip() {
 
     launch_int8_kv_cache_append(
         &ctx,
-        &k_in_dev,
-        &v_in_dev,
+        k_in_dev.as_f16(),
+        v_in_dev.as_f16(),
         &mut k_pool,
         &mut v_pool,
         &mut k_scales,
@@ -266,13 +266,13 @@ fn int8_paged_decode_parity_vs_host_ref() {
     let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
     launch_int8_paged_decode_attention(
         &ctx,
-        &q_dev,
+        q_dev.as_f16(),
         &k_pool_i8,
         &v_pool_i8,
         &k_scales_dev,
         &v_scales_dev,
         &bt_dev.as_view(),
-        &mut out_dev,
+        out_dev.as_f16_mut(),
         NUM_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -410,8 +410,8 @@ fn int8_kv_append_then_decode_e2e() {
 
     launch_int8_kv_cache_append(
         &ctx,
-        &k_in_dev,
-        &v_in_dev,
+        k_in_dev.as_f16(),
+        v_in_dev.as_f16(),
         &mut k_pool,
         &mut v_pool,
         &mut k_scales,
@@ -426,13 +426,13 @@ fn int8_kv_append_then_decode_e2e() {
     let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
     launch_int8_paged_decode_attention(
         &ctx,
-        &q_dev,
+        q_dev.as_f16(),
         &k_pool,
         &v_pool,
         &k_scales,
         &v_scales,
         &bt_dev.as_view(),
-        &mut out_dev,
+        out_dev.as_f16_mut(),
         NUM_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -545,8 +545,8 @@ fn kv_cache_quant_int8_e2e() {
     // Append.
     launch_int8_kv_cache_append(
         &ctx_handle,
-        &k_in_dev,
-        &v_in_dev,
+        k_in_dev.as_f16(),
+        v_in_dev.as_f16(),
         cache.k.buffer_mut(),
         cache.v.buffer_mut(),
         cache.k_scales.buffer_mut(),
@@ -562,13 +562,13 @@ fn kv_cache_quant_int8_e2e() {
     let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
     launch_int8_paged_decode_attention(
         &ctx_handle,
-        &q_dev,
+        q_dev.as_f16(),
         cache.k.buffer(),
         cache.v.buffer(),
         cache.k_scales.buffer(),
         cache.v_scales.buffer(),
         &bt_dev.as_view(),
-        &mut out_dev,
+        out_dev.as_f16_mut(),
         NUM_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
