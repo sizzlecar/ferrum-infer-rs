@@ -18,6 +18,9 @@ pub mod cpu_gguf;
 #[cfg(feature = "cuda")]
 pub mod cuda_marlin;
 
+#[cfg(feature = "cuda")]
+pub mod cuda_marlin_stack;
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal_gguf;
 
