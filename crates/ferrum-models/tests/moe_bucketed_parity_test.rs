@@ -55,14 +55,14 @@ fn build_stacked(
     num_experts: usize,
     group_size: usize,
     base_seed: u64,
-) -> Arc<<CpuBackend as Backend>::GptqStore> {
+) -> Arc<dyn ferrum_kernels::MarlinExpertStack<CpuBackend>> {
     let parts: Vec<_> = (0..num_experts)
         .map(|e| synth_gptq(k, n_per_expert, group_size, base_seed + e as u64))
         .collect();
     let qweights: Vec<&[i32]> = parts.iter().map(|p| p.0.as_slice()).collect();
     let scales: Vec<&[f32]> = parts.iter().map(|p| p.1.as_slice()).collect();
     let qzeros: Vec<&[i32]> = parts.iter().map(|p| p.2.as_slice()).collect();
-    let store = <CpuBackend as BackendQuantMarlin>::load_gptq_stacked(
+    <CpuBackend as BackendQuantMarlin>::load_gptq_stacked(
         &qweights,
         &scales,
         &qzeros,
@@ -72,8 +72,7 @@ fn build_stacked(
         k,
         n_per_expert,
     )
-    .expect("CPU stacked load_gptq_stacked");
-    Arc::new(store)
+    .expect("CPU stacked load_gptq_stacked")
 }
 
 #[test]
@@ -85,27 +84,10 @@ fn bucketed_matches_per_pair_dispatch() {
     let batch = 5;
     let group_size = 32;
 
-    // Build stacked stores for gate_up (2 * inter cols per expert) and
-    // down (hidden cols per expert).
-    let gate_up_arc = build_stacked(hidden, 2 * inter, num_experts, group_size, 0xA);
-    let down_arc = build_stacked(inter, hidden, num_experts, group_size, 0xB);
-
-    // Phase C step 3: build trait-object MarlinExpertStack first;
-    // step 4b: StackedExpertLinear::new takes the stack directly.
-    let gate_up_stack = <CpuBackend as BackendQuantMarlin>::make_marlin_expert_stack(
-        gate_up_arc.clone(),
-        num_experts,
-        2 * inter,
-        hidden,
-    )
-    .expect("make_marlin_expert_stack gate_up");
-    let down_stack = <CpuBackend as BackendQuantMarlin>::make_marlin_expert_stack(
-        down_arc.clone(),
-        num_experts,
-        hidden,
-        inter,
-    )
-    .expect("make_marlin_expert_stack down");
+    // Build stacked MarlinExpertStacks (Phase C step 4e: build_stacked now
+    // returns the trait object directly).
+    let gate_up_stack = build_stacked(hidden, 2 * inter, num_experts, group_size, 0xA);
+    let down_stack = build_stacked(inter, hidden, num_experts, group_size, 0xB);
 
     // Per-expert StackedExpertLinear views built from the trait-object
     // stack (Phase C step 4b). Used by per-pair dispatch path.
