@@ -550,8 +550,8 @@ impl BackendPagedKv for CudaBackend {
             let k_off = li * BATCHED_SCRATCH_CAP;
             let v_off = (li + super::MAX_LAYERS_FOR_GRAPH) * BATCHED_SCRATCH_CAP;
             for i in 0..m {
-                let (kp, _) = k_caches[li * m + i].device_ptr(&stream);
-                let (vp, _) = v_caches[li * m + i].device_ptr(&stream);
+                let (kp, _) = k_caches[li * m + i].as_f16().device_ptr(&stream);
+                let (vp, _) = v_caches[li * m + i].as_f16().device_ptr(&stream);
                 ctx.batched_host_cache_ptrs[k_off + i] = kp;
                 ctx.batched_host_cache_ptrs[v_off + i] = vp;
                 ctx.batched_host_k_ptrs[k_off + i] = kp;
@@ -677,9 +677,9 @@ impl BackendPagedKv for CudaBackend {
         // CudaBuf::U32, the kernel reads them as `int*` — same wire-level
         // behavior as the prior f16-bit-tunneled layout but with a
         // dtype tag that prevents byte-count miscalculation.
-        let qv = q.slice(..);
-        let kp = k_pool.slice(..);
-        let vp = v_pool.slice(..);
+        let qv = q.as_f16().slice(..);
+        let kp = k_pool.as_f16().slice(..);
+        let vp = v_pool.as_f16().slice(..);
         let csq = cu_seqlens_q.as_u32().slice(..);
         let po = pos_offsets.as_u32().slice(..);
         let bt = block_tables.as_u32().slice(..);
@@ -946,9 +946,9 @@ impl BackendPagedKv for CudaBackend {
         );
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
-        let qv = q.slice(..);
-        let kp = k_pool.slice(..);
-        let vp = v_pool.slice(..);
+        let qv = q.as_f16().slice(..);
+        let kp = k_pool.as_f16().slice(..);
+        let vp = v_pool.as_f16().slice(..);
         // block_tables / valid_kv_lens are CudaBuf::U32 (typed since B-2);
         // slice the U32 variant to give the kernel an int* it can read.
         let bt = block_tables.as_u32().slice(..);
