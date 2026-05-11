@@ -33,10 +33,22 @@ The MoE decode path has two characteristics that Llama doesn't:
 CUDA Graphs require the **same sequence of kernel launches** per replay. We can't capture a graph for "all active experts dispatch" because the dispatch list isn't fixed.
 
 ### Mitigations
-1. **Fused MoE Marlin (`FERRUM_MOE_FUSED=1`, default ON)** — collapses N per-expert calls into 1-4 bucketed `marlin_gemm_moe` launches. Kernel reads `expert_ids` from device to route blocks. Number of launches is FIXED (1 per `thread_m_blocks` bucket ∈ {1,2,3,4}). **This path IS capturable.**
-2. **vLLM marlin_moe_wna16 (`FERRUM_VLLM_MOE=1`)** — single fused launch per phase. **Definitely capturable.**
+1. **Fused MoE Marlin (`FERRUM_MOE_FUSED=1`, default ON)** — collapses N per-expert calls into 1-4 bucketed `marlin_gemm_moe` launches. Kernel reads `expert_ids` from device to route blocks. Number of launches is FIXED (1 per `thread_m_blocks` bucket ∈ {1,2,3,4}). **The kernel itself IS capturable.**
+2. **vLLM marlin_moe_wna16 (`FERRUM_VLLM_MOE=1`)** — single fused launch per phase. **The kernel itself IS capturable.**
 
-So: if `FERRUM_MOE_FUSED=1` or `FERRUM_VLLM_MOE=1` (current bench config has both), the dispatch shape is stable → graphable.
+### Blocker 1b (discovered 2026-05-12 in Phase 1 attempt): host-mediated routing
+Even with `FERRUM_VLLM_MOE=1`, `moe_forward_bucketed` calls `B::try_gpu_route_topk_into_host` which does **D2H + stream.synchronize** per layer (CUDA impl at `cuda/moe.rs:170-186`). This:
+- Reads top-K expert ids/weights to host so the bucket plan + `sorted_token_ids` can be built host-side.
+- D2H + synchronize during graph capture raises `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.
+
+**This is the actual blocker, not the per-expert variation.** Even if we resolve the dispatch-count variation via FUSED/VLLM_MOE, the per-layer host→device round-trip kills capture.
+
+### Prerequisite: device-side routing
+Before any graph capture can work for MoE decode, the routing must move fully on-device:
+- `route_topk_softmax` already writes ids/weights to device (used by GPU-only path under `FERRUM_MOE_HOST_TOPK=0` for the non-bucketed `moe_forward_stacked`).
+- Need: device-side build of `sorted_token_ids` / `expert_ids` / `num_tokens_past_padded` (the inputs to `moe_align_block_size` + `marlin_moe_wna16`). vLLM does this with their `moe_align_block_size` kernel — we already have `B::moe_align_block_size` on the trait but it's only used for the post-route bucket assignment, not for actual routing.
+
+The path forward is: have `moe_forward_bucketed` call a NEW pure-device routing helper (`B::route_into_bucket_plan`?) that produces the routing buffers without ever touching host.
 
 ### Blocker 2: Pre-grow scratch before begin_capture
 LlamaFamilyModel uses `B::pregrow_marlin_gather_scratch(m_total * intermediate_size)` to eagerly grow the marlin scratch slot. Same pattern needed for MoE:
