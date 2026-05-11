@@ -9,14 +9,15 @@ Workload: random_input_len=256, random_output_len=128, num_prompts = `c * 4`
 
 ## Result
 
-| c | output tok/s | mean TPOT | mean TTFT | p99 TPOT | completed |
-|---|-------------:|----------:|----------:|---------:|----------:|
-| 1  | 127.2 | 7.54 ms  | 49 ms  | —      | 4/4 |
-| 8  | 432.8 | 16.63 ms | 243 ms | —      | 32/32 |
-| 16 | 582.1 | 24.42 ms | 408 ms | —      | 64/64 |
-| 32 | **717.5** | **39.11 ms** | 736 ms | 48.69 ms | 128/128 |
+| c | output tok/s (run1) | output tok/s (run2) | mean TPOT (run1) | completed |
+|---|--------------------:|--------------------:|-----------------:|----------:|
+| 1  | 127.2 | 128.0 | 7.54 ms  | 4/4 |
+| 8  | 432.8 | 434.6 | 16.63 ms | 32/32 |
+| 16 | 582.1 | 580.1 | 24.42 ms | 64/64 |
+| 32 | **717.5** | 697.4 | **39.11 ms** | 128/128 |
 
-All concurrency levels: `fail=0`.
+Two consecutive bench runs — variance within ±3% at c=32, ±0.5% at lower c.
+All concurrency levels: `fail=0` both runs.
 
 ## Comparison vs pre-refactor baseline
 
