@@ -6,13 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Ferrum Infer is a Rust-native LLM inference engine. Single binary, no Python — supports Metal (macOS), CUDA (NVIDIA), and CPU backends. Targets vLLM-level performance with PagedAttention, continuous batching, and custom CUDA kernels.
 
-**Current performance (RTX PRO 6000 Blackwell, Qwen3-4B):**
+**Current baseline (Qwen3-30B-A3B-GPTQ-Int4, RTX 4090, `ferrum bench-serve`):**
 
-| Mode | FP16 | INT4 (Marlin) |
-|------|------|---------------|
-| Single request | 88.8 tok/s (TPOT 11.35ms) | **112.4 tok/s (TPOT 8.90ms)** |
-| 4 concurrent | 109.4 tok/s | — |
-| VRAM usage | ~8 GB | **~2.5 GB (-69%)** |
+| c | tok/s | TPOT | ratio vs vLLM 0.20.1 |
+|---|------:|-----:|---------------------:|
+| 1  | 96.2  | 10.04ms | 60% |
+| 8  | 241.5 | 31.13ms | 58% |
+| 16 | 272.1 | 55.52ms | 54% |
+| 32 | **318.4** | 94.75ms | **17%** |
+
+`bash bench/v0.2-cuda/m3_bench_serve.sh` for repro. The c=32 cliff vs vLLM is the active perf target.
 
 - INT4 quantization: GPTQ format auto-detected, Marlin fused kernel on Blackwell
 - Paged KV attention with block reclamation
@@ -21,52 +24,47 @@ Ferrum Infer is a Rust-native LLM inference engine. Single binary, no Python —
 ## Build & Development Commands
 
 ```bash
-cargo check --workspace --all-targets    # Fast compile validation
-cargo build --workspace                  # Full build
-cargo test --workspace                   # All tests
-cargo test -p ferrum-scheduler           # Single crate tests
-cargo fmt --all -- --check               # Format check (CI enforced)
-cargo clippy --workspace --all-targets -- -A warnings  # Lint (CI advisory)
+cargo check --workspace --all-targets   # Fast compile validation (Mac, no GPU features)
+cargo test --workspace                  # Full test suite
+cargo fmt --all -- --check              # CI-enforced format check
+cargo clippy --workspace --all-targets -- -A warnings  # CI-advisory lint
 
-# Run CLI
-cargo run -p ferrum-cli --bin ferrum -- run qwen3:0.6b
+# Default CLI surface (the only entry points users see)
+cargo run -p ferrum-cli --bin ferrum -- run qwen3:0.6b           # interactive chat
 cargo run -p ferrum-cli --bin ferrum -- serve --model qwen3:0.6b --port 8000
-cargo run -p ferrum-cli --bin ferrum -- pull qwen3:0.6b
-cargo run -p ferrum-cli --bin ferrum -- list
+cargo run -p ferrum-cli --bin ferrum -- bench qwen3:4b --concurrency 4 --max-tokens 128
+cargo run -p ferrum-cli --bin ferrum -- bench-serve --base-url http://127.0.0.1:8000 \
+    --model /path/to/model --tokenizer /path/to/model --max-concurrency 32   # HTTP bench, vllm-parity
 
-# With Metal acceleration (macOS)
-cargo run -p ferrum-cli --bin ferrum --features metal -- run qwen3:0.6b
-
-# Whisper ASR transcription
-cargo run -p ferrum-cli --bin ferrum --features metal -- transcribe whisper-turbo audio.wav -l zh
-cargo run -p ferrum-cli --bin ferrum --features metal -- serve whisper-turbo
-
-# Benchmarks
-cargo run -p ferrum-cli --bin ferrum -- bench qwen3:4b                          # sequential baseline
-cargo run -p ferrum-cli --bin ferrum -- bench qwen3:4b --concurrency 4          # batch decode
-cargo run -p ferrum-cli --bin ferrum -- bench qwen3:4b --max-tokens 1024        # long decode
-cargo run -p ferrum-cli --bin ferrum -- bench qwen3:4b --long-context           # long prompt (~2k tokens)
-
-# CUDA with batch decode + paged KV
-FERRUM_MAX_BATCH=8 cargo run -p ferrum-cli --features cuda -- bench qwen3:4b --concurrency 4
-FERRUM_PAGED_KV=1 FERRUM_KV_BLOCKS=128 cargo run -p ferrum-cli --features cuda -- bench qwen3:4b --concurrency 4
-
-# Triton-rs PTX kernels (optional, decode-path swap-in)
-cargo run -p ferrum-cli --features cuda,triton-kernels -- run qwen2.5:3b-int4
-FERRUM_TRITON_INT4=1 cargo run -p ferrum-cli --features cuda,triton-kernels -- run qwen2.5:3b-int4
+# Feature gates
+cargo run -p ferrum-cli --features metal -- ...                  # macOS Metal
+cargo run -p ferrum-cli --features cuda,vllm-moe-marlin -- ...   # CUDA + vLLM marlin moe
+cargo run -p ferrum-cli --features cuda,triton-kernels -- ...    # CUDA + Triton PTX
+# Triton w4a16 INT4: FERRUM_TRITON_INT4=1 (default off; Marlin is faster)
 ```
+
+Internal env vars (`FERRUM_KV_MAX_BLOCKS` / `FERRUM_PAGED_MAX_SEQS` / `FERRUM_VLLM_MOE` etc.) are set by `gpu_mem_autosize` for `serve` and chat-profile defaults for `run`. Users should not set them by hand — that's the autosizer's job.
 
 ## Architecture
 
-**Architecture v2 (Model-as-Code) — done.** The model layer is explicit Rust generic over a `Backend<B>` trait, not a config-driven runner. `LlamaFamilyModel<B>` (in `ferrum-models`) covers Qwen3 / Qwen2.x / Llama / Mistral; per-family quirks (Qwen3 QK-norm, Mistral sliding window) are toggles on the config struct. All hardware behavior goes through the `Backend` trait — adding a backend = implementing the trait, not editing models.
+**Architecture v2 (Model-as-Code) — done.** The model layer is explicit Rust generic over a `Backend<B>` trait, not a config-driven runner. `LlamaFamilyModel<B, K>` (in `ferrum-models`) covers Qwen3 / Qwen2.x / Llama / Mistral; `Qwen3MoeModel<B, K>` covers Qwen3-MoE / 30B-A3B; per-family quirks (Qwen3 QK-norm, Mistral sliding window) are toggles on the config struct. K is the KV-precision marker (`KvFp16` default; `KvInt8` functional, FP8 ahead). All hardware behavior goes through the `Backend` supertrait stack — adding a backend = implementing the relevant supertraits, not editing models.
 
-**Dependency layers (bottom-up):**
+**5 polymorphism dimensions** (each is one independent axis, not multiplicative):
+1. Model architecture — per-family Rust struct
+2. Compute precision — `Linear<B>` impl
+3. Weight format — `WeightLoader<B>` (safetensors / GPTQ / GGUF; AWQ / EXL2 pluggable)
+4. Inference device — `Backend` + capability supertraits (CUDA / Metal / CPU; AMD pluggable)
+5. KV cache precision — `KvDtypeKind` marker + `BackendKvDtype<K>` (FP16 / INT8; FP8 pluggable)
 
-1. **Foundation (no GPU deps):** `ferrum-types` (shared types, errors), `ferrum-interfaces` (trait contracts: ComputeBackend, ModelExecutor, Scheduler, KvCacheManager, Sampler, Tokenizer)
-2. **Core logic (hardware-agnostic):** `ferrum-scheduler` (continuous batching, priority), `ferrum-sampler` (top-k/p, temperature, JSON mode), `ferrum-tokenizer` (HF wrapper), `ferrum-kv` (paged KV cache, block allocation), `ferrum-runtime` (backend registry)
-3. **Compute (feature-gated):** `ferrum-kernels` (unified `Backend<B>` impls for CPU / CUDA / Metal — owns custom CUDA kernels, Triton PTX, Marlin, paged KV, NCCL, TP decode), `ferrum-attention` (fused-transformer prototype — Metal/CPU shipping, CUDA module is a stub kept around for future use), `ferrum-quantization` (`Linear` trait, GPTQ loader, native safetensors)
-4. **Application:** `ferrum-engine` (orchestration, `ContinuousBatchEngine`), `ferrum-models` (`LlamaFamilyModel<B>`, BERT, Whisper, Qwen3-TTS), `ferrum-server` (Axum HTTP, OpenAI-compatible API), `ferrum-cli` (binary entry point)
+**13 crates, dependency layers (bottom-up):**
+
+1. **Foundation (no GPU deps):** `ferrum-types` (shared types/errors/config), `ferrum-interfaces` (trait contracts: ModelExecutor, Scheduler, KvCacheManager, Sampler, Tokenizer, KvDtypeKind markers)
+2. **Core logic (hardware-agnostic):** `ferrum-scheduler` (continuous batching, priority), `ferrum-sampler` (top-k/p, temperature, JSON mode), `ferrum-tokenizer` (HF wrapper), `ferrum-kv` (paged KV cache, block allocation)
+3. **Compute (feature-gated):** `ferrum-kernels` (unified `Backend<B>` impls for CPU / CUDA / Metal — owns custom CUDA kernels, Triton PTX, Marlin, paged KV, NCCL, TP decode, fused-transformer attention, Linear<B> quant impls), `ferrum-quantization` (`Linear` trait, GPTQ loader, native safetensors)
+4. **Application:** `ferrum-engine` (orchestration, `ContinuousBatchEngine` — the only LLM engine impl; also owns tensor_factory + parallel device manager), `ferrum-models` (`LlamaFamilyModel<B, K>` / `Qwen3MoeModel<B, K>` / BERT / Whisper / Qwen3-TTS), `ferrum-server` (Axum HTTP, OpenAI-compatible API), `ferrum-cli` (binary entry point)
 5. **Testing:** `ferrum-testkit` (mocks for all trait contracts — enables GPU-free testing)
+
+**Deleted crates (history):** `ferrum-runtime` (folded into `ferrum-engine` PR #121), `ferrum-attention` (merged into `ferrum-kernels::attention` PR #128).
 
 **Key design rules:**
 - `cargo check --workspace` and `cargo test --workspace` must pass on Mac without GPU features
@@ -89,7 +87,7 @@ process_batch:
   • prefill: tokenizer.encode → model.prefill (candle path, cuBLAS GEMM, flash-attn-2)
   • decode:  model.decode (custom CudaDecodeRunner + per-layer kernels)
   • per-request: build SamplingConfig, sample logits, push StreamChunk over mpsc
-Model forward  (LlamaFamilyModel<B>::forward_layer, ferrum-models)
+Model forward  (LlamaFamilyModel<B, K>::forward_layer, ferrum-models)
   per layer: rms_norm → qkv_proj → [qk_norm if Qwen3] → rope → kv_append
            → flash/decode attention → o_proj → fused_add_rms_norm
            → gate_up_proj → fused_silu_mul → down_proj → residual_add
@@ -113,23 +111,32 @@ Tokenizer.decode([token_id])  → SSE chunk back to client
 
 ## CUDA Decode Runner
 
-Candle handles weight loading and prefill (FlashAttention-2). Decode is fully controlled by `CudaDecodeRunner` in `ferrum-kernels`:
+CUDA backend lives in `crates/ferrum-kernels/src/backend/cuda/`. After PRs #148-#152 (Audit #8), the 4756-line `cuda.rs` is split into 6 supertrait-aligned files:
+
+| File | Owns |
+|------|------|
+| `mod.rs` (1986 lines) | core `impl Backend for CudaBackend` + `CudaState` + global stream / decode-state slots + `KvFp16` marker impl |
+| `collective.rs` | `BackendCollective` (TP all-reduce) |
+| `graph.rs` | `BackendGraph` + `GraphSlotRaw` + `DECODE_GRAPHS` multi-slot cache |
+| `int8_kv.rs` | `BackendInt8KvOps` + `OptionalCudaInt8` + KvCacheQuant constructor |
+| `quant.rs` | `BackendQuantMarlin` + `BackendQuantGguf` + Marlin gather scratch + vLLM marlin moe |
+| `paged.rs` | `BackendPagedKv` + SplitKScratch + paged dispatchers |
+| `moe.rs` | `BackendMoeFused` (route_topk_softmax, moe_align_block_size, moe_combine) |
 
 **Custom CUDA kernels** (PTX compiled at build time via `ferrum-kernels/build.rs`):
 - `rms_norm.cu`, `fused_add_rms_norm.cu` — layer normalization
 - `rope.cu` — rotary position embedding (Q+K fused)
 - `fused_silu_mul.cu` — MLP activation (+ interleaved variant for batch)
-- `decode_attention.cu` — single-block warp-cooperative attention
-- `flash_decode_attention.cu` — split-K flash decoding for long contexts
-- `paged_decode_attention.cu` — block-table indirect attention (+ split-K variant)
+- `decode_attention.cu` / `flash_decode_attention.cu` / `paged_decode_attention.cu` (+ split-K + INT8 variants)
 - `residual_add.cu` — element-wise residual
-- `marlin.cu` — INT4×FP16 GPTQ GEMM (Blackwell-tuned, used for decode quant path)
+- `marlin.cu` — INT4×FP16 GPTQ GEMM (Blackwell-tuned)
+- `vllm_marlin_moe/ops.cu` — vendored vLLM marlin_moe_wna16 (under `vllm-moe-marlin` feature)
 
 **Decode optimizations:**
 - Double-buffered residual + cross-layer norm fusion (108 fewer kernel launches)
-- Piecewise CUDA Graphs (`L+1` graphs covering pre_attn / post_attn{i}+pre_attn{i+1} / post_attn+norm+lm_head); attention itself stays eager
+- Piecewise CUDA Graphs on `LlamaFamilyModel` decode (L+1 graphs); attention stays eager. `FERRUM_UNIFIED_GRAPH=1` opts into full-forward graph capture (~+5% measured). **`Qwen3MoeModel` has no graph capture yet** — primary perf gap to vLLM on MoE.
 - Flash Decoding: split KV across blocks for GPU SM utilization (auto at kv_len > 256)
-- Batch decode: batched cuBLAS GEMM (m=batch) with per-item attention loop
+- Batch decode: batched cuBLAS GEMM (m=batch) with per-item attention loop, OR `split_qkv_norm_rope_into_paged_cache_varlen` batched-attn path (PR #102)
 - Paged KV: GPU block pool with block-table indirection, free-list reclamation
 - Tensor parallel decode: persistent per-rank threads + NCCL all-reduce (use only when single GPU OOMs or NVLink is present — PCIe path is bandwidth-bound)
 
@@ -180,44 +187,21 @@ Models are downloaded from HuggingFace and cached locally.
 
 ## Whisper ASR
 
-Custom Whisper forward pass — candle loads weights only, inference is ours (Metal/CUDA/CPU).
+Custom Whisper forward pass (candle loads weights only, inference is ours). Files: `crates/ferrum-models/src/multimodal/whisper.rs` + decode in `whisper_decoder.rs`.
 
-**Architecture:**
-- Custom LayerNorm, Softmax, Linear (bypasses candle-nn CustomOp which lacks Metal support)
-- rustfft-based STFT for mel spectrogram (matches Python whisper to float32 precision)
-- Mel filterbank extracted from Python whisper (identical to torch version)
-- Self-attention KV cache with positional embedding offset tracking
-- Cross-attention KV cache (compute once per segment)
+- Custom `LayerNorm`/`Softmax`/`Linear` (bypass candle-nn's missing Metal CustomOp)
+- rustfft-based STFT + Python-whisper-extracted mel filterbank (float32 parity)
+- Decode pipeline matches `whisper.transcribe`: timestamp-based, 3 logit filters (SuppressBlank / SuppressTokens / ApplyTimestampRules), temperature fallback 0.0→1.0 in 0.2 steps, compression-ratio + avg-logprob checks, repetition detection.
+- Perf: 5-min Chinese audio whisper-large-v3-turbo on Mac Metal ~72s (vs Python CPU torch 107s; PyTorch MPS broken at the time).
+- Known limit: Metal float32 matmul accumulation differs from CPU after ~4 encoder layers — minor char-level drift (e.g. "核销" vs "和销"). Hardware-level, not fixable in software.
 
-**Decode pipeline (matches Python whisper.transcribe):**
-- Timestamp-based sequential decode (not no_timestamps mode)
-- Three logit filters: SuppressBlank, SuppressTokens (82 non-speech + special), ApplyTimestampRules
-- Temperature fallback: 0.0 → 0.2 → 0.4 → 0.6 → 0.8 → 1.0
-- Compression ratio check (real zlib via flate2) + avg logprob threshold
-- No-speech detection and segment skipping
-- Seek-based segmentation from timestamp tokens
-- Repetition detection (consecutive token limit)
-
-**CLI:**
+CLI:
 ```bash
-# Transcribe audio file (WAV/M4A/MP3 — auto ffmpeg conversion)
-cargo run -p ferrum-cli --bin ferrum --features metal -- transcribe whisper-turbo audio.m4a -l zh
-
-# HTTP server with /v1/audio/transcriptions endpoint
-cargo run -p ferrum-cli --bin ferrum --features metal -- serve whisper-turbo
+cargo run -p ferrum-cli --features metal -- transcribe whisper-turbo audio.m4a -l zh
+cargo run -p ferrum-cli --features metal -- serve whisper-turbo
 curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.wav" -F "language=zh"
 ```
 
-**Performance (5-min Chinese audio, whisper-large-v3-turbo):**
-
-| Backend | Time | vs Python |
-|---------|------|-----------|
-| Rust Metal (release) | ~72s | 1.5x faster |
-| Python CPU (torch) | 107s | baseline |
-| Python MPS | N/A (PyTorch bug) | — |
-
-**Known limitation:** Metal float32 matmul accumulation order differs from CPU, causing minor character-level differences (e.g., "核销" vs "和销") after 4 encoder transformer layers. Not fixable at software level — hardware floating-point behavior. On CUDA, this is controllable via cuBLAS compute type.
-
 ## Config
 
-Runtime defaults in `ferrum.toml`. Model cache at `~/.cache/huggingface` (shared with HF Python).
+Runtime defaults: `EngineConfig::default()` in `ferrum-types::config` (no helper wrapper; PR #153 dropped `simple_engine_config`). Model cache at `~/.cache/huggingface` (shared with HF Python).
