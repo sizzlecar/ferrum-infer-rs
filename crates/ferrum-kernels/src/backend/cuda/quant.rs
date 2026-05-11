@@ -636,7 +636,7 @@ impl BackendQuantMarlin for CudaBackend {
         #[cfg(feature = "vllm-moe-marlin")]
         if use_vllm_moe() {
             let stream = default_stream();
-            let store = crate::vllm_marlin::load_stacked_gptq_vllm_marlin(
+            let mw = crate::vllm_marlin::load_stacked_gptq_vllm_marlin(
                 &stream,
                 qweights,
                 scales,
@@ -649,7 +649,19 @@ impl BackendQuantMarlin for CudaBackend {
             tracing::info!(
                 "GPTQ stacked load (vLLM marlin path): {num_experts} experts × N={n_per_expert} × K={k} (gs={group_size})",
             );
-            return Ok(store);
+            // Phase C step 4e: wrap in trait-object MarlinExpertStack.
+            #[cfg(feature = "triton-kernels")]
+            let store: GptqStoreCuda = GptqStoreCuda::Marlin(mw);
+            #[cfg(not(feature = "triton-kernels"))]
+            let store: GptqStoreCuda = mw;
+            return Ok(std::sync::Arc::new(
+                crate::quant_linear::cuda_marlin_stack::CudaMarlinExpertStack::new(
+                    std::sync::Arc::new(store),
+                    num_experts,
+                    n_per_expert,
+                    k,
+                ),
+            ));
         }
 
         // Triton path: would need a stacked variant — not implemented.
@@ -947,29 +959,27 @@ pub(crate) fn moe_gemm_phase_vllm_impl(
     #[cfg(not(feature = "triton-kernels"))]
     let mw: &crate::marlin::MarlinWeight = weight;
 
-    use cudarc::driver::sys::CUdeviceptr;
     use cudarc::driver::CudaSlice;
-    use cudarc::driver::DevicePtr;
 
     let stream = ctx.stream.clone();
     let c_tmp_mut: &mut CudaSlice<f32> = ctx.vllm_moe_c_tmp();
 
-    let (st_ptr, _g0) = sorted_token_ids.device_ptr(&stream);
-    let (eid_ptr, _g1) = expert_ids.device_ptr(&stream);
-    let (npp_ptr, _g2) = num_tokens_past_padded.device_ptr(&stream);
-    let st_view: CudaSlice<i32> = unsafe { stream.upgrade_device_ptr(st_ptr as CUdeviceptr, 0) };
-    let eid_view: CudaSlice<i32> = unsafe { stream.upgrade_device_ptr(eid_ptr as CUdeviceptr, 0) };
-    let npp_view: CudaSlice<i32> = unsafe { stream.upgrade_device_ptr(npp_ptr as CUdeviceptr, 0) };
+    // Phase D step 2+3: upload_moe_routing now returns CudaBuf::I32
+    // directly — no more upgrade_device_ptr leak. Pass the typed
+    // CudaSlice<i32> refs straight to the kernel wrapper.
+    let st_ref = sorted_token_ids.as_i32();
+    let eid_ref = expert_ids.as_i32();
+    let npp_ref = num_tokens_past_padded.as_i32();
 
-    let r = crate::marlin::marlin_gemm_moe_vllm(
+    crate::marlin::marlin_gemm_moe_vllm(
         &stream,
-        input,
+        input.as_f16(),
         mw,
-        output,
+        output.as_f16_mut(),
         Some(c_tmp_mut),
-        &st_view,
-        &eid_view,
-        &npp_view,
+        st_ref,
+        eid_ref,
+        npp_ref,
         None,
         moe_block_size as i32,
         top_k as i32,
@@ -978,11 +988,8 @@ pub(crate) fn moe_gemm_phase_vllm_impl(
         prob_m as i32,
         n_per_expert as i32,
         k as i32,
-    );
-    std::mem::forget(st_view);
-    std::mem::forget(eid_view);
-    std::mem::forget(npp_view);
-    r.map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
+    )
+    .map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
 }
 // CUDA does not ship GGUF k-quant kernels; inherit unsupported defaults.
 impl BackendQuantGguf for CudaBackend {}
