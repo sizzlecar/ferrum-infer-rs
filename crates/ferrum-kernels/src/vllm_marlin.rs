@@ -183,7 +183,7 @@ pub fn load_stacked_gptq_vllm_marlin(
 
     let total_qw = num_experts * qw_per;
     let total_sc = num_experts * sc_per;
-    let mut qw_out: cudarc::driver::CudaSlice<i32> = stream
+    let qw_out: cudarc::driver::CudaSlice<i32> = stream
         .alloc_zeros::<i32>(total_qw)
         .map_err(|err| candle_core::Error::Msg(format!("alloc stacked qw: {err}")))?;
 
