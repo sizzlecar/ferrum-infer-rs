@@ -256,38 +256,6 @@ impl CudaBuf {
         CudaBuf::I8(s)
     }
 
-    /// Forwarders that assume F16 — the common case for the existing
-    /// CUDA kernel call sites. Each panics on a non-F16 variant; the
-    /// migration to per-dtype-aware callsites is the rest of Phase B-2.
-    pub fn slice<R: std::ops::RangeBounds<usize>>(
-        &self,
-        range: R,
-    ) -> cudarc::driver::CudaView<'_, f16> {
-        self.as_f16().slice(range)
-    }
-    pub fn slice_mut<R: std::ops::RangeBounds<usize>>(
-        &mut self,
-        range: R,
-    ) -> cudarc::driver::CudaViewMut<'_, f16> {
-        self.as_f16_mut().slice_mut(range)
-    }
-    /// Forward to inner CudaSlice's device_ptr — only valid for F16
-    /// variant (panic otherwise). Used by kernel launch sites that
-    /// need a raw `(u64, _guard)` device pointer pair.
-    pub fn device_ptr<'a>(
-        &'a self,
-        stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
-    ) -> (u64, cudarc::driver::SyncOnDrop<'a>) {
-        use cudarc::driver::DevicePtr;
-        self.as_f16().device_ptr(stream)
-    }
-    pub fn device_ptr_mut<'a>(
-        &'a mut self,
-        stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
-    ) -> (u64, cudarc::driver::SyncOnDrop<'a>) {
-        use cudarc::driver::DevicePtrMut;
-        self.as_f16_mut().device_ptr_mut(stream)
-    }
     /// Bit-reinterpret the underlying buffer as a view of another type.
     /// Dispatches on the active variant so callers don't have to know
     /// which inner `CudaSlice<T>` holds the bytes — handy when integer
