@@ -117,7 +117,6 @@ impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
     type Context = ();
     type GptqStore = CpuGptqStore;
-    type QuantStore = CpuQuantStore;
 
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
