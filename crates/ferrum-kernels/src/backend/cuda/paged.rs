@@ -420,8 +420,9 @@ fn paged_batched_decode_single_pass(
     k_pool: &CudaSlice<f16>,
     v_pool: &CudaSlice<f16>,
     out: &mut CudaSlice<f16>,
-    block_tables: &CudaSlice<f16>,
-    valid_kv_lens: &CudaSlice<f16>,
+    // U32 typed storage post-B-2; kernel reads as int*.
+    block_tables: &CudaSlice<u32>,
+    valid_kv_lens: &CudaSlice<u32>,
     num_seqs: usize,
     max_kv_len: usize,
     num_heads: usize,
