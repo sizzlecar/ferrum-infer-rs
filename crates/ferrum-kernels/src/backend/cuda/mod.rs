@@ -429,17 +429,18 @@ impl Backend for CudaBackend {
         // - Synchronous (`cuMemcpyHtoD_v2`, not `..Async`) so the local
         //   host Vec stays alive across the copy. Async memcpy on a
         //   captured stream would record a stale host pointer.
-        // - Explicit `bind_to_thread` because tokio shifts decode_batch
-        //   calls across worker threads. Without it, calls landing on a
-        //   thread that hadn't bound the context fail with
-        //   `CUDA_ERROR_INVALID_CONTEXT` — observed after graph capture
-        //   activated and the next call ran on a fresh worker.
+        // - `bind_to_thread` is best-effort: tokio shifts decode batches
+        //   across worker threads, so re-binding on each call keeps the
+        //   driver context current on the calling thread. A failure here
+        //   used to early-return without writing (silent data-corruption
+        //   on test threads that hadn't yet bound) — now we log and
+        //   still attempt the memcpy, which is more robust on the test
+        //   path where the context is already current.
         if data.is_empty() {
             return;
         }
         if let Err(e) = ctx.ctx.bind_to_thread() {
-            eprintln!("write_u32 bind_to_thread failed: {e}");
-            return;
+            eprintln!("write_u32 bind_to_thread failed (continuing): {e}");
         }
         let stream = ctx.stream.clone();
         // Legacy callers feed signed values masquerading as u32 (e.g.
