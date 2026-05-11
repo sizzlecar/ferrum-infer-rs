@@ -482,7 +482,7 @@ impl Backend for CudaBackend {
             // PARTIAL read (len < buf capacity), e.g. reading only 4 rows
             // out of a batch_logits buffer sized for max_batch. Slice the
             // device buffer so its reported length matches `len`.
-            let view = buf.slice(0..len);
+            let view = buf.as_f16().slice(0..len);
             stream.memcpy_dtoh(&view, &mut host).expect("cuda dtoh");
             stream.synchronize().expect("cuda dtoh sync");
             host.into_iter().map(|x| x.to_f32()).collect()
@@ -581,9 +581,9 @@ impl Backend for CudaBackend {
         // cuBLAS is set to CUBLAS_POINTER_MODE_DEVICE (see ensure_blas_handle)
         // so alpha/beta are read from device memory. Using the process-global
         // alpha_f32/beta_f32 slices keeps pointers stable for graph capture.
-        let (a_ptr, _rec_a) = b.device_ptr(&ctx.stream); // cuBLAS arg "A" = weight = our `b`
-        let (b_ptr, _rec_b) = a.device_ptr(&ctx.stream); // cuBLAS arg "B" = input = our `a`
-        let (c_ptr, _rec_c) = out.device_ptr_mut(&ctx.stream);
+        let (a_ptr, _rec_a) = b.as_f16().device_ptr(&ctx.stream); // cuBLAS arg "A" = weight = our `b`
+        let (b_ptr, _rec_b) = a.as_f16().device_ptr(&ctx.stream); // cuBLAS arg "B" = input = our `a`
+        let (c_ptr, _rec_c) = out.as_f16_mut().device_ptr_mut(&ctx.stream);
         let blas_guard = blas_slot().read().expect("BLAS poisoned");
         let slot = blas_guard.as_ref().expect("BLAS not init");
         let (alpha_ptr, _ga) = slot.alpha_f32.device_ptr(&ctx.stream);
@@ -783,8 +783,8 @@ impl Backend for CudaBackend {
         dst_offset: usize,
         len: usize,
     ) {
-        let src_view = src.slice(src_offset..src_offset + len);
-        let mut dst_view = dst.slice_mut(dst_offset..dst_offset + len);
+        let src_view = src.as_f16().slice(src_offset..src_offset + len);
+        let mut dst_view = dst.as_f16_mut().slice_mut(dst_offset..dst_offset + len);
         ctx.stream
             .memcpy_dtod(&src_view, &mut dst_view)
             .expect("copy_slice dtod");
@@ -984,7 +984,7 @@ impl Backend for CudaBackend {
         let grid_x = (per_item as u32 + block_dim - 1) / block_dim;
         with_batched_scratch_mut(|slot_g| {
             for i in 0..m {
-                let (cp, _) = caches[i].device_ptr(&stream);
+                let (cp, _) = caches[i].as_f16().device_ptr(&stream);
                 slot_g.host_cache_ptrs[host_start + i] = cp;
             }
             // Async memcpy host_slice → device per-slot region. Recorded
@@ -1075,8 +1075,8 @@ impl Backend for CudaBackend {
         let shared_bytes = (max_valid_kv.min(capacity).max(1) as u32) * 4;
         with_batched_scratch_mut(|slot_g| {
             for i in 0..m {
-                let (kp, _) = k_caches[i].device_ptr(&stream);
-                let (vp, _) = v_caches[i].device_ptr(&stream);
+                let (kp, _) = k_caches[i].as_f16().device_ptr(&stream);
+                let (vp, _) = v_caches[i].as_f16().device_ptr(&stream);
                 slot_g.host_k_ptrs[host_start + i] = kp;
                 slot_g.host_v_ptrs[host_start + i] = vp;
             }
@@ -1490,8 +1490,8 @@ impl Backend for CudaBackend {
         let in_byte_off = in_row_offset * 2 * intermediate * std::mem::size_of::<half::f16>();
         let out_byte_off = out_row_offset * intermediate * std::mem::size_of::<half::f16>();
 
-        let (gu_base, _g) = gate_up.device_ptr(&stream);
-        let (out_base, _g2) = out.device_ptr_mut(&stream);
+        let (gu_base, _g) = gate_up.as_f16().device_ptr(&stream);
+        let (out_base, _g2) = out.as_f16_mut().device_ptr_mut(&stream);
         let gu_ptr = gu_base + in_byte_off as u64;
         let out_ptr = out_base + out_byte_off as u64;
 
@@ -1602,7 +1602,7 @@ impl Backend for CudaBackend {
     fn zero_buffer(ctx: &mut Self::Context, buf: &mut Self::Buffer, len: usize) -> Result<()> {
         use cudarc::driver::DevicePtr;
         let stream = ctx.stream.clone();
-        let (ptr, _g) = buf.device_ptr(&stream);
+        let (ptr, _g) = buf.as_f16().device_ptr(&stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD16Async(
                 ptr as cudarc::driver::sys::CUdeviceptr,
