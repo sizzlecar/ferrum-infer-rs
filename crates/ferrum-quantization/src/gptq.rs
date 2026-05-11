@@ -85,24 +85,26 @@ pub struct StackedExpertLinear<B: Backend + BackendQuantMarlin> {
 }
 
 impl<B: Backend + BackendQuantMarlin> StackedExpertLinear<B> {
+    /// Phase C step 4b: takes the trait-object MarlinExpertStack
+    /// directly (was `Arc<B::GptqStore>` + `B::make_stacked_expert_linear`).
     pub fn new(
-        store: Arc<B::GptqStore>,
+        stack: Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
         expert_offset: usize,
         expert_n: usize,
-        k: usize,
     ) -> Result<Self> {
-        let inner = B::make_stacked_expert_linear(store, expert_offset, expert_n, k, None)?;
+        let k = stack.k();
+        let inner = stack.make_expert_linear(expert_offset, expert_n, None)?;
         Ok(Self { inner, k, expert_n })
     }
 
     pub fn new_with_bias(
-        store: Arc<B::GptqStore>,
+        stack: Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
         expert_offset: usize,
         expert_n: usize,
-        k: usize,
         bias: &[f32],
     ) -> Result<Self> {
-        let inner = B::make_stacked_expert_linear(store, expert_offset, expert_n, k, Some(bias))?;
+        let k = stack.k();
+        let inner = stack.make_expert_linear(expert_offset, expert_n, Some(bias))?;
         Ok(Self { inner, k, expert_n })
     }
 }

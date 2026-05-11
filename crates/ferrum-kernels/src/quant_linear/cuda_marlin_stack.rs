@@ -18,6 +18,7 @@
 use crate::backend::cuda::{CudaBackend, GptqStoreCuda};
 use crate::marlin_expert_stack::MarlinExpertStack;
 use crate::Linear;
+use cudarc::driver::DevicePtr;
 use ferrum_types::Result;
 use std::sync::Arc;
 
@@ -55,9 +56,30 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
     }
 
     fn zero_workspace(&self, ctx: &mut <CudaBackend as crate::backend::Backend>::Context) -> Result<()> {
-        <CudaBackend as crate::backend::BackendQuantMarlin>::marlin_zero_stacked_workspace(
-            ctx, &self.store,
-        )
+        // Inlined from BackendQuantMarlin::marlin_zero_stacked_workspace
+        // (Phase C step 4a). Bulk-zeros the per-expert Marlin workspace
+        // mutex slots via a single cuMemsetD32Async — replaces the
+        // per-call workspace-zero that fired ~12k times per token
+        // (c=32 × 128 experts × 2 phases × 48 layers) with one launch.
+        #[cfg(feature = "triton-kernels")]
+        let mw = match self.store.as_ref() {
+            GptqStoreCuda::Marlin(mw) => mw,
+            GptqStoreCuda::Triton(_) => {
+                return Err(ferrum_types::FerrumError::unsupported(
+                    "zero_workspace: not applicable to Triton store",
+                ));
+            }
+        };
+        #[cfg(not(feature = "triton-kernels"))]
+        let mw: &crate::marlin::MarlinWeight = self.store.as_ref();
+        let stream = ctx.stream.clone();
+        let raw_stream = stream.cu_stream();
+        let (ws_ptr, _g) = mw.workspace.device_ptr(&stream);
+        let ws_len = mw.workspace.len();
+        unsafe {
+            cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, ws_len, raw_stream);
+        }
+        Ok(())
     }
 
     fn gemm_phase_batched(
@@ -123,12 +145,20 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         expert_n: usize,
         bias_host: Option<&[f32]>,
     ) -> Result<Box<dyn Linear<CudaBackend> + Send + Sync>> {
-        <CudaBackend as crate::backend::BackendQuantMarlin>::make_stacked_expert_linear(
-            self.store.clone(),
-            expert_offset,
-            expert_n,
-            self.k,
-            bias_host,
-        )
+        // Inlined from BackendQuantMarlin::make_stacked_expert_linear
+        // (Phase C step 4b). The returned Linear<CudaBackend> is a
+        // single-expert column-slice view onto the shared stacked
+        // Marlin tile; its `forward` does the per-expert offset
+        // GEMM via crate::backend::cuda::marlin_gemm_with_perm.
+        let bias = bias_host.map(<CudaBackend as crate::backend::Backend>::from_slice);
+        Ok(Box::new(
+            crate::quant_linear::cuda_marlin::CudaMarlinStackedExpertLinear {
+                store: self.store.clone(),
+                expert_offset,
+                expert_n,
+                k: self.k,
+                bias,
+            },
+        ))
     }
 }

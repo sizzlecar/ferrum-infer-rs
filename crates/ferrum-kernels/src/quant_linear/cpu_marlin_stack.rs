@@ -53,10 +53,10 @@ impl MarlinExpertStack<CpuBackend> for CpuMarlinExpertStack {
         self
     }
 
-    fn zero_workspace(&self, ctx: &mut <CpuBackend as crate::backend::Backend>::Context) -> Result<()> {
-        <CpuBackend as crate::backend::BackendQuantMarlin>::marlin_zero_stacked_workspace(
-            ctx, &self.store,
-        )
+    fn zero_workspace(&self, _ctx: &mut <CpuBackend as crate::backend::Backend>::Context) -> Result<()> {
+        // CPU GptqStore (dequant-on-load) has no per-expert workspace
+        // mutex slots — Marlin-specific GPU artefact. No-op.
+        Ok(())
     }
 
     fn gemm_phase_batched(
@@ -84,12 +84,28 @@ impl MarlinExpertStack<CpuBackend> for CpuMarlinExpertStack {
         expert_n: usize,
         bias_host: Option<&[f32]>,
     ) -> Result<Box<dyn Linear<CpuBackend> + Send + Sync>> {
-        <CpuBackend as crate::backend::BackendQuantMarlin>::make_stacked_expert_linear(
-            self.store.clone(),
-            expert_offset,
-            expert_n,
-            self.k,
-            bias_host,
-        )
+        // Inlined from BackendQuantMarlin::make_stacked_expert_linear
+        // (Phase C step 4b).
+        if expert_offset + expert_n > self.store.n {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "make_expert_linear OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
+                self.store.n
+            )));
+        }
+        if self.k != self.store.k {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "make_expert_linear k mismatch: arg {} vs store.k {}",
+                self.k, self.store.k
+            )));
+        }
+        let row_start = expert_offset * self.k;
+        let row_end = (expert_offset + expert_n) * self.k;
+        let slice = self.store.weight_f32[row_start..row_end].to_vec();
+        Ok(Box::new(crate::quant_linear::cpu_dequant::CpuGptqLinear {
+            weight_f32: slice,
+            bias: bias_host.map(|b| b.to_vec()),
+            in_features: self.k,
+            out_features: expert_n,
+        }))
     }
 }
