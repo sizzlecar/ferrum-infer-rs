@@ -63,14 +63,23 @@ fn bench_paged_decode_attn() {
     let valid_kv_lens_i32 = stream.clone_htod(&kvl_host).unwrap();
 
     // Reinterpret i32 device buffers as f16 (Self::Buffer) for the trait API.
+    // Wrap in CudaBuf::F16 — the trait expects &Self::Buffer = &CudaBuf;
+    // downstream forwarders extract via .as_f16() and the underlying
+    // CudaSlice<f16> view aliases the i32 bytes (legacy type-tunnel kept
+    // until Phase B-3 migrates these to typed CudaBuf::I32 storage).
     use cudarc::driver::sys::CUdeviceptr;
     use cudarc::driver::CudaSlice;
     use cudarc::driver::DevicePtr;
+    use ferrum_kernels::backend::CudaBuf;
     use half::f16;
     let (bt_ptr, _g0) = block_tables_i32.device_ptr(&stream);
     let (kvl_ptr, _g1) = valid_kv_lens_i32.device_ptr(&stream);
-    let bt_f16: CudaSlice<f16> = unsafe { stream.upgrade_device_ptr(bt_ptr as CUdeviceptr, 0) };
-    let kvl_f16: CudaSlice<f16> = unsafe { stream.upgrade_device_ptr(kvl_ptr as CUdeviceptr, 0) };
+    let bt_f16_inner: CudaSlice<f16> =
+        unsafe { stream.upgrade_device_ptr(bt_ptr as CUdeviceptr, 0) };
+    let kvl_f16_inner: CudaSlice<f16> =
+        unsafe { stream.upgrade_device_ptr(kvl_ptr as CUdeviceptr, 0) };
+    let bt_f16 = CudaBuf::from_f16(bt_f16_inner);
+    let kvl_f16 = CudaBuf::from_f16(kvl_f16_inner);
 
     let mut out_dev = CudaBackend::alloc(NUM_SEQS * NUM_HEADS * HEAD_DIM);
     let mut ctx = <CudaBackend as Backend>::new_context();

@@ -54,9 +54,9 @@ pub(super) use super::MAX_LAYERS_FOR_GRAPH;
 pub use int8_kv::{OptionalCudaInt8, OptionalCudaScalesF16};
 // Preserve historical `crate::backend::cuda::*` paths used by external
 // callers (`quant_linear::cuda_marlin`, parity tests).
-pub use quant::{marlin_gemm_with_perm, GptqStoreCuda};
 #[cfg(feature = "marlin")]
 pub use quant::pregrow_marlin_gather_scratch;
+pub use quant::{marlin_gemm_with_perm, GptqStoreCuda};
 
 use super::{
     AttnConfig, Backend, BackendCollective, BackendGraph, BackendMoeFused, BackendPagedKv,
@@ -157,7 +157,7 @@ pub struct CudaState {
     /// the token-major attn output before transpose-back to head-major.
     /// Lazy-grow on first use. Caching prevents per-call alloc churn
     /// that triggered CUDA_ERROR_ILLEGAL_ADDRESS via stream-ordered free.
-    paged_attn_out_tm: Option<CudaSlice<f16>>,
+    paged_attn_out_tm: Option<crate::backend::CudaBuf>,
     paged_attn_out_tm_capacity: usize,
     /// fp32 reduce scratch for vLLM marlin_moe_wna16. Sized at the upper
     /// bound vLLM uses internally: `sms * 4 * moe_block_size * max_thread_n`
@@ -328,7 +328,15 @@ unsafe impl DeviceRepr for FlashAttnParams {}
 pub struct CudaBackend;
 
 impl Backend for CudaBackend {
-    type Buffer = CudaSlice<f16>;
+    // Phase B-2: typed-buffer migration. `CudaBuf` is an enum over
+    // `CudaSlice<{f16,f32,u32,i32,i8}>` — Phase B-1 added the wrapper,
+    // this PR switches `Self::Buffer` to use it. Existing
+    // `CudaSlice<f16>` ops migrate via `.as_f16()` / `.as_f16_mut()`
+    // accessors on the wrapper. Integer storage (block tables,
+    // expert ids, ...) gets a proper typed dtype tag instead of the
+    // old i32-bit-cast-through-f16 type tunnel that under-allocated
+    // by half (`alloc_u32` default was wrong on CUDA).
+    type Buffer = crate::backend::CudaBuf;
     type Context = CudaState;
     type GptqStore = GptqStoreCuda;
 
@@ -396,54 +404,55 @@ impl Backend for CudaBackend {
     }
 
     fn alloc_u32(n: usize) -> Self::Buffer {
-        // Buffer storage is f16 (2 bytes per element). For n u32 slots
-        // we need n*4 bytes = 2*n f16 elements. The trait default
-        // collapses f32→f16 one-for-one which under-allocates (buffer
-        // is HALF the bytes the kernel expects), causing writes into
-        // un-mapped pool memory and CUDA_ERROR_MISALIGNED_ADDRESS at
-        // sync. Override to allocate the right byte count.
+        // With typed CudaBuf, the legacy under-allocation hazard (f16
+        // backing for u32 data) goes away — store as `CudaBuf::U32`
+        // and callers' `.as_u32_mut()` / typed writes hit the right
+        // bytes. Pre-typed-buffer code allocated `2*n` f16 elements
+        // to hit `n*4` bytes; the U32 variant is `n` slots and the
+        // discriminant carries the dtype.
         let n = n.max(1);
         with_stream(|stream| {
-            stream
-                .alloc_zeros::<f16>(2 * n)
-                .expect("CudaBackend::alloc_u32: alloc_zeros<f16>")
+            crate::backend::CudaBuf::from_u32(
+                stream
+                    .alloc_zeros::<u32>(n)
+                    .expect("CudaBackend::alloc_u32: alloc_zeros<u32>"),
+            )
         })
     }
 
     fn write_u32(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[u32]) {
-        // Synchronous host→device write of int32 values. Used by callers
-        // to populate device-side scratch buffers (positions, kv_lens)
-        // BEFORE a CUDA-graph replay so the buffer's contents are
-        // current when the replay re-runs the kernels that read them.
+        // Synchronous host→device write of u32 values. Used to populate
+        // device-side scratch buffers (positions, kv_lens, cu_seqlens,
+        // ...) BEFORE a kernel launch or CUDA-graph replay so the
+        // buffer contents are current when the kernel reads them.
         //
-        // - Synchronous (`cuMemcpyHtoD_v2`, not `..Async`) so the local
-        //   host Vec stays alive across the copy. Async memcpy on a
-        //   captured stream would record a stale host pointer.
-        // - Explicit `bind_to_thread` because tokio shifts decode_batch
-        //   calls across worker threads. Without it, calls landing on a
-        //   thread that hadn't bound the context fail with
-        //   `CUDA_ERROR_INVALID_CONTEXT` — observed after graph capture
-        //   activated and the next call ran on a fresh worker.
+        // We route through cudarc's `stream.memcpy_htod` + explicit
+        // `stream.synchronize()` instead of raw `cuMemcpyHtoD_v2` so:
+        //   1. `bind_to_thread` is handled inside cudarc (no early-
+        //      return-on-failure that silently leaves the buffer at
+        //      its alloc_zeros default — that was the cause of the
+        //      kv_cache_append_batched_per_item parity diff).
+        //   2. The copy happens on `ctx.stream` so it is ordered with
+        //      subsequent kernel launches on the same stream — no
+        //      cross-stream visibility hazard.
+        //   3. `synchronize()` blocks the host until the copy lands,
+        //      preserving the original sync semantics (host_i32 Vec
+        //      can be dropped, captured graphs see fresh contents).
         if data.is_empty() {
             return;
         }
-        if let Err(e) = ctx.ctx.bind_to_thread() {
-            eprintln!("write_u32 bind_to_thread failed: {e}");
+        // Legacy callers feed signed values masquerading as u32 (e.g.
+        // -1 sentinel for "no expert"); bit-cast preserves the pattern
+        // the kernels read.
+        let host_u32: Vec<u32> = data.to_vec();
+        let stream = ctx.stream.clone();
+        let dst_slice = dst.as_u32_mut();
+        if let Err(e) = stream.memcpy_htod(host_u32.as_slice(), dst_slice) {
+            eprintln!("write_u32 memcpy_htod failed: {e}");
             return;
         }
-        let stream = ctx.stream.clone();
-        let host_i32: Vec<i32> = data.iter().map(|&x| x as i32).collect();
-        use cudarc::driver::DevicePtrMut;
-        let (dst_ptr, _g) = dst.device_ptr_mut(&stream);
-        unsafe {
-            let st = cudarc::driver::sys::cuMemcpyHtoD_v2(
-                dst_ptr,
-                host_i32.as_ptr() as *const std::ffi::c_void,
-                host_i32.len() * std::mem::size_of::<i32>(),
-            );
-            if st != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("write_u32 cuMemcpyHtoD failed: {st:?}");
-            }
+        if let Err(e) = stream.synchronize() {
+            eprintln!("write_u32 synchronize failed: {e}");
         }
     }
 
@@ -452,12 +461,18 @@ impl Backend for CudaBackend {
     }
 
     fn alloc(len: usize) -> Self::Buffer {
-        with_stream(|stream| unsafe { stream.alloc::<f16>(len) }.expect("cuda alloc"))
+        with_stream(|stream| {
+            crate::backend::CudaBuf::from_f16(
+                unsafe { stream.alloc::<f16>(len) }.expect("cuda alloc"),
+            )
+        })
     }
 
     fn from_slice(data: &[f32]) -> Self::Buffer {
         let host: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
-        with_stream(|stream| stream.clone_htod(&host).expect("cuda htod"))
+        with_stream(|stream| {
+            crate::backend::CudaBuf::from_f16(stream.clone_htod(&host).expect("cuda htod"))
+        })
     }
 
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
@@ -1251,20 +1266,21 @@ impl Backend for CudaBackend {
         let mut q_buf = <Self as Backend>::alloc(q_buf_size);
         let mut k_buf = <Self as Backend>::alloc(kv_buf_size);
         let mut v_buf = <Self as Backend>::alloc(kv_buf_size);
-        Self::split_qkv(ctx, qkv, &mut q_buf, &mut k_buf, &mut v_buf, tokens, q_dim, kv_dim);
-        Self::qk_norm_rope(
-            ctx, &q_buf, q_norm_w, cos, sin, q_out,
-            tokens, q_heads, head_dim, pos_offset, eps, qk_mode,
+        Self::split_qkv(
+            ctx, qkv, &mut q_buf, &mut k_buf, &mut v_buf, tokens, q_dim, kv_dim,
         );
         Self::qk_norm_rope(
-            ctx, &k_buf, k_norm_w, cos, sin, k_out,
-            tokens, kv_heads, head_dim, pos_offset, eps, qk_mode,
+            ctx, &q_buf, q_norm_w, cos, sin, q_out, tokens, q_heads, head_dim, pos_offset, eps,
+            qk_mode,
+        );
+        Self::qk_norm_rope(
+            ctx, &k_buf, k_norm_w, cos, sin, k_out, tokens, kv_heads, head_dim, pos_offset, eps,
+            qk_mode,
         );
         // V: no norm + RoPE-only (qk_mode=0); pass q_norm_w as a dummy
         // (kernel ignores it when mode=0).
         Self::qk_norm_rope(
-            ctx, &v_buf, q_norm_w, cos, sin, v_out,
-            tokens, kv_heads, head_dim, pos_offset, eps, 0,
+            ctx, &v_buf, q_norm_w, cos, sin, v_out, tokens, kv_heads, head_dim, pos_offset, eps, 0,
         );
         Ok(())
     }
@@ -1686,7 +1702,6 @@ pub fn install_thread_stream(stream: Arc<CudaStream>) {
     *stream_slot().write().expect("GLOBAL_STREAM poisoned") = Some(stream);
 }
 
-
 // ────────────────────────────────────────────────────────────────────────
 // Process-global decode state buffers (token_id, pos, kv_len)
 // ────────────────────────────────────────────────────────────────────────
@@ -1920,7 +1935,6 @@ fn modules_cache() -> &'static std::sync::Mutex<HashMap<&'static str, Arc<CudaMo
     MODULES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-
 pub(super) fn ensure_module(
     ctx: &Arc<CudaContext>,
     key: &'static str,
@@ -1942,8 +1956,6 @@ pub(super) fn ensure_module(
     g.insert(key, m.clone());
     m
 }
-
-
 
 // CUDA: existing KV cache path is FP16.
 impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {

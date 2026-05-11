@@ -22,8 +22,8 @@ use ferrum_quantization::loader::WeightLoader;
 use ferrum_quantization::PrefixedLoader;
 use ferrum_types::Result;
 
-use crate::multimodal::qwen3_tts::TalkerConfig;
 use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
+use crate::multimodal::qwen3_tts::TalkerConfig;
 
 /// Object-safe trait so the candle-based talker can hold
 /// `Box<dyn TalkerBackboneForward>` without threading the Backend type

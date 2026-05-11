@@ -23,8 +23,8 @@ use ferrum_quantization::PrefixedLoader;
 use ferrum_types::Result;
 use std::collections::HashMap;
 
-use crate::multimodal::qwen3_tts::TalkerConfig;
 use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
+use crate::multimodal::qwen3_tts::TalkerConfig;
 
 /// Qwen3-TTS Talker, Model-as-Code implementation over `Backend<B>`.
 ///

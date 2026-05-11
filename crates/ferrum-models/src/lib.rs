@@ -16,7 +16,6 @@
     unused_assignments
 )]
 
-pub mod multimodal;
 pub mod audio_processor;
 pub mod common;
 pub mod definition;
@@ -31,13 +30,13 @@ pub mod mel;
 pub mod models;
 pub mod moe;
 pub mod moe_config;
+pub mod multimodal;
 pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;
 pub mod tokenizer;
 pub mod weight_format;
 
-pub use multimodal::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
@@ -47,6 +46,7 @@ pub use executor::{
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;
 pub use loader::SafeTensorsLoader;
+pub use multimodal::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
 pub use registry::{
     Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,
 };

@@ -169,8 +169,7 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
         .expect("upload tokens_per_expert");
 
     // Pre-zero stacked workspace (mirrors production).
-    let _ =
-        <CudaBackend as BackendQuantMarlin>::marlin_zero_stacked_workspace(&mut ctx, &*stacked);
+    let _ = <CudaBackend as BackendQuantMarlin>::marlin_zero_stacked_workspace(&mut ctx, &*stacked);
 
     ferrum_kernels::marlin::marlin_gemm_moe(
         &stream,

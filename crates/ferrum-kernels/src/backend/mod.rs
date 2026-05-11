@@ -15,9 +15,9 @@ pub mod dtype;
 pub use dtype::Dtype;
 
 pub mod buffer;
+pub use buffer::CpuBuf;
 #[cfg(feature = "cuda")]
 pub use buffer::CudaBuf;
-pub use buffer::CpuBuf;
 
 pub mod cpu;
 

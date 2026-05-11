@@ -88,7 +88,11 @@ impl ModelExecutor for StubModelExecutor {
 
         debug!("Stub decode: batch={}", batch_size);
 
-        let logits = self.tensor_factory.zeros(&[batch_size, vocab_size], DataType::FP32, &self.info.device)?;
+        let logits = self.tensor_factory.zeros(
+            &[batch_size, vocab_size],
+            DataType::FP32,
+            &self.info.device,
+        )?;
 
         Ok(DecodeOutput::new(logits, input.kv_cache.clone()))
     }

@@ -45,9 +45,7 @@ impl OptionalCudaInt8 {
     /// Allocate `len` zeroed `int8_t` elements on the default CUDA stream.
     pub fn alloc(len: usize) -> Self {
         let stream = default_stream();
-        let buf = stream
-            .alloc_zeros::<i8>(len)
-            .expect("alloc int8 KV buffer");
+        let buf = stream.alloc_zeros::<i8>(len).expect("alloc int8 KV buffer");
         Self(Some(buf))
     }
 
@@ -75,11 +73,15 @@ impl OptionalCudaScalesF16 {
     }
 
     pub fn buffer(&self) -> &cudarc::driver::CudaSlice<half::f16> {
-        self.0.as_ref().expect("OptionalCudaScalesF16 not allocated")
+        self.0
+            .as_ref()
+            .expect("OptionalCudaScalesF16 not allocated")
     }
 
     pub fn buffer_mut(&mut self) -> &mut cudarc::driver::CudaSlice<half::f16> {
-        self.0.as_mut().expect("OptionalCudaScalesF16 not allocated")
+        self.0
+            .as_mut()
+            .expect("OptionalCudaScalesF16 not allocated")
     }
 }
 
@@ -154,8 +156,8 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
 
         crate::int8_kv::launch_int8_kv_cache_append(
             &ctx.ctx,
-            k_in,
-            v_in,
+            k_in.as_f16(),
+            v_in.as_f16(),
             layer_k.buffer_mut(),
             layer_v.buffer_mut(),
             layer_k_scales.buffer_mut(),
@@ -185,8 +187,10 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         block_size: usize,
         scale: f32,
     ) -> Result<()> {
-        // block_table is stored as f16 but holds i32 (alloc_u32 doubles
-        // bytes). Reinterpret to i32 view of length max_blocks_per_seq.
+        // block_table is CudaBuf::U32 (typed since B-2). The launch
+        // function takes `&CudaView<i32>` — same byte pattern, signed
+        // view; transmute on CudaBuf dispatches to the U32 variant's
+        // CudaSlice::transmute which reinterprets u32→i32 1:1.
         let n_blocks = valid_kv_len.div_ceil(block_size).max(1);
         let bt_i32_view = unsafe {
             block_table
@@ -195,13 +199,13 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         };
         crate::int8_kv::launch_int8_paged_decode_attention(
             &ctx.ctx,
-            q,
+            q.as_f16(),
             layer_k.buffer(),
             layer_v.buffer(),
             layer_k_scales.buffer(),
             layer_v_scales.buffer(),
             &bt_i32_view,
-            output,
+            output.as_f16_mut(),
             num_q_heads,
             num_kv_heads,
             head_dim,

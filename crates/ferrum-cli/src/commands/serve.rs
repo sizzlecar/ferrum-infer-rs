@@ -211,15 +211,16 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         let draft_id = resolve_model_alias(draft_name);
         println!("{} {}", "Draft model:".dimmed(), draft_id.cyan());
         let cache_dir = get_hf_cache_dir(&config);
-        let draft_source = crate::source_resolver::find_cached_model(&cache_dir, &draft_id).ok_or_else(|| {
-            eprintln!(
-                "{} Draft model '{}' not in HF cache. Run: ferrum pull {}",
-                "Error:".red().bold(),
-                draft_id,
-                draft_name
-            );
-            ferrum_types::FerrumError::model("Draft model not found")
-        })?;
+        let draft_source = crate::source_resolver::find_cached_model(&cache_dir, &draft_id)
+            .ok_or_else(|| {
+                eprintln!(
+                    "{} Draft model '{}' not in HF cache. Run: ferrum pull {}",
+                    "Error:".red().bold(),
+                    draft_id,
+                    draft_name
+                );
+                ferrum_types::FerrumError::model("Draft model not found")
+            })?;
         std::env::set_var(
             "FERRUM_SPEC_DRAFT",
             draft_source.local_path.to_string_lossy().to_string(),

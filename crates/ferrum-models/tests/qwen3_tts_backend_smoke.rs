@@ -66,8 +66,7 @@ fn run_full_chain<
         + ferrum_kernels::backend::BackendQuantMarlin
         + ferrum_kernels::backend::BackendQuantGguf
         + ferrum_kernels::backend::BackendPagedKv
-        + ferrum_kernels::backend::BackendMoeFused
-       ,
+        + ferrum_kernels::backend::BackendMoeFused,
 >(
     dir: &PathBuf,
     cfg: &TalkerConfig,
@@ -195,8 +194,7 @@ fn run_long_decode<
         + ferrum_kernels::backend::BackendQuantMarlin
         + ferrum_kernels::backend::BackendQuantGguf
         + ferrum_kernels::backend::BackendPagedKv
-        + ferrum_kernels::backend::BackendMoeFused
-       ,
+        + ferrum_kernels::backend::BackendMoeFused,
 >(
     dir: &PathBuf,
     cfg: &TalkerConfig,
