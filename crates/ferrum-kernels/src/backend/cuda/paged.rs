@@ -789,13 +789,12 @@ impl BackendPagedKv for CudaBackend {
         // alloc_u32 + write_u32 (NOT from_slice_i32 — that default goes
         // through f32→f16 and zeroes the bit pattern).
         // Need final_kv_len from context_lens[0] — D2H 4 bytes (cold path).
+        // Post-Phase-B-2 context_lens is `CudaBuf::U32` (typed), so we read
+        // the U32 variant directly — the prior `transmute::<u32>` route was
+        // for the f16-bit-tunneled allocation that B-2 retired.
         let cl_host: Vec<u32> = {
             let stream = ctx.stream.clone();
-            let view = unsafe {
-                context_lens
-                    .transmute::<u32>(1)
-                    .ok_or_else(|| FerrumError::model("context_lens transmute failed"))?
-            };
+            let view = context_lens.as_u32().slice(0..1);
             let mut h = vec![0u32; 1];
             stream
                 .memcpy_dtoh(&view, h.as_mut_slice())

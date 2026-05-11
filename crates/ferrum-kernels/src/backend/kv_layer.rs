@@ -35,11 +35,7 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     ) -> Self::Layer;
 
     /// Allocate a contiguous cache layer (FP16 only; INT8 panics).
-    fn alloc_contig(
-        capacity: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    ) -> Self::Layer;
+    fn alloc_contig(capacity: usize, num_kv_heads: usize, head_dim: usize) -> Self::Layer;
 
     // Metadata accessors (variant-agnostic).
     fn len(layer: &Self::Layer) -> usize;
@@ -192,18 +188,42 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         }
     }
 
-    fn len(layer: &Self::Layer) -> usize { layer.len }
-    fn set_len(layer: &mut Self::Layer, new_len: usize) { layer.len = new_len; }
-    fn capacity(layer: &Self::Layer) -> usize { layer.capacity }
-    fn block_size(layer: &Self::Layer) -> usize { layer.block_size }
-    fn num_kv_heads(layer: &Self::Layer) -> usize { layer.num_kv_heads }
-    fn head_dim(layer: &Self::Layer) -> usize { layer.head_dim }
-    fn block_table(layer: &Self::Layer) -> Option<&B::Buffer> { layer.block_table.as_ref() }
-    fn block_table_mut(layer: &mut Self::Layer) -> Option<&mut B::Buffer> { layer.block_table.as_mut() }
-    fn context_lens(layer: &Self::Layer) -> Option<&B::Buffer> { layer.context_lens.as_ref() }
-    fn context_lens_mut(layer: &mut Self::Layer) -> Option<&mut B::Buffer> { layer.context_lens.as_mut() }
-    fn paged_block_indices(layer: &Self::Layer) -> &[u32] { &layer.paged_block_indices }
-    fn paged_block_indices_mut(layer: &mut Self::Layer) -> &mut Vec<u32> { &mut layer.paged_block_indices }
+    fn len(layer: &Self::Layer) -> usize {
+        layer.len
+    }
+    fn set_len(layer: &mut Self::Layer, new_len: usize) {
+        layer.len = new_len;
+    }
+    fn capacity(layer: &Self::Layer) -> usize {
+        layer.capacity
+    }
+    fn block_size(layer: &Self::Layer) -> usize {
+        layer.block_size
+    }
+    fn num_kv_heads(layer: &Self::Layer) -> usize {
+        layer.num_kv_heads
+    }
+    fn head_dim(layer: &Self::Layer) -> usize {
+        layer.head_dim
+    }
+    fn block_table(layer: &Self::Layer) -> Option<&B::Buffer> {
+        layer.block_table.as_ref()
+    }
+    fn block_table_mut(layer: &mut Self::Layer) -> Option<&mut B::Buffer> {
+        layer.block_table.as_mut()
+    }
+    fn context_lens(layer: &Self::Layer) -> Option<&B::Buffer> {
+        layer.context_lens.as_ref()
+    }
+    fn context_lens_mut(layer: &mut Self::Layer) -> Option<&mut B::Buffer> {
+        layer.context_lens.as_mut()
+    }
+    fn paged_block_indices(layer: &Self::Layer) -> &[u32] {
+        &layer.paged_block_indices
+    }
+    fn paged_block_indices_mut(layer: &mut Self::Layer) -> &mut Vec<u32> {
+        &mut layer.paged_block_indices
+    }
 
     fn paged_write(
         ctx: &mut B::Context,
@@ -234,11 +254,28 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
             .as_ref()
             .ok_or_else(|| FerrumError::model("FP16 paged_write: missing block_table"))?;
         B::split_qkv_norm_rope_into_paged_cache(
-            ctx, qkv, 0, q_norm_w, k_norm_w, cos, sin, q_out, 0,
-            pool_k, pool_v, bt,
-            tokens, num_q_heads, num_kv_heads, head_dim,
-            pos_offset, eps, qk_mode,
-            cache_len_before, block_size, num_blocks_per_seq,
+            ctx,
+            qkv,
+            0,
+            q_norm_w,
+            k_norm_w,
+            cos,
+            sin,
+            q_out,
+            0,
+            pool_k,
+            pool_v,
+            bt,
+            tokens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pos_offset,
+            eps,
+            qk_mode,
+            cache_len_before,
+            block_size,
+            num_blocks_per_seq,
         )
     }
 
@@ -271,9 +308,20 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         let bt = unsafe { &*bt_ptr };
         let cl = layer.context_lens.as_ref().unwrap();
         B::paged_decode_attention(
-            ctx, q, pool_k, pool_v, output, bt, cl,
-            1, num_q_heads, num_kv_heads, head_dim,
-            block_size, num_blocks_per_seq, tokens,
+            ctx,
+            q,
+            pool_k,
+            pool_v,
+            output,
+            bt,
+            cl,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            num_blocks_per_seq,
+            tokens,
         )
     }
 
@@ -302,36 +350,106 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         let cache_len_before = layer.len;
         let cache_capacity = layer.capacity;
         let used_into_cache = B::split_qkv_norm_rope_into_cache(
-            ctx, qkv, q_norm_w, k_norm_w, cos, sin, q_out,
-            &mut layer.k, &mut layer.v,
-            tokens, num_q_heads, num_kv_heads, head_dim,
-            pos_offset, eps, qk_mode,
-            cache_len_before, cache_capacity,
+            ctx,
+            qkv,
+            q_norm_w,
+            k_norm_w,
+            cos,
+            sin,
+            q_out,
+            &mut layer.k,
+            &mut layer.v,
+            tokens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pos_offset,
+            eps,
+            qk_mode,
+            cache_len_before,
+            cache_capacity,
         )
         .is_ok();
         if used_into_cache {
             return Ok(());
         }
         let used_fused_qkv = B::split_qkv_norm_rope(
-            ctx, qkv, q_norm_w, k_norm_w, cos, sin,
-            q_out, k_scratch, v_scratch,
-            tokens, num_q_heads, num_kv_heads, head_dim,
-            pos_offset, eps, qk_mode,
+            ctx,
+            qkv,
+            q_norm_w,
+            k_norm_w,
+            cos,
+            sin,
+            q_out,
+            k_scratch,
+            v_scratch,
+            tokens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pos_offset,
+            eps,
+            qk_mode,
         )
         .is_ok();
         if !used_fused_qkv {
             let q_dim = num_q_heads * head_dim;
             let kv_dim = num_kv_heads * head_dim;
             B::split_qkv(ctx, qkv, q_buf, k_buf, v_buf, tokens, q_dim, kv_dim);
-            B::qk_norm_rope(ctx, q_buf, q_norm_w, cos, sin, q_out, tokens, num_q_heads, head_dim, pos_offset, eps, qk_mode);
-            B::qk_norm_rope(ctx, k_buf, k_norm_w, cos, sin, k_scratch, tokens, num_kv_heads, head_dim, pos_offset, eps, qk_mode);
-            B::qk_norm_rope(ctx, v_buf, q_norm_w, cos, sin, v_scratch, tokens, num_kv_heads, head_dim, pos_offset, eps, 0);
+            B::qk_norm_rope(
+                ctx,
+                q_buf,
+                q_norm_w,
+                cos,
+                sin,
+                q_out,
+                tokens,
+                num_q_heads,
+                head_dim,
+                pos_offset,
+                eps,
+                qk_mode,
+            );
+            B::qk_norm_rope(
+                ctx,
+                k_buf,
+                k_norm_w,
+                cos,
+                sin,
+                k_scratch,
+                tokens,
+                num_kv_heads,
+                head_dim,
+                pos_offset,
+                eps,
+                qk_mode,
+            );
+            B::qk_norm_rope(
+                ctx,
+                v_buf,
+                q_norm_w,
+                cos,
+                sin,
+                v_scratch,
+                tokens,
+                num_kv_heads,
+                head_dim,
+                pos_offset,
+                eps,
+                0,
+            );
         }
         B::kv_cache_append_head_major(
-            ctx, &mut layer.k, &mut layer.v,
-            cache_len_before, cache_capacity,
-            k_scratch, v_scratch,
-            tokens, num_kv_heads, head_dim,
+            ctx,
+            &mut layer.k,
+            &mut layer.v,
+            cache_len_before,
+            cache_capacity,
+            k_scratch,
+            v_scratch,
+            tokens,
+            num_kv_heads,
+            head_dim,
         );
         Ok(())
     }
@@ -347,8 +465,7 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
     ) -> Result<()> {
         let kv_len = layer.len;
         B::flash_attention(
-            ctx, q, &layer.k, &layer.v, output,
-            1, tokens, kv_len, pos_offset, &attn_cfg,
+            ctx, q, &layer.k, &layer.v, output, 1, tokens, kv_len, pos_offset, &attn_cfg,
         );
         Ok(())
     }
@@ -374,18 +491,42 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         panic!("KvInt8::alloc_contig: INT8 KV is paged-only")
     }
 
-    fn len(layer: &Self::Layer) -> usize { layer.len }
-    fn set_len(layer: &mut Self::Layer, new_len: usize) { layer.len = new_len; }
-    fn capacity(layer: &Self::Layer) -> usize { layer.capacity }
-    fn block_size(layer: &Self::Layer) -> usize { layer.block_size }
-    fn num_kv_heads(layer: &Self::Layer) -> usize { layer.num_kv_heads }
-    fn head_dim(layer: &Self::Layer) -> usize { layer.head_dim }
-    fn block_table(layer: &Self::Layer) -> Option<&B::Buffer> { layer.block_table.as_ref() }
-    fn block_table_mut(layer: &mut Self::Layer) -> Option<&mut B::Buffer> { layer.block_table.as_mut() }
-    fn context_lens(layer: &Self::Layer) -> Option<&B::Buffer> { layer.context_lens.as_ref() }
-    fn context_lens_mut(layer: &mut Self::Layer) -> Option<&mut B::Buffer> { layer.context_lens.as_mut() }
-    fn paged_block_indices(layer: &Self::Layer) -> &[u32] { &layer.paged_block_indices }
-    fn paged_block_indices_mut(layer: &mut Self::Layer) -> &mut Vec<u32> { &mut layer.paged_block_indices }
+    fn len(layer: &Self::Layer) -> usize {
+        layer.len
+    }
+    fn set_len(layer: &mut Self::Layer, new_len: usize) {
+        layer.len = new_len;
+    }
+    fn capacity(layer: &Self::Layer) -> usize {
+        layer.capacity
+    }
+    fn block_size(layer: &Self::Layer) -> usize {
+        layer.block_size
+    }
+    fn num_kv_heads(layer: &Self::Layer) -> usize {
+        layer.num_kv_heads
+    }
+    fn head_dim(layer: &Self::Layer) -> usize {
+        layer.head_dim
+    }
+    fn block_table(layer: &Self::Layer) -> Option<&B::Buffer> {
+        layer.block_table.as_ref()
+    }
+    fn block_table_mut(layer: &mut Self::Layer) -> Option<&mut B::Buffer> {
+        layer.block_table.as_mut()
+    }
+    fn context_lens(layer: &Self::Layer) -> Option<&B::Buffer> {
+        layer.context_lens.as_ref()
+    }
+    fn context_lens_mut(layer: &mut Self::Layer) -> Option<&mut B::Buffer> {
+        layer.context_lens.as_mut()
+    }
+    fn paged_block_indices(layer: &Self::Layer) -> &[u32] {
+        &layer.paged_block_indices
+    }
+    fn paged_block_indices_mut(layer: &mut Self::Layer) -> &mut Vec<u32> {
+        &mut layer.paged_block_indices
+    }
 
     fn paged_write(
         ctx: &mut B::Context,
@@ -410,10 +551,22 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
     ) -> Result<()> {
         // 1. split + norm + RoPE → FP16 head-major scratch (k/v_scratch).
         B::split_qkv_norm_rope(
-            ctx, qkv, q_norm_w, k_norm_w, cos, sin,
-            q_out, k_scratch, v_scratch,
-            tokens, num_q_heads, num_kv_heads, head_dim,
-            pos_offset, eps, qk_mode,
+            ctx,
+            qkv,
+            q_norm_w,
+            k_norm_w,
+            cos,
+            sin,
+            q_out,
+            k_scratch,
+            v_scratch,
+            tokens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pos_offset,
+            eps,
+            qk_mode,
         )?;
         // 2. quantize FP16 → INT8 + per-token scales, paged append.
         // `paged_block_indices` is the host-side mirror populated at
@@ -425,12 +578,19 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         // borrow on `layer` while passing &mut layer.k/v/scales below.
         let paged_indices: Vec<u32> = layer.paged_block_indices.clone();
         B::int8_kv_append_paged(
-            ctx, k_scratch, v_scratch,
-            &mut layer.k, &mut layer.v,
-            &mut layer.k_scales, &mut layer.v_scales,
+            ctx,
+            k_scratch,
+            v_scratch,
+            &mut layer.k,
+            &mut layer.v,
+            &mut layer.k_scales,
+            &mut layer.v_scales,
             &paged_indices,
-            cache_len_before, tokens, block_size,
-            num_kv_heads, head_dim,
+            cache_len_before,
+            tokens,
+            block_size,
+            num_kv_heads,
+            head_dim,
         )
     }
 
@@ -459,11 +619,20 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
             .ok_or_else(|| FerrumError::model("INT8 paged_decode: missing block_table"))?;
         let scale = (head_dim as f32).sqrt().recip();
         B::int8_paged_decode_attention(
-            ctx, q,
-            &layer.k, &layer.v, &layer.k_scales, &layer.v_scales,
-            bt, output,
-            num_q_heads, num_kv_heads, head_dim,
-            final_kv_len, block_size, scale,
+            ctx,
+            q,
+            &layer.k,
+            &layer.v,
+            &layer.k_scales,
+            &layer.v_scales,
+            bt,
+            output,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            final_kv_len,
+            block_size,
+            scale,
         )
     }
 }

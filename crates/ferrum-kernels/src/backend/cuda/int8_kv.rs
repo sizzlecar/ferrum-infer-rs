@@ -45,9 +45,7 @@ impl OptionalCudaInt8 {
     /// Allocate `len` zeroed `int8_t` elements on the default CUDA stream.
     pub fn alloc(len: usize) -> Self {
         let stream = default_stream();
-        let buf = stream
-            .alloc_zeros::<i8>(len)
-            .expect("alloc int8 KV buffer");
+        let buf = stream.alloc_zeros::<i8>(len).expect("alloc int8 KV buffer");
         Self(Some(buf))
     }
 
@@ -75,11 +73,15 @@ impl OptionalCudaScalesF16 {
     }
 
     pub fn buffer(&self) -> &cudarc::driver::CudaSlice<half::f16> {
-        self.0.as_ref().expect("OptionalCudaScalesF16 not allocated")
+        self.0
+            .as_ref()
+            .expect("OptionalCudaScalesF16 not allocated")
     }
 
     pub fn buffer_mut(&mut self) -> &mut cudarc::driver::CudaSlice<half::f16> {
-        self.0.as_mut().expect("OptionalCudaScalesF16 not allocated")
+        self.0
+            .as_mut()
+            .expect("OptionalCudaScalesF16 not allocated")
     }
 }
 

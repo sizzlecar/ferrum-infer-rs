@@ -152,9 +152,9 @@ fn int8_kv_append_roundtrip() {
 /// kernel's algorithm. Used to validate the GPU INT8 output.
 #[allow(clippy::too_many_arguments)]
 fn host_ref_paged_decode(
-    q: &[f32],         // [num_q_heads, head_dim]
-    k_pool: &[f32],    // [pool_tokens * num_kv_heads * head_dim]
-    v_pool: &[f32],    // same
+    q: &[f32],      // [num_q_heads, head_dim]
+    k_pool: &[f32], // [pool_tokens * num_kv_heads * head_dim]
+    v_pool: &[f32], // same
     block_table: &[i32],
     num_q_heads: usize,
     num_kv_heads: usize,
@@ -316,7 +316,10 @@ fn int8_paged_decode_parity_vs_host_ref() {
     // INT8 quantization noise floor (~max(|K|)/127 propagated through
     // attention, ≈ 0.0003 at this shape).
     assert!(cosine > 0.999, "cosine similarity too low: {cosine}");
-    assert!(rel_to_mag < 0.02, "max abs / max mag too high: {rel_to_mag}");
+    assert!(
+        rel_to_mag < 0.02,
+        "max abs / max mag too high: {rel_to_mag}"
+    );
 }
 
 /// End-to-end kernel composition test that mirrors how a model decode

@@ -808,10 +808,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         // logits — no real backend dispatch involved. Wire the candle
         // tensor factory directly without the legacy `ComputeBackend`
         // wrapper.
-        let tensor_factory: Arc<dyn ferrum_interfaces::TensorFactory> =
-            Arc::new(crate::tensor_factory::candle::CandleTensorFactory::new(
-                config.device.clone(),
-            ));
+        let tensor_factory: Arc<dyn ferrum_interfaces::TensorFactory> = Arc::new(
+            crate::tensor_factory::candle::CandleTensorFactory::new(config.device.clone()),
+        );
 
         let executor = ferrum_models::StubModelExecutor::new(
             config.engine_config.model.model_id.clone(),
@@ -1093,99 +1092,97 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 use ferrum_interfaces::kv_dtype::{KvFp16, KvInt8};
                 use ferrum_types::KvCacheDtype;
                 let kv_dtype = config.engine_config.kv_cache.dtype;
-                let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> = match (
-                    &config.device,
-                    kv_dtype,
-                ) {
-                    (Device::CPU, KvCacheDtype::Fp16) => {
-                        info!("  Backend: CPU, KV: fp16");
-                        build_llm::<ferrum_kernels::backend::cpu::CpuBackend, KvFp16>(
-                            arch,
-                            qcfg,
-                            moe_cfg,
-                            &model_path,
-                        )?
-                    }
-                    #[cfg(any(target_os = "macos", target_os = "ios"))]
-                    (Device::Metal, KvCacheDtype::Fp16) => {
-                        #[cfg(feature = "metal")]
-                        {
-                            // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
-                            // inside MetalBackend. Halves big-tensor RAM;
-                            // recommended for 4B+ models on 16 GB Macs.
-                            let dtype_hint = std::env::var("FERRUM_METAL_DTYPE")
-                                .unwrap_or_else(|_| "f32".to_string());
-                            info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
-                            build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
+                let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> =
+                    match (&config.device, kv_dtype) {
+                        (Device::CPU, KvCacheDtype::Fp16) => {
+                            info!("  Backend: CPU, KV: fp16");
+                            build_llm::<ferrum_kernels::backend::cpu::CpuBackend, KvFp16>(
                                 arch,
                                 qcfg,
                                 moe_cfg,
                                 &model_path,
                             )?
                         }
-                        #[cfg(not(feature = "metal"))]
-                        {
-                            return Err(FerrumError::device(
-                                "Metal requested but 'metal' feature not enabled",
-                            ));
-                        }
-                    }
-                    (Device::CUDA(_), KvCacheDtype::Fp16) => {
-                        #[cfg(feature = "cuda")]
-                        {
-                            info!("  Backend: CUDA, KV: fp16");
-                            build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvFp16>(
-                                arch,
-                                qcfg,
-                                moe_cfg,
-                                &model_path,
-                            )?
-                        }
-                        #[cfg(not(feature = "cuda"))]
-                        {
-                            return Err(FerrumError::device(
-                                "CUDA requested but 'cuda' feature not enabled",
-                            ));
-                        }
-                    }
-                    (Device::CUDA(_), KvCacheDtype::Int8) => {
-                        #[cfg(feature = "cuda")]
-                        {
-                            // Dim 5 PR C: only CudaBackend implements
-                            // BackendInt8KvOps with real launchers; LlamaFamilyModel<B, KvInt8>
-                            // uses LayerKvCache::Int8 + paged INT8 KV. Qwen3-MoE
-                            // INT8 KV is a follow-up — reject here so users
-                            // see a clear error instead of a panic at
-                            // alloc_paged_int8_layer time.
-                            if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
-                                return Err(FerrumError::unsupported(
-                                    "INT8 KV cache is not yet wired through Qwen3MoeModel \
-                                     (LlamaFamilyModel-only in PR C). Use --kv-dtype fp16 \
-                                     for MoE models or wait for the follow-up PR.",
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
+                        (Device::Metal, KvCacheDtype::Fp16) => {
+                            #[cfg(feature = "metal")]
+                            {
+                                // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
+                                // inside MetalBackend. Halves big-tensor RAM;
+                                // recommended for 4B+ models on 16 GB Macs.
+                                let dtype_hint = std::env::var("FERRUM_METAL_DTYPE")
+                                    .unwrap_or_else(|_| "f32".to_string());
+                                info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
+                                build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
+                                    arch,
+                                    qcfg,
+                                    moe_cfg,
+                                    &model_path,
+                                )?
+                            }
+                            #[cfg(not(feature = "metal"))]
+                            {
+                                return Err(FerrumError::device(
+                                    "Metal requested but 'metal' feature not enabled",
                                 ));
                             }
-                            info!("  Backend: CUDA, KV: int8 (paged, vLLM-style)");
-                            build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvInt8>(
-                                arch,
-                                qcfg,
-                                moe_cfg,
-                                &model_path,
-                            )?
                         }
-                        #[cfg(not(feature = "cuda"))]
-                        {
-                            return Err(FerrumError::device(
-                                "CUDA requested but 'cuda' feature not enabled",
-                            ));
+                        (Device::CUDA(_), KvCacheDtype::Fp16) => {
+                            #[cfg(feature = "cuda")]
+                            {
+                                info!("  Backend: CUDA, KV: fp16");
+                                build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvFp16>(
+                                    arch,
+                                    qcfg,
+                                    moe_cfg,
+                                    &model_path,
+                                )?
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            {
+                                return Err(FerrumError::device(
+                                    "CUDA requested but 'cuda' feature not enabled",
+                                ));
+                            }
                         }
-                    }
-                    (dev, dt) => {
-                        return Err(FerrumError::unsupported(format!(
-                            "(device={dev:?}, kv_dtype={dt:?}) not implemented — \
+                        (Device::CUDA(_), KvCacheDtype::Int8) => {
+                            #[cfg(feature = "cuda")]
+                            {
+                                // Dim 5 PR C: only CudaBackend implements
+                                // BackendInt8KvOps with real launchers; LlamaFamilyModel<B, KvInt8>
+                                // uses LayerKvCache::Int8 + paged INT8 KV. Qwen3-MoE
+                                // INT8 KV is a follow-up — reject here so users
+                                // see a clear error instead of a panic at
+                                // alloc_paged_int8_layer time.
+                                if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
+                                    return Err(FerrumError::unsupported(
+                                        "INT8 KV cache is not yet wired through Qwen3MoeModel \
+                                     (LlamaFamilyModel-only in PR C). Use --kv-dtype fp16 \
+                                     for MoE models or wait for the follow-up PR.",
+                                    ));
+                                }
+                                info!("  Backend: CUDA, KV: int8 (paged, vLLM-style)");
+                                build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvInt8>(
+                                    arch,
+                                    qcfg,
+                                    moe_cfg,
+                                    &model_path,
+                                )?
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            {
+                                return Err(FerrumError::device(
+                                    "CUDA requested but 'cuda' feature not enabled",
+                                ));
+                            }
+                        }
+                        (dev, dt) => {
+                            return Err(FerrumError::unsupported(format!(
+                                "(device={dev:?}, kv_dtype={dt:?}) not implemented — \
                              see docs/dim5-model-wireup-plan.md"
-                        )));
-                    }
-                };
+                            )));
+                        }
+                    };
 
                 Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)))
             }
@@ -1229,10 +1226,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         ComponentMetadata {
             name: "llm".to_string(),
             version: "0.2.0".to_string(),
-            description:
-                "LLM executor (LlamaFamily / Qwen3MoE via Backend<B>; \
+            description: "LLM executor (LlamaFamily / Qwen3MoE via Backend<B>; \
                  BERT / CLIP / Whisper via candle)"
-                    .to_string(),
+                .to_string(),
             supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec![
                 "llama".to_string(),
@@ -1431,5 +1427,4 @@ mod tests {
 
         assert_eq!(token.get(), 3); // Index of 0.9
     }
-
 }

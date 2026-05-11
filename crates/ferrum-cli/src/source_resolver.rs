@@ -39,8 +39,7 @@ pub fn detect_format(path: &Path) -> ModelFormat {
     {
         return ModelFormat::GGUF;
     }
-    if path.join("model.safetensors").exists()
-        || path.join("model.safetensors.index.json").exists()
+    if path.join("model.safetensors").exists() || path.join("model.safetensors.index.json").exists()
     {
         ModelFormat::SafeTensors
     } else if path.join("pytorch_model.bin").exists() {
@@ -81,26 +80,17 @@ pub fn apply_gguf_chat_profile_env(gguf_path: &Path) {
     use ferrum_quantization::gguf::GgufFile;
 
     let is_moe = match GgufFile::open(gguf_path) {
-        Ok(g) => g
-            .architecture()
-            .map(|s| s.contains("moe"))
-            .unwrap_or(false),
+        Ok(g) => g.architecture().map(|s| s.contains("moe")).unwrap_or(false),
         Err(_) => false,
     };
 
     // SAFETY: std::env::set_var is unsafe on Rust 2024+. We only call
     // this once at CLI startup before any other thread spawns.
     if std::env::var_os("FERRUM_KV_CAPACITY").is_none() {
-        std::env::set_var(
-            "FERRUM_KV_CAPACITY",
-            if is_moe { "512" } else { "8192" },
-        );
+        std::env::set_var("FERRUM_KV_CAPACITY", if is_moe { "512" } else { "8192" });
     }
     if std::env::var_os("FERRUM_METAL_PAGED_KV").is_none() {
-        std::env::set_var(
-            "FERRUM_METAL_PAGED_KV",
-            if is_moe { "1" } else { "0" },
-        );
+        std::env::set_var("FERRUM_METAL_PAGED_KV", if is_moe { "1" } else { "0" });
     }
     if is_moe {
         for (k, v) in [

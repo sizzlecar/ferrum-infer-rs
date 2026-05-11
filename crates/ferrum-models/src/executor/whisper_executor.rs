@@ -22,8 +22,8 @@ use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, Result};
 use tracing::info;
 
 use super::common;
-use crate::multimodal::whisper::WhisperModelWrapper;
 use crate::audio_processor;
+use crate::multimodal::whisper::WhisperModelWrapper;
 
 // ── Token constants ─────────────────────────────────────────────────────
 // These match Python whisper's tokenizer for multilingual models.

@@ -288,13 +288,21 @@ impl CudaBuf {
         use cudarc::driver::DevicePtrMut;
         self.as_f16_mut().device_ptr_mut(stream)
     }
-    /// Reinterpret the F16 buffer as another type. Used by paged_kv +
-    /// quant_linear code that allocates a `CudaSlice<f16>` and
-    /// reinterprets it (e.g. as i32 block tables before we had a typed
-    /// API). Phase B-2 keeps this so the migration is incremental;
-    /// future cleanup deletes callers that no longer need it.
+    /// Bit-reinterpret the underlying buffer as a view of another type.
+    /// Dispatches on the active variant so callers don't have to know
+    /// which inner `CudaSlice<T>` holds the bytes — handy when integer
+    /// data was allocated as `CudaBuf::U32` (post-B-2) but a kernel
+    /// expects an `&CudaView<i32>` (same byte pattern, signed view).
+    /// `len` is in elements of the target type `T`; cudarc returns
+    /// `None` if `len * size_of::<T>()` doesn't fit the source bytes.
     pub unsafe fn transmute<T>(&self, len: usize) -> Option<cudarc::driver::CudaView<'_, T>> {
-        unsafe { self.as_f16().transmute(len) }
+        match self {
+            CudaBuf::F16(s) => unsafe { s.transmute(len) },
+            CudaBuf::F32(s) => unsafe { s.transmute(len) },
+            CudaBuf::U32(s) => unsafe { s.transmute(len) },
+            CudaBuf::I32(s) => unsafe { s.transmute(len) },
+            CudaBuf::I8(s) => unsafe { s.transmute(len) },
+        }
     }
 }
 

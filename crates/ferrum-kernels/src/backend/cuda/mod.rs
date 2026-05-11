@@ -54,9 +54,9 @@ pub(super) use super::MAX_LAYERS_FOR_GRAPH;
 pub use int8_kv::{OptionalCudaInt8, OptionalCudaScalesF16};
 // Preserve historical `crate::backend::cuda::*` paths used by external
 // callers (`quant_linear::cuda_marlin`, parity tests).
-pub use quant::{marlin_gemm_with_perm, GptqStoreCuda};
 #[cfg(feature = "marlin")]
 pub use quant::pregrow_marlin_gather_scratch;
+pub use quant::{marlin_gemm_with_perm, GptqStoreCuda};
 
 use super::{
     AttnConfig, Backend, BackendCollective, BackendGraph, BackendMoeFused, BackendPagedKv,
@@ -1270,20 +1270,21 @@ impl Backend for CudaBackend {
         let mut q_buf = <Self as Backend>::alloc(q_buf_size);
         let mut k_buf = <Self as Backend>::alloc(kv_buf_size);
         let mut v_buf = <Self as Backend>::alloc(kv_buf_size);
-        Self::split_qkv(ctx, qkv, &mut q_buf, &mut k_buf, &mut v_buf, tokens, q_dim, kv_dim);
-        Self::qk_norm_rope(
-            ctx, &q_buf, q_norm_w, cos, sin, q_out,
-            tokens, q_heads, head_dim, pos_offset, eps, qk_mode,
+        Self::split_qkv(
+            ctx, qkv, &mut q_buf, &mut k_buf, &mut v_buf, tokens, q_dim, kv_dim,
         );
         Self::qk_norm_rope(
-            ctx, &k_buf, k_norm_w, cos, sin, k_out,
-            tokens, kv_heads, head_dim, pos_offset, eps, qk_mode,
+            ctx, &q_buf, q_norm_w, cos, sin, q_out, tokens, q_heads, head_dim, pos_offset, eps,
+            qk_mode,
+        );
+        Self::qk_norm_rope(
+            ctx, &k_buf, k_norm_w, cos, sin, k_out, tokens, kv_heads, head_dim, pos_offset, eps,
+            qk_mode,
         );
         // V: no norm + RoPE-only (qk_mode=0); pass q_norm_w as a dummy
         // (kernel ignores it when mode=0).
         Self::qk_norm_rope(
-            ctx, &v_buf, q_norm_w, cos, sin, v_out,
-            tokens, kv_heads, head_dim, pos_offset, eps, 0,
+            ctx, &v_buf, q_norm_w, cos, sin, v_out, tokens, kv_heads, head_dim, pos_offset, eps, 0,
         );
         Ok(())
     }
@@ -1705,7 +1706,6 @@ pub fn install_thread_stream(stream: Arc<CudaStream>) {
     *stream_slot().write().expect("GLOBAL_STREAM poisoned") = Some(stream);
 }
 
-
 // ────────────────────────────────────────────────────────────────────────
 // Process-global decode state buffers (token_id, pos, kv_len)
 // ────────────────────────────────────────────────────────────────────────
@@ -1939,7 +1939,6 @@ fn modules_cache() -> &'static std::sync::Mutex<HashMap<&'static str, Arc<CudaMo
     MODULES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-
 pub(super) fn ensure_module(
     ctx: &Arc<CudaContext>,
     key: &'static str,
@@ -1961,8 +1960,6 @@ pub(super) fn ensure_module(
     g.insert(key, m.clone());
     m
 }
-
-
 
 // CUDA: existing KV cache path is FP16.
 impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {

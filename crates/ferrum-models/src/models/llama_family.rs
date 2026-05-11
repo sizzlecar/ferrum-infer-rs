@@ -1109,8 +1109,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // K::paged_decode_attention reads from layer-local INT8 buffers or the
         // shared FP16 pool depending on K. Then K-agnostic post-attn tail.
         if cache_block_size > 0 {
-            let (pool_k_ptr, pool_v_ptr) = paged_pool_ptr
-                .expect("paged_pools must be allocated when block_size > 0");
+            let (pool_k_ptr, pool_v_ptr) =
+                paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
             // SAFETY: paged_pools is allocated once and never resized; the
             // raw pointers don't outlive this method scope.
             let pool_k = unsafe { &mut *pool_k_ptr };

@@ -20,8 +20,8 @@ use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, Result};
 use tracing::info;
 
 use super::common;
-use crate::multimodal::clip::ClipModelWrapper;
 use crate::image_processor::ClipImageProcessor;
+use crate::multimodal::clip::ClipModelWrapper;
 use crate::tensor_wrapper::CandleTensorWrapper;
 
 /// CLIP executor for text and image embeddings.
