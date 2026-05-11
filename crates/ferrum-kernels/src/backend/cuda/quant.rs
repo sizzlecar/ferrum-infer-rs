@@ -454,45 +454,10 @@ impl BackendQuantMarlin for CudaBackend {
             let _ = (ctx, required);
         }
     }
-    #[cfg(feature = "marlin")]
-    fn gemm_gptq_with_offset_strided(
-        ctx: &mut Self::Context,
-        input: &Self::Buffer,
-        in_row_offset: usize,
-        weight: &Self::GptqStore,
-        expert_offset: usize,
-        expert_n: usize,
-        output: &mut Self::Buffer,
-        out_row_offset: usize,
-        m: usize,
-        _k: usize,
-    ) -> Result<()> {
-        #[cfg(feature = "triton-kernels")]
-        let mw = match weight {
-            GptqStoreCuda::Marlin(mw) => mw,
-            GptqStoreCuda::Triton(_) => {
-                return Err(FerrumError::unsupported(
-                    "gemm_gptq_with_offset_strided: Triton w4a16 store has no \
-                     stride-aware variant; load MoE via Marlin (default)",
-                ));
-            }
-        };
-        #[cfg(not(feature = "triton-kernels"))]
-        let mw: &crate::marlin::MarlinWeight = weight;
-        let stream = ctx.stream.clone();
-        crate::marlin::marlin_gemm_with_offset_strided(
-            &stream,
-            input.as_f16(),
-            in_row_offset as i32,
-            mw,
-            output.as_f16_mut(),
-            out_row_offset as i32,
-            m as i32,
-            expert_offset as i32,
-            expert_n as i32,
-        )
-        .map_err(|e| FerrumError::model(format!("marlin offset_strided gemm: {e}")))
-    }
+    // Phase C step 4e: CUDA gemm_gptq_with_offset_strided dead code
+    // removed. The remaining caller (moe_gemm_phase_batched_impl
+    // serial/multi-stream path below) calls marlin_gemm_with_offset_strided
+    // directly.
     fn load_gptq(
         qweight: &[i32],
         scales: &[f32],
@@ -643,7 +608,7 @@ impl BackendQuantMarlin for CudaBackend {
         group_size: usize,
         k: usize,
         n_per_expert: usize,
-    ) -> Result<Self::GptqStore> {
+    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
         if bits != 4 {
             return Err(FerrumError::unsupported(format!(
                 "CUDA GPTQ stacked: only bits=4 supported (got {bits})"
@@ -797,32 +762,22 @@ impl BackendQuantMarlin for CudaBackend {
         );
 
         #[cfg(feature = "triton-kernels")]
-        {
-            Ok(GptqStoreCuda::Marlin(marlin_weight))
-        }
+        let store: GptqStoreCuda = GptqStoreCuda::Marlin(marlin_weight);
         #[cfg(not(feature = "triton-kernels"))]
-        {
-            Ok(marlin_weight)
-        }
-    }
-    // Phase C step 4b: make_stacked_expert_linear inlined into
-    // CudaMarlinExpertStack::make_expert_linear.
-
-    fn make_marlin_expert_stack(
-        store: std::sync::Arc<Self::GptqStore>,
-        num_experts: usize,
-        n_per_expert: usize,
-        k: usize,
-    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
+        let store: GptqStoreCuda = marlin_weight;
         Ok(std::sync::Arc::new(
             crate::quant_linear::cuda_marlin_stack::CudaMarlinExpertStack::new(
-                store,
+                std::sync::Arc::new(store),
                 num_experts,
                 n_per_expert,
                 k,
             ),
         ))
     }
+    // Phase C step 4b: make_stacked_expert_linear inlined into
+    // CudaMarlinExpertStack::make_expert_linear.
+    // Phase C step 4e: make_marlin_expert_stack subsumed by load_gptq_stacked
+    // (now returns the trait object directly).
     // Phase C step 4a: marlin_zero_stacked_workspace inlined into
     // CudaMarlinExpertStack::zero_workspace (quant_linear/cuda_marlin_stack.rs).
     // Phase C step 4c/4d: moe_gemm_phase_batched / moe_gemm_phase_vllm

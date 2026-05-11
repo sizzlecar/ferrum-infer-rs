@@ -116,7 +116,8 @@ pub enum CpuQuantStore {
 impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
     type Context = ();
-    type GptqStore = CpuGptqStore;
+    // type GptqStore: removed in Phase C step 4e. CpuGptqStore is now
+    // a private (crate-internal) detail of CpuMarlinExpertStack.
 
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
@@ -745,7 +746,7 @@ impl crate::backend::BackendQuantMarlin for CpuBackend {
         group_size: usize,
         k: usize,
         n_per_expert: usize,
-    ) -> Result<Self::GptqStore> {
+    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
         // Phase 3e/2 addition: dequant each expert independently, concat
         // along N (rows in [n, k] layout). Used by MoE parity tests.
         let num_experts = qweights.len();
@@ -762,21 +763,11 @@ impl crate::backend::BackendQuantMarlin for CpuBackend {
             let w_e = cpu_dequant_gptq(qw_e, sc_e, qz_e, bits, group_size, k, n_per_expert)?;
             all_w.extend_from_slice(&w_e);
         }
-        Ok(CpuGptqStore {
+        let store = std::sync::Arc::new(CpuGptqStore {
             weight_f32: all_w,
             k,
             n: total_n,
-        })
-    }
-    // Phase C step 4b: make_stacked_expert_linear inlined into
-    // CpuMarlinExpertStack::make_expert_linear.
-
-    fn make_marlin_expert_stack(
-        store: std::sync::Arc<Self::GptqStore>,
-        num_experts: usize,
-        n_per_expert: usize,
-        k: usize,
-    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
+        });
         Ok(std::sync::Arc::new(
             crate::quant_linear::cpu_marlin_stack::CpuMarlinExpertStack::new(
                 store,
@@ -786,55 +777,63 @@ impl crate::backend::BackendQuantMarlin for CpuBackend {
             ),
         ))
     }
+    // Phase C step 4b: make_stacked_expert_linear inlined into
+    // CpuMarlinExpertStack::make_expert_linear.
+    // Phase C step 4e: make_marlin_expert_stack subsumed by load_gptq_stacked.
+    // gemm_gptq_with_offset_strided body moved to free function
+    // cpu_gemm_gptq_with_offset_strided below — called by
+    // CpuMarlinExpertStack::gemm_phase_batched.
+}
 
-    fn gemm_gptq_with_offset_strided(
-        _ctx: &mut Self::Context,
-        input: &Self::Buffer,
-        in_row_offset: usize,
-        weight: &Self::GptqStore,
-        expert_offset: usize,
-        expert_n: usize,
-        output: &mut Self::Buffer,
-        out_row_offset: usize,
-        m: usize,
-        k: usize,
-    ) -> Result<()> {
-        if expert_offset + expert_n > weight.n {
-            return Err(FerrumError::model(format!(
-                "gemm_gptq_with_offset_strided OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
-                weight.n
-            )));
-        }
-        if k != weight.k {
-            return Err(FerrumError::model(format!(
-                "gemm_gptq_with_offset_strided k mismatch: arg {k} vs weight.k {}",
-                weight.k
-            )));
-        }
-        // [m, K] input slice and [m, expert_n] output slice; weight
-        // [expert_n, K] taken from the column-slice of weight_f32.
-        let in_start = in_row_offset * k;
-        let in_end = (in_row_offset + m) * k;
-        let out_start = out_row_offset * expert_n;
-        let out_end = (out_row_offset + m) * expert_n;
-        let row_start = expert_offset * k;
-        let row_end = (expert_offset + expert_n) * k;
-        let weight_slice = weight.weight_f32[row_start..row_end].to_vec();
-        let in_slice = input[in_start..in_end].to_vec();
-        let mut out_slice = vec![0.0f32; m * expert_n];
-        let mut ctx_local = ();
-        Self::gemm(
-            &mut ctx_local,
-            &in_slice,
-            &weight_slice,
-            &mut out_slice,
-            m,
-            expert_n,
-            k,
-        );
-        output[out_start..out_end].copy_from_slice(&out_slice);
-        Ok(())
+/// Free-function form of the deleted
+/// `BackendQuantMarlin::gemm_gptq_with_offset_strided` (Phase C step 4e).
+/// Single caller: `CpuMarlinExpertStack::gemm_phase_batched`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cpu_gemm_gptq_with_offset_strided(
+    _ctx: &mut <CpuBackend as Backend>::Context,
+    input: &<CpuBackend as Backend>::Buffer,
+    in_row_offset: usize,
+    weight: &CpuGptqStore,
+    expert_offset: usize,
+    expert_n: usize,
+    output: &mut <CpuBackend as Backend>::Buffer,
+    out_row_offset: usize,
+    m: usize,
+    k: usize,
+) -> Result<()> {
+    if expert_offset + expert_n > weight.n {
+        return Err(FerrumError::model(format!(
+            "cpu_gemm_gptq_with_offset_strided OOB: offset {expert_offset} + n {expert_n} > stacked_n {}",
+            weight.n
+        )));
     }
+    if k != weight.k {
+        return Err(FerrumError::model(format!(
+            "cpu_gemm_gptq_with_offset_strided k mismatch: arg {k} vs weight.k {}",
+            weight.k
+        )));
+    }
+    let in_start = in_row_offset * k;
+    let in_end = (in_row_offset + m) * k;
+    let out_start = out_row_offset * expert_n;
+    let out_end = (out_row_offset + m) * expert_n;
+    let row_start = expert_offset * k;
+    let row_end = (expert_offset + expert_n) * k;
+    let weight_slice = weight.weight_f32[row_start..row_end].to_vec();
+    let in_slice = input[in_start..in_end].to_vec();
+    let mut out_slice = vec![0.0f32; m * expert_n];
+    let mut ctx_local = ();
+    CpuBackend::gemm(
+        &mut ctx_local,
+        &in_slice,
+        &weight_slice,
+        &mut out_slice,
+        m,
+        expert_n,
+        k,
+    );
+    output[out_start..out_end].copy_from_slice(&out_slice);
+    Ok(())
 }
 
 impl crate::backend::BackendQuantGguf for CpuBackend {

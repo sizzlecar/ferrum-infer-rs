@@ -342,7 +342,11 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         expert_prefix_fmt: &str,
         num_experts: usize,
         proj_names: &[&str],
-    ) -> Result<(B::GptqStore, usize, usize)> {
+    ) -> Result<(
+        std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
+        usize,
+        usize,
+    )> {
         let qcfg = self.quant_config.as_ref().ok_or_else(|| {
             FerrumError::model(
                 "load_stacked_gptq_experts requires quantize_config.json".to_string(),

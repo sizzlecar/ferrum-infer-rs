@@ -274,6 +274,8 @@ fn cuda_stacked_offset_vs_per_expert() {
     let qw_refs: Vec<&[i32]> = experts.iter().map(|e| e.qweight.as_slice()).collect();
     let sc_refs: Vec<&[f32]> = experts.iter().map(|e| e.scales.as_slice()).collect();
     let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
+    // Phase C step 4e: load_gptq_stacked now returns the trait-object
+    // MarlinExpertStack directly (no intermediate GptqStore type).
     let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked(
         &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
@@ -284,7 +286,6 @@ fn cuda_stacked_offset_vs_per_expert() {
     let mut ctx = <CudaBackend as Backend>::new_context();
 
     // Run per-expert reference + offset variant for each expert; compare.
-    let stacked_arc = std::sync::Arc::new(stacked);
     for (e, lin) in per_expert.iter().enumerate() {
         let input_dev = CudaBackend::from_slice(&input);
         let mut ref_out_dev = CudaBackend::alloc(m * n_per);
@@ -294,17 +295,8 @@ fn cuda_stacked_offset_vs_per_expert() {
 
         let input_dev_off = CudaBackend::from_slice(&input);
         let mut off_out_dev = CudaBackend::alloc(m * n_per);
-        // Phase C step 4b: StackedExpertLinear takes a MarlinExpertStack
-        // trait object. Wrap the raw GptqStoreCuda first.
-        let off_stack = <CudaBackend as ferrum_kernels::backend::BackendQuantMarlin>::make_marlin_expert_stack(
-            stacked_arc.clone(),
-            num_experts,
-            n_per,
-            k,
-        )
-        .expect("make_marlin_expert_stack");
         let off_lin = ferrum_quantization::StackedExpertLinear::<CudaBackend>::new(
-            off_stack,
+            stacked.clone(),
             e * n_per,
             n_per,
         )
@@ -396,20 +388,10 @@ fn cpu_stacked_vs_per_expert_parity() {
     )
     .expect("stacked load_gptq_stacked");
 
-    // Slice-and-compare: for each expert, the stacked-store sliced view
-    // must equal the per-expert dedicated GEMM. Phase 3e/2: per-expert
-    // dispatch goes through `StackedExpertLinear<CpuBackend>::forward`.
-    let stacked_arc = std::sync::Arc::new(stacked_store);
-    // Phase C step 4b: wrap the raw GptqStore in a MarlinExpertStack
-    // trait object first; StackedExpertLinear::new takes the stack
-    // directly (no longer routes through B::make_stacked_expert_linear).
-    let stacked_stack = <CpuBackend as ferrum_kernels::backend::BackendQuantMarlin>::make_marlin_expert_stack(
-        stacked_arc.clone(),
-        num_experts,
-        n_per,
-        k,
-    )
-    .expect("make_marlin_expert_stack");
+    // Phase C step 4e: load_gptq_stacked returns Arc<dyn MarlinExpertStack>
+    // directly — `stacked_store` is already the trait object, no separate
+    // make_marlin_expert_stack wrap.
+    let stacked_stack = stacked_store;
     for (e, ref_out) in per_expert_outs.iter().enumerate() {
         let mut stacked_out = vec![0.0f32; m * n_per];
         let mut ctx = <CpuBackend as Backend>::new_context();

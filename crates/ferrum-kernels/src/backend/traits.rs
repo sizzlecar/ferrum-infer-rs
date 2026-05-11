@@ -262,23 +262,16 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// Opaque per-backend GPTQ weight representation.
     ///   - CPU: dequantized f32 weights (run as regular GEMM)
     ///   - Metal: `()` — unsupported; `gemm_gptq` errors
-    ///   - CUDA: `MarlinWeight` — pre-repacked tiles + permuted scales
-    ///
-    /// Each backend repacks raw GPTQ tensors (qweight/scales/qzeros, all
-    /// i32/f16) into its preferred format at model load time, so inference
-    /// doesn't pay the repack cost per forward pass.
-    type GptqStore: Send + Sync;
-
-    // Note (Phase 3e/4): `type QuantStore` (GGUF k-quant storage) was removed
-    // — single-linear GGUF goes through `Box<dyn Linear<Self>>` (returned by
-    // `load_quant` / `load_quant_fused`), and stacked-expert MoE GGUF goes
-    // through `Box<dyn StackedExpertGgufLinear<Self>>` (returned by
-    // `load_quant_experts`). Backend trait no longer needs a backend-
-    // specific GGUF type, so adding a new k-quant flavour is purely a
-    // new enum variant inside the backend's concrete Linear impl.
-    // `type GptqStore` is still here because GPTQ load inputs are split
-    // arrays (qweight / scales / qzeros) — see PR D for the matching
-    // GPTQ cutover.
+    // Note (Phase 3e/4 + Phase C):
+    // - `type QuantStore` (GGUF k-quant storage) was removed in Phase 3e/4
+    //   — stacked-expert MoE GGUF goes through Box<dyn StackedExpertGgufLinear<Self>>
+    //   returned by `load_quant_experts`.
+    // - `type GptqStore` (Marlin/dequant GPTQ storage) was removed in Phase C
+    //   step 4e — stacked-expert Marlin MoE goes through
+    //   Arc<dyn MarlinExpertStack<Self>> returned by `load_gptq_stacked`,
+    //   and single-tensor GPTQ goes through Box<dyn Linear<Self>> returned
+    //   by `load_gptq`. Adding a new Marlin-capable backend is purely a
+    //   new MarlinExpertStack<NewBackend> impl — no Backend trait edits.
 
     /// Create a new execution context (begin accumulating work).
     fn new_context() -> Self::Context;
@@ -1032,6 +1025,17 @@ pub trait BackendQuantMarlin: Backend {
     ///
     /// Default returns Err(unsupported); override on backends with a
     /// per-expert MoE GPTQ path.
+    /// Phase C step 4e: returns the trait-object `MarlinExpertStack`
+    /// directly. Internally, each backend constructs its own opaque
+    /// repacked tile (Marlin: per-expert-then-concat; CPU: dequantized
+    /// f32 weight slab) and wraps it in the concrete
+    /// `{Cuda,Cpu}MarlinExpertStack` impl.
+    ///
+    /// Removing `Self::GptqStore` from the public API kills the type
+    /// leak that previously forced `ExpertStack<B>` to carry
+    /// `Option<Arc<B::GptqStore>>`. Adding a new Marlin backend now
+    /// only requires implementing this method + a fresh
+    /// `MarlinExpertStack<NewBackend>` impl — no Backend trait edits.
     #[allow(clippy::too_many_arguments)]
     fn load_gptq_stacked(
         _qweights: &[&[i32]],
@@ -1042,52 +1046,22 @@ pub trait BackendQuantMarlin: Backend {
         _group_size: usize,
         _k: usize,
         _n_per_expert: usize,
-    ) -> Result<Self::GptqStore> {
+    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
         Err(FerrumError::unsupported(
             "load_gptq_stacked not implemented for this backend",
         ))
     }
-    // Phase C step 4b: BackendQuantMarlin::make_stacked_expert_linear
-    // was removed — its body is now inlined into
-    // `MarlinExpertStack::make_expert_linear` (concrete impls in
-    // `quant_linear/{cuda,cpu}_marlin_stack.rs`). Callers reach
-    // single-expert Linear views via
-    // `store.clone().make_expert_linear(offset, n, bias)`.
-
-    /// Phase C step 3: wrap a raw `Arc<Self::GptqStore>` into the
-    /// trait-object `MarlinExpertStack<Self>`. Lets callers go through
-    /// `store.gemm_phase_*` / `store.zero_workspace()` instead of
-    /// reaching into the per-backend `moe_gemm_phase_*` methods —
-    /// the eventual goal is to drop `type GptqStore` from this trait.
-    ///
-    /// Default returns unsupported. CUDA overrides with
-    /// `CudaMarlinExpertStack`. Backends without a stacked Marlin path
-    /// don't implement this; their model code falls back to per-expert
-    /// `Linear<B>` dispatch.
-    fn make_marlin_expert_stack(
-        _store: std::sync::Arc<Self::GptqStore>,
-        _num_experts: usize,
-        _n_per_expert: usize,
-        _k: usize,
-    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
-        Err(FerrumError::unsupported(
-            "make_marlin_expert_stack not implemented for this backend",
-        ))
-    }
-    // Phase C step 4a: BackendQuantMarlin::marlin_zero_stacked_workspace
-    // was removed — its body is now inlined into
-    // `MarlinExpertStack::zero_workspace` (concrete impls in
-    // `quant_linear/{cuda,cpu}_marlin_stack.rs`). Callers reach the
-    // workspace-zero op via `store.zero_workspace(ctx)` instead.
-    /// Batched per-expert offset GEMM dispatch — runs N concurrent
-    /// Marlin calls across a stream pool to amortize launch overhead
-    /// and overlap small-m kernels that under-utilize SMs individually.
-    ///
-    // Phase C step 4c+4d: BackendQuantMarlin::moe_gemm_phase_batched
-    // and moe_gemm_phase_vllm removed — their bodies are now inlined
-    // into MarlinExpertStack::gemm_phase_batched / gemm_phase_vllm
-    // (concrete impls in quant_linear/{cuda,cpu}_marlin_stack.rs).
-    // Callers reach them via `store.gemm_phase_*(ctx, ...)`.
+    // Phase C step 4a: marlin_zero_stacked_workspace — body inlined into
+    // MarlinExpertStack::zero_workspace.
+    // Phase C step 4b: make_stacked_expert_linear — body inlined into
+    // MarlinExpertStack::make_expert_linear.
+    // Phase C step 4c+4d: moe_gemm_phase_batched + moe_gemm_phase_vllm —
+    // bodies inlined into MarlinExpertStack::gemm_phase_batched /
+    // gemm_phase_vllm (concrete impls in quant_linear/{cuda,cpu}_marlin_stack.rs).
+    // Phase C step 4e: make_marlin_expert_stack subsumed by
+    // load_gptq_stacked (now returns the trait object directly).
+    // gemm_gptq_with_offset_strided — body inlined into CpuMarlinExpertStack
+    // (the only remaining caller).
     /// Pre-grow any backend-internal scratch slots whose size depends
     /// on `m_total * intermediate_size` (the largest matmul fan-in
     /// inside `unified_forward_internal`). Default no-op. CUDA
@@ -1098,31 +1072,10 @@ pub trait BackendQuantMarlin: Backend {
     fn pregrow_marlin_gather_scratch(_ctx: &mut Self::Context, _required: usize) {
         // default: no scratch to pre-grow
     }
-    /// Variant of [`Backend::gemm_gptq_with_offset`] that also takes
-    /// row-offsets into the input and output buffers. Lets the bucketed
-    /// MoE dispatcher run an expert's column-slice GEMM against a
-    /// sub-range of the packed input/output buffers without needing a
-    /// buffer-view type.
-    ///
-    /// Default impl returns Err so backends without MoE batched dispatch
-    /// don't have to implement.
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_gptq_with_offset_strided(
-        _ctx: &mut Self::Context,
-        _input: &Self::Buffer,
-        _in_row_offset: usize,
-        _weight: &Self::GptqStore,
-        _expert_offset: usize,
-        _expert_n: usize,
-        _output: &mut Self::Buffer,
-        _out_row_offset: usize,
-        _m: usize,
-        _k: usize,
-    ) -> Result<()> {
-        Err(ferrum_types::FerrumError::unsupported(
-            "gemm_gptq_with_offset_strided not implemented for this backend",
-        ))
-    }
+    // Phase C step 4e: gemm_gptq_with_offset_strided removed —
+    // body inlined into CpuMarlinExpertStack (the only caller after
+    // step 4c moved the multi-stream pool dispatch into the CUDA
+    // free function).
 }
 
 // ════════════════════════════════════════════════════════════════════════

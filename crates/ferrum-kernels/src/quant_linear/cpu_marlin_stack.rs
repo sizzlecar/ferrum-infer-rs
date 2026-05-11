@@ -16,7 +16,7 @@ use ferrum_types::Result;
 use std::sync::Arc;
 
 pub struct CpuMarlinExpertStack {
-    pub store: Arc<<CpuBackend as crate::backend::Backend>::GptqStore>,
+    pub store: Arc<crate::backend::cpu::CpuGptqStore>,
     pub num_experts: usize,
     pub n_per_expert: usize,
     pub k: usize,
@@ -24,7 +24,7 @@ pub struct CpuMarlinExpertStack {
 
 impl CpuMarlinExpertStack {
     pub fn new(
-        store: Arc<<CpuBackend as crate::backend::Backend>::GptqStore>,
+        store: Arc<crate::backend::cpu::CpuGptqStore>,
         num_experts: usize,
         n_per_expert: usize,
         k: usize,
@@ -67,11 +67,11 @@ impl MarlinExpertStack<CpuBackend> for CpuMarlinExpertStack {
         output: &mut <CpuBackend as crate::backend::Backend>::Buffer,
         k: usize,
     ) -> Result<()> {
-        // Phase C step 4c: inlined from the default
-        // BackendQuantMarlin::moe_gemm_phase_batched impl — serial loop
-        // calling gemm_gptq_with_offset_strided per active expert.
+        // Phase C step 4c+4e: serial loop calling the moved-out CPU
+        // gemm_gptq_with_offset_strided free function. No longer
+        // routes through any Backend trait method.
         for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
-            <CpuBackend as crate::backend::BackendQuantMarlin>::gemm_gptq_with_offset_strided(
+            crate::backend::cpu::cpu_gemm_gptq_with_offset_strided(
                 ctx,
                 input,
                 *in_row_offset,

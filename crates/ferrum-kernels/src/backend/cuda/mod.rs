@@ -338,7 +338,8 @@ impl Backend for CudaBackend {
     // by half (`alloc_u32` default was wrong on CUDA).
     type Buffer = crate::backend::CudaBuf;
     type Context = CudaState;
-    type GptqStore = GptqStoreCuda;
+    // type GptqStore: removed in Phase C step 4e. GptqStoreCuda is
+    // now a private (crate-internal) detail of CudaMarlinExpertStack.
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
