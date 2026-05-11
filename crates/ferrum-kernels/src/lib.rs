@@ -9,6 +9,9 @@ pub mod backend;
 pub mod linear;
 pub use linear::Linear;
 
+pub mod stacked_expert;
+pub use stacked_expert::StackedExpertGgufLinear;
+
 pub mod quant_linear;
 
 pub mod attention;
