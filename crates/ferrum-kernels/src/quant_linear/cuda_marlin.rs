@@ -13,9 +13,7 @@
 use crate::backend::cuda::{CudaBackend, GptqStoreCuda};
 use crate::backend::CudaBuf;
 use crate::Linear;
-use cudarc::driver::CudaSlice;
 use ferrum_types::{FerrumError, Result};
-use half::f16;
 use std::sync::Arc;
 
 /// Single-tensor GPTQ-Marlin Linear projection.
