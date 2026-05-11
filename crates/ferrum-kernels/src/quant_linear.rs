@@ -14,6 +14,7 @@
 
 pub mod cpu_dequant;
 pub mod cpu_gguf;
+pub mod cpu_marlin_stack;
 
 #[cfg(feature = "cuda")]
 pub mod cuda_marlin;

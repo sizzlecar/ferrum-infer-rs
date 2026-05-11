@@ -797,6 +797,23 @@ impl crate::backend::BackendQuantMarlin for CpuBackend {
             out_features: expert_n,
         }))
     }
+
+    fn make_marlin_expert_stack(
+        store: std::sync::Arc<Self::GptqStore>,
+        num_experts: usize,
+        n_per_expert: usize,
+        k: usize,
+    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
+        Ok(std::sync::Arc::new(
+            crate::quant_linear::cpu_marlin_stack::CpuMarlinExpertStack::new(
+                store,
+                num_experts,
+                n_per_expert,
+                k,
+            ),
+        ))
+    }
+
     fn gemm_gptq_with_offset_strided(
         _ctx: &mut Self::Context,
         input: &Self::Buffer,
