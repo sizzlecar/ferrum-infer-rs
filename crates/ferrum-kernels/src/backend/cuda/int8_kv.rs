@@ -138,7 +138,7 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
             slot_mapping_host[t] = (block_physical * block_size + slot_in_block) as i32;
         }
         let slot_mapping = stream
-            .memcpy_stod(&slot_mapping_host)
+            .clone_htod(&slot_mapping_host)
             .map_err(|e| FerrumError::model(format!("htod slot_mapping: {e}")))?;
 
         // Lazily alloc INT8 buffers + scales on first call (the constructor
