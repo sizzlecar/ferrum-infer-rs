@@ -25,7 +25,6 @@ pub fn setup_logging(verbose: bool, quiet: bool) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new(format!(
                 "{},\
-                 ferrum_engine::metal::metal_executor=error,\
                  tokenizers=error,\
                  ferrum_models=info,\
                  ferrum_quantization=info,\
