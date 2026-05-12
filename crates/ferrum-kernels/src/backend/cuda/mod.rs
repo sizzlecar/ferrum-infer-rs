@@ -159,13 +159,71 @@ pub struct CudaState {
     /// that triggered CUDA_ERROR_ILLEGAL_ADDRESS via stream-ordered free.
     paged_attn_out_tm: Option<crate::backend::CudaBuf>,
     paged_attn_out_tm_capacity: usize,
-    /// fp32 reduce scratch for vLLM marlin_moe_wna16. Sized at the upper
-    /// bound vLLM uses internally: `sms * 4 * moe_block_size * max_thread_n`
-    /// (= 128 * 4 * 16 * 256 = 2M fp32 = 8MB on a 4090). Lazy-alloc; once
-    /// up the buffer is reused across all layers and forwards. Without
-    /// this scratch we fall back to atomic_add which is 1.3-1.5× slower.
-    #[cfg(feature = "vllm-moe-marlin")]
-    vllm_moe_c_tmp_f32: Option<CudaSlice<f32>>,
+}
+
+// Process-global fp32 reduce scratch for vLLM marlin_moe_wna16.
+//
+// Sized at the upper bound vLLM uses internally:
+// `sms * 4 * moe_block_size * max_thread_n` (= 128 * 4 * 16 * 256 =
+// 2M fp32 = 8MB on a 4090).
+//
+// MUST be process-global (not per-CudaState) for CUDA Graph capture.
+// `new_context()` builds a fresh CudaState every `decode_batch_internal`
+// call; if c_tmp lived on the state it would be dropped + reallocated
+// per call, but the captured graph holds the c_tmp pointer from
+// capture time → next replay reads a freed/reassigned address →
+// `cuGraphLaunch: CUDA_ERROR_INVALID_VALUE` on every pre-capture
+// replay (the post-capture replay just happens to still see the
+// original ctx's allocation). Mirrors the pattern already used by
+// `MARLIN_GATHER_SCRATCH`, cuBLAS workspace, and `BATCHED_SCRATCH_*`.
+#[cfg(feature = "vllm-moe-marlin")]
+static VLLM_MOE_C_TMP: std::sync::OnceLock<std::sync::RwLock<Option<CudaSlice<f32>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "vllm-moe-marlin")]
+fn vllm_moe_c_tmp_slot() -> &'static std::sync::RwLock<Option<CudaSlice<f32>>> {
+    VLLM_MOE_C_TMP.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Run `body` with a `&mut CudaSlice<f32>` pointing at the process-
+/// global vLLM MoE fp32 reduce scratch. Allocates on first call only;
+/// every subsequent caller sees the SAME GPU address — graph-capture
+/// safe (the address baked into a captured kernel arg stays valid
+/// for the lifetime of the process).
+#[cfg(feature = "vllm-moe-marlin")]
+pub fn with_vllm_moe_c_tmp<R>(
+    stream: &Arc<CudaStream>,
+    body: impl FnOnce(&mut CudaSlice<f32>) -> R,
+) -> R {
+    let slot = vllm_moe_c_tmp_slot();
+    // Fast path: scratch already up. Take the write lock briefly to
+    // hand a `&mut` to the body. There is at most one engine forward
+    // call serialized on the model's iteration_lock at any time, so
+    // contention here is zero in practice.
+    {
+        let g = slot.read().expect("VLLM_MOE_C_TMP poisoned");
+        if g.is_some() {
+            drop(g);
+            let mut w = slot.write().expect("VLLM_MOE_C_TMP poisoned");
+            let s = w.as_mut().expect("just observed Some");
+            return body(s);
+        }
+    }
+    // First-time alloc.
+    let mut w = slot.write().expect("VLLM_MOE_C_TMP poisoned");
+    if w.is_none() {
+        const C_TMP_SIZE_F32: usize = 2 * 1024 * 1024;
+        let buf = stream
+            .alloc_zeros::<f32>(C_TMP_SIZE_F32)
+            .expect("alloc_zeros vllm_moe_c_tmp_f32 (process-global)");
+        tracing::info!(
+            "vLLM moe c_tmp scratch allocated (process-global): {} fp32 ({:.1} MB)",
+            C_TMP_SIZE_F32,
+            (C_TMP_SIZE_F32 * 4) as f32 / 1e6
+        );
+        *w = Some(buf);
+    }
+    body(w.as_mut().unwrap())
 }
 
 pub(super) const BATCHED_SCRATCH_CAP: usize = 64;
@@ -208,32 +266,10 @@ impl CudaState {
         self.moe_streams.as_ref().unwrap()
     }
 
-    /// Lazy-alloc the fp32 reduce scratch buffer used by
-    /// `moe_gemm_phase_vllm`. Sized at vLLM's static upper bound:
-    /// `sms * 4 * moe_block_size * max_thread_n` (= 128 * 4 * 16 * 256 =
-    /// 2M fp32 = 8MB on RTX 4090). Once allocated it's reused for every
-    /// vLLM moe call — phase 1, phase 3, every layer, every forward.
-    #[cfg(feature = "vllm-moe-marlin")]
-    pub fn vllm_moe_c_tmp(&mut self) -> &mut CudaSlice<f32> {
-        if self.vllm_moe_c_tmp_f32.is_none() {
-            // Static upper bound: covers any (size_n, total_padded) pair
-            // we'd ever feed under our shapes (gate_up_dim ≤ 16k,
-            // total_padded ≤ num_experts * block_size = 128 * 16 = 2048).
-            // 2M f32 = 8 MB.
-            const C_TMP_SIZE_F32: usize = 2 * 1024 * 1024;
-            let buf = self
-                .stream
-                .alloc_zeros::<f32>(C_TMP_SIZE_F32)
-                .expect("alloc_zeros vllm_moe_c_tmp_f32");
-            self.vllm_moe_c_tmp_f32 = Some(buf);
-            tracing::info!(
-                "vLLM moe c_tmp scratch allocated: {} fp32 ({:.1} MB)",
-                C_TMP_SIZE_F32,
-                (C_TMP_SIZE_F32 * 4) as f32 / 1e6
-            );
-        }
-        self.vllm_moe_c_tmp_f32.as_mut().unwrap()
-    }
+    // `vllm_moe_c_tmp` moved out of CudaState — see VLLM_MOE_C_TMP
+    // process-global below + `with_vllm_moe_c_tmp` helper. Was on
+    // per-state lazy-alloc; that caused INVALID_VALUE on every
+    // graph replay since each new_context() reseats the buffer.
 
     /// Lazy-init the persistent cuEvents used by
     /// `moe_gemm_phase_batched` for cross-stream sync. The (entry,
@@ -399,8 +435,6 @@ impl Backend for CudaBackend {
             moe_route_capacity: 0,
             paged_attn_out_tm: None,
             paged_attn_out_tm_capacity: 0,
-            #[cfg(feature = "vllm-moe-marlin")]
-            vllm_moe_c_tmp_f32: None,
         }
     }
 

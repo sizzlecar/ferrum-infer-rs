@@ -959,10 +959,7 @@ pub(crate) fn moe_gemm_phase_vllm_impl(
     #[cfg(not(feature = "triton-kernels"))]
     let mw: &crate::marlin::MarlinWeight = weight;
 
-    use cudarc::driver::CudaSlice;
-
     let stream = ctx.stream.clone();
-    let c_tmp_mut: &mut CudaSlice<f32> = ctx.vllm_moe_c_tmp();
 
     // Phase D step 2+3: upload_moe_routing now returns CudaBuf::I32
     // directly — no more upgrade_device_ptr leak. Pass the typed
@@ -971,25 +968,29 @@ pub(crate) fn moe_gemm_phase_vllm_impl(
     let eid_ref = expert_ids.as_i32();
     let npp_ref = num_tokens_past_padded.as_i32();
 
-    crate::marlin::marlin_gemm_moe_vllm(
-        &stream,
-        input.as_f16(),
-        mw,
-        output.as_f16_mut(),
-        Some(c_tmp_mut),
-        st_ref,
-        eid_ref,
-        npp_ref,
-        None,
-        moe_block_size as i32,
-        top_k as i32,
-        false,
-        false,
-        prob_m as i32,
-        n_per_expert as i32,
-        k as i32,
-    )
-    .map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
+    // c_tmp moved process-global (was per-ctx lazy-alloc). Captured
+    // graph kernel args stay valid across `new_context()` calls now.
+    crate::backend::cuda::with_vllm_moe_c_tmp(&stream, |c_tmp_mut| {
+        crate::marlin::marlin_gemm_moe_vllm(
+            &stream,
+            input.as_f16(),
+            mw,
+            output.as_f16_mut(),
+            Some(c_tmp_mut),
+            st_ref,
+            eid_ref,
+            npp_ref,
+            None,
+            moe_block_size as i32,
+            top_k as i32,
+            false,
+            false,
+            prob_m as i32,
+            n_per_expert as i32,
+            k as i32,
+        )
+        .map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
+    })
 }
 // CUDA does not ship GGUF k-quant kernels; inherit unsupported defaults.
 impl BackendQuantGguf for CudaBackend {}
