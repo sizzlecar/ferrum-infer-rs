@@ -222,6 +222,31 @@ pub struct Qwen3MoeScratch<B: QuantLlmBackend + BackendMoeFused> {
     /// expert. Phase 1/3 dispatcher consults to compute each expert's
     /// row slice in the packed buffers.
     pub route_expert_offsets_dev: B::Buffer,
+    /// `[max_tokens * top_k]` f32 — pair_weights from `route_topk_softmax`
+    /// in float precision. Separate from `weights_2d` (which is F16 for
+    /// the legacy per-pair path's `copy_slice` consumption) — the route
+    /// kernel writes `float* out_weights`, so we need F32-byte capacity.
+    pub route_pair_weights_dev: B::Buffer,
+
+    // ── Device-side vLLM marlin_moe routing buffers ─────────────────
+    //
+    // Outputs of `B::moe_align_block_size` invoked on device-side
+    // `selected_ids_buf`. Layout matches vLLM's marlin_moe_wna16
+    // kernel input — same shape as host `vllm_routing` builder
+    // produces, but built entirely on-device so the GEMM phases can
+    // be captured.
+    /// `[max_tokens * top_k + num_experts * VLLM_MOE_BLOCK_SIZE]` i32
+    /// — flat list of pair indices in `[0, batch*top_k)`, sorted by
+    /// expert and padded with sentinel inside each expert group to
+    /// `VLLM_MOE_BLOCK_SIZE=16` boundary. Worst-case sized assuming
+    /// each expert needs up to (block_size-1) padding.
+    pub route_sorted_tokens_dev: B::Buffer,
+    /// `[sorted_tokens / VLLM_MOE_BLOCK_SIZE + num_experts]` i32 —
+    /// which expert each block of `sorted_tokens` belongs to.
+    pub route_block_ids_dev: B::Buffer,
+    /// `[1]` i32 — actual padded token count (`total_padded`). Read
+    /// by `gemm_phase_vllm` as `num_tokens_post_padded[0]`.
+    pub route_total_post_pad_dev: B::Buffer,
 
     // ── Final-token / lm_head outputs ────────────────────────────────
     pub last_hidden: B::Buffer,
@@ -336,6 +361,26 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
                 t * cfg.num_experts_per_tok
             ]),
             route_expert_offsets_dev: B::from_slice_typed::<i32>(&vec![0i32; n_exp + 1]),
+            route_pair_weights_dev: B::from_slice_typed::<f32>(&vec![
+                0.0f32;
+                t * cfg.num_experts_per_tok
+            ]),
+            // moe_align_block_size outputs — worst-case sizing assumes
+            // each active expert pads up to (VLLM_MOE_BLOCK_SIZE-1)
+            // extra rows beyond its real `m_e`. Block-size hardcoded to
+            // match dispatch.rs::VLLM_MOE_BLOCK_SIZE=16.
+            route_sorted_tokens_dev: B::from_slice_typed::<i32>(&vec![
+                0i32;
+                t * cfg.num_experts_per_tok
+                    + n_exp * 16
+            ]),
+            route_block_ids_dev: B::from_slice_typed::<i32>(&vec![
+                0i32;
+                t * cfg.num_experts_per_tok / 16
+                    + n_exp
+                    + 1
+            ]),
+            route_total_post_pad_dev: B::from_slice_typed::<i32>(&[0i32]),
             last_hidden: B::alloc(h),
             last_normed: B::alloc(h),
             logits: B::alloc(vocab),
@@ -1398,10 +1443,13 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 &mut self.scratch.moe_route_scratch,
                 Some(crate::moe::dispatch::DeviceRouteScratch {
                     selected_ids: &mut self.scratch.selected_ids_buf,
-                    pair_weights: &mut self.scratch.weights_2d,
+                    pair_weights: &mut self.scratch.route_pair_weights_dev,
                     pairs_by_token: &mut self.scratch.route_pairs_dev,
                     packed_token_idx: &mut self.scratch.route_packed_idx_dev,
                     expert_offsets: &mut self.scratch.route_expert_offsets_dev,
+                    sorted_tokens: &mut self.scratch.route_sorted_tokens_dev,
+                    block_ids: &mut self.scratch.route_block_ids_dev,
+                    total_post_pad: &mut self.scratch.route_total_post_pad_dev,
                 }),
             )?;
         } else if stacked_path_available {
@@ -2877,10 +2925,13 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 &mut self.scratch.moe_route_scratch,
                 Some(crate::moe::dispatch::DeviceRouteScratch {
                     selected_ids: &mut self.scratch.selected_ids_buf,
-                    pair_weights: &mut self.scratch.weights_2d,
+                    pair_weights: &mut self.scratch.route_pair_weights_dev,
                     pairs_by_token: &mut self.scratch.route_pairs_dev,
                     packed_token_idx: &mut self.scratch.route_packed_idx_dev,
                     expert_offsets: &mut self.scratch.route_expert_offsets_dev,
+                    sorted_tokens: &mut self.scratch.route_sorted_tokens_dev,
+                    block_ids: &mut self.scratch.route_block_ids_dev,
+                    total_post_pad: &mut self.scratch.route_total_post_pad_dev,
                 }),
             )?;
         } else {
