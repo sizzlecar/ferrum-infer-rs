@@ -80,6 +80,25 @@ The full refactor to enable MoE CUDA Graph capture:
 
 Total: probably 800-1200 lines, **multi-day focused**. Worth doing because it unlocks the path to vLLM-parity perf on MoE — but not autonomous-tick scope. Defer until user prioritises perf over other roadmap items.
 
+### Status as of #174 (2026-05-12 morning)
+
+Groundwork landed on main:
+- ✅ `kernels/moe_build_pairs.cu` + `B::moe_build_pairs_by_token` (writes pairs / packed_token_idx / expert_offsets on-device)
+- ✅ `B::moe_combine` signature change to device buffers
+- ✅ `Qwen3MoeScratch.route_pairs_dev` / `route_packed_idx_dev` / `route_expert_offsets_dev` pre-allocated
+- ✅ Bench: no regression (c=32 = 723.9 vs 717.5 baseline, +0.9%)
+
+Remaining cascade for actual capture-enabled MoE:
+- ❌ `moe_forward_bucketed` device-routing branch (under `FERRUM_MOE_DEVICE_ROUTE=1`):
+  - Replace `try_gpu_route_topk_into_host` with `B::route_topk_softmax` + `B::moe_build_pairs_by_token`
+  - Skip `route_scratch.plan.rebuild_into` host call
+  - Skip `vllm_routing` host build → use `B::moe_align_block_size` on device for VLLM path
+- ❌ `B::embedding_lookup_dev` new trait method (takes ids as `&Self::Buffer` not `&[u32]`) — used for gather step; current `embedding_lookup` does `clone_htod(ids)` internally, same host-pointer-captures-stale problem
+- ❌ Skip `phase1_dispatches`/`phase3_dispatches` under VLLM_MOE (fused kernel handles routing internally — host dispatch list not needed)
+- ❌ Re-enable `Qwen3MoeModel` Phase 1 graph scaffold (state fields + capture/replay wrapper around layer loop in `decode_batch_internal`)
+
+Each item is ~50-200 lines. Total remaining: ~300-500 lines of careful surgery on perf-critical paths. Suitable for a focused multi-hour session with bench validation after each step.
+
 ### Blocker 2: Pre-grow scratch before begin_capture
 LlamaFamilyModel uses `B::pregrow_marlin_gather_scratch(m_total * intermediate_size)` to eagerly grow the marlin scratch slot. Same pattern needed for MoE:
 - Marlin gather scratch
