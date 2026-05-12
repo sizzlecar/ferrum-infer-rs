@@ -6,20 +6,86 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Ferrum Infer is a Rust-native LLM inference engine. Single binary, no Python — supports Metal (macOS), CUDA (NVIDIA), and CPU backends. Targets vLLM-level performance with PagedAttention, continuous batching, and custom CUDA kernels.
 
-**Current baseline (Qwen3-30B-A3B-GPTQ-Int4, RTX 4090, `ferrum bench-serve`, post Audit #8/#9/#5 reorg + Phase 3 MoE fixes @ commit `0022412`):**
+**Current baseline (Qwen3-30B-A3B-GPTQ-Int4, RTX 4090, random-dataset `ferrum bench-serve`, post Audit #8/#9/#5 reorg + Phase 3 MoE fixes @ commit `0022412`):**
 
-| c | tok/s | TPOT | ratio vs vLLM 0.20.1 |
-|---|------:|-----:|---------------------:|
-| 1  | 146.6 | 6.52ms  | ~91% |
-| 8  | 541.3 | 13.10ms | ~115% |
-| 16 | 725.1 | 19.28ms | ~115% |
-| 32 | **811.8** | **34.46ms** | **~43%** |
+| c | tok/s | TPOT | note |
+|---|------:|-----:|------|
+| 1  | 146.6 | 6.52ms  | random-len 256/128, num_prompts=c×4 |
+| 8  | 541.3 | 13.10ms |  |
+| 16 | 725.1 | 19.28ms |  |
+| 32 | **811.8** | **34.46ms** | active perf target — see "Performance Testing" below |
 
-`bash bench/v0.2-cuda/m3_bench_serve.sh` for repro (release build needs `--features cuda,vllm-moe-marlin`). Phase B-2 / C / D Backend refactor 2.4×'d c=32 throughput (was 318.4 / TPOT 95ms); Phase 3 MoE fix commits (`db7e529` / `76bf72f` / `e423636`) + Audit #8/#9/#5 reorg pushed it further to 811.8. The c=32 cliff vs vLLM (vLLM ~1870 tok/s) is still the active perf target.
+`bash bench/v0.2-cuda/m3_bench_serve.sh` for repro (release build needs `--features cuda,vllm-moe-marlin`). Random-dataset bench is fast (~10 min) but not apples-to-apples with the published vLLM number (`bench/v0.2-cuda/run_cell.sh` is ShareGPT). For the gap-closing comparison vs vLLM, use the run_cell.sh path described below.
 
 - INT4 quantization: GPTQ format auto-detected, Marlin fused kernel on Blackwell
 - Paged KV attention with block reclamation
 - Flash Decoding (split-K) for long contexts
+
+## Performance Testing
+
+### CUDA (RTX 4090) — primary perf target
+
+**Reference model**: `Qwen/Qwen3-30B-A3B-GPTQ-Int4` (M3 tag, ~17 GB MoE GPTQ-Int4). M1 / M2 (Llama-3.1-8B FP16 / GPTQ-Int4) also covered when sweeping the v0.2 matrix; `bench/v0.2-cuda/models.txt` is the canonical model list.
+
+**Methodology** (vendored from PR #102, ShareGPT dataset — this is the apples-to-apples comparison with the published vLLM number):
+
+1. `bash bench/v0.2-cuda/setup.sh` — one-time pod setup (Rust + ferrum release build with `--features cuda,vllm-moe-marlin` + `pip install vllm` + ShareGPT subset).
+2. `bash bench/v0.2-cuda/run_sweep.sh` — the 144-cell matrix (vllm + ferrum × M1/M2/M3 × c=1/4/16/32 × 3 repeats). Calls `run_cell.sh` per cell.
+3. Each cell uses `vllm bench serve --backend openai-chat --base-url http://...` against the running server. Engine-agnostic measurement tool: same dataset, same client, same metrics across vLLM and ferrum.
+4. Dataset: `bench/v0.2-cuda/prompts.jsonl` — ShareGPT V3 subset, 128 prompts, deterministic seed = ferrum repo HEAD short hash (different commits → different prompt subsets, but vLLM and ferrum at the same commit see identical prompts).
+5. Workloads: c=1 → 4 prompts (128-tok input, 512-tok output); c≥4 → c×4 prompts (512-tok input, 256-tok output).
+
+**Ferrum server env block** (post Phase 1.5/2/3 fix commits):
+
+```
+FERRUM_VLLM_MOE=1
+FERRUM_KV_CAPACITY=2048
+FERRUM_KV_MAX_BLOCKS=4096
+FERRUM_PAGED_MAX_SEQS=32
+FERRUM_MOE_BUCKETED=1
+FERRUM_MARLIN_SKIP_WS_ZERO=1
+FERRUM_MOE_STREAMS=4
+# FERRUM_MOE_GRAPH=1 + FERRUM_GRAPH_SKIP_UPLOAD=1 at c ≤ 16 only;
+# graph regresses c=32 by ~6% (cuGraphLaunch overhead on 480-node MoE
+# graph dominates at high m). See memory project_moe_phase3_graph_bug.
+```
+
+**vLLM server args** (matches `bench/v0.2-cuda/run_sweep.sh::vllm_start`):
+
+```
+vllm serve <model> --port 8800 --max-num-seqs 64 --max-model-len 4096 \
+  --no-enable-prefix-caching --no-enable-log-requests --quantization gptq_marlin
+```
+
+**Result files**: `bench/v0.2-cuda/results/{engine}__{model_tag}__c{C}__r{R}.json` (vLLM 0.20 schema: `output_throughput`, `mean_tpot_ms`, `p99_tpot_ms`, `mean_ttft_ms`, `completed`, `failed`).
+
+**Recorded vLLM 0.20 baseline on M3 c=32**: ~1900 tok/s, mean TPOT 15.65 ms (see `results/vllm__M3__c32__r1.json`). This is the gap target.
+
+### Metal (Apple Silicon) — local dev / correctness only, not the primary perf target
+
+**Reference models**: smaller LLMs that fit in M-series unified memory:
+- `Qwen/Qwen3-0.6B` FP16 — used for the smoke run after any backend refactor
+- `Qwen/Qwen3-1.7B`, `Qwen/Qwen3-4B` FP16 — interactive sanity
+- `Qwen/Qwen3-0.6B-GGUF` Q4_K_M — exercises the Metal GGUF path (`backend/metal/q4_k_*`)
+- `bartowski/Llama-3.1-8B-Instruct-Q4_K_M.gguf` — 8B GGUF on 16-32 GB Macs
+
+**Methodology**: smoke-only — `cargo run --release -p ferrum-cli --features metal -- bench qwen3:0.6b --concurrency 1 --max-tokens 16` after a release build. Acceptance: tok/s within ~10% of the previous run on the same Mac (thermal noise + dynamic frequency dominate beyond that).
+
+Apple Silicon thermal management + lack of dedicated server hardware makes multi-c ShareGPT sweeps on Metal unreliable as a perf gate. The Metal path is validated for **correctness** (Qwen3 parity tests in `crates/ferrum-models/tests/qwen3_*_parity_test.rs`, 18 GGUF kernel tests in `ferrum-kernels::backend::metal::*`) and ballpark perf only.
+
+### Perf targets
+
+| horizon | c=32 vs vLLM 0.20.x on M3 4090 | current |
+|---------|--------------------------------|--------:|
+| Near-term (1-2 mo) | **≥ 50%** (≥ ~950 tok/s) | 811.8 / 43% (random-dataset) |
+| Mid-term (3-6 mo)  | **≥ 65%** (≥ ~1240 tok/s) | — |
+| Stretch            | **≥ 80%** (≥ ~1520 tok/s) | — |
+
+c=1 / 8 / 16 are already at vLLM parity or ahead under the random-dataset bench; the c=32 cliff is the **only** active perf target. Path-to-target inputs:
+
+- vLLM internals reference: memory `project_vllm_decode_design.md` (FULL CUDA Graph 3× win, BatchDescriptor cached by m_padded, Marlin tile fixed, PagedAttn V2 grid)
+- MoE graph c=32 regression analysis: memory `project_moe_phase3_graph_bug.md`
+- Continuous-batch scheduler quality / prefix cache / spec decode — not yet implemented in ferrum; each is a multi-week project
 
 ## Build & Development Commands
 
