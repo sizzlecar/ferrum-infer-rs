@@ -31,10 +31,10 @@
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
-  #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
+  #include "quant_utils_stub.cuh"  // ferrum: stub — we never instantiate FP8 KV
 typedef __hip_bfloat16 __nv_bfloat16;
 #else
-  #include "../quantization/w8a8/fp8/nvidia/quant_utils.cuh"
+  #include "quant_utils_stub.cuh"  // ferrum: stub — we never instantiate FP8 KV
 #endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
