@@ -714,7 +714,7 @@ impl Backend for CudaBackend {
             let mut b = stream.launch_builder(&func);
             b.arg(logits);
             b.arg(&n_i32);
-            b.arg(out_dev);
+            b.arg(&mut *out_dev);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (m as u32, 1, 1),
