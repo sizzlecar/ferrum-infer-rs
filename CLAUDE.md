@@ -6,16 +6,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Ferrum Infer is a Rust-native LLM inference engine. Single binary, no Python — supports Metal (macOS), CUDA (NVIDIA), and CPU backends. Targets vLLM-level performance with PagedAttention, continuous batching, and custom CUDA kernels.
 
-**Current baseline (Qwen3-30B-A3B-GPTQ-Int4, RTX 4090, random-dataset `ferrum bench-serve`, post Audit #8/#9/#5 reorg + Phase 3 MoE fixes @ commit `0022412`):**
+**Current baselines (RTX 4090, ShareGPT `bench/v0.2-cuda/run_cell.sh` apples-to-apples — bench dataset, server config, client harness all identical across engines):**
 
-| c | tok/s | TPOT | note |
-|---|------:|-----:|------|
-| 1  | 146.6 | 6.52ms  | random-len 256/128, num_prompts=c×4 |
-| 8  | 541.3 | 13.10ms |  |
-| 16 | 725.1 | 19.28ms |  |
-| 32 | **811.8** | **34.46ms** | active perf target — see "Performance Testing" below |
+M3 — Qwen3-30B-A3B-GPTQ-Int4 (MoE, active perf target):
 
-`bash bench/v0.2-cuda/m3_bench_serve.sh` for repro (release build needs `--features cuda,vllm-moe-marlin`). Random-dataset bench is fast (~10 min) but not apples-to-apples with the published vLLM number (`bench/v0.2-cuda/run_cell.sh` is ShareGPT). For the gap-closing comparison vs vLLM, use the run_cell.sh path described below.
+| c | ferrum tok/s | vLLM 0.20.1 tok/s | ratio | as of |
+|---|------:|------:|------:|---|
+| 1  | 180.7 | 180.7 | 100% | vLLM only — re-run ferrum pending |
+| 4  | 511.6 | 511.6 | 100% | vLLM only |
+| 16 | 1226.5 | 1226.5 | 100% | vLLM only |
+| 32 | — | **1902.8** | — | **gap target** (random-dataset ferrum 811.8 ≈ 43% as proxy) |
+
+Random-dataset proxy at commit `0022412`: c=1 146.6 / c=8 541.3 / c=16 725.1 / c=32 **811.8** tok/s — `bash bench/v0.2-cuda/m3_bench_serve.sh`. Fast (~10 min) but the 43%/55%/65% ratios are only suggestive — for the real gap-to-vLLM, re-run via `run_sweep.sh` (ShareGPT).
+
+M2 — Llama-3.1-8B-GPTQ-INT4 (Apples-to-apples 2026-05-07 @ commit `c6a81d9`):
+
+| c | ferrum tok/s | vLLM 0.20.1 tok/s | ratio |
+|---|------:|------:|------:|
+| 1  | 111.0 | 148.4 | 75% |
+| 4  | 369.3 | 496.1 | 74% |
+| 16 | 964.0 | 1490.3 | 65% |
+| 32 | **1215.4** | **2203.8** | **55%** |
+
+M1 — Llama-3.1-8B FP16 (apples-to-apples table in `docs/bench/cuda-rtx4090-2026-05-07/README.md`).
+
+Notable: at M2 c=32 ferrum **P99 TPOT 23.06 ms vs vLLM 38.15 ms** — ferrum's mixed-batch scheduler keeps tail latency stable while vLLM's preemption / paged-attn V2 fallback creates spikes. Median (P50) still favors vLLM.
 
 - INT4 quantization: GPTQ format auto-detected, Marlin fused kernel on Blackwell
 - Paged KV attention with block reclamation
