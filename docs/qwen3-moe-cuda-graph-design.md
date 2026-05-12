@@ -105,11 +105,18 @@ To make `moe_forward_bucketed` actually capture-ready (no D2H, no host pointer r
 - ❌ Under `use_device_route`, SKIP `route_scratch.plan.rebuild_into` (consumers gone after vllm_routing port)
 - ❌ Skip `phase1_dispatches`/`phase3_dispatches` host build under `use_vllm_moe + use_device_route` (fused kernel handles routing internally)
 
-### Phase 3 — graph capture
+### Phase 3 — graph capture (LANDED)
 
-- ❌ Re-enable `Qwen3MoeModel` Phase 1 graph scaffold (state fields + capture/replay wrapper around layer loop in `decode_batch_internal`)
-- ❌ Pre-grow MoE-specific scratch (vllm_moe_c_tmp, route buffers, paged_attn_out_tm) before begin_capture
-- ❌ Bench under `FERRUM_MOE_GRAPH=1`; expect +15-25% TPOT at c=32 (pushes Qwen3-30B-A3B from ~38% to ~50% of vLLM)
+Implementation now on `main`:
+- ✅ Phase 3a: `populate_paged_batch_scratch_decode` — pulls per-layer write_typed (block_tables / context_lens / pos_offsets / cu_seqlens_q) + cache.len bump OUT of `forward_layer_batched_decode` and runs ONCE before the layer loop. Invariant: same-cache_id layers share `paged_block_indices` and `len`, so 1 host gather replaces num_layers redundant ones.
+- ✅ Phase 3b: `Qwen3MoeModel` gains `batched_graph_warmup: usize`, `batched_graph_failed: bool`, `batched_graph_keys_seen: HashSet<u64>` (+ pub accessors). Cleared on `reset()`, `release(cid)`, and scratch realloc.
+- ✅ Phase 3c: capture/replay wrapper around layer loop + final rms_norm + lm_head in `decode_batch_internal`. Gated on `FERRUM_MOE_GRAPH=1`. Per-shape graph cache keyed by `(1u64<<63) | m_padded`. 3-iter warmup → begin_capture → run forward → end_capture + immediate replay. Failures (capture err / replay err) flip `batched_graph_failed=true` to stay eager forever after. Marlin gather scratch pre-grown with `B::pregrow_marlin_gather_scratch(total_pairs * intermediate_size)` BEFORE capture begins.
+- ✅ Phase 3d: 4 CPU-backend tests in `qwen3_moe_model_test.rs` covering disabled / enabled-graceful / capture-fail-recovery / reset-clears paths. Serialized on a shared mutex (env-var races between parallel tests). Real capture validation needs a CUDA pod.
+
+### Phase 3 next — bench validation
+
+- ❌ Bench under `FERRUM_MOE_GRAPH=1 + FERRUM_MOE_DEVICE_ROUTE=1 + FERRUM_VLLM_MOE=1` on Vast 4090; expect +15-25% TPOT at c=32 (pushes Qwen3-30B-A3B from ~38% to ~50% of vLLM ~1870 tok/s)
+- ❌ If capture works correctly, flip `FERRUM_MOE_GRAPH=1` default-on (gated by feature flag or remain opt-in until soak-tested)
 
 Phase 2 ~250 lines; Phase 3 ~300 lines + state machine. Multi-hour focused sessions per phase.
 
