@@ -35,6 +35,29 @@ pub mod moe;
 pub mod paged;
 pub mod quant;
 
+// GGUF k-quant kernels (Audit #9 moved here from kernels-crate top level).
+// Re-exported via `pub use backend::metal::{...}` in `crate::lib` so the
+// historical `ferrum_kernels::q4_k_gemm::*` and internal `crate::q4_k_*`
+// paths keep working without rippling import updates through the
+// metal_gguf_moe.rs et al. consumers.
+pub mod moe_post_ops;
+pub mod moe_post_ops_batched;
+pub mod moe_router;
+pub mod q4_k;
+pub mod q4_k_gemm;
+pub mod q4_k_gemv;
+pub mod q4_k_gemv_v2;
+pub mod q4_k_moe_id_gate_up_silu;
+pub mod q4_k_moe_id_gate_up_silu_batched;
+pub mod q4_k_moe_id_gemm;
+pub mod q4_k_moe_id_gemv;
+pub mod q4_k_moe_id_gemv_batched;
+pub mod q6_k_gemm;
+pub mod q6_k_gemv;
+pub mod q6_k_moe_id_gemm;
+pub mod q6_k_moe_id_gemv;
+pub mod q6_k_moe_id_gemv_batched;
+
 // Preserve the historical `crate::backend::metal::*` public surface that
 // external callers (`quant_linear::metal_gguf*`, model tests,
 // `ferrum-engine::registry`) depend on.

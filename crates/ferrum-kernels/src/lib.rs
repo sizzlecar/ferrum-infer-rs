@@ -21,40 +21,18 @@ pub mod attention;
 
 pub mod moe_host;
 
+// Audit #9: Metal GGUF k-quant kernels (q4_k_*, q6_k_*, moe_*) physically
+// live in `backend/metal/` now. Re-exported here so external callers'
+// `ferrum_kernels::q4_k_gemm::*` paths + internal `crate::q4_k_*::*` paths
+// keep working unchanged. (`moe_host` stays top-level — it's the CPU
+// reference impl used from `ferrum-models`, not a Metal kernel.)
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod moe_post_ops;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod moe_post_ops_batched;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod moe_router;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k_gemm;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k_gemv;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k_gemv_v2;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k_moe_id_gate_up_silu;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k_moe_id_gate_up_silu_batched;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k_moe_id_gemm;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k_moe_id_gemv;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q4_k_moe_id_gemv_batched;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q6_k_gemm;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q6_k_gemv;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q6_k_moe_id_gemm;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q6_k_moe_id_gemv;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod q6_k_moe_id_gemv_batched;
+pub use backend::metal::{
+    moe_post_ops, moe_post_ops_batched, moe_router, q4_k, q4_k_gemm, q4_k_gemv, q4_k_gemv_v2,
+    q4_k_moe_id_gate_up_silu, q4_k_moe_id_gate_up_silu_batched, q4_k_moe_id_gemm, q4_k_moe_id_gemv,
+    q4_k_moe_id_gemv_batched, q6_k_gemm, q6_k_gemv, q6_k_moe_id_gemm, q6_k_moe_id_gemv,
+    q6_k_moe_id_gemv_batched,
+};
 
 #[cfg(feature = "cuda")]
 pub(crate) mod ptx {
