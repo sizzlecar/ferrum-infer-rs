@@ -188,10 +188,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
             .and_then(|s| s.to_str())
             .expect("cu filename");
         let obj = out_dir.join(format!("vllm_paged_attn_{stem}.o"));
-        eprintln!(
-            "[vllm-paged-attn-v2] compiling {src} -> {}",
-            obj.display()
-        );
+        eprintln!("[vllm-paged-attn-v2] compiling {src} -> {}", obj.display());
 
         let status = std::process::Command::new(&nvcc)
             .args(["-c", src, "-o"])
@@ -210,9 +207,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
                 "0",
             ])
             .status()
-            .unwrap_or_else(|e| {
-                panic!("[vllm-paged-attn-v2] nvcc spawn failed for {src}: {e}")
-            });
+            .unwrap_or_else(|e| panic!("[vllm-paged-attn-v2] nvcc spawn failed for {src}: {e}"));
         if !status.success() {
             panic!(
                 "[vllm-paged-attn-v2] nvcc failed compiling {src}. Disable \
@@ -245,7 +240,10 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
     }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
-    eprintln!("[vllm-paged-attn-v2] static lib built: {}", lib_file.display());
+    eprintln!(
+        "[vllm-paged-attn-v2] static lib built: {}",
+        lib_file.display()
+    );
 }
 
 fn compile_vllm_moe_marlin(out_dir: &PathBuf) {

@@ -1228,9 +1228,7 @@ impl BackendPagedKv for CudaBackend {
             })
         }
         .map(|_| ())
-        .map_err(|e| {
-            FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache_vllm: {e}"))
-        })
+        .map_err(|e| FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache_vllm: {e}")))
     }
 
     #[cfg(feature = "vllm-paged-attn-v2")]
