@@ -8,16 +8,30 @@ Ferrum Infer is a Rust-native LLM inference engine. Single binary, no Python —
 
 **Current baselines (RTX 4090, ShareGPT `bench/v0.2-cuda/run_cell.sh` apples-to-apples — bench dataset, server config, client harness all identical across engines):**
 
-M3 — Qwen3-30B-A3B-GPTQ-Int4 (MoE, active perf target):
+M3 — Qwen3-30B-A3B-GPTQ-Int4 (MoE, active perf target).
+Apples-to-apples ShareGPT, vLLM 0.20.2 + ferrum @ commit `4a17a17` (greedy GPU
+argmax + MOE_BATCH_THRESHOLD=4 + MOE_GRAPH+SKIP_UPLOAD enabled in bench env):
 
-| c | ferrum tok/s | vLLM 0.20.1 tok/s | ratio | as of |
-|---|------:|------:|------:|---|
-| 1  | 180.7 | 180.7 | 100% | vLLM only — re-run ferrum pending |
-| 4  | 511.6 | 511.6 | 100% | vLLM only |
-| 16 | 1226.5 | 1226.5 | 100% | vLLM only |
-| 32 | — | **1902.8** | — | **gap target** (random-dataset ferrum 811.8 ≈ 43% as proxy) |
+| c | ferrum tok/s | vLLM tok/s | ratio | ferrum TPOT |
+|---|------:|------:|------:|------:|
+| 1  | 143.4 | 205.1 | 70% | 6.4 ms |
+| 4  | **328.9** | 511.9 | **65%** | 10.6 ms |
+| 16 | **787.7** | 1238.9 | **64%** | 14.8 ms |
+| 32 | **1038**  | 1887.1 | **55%** | 22.2 ms |
 
-Random-dataset proxy at commit `0022412`: c=1 146.6 / c=8 541.3 / c=16 725.1 / c=32 **811.8** tok/s — `bash bench/v0.2-cuda/m3_bench_serve.sh`. Fast (~10 min) but the 43%/55%/65% ratios are only suggestive — for the real gap-to-vLLM, re-run via `run_sweep.sh` (ShareGPT).
+vs the 2026-05-07 M2 baseline (Llama INT4, 55%/65% c=32/16), MoE M3 is now in
+the same ratio range. Headline wins this session (`b966e54..4a17a17`):
+- GPU argmax greedy fast path (`FERRUM_GREEDY_ARGMAX=1`) — replaces 19 MB D2H
+  + host argmax (~5 ms/iter at c=32) with one tiny-output kernel.
+- `FERRUM_MOE_BATCH_THRESHOLD=4` (was default 8) — c=4 went from per-item
+  decode-loop (4× ~7 ms) to batched (~10 ms), +110%.
+- `FERRUM_MOE_GRAPH=1 FERRUM_GRAPH_SKIP_UPLOAD=1` — full-layer-loop graph
+  replay, +10%/+8% at c=4/16. Marginal at c=32 (kernel time already
+  dominates over launch overhead).
+
+`docs/bench/v0.2-cuda/results/ferrum__M3__c*__r1.json` carry the latest cells.
+Random-dataset proxy still useful for fast smoke (`bash bench/v0.2-cuda/m3_bench_serve.sh`,
+~10 min, no ShareGPT data dependency).
 
 M2 — Llama-3.1-8B-GPTQ-INT4 (Apples-to-apples 2026-05-07 @ commit `c6a81d9`):
 
