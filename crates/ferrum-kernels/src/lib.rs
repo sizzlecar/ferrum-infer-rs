@@ -44,125 +44,62 @@ pub(crate) mod ptx {
     include!(concat!(env!("OUT_DIR"), "/ptx.rs"));
 }
 
+// Audit #9: CUDA kernels physically live under `backend/cuda/` now.
+// Re-exports preserve the historical `ferrum_kernels::foo::*` public
+// surface + internal `crate::foo::*` paths.
+//
+// Two files stay at the crate root for now because they would otherwise
+// collide with same-named files already under `backend/cuda/` (which
+// host the Backend-trait impls, not the kernel launchers):
+//   - `int8_kv.rs` (top-level launchers `launch_int8_paged_decode_*`)
+//   - `quant.rs`   (top-level `dequant_int4` legacy path)
+
 #[cfg(feature = "cuda")]
 pub mod int8_kv;
-
-#[cfg(feature = "cuda")]
-mod fused_add_rms_norm;
-#[cfg(feature = "cuda")]
-pub use fused_add_rms_norm::fused_add_rms_norm;
-
-#[cfg(feature = "cuda")]
-mod fused_silu_mul;
-#[cfg(feature = "cuda")]
-pub use fused_silu_mul::fused_silu_mul;
-
-#[cfg(feature = "cuda")]
-mod rms_norm;
-#[cfg(feature = "cuda")]
-pub use rms_norm::rms_norm;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_meta;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_ptx;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_rms_norm;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_rms_norm::rms_norm_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_residual_add;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_residual_add::residual_add_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_residual_add_inplace;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_residual_add_inplace::residual_add_inplace_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_fused_silu_mul;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_fused_silu_mul::fused_silu_mul_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_fused_add_rms_norm;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_fused_add_rms_norm::fused_add_rms_norm_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_layer_norm;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_layer_norm::layer_norm_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_softmax;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_softmax::softmax_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_gelu;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_gelu::gelu_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-mod triton_add_bias;
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub use triton_add_bias::add_bias_triton;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub mod triton_w4a16;
-
-#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
-pub mod triton_fused_moe;
-
-#[cfg(feature = "cuda")]
-mod rope;
-#[cfg(feature = "cuda")]
-pub use rope::rope;
-
-#[cfg(feature = "cuda")]
-mod decode_attention;
-#[cfg(feature = "cuda")]
-pub use decode_attention::decode_attention;
-
-#[cfg(feature = "cuda")]
-mod residual_add;
-#[cfg(feature = "cuda")]
-pub use residual_add::residual_add;
-
-#[cfg(feature = "cuda")]
-pub mod cublas;
-
-#[cfg(feature = "cuda")]
-pub mod decode_buffers;
-
-#[cfg(feature = "cuda")]
-pub mod weight_store;
-
-#[cfg(feature = "cuda")]
-pub mod cuda_graph;
-
 #[cfg(feature = "cuda")]
 pub mod quant;
 
 #[cfg(feature = "cuda")]
-pub mod marlin;
+pub use backend::cuda::{
+    cublas, cuda_decode, cuda_graph, decode_buffers, gpu_paged_kv, marlin, nccl_comm, tp_decode,
+    weight_store,
+};
+
+#[cfg(feature = "cuda")]
+pub use backend::cuda::decode_attention::decode_attention;
+#[cfg(feature = "cuda")]
+pub use backend::cuda::fused_add_rms_norm::fused_add_rms_norm;
+#[cfg(feature = "cuda")]
+pub use backend::cuda::fused_silu_mul::fused_silu_mul;
+#[cfg(feature = "cuda")]
+pub use backend::cuda::residual_add::residual_add;
+#[cfg(feature = "cuda")]
+pub use backend::cuda::rms_norm::rms_norm;
+#[cfg(feature = "cuda")]
+pub use backend::cuda::rope::rope;
+
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_add_bias::add_bias_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_fused_add_rms_norm::fused_add_rms_norm_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_fused_silu_mul::fused_silu_mul_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_gelu::gelu_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_layer_norm::layer_norm_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_residual_add::residual_add_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_residual_add_inplace::residual_add_inplace_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_rms_norm::rms_norm_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::triton_softmax::softmax_triton;
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub use backend::cuda::{triton_fused_moe, triton_w4a16};
 
 // vLLM gptq_marlin port (Phase 12). Behind its own feature for opt-in
 // while we validate correctness + perf vs ferrum's existing IST-DASLab Marlin.
 #[cfg(feature = "vllm-marlin")]
-pub mod vllm_marlin;
-
-#[cfg(feature = "cuda")]
-pub mod gpu_paged_kv;
-
-#[cfg(feature = "cuda")]
-pub mod cuda_decode;
-
-#[cfg(feature = "cuda")]
-pub mod nccl_comm;
-
-#[cfg(feature = "cuda")]
-pub mod tp_decode;
+pub use backend::cuda::vllm_marlin;
