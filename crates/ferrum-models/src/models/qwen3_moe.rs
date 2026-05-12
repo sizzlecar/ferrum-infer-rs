@@ -1684,11 +1684,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
     ///
     /// MUST be called after `ensure_kv(cache_id)`. Returns 0 if non-paged
     /// or paged_block_alloc is None.
-    pub(crate) fn try_acquire_prefix_cache(
-        &mut self,
-        cache_id: &str,
-        tokens: &[u32],
-    ) -> usize {
+    pub(crate) fn try_acquire_prefix_cache(&mut self, cache_id: &str, tokens: &[u32]) -> usize {
         let Some(alloc_arc) = self.paged_block_alloc.as_ref() else {
             return 0;
         };
@@ -1703,8 +1699,10 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
 
         // Hash chain on input tokens (only full blocks — trailing partial
         // block can't be cached as standalone).
-        let token_ids: Vec<ferrum_types::TokenId> =
-            tokens.iter().map(|&t| ferrum_types::TokenId::new(t)).collect();
+        let token_ids: Vec<ferrum_types::TokenId> = tokens
+            .iter()
+            .map(|&t| ferrum_types::TokenId::new(t))
+            .collect();
         let hashes: Vec<BlockHash> = block_hash_chain(&token_ids, block_size);
         if hashes.is_empty() {
             return 0;
@@ -1859,7 +1857,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 .map(|c| c.block_size)
                 .unwrap_or(16);
             // Roll back one block so we still have a suffix to prefill.
-            cached_prefix_tokens.saturating_sub(block_size).min(tokens.len() - 1)
+            cached_prefix_tokens
+                .saturating_sub(block_size)
+                .min(tokens.len() - 1)
         } else {
             cached_prefix_tokens
         };
