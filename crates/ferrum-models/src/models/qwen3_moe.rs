@@ -3254,15 +3254,15 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
     }
 
     fn release(&mut self, cache_id: &str) {
-        // Phase 3 (FERRUM_MOE_GRAPH=1) may have populated multi-key
-        // graph cache keyed by m_padded. Reset all keys + clear state
-        // so the next decode_batch starts fresh on the new working set.
+        // Mirror LlamaFamilyModel::release — do NOT reset the captured
+        // graphs here. Graphs reference paged_pool addresses (model-
+        // level + stable) and paged_batch_* scratch addresses (also
+        // model-level + stable); the per-cache_id state (paged_block_
+        // indices) lives in `kv_caches` and never appears in graph
+        // node args. Wiping graphs on release would invalidate them
+        // mid-flight (a release between capture and the next replay
+        // → CUDA_ERROR_INVALID_VALUE on cuGraphLaunch).
         let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        B::reset_all_graphs(&mut ctx);
-        self.batched_graph_keys_seen.clear();
-        self.batched_graph_warmup = 0;
-        self.batched_graph_failed = false;
         B::sync(&mut ctx);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             // Paged mode: return the cache_id's blocks to the shared
