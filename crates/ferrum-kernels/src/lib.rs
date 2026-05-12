@@ -78,6 +78,12 @@ pub use backend::cuda::rms_norm::rms_norm;
 #[cfg(feature = "cuda")]
 pub use backend::cuda::rope::rope;
 
+// Preserve `crate::triton_ptx` / `crate::triton_meta` paths for in-crate
+// callers (e.g. `quant_linear::cuda_marlin::CudaMarlinLinear::forward`).
+// These are NOT part of the kernels-crate public API.
+#[cfg(all(feature = "cuda", feature = "triton-kernels"))]
+pub(crate) use backend::cuda::{triton_meta, triton_ptx};
+
 #[cfg(all(feature = "cuda", feature = "triton-kernels"))]
 pub use backend::cuda::triton_add_bias::add_bias_triton;
 #[cfg(all(feature = "cuda", feature = "triton-kernels"))]
