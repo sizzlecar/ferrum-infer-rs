@@ -1143,4 +1143,212 @@ impl BackendPagedKv for CudaBackend {
             FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache_varlen: {e}"))
         })
     }
+
+    // ─────────── vLLM-layout paged write + paged_attention_v2 ───────────
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    fn supports_vllm_paged_attn() -> bool {
+        true
+    }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache_vllm(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        qkv_byte_offset: u64,
+        q_norm_w: &Self::Buffer,
+        k_norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        q_out_byte_offset: u64,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        block_table: &Self::Buffer,
+        tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        pos_offset: usize,
+        eps: f32,
+        qk_mode: i32,
+        cache_len: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "split_qkv_norm_rope_into_paged_cache_vllm",
+            ptx::SPLIT_QKV_NORM_ROPE_INTO_PAGED_CACHE_VLLM,
+            "split_qkv_norm_rope_into_paged_cache_vllm_f16",
+        );
+        let stream = ctx.stream.clone();
+        let qkv_byte_offset_u64 = qkv_byte_offset;
+        let q_out_byte_offset_u64 = q_out_byte_offset;
+        let tokens_i32 = tokens as i32;
+        let q_heads_i32 = q_heads as i32;
+        let kv_heads_i32 = kv_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let pos_offset_i32 = pos_offset as i32;
+        let cache_len_i32 = cache_len as i32;
+        let block_size_i32 = block_size as i32;
+        let max_blocks_per_seq_i32 = max_blocks_per_seq as i32;
+        let qk_mode_i32 = qk_mode;
+        let mut b = stream.launch_builder(&func);
+        b.arg(qkv);
+        b.arg(&qkv_byte_offset_u64);
+        b.arg(q_norm_w);
+        b.arg(k_norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(q_out);
+        b.arg(&q_out_byte_offset_u64);
+        b.arg(cache_k);
+        b.arg(cache_v);
+        b.arg(block_table);
+        b.arg(&tokens_i32);
+        b.arg(&q_heads_i32);
+        b.arg(&kv_heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(&pos_offset_i32);
+        b.arg(&eps);
+        b.arg(&qk_mode_i32);
+        b.arg(&cache_len_i32);
+        b.arg(&block_size_i32);
+        b.arg(&max_blocks_per_seq_i32);
+        let total_heads = (q_heads + 2 * kv_heads) as u32;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (tokens as u32, total_heads, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| {
+            FerrumError::model(format!("split_qkv_norm_rope_into_paged_cache_vllm: {e}"))
+        })
+    }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache_varlen_vllm(
+        ctx: &mut Self::Context,
+        qkv: &Self::Buffer,
+        q_norm_w: &Self::Buffer,
+        k_norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        cu_seqlens_q: &Self::Buffer,
+        pos_offsets: &Self::Buffer,
+        block_tables: &Self::Buffer,
+        num_seqs: usize,
+        m_total: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        qk_mode: i32,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if m_total == 0 || num_seqs == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "split_qkv_norm_rope_into_paged_cache_varlen_vllm",
+            ptx::SPLIT_QKV_NORM_ROPE_INTO_PAGED_CACHE_VLLM,
+            "split_qkv_norm_rope_into_paged_cache_varlen_vllm_f16",
+        );
+        let stream = ctx.stream.clone();
+        let num_seqs_i32 = num_seqs as i32;
+        let m_total_i32 = m_total as i32;
+        let q_heads_i32 = q_heads as i32;
+        let kv_heads_i32 = kv_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let qk_mode_i32 = qk_mode;
+        let block_size_i32 = block_size as i32;
+        let max_blocks_per_seq_i32 = max_blocks_per_seq as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(qkv);
+        b.arg(q_norm_w);
+        b.arg(k_norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(q_out);
+        b.arg(cache_k);
+        b.arg(cache_v);
+        b.arg(cu_seqlens_q);
+        b.arg(pos_offsets);
+        b.arg(block_tables);
+        b.arg(&num_seqs_i32);
+        b.arg(&m_total_i32);
+        b.arg(&q_heads_i32);
+        b.arg(&kv_heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(&eps);
+        b.arg(&qk_mode_i32);
+        b.arg(&block_size_i32);
+        b.arg(&max_blocks_per_seq_i32);
+        let total_heads = (q_heads + 2 * kv_heads) as u32;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (m_total as u32, total_heads, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| {
+            FerrumError::model(format!(
+                "split_qkv_norm_rope_into_paged_cache_varlen_vllm: {e}"
+            ))
+        })
+    }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[allow(clippy::too_many_arguments)]
+    fn paged_decode_attention_v2(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        block_tables: &Self::Buffer,
+        context_lens: &Self::Buffer,
+        num_seqs: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_num_blocks_per_seq: usize,
+        max_seq_len: usize,
+    ) -> Result<()> {
+        if num_seqs == 0 {
+            return Ok(());
+        }
+        let stream = ctx.stream.clone();
+        super::vllm_paged_attn::dispatch_paged_attention_v2(
+            &stream,
+            out.as_f16_mut(),
+            q.as_f16(),
+            k_pool.as_f16(),
+            v_pool.as_f16(),
+            block_tables.as_u32(),
+            context_lens.as_u32(),
+            num_seqs,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_num_blocks_per_seq,
+            max_seq_len,
+        )
+    }
 }
