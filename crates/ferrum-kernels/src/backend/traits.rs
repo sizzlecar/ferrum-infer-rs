@@ -1431,6 +1431,110 @@ pub trait BackendPagedKv: Backend {
             "paged_batched_decode_attention not implemented for this backend",
         ))
     }
+
+    /// Capability: backend has vLLM-layout paged KV write kernels and the
+    /// `paged_attention_v2` decode kernel. Models that opt into this layout
+    /// at construction time (via `FERRUM_USE_VLLM_PAGED_ATTN=1`) must
+    /// dispatch ALL paged writes and reads through the `_vllm` variants —
+    /// the layouts are not compatible. Default `false`.
+    fn supports_vllm_paged_attn() -> bool {
+        false
+    }
+
+    /// vLLM-layout variant of
+    /// [`Self::split_qkv_norm_rope_into_paged_cache`]. K/V are written in
+    /// vLLM's `paged_attention_v2` layout: K is
+    /// `[num_blocks, kv_heads, head_dim/x, block_size, x]` (x = 16/sizeof(elem)),
+    /// V is `[num_blocks, kv_heads, head_dim, block_size]`. Q output and
+    /// every other argument matches the non-vllm variant exactly so the
+    /// model layer can swap dispatchers based on a single flag.
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache_vllm(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _qkv_byte_offset: u64,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _q_out_byte_offset: u64,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _block_table: &Self::Buffer,
+        _tokens: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _pos_offset: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _cache_len: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope_into_paged_cache_vllm not implemented for this backend",
+        ))
+    }
+
+    /// vLLM-layout variant of
+    /// [`Self::split_qkv_norm_rope_into_paged_cache_varlen`]. Same signature
+    /// — only the K/V cache layout changes.
+    #[allow(clippy::too_many_arguments)]
+    fn split_qkv_norm_rope_into_paged_cache_varlen_vllm(
+        _ctx: &mut Self::Context,
+        _qkv: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _m_total: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _block_size: usize,
+        _max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "split_qkv_norm_rope_into_paged_cache_varlen_vllm not implemented for this backend",
+        ))
+    }
+
+    /// vLLM `paged_attention_v2` — multi-partition split-K decode attention
+    /// reading the vLLM K/V layout. `q_len` is implicitly 1 (decode only;
+    /// vLLM's v2 kernel does not support q_len > 1). `max_seq_len` is the
+    /// max kv_len across the batch — used to size the partition reduction.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_decode_attention_v2(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _context_lens: &Self::Buffer,
+        _num_seqs: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+        _max_seq_len: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_decode_attention_v2 not implemented for this backend",
+        ))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════

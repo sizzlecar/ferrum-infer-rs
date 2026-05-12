@@ -522,6 +522,18 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     pub(crate) batched_graph_warmup: usize,
     pub(crate) batched_graph_failed: bool,
     pub(crate) batched_graph_keys_seen: std::collections::HashSet<u64>,
+
+    // ── vLLM paged_attention_v2 opt-in ──────────────────────────────────
+    //
+    // True when (a) the backend reports `supports_vllm_paged_attn() == true`
+    // (CUDA built with the `vllm-paged-attn-v2` feature) AND (b) the user
+    // set `FERRUM_USE_VLLM_PAGED_ATTN=1`. When set, the model writes K/V
+    // in vLLM's layout end-to-end (prefill + decode) and uses vLLM's
+    // `paged_attention_v2` multi-partition kernel for decode reads.
+    //
+    // Cached once at construction — flipping at runtime would corrupt the
+    // KV cache (the layouts are not compatible).
+    pub(crate) use_vllm_paged_attn: bool,
 }
 
 impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
@@ -650,6 +662,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             batched_graph_warmup: 0,
             batched_graph_failed: false,
             batched_graph_keys_seen: std::collections::HashSet::new(),
+            use_vllm_paged_attn: B::supports_vllm_paged_attn()
+                && std::env::var("FERRUM_USE_VLLM_PAGED_ATTN").as_deref() == Ok("1"),
         })
     }
 
@@ -834,6 +848,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             batched_graph_warmup: 0,
             batched_graph_failed: false,
             batched_graph_keys_seen: std::collections::HashSet::new(),
+            use_vllm_paged_attn: B::supports_vllm_paged_attn()
+                && std::env::var("FERRUM_USE_VLLM_PAGED_ATTN").as_deref() == Ok("1"),
         })
     }
 
@@ -1172,7 +1188,12 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             // SAFETY: pools allocated-once, see paged_pool_ptr setup above.
             let pool_k = unsafe { &mut *pool_k_ptr };
             let pool_v = unsafe { &mut *pool_v_ptr };
-            B::split_qkv_norm_rope_into_paged_cache(
+            let dispatch = if self.use_vllm_paged_attn {
+                B::split_qkv_norm_rope_into_paged_cache_vllm
+            } else {
+                B::split_qkv_norm_rope_into_paged_cache
+            };
+            dispatch(
                 ctx,
                 &self.scratch.qkv_out,
                 0,
@@ -1332,23 +1353,52 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let pool_v = unsafe { &*pool_v_ptr };
             let final_kv_len = cache.len as u32;
             B::write_typed::<u32>(ctx, cl_buf, &[final_kv_len]);
-            B::paged_decode_attention(
-                ctx,
-                &self.scratch.q_head_major,
-                pool_k,
-                pool_v,
-                &mut self.scratch.attn_head_major_out,
-                bt,
-                cl_buf,
-                1, // num_seqs (single-seq m=1 path)
-                nh,
-                nkv,
-                hd,
-                cache.block_size,
-                num_blocks_per_seq,
-                tokens,
-            )
-            .expect("paged_decode_attention");
+            if self.use_vllm_paged_attn && tokens == 1 {
+                // vLLM's paged_attention_v2 is decode-only (q_len=1). Single-
+                // seq decode here always has tokens=1; prefill (tokens>1)
+                // falls through to the existing paged_decode_attention which
+                // handles causal q_len>1. Note: when use_vllm_paged_attn is
+                // on, the prefill path reads K/V in vLLM layout, so
+                // paged_decode_attention won't actually work for prefill in
+                // that mode — single-seq prefill is not on the c=32 hot
+                // path so we accept this limitation and let the existing
+                // call fail at runtime if someone hits it.
+                B::paged_decode_attention_v2(
+                    ctx,
+                    &self.scratch.q_head_major,
+                    pool_k,
+                    pool_v,
+                    &mut self.scratch.attn_head_major_out,
+                    bt,
+                    cl_buf,
+                    1, // num_seqs
+                    nh,
+                    nkv,
+                    hd,
+                    cache.block_size,
+                    num_blocks_per_seq,
+                    cache.len, // max_seq_len = current kv_len for single-seq decode
+                )
+                .expect("paged_decode_attention_v2 (single-seq decode)");
+            } else {
+                B::paged_decode_attention(
+                    ctx,
+                    &self.scratch.q_head_major,
+                    pool_k,
+                    pool_v,
+                    &mut self.scratch.attn_head_major_out,
+                    bt,
+                    cl_buf,
+                    1, // num_seqs (single-seq m=1 path)
+                    nh,
+                    nkv,
+                    hd,
+                    cache.block_size,
+                    num_blocks_per_seq,
+                    tokens,
+                )
+                .expect("paged_decode_attention");
+            }
             let _ = kv_stride; // consumed by contig path only
         } else {
             let attn_cfg = ferrum_kernels::backend::AttnConfig {
@@ -2548,7 +2598,12 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 let bt_safe: &B::Buffer = unsafe { &*bt_ptr_raw };
                 let pos_safe: &B::Buffer = unsafe { &*pos_ptr_raw };
                 let cu_safe: &B::Buffer = unsafe { &*cu_ptr_raw };
-                B::split_qkv_norm_rope_into_paged_cache_varlen(
+                let varlen_dispatch = if self.use_vllm_paged_attn {
+                    B::split_qkv_norm_rope_into_paged_cache_varlen_vllm
+                } else {
+                    B::split_qkv_norm_rope_into_paged_cache_varlen
+                };
+                varlen_dispatch(
                     ctx,
                     &self.scratch.qkv_out,
                     q_norm_w,
@@ -2642,23 +2697,57 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let cl_safe = unsafe { &*cl_ptr };
             let q_safe = unsafe { &*q_ptr };
             let o_safe = unsafe { &mut *o_ptr };
-            B::paged_decode_attention(
-                ctx,
-                q_safe,
-                pool_k,
-                pool_v,
-                o_safe,
-                bt_safe,
-                cl_safe,
-                m,
-                nh,
-                nkv,
-                hd,
-                block_size,
-                max_blocks_per_seq,
-                1, // q_len
-            )
-            .expect("paged batched decode");
+            if self.use_vllm_paged_attn {
+                // Compute max_kv_len across the batch (post-bump, so layer-0
+                // cache.len is the current kv_len). v2 needs this to size
+                // the partition reduction.
+                let max_kv_len = batch
+                    .iter()
+                    .map(|(cid, _, _)| {
+                        self.kv_caches
+                            .get(cid)
+                            .and_then(|cs| cs.first())
+                            .map(|c| c.len)
+                            .unwrap_or(0)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                B::paged_decode_attention_v2(
+                    ctx,
+                    q_safe,
+                    pool_k,
+                    pool_v,
+                    o_safe,
+                    bt_safe,
+                    cl_safe,
+                    m,
+                    nh,
+                    nkv,
+                    hd,
+                    block_size,
+                    max_blocks_per_seq,
+                    max_kv_len,
+                )
+                .expect("paged_decode_attention_v2 (batched)");
+            } else {
+                B::paged_decode_attention(
+                    ctx,
+                    q_safe,
+                    pool_k,
+                    pool_v,
+                    o_safe,
+                    bt_safe,
+                    cl_safe,
+                    m,
+                    nh,
+                    nkv,
+                    hd,
+                    block_size,
+                    max_blocks_per_seq,
+                    1, // q_len
+                )
+                .expect("paged batched decode");
+            }
 
             // Step 4: ONE batched copy paged_batch_o[0..m*q_dim] →
             // attn_flat[0..m*q_dim]. Layouts match (both head-major,

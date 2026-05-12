@@ -102,6 +102,10 @@ pub mod triton_w4a16;
 // vLLM gptq_marlin port (opt-in feature, depends on `cuda`).
 #[cfg(feature = "vllm-marlin")]
 pub mod vllm_marlin;
+// vLLM paged_attention_v2 port (opt-in, depends on `cuda`). Wraps the
+// extern "C" launcher in `kernels/vllm_attn/launcher.cu`.
+#[cfg(feature = "vllm-paged-attn-v2")]
+pub mod vllm_paged_attn;
 // Re-export so submodules (paged, etc.) can reach the constant via
 // `super::MAX_LAYERS_FOR_GRAPH` like the original mod.rs code did.
 pub(super) use super::MAX_LAYERS_FOR_GRAPH;
