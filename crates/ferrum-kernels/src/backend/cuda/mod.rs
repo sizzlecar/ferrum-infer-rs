@@ -48,6 +48,60 @@ pub mod int8_kv;
 pub mod moe;
 pub mod paged;
 pub mod quant;
+
+// Audit #9: CUDA-only kernels moved from crate-root to backend/cuda/.
+// Re-exported via `pub use backend::cuda::{...}` (or the more specific
+// `pub use backend::cuda::foo::Foo`) in `crate::lib` so the historical
+// `ferrum_kernels::foo::*` public paths + internal `crate::foo::*`
+// references keep working unchanged.
+pub mod cublas;
+pub mod cuda_decode;
+pub mod cuda_graph;
+pub mod decode_attention;
+pub mod decode_buffers;
+pub mod fused_add_rms_norm;
+pub mod fused_silu_mul;
+pub mod gpu_paged_kv;
+pub mod marlin;
+pub mod nccl_comm;
+pub mod residual_add;
+pub mod rms_norm;
+pub mod rope;
+pub mod tp_decode;
+pub mod weight_store;
+
+// Triton kernels (only when the `triton-kernels` feature is also on —
+// `cuda` alone doesn't enable them).
+#[cfg(feature = "triton-kernels")]
+pub mod triton_add_bias;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_fused_add_rms_norm;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_fused_moe;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_fused_silu_mul;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_gelu;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_layer_norm;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_meta;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_ptx;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_residual_add;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_residual_add_inplace;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_rms_norm;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_softmax;
+#[cfg(feature = "triton-kernels")]
+pub mod triton_w4a16;
+
+// vLLM gptq_marlin port (opt-in feature, depends on `cuda`).
+#[cfg(feature = "vllm-marlin")]
+pub mod vllm_marlin;
 // Re-export so submodules (paged, etc.) can reach the constant via
 // `super::MAX_LAYERS_FOR_GRAPH` like the original mod.rs code did.
 pub(super) use super::MAX_LAYERS_FOR_GRAPH;
