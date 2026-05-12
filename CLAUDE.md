@@ -170,8 +170,7 @@ INT4 Marlin uses ~24% of DRAM bandwidth peak — there is ~4× headroom remainin
 
 ## Build Scripts
 
-- **`ferrum-engine/build.rs`**: Compiles Metal shaders (.metal → .air → .metallib) on macOS via `xcrun`. Generates empty stub on non-Apple platforms.
-- **`ferrum-kernels/build.rs`**: Compiles CUDA .cu files to PTX using `bindgen_cuda`. Requires CUDA_HOME env var. Generates `ptx.rs` in OUT_DIR.
+- **`ferrum-kernels/build.rs`**: Compiles CUDA .cu files to PTX using `bindgen_cuda`. Requires CUDA_HOME env var. Generates `ptx.rs` in OUT_DIR. Metal shaders embed at compile time via `include_str!` inside the `.rs` files alongside the `.metal` sources (no separate build script).
 
 ## Model Support
 

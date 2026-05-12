@@ -58,10 +58,6 @@ pub mod tensor_factory;
 pub mod transcription_engine;
 pub mod tts_engine;
 
-// Metal backend (Apple Silicon only)
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub mod metal;
-
 // Re-exports of interfaces
 pub use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 pub use ferrum_interfaces::{
