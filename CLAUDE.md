@@ -61,17 +61,48 @@ vllm serve <model> --port 8800 --max-num-seqs 64 --max-model-len 4096 \
 
 **Recorded vLLM 0.20 baseline on M3 c=32**: ~1900 tok/s, mean TPOT 15.65 ms (see `results/vllm__M3__c32__r1.json`). This is the gap target.
 
-### Metal (Apple Silicon) — local dev / correctness only, not the primary perf target
+### Metal (Apple Silicon) — comparison vs llama.cpp + mistralrs
 
-**Reference models**: smaller LLMs that fit in M-series unified memory:
-- `Qwen/Qwen3-0.6B` FP16 — used for the smoke run after any backend refactor
-- `Qwen/Qwen3-1.7B`, `Qwen/Qwen3-4B` FP16 — interactive sanity
-- `Qwen/Qwen3-0.6B-GGUF` Q4_K_M — exercises the Metal GGUF path (`backend/metal/q4_k_*`)
-- `bartowski/Llama-3.1-8B-Instruct-Q4_K_M.gguf` — 8B GGUF on 16-32 GB Macs
+**Reference models** (all `Q4_K_M` GGUF — same files read by all three engines):
+- `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF` (4.6 GB)
+- `unsloth/Qwen3-8B-GGUF` (4.7 GB)
+- `Qwen/Qwen3-30B-A3B-GGUF` MoE (17.3 GB)
 
-**Methodology**: smoke-only — `cargo run --release -p ferrum-cli --features metal -- bench qwen3:0.6b --concurrency 1 --max-tokens 16` after a release build. Acceptance: tok/s within ~10% of the previous run on the same Mac (thermal noise + dynamic frequency dominate beyond that).
+**Hardware**: MacBook Pro 16" 2021 (M1 Max, 32 GB unified, macOS 15+). 30B-A3B + paged-KV pool at c=16 lands ~21 GB resident — fits the 32 GB pool.
 
-Apple Silicon thermal management + lack of dedicated server hardware makes multi-c ShareGPT sweeps on Metal unreliable as a perf gate. The Metal path is validated for **correctness** (Qwen3 parity tests in `crates/ferrum-models/tests/qwen3_*_parity_test.rs`, 18 GGUF kernel tests in `ferrum-kernels::backend::metal::*`) and ballpark perf only.
+**Comparison engines**: `llama.cpp` (homebrew, e.g. b8960) + `mistralrs` 0.8.1.
+
+**Methodology** — full reproducible suite at `docs/bench/macos-2026-05-02/`:
+
+1. `bash docs/bench/macos-2026-05-02/run_suite.sh` — 36-cell base suite (3 engines × 3 models × c = 1/4/8/16).
+2. `bash docs/bench/macos-2026-05-02/rerun_c16.sh` — clean-state c=16 rerun with 15s cooldown + pkill between cells (controls for run-to-run variance + 36-cell swap pressure).
+3. `bash docs/bench/macos-2026-05-02/rerun_moe_batched.sh` — Qwen3-30B-A3B with `FERRUM_MOE_BATCHED=1 FERRUM_MOE_BATCHED_DECODE=1 FERRUM_MOE_BATCH_THRESHOLD=2` (opt-in MoE batched-decode path — required for c ≥ 8 MoE numbers).
+4. Bench harness: `bench/scripts/bench_serving.py` — OpenAI `/v1/chat/completions` SSE, temperature 0, `max_tokens=64`, total prompts 8/16/24/32 for c=1/4/8/16, one prewarm chat completion (`max_tokens=4`) per cell.
+
+**Ferrum server env block** (dense path):
+
+```
+FERRUM_METAL_PAGED_KV=1
+FERRUM_PAGED_MAX_SEQS=$((c * 2))
+FERRUM_KV_CAPACITY=512
+FERRUM_MAX_BATCH=$c
+```
+
+For MoE at c ≥ 8 add `FERRUM_MOE_BATCHED=1 FERRUM_MOE_BATCHED_DECODE=1 FERRUM_MOE_BATCH_THRESHOLD=2`. (Crossover is c ≈ 8 — below that, per-token decode is faster on M1 Max.)
+
+**Headline c = 16 throughput (tok/s, M1 Max, best-of-3 runs, recorded 2026-05-02 PR #81)**:
+
+| Model | ferrum | llama.cpp (b8960) | mistralrs (0.8.1) | ferrum vs llama.cpp |
+|---|---:|---:|---:|---:|
+| LLaMA-3.1-8B          | **96.7** | 67.2 | 23.3   | **+44%** |
+| Qwen3-8B              | **93.2** | 68.6 | 23.5   | **+36%** |
+| Qwen3-30B-A3B (MoE)   | 79.2     | 83.4 | panic¹ | −5% (matched) |
+
+¹ mistralrs 0.8.1 `PoisonError`-panics on Qwen3-30B-A3B-Q4_K_M (`mistralrs-core add_request.rs:466`).
+
+c = 1/4/8 grid and TPOT distributions are in [`docs/bench/macos-2026-05-02/README.md`](docs/bench/macos-2026-05-02/README.md).
+
+Smaller Metal models (Qwen3-0.6B / 1.7B / 4B FP16) are used for fast post-refactor smoke (`cargo run --release -p ferrum-cli --features metal -- bench qwen3:0.6b --concurrency 1 --max-tokens 16`) but the headline Metal numbers above are the perf gate.
 
 ### Perf targets
 
