@@ -441,9 +441,18 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         self.unified_silu_out = Some(B::alloc(cap * im));
         self.unified_mlp_out = Some(B::alloc(cap * h));
         if self.unified_cu_seqlens_q.is_none() {
-            self.unified_cu_seqlens_q = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs + 1));
-            self.unified_pos_offsets = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs));
-            self.unified_block_tables = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs * max_blocks_per_seq));
+            self.unified_cu_seqlens_q = Some(B::alloc_typed(
+                ferrum_kernels::backend::Dtype::U32,
+                max_seqs + 1,
+            ));
+            self.unified_pos_offsets = Some(B::alloc_typed(
+                ferrum_kernels::backend::Dtype::U32,
+                max_seqs,
+            ));
+            self.unified_block_tables = Some(B::alloc_typed(
+                ferrum_kernels::backend::Dtype::U32,
+                max_seqs * max_blocks_per_seq,
+            ));
             self.unified_packed_normed = Some(B::alloc(max_seqs * h));
             self.unified_packed_logits = Some(B::alloc(max_seqs * v));
         }
@@ -465,8 +474,14 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let q_dim = cfg.num_heads * cfg.head_dim;
         self.paged_batch_q = Some(B::alloc(max_seqs * q_dim));
         self.paged_batch_o = Some(B::alloc(max_seqs * q_dim));
-        self.paged_batch_block_tables = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs * max_blocks_per_seq));
-        self.paged_batch_context_lens = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs));
+        self.paged_batch_block_tables = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs * max_blocks_per_seq,
+        ));
+        self.paged_batch_context_lens = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs,
+        ));
         self.paged_max_blocks_per_seq = max_blocks_per_seq;
         self.paged_max_seqs = max_seqs;
     }

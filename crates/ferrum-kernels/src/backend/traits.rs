@@ -432,6 +432,34 @@ pub trait Backend: Send + Sync + Sized + 'static {
         dim: usize,
     );
 
+    /// Device-buffer variant of `embedding_lookup` for graph-capturable
+    /// MoE routing — the gather step before phase-1 GEMM in
+    /// `moe_forward_bucketed`. The host-slice `embedding_lookup` does
+    /// `clone_htod(ids)` internally, which records stale host pointers
+    /// under CUDA Graph capture replay.
+    ///
+    /// `ids: &Self::Buffer` must be a device I32 buffer of `batch`
+    /// elements (e.g. `Qwen3MoeScratch::route_packed_idx_dev`).
+    /// `batch` is passed explicitly since a typed CudaBuf carries
+    /// its element count but the caller often wants a partial gather.
+    ///
+    /// Default impl: round-trip via `to_vec` + dispatch the host-slice
+    /// variant. CUDA overrides.
+    fn embedding_lookup_dev(
+        ctx: &mut Self::Context,
+        table: &Self::Buffer,
+        ids: &Self::Buffer,
+        out: &mut Self::Buffer,
+        batch: usize,
+        dim: usize,
+    ) {
+        // Default: round-trip. CUDA overrides with a direct device-arg
+        // kernel launch (no clone_htod).
+        let ids_host_f32 = Self::to_vec(ids, batch);
+        let ids_host_u32: Vec<u32> = ids_host_f32.iter().map(|x| x.to_bits()).collect();
+        Self::embedding_lookup(ctx, table, &ids_host_u32, out, dim);
+    }
+
     // ── Transformer-specific fused ops ─────────────────────────────────
     // These avoid CPU round-trips for data layout transformations.
 

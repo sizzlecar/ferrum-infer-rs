@@ -30,7 +30,12 @@ pub struct CudaMarlinExpertStack {
 }
 
 impl CudaMarlinExpertStack {
-    pub fn new(store: Arc<GptqStoreCuda>, num_experts: usize, n_per_expert: usize, k: usize) -> Self {
+    pub fn new(
+        store: Arc<GptqStoreCuda>,
+        num_experts: usize,
+        n_per_expert: usize,
+        k: usize,
+    ) -> Self {
         Self {
             store,
             num_experts,
@@ -55,7 +60,10 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         self
     }
 
-    fn zero_workspace(&self, ctx: &mut <CudaBackend as crate::backend::Backend>::Context) -> Result<()> {
+    fn zero_workspace(
+        &self,
+        ctx: &mut <CudaBackend as crate::backend::Backend>::Context,
+    ) -> Result<()> {
         // Inlined from BackendQuantMarlin::marlin_zero_stacked_workspace
         // (Phase C step 4a). Bulk-zeros the per-expert Marlin workspace
         // mutex slots via a single cuMemsetD32Async — replaces the

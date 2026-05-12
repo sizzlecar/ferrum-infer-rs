@@ -93,8 +93,10 @@ fn moe_align_matches_reference_qwen3moe_shape() {
     // GPU side
     let mut ctx = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::new_context();
     // upload expert_ids as i32 buffer (use alloc_u32 + write_u32)
-    let mut expert_ids_dev =
-        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(ferrum_kernels::backend::Dtype::U32, n_pairs);
+    let mut expert_ids_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(
+        ferrum_kernels::backend::Dtype::U32,
+        n_pairs,
+    );
     let expert_ids_u32: Vec<u32> = expert_ids_host.iter().map(|&v| v as u32).collect();
     <ferrum_kernels::backend::cuda::CudaBackend as Backend>::write_typed::<u32>(
         &mut ctx,
@@ -102,11 +104,18 @@ fn moe_align_matches_reference_qwen3moe_shape() {
         &expert_ids_u32,
     );
 
-    let mut sorted_dev =
-        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(ferrum_kernels::backend::Dtype::U32, sorted_max);
-    let mut block_ids_dev =
-        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(ferrum_kernels::backend::Dtype::U32, sorted_max / BLOCK_SIZE);
-    let mut total_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(ferrum_kernels::backend::Dtype::U32, 1);
+    let mut sorted_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(
+        ferrum_kernels::backend::Dtype::U32,
+        sorted_max,
+    );
+    let mut block_ids_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(
+        ferrum_kernels::backend::Dtype::U32,
+        sorted_max / BLOCK_SIZE,
+    );
+    let mut total_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(
+        ferrum_kernels::backend::Dtype::U32,
+        1,
+    );
 
     <ferrum_kernels::backend::cuda::CudaBackend as BackendMoeFused>::moe_align_block_size(
         &mut ctx,

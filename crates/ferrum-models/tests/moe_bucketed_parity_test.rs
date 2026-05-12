@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
+use ferrum_kernels::backend::BackendQuantMarlin;
 use ferrum_models::moe::{moe_forward, moe_forward_bucketed, ExpertStack, MoeRouteScratch};
 use ferrum_quantization::{Linear, StackedExpertLinear};
 
@@ -178,6 +178,7 @@ fn bucketed_matches_per_pair_dispatch() {
         &mut silu_packed,
         &mut down_packed,
         &mut route_scratch,
+        None,
     )
     .expect("bucketed forward");
 

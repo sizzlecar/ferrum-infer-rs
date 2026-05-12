@@ -138,7 +138,8 @@ impl<B: Backend> PagedSeqState<B> {
     /// blocks. The allocator isn't touched here — the first call to
     /// [`Self::ensure_capacity`] does the real work.
     pub fn new(block_size: usize, max_blocks_per_seq: usize) -> Self {
-        let block_table_buf = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
+        let block_table_buf =
+            B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
         let context_lens_buf = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, 1);
         // Initialise context_lens to 0 so a forward dispatched before
         // any token has been written sees an empty context.
