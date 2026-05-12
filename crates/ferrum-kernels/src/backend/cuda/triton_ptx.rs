@@ -14,48 +14,48 @@
 #![allow(dead_code)]
 
 pub mod rms_norm_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/rms_norm_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/rms_norm_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/rms_norm_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/rms_norm_f32.json");
 }
 
 pub mod residual_add_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/residual_add_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/residual_add_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/residual_add_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/residual_add_f32.json");
 }
 
 pub mod residual_add_inplace_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/residual_add_inplace_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/residual_add_inplace_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/residual_add_inplace_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/residual_add_inplace_f32.json");
 }
 
 pub mod fused_silu_mul_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/fused_silu_mul_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/fused_silu_mul_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/fused_silu_mul_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/fused_silu_mul_f32.json");
 }
 
 pub mod fused_add_rms_norm_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/fused_add_rms_norm_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/fused_add_rms_norm_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/fused_add_rms_norm_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/fused_add_rms_norm_f32.json");
 }
 
 pub mod layer_norm_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/layer_norm_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/layer_norm_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/layer_norm_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/layer_norm_f32.json");
 }
 
 pub mod softmax_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/softmax_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/softmax_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/softmax_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/softmax_f32.json");
 }
 
 pub mod gelu_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/gelu_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/gelu_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/gelu_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/gelu_f32.json");
 }
 
 pub mod add_bias_f32 {
-    pub const PTX: &str = include_str!("../triton_ptx/add_bias_f32.ptx");
-    pub const META: &str = include_str!("../triton_ptx/add_bias_f32.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/add_bias_f32.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/add_bias_f32.json");
 }
 
 // ── f16 variants (used by the LLM decode path; Qwen / Llama / TinyLlama
@@ -64,69 +64,69 @@ pub mod add_bias_f32 {
 //   so loaders should use `meta.name` rather than hard-coding.
 
 pub mod rms_norm_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/rms_norm_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/rms_norm_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/rms_norm_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/rms_norm_f16.json");
 }
 
 pub mod residual_add_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/residual_add_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/residual_add_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/residual_add_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/residual_add_f16.json");
 }
 
 pub mod residual_add_inplace_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/residual_add_inplace_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/residual_add_inplace_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/residual_add_inplace_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/residual_add_inplace_f16.json");
 }
 
 pub mod fused_silu_mul_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/fused_silu_mul_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/fused_silu_mul_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/fused_silu_mul_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/fused_silu_mul_f16.json");
 }
 
 pub mod fused_add_rms_norm_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/fused_add_rms_norm_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/fused_add_rms_norm_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/fused_add_rms_norm_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/fused_add_rms_norm_f16.json");
 }
 
 pub mod layer_norm_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/layer_norm_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/layer_norm_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/layer_norm_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/layer_norm_f16.json");
 }
 
 pub mod softmax_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/softmax_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/softmax_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/softmax_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/softmax_f16.json");
 }
 
 pub mod gelu_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/gelu_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/gelu_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/gelu_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/gelu_f16.json");
 }
 
 pub mod add_bias_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/add_bias_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/add_bias_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/add_bias_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/add_bias_f16.json");
 }
 
 // decode_attention seq-major, HEAD_DIM=64 (TinyLlama / 1.1B-class Llamas)
 // and HEAD_DIM=128 (Qwen3, Llama-3, …). Both PTX kernels handle arbitrary
 // valid_kv_len (partial last KV tile gets per-position score masking).
 pub mod decode_attention_f16_h64 {
-    pub const PTX: &str = include_str!("../triton_ptx/decode_attention_f16_h64.ptx");
-    pub const META: &str = include_str!("../triton_ptx/decode_attention_f16_h64.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/decode_attention_f16_h64.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/decode_attention_f16_h64.json");
 }
 
 pub mod decode_attention_f16_h128 {
-    pub const PTX: &str = include_str!("../triton_ptx/decode_attention_f16_h128.ptx");
-    pub const META: &str = include_str!("../triton_ptx/decode_attention_f16_h128.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/decode_attention_f16_h128.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/decode_attention_f16_h128.json");
 }
 
 // w4a16 GPTQ INT4-weight × FP16-act fused GEMM. Tile <BM=64, BN=64, BK=32>.
 // Drop-in alternative to Marlin's `gemm_gptq` path; gated at load time via
 // FERRUM_TRITON_INT4=1 so the existing Marlin path stays default.
 pub mod w4a16_gptq_f16 {
-    pub const PTX: &str = include_str!("../triton_ptx/w4a16_gptq_f16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/w4a16_gptq_f16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/w4a16_gptq_f16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/w4a16_gptq_f16.json");
 }
 
 // Stage 15: fused MoE GPTQ INT4×FP16 GEMM with per-tile expert routing
@@ -134,6 +134,6 @@ pub mod w4a16_gptq_f16 {
 // vLLM's standard moe_block_size for INT4 paths. ONE launch processes all
 // (token, expert) pairs of one MoE phase.
 pub mod fused_moe_w4a16_f16_bm16 {
-    pub const PTX: &str = include_str!("../triton_ptx/fused_moe_w4a16_f16_bm16.ptx");
-    pub const META: &str = include_str!("../triton_ptx/fused_moe_w4a16_f16_bm16.json");
+    pub const PTX: &str = include_str!("../../../triton_ptx/fused_moe_w4a16_f16_bm16.ptx");
+    pub const META: &str = include_str!("../../../triton_ptx/fused_moe_w4a16_f16_bm16.json");
 }
