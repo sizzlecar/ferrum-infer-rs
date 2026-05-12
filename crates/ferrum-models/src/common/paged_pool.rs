@@ -16,11 +16,29 @@
 //!   `Result::Err` so the scheduler can refuse the request rather than
 //!   panicking deep in the model forward.
 //!
-//! What's *not* here yet (deferred to Phase 4c / 5):
-//! - Prefix sharing: today a fresh `PagedSeqState` always allocates new
-//!   blocks even if its prompt overlaps another live sequence's.
-//! - Eviction / preemption: when blocks run out we just `Err`. A real
-//!   scheduler would either refuse-and-queue or evict the least-recently-used.
+//! ## Ref counting (Phase 1 of block-level prefix cache)
+//!
+//! Each physical block has a `u16` ref count. `allocate` / `allocate_n`
+//! create a block with `ref_count = 1`. `free` decrements; when the count
+//! reaches zero the block returns to the free list (physical reuse).
+//! New API `acquire(block)` increments — used by the upcoming prefix cache
+//! when another sequence wants to share an already-resident block.
+//!
+//! Backwards compatible: pre-prefix-cache callers don't touch `acquire`,
+//! so every block stays at ref=1 and `free` behaves identically to the
+//! old single-ref free.
+//!
+//! ## What's *not* here yet (deferred to Phase 2-4 of prefix cache):
+//! - **Block hash chain** + global hash → block_id table.
+//! - **Engine integration**: hashing incoming prompt blocks, looking up
+//!   matching prefix, splicing the existing blocks into the new seq's
+//!   block_table.
+//! - **Eviction policy**: when ref hits 0 the block becomes immediately
+//!   reusable; an LRU "soft-free" tier would let us keep recently-evicted
+//!   blocks hot for opportunistic prefix-cache hits before they're
+//!   overwritten by a new allocate.
+//! - **Preemption**: when blocks run out we still just `Err`; real
+//!   scheduler would refuse-and-queue or evict.
 //! - Cross-process or cross-model pooling.
 
 use ferrum_kernels::backend::Backend;
@@ -39,6 +57,13 @@ pub struct BlockAllocator {
     /// Watermark: how many blocks have been live at peak, useful for
     /// pool-sizing diagnostics in the bench harness.
     peak_in_use: AtomicUsize,
+    /// Per-block reference count. `ref_counts[i] == 0` ⟺ block i is on
+    /// the free list. `allocate` sets to 1; `acquire` increments;
+    /// `free` decrements and (only when reaching 0) returns the block
+    /// to the free list. Width 16 bits — supports up to 65535 concurrent
+    /// sharers of the same physical KV block, far past any realistic
+    /// continuous batching cap.
+    ref_counts: Vec<u16>,
 }
 
 impl BlockAllocator {
@@ -53,15 +78,26 @@ impl BlockAllocator {
             free_list,
             capacity: num_blocks,
             peak_in_use: AtomicUsize::new(0),
+            ref_counts: vec![0u16; num_blocks as usize],
         }
     }
 
     /// Allocate a single physical block. Returns `Err` when the pool is
     /// exhausted — caller is expected to refuse the request and queue
     /// it (or evict another seq, when that's wired up).
+    ///
+    /// New block starts with `ref_count = 1`. Drop one ref via `free()`
+    /// to return it to the pool, or call `acquire()` for additional
+    /// sharers.
     pub fn allocate(&mut self) -> Result<u32> {
         match self.free_list.pop() {
             Some(b) => {
+                debug_assert!(
+                    self.ref_counts[b as usize] == 0,
+                    "allocate yielded block {b} with non-zero ref_count {}",
+                    self.ref_counts[b as usize]
+                );
+                self.ref_counts[b as usize] = 1;
                 let in_use = self.capacity as usize - self.free_list.len();
                 self.peak_in_use.fetch_max(in_use, Ordering::Relaxed);
                 Ok(b)
@@ -74,6 +110,7 @@ impl BlockAllocator {
     }
 
     /// Bulk allocate. Atomic: either all `n` succeed or none are taken.
+    /// Each returned block starts at `ref_count = 1`.
     pub fn allocate_n(&mut self, n: usize) -> Result<Vec<u32>> {
         if self.free_list.len() < n {
             return Err(FerrumError::resource_exhausted(format!(
@@ -83,19 +120,71 @@ impl BlockAllocator {
         }
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            out.push(self.free_list.pop().unwrap());
+            let b = self.free_list.pop().unwrap();
+            debug_assert!(
+                self.ref_counts[b as usize] == 0,
+                "allocate_n yielded block {b} with non-zero ref_count"
+            );
+            self.ref_counts[b as usize] = 1;
+            out.push(b);
         }
         let in_use = self.capacity as usize - self.free_list.len();
         self.peak_in_use.fetch_max(in_use, Ordering::Relaxed);
         Ok(out)
     }
 
-    /// Return blocks to the free list. Caller is responsible for
-    /// ensuring no live sequence still references them; freeing a block
-    /// while it's still in a `PagedSeqState::blocks` will silently
-    /// corrupt the next allocation that gets it.
+    /// Increment the ref count for an already-allocated block. Used by
+    /// prefix-caching paths when a new sequence wants to share a block
+    /// that's already resident from a prior request.
+    ///
+    /// Panics in debug builds if the block is not currently allocated
+    /// (ref_count==0) — a release-build path that calls `acquire` on a
+    /// free block is a memory-safety bug we'd rather catch loudly.
+    pub fn acquire(&mut self, block: u32) {
+        let bi = block as usize;
+        debug_assert!(
+            self.ref_counts[bi] > 0,
+            "acquire on block {block} with ref_count=0 (not currently allocated)"
+        );
+        self.ref_counts[bi] = self.ref_counts[bi]
+            .checked_add(1)
+            .expect("BlockAllocator ref_count u16 overflow (>65535 sharers)");
+    }
+
+    /// Bulk acquire — convenience for prefix-cache hit paths that take a
+    /// list of physical block ids to share.
+    pub fn acquire_many(&mut self, blocks: &[u32]) {
+        for &b in blocks {
+            self.acquire(b);
+        }
+    }
+
+    /// Drop one ref from each block. Blocks whose ref_count hits 0 are
+    /// returned to the free list and become available for the next
+    /// `allocate*` call.
+    ///
+    /// Pre-prefix-cache callers see no behavioural change: every block
+    /// they hold starts at ref=1 (from `allocate`), and `free` drops it
+    /// to 0 — physically frees on the same call, same as before.
     pub fn free(&mut self, blocks: &[u32]) {
-        self.free_list.extend_from_slice(blocks);
+        for &b in blocks {
+            let bi = b as usize;
+            debug_assert!(
+                self.ref_counts[bi] > 0,
+                "free on block {b} with ref_count=0 (double-free)"
+            );
+            self.ref_counts[bi] -= 1;
+            if self.ref_counts[bi] == 0 {
+                self.free_list.push(b);
+            }
+        }
+    }
+
+    /// Read current ref count for a block. 0 means free, ≥1 means in
+    /// use by that many sequences.
+    #[inline]
+    pub fn ref_count(&self, block: u32) -> u16 {
+        self.ref_counts[block as usize]
     }
 
     pub fn free_count(&self) -> usize {
@@ -246,5 +335,72 @@ mod tests {
         assert_eq!(a.peak_in_use(), 5); // peak doesn't decrease
         let _ = a.allocate_n(3).unwrap();
         assert_eq!(a.peak_in_use(), 5);
+    }
+
+    #[test]
+    fn refcount_allocate_starts_at_one() {
+        let mut a = BlockAllocator::new(4);
+        let b = a.allocate().unwrap();
+        assert_eq!(a.ref_count(b), 1);
+    }
+
+    #[test]
+    fn refcount_acquire_increments() {
+        let mut a = BlockAllocator::new(4);
+        let b = a.allocate().unwrap();
+        a.acquire(b);
+        a.acquire(b);
+        assert_eq!(a.ref_count(b), 3);
+    }
+
+    #[test]
+    fn refcount_free_decrements_no_physical_release() {
+        let mut a = BlockAllocator::new(4);
+        let b = a.allocate().unwrap();
+        a.acquire(b); // ref=2
+        a.free(&[b]); // ref=1 — NOT yet returned to free_list
+        assert_eq!(a.ref_count(b), 1);
+        assert_eq!(a.free_count(), 3); // only 3 of original 4 blocks free
+    }
+
+    #[test]
+    fn refcount_free_physical_release_at_zero() {
+        let mut a = BlockAllocator::new(4);
+        let b = a.allocate().unwrap();
+        a.acquire(b); // ref=2
+        a.free(&[b]); // ref=1
+        a.free(&[b]); // ref=0 → physical release
+        assert_eq!(a.ref_count(b), 0);
+        assert_eq!(a.free_count(), 4);
+    }
+
+    #[test]
+    fn refcount_legacy_single_ref_behaviour_unchanged() {
+        // Pre-prefix-cache code never calls `acquire`. Verify that
+        // allocate+free behaves identically to the old version: block
+        // immediately returns to the pool.
+        let mut a = BlockAllocator::new(2);
+        let b = a.allocate().unwrap();
+        assert_eq!(a.free_count(), 1);
+        a.free(&[b]);
+        assert_eq!(a.free_count(), 2);
+        assert_eq!(a.ref_count(b), 0);
+        // Re-allocation reuses the slot (LIFO).
+        let b2 = a.allocate().unwrap();
+        assert_eq!(b2, b);
+    }
+
+    #[test]
+    fn refcount_bulk_acquire_and_release() {
+        let mut a = BlockAllocator::new(8);
+        let blocks = a.allocate_n(3).unwrap();
+        a.acquire_many(&blocks); // each ref=2
+        for &b in &blocks {
+            assert_eq!(a.ref_count(b), 2);
+        }
+        a.free(&blocks); // each ref=1, none physically released
+        assert_eq!(a.free_count(), 5);
+        a.free(&blocks); // each ref=0, all released
+        assert_eq!(a.free_count(), 8);
     }
 }
