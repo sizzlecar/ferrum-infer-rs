@@ -31,6 +31,8 @@ FERRUM_MOE_BUCKETED=1 \
 FERRUM_MARLIN_SKIP_WS_ZERO=1 \
 FERRUM_MOE_STREAMS=4 \
 FERRUM_MOE_BATCH_THRESHOLD=4 \
+FERRUM_MOE_GRAPH=1 \
+FERRUM_GRAPH_SKIP_UPLOAD=1 \
 FERRUM_USE_VLLM_PAGED_ATTN=1 \
   /workspace/ferrum-infer-rs/target/release/ferrum serve \
     --model /workspace/models/M3 --port "$PORT" \
