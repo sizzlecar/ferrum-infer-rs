@@ -99,8 +99,14 @@ RUN_R=$(date +%s)
 echo "[nsys] capture window opens shortly; launching c=32 bench r=$RUN_R"
 bash bench/v0.2-cuda/run_cell.sh ferrum_nsys M3 32 "$RUN_R" "$PORT" 2>&1 | tee "$OUT_DIR/bench.log"
 
-# Wait for nsys to finish capturing
-sleep 5
+# nsys --delay=15 + --duration=20 → window closes at t≈35 of process
+# lifetime. Bench finishes at t≈26. Sleep covers the rest of the window
+# AND nsys's writeback (it writes a 36 MB .qdstrm THEN converts to
+# .nsys-rep — typically ~5 s on Vast). Killing too early leaves a
+# corrupt .qdstrm and no .nsys-rep, which is what bit us in earlier
+# attempts.
+echo "[nsys] waiting for capture window to close + finalize (~25s)"
+sleep 25
 echo "[ferrum] stopping"
 kill -INT "$PID" 2>/dev/null || true
 wait "$PID" 2>/dev/null || true
