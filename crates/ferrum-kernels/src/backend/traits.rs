@@ -1466,6 +1466,35 @@ pub trait BackendMoeFused: Backend {
     /// Layout matches vLLM's marlin_moe_wna16 kernel input
     /// expectation. The fused Marlin kernel reads a row from
     /// `a[sorted_token_ids[i] / top_k]` and weights from
+    /// Build `pairs_by_token` device-side from device-side `expert_ids`.
+    /// Inverts the bucket-sort permutation so `moe_combine` can read
+    /// routing output without a host round-trip — the prerequisite for
+    /// graph-capturing the MoE bucketed path. Also fills
+    /// `expert_offsets` (exclusive prefix sum of tokens-per-expert)
+    /// since they're computed by the same kernel.
+    ///
+    /// Inputs (device):
+    /// - `expert_ids: I32 [batch * top_k]` — top-K selected expert ids.
+    ///
+    /// Outputs (device):
+    /// - `pairs_by_token: I32 [batch * top_k]` — sorted-by-expert position
+    ///   of each (b, k) pair (the row index into `packed_down`).
+    /// - `expert_offsets: I32 [num_experts + 1]` — prefix sum.
+    ///
+    /// Default impl returns Err — only CUDA implements this.
+    fn moe_build_pairs_by_token(
+        _ctx: &mut Self::Context,
+        _expert_ids: &Self::Buffer,
+        _pairs_by_token: &mut Self::Buffer,
+        _expert_offsets: &mut Self::Buffer,
+        _batch_x_topk: usize,
+        _num_experts: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "moe_build_pairs_by_token not implemented for this backend",
+        ))
+    }
+
     /// `b[block_ids[blockIdx.y] * n_per_expert + ...]`.
     ///
     /// Default impl returns Err — only CUDA implements this.

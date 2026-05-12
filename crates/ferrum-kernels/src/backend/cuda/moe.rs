@@ -187,6 +187,45 @@ impl BackendMoeFused for CudaBackend {
 
         Ok(())
     }
+    fn moe_build_pairs_by_token(
+        ctx: &mut Self::Context,
+        expert_ids: &Self::Buffer,
+        pairs_by_token: &mut Self::Buffer,
+        expert_offsets: &mut Self::Buffer,
+        batch_x_topk: usize,
+        num_experts: usize,
+    ) -> Result<()> {
+        if num_experts > 256 {
+            return Err(FerrumError::model(format!(
+                "moe_build_pairs_by_token: num_experts={num_experts} > MAX 256 (shmem limit)"
+            )));
+        }
+        let func = ctx.func(
+            "moe_build_pairs_by_token",
+            ptx::MOE_BUILD_PAIRS,
+            "moe_build_pairs_by_token",
+        );
+        let n = batch_x_topk as i32;
+        let ne = num_experts as i32;
+        let smem = (num_experts as u32) * 4; // i32 counts per expert
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(expert_ids);
+        b.arg(pairs_by_token);
+        b.arg(expert_offsets);
+        b.arg(&n);
+        b.arg(&ne);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: smem,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("moe_build_pairs_by_token launch: {e}")))?;
+        Ok(())
+    }
+
     fn moe_align_block_size(
         ctx: &mut Self::Context,
         expert_ids_per_pair: &Self::Buffer,
