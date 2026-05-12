@@ -58,6 +58,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/moe_build_pairs.cu");
     println!("cargo:rerun-if-changed=kernels/int8_paged_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/argmax_rows.cu");
+    println!("cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -100,6 +101,7 @@ fn main() {
             "kernels/moe_build_pairs.cu",
             "kernels/int8_paged_decode_attention.cu",
             "kernels/argmax_rows.cu",
+            "kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu",
         ])
         .out_dir(out_dir)
         .arg("-Ikernels") // for common.cuh
@@ -140,6 +142,110 @@ fn main() {
     if env::var_os("CARGO_FEATURE_VLLM_MOE_MARLIN").is_some() {
         compile_vllm_moe_marlin(&out_dir_clone);
     }
+
+    // vLLM paged_attention_v2 port (2026-05-12). Vendored from vllm v0.20.2
+    // (csrc/attention/{paged_attention_v2.cu,attention_kernels.cuh,...})
+    // with torch headers stripped. Opt-in via `--features vllm-paged-attn-v2`.
+    // Builds a static lib of the single (HEAD=128, BLOCK=16, FP16, no-FP8,
+    // no-blocksparse) instantiation — ~1-2 min compile.
+    if env::var_os("CARGO_FEATURE_VLLM_PAGED_ATTN_V2").is_some() {
+        compile_vllm_paged_attn(&out_dir_clone);
+    }
+}
+
+fn compile_vllm_paged_attn(out_dir: &PathBuf) {
+    let cu_files: &[&str] = &["kernels/vllm_attn/launcher.cu"];
+    for f in cu_files {
+        println!("cargo:rerun-if-changed={f}");
+    }
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/attention_kernels.cuh");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/attention_dtypes.h");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/attention_utils.cuh");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/attention_generic.cuh");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/dtype_float16.cuh");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/dtype_float32.cuh");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/dtype_bfloat16.cuh");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/dtype_fp8.cuh");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/ferrum_shim.h");
+    println!("cargo:rerun-if-changed=kernels/vllm_attn/include/cuda_compat.h");
+
+    let cuda_root = cuda_root_from_env();
+    let nvcc = cuda_root
+        .as_ref()
+        .map(|r| r.join("bin").join("nvcc"))
+        .unwrap_or_else(|| PathBuf::from("nvcc"));
+    if !nvcc.exists() && cuda_root.is_some() {
+        eprintln!("nvcc not found at {nvcc:?}, skipping vllm-paged-attn-v2");
+        return;
+    }
+
+    let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
+
+    let mut object_files: Vec<PathBuf> = Vec::new();
+    for src in cu_files {
+        let stem = std::path::Path::new(src)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("cu filename");
+        let obj = out_dir.join(format!("vllm_paged_attn_{stem}.o"));
+        eprintln!(
+            "[vllm-paged-attn-v2] compiling {src} -> {}",
+            obj.display()
+        );
+
+        let status = std::process::Command::new(&nvcc)
+            .args(["-c", src, "-o"])
+            .arg(obj.to_str().unwrap())
+            .args([
+                &format!("-arch=sm_{compute_cap}"),
+                "-Ikernels/vllm_attn",
+                "-std=c++17",
+                "-O3",
+                "--use_fast_math",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "-Xcompiler",
+                "-fPIC",
+                "--threads",
+                "0",
+            ])
+            .status()
+            .unwrap_or_else(|e| {
+                panic!("[vllm-paged-attn-v2] nvcc spawn failed for {src}: {e}")
+            });
+        if !status.success() {
+            panic!(
+                "[vllm-paged-attn-v2] nvcc failed compiling {src}. Disable \
+                 the feature or fix CUDA setup."
+            );
+        }
+        object_files.push(obj);
+    }
+
+    let lib_file = out_dir.join("libvllm_paged_attn.a");
+    let mut ar_args: Vec<String> = vec!["rcs".to_string(), lib_file.display().to_string()];
+    for o in &object_files {
+        ar_args.push(o.display().to_string());
+    }
+    let ar_status = std::process::Command::new("ar")
+        .args(&ar_args)
+        .status()
+        .unwrap_or_else(|e| panic!("[vllm-paged-attn-v2] ar spawn failed: {e}"));
+    if !ar_status.success() {
+        panic!("[vllm-paged-attn-v2] ar failed to bundle {lib_file:?}");
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=vllm_paged_attn");
+    if let Some(ref cuda_root) = cuda_root {
+        let lib64 = cuda_root.join("lib64");
+        if lib64.exists() {
+            println!("cargo:rustc-link-search=native={}", lib64.display());
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    eprintln!("[vllm-paged-attn-v2] static lib built: {}", lib_file.display());
 }
 
 fn compile_vllm_moe_marlin(out_dir: &PathBuf) {

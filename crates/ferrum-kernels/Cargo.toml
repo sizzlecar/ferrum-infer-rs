@@ -34,6 +34,16 @@ vllm-moe-marlin = ["cuda", "vllm-marlin"]  # vLLM marlin_moe_wna16 port (Stage
                         # instantiations). Pulls in vllm-marlin because the
                         # MoE path needs the gptq_marlin_repack helper to
                         # convert GPTQ-on-disk → vLLM-Marlin tile layout.
+vllm-paged-attn-v2 = ["cuda"]  # vLLM paged_attention_v2 port (2026-05-12).
+                        # Vendored from vllm v0.20.2 csrc/attention/. Single
+                        # template instantiation (HEAD=128, BLOCK=16, FP16) —
+                        # ~1-2 min compile. Bench expected to switch c=32 attn
+                        # from `paged_batched_flash_decode_attn_f16` to vLLM's
+                        # v2 multi-partition kernel. Pairs with the
+                        # `split_qkv_norm_rope_into_paged_cache_varlen_vllm_f16`
+                        # PTX kernel which writes the vLLM K/V layout vLLM v2
+                        # expects (`[blocks, heads, head/x, block, x]` K).
+                        # Runtime selection via `FERRUM_USE_VLLM_PAGED_ATTN=1`.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files
