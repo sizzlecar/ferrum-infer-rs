@@ -1241,6 +1241,12 @@ pub struct DeviceRouteScratch<'a, B: crate::moe::dispatch::Backend> {
     pub pairs_by_token: &'a mut B::Buffer,
     pub packed_token_idx: &'a mut B::Buffer,
     pub expert_offsets: &'a mut B::Buffer,
+    // Phase 2: moe_align_block_size outputs for the vLLM marlin_moe
+    // fused GEMM path. Same shape as host `vllm_routing` builder
+    // produces, but device-resident.
+    pub sorted_tokens: &'a mut B::Buffer,
+    pub block_ids: &'a mut B::Buffer,
+    pub total_post_pad: &'a mut B::Buffer,
 }
 
 /// Bucketed MoE forward: gather → per-expert m=N Marlin GEMM → silu_mul →
@@ -1310,22 +1316,25 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     //
     // This is the prerequisite for CUDA Graph capture over the MoE
     // layer loop in Qwen3MoeModel::decode_batch_internal.
+    let use_vllm_moe = std::env::var("FERRUM_VLLM_MOE").map_or(false, |v| v == "1");
+    // use_device_route requires use_vllm_moe — capture is only possible
+    // through the fused marlin_moe_wna16 kernel. The non-vLLM bucketed
+    // path needs host phase1_dispatches/phase3_dispatches lists which
+    // are inherently host-built (one entry per active expert with
+    // expert-id-dependent shape), so it can't be captured.
     let use_device_route = device_route.is_some()
+        && use_vllm_moe
         && std::env::var("FERRUM_MOE_DEVICE_ROUTE")
             .map(|v| v == "1")
             .unwrap_or(false);
 
     // Run device-side routing kernels EARLY so `dr.packed_token_idx`
-    // is available for the device-buffer gather (embedding_lookup_dev)
-    // and `dr.pairs_by_token` / `dr.pair_weights` for moe_combine.
+    // is available for the device-buffer gather (embedding_lookup_dev),
+    // `dr.pairs_by_token` / `dr.pair_weights` for moe_combine, and
+    // `dr.sorted_tokens` / `dr.block_ids` / `dr.total_post_pad` (via
+    // moe_align_block_size below) for the vLLM marlin_moe GEMM phases.
     // Kept alive in `dr_kept` until end of function.
-    //
-    // Phase 1 (this PR): still redundant with the host `try_gpu_route_…`
-    // path below — the host path stays so `route_scratch.output` /
-    // `plan` / `vllm_routing` builder keep working. Phase 2 will skip
-    // those under use_device_route once the bucket plan is fully on
-    // device (`B::moe_align_block_size`).
-    let dr_kept: Option<DeviceRouteScratch<'_, B>> = if use_device_route {
+    let mut dr_kept: Option<DeviceRouteScratch<'_, B>> = if use_device_route {
         let dr = device_route.expect("device_route is Some when use_device_route");
         B::route_topk_softmax(
             ctx,
@@ -1352,90 +1361,87 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         None
     };
 
-    // ── Routing: try GPU fast-path first, fall back to host. ─────────
+    // ── Routing + bucket plan (host) ─────────────────────────────────
     //
-    // The GPU path runs `route_topk_softmax_f16` on the device buffer
-    // and D2Hs only `[batch, top_k]` ids + weights (~1 KB at c=32) into
-    // the host RouterOutput vectors. The host path goes through the
-    // existing 16-KB router_logits D2H + softmax+topk in Rust.
+    // Skipped entirely under use_device_route — the device kernels run
+    // by `dr_kept` above produce equivalent on-device buffers. The host
+    // path stays for the legacy non-vllm bucketed dispatch and for
+    // tests (where device_route is None).
     //
-    // Default `try_gpu_route_topk_into_host` returns `Err(unsupported)`
-    // on backends that don't override (CPU / Metal / future), so this
-    // branch is a strict superset of the host path.
-    let t_route_total = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let gpu_route = B::try_gpu_route_topk_into_host(
-        ctx,
-        router_logits,
-        &mut route_scratch.output.expert_ids,
-        &mut route_scratch.output.expert_weights,
-        batch,
-        num_experts,
-        top_k,
-        norm_topk_prob,
-    );
-    if gpu_route.is_err() {
-        // Host fallback. Mirrors the per-phase profile wiring above so
-        // [bucket-prof] stays meaningful: t_sync wraps the explicit
-        // drain; t_d2h wraps the to_vec; t_route wraps route_into.
-        let t_sync = if prof {
+    // GPU fast-path: `try_gpu_route_topk_into_host` runs the same
+    // route_topk_softmax kernel and D2Hs only `[batch, top_k]` ids +
+    // weights (~1 KB at c=32) into RouterOutput. Host fallback covers
+    // backends without the override (CPU / Metal / future).
+    let plan: Option<&crate::moe::MoeBucketPlan> = if !use_device_route {
+        let t_route_total = if prof {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        B::sync(ctx);
-        if let Some(t) = t_sync {
-            MOE_BUCKET_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
-        let t_d2h = if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let logits_host = B::to_vec(router_logits, batch * num_experts);
-        if let Some(t) = t_d2h {
-            MOE_BUCKET_D2H_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
-        let t_route = if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        crate::moe::router::route_into(
-            &logits_host,
+        let gpu_route = B::try_gpu_route_topk_into_host(
+            ctx,
+            router_logits,
+            &mut route_scratch.output.expert_ids,
+            &mut route_scratch.output.expert_weights,
             batch,
             num_experts,
             top_k,
             norm_topk_prob,
-            &mut route_scratch.output,
-            &mut route_scratch.probs,
         );
-        if let Some(t) = t_route {
+        if gpu_route.is_err() {
+            let t_sync = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            B::sync(ctx);
+            if let Some(t) = t_sync {
+                MOE_BUCKET_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            let t_d2h = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let logits_host = B::to_vec(router_logits, batch * num_experts);
+            if let Some(t) = t_d2h {
+                MOE_BUCKET_D2H_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            let t_route = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            crate::moe::router::route_into(
+                &logits_host,
+                batch,
+                num_experts,
+                top_k,
+                norm_topk_prob,
+                &mut route_scratch.output,
+                &mut route_scratch.probs,
+            );
+            if let Some(t) = t_route {
+                MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        } else if let Some(t) = t_route_total {
             MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-    } else if let Some(t) = t_route_total {
-        // GPU path: charge the whole route+D2H to the route bucket.
-        // (sync/d2h sub-buckets are 0 because the kernel + dtoh are
-        // fused into one stream synchronize.)
-        MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    }
-
-    // ── Build bucket plan host-side ────────────────────────────────────
-    let t_plan = if prof {
-        Some(std::time::Instant::now())
+        let t_plan = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        route_scratch
+            .plan
+            .rebuild_into(&route_scratch.output, batch, num_experts, top_k);
+        if let Some(t) = t_plan {
+            MOE_BUCKET_PLAN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        Some(&route_scratch.plan)
     } else {
         None
     };
-    route_scratch
-        .plan
-        .rebuild_into(&route_scratch.output, batch, num_experts, top_k);
-    let plan = &route_scratch.plan;
-    if let Some(t) = t_plan {
-        MOE_BUCKET_PLAN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    }
 
     // ── Gather: x_packed[i] = x[packed_token_idx[i]] ───────────────────
     // Under use_device_route, read packed_token_idx from device (no
@@ -1455,6 +1461,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             hidden_size,
         );
     } else {
+        let plan = plan.expect("plan is Some when !use_device_route");
         B::embedding_lookup(ctx, x, &plan.packed_token_idx, x_packed, hidden_size);
     }
     if let Some(t) = t_gather {
@@ -1481,93 +1488,132 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     })?;
     let _ = gu_store.zero_workspace(ctx);
 
-    // Decide path: vLLM marlin_moe_wna16 fused or our per-expert bucketed
-    // GEMMs. The vLLM path needs (sorted_token_ids, expert_ids,
-    // num_tokens_past_padded) routing buffers — build them once on host
-    // from `plan.expert_offsets` and reuse across phase 1 and phase 3.
-    let use_vllm_moe = std::env::var("FERRUM_VLLM_MOE").map_or(false, |v| v == "1");
+    // Decide path: vLLM marlin_moe_wna16 fused or per-expert bucketed
+    // GEMMs. Under use_device_route, build routing on-device via
+    // `moe_align_block_size`; under use_vllm_moe alone, host-build it.
+    // Either way the GEMM dispatcher takes `&Buffer` for the 3 routing
+    // arrays.
     let total_pairs_active = batch * top_k;
     const VLLM_MOE_BLOCK_SIZE: usize = 16;
-    let vllm_routing = if use_vllm_moe {
-        // total_padded = sum_e ceil(m_e / block) * block
-        let mut padded_offsets = Vec::with_capacity(num_experts + 1);
-        let mut acc = 0usize;
-        for e in 0..num_experts {
+    // sorted_max bound — must match Qwen3MoeScratch.route_sorted_tokens_dev
+    // capacity (t * top_k + num_experts * VLLM_MOE_BLOCK_SIZE).
+    let sorted_max_size = batch * top_k + num_experts * VLLM_MOE_BLOCK_SIZE;
+    let vllm_routing_owned: Option<ferrum_kernels::backend::MoeRouting<B>> =
+        if use_vllm_moe && !use_device_route {
+            let plan = plan.expect("plan is Some when host vllm builder runs");
+            let mut padded_offsets = Vec::with_capacity(num_experts + 1);
+            let mut acc = 0usize;
+            for e in 0..num_experts {
+                padded_offsets.push(acc);
+                let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
+                let pe = m_e.div_ceil(VLLM_MOE_BLOCK_SIZE) * VLLM_MOE_BLOCK_SIZE;
+                acc += pe;
+            }
             padded_offsets.push(acc);
-            let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
-            let pe = m_e.div_ceil(VLLM_MOE_BLOCK_SIZE) * VLLM_MOE_BLOCK_SIZE;
-            acc += pe;
-        }
-        padded_offsets.push(acc);
-        let total_padded = acc;
-        let total_blocks = total_padded / VLLM_MOE_BLOCK_SIZE;
-        let sentinel = total_pairs_active as i32;
+            let total_padded = acc;
+            let total_blocks = total_padded / VLLM_MOE_BLOCK_SIZE;
+            let sentinel = total_pairs_active as i32;
 
-        let mut sorted_token_ids = vec![sentinel; total_padded];
-        let mut expert_ids = vec![0i32; total_blocks];
+            let mut sorted_token_ids = vec![sentinel; total_padded];
+            let mut expert_ids = vec![0i32; total_blocks];
+            for e in 0..num_experts {
+                let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
+                if m_e == 0 {
+                    continue;
+                }
+                let p_off = padded_offsets[e];
+                let real_off = plan.expert_offsets[e];
+                for i in 0..m_e {
+                    sorted_token_ids[p_off + i] = (real_off + i) as i32;
+                }
+                let blocks_for_e = (padded_offsets[e + 1] - p_off) / VLLM_MOE_BLOCK_SIZE;
+                let block_start = p_off / VLLM_MOE_BLOCK_SIZE;
+                for b in 0..blocks_for_e {
+                    expert_ids[block_start + b] = e as i32;
+                }
+            }
+            let num_tokens_past_padded = vec![total_padded as i32];
+            Some(B::upload_moe_routing(
+                ctx,
+                &sorted_token_ids,
+                &expert_ids,
+                &num_tokens_past_padded,
+            )?)
+        } else {
+            None
+        };
+
+    // Device-side moe_align_block_size — under use_device_route, fill
+    // dr.{sorted_tokens, block_ids, total_post_pad} on device from
+    // dr.selected_ids. No host roundtrip → captures cleanly.
+    if use_device_route {
+        let dr = dr_kept
+            .as_mut()
+            .expect("dr_kept is Some when use_device_route");
+        B::moe_align_block_size(
+            ctx,
+            dr.selected_ids,
+            dr.sorted_tokens,
+            dr.block_ids,
+            dr.total_post_pad,
+            batch * top_k,
+            num_experts,
+            VLLM_MOE_BLOCK_SIZE,
+            sorted_max_size,
+        )?;
+    }
+
+    // Resolve the 3 routing buffers for vLLM phase 1/3 GEMM. Either
+    // from dr_kept (device-built by moe_align_block_size) or from
+    // vllm_routing_owned (host-built + uploaded). None → use legacy
+    // per-expert batched GEMM path.
+    let vllm_refs: Option<(&B::Buffer, &B::Buffer, &B::Buffer)> = if use_device_route {
+        let dr = dr_kept
+            .as_ref()
+            .expect("dr_kept is Some when use_device_route");
+        Some((&*dr.sorted_tokens, &*dr.block_ids, &*dr.total_post_pad))
+    } else if let Some(r) = vllm_routing_owned.as_ref() {
+        Some((
+            &r.sorted_token_ids,
+            &r.expert_ids,
+            &r.num_tokens_past_padded,
+        ))
+    } else {
+        None
+    };
+
+    // Phase 1/3 batched-GEMM dispatch lists. Only built (and read) for
+    // the non-vLLM path. Under use_device_route the host plan is None
+    // anyway, so we'd fail to build them — skip via vllm_refs.is_some.
+    let phase1_dispatches: Vec<(usize, usize, usize, usize)> = if vllm_refs.is_none() {
+        let plan = plan.expect("plan is Some when batched GEMM path runs");
+        let mut v: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
         for e in 0..num_experts {
             let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
             if m_e == 0 {
                 continue;
             }
-            let p_off = padded_offsets[e];
-            let real_off = plan.expert_offsets[e];
-            for i in 0..m_e {
-                sorted_token_ids[p_off + i] = (real_off + i) as i32;
-            }
-            let blocks_for_e = (padded_offsets[e + 1] - p_off) / VLLM_MOE_BLOCK_SIZE;
-            let block_start = p_off / VLLM_MOE_BLOCK_SIZE;
-            for b in 0..blocks_for_e {
-                expert_ids[block_start + b] = e as i32;
-            }
+            let pair_off = plan.expert_offsets[e];
+            v.push((e, pair_off, pair_off, m_e));
         }
-        let num_tokens_past_padded = vec![total_padded as i32];
-        Some(B::upload_moe_routing(
-            ctx,
-            &sorted_token_ids,
-            &expert_ids,
-            &num_tokens_past_padded,
-        )?)
+        v.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        v
     } else {
-        None
+        Vec::new()
     };
-
-    // Build the dispatch list for phase 1. (expert_idx, in_row, out_row, m)
-    // for each active expert. Send to the multi-stream batched dispatcher.
-    //
-    // Sort by `m` descending so the round-robin pool feeds the longest
-    // GEMMs first — without this, an unlucky distribution could hand a
-    // bunch of m=1 calls to one stream while another stream is still
-    // running its m=4 tail, leaving the pool unbalanced. With sort,
-    // each stream pops the next-largest job and they all finish close
-    // together. Tied `m` keeps the original (expert-id ascending) order,
-    // which matters for any host-side determinism we care about.
-    let mut phase1_dispatches: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
-    for e in 0..num_experts {
-        let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
-        if m_e == 0 {
-            continue;
-        }
-        let pair_off = plan.expert_offsets[e];
-        phase1_dispatches.push((e, pair_off, pair_off, m_e));
-    }
-    phase1_dispatches.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
     let t_gemm1 = if prof {
         Some(std::time::Instant::now())
     } else {
         None
     };
-    if let Some(routing) = &vllm_routing {
-        // fp32_reduce path: kernel writes C directly via global reduce,
-        // no caller-side zero needed (atomic_add fallback inside the
-        // wrapper would also self-zero under slice_count > 1 / slice_idx
-        // == 0; either way this is safe).
+    if let Some((sorted_tokens, block_ids, total_post_pad)) = vllm_refs {
+        // fp32_reduce path: kernel writes C directly via global reduce.
         gu_store.gemm_phase_vllm(
             ctx,
             x_packed,
-            &routing.sorted_token_ids,
-            &routing.expert_ids,
-            &routing.num_tokens_past_padded,
+            sorted_tokens,
+            block_ids,
+            total_post_pad,
             gate_up_packed,
             total_pairs_active,
             VLLM_MOE_BLOCK_SIZE,
@@ -1618,28 +1664,34 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         )
     })?;
     let _ = d_store.zero_workspace(ctx);
-    let mut phase3_dispatches: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
-    for e in 0..num_experts {
-        let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
-        if m_e == 0 {
-            continue;
+    let phase3_dispatches: Vec<(usize, usize, usize, usize)> = if vllm_refs.is_none() {
+        let plan = plan.expect("plan is Some when batched GEMM path runs");
+        let mut v: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
+            if m_e == 0 {
+                continue;
+            }
+            let pair_off = plan.expert_offsets[e];
+            v.push((e, pair_off, pair_off, m_e));
         }
-        let pair_off = plan.expert_offsets[e];
-        phase3_dispatches.push((e, pair_off, pair_off, m_e));
-    }
-    phase3_dispatches.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        v.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        v
+    } else {
+        Vec::new()
+    };
     let t_gemm3 = if prof {
         Some(std::time::Instant::now())
     } else {
         None
     };
-    if let Some(routing) = &vllm_routing {
+    if let Some((sorted_tokens, block_ids, total_post_pad)) = vllm_refs {
         d_store.gemm_phase_vllm(
             ctx,
             silu_packed,
-            &routing.sorted_token_ids,
-            &routing.expert_ids,
-            &routing.num_tokens_past_padded,
+            sorted_tokens,
+            block_ids,
+            total_post_pad,
             down_packed,
             total_pairs_active,
             VLLM_MOE_BLOCK_SIZE,
@@ -1688,6 +1740,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         pairs_ref = &*dr.pairs_by_token;
         weights_ref = &*dr.pair_weights;
     } else {
+        let plan = plan.expect("plan is Some when host moe_combine runs");
         _pairs_owned = B::from_slice_typed::<i32>(&plan.pairs_by_token);
         _weights_owned = B::from_slice_typed::<f32>(&plan.pair_weights);
         pairs_ref = &_pairs_owned;
