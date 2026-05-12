@@ -1088,6 +1088,53 @@ pub fn moe_forward<B: QuantLlmBackend + BackendMoeFused>(
     Ok(())
 }
 
+/// Largest moe_block_size we'd ever pick. Drives Qwen3MoeScratch
+/// `route_sorted_tokens_dev` sizing (allocates `t*top_k + n_exp*MAX`).
+pub const MOE_BLOCK_SIZE_MAX: usize = 64;
+
+/// Pick `moe_block_size` ∈ {16, 32, 64} based on routing distribution.
+///
+/// Marlin-MoE templates instantiate for thread_m_blocks ∈ {1, 2, 3, 4}
+/// → block_size ∈ {16, 32, 48, 64}. Larger block_size enables the
+/// "large_batch tile" path (thread_n=256, num_threads=256, 8× more work
+/// per kernel launch) but pads each expert's tokens up to a multiple of
+/// block_size — sparse routing wastes most of that.
+///
+/// Decision: pick the largest size whose **total padded tokens** stays
+/// within 30% of actual. If we can't keep overhead below the threshold,
+/// stick with 16. Skips block_size=48 for simplicity (rare sweet spot).
+///
+/// Device-routing path doesn't expose `plan` host-side; fall back to 16
+/// (no regression vs pre-PR behaviour).
+fn pick_moe_block_size(
+    plan: Option<&MoeBucketPlan>,
+    num_experts: usize,
+    use_device_route: bool,
+) -> usize {
+    const CANDIDATES: &[usize] = &[64, 32, 16];
+    const PADDING_BUDGET: f64 = 1.30; // ≤ 30% overhead vs actual tokens
+    if use_device_route {
+        return 16;
+    }
+    let Some(plan) = plan else {
+        return 16;
+    };
+    let m_e: Vec<usize> = (0..num_experts)
+        .map(|e| plan.expert_offsets[e + 1] - plan.expert_offsets[e])
+        .collect();
+    let total_actual: usize = m_e.iter().sum();
+    if total_actual == 0 {
+        return 16;
+    }
+    for &bs in CANDIDATES {
+        let total_padded: usize = m_e.iter().map(|&m| m.div_ceil(bs) * bs).sum();
+        if (total_padded as f64) <= (total_actual as f64) * PADDING_BUDGET {
+            return bs;
+        }
+    }
+    16
+}
+
 /// Bucket plan: per-expert lists of which (token, k_slot) pairs route
 /// through that expert. Built host-side from the router output and used
 /// by [`moe_forward_bucketed`] to issue ONE m=tokens_per_expert Marlin
@@ -1504,10 +1551,48 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // Either way the GEMM dispatcher takes `&Buffer` for the 3 routing
     // arrays.
     let total_pairs_active = batch * top_k;
-    const VLLM_MOE_BLOCK_SIZE: usize = 16;
+    // ── Dynamic moe_block_size policy ────────────────────────────────────
+    //
+    // Marlin-MoE kernel template is instantiated for thread_m_blocks ∈
+    // {1, 2, 3, 4} via COMMON_GET_IF_M1 / COMMON_GET_IF_M234 in
+    // vllm_marlin_moe/ops.cu. Each maps to block_size = thread_m_blocks
+    // × 16 ∈ {16, 32, 48, 64}. Picking the right one is a classic
+    // throughput-vs-padding-waste tradeoff:
+    //
+    //   block_size=16 :  16 thread_n=128 num_threads=128 (small_batch tile)
+    //   block_size=32+:  16 thread_n=256 num_threads=256 (large_batch tile,
+    //                    8× more work per kernel launch)
+    //
+    // Larger tile = more arithmetic per memory load = higher DRAM
+    // utilization. But each expert pads its actual token count up to
+    // a multiple of block_size — sparse routing (many experts, few
+    // tokens each) bleeds into massive padding waste.
+    //
+    // Test data (commit ccba35f static block=64 vs reverted block=16):
+    //   bench/v0.2-cuda dmon @ c=32:
+    //     block=16  →  SM=99%  DRAM=50%  (mem-stalled, tile too small)
+    //     block=64  →  varies wildly:
+    //                    same-prompt c=32  : 2078 tok/s (+100% vs block=16)
+    //                    apples c=32 diverse: 921 tok/s (-11% vs block=16)
+    //
+    // Decision rule: pick the largest block_size whose padding overhead
+    // would still be ≤ ~30%. The host-routing path has `plan.expert_offsets`
+    // which gives exact m_e per expert — pick by actual data. The
+    // device-routing path doesn't have host visibility so falls back to
+    // a conservative 16 (matches pre-PR behaviour, no regression).
+    //
+    // Worst-case scratch sizing: 64 (the largest block_size we'd pick).
+    // `Qwen3MoeScratch.route_sorted_tokens_dev` capacity is allocated
+    // assuming this upper bound.
+    let max_block_size: usize = 64;
+    let moe_block_size: usize = pick_moe_block_size(plan, num_experts, use_device_route);
+    debug_assert!(
+        moe_block_size <= max_block_size,
+        "moe_block_size {moe_block_size} exceeds scratch worst-case {max_block_size}"
+    );
     // sorted_max bound — must match Qwen3MoeScratch.route_sorted_tokens_dev
-    // capacity (t * top_k + num_experts * VLLM_MOE_BLOCK_SIZE).
-    let sorted_max_size = batch * top_k + num_experts * VLLM_MOE_BLOCK_SIZE;
+    // capacity (allocated for the worst-case max_block_size).
+    let sorted_max_size = batch * top_k + num_experts * max_block_size;
     let vllm_routing_owned: Option<ferrum_kernels::backend::MoeRouting<B>> =
         if use_vllm_moe && !use_device_route {
             let plan = plan.expect("plan is Some when host vllm builder runs");
@@ -1516,12 +1601,12 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             for e in 0..num_experts {
                 padded_offsets.push(acc);
                 let m_e = plan.expert_offsets[e + 1] - plan.expert_offsets[e];
-                let pe = m_e.div_ceil(VLLM_MOE_BLOCK_SIZE) * VLLM_MOE_BLOCK_SIZE;
+                let pe = m_e.div_ceil(moe_block_size) * moe_block_size;
                 acc += pe;
             }
             padded_offsets.push(acc);
             let total_padded = acc;
-            let total_blocks = total_padded / VLLM_MOE_BLOCK_SIZE;
+            let total_blocks = total_padded / moe_block_size;
             let sentinel = total_pairs_active as i32;
 
             let mut sorted_token_ids = vec![sentinel; total_padded];
@@ -1536,8 +1621,8 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
                 for i in 0..m_e {
                     sorted_token_ids[p_off + i] = (real_off + i) as i32;
                 }
-                let blocks_for_e = (padded_offsets[e + 1] - p_off) / VLLM_MOE_BLOCK_SIZE;
-                let block_start = p_off / VLLM_MOE_BLOCK_SIZE;
+                let blocks_for_e = (padded_offsets[e + 1] - p_off) / moe_block_size;
+                let block_start = p_off / moe_block_size;
                 for b in 0..blocks_for_e {
                     expert_ids[block_start + b] = e as i32;
                 }
@@ -1568,7 +1653,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             dr.total_post_pad,
             batch * top_k,
             num_experts,
-            VLLM_MOE_BLOCK_SIZE,
+            moe_block_size,
             sorted_max_size,
         )?;
     }
@@ -1626,7 +1711,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             total_post_pad,
             gate_up_packed,
             total_pairs_active,
-            VLLM_MOE_BLOCK_SIZE,
+            moe_block_size,
             1, // top_k=1: pre-gathered rows already index packed input directly
         )?;
     } else {
@@ -1704,7 +1789,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             total_post_pad,
             down_packed,
             total_pairs_active,
-            VLLM_MOE_BLOCK_SIZE,
+            moe_block_size,
             1,
         )?;
     } else {
