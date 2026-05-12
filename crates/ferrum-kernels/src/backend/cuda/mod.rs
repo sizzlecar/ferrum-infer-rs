@@ -379,7 +379,7 @@ impl CudaState {
         m
     }
 
-    fn func(
+    pub(crate) fn func(
         &mut self,
         module_key: &'static str,
         ptx_src: &str,
