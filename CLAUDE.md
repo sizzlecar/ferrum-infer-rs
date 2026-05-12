@@ -6,16 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Ferrum Infer is a Rust-native LLM inference engine. Single binary, no Python — supports Metal (macOS), CUDA (NVIDIA), and CPU backends. Targets vLLM-level performance with PagedAttention, continuous batching, and custom CUDA kernels.
 
-**Current baseline (Qwen3-30B-A3B-GPTQ-Int4, RTX 4090, `ferrum bench-serve`, post Backend-trait refactor #163-#173):**
+**Current baseline (Qwen3-30B-A3B-GPTQ-Int4, RTX 4090, `ferrum bench-serve`, post Audit #8/#9/#5 reorg + Phase 3 MoE fixes @ commit `0022412`):**
 
 | c | tok/s | TPOT | ratio vs vLLM 0.20.1 |
 |---|------:|-----:|---------------------:|
-| 1  | 127.2 | 7.54ms  | ~80% |
-| 8  | 432.8 | 16.63ms | ~92% |
-| 16 | 582.1 | 24.42ms | ~93% |
-| 32 | **717.5** | **39.11ms** | **~38%** |
+| 1  | 146.6 | 6.52ms  | ~91% |
+| 8  | 541.3 | 13.10ms | ~115% |
+| 16 | 725.1 | 19.28ms | ~115% |
+| 32 | **811.8** | **34.46ms** | **~43%** |
 
-`bash bench/v0.2-cuda/m3_bench_serve.sh` for repro (release build needs `--features cuda,vllm-moe-marlin`). Phase B-2 / C / D Backend refactor as side-effect 2.4×'d c=32 throughput (was 318.4 / TPOT 95ms). The c=32 cliff vs vLLM (vLLM ~1870 tok/s) is still the active perf target.
+`bash bench/v0.2-cuda/m3_bench_serve.sh` for repro (release build needs `--features cuda,vllm-moe-marlin`). Phase B-2 / C / D Backend refactor 2.4×'d c=32 throughput (was 318.4 / TPOT 95ms); Phase 3 MoE fix commits (`db7e529` / `76bf72f` / `e423636`) + Audit #8/#9/#5 reorg pushed it further to 811.8. The c=32 cliff vs vLLM (vLLM ~1870 tok/s) is still the active perf target.
 
 - INT4 quantization: GPTQ format auto-detected, Marlin fused kernel on Blackwell
 - Paged KV attention with block reclamation
