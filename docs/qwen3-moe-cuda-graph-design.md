@@ -61,7 +61,24 @@ The refactor: replace step 1 with `B::route_topk_softmax` (no D2H), replace step
 
 Scope estimate: ~300-500 lines in `moe/dispatch.rs`, plus possibly a new helper for the `padded_offsets` math that's currently host-side. The bucketed `phase1_dispatches` host-list is no longer needed under VLLM_MOE (the fused kernel routes internally) — so the rewrite can simplify the post-VLLM_MOE branch significantly.
 
-Once done, the Phase 1 graph scaffold (`refactor/qwen3-moe-cuda-graph-phase1` branch, since closed) reactivates with maybe one tweak.
+### Additional blocker: moe_combine takes host slices
+
+Investigation continued: `B::moe_combine` signature is `(ctx, packed_down, pairs_by_token: &[i32], pair_weights: &[f32], out, ...)` — both routing slices are host inputs. The CUDA impl `clone_htod`s them inside the function. Inside a graph capture, the H2D copy would record stale host pointers (host data is rebuilt each layer) → wrong results on replay.
+
+Two ways to resolve:
+1. Add device buffers `pairs_by_token_dev` / `pair_weights_dev` on the route scratch (built once per `decode_batch` from `route_topk_softmax` output via a new on-device kernel) and pass them through to `moe_combine`.
+2. Replace `moe_combine` with a fused write inside the down-proj kernel (vLLM's `mul_topk_weights=true` path on `marlin_gemm_moe_vllm` does this — multiplies output by topk weights as part of the GEMM).
+
+Option 2 is cleaner but requires the down-proj to know the routing → only works with the VLLM_MOE fused path (which already takes `topk_weights` and `mul_topk_weights` flags). Quick scan: `crates/ferrum-kernels/src/backend/cuda/quant.rs` `moe_gemm_phase_vllm_impl` currently passes `None` for `topk_weights` and `false` for `mul_topk_weights`. Flipping those on, with the device-side weights buffer, drops the entire moe_combine step.
+
+### Revised scope
+
+The full refactor to enable MoE CUDA Graph capture:
+1. Device-side routing path in `moe_forward_bucketed` (skip `try_gpu_route_topk_into_host`, use `route_topk_softmax` + `moe_align_block_size`).
+2. Device-side `pair_weights` buffer feeding `moe_gemm_phase_vllm`'s `topk_weights` arg, with `mul_topk_weights=true` — removes `moe_combine` from the layer.
+3. Then re-enable the Phase 1 graph scaffold.
+
+Total: probably 800-1200 lines, **multi-day focused**. Worth doing because it unlocks the path to vLLM-parity perf on MoE — but not autonomous-tick scope. Defer until user prioritises perf over other roadmap items.
 
 ### Blocker 2: Pre-grow scratch before begin_capture
 LlamaFamilyModel uses `B::pregrow_marlin_gather_scratch(m_total * intermediate_size)` to eagerly grow the marlin scratch slot. Same pattern needed for MoE:
