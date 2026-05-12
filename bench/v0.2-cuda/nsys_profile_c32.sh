@@ -4,7 +4,7 @@
 # Strategy: launch ferrum under nsys profile with --delay/--duration to
 # capture a steady-state window (~20s of bench after warmup). The
 # resulting .nsys-rep can be opened in nsight-systems GUI, or summarised
-# via `nsys stats --report cuda_kernel_sum ferrum_c32.nsys-rep`.
+# via `"$NSYS" stats --report cuda_kernel_sum ferrum_c32.nsys-rep`.
 #
 # Use the data to answer:
 #   - Of attn_peritem=5 ms: how split between split_qkv_norm_rope and
@@ -23,10 +23,24 @@ export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
 export CUDA_HOME=/usr/local/cuda
 cd /workspace/ferrum-infer-rs
 
-if ! command -v nsys >/dev/null 2>&1; then
-  echo "nsys not found. Install CUDA toolkit's Nsight Systems CLI." >&2
+NSYS=""
+if command -v nsys >/dev/null 2>&1; then
+  NSYS=nsys
+else
+  # Fall back to the nsys bundled inside Nsight Compute (Vast cuda-devel
+  # ships nsight-compute but not standalone nsight-systems).
+  for candidate in /opt/nvidia/nsight-compute/*/host/target-linux-x64/nsys; do
+    if [ -x "$candidate" ]; then
+      NSYS="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$NSYS" ]; then
+  echo "nsys not found. Install Nsight Systems CLI." >&2
   exit 1
 fi
+echo "[nsys] using: $NSYS"
 
 OUT_DIR=/workspace/ferrum-infer-rs/bench/v0.2-cuda/results_nsys_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUT_DIR"
@@ -51,7 +65,7 @@ FERRUM_MOE_BUCKETED=1 \
 FERRUM_MARLIN_SKIP_WS_ZERO=1 \
 FERRUM_MOE_STREAMS=4 \
 FERRUM_MOE_BATCH_THRESHOLD=4 \
-  nsys profile \
+  "$NSYS" profile \
     --trace=cuda,nvtx,cudnn,osrt \
     --delay=30 --duration=20 \
     --force-overwrite=true \
@@ -97,12 +111,12 @@ echo "=== nsys file: $NSYS_FILE ==="
 ls -la "$NSYS_FILE"
 echo
 echo "=== top 20 kernels by total time ==="
-nsys stats --report cuda_kernel_sum --format csv "$NSYS_FILE" 2>/dev/null \
+"$NSYS" stats --report cuda_kernel_sum --format csv "$NSYS_FILE" 2>/dev/null \
   | head -22
 
 echo
 echo "=== top 10 cuda API calls ==="
-nsys stats --report cuda_api_sum --format csv "$NSYS_FILE" 2>/dev/null \
+"$NSYS" stats --report cuda_api_sum --format csv "$NSYS_FILE" 2>/dev/null \
   | head -12
 
 echo
