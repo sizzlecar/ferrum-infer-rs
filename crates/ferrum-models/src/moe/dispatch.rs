@@ -1574,7 +1574,15 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     }
 
     // ── Combine: out[b, h] = Σ_k weights[b,k] * down_packed[pairs_by_token[b,k], h]
+    //
+    // Phase D follow-up: moe_combine now takes device buffers. For now
+    // we upload the host plan via from_slice_typed each layer (still
+    // captures stale host pointers, but the API is graph-friendly).
+    // Next step replaces this with on-device construction via
+    // B::moe_build_pairs_by_token + route_topk_softmax output.
     let total_pairs = batch * top_k;
+    let pairs_dev = B::from_slice_typed::<i32>(&plan.pairs_by_token);
+    let weights_dev = B::from_slice_typed::<f32>(&plan.pair_weights);
     let t_comb = if prof {
         Some(std::time::Instant::now())
     } else {
@@ -1583,8 +1591,8 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     B::moe_combine(
         ctx,
         down_packed,
-        &plan.pairs_by_token,
-        &plan.pair_weights,
+        &pairs_dev,
+        &weights_dev,
         out,
         batch,
         hidden_size,

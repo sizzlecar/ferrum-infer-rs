@@ -204,6 +204,25 @@ pub struct Qwen3MoeScratch<B: QuantLlmBackend + BackendMoeFused> {
     /// natural `[batch, top_k]` layout for `weighted_sum_batched`.
     pub weights_2d: B::Buffer,
 
+    // ── Device-side routing scratch for graph-capturable MoE path ────
+    //
+    // Output of `B::moe_build_pairs_by_token` invoked on device-side
+    // `selected_ids_buf` (which `B::route_topk_softmax` fills). When
+    // these are populated, the bucketed-MoE forward can run without
+    // any host round-trip — the prerequisite for CUDA Graph capture.
+    /// `[max_tokens * top_k]` i32 — sorted-by-expert position of each
+    /// (b, k) pair (row index into `down_packed` that `moe_combine`
+    /// reads).
+    pub route_pairs_dev: B::Buffer,
+    /// `[max_tokens * top_k]` i32 — inverse of `route_pairs_dev`: for
+    /// each packed row, the original token b. Used by gather
+    /// (`embedding_lookup` x → x_packed before phase 1).
+    pub route_packed_idx_dev: B::Buffer,
+    /// `[num_experts + 1]` i32 — exclusive prefix sum of tokens-per-
+    /// expert. Phase 1/3 dispatcher consults to compute each expert's
+    /// row slice in the packed buffers.
+    pub route_expert_offsets_dev: B::Buffer,
+
     // ── Final-token / lm_head outputs ────────────────────────────────
     pub last_hidden: B::Buffer,
     pub last_normed: B::Buffer,
@@ -310,6 +329,12 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
             ids_2d: B::from_slice_typed::<i32>(&vec![0i32; n_exp * t * cfg.num_experts_per_tok]),
             tpe_buf: B::from_slice_typed::<i32>(&vec![0i32; n_exp]),
             weights_2d: B::from_slice(&vec![0.0f32; t * cfg.num_experts_per_tok]),
+            // Device-side routing scratch (graph-capturable MoE path).
+            route_pairs_dev: B::from_slice_typed::<i32>(&vec![0i32; t * cfg.num_experts_per_tok]),
+            route_packed_idx_dev: B::from_slice_typed::<i32>(
+                &vec![0i32; t * cfg.num_experts_per_tok],
+            ),
+            route_expert_offsets_dev: B::from_slice_typed::<i32>(&vec![0i32; n_exp + 1]),
             last_hidden: B::alloc(h),
             last_normed: B::alloc(h),
             logits: B::alloc(vocab),

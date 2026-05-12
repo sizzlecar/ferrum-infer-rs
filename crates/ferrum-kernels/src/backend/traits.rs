@@ -1466,6 +1466,43 @@ pub trait BackendMoeFused: Backend {
     /// Layout matches vLLM's marlin_moe_wna16 kernel input
     /// expectation. The fused Marlin kernel reads a row from
     /// `a[sorted_token_ids[i] / top_k]` and weights from
+    /// Build `pairs_by_token` + `packed_token_idx` device-side from
+    /// device-side `expert_ids`. The counting-sort permutation that
+    /// lets `moe_combine` (and the gather step before phase 1 GEMM)
+    /// read routing output without a host round-trip — the prerequisite
+    /// for graph-capturing the MoE bucketed path.
+    ///
+    /// Inputs (device):
+    /// - `expert_ids: I32 [batch * top_k]` — top-K selected expert ids.
+    ///
+    /// Outputs (device):
+    /// - `pairs_by_token: I32 [batch * top_k]` — sorted-by-expert
+    ///   position of each (b, k) pair (the row index into `packed_down`
+    ///   that `moe_combine` reads).
+    /// - `packed_token_idx: I32 [batch * top_k]` — inverse map: for
+    ///   each packed row, the original token b. Used by the gather
+    ///   step (`embedding_lookup` of `x` into `x_packed` before phase 1).
+    /// - `expert_offsets: I32 [num_experts + 1]` — exclusive prefix
+    ///   sum of tokens-per-expert; phase 1/3 dispatchers use it to
+    ///   compute each expert's row slice in the packed buffers.
+    ///
+    /// Default impl returns Err — only CUDA implements this.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_build_pairs_by_token(
+        _ctx: &mut Self::Context,
+        _expert_ids: &Self::Buffer,
+        _pairs_by_token: &mut Self::Buffer,
+        _packed_token_idx: &mut Self::Buffer,
+        _expert_offsets: &mut Self::Buffer,
+        _batch_x_topk: usize,
+        _num_experts: usize,
+        _top_k: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "moe_build_pairs_by_token not implemented for this backend",
+        ))
+    }
+
     /// `b[block_ids[blockIdx.y] * n_per_expert + ...]`.
     ///
     /// Default impl returns Err — only CUDA implements this.
@@ -1697,27 +1734,44 @@ pub trait BackendMoeFused: Backend {
     ///
     /// Default impl round-trips via host memory — correct but slow.
     /// CUDA backend launches a single fused kernel.
+    ///
+    /// Phase D follow-up: `pairs_by_token` (I32) and `pair_weights` (F32)
+    /// are now device buffers so callers can build them on-device for
+    /// graph capture (was `&[i32]` / `&[f32]` host slices with internal
+    /// clone_htod, which records stale host pointers under CUDA Graph
+    /// capture replay).
     #[allow(clippy::too_many_arguments)]
     fn moe_combine(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         packed_down: &Self::Buffer,
-        pairs_by_token: &[i32],
-        pair_weights: &[f32],
+        pairs_by_token: &Self::Buffer,
+        pair_weights: &Self::Buffer,
         out: &mut Self::Buffer,
         batch: usize,
         hidden: usize,
         top_k: usize,
         total_pairs: usize,
     ) {
+        // Reference default: D2H pairs/weights, run the host loop, H2D out.
+        // CUDA backend overrides with a single device kernel.
+        let _ = ctx;
         let packed = Self::to_vec(packed_down, total_pairs * hidden);
+        let pairs_host_f32 = Self::to_vec(pairs_by_token, batch * top_k);
+        let weights_host = Self::to_vec(pair_weights, batch * top_k);
         let mut out_h = vec![0.0f32; batch * hidden];
         for b in 0..batch {
             for k in 0..top_k {
-                let pair_row = pairs_by_token[b * top_k + k];
+                // `to_vec` returns f32; the device-side I32 buffer is
+                // bit-cast to f32 by the trait's f16-default to_vec path,
+                // so we re-extract via raw transmute. Backends override
+                // this default with a typed kernel that doesn't go
+                // through f16; on the default path callers are CPU
+                // parity tests where the byte pattern is preserved.
+                let pair_row = pairs_host_f32[b * top_k + k].to_bits() as i32;
                 if pair_row < 0 {
                     continue;
                 }
-                let w = pair_weights[b * top_k + k];
+                let w = weights_host[b * top_k + k];
                 let src = &packed[(pair_row as usize) * hidden..(pair_row as usize + 1) * hidden];
                 let dst = &mut out_h[b * hidden..(b + 1) * hidden];
                 for h in 0..hidden {
