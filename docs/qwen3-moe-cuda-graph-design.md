@@ -43,12 +43,25 @@ Even with `FERRUM_VLLM_MOE=1`, `moe_forward_bucketed` calls `B::try_gpu_route_to
 
 **This is the actual blocker, not the per-expert variation.** Even if we resolve the dispatch-count variation via FUSED/VLLM_MOE, the per-layer host→device round-trip kills capture.
 
-### Prerequisite: device-side routing
-Before any graph capture can work for MoE decode, the routing must move fully on-device:
-- `route_topk_softmax` already writes ids/weights to device (used by GPU-only path under `FERRUM_MOE_HOST_TOPK=0` for the non-bucketed `moe_forward_stacked`).
-- Need: device-side build of `sorted_token_ids` / `expert_ids` / `num_tokens_past_padded` (the inputs to `moe_align_block_size` + `marlin_moe_wna16`). vLLM does this with their `moe_align_block_size` kernel — we already have `B::moe_align_block_size` on the trait but it's only used for the post-route bucket assignment, not for actual routing.
+### Prerequisite: device-side routing — kernels already exist, just needs plumbing
+Investigation 2026-05-12 (post-Phase-1 attempt) — the rewrite is more tractable than feared:
 
-The path forward is: have `moe_forward_bucketed` call a NEW pure-device routing helper (`B::route_into_bucket_plan`?) that produces the routing buffers without ever touching host.
+| Need | Have today |
+|------|-----------|
+| Top-K softmax on device | ✅ `B::route_topk_softmax` — used by `moe_forward_stacked` non-bucketed path. Writes ids[i32] / weights[f32] device buffers. |
+| sorted_token_ids / expert_ids / num_tokens_past_padded device-side | ✅ `B::moe_align_block_size` — converts `expert_ids_per_pair` to sorted/block layout entirely on device (CUDA impl at `cuda/moe.rs:190-237`). |
+| Per-block expert routing inside kernel | ✅ `marlin_gemm_moe_vllm` (vendored vLLM `marlin_moe_wna16` under `vllm-moe-marlin` feature). |
+
+The blocker is in `moe_forward_bucketed` (`moe/dispatch.rs:1249+`):
+1. It calls `B::try_gpu_route_topk_into_host` which does the `route_topk_softmax` kernel BUT ALSO `memcpy_dtoh` + `synchronize` to read results host-side.
+2. Bucket plan + sorted_token_ids construction happens host-side (`route_scratch.plan.rebuild_into`, `vllm_routing` builder block around line 1392-1431).
+3. Then `B::upload_moe_routing` ships the host-built buffers back to device.
+
+The refactor: replace step 1 with `B::route_topk_softmax` (no D2H), replace steps 2-3 with `B::moe_align_block_size` on the device-side ids. Then the entire MoE phase runs on-device without host round-trips, and the layer loop is capturable.
+
+Scope estimate: ~300-500 lines in `moe/dispatch.rs`, plus possibly a new helper for the `padded_offsets` math that's currently host-side. The bucketed `phase1_dispatches` host-list is no longer needed under VLLM_MOE (the fused kernel routes internally) — so the rewrite can simplify the post-VLLM_MOE branch significantly.
+
+Once done, the Phase 1 graph scaffold (`refactor/qwen3-moe-cuda-graph-phase1` branch, since closed) reactivates with maybe one tweak.
 
 ### Blocker 2: Pre-grow scratch before begin_capture
 LlamaFamilyModel uses `B::pregrow_marlin_gather_scratch(m_total * intermediate_size)` to eagerly grow the marlin scratch slot. Same pattern needed for MoE:
