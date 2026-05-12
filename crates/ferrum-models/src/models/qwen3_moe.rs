@@ -2119,6 +2119,17 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             }
         }
 
+        // Inner profile: layer loop / final norm / lm_head Rust-side wall.
+        // FERRUM_RBD_PROF=1 (set the same time as the engine's per-stage
+        // timer) — splits the 17 ms / iter "decode wall" at c=32 to find
+        // whether per-layer Rust dispatch (48 × ?us) or final norm/lm_head
+        // dominates. Zero overhead when env unset.
+        let inner_prof = std::env::var("FERRUM_RBD_PROF").is_ok();
+        let t_loop = if inner_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         if !did_pure_replay {
             // 1..num_layers: batched forward for each layer.
             // Records into graph if capture is active above.
@@ -2146,6 +2157,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 m,
             );
         }
+        let loop_us = t_loop.map(|t| t.elapsed().as_micros() as u64);
 
         if should_capture && !self.batched_graph_failed {
             if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
@@ -2163,7 +2175,13 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             }
         }
 
+        let t_sync = if inner_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         B::sync(&mut ctx);
+        let sync_us = t_sync.map(|t| t.elapsed().as_micros() as u64);
         self.scratch.residual = Some(residual);
 
         // Greedy fast path: when `FERRUM_GREEDY_ARGMAX=1` is set, do the
@@ -2191,6 +2209,11 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 );
             }
         }
+        let t_argmax = if inner_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let all = if greedy {
             // No logits download — argmax kernel returns m tokens.
             // Callers expect Vec<f32> per item, so encode tokens as floats.
@@ -2202,6 +2225,22 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         } else {
             B::to_vec(&self.scratch.batch_logits, m * vocab)
         };
+        let argmax_us = t_argmax.map(|t| t.elapsed().as_micros() as u64);
+        if inner_prof {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(32) {
+                eprintln!(
+                    "[moe-inner-prof] iter#{} m={} loop={}us sync={}us argmax={}us",
+                    n,
+                    m,
+                    loop_us.unwrap_or(0),
+                    sync_us.unwrap_or(0),
+                    argmax_us.unwrap_or(0),
+                );
+            }
+        }
 
         // Profile dump (one decode_batch_internal call = one decode step
         // covering all m tokens).
