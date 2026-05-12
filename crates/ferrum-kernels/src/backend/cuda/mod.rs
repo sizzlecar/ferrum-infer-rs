@@ -652,6 +652,44 @@ impl Backend for CudaBackend {
         })
     }
 
+    fn argmax_rows_f16(
+        ctx: &mut Self::Context,
+        logits: &Self::Buffer,
+        m: usize,
+        n: usize,
+    ) -> Result<Vec<u32>> {
+        // Greedy fast path: one kernel + tiny D2H replaces the
+        // m × n × 2 bytes logit download + host-side argmax scan.
+        // At c=32, vocab=152064: 19.5 MB + 4.8 ms CPU → 128 B + ~0.3 ms GPU.
+        let func = ctx.func("argmax_rows", ptx::ARGMAX_ROWS, "argmax_rows_f16");
+        let stream = ctx.stream.clone();
+        // Output: device-allocated i32 buffer, m elements.
+        let mut out_dev: CudaSlice<i32> = stream
+            .alloc_zeros(m)
+            .map_err(|e| FerrumError::internal(format!("argmax_rows alloc: {e}")))?;
+        let n_i32 = n as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(logits);
+        b.arg(&n_i32);
+        b.arg(&mut out_dev);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (m as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::internal(format!("argmax_rows launch: {e}")))?;
+        let mut host = vec![0i32; m];
+        stream
+            .memcpy_dtoh(&out_dev, &mut host)
+            .map_err(|e| FerrumError::internal(format!("argmax_rows dtoh: {e}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| FerrumError::internal(format!("argmax_rows sync: {e}")))?;
+        Ok(host.into_iter().map(|x| x as u32).collect())
+    }
+
     // ── Norms ────────────────────────────────────────────────────────────
 
     fn rms_norm(

@@ -57,6 +57,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/moe_align_block_size.cu");
     println!("cargo:rerun-if-changed=kernels/moe_build_pairs.cu");
     println!("cargo:rerun-if-changed=kernels/int8_paged_decode_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/argmax_rows.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -98,6 +99,7 @@ fn main() {
             "kernels/moe_align_block_size.cu",
             "kernels/moe_build_pairs.cu",
             "kernels/int8_paged_decode_attention.cu",
+            "kernels/argmax_rows.cu",
         ])
         .out_dir(out_dir)
         .arg("-Ikernels") // for common.cuh

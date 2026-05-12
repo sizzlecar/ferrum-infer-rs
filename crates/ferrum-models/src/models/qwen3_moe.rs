@@ -2166,7 +2166,28 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         B::sync(&mut ctx);
         self.scratch.residual = Some(residual);
 
-        let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+        // Greedy fast path: when `FERRUM_GREEDY_ARGMAX=1` is set, do the
+        // argmax on-device and return one f32 per row carrying the
+        // token id (cast). Replaces the m × vocab × 2 B logit download +
+        // host argmax with one kernel + tiny D2H. At c=32, vocab=152064:
+        // 19.5 MB + ~5 ms CPU → 128 B + ~0.3 ms GPU.
+        // The engine has a complementary fast path that interprets a
+        // size-1 Vec<f32> as `TokenId::new(logits[0] as u32)`, skipping
+        // sample_with_processors entirely.
+        let greedy = std::env::var("FERRUM_GREEDY_ARGMAX")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let all = if greedy {
+            // No logits download — argmax kernel returns m tokens.
+            // Callers expect Vec<f32> per item, so encode tokens as floats.
+            // Note: rows of the returned `all` are size 1 (not vocab),
+            // and the splitter below reads only 1 element per row.
+            let tokens = B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, m, vocab)
+                .expect("argmax_rows_f16");
+            tokens.into_iter().map(|t| t as f32).collect::<Vec<f32>>()
+        } else {
+            B::to_vec(&self.scratch.batch_logits, m * vocab)
+        };
 
         // Profile dump (one decode_batch_internal call = one decode step
         // covering all m tokens).
@@ -2236,9 +2257,17 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             }
         }
 
-        (0..m)
-            .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
-            .collect()
+        if greedy {
+            // `all` has shape [m] in this branch — each entry is a token
+            // id encoded as f32. Wrap each in a 1-elem Vec so the
+            // engine's greedy fast path can detect (len==1) and pick
+            // `logits[0] as u32` without going through sample_with_processors.
+            all.into_iter().map(|t| vec![t]).collect()
+        } else {
+            (0..m)
+                .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
+                .collect()
+        }
     }
 
     /// Pre-populate per-decode-step paged-batch scratch (block_tables /
