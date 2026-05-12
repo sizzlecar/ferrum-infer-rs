@@ -797,7 +797,16 @@ impl EngineInner {
                 let seq = sequences
                     .get_mut(rid)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                let token = seq.sample_with_processors(&mut logits)?;
+                // Greedy fast path: the model did GPU argmax and emitted
+                // one f32 carrying the token id (under `FERRUM_GREEDY_ARGMAX=1`).
+                // Skip sample_with_processors entirely — at vocab=152064
+                // (Qwen3), the host argmax scan is ~150 µs per item and
+                // dominates the engine's per-iter overhead at c=32.
+                let token = if logits.len() == 1 {
+                    TokenId::new(logits[0] as u32)
+                } else {
+                    seq.sample_with_processors(&mut logits)?
+                };
                 seq.generated_tokens.push(token);
                 seq.tokens_this_iteration += 1;
                 // The model has appended this iter's token to its internal

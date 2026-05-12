@@ -836,6 +836,38 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
     fn from_slice(data: &[f32]) -> Self::Buffer;
 
+    /// Greedy-decode fast path: GPU argmax over each row of a
+    /// `[m, n]` FP16 logits buffer, returning the m token indices on the
+    /// host. Saves `m × n × 2` bytes of D2H per call (e.g. 19.5 MB at
+    /// c=32, vocab=152064) and the host-side argmax scan (~150 µs × m).
+    ///
+    /// Default impl falls back to the slow path: full `to_vec` + host
+    /// argmax. CUDA overrides with a native kernel + tiny D2H (m × 4 B).
+    /// Backends that don't override pay the same cost as
+    /// `to_vec` + host argmax, so callers can call this unconditionally.
+    fn argmax_rows_f16(
+        _ctx: &mut Self::Context,
+        logits: &Self::Buffer,
+        m: usize,
+        n: usize,
+    ) -> Result<Vec<u32>> {
+        let host = Self::to_vec(logits, m * n);
+        let mut out = Vec::with_capacity(m);
+        for row in 0..m {
+            let slice = &host[row * n..(row + 1) * n];
+            let mut max_idx = 0usize;
+            let mut max_val = f32::NEG_INFINITY;
+            for (i, &v) in slice.iter().enumerate() {
+                if v > max_val {
+                    max_val = v;
+                    max_idx = i;
+                }
+            }
+            out.push(max_idx as u32);
+        }
+        Ok(out)
+    }
+
     /// Load a weight tensor straight from its on-disk byte representation,
     /// letting the backend pick its preferred storage dtype.
     ///
