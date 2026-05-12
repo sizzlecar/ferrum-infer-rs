@@ -331,9 +331,10 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
             weights_2d: B::from_slice(&vec![0.0f32; t * cfg.num_experts_per_tok]),
             // Device-side routing scratch (graph-capturable MoE path).
             route_pairs_dev: B::from_slice_typed::<i32>(&vec![0i32; t * cfg.num_experts_per_tok]),
-            route_packed_idx_dev: B::from_slice_typed::<i32>(
-                &vec![0i32; t * cfg.num_experts_per_tok],
-            ),
+            route_packed_idx_dev: B::from_slice_typed::<i32>(&vec![
+                0i32;
+                t * cfg.num_experts_per_tok
+            ]),
             route_expert_offsets_dev: B::from_slice_typed::<i32>(&vec![0i32; n_exp + 1]),
             last_hidden: B::alloc(h),
             last_normed: B::alloc(h),
@@ -376,14 +377,26 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
         let q_dim = cfg.base.num_heads * cfg.base.head_dim;
         self.paged_batch_q = Some(B::alloc(max_seqs * q_dim));
         self.paged_batch_o = Some(B::alloc(max_seqs * q_dim));
-        self.paged_batch_block_tables = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs * max_blocks_per_seq));
-        self.paged_batch_context_lens = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs));
-        self.paged_batch_pos_offsets = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs));
+        self.paged_batch_block_tables = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs * max_blocks_per_seq,
+        ));
+        self.paged_batch_context_lens = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs,
+        ));
+        self.paged_batch_pos_offsets = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs,
+        ));
         // cu_seqlens_q is constant [0, 1, 2, ..., max_seqs] for batched
         // decode (q_len=1 per seq) — pre-fill once via a "context" we can
         // borrow temporarily; if the writer needs ctx, we lazy-init at
         // first call instead.
-        self.paged_batch_cu_seqlens_q = Some(B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_seqs + 1));
+        self.paged_batch_cu_seqlens_q = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs + 1,
+        ));
         self.paged_max_blocks_per_seq = max_blocks_per_seq;
     }
 
@@ -846,9 +859,11 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                         // Paged mode: cache holds metadata only. K/V are
                         // 1-element placeholders. Real data lives in
                         // `self.paged_pools[li].{k,v}`.
-                        let mut block_table = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
+                        let mut block_table =
+                            B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
                         let _ = &mut block_table; // suppress unused-mut on backends that no-op write_u32
-                        let mut context_lens = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, 1);
+                        let mut context_lens =
+                            B::alloc_typed(ferrum_kernels::backend::Dtype::U32, 1);
                         let mut bt_ctx = B::new_context();
                         B::write_typed::<u32>(&mut bt_ctx, &mut context_lens, &[0u32]);
                         B::sync(&mut bt_ctx);
@@ -1381,6 +1396,13 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 &mut self.scratch.silu_stacked,
                 &mut self.scratch.down_out_stacked,
                 &mut self.scratch.moe_route_scratch,
+                Some(crate::moe::dispatch::DeviceRouteScratch {
+                    selected_ids: &mut self.scratch.selected_ids_buf,
+                    pair_weights: &mut self.scratch.weights_2d,
+                    pairs_by_token: &mut self.scratch.route_pairs_dev,
+                    packed_token_idx: &mut self.scratch.route_packed_idx_dev,
+                    expert_offsets: &mut self.scratch.route_expert_offsets_dev,
+                }),
             )?;
         } else if stacked_path_available {
             if tokens > 1 {
@@ -2853,6 +2875,13 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 &mut self.scratch.silu_stacked,
                 &mut self.scratch.down_out_stacked,
                 &mut self.scratch.moe_route_scratch,
+                Some(crate::moe::dispatch::DeviceRouteScratch {
+                    selected_ids: &mut self.scratch.selected_ids_buf,
+                    pair_weights: &mut self.scratch.weights_2d,
+                    pairs_by_token: &mut self.scratch.route_pairs_dev,
+                    packed_token_idx: &mut self.scratch.route_packed_idx_dev,
+                    expert_offsets: &mut self.scratch.route_expert_offsets_dev,
+                }),
             )?;
         } else {
             // Backend without stacked variants — fall back to the legacy

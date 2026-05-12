@@ -110,10 +110,8 @@ pub struct ExpertStack<B: QuantLlmBackend + BackendMoeFused> {
     /// Phase C step 3: replaces `Option<Arc<B::GptqStore>>` with a
     /// `Box<dyn MarlinExpertStack<B>>` trait object — kills the
     /// `type GptqStore` leak through the model layer.
-    pub gate_up_marlin_stack:
-        Option<std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>>,
-    pub down_marlin_stack:
-        Option<std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>>,
+    pub gate_up_marlin_stack: Option<std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>>,
+    pub down_marlin_stack: Option<std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>>,
 }
 
 impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
@@ -1229,6 +1227,22 @@ impl Default for MoeRouteScratch {
     }
 }
 
+/// Bundle of pre-allocated device buffers for the graph-capturable
+/// device-routing path in [`moe_forward_bucketed`]. Pass `Some` to
+/// take the device path (under `FERRUM_MOE_DEVICE_ROUTE=1`); pass
+/// `None` for the legacy host-mediated path (used by tests + the
+/// non-vLLM CUDA bucketed path).
+///
+/// Pre-allocated on Qwen3MoeScratch (`route_pairs_dev` etc.) so the
+/// per-layer call doesn't alloc inside a captured stream.
+pub struct DeviceRouteScratch<'a, B: crate::moe::dispatch::Backend> {
+    pub selected_ids: &'a mut B::Buffer,
+    pub pair_weights: &'a mut B::Buffer,
+    pub pairs_by_token: &'a mut B::Buffer,
+    pub packed_token_idx: &'a mut B::Buffer,
+    pub expert_offsets: &'a mut B::Buffer,
+}
+
 /// Bucketed MoE forward: gather → per-expert m=N Marlin GEMM → silu_mul →
 /// per-expert m=N Marlin GEMM → moe_combine.
 ///
@@ -1263,6 +1277,11 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     silu_packed: &mut B::Buffer,
     down_packed: &mut B::Buffer,
     route_scratch: &mut MoeRouteScratch,
+    // Optional device routing scratch — when Some AND
+    // FERRUM_MOE_DEVICE_ROUTE=1 AND FERRUM_VLLM_MOE=1, runs the
+    // graph-capturable device-routing branch. None / unset = legacy
+    // host-mediated path (used by tests + non-vLLM path).
+    device_route: Option<DeviceRouteScratch<'_, B>>,
 ) -> Result<()> {
     if experts.num_experts() != num_experts {
         return Err(FerrumError::model(format!(
@@ -1277,6 +1296,61 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     if prof {
         MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
+
+    // ── Device-route fast path (opt-in via FERRUM_MOE_DEVICE_ROUTE=1
+    //     + FERRUM_VLLM_MOE=1 + device_route Some) ────────────────────
+    //
+    // Skips ALL host round-trips in the routing + bucket-plan stages:
+    //   1. B::route_topk_softmax → device expert_ids + weights
+    //   2. B::moe_build_pairs_by_token → device pairs / packed_idx /
+    //      expert_offsets
+    //   3. Gather via B::embedding_lookup_dev (device packed_idx)
+    //   4. (rest of function reuses these device buffers; the vLLM
+    //      MoE GEMM consumes them directly)
+    //
+    // This is the prerequisite for CUDA Graph capture over the MoE
+    // layer loop in Qwen3MoeModel::decode_batch_internal.
+    let use_device_route = device_route.is_some()
+        && std::env::var("FERRUM_MOE_DEVICE_ROUTE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+    // Run device-side routing kernels EARLY so `dr.packed_token_idx`
+    // is available for the device-buffer gather (embedding_lookup_dev)
+    // and `dr.pairs_by_token` / `dr.pair_weights` for moe_combine.
+    // Kept alive in `dr_kept` until end of function.
+    //
+    // Phase 1 (this PR): still redundant with the host `try_gpu_route_…`
+    // path below — the host path stays so `route_scratch.output` /
+    // `plan` / `vllm_routing` builder keep working. Phase 2 will skip
+    // those under use_device_route once the bucket plan is fully on
+    // device (`B::moe_align_block_size`).
+    let dr_kept: Option<DeviceRouteScratch<'_, B>> = if use_device_route {
+        let dr = device_route.expect("device_route is Some when use_device_route");
+        B::route_topk_softmax(
+            ctx,
+            router_logits,
+            dr.selected_ids,
+            dr.pair_weights,
+            batch,
+            num_experts,
+            top_k,
+            norm_topk_prob,
+        )?;
+        B::moe_build_pairs_by_token(
+            ctx,
+            dr.selected_ids,
+            dr.pairs_by_token,
+            dr.packed_token_idx,
+            dr.expert_offsets,
+            batch * top_k,
+            num_experts,
+            top_k,
+        )?;
+        Some(dr)
+    } else {
+        None
+    };
 
     // ── Routing: try GPU fast-path first, fall back to host. ─────────
     //
@@ -1363,14 +1437,26 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         MOE_BUCKET_PLAN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
-    // ── Gather: x_packed[i] = x[plan.packed_token_idx[i]] ──────────────
-    // embedding_lookup is byte-for-byte the gather we need.
+    // ── Gather: x_packed[i] = x[packed_token_idx[i]] ───────────────────
+    // Under use_device_route, read packed_token_idx from device (no
+    // host roundtrip → graph-capturable). Else use the host plan.
     let t_gather = if prof {
         Some(std::time::Instant::now())
     } else {
         None
     };
-    B::embedding_lookup(ctx, x, &plan.packed_token_idx, x_packed, hidden_size);
+    if let Some(ref dr) = dr_kept {
+        B::embedding_lookup_dev(
+            ctx,
+            x,
+            dr.packed_token_idx,
+            x_packed,
+            batch * top_k,
+            hidden_size,
+        );
+    } else {
+        B::embedding_lookup(ctx, x, &plan.packed_token_idx, x_packed, hidden_size);
+    }
     if let Some(t) = t_gather {
         B::sync(ctx);
         MOE_BUCKET_GATHER_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1575,24 +1661,43 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
 
     // ── Combine: out[b, h] = Σ_k weights[b,k] * down_packed[pairs_by_token[b,k], h]
     //
-    // Phase D follow-up: moe_combine now takes device buffers. For now
-    // we upload the host plan via from_slice_typed each layer (still
-    // captures stale host pointers, but the API is graph-friendly).
-    // Next step replaces this with on-device construction via
-    // B::moe_build_pairs_by_token + route_topk_softmax output.
+    // Two paths for the pairs/weights device buffers:
+    //
+    //   (a) device-route mode: reuse `dr_kept` populated up top by
+    //       B::route_topk_softmax + B::moe_build_pairs_by_token. No
+    //       host→device upload, so this is graph-capturable when
+    //       wrapped in begin_graph_capture.
+    //
+    //   (b) legacy: upload host plan (plan.pairs_by_token /
+    //       plan.pair_weights) via from_slice_typed. Records host
+    //       pointer; captures stale on replay.
+    //
+    // Both produce mathematically equivalent outputs — device path
+    // does the same counting-sort the host plan rebuild does, just
+    // on-device via the moe_build_pairs kernel.
     let total_pairs = batch * top_k;
-    let pairs_dev = B::from_slice_typed::<i32>(&plan.pairs_by_token);
-    let weights_dev = B::from_slice_typed::<f32>(&plan.pair_weights);
     let t_comb = if prof {
         Some(std::time::Instant::now())
     } else {
         None
     };
+    let (pairs_ref, weights_ref);
+    let _pairs_owned;
+    let _weights_owned;
+    if let Some(ref dr) = dr_kept {
+        pairs_ref = &*dr.pairs_by_token;
+        weights_ref = &*dr.pair_weights;
+    } else {
+        _pairs_owned = B::from_slice_typed::<i32>(&plan.pairs_by_token);
+        _weights_owned = B::from_slice_typed::<f32>(&plan.pair_weights);
+        pairs_ref = &_pairs_owned;
+        weights_ref = &_weights_owned;
+    }
     B::moe_combine(
         ctx,
         down_packed,
-        &pairs_dev,
-        &weights_dev,
+        pairs_ref,
+        weights_ref,
         out,
         batch,
         hidden_size,

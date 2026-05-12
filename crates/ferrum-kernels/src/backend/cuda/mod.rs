@@ -499,37 +499,32 @@ impl Backend for CudaBackend {
         // NULL-stream cuMemcpyHtoD_v2, not the sync.
         match T::DTYPE {
             Dtype::U32 => {
-                let host: &[u32] = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len())
-                };
+                let host: &[u32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len()) };
                 let d = dst.as_u32_mut();
                 stream.memcpy_htod(host, d).expect("cuda write_typed u32");
             }
             Dtype::I32 => {
-                let host: &[i32] = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len())
-                };
+                let host: &[i32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len()) };
                 let d = dst.as_i32_mut();
                 stream.memcpy_htod(host, d).expect("cuda write_typed i32");
             }
             Dtype::F32 => {
-                let host: &[f32] = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len())
-                };
+                let host: &[f32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()) };
                 let d = dst.as_f32_mut();
                 stream.memcpy_htod(host, d).expect("cuda write_typed f32");
             }
             Dtype::F16 => {
-                let host: &[f16] = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const f16, data.len())
-                };
+                let host: &[f16] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f16, data.len()) };
                 let d = dst.as_f16_mut();
                 stream.memcpy_htod(host, d).expect("cuda write_typed f16");
             }
             Dtype::I8 => {
-                let host: &[i8] = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const i8, data.len())
-                };
+                let host: &[i8] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i8, data.len()) };
                 let d = dst.as_i8_mut();
                 stream.memcpy_htod(host, d).expect("cuda write_typed i8");
             }
@@ -871,6 +866,43 @@ impl Backend for CudaBackend {
     }
 
     // ── Embedding ───────────────────────────────────────────────────────
+
+    fn embedding_lookup_dev(
+        ctx: &mut Self::Context,
+        table: &Self::Buffer,
+        ids: &Self::Buffer,
+        out: &mut Self::Buffer,
+        batch: usize,
+        dim: usize,
+    ) {
+        // Device-buffer variant — no clone_htod, so the kernel launch
+        // captures cleanly under CUDA Graph. `ids` is treated as the
+        // I32 variant of CudaBuf (the kernel reads `const int*`).
+        let dim_i32 = dim as i32;
+        let batch_i32 = batch as i32;
+        let block = 256u32;
+        let grid_x = ((dim as u32) + block - 1) / block;
+        let func = ctx.func(
+            "embedding_lookup",
+            ptx::EMBEDDING_LOOKUP,
+            "embedding_lookup_f16",
+        );
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(table);
+        b.arg(ids);
+        b.arg(out);
+        b.arg(&batch_i32);
+        b.arg(&dim_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid_x, batch as u32, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("embedding_lookup_dev launch");
+    }
 
     fn embedding_lookup(
         ctx: &mut Self::Context,

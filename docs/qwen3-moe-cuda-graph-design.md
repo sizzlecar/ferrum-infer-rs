@@ -88,16 +88,30 @@ Groundwork landed on main:
 - ✅ `Qwen3MoeScratch.route_pairs_dev` / `route_packed_idx_dev` / `route_expert_offsets_dev` pre-allocated
 - ✅ Bench: no regression (c=32 = 723.9 vs 717.5 baseline, +0.9%)
 
-Remaining cascade for actual capture-enabled MoE:
-- ❌ `moe_forward_bucketed` device-routing branch (under `FERRUM_MOE_DEVICE_ROUTE=1`):
-  - Replace `try_gpu_route_topk_into_host` with `B::route_topk_softmax` + `B::moe_build_pairs_by_token`
-  - Skip `route_scratch.plan.rebuild_into` host call
-  - Skip `vllm_routing` host build → use `B::moe_align_block_size` on device for VLLM path
-- ❌ `B::embedding_lookup_dev` new trait method (takes ids as `&Self::Buffer` not `&[u32]`) — used for gather step; current `embedding_lookup` does `clone_htod(ids)` internally, same host-pointer-captures-stale problem
-- ❌ Skip `phase1_dispatches`/`phase3_dispatches` under VLLM_MOE (fused kernel handles routing internally — host dispatch list not needed)
-- ❌ Re-enable `Qwen3MoeModel` Phase 1 graph scaffold (state fields + capture/replay wrapper around layer loop in `decode_batch_internal`)
+### Phase 1.5 (2026-05-12 afternoon)
 
-Each item is ~50-200 lines. Total remaining: ~300-500 lines of careful surgery on perf-critical paths. Suitable for a focused multi-hour session with bench validation after each step.
+- ✅ `B::embedding_lookup_dev` new trait method (ids as `&Self::Buffer`, not `&[u32]`). CUDA impl launches `embedding_lookup_f16` directly with device ids — no `clone_htod`. CPU/Metal default impl round-trips via `to_vec` (those paths don't need capture).
+- ✅ `moe_forward_bucketed` device-route kernels (`route_topk_softmax + moe_build_pairs_by_token`) moved to top of function under `FERRUM_MOE_DEVICE_ROUTE=1`. `dr_kept: Option<DeviceRouteScratch>` survives the full function. Gather uses `embedding_lookup_dev` with `dr.packed_token_idx`. moe_combine reads `dr.pairs_by_token` / `dr.pair_weights` (Phase D wiring intact).
+- ✅ CPU parity test passes (`moe_bucketed_parity_test`).
+- ⚠️ Redundant work under use_device_route: `try_gpu_route_topk_into_host` (host D2H + sync), `route_scratch.plan.rebuild_into`, host `vllm_routing` builder all STILL RUN — their outputs are consumed by phase1/phase3 host dispatch lists. Phase 2 strips them.
+
+### Phase 2 cascade (next session)
+
+To make `moe_forward_bucketed` actually capture-ready (no D2H, no host pointer recording):
+
+- ❌ Add pre-allocated `route_sorted_tokens_dev` / `route_block_ids_dev` / `route_total_post_pad_dev` to `DeviceRouteScratch` (3 more I32 device buffers in `Qwen3MoeScratch`)
+- ❌ Under `use_device_route + use_vllm_moe`, replace the host `vllm_routing` builder block (~40 lines) with a `B::moe_align_block_size` device call → wrap outputs in `MoeRouting` shape for `gemm_phase_vllm`
+- ❌ Under `use_device_route`, SKIP `B::try_gpu_route_topk_into_host` (kernel + dtoh + synchronize)
+- ❌ Under `use_device_route`, SKIP `route_scratch.plan.rebuild_into` (consumers gone after vllm_routing port)
+- ❌ Skip `phase1_dispatches`/`phase3_dispatches` host build under `use_vllm_moe + use_device_route` (fused kernel handles routing internally)
+
+### Phase 3 — graph capture
+
+- ❌ Re-enable `Qwen3MoeModel` Phase 1 graph scaffold (state fields + capture/replay wrapper around layer loop in `decode_batch_internal`)
+- ❌ Pre-grow MoE-specific scratch (vllm_moe_c_tmp, route buffers, paged_attn_out_tm) before begin_capture
+- ❌ Bench under `FERRUM_MOE_GRAPH=1`; expect +15-25% TPOT at c=32 (pushes Qwen3-30B-A3B from ~38% to ~50% of vLLM)
+
+Phase 2 ~250 lines; Phase 3 ~300 lines + state machine. Multi-hour focused sessions per phase.
 
 ### Blocker 2: Pre-grow scratch before begin_capture
 LlamaFamilyModel uses `B::pregrow_marlin_gather_scratch(m_total * intermediate_size)` to eagerly grow the marlin scratch slot. Same pattern needed for MoE:

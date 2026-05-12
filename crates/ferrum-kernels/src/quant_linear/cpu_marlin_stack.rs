@@ -53,7 +53,10 @@ impl MarlinExpertStack<CpuBackend> for CpuMarlinExpertStack {
         self
     }
 
-    fn zero_workspace(&self, _ctx: &mut <CpuBackend as crate::backend::Backend>::Context) -> Result<()> {
+    fn zero_workspace(
+        &self,
+        _ctx: &mut <CpuBackend as crate::backend::Backend>::Context,
+    ) -> Result<()> {
         // CPU GptqStore (dequant-on-load) has no per-expert workspace
         // mutex slots — Marlin-specific GPU artefact. No-op.
         Ok(())
