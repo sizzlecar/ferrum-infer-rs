@@ -773,6 +773,8 @@ impl EngineInner {
             }
         }
 
+        let prof = std::env::var("FERRUM_RBD_PROF").is_ok();
+        let t_decode = if prof { Some(Instant::now()) } else { None };
         let results = self.model_executor.unified_decode(&batch).await?;
         if results.len() != rids.len() {
             return Err(FerrumError::internal(format!(
@@ -781,6 +783,12 @@ impl EngineInner {
                 rids.len(),
             )));
         }
+        let t_decode_done = if prof { Some(Instant::now()) } else { None };
+        let mut t_sample_us: u64 = 0;
+        let mut t_sched_us: u64 = 0;
+        let mut t_stream_us: u64 = 0;
+        let mut t_stop_us: u64 = 0;
+        let mut t_complete_us: u64 = 0;
 
         // Per-item post-processing: sample, update sequence state, stream
         // the new token, check stop conditions. Decode-only items always
@@ -792,6 +800,7 @@ impl EngineInner {
                 ))
             })?;
 
+            let t0_sample = if prof { Some(Instant::now()) } else { None };
             let next_token = {
                 let mut sequences = self.sequences.write();
                 let seq = sequences
@@ -822,6 +831,11 @@ impl EngineInner {
                 token
             };
 
+            if let Some(t0) = t0_sample {
+                t_sample_us += t0.elapsed().as_micros() as u64;
+            }
+
+            let t0_sched = if prof { Some(Instant::now()) } else { None };
             let generated_count = {
                 let sequences = self.sequences.read();
                 sequences
@@ -832,16 +846,28 @@ impl EngineInner {
             self.scheduler.update_decode_progress(rid, generated_count);
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
+            if let Some(t0) = t0_sched {
+                t_sched_us += t0.elapsed().as_micros() as u64;
+            }
 
+            let t0_stream = if prof { Some(Instant::now()) } else { None };
             self.send_stream_update(rid, next_token).await;
+            if let Some(t0) = t0_stream {
+                t_stream_us += t0.elapsed().as_micros() as u64;
+            }
 
+            let t0_stop = if prof { Some(Instant::now()) } else { None };
             let should_stop = {
                 let sequences = self.sequences.read();
                 sequences
                     .get(rid)
                     .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
             };
+            if let Some(t0) = t0_stop {
+                t_stop_us += t0.elapsed().as_micros() as u64;
+            }
             if should_stop {
+                let t0_comp = if prof { Some(Instant::now()) } else { None };
                 let finish_reason = {
                     let sequences = self.sequences.read();
                     match sequences.get(rid) {
@@ -855,9 +881,34 @@ impl EngineInner {
                     }
                 };
                 self.complete_request(rid, finish_reason).await?;
+                if let Some(t0) = t0_comp {
+                    t_complete_us += t0.elapsed().as_micros() as u64;
+                }
             }
         }
 
+        if let (Some(t0), Some(t1)) = (t_decode, t_decode_done) {
+            use std::sync::atomic::AtomicU64;
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(32) {
+                let decode_us = t1.duration_since(t0).as_micros() as u64;
+                let total_post_us =
+                    t_sample_us + t_sched_us + t_stream_us + t_stop_us + t_complete_us;
+                eprintln!(
+                    "[rbd-prof] iter#{} m={} decode={}us post={}us | sample={} sched={} stream={} stop={} complete={} (us)",
+                    n,
+                    rids.len(),
+                    decode_us,
+                    total_post_us,
+                    t_sample_us,
+                    t_sched_us,
+                    t_stream_us,
+                    t_stop_us,
+                    t_complete_us,
+                );
+            }
+        }
         Ok(())
     }
 
