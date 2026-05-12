@@ -1973,10 +1973,23 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         B::sync(&mut ctx);
         self.scratch.residual = Some(residual);
 
-        // Extract M logit vectors from the flat buffer.
-        let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
-        (0..m)
-            .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
-            .collect()
+        // Greedy fast path: FERRUM_GREEDY_ARGMAX=1 → GPU argmax + tiny
+        // D2H (m × 4 B) instead of full logit download (m × vocab × 2 B).
+        // Saves ~5 ms / iter at c=32 on Qwen3 vocab=152064. Engine has a
+        // matching size-1-Vec fast path in run_batch_decode that picks
+        // `logits[0] as u32` and skips sample_with_processors entirely.
+        let greedy = std::env::var("FERRUM_GREEDY_ARGMAX")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if greedy {
+            let tokens = B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, m, vocab)
+                .expect("argmax_rows_f16");
+            tokens.into_iter().map(|t| vec![t as f32]).collect()
+        } else {
+            let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+            (0..m)
+                .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
+                .collect()
+        }
     }
 }

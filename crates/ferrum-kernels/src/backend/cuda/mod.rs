@@ -234,6 +234,46 @@ pub struct CudaState {
 static VLLM_MOE_C_TMP: std::sync::OnceLock<std::sync::RwLock<Option<CudaSlice<f32>>>> =
     std::sync::OnceLock::new();
 
+// Greedy-argmax output scratch — see `Backend::argmax_rows_f16`.
+// Process-global like VLLM_MOE_C_TMP so the GPU address baked into
+// captured kernel args stays valid for the engine's life. Allocated
+// to MAX_BATCH capacity on first use; the caller passes m ≤ capacity
+// and reads only the first m entries.
+static ARGMAX_OUT: std::sync::OnceLock<std::sync::RwLock<Option<CudaSlice<i32>>>> =
+    std::sync::OnceLock::new();
+
+fn argmax_out_slot() -> &'static std::sync::RwLock<Option<CudaSlice<i32>>> {
+    ARGMAX_OUT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn with_argmax_out<R>(
+    stream: &Arc<CudaStream>,
+    m: usize,
+    body: impl FnOnce(&mut CudaSlice<i32>) -> R,
+) -> R {
+    let slot = argmax_out_slot();
+    // Fast path: existing buffer large enough.
+    {
+        let g = slot.read().expect("ARGMAX_OUT poisoned");
+        if let Some(buf) = g.as_ref() {
+            if buf.len() >= m {
+                drop(g);
+                let mut w = slot.write().expect("ARGMAX_OUT poisoned");
+                return body(w.as_mut().expect("just observed Some"));
+            }
+        }
+    }
+    // Slow path: allocate / grow. Round up so growth amortises.
+    let capacity = m.max(64).next_power_of_two();
+    let mut w = slot.write().expect("ARGMAX_OUT poisoned");
+    let need_alloc = w.as_ref().map(|b| b.len() < m).unwrap_or(true);
+    if need_alloc {
+        let new = unsafe { stream.alloc::<i32>(capacity) }.expect("argmax_out alloc");
+        *w = Some(new);
+    }
+    body(w.as_mut().expect("alloc above"))
+}
+
 #[cfg(feature = "vllm-moe-marlin")]
 fn vllm_moe_c_tmp_slot() -> &'static std::sync::RwLock<Option<CudaSlice<f32>>> {
     VLLM_MOE_C_TMP.get_or_init(|| std::sync::RwLock::new(None))
@@ -663,30 +703,38 @@ impl Backend for CudaBackend {
         // At c=32, vocab=152064: 19.5 MB + 4.8 ms CPU → 128 B + ~0.3 ms GPU.
         let func = ctx.func("argmax_rows", ptx::ARGMAX_ROWS, "argmax_rows_f16");
         let stream = ctx.stream.clone();
-        // Output: device-allocated i32 buffer, m elements.
-        let mut out_dev: CudaSlice<i32> = stream
-            .alloc_zeros(m)
-            .map_err(|e| FerrumError::internal(format!("argmax_rows alloc: {e}")))?;
-        let n_i32 = n as i32;
-        let mut b = stream.launch_builder(&func);
-        b.arg(logits);
-        b.arg(&n_i32);
-        b.arg(&mut out_dev);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (m as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map_err(|e| FerrumError::internal(format!("argmax_rows launch: {e}")))?;
-        let mut host = vec![0i32; m];
-        stream
-            .memcpy_dtoh(&out_dev, &mut host)
-            .map_err(|e| FerrumError::internal(format!("argmax_rows dtoh: {e}")))?;
-        stream
-            .synchronize()
-            .map_err(|e| FerrumError::internal(format!("argmax_rows sync: {e}")))?;
+        // Output buffer: process-global, grown lazily. Reuses the same
+        // device allocation across iters (avoids ~30-50 µs / iter for
+        // `stream.alloc_zeros`). Mirrors the MARLIN_GATHER_SCRATCH /
+        // VLLM_MOE_C_TMP pattern; the slot is owned process-wide so the
+        // GPU address it hands out is stable for the engine's life
+        // (graph-capture safe — see vllm_moe_c_tmp's doc for rationale).
+        let host = with_argmax_out(&stream, m, |out_dev| -> Result<Vec<i32>> {
+            let n_i32 = n as i32;
+            let mut b = stream.launch_builder(&func);
+            b.arg(logits);
+            b.arg(&n_i32);
+            b.arg(out_dev);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (m as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::internal(format!("argmax_rows launch: {e}")))?;
+            let mut host = vec![0i32; m];
+            // Use a sliced view so cudarc's host.len() == src.len() guard
+            // accepts (out_dev may be capacity > m).
+            let view = out_dev.slice(0..m);
+            stream
+                .memcpy_dtoh(&view, &mut host)
+                .map_err(|e| FerrumError::internal(format!("argmax_rows dtoh: {e}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::internal(format!("argmax_rows sync: {e}")))?;
+            Ok(host)
+        })?;
         Ok(host.into_iter().map(|x| x as u32).collect())
     }
 
