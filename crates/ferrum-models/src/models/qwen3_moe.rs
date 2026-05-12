@@ -503,6 +503,25 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     // re-init the next forward enters `forward_layer_batched_decode`
     // and panics on `paged_batch_block_tables missing`.
     pub paged_dims: Option<(usize, usize)>, // (max_seqs, max_blocks_per_seq)
+
+    // ── CUDA Graph capture state (FERRUM_MOE_GRAPH=1) ────────────────────
+    //
+    // Mirrors `LlamaFamilyModel`'s batched_graph_* fields. Captures the
+    // layer loop + final rms_norm + lm_head into one graph keyed by
+    // `m_padded` (next_power_of_two of batch size). Empty until the
+    // first warmup completes; resets on `release(cid)` / `reset()`.
+    //
+    // Phase 3 prerequisites are now satisfied:
+    //   * Phase 2: moe_forward_bucketed runs entirely device-side under
+    //     FERRUM_MOE_DEVICE_ROUTE=1 + FERRUM_VLLM_MOE=1 (no D2H sync,
+    //     no host pointer recording)
+    //   * Phase 3a: paged-batch scratch (block_tables / context_lens /
+    //     pos_offsets / cu_seqlens_q) pre-populated once before the
+    //     layer loop, so per-layer write_typed is gone
+    //   * Phase 3c: capture/replay wrapper (this state's consumer)
+    pub(crate) batched_graph_warmup: usize,
+    pub(crate) batched_graph_failed: bool,
+    pub(crate) batched_graph_keys_seen: std::collections::HashSet<u64>,
 }
 
 impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
@@ -628,6 +647,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             paged_pools: None,
             paged_block_alloc: None,
             paged_dims: None,
+            batched_graph_warmup: 0,
+            batched_graph_failed: false,
+            batched_graph_keys_seen: std::collections::HashSet::new(),
         })
     }
 
@@ -809,7 +831,32 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             paged_pools: None,
             paged_block_alloc: None,
             paged_dims: None,
+            batched_graph_warmup: 0,
+            batched_graph_failed: false,
+            batched_graph_keys_seen: std::collections::HashSet::new(),
         })
+    }
+
+    /// Read-only access to the captured-graph warmup counter. Bumps once
+    /// per non-replay `decode_batch_internal` call under
+    /// `FERRUM_MOE_GRAPH=1`; capture starts on the 4th call (warmup>=3).
+    /// Test helper — production code should not branch on this.
+    pub fn batched_graph_warmup(&self) -> usize {
+        self.batched_graph_warmup
+    }
+
+    /// True iff CUDA Graph capture failed at some point — backend
+    /// returns Err from begin/end/replay or replay produced wrong
+    /// output. Once true, subsequent calls stay eager. Test helper.
+    pub fn batched_graph_failed(&self) -> bool {
+        self.batched_graph_failed
+    }
+
+    /// Set of `m_padded` keys for which a graph has been captured.
+    /// Empty until the first successful capture; cleared on
+    /// `reset()`, `release()`, or scratch realloc. Test helper.
+    pub fn batched_graph_keys_seen(&self) -> &std::collections::HashSet<u64> {
+        &self.batched_graph_keys_seen
     }
 
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
@@ -818,6 +865,12 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 let mut ctx = B::new_context();
                 B::reset_all_graphs(&mut ctx);
             }
+            // Scratch realloc invalidates captured graph addresses —
+            // clear the cache so the next decode_batch starts a fresh
+            // capture cycle.
+            self.batched_graph_keys_seen.clear();
+            self.batched_graph_warmup = 0;
+            self.batched_graph_failed = false;
             self.scratch = Qwen3MoeScratch::alloc(&self.cfg, tokens);
             // Realloc wiped paged_batch_*. Re-enable using the dims
             // pinned at first ensure_kv. Without this, the next
@@ -1980,30 +2033,126 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             .expect("scratch residual missing (previous call didn't restore)");
         B::embedding_lookup(&mut ctx, &self.embed, &tokens, &mut residual, h);
 
-        // 1..num_layers: batched forward for each layer
-        for li in 0..self.cfg.base.num_layers {
-            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m)
-                .expect("forward_layer_batched_decode");
+        // Pre-populate paged-batch scratch (block_tables / context_lens
+        // / pos_offsets / cu_seqlens_q) ONCE before the layer loop. All
+        // layers share the same per-step host state for a given
+        // cache_id, so 1 set of write_typeds replaces num_layers sets.
+        // This is also the prerequisite for CUDA Graph capture — H2D
+        // copies inside captured regions record stale host pointers.
+        self.populate_paged_batch_scratch_decode(&mut ctx, batch, m);
+
+        // ── CUDA-graph capture/replay (FERRUM_MOE_GRAPH=1) ───────────
+        //
+        // Per-shape graph cache keyed by `m_padded`. Captures the layer
+        // loop + final rms_norm + lm_head — every kernel that's stable
+        // across decode iters. Pre-work (paged scratch upload + embed
+        // + marlin gather scratch grow) and post-work (sync + to_vec)
+        // stay eager.
+        //
+        // Requires FERRUM_MOE_DEVICE_ROUTE=1 + FERRUM_VLLM_MOE=1 to be
+        // graph-clean (otherwise moe_forward_bucketed has D2H + host
+        // pointer writes that fail capture). Recovery: if begin_capture
+        // / end_capture errors, set `batched_graph_failed=true` and
+        // never retry — stays eager for the rest of this model's life.
+        let graph_enabled = std::env::var("FERRUM_MOE_GRAPH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let m_padded = m.next_power_of_two();
+        // High bit set + low 32 bits = m_padded — same scheme as
+        // LlamaFamilyModel's unified key, ensures no collision with
+        // single-item graph key 0.
+        let graph_key: u64 = (1u64 << 63) | (m_padded as u64);
+        let cache_has_key = self.batched_graph_keys_seen.contains(&graph_key);
+
+        // Pre-grow marlin gather scratch before capture begins —
+        // `with_marlin_gather_scratch`'s in-place grow does
+        // `stream.alloc` which CUDA Graph capture forbids inside the
+        // captured stream. Bucketed MoE phase 1/3 GEMMs need at most
+        // `total_pairs * intermediate_size` (phase 3 is the bigger k).
+        let total_pairs = m * self.cfg.num_experts_per_tok;
+        let max_marlin_required = total_pairs * self.cfg.expert_intermediate_size;
+        B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
+
+        // Settle pre-work (write_typeds + embed + pregrow) before
+        // begin_capture or replay — the captured region must start
+        // from a quiescent stream state.
+        B::sync(&mut ctx);
+
+        let mut did_pure_replay = false;
+        if graph_enabled && cache_has_key && !self.batched_graph_failed {
+            match B::replay_graph(&mut ctx, graph_key) {
+                Ok(true) => did_pure_replay = true,
+                Ok(false) => {}
+                Err(e) => {
+                    self.batched_graph_failed = true;
+                    eprintln!("[moe-graph] replay err: {e}");
+                }
+            }
         }
 
-        // Final RMSNorm on [M, H] → norm_out [M, H]
-        B::rms_norm(
-            &mut ctx,
-            &residual,
-            &self.final_norm_w,
-            self.cfg.base.rms_norm_eps,
-            &mut self.scratch.norm_out,
-            m,
-            h,
-        );
+        const MOE_GRAPH_WARMUP: usize = 3;
+        let should_capture = graph_enabled
+            && !self.batched_graph_failed
+            && !cache_has_key
+            && self.batched_graph_warmup >= MOE_GRAPH_WARMUP
+            && !did_pure_replay;
+        // Only bump the warmup counter when the flag is on — otherwise
+        // we accumulate uselessly across the model's lifetime and the
+        // first FERRUM_MOE_GRAPH=1 call would skip warmup.
+        if graph_enabled && !did_pure_replay {
+            self.batched_graph_warmup += 1;
+        }
 
-        // LM head with m=M → batch_logits [M, vocab]
-        self.lm_head.forward(
-            &mut ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.batch_logits,
-            m,
-        );
+        if should_capture {
+            if let Err(e) = B::begin_graph_capture(&mut ctx) {
+                eprintln!("[moe-graph] begin_capture err: {e}");
+                self.batched_graph_failed = true;
+            }
+        }
+
+        if !did_pure_replay {
+            // 1..num_layers: batched forward for each layer.
+            // Records into graph if capture is active above.
+            for li in 0..self.cfg.base.num_layers {
+                self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m)
+                    .expect("forward_layer_batched_decode");
+            }
+
+            // Final RMSNorm on [M, H] → norm_out [M, H]
+            B::rms_norm(
+                &mut ctx,
+                &residual,
+                &self.final_norm_w,
+                self.cfg.base.rms_norm_eps,
+                &mut self.scratch.norm_out,
+                m,
+                h,
+            );
+
+            // LM head with m=M → batch_logits [M, vocab]
+            self.lm_head.forward(
+                &mut ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.batch_logits,
+                m,
+            );
+        }
+
+        if should_capture && !self.batched_graph_failed {
+            if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
+                eprintln!("[moe-graph] end_capture err: {e}");
+                self.batched_graph_failed = true;
+            } else {
+                self.batched_graph_keys_seen.insert(graph_key);
+                // Post-capture replay — capture only RECORDS, so without
+                // this the layer-loop kernels never actually execute and
+                // batch_logits stays uninitialised.
+                if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
+                    eprintln!("[moe-graph] post-capture replay err: {e}");
+                    self.batched_graph_failed = true;
+                }
+            }
+        }
 
         B::sync(&mut ctx);
         self.scratch.residual = Some(residual);
@@ -2083,10 +2232,96 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             .collect()
     }
 
+    /// Pre-populate per-decode-step paged-batch scratch (block_tables /
+    /// context_lens / pos_offsets / cu_seqlens_q) on the device side
+    /// and bump cache.len for all layers in lockstep.
+    ///
+    /// Called ONCE before the layer loop in `decode_batch_internal`,
+    /// replacing the per-layer write_typed inside
+    /// `forward_layer_batched_decode`. This is the prerequisite for
+    /// CUDA Graph capture: H2D copies during capture record the host
+    /// pointer, so they must happen outside the captured region
+    /// against stable scratch addresses.
+    ///
+    /// Invariant: all layers of a given cache_id share the same
+    /// `paged_block_indices` and `len`, so we read layer-0 for the
+    /// "shared" host values and bump all layers identically.
+    fn populate_paged_batch_scratch_decode(
+        &mut self,
+        ctx: &mut B::Context,
+        batch: &[(String, u32, u32)],
+        m: usize,
+    ) {
+        if !self.paged_pools.is_some() {
+            return; // non-paged path doesn't use this scratch
+        }
+        let max_blocks_per_seq = self.scratch.paged_max_blocks_per_seq;
+        let num_layers = self.cfg.base.num_layers;
+
+        let mut stacked_bt: Vec<u32> = vec![0u32; m * max_blocks_per_seq];
+        let mut stacked_cl: Vec<u32> = vec![0u32; m];
+        let mut pos_offsets_host: Vec<u32> = vec![0u32; m];
+        let mut cu_seqlens_host: Vec<u32> = vec![0u32; m + 1];
+        for i in 0..=m {
+            cu_seqlens_host[i] = i as u32;
+        }
+        for (i, (cache_id, _, _)) in batch.iter().enumerate() {
+            let caches = self
+                .kv_caches
+                .get_mut(cache_id)
+                .expect("paged batched: cache not present");
+            // Read shared values from layer-0 (invariant: same len + block
+            // indices across all layers for one cache_id).
+            let cache0 = &caches[0];
+            pos_offsets_host[i] = cache0.len as u32;
+            let blocks = &cache0.paged_block_indices;
+            let n_to_copy = blocks.len().min(max_blocks_per_seq);
+            stacked_bt[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
+                .copy_from_slice(&blocks[..n_to_copy]);
+            // Bump ALL layers in lockstep (replaces the per-layer bump
+            // that used to live in forward_layer_batched_decode).
+            for li in 0..num_layers {
+                caches[li].len += 1;
+            }
+            stacked_cl[i] = caches[0].len as u32;
+        }
+
+        let bt_buf = self
+            .scratch
+            .paged_batch_block_tables
+            .as_mut()
+            .expect("paged_batch_block_tables missing");
+        B::write_typed::<u32>(ctx, bt_buf, &stacked_bt);
+        let cl_buf = self
+            .scratch
+            .paged_batch_context_lens
+            .as_mut()
+            .expect("paged_batch_context_lens missing");
+        B::write_typed::<u32>(ctx, cl_buf, &stacked_cl);
+        let pos_buf = self
+            .scratch
+            .paged_batch_pos_offsets
+            .as_mut()
+            .expect("paged_batch_pos_offsets missing");
+        B::write_typed::<u32>(ctx, pos_buf, &pos_offsets_host);
+        let cu_buf = self
+            .scratch
+            .paged_batch_cu_seqlens_q
+            .as_mut()
+            .expect("paged_batch_cu_seqlens_q missing");
+        B::write_typed::<u32>(ctx, cu_buf, &cu_seqlens_host);
+    }
+
     /// One transformer layer over M items: GEMMs at m=M, per-item
     /// attention loop, MoE FFN at m=M via the prefill batched path.
     /// Mirrors `LlamaFamilyModel::forward_layer_batched_decode` minus
     /// the paged branch.
+    ///
+    /// PRECONDITION (paged path): caller must invoke
+    /// `populate_paged_batch_scratch_decode` once before the layer
+    /// loop. This function reads the pre-populated scratch buffers
+    /// (`paged_batch_block_tables` etc.) and no longer does its own
+    /// host gather / write_typed / cache.len bump.
     fn forward_layer_batched_decode(
         &mut self,
         ctx: &mut B::Context,
@@ -2176,9 +2411,11 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let block_size = 16; // matches PAGED_BLOCK_SIZE in ensure_kv
             let qkv_stride = q_dim + 2 * kv_dim;
 
-            // Step 1: gather per-seq metadata on host (cache.len before
-            // append, full block_tables stack, post-append context_lens),
-            // bump cache.len, build cu_seqlens_q.
+            // Paged scratch (block_tables / context_lens / pos_offsets /
+            // cu_seqlens_q) was pre-populated by
+            // `populate_paged_batch_scratch_decode` before the layer
+            // loop — see precondition docstring on this fn. We just
+            // claim per-layer pool pointers and proceed to QKV+attn.
             let q_head_major_size_bytes = (q_dim * std::mem::size_of::<f32>()) as u64;
             let _qkv_stride_bytes = (qkv_stride * std::mem::size_of::<f32>()) as u64;
             let _ = q_head_major_size_bytes; // unused in batched path
@@ -2192,55 +2429,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             // SAFETY: pools allocated-once, see paged_pools field comment.
             let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
 
-            let mut stacked_bt: Vec<u32> = vec![0u32; m * max_blocks_per_seq];
-            let mut stacked_cl: Vec<u32> = vec![0u32; m];
-            let mut pos_offsets_host: Vec<u32> = vec![0u32; m];
-            let mut cu_seqlens_host: Vec<u32> = vec![0u32; m + 1];
-            for i in 0..=m {
-                cu_seqlens_host[i] = i as u32;
-            }
-            for (i, (cache_id, _, _)) in batch.iter().enumerate() {
-                let caches = self
-                    .kv_caches
-                    .get_mut(cache_id)
-                    .expect("paged batched: cache not present");
-                let cache = &mut caches[li];
-                pos_offsets_host[i] = cache.len as u32; // RoPE position = pre-append cache len
-                let blocks = &cache.paged_block_indices;
-                let n_to_copy = blocks.len().min(max_blocks_per_seq);
-                stacked_bt[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
-                    .copy_from_slice(&blocks[..n_to_copy]);
-                cache.len += 1;
-                stacked_cl[i] = cache.len as u32;
-            }
-
-            // Step 2: upload all per-seq metadata.
-            let bt_buf = self
-                .scratch
-                .paged_batch_block_tables
-                .as_mut()
-                .expect("paged_batch_block_tables missing");
-            B::write_typed::<u32>(ctx, bt_buf, &stacked_bt);
-            let cl_buf = self
-                .scratch
-                .paged_batch_context_lens
-                .as_mut()
-                .expect("paged_batch_context_lens missing");
-            B::write_typed::<u32>(ctx, cl_buf, &stacked_cl);
-            let pos_buf = self
-                .scratch
-                .paged_batch_pos_offsets
-                .as_mut()
-                .expect("paged_batch_pos_offsets missing");
-            B::write_typed::<u32>(ctx, pos_buf, &pos_offsets_host);
-            let cu_buf = self
-                .scratch
-                .paged_batch_cu_seqlens_q
-                .as_mut()
-                .expect("paged_batch_cu_seqlens_q missing");
-            B::write_typed::<u32>(ctx, cu_buf, &cu_seqlens_host);
-
-            // Step 3: write K/V into the shared pool + RoPE'd Q into
+            // Step 1: write K/V into the shared pool + RoPE'd Q into
             // paged_batch_q at offset i × q_dim. Two code paths:
             //
             //   - CUDA (`B::supports_varlen_qkv() == true`): ONE batched
@@ -2310,10 +2499,12 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                         .block_table
                         .as_ref()
                         .expect("paged batched: cache.block_table missing");
-                    // pos_offsets_host[i] is pre-append cache.len (captured
-                    // before the increment in step 1). The per-item kernel
-                    // uses it for BOTH RoPE position AND K/V write offset.
-                    let pos_i = pos_offsets_host[i] as usize;
+                    // Pre-append cache.len = post-bump cache.len - 1.
+                    // `populate_paged_batch_scratch_decode` (called once
+                    // before the layer loop) already bumped this layer's
+                    // cache.len by 1; the per-item kernel uses pre-append
+                    // pos for BOTH RoPE position AND K/V write offset.
+                    let pos_i = cache.len.saturating_sub(1);
                     let bt_raw = bt as *const B::Buffer;
                     // SAFETY: bt is read-only in the dispatch; we don't
                     // mutate self.kv_caches between this raw deref and
@@ -3063,11 +3254,15 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
     }
 
     fn release(&mut self, cache_id: &str) {
-        // qwen3_moe doesn't currently use the batched-graph capture path,
-        // so single-key reset is sufficient.
+        // Phase 3 (FERRUM_MOE_GRAPH=1) may have populated multi-key
+        // graph cache keyed by m_padded. Reset all keys + clear state
+        // so the next decode_batch starts fresh on the new working set.
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
-        B::reset_graph(&mut ctx, 0);
+        B::reset_all_graphs(&mut ctx);
+        self.batched_graph_keys_seen.clear();
+        self.batched_graph_warmup = 0;
+        self.batched_graph_failed = false;
         B::sync(&mut ctx);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             // Paged mode: return the cache_id's blocks to the shared
@@ -3096,6 +3291,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
         B::reset_all_graphs(&mut ctx);
+        self.batched_graph_keys_seen.clear();
+        self.batched_graph_warmup = 0;
+        self.batched_graph_failed = false;
         B::sync(&mut ctx);
         self.kv_caches.clear();
         self.kv_free_pool.clear();
