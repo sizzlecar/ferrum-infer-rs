@@ -26,8 +26,6 @@ nohup nsys profile \
     --trace cuda \
     --delay 60 \
     --duration 60 \
-    --capture-range timer \
-    --capture-range-end stop \
     --force-overwrite true \
     -- vllm serve /workspace/models/M3 --port "$PORT" \
         --max-num-seqs 64 --max-model-len 4096 \
