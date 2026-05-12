@@ -366,14 +366,20 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
                 0.0f32;
                 t * cfg.num_experts_per_tok
             ]),
-            // moe_align_block_size outputs — worst-case sizing assumes
-            // each active expert pads up to (VLLM_MOE_BLOCK_SIZE-1)
-            // extra rows beyond its real `m_e`. Block-size hardcoded to
-            // match dispatch.rs::VLLM_MOE_BLOCK_SIZE=16.
+            // moe_align_block_size outputs — worst-case sized for the
+            // largest `moe_block_size` the dispatch path can pick, so the
+            // dynamic picker in `dispatch.rs::pick_moe_block_size` is free
+            // to go up to 64 without re-allocating scratch per-iter.
+            //
+            // sorted_tokens capacity = t*top_k + n_exp * MOE_BLOCK_SIZE_MAX
+            // (each active expert pads at most MAX-1 extra rows past m_e).
+            // block_ids capacity = ceil(t*top_k / MIN_BLOCK_SIZE) + n_exp + 1
+            // (worst case: smallest block_size used → most blocks). Min is
+            // 16 today; if a smaller is ever introduced, bump this.
             route_sorted_tokens_dev: B::from_slice_typed::<i32>(&vec![
                 0i32;
                 t * cfg.num_experts_per_tok
-                    + n_exp * 16
+                    + n_exp * crate::moe::dispatch::MOE_BLOCK_SIZE_MAX
             ]),
             route_block_ids_dev: B::from_slice_typed::<i32>(&vec![
                 0i32;
