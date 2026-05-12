@@ -187,6 +187,50 @@ impl BackendMoeFused for CudaBackend {
 
         Ok(())
     }
+    fn moe_build_pairs_by_token(
+        ctx: &mut Self::Context,
+        expert_ids: &Self::Buffer,
+        pairs_by_token: &mut Self::Buffer,
+        packed_token_idx: &mut Self::Buffer,
+        expert_offsets: &mut Self::Buffer,
+        batch_x_topk: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) -> Result<()> {
+        if num_experts > 256 {
+            return Err(FerrumError::model(format!(
+                "moe_build_pairs_by_token: num_experts={num_experts} > MAX 256 (shmem limit)"
+            )));
+        }
+        let func = ctx.func(
+            "moe_build_pairs_by_token",
+            ptx::MOE_BUILD_PAIRS,
+            "moe_build_pairs_by_token",
+        );
+        let n = batch_x_topk as i32;
+        let ne = num_experts as i32;
+        let tk = top_k as i32;
+        let smem = (num_experts as u32) * 4; // i32 counts per expert
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(expert_ids);
+        b.arg(pairs_by_token);
+        b.arg(packed_token_idx);
+        b.arg(expert_offsets);
+        b.arg(&n);
+        b.arg(&ne);
+        b.arg(&tk);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: smem,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("moe_build_pairs_by_token launch: {e}")))?;
+        Ok(())
+    }
+
     fn moe_align_block_size(
         ctx: &mut Self::Context,
         expert_ids_per_pair: &Self::Buffer,
@@ -238,25 +282,19 @@ impl BackendMoeFused for CudaBackend {
     fn moe_combine(
         ctx: &mut Self::Context,
         packed_down: &Self::Buffer,
-        pairs_by_token: &[i32],
-        pair_weights: &[f32],
+        pairs_by_token: &Self::Buffer,
+        pair_weights: &Self::Buffer,
         out: &mut Self::Buffer,
         batch: usize,
         hidden: usize,
         top_k: usize,
         _total_pairs: usize,
     ) {
-        debug_assert_eq!(pairs_by_token.len(), batch * top_k);
-        debug_assert_eq!(pair_weights.len(), batch * top_k);
-
-        let stream = ctx.stream.clone();
-        let pairs_dev = stream
-            .clone_htod(pairs_by_token)
-            .expect("moe_combine pairs htod");
-        let weights_dev = stream
-            .clone_htod(pair_weights)
-            .expect("moe_combine weights htod");
-
+        // Phase D follow-up: device-buffer routing — no clone_htod here.
+        // Callers (moe_forward_bucketed) upload pairs/weights to device
+        // once per call (or, eventually, build them entirely device-side
+        // via B::moe_build_pairs_by_token + route_topk_softmax — that
+        // path unlocks CUDA Graph capture).
         let func = ctx.func("moe_combine", ptx::MOE_COMBINE, "moe_combine_f16");
         let batch_i32 = batch as i32;
         let hidden_i32 = hidden as i32;
@@ -268,8 +306,8 @@ impl BackendMoeFused for CudaBackend {
         let stream = ctx.stream.clone();
         let mut b = stream.launch_builder(&func);
         b.arg(packed_down);
-        b.arg(&pairs_dev);
-        b.arg(&weights_dev);
+        b.arg(pairs_by_token);
+        b.arg(pair_weights);
         b.arg(out);
         b.arg(&batch_i32);
         b.arg(&hidden_i32);
