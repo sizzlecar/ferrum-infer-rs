@@ -99,18 +99,67 @@ bash bench/v0.2-cuda/bench_phase3_variants.sh graph
 Each variant takes ~6 min (build + serve + bench-serve sweep). Pod
 cost: ~$0.27/hour.
 
-## Recommended next steps
+## Update — Phase 3 fixes landed in same session
 
-1. **Ship Phase 2 default-on**: `FERRUM_MOE_DEVICE_ROUTE` default
-   should flip to `1` (or just be removed and become unconditional)
-   given the +15% c=32 win + no parity regressions.
-2. **Debug the Phase 3 capture bug** (deferred): instrument
-   `replay_graph` to log the cuGraphLaunch call site / args; trace
-   what happens between post-replay and the next call's pre-replay.
-   Likely a kernel inside `moe_forward_bucketed` interacts badly
-   with graph capture lifetime. ~half day.
-3. **Investigate the c=32 cliff** vs vLLM (~45% gap): expected next
-   bottlenecks are (a) MoE phase 1/3 GEMM utilization
-   (`gemm_phase_vllm`'s `vllm_moe_c_tmp` reduce overhead), (b) the
-   per-layer post-attn + MoE residual pattern (still 6+ kernels per
-   layer where vLLM has 2-3). This is multi-day algorithmic work.
+Two Phase 3 root-cause bugs found + fixed:
+
+1. **`vllm_moe_c_tmp_f32` was per-CudaState lazy-alloc** (commit
+   76bf72f). `new_context()` rebuilt the state each
+   `decode_batch_internal`, dropping the c_tmp buffer → captured
+   graph held a freed GPU address → `cuGraphLaunch:
+   CUDA_ERROR_INVALID_VALUE` on every pre-capture replay. Moved
+   to a process-global OnceLock<RwLock<Option<CudaSlice<f32>>>>
+   pattern (mirrors MARLIN_GATHER_SCRATCH).
+2. **graph_key used `m_padded`** (commit db7e529). m=15..32 all
+   coalesced to graph_key=32; captured kernel launches bake in the
+   m used at capture time, so replaying for a different actual m
+   read stale per-seq slots → wrong logits → early-EOS garbage
+   tokens → c=32 output_tokens halved (7557 / 16512 expected).
+   Llama unified keys by `(m_total, num_seqs)` for the same reason.
+   Fixed to key by actual `m`.
+
+## Re-bench after both fixes (commit db7e529)
+
+Best config: `FERRUM_MOE_GRAPH=1 FERRUM_GRAPH_SKIP_UPLOAD=1`
+(per-replay cuGraphUpload adds overhead for the large MoE captured
+graph; SKIP_SYNC also tested but hurts c=8/16).
+
+| c  | eager (Phase 2) | graph + skip_upload | Δ vs eager |
+|----|----------------:|--------------------:|-----------:|
+| 1  | 146.0           | 146.4               | +0.3%      |
+| 8  | 525.3           | **558.7**           | **+6.4%**  |
+| 16 | 680.0           | **745.8**           | **+9.7%**  |
+| 32 | 847.7           | 793.6               | **−6.4%**  |
+
+All variants produce correct full token counts (16512 at c=32, etc.).
+0 replay errors throughout.
+
+**c=32 still regresses.** Even with skip_upload, per-replay
+`cuGraphLaunch` + sync overhead exceeds the launch-overhead savings
+when each iter is ~32ms of GPU work. The captured graph is large
+(~48 layers × ~10 kernels each = ~480 nodes) and at c=32 the GPU is
+already near-saturated, so the launch-overhead amortization that
+helps c=8/16 doesn't apply.
+
+vs vLLM 0.20.1 (~1870 tok/s c=32): best stable config still
+device_route eager (847.7 tok/s ≈ **45%**). Graph capture doesn't
+push past this at c=32.
+
+## Recommended ship config
+
+| Flag | Default | When to flip |
+|------|---------|--------------|
+| `FERRUM_MOE_DEVICE_ROUTE` | (removed — always on under VLLM_MOE) | n/a — locked in |
+| `FERRUM_MOE_HOST_ROUTE` | unset | =1 to force the legacy host path (diagnostic) |
+| `FERRUM_MOE_GRAPH` | unset (off) | =1 at c≤16 for +6-10% TPOT; do NOT set at c=32+ |
+| `FERRUM_GRAPH_SKIP_UPLOAD` | unset | =1 required alongside `FERRUM_MOE_GRAPH=1` (MoE-specific; Llama unified needs upload kept on) |
+
+## Remaining next steps
+
+1. **Investigate c=32 graph regression** — instrument `replay_graph`
+   with `FERRUM_GRAPH_PROF=1`; measure cuGraphLaunch vs sync time at
+   c=32. May not have a clean fix — if `cuGraphLaunch` is intrinsically
+   ~5ms for a 480-node graph on Ada, c=32 will always lose since the
+   eager-mode launch overhead is well-hidden in async queue at high m.
+2. **The actual c=32 cliff vs vLLM** (~55% gap remaining) — see
+   original "Recommended next steps" #3 above.
