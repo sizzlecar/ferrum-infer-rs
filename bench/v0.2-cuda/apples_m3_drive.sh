@@ -41,8 +41,8 @@ pkill -9 -f "vllm serve" 2>/dev/null || true
 deactivate 2>/dev/null || true
 sleep 5
 
-# 2. ferrum (MIXED_BATCH=1 — NEW)
-echo "=== [ferrum] starting with FERRUM_MIXED_BATCH=1 ==="
+# 2. ferrum (default config — matches docs/bench/moe-phase3 device_route variant)
+echo "=== [ferrum] starting ==="
 PORT=8801
 SERVER_LOG=bench/v0.2-cuda/results/ferrum__M3__r1.server.log
 CUDA_VISIBLE_DEVICES=0 \
@@ -51,11 +51,12 @@ FERRUM_KV_CAPACITY=2048 \
 FERRUM_KV_MAX_BLOCKS=4096 \
 FERRUM_PAGED_MAX_SEQS=32 \
 FERRUM_METAL_PAGED_KV=1 \
-FERRUM_MIXED_BATCH=1 \
+FERRUM_MIXED_BATCH=0 \
 FERRUM_GREEDY_ARGMAX=1 \
 FERRUM_MOE_BUCKETED=1 \
 FERRUM_MARLIN_SKIP_WS_ZERO=1 \
 FERRUM_MOE_STREAMS=4 \
+FERRUM_MOE_BATCH_THRESHOLD=4 \
   /workspace/ferrum-infer-rs/target/release/ferrum serve \
     --model /workspace/models/M3 --port "$PORT" \
     --gpu-memory-utilization 0.95 \

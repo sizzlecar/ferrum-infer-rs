@@ -2177,6 +2177,20 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let greedy = std::env::var("FERRUM_GREEDY_ARGMAX")
             .map(|v| v == "1")
             .unwrap_or(false);
+        // One-shot log on first decode call so the bench / smoke tests
+        // can confirm the env var actually wired through. Cheap atomic
+        // bool fence; no per-call cost after first hit.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[qwen3_moe] decode_batch_internal: FERRUM_GREEDY_ARGMAX={} (path={})",
+                    if greedy { "1" } else { "0" },
+                    if greedy { "GPU argmax" } else { "host argmax" }
+                );
+            }
+        }
         let all = if greedy {
             // No logits download — argmax kernel returns m tokens.
             // Callers expect Vec<f32> per item, so encode tokens as floats.
