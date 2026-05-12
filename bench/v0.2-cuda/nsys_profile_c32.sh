@@ -95,8 +95,9 @@ source /workspace/vllm-venv/bin/activate
 # delay=15 fires the capture window right when we hit `ready`. Bench
 # runs ~12 s, fully inside the 20 s capture window (15..35 from process
 # start). No host-side sleep needed — go straight from prewarm to bench.
-echo "[nsys] capture window opens shortly; launching c=32 bench"
-bash bench/v0.2-cuda/run_cell.sh ferrum_nsys M3 32 99 "$PORT" 2>&1 | tee "$OUT_DIR/bench.log"
+RUN_R=$(date +%s)
+echo "[nsys] capture window opens shortly; launching c=32 bench r=$RUN_R"
+bash bench/v0.2-cuda/run_cell.sh ferrum_nsys M3 32 "$RUN_R" "$PORT" 2>&1 | tee "$OUT_DIR/bench.log"
 
 # Wait for nsys to finish capturing
 sleep 5
