@@ -277,25 +277,19 @@ impl BackendMoeFused for CudaBackend {
     fn moe_combine(
         ctx: &mut Self::Context,
         packed_down: &Self::Buffer,
-        pairs_by_token: &[i32],
-        pair_weights: &[f32],
+        pairs_by_token: &Self::Buffer,
+        pair_weights: &Self::Buffer,
         out: &mut Self::Buffer,
         batch: usize,
         hidden: usize,
         top_k: usize,
         _total_pairs: usize,
     ) {
-        debug_assert_eq!(pairs_by_token.len(), batch * top_k);
-        debug_assert_eq!(pair_weights.len(), batch * top_k);
-
-        let stream = ctx.stream.clone();
-        let pairs_dev = stream
-            .clone_htod(pairs_by_token)
-            .expect("moe_combine pairs htod");
-        let weights_dev = stream
-            .clone_htod(pair_weights)
-            .expect("moe_combine weights htod");
-
+        // Phase D follow-up: device-buffer routing — no clone_htod here.
+        // Callers (moe_forward_bucketed) upload pairs/weights to device
+        // once per call (or, eventually, build them entirely device-side
+        // via B::moe_build_pairs_by_token + route_topk_softmax — that
+        // path unlocks CUDA Graph capture).
         let func = ctx.func("moe_combine", ptx::MOE_COMBINE, "moe_combine_f16");
         let batch_i32 = batch as i32;
         let hidden_i32 = hidden as i32;
@@ -307,8 +301,8 @@ impl BackendMoeFused for CudaBackend {
         let stream = ctx.stream.clone();
         let mut b = stream.launch_builder(&func);
         b.arg(packed_down);
-        b.arg(&pairs_dev);
-        b.arg(&weights_dev);
+        b.arg(pairs_by_token);
+        b.arg(pair_weights);
         b.arg(out);
         b.arg(&batch_i32);
         b.arg(&hidden_i32);
