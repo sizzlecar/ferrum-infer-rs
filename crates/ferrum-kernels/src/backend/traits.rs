@@ -1466,29 +1466,37 @@ pub trait BackendMoeFused: Backend {
     /// Layout matches vLLM's marlin_moe_wna16 kernel input
     /// expectation. The fused Marlin kernel reads a row from
     /// `a[sorted_token_ids[i] / top_k]` and weights from
-    /// Build `pairs_by_token` device-side from device-side `expert_ids`.
-    /// Inverts the bucket-sort permutation so `moe_combine` can read
-    /// routing output without a host round-trip — the prerequisite for
-    /// graph-capturing the MoE bucketed path. Also fills
-    /// `expert_offsets` (exclusive prefix sum of tokens-per-expert)
-    /// since they're computed by the same kernel.
+    /// Build `pairs_by_token` + `packed_token_idx` device-side from
+    /// device-side `expert_ids`. The counting-sort permutation that
+    /// lets `moe_combine` (and the gather step before phase 1 GEMM)
+    /// read routing output without a host round-trip — the prerequisite
+    /// for graph-capturing the MoE bucketed path.
     ///
     /// Inputs (device):
     /// - `expert_ids: I32 [batch * top_k]` — top-K selected expert ids.
     ///
     /// Outputs (device):
-    /// - `pairs_by_token: I32 [batch * top_k]` — sorted-by-expert position
-    ///   of each (b, k) pair (the row index into `packed_down`).
-    /// - `expert_offsets: I32 [num_experts + 1]` — prefix sum.
+    /// - `pairs_by_token: I32 [batch * top_k]` — sorted-by-expert
+    ///   position of each (b, k) pair (the row index into `packed_down`
+    ///   that `moe_combine` reads).
+    /// - `packed_token_idx: I32 [batch * top_k]` — inverse map: for
+    ///   each packed row, the original token b. Used by the gather
+    ///   step (`embedding_lookup` of `x` into `x_packed` before phase 1).
+    /// - `expert_offsets: I32 [num_experts + 1]` — exclusive prefix
+    ///   sum of tokens-per-expert; phase 1/3 dispatchers use it to
+    ///   compute each expert's row slice in the packed buffers.
     ///
     /// Default impl returns Err — only CUDA implements this.
+    #[allow(clippy::too_many_arguments)]
     fn moe_build_pairs_by_token(
         _ctx: &mut Self::Context,
         _expert_ids: &Self::Buffer,
         _pairs_by_token: &mut Self::Buffer,
+        _packed_token_idx: &mut Self::Buffer,
         _expert_offsets: &mut Self::Buffer,
         _batch_x_topk: usize,
         _num_experts: usize,
+        _top_k: usize,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "moe_build_pairs_by_token not implemented for this backend",

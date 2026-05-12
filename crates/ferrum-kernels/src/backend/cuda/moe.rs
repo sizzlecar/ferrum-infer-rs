@@ -191,9 +191,11 @@ impl BackendMoeFused for CudaBackend {
         ctx: &mut Self::Context,
         expert_ids: &Self::Buffer,
         pairs_by_token: &mut Self::Buffer,
+        packed_token_idx: &mut Self::Buffer,
         expert_offsets: &mut Self::Buffer,
         batch_x_topk: usize,
         num_experts: usize,
+        top_k: usize,
     ) -> Result<()> {
         if num_experts > 256 {
             return Err(FerrumError::model(format!(
@@ -207,14 +209,17 @@ impl BackendMoeFused for CudaBackend {
         );
         let n = batch_x_topk as i32;
         let ne = num_experts as i32;
+        let tk = top_k as i32;
         let smem = (num_experts as u32) * 4; // i32 counts per expert
         let stream = ctx.stream.clone();
         let mut b = stream.launch_builder(&func);
         b.arg(expert_ids);
         b.arg(pairs_by_token);
+        b.arg(packed_token_idx);
         b.arg(expert_offsets);
         b.arg(&n);
         b.arg(&ne);
+        b.arg(&tk);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),

@@ -22,11 +22,13 @@
 #include <cstdint>
 
 extern "C" __global__ void moe_build_pairs_by_token(
-    const int32_t* __restrict__ expert_ids,   // [batch * top_k]
-    int32_t*       __restrict__ pairs_by_token,// [batch * top_k]
-    int32_t*       __restrict__ expert_offsets,// [num_experts + 1]
+    const int32_t* __restrict__ expert_ids,    // [batch * top_k]
+    int32_t*       __restrict__ pairs_by_token, // [batch * top_k]
+    int32_t*       __restrict__ packed_token_idx,// [batch * top_k]
+    int32_t*       __restrict__ expert_offsets, // [num_experts + 1]
     int batch_x_topk,
-    int num_experts
+    int num_experts,
+    int top_k
 ) {
     // counts[e] used as both per-expert count (pass 1) and per-expert
     // write cursor (pass 3) — see comments below.
@@ -64,6 +66,7 @@ extern "C" __global__ void moe_build_pairs_by_token(
 
     // ── Pass 3: scatter (b, k) to its sorted slot ────────────────────
     // pairs_by_token[(b, k)] = expert_offsets[e] + per-expert position.
+    // packed_token_idx[packed_row] = b (the original token id, for gather).
     // The per-expert position comes from atomicAdd into counts[e]
     // (now reused as a write cursor — starts at 0 from pass 2 reset).
     for (int p = tid; p < batch_x_topk; p += block_size) {
@@ -73,6 +76,9 @@ extern "C" __global__ void moe_build_pairs_by_token(
             continue;
         }
         int slot = atomicAdd(&counts[e], 1);
-        pairs_by_token[p] = expert_offsets[e] + slot;
+        int packed_row = expert_offsets[e] + slot;
+        pairs_by_token[p] = packed_row;
+        // p = b * top_k + k; we want packed_token_idx[packed_row] = b.
+        packed_token_idx[packed_row] = p / top_k;
     }
 }
