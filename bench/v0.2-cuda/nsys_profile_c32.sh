@@ -67,7 +67,7 @@ FERRUM_MOE_STREAMS=4 \
 FERRUM_MOE_BATCH_THRESHOLD=4 \
   "$NSYS" profile \
     --trace=cuda,nvtx,cudnn,osrt \
-    --delay=30 --duration=20 \
+    --delay=70 --duration=15 \
     --force-overwrite=true \
     --output="$NSYS_FILE" \
     /workspace/ferrum-infer-rs/target/release/ferrum serve \
@@ -91,11 +91,14 @@ curl -sf -m 60 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
 
 source /workspace/vllm-venv/bin/activate
 
-# Sleep to let nsys --delay window pass + some early warmup decode iters.
-echo "[nsys] waiting for capture window (delay=30s)"
-sleep 35
+# Server "ready" fires at ~30s. nsys delay=70 → window opens at t=70.
+# We need bench to START during that window. Sleep brings us to ~t=68
+# (server is up at t≈30, plus prewarm ~1s, plus this sleep). Then bench
+# cell runs ~12s, fully inside the 15s capture window.
+echo "[nsys] waiting until t≈68 to start bench (nsys delay=70)"
+sleep 37
 
-# Run c=32 bench cell during the 20s capture
+# Run c=32 bench cell during the 15s capture
 echo "[nsys] launching c=32 bench (capture in progress)"
 bash bench/v0.2-cuda/run_cell.sh ferrum_nsys M3 32 99 "$PORT" 2>&1 | tee "$OUT_DIR/bench.log"
 
