@@ -1590,9 +1590,14 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         moe_block_size <= max_block_size,
         "moe_block_size {moe_block_size} exceeds scratch worst-case {max_block_size}"
     );
-    // sorted_max bound — must match Qwen3MoeScratch.route_sorted_tokens_dev
-    // capacity (allocated for the worst-case max_block_size).
-    let sorted_max_size = batch * top_k + num_experts * max_block_size;
+    // sorted_max bound — passed to moe_align as a runtime cap so it
+    // never writes past `total_padded` for the chosen block_size. We use
+    // the picked `moe_block_size`, not `max_block_size`, so moe_align
+    // doesn't sentinel-fill the slack between the actual padded count
+    // and the worst-case buffer capacity (saves ~6 KB of writes per
+    // layer × 48 layers × 32 layer-loop iters when block_size lands at 16).
+    // The buffer itself is sized for max_block_size in qwen3_moe.rs.
+    let sorted_max_size = batch * top_k + num_experts * moe_block_size;
     let vllm_routing_owned: Option<ferrum_kernels::backend::MoeRouting<B>> =
         if use_vllm_moe && !use_device_route {
             let plan = plan.expect("plan is Some when host vllm builder runs");
