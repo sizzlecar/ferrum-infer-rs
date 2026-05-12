@@ -2057,11 +2057,20 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let graph_enabled = std::env::var("FERRUM_MOE_GRAPH")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let m_padded = m.next_power_of_two();
-        // High bit set + low 32 bits = m_padded — same scheme as
-        // LlamaFamilyModel's unified key, ensures no collision with
-        // single-item graph key 0.
-        let graph_key: u64 = (1u64 << 63) | (m_padded as u64);
+        // Per-m graph cache. Key is `m` exactly, NOT `m_padded`.
+        // Captured kernel launches bake the grid_dim / loop bounds for
+        // the m used at capture time; replaying the same graph for a
+        // different actual m → wrong indexing into per-seq scratch
+        // (block_tables / context_lens) → early-EOS garbage tokens.
+        // Llama's unified graph keys by `(m_total, num_seqs)` for the
+        // same reason. For MoE decode where each seq contributes 1
+        // token (q_len=1), m is num_seqs is m_total, so the single
+        // u64 m fully identifies the shape.
+        //
+        // High bit set so this key space never collides with the
+        // single-item / batched-graph keys used by LlamaFamilyModel
+        // (which share the same DECODE_GRAPHS cache).
+        let graph_key: u64 = (1u64 << 63) | (m as u64);
         let cache_has_key = self.batched_graph_keys_seen.contains(&graph_key);
 
         // Pre-grow marlin gather scratch before capture begins —
