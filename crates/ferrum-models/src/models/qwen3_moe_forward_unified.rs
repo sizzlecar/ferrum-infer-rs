@@ -90,11 +90,9 @@ where
             paged_max_seqs,
         );
         let max_seqs = paged_max_seqs.max(num_seqs);
-        // Grow LEGACY scratch first — moe_forward_batched_prefill_impl
-        // reads/writes scratch.{router_logits, norm_out, moe_out},
-        // sized for max_tokens. Unified path can exceed that; this is
-        // a no-op when m_total <= max_tokens.
-        self.ensure_scratch(m_total);
+        // Caller (DecoderOnlyLLM::unified_forward) already verified
+        // m_total <= self.scratch.max_tokens; never realloc here.
+        debug_assert!(m_total <= self.scratch.max_tokens);
         let cfg_clone = self.cfg.clone();
         self.scratch
             .ensure_unified_scratch(&cfg_clone, m_total, max_seqs, max_blocks_per_seq);

@@ -3801,6 +3801,19 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM
                  (set FERRUM_METAL_PAGED_KV=1). Engine falls back.",
             ));
         }
+        // Safety: only handle batches that fit in EXISTING scratch.
+        // Growing legacy scratch under load risks OOM (model + KV pool
+        // + new scratch all alive briefly during realloc → 24 GB GPU
+        // saturates on 17 GB model + 6 GB KV pool). Caller (LlmExecutor)
+        // falls back to per-item dispatch under one model lock.
+        let m_total: usize = items.iter().map(|it| it.1.len()).sum();
+        if m_total > self.scratch.max_tokens {
+            return Err(FerrumError::unsupported(format!(
+                "Qwen3MoeModel::unified_forward: m_total={} > scratch.max_tokens={}; \
+                 fall back to legacy split (no scratch realloc under load)",
+                m_total, self.scratch.max_tokens,
+            )));
+        }
         Ok(self.unified_forward_internal(items))
     }
 
