@@ -250,6 +250,26 @@ pub trait ModelExecutor: Send + Sync {
     /// Execute prefill phase (process initial prompt)
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput>;
 
+    /// Batch prefill: process multiple prompts' prefill in ONE forward pass.
+    ///
+    /// Default implementation falls back to per-request `prefill()` (serial,
+    /// which is the current behavior the engine sees today). Executors that
+    /// support unified mixed-batch forward (e.g. via `model.unified_forward`
+    /// over a varlen QKV path) should override this to amortize launch /
+    /// kernel-overhead across all `inputs` items in one call.
+    ///
+    /// Used by the continuous-batching engine to coalesce a cohort of new
+    /// prefills (apples M3 c=32 sees 32 simultaneous prefills as one logical
+    /// batch; the serial fallback runs each in ~47 ms while a true batched
+    /// path runs all 32 in ~100 ms).
+    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            outputs.push(self.prefill(input).await?);
+        }
+        Ok(outputs)
+    }
+
     /// Execute decode phase (generate next token)
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput>;
 

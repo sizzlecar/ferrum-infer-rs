@@ -1,5 +1,6 @@
 //! Cross-model traits and helpers (Model-as-Code shared infrastructure).
 
+pub mod decoder_unified;
 pub mod families;
 pub mod llm;
 pub mod paged_pool;

@@ -304,6 +304,23 @@ pub struct Qwen3MoeScratch<B: QuantLlmBackend + BackendMoeFused> {
     /// Holds RouterOutput / softmax buffer / MoeBucketPlan reused across
     /// every layer (~10 ms / token reclaimed at c=32 / Qwen3-MoE 30B-A3B).
     pub moe_route_scratch: crate::moe::MoeRouteScratch,
+
+    // ── Unified mixed-batch INDEX buffers ─────────────────────────────
+    //
+    // vLLM-style: small index tensors written per call. The big
+    // activation tensors (residual/norm_out/qkv_out/moe_out) are
+    // SHARED with legacy decode/prefill paths — sized for max_tokens,
+    // pre-allocated at scratch construction, never grown on demand.
+    /// `[max_seqs + 1]` u32 — cumulative q-token counts across items.
+    pub unified_cu_seqlens_q: Option<B::Buffer>,
+    /// `[max_seqs]` u32 — per-item starting absolute KV position.
+    pub unified_pos_offsets: Option<B::Buffer>,
+    /// `[max_seqs * max_blocks_per_seq]` u32 — stacked block tables.
+    pub unified_block_tables: Option<B::Buffer>,
+    /// `[max_seqs, hidden]` — gather of last-token rows for lm_head.
+    pub unified_packed_normed: Option<B::Buffer>,
+    /// `[max_seqs, vocab]` — per-final-token logits from lm_head.
+    pub unified_packed_logits: Option<B::Buffer>,
 }
 
 impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
@@ -412,7 +429,44 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
             paged_max_blocks_per_seq: 0,
             max_tokens: t,
             moe_route_scratch: crate::moe::MoeRouteScratch::new(),
+            // Unified small index buffers — allocated once by ensure.
+            unified_cu_seqlens_q: None,
+            unified_pos_offsets: None,
+            unified_block_tables: None,
+            unified_packed_normed: None,
+            unified_packed_logits: None,
         }
+    }
+
+    /// Allocate small per-call index buffers for the unified mixed-batch
+    /// forward. Idempotent. The BIG activation tensors (residual / norm_out
+    /// / qkv_out / moe_out) are shared with the legacy paths and sized
+    /// for `max_tokens` at scratch construction — no realloc here.
+    pub(crate) fn ensure_unified_scratch(
+        &mut self,
+        cfg: &Qwen3MoeConfig,
+        max_seqs: usize,
+        max_blocks_per_seq: usize,
+    ) {
+        if self.unified_cu_seqlens_q.is_some() {
+            return;
+        }
+        let h = cfg.base.hidden_size;
+        let v = cfg.base.vocab_size;
+        self.unified_cu_seqlens_q = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs + 1,
+        ));
+        self.unified_pos_offsets = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs,
+        ));
+        self.unified_block_tables = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs * max_blocks_per_seq,
+        ));
+        self.unified_packed_normed = Some(B::alloc(max_seqs * h));
+        self.unified_packed_logits = Some(B::alloc(max_seqs * v));
     }
 
     /// Allocate scratch for paged batched dispatch. Mirrors
@@ -3567,7 +3621,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
     }
 }
 
-impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
+impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM
+    for Qwen3MoeModel<B, K>
+{
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -3659,6 +3715,48 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
                 .map(|(cid, tok, p)| self.decode(cid, *tok, *p))
                 .collect()
         }
+    }
+
+    fn unified_forward(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Pure-decode shortcut: every item is q_len=1 + is_final_chunk.
+        // For this shape, ferrum's legacy `forward_layer_batched_decode`
+        // path (with FERRUM_MOE_GRAPH=1 graph capture + decode-tuned
+        // moe_forward_stacked) is faster than our generic varlen +
+        // bucketed-MoE unified path. Returning Unsupported routes the
+        // engine to the legacy decode_batch path via LlmExecutor's
+        // fallback partition.
+        let all_decode = items
+            .iter()
+            .all(|it| it.1.len() == 1 && it.3);
+        if all_decode {
+            return Err(FerrumError::unsupported(
+                "Qwen3MoeModel::unified_forward: pure-decode batch — \
+                 routed to legacy decode_batch (faster for q_len=1)",
+            ));
+        }
+        // Any prefill chunk (q_len > 1) OR non-final-chunk item:
+        // unified path wins by collapsing N serial prefills into one
+        // [M_total, hidden] forward.
+        if self.paged_pools.is_none() {
+            return Err(FerrumError::unsupported(
+                "Qwen3MoeModel::unified_forward: paged KV required \
+                 (set FERRUM_METAL_PAGED_KV=1).",
+            ));
+        }
+        let m_total: usize = items.iter().map(|it| it.1.len()).sum();
+        if m_total > self.scratch.max_tokens {
+            return Err(FerrumError::unsupported(format!(
+                "Qwen3MoeModel::unified_forward: m_total={} > scratch.max_tokens={}",
+                m_total, self.scratch.max_tokens,
+            )));
+        }
+        Ok(self.unified_forward_internal(items))
     }
 
     fn release(&mut self, cache_id: &str) {

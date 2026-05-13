@@ -73,10 +73,8 @@ case "$ENGINE" in
             --output "$OUT_REP" \
             --trace cuda \
             --sample none \
-            --delay 30 \
-            --duration 40 \
-            --capture-range timer \
-            --capture-range-end stop \
+            --delay 35 \
+            --duration 25 \
             --force-overwrite true \
             vllm serve /workspace/models/M3 --port 8800 \
                 --max-num-seqs 64 --max-model-len 4096 \
