@@ -63,6 +63,9 @@ run_model() {
     fi
 
     # ── vLLM half ───────────────────────────────────────────
+    if [ -n "${SKIP_VLLM:-}" ]; then
+        echo "[$TAG] SKIP_VLLM=1 — using existing vllm results from bench/v0.2-cuda/results/"
+    else
     echo
     echo "============================================="
     echo "[$TAG] vllm"
@@ -96,6 +99,7 @@ run_model() {
     pkill -9 -f "VLLM" 2>/dev/null || true
     deactivate 2>/dev/null || true
     sleep 5
+    fi  # SKIP_VLLM gate
 
     # ── ferrum half ───────────────────────────────────────────
     echo
