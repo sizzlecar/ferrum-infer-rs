@@ -3,6 +3,7 @@
 #include "attention_generic.cuh"
 
 #include <stdint.h>
+#include <string>  // ferrum: original vendored from torch context; add for std::string
 #ifdef ENABLE_FP8
   #ifndef USE_ROCM
     #include <cuda_fp8.h>
