@@ -3724,25 +3724,32 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        // Require paged-KV — the unified path uses the varlen kernels
-        // that only work on the paged pool layout (PR #102+). Without
-        // paged pools, fall through to the engine's legacy serial path.
+        // Phase 2B status: implementation is in place but the engine's
+        // scheduler today only emits decode-only batches (m_total=num_seqs,
+        // q_len=1 per item). For pure decode the legacy `forward_layer_
+        // batched_decode` path is already optimized (FERRUM_MOE_GRAPH
+        // graph capture, fast paths for m=1 per item) and outperforms
+        // the unified path that does generic varlen + bucketed MoE.
+        // Phase 3 (token-budget scheduler with chunked prefill) is the
+        // prerequisite for the unified path to see actual mixed batches
+        // where it wins. Until then, gate behind opt-in env var.
+        if std::env::var("FERRUM_QWEN3MOE_UNIFIED").as_deref() != Ok("1") {
+            return Err(FerrumError::unsupported(
+                "Qwen3MoeModel::unified_forward: gated by FERRUM_QWEN3MOE_UNIFIED=1 \
+                 (Phase 3 scheduler not yet emitting mixed batches; legacy decode \
+                 path is faster for decode-only iters).",
+            ));
+        }
         if self.paged_pools.is_none() {
             return Err(FerrumError::unsupported(
                 "Qwen3MoeModel::unified_forward: paged KV required \
-                 (set FERRUM_METAL_PAGED_KV=1). Engine falls back.",
+                 (set FERRUM_METAL_PAGED_KV=1).",
             ));
         }
-        // Safety: only handle batches that fit in EXISTING scratch.
-        // Growing legacy scratch under load risks OOM (model + KV pool
-        // + new scratch all alive briefly during realloc → 24 GB GPU
-        // saturates on 17 GB model + 6 GB KV pool). Caller (LlmExecutor)
-        // falls back to per-item dispatch under one model lock.
         let m_total: usize = items.iter().map(|it| it.1.len()).sum();
         if m_total > self.scratch.max_tokens {
             return Err(FerrumError::unsupported(format!(
-                "Qwen3MoeModel::unified_forward: m_total={} > scratch.max_tokens={}; \
-                 fall back to legacy split (no scratch realloc under load)",
+                "Qwen3MoeModel::unified_forward: m_total={} > scratch.max_tokens={}",
                 m_total, self.scratch.max_tokens,
             )));
         }
