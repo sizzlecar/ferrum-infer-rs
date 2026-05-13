@@ -296,7 +296,50 @@ impl EngineInner {
             resource_constraints: ferrum_interfaces::scheduler::ResourceConstraints::default(),
         };
 
-        let batch = match self.scheduler.next_batch(hint).await {
+        // FERRUM_NEXT_BATCH_PROF=1: count Some/None returns to root-cause
+        // the apples HTTP-serve 17 ms inter-batch-iter gap. Prints every
+        // 1024 run_iteration calls. Set None_size to 0 explicitly so the
+        // bg-loop tight-spin theory can be confirmed.
+        let nb_prof = std::env::var("FERRUM_NEXT_BATCH_PROF").is_ok();
+        let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
+        let nb_result = self.scheduler.next_batch(hint).await;
+        if let Some(t0) = nb_t0 {
+            use std::sync::atomic::AtomicU64;
+            static SOME_N: AtomicU64 = AtomicU64::new(0);
+            static NONE_N: AtomicU64 = AtomicU64::new(0);
+            static SOME_US: AtomicU64 = AtomicU64::new(0);
+            static NONE_US: AtomicU64 = AtomicU64::new(0);
+            let us = t0.elapsed().as_micros() as u64;
+            let is_some = nb_result.is_some();
+            let batch_size = nb_result.as_ref().map_or(0, |b| b.size());
+            if is_some {
+                SOME_N.fetch_add(1, Ordering::Relaxed);
+                SOME_US.fetch_add(us, Ordering::Relaxed);
+            } else {
+                NONE_N.fetch_add(1, Ordering::Relaxed);
+                NONE_US.fetch_add(us, Ordering::Relaxed);
+            }
+            let total = SOME_N.load(Ordering::Relaxed) + NONE_N.load(Ordering::Relaxed);
+            if total.is_multiple_of(1024) {
+                let s_n = SOME_N.load(Ordering::Relaxed);
+                let n_n = NONE_N.load(Ordering::Relaxed);
+                let s_us = SOME_US.load(Ordering::Relaxed);
+                let n_us = NONE_US.load(Ordering::Relaxed);
+                eprintln!(
+                    "[nb-prof] total={} some={} none={} ratio={:.3} | some_avg={}us none_avg={}us last_batch_size={} last_was_some={}",
+                    total,
+                    s_n,
+                    n_n,
+                    s_n as f64 / total as f64,
+                    if s_n > 0 { s_us / s_n } else { 0 },
+                    if n_n > 0 { n_us / n_n } else { 0 },
+                    batch_size,
+                    is_some,
+                );
+            }
+        }
+
+        let batch = match nb_result {
             Some(b) => b,
             None => {
                 tokio::time::sleep(Duration::from_millis(1)).await;
