@@ -151,6 +151,8 @@ Append after every optimization. Even if bench is unchanged, capture the API del
 | 2026-05-13 | `0f2dadb` | RBD/BATCH_DECODE prof | 1031 | 55% | — | — | — | — | profiling overhead < 1%; localized 17 ms inter-batch gap |
 | 2026-05-13 | `1d0c200` | Phase 1: batched prefill (M3) | 1004 | 53% | — | — | — | — | Qwen3Moe lacks unified_forward → falls back to serial; M3 unaffected |
 | 2026-05-13 | `1d0c200` | Phase 1: batched prefill (M2) | 855 | 39% (M2 baseline 38%) | — | — | — | — | Llama unified_forward fires (fallback=false), 26 batch_prefill calls / bench. Batched prefill works at kernel level (~+50% prefill bandwidth) but M2's prefill is only 5% of bench wall (decode is the bottleneck) — net throughput unchanged. |
+| 2026-05-13 | `b9e0bd6` | Wave 1: unified process_batch (M3) | 1021 | 54% | — | — | — | — | Qwen3Moe still falls back to serial in LlmExecutor — architecture seam updated but no kernel-level coalescing yet. Wave 2 (Qwen3Moe native unified_forward) is the unlock. |
+| 2026-05-13 | `b9e0bd6` | Wave 1: unified process_batch (M2) | **881** | **40%** | — | — | — | — | Llama unified_forward now called with mixed prefill+decode items per iter. +3.5% over baseline. Confirms architecture: real continuous batching at engine layer; but M2 dec ode kernel is still the dominant wall-time (compute-bound), so engine-level mixing only recovers the cohort gap, not the per-iter kernel cost. |
 | | | | | | | | | | |
 
 ## Phase 1 retrospective
