@@ -506,18 +506,35 @@ where
                 .expect("unified_moe_input missing");
             B::copy_slice(ctx, moe_input, 0, &mut self.scratch.norm_out, 0, m_total * h);
         }
-        crate::moe::forward::moe_forward_batched_prefill_impl::<B>(
+        crate::moe::moe_forward_bucketed::<B>(
             ctx,
-            moe_layer,
-            &mut self.scratch,
+            &self.scratch.norm_out,
+            &self.scratch.router_logits,
+            &mut self.scratch.moe_out,
+            m_total,
             h,
             inter,
-            top_k,
             n_exp,
+            top_k,
             norm_topk_prob,
-            m_total,
+            &moe_layer.experts,
+            &mut self.scratch.x_packed_bucket,
+            &mut self.scratch.gate_up_packed_bucket,
+            &mut self.scratch.silu_stacked,
+            &mut self.scratch.down_out_stacked,
+            &mut self.scratch.moe_route_scratch,
+            Some(crate::moe::dispatch::DeviceRouteScratch {
+                selected_ids: &mut self.scratch.selected_ids_buf,
+                pair_weights: &mut self.scratch.route_pair_weights_dev,
+                pairs_by_token: &mut self.scratch.route_pairs_dev,
+                packed_token_idx: &mut self.scratch.route_packed_idx_dev,
+                expert_offsets: &mut self.scratch.route_expert_offsets_dev,
+                sorted_tokens: &mut self.scratch.route_sorted_tokens_dev,
+                block_ids: &mut self.scratch.route_block_ids_dev,
+                total_post_pad: &mut self.scratch.route_total_post_pad_dev,
+            }),
         )
-        .expect("Qwen3Moe unified: moe_forward_batched_prefill_impl");
+        .expect("Qwen3Moe unified: moe_forward_bucketed");
         {
             let moe_out = self
                 .scratch
