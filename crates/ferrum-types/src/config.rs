@@ -438,6 +438,26 @@ pub struct BatchConfig {
     pub max_wait_ms: u64,
     pub enable_dynamic: bool,
     pub enable_continuous: bool,
+    /// vLLM-style per-iteration token budget. The scheduler emits a
+    /// mixed prefill+decode batch summing to at most this many Q
+    /// tokens (decode = 1 each, prefill chunk = its chunk size).
+    /// Default 4096 — large enough that the Qwen3MoE unified path
+    /// activates for typical cohort prefills (c=32 × 128 tokens ≈
+    /// 4 K) without pushing scratch past the 4 GB reserve carved by
+    /// `gpu_mem_autosize`. `FERRUM_MAX_BATCHED_TOKENS` (set by the
+    /// autosizer for `serve` / chat profile) overrides; users
+    /// should not set it by hand.
+    #[serde(default = "BatchConfig::default_max_num_batched_tokens")]
+    pub max_num_batched_tokens: usize,
+}
+
+impl BatchConfig {
+    fn default_max_num_batched_tokens() -> usize {
+        std::env::var("FERRUM_MAX_BATCHED_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048)
+    }
 }
 
 impl Default for BatchConfig {
@@ -447,6 +467,7 @@ impl Default for BatchConfig {
             max_wait_ms: 8,
             enable_dynamic: true,
             enable_continuous: false,
+            max_num_batched_tokens: Self::default_max_num_batched_tokens(),
         }
     }
 }

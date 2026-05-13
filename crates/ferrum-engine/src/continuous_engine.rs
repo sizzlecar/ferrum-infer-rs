@@ -288,9 +288,15 @@ impl EngineInner {
         let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
         let t_iter_start = if prof { Some(Instant::now()) } else { None };
 
+        // Phase 3 token-budget hint: scheduler emits a mixed batch
+        // summing to at most `max_num_batched_tokens` Q tokens. This
+        // replaces the prior `max_batch_size * 2048` heuristic which
+        // never bit and left scheduler-side prefill admission capped
+        // at `max_prefill_batch=8`. Defaults to 4096 (autosizer can
+        // override via `FERRUM_MAX_BATCHED_TOKENS`).
         let hint = ferrum_interfaces::BatchHint {
             max_batch_size: self.config.batching.max_batch_size,
-            max_tokens: self.config.batching.max_batch_size * 2048,
+            max_tokens: self.config.batching.max_num_batched_tokens,
             target_latency_ms: None,
             available_memory: None,
             resource_constraints: ferrum_interfaces::scheduler::ResourceConstraints::default(),
@@ -386,8 +392,8 @@ impl EngineInner {
         // For chunked-prefill (FERRUM_CHUNKED_PREFILL=N) or speculative
         // decoding, fall back to the legacy split path. Phase 3 will
         // extend chunked-prefill into the unified mode.
-        let chunked_or_spec = std::env::var("FERRUM_CHUNKED_PREFILL").is_ok()
-            || self.spec_config.is_some();
+        let chunked_or_spec =
+            std::env::var("FERRUM_CHUNKED_PREFILL").is_ok() || self.spec_config.is_some();
         if chunked_or_spec {
             return self.process_batch_legacy_split(batch).await;
         }
@@ -397,10 +403,7 @@ impl EngineInner {
     /// Legacy split path: separate prefill (batched via run_batch_prefill)
     /// then decode (batched via run_batch_decode). Used for chunked-prefill
     /// and speculative-decoding flows that the unified path doesn't model yet.
-    async fn process_batch_legacy_split(
-        &self,
-        batch: &ferrum_interfaces::BatchPlan,
-    ) -> Result<()> {
+    async fn process_batch_legacy_split(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
         let mut prefill_ids = Vec::new();
         let mut decode_ids = Vec::new();
         {
@@ -467,10 +470,7 @@ impl EngineInner {
     /// partitions the batch by item shape and serializes prefills under one
     /// model lock — behavior-preserving but no perf gain. Llama already
     /// supports unified_forward, so M2 immediately co-batches prefill+decode.
-    async fn process_batch_unified(
-        &self,
-        batch: &ferrum_interfaces::BatchPlan,
-    ) -> Result<()> {
+    async fn process_batch_unified(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
         use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
         use ferrum_interfaces::KvCacheHandle;
 
@@ -515,7 +515,9 @@ impl EngineInner {
         for rid in &prefill_ids {
             let (input_tokens, num_tokens) = {
                 let sequences = self.sequences.read();
-                let Some(seq) = sequences.get(rid) else { continue };
+                let Some(seq) = sequences.get(rid) else {
+                    continue;
+                };
                 (seq.input_tokens.clone(), seq.input_tokens.len())
             };
             if !skip_prefix_cache {
@@ -527,7 +529,9 @@ impl EngineInner {
                     let cloned_kv = cached_kv.clone_handle()?;
                     let first_token = {
                         let mut sequences = self.sequences.write();
-                        let Some(seq) = sequences.get_mut(rid) else { continue };
+                        let Some(seq) = sequences.get_mut(rid) else {
+                            continue;
+                        };
                         if let Some(ref jp) = seq.json_processor {
                             jp.reset();
                         }
@@ -609,15 +613,22 @@ impl EngineInner {
         {
             let sequences = self.sequences.read();
             for rid in &decode_ids {
-                let Some(seq) = sequences.get(rid) else { continue };
-                let Some(kv) = seq.kv_cache.clone() else { continue };
+                let Some(seq) = sequences.get(rid) else {
+                    continue;
+                };
+                let Some(kv) = seq.kv_cache.clone() else {
+                    continue;
+                };
                 let last_token = seq
                     .generated_tokens
                     .last()
                     .copied()
                     .unwrap_or(TokenId::new(0));
                 let pos_offset = kv.block_table().sequence_length;
-                let seq_id = seq.model_cache_id.clone().unwrap_or_else(|| rid.to_string());
+                let seq_id = seq
+                    .model_cache_id
+                    .clone()
+                    .unwrap_or_else(|| rid.to_string());
                 unified.items.push(UnifiedBatchItem {
                     seq_id,
                     q_tokens: vec![last_token.get()],
@@ -638,6 +649,15 @@ impl EngineInner {
             Ok(r) => r,
             Err(e) => {
                 warn!("Unified forward failed: {}; falling back to split", e);
+                // Release the KV cache slots we just allocated for the
+                // unified-path prefills — otherwise the legacy split
+                // path's `run_batch_prefill` re-allocates for the same
+                // request_id, double-counting `active_caches` (only one
+                // of the two pairs ever gets deallocated by
+                // `complete_request`). Found via paged_attention_test.
+                for (rid, _, _) in &unified_prefills {
+                    let _ = self.kv_cache.deallocate(rid.clone()).await;
+                }
                 return self.process_batch_legacy_split(batch).await;
             }
         };
@@ -663,12 +683,16 @@ impl EngineInner {
             let num_tokens = input_tokens.len();
             let kv_handle = unified.items[i].kv_cache.clone();
             // Store in prefix cache (best-effort).
-            let _ = self
-                .prefix_cache
-                .store_prefix(&input_tokens, kv_handle.clone(), logits_vec.clone());
+            let _ = self.prefix_cache.store_prefix(
+                &input_tokens,
+                kv_handle.clone(),
+                logits_vec.clone(),
+            );
             let first_token = {
                 let mut sequences = self.sequences.write();
-                let Some(seq) = sequences.get_mut(&rid) else { continue };
+                let Some(seq) = sequences.get_mut(&rid) else {
+                    continue;
+                };
                 if let Some(ref jp) = seq.json_processor {
                     jp.reset();
                 }
@@ -705,7 +729,9 @@ impl EngineInner {
             };
             let next_token = {
                 let mut sequences = self.sequences.write();
-                let Some(seq) = sequences.get_mut(&rid) else { continue };
+                let Some(seq) = sequences.get_mut(&rid) else {
+                    continue;
+                };
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
                     TokenId::new(logits[0] as u32)
@@ -1116,8 +1142,11 @@ impl EngineInner {
         // ── Phase 1a: per-request setup (prefix cache → tokens → kv alloc) ──
         // After this loop, `to_prefill` holds only requests that need a real
         // model call. Prefix cache hits + immediate stops are handled inline.
-        let mut to_prefill: Vec<(RequestId, Vec<TokenId>, Arc<dyn ferrum_interfaces::KvCacheHandle>)> =
-            Vec::new();
+        let mut to_prefill: Vec<(
+            RequestId,
+            Vec<TokenId>,
+            Arc<dyn ferrum_interfaces::KvCacheHandle>,
+        )> = Vec::new();
 
         let model_info = self.model_executor.info();
         let skip_prefix_cache = if cfg!(feature = "cuda") {

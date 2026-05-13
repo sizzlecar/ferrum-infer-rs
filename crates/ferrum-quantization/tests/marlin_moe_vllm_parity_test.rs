@@ -1,7 +1,15 @@
-//! Stage 14d — vLLM marlin_moe_wna16 vs Stage 12.1 fused parity (CUDA only).
+//! Stage 14d — vLLM marlin_moe_wna16 vs per-expert parity (CUDA only).
 //!
 //! Adapter test: feed both paths the same synthetic 4-expert problem and
 //! compare per-expert output rows in the pre-gathered C buffer.
+//!
+//! Post Phase B-D: BOTH paths now route through the
+//! `MarlinExpertStack` trait — `make_expert_linear` for the per-expert
+//! reference, `gemm_phase_vllm` for the fused vLLM kernel. The stack
+//! is one and the same (`load_gptq_stacked` returns the trait object).
+//! The "two formats" the old test set up (IST-DASLab via load_gptq_stacked
+//! + vLLM Marlin via load_stacked_gptq_vllm_marlin) collapsed into one
+//! when `gemm_phase_vllm` was hoisted onto MarlinExpertStack.
 //!
 //! Run on RTX 4090:
 //!   cargo test -p ferrum-quantization --features cuda,vllm-moe-marlin --release \
@@ -66,10 +74,7 @@ mod synth {
 #[ignore]
 fn cuda_marlin_moe_vllm_vs_per_expert() {
     use ferrum_kernels::backend::cuda::CudaBackend;
-    use ferrum_kernels::backend::{Backend, BackendMoeFused, BackendPagedKv, BackendQuantMarlin};
-    use ferrum_quantization::gptq::StackedExpertLinear;
-    use ferrum_quantization::Linear;
-    use std::sync::Arc;
+    use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 
     let k: usize = 256;
     let n_per: usize = 256;
@@ -81,7 +86,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         .collect();
 
     // Optional: replace all per-channel scales with a single constant.
-    // Defeats any scale-permutation difference between ref and vllm.
+    // Defeats any scale-permutation difference between paths.
     if std::env::var("FERRUM_PARITY_UNIT_SCALES").is_ok() {
         eprintln!("DEBUG: forcing all scales = 0.05");
         for ex in experts.iter_mut() {
@@ -94,26 +99,26 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     // Pre-gathered layout: each expert's rows contiguous.
     let tokens_per_expert: Vec<usize> = vec![16, 8, 12, 4];
     let total_tokens: usize = tokens_per_expert.iter().sum();
-    let mut a_row_offsets: Vec<i32> = Vec::with_capacity(num_experts);
+    let mut a_row_offsets: Vec<usize> = Vec::with_capacity(num_experts);
     {
         let mut acc = 0usize;
         for &m_e in &tokens_per_expert {
-            a_row_offsets.push(acc as i32);
+            a_row_offsets.push(acc);
             acc += m_e;
         }
     }
 
-    // ── Two stacked stores: ref path (IST-DASLab Marlin format) +
-    // vLLM path (vLLM Marlin format). They are NOT byte-compatible —
-    // different inner permutations even though the outer shape matches.
+    // Single stacked store: post Phase B-D the trait-object stack
+    // exposes both `make_expert_linear` (per-expert ref path) and
+    // `gemm_phase_vllm` (fused vLLM marlin_moe_wna16 path). No need
+    // for two separate weight formats anymore.
     let qw_refs: Vec<&[i32]> = experts.iter().map(|e| e.qweight.as_slice()).collect();
     let sc_refs: Vec<&[f32]> = experts.iter().map(|e| e.scales.as_slice()).collect();
     let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
     let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked(
         &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
-    .expect("stacked load_gptq (IST-DASLab format, ref path)");
-    let stacked = Arc::new(stacked);
+    .expect("stacked load_gptq");
 
     let a_data: Vec<f32> = (0..total_tokens * k)
         .map(|i| ((i as f32) * 0.0027).sin())
@@ -121,28 +126,16 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     let mut ctx = <CudaBackend as Backend>::new_context();
     let a_dev = CudaBackend::from_slice(&a_data);
 
-    // Build vLLM-format stacked weight on the test context's stream.
-    let stacked_vllm = ferrum_kernels::vllm_marlin::load_stacked_gptq_vllm_marlin(
-        &ctx.stream,
-        &qw_refs,
-        &sc_refs,
-        4,
-        gs,
-        k,
-        n_per,
-    )
-    .expect("stacked load_gptq (vLLM Marlin format)");
-
     let force_expert0 = std::env::var("FERRUM_PARITY_FORCE_EXPERT0").is_ok();
 
-    // Reference: per-expert via existing path.
+    // Reference: per-expert via the trait `make_expert_linear`.
     let mut c_ref = vec![0f32; total_tokens * n_per];
     for e in 0..num_experts {
         let m_e = tokens_per_expert[e];
         if m_e == 0 {
             continue;
         }
-        let row_start = a_row_offsets[e] as usize;
+        let row_start = a_row_offsets[e];
         let a_e: Vec<f32> = a_data[row_start * k..(row_start + m_e) * k].to_vec();
         let a_e_dev = CudaBackend::from_slice(&a_e);
         let mut out_e_dev = CudaBackend::alloc(m_e * n_per);
@@ -150,15 +143,10 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         // expert 0, so the reference must also use expert 0 weights for
         // all rows (same offset for every expert).
         let weight_expert = if force_expert0 { 0 } else { e };
-        // Phase 3e/2 deleted gemm_gptq_with_offset; the per-expert
-        // reference now goes through the StackedExpertLinear view.
-        let view = StackedExpertLinear::<CudaBackend>::new(
-            stacked.clone(),
-            weight_expert * n_per,
-            n_per,
-            k,
-        )
-        .expect("StackedExpertLinear::new");
+        let view = stacked
+            .clone()
+            .make_expert_linear(weight_expert * n_per, n_per, None)
+            .expect("make_expert_linear");
         view.forward(&mut ctx, &a_e_dev, &mut out_e_dev, m_e);
         <CudaBackend as Backend>::sync(&mut ctx);
         let out_e = CudaBackend::to_vec(&out_e_dev, m_e * n_per);
@@ -193,7 +181,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     for e in 0..num_experts {
         let m_e = tokens_per_expert[e];
         let p_off = padded_offsets[e];
-        let real_off = a_row_offsets[e] as usize;
+        let real_off = a_row_offsets[e];
         for i in 0..m_e {
             sorted_token_ids[p_off + i] = (real_off + i) as i32;
         }
@@ -210,7 +198,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     }
     // Optional debug override: route every block to expert 0 to isolate
     // per-expert stride bugs from kernel-config bugs.
-    if std::env::var("FERRUM_PARITY_FORCE_EXPERT0").is_ok() {
+    if force_expert0 {
         eprintln!("DEBUG: forcing expert_ids = [0; total_blocks]");
         for b in 0..total_blocks {
             expert_ids[b] = 0;
@@ -218,49 +206,38 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     }
     let num_tokens_past_padded = vec![total_padded as i32];
 
-    // Allocate output per vLLM contract: [size_m * top_k, n]. Must be
-    // zeroed before kernel launch when use_atomic_add=1 — the kernel only
-    // self-zeros C when slice_count > 1 && slice_idx == 0, otherwise it
-    // accumulates onto whatever was there. Backend::alloc doesn't zero.
+    // Allocate zeroed output per vLLM contract: [size_m * top_k, n].
+    // The kernel uses atomic-add when c_tmp is None, so caller must
+    // pre-zero. `Backend::alloc` doesn't zero; bounce through a zero
+    // host buffer (parity test → not perf path → cost doesn't matter).
     let size_m = total_tokens;
-    let top_k = 1;
-    let mut c_vllm_dev = ctx
-        .stream
-        .alloc_zeros::<half::f16>(size_m * top_k * n_per)
-        .expect("alloc zeroed c_vllm");
+    let top_k: usize = 1;
+    let mut c_vllm_dev: <CudaBackend as Backend>::Buffer =
+        CudaBackend::from_slice(&vec![0f32; size_m * top_k * n_per]);
 
-    // Upload index buffers.
-    let stream = ctx.stream.clone();
-    let st_dev = stream
-        .clone_htod(&sorted_token_ids)
-        .expect("upload sorted_token_ids");
-    let eid_dev = stream.clone_htod(&expert_ids).expect("upload expert_ids");
-    let npp_dev = stream
-        .clone_htod(&num_tokens_past_padded)
-        .expect("upload num_tokens_past_padded");
+    // Upload index buffers through the typed-buffer API (Phase B-2).
+    let st_buf = CudaBackend::from_slice_typed::<i32>(&sorted_token_ids);
+    let eid_buf = CudaBackend::from_slice_typed::<i32>(&expert_ids);
+    let npp_buf = CudaBackend::from_slice_typed::<i32>(&num_tokens_past_padded);
 
-    let _ =
-        <CudaBackend as BackendQuantMarlin>::marlin_zero_stacked_workspace(&mut ctx, &stacked_vllm);
+    // Zero workspace via the trait method (replaces deleted
+    // `BackendQuantMarlin::marlin_zero_stacked_workspace`).
+    stacked.zero_workspace(&mut ctx).expect("zero_workspace");
 
-    ferrum_kernels::marlin::marlin_gemm_moe_vllm(
-        &stream,
-        &a_dev,
-        &stacked_vllm,
-        &mut c_vllm_dev,
-        None, // c_tmp
-        &st_dev,
-        &eid_dev,
-        &npp_dev,
-        None, // topk_weights
-        moe_block_size,
-        top_k as i32,
-        false, // mul_topk_weights
-        false, // is_ep
-        size_m as i32,
-        n_per as i32,
-        k as i32,
-    )
-    .expect("marlin_gemm_moe_vllm");
+    // Run fused vLLM marlin_moe_wna16 via the trait method.
+    stacked
+        .gemm_phase_vllm(
+            &mut ctx,
+            &a_dev,
+            &st_buf,
+            &eid_buf,
+            &npp_buf,
+            &mut c_vllm_dev,
+            size_m,
+            mb,
+            top_k,
+        )
+        .expect("gemm_phase_vllm");
     <CudaBackend as Backend>::sync(&mut ctx);
     let c_vllm = CudaBackend::to_vec(&c_vllm_dev, size_m * top_k * n_per);
 
@@ -272,7 +249,7 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
         if m_e == 0 {
             continue;
         }
-        let row_start = a_row_offsets[e] as usize;
+        let row_start = a_row_offsets[e];
         let slice_ref = &c_ref[row_start * n_per..(row_start + m_e) * n_per];
         let slice_vllm = &c_vllm[row_start * n_per..(row_start + m_e) * n_per];
         let max_diff = slice_ref

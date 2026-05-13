@@ -109,17 +109,14 @@ where
                 .expect("unified_pos_offsets missing");
             B::write_typed::<u32>(&mut ctx, po, &pos_offsets);
         }
-        let stacked = crate::common::decoder_unified::stack_block_tables(
-            items,
-            max_blocks_per_seq,
-            |cid| {
+        let stacked =
+            crate::common::decoder_unified::stack_block_tables(items, max_blocks_per_seq, |cid| {
                 self.kv_caches
                     .get(cid)
                     .expect("kv cache missing for unified item")[0]
                     .paged_block_indices
                     .clone()
-            },
-        );
+            });
         {
             let bt = self
                 .scratch
