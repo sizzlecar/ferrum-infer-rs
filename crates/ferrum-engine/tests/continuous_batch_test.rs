@@ -306,6 +306,8 @@ async fn concurrent_streams_all_complete() {
 // Prefix cache tests
 // ────────────────────────────────────────────────────────────────────────────
 
+/// CPU/Metal-only — engine defaults `skip_prefix_cache = true` on cuda builds.
+#[cfg(not(feature = "cuda"))]
 #[tokio::test]
 async fn prefix_cache_avoids_second_prefill() {
     let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));

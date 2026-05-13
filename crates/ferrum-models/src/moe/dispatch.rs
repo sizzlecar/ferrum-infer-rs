@@ -1113,7 +1113,24 @@ fn pick_moe_block_size(
 ) -> usize {
     const CANDIDATES: &[usize] = &[64, 32, 16];
     const PADDING_BUDGET: f64 = 1.30; // ≤ 30% overhead vs actual tokens
+                                      // Manual override (testing / autotuning): FERRUM_MOE_BLOCK_SIZE=16/32/64.
+                                      // 8 / 48 are also valid kernel instantiations but unused here.
+    if let Some(bs) = std::env::var("FERRUM_MOE_BLOCK_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|bs| matches!(*bs, 16 | 32 | 64))
+    {
+        return bs;
+    }
     if use_device_route {
+        // Empirical 2026-05-13: block_size=64 (`thread_m_blocks=4`,
+        // matching vLLM's tile) regresses M3 c=32 by 5.7% on RTX 4090
+        // because sparse routing (top_k=8 / num_experts=128 / m=32 ≈
+        // 2 pairs per active expert) pads each expert's tile by ~32×,
+        // and the wasted sentinel-row compute exceeds the tile-width
+        // win. block_size=32 is within noise of 16. Keep 16 as default;
+        // FERRUM_MOE_BLOCK_SIZE override stays for future autotuning
+        // when m / routing density changes (e.g. dense Llama at m=32).
         return 16;
     }
     let Some(plan) = plan else {

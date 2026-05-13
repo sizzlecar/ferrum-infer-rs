@@ -44,6 +44,13 @@ fn make_request(prompt: &str, max_tokens: usize) -> InferenceRequest {
 
 /// Two identical prompts in a row should hit the prefix cache on the
 /// second call (tokenization produces the same TokenId vec → exact match).
+///
+/// CPU/Metal-only: when compiled with `--features cuda`, the engine
+/// defaults `skip_prefix_cache = true` (continuous_engine.rs comment:
+/// "end-to-end engine + prefix-cache not yet validated on GPU").
+/// These tests use Mock backends but the engine's gate is a compile-
+/// time `cfg!(feature = "cuda")`, so they have to mirror it.
+#[cfg(not(feature = "cuda"))]
 #[tokio::test]
 async fn prefix_cache_hit_on_repeat_prompt() {
     let engine = make_engine();
@@ -98,6 +105,9 @@ async fn prefix_cache_cold_start_miss() {
 }
 
 /// Stats accessor returns sensible counters after mixed traffic.
+///
+/// CPU/Metal-only (see `prefix_cache_hit_on_repeat_prompt`).
+#[cfg(not(feature = "cuda"))]
 #[tokio::test]
 async fn prefix_cache_stats_accounting() {
     let engine = make_engine();

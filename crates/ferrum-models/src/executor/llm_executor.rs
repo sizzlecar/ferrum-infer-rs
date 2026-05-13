@@ -177,10 +177,7 @@ impl ModelExecutor for LlmExecutor {
     /// Falls back to the trait default (serial per-item) when the model
     /// returns `Err(unsupported)` from `unified_forward` — e.g. Qwen3MoeModel
     /// today, until Phase 2 adds its native unified path.
-    async fn batch_prefill(
-        &self,
-        inputs: &[PrefillInput],
-    ) -> Result<Vec<PrefillOutput>> {
+    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -225,7 +222,11 @@ impl ModelExecutor for LlmExecutor {
             .collect();
 
         let nb_prof = std::env::var("FERRUM_BATCH_PREFILL_PROF").is_ok();
-        let bp_t0 = if nb_prof { Some(std::time::Instant::now()) } else { None };
+        let bp_t0 = if nb_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut took_fallback = false;
         let per_item_logits: Vec<Vec<f32>> = {
             let mut model = self.model.lock();
