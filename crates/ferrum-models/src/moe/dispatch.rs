@@ -1123,15 +1123,15 @@ fn pick_moe_block_size(
         return bs;
     }
     if use_device_route {
-        // Device-route doesn't expose `plan` host-side, so we can't
-        // measure per-expert padding overhead. Default to 64 to match
-        // vLLM's tile choice on RTX 4090 (`thread_m_blocks = 64/16 =
-        // 4`). At m=32 × top_k=8 = 256 pairs across ≤128 active
-        // experts, padding overhead is bounded by the kernel grid; the
-        // tile-width win dominates the per-expert wasted columns on
-        // INT4 MoE GEMMs. Set FERRUM_MOE_BLOCK_SIZE=16 to revert if a
-        // workload regresses (very low m or pathological routing).
-        return 64;
+        // Empirical 2026-05-13: block_size=64 (`thread_m_blocks=4`,
+        // matching vLLM's tile) regresses M3 c=32 by 5.7% on RTX 4090
+        // because sparse routing (top_k=8 / num_experts=128 / m=32 ≈
+        // 2 pairs per active expert) pads each expert's tile by ~32×,
+        // and the wasted sentinel-row compute exceeds the tile-width
+        // win. block_size=32 is within noise of 16. Keep 16 as default;
+        // FERRUM_MOE_BLOCK_SIZE override stays for future autotuning
+        // when m / routing density changes (e.g. dense Llama at m=32).
+        return 16;
     }
     let Some(plan) = plan else {
         return 16;
