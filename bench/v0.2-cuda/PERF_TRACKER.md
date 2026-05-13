@@ -84,6 +84,31 @@ Bench: `ferrum bench M3 --concurrency 32 --max-tokens 64 --rounds 1`, ~42 decode
 
 ---
 
+## HTTP-serve path overhead — localized 2026-05-13
+
+`ferrum bench` (internal, no HTTP) = 1593 tok/s, TPOT 12.6 ms.
+apples HTTP (`ferrum serve` + vllm bench client) = 1031 tok/s, TPOT 22.4 ms.
+**HTTP path adds ~10 ms/iter wall time.**
+
+Decomposition via `FERRUM_RBD_PROF=1` + `FERRUM_BATCH_DECODE_PROF=1`:
+
+| measure | steady-state value | source |
+|---|---:|---|
+| `run_iteration` internal (iter-prof total) | **13-14 ms** | line 285 fn |
+| `run_batch_decode.unified_decode()` | 13-14 ms | line 778 |
+| post-processing (sample/sched/stream/stop/complete) | **2 μs** | line 803-887 |
+| bg-loop inter-iter gap | 85 μs (early) / 14 μs (late) | line 1488 |
+| **wall per batch-iter (bench)** | **31 ms** | 32/1031 tok/s |
+| **unexplained gap** | **~17 ms** | between consecutive batch-iters |
+
+The 17 ms is **NOT** in run_iteration AND **NOT** in bg-loop-gap. Hypothesis: `scheduler.next_batch()` returns `None` for many ticks between batched ones, each `None` tick does `tokio::time::sleep(1ms)`. But the count math is inconsistent (63K bg-loop-gap prints vs 384 iter-prof prints in 12 s bench), so the exact mechanism needs unconditional `eprintln` at the start of `run_iteration` + `next_batch` return path. **Estimated 10-min recompile + 1-min bench to nail it.**
+
+Top suspect chain:
+1. After a batch-iter, the 32 mpsc `send_stream_update` sends fire instantaneously (rbd-prof says 2 μs total)
+2. bg loop yields → next `run_iteration` enters → `scheduler.next_batch` called
+3. Either scheduler internally yields/sleeps, or its decode_queue is briefly empty
+4. Many None ticks chain together before next Some(batch)
+
 ## Run log
 
 Append after every optimization. Even if bench is unchanged, capture the API delta to know whether the change had the intended micro-effect.
@@ -91,6 +116,7 @@ Append after every optimization. Even if bench is unchanged, capture the API del
 | date | commit | change | bench tok/s | ratio | sync/iter | alloc+free/iter | launches/iter | HtoD/iter | notes |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
 | 2026-05-13 | `0f2dadb` | **baseline R0** | 1044 | 55% | 117 | 477 | 700 | 231 | — |
+| 2026-05-13 | `0f2dadb` | RBD/BATCH_DECODE prof | 1031 | 55% | — | — | — | — | profiling overhead < 1%; localized 17 ms inter-batch gap |
 | | | | | | | | | | |
 
 ### R0 raw artifacts on pod
