@@ -130,7 +130,10 @@ run_model() {
         rm -f bench/v0.2-cuda/results/ferrum__${TAG}__c${c}__r1.*
         bash bench/v0.2-cuda/run_cell.sh ferrum "$TAG" "$c" 1 "$PORT" 2>&1 | tail -3 || echo "  (cell failed)"
     done
-    kill -INT "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null || true
+    # Hard kill — ferrum's SIGINT shutdown has a futex_wait_queue_me hang
+    # that strands `wait $FPID` indefinitely (observed apples 2026-05-13
+    # M2 c=32). Until that's fixed upstream, the iter loop uses SIGKILL.
+    kill -9 "$FPID" 2>/dev/null || true
     pkill -9 -f "ferrum.*serve" 2>/dev/null || true
     sleep 3
 }
