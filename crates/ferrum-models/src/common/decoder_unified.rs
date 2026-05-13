@@ -43,11 +43,7 @@ pub fn compute_pos_offsets(items: &[(String, Vec<u32>, usize, bool)]) -> Vec<u32
 /// attention kernel's shared-mem sizing (must fit the longest reachable
 /// `kv_pos` across all items in the batch).
 pub fn compute_max_kv_len(items: &[(String, Vec<u32>, usize, bool)]) -> usize {
-    items
-        .iter()
-        .map(|it| it.2 + it.1.len())
-        .max()
-        .unwrap_or(0)
+    items.iter().map(|it| it.2 + it.1.len()).max().unwrap_or(0)
 }
 
 /// Flatten all items' q-tokens into one concatenated `[M_total]` vec.
@@ -118,13 +114,22 @@ pub const fn unified_graph_key(m_total: usize, num_seqs: usize) -> u64 {
 mod tests {
     use super::*;
 
-    fn item(cid: &str, q_len: usize, pos: usize, final_chunk: bool) -> (String, Vec<u32>, usize, bool) {
+    fn item(
+        cid: &str,
+        q_len: usize,
+        pos: usize,
+        final_chunk: bool,
+    ) -> (String, Vec<u32>, usize, bool) {
         (cid.to_string(), vec![0u32; q_len], pos, final_chunk)
     }
 
     #[test]
     fn cu_seqlens_q_mixed_lengths() {
-        let items = vec![item("a", 5, 0, true), item("b", 1, 100, true), item("c", 3, 10, false)];
+        let items = vec![
+            item("a", 5, 0, true),
+            item("b", 1, 100, true),
+            item("c", 3, 10, false),
+        ];
         let (q_lens, cu, m_total) = compute_cu_seqlens_q(&items);
         assert_eq!(q_lens, vec![5, 1, 3]);
         assert_eq!(cu, vec![0, 5, 6, 9]);
@@ -133,7 +138,11 @@ mod tests {
 
     #[test]
     fn pos_offsets_and_max_kv_len() {
-        let items = vec![item("a", 5, 0, true), item("b", 1, 100, true), item("c", 3, 10, false)];
+        let items = vec![
+            item("a", 5, 0, true),
+            item("b", 1, 100, true),
+            item("c", 3, 10, false),
+        ];
         assert_eq!(compute_pos_offsets(&items), vec![0u32, 100, 10]);
         assert_eq!(compute_max_kv_len(&items), 101); // b: 100 + 1
     }
@@ -141,7 +150,7 @@ mod tests {
     #[test]
     fn final_indices_only_final_chunks() {
         let items = vec![
-            item("a", 5, 0, true),  // last token at global 4
+            item("a", 5, 0, true),   // last token at global 4
             item("b", 1, 100, true), // last at global 5
             item("c", 3, 10, false), // not final
         ];

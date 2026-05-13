@@ -616,7 +616,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg.base);
-        let scratch = Qwen3MoeScratch::alloc(&cfg, 1);
+        let scratch = Qwen3MoeScratch::alloc(&cfg, initial_scratch_tokens());
 
         let embed = loader.load_tensor("model.embed_tokens.weight")?;
 
@@ -749,7 +749,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg.base);
-        let scratch = Qwen3MoeScratch::alloc(&cfg, 1);
+        let scratch = Qwen3MoeScratch::alloc(&cfg, initial_scratch_tokens());
         let embed = loader.load_tensor("model.embed_tokens.weight")?;
         let mut attn_layers = Vec::with_capacity(cfg.base.num_layers);
         let mut moe_layers = Vec::with_capacity(cfg.base.num_layers);
@@ -3621,9 +3621,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
     }
 }
 
-impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM
-    for Qwen3MoeModel<B, K>
-{
+impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -3731,9 +3729,7 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM
         // bucketed-MoE unified path. Returning Unsupported routes the
         // engine to the legacy decode_batch path via LlmExecutor's
         // fallback partition.
-        let all_decode = items
-            .iter()
-            .all(|it| it.1.len() == 1 && it.3);
+        let all_decode = items.iter().all(|it| it.1.len() == 1 && it.3);
         if all_decode {
             return Err(FerrumError::unsupported(
                 "Qwen3MoeModel::unified_forward: pure-decode batch — \
@@ -3804,6 +3800,26 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM
         self.kv_caches.clear();
         self.kv_free_pool.clear();
     }
+}
+
+/// Initial `max_tokens` for `Qwen3MoeScratch::alloc` at model
+/// construction. Reads `FERRUM_MAX_BATCHED_TOKENS` (set by the CLI
+/// `gpu_mem_autosize` for `serve` and the chat-profile defaults for
+/// `run`); falls back to 1 when unset so the lazy `ensure_scratch`
+/// path remains for callers that bypass the autosizer.
+///
+/// Pre-allocating to the autosizer's budget is the Phase 3 unlock for
+/// `unified_forward`: the gate `m_total > scratch.max_tokens` no
+/// longer fires for typical cohort prefills, so mixed prefill+decode
+/// batches drop into the varlen kernel chain instead of falling back
+/// to legacy per-item dispatch. See
+/// `docs/progress/2026-05-13-continuous-batching-foundation.md`.
+fn initial_scratch_tokens() -> usize {
+    std::env::var("FERRUM_MAX_BATCHED_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|t| *t > 0)
+        .unwrap_or(1)
 }
 
 /// Build a stub Linear<B> with the given shape but zero weights. Used to

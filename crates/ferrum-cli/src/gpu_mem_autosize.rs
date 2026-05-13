@@ -239,6 +239,17 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     };
 
     let kv_capacity_overridden = std::env::var("FERRUM_KV_CAPACITY").is_ok();
+    let max_batched_tokens_overridden = std::env::var("FERRUM_MAX_BATCHED_TOKENS").is_ok();
+    // Phase 3 token budget. Server prioritises cohort prefill width
+    // (4096 covers 32 × ~128-token prompts in one iter — the apples
+    // workload — and the Qwen3MoE unified path activates because
+    // m_total ≤ scratch.max_tokens). Chat is single-user with long
+    // turns, no batch width to spend on; 2048 is plenty and keeps the
+    // scratch (most notably `batch_logits` = t × vocab × 2 B) small.
+    let max_batched_tokens = match profile {
+        AutoSizeProfile::Server => 4096,
+        AutoSizeProfile::Chat => 2048,
+    };
     // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
     unsafe {
         if !kv_overridden {
@@ -250,9 +261,12 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         if kv_capacity > 0 && !kv_capacity_overridden {
             std::env::set_var("FERRUM_KV_CAPACITY", kv_capacity.to_string());
         }
+        if !max_batched_tokens_overridden {
+            std::env::set_var("FERRUM_MAX_BATCHED_TOKENS", max_batched_tokens.to_string());
+        }
     }
     eprintln!(
-        "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={}",
+        "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={} MAX_BATCHED_TOKENS={}",
         if kv_overridden {
             "<user>".to_string()
         } else {
@@ -269,6 +283,11 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             kv_capacity.to_string()
         } else {
             "<default>".to_string()
+        },
+        if max_batched_tokens_overridden {
+            "<user>".to_string()
+        } else {
+            max_batched_tokens.to_string()
         },
     );
 }

@@ -353,11 +353,15 @@ impl ContinuousBatchScheduler {
         }
         drop(decode_queue);
 
-        // Then, add prefill requests if we have capacity
-        let prefill_remaining = hint
-            .max_batch_size
-            .saturating_sub(batch_requests.len())
-            .min(self.cb_config.max_prefill_batch);
+        // Then, add prefill requests up to the per-iter token budget.
+        // Phase 3: `max_prefill_batch=8` no longer caps the count —
+        // the only budget is `hint.max_tokens` (= EngineConfig's
+        // `max_num_batched_tokens`, default 4096). Decodes contribute
+        // 1 token each; prefill chunks contribute their chunk size.
+        // This is what lets the Qwen3MoE `unified_forward` path
+        // activate for cohort prefills (m_total must stay ≤ scratch
+        // max_tokens, which is pre-allocated to the same budget).
+        let prefill_remaining = hint.max_batch_size.saturating_sub(batch_requests.len());
 
         if prefill_remaining > 0 {
             let prefill_queue = self.prefill_queue.read();
