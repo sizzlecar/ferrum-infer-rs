@@ -155,7 +155,7 @@ for engine in vllm ferrum; do
                 python3 -c "
 import json
 d = json.load(open('$F'))
-print(f\"{'${engine}':8s} ${TAG} c=${c:>2} out={d.get('output_throughput',0):8.1f} tok/s  p50={d.get('mean_tpot_ms',0):6.2f}ms\")
+c_str = '${c}'; print(f\"{'${engine}':8s} ${TAG} c={c_str:>2s} out={d.get('output_throughput',0):8.1f} tok/s  p50={d.get('mean_tpot_ms',0):6.2f}ms\")
 "
             fi
         done
