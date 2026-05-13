@@ -109,6 +109,38 @@ Top suspect chain:
 3. Either scheduler internally yields/sleeps, or its decode_queue is briefly empty
 4. Many None ticks chain together before next Some(batch)
 
+## R2 (FERRUM_NEXT_BATCH_PROF + FERRUM_SCHED_NONE_PROF) — root cause confirmed
+
+Per-call counters in `run_iteration` (next_batch Some/None) and inside scheduler
+(queue sizes on each return).
+
+| measure | value | source |
+|---|---:|---|
+| Some returns (during full bench) | **411** | nb-prof |
+| None returns (during full bench) | **8805** | nb-prof |
+| **None/Some ratio** | **21.4** | both 22× more None than Some |
+| next_batch latency when Some | 11 μs | nb-prof |
+| next_batch latency when None | 1 μs | nb-prof |
+| decode_queue when returning Some | **32** | sched-some probe |
+| decode_queue when returning None | **0** | sched-none probe |
+
+**Conclusion**: during the apples bench, the scheduler's `decode_queue` flips between **32 (full cohort)** and **0 (cohort drained)** — there's no in-flight overlap. The bench client (`vllm bench serve --max-concurrency 32`) maintains a worker pool of 32; only after ALL 32 EOS does it fire the next 32 prompts. Between cohorts, ferrum has nothing to do.
+
+128 prompts / 32 per cohort = **4 cohorts**. Each cohort:
+- ~1.5 sec of engine work (32 prompts × ~96 tokens × 14 ms / 32 = 1.34 sec at batch-32)
+- ~1.5 sec of dead wait while client closes connections, opens next 32
+
+Total = 4 × (1.5 + 1.5) = 12 sec — matches measured bench wall.
+
+vLLM gets 1867 tok/s under the same client because it overlaps cohort transitions: SSE chunks reach the client faster (so worker moves on faster), AND the engine admits next prefills while decode is still running (the `available_slots` admission in `create_iteration_batch` already allows up to `max_decode_batch - decoding_count = 224` to admit, but the bench client only ever has 32 in flight).
+
+**Fix directions** (need to pick one):
+- **A** — Lower SSE per-chunk latency: tune Axum response framing, JSON encoding, mpsc backpressure. ferrum's send_stream_update is 2 μs in rbd-prof but the Axum handler / TCP write may add the rest.
+- **B** — Pipeline cohort transition: have ferrum's engine pre-warm the next 32 in waiting_queue's prefill kernel while the current cohort still has decode work pending. Requires bench client to keep more prompts in-flight (or have a queue of pending submissions ready when slots free).
+- **C** — Make scheduler.next_batch's None path event-driven (`tokio::Notify` waited on submit / mark_prefill_complete / scheduler.complete) instead of `tokio::time::sleep(1ms)`. Removes the 8805 sleep wastes ≈ 6.2 sec idle. Estimated +20-50% throughput just from removing wasted CPU.
+
+**R2 throughput**: 1030 tok/s @ 0f2dadb + probes (no perf optimization yet).
+
 ## Run log
 
 Append after every optimization. Even if bench is unchanged, capture the API delta to know whether the change had the intended micro-effect.
