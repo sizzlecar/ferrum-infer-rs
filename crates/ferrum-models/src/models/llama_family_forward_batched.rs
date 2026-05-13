@@ -1007,19 +1007,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let num_layers = self.cfg.num_layers;
         let num_seqs = items.len();
 
-        // Per-item bookkeeping (host).
-        let q_lens: Vec<usize> = items.iter().map(|it| it.1.len()).collect();
-        let mut cu_seqlens_q: Vec<u32> = Vec::with_capacity(num_seqs + 1);
-        cu_seqlens_q.push(0);
-        for &l in &q_lens {
-            let prev = *cu_seqlens_q.last().unwrap();
-            cu_seqlens_q.push(prev + l as u32);
-        }
-        let m_total = *cu_seqlens_q.last().unwrap() as usize;
-        let pos_offsets: Vec<u32> = items.iter().map(|it| it.2 as u32).collect();
-        // Causal max over (pos_offset + q_len) — shared-mem size for the
-        // varlen attn kernel needs to fit the longest reachable kv_pos.
-        let max_kv_len: usize = items.iter().map(|it| it.2 + it.1.len()).max().unwrap_or(0);
+        // Per-item bookkeeping (host) — shared helpers from
+        // `common::decoder_unified` so Qwen3-MoE / future decoder
+        // families don't re-implement cu_seqlens construction etc.
+        let (q_lens, cu_seqlens_q, m_total) =
+            crate::common::decoder_unified::compute_cu_seqlens_q(items);
+        let pos_offsets = crate::common::decoder_unified::compute_pos_offsets(items);
+        let max_kv_len = crate::common::decoder_unified::compute_max_kv_len(items);
 
         // Ensure all items' KV caches exist.
         for (cid, _, _, _) in items {
@@ -1027,7 +1021,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         // Concatenated input tokens for one embedding_lookup.
-        let all_tokens: Vec<u32> = items.iter().flat_map(|it| it.1.iter().copied()).collect();
+        let all_tokens = crate::common::decoder_unified::concat_q_tokens(items);
         debug_assert_eq!(all_tokens.len(), m_total);
 
         // Paged path requirements.
@@ -1094,19 +1088,18 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             B::write_typed::<u32>(&mut ctx, po, &pos_offsets);
         }
         // Stack per-seq block tables host-side, then upload.
-        {
-            let mut stacked: Vec<u32> = vec![0u32; num_seqs * max_blocks_per_seq];
-            for (i, (cid, _, _, _)) in items.iter().enumerate() {
-                let caches = self
-                    .kv_caches
+        let stacked = crate::common::decoder_unified::stack_block_tables(
+            items,
+            max_blocks_per_seq,
+            |cid| {
+                self.kv_caches
                     .get(cid)
-                    .expect("kv cache missing for unified item");
-                let cache0 = &caches[0];
-                let blocks = &cache0.paged_block_indices;
-                let n_to_copy = blocks.len().min(max_blocks_per_seq);
-                stacked[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
-                    .copy_from_slice(&blocks[..n_to_copy]);
-            }
+                    .expect("kv cache missing for unified item")[0]
+                    .paged_block_indices
+                    .clone()
+            },
+        );
+        {
             let bt = self
                 .scratch
                 .unified_block_tables
@@ -1138,7 +1131,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let graph_enabled = std::env::var("FERRUM_UNIFIED_GRAPH")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let graph_key: u64 = (1u64 << 63) | ((m_total as u64) << 32) | (num_seqs as u64);
+        let graph_key = crate::common::decoder_unified::unified_graph_key(m_total, num_seqs);
         let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
 
         // Pre-grow the marlin gather scratch slot to the worst-case
@@ -1277,17 +1270,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // items. Pure host work — same shape across iters at c=16
         // steady state, so the captured copy_slice + lm_head launches
         // record stable offsets.
-        let final_indices: Vec<(usize, usize)> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.3)
-            .map(|(orig_idx, _)| {
-                let item = &items[orig_idx];
-                let last_token_local = item.1.len() - 1;
-                let global = (cu_seqlens_q[orig_idx] as usize) + last_token_local;
-                (orig_idx, global)
-            })
-            .collect();
+        let final_indices =
+            crate::common::decoder_unified::compute_final_indices(items, &cu_seqlens_q);
         let num_sampled = final_indices.len();
 
         // Take scratch buffers we'll either record into the graph or
