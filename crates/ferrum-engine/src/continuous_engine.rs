@@ -296,7 +296,50 @@ impl EngineInner {
             resource_constraints: ferrum_interfaces::scheduler::ResourceConstraints::default(),
         };
 
-        let batch = match self.scheduler.next_batch(hint).await {
+        // FERRUM_NEXT_BATCH_PROF=1: count Some/None returns to root-cause
+        // the apples HTTP-serve 17 ms inter-batch-iter gap. Prints every
+        // 1024 run_iteration calls. Set None_size to 0 explicitly so the
+        // bg-loop tight-spin theory can be confirmed.
+        let nb_prof = std::env::var("FERRUM_NEXT_BATCH_PROF").is_ok();
+        let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
+        let nb_result = self.scheduler.next_batch(hint).await;
+        if let Some(t0) = nb_t0 {
+            use std::sync::atomic::AtomicU64;
+            static SOME_N: AtomicU64 = AtomicU64::new(0);
+            static NONE_N: AtomicU64 = AtomicU64::new(0);
+            static SOME_US: AtomicU64 = AtomicU64::new(0);
+            static NONE_US: AtomicU64 = AtomicU64::new(0);
+            let us = t0.elapsed().as_micros() as u64;
+            let is_some = nb_result.is_some();
+            let batch_size = nb_result.as_ref().map_or(0, |b| b.size());
+            if is_some {
+                SOME_N.fetch_add(1, Ordering::Relaxed);
+                SOME_US.fetch_add(us, Ordering::Relaxed);
+            } else {
+                NONE_N.fetch_add(1, Ordering::Relaxed);
+                NONE_US.fetch_add(us, Ordering::Relaxed);
+            }
+            let total = SOME_N.load(Ordering::Relaxed) + NONE_N.load(Ordering::Relaxed);
+            if total.is_multiple_of(1024) {
+                let s_n = SOME_N.load(Ordering::Relaxed);
+                let n_n = NONE_N.load(Ordering::Relaxed);
+                let s_us = SOME_US.load(Ordering::Relaxed);
+                let n_us = NONE_US.load(Ordering::Relaxed);
+                eprintln!(
+                    "[nb-prof] total={} some={} none={} ratio={:.3} | some_avg={}us none_avg={}us last_batch_size={} last_was_some={}",
+                    total,
+                    s_n,
+                    n_n,
+                    s_n as f64 / total as f64,
+                    if s_n > 0 { s_us / s_n } else { 0 },
+                    if n_n > 0 { n_us / n_n } else { 0 },
+                    batch_size,
+                    is_some,
+                );
+            }
+        }
+
+        let batch = match nb_result {
             Some(b) => b,
             None => {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -334,9 +377,32 @@ impl EngineInner {
     // ── batch processing ───────────────────────────────────────────────
 
     async fn process_batch(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
+        // Single-shot unified path: prefill + decode items go through ONE
+        // `model_executor.unified_decode` call. Phase-2/3 redesign goal —
+        // prefill chunks and decode tokens are co-batched at the kernel
+        // level, eliminating the cohort gap (decode_queue=0 ↔ 32
+        // alternation that consumed half the bench wall on apples).
+        //
+        // For chunked-prefill (FERRUM_CHUNKED_PREFILL=N) or speculative
+        // decoding, fall back to the legacy split path. Phase 3 will
+        // extend chunked-prefill into the unified mode.
+        let chunked_or_spec = std::env::var("FERRUM_CHUNKED_PREFILL").is_ok()
+            || self.spec_config.is_some();
+        if chunked_or_spec {
+            return self.process_batch_legacy_split(batch).await;
+        }
+        self.process_batch_unified(batch).await
+    }
+
+    /// Legacy split path: separate prefill (batched via run_batch_prefill)
+    /// then decode (batched via run_batch_decode). Used for chunked-prefill
+    /// and speculative-decoding flows that the unified path doesn't model yet.
+    async fn process_batch_legacy_split(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> Result<()> {
         let mut prefill_ids = Vec::new();
         let mut decode_ids = Vec::new();
-
         {
             let mut sequences = self.sequences.write();
             for scheduled_req in &batch.requests {
@@ -352,7 +418,6 @@ impl EngineInner {
                         Some(self.tokenizer.clone()),
                     )
                 });
-
                 if !seq.prefill_complete {
                     prefill_ids.push(rid.clone());
                 } else {
@@ -360,16 +425,17 @@ impl EngineInner {
                 }
             }
         }
-
-        // Prefill new requests
-        for rid in &prefill_ids {
-            if let Err(e) = self.run_prefill(rid).await {
-                warn!("Prefill failed for {}: {}", rid, e);
-                self.complete_request(rid, FinishReason::Error).await?;
+        if !prefill_ids.is_empty() {
+            if let Err(e) = self.run_batch_prefill(&prefill_ids).await {
+                warn!("Batch prefill failed: {}; falling back to per-request", e);
+                for rid in &prefill_ids {
+                    if let Err(e) = self.run_prefill(rid).await {
+                        warn!("Prefill failed for {}: {}", rid, e);
+                        self.complete_request(rid, FinishReason::Error).await?;
+                    }
+                }
             }
         }
-
-        // Decode continuing requests (batch when possible)
         if decode_ids.len() > 1 {
             if let Err(e) = self.run_batch_decode(&decode_ids).await {
                 warn!("Batch decode failed, falling back to per-request: {}", e);
@@ -386,6 +452,305 @@ impl EngineInner {
                     warn!("Decode failed for {}: {}", rid, e);
                     self.complete_request(rid, FinishReason::Error).await?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Unified path: build ONE `UnifiedBatch` from all requests in the plan
+    /// (prefill items get full input_tokens at pos_offset=0; decode items
+    /// get [last_token] at pos_offset=current_kv_len), then a single
+    /// `model_executor.unified_decode` call drives the entire forward.
+    ///
+    /// When the model's `unified_forward` returns Unsupported (Qwen3Moe
+    /// today, until Phase 2 native), `LlmExecutor.unified_decode`'s fallback
+    /// partitions the batch by item shape and serializes prefills under one
+    /// model lock — behavior-preserving but no perf gain. Llama already
+    /// supports unified_forward, so M2 immediately co-batches prefill+decode.
+    async fn process_batch_unified(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> Result<()> {
+        use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
+        use ferrum_interfaces::KvCacheHandle;
+
+        // ── 0. Materialize SequenceState for every request, classify ──
+        let mut prefill_ids: Vec<RequestId> = Vec::new();
+        let mut decode_ids: Vec<RequestId> = Vec::new();
+        {
+            let mut sequences = self.sequences.write();
+            for scheduled_req in &batch.requests {
+                let rid = &scheduled_req.request.id;
+                let seq = sequences.entry(rid.clone()).or_insert_with(|| {
+                    let input_tokens = self
+                        .tokenizer
+                        .encode(&scheduled_req.request.prompt, true)
+                        .unwrap_or_else(|_| vec![TokenId::new(0)]);
+                    SequenceState::new_with_tokenizer(
+                        scheduled_req.request.clone(),
+                        input_tokens,
+                        Some(self.tokenizer.clone()),
+                    )
+                });
+                if !seq.prefill_complete {
+                    prefill_ids.push(rid.clone());
+                } else {
+                    decode_ids.push(rid.clone());
+                }
+            }
+        }
+
+        // ── 1. Per-prefill setup: prefix-cache check, KV alloc, gather tokens ──
+        // Prefix-cache hits short-circuit through the legacy single-prompt
+        // path (they don't enter the unified batch — they have no model
+        // call to make). The remainder are added to `unified_prefills`.
+        let model_info = self.model_executor.info();
+        let skip_prefix_cache = if cfg!(feature = "cuda") {
+            std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1")
+        } else {
+            std::env::var("FERRUM_PREFIX_CACHE").is_ok_and(|v| v == "0")
+        };
+        let mut unified_prefills: Vec<(RequestId, Vec<TokenId>, Arc<dyn KvCacheHandle>)> =
+            Vec::new();
+        for rid in &prefill_ids {
+            let (input_tokens, num_tokens) = {
+                let sequences = self.sequences.read();
+                let Some(seq) = sequences.get(rid) else { continue };
+                (seq.input_tokens.clone(), seq.input_tokens.len())
+            };
+            if !skip_prefix_cache {
+                let hit = self
+                    .prefix_cache
+                    .find_prefix(&input_tokens)
+                    .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens.len());
+                if let Some((_, cached_kv, cached_logits)) = hit {
+                    let cloned_kv = cached_kv.clone_handle()?;
+                    let first_token = {
+                        let mut sequences = self.sequences.write();
+                        let Some(seq) = sequences.get_mut(rid) else { continue };
+                        if let Some(ref jp) = seq.json_processor {
+                            jp.reset();
+                        }
+                        let mut logits = cached_logits;
+                        let token = seq.sample_with_processors(&mut logits)?;
+                        seq.generated_tokens.push(token);
+                        seq.model_cache_id = Some(cloned_kv.cache_id());
+                        seq.kv_cache = Some(cloned_kv);
+                        seq.prefill_complete = true;
+                        seq.phase = RequestPhase::Decoding;
+                        token
+                    };
+                    self.scheduler.mark_prefill_complete(rid, num_tokens);
+                    self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    counter!("ferrum.engine.prefix_cache_hits").increment(1);
+                    self.send_stream_update(rid, first_token).await;
+                    let should_stop = {
+                        let sequences = self.sequences.read();
+                        sequences
+                            .get(rid)
+                            .is_none_or(|s| s.should_stop(model_info.vocab_size))
+                    };
+                    if should_stop {
+                        self.complete_request(rid, FinishReason::EOS).await?;
+                    }
+                    continue;
+                }
+            }
+            // Allocate KV pages (with preempt fallback) for fresh prefill.
+            let alloc_request = AllocationRequest {
+                request_id: rid.clone(),
+                initial_tokens: num_tokens,
+                max_sequence_length: model_info.max_sequence_length,
+                num_layers: model_info.num_layers,
+                num_heads: model_info.num_kv_heads,
+                head_dim: model_info.hidden_size / model_info.num_heads.max(1),
+                device: self.config.backend.device.clone(),
+                dtype: model_info.dtype,
+                priority: Priority::Normal,
+            };
+            let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
+                Ok(h) => h,
+                Err(_) => {
+                    if self.preempt_victim(rid).await {
+                        match self.kv_cache.allocate(&alloc_request).await {
+                            Ok(h) => h,
+                            Err(e) => {
+                                warn!("Unified prefill alloc failed for {}: {}", rid, e);
+                                self.complete_request(rid, FinishReason::Error).await?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        warn!("Unified prefill alloc failed for {}: no victim", rid);
+                        self.complete_request(rid, FinishReason::Error).await?;
+                        continue;
+                    }
+                }
+            };
+            unified_prefills.push((rid.clone(), input_tokens, kv_handle));
+        }
+
+        // ── 2. Build the UnifiedBatch (prefill chunks + decode tokens) ──
+        let mut unified = UnifiedBatch::new();
+        let mut prefill_meta: Vec<(RequestId, Vec<TokenId>)> = Vec::new();
+        let mut decode_meta: Vec<RequestId> = Vec::new();
+        for (rid, tokens, kv_handle) in &unified_prefills {
+            let q_tokens: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
+            let seq_id = kv_handle.cache_id();
+            unified.items.push(UnifiedBatchItem {
+                seq_id,
+                q_tokens,
+                kv_cache: kv_handle.clone(),
+                pos_offset: 0,
+                is_final_chunk: true,
+            });
+            prefill_meta.push((rid.clone(), tokens.clone()));
+        }
+        {
+            let sequences = self.sequences.read();
+            for rid in &decode_ids {
+                let Some(seq) = sequences.get(rid) else { continue };
+                let Some(kv) = seq.kv_cache.clone() else { continue };
+                let last_token = seq
+                    .generated_tokens
+                    .last()
+                    .copied()
+                    .unwrap_or(TokenId::new(0));
+                let pos_offset = kv.block_table().sequence_length;
+                let seq_id = seq.model_cache_id.clone().unwrap_or_else(|| rid.to_string());
+                unified.items.push(UnifiedBatchItem {
+                    seq_id,
+                    q_tokens: vec![last_token.get()],
+                    kv_cache: kv,
+                    pos_offset,
+                    is_final_chunk: true,
+                });
+                decode_meta.push(rid.clone());
+            }
+        }
+
+        if unified.items.is_empty() {
+            return Ok(());
+        }
+
+        // ── 3. ONE unified forward call ──
+        let results = match self.model_executor.unified_decode(&unified).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Unified forward failed: {}; falling back to split", e);
+                return self.process_batch_legacy_split(batch).await;
+            }
+        };
+        if results.len() != unified.items.len() {
+            return Err(FerrumError::internal(format!(
+                "unified_decode returned {} results for {} items",
+                results.len(),
+                unified.items.len(),
+            )));
+        }
+
+        // ── 4. Per-item post-process — split by category ──
+        // Prefill items come first (in the order added), then decode items.
+        let prefill_count = prefill_meta.len();
+        for (i, (rid, input_tokens)) in prefill_meta.into_iter().enumerate() {
+            let logits_vec = match &results[i] {
+                Some(l) => l.clone(),
+                None => {
+                    warn!("Unified prefill result missing for {}", rid);
+                    continue;
+                }
+            };
+            let num_tokens = input_tokens.len();
+            let kv_handle = unified.items[i].kv_cache.clone();
+            // Store in prefix cache (best-effort).
+            let _ = self
+                .prefix_cache
+                .store_prefix(&input_tokens, kv_handle.clone(), logits_vec.clone());
+            let first_token = {
+                let mut sequences = self.sequences.write();
+                let Some(seq) = sequences.get_mut(&rid) else { continue };
+                if let Some(ref jp) = seq.json_processor {
+                    jp.reset();
+                }
+                let mut logits = logits_vec;
+                let token = seq.sample_with_processors(&mut logits)?;
+                seq.generated_tokens.push(token);
+                seq.model_cache_id = Some(kv_handle.cache_id());
+                seq.kv_cache = Some(kv_handle);
+                seq.prefill_complete = true;
+                seq.phase = RequestPhase::Decoding;
+                token
+            };
+            self.scheduler.mark_prefill_complete(&rid, num_tokens);
+            self.total_prefill_tokens
+                .fetch_add(num_tokens as u64, Ordering::Relaxed);
+            counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
+            counter!("ferrum.engine.prefills_total").increment(1);
+            self.send_stream_update(&rid, first_token).await;
+            let should_stop = {
+                let sequences = self.sequences.read();
+                sequences
+                    .get(&rid)
+                    .is_none_or(|s| s.should_stop(model_info.vocab_size))
+            };
+            if should_stop {
+                self.complete_request(&rid, FinishReason::EOS).await?;
+            }
+        }
+        for (j, rid) in decode_meta.into_iter().enumerate() {
+            let i = prefill_count + j;
+            let logits_vec = match &results[i] {
+                Some(l) => l.clone(),
+                None => continue,
+            };
+            let next_token = {
+                let mut sequences = self.sequences.write();
+                let Some(seq) = sequences.get_mut(&rid) else { continue };
+                let mut logits = logits_vec;
+                let token = if logits.len() == 1 {
+                    TokenId::new(logits[0] as u32)
+                } else {
+                    seq.sample_with_processors(&mut logits)?
+                };
+                seq.generated_tokens.push(token);
+                seq.tokens_this_iteration += 1;
+                if let Some(h) = seq.kv_cache.take() {
+                    let new_len = h.block_table().sequence_length + 1;
+                    seq.kv_cache = Some(self.make_kv_handle_with_seq(&h, new_len));
+                }
+                token
+            };
+            let generated_count = {
+                let sequences = self.sequences.read();
+                sequences
+                    .get(&rid)
+                    .map(|s| s.generated_tokens.len())
+                    .unwrap_or(0)
+            };
+            self.scheduler.update_decode_progress(&rid, generated_count);
+            self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+            counter!("ferrum.engine.decode_tokens_total").increment(1);
+            self.send_stream_update(&rid, next_token).await;
+            let should_stop = {
+                let sequences = self.sequences.read();
+                sequences
+                    .get(&rid)
+                    .is_none_or(|s| s.should_stop(model_info.vocab_size))
+            };
+            if should_stop {
+                let finish_reason = {
+                    let sequences = self.sequences.read();
+                    match sequences.get(&rid) {
+                        Some(seq)
+                            if seq.generated_tokens.len() >= seq.sampling_params.max_tokens =>
+                        {
+                            FinishReason::Length
+                        }
+                        Some(_) => FinishReason::EOS,
+                        None => FinishReason::Error,
+                    }
+                };
+                self.complete_request(&rid, finish_reason).await?;
             }
         }
 
@@ -714,6 +1079,204 @@ impl EngineInner {
             self.complete_request(request_id, FinishReason::EOS).await?;
         }
 
+        Ok(())
+    }
+
+    // ── batch prefill ─────────────────────────────────────────────────
+
+    /// Run prefill for multiple requests as ONE batched forward pass.
+    ///
+    /// Replaces the serial `for rid in prefill_ids { run_prefill }` loop
+    /// in `process_batch`. Per-request setup (prefix cache check + KV
+    /// allocation + tokenization) still happens individually; the GPU
+    /// call coalesces into one `model_executor.batch_prefill` invocation.
+    ///
+    /// Falls back to serial `run_prefill` per request when chunked prefill
+    /// is enabled (`FERRUM_CHUNKED_PREFILL=N`) — those paths have
+    /// multi-call semantics that the batched path doesn't model yet.
+    /// Phase 2 will lift this restriction.
+    async fn run_batch_prefill(&self, request_ids: &[RequestId]) -> Result<()> {
+        use ferrum_interfaces::model_executor::PrefillInput;
+
+        if request_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Chunked-prefill opt-in path: fall back to serial.
+        if std::env::var("FERRUM_CHUNKED_PREFILL").is_ok() {
+            for rid in request_ids {
+                if let Err(e) = self.run_prefill(rid).await {
+                    warn!("Prefill failed for {}: {}", rid, e);
+                    self.complete_request(rid, FinishReason::Error).await?;
+                }
+            }
+            return Ok(());
+        }
+
+        // ── Phase 1a: per-request setup (prefix cache → tokens → kv alloc) ──
+        // After this loop, `to_prefill` holds only requests that need a real
+        // model call. Prefix cache hits + immediate stops are handled inline.
+        let mut to_prefill: Vec<(RequestId, Vec<TokenId>, Arc<dyn ferrum_interfaces::KvCacheHandle>)> =
+            Vec::new();
+
+        let model_info = self.model_executor.info();
+        let skip_prefix_cache = if cfg!(feature = "cuda") {
+            std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1")
+        } else {
+            std::env::var("FERRUM_PREFIX_CACHE").is_ok_and(|v| v == "0")
+        };
+
+        for rid in request_ids {
+            let (input_tokens, num_tokens) = {
+                let sequences = self.sequences.read();
+                let Some(seq) = sequences.get(rid) else {
+                    continue; // request gone (cancelled mid-batch)
+                };
+                (seq.input_tokens.clone(), seq.input_tokens.len())
+            };
+
+            // Prefix cache hit short-circuit (mirrors run_prefill_inner).
+            if !skip_prefix_cache {
+                let hit = self
+                    .prefix_cache
+                    .find_prefix(&input_tokens)
+                    .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens.len());
+                if let Some((_, cached_kv, cached_logits)) = hit {
+                    let cloned_kv = cached_kv.clone_handle()?;
+                    let first_token = {
+                        let mut sequences = self.sequences.write();
+                        let Some(seq) = sequences.get_mut(rid) else {
+                            continue;
+                        };
+                        if let Some(ref jp) = seq.json_processor {
+                            jp.reset();
+                        }
+                        let mut logits = cached_logits;
+                        let token = seq.sample_with_processors(&mut logits)?;
+                        seq.generated_tokens.push(token);
+                        seq.model_cache_id = Some(cloned_kv.cache_id());
+                        seq.kv_cache = Some(cloned_kv);
+                        seq.prefill_complete = true;
+                        seq.phase = RequestPhase::Decoding;
+                        token
+                    };
+                    self.scheduler.mark_prefill_complete(rid, num_tokens);
+                    self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    counter!("ferrum.engine.prefix_cache_hits").increment(1);
+                    self.send_stream_update(rid, first_token).await;
+                    let should_stop = {
+                        let sequences = self.sequences.read();
+                        sequences
+                            .get(rid)
+                            .is_none_or(|s| s.should_stop(model_info.vocab_size))
+                    };
+                    if should_stop {
+                        self.complete_request(rid, FinishReason::EOS).await?;
+                    }
+                    continue;
+                }
+            }
+
+            // Cache miss — allocate KV pages.
+            let alloc_request = AllocationRequest {
+                request_id: rid.clone(),
+                initial_tokens: num_tokens,
+                max_sequence_length: model_info.max_sequence_length,
+                num_layers: model_info.num_layers,
+                num_heads: model_info.num_kv_heads,
+                head_dim: model_info.hidden_size / model_info.num_heads.max(1),
+                device: self.config.backend.device.clone(),
+                dtype: model_info.dtype,
+                priority: Priority::Normal,
+            };
+            let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
+                Ok(h) => h,
+                Err(_) => {
+                    if self.preempt_victim(rid).await {
+                        match self.kv_cache.allocate(&alloc_request).await {
+                            Ok(h) => h,
+                            Err(e) => {
+                                warn!("Prefill alloc failed for {} after preempt: {}", rid, e);
+                                self.complete_request(rid, FinishReason::Error).await?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        warn!("Prefill alloc failed for {}: no preempt victim", rid);
+                        self.complete_request(rid, FinishReason::Error).await?;
+                        continue;
+                    }
+                }
+            };
+            to_prefill.push((rid.clone(), input_tokens, kv_handle));
+        }
+
+        if to_prefill.is_empty() {
+            return Ok(());
+        }
+
+        // ── Phase 1b: ONE batched model_executor.batch_prefill call ──
+        let inputs: Vec<PrefillInput> = to_prefill
+            .iter()
+            .map(|(_, tokens, kv)| {
+                let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
+                let tensor = self.tokens_to_tensor(&token_u32s)?;
+                Ok(PrefillInput::new(tensor).with_kv_cache(kv.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let outputs = self.model_executor.batch_prefill(&inputs).await?;
+        if outputs.len() != to_prefill.len() {
+            return Err(FerrumError::internal(format!(
+                "batch_prefill returned {} outputs for {} inputs",
+                outputs.len(),
+                to_prefill.len(),
+            )));
+        }
+
+        // ── Phase 1c: per-item post-process (sample, update seq, stream, stop) ──
+        for ((rid, input_tokens, _), prefill_output) in to_prefill.iter().zip(outputs.iter()) {
+            let num_tokens = input_tokens.len();
+            let last_logits = prefill_output.last_token_logits()?;
+            let logits_vec = last_logits.to_vec_f32()?;
+            let _ = self.prefix_cache.store_prefix(
+                input_tokens,
+                prefill_output.kv_cache.clone(),
+                logits_vec.clone(),
+            );
+            let first_token = {
+                let mut sequences = self.sequences.write();
+                let Some(seq) = sequences.get_mut(rid) else {
+                    continue;
+                };
+                if let Some(ref jp) = seq.json_processor {
+                    jp.reset();
+                }
+                let mut logits = logits_vec;
+                let token = seq.sample_with_processors(&mut logits)?;
+                seq.generated_tokens.push(token);
+                seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
+                seq.kv_cache = Some(prefill_output.kv_cache.clone());
+                seq.prefill_complete = true;
+                seq.phase = RequestPhase::Decoding;
+                token
+            };
+            self.scheduler.mark_prefill_complete(rid, num_tokens);
+            self.total_prefill_tokens
+                .fetch_add(num_tokens as u64, Ordering::Relaxed);
+            counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
+            counter!("ferrum.engine.prefills_total").increment(1);
+            self.send_stream_update(rid, first_token).await;
+            let should_stop = {
+                let sequences = self.sequences.read();
+                sequences
+                    .get(rid)
+                    .is_none_or(|s| s.should_stop(model_info.vocab_size))
+            };
+            if should_stop {
+                self.complete_request(rid, FinishReason::EOS).await?;
+            }
+        }
         Ok(())
     }
 
