@@ -153,7 +153,23 @@ Append after every optimization. Even if bench is unchanged, capture the API del
 | 2026-05-13 | `1d0c200` | Phase 1: batched prefill (M2) | 855 | 39% (M2 baseline 38%) | — | — | — | — | Llama unified_forward fires (fallback=false), 26 batch_prefill calls / bench. Batched prefill works at kernel level (~+50% prefill bandwidth) but M2's prefill is only 5% of bench wall (decode is the bottleneck) — net throughput unchanged. |
 | 2026-05-13 | `b9e0bd6` | Wave 1: unified process_batch (M3) | 1021 | 54% | — | — | — | — | Qwen3Moe still falls back to serial in LlmExecutor — architecture seam updated but no kernel-level coalescing yet. Wave 2 (Qwen3Moe native unified_forward) is the unlock. |
 | 2026-05-13 | `b9e0bd6` | Wave 1: unified process_batch (M2) | **881** | **40%** | — | — | — | — | Llama unified_forward now called with mixed prefill+decode items per iter. +3.5% over baseline. Confirms architecture: real continuous batching at engine layer; but M2 dec ode kernel is still the dominant wall-time (compute-bound), so engine-level mixing only recovers the cohort gap, not the per-iter kernel cost. |
+| 2026-05-13 | `e9bac55` | Phase 2B v3: Qwen3Moe unified_forward shape-gated (M3) | 1023 | 54% | — | — | — | — | Implementation complete (uses legacy scratch, no buffer duplication, MoE via moe_forward_bucketed at m_total). Decode-only batches bypass to legacy fast path. **No perf gain because cohort prefill batches (m_total ~1600+) exceed scratch.max_tokens (~200, lazily grown to max single-prompt size) → bound check rejects → fallback to serial prefill.** |
 | | | | | | | | | | |
+
+## Phase 2B v3 retrospective — scratch sizing is the blocker
+
+Qwen3Moe.unified_forward is implemented correctly per vLLM design:
+- Uses LEGACY scratch (residual / norm_out / qkv_out / moe_out) — no buffer duplication
+- Pure-decode batches → bypass to legacy fast path (correct)
+- Prefill / mixed batches → unified_forward_internal (one [m_total, hidden] forward)
+
+**Why no perf gain on M3**: cohort prefill batch from scheduler = 8 prompts × ~200 tokens = m_total ~1600. ferrum's Qwen3Moe scratch is LAZILY GROWN — initial 1, grows on first prefill to max(prompt_len) ≈ 200. The unified path's bound check (`m_total ≤ scratch.max_tokens`) rejects 1600 > 200 → returns Unsupported → LlmExecutor falls back to serial prefill loop (current baseline).
+
+vLLM avoids this: pre-allocates scratch for `max_num_batched_tokens=8192` at engine startup. KV pool sized to fit remaining GPU memory. ferrum allocates KV pool first, leaves no growth room for big scratch.
+
+**Real activation blocker**: engine-init-time memory budgeting. Add `max_num_batched_tokens` config, allocate scratch up-front, fit KV pool to remainder. This is engine-layer surgery, not model-layer. Phase 3 prerequisite.
+
+Architecture/code is ready (commits `b26220f` shared helpers + `91d169b` Qwen3MoeScratch fields + `88c4028` outer scaffolding + `b5acc9b` MoE wiring + `e9bac55` shape gate). Phase 3 unlocks them.
 
 ## Phase 1 retrospective
 
