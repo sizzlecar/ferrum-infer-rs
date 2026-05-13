@@ -3724,22 +3724,25 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        // Phase 2B status: implementation is in place but the engine's
-        // scheduler today only emits decode-only batches (m_total=num_seqs,
-        // q_len=1 per item). For pure decode the legacy `forward_layer_
-        // batched_decode` path is already optimized (FERRUM_MOE_GRAPH
-        // graph capture, fast paths for m=1 per item) and outperforms
-        // the unified path that does generic varlen + bucketed MoE.
-        // Phase 3 (token-budget scheduler with chunked prefill) is the
-        // prerequisite for the unified path to see actual mixed batches
-        // where it wins. Until then, gate behind opt-in env var.
-        if std::env::var("FERRUM_QWEN3MOE_UNIFIED").as_deref() != Ok("1") {
+        // Pure-decode shortcut: every item is q_len=1 + is_final_chunk.
+        // For this shape, ferrum's legacy `forward_layer_batched_decode`
+        // path (with FERRUM_MOE_GRAPH=1 graph capture + decode-tuned
+        // moe_forward_stacked) is faster than our generic varlen +
+        // bucketed-MoE unified path. Returning Unsupported routes the
+        // engine to the legacy decode_batch path via LlmExecutor's
+        // fallback partition.
+        let all_decode = items
+            .iter()
+            .all(|it| it.1.len() == 1 && it.3);
+        if all_decode {
             return Err(FerrumError::unsupported(
-                "Qwen3MoeModel::unified_forward: gated by FERRUM_QWEN3MOE_UNIFIED=1 \
-                 (Phase 3 scheduler not yet emitting mixed batches; legacy decode \
-                 path is faster for decode-only iters).",
+                "Qwen3MoeModel::unified_forward: pure-decode batch — \
+                 routed to legacy decode_batch (faster for q_len=1)",
             ));
         }
+        // Any prefill chunk (q_len > 1) OR non-final-chunk item:
+        // unified path wins by collapsing N serial prefills into one
+        // [M_total, hidden] forward.
         if self.paged_pools.is_none() {
             return Err(FerrumError::unsupported(
                 "Qwen3MoeModel::unified_forward: paged KV required \
