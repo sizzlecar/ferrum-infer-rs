@@ -1113,8 +1113,25 @@ fn pick_moe_block_size(
 ) -> usize {
     const CANDIDATES: &[usize] = &[64, 32, 16];
     const PADDING_BUDGET: f64 = 1.30; // ≤ 30% overhead vs actual tokens
+                                      // Manual override (testing / autotuning): FERRUM_MOE_BLOCK_SIZE=16/32/64.
+                                      // 8 / 48 are also valid kernel instantiations but unused here.
+    if let Some(bs) = std::env::var("FERRUM_MOE_BLOCK_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|bs| matches!(*bs, 16 | 32 | 64))
+    {
+        return bs;
+    }
     if use_device_route {
-        return 16;
+        // Device-route doesn't expose `plan` host-side, so we can't
+        // measure per-expert padding overhead. Default to 64 to match
+        // vLLM's tile choice on RTX 4090 (`thread_m_blocks = 64/16 =
+        // 4`). At m=32 × top_k=8 = 256 pairs across ≤128 active
+        // experts, padding overhead is bounded by the kernel grid; the
+        // tile-width win dominates the per-expert wasted columns on
+        // INT4 MoE GEMMs. Set FERRUM_MOE_BLOCK_SIZE=16 to revert if a
+        // workload regresses (very low m or pathological routing).
+        return 64;
     }
     let Some(plan) = plan else {
         return 16;
