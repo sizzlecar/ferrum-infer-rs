@@ -649,6 +649,15 @@ impl EngineInner {
             Ok(r) => r,
             Err(e) => {
                 warn!("Unified forward failed: {}; falling back to split", e);
+                // Release the KV cache slots we just allocated for the
+                // unified-path prefills — otherwise the legacy split
+                // path's `run_batch_prefill` re-allocates for the same
+                // request_id, double-counting `active_caches` (only one
+                // of the two pairs ever gets deallocated by
+                // `complete_request`). Found via paged_attention_test.
+                for (rid, _, _) in &unified_prefills {
+                    let _ = self.kv_cache.deallocate(rid.clone()).await;
+                }
                 return self.process_batch_legacy_split(batch).await;
             }
         };
