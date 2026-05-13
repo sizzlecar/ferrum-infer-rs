@@ -191,8 +191,15 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     // FERRUM_KV_MAX_BLOCKS + FERRUM_PAGED_MAX_SEQS (apples bench does both,
     // which used to silently skip the Phase 3 scratch budget alongside).
     if !max_batched_tokens_overridden {
+        // 2048 is the safe default across both apples M2 (Llama-INT4 8B,
+        // ~4 GB) and M3 (Qwen3-30B-A3B, ~17 GB weights + 1 GB scratch +
+        // 6 GB KV pool on 24 GB cards). 4096 OOMs on M3 because the
+        // Qwen3MoE scratch grows linearly with `t` (batch_logits =
+        // t × vocab × 2 B alone is 1.2 GB at t=4096). The unified path
+        // still activates at 2048 — scheduler admits up to 4 prefill
+        // chunks (4 × 512 = 2048) per iter, m_total stays ≤ scratch.
         let mbt = match profile {
-            AutoSizeProfile::Server => 4096,
+            AutoSizeProfile::Server => 2048,
             AutoSizeProfile::Chat => 2048,
         };
         // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.

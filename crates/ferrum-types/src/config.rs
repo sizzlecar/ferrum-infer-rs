@@ -456,7 +456,7 @@ impl BatchConfig {
         std::env::var("FERRUM_MAX_BATCHED_TOKENS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4096)
+            .unwrap_or(2048)
     }
 }
 

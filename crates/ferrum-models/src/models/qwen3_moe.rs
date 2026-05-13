@@ -3822,7 +3822,7 @@ fn initial_scratch_tokens() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|t| *t > 0)
-        .unwrap_or(4096)
+        .unwrap_or(2048)
 }
 
 /// Build a stub Linear<B> with the given shape but zero weights. Used to
