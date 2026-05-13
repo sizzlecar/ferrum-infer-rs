@@ -637,11 +637,19 @@ impl BackendPagedKv for CudaBackend {
         // shows c=1/kv=4096 9× speedup, c=4/kv=384 +103%, c=16/kv=384
         // marginal/-2%. Heuristic gates split-K to regions where it wins.
         // FERRUM_SPLIT_K_ATTN=1 forces on, FERRUM_SPLIT_K_ATTN=0 forces off.
+        //
+        // total_q_tokens cap: the unified prefill path can pack
+        // O(thousands) of q tokens into a single call (32 prefills × ~150
+        // tokens each). partial_out = total_q × heads × splits × head_dim
+        // f32 grows to hundreds of MB — observed OOM at M3 c=32 unified
+        // (4800 × 32 × 8 × 128 × 4 ≈ 628 MB). Skip split-K when the grid
+        // is already well-occupied via q-tokens (>64) — the per-call
+        // transient cost dominates any kernel win.
         let split_k_force = std::env::var("FERRUM_SPLIT_K_ATTN").ok();
         let use_split_k = match split_k_force.as_deref() {
             Some("1") => true,
             Some("0") => false,
-            _ => num_seqs <= 4 || max_kv_len >= 768,
+            _ => total_q_tokens <= 64 && (num_seqs <= 4 || max_kv_len >= 768),
         };
 
         if use_split_k {
