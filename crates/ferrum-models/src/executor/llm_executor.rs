@@ -171,6 +171,109 @@ impl ModelExecutor for LlmExecutor {
         Ok(PrefillOutput::new(logits_ref, kv_handle))
     }
 
+    /// Batched prefill: combine all prompts into ONE `model.unified_forward`
+    /// call so launch / kernel-overhead is amortized across the cohort.
+    ///
+    /// Falls back to the trait default (serial per-item) when the model
+    /// returns `Err(unsupported)` from `unified_forward` — e.g. Qwen3MoeModel
+    /// today, until Phase 2 adds its native unified path.
+    async fn batch_prefill(
+        &self,
+        inputs: &[PrefillInput],
+    ) -> Result<Vec<PrefillOutput>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Per-input: derive cache_id (reuse supplied handle's id or generate
+        // fresh) + prior_seq_len. Mirrors the single-prefill path so chunked
+        // prefill continuations route correctly when batched.
+        let mut cache_ids = Vec::with_capacity(inputs.len());
+        let mut prior_seq_lens = Vec::with_capacity(inputs.len());
+        let mut tokens_per_input = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let tokens = common::tensor_to_tokens(&input.input_ids)?;
+            let supplied_handle_id = input.kv_cache.as_ref().and_then(|h| {
+                h.as_any()
+                    .downcast_ref::<GenericKvCacheHandle>()
+                    .map(|g| g.request_cache_id().to_string())
+            });
+            let cache_id = supplied_handle_id
+                .clone()
+                .unwrap_or_else(|| self.gen_cache_id());
+            let prior_seq_len = input
+                .kv_cache
+                .as_ref()
+                .and_then(|h| h.as_any().downcast_ref::<GenericKvCacheHandle>())
+                .map(|g| {
+                    use ferrum_interfaces::KvCacheHandle;
+                    g.block_table().sequence_length
+                })
+                .unwrap_or(0);
+            cache_ids.push(cache_id);
+            prior_seq_lens.push(prior_seq_len);
+            tokens_per_input.push(tokens);
+        }
+
+        // Build unified items and ONE `unified_forward` call. If the model
+        // doesn't support it, fall back to the trait-default serial path.
+        let unified_items: Vec<(String, Vec<u32>, usize, bool)> = cache_ids
+            .iter()
+            .zip(tokens_per_input.iter())
+            .zip(prior_seq_lens.iter())
+            .map(|((cid, toks), &prior)| (cid.clone(), toks.clone(), prior, true))
+            .collect();
+        let per_item_logits: Vec<Vec<f32>> = {
+            let mut model = self.model.lock();
+            match model.unified_forward(&unified_items) {
+                Ok(per_item) => per_item
+                    .into_iter()
+                    .map(|opt| opt.expect("is_final_chunk=true must yield logits"))
+                    .collect(),
+                Err(FerrumError::Unsupported { .. }) => {
+                    // Serial fallback: per-item prefill under one lock.
+                    let mut out = Vec::with_capacity(inputs.len());
+                    for (cid, toks) in cache_ids.iter().zip(tokens_per_input.iter()) {
+                        out.push(model.prefill(cid, toks));
+                    }
+                    out
+                }
+                Err(e) => return Err(e),
+            }
+        };
+
+        let cfg = self.model.lock().config().clone();
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for (i, logits) in per_item_logits.into_iter().enumerate() {
+            let logits_tensor = candle_core::Tensor::new(&logits[..], &candle_core::Device::Cpu)
+                .map_err(|e| FerrumError::model(format!("logits tensor: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("unsqueeze: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| FerrumError::model(format!("unsqueeze2: {e}")))?;
+            let logits_ref = common::wrap_tensor(logits_tensor);
+            let seq_len = inputs[i]
+                .kv_cache
+                .as_ref()
+                .and_then(|h| h.as_any().downcast_ref::<GenericKvCacheHandle>())
+                .map(|g| {
+                    use ferrum_interfaces::KvCacheHandle;
+                    g.block_table().sequence_length + tokens_per_input[i].len()
+                })
+                .unwrap_or(tokens_per_input[i].len());
+            let kv_handle = Arc::new(GenericKvCacheHandle::new(
+                cfg.num_layers,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                candle_core::Device::Cpu,
+                seq_len,
+                cache_ids[i].clone(),
+            ));
+            outputs.push(PrefillOutput::new(logits_ref, kv_handle));
+        }
+        Ok(outputs)
+    }
+
     async fn truncate_kv(
         &self,
         kv_cache: &Arc<dyn ferrum_interfaces::KvCacheHandle>,

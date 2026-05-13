@@ -404,11 +404,18 @@ impl EngineInner {
             }
         }
 
-        // Prefill new requests
-        for rid in &prefill_ids {
-            if let Err(e) = self.run_prefill(rid).await {
-                warn!("Prefill failed for {}: {}", rid, e);
-                self.complete_request(rid, FinishReason::Error).await?;
+        // Prefill new requests — batched into ONE model.batch_prefill call.
+        // Falls back to serial run_prefill when chunked-prefill env is set
+        // (see run_batch_prefill for the chunked-fallback path).
+        if !prefill_ids.is_empty() {
+            if let Err(e) = self.run_batch_prefill(&prefill_ids).await {
+                warn!("Batch prefill failed: {}; falling back to per-request", e);
+                for rid in &prefill_ids {
+                    if let Err(e) = self.run_prefill(rid).await {
+                        warn!("Prefill failed for {}: {}", rid, e);
+                        self.complete_request(rid, FinishReason::Error).await?;
+                    }
+                }
             }
         }
 
@@ -757,6 +764,204 @@ impl EngineInner {
             self.complete_request(request_id, FinishReason::EOS).await?;
         }
 
+        Ok(())
+    }
+
+    // ── batch prefill ─────────────────────────────────────────────────
+
+    /// Run prefill for multiple requests as ONE batched forward pass.
+    ///
+    /// Replaces the serial `for rid in prefill_ids { run_prefill }` loop
+    /// in `process_batch`. Per-request setup (prefix cache check + KV
+    /// allocation + tokenization) still happens individually; the GPU
+    /// call coalesces into one `model_executor.batch_prefill` invocation.
+    ///
+    /// Falls back to serial `run_prefill` per request when chunked prefill
+    /// is enabled (`FERRUM_CHUNKED_PREFILL=N`) — those paths have
+    /// multi-call semantics that the batched path doesn't model yet.
+    /// Phase 2 will lift this restriction.
+    async fn run_batch_prefill(&self, request_ids: &[RequestId]) -> Result<()> {
+        use ferrum_interfaces::model_executor::PrefillInput;
+
+        if request_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Chunked-prefill opt-in path: fall back to serial.
+        if std::env::var("FERRUM_CHUNKED_PREFILL").is_ok() {
+            for rid in request_ids {
+                if let Err(e) = self.run_prefill(rid).await {
+                    warn!("Prefill failed for {}: {}", rid, e);
+                    self.complete_request(rid, FinishReason::Error).await?;
+                }
+            }
+            return Ok(());
+        }
+
+        // ── Phase 1a: per-request setup (prefix cache → tokens → kv alloc) ──
+        // After this loop, `to_prefill` holds only requests that need a real
+        // model call. Prefix cache hits + immediate stops are handled inline.
+        let mut to_prefill: Vec<(RequestId, Vec<TokenId>, Arc<dyn ferrum_interfaces::KvCacheHandle>)> =
+            Vec::new();
+
+        let model_info = self.model_executor.info();
+        let skip_prefix_cache = if cfg!(feature = "cuda") {
+            std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1")
+        } else {
+            std::env::var("FERRUM_PREFIX_CACHE").is_ok_and(|v| v == "0")
+        };
+
+        for rid in request_ids {
+            let (input_tokens, num_tokens) = {
+                let sequences = self.sequences.read();
+                let Some(seq) = sequences.get(rid) else {
+                    continue; // request gone (cancelled mid-batch)
+                };
+                (seq.input_tokens.clone(), seq.input_tokens.len())
+            };
+
+            // Prefix cache hit short-circuit (mirrors run_prefill_inner).
+            if !skip_prefix_cache {
+                let hit = self
+                    .prefix_cache
+                    .find_prefix(&input_tokens)
+                    .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens.len());
+                if let Some((_, cached_kv, cached_logits)) = hit {
+                    let cloned_kv = cached_kv.clone_handle()?;
+                    let first_token = {
+                        let mut sequences = self.sequences.write();
+                        let Some(seq) = sequences.get_mut(rid) else {
+                            continue;
+                        };
+                        if let Some(ref jp) = seq.json_processor {
+                            jp.reset();
+                        }
+                        let mut logits = cached_logits;
+                        let token = seq.sample_with_processors(&mut logits)?;
+                        seq.generated_tokens.push(token);
+                        seq.model_cache_id = Some(cloned_kv.cache_id());
+                        seq.kv_cache = Some(cloned_kv);
+                        seq.prefill_complete = true;
+                        seq.phase = RequestPhase::Decoding;
+                        token
+                    };
+                    self.scheduler.mark_prefill_complete(rid, num_tokens);
+                    self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    counter!("ferrum.engine.prefix_cache_hits").increment(1);
+                    self.send_stream_update(rid, first_token).await;
+                    let should_stop = {
+                        let sequences = self.sequences.read();
+                        sequences
+                            .get(rid)
+                            .is_none_or(|s| s.should_stop(model_info.vocab_size))
+                    };
+                    if should_stop {
+                        self.complete_request(rid, FinishReason::EOS).await?;
+                    }
+                    continue;
+                }
+            }
+
+            // Cache miss — allocate KV pages.
+            let alloc_request = AllocationRequest {
+                request_id: rid.clone(),
+                initial_tokens: num_tokens,
+                max_sequence_length: model_info.max_sequence_length,
+                num_layers: model_info.num_layers,
+                num_heads: model_info.num_kv_heads,
+                head_dim: model_info.hidden_size / model_info.num_heads.max(1),
+                device: self.config.backend.device.clone(),
+                dtype: model_info.dtype,
+                priority: Priority::Normal,
+            };
+            let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
+                Ok(h) => h,
+                Err(_) => {
+                    if self.preempt_victim(rid).await {
+                        match self.kv_cache.allocate(&alloc_request).await {
+                            Ok(h) => h,
+                            Err(e) => {
+                                warn!("Prefill alloc failed for {} after preempt: {}", rid, e);
+                                self.complete_request(rid, FinishReason::Error).await?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        warn!("Prefill alloc failed for {}: no preempt victim", rid);
+                        self.complete_request(rid, FinishReason::Error).await?;
+                        continue;
+                    }
+                }
+            };
+            to_prefill.push((rid.clone(), input_tokens, kv_handle));
+        }
+
+        if to_prefill.is_empty() {
+            return Ok(());
+        }
+
+        // ── Phase 1b: ONE batched model_executor.batch_prefill call ──
+        let inputs: Vec<PrefillInput> = to_prefill
+            .iter()
+            .map(|(_, tokens, kv)| {
+                let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
+                let tensor = self.tokens_to_tensor(&token_u32s)?;
+                Ok(PrefillInput::new(tensor).with_kv_cache(kv.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let outputs = self.model_executor.batch_prefill(&inputs).await?;
+        if outputs.len() != to_prefill.len() {
+            return Err(FerrumError::internal(format!(
+                "batch_prefill returned {} outputs for {} inputs",
+                outputs.len(),
+                to_prefill.len(),
+            )));
+        }
+
+        // ── Phase 1c: per-item post-process (sample, update seq, stream, stop) ──
+        for ((rid, input_tokens, _), prefill_output) in to_prefill.iter().zip(outputs.iter()) {
+            let num_tokens = input_tokens.len();
+            let last_logits = prefill_output.last_token_logits()?;
+            let logits_vec = last_logits.to_vec_f32()?;
+            let _ = self.prefix_cache.store_prefix(
+                input_tokens,
+                prefill_output.kv_cache.clone(),
+                logits_vec.clone(),
+            );
+            let first_token = {
+                let mut sequences = self.sequences.write();
+                let Some(seq) = sequences.get_mut(rid) else {
+                    continue;
+                };
+                if let Some(ref jp) = seq.json_processor {
+                    jp.reset();
+                }
+                let mut logits = logits_vec;
+                let token = seq.sample_with_processors(&mut logits)?;
+                seq.generated_tokens.push(token);
+                seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
+                seq.kv_cache = Some(prefill_output.kv_cache.clone());
+                seq.prefill_complete = true;
+                seq.phase = RequestPhase::Decoding;
+                token
+            };
+            self.scheduler.mark_prefill_complete(rid, num_tokens);
+            self.total_prefill_tokens
+                .fetch_add(num_tokens as u64, Ordering::Relaxed);
+            counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
+            counter!("ferrum.engine.prefills_total").increment(1);
+            self.send_stream_update(rid, first_token).await;
+            let should_stop = {
+                let sequences = self.sequences.read();
+                sequences
+                    .get(rid)
+                    .is_none_or(|s| s.should_stop(model_info.vocab_size))
+            };
+            if should_stop {
+                self.complete_request(rid, FinishReason::EOS).await?;
+            }
+        }
         Ok(())
     }
 
