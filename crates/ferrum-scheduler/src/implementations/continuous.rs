@@ -440,6 +440,27 @@ impl ContinuousBatchScheduler {
         }
 
         if batch_requests.is_empty() {
+            // FERRUM_SCHED_NONE_PROF=1: log why we returned None. Rate-limited.
+            if std::env::var("FERRUM_SCHED_NONE_PROF").is_ok() {
+                use std::sync::atomic::AtomicU64;
+                static NONE_PROF_N: AtomicU64 = AtomicU64::new(0);
+                let n = NONE_PROF_N.fetch_add(1, Ordering::Relaxed);
+                if n.is_multiple_of(512) {
+                    let d_len = self.decode_queue.read().len();
+                    let p_len = self.prefill_queue.read().len();
+                    let w_len = self.waiting_queue.read().len();
+                    let d_count = self.decoding_count();
+                    eprintln!(
+                        "[sched-none] n={} decode_queue={} prefill_queue={} waiting_queue={} decoding_count={} hint.max_batch={}",
+                        n,
+                        d_len,
+                        p_len,
+                        w_len,
+                        d_count,
+                        hint.max_batch_size,
+                    );
+                }
+            }
             return None;
         }
 
