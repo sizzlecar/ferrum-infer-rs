@@ -223,6 +223,10 @@ impl ModelExecutor for LlmExecutor {
             .zip(prior_seq_lens.iter())
             .map(|((cid, toks), &prior)| (cid.clone(), toks.clone(), prior, true))
             .collect();
+
+        let nb_prof = std::env::var("FERRUM_BATCH_PREFILL_PROF").is_ok();
+        let bp_t0 = if nb_prof { Some(std::time::Instant::now()) } else { None };
+        let mut took_fallback = false;
         let per_item_logits: Vec<Vec<f32>> = {
             let mut model = self.model.lock();
             match model.unified_forward(&unified_items) {
@@ -231,7 +235,7 @@ impl ModelExecutor for LlmExecutor {
                     .map(|opt| opt.expect("is_final_chunk=true must yield logits"))
                     .collect(),
                 Err(FerrumError::Unsupported { .. }) => {
-                    // Serial fallback: per-item prefill under one lock.
+                    took_fallback = true;
                     let mut out = Vec::with_capacity(inputs.len());
                     for (cid, toks) in cache_ids.iter().zip(tokens_per_input.iter()) {
                         out.push(model.prefill(cid, toks));
@@ -241,6 +245,16 @@ impl ModelExecutor for LlmExecutor {
                 Err(e) => return Err(e),
             }
         };
+        if let Some(t0) = bp_t0 {
+            let total_q: usize = unified_items.iter().map(|it| it.1.len()).sum();
+            eprintln!(
+                "[batch-prefill] n_items={} total_q={} fallback={} elapsed={}us",
+                inputs.len(),
+                total_q,
+                took_fallback,
+                t0.elapsed().as_micros()
+            );
+        }
 
         let cfg = self.model.lock().config().clone();
         let mut outputs = Vec::with_capacity(inputs.len());
