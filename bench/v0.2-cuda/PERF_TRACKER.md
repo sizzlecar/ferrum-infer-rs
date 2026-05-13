@@ -149,7 +149,17 @@ Append after every optimization. Even if bench is unchanged, capture the API del
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
 | 2026-05-13 | `0f2dadb` | **baseline R0** | 1044 | 55% | 117 | 477 | 700 | 231 | — |
 | 2026-05-13 | `0f2dadb` | RBD/BATCH_DECODE prof | 1031 | 55% | — | — | — | — | profiling overhead < 1%; localized 17 ms inter-batch gap |
+| 2026-05-13 | `1d0c200` | Phase 1: batched prefill (M3) | 1004 | 53% | — | — | — | — | Qwen3Moe lacks unified_forward → falls back to serial; M3 unaffected |
+| 2026-05-13 | `1d0c200` | Phase 1: batched prefill (M2) | 855 | 39% (M2 baseline 38%) | — | — | — | — | Llama unified_forward fires (fallback=false), 26 batch_prefill calls / bench. Batched prefill works at kernel level (~+50% prefill bandwidth) but M2's prefill is only 5% of bench wall (decode is the bottleneck) — net throughput unchanged. |
 | | | | | | | | | | |
+
+## Phase 1 retrospective
+
+Phase 1 lit up the path (Llama batches prefill via unified_forward, no fallback) but did NOT move the needle on either bench:
+- **M2**: decode is ~95% of wall time at c=32; batched prefill saves ~1 sec out of 12 → ±noise.
+- **M3**: Qwen3MoeModel doesn't implement unified_forward → batch_prefill falls back to serial.
+
+Lesson: prefill batching alone helps **only when prefill is the bench bottleneck AND the model supports unified_forward**. For M3 that requires Phase 2 (native Qwen3Moe forward_unified); for M2 the gap is elsewhere (decode kernel efficiency, possibly Marlin tile choice — see vLLM `<256, 4, 16, 4>` vs ferrum `<256, 1, 8, 8>`).
 
 ### R0 raw artifacts on pod
 - `/tmp/ferrum_bench.nsys-rep` (6.5 MB) — `nsys-ui` to open
