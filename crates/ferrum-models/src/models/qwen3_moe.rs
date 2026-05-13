@@ -304,6 +304,55 @@ pub struct Qwen3MoeScratch<B: QuantLlmBackend + BackendMoeFused> {
     /// Holds RouterOutput / softmax buffer / MoeBucketPlan reused across
     /// every layer (~10 ms / token reclaimed at c=32 / Qwen3-MoE 30B-A3B).
     pub moe_route_scratch: crate::moe::MoeRouteScratch,
+
+    // ── Unified mixed-batch scratch (Phase 2B scaffolding) ────────────
+    //
+    // Mirrors `LlamaFamilyScratch::unified_*`. Grown on demand by
+    // `ensure_unified_scratch(M_total_max)`. Used only by
+    // `unified_forward_internal` (the chunked-prefill + mixed-batch
+    // path); legacy `forward_layer_batched_decode` leaves these `None`.
+    pub unified_residual: Option<B::Buffer>,
+    pub unified_norm_out: Option<B::Buffer>,
+    pub unified_qkv_out: Option<B::Buffer>,
+    pub unified_packed_q: Option<B::Buffer>,
+    pub unified_attn_out: Option<B::Buffer>,
+    pub unified_o_proj_out: Option<B::Buffer>,
+    /// `[M_total, hidden]` — input to MoE FFN block (post-norm output
+    /// that the MoE expert dispatch reads). Mirrors Llama's
+    /// `unified_norm_out` but Qwen3-MoE writes the MoE block's input
+    /// here from the attention residual via fused_add_rms_norm.
+    pub unified_moe_input: Option<B::Buffer>,
+    /// `[M_total, num_experts]` — router logits over all unified tokens.
+    pub unified_router_logits: Option<B::Buffer>,
+    /// `[M_total, hidden]` — MoE block output before residual add.
+    pub unified_moe_out: Option<B::Buffer>,
+
+    // Index buffers (device-resident, written by the engine per call).
+    /// `[max_seqs + 1]` u32 — cumulative q-token counts across items.
+    pub unified_cu_seqlens_q: Option<B::Buffer>,
+    /// `[max_seqs]` u32 — per-item starting absolute KV position.
+    pub unified_pos_offsets: Option<B::Buffer>,
+    /// `[max_seqs * max_blocks_per_seq]` u32 — stacked block tables.
+    pub unified_block_tables: Option<B::Buffer>,
+
+    // LM-head sampling buffers (per-final-chunk-item).
+    /// `[max_seqs, hidden]` — per-final-token normed hidden state,
+    /// gather-copy'd from `unified_residual` at the final-indices step.
+    pub unified_packed_normed: Option<B::Buffer>,
+    /// `[max_seqs, vocab]` — per-final-token logits from lm_head.
+    pub unified_packed_logits: Option<B::Buffer>,
+
+    /// Capacity (in M_total) of the unified scratch. Used by
+    /// `ensure_unified_scratch` to skip realloc when the request
+    /// fits within the current allocation.
+    pub unified_capacity: usize,
+
+    /// CUDA-graph cache state for unified mixed-batch forward.
+    /// Mirrors `LlamaFamilyScratch::unified_graph_*`. Set of
+    /// already-captured `unified_graph_key(m_total, num_seqs)` values.
+    pub unified_graph_keys_seen: std::collections::HashSet<u64>,
+    pub unified_graph_warmup: usize,
+    pub unified_graph_failed: bool,
 }
 
 impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
@@ -412,7 +461,80 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
             paged_max_blocks_per_seq: 0,
             max_tokens: t,
             moe_route_scratch: crate::moe::MoeRouteScratch::new(),
+            // Unified scratch: grown lazily by `ensure_unified_scratch`.
+            unified_residual: None,
+            unified_norm_out: None,
+            unified_qkv_out: None,
+            unified_packed_q: None,
+            unified_attn_out: None,
+            unified_o_proj_out: None,
+            unified_moe_input: None,
+            unified_router_logits: None,
+            unified_moe_out: None,
+            unified_cu_seqlens_q: None,
+            unified_pos_offsets: None,
+            unified_block_tables: None,
+            unified_packed_normed: None,
+            unified_packed_logits: None,
+            unified_capacity: 0,
+            unified_graph_keys_seen: std::collections::HashSet::new(),
+            unified_graph_warmup: 0,
+            unified_graph_failed: false,
         }
+    }
+
+    /// Grow `unified_*` scratch buffers to fit `m_total` tokens across
+    /// `max_seqs` sequences (each with up to `max_blocks_per_seq` paged
+    /// blocks). Idempotent — skips realloc when the existing capacity
+    /// is already sufficient. Called by `unified_forward_internal`.
+    pub(crate) fn ensure_unified_scratch(
+        &mut self,
+        cfg: &Qwen3MoeConfig,
+        m_total: usize,
+        max_seqs: usize,
+        max_blocks_per_seq: usize,
+    ) {
+        if m_total <= self.unified_capacity
+            && self.unified_residual.is_some()
+            && self.unified_cu_seqlens_q.is_some()
+        {
+            return;
+        }
+        let cap = m_total.max(self.unified_capacity).max(1);
+        let h = cfg.base.hidden_size;
+        let q_dim = cfg.base.num_heads * cfg.base.head_dim;
+        let kv_dim = cfg.base.num_kv_heads * cfg.base.head_dim;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let n_exp = cfg.num_experts;
+        let v = cfg.base.vocab_size;
+        // Per-M_total buffers (resize on growth).
+        self.unified_residual = Some(B::alloc(cap * h));
+        self.unified_norm_out = Some(B::alloc(cap * h));
+        self.unified_qkv_out = Some(B::alloc(cap * qkv_dim));
+        self.unified_packed_q = Some(B::alloc(cap * q_dim));
+        self.unified_attn_out = Some(B::alloc(cap * q_dim));
+        self.unified_o_proj_out = Some(B::alloc(cap * h));
+        self.unified_moe_input = Some(B::alloc(cap * h));
+        self.unified_router_logits = Some(B::alloc(cap * n_exp));
+        self.unified_moe_out = Some(B::alloc(cap * h));
+        // Per-max_seqs buffers (only allocated once, max_seqs is stable).
+        if self.unified_cu_seqlens_q.is_none() {
+            self.unified_cu_seqlens_q = Some(B::alloc_typed(
+                ferrum_kernels::backend::Dtype::U32,
+                max_seqs + 1,
+            ));
+            self.unified_pos_offsets = Some(B::alloc_typed(
+                ferrum_kernels::backend::Dtype::U32,
+                max_seqs,
+            ));
+            self.unified_block_tables = Some(B::alloc_typed(
+                ferrum_kernels::backend::Dtype::U32,
+                max_seqs * max_blocks_per_seq,
+            ));
+            self.unified_packed_normed = Some(B::alloc(max_seqs * h));
+            self.unified_packed_logits = Some(B::alloc(max_seqs * v));
+        }
+        self.unified_capacity = cap;
     }
 
     /// Allocate scratch for paged batched dispatch. Mirrors
