@@ -3689,7 +3689,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
     }
 }
 
-impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
+impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM
+    for Qwen3MoeModel<B, K>
+{
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -3781,6 +3783,25 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
                 .map(|(cid, tok, p)| self.decode(cid, *tok, *p))
                 .collect()
         }
+    }
+
+    fn unified_forward(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Require paged-KV — the unified path uses the varlen kernels
+        // that only work on the paged pool layout (PR #102+). Without
+        // paged pools, fall through to the engine's legacy serial path.
+        if self.paged_pools.is_none() {
+            return Err(FerrumError::unsupported(
+                "Qwen3MoeModel::unified_forward: paged KV required \
+                 (set FERRUM_METAL_PAGED_KV=1). Engine falls back.",
+            ));
+        }
+        Ok(self.unified_forward_internal(items))
     }
 
     fn release(&mut self, cache_id: &str) {

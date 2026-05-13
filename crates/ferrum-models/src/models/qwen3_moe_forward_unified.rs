@@ -13,17 +13,13 @@
 //! cuGraphLaunch overhead would be a perf regression).
 
 use ferrum_interfaces::kv_dtype::KvDtypeKind;
-use ferrum_kernels::backend::{Backend, BackendMoeFused, BackendPagedKv, MoeLlmBackend, QuantLlmBackend};
+use ferrum_kernels::backend::{Backend, BackendPagedKv, MoeLlmBackend};
 
 use super::qwen3_moe::Qwen3MoeModel;
 
 impl<B, K> Qwen3MoeModel<B, K>
 where
-    B: MoeLlmBackend
-        + QuantLlmBackend
-        + BackendMoeFused
-        + BackendPagedKv
-        + ferrum_kernels::backend::BackendKvDtype<K>,
+    B: MoeLlmBackend + BackendPagedKv,
     K: KvDtypeKind,
 {
     /// Unified mixed-batch forward for Qwen3-MoE. See
@@ -94,6 +90,11 @@ where
             paged_max_seqs,
         );
         let max_seqs = paged_max_seqs.max(num_seqs);
+        // Grow LEGACY scratch first — moe_forward_batched_prefill_impl
+        // reads/writes scratch.{router_logits, norm_out, moe_out},
+        // sized for max_tokens. Unified path can exceed that; this is
+        // a no-op when m_total <= max_tokens.
+        self.ensure_scratch(m_total);
         let cfg_clone = self.cfg.clone();
         self.scratch
             .ensure_unified_scratch(&cfg_clone, m_total, max_seqs, max_blocks_per_seq);
@@ -468,62 +469,72 @@ where
             );
         }
 
-        // 7. Router logits: moe_input → unified_router_logits.
-        //    GEMM at m = M_total.
+        // 7. Router logits: moe_input → scratch.router_logits.
+        //    GEMM at m = M_total. Writes directly into the LEGACY
+        //    scratch.router_logits buffer (sized for m_total via
+        //    ensure_scratch above) so moe_forward_batched_prefill_impl
+        //    reads the right data without a copy.
         {
             let moe_input = self
                 .scratch
                 .unified_moe_input
                 .as_ref()
                 .expect("unified_moe_input missing");
-            let router_logits = self
-                .scratch
-                .unified_router_logits
-                .as_mut()
-                .expect("unified_router_logits missing");
-            moe_layer
-                .router
-                .forward(ctx, moe_input, router_logits, m_total);
+            moe_layer.router.forward(
+                ctx,
+                moe_input,
+                &mut self.scratch.router_logits,
+                m_total,
+            );
         }
 
         // 8. MoE expert dispatch via the existing batched-prefill impl.
-        //    This handles route_topk_softmax + compute_ids_tpe (or vLLM
-        //    align_block) + per-expert Marlin GEMM + combine, all at
-        //    m = M_total. The function reads from `scratch.router_logits`
-        //    and writes the combined output into a target buffer the
-        //    caller specifies.
+        //    Reads `scratch.router_logits` + `scratch.norm_out`, writes
+        //    `scratch.moe_out`. Bridge: copy unified_moe_input into
+        //    scratch.norm_out before the call; copy scratch.moe_out out
+        //    into unified_moe_out after.
         //
-        //    For now, copy unified_router_logits into the existing
-        //    scratch.router_logits buffer that moe_forward_batched_prefill_impl
-        //    reads from. (Future: refactor moe_forward_batched_prefill_impl
-        //    to read its inputs by parameter so we don't need this copy.)
-        //
-        // TODO(Phase 2B step 2): wire moe_forward_batched_prefill_impl
-        // for the unified path. The current legacy path uses
-        // `scratch.router_logits` + `scratch.norm_out` as inputs and
-        // `scratch.moe_out` as output. Unified path uses
-        // `unified_router_logits` + `unified_moe_input` + `unified_moe_out`.
-        // Re-route through additional buffer parameters or temporary
-        // pointer swap.
-        let _ = (top_k, n_exp, norm_topk_prob, moe_layer);
+        //    Future optimization: refactor moe_forward_batched_prefill_impl
+        //    to take input/output buffers as parameters, eliminating
+        //    these two copies. For now they cost ~M_total × h × 2 bytes
+        //    each ≈ 100 KB at c=32 — negligible vs the MoE GEMM cost.
+        {
+            let moe_input = self
+                .scratch
+                .unified_moe_input
+                .as_ref()
+                .expect("unified_moe_input missing");
+            B::copy_slice(ctx, moe_input, 0, &mut self.scratch.norm_out, 0, m_total * h);
+        }
+        crate::moe::forward::moe_forward_batched_prefill_impl::<B>(
+            ctx,
+            moe_layer,
+            &mut self.scratch,
+            h,
+            inter,
+            top_k,
+            n_exp,
+            norm_topk_prob,
+            m_total,
+        )
+        .expect("Qwen3Moe unified: moe_forward_batched_prefill_impl");
+        {
+            let moe_out = self
+                .scratch
+                .unified_moe_out
+                .as_mut()
+                .expect("unified_moe_out missing");
+            B::copy_slice(ctx, &self.scratch.moe_out, 0, moe_out, 0, m_total * h);
+        }
 
-        // 9. Residual add: unified_moe_out → residual
-        // 10. (Next layer's input_rms_norm picks up residual.)
-        // TODO(Phase 2B step 2): once step 8 writes to unified_moe_out,
-        // enable:
-        //   let moe_out = self.scratch.unified_moe_out.as_ref().unwrap();
-        //   B::residual_add(ctx, residual, moe_out, m_total, h);
-
-        let _ = inter; // silence until step 8 wired
-
-        // INCOMPLETE — unified_forward_layer returns without doing the MoE
-        // block. The caller (unified_forward_internal) will produce wrong
-        // logits. This commit lands the attention path + scaffolding;
-        // step 8 (MoE wiring) is the next concrete change.
-        panic!(
-            "Qwen3MoeModel::unified_forward_layer: MoE block not yet wired. \
-             Phase 2B step 2 TODO. Until then, unified_forward returns Unsupported \
-             via the trait impl gate."
-        );
+        // 9. Residual add: residual += unified_moe_out
+        {
+            let moe_out = self
+                .scratch
+                .unified_moe_out
+                .as_ref()
+                .expect("unified_moe_out missing");
+            B::add_inplace(ctx, residual, moe_out, m_total * h);
+        }
     }
 }
