@@ -3805,21 +3805,24 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
 /// Initial `max_tokens` for `Qwen3MoeScratch::alloc` at model
 /// construction. Reads `FERRUM_MAX_BATCHED_TOKENS` (set by the CLI
 /// `gpu_mem_autosize` for `serve` and the chat-profile defaults for
-/// `run`); falls back to 1 when unset so the lazy `ensure_scratch`
-/// path remains for callers that bypass the autosizer.
+/// `run`); falls back to 4096 when unset to mirror `BatchConfig`'s
+/// default so the unified path activates out-of-the-box even when the
+/// caller bypassed the autosizer (e.g. bench scripts that pin
+/// FERRUM_KV_MAX_BLOCKS + FERRUM_PAGED_MAX_SEQS, which used to
+/// short-circuit the autosize early-return).
 ///
-/// Pre-allocating to the autosizer's budget is the Phase 3 unlock for
-/// `unified_forward`: the gate `m_total > scratch.max_tokens` no
-/// longer fires for typical cohort prefills, so mixed prefill+decode
-/// batches drop into the varlen kernel chain instead of falling back
-/// to legacy per-item dispatch. See
+/// Pre-allocating to the engine-side token budget is the Phase 3
+/// unlock for `unified_forward`: the gate `m_total > scratch.max_tokens`
+/// no longer fires for typical cohort prefills, so mixed
+/// prefill+decode batches drop into the varlen kernel chain instead
+/// of falling back to legacy per-item dispatch. See
 /// `docs/progress/2026-05-13-continuous-batching-foundation.md`.
 fn initial_scratch_tokens() -> usize {
     std::env::var("FERRUM_MAX_BATCHED_TOKENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|t| *t > 0)
-        .unwrap_or(1)
+        .unwrap_or(4096)
 }
 
 /// Build a stub Linear<B> with the given shape but zero weights. Used to
