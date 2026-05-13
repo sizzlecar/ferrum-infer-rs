@@ -172,19 +172,23 @@ pub fn dispatch_paged_attention_v2(
         let (v_dp, _v_recs) = v_cache.device_ptr(stream);
         let (bt_dp, _bt_recs) = block_tables.device_ptr(stream);
         let (sl_dp, _sl_recs) = seq_lens.device_ptr(stream);
+        // cudarc 0.19's `device_ptr*` returns `(u64, _records)` where the
+        // u64 is the raw device address. Cast u64 → typed pointer directly
+        // (the intermediate `as *const _` form fails to infer the element
+        // type when the destination is `*const c_void`).
         let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
         ferrum_vllm_paged_attention_v2_f16_h128_b16(
-            out_dp as *mut _ as *mut std::ffi::c_void,
-            es_dp as *mut _ as *mut std::ffi::c_void,
-            ml_dp as *mut _ as *mut std::ffi::c_void,
-            to_dp as *mut _ as *mut std::ffi::c_void,
-            q_dp as *const _ as *const std::ffi::c_void,
-            k_dp as *const _ as *const std::ffi::c_void,
-            v_dp as *const _ as *const std::ffi::c_void,
+            out_dp as *mut std::ffi::c_void,
+            es_dp as *mut std::ffi::c_void,
+            ml_dp as *mut std::ffi::c_void,
+            to_dp as *mut std::ffi::c_void,
+            q_dp as *const std::ffi::c_void,
+            k_dp as *const std::ffi::c_void,
+            v_dp as *const std::ffi::c_void,
             num_kv_heads as i32,
             scale,
-            bt_dp as *const _ as *const std::ffi::c_void,
-            sl_dp as *const _ as *const std::ffi::c_void,
+            bt_dp as *const std::ffi::c_void,
+            sl_dp as *const std::ffi::c_void,
             num_seqs as i32,
             num_heads as i32,
             max_num_blocks_per_seq as i32,

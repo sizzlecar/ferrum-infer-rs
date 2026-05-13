@@ -66,21 +66,30 @@ extern "C" void ferrum_vllm_paged_attention_v2_f16_h128_b16(
 
     dim3 grid(num_heads, num_seqs, max_num_partitions);
     dim3 block(NUM_THREADS);
+    // vLLM's dtype machinery (`Vec<uint16_t,N>::Type`, `from_float(uint16_t&, float)`)
+    // is specialized for `uint16_t` as the half-precision scalar — never
+    // `__half` directly. Cast our __half pointers to uint16_t* for the kernel
+    // call. Bitwise identical, just template-matching plumbing.
     vllm::paged_attention_v2_kernel<
-        __half, __half, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, KV_DTYPE,
+        uint16_t, uint16_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, KV_DTYPE,
         IS_BLOCK_SPARSE, PARTITION_SIZE>
         <<<grid, block, shared_mem_size, stream>>>(
-            exp_sums, max_logits, tmp_out, query, key_cache, value_cache,
-            num_kv_heads, scale, block_tables, seq_lens,
-            max_num_blocks_per_seq, alibi_slopes_ptr, q_stride,
-            kv_block_stride, kv_head_stride, k_scale_ptr, v_scale_ptr,
-            tp_rank, blocksparse_local_blocks, blocksparse_vert_stride,
-            blocksparse_block_size, blocksparse_head_sliding_step);
+            exp_sums, max_logits, reinterpret_cast<uint16_t*>(tmp_out),
+            reinterpret_cast<const uint16_t*>(query),
+            reinterpret_cast<const uint16_t*>(key_cache),
+            reinterpret_cast<const uint16_t*>(value_cache), num_kv_heads,
+            scale, block_tables, seq_lens, max_num_blocks_per_seq,
+            alibi_slopes_ptr, q_stride, kv_block_stride, kv_head_stride,
+            k_scale_ptr, v_scale_ptr, tp_rank, blocksparse_local_blocks,
+            blocksparse_vert_stride, blocksparse_block_size,
+            blocksparse_head_sliding_step);
 
     dim3 reduce_grid(num_heads, num_seqs);
     int reduce_shared_mem_size = 2 * max_num_partitions * sizeof(float);
     vllm::paged_attention_v2_reduce_kernel<
-        __half, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE>
+        uint16_t, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE>
         <<<reduce_grid, block, reduce_shared_mem_size, stream>>>(
-            out, exp_sums, max_logits, tmp_out, seq_lens, max_num_partitions);
+            reinterpret_cast<uint16_t*>(out), exp_sums, max_logits,
+            reinterpret_cast<const uint16_t*>(tmp_out), seq_lens,
+            max_num_partitions);
 }
