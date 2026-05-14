@@ -120,6 +120,12 @@ pub struct SequenceState {
     /// Multi-token text stop sequences (`stop_sequences` entries that don't
     /// resolve to a single token). Checked via accumulated decoded text.
     pub stop_text_seqs: Vec<String>,
+    /// Bytes of decoded `generated_tokens` already flushed via the stream
+    /// channel. Used by `send_stream_update` to compute per-call delta from
+    /// the full-history decode, so multi-byte UTF-8 sequences (Chinese chars,
+    /// emoji) that span several BPE tokens don't get rendered as
+    /// `\u{FFFD}` replacement chars when decoded one token at a time.
+    pub streamed_text_len: usize,
 }
 
 impl SequenceState {
@@ -197,6 +203,7 @@ impl SequenceState {
             model_cache_id: None,
             stop_token_ids,
             stop_text_seqs,
+            streamed_text_len: 0,
         }
     }
 
@@ -1905,25 +1912,50 @@ impl EngineInner {
     // ── stream helper ──────────────────────────────────────────────────
 
     async fn send_stream_update(&self, request_id: &RequestId, token: TokenId) {
-        let sender = {
-            let sequences = self.sequences.read();
-            sequences
-                .get(request_id)
-                .and_then(|s| s.stream_sender.clone())
+        // Decode the full generated-token history (skip_special=true matches
+        // the final-response decode in `complete_request`) and emit only
+        // the delta that hasn't been streamed yet. Per-token decode is
+        // wrong for any model whose vocab can split a multi-byte UTF-8
+        // sequence across BPE pieces — Qwen3 / Qwen2.5 routinely do this
+        // for Chinese chars and emoji, and the single-token decode then
+        // returns a `\u{FFFD}` replacement char that renders as a square /
+        // `?` glyph in the terminal.
+        //
+        // Algorithm: hold the write lock once to (a) clone sender, (b)
+        // decode current full history, (c) if the decoded text ends in
+        // `\u{FFFD}` defer the emit (a later token will complete the
+        // multi-byte sequence), (d) otherwise carve off the substring
+        // past `streamed_text_len` and bump the watermark. Buffering is
+        // bounded — the longest multi-byte sequence is 4 bytes, so at
+        // most one or two tokens get deferred before flushing.
+        let (sender, delta) = {
+            let mut sequences = self.sequences.write();
+            let Some(seq) = sequences.get_mut(request_id) else {
+                return;
+            };
+            let sender = seq.stream_sender.clone();
+            let full = self
+                .tokenizer
+                .decode(&seq.generated_tokens, true)
+                .unwrap_or_else(|_| format!("token_{}", token.get()));
+            if full.ends_with('\u{FFFD}') {
+                // Partial multi-byte UTF-8 at the tail; wait for the next
+                // token. Do NOT advance streamed_text_len so the bytes get
+                // re-considered once the sequence completes.
+                return;
+            }
+            let delta = full[seq.streamed_text_len..].to_string();
+            seq.streamed_text_len = full.len();
+            (sender, delta)
         };
 
         if let Some(tx) = sender {
-            // skip_special=true matches the final-response decode in
-            // `complete_request`. Pre-fix this used `false`, which leaked
-            // end-of-turn markers like `<|im_end|>` into streamed chat output.
-            let token_text = self
-                .tokenizer
-                .decode(&[token], true)
-                .unwrap_or_else(|_| format!("token_{}", token.get()));
-
+            if delta.is_empty() {
+                return;
+            }
             let chunk = StreamChunk {
                 request_id: request_id.clone(),
-                text: token_text,
+                text: delta,
                 token: Some(token),
                 finish_reason: None,
                 usage: None,
