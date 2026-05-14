@@ -24,13 +24,57 @@ use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, SeedableRng};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
+
+/// Resolve per-request stop conditions into (single-token-ids, multi-token-texts).
+///
+/// Combines:
+/// 1. Model EOS reported by the tokenizer (`special_tokens().eos_token`).
+/// 2. Common chat-EOS literal names looked up in the tokenizer's vocab —
+///    `<|im_end|>`, `<|endoftext|>`, `<|eot_id|>`, `</s>`. Each lookup is
+///    model-specific (only IDs that actually exist in this vocab get added),
+///    so there's no risk of inserting an unrelated token id from a hard-coded
+///    fallback list (e.g. `2` is `</s>` for LLaMA but `!` for Qwen3).
+/// 3. User-supplied `stop_sequences` — each is encoded with `add_special=false`;
+///    one-token results land in `stop_token_ids`, multi-token results go to
+///    `stop_text_seqs` for text-match fallback.
+fn resolve_stop_conditions(
+    params: &SamplingParams,
+    tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+) -> (HashSet<u32>, Vec<String>) {
+    let mut ids: HashSet<u32> = HashSet::new();
+    let mut text_seqs: Vec<String> = Vec::new();
+
+    if let Some(tok) = tokenizer {
+        if let Some(eos) = tok.special_tokens().eos_token {
+            ids.insert(eos.get());
+        }
+        for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
+            if let Some(t) = tok.token_id(name) {
+                ids.insert(t.get());
+            }
+        }
+        for stop_seq in &params.stop_sequences {
+            match tok.encode(stop_seq, false) {
+                Ok(toks) if toks.len() == 1 => {
+                    ids.insert(toks[0].get());
+                }
+                _ => text_seqs.push(stop_seq.clone()),
+            }
+        }
+    } else {
+        for stop_seq in &params.stop_sequences {
+            text_seqs.push(stop_seq.clone());
+        }
+    }
+    (ids, text_seqs)
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Sequence state
@@ -66,6 +110,16 @@ pub struct SequenceState {
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Model executor's KV cache key for this sequence (for cleanup on completion).
     pub model_cache_id: Option<String>,
+    /// Single-token stop ids: model's EOS + any `stop_sequences` that encode to
+    /// exactly one token. Checked against the last generated token each step
+    /// — replaces the old "token id near top of vocab = EOS" placeholder. Built
+    /// from `tokenizer.eos_token`, a common-EOS fallback list (`</s>`,
+    /// `<|im_end|>`, `<|endoftext|>`, `<|eot_id|>`), and one-token encodings of
+    /// `sampling_params.stop_sequences`.
+    pub stop_token_ids: HashSet<u32>,
+    /// Multi-token text stop sequences (`stop_sequences` entries that don't
+    /// resolve to a single token). Checked via accumulated decoded text.
+    pub stop_text_seqs: Vec<String>,
 }
 
 impl SequenceState {
@@ -119,6 +173,8 @@ impl SequenceState {
             }
             _ => None,
         };
+        let (stop_token_ids, stop_text_seqs) =
+            resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref());
         Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
@@ -139,6 +195,8 @@ impl SequenceState {
             draft_kv_cache: None,
             token_frequencies: HashMap::new(),
             model_cache_id: None,
+            stop_token_ids,
+            stop_text_seqs,
         }
     }
 
@@ -146,12 +204,25 @@ impl SequenceState {
         self.input_tokens.len() + self.generated_tokens.len()
     }
 
-    pub fn should_stop(&self, vocab_size: usize) -> bool {
+    /// Should this sequence stop generating?
+    ///
+    /// Checks: (1) max-tokens budget exhausted, (2) last generated token is in
+    /// the resolved `stop_token_ids` set (model EOS + any single-token
+    /// `stop_sequences`). The pre-2026-05 placeholder ("last token id near
+    /// top of vocab") was wrong for every real model — Qwen3 EOS is 151645
+    /// in a 151936-vocab, Llama-3 EOT is 128009 in a 128256-vocab, etc. —
+    /// causing chat to never stop until KV overflow.
+    ///
+    /// Multi-token text stop sequences (`stop_text_seqs`) are NOT checked
+    /// here; the chat REPL only uses single-token EOS markers, and adding
+    /// a per-step decode just to support a rare case is not free. Callers
+    /// that need text stops can layer that check on top.
+    pub fn should_stop(&self) -> bool {
         if self.generated_tokens.len() >= self.sampling_params.max_tokens {
             return true;
         }
         if let Some(&last_token) = self.generated_tokens.last() {
-            if last_token.get() >= (vocab_size - 10) as u32 {
+            if self.stop_token_ids.contains(&last_token.get()) {
                 return true;
             }
         }
@@ -260,10 +331,16 @@ impl EngineInner {
             .from_slice(&f32_data, &[1, len], DataType::FP32, Device::CPU)
     }
 
-    /// Rebuild a KvCacheHandle with a corrected sequence_length. Used by
-    /// speculative-decode rollback — covers the `GenericKvCacheHandle`
-    /// that our LLM executors return; for any other handle type we just
-    /// return the original clone (stub / mock executors don't care).
+    /// Rebuild a KvCacheHandle with a corrected sequence_length.
+    ///
+    /// Only meaningful for `GenericKvCacheHandle`, which is what the LLM
+    /// executor (`LlmExecutor::prefill` / `decode`) constructs and threads
+    /// through speculative decoding. Resource handles minted by
+    /// `KvCacheManager` impls (Paged / Default) are returned as a plain
+    /// clone — those handles don't track per-iter position (the model's
+    /// internal paged_pool does), and the engine no longer reads
+    /// `sequence_length` from them for position purposes (see
+    /// `process_batch_unified` for the SequenceState-sourced pos_offset).
     fn make_kv_handle_with_seq(
         &self,
         h: &std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle>,
@@ -550,9 +627,7 @@ impl EngineInner {
                     self.send_stream_update(rid, first_token).await;
                     let should_stop = {
                         let sequences = self.sequences.read();
-                        sequences
-                            .get(rid)
-                            .is_none_or(|s| s.should_stop(model_info.vocab_size))
+                        sequences.get(rid).is_none_or(|s| s.should_stop())
                     };
                     if should_stop {
                         self.complete_request(rid, FinishReason::EOS).await?;
@@ -624,7 +699,16 @@ impl EngineInner {
                     .last()
                     .copied()
                     .unwrap_or(TokenId::new(0));
-                let pos_offset = kv.block_table().sequence_length;
+                // pos_offset = position of the NEW token in the K/V cache.
+                // It must increment by 1 every decode step. Source of truth
+                // is the engine's own bookkeeping: input prompt + tokens
+                // generated so far (the last one is the one we're about to
+                // decode, so its slot is `len - 1` past the prompt). NOT
+                // `kv.block_table().sequence_length` — that field is set
+                // once at allocate() time and `make_kv_handle_with_seq`
+                // doesn't actually update Paged/Default handles, so reading
+                // it leaves every decode step at the same position.
+                let pos_offset = seq.input_tokens.len() + seq.generated_tokens.len() - 1;
                 let seq_id = seq
                     .model_cache_id
                     .clone()
@@ -713,9 +797,7 @@ impl EngineInner {
             self.send_stream_update(&rid, first_token).await;
             let should_stop = {
                 let sequences = self.sequences.read();
-                sequences
-                    .get(&rid)
-                    .is_none_or(|s| s.should_stop(model_info.vocab_size))
+                sequences.get(&rid).is_none_or(|s| s.should_stop())
             };
             if should_stop {
                 self.complete_request(&rid, FinishReason::EOS).await?;
@@ -740,10 +822,14 @@ impl EngineInner {
                 };
                 seq.generated_tokens.push(token);
                 seq.tokens_this_iteration += 1;
-                if let Some(h) = seq.kv_cache.take() {
-                    let new_len = h.block_table().sequence_length + 1;
-                    seq.kv_cache = Some(self.make_kv_handle_with_seq(&h, new_len));
-                }
+                // pos_offset is sourced from SequenceState bookkeeping above
+                // (`input_tokens.len() + generated_tokens.len() - 1`); the
+                // engine-side KV handle's `sequence_length` field is no
+                // longer load-bearing here. Resource handles like
+                // PagedKvCacheHandle don't update the field anyway (the
+                // model's internal paged_pool is what actually grows), so
+                // the previous `make_kv_handle_with_seq` write was a
+                // silent no-op for production handles.
                 token
             };
             let generated_count = {
@@ -759,9 +845,7 @@ impl EngineInner {
             self.send_stream_update(&rid, next_token).await;
             let should_stop = {
                 let sequences = self.sequences.read();
-                sequences
-                    .get(&rid)
-                    .is_none_or(|s| s.should_stop(model_info.vocab_size))
+                sequences.get(&rid).is_none_or(|s| s.should_stop())
             };
             if should_stop {
                 let finish_reason = {
@@ -962,9 +1046,7 @@ impl EngineInner {
 
                 let should_stop = {
                     let sequences = self.sequences.read();
-                    sequences
-                        .get(request_id)
-                        .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
+                    sequences.get(request_id).is_none_or(|s| s.should_stop())
                 };
                 if should_stop {
                     self.complete_request(request_id, FinishReason::EOS).await?;
@@ -1097,9 +1179,7 @@ impl EngineInner {
 
         let should_stop = {
             let sequences = self.sequences.read();
-            sequences
-                .get(request_id)
-                .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
+            sequences.get(request_id).is_none_or(|s| s.should_stop())
         };
         if should_stop {
             self.complete_request(request_id, FinishReason::EOS).await?;
@@ -1195,9 +1275,7 @@ impl EngineInner {
                     self.send_stream_update(rid, first_token).await;
                     let should_stop = {
                         let sequences = self.sequences.read();
-                        sequences
-                            .get(rid)
-                            .is_none_or(|s| s.should_stop(model_info.vocab_size))
+                        sequences.get(rid).is_none_or(|s| s.should_stop())
                     };
                     if should_stop {
                         self.complete_request(rid, FinishReason::EOS).await?;
@@ -1298,9 +1376,7 @@ impl EngineInner {
             self.send_stream_update(rid, first_token).await;
             let should_stop = {
                 let sequences = self.sequences.read();
-                sequences
-                    .get(rid)
-                    .is_none_or(|s| s.should_stop(model_info.vocab_size))
+                sequences.get(rid).is_none_or(|s| s.should_stop())
             };
             if should_stop {
                 self.complete_request(rid, FinishReason::EOS).await?;
@@ -1343,7 +1419,11 @@ impl EngineInner {
                     .last()
                     .copied()
                     .unwrap_or(TokenId::new(0));
-                let pos_offset = kv_cache.block_table().sequence_length;
+                // pos_offset = position of the NEW token. Compute from
+                // engine bookkeeping (see process_batch_unified for why
+                // `kv_cache.block_table().sequence_length` is not reliable
+                // — Paged/Default handles never increment it).
+                let pos_offset = seq.input_tokens.len() + seq.generated_tokens.len() - 1;
                 // Use the model-side cache_id (set in `run_prefill_inner`
                 // from `prefill_output.kv_cache.cache_id()`), NOT the
                 // engine's request_id. The model's `kv_caches` is keyed
@@ -1410,16 +1490,11 @@ impl EngineInner {
                 };
                 seq.generated_tokens.push(token);
                 seq.tokens_this_iteration += 1;
-                // The model has appended this iter's token to its internal
-                // KV; update the engine-side handle so the NEXT iter's
-                // pos_offset (read via block_table().sequence_length)
-                // sees the bumped count. The legacy run_batch_decode path
-                // got this for free by replacing seq.kv_cache with
-                // decode_output.kv_cache (which the executor pre-bumped).
-                if let Some(h) = seq.kv_cache.take() {
-                    let new_len = h.block_table().sequence_length + 1;
-                    seq.kv_cache = Some(self.make_kv_handle_with_seq(&h, new_len));
-                }
+                // pos_offset is sourced from SequenceState bookkeeping
+                // (see process_batch_unified). The engine-side KV handle's
+                // sequence_length is not used for position tracking
+                // anymore — production handles (Paged/Default) don't
+                // update it across iterations.
                 token
             };
 
@@ -1451,9 +1526,7 @@ impl EngineInner {
             let t0_stop = if prof { Some(Instant::now()) } else { None };
             let should_stop = {
                 let sequences = self.sequences.read();
-                sequences
-                    .get(rid)
-                    .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
+                sequences.get(rid).is_none_or(|s| s.should_stop())
             };
             if let Some(t0) = t0_stop {
                 t_stop_us += t0.elapsed().as_micros() as u64;
@@ -1565,9 +1638,7 @@ impl EngineInner {
 
         let should_stop = {
             let sequences = self.sequences.read();
-            sequences
-                .get(request_id)
-                .is_none_or(|s| s.should_stop(self.model_executor.info().vocab_size))
+            sequences.get(request_id).is_none_or(|s| s.should_stop())
         };
 
         if should_stop {
@@ -1708,7 +1779,15 @@ impl EngineInner {
         });
 
         // Capture entry seq_len so we can compute the correct rollback
-        // length on partial rejection below.
+        // length on partial rejection below. Both handles here are
+        // `GenericKvCacheHandle` (constructed by `LlmExecutor::prefill` /
+        // `decode`, NOT the engine `KvCacheManager`-allocated Paged/Default
+        // handles used on the non-spec path), so `sequence_length` is
+        // correctly updated each step via `with_sequence_length(new_seq)`.
+        // Verified 2026-05-14 with FERRUM_DEBUG_SPEC_POS instrumentation:
+        // entry_target_seq grows by N+1 per step, matching the actual
+        // model writes (see make_kv_handle_with_seq at L1827-1828 for the
+        // update site on the partial-reject path).
         let entry_target_seq = target_kv.block_table().sequence_length;
         let entry_draft_seq = draft_kv.block_table().sequence_length;
 
@@ -1781,9 +1860,7 @@ impl EngineInner {
 
             let should_stop = {
                 let sequences = self.sequences.read();
-                sequences.get(request_id).map_or(true, |s| {
-                    s.should_stop(self.model_executor.info().vocab_size)
-                })
+                sequences.get(request_id).map_or(true, |s| s.should_stop())
             };
             if should_stop {
                 let finish_reason = {
@@ -1836,9 +1913,12 @@ impl EngineInner {
         };
 
         if let Some(tx) = sender {
+            // skip_special=true matches the final-response decode in
+            // `complete_request`. Pre-fix this used `false`, which leaked
+            // end-of-turn markers like `<|im_end|>` into streamed chat output.
             let token_text = self
                 .tokenizer
-                .decode(&[token], false)
+                .decode(&[token], true)
                 .unwrap_or_else(|_| format!("token_{}", token.get()));
 
             let chunk = StreamChunk {
