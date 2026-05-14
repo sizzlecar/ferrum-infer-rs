@@ -58,31 +58,44 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
         && p.is_file()
 }
 
-/// `ferrum run <gguf>` chat-profile env-var defaults. Sniffs the GGUF
-/// arch (dense vs MoE) and sets:
+/// Chat-profile env-var defaults for `ferrum run`. Sniffs the arch
+/// (dense vs MoE — works for both GGUF files and safetensors snapshot
+/// dirs) and sets:
 ///
 ///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 512 MoE
-///   - `FERRUM_METAL_PAGED_KV`  — 0 dense / 1 MoE (paged-KV is a hard
-///     requirement for the Qwen3-MoE GPU dispatch path; without it
-///     decode emits ~0.1 tok/s of garbage on Metal)
-///   - `FERRUM_PAGED_MAX_SEQS=2`, `FERRUM_MAX_BATCH=1`,
-///     `FERRUM_MOE_BATCHED=1`, `FERRUM_MOE_BATCHED_DECODE=1`,
+///   - `FERRUM_METAL_PAGED_KV`  — 0 dense GGUF / 1 dense safetensors / 1 MoE.
+///     Paged-KV is a hard requirement for the Qwen3-MoE GPU dispatch path
+///     (without it decode emits ~0.1 tok/s of garbage on Metal). Dense
+///     safetensors *also* requires paged on Metal: the contiguous-KV
+///     attention path produces token noise from the very first decode step
+///     for safetensors-loaded Qwen3. Dense GGUF (candle-transformers
+///     loader) works on the contig path and keeps `0` to avoid allocating
+///     a pool it doesn't need.
+///   - `FERRUM_PAGED_MAX_SEQS=2`, `FERRUM_MAX_BATCH=1` — single-user REPL.
+///     Keeps the paged pool at ~1.7 GB for `cap=8192` dense; without this
+///     cap the default `max_seqs=32` makes the pool ~30 GB on a 32 GB Mac.
+///   - `FERRUM_MOE_BATCHED=1`, `FERRUM_MOE_BATCHED_DECODE=1`,
 ///     `FERRUM_MOE_BATCH_THRESHOLD=2` — MoE only. Match the published
 ///     `docs/bench/macos-2026-05-02` c=1 30B-A3B → 42 tok/s defaults.
 ///
 /// Idempotent: if a user explicitly sets one of these env vars before
 /// invoking `ferrum run`, that value wins (we only set when unset).
-/// Called automatically by `resolve_model_source` when the resolved
-/// source is GGUF and the autosize profile is `Chat`. Server/bench
-/// callers don't get these defaults — they don't fit the multi-turn
-/// REPL pattern this profile is tuned for.
-pub fn apply_gguf_chat_profile_env(gguf_path: &Path) {
-    use ferrum_quantization::gguf::GgufFile;
-
-    let is_moe = match GgufFile::open(gguf_path) {
-        Ok(g) => g.architecture().map(|s| s.contains("moe")).unwrap_or(false),
-        Err(_) => false,
-    };
+/// Called automatically by `resolve_model_source` when the autosize
+/// profile is `Chat`. Server/bench callers don't get these defaults —
+/// they don't fit the multi-turn REPL pattern this profile is tuned for.
+///
+/// Without this, dense safetensors models (e.g. `Qwen/Qwen3-0.6B`)
+/// inherit the model-level `DEFAULT_KV_CAPACITY=512` floor in
+/// `llama_family.rs::ensure_kv`, which overflows after ~512 tokens on
+/// a `max_tokens=2048` chat — manifesting as a `KV cache overflow on
+/// layer 0` panic mid-response.
+pub fn apply_chat_profile_env(snapshot_path: &Path) {
+    let is_gguf = snapshot_path.is_file()
+        && snapshot_path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+    let is_moe = detect_moe_arch(snapshot_path);
 
     // SAFETY: std::env::set_var is unsafe on Rust 2024+. We only call
     // this once at CLI startup before any other thread spawns.
@@ -90,12 +103,23 @@ pub fn apply_gguf_chat_profile_env(gguf_path: &Path) {
         std::env::set_var("FERRUM_KV_CAPACITY", if is_moe { "512" } else { "8192" });
     }
     if std::env::var_os("FERRUM_METAL_PAGED_KV").is_none() {
-        std::env::set_var("FERRUM_METAL_PAGED_KV", if is_moe { "1" } else { "0" });
+        // Dense GGUF: contig path works, no need to allocate the pool.
+        // Dense safetensors + MoE: paged required for correctness on Metal.
+        let need_paged = is_moe || !is_gguf;
+        std::env::set_var("FERRUM_METAL_PAGED_KV", if need_paged { "1" } else { "0" });
+    }
+    // Single-user REPL pool sizing — both safetensors dense (avoids
+    // 30 GB pool at default max_seqs=32) and MoE (per published bench
+    // tuning). Skipped for GGUF dense which doesn't allocate a pool.
+    if !is_gguf || is_moe {
+        for (k, v) in [("FERRUM_PAGED_MAX_SEQS", "2"), ("FERRUM_MAX_BATCH", "1")] {
+            if std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
     }
     if is_moe {
         for (k, v) in [
-            ("FERRUM_PAGED_MAX_SEQS", "2"),
-            ("FERRUM_MAX_BATCH", "1"),
             ("FERRUM_MOE_BATCHED", "1"),
             ("FERRUM_MOE_BATCHED_DECODE", "1"),
             ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
@@ -105,6 +129,46 @@ pub fn apply_gguf_chat_profile_env(gguf_path: &Path) {
             }
         }
     }
+}
+
+/// Detect whether `path` is a Mixture-of-Experts model. Handles both a
+/// `.gguf` file (peek `general.architecture` from GGUF metadata) and a
+/// safetensors snapshot directory (read `config.json` and match
+/// `architectures` / `model_type` against `moe`, case-insensitive).
+fn detect_moe_arch(path: &Path) -> bool {
+    use ferrum_quantization::gguf::GgufFile;
+
+    if path.is_file()
+        && path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false)
+    {
+        return GgufFile::open(path)
+            .ok()
+            .and_then(|g| g.architecture().ok().map(|s| s.to_string()))
+            .map(|a| a.to_lowercase().contains("moe"))
+            .unwrap_or(false);
+    }
+
+    let config_path = path.join("config.json");
+    let Ok(contents) = std::fs::read_to_string(&config_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    if let Some(archs) = json.get("architectures").and_then(|v| v.as_array()) {
+        if archs
+            .iter()
+            .any(|a| a.as_str().is_some_and(|s| s.to_lowercase().contains("moe")))
+        {
+            return true;
+        }
+    }
+    json.get("model_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|mt| mt.to_lowercase().contains("moe"))
 }
 
 /// Look up `model_id` in the HF cache (`hub/models--owner--repo/snapshots/<rev>`).
@@ -203,12 +267,8 @@ pub async fn resolve_model_source(
         if let Some((profile, gpu_util)) = autosize {
             apply_auto_size_with_profile(&local_path, gpu_util, profile);
             autosized = true;
-            // Chat profile + GGUF: also set the run-mode KV / MoE
-            // env-var defaults that `run_gguf_one_shot` used to set
-            // inline. Server / bench callers (profile=Server or
-            // autosize=None) don't get these.
             if profile == AutoSizeProfile::Chat {
-                apply_gguf_chat_profile_env(&local_path);
+                apply_chat_profile_env(&local_path);
             }
         }
         return Ok(Resolved {
@@ -231,6 +291,9 @@ pub async fn resolve_model_source(
             if let Some((profile, gpu_util)) = autosize {
                 apply_auto_size_with_profile(&direct, gpu_util, profile);
                 autosized = true;
+                if profile == AutoSizeProfile::Chat {
+                    apply_chat_profile_env(&direct);
+                }
             }
             return Ok(Resolved {
                 source: ResolvedModelSource {
@@ -251,6 +314,9 @@ pub async fn resolve_model_source(
         if let Some((profile, gpu_util)) = autosize {
             apply_auto_size_with_profile(&source.local_path, gpu_util, profile);
             autosized = true;
+            if profile == AutoSizeProfile::Chat {
+                apply_chat_profile_env(&source.local_path);
+            }
         }
         return Ok(Resolved { source, autosized });
     }
@@ -278,6 +344,9 @@ pub async fn resolve_model_source(
     if let Some((profile, gpu_util)) = autosize {
         apply_auto_size_with_profile(&snapshot_path, gpu_util, profile);
         autosized = true;
+        if profile == AutoSizeProfile::Chat {
+            apply_chat_profile_env(&snapshot_path);
+        }
     }
     Ok(Resolved {
         source: ResolvedModelSource {
