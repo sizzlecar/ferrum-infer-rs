@@ -16,7 +16,15 @@ pub struct BlockTable {
     pub physical_blocks: SmallVec<[BlockId; 8]>,
     /// Mapping from logical to physical block indices
     pub logical_to_physical: SmallVec<[u32; 8]>,
-    /// Current sequence length in tokens
+    /// Cache-fill bookkeeping owned by the `KvCacheManager` that allocated
+    /// this handle. **Not authoritative for engine-side position tracking**:
+    /// only updated by the manager that minted the handle (Paged sets it
+    /// at allocate-time and never bumps it; Default ignores `initial_tokens`
+    /// and leaves it at 0; `GenericKvCacheHandle` is the only one updated
+    /// per decode step, via `with_sequence_length`). The engine sources the
+    /// "where is the next token written" answer from `SequenceState`
+    /// (`input_tokens.len() + generated_tokens.len() - 1`) — see
+    /// `ContinuousBatchEngine::process_batch_unified` / `run_batch_decode`.
     pub sequence_length: usize,
     /// Block size (tokens per block)
     pub block_size: usize,
