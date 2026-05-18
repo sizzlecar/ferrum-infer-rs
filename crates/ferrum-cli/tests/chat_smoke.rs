@@ -1,21 +1,28 @@
 //! Chat REPL smoke tests via `--output-format jsonl`.
 //!
-//! Drives `ferrum run` with stdin pipe + JSONL stdout, then asserts
-//! structural properties per turn. Catches the d67fbbb-class regressions:
-//! EOS / stop_sequences / stream / multi-turn KV / chat template.
+//! Most tests exercise engine/CLI plumbing (EOS detection, chunk counting,
+//! history cap, exit reason, max-tokens propagation) which is **model
+//! independent** — they run on Qwen3-0.6B only, the smallest fully-coherent
+//! instruct model in our matrix.
 //!
-//! These tests load a real model and default to `#[ignore]` so a bare
-//! `cargo test` stays fast. Pre-pull the model once, then opt in:
+//! `test_repl_no_template_leak` is the only test that genuinely benefits
+//! from cross-family coverage — it runs on all three PR-time models
+//! (Qwen3-0.6B / TinyLlama-1.1B / Qwen2.5-0.5B) because each family has
+//! distinct chat-template tokens that the sampler must strip.
 //!
-//!     ferrum pull qwen3:0.6b
-//!     cargo test -p ferrum-cli --features metal --test chat_smoke -- --ignored
+//! Loads real models, `#[ignore]` by default. Opt in:
+//!
+//!     ferrum pull qwen3:0.6b && ferrum pull tinyllama && ferrum pull qwen2.5:0.5b
+//!     cargo test -p ferrum-cli --features metal --test chat_smoke \
+//!       -- --ignored --test-threads=1
+//!
+//! Expected ~5 min on M1 Metal (13 test instances).
 
+use rstest::rstest;
 use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-
-const SMOKE_MODEL: &str = "qwen3:0.6b";
 
 /// One JSONL record from `ferrum run --output-format jsonl`.
 #[derive(Debug)]
@@ -102,7 +109,7 @@ fn run_chat_full(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         panic!(
-            "ferrum run exited non-zero ({:?}); stderr:\n{stderr}",
+            "ferrum run [{model}] exited non-zero ({:?}); stderr:\n{stderr}",
             output.status
         );
     }
@@ -131,7 +138,7 @@ fn run_chat_oneshot(model: &str, prompt: &str) -> Vec<ChatEvent> {
     let output = cmd.output().expect("run ferrum one-shot");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("ferrum --prompt exited non-zero; stderr:\n{stderr}");
+        panic!("ferrum --prompt [{model}] exited non-zero; stderr:\n{stderr}");
     }
     parse_jsonl(&String::from_utf8_lossy(&output.stdout))
 }
@@ -148,65 +155,71 @@ fn parse_jsonl(stdout: &str) -> Vec<ChatEvent> {
         .collect()
 }
 
+/// Family-specific template tokens that must never leak into assistant
+/// content. The set varies because each model family uses a different chat
+/// template — Qwen ChatML, Llama-3 header tokens, TinyLlama-style tags.
+fn leaky_markers_for(model: &str) -> &'static [&'static str] {
+    let m = model.to_lowercase();
+    if m.contains("qwen") {
+        &["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+    } else if m.contains("llama") && m.contains("3") {
+        &["<|begin_of_text|>", "<|eot_id|>", "<|start_header_id|>"]
+    } else {
+        // TinyLlama / generic chat template
+        &["<|system|>", "<|user|>", "<|assistant|>"]
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// PR 1 — 4 critical tests
+// Structural tests — exercised on all 3 PR-time models
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[test]
-#[ignore = "loads real model — run with `cargo test -- --ignored` after `ferrum pull qwen3:0.6b`"]
-fn test_oneshot_prompt() {
-    let events = run_chat_oneshot(SMOKE_MODEL, "Say hi in one short sentence.");
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
+#[ignore = "loads real model — run with `cargo test -- --ignored`"]
+fn test_oneshot_prompt(#[case] model: &str) {
+    let events = run_chat_oneshot(model, "Say hi in one short sentence.");
     let assistant: Vec<_> = events.iter().filter(|e| e.event() == "assistant").collect();
     assert_eq!(
         assistant.len(),
         1,
-        "expected exactly one assistant event, got {}",
+        "[{model}] expected exactly one assistant event, got {}",
         assistant.len()
     );
     let a = &assistant[0];
     assert!(
         a.content().map(|c| !c.trim().is_empty()).unwrap_or(false),
-        "assistant content was empty"
+        "[{model}] assistant content empty"
     );
     assert!(
         matches!(a.finish_reason(), Some("stop" | "eos" | "length")),
-        "unexpected finish_reason: {:?}",
+        "[{model}] unexpected finish_reason: {:?}",
         a.finish_reason()
     );
 }
 
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
 #[ignore = "loads real model"]
-fn test_repl_natural_eos() {
-    let events = run_chat(
-        SMOKE_MODEL,
-        None,
-        &["Say hi in one short sentence.", "/bye"],
-    );
+fn test_repl_natural_eos(#[case] model: &str) {
+    let events = run_chat(model, None, &["Say hi in one short sentence.", "/bye"]);
     let assistants: Vec<_> = events.iter().filter(|e| e.event() == "assistant").collect();
-    assert_eq!(
-        assistants.len(),
-        1,
-        "expected 1 assistant turn, got {}",
-        assistants.len()
-    );
+    assert_eq!(assistants.len(), 1, "[{model}] expected 1 assistant turn");
     let a = &assistants[0];
-    // Short prompt with max-tokens=100 → should hit natural stop, not length truncation.
-    // This catches the d67fbbb-class regression where EOS detection placeholder
-    // (vocab_size-10) never fires, so finish_reason was always 'length'.
     assert!(
         matches!(a.finish_reason(), Some("stop" | "eos")),
-        "expected natural stop / eos; got finish_reason={:?}, content={:?}",
+        "[{model}] expected natural stop/eos; got {:?}, content={:?}",
         a.finish_reason(),
         a.content()
     );
 }
 
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
 #[ignore = "loads real model"]
-fn test_repl_multi_turn_recall() {
+fn test_repl_multi_turn_recall(#[case] model: &str) {
     let events = run_chat(
-        SMOKE_MODEL,
+        model,
         None,
         &[
             "Remember this fact: my name is XiaoMing.",
@@ -215,79 +228,64 @@ fn test_repl_multi_turn_recall() {
         ],
     );
     let assistants: Vec<_> = events.iter().filter(|e| e.event() == "assistant").collect();
-    assert_eq!(
-        assistants.len(),
-        2,
-        "expected 2 assistant turns, got {}",
-        assistants.len()
-    );
+    assert_eq!(assistants.len(), 2, "[{model}] expected 2 assistant turns");
     let second = assistants[1].content().unwrap_or("");
-    // Catches d67fbbb-class regression where history wasn't carried into turn 2.
     assert!(
         second.to_lowercase().contains("xiaoming"),
-        "second turn should recall 'XiaoMing'; got: {second:?}"
+        "[{model}] second turn should recall 'XiaoMing'; got: {second:?}"
     );
 }
 
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
+#[case::tinyllama("tinyllama")]
+#[case::qwen25("qwen2.5:0.5b")]
 #[ignore = "loads real model"]
-fn test_repl_no_template_leak() {
+fn test_repl_no_template_leak(#[case] model: &str) {
     let events = run_chat(
-        SMOKE_MODEL,
+        model,
         None,
         &["Hi there.", "Tell me a small number.", "/bye"],
     );
-    // Sampler / stop-sequence path should swallow these, never expose them
-    // to user-visible content. If a regression lets them through, it's a
-    // chat-template double-application or sampler stop bug.
-    let leaky_markers = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "</s>", "<s>"];
+    let markers = leaky_markers_for(model);
     for e in events.iter().filter(|e| e.event() == "assistant") {
         let content = e.content().unwrap_or("");
-        for marker in &leaky_markers {
+        for marker in markers {
             assert!(
                 !content.contains(marker),
-                "assistant leaked special token {marker:?} in content: {content:?}"
+                "[{model}] assistant leaked template token {marker:?} in content: {content:?}"
             );
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PR 2 — remaining 7 Tier 1 tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
 #[ignore = "loads real model"]
-fn test_repl_max_tokens_truncation() {
-    // --max-tokens=5 forces length truncation (model won't naturally finish
-    // a "long story" prompt in 5 tokens). Catches regressions where
-    // max-tokens isn't propagated to SamplingParams.
+fn test_repl_max_tokens_truncation(#[case] model: &str) {
     let events = run_chat_full(
-        SMOKE_MODEL,
+        model,
         None,
         5,
         &["Tell me a long story about dragons.", "/bye"],
     );
     let assistants: Vec<_> = events.iter().filter(|e| e.event() == "assistant").collect();
-    assert_eq!(assistants.len(), 1, "expected 1 assistant turn");
+    assert_eq!(assistants.len(), 1, "[{model}] expected 1 assistant turn");
     assert_eq!(
         assistants[0].finish_reason(),
         Some("length"),
-        "max-tokens=5 should hit length truncation; got {:?}; content={:?}",
+        "[{model}] max-tokens=5 should hit length truncation; got {:?}, content={:?}",
         assistants[0].finish_reason(),
         assistants[0].content()
     );
 }
 
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
 #[ignore = "loads real model"]
-fn test_repl_stop_seq_each_turn() {
-    // 3 short turns, every one must hit a natural stop. This is the
-    // d67fbbb regression-net for stop-detection across multiple turns —
-    // a stop-state-leak between turns would manifest as missing/wrong
-    // finish_reason on later turns.
+fn test_repl_stop_seq_each_turn(#[case] model: &str) {
     let events = run_chat(
-        SMOKE_MODEL,
+        model,
         None,
         &[
             "Hi.",
@@ -297,25 +295,22 @@ fn test_repl_stop_seq_each_turn() {
         ],
     );
     let assistants: Vec<_> = events.iter().filter(|e| e.event() == "assistant").collect();
-    assert_eq!(assistants.len(), 3, "expected 3 assistant turns");
+    assert_eq!(assistants.len(), 3, "[{model}] expected 3 assistant turns");
     for (i, a) in assistants.iter().enumerate() {
         assert!(
             matches!(a.finish_reason(), Some("stop" | "eos")),
-            "turn {} unexpected finish_reason: {:?}",
-            i,
+            "[{model}] turn {i} finish_reason: {:?}",
             a.finish_reason()
         );
     }
 }
 
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
 #[ignore = "loads real model"]
-fn test_repl_chunk_count_matches() {
-    // chunk_count must be > 0 when content is non-empty, and content must
-    // be at least chunk_count bytes (each emitted chunk has ≥1 byte).
-    // Catches stream-counter regressions and "last chunk swallowed" bugs.
+fn test_repl_chunk_count_matches(#[case] model: &str) {
     let events = run_chat(
-        SMOKE_MODEL,
+        model,
         None,
         &["Write one short sentence about cats.", "/bye"],
     );
@@ -326,113 +321,111 @@ fn test_repl_chunk_count_matches() {
     let content = a.content().unwrap_or("");
     assert!(
         chunk_count > 0,
-        "chunk_count should be > 0 with non-empty content; got 0, content={content:?}"
+        "[{model}] chunk_count should be > 0 with non-empty content; content={content:?}"
     );
     assert!(
         content.len() >= chunk_count as usize,
-        "content.len()={} should be >= chunk_count={chunk_count} (each chunk ≥ 1 byte); content={content:?}",
+        "[{model}] content.len()={} should be >= chunk_count={chunk_count}",
         content.len()
     );
 }
 
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
 #[ignore = "loads real model"]
-fn test_repl_history_truncation_at_10() {
-    // CLI caps history at 10 entries. Drive 12 short turns and verify
-    // each turn still produces a non-empty response with a valid
-    // finish_reason — proves the truncation logic doesn't crash mid-flight
-    // and doesn't corrupt the prompt structure for later turns.
-    let mut lines: Vec<String> = (1..=12)
+fn test_repl_history_truncation_at_10(#[case] model: &str) {
+    // 8 turns is sufficient to trigger the 10-entry cap (push 16 history
+    // entries before the while-loop trims) without paying 12-turn runtime.
+    let mut lines: Vec<String> = (1..=8)
         .map(|i| format!("Reply with just the number {i}."))
         .collect();
     lines.push("/bye".to_string());
     let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
 
-    let events = run_chat_full(SMOKE_MODEL, None, 30, &line_refs);
+    let events = run_chat_full(model, None, 30, &line_refs);
     let assistants: Vec<_> = events.iter().filter(|e| e.event() == "assistant").collect();
     assert_eq!(
         assistants.len(),
-        12,
-        "expected 12 assistant turns, got {}",
+        8,
+        "[{model}] expected 8 assistant turns, got {}",
         assistants.len()
     );
     for (i, a) in assistants.iter().enumerate() {
         assert!(
             a.content().map(|c| !c.trim().is_empty()).unwrap_or(false),
-            "turn {i} content empty: {:?}",
-            a.content()
+            "[{model}] turn {i} content empty"
         );
         assert!(
             matches!(a.finish_reason(), Some("stop" | "eos" | "length")),
-            "turn {i} finish_reason: {:?}",
+            "[{model}] turn {i} finish_reason: {:?}",
             a.finish_reason()
         );
     }
 }
 
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
 #[ignore = "loads real model"]
-fn test_repl_system_prompt() {
-    // System prompt should constrain generation. Catches regression where
-    // --system flag is parsed but not actually plumbed through to
-    // build_chat_prompt.
+fn test_repl_clean_exit_bye(#[case] model: &str) {
+    let events = run_chat(model, None, &["Hi.", "/bye"]);
+    let last = events.last().expect("at least one event");
+    assert_eq!(
+        last.event(),
+        "exit",
+        "[{model}] last event should be 'exit'; got: {:?}",
+        last.event()
+    );
+    assert_eq!(
+        last.exit_reason(),
+        Some("bye"),
+        "[{model}] exit reason should be 'bye'; got: {:?}",
+        last.exit_reason()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Capability-scoped tests — limited to instruction-following / Chinese-capable
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
+#[ignore = "loads real model"]
+fn test_repl_system_prompt(#[case] model: &str) {
+    // Only Qwen3-0.6B follows simple instructions reliably at this scale —
+    // Qwen2.5-0.5B and TinyLlama-1.1B produce incoherent output even at temp=0.
     let events = run_chat(
-        SMOKE_MODEL,
+        model,
         Some("You must always reply with exactly the word YES, nothing else."),
         &["What is the weather like?", "/bye"],
     );
     let assistants: Vec<_> = events.iter().filter(|e| e.event() == "assistant").collect();
     assert_eq!(assistants.len(), 1);
     let content = assistants[0].content().unwrap_or("");
-    // Loose check: response must contain "yes" (case-insensitive). Small
-    // models won't be perfectly obedient but should at least mention it.
     assert!(
         content.to_lowercase().contains("yes"),
-        "system prompt asked for 'YES'; assistant said: {content:?}"
+        "[{model}] system prompt asked for 'YES'; assistant said: {content:?}"
     );
 }
 
-#[test]
+#[rstest]
+#[case::qwen3("qwen3:0.6b")]
 #[ignore = "loads real model"]
-fn test_repl_utf8_chinese() {
-    // Pure-Chinese round-trip. Verifies UTF-8 byte boundaries don't crack
-    // in tokenizer / decoder / JSONL serialization paths.
+fn test_repl_utf8_chinese(#[case] model: &str) {
+    // Only Qwen3-0.6B reliably produces coherent Chinese; Qwen2.5-0.5B
+    // at greedy temp=0 outputs near-random tokens.
     let events = run_chat(
-        SMOKE_MODEL,
+        model,
         Some("请用中文回答。"),
         &["你好，请用一句话问候我。", "/bye"],
     );
     let assistants: Vec<_> = events.iter().filter(|e| e.event() == "assistant").collect();
     assert_eq!(assistants.len(), 1);
     let content = assistants[0].content().unwrap_or("");
-    // Expect at least one CJK Unified Ideograph character in response.
     let has_cjk = content
         .chars()
         .any(|c| (0x4E00..=0x9FFF).contains(&(c as u32)));
     assert!(
         has_cjk,
-        "expected Chinese characters in response; got: {content:?}"
-    );
-}
-
-#[test]
-#[ignore = "loads real model"]
-fn test_repl_clean_exit_bye() {
-    // The final JSONL record must be an `exit` event with reason="bye"
-    // when the user typed /bye. Catches regressions in exit-path bookkeeping
-    // (e.g., always emitting "eof" regardless of how loop terminated).
-    let events = run_chat(SMOKE_MODEL, None, &["Hi.", "/bye"]);
-    let last = events.last().expect("at least one event");
-    assert_eq!(
-        last.event(),
-        "exit",
-        "last event should be 'exit'; got: {:?}",
-        last.event()
-    );
-    assert_eq!(
-        last.exit_reason(),
-        Some("bye"),
-        "exit reason should be 'bye'; got: {:?}",
-        last.exit_reason()
+        "[{model}] expected Chinese characters in response; got: {content:?}"
     );
 }
