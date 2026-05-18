@@ -1,0 +1,76 @@
+name: Chat Smoke (nightly)
+
+# Runs the chat / pty / stress smoke suites against real models.
+# These are #[ignore]'d in cargo test by default — opt in here.
+#
+# Trigger:
+#   - Daily at 03:00 UTC
+#   - Manual via workflow_dispatch (use when iterating on cli run / REPL)
+#
+# Not on every PR — model pulls + cold-loads cost ~5–10 min per lane.
+# PR-time CI (.github/workflows/ci.yml) already catches compile errors
+# via `cargo check --all-targets`.
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: chat-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  metal:
+    name: Chat smoke (macOS Metal)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-chat-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-chat-smoke-
+
+      # Cache HF models so cold-load is fast across runs.
+      - uses: actions/cache@v3
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cache-chat-smoke-v1
+          restore-keys: hf-cache-chat-smoke-
+
+      - name: Build release binary + tests
+        run: cargo build --release -p ferrum-cli --features metal --tests
+
+      - name: Pre-pull required models
+        run: |
+          ./target/release/ferrum pull qwen3:0.6b
+          ./target/release/ferrum pull tinyllama
+          ./target/release/ferrum pull qwen2.5:0.5b
+
+      - name: Chat smoke (JSONL stdin pipe — 13 instances)
+        run: |
+          cargo test --release -p ferrum-cli --features metal \
+            --test chat_smoke -- --ignored --test-threads=1
+
+      - name: Chat pty smoke (3 tests — bye / Ctrl+D / SIGINT)
+        run: |
+          cargo test --release -p ferrum-cli --features metal \
+            --test chat_pty -- --ignored --test-threads=1
+
+      - name: Chat stress (30-turn no-OOM + 3-way concurrency)
+        run: |
+          cargo test --release -p ferrum-cli --features metal \
+            --test chat_stress -- --ignored --test-threads=1

@@ -84,6 +84,27 @@ The unified path lives in `crates/ferrum-engine/src/continuous_engine.rs::proces
 - CUDA code behind `#[cfg(feature = "cuda")]`, Metal behind target OS gates, Triton kernels behind `#[cfg(feature = "triton-kernels")]` (implies cuda)
 - Shared types/traits go in `ferrum-types`/`ferrum-interfaces`, never duplicated
 
+## Done criteria — engine / scheduler / sampler / CLI run changes
+
+Any PR that touches `ferrum-engine/src/continuous_engine.rs`,
+`ferrum-engine/src/sampler/`, `ferrum-scheduler/`, or
+`ferrum-cli/src/commands/run.rs` is in the d67fbbb blast radius
+(EOS / stop_sequences / stream / multi-turn KV / chat template). It is
+NOT done until the chat smoke suites pass locally:
+
+```bash
+ferrum pull qwen3:0.6b           # + tinyllama, qwen2.5:0.5b for full matrix
+cargo test --release -p ferrum-cli --features metal --test chat_smoke -- --ignored --test-threads=1
+cargo test --release -p ferrum-cli --features metal --test chat_pty   -- --ignored --test-threads=1
+cargo test --release -p ferrum-cli --features metal --test chat_stress -- --ignored --test-threads=1
+```
+
+Total ~70 s on M1 Metal (`--release` is required — debug is ~5× slower).
+Nightly CI (`.github/workflows/chat-smoke.yml`) runs the same suites on
+macos-latest. PR-time CI (`.github/workflows/ci.yml`) only compiles them
+via `cargo check --all-targets` — actual runs are nightly because each
+test cold-loads a real model.
+
 ## CUDA backend layout
 
 `crates/ferrum-kernels/src/backend/cuda/` split by supertrait:
