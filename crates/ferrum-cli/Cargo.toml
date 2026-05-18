@@ -79,6 +79,7 @@ shellexpand = "3.1"
 
 [dev-dependencies]
 rstest = "0.23"
+rexpect = "0.6"
 
 [features]
 default = []
