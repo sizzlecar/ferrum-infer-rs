@@ -2,10 +2,10 @@
 
 use crate::config::CliConfig;
 use chrono::Utc;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use colored::*;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
-use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
+use ferrum_types::{FinishReason, InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -13,6 +13,75 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Output format for `ferrum run`. JSONL mode emits one record per event
+/// (assistant generation result, user input, exit) on stdout — used by
+/// integration tests and scripting. Text mode is the default interactive UX.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Default)]
+pub enum OutputFormat {
+    /// Streaming text on stdout, stats on stderr (default — interactive UX).
+    #[default]
+    Text,
+    /// One JSON record per event on stdout (machine-readable; tests).
+    Jsonl,
+}
+
+fn finish_reason_str(r: FinishReason) -> &'static str {
+    match r {
+        FinishReason::Length => "length",
+        FinishReason::Stop => "stop",
+        FinishReason::EOS => "eos",
+        FinishReason::Cancelled => "cancelled",
+        FinishReason::Error => "error",
+        FinishReason::ContentFilter => "content_filter",
+    }
+}
+
+fn emit_jsonl_ready(model: &str, backend: &str) {
+    let record = serde_json::json!({
+        "event": "ready",
+        "model": model,
+        "backend": backend,
+    });
+    println!("{record}");
+}
+
+fn emit_jsonl_user(turn: usize, content: &str) {
+    let record = serde_json::json!({
+        "event": "user",
+        "turn": turn,
+        "content": content,
+    });
+    println!("{record}");
+}
+
+fn emit_jsonl_assistant(
+    turn: usize,
+    content: &str,
+    finish_reason: Option<FinishReason>,
+    n_tokens: usize,
+    chunk_count: usize,
+    ms: f64,
+) {
+    let record = serde_json::json!({
+        "event": "assistant",
+        "turn": turn,
+        "content": content,
+        "finish_reason": finish_reason.map(finish_reason_str),
+        "n_tokens": n_tokens,
+        "chunk_count": chunk_count,
+        "ms": ms,
+    });
+    println!("{record}");
+}
+
+fn emit_jsonl_exit(reason: &str) {
+    let record = serde_json::json!({
+        "event": "exit",
+        "reason": reason,
+    });
+    println!("{record}");
+}
 
 #[derive(Args)]
 pub struct RunCommand {
@@ -98,6 +167,11 @@ pub struct RunCommand {
     /// Override via `FERRUM_KV_DTYPE` env var.
     #[arg(long, value_name = "DTYPE")]
     pub kv_dtype: Option<String>,
+
+    /// Output format. `text` (default) — streaming text + stats UX.
+    /// `jsonl` — one JSON record per event on stdout; used by tests and scripts.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub output_format: OutputFormat,
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
@@ -135,7 +209,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // Select device
     let device = select_device(&cmd.backend);
-    eprintln!("{}", format!("Using {:?} backend", device).dimmed());
+    let device_label = format!("{device:?}");
+    eprintln!("{}", format!("Using {device_label} backend").dimmed());
 
     // Create engine. Big-model loads (15-60 GB safetensors) are slow on
     // first run — print a hint so users don't think it's frozen. Per-
@@ -200,14 +275,26 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         let mut stream = engine.infer_stream(request).await?;
         let start = std::time::Instant::now();
         let mut tokens = 0usize;
+        let mut content = String::new();
+        let mut chunk_count = 0usize;
+        let mut finish_reason: Option<FinishReason> = None;
+        let format = cmd.output_format;
+        let bench = cmd.bench_mode;
         while let Some(chunk) = stream.next().await {
             if let Ok(c) = chunk {
-                if !cmd.bench_mode {
-                    print!("{}", c.text);
-                    io::stdout().flush().ok();
+                if !c.text.is_empty() {
+                    chunk_count += 1;
+                    content.push_str(&c.text);
+                    if format == OutputFormat::Text && !bench {
+                        print!("{}", c.text);
+                        io::stdout().flush().ok();
+                    }
                 }
-                tokens += 1;
-                if c.finish_reason.is_some() {
+                if c.token.is_some() {
+                    tokens += 1;
+                }
+                if let Some(r) = c.finish_reason {
+                    finish_reason = Some(r);
                     break;
                 }
             }
@@ -218,25 +305,49 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         } else {
             0.0
         };
-        if !cmd.bench_mode {
-            println!();
+        match format {
+            OutputFormat::Text => {
+                if !bench {
+                    println!();
+                }
+                eprintln!(
+                    "{}",
+                    format!("[{tokens} tokens, {tps:.1} tok/s, {elapsed:.1}s]").dimmed()
+                );
+            }
+            OutputFormat::Jsonl => {
+                emit_jsonl_assistant(
+                    0,
+                    &content,
+                    finish_reason,
+                    tokens,
+                    chunk_count,
+                    elapsed * 1000.0,
+                );
+            }
         }
-        eprintln!(
-            "{}",
-            format!("[{tokens} tokens, {tps:.1} tok/s, {elapsed:.1}s]").dimmed()
-        );
         return Ok(());
     }
 
     // Print ready message
-    eprintln!();
-    eprintln!("{}", "Ready. Type your message and press Enter.".green());
-    eprintln!("{}", "Use /bye or Ctrl+D to exit.".dimmed());
-    eprintln!();
+    let format = cmd.output_format;
+    match format {
+        OutputFormat::Text => {
+            eprintln!();
+            eprintln!("{}", "Ready. Type your message and press Enter.".green());
+            eprintln!("{}", "Use /bye or Ctrl+D to exit.".dimmed());
+            eprintln!();
+        }
+        OutputFormat::Jsonl => {
+            emit_jsonl_ready(&model_id, &device_label);
+        }
+    }
 
     // Interactive loop
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content)
     let generating = Arc::new(AtomicBool::new(false));
+    let mut turn = 0usize;
+    let mut exit_reason: &str = "eof";
 
     // If stdin is not a TTY (piped input), don't print prompts and just consume lines.
     // This enables: `printf "hi\n/bye\n" | ferrum run ...` for automation/profiling.
@@ -260,7 +371,17 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     continue;
                 }
                 if input == "/bye" || input == "exit" || input == "quit" {
+                    exit_reason = match input {
+                        "/bye" => "bye",
+                        "exit" => "exit",
+                        "quit" => "quit",
+                        _ => "command",
+                    };
                     break;
+                }
+
+                if format == OutputFormat::Jsonl {
+                    emit_jsonl_user(turn, input);
                 }
 
                 // Build prompt with history
@@ -306,25 +427,40 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 let mut stream = engine.infer_stream(request).await?;
                 let mut response = String::new();
                 let start = std::time::Instant::now();
-                let mut token_count = 0;
+                let mut token_count = 0usize;
+                let mut chunk_count = 0usize;
+                let mut finish_reason: Option<FinishReason> = None;
 
                 while let Some(result) = stream.next().await {
                     match result {
                         Ok(chunk) => {
                             if !chunk.text.is_empty() {
-                                print!("{}", chunk.text);
-                                io::stdout().flush().unwrap();
+                                chunk_count += 1;
                                 response.push_str(&chunk.text);
+                                if format == OutputFormat::Text {
+                                    print!("{}", chunk.text);
+                                    io::stdout().flush().unwrap();
+                                }
                             }
                             if chunk.token.is_some() {
                                 token_count += 1;
                             }
-                            if chunk.finish_reason.is_some() {
+                            if let Some(r) = chunk.finish_reason {
+                                finish_reason = Some(r);
                                 break;
                             }
                         }
                         Err(e) => {
-                            eprintln!("\n{} {}", "Error:".red(), e);
+                            if format == OutputFormat::Text {
+                                eprintln!("\n{} {}", "Error:".red(), e);
+                            } else {
+                                let record = serde_json::json!({
+                                    "event": "error",
+                                    "turn": turn,
+                                    "message": e.to_string(),
+                                });
+                                println!("{record}");
+                            }
                             break;
                         }
                     }
@@ -332,25 +468,36 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
                 generating.store(false, Ordering::SeqCst);
 
-                // Print stats
                 let elapsed = start.elapsed();
-                let tps = if elapsed.as_secs_f64() > 0.0 {
-                    token_count as f64 / elapsed.as_secs_f64()
+                let elapsed_s = elapsed.as_secs_f64();
+                let tps = if elapsed_s > 0.0 {
+                    token_count as f64 / elapsed_s
                 } else {
                     0.0
                 };
-                println!();
-                eprintln!(
-                    "{}",
-                    format!(
-                        "[{} tokens, {:.1} tok/s, {:.1}s]",
-                        token_count,
-                        tps,
-                        elapsed.as_secs_f64()
-                    )
-                    .dimmed()
-                );
-                eprintln!();
+                let clean_response = response.trim().to_string();
+
+                match format {
+                    OutputFormat::Text => {
+                        println!();
+                        eprintln!(
+                            "{}",
+                            format!("[{token_count} tokens, {tps:.1} tok/s, {elapsed_s:.1}s]")
+                                .dimmed()
+                        );
+                        eprintln!();
+                    }
+                    OutputFormat::Jsonl => {
+                        emit_jsonl_assistant(
+                            turn,
+                            &clean_response,
+                            finish_reason,
+                            token_count,
+                            chunk_count,
+                            elapsed_s * 1000.0,
+                        );
+                    }
+                }
 
                 // In non-interactive mode, don't wait for terminal formatting/spacing.
                 if !stdin_is_tty {
@@ -360,7 +507,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
                 // Add to history
                 history.push(("user".to_string(), input.to_string()));
-                let clean_response = response.trim().to_string();
                 if !clean_response.is_empty() {
                     history.push(("assistant".to_string(), clean_response));
                 }
@@ -369,15 +515,24 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 while history.len() > 10 {
                     history.remove(0);
                 }
+                turn += 1;
             }
             Err(e) => {
                 eprintln!("{} {}", "Error reading input:".red(), e);
+                exit_reason = "read_error";
                 break;
             }
         }
     }
 
-    eprintln!("{}", "Goodbye!".bright_yellow());
+    match format {
+        OutputFormat::Text => {
+            eprintln!("{}", "Goodbye!".bright_yellow());
+        }
+        OutputFormat::Jsonl => {
+            emit_jsonl_exit(exit_reason);
+        }
+    }
     Ok(())
 }
 
