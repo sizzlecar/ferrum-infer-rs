@@ -84,26 +84,38 @@ The unified path lives in `crates/ferrum-engine/src/continuous_engine.rs::proces
 - CUDA code behind `#[cfg(feature = "cuda")]`, Metal behind target OS gates, Triton kernels behind `#[cfg(feature = "triton-kernels")]` (implies cuda)
 - Shared types/traits go in `ferrum-types`/`ferrum-interfaces`, never duplicated
 
-## Done criteria — engine / scheduler / sampler / CLI run changes
+## Done criteria — engine / scheduler / sampler / CLI run / HTTP server
 
 Any PR that touches `ferrum-engine/src/continuous_engine.rs`,
-`ferrum-engine/src/sampler/`, `ferrum-scheduler/`, or
-`ferrum-cli/src/commands/run.rs` is in the d67fbbb blast radius
-(EOS / stop_sequences / stream / multi-turn KV / chat template). It is
-NOT done until the chat smoke suites pass locally:
+`ferrum-engine/src/sampler/`, `ferrum-scheduler/`,
+`ferrum-cli/src/commands/run.rs`, `ferrum-cli/src/commands/serve.rs`,
+or `ferrum-server/` is in the d67fbbb blast radius (EOS /
+stop_sequences / stream / multi-turn KV / chat template / OpenAI wire
+format). It is NOT done until both blast-radius suites pass locally:
 
 ```bash
-ferrum pull qwen3:0.6b           # + tinyllama, qwen2.5:0.5b for full matrix
-cargo test --release -p ferrum-cli --features metal --test chat_smoke -- --ignored --test-threads=1
-cargo test --release -p ferrum-cli --features metal --test chat_pty   -- --ignored --test-threads=1
-cargo test --release -p ferrum-cli --features metal --test chat_stress -- --ignored --test-threads=1
+# Pre-pull models once
+ferrum pull qwen3:0.6b           # + tinyllama, qwen2.5:0.5b for full chat matrix
+
+# CLI lane (REPL / PTY / stress)
+cargo test --release -p ferrum-cli --features metal --test chat_smoke   -- --ignored --test-threads=1
+cargo test --release -p ferrum-cli --features metal --test chat_pty     -- --ignored --test-threads=1
+cargo test --release -p ferrum-cli --features metal --test chat_stress  -- --ignored --test-threads=1
+
+# HTTP server lane (OpenAI /v1/chat/completions)
+cargo test --release -p ferrum-cli --features metal --test server_smoke         -- --ignored --test-threads=1
+cargo test --release -p ferrum-cli --features metal --test server_openai_compat -- --ignored --test-threads=1
+cargo test --release -p ferrum-cli --features metal --test server_stress        -- --ignored --test-threads=1
 ```
 
-Total ~70 s on M1 Metal (`--release` is required — debug is ~5× slower).
-Nightly CI (`.github/workflows/chat-smoke.yml`) runs the same suites on
+Total ~115 s on M1 Metal (`--release` is required — debug is ~5× slower).
+Nightly CI (`.github/workflows/chat-smoke.yml`) runs every suite above on
 macos-latest. PR-time CI (`.github/workflows/ci.yml`) only compiles them
 via `cargo check --all-targets` — actual runs are nightly because each
 test cold-loads a real model.
+
+Known server-side gaps (loose-assertion floor in current tests, tighten
+when each lands a fix): see `~/.claude/projects/*/memory/project_http_server_gaps_2026_05_19.md`.
 
 ## CUDA backend layout
 
