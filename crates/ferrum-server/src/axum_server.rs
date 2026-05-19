@@ -293,6 +293,14 @@ async fn chat_completions_handler(
     );
     debug!("Request: {:?}", request);
 
+    // OpenAI spec requires at least one message. Reject empty arrays at
+    // the boundary rather than synthesising a fake prompt downstream.
+    if request.messages.is_empty() {
+        return Err(ServerError::BadRequest(
+            "messages array must not be empty".to_string(),
+        ));
+    }
+
     // Convert OpenAI request to internal format
     let inference_request =
         convert_chat_request(&request).map_err(|e| ServerError::BadRequest(e.to_string()))?;
