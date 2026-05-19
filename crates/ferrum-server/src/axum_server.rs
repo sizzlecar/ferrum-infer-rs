@@ -450,15 +450,23 @@ async fn handle_chat_completions_sync(
     })?;
     match engine.infer(inference_request).await {
         Ok(output) => {
-            // OpenAI convention: user-supplied `stop` sequences are NOT
-            // included in the final completion text. The engine emits
-            // the stop token alongside everything else (the streaming
-            // chunks include it too, mirroring vLLM's behaviour); we
-            // strip a trailing match here on the way out so the
-            // assistant message a non-streaming client sees never
-            // contains the stop sentinel.
+            // Post-process the completion text in two passes:
+            //   1. Strip a markdown fence when `response_format = json_object`
+            //      or `json_schema` — JsonModeProcessor's soft biases don't
+            //      hard-mask the fence the model wants to emit.
+            //   2. Strip a trailing user-supplied `stop` sentinel — OpenAI
+            //      convention is that stop strings mark a boundary and are
+            //      NOT included in the returned completion.
+            // Order matters: fence-strip first reveals the actual JSON,
+            // then any stop sentinel inside that JSON gets trimmed.
+            let after_fence = match &openai_request.response_format {
+                Some(rf) if rf.format_type == "json_object" || rf.format_type == "json_schema" => {
+                    strip_markdown_json_fence(&output.text)
+                }
+                _ => output.text,
+            };
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
-            let content = strip_trailing_stop(&output.text, &stop_sequences);
+            let content = strip_trailing_stop(&after_fence, &stop_sequences);
             let response = ChatCompletionsResponse {
                 id: Uuid::new_v4().to_string(),
                 object: "chat.completion".to_string(),
@@ -916,6 +924,27 @@ fn strip_trailing_stop(text: &str, stops: &[String]) -> String {
         }
     }
     out
+}
+
+/// When `response_format = json_object` is set, the model is meant to
+/// emit valid JSON only. Qwen / Llama instruct models frequently wrap
+/// the JSON in markdown fences anyway (```` ```json ... ``` ````)
+/// because that's how they were trained. `JsonModeProcessor` only
+/// applies soft logit biases, not a hard mask, so the fence slips
+/// through. Strip a single outermost ` ```json ... ``` ` /
+/// ` ``` ... ``` ` wrapper. Preserves inner JSON exactly. Returns the
+/// input unchanged if no fence is present.
+fn strip_markdown_json_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    // Try the most specific marker first.
+    for prefix in ["```json\n", "```json", "```\n", "```"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if let Some(inner) = rest.strip_suffix("```") {
+                return inner.trim().to_string();
+            }
+        }
+    }
+    text.to_string()
 }
 
 /// Render OpenAI-style chat messages into the prompt string the model was

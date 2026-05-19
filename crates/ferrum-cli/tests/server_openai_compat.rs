@@ -221,20 +221,14 @@ async fn test_openai_client_response_format_json_object() {
     let response = client.chat().create(request).await.expect("chat request");
     let content = response.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!content.trim().is_empty(), "json_object response empty");
-    // Loose floor: extract the first `{...}` substring and parse it.
-    // The strict assertion (entire content is valid JSON) currently
-    // fails because `JsonModeProcessor` doesn't hard-mask markdown
-    // fences — see `project_http_server_gaps_2026_05_19.md`. Tighten
-    // when the processor lands a fix.
-    let start = content.find('{');
-    let end = content.rfind('}');
-    let parsed = match (start, end) {
-        (Some(s), Some(e)) if e > s => serde_json::from_str::<serde_json::Value>(&content[s..=e]),
-        _ => Err(serde_json::from_str::<serde_json::Value>("").unwrap_err()),
-    };
+    // Strict: the whole content must be valid JSON. The server strips
+    // markdown fences in `strip_markdown_json_fence` before returning;
+    // models that don't emit a fence at all pass through unchanged.
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(content.trim());
     assert!(
         parsed.is_ok(),
-        "response_format=json_object should contain parseable JSON; got: {content:?}"
+        "response_format=json_object should produce parseable JSON \
+         (server strips markdown fences); got: {content:?}"
     );
 }
 
