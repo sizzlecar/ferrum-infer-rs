@@ -445,3 +445,44 @@ async fn test_chat_concurrent_2_requests() {
     assert!(!content_a.trim().is_empty(), "request A content empty");
     assert!(!content_b.trim().is_empty(), "request B content empty");
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "loads real model"]
+async fn test_chat_greedy_is_deterministic() {
+    // Two identical greedy requests must produce byte-identical
+    // completion content. Originally dropped from PR 8 because prefix
+    // cache (on by default at the time) had a CoW gap that let
+    // request 1's decode mutate the cached KV, so request 2/3 diverged
+    // deterministically into a different stable state. Now the prefix
+    // cache defaults OFF — the cache-induced non-determinism is gone.
+    let fx = ServerFixture::spawn(SMOKE_MODEL).await;
+    let req = json!({
+        "model": SMOKE_MODEL,
+        "messages": [{"role": "user", "content": "Reply with the digits 1 2 3 in order."}],
+        "max_tokens": 20,
+        "temperature": 0.0
+    });
+    let mut contents = Vec::new();
+    for _ in 0..2 {
+        let body: Value = Client::new()
+            .post(fx.chat_url())
+            .json(&req)
+            .send()
+            .await
+            .expect("post")
+            .json()
+            .await
+            .expect("json");
+        contents.push(
+            body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        contents[0], contents[1],
+        "greedy decoding must be deterministic across requests"
+    );
+    assert!(!contents[0].trim().is_empty(), "greedy content empty");
+}
