@@ -450,6 +450,15 @@ async fn handle_chat_completions_sync(
     })?;
     match engine.infer(inference_request).await {
         Ok(output) => {
+            // OpenAI convention: user-supplied `stop` sequences are NOT
+            // included in the final completion text. The engine emits
+            // the stop token alongside everything else (the streaming
+            // chunks include it too, mirroring vLLM's behaviour); we
+            // strip a trailing match here on the way out so the
+            // assistant message a non-streaming client sees never
+            // contains the stop sentinel.
+            let stop_sequences = openai_request.stop.clone().unwrap_or_default();
+            let content = strip_trailing_stop(&output.text, &stop_sequences);
             let response = ChatCompletionsResponse {
                 id: Uuid::new_v4().to_string(),
                 object: "chat.completion".to_string(),
@@ -459,7 +468,7 @@ async fn handle_chat_completions_sync(
                     index: 0,
                     message: Some(ChatMessage {
                         role: MessageRole::Assistant,
-                        content: output.text,
+                        content,
                         name: None,
                     }),
                     delta: None,
@@ -887,6 +896,26 @@ impl std::fmt::Display for MessageRole {
             MessageRole::Function => write!(f, "function"),
         }
     }
+}
+
+/// Strip a single trailing occurrence of any user-supplied stop sequence
+/// from `text`. Mirrors OpenAI's convention that `stop` strings act as
+/// boundaries that are NOT included in the returned completion. We only
+/// strip from the suffix (not all occurrences) because a stop sequence
+/// the model produced legitimately mid-response shouldn't be redacted.
+fn strip_trailing_stop(text: &str, stops: &[String]) -> String {
+    let mut out = text.to_string();
+    let trimmed = out.trim_end();
+    for stop in stops {
+        if stop.is_empty() {
+            continue;
+        }
+        if let Some(prefix) = trimmed.strip_suffix(stop.as_str()) {
+            out = prefix.to_string();
+            break;
+        }
+    }
+    out
 }
 
 /// Render OpenAI-style chat messages into the prompt string the model was
