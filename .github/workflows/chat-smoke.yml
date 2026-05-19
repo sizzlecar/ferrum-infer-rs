@@ -1,11 +1,12 @@
 name: Chat Smoke (nightly)
 
-# Runs the chat / pty / stress smoke suites against real models.
-# These are #[ignore]'d in cargo test by default — opt in here.
+# Runs every chat / pty / stress / server smoke suite against real models.
+# All are #[ignore]'d in `cargo test` by default — opt in here.
 #
 # Trigger:
 #   - Daily at 03:00 UTC
-#   - Manual via workflow_dispatch (use when iterating on cli run / REPL)
+#   - Manual via workflow_dispatch (use when iterating on cli run /
+#     cli serve / REPL / ferrum-server)
 #
 # Not on every PR — model pulls + cold-loads cost ~5–10 min per lane.
 # PR-time CI (.github/workflows/ci.yml) already catches compile errors
@@ -74,3 +75,18 @@ jobs:
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test chat_stress -- --ignored --test-threads=1
+
+      - name: HTTP server smoke (9 tests — OpenAI /v1/chat/completions)
+        run: |
+          cargo test --release -p ferrum-cli --features metal \
+            --test server_smoke -- --ignored --test-threads=1
+
+      - name: HTTP server OpenAI client contract (4 tests — async-openai)
+        run: |
+          cargo test --release -p ferrum-cli --features metal \
+            --test server_openai_compat -- --ignored --test-threads=1
+
+      - name: HTTP server stress (8 concurrent + prefix cache speedup)
+        run: |
+          cargo test --release -p ferrum-cli --features metal \
+            --test server_stress -- --ignored --test-threads=1
