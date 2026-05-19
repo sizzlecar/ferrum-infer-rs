@@ -2289,7 +2289,7 @@ impl InferenceEngine for ContinuousBatchEngine {
         let metrics = self.inner.scheduler.metrics();
         EngineStatus {
             is_ready: self.inner.is_running.load(Ordering::SeqCst),
-            loaded_models: vec![],
+            loaded_models: vec![self.inner.config.model.model_id.clone()],
             active_requests: metrics.running_requests,
             queued_requests: metrics.waiting_requests,
             memory_usage: ferrum_types::MemoryUsage {
