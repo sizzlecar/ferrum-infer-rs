@@ -363,12 +363,10 @@ async fn test_chat_empty_messages_400() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "loads real model"]
-async fn test_models_endpoint_structure() {
-    // GET /v1/models must return the OpenAI list envelope. The `data`
-    // array currently comes back empty because
-    // `state.status().loaded_models` isn't populated (see gaps memo);
-    // we only check structure here, not that the loaded model is
-    // listed. Tighten when that gap is fixed.
+async fn test_models_endpoint_lists_loaded() {
+    // GET /v1/models must return the OpenAI list envelope and include
+    // the currently loaded model. Catches regressions where the engine
+    // forgets to plumb its `EngineConfig.model.model_id` into `status()`.
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
     let resp = Client::new()
         .get(format!("{}/v1/models", fx.url))
@@ -378,7 +376,19 @@ async fn test_models_endpoint_structure() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.expect("json");
     assert_eq!(body["object"].as_str(), Some("list"));
-    assert!(body["data"].is_array(), "data must be an array");
+    let data = body["data"].as_array().expect("data must be an array");
+    assert!(!data.is_empty(), "/v1/models data array must not be empty");
+    // The loaded model's id is `Qwen/Qwen3-0.6B` after alias resolution;
+    // the request alias was `qwen3:0.6b`. Match on the canonical id.
+    let ids: Vec<_> = data.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(
+        ids.iter()
+            .any(|id| id.to_lowercase().contains("qwen3-0.6b")),
+        "expected loaded model in /v1/models data; got ids: {ids:?}"
+    );
+    for entry in data {
+        assert_eq!(entry["object"].as_str(), Some("model"));
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
