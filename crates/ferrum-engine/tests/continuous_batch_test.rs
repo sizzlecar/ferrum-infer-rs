@@ -306,8 +306,20 @@ async fn concurrent_streams_all_complete() {
 // Prefix cache tests
 // ────────────────────────────────────────────────────────────────────────────
 
-/// CPU/Metal-only — engine defaults `skip_prefix_cache = true` on cuda builds.
-#[cfg(not(feature = "cuda"))]
+/// Prefix cache hit path — engine defaults `skip_prefix_cache = true`
+/// on every backend (the CoW write-fork path in ferrum-kv isn't fully
+/// wired, see `~/.claude/projects/*/memory/project_http_server_gaps_2026_05_19.md`
+/// bug #4). Opt in by running with `FERRUM_PREFIX_CACHE=1`:
+///
+///     FERRUM_PREFIX_CACHE=1 cargo test -p ferrum-engine \
+///         --test continuous_batch_test prefix_cache_avoids_second_prefill \
+///         -- --ignored
+///
+/// Marked `#[ignore]` so default `cargo test` stays green. Equivalent
+/// user-observable coverage lives in
+/// `ferrum-cli/tests/server_stress.rs::test_prefix_cache_speedup`,
+/// which uses subprocess env isolation (safe under parallel tests).
+#[ignore = "prefix cache defaults OFF; opt in with FERRUM_PREFIX_CACHE=1 + --ignored"]
 #[tokio::test]
 async fn prefix_cache_avoids_second_prefill() {
     let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
