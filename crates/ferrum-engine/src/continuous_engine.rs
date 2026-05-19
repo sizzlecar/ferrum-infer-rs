@@ -589,11 +589,15 @@ impl EngineInner {
         // path (they don't enter the unified batch — they have no model
         // call to make). The remainder are added to `unified_prefills`.
         let model_info = self.model_executor.info();
-        let skip_prefix_cache = if cfg!(feature = "cuda") {
-            std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1")
-        } else {
-            std::env::var("FERRUM_PREFIX_CACHE").is_ok_and(|v| v == "0")
-        };
+        // Prefix cache defaults OFF on every backend. The `clone_handle`
+        // path in `crates/ferrum-kv/src/managers/paged.rs` is COW-by-flag
+        // but the engine write path doesn't fork blocks on first write,
+        // so a second request that hits the cache shares mutated KV from
+        // the first request's decode and diverges deterministically
+        // (request 1 ≠ request 2 == request 3). Reproduced 2026-05-19;
+        // see `~/.claude/projects/*/memory/project_http_server_gaps_2026_05_19.md`.
+        // Opt in via `FERRUM_PREFIX_CACHE=1` once the CoW fix lands.
+        let skip_prefix_cache = std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1");
         let mut unified_prefills: Vec<(RequestId, Vec<TokenId>, Arc<dyn KvCacheHandle>)> =
             Vec::new();
         for rid in &prefill_ids {
@@ -997,17 +1001,21 @@ impl EngineInner {
         // through to full prefill — supporting them needs incremental prefill
         // on top of a cloned KV, not yet exposed by the executor contract.
         //
-        // CUDA default: OFF. Historical candle CUDA decode runner released
-        // the KV on completion, invalidating clones ("No candle KV cache to
-        // export"). The Phase E Model-as-Code CUDA path may be safe, but
-        // end-to-end engine + prefix-cache is not yet validated on GPU.
-        // Toggle via env `FERRUM_PREFIX_CACHE=1` to opt in on CUDA; CPU/Metal
-        // defaults ON (validated).
-        let skip_prefix_cache = if cfg!(feature = "cuda") {
-            std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1")
-        } else {
-            std::env::var("FERRUM_PREFIX_CACHE").is_ok_and(|v| v == "0")
-        };
+        // CUDA + CPU + Metal: prefix cache defaults OFF. The `clone_handle`
+        // path in ferrum-kv flags blocks as COW but the write path doesn't
+        // fork before mutating, so cache hits share decode-time mutations
+        // back into the cached prefix — first request differs from
+        // subsequent ones (reproduced 2026-05-19, see gaps memo). Opt in
+        // via env `FERRUM_PREFIX_CACHE=1` once the CoW fix lands.
+        // Prefix cache defaults OFF on every backend. The `clone_handle`
+        // path in `crates/ferrum-kv/src/managers/paged.rs` is COW-by-flag
+        // but the engine write path doesn't fork blocks on first write,
+        // so a second request that hits the cache shares mutated KV from
+        // the first request's decode and diverges deterministically
+        // (request 1 ≠ request 2 == request 3). Reproduced 2026-05-19;
+        // see `~/.claude/projects/*/memory/project_http_server_gaps_2026_05_19.md`.
+        // Opt in via `FERRUM_PREFIX_CACHE=1` once the CoW fix lands.
+        let skip_prefix_cache = std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1");
         if !skip_prefix_cache {
             let hit = self
                 .prefix_cache
@@ -1236,11 +1244,15 @@ impl EngineInner {
         )> = Vec::new();
 
         let model_info = self.model_executor.info();
-        let skip_prefix_cache = if cfg!(feature = "cuda") {
-            std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1")
-        } else {
-            std::env::var("FERRUM_PREFIX_CACHE").is_ok_and(|v| v == "0")
-        };
+        // Prefix cache defaults OFF on every backend. The `clone_handle`
+        // path in `crates/ferrum-kv/src/managers/paged.rs` is COW-by-flag
+        // but the engine write path doesn't fork blocks on first write,
+        // so a second request that hits the cache shares mutated KV from
+        // the first request's decode and diverges deterministically
+        // (request 1 ≠ request 2 == request 3). Reproduced 2026-05-19;
+        // see `~/.claude/projects/*/memory/project_http_server_gaps_2026_05_19.md`.
+        // Opt in via `FERRUM_PREFIX_CACHE=1` once the CoW fix lands.
+        let skip_prefix_cache = std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1");
 
         for rid in request_ids {
             let (input_tokens, num_tokens) = {
