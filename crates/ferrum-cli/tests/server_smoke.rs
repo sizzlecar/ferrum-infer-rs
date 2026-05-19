@@ -312,31 +312,39 @@ async fn test_chat_max_tokens_truncation() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "loads real model"]
-async fn test_chat_custom_stop_param_accepted() {
-    // OpenAI `stop` field must be accepted without 4xx/5xx and produce a
-    // valid completion. The strict assertion that the stop string is
-    // actually honored (period absent in output) is currently a known
-    // bug — kept loose here, will tighten when the sampler stop path is
-    // fixed. See project_http_server_gaps_2026_05_19.md.
+async fn test_chat_custom_stop_strips_sentinel() {
+    // OpenAI convention: a user-supplied `stop` sequence marks a boundary
+    // and is NOT included in the returned completion. The server strips
+    // a trailing stop sentinel on the way out (see `strip_trailing_stop`
+    // in `ferrum-server/src/axum_server.rs`).
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let resp = Client::new()
+    let body: Value = Client::new()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
-            "messages": [{"role": "user", "content": "Reply with one short sentence."}],
+            "messages": [{"role": "user", "content": "Reply with one sentence ending in a period."}],
             "max_tokens": 80,
             "temperature": 0.0,
-            "stop": ["XYZ_UNLIKELY_TOKEN"]
+            "stop": ["."]
         }))
         .send()
         .await
-        .expect("post");
-    assert_eq!(resp.status(), 200, "stop param request rejected");
-    let body: Value = resp.json().await.expect("json");
+        .expect("post")
+        .json()
+        .await
+        .expect("json");
     let content = body["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("");
-    assert!(!content.trim().is_empty(), "content empty with stop param");
+    assert!(
+        !content.trim_end().ends_with('.'),
+        "stop sentinel '.' should have been stripped; got: {content:?}"
+    );
+    let fr = body["choices"][0]["finish_reason"].as_str();
+    assert!(
+        matches!(fr, Some("stop")),
+        "stop sequence should yield finish_reason=stop; got {fr:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
