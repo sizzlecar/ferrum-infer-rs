@@ -341,11 +341,9 @@ async fn test_chat_custom_stop_param_accepted() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "loads real model"]
-async fn test_chat_empty_messages_no_5xx() {
-    // Empty messages array must not crash the server. OpenAI spec
-    // expects 400, but ferrum currently returns 200 with synthetic
-    // content (see project_http_server_gaps_2026_05_19.md). The only
-    // floor we guard here is "no 5xx / no panic".
+async fn test_chat_empty_messages_400() {
+    // OpenAI spec rejects empty messages with 400 BadRequest. We enforce
+    // this in `chat_completions_handler` before tokenization.
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
     let resp = Client::new()
         .post(fx.chat_url())
@@ -356,10 +354,10 @@ async fn test_chat_empty_messages_no_5xx() {
         .send()
         .await
         .expect("post");
-    let status = resp.status().as_u16();
-    assert!(
-        status < 500,
-        "empty messages produced 5xx (server crash/panic); got {status}"
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "empty messages should be 400 BadRequest"
     );
 }
 
