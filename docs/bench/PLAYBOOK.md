@@ -593,7 +593,7 @@ Inspect the parity-confirmed report. Three branches:
 | 0.6 | ✓ `scripts/lock_gpu.sh` + `scripts/unlock_gpu.sh` |
 | 0.7 | ✓ `scripts/bench_vs_vllm.sh` with config-parity dump |
 | 1.1 | ✓ `BackendTimer` trait + CPU/Metal/CUDA impls in `crates/ferrum-kernels/src/backend/timer.rs` (CUDA via `cuEventRecord/Synchronize/ElapsedTime`; Metal via sync-wrap; CPU via `Instant`) |
-| 1.2 | ⚠ deferred — migrate ~10 `FERRUM_*_PROF` probe sites onto `BackendTimer` (mechanical; see decision doc) |
+| 1.2 | ✓ `Backend::Timer` associated type + `make_timer()` + `start_probe_timer` / `finish_probe_timer` helpers. 4 hot `B::sync + Instant::now()` probe sites in `qwen3_moe.rs` migrated (attn / moe / prefill / decode-stage). Closure-shaped sites in `moe/forward.rs` and wall-clock-by-design sites are unchanged — different refactor. |
 | 1.3 | ✓ TTFT/TPOT/ITL histograms in engine (`ferrum.engine.{ttft,tpot,itl}_seconds`) + corrected bug at `continuous_engine.rs:2253` |
 | 1.4 | ✓ `/metrics` Prometheus endpoint (already wired in `axum_server.rs`) |
 | 1.5 | ✓ Chrome trace JSON in `crates/ferrum-bench-core/src/trace.rs` — `TraceWriter` with `FERRUM_TRACE_OUT` env-gated emit, compatible with chrome://tracing / Perfetto / Nsight |
@@ -602,7 +602,7 @@ Inspect the parity-confirmed report. Three branches:
 | 2.3 | ✓ `--dataset sharegpt --sharegpt-path PATH` (HF Vicuna format) |
 | 2.4 | ✓ `--output md` + `ferrum_bench_core::report::{render_single, render_sweep}` |
 | 3.1 | ✓ NMSE op-diff harness in `ferrum-testkit::op_diff` — `rms_norm` + `silu_mul` covered (Metal NMSE empirically 1e-15 against CPU); extend pattern to rope/varlen_attn/marlin_matmul as follow-up PRs |
-| 3.2 | ⚠ skeleton at `crates/ferrum-cli/tests/quant_kl.rs` — body blocked on logits-capture API + paired INT4 model variant in HF cache |
+| 3.2 | ✓ Token-divergence proxy KL gate at `crates/ferrum-cli/tests/quant_kl.rs`: `self_determinism_qwen3_0p6b` (always runnable) + `paired_quant_drift_qwen2p5_3b` (auto-skip if INT4 variant not cached). Real KL on logits remains future work. |
 | 3.3 | ✓ `scripts/lm_eval_light.sh` against `/v1/completions` (MMLU + ARC-easy + GSM8K, rtol=0.05) |
 | 4   | ✓ `scripts/visualize_layerwise.py` — reads chrome trace JSON, groups by `cat`, stacked-bar PNG per layer. Smoke-tested with fixture trace. |
 
