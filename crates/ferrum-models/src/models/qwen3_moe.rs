@@ -1485,9 +1485,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             );
         }
 
-        if let Some(us) =
-            ferrum_kernels::backend::timer::finish_probe_timer::<B>(attn_t0, ctx)
-        {
+        if let Some(us) = ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
+            attn_t0, ctx, "attn", "attention", li as u32,
+        ) {
             ATTN_TIME_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
             ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1652,9 +1652,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             B::add_inplace(ctx, residual, &self.scratch.moe_out, tokens * h);
         }
 
-        if let Some(us) =
-            ferrum_kernels::backend::timer::finish_probe_timer::<B>(moe_t0, ctx)
-        {
+        if let Some(us) = ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
+            moe_t0, ctx, "moe", "moe", li as u32,
+        ) {
             MOE_TIME_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
             MOE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }

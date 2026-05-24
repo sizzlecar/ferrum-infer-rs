@@ -84,10 +84,9 @@ impl Env {
         EnvHash(format!("sha256:{:x}", digest))
     }
 
-    /// Capture only the fields that don't require external tooling:
-    /// `commit_sha`, `rust` toolchain, `ferrum_features`. Use this when
-    /// you don't have access to `nvidia-smi`; callers should fill in
-    /// the rest before serializing the report.
+    /// Capture commit + rust + features + auto-detected hw/driver/cuda.
+    /// On CUDA hosts populates GPU driver + CUDA toolkit versions via
+    /// `nvidia-smi` and `nvcc --version`; on macOS uses `sysctl`.
     pub fn capture_minimal(commit_sha: String, ferrum_features: Vec<String>) -> Self {
         let mut feat = ferrum_features;
         feat.sort();
@@ -95,13 +94,13 @@ impl Env {
         Self {
             commit_sha,
             hw_id: detect_hw_id(),
-            driver: None,
-            cuda: None,
+            driver: detect_nvidia_driver(),
+            cuda: detect_cuda_version(),
             rust: detect_rust_version(),
             ferrum_features: feat,
-            gpu_clock_lock_mhz: None,
-            gpu_power_limit_w: None,
-            gpu_persistence_mode: None,
+            gpu_clock_lock_mhz: detect_gpu_clock_lock_mhz(),
+            gpu_power_limit_w: detect_gpu_power_limit_w(),
+            gpu_persistence_mode: detect_gpu_persistence(),
             gpu_auto_boost: None,
             ferrum_env: capture_ferrum_env(),
             vllm_args: None,
@@ -109,25 +108,112 @@ impl Env {
     }
 }
 
-/// Heuristic hardware ID. Returns a generic `unknown` if we can't
-/// detect anything specific — callers should override via CLI flag for
-/// any committed report.
+/// Heuristic hardware ID. On CUDA hosts uses the GPU name (e.g.
+/// "rtx-4090"); on macOS uses the CPU brand (e.g. "apple-m1-max").
+/// Returns generic "unknown" only when both fail.
 pub fn detect_hw_id() -> String {
-    // Mac via uname -m + sw_vers; everything else gets a generic.
+    // Try nvidia-smi first — most reliable on CUDA hosts.
+    if let Some(name) = nvidia_smi_query("name") {
+        // "NVIDIA GeForce RTX 4090" → "rtx-4090"
+        let normalized = name
+            .to_lowercase()
+            .replace("nvidia ", "")
+            .replace("geforce ", "")
+            .trim()
+            .replace(' ', "-");
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
     #[cfg(target_os = "macos")]
     {
-        return std::process::Command::new("sysctl")
+        if let Some(brand) = std::process::Command::new("sysctl")
             .args(["-n", "machdep.cpu.brand_string"])
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_lowercase().replace(' ', "-"))
-            .unwrap_or_else(|| "macos-unknown".to_string());
+        {
+            return brand.trim().to_lowercase().replace(' ', "-");
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "unknown".to_string()
+    // Linux fallback: read /proc/cpuinfo "model name" first line.
+    if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("model name") {
+                if let Some(name) = rest.split(':').nth(1) {
+                    return name.trim().to_lowercase().replace(' ', "-");
+                }
+            }
+        }
     }
+    "unknown".to_string()
+}
+
+/// Best-effort NVIDIA driver version via `nvidia-smi --query-gpu=driver_version`.
+/// Returns None on hosts without nvidia-smi.
+pub fn detect_nvidia_driver() -> Option<String> {
+    nvidia_smi_query("driver_version")
+}
+
+/// Best-effort CUDA toolkit version via `nvcc --version` or
+/// `nvidia-smi --query-gpu=cuda_version`. Toolkit version (nvcc) is
+/// reported when available, else driver-reported runtime version.
+pub fn detect_cuda_version() -> Option<String> {
+    // Try nvcc first — that's the toolkit (what ferrum compiles against).
+    if let Ok(out) = std::process::Command::new("nvcc").arg("--version").output() {
+        if let Ok(s) = String::from_utf8(out.stdout) {
+            for line in s.lines() {
+                if let Some(idx) = line.find("release ") {
+                    let rest = &line[idx + 8..];
+                    if let Some(comma) = rest.find(',') {
+                        return Some(rest[..comma].trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to driver-reported runtime CUDA via nvidia-smi.
+    nvidia_smi_query("cuda_version")
+}
+
+/// Query nvidia-smi for a single field. Returns None if nvidia-smi
+/// isn't available or the field isn't supported.
+fn nvidia_smi_query(field: &str) -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            &format!("--query-gpu={field}"),
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let first = s.lines().next()?.trim().to_string();
+    if first.is_empty() || first == "[Not Supported]" || first == "[N/A]" {
+        return None;
+    }
+    Some(first)
+}
+
+/// GPU clock lock state (MHz). Returns the *current* graphics clock —
+/// when `nvidia-smi -lgc N,N` is applied this equals the lock value;
+/// without lock it equals whatever the GPU is currently doing.
+pub fn detect_gpu_clock_lock_mhz() -> Option<u32> {
+    nvidia_smi_query("clocks.gr")
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// GPU power limit in watts.
+pub fn detect_gpu_power_limit_w() -> Option<u32> {
+    nvidia_smi_query("power.limit")
+        .and_then(|s| s.split('.').next()?.parse::<u32>().ok())
+}
+
+/// Persistence mode (true ⇒ enabled).
+pub fn detect_gpu_persistence() -> Option<bool> {
+    nvidia_smi_query("persistence_mode").map(|s| s == "Enabled")
 }
 
 /// Best-effort Rust toolchain version. Tries `rustc --version` via the

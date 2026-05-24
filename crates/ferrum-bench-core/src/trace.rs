@@ -30,7 +30,31 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+/// Global TraceWriter — lazy-initialized from `FERRUM_TRACE_OUT` env
+/// on first access. Returns a disabled writer when env is unset, so
+/// callers can unconditionally `global_trace().push(...)` without a
+/// per-call gate.
+///
+/// On program exit, `Drop` flushes buffered events to disk. For
+/// processes that don't exit cleanly (e.g. killed by signal),
+/// explicit `flush()` is required to avoid losing the buffer.
+static GLOBAL_TRACE: OnceLock<TraceWriter> = OnceLock::new();
+
+/// Get the global trace writer. Cheap (just an atomic load after the
+/// first call) — safe to call from hot paths.
+pub fn global_trace() -> &'static TraceWriter {
+    GLOBAL_TRACE.get_or_init(TraceWriter::from_env)
+}
+
+/// Explicit flush of the global writer — useful before SIGINT / panic
+/// hooks so the partial trace is on disk.
+pub fn flush_global_trace() {
+    if let Some(w) = GLOBAL_TRACE.get() {
+        let _ = w.flush();
+    }
+}
 
 /// One trace event ("complete" phase only — see module docs).
 #[derive(Debug, Clone, Serialize, Deserialize)]

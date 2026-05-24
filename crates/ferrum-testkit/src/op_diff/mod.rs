@@ -27,6 +27,7 @@
 //! Tighter bucketing per op is welcome — define op-specific constants
 //! once empirical baselines are stable.
 
+pub mod gemm;
 pub mod rms_norm;
 pub mod silu_mul;
 

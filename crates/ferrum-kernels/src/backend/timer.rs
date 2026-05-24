@@ -66,6 +66,24 @@ pub fn finish_probe_timer<B: Backend>(
     Some((t.elapsed_ms() * 1000.0) as u64)
 }
 
+/// Convenience wrapper: close a timer AND push a chrome-trace event in
+/// one call. When `FERRUM_TRACE_OUT` is unset, the trace push is a
+/// no-op (cheap atomic check inside [`global_trace`]).
+///
+/// PLAYBOOK § 1.5 — Phase 4 `visualize_layerwise.py` reads chrome-trace
+/// JSON populated by these probe sites.
+pub fn finish_probe_timer_traced<B: Backend>(
+    timer: Option<B::Timer>,
+    ctx: &mut B::Context,
+    name: &str,
+    cat: &str,
+    tid: u32,
+) -> Option<u64> {
+    let us = finish_probe_timer::<B>(timer, ctx)?;
+    ferrum_bench_core::trace::global_trace().push(name, cat, (us as f64) / 1000.0, tid);
+    Some(us)
+}
+
 /// GPU-side timer scoped to a single Backend context.
 pub trait BackendTimer<B: Backend>: Send {
     /// Allocate timer state. On CUDA this creates two `cuEvent_t`
