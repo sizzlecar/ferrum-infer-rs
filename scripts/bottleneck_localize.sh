@@ -173,7 +173,7 @@ VLLM_ARGS=(
     --gpu-memory-utilization 0.85
     --max-num-seqs 32
     --max-model-len 4096
-    --dtype fp16
+    --dtype float16
     --no-enable-prefix-caching
     --enable-chunked-prefill
 )

@@ -23,9 +23,14 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Matches per-bucket lines: "  attn:    7 ms ( 39%) over   24 calls"
+# Matches per-bucket lines from two formats:
+#   1. [decode-profile] style: "  attn:    7 ms ( 39%) over   24 calls"
+#   2. [unified-op] style:     "[unified-op] paged_varlen_attention: 1792 calls 230 ms total avg=128us"
 BUCKET_RE = re.compile(
     r"^\s+(\S+):\s+(\d+)\s+ms\s+\(\s*(\d+)%?\)\s+over\s+(\d+)\s+calls"
+)
+UNIFIED_OP_RE = re.compile(
+    r"\[unified-op\]\s+([\w/+]+):\s+(\d+)\s+calls\s+(\d+)\s+ms\s+total"
 )
 TOTAL_RE = re.compile(r"\[\w+-profile\] tokens=(\d+) total=(\d+) ms")
 
@@ -49,6 +54,16 @@ def parse_log(path):
                 calls = int(mb.group(4))
                 totals[op][0] += ms
                 totals[op][1] += calls
+                continue
+            mu = UNIFIED_OP_RE.search(line)
+            if mu:
+                op = mu.group(1)
+                calls = int(mu.group(2))
+                ms = int(mu.group(3))
+                totals[op][0] += ms
+                totals[op][1] += calls
+                overall_ms += ms  # unified-op output doesn't have separate "total" lines
+                overall_iters += 1
     return totals, overall_ms, overall_iters
 
 
