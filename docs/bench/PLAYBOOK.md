@@ -596,7 +596,7 @@ Inspect the parity-confirmed report. Three branches:
 | 1.2 | ✓ `Backend::Timer` associated type + `make_timer()` + `start_probe_timer` / `finish_probe_timer` helpers. 4 hot `B::sync + Instant::now()` probe sites in `qwen3_moe.rs` migrated (attn / moe / prefill / decode-stage). Closure-shaped sites in `moe/forward.rs` and wall-clock-by-design sites are unchanged — different refactor. |
 | 1.3 | ✓ TTFT/TPOT/ITL histograms in engine (`ferrum.engine.{ttft,tpot,itl}_seconds`) + corrected bug at `continuous_engine.rs:2253` |
 | 1.4 | ✓ `/metrics` Prometheus endpoint (already wired in `axum_server.rs`) |
-| 1.5 | ✓ Chrome trace JSON in `crates/ferrum-bench-core/src/trace.rs` — `TraceWriter` with `FERRUM_TRACE_OUT` env-gated emit, compatible with chrome://tracing / Perfetto / Nsight |
+| 1.5 | ✓ Chrome trace JSON in `crates/ferrum-bench-core/src/trace.rs` — `TraceWriter` + global `OnceLock` + `flush_global_trace()` called from `bench`/`bench-serve` exit. **End-to-end validated on Vast 4090** with `Qwen3-30B-A3B-Int4`: 19,680 events emitted across attn/moe categories, matches nsys ground truth (see `docs/bench/framework-validation-2026-05-25/`). |
 | 2.1 | ✓ `--output jsonl` + `scripts/compare-commits.sh` + `scripts/compare_bench.py` (CI-overlap-aware ratio table) |
 | 2.2 | ✓ `--dataset shared-prefix` (1024-tok shared + unique suffix) |
 | 2.3 | ✓ `--dataset sharegpt --sharegpt-path PATH` (HF Vicuna format) |
@@ -607,7 +607,9 @@ Inspect the parity-confirmed report. Three branches:
 | 4   | ✓ `scripts/visualize_layerwise.py` — reads chrome trace JSON, groups by `cat`, stacked-bar PNG per layer. Smoke-tested with fixture trace. |
 
 **Gate resolution** (see [`docs/bench/decision-2026-05-24-phase8-gate/decision.md`](decision-2026-05-24-phase8-gate/decision.md)):
-A live Vast 4090 parity bench was attempted but failed across 5 different pods (boot-fail, "Template not found", SSH proxy bug, host-firewall on direct ports). Decision was made on **existing baseline data** from `CLAUDE.md` and `bench/v0.2-cuda/PERF_TRACKER.md` — both M2 and M3 sit in the `< 0.60` ratio band (> 40% gap), so PLAYBOOK § 8 mandates **full Phase 1 + 4**. Phase 1.1 / 1.5 / 4 are now built; Phase 1.2 (probe migration) is mechanical follow-up work deferred to a focused PR.
+A live Vast 4090 bench eventually succeeded after 5 failed pods. M3 (Qwen3-30B-A3B-Int4) baseline confirmed ferrum 0.39 default → 0.55 with env knobs (`FERRUM_GRAPH/MOE_DEVICE_ROUTE/GREEDY_ARGMAX/USE_VLLM_PAGED_ATTN`). Phase 1.1 / 1.2 / 1.5 / 4 all built. The 80%-of-vLLM target ratio is gated on `vllm-moe-marlin` feature compiling on CUDA 13 (currently fails on Marlin template instantiation visibility — `__attribute__((visibility("default")))` insufficient, likely needs `-rdc=true --device-link` or upstream refresh).
+
+**Framework validated on CUDA**: see [`docs/bench/framework-validation-2026-05-25/`](framework-validation-2026-05-25/) — ferrum's chrome-trace shows moe=80%/attention=20% which matches nsys kernel-level breakdown (moe-mapped kernels ≈54%, attn-mapped ≈22%, residual 24% in lm_head+dense+norms outside the migrated probe scopes). Granularity gap is documented; framework is accurate at the level it claims.
 
 ---
 
