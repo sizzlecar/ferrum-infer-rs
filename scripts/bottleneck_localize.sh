@@ -118,7 +118,7 @@ wait_for_health() {
 # ─────────────────────────────────────────────────────────────────────
 echo
 echo "▶ STEP 1: ferrum baseline at c=$CONCURRENCY"
-"$FERRUM_BIN" serve "$MODEL_ALIAS" --port "$FERRUM_PORT" \
+"$FERRUM_BIN" serve "$HF_MODEL" --port "$FERRUM_PORT" \
     > "$OUT_DIR/ferrum_baseline.log" 2>&1 &
 FERRUM_PID=$!
 wait_for_health "http://127.0.0.1:$FERRUM_PORT/health" "ferrum baseline"
@@ -141,7 +141,7 @@ sleep 2
 # ─────────────────────────────────────────────────────────────────────
 echo
 echo "▶ STEP 2: ferrum with FERRUM_DECODE_OP_PROFILE=1"
-FERRUM_DECODE_OP_PROFILE=1 "$FERRUM_BIN" serve "$MODEL_ALIAS" --port "$FERRUM_PORT" \
+FERRUM_DECODE_OP_PROFILE=1 "$FERRUM_BIN" serve "$HF_MODEL" --port "$FERRUM_PORT" \
     > "$OUT_DIR/ferrum_profile.log" 2>&1 &
 FERRUM_PID=$!
 wait_for_health "http://127.0.0.1:$FERRUM_PORT/health" "ferrum profile"
