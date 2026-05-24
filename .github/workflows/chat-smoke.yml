@@ -90,3 +90,13 @@ jobs:
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test server_stress -- --ignored --test-threads=1
+
+      - name: Reference output match (byte-equal regression gate)
+        # Frozen baseline of greedy decode outputs (vLLM test_fingerprint
+        # style). Any tokenizer / kernel / sampler drift surfaces here as
+        # a content / finish_reason / completion_tokens mismatch.
+        # Update baseline (after human-reviewed change) with:
+        #   FERRUM_UPDATE_FIXTURES=1 cargo test --release ... --test reference_match ...
+        run: |
+          cargo test --release -p ferrum-cli --features metal \
+            --test reference_match -- --ignored --test-threads=1

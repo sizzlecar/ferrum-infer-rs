@@ -119,6 +119,11 @@ impl Backend for CpuBackend {
     // type GptqStore: removed in Phase C step 4e. CpuGptqStore is now
     // a private (crate-internal) detail of CpuMarlinExpertStack.
 
+    type Timer = crate::backend::timer::CpuTimer;
+    fn make_timer() -> Self::Timer {
+        crate::backend::timer::CpuTimer::new()
+    }
+
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
 

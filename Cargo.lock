@@ -1296,6 +1296,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-bench-core"
+version = "0.7.3"
+dependencies = [
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "ferrum-cli"
 version = "0.7.3"
 dependencies = [
@@ -1311,6 +1321,7 @@ dependencies = [
  "criterion",
  "dialoguer",
  "dirs 5.0.1",
+ "ferrum-bench-core",
  "ferrum-engine",
  "ferrum-interfaces",
  "ferrum-kernels",
@@ -1604,6 +1615,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ferrum-interfaces",
+ "ferrum-kernels",
  "ferrum-kv",
  "ferrum-types",
  "parking_lot",

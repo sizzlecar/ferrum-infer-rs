@@ -106,9 +106,14 @@ cargo test --release -p ferrum-cli --features metal --test chat_stress  -- --ign
 cargo test --release -p ferrum-cli --features metal --test server_smoke         -- --ignored --test-threads=1
 cargo test --release -p ferrum-cli --features metal --test server_openai_compat -- --ignored --test-threads=1
 cargo test --release -p ferrum-cli --features metal --test server_stress        -- --ignored --test-threads=1
+
+# Correctness lane — byte-equal baseline of greedy decode outputs
+# (vLLM test_fingerprint style). Re-baseline with FERRUM_UPDATE_FIXTURES=1
+# only after human-reviewing the diff.
+cargo test --release -p ferrum-cli --features metal --test reference_match      -- --ignored --test-threads=1
 ```
 
-Total ~115 s on M1 Metal (`--release` is required — debug is ~5× slower).
+Total ~120 s on M1 Metal (`--release` is required — debug is ~5× slower).
 Nightly CI (`.github/workflows/chat-smoke.yml`) runs every suite above on
 macos-latest. PR-time CI (`.github/workflows/ci.yml`) only compiles them
 via `cargo check --all-targets` — actual runs are nightly because each

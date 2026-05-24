@@ -11,6 +11,9 @@ readme = "../../README.md"
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-kv = { workspace = true }
+# Op-diff harness imports concrete backends; pure ops only — no kernel
+# feature flags pulled into this crate's default build.
+ferrum-kernels = { workspace = true }
 
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -20,3 +23,11 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+default = []
+# Forwards to ferrum-kernels/metal so op-diff can include the Metal
+# backend in cross-backend NMSE comparisons.
+metal = ["ferrum-kernels/metal"]
+# Forwards to ferrum-kernels/cuda for the same reason on CUDA hosts.
+cuda = ["ferrum-kernels/cuda"]

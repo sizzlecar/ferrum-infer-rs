@@ -96,6 +96,21 @@ pub struct SequenceState {
     pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
     pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
     pub start_time: Instant,
+    /// Wall-clock `Instant` at which the first SSE chunk was actually
+    /// sent to the client stream. Populated lazily by `send_stream_update`
+    /// the first time a non-empty delta is emitted (multi-byte UTF-8
+    /// buffering can defer that past the first scheduler-completed token).
+    /// Used to record `ferrum.engine.ttft_seconds` and as the start point
+    /// of the TPOT window.
+    pub first_emit_at: Option<Instant>,
+    /// Wall-clock `Instant` at the most recent successfully-sent chunk.
+    /// Used to compute per-token ITL deltas (`ferrum.engine.itl_seconds`).
+    pub last_emit_at: Option<Instant>,
+    /// Count of stream chunks successfully sent to the client. Lags
+    /// `generated_tokens.len()` by the number of tokens currently buffered
+    /// for a multi-byte UTF-8 sequence (so a Chinese char split across
+    /// 2 BPE tokens emits once, increments the count by 1).
+    pub emitted_chunks: u32,
     pub tokens_this_iteration: usize,
     /// Number of times this request has been preempted.
     pub preemption_count: usize,
@@ -194,6 +209,9 @@ impl SequenceState {
             stream_sender: None,
             response_sender: None,
             start_time: Instant::now(),
+            first_emit_at: None,
+            last_emit_at: None,
+            emitted_chunks: 0,
             tokens_this_iteration: 0,
             preemption_count: 0,
             json_processor,
@@ -1940,7 +1958,7 @@ impl EngineInner {
         // past `streamed_text_len` and bump the watermark. Buffering is
         // bounded — the longest multi-byte sequence is 4 bytes, so at
         // most one or two tokens get deferred before flushing.
-        let (sender, delta) = {
+        let (sender, delta, ttft_s, itl_s) = {
             let mut sequences = self.sequences.write();
             let Some(seq) = sequences.get_mut(request_id) else {
                 return;
@@ -1958,8 +1976,40 @@ impl EngineInner {
             }
             let delta = full[seq.streamed_text_len..].to_string();
             seq.streamed_text_len = full.len();
-            (sender, delta)
+
+            // Latency-metric tracking (PLAYBOOK § 7 definitions).
+            // We capture timestamps in the critical section so the
+            // first-emit point matches the moment we commit to streaming
+            // the delta — not the moment the chunk actually crosses the
+            // socket, which the engine can't observe.
+            let mut ttft_s: Option<f64> = None;
+            let mut itl_s: Option<f64> = None;
+            if !delta.is_empty() {
+                let now = Instant::now();
+                match seq.first_emit_at {
+                    None => {
+                        ttft_s = Some(now.duration_since(seq.start_time).as_secs_f64());
+                        seq.first_emit_at = Some(now);
+                    }
+                    Some(_) => {
+                        if let Some(prev) = seq.last_emit_at {
+                            itl_s = Some(now.duration_since(prev).as_secs_f64());
+                        }
+                    }
+                }
+                seq.last_emit_at = Some(now);
+                seq.emitted_chunks = seq.emitted_chunks.saturating_add(1);
+            }
+
+            (sender, delta, ttft_s, itl_s)
         };
+
+        if let Some(t) = ttft_s {
+            histogram!("ferrum.engine.ttft_seconds").record(t);
+        }
+        if let Some(t) = itl_s {
+            histogram!("ferrum.engine.itl_seconds").record(t);
+        }
 
         if let Some(tx) = sender {
             if delta.is_empty() {
@@ -1992,6 +2042,19 @@ impl EngineInner {
                     .tokenizer
                     .decode(&seq.generated_tokens, true)
                     .unwrap_or_default();
+
+                // TPOT histogram (PLAYBOOK § 7 definition):
+                //   tpot = (e2e − ttft) / (output_tokens − 1)
+                // Only meaningful when first_emit_at is set (i.e. at
+                // least one stream chunk landed) and ≥ 2 chunks were
+                // emitted to give a non-degenerate decode window.
+                if let (Some(first), Some(last)) = (seq.first_emit_at, seq.last_emit_at) {
+                    if seq.emitted_chunks >= 2 {
+                        let decode_s = last.duration_since(first).as_secs_f64();
+                        let tpot_s = decode_s / (seq.emitted_chunks - 1) as f64;
+                        histogram!("ferrum.engine.tpot_seconds").record(tpot_s);
+                    }
+                }
 
                 let response = InferenceResponse {
                     request_id: request_id.clone(),
@@ -2250,8 +2313,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         if let Ok(ref resp) = result {
             counter!("ferrum.engine.requests_completed").increment(1);
             counter!("ferrum.engine.tokens_generated_total").increment(resp.tokens.len() as u64);
-            histogram!("ferrum.engine.ttft_ms")
-                .record(elapsed_ms / resp.tokens.len().max(1) as f64);
+            // NOTE: real TTFT lives in `send_stream_update` —
+            // emitted as `ferrum.engine.ttft_seconds`. The sync `infer`
+            // path returns the whole response at once, so there's no
+            // observable first-token moment to record here.
         } else {
             counter!("ferrum.engine.requests_failed").increment(1);
         }

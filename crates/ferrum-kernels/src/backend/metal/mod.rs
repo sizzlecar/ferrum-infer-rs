@@ -452,6 +452,10 @@ pub struct MetalBackend;
 impl Backend for MetalBackend {
     type Buffer = MetalBuf;
     type Context = MetalContext;
+    type Timer = crate::backend::timer::MetalTimer;
+    fn make_timer() -> Self::Timer {
+        crate::backend::timer::MetalTimer::new()
+    }
     // type GptqStore: removed in Phase C step 4e. Metal has no Marlin
     // GPTQ path (GGUF is the quant story on Metal). Adding GPTQ later
     // means impl-ing MarlinExpertStack<MetalBackend> + load_gptq_stacked.

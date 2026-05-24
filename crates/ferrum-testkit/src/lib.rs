@@ -11,6 +11,7 @@ pub mod bench;
 mod configurable_executor;
 mod executor;
 mod kv_cache;
+pub mod op_diff;
 pub mod paged_executor;
 mod sampler;
 mod tensor;

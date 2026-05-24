@@ -259,6 +259,16 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ///   - CUDA: wraps a CudaStream
     type Context;
 
+    /// GPU-side timer scoped to this backend. See `super::timer` —
+    /// CPU: `Instant`; Metal: sync-wrap; CUDA: `cuEvent`.
+    /// PLAYBOOK § 1.1.
+    type Timer: super::timer::BackendTimer<Self>;
+
+    /// Factory for `Self::Timer` — exists so call sites that have a
+    /// `<B: Backend>` parameter can spawn a timer without importing the
+    /// concrete impl. PLAYBOOK § 1.2.
+    fn make_timer() -> Self::Timer;
+
     /// Opaque per-backend GPTQ weight representation.
     ///   - CPU: dequantized f32 weights (run as regular GEMM)
     ///   - Metal: `()` — unsupported; `gemm_gptq` errors

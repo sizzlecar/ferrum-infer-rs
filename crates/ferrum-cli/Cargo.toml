@@ -21,6 +21,7 @@ ferrum-scheduler = { workspace = true }
 ferrum-server = { workspace = true }
 ferrum-kernels = { workspace = true }
 ferrum-quantization = { workspace = true }
+ferrum-bench-core = { workspace = true }
 
 # ML dependencies
 candle-core = { workspace = true }

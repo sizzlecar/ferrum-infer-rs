@@ -40,6 +40,7 @@ template <typename scalar_t,  // compute dtype, half or nv_float16
                                    // with a separate quantization scale
           const bool is_zp_float   // is zero point of float16 type?
           >
+__attribute__((visibility("default")))
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }
