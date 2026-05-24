@@ -310,7 +310,10 @@ impl BackendTimer<crate::backend::cuda::CudaBackend> for CudaTimer {
             // cuEventSynchronize blocks until the event is observed
             // on the stream. Required before cuEventElapsedTime.
             let _ = cu::cuEventSynchronize(e);
-            let _ = cu::cuEventElapsedTime(&mut ms as *mut f32, s, e);
+            // CUDA 13 renamed `cuEventElapsedTime` → `cuEventElapsedTime_v2`.
+            // The v2 ABI returns `float` (ms) into a `*mut f32`. Both CUDA
+            // 12.x and 13.x ship the v2 symbol; v1 is only present in 12.x.
+            let _ = cu::cuEventElapsedTime_v2(&mut ms as *mut f32, s, e);
         }
         ms as f64
     }
