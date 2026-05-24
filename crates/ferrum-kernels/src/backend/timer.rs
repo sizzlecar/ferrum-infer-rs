@@ -215,6 +215,12 @@ pub struct CudaTimer {
     recorded_end: bool,
 }
 
+// `CUevent` is `*mut c_void` (a CUDA driver handle). The CUDA driver API
+// is documented as thread-safe for these handles; the trait bound
+// `BackendTimer<B>: Send` requires it.
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaTimer {}
+
 #[cfg(feature = "cuda")]
 impl Default for CudaTimer {
     fn default() -> Self {
