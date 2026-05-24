@@ -63,25 +63,25 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
     // buffers. Eliminates the per-layer `B::sync + B::to_vec(router_logits)
     // + host route()` round trip — the dominant remaining cost in the
     // decode hot path (~10% of total decode latency).
-    let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
-    let stage_t0 = || -> Option<std::time::Instant> {
-        if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        }
+    // PLAYBOOK § 1.2 — closure-shaped probes migrated to BackendTimer.
+    // start: CUDA event record (no sync); stop: event record + sync once,
+    // then read elapsed_ms. Also pushes chrome-trace events when
+    // FERRUM_TRACE_OUT is set (Phase 1.5).
+    use ferrum_kernels::backend::Backend;
+    use ferrum_kernels::backend::timer::{start_probe_timer, finish_probe_timer_traced};
+    let stage_t0 = |ctx: &mut B::Context| -> Option<<B as Backend>::Timer> {
+        start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx)
     };
-    let stage_end = |t0: Option<std::time::Instant>, ctx: &mut B::Context, c: &AtomicU64| {
-        if let Some(t) = t0 {
-            B::sync(ctx);
-            c.fetch_add(
-                t.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+    let stage_end = |t: Option<<B as Backend>::Timer>,
+                     ctx: &mut B::Context,
+                     name: &str,
+                     c: &AtomicU64| {
+        if let Some(us) = finish_probe_timer_traced::<B>(t, ctx, name, "moe", 0) {
+            c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         }
     };
 
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     B::route_topk_softmax(
         ctx,
         &scratch.router_logits,
@@ -92,7 +92,7 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
         top_k,
         norm_topk_prob,
     )?;
-    stage_end(t0, ctx, &DEC_ROUTE_US);
+    stage_end(t0, ctx, "route", &DEC_ROUTE_US);
 
     // moe_forward_stacked_decode_impl is only called when `tokens == 1`
     // (the branch in `forward_layer` routes prefill m>1 through
@@ -129,7 +129,7 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
 
         if use_fused {
             // 1+2+3 fused: silu_stacked = SiLU(gate · norm_out) * (up · norm_out)
-            let t0 = stage_t0();
+            let t0 = stage_t0(ctx);
             moe_layer.experts.gemv_gate_up_silu_fused(
                 ctx,
                 &scratch.norm_out,
@@ -137,10 +137,10 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
                 &mut scratch.silu_stacked,
                 top_k,
             )?;
-            stage_end(t0, ctx, &DEC_SILU_US);
+            stage_end(t0, ctx, "gate_up_silu_fused", &DEC_SILU_US);
         } else {
             // 1. Batched gate gemv — broadcast input across top_k slots.
-            let t0 = stage_t0();
+            let t0 = stage_t0(ctx);
             moe_layer.experts.gemv_gate(
                 ctx,
                 &scratch.norm_out,
@@ -148,10 +148,10 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
                 &mut scratch.gate_out_stacked,
                 top_k,
             )?;
-            stage_end(t0, ctx, &DEC_GATE_US);
+            stage_end(t0, ctx, "gate", &DEC_GATE_US);
 
             // 2. Batched up gemv — also broadcast.
-            let t0 = stage_t0();
+            let t0 = stage_t0(ctx);
             moe_layer.experts.gemv_up(
                 ctx,
                 &scratch.norm_out,
@@ -159,12 +159,12 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
                 &mut scratch.up_out_stacked,
                 top_k,
             )?;
-            stage_end(t0, ctx, &DEC_UP_US);
+            stage_end(t0, ctx, "up", &DEC_UP_US);
 
             // 3. Stacked SiLU·gate → silu_stacked. Single dispatch covers
             //    all top_k slots — replaces the per-slot loop's
             //    (3 copy_slice + 1 silu_mul) × 8 = 32 dispatches.
-            let t0 = stage_t0();
+            let t0 = stage_t0(ctx);
             B::silu_mul_stacked(
                 ctx,
                 &scratch.gate_out_stacked,
@@ -173,12 +173,12 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
                 top_k,
                 inter,
             )?;
-            stage_end(t0, ctx, &DEC_SILU_US);
+            stage_end(t0, ctx, "silu", &DEC_SILU_US);
         }
 
         // 4. Batched down gemv — per-slot input via in_stride = inter.
         //    silu_stacked[k * inter ..] is the activation row for slot k.
-        let t0 = stage_t0();
+        let t0 = stage_t0(ctx);
         moe_layer.experts.gemv_down(
             ctx,
             &scratch.silu_stacked,
@@ -187,7 +187,7 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
             top_k,
             inter,
         )?;
-        stage_end(t0, ctx, &DEC_DOWN_US);
+        stage_end(t0, ctx, "down", &DEC_DOWN_US);
 
         // 5. Fused weighted-sum + residual-add (+ optional next-layer
         //    rms_norm). Two paths:
@@ -198,7 +198,7 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
         //      The next layer's leading rms_norm is skipped. Saves an
         //      additional dispatch per layer transition.
         //    * `next_norm_w = None` (last layer): just residual-add.
-        let t0 = stage_t0();
+        let t0 = stage_t0(ctx);
         if let Some(nnw) = next_norm_w {
             B::weighted_sum_residual_norm_stacked(
                 ctx,
@@ -221,7 +221,7 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
                 h,
             )?;
         }
-        stage_end(t0, ctx, &DEC_WSUM_US);
+        stage_end(t0, ctx, "wsum", &DEC_WSUM_US);
     }
 
     Ok(())
@@ -250,25 +250,22 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
     norm_topk_prob: bool,
     tokens: usize,
 ) -> Result<()> {
-    let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
-    let stage_t0 = || -> Option<std::time::Instant> {
-        if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
+    // PLAYBOOK § 1.2 — migrated. Two-counter close (us + calls) for prefill probes.
+    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer};
+    use ferrum_kernels::backend::Backend;
+    let stage_t0 = |ctx: &mut B::Context| -> Option<<B as Backend>::Timer> {
+        start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx)
+    };
+    let stage_end = |t: Option<<B as Backend>::Timer>,
+                     ctx: &mut B::Context,
+                     name: &str,
+                     us: &AtomicU64,
+                     n: &AtomicU64| {
+        if let Some(elapsed) = finish_probe_timer_traced::<B>(t, ctx, name, "moe_prefill", 0) {
+            us.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     };
-    let stage_end =
-        |t0: Option<std::time::Instant>, ctx: &mut B::Context, us: &AtomicU64, n: &AtomicU64| {
-            if let Some(t) = t0 {
-                B::sync(ctx);
-                us.fetch_add(
-                    t.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        };
 
     // GPU-side routing: keep the whole pipeline device-resident. Two
     // dispatches replace the per-layer `B::sync + to_vec(router_logits)
@@ -291,7 +288,7 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
     let use_indirect_dispatch =
         use_gpu_topk && std::env::var("FERRUM_MOE_DIRECT_DISPATCH").as_deref() != Ok("1");
     let max_per_expert = if use_gpu_topk {
-        let t0 = stage_t0();
+        let t0 = stage_t0(ctx);
         B::route_topk_softmax(
             ctx,
             &scratch.router_logits,
@@ -315,17 +312,12 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
             inter,
             h,
         )?;
-        stage_end(
-            t0,
-            ctx,
-            &MOE_PREFILL_HOST_TOPK_US,
-            &MOE_PREFILL_HOST_TOPK_CALLS,
-        );
+        stage_end(t0, ctx, "host_topk", &MOE_PREFILL_HOST_TOPK_US, &MOE_PREFILL_HOST_TOPK_CALLS);
         // Worst-case ids row stride; matches `dispatch_compute_ids_tpe`.
         tokens * top_k
     } else {
         use ferrum_kernels::moe_host::compute_ids_tpe;
-        let t0 = stage_t0();
+        let t0 = stage_t0(ctx);
         B::sync(ctx);
         let logits_host = B::to_vec(&scratch.router_logits, tokens * n_exp);
         let route = crate::moe::router::route(&logits_host, tokens, n_exp, top_k, norm_topk_prob);
@@ -334,12 +326,7 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         B::write_typed::<i32>(ctx, &mut scratch.tpe_buf, &tpe_host);
         B::write_typed::<i32>(ctx, &mut scratch.ids_2d, &ids_host);
         B::write_typed::<f32>(ctx, &mut scratch.weights_2d, &route.expert_weights);
-        stage_end(
-            t0,
-            ctx,
-            &MOE_PREFILL_HOST_TOPK_US,
-            &MOE_PREFILL_HOST_TOPK_CALLS,
-        );
+        stage_end(t0, ctx, "host_topk", &MOE_PREFILL_HOST_TOPK_US, &MOE_PREFILL_HOST_TOPK_CALLS);
         max_per_expert
     };
 
@@ -349,7 +336,7 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
     //    dst layout:  [batch, top_k, expert_inter] — natural.
     let gate_up_args = use_indirect_dispatch.then_some(&scratch.gate_up_args_buf);
     let down_args = use_indirect_dispatch.then_some(&scratch.down_args_buf);
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     moe_layer.experts.gemm_gate(
         ctx,
         &scratch.norm_out,
@@ -361,10 +348,10 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         max_per_expert,
         tokens,
     )?;
-    stage_end(t0, ctx, &MOE_PREFILL_GATE_US, &MOE_PREFILL_GATE_CALLS);
+    stage_end(t0, ctx, "gate", &MOE_PREFILL_GATE_US, &MOE_PREFILL_GATE_CALLS);
 
     // 2. Batched up gemm — same shape as gate.
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     moe_layer.experts.gemm_up(
         ctx,
         &scratch.norm_out,
@@ -376,11 +363,11 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         max_per_expert,
         tokens,
     )?;
-    stage_end(t0, ctx, &MOE_PREFILL_UP_US, &MOE_PREFILL_UP_CALLS);
+    stage_end(t0, ctx, "up", &MOE_PREFILL_UP_US, &MOE_PREFILL_UP_CALLS);
 
     // 3. SiLU·gate over [tokens * top_k, expert_inter] flat layout.
     let total_pairs = tokens * top_k;
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     B::silu_mul_batched(
         ctx,
         &scratch.gate_out_stacked,
@@ -389,11 +376,11 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         total_pairs,
         inter,
     )?;
-    stage_end(t0, ctx, &MOE_PREFILL_SILU_US, &MOE_PREFILL_SILU_CALLS);
+    stage_end(t0, ctx, "silu", &MOE_PREFILL_SILU_US, &MOE_PREFILL_SILU_CALLS);
 
     // 4. Batched down gemm — src1 is [batch, top_k, expert_inter] from
     //    silu_stacked. ne11 = top_k → each pair reads its own row.
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     moe_layer.experts.gemm_down(
         ctx,
         &scratch.silu_stacked,
@@ -405,10 +392,10 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         max_per_expert,
         tokens,
     )?;
-    stage_end(t0, ctx, &MOE_PREFILL_DOWN_US, &MOE_PREFILL_DOWN_CALLS);
+    stage_end(t0, ctx, "down", &MOE_PREFILL_DOWN_US, &MOE_PREFILL_DOWN_CALLS);
 
     // 5. Per-batch weighted sum: moe_out[b, h] = Σ_k w[b,k] · down[b,k,h]
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     B::weighted_sum_batched(
         ctx,
         &scratch.down_out_stacked,
@@ -418,7 +405,7 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         top_k,
         h,
     )?;
-    stage_end(t0, ctx, &MOE_PREFILL_WSUM_US, &MOE_PREFILL_WSUM_CALLS);
+    stage_end(t0, ctx, "wsum", &MOE_PREFILL_WSUM_US, &MOE_PREFILL_WSUM_CALLS);
 
     Ok(())
 }
@@ -454,21 +441,18 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
     norm_topk_prob: bool,
     tokens: usize,
 ) -> Result<()> {
-    let prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
-    let stage_t0 = || -> Option<std::time::Instant> {
-        if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        }
+    // PLAYBOOK § 1.2 — migrated (batched-decode variant).
+    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer};
+    use ferrum_kernels::backend::Backend;
+    let stage_t0 = |ctx: &mut B::Context| -> Option<<B as Backend>::Timer> {
+        start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx)
     };
-    let stage_end = |t0: Option<std::time::Instant>, ctx: &mut B::Context, c: &AtomicU64| {
-        if let Some(t) = t0 {
-            B::sync(ctx);
-            c.fetch_add(
-                t.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+    let stage_end = |t: Option<<B as Backend>::Timer>,
+                     ctx: &mut B::Context,
+                     name: &str,
+                     c: &AtomicU64| {
+        if let Some(us) = finish_probe_timer_traced::<B>(t, ctx, name, "moe_batched", 0) {
+            c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         }
     };
 
@@ -476,7 +460,7 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
 
     // 1. Single batched router pass — fills selected_ids_buf [m * top_k]
     //    and weights_2d [m * top_k] in one Metal dispatch.
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     B::route_topk_softmax(
         ctx,
         &scratch.router_logits,
@@ -487,13 +471,13 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
         top_k,
         norm_topk_prob,
     )?;
-    stage_end(t0, ctx, &MOE_BATCHED_DECODE_ROUTE_US);
+    stage_end(t0, ctx, "route", &MOE_BATCHED_DECODE_ROUTE_US);
 
     // 2+3+4. Fused gate+up+silu — single Metal dispatch covers all
     // m*top_k pairs. Falls back to the 3-dispatch sequence on backends
     // that don't have the fused-batched kernel.
     if B::supports_batched_moe_gate_up_silu() {
-        let t0 = stage_t0();
+        let t0 = stage_t0(ctx);
         moe_layer.experts.gemv_gate_up_silu_batched_fused(
             ctx,
             &scratch.norm_out,
@@ -506,10 +490,10 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
         )?;
         // Charge the whole fused step to the SiLU bucket — keeps the
         // profile counter additive with the unfused path's silu line.
-        stage_end(t0, ctx, &MOE_BATCHED_DECODE_SILU_US);
+        stage_end(t0, ctx, "silu", &MOE_BATCHED_DECODE_SILU_US);
     } else {
         // 2. Batched gate gemv — one launch covers all m*top_k pairs.
-        let t0 = stage_t0();
+        let t0 = stage_t0(ctx);
         moe_layer.experts.gemv_gate_batched(
             ctx,
             &scratch.norm_out,
@@ -520,10 +504,10 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
             h,
             0,
         )?;
-        stage_end(t0, ctx, &MOE_BATCHED_DECODE_GATE_US);
+        stage_end(t0, ctx, "gate", &MOE_BATCHED_DECODE_GATE_US);
 
         // 3. Batched up gemv.
-        let t0 = stage_t0();
+        let t0 = stage_t0(ctx);
         moe_layer.experts.gemv_up_batched(
             ctx,
             &scratch.norm_out,
@@ -534,10 +518,10 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
             h,
             0,
         )?;
-        stage_end(t0, ctx, &MOE_BATCHED_DECODE_UP_US);
+        stage_end(t0, ctx, "up", &MOE_BATCHED_DECODE_UP_US);
 
         // 4. SiLU·gate.
-        let t0 = stage_t0();
+        let t0 = stage_t0(ctx);
         B::silu_mul_batched(
             ctx,
             &scratch.gate_out_stacked,
@@ -546,12 +530,12 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
             total_pairs,
             inter,
         )?;
-        stage_end(t0, ctx, &MOE_BATCHED_DECODE_SILU_US);
+        stage_end(t0, ctx, "silu", &MOE_BATCHED_DECODE_SILU_US);
     }
 
     // 5. Batched down gemv — src1 = silu_stacked [m, top_k, ffn]: each
     //    pair has its own row, outer = top_k * ffn, inner = ffn.
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     moe_layer.experts.gemv_down_batched(
         ctx,
         &scratch.silu_stacked,
@@ -562,11 +546,11 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
         top_k * inter, // outer: top_k * ffn floats per token
         inter,         // inner: ffn floats per slot
     )?;
-    stage_end(t0, ctx, &MOE_BATCHED_DECODE_DOWN_US);
+    stage_end(t0, ctx, "down", &MOE_BATCHED_DECODE_DOWN_US);
 
     // 6. Per-token weighted sum across slots → moe_out [m, h]. Caller
     //    does residual += moe_out at the end of forward_layer.
-    let t0 = stage_t0();
+    let t0 = stage_t0(ctx);
     B::weighted_sum_batched(
         ctx,
         &scratch.down_out_stacked,
@@ -576,7 +560,7 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
         top_k,
         h,
     )?;
-    stage_end(t0, ctx, &MOE_BATCHED_DECODE_WSUM_US);
+    stage_end(t0, ctx, "wsum", &MOE_BATCHED_DECODE_WSUM_US);
 
     Ok(())
 }
