@@ -601,7 +601,7 @@ Inspect the parity-confirmed report. Three branches:
 | 2.2 | ✓ `--dataset shared-prefix` (1024-tok shared + unique suffix) |
 | 2.3 | ✓ `--dataset sharegpt --sharegpt-path PATH` (HF Vicuna format) |
 | 2.4 | ✓ `--output md` + `ferrum_bench_core::report::{render_single, render_sweep}` |
-| 3.1 | ✓ NMSE op-diff harness in `ferrum-testkit::op_diff` — `rms_norm` + `silu_mul` covered (Metal NMSE empirically 1e-15 against CPU); extend pattern to rope/varlen_attn/marlin_matmul as follow-up PRs |
+| 3.1 | ✓ NMSE op-diff harness in `ferrum-testkit::op_diff` — `rms_norm` + `silu_mul` + `gemm` covered (3 ops × 2 shape variants = 6 tests). Metal NMSE ~1e-15, **CUDA NMSE ~1e-7 on RTX 4090, well under fp16 tol 1e-6**. Pattern extends to rope/varlen_attn/marlin as follow-up. |
 | 3.2 | ✓ Token-divergence proxy KL gate at `crates/ferrum-cli/tests/quant_kl.rs`: `self_determinism_qwen3_0p6b` (always runnable) + `paired_quant_drift_qwen2p5_3b` (auto-skip if INT4 variant not cached). Real KL on logits remains future work. |
 | 3.3 | ✓ `scripts/lm_eval_light.sh` against `/v1/completions` (MMLU + ARC-easy + GSM8K, rtol=0.05) |
 | 4   | ✓ `scripts/visualize_layerwise.py` — reads chrome trace JSON, groups by `cat`, stacked-bar PNG per layer. Smoke-tested with fixture trace. |
