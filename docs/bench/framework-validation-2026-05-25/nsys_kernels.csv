@@ -1,0 +1,32 @@
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+
+NOTICE: Existing SQLite export found: /tmp/nsys-ferrum/m3_ferrum.sqlite
+        It is assumed file was previously exported from: /tmp/nsys-ferrum/m3_ferrum.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/tmp/nsys-ferrum/m3_ferrum.sqlite] with [/opt/nvidia/nsight-compute/2026.1.0/host/target-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+49.0,3301134024,194880,16939.3,11745.0,9408,207842,19487.7,"void Marlin<(int)256, (int)1, (int)8, (int)8, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+9.9,668985473,42528,15730.5,15712.0,12608,19104,1397.4,paged_batched_flash_decode_attn_f16
+8.6,578864596,889,651141.3,651111.0,650151,654279,403.9,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<__half>, float>>(T13)"
+5.8,392683154,5952,65975.0,66113.0,54752,77217,6093.4,paged_batched_decode_attn_f16
+5.2,350880393,480,731000.8,934442.0,318819,1217453,327293.7,paged_varlen_attn_f16
+4.6,312613066,2016,155066.0,111601.5,20896,841801,152626.1,"void Marlin<(int)256, (int)4, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+2.5,171881708,48960,3510.7,3520.0,3424,4128,44.7,moe_router_topk_softmax_f16
+1.6,108733035,42528,2556.7,2528.0,2336,3104,99.4,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<__half>, float>>(T13)"
+1.6,106830956,6083,17562.2,3072.0,2944,707015,97517.2,void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8>(T1::Params)
+1.5,102646955,48960,2096.5,2048.0,1920,12576,594.5,fused_add_rms_norm_inplace_f16
+1.5,101282024,49980,2026.5,1984.0,1856,10624,518.3,rms_norm_f16
+1.2,82879014,42672,1942.2,1920.0,1824,8193,340.5,split_qkv_norm_rope_into_paged_cache_f16
+1.1,72982810,48960,1490.7,1408.0,1344,26144,1065.8,moe_combine_f16
+1.0,69675951,49980,1394.1,1056.0,1024,46112,2824.1,embedding_lookup_f16
+1.0,65095485,42528,1530.7,1536.0,1504,2048,17.0,paged_batched_flash_decode_reduce_f16
+0.9,60660029,48960,1239.0,1024.0,960,28896,1569.3,fused_silu_mul_interleaved_f16
+0.7,50278086,48960,1026.9,960.0,928,10176,507.7,residual_add_inplace_f16
+0.7,48671933,1632,29823.5,22256.0,11712,129825,18253.1,"void Marlin<(int)256, (int)2, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+0.6,37984547,1246,30485.2,25376.0,15776,95553,12443.1,"void Marlin<(int)256, (int)3, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+0.3,23446569,6288,3728.8,2944.0,2400,24704,3543.0,split_qkv_norm_rope_into_paged_cache_varlen_f16
+0.3,18398122,124,148372.0,148354.0,147010,149313,408.8,argmax_rows_f16
+0.1,9881385,6432,1536.3,1504.0,1408,2112,77.0,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, __half, __half, float, __half, (bool)0, __half, __half, __half, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
+0.0,1871443,288,6498.1,6336.0,6144,7648,432.9,ampere_fp16_s16816gemm_fp16_64x64_ldg8_f2f_stages_64x5_tn

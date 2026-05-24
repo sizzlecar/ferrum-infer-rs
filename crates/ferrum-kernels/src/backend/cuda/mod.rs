@@ -472,6 +472,10 @@ impl Backend for CudaBackend {
     // by half (`alloc_u32` default was wrong on CUDA).
     type Buffer = crate::backend::CudaBuf;
     type Context = CudaState;
+    type Timer = crate::backend::timer::CudaTimer;
+    fn make_timer() -> Self::Timer {
+        crate::backend::timer::CudaTimer::new()
+    }
     // type GptqStore: removed in Phase C step 4e. GptqStoreCuda is
     // now a private (crate-internal) detail of CudaMarlinExpertStack.
 

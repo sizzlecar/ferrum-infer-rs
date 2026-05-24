@@ -296,6 +296,13 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
                 "--expt-extended-lambda",
                 "-Xcompiler",
                 "-fPIC",
+                // CUDA 13's nvcc defaults templated kernel instantiations
+                // to hidden ELF visibility — the resulting static archive
+                // doesn't expose Marlin<...> instances at link time, and
+                // rust-lld then fails to resolve them. Explicit default
+                // visibility is safe on 12.x too.
+                "-Xcompiler",
+                "-fvisibility=default",
                 "--threads",
                 "0",
             ])

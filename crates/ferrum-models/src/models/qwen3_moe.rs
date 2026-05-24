@@ -1147,12 +1147,12 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let attn_layer = &self.attn_layers[li];
         let moe_layer = &self.moe_layers[li];
 
-        let attn_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        // PLAYBOOK § 1.2 — was: `B::sync(ctx); Some(Instant::now())`.
+        // Migrated onto BackendTimer (CUDA: cuEvents, async, no sync paid).
+        let attn_t0 = ferrum_kernels::backend::timer::start_probe_timer::<B>(
+            "FERRUM_DECODE_OP_PROFILE",
+            ctx,
+        );
 
         // 1. Input RMSNorm — skipped when the previous layer's MoE tail
         //    fused this norm via `weighted_sum_residual_norm_stacked`.
@@ -1485,12 +1485,10 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             );
         }
 
-        if let Some(t0) = attn_t0 {
-            B::sync(ctx);
-            ATTN_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        if let Some(us) = ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
+            attn_t0, ctx, "attn", "attention", li as u32,
+        ) {
+            ATTN_TIME_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
             ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
@@ -1533,12 +1531,11 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         );
 
         // ── MoE FFN block ────────────────────────────────────────────
-        let moe_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        // PLAYBOOK § 1.2 — migrated onto BackendTimer.
+        let moe_t0 = ferrum_kernels::backend::timer::start_probe_timer::<B>(
+            "FERRUM_DECODE_OP_PROFILE",
+            ctx,
+        );
 
         // 10. Router gemv: norm_out [tokens, hidden] → router_logits [tokens, num_experts]
         moe_layer.router.forward(
@@ -1655,12 +1652,10 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             B::add_inplace(ctx, residual, &self.scratch.moe_out, tokens * h);
         }
 
-        if let Some(t0) = moe_t0 {
-            B::sync(ctx);
-            MOE_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        if let Some(us) = ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
+            moe_t0, ctx, "moe", "moe", li as u32,
+        ) {
+            MOE_TIME_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
             MOE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
@@ -1958,8 +1953,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // for Qwen3-MoE: when set, dump (attn-us, moe-us, total-us) at
         // the end of prefill so we can attribute the prefill bottleneck
         // between attention and MoE.
+        // PLAYBOOK § 1.2 — migrated. Counter reset (when probe is on)
+        // stays inline; timer construction goes through BackendTimer.
         let prefill_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(&mut ctx);
             for c in [
                 &ATTN_TIME_US,
                 &ATTN_CALLS,
@@ -1980,7 +1976,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             ] {
                 c.store(0, std::sync::atomic::Ordering::Relaxed);
             }
-            Some(std::time::Instant::now())
+            let mut t = <B as ferrum_kernels::backend::Backend>::make_timer();
+            ferrum_kernels::backend::timer::BackendTimer::<B>::record_start(&mut t, &mut ctx);
+            Some(t)
         } else {
             None
         };
@@ -2043,9 +2041,10 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             1,
         );
 
-        B::sync(&mut ctx);
-        if let Some(t0) = prefill_t0 {
-            let total_us = t0.elapsed().as_micros() as u64;
+        if let Some(mut t0) = prefill_t0 {
+            ferrum_kernels::backend::timer::BackendTimer::<B>::record_end(&mut t0, &mut ctx);
+            let total_us = (ferrum_kernels::backend::timer::BackendTimer::<B>::elapsed_ms(&t0)
+                * 1000.0) as u64;
             let attn_us = ATTN_TIME_US.load(std::sync::atomic::Ordering::Relaxed);
             let attn_n = ATTN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
             let moe_us = MOE_TIME_US.load(std::sync::atomic::Ordering::Relaxed);
@@ -2123,8 +2122,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // at the bottom of every decode token. Reuses the same atomic
         // counters that `forward_layer` already populates (ATTN_TIME_US,
         // MOE_TIME_US — drained here per-token instead of per-prefill).
+        // PLAYBOOK § 1.2 — migrated. See site 1959 for the same pattern.
         let stage_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
-            B::sync(&mut ctx);
             for c in [
                 &ATTN_TIME_US,
                 &ATTN_CALLS,
@@ -2142,7 +2141,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             ] {
                 c.store(0, std::sync::atomic::Ordering::Relaxed);
             }
-            Some(std::time::Instant::now())
+            let mut t = <B as ferrum_kernels::backend::Backend>::make_timer();
+            ferrum_kernels::backend::timer::BackendTimer::<B>::record_start(&mut t, &mut ctx);
+            Some(t)
         } else {
             None
         };
@@ -2218,9 +2219,11 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         self.scratch.residual = Some(residual);
 
         // FERRUM_DECODE_OP_PROFILE: per-token decode breakdown.
-        if let Some(t0) = stage_t0 {
+        if let Some(mut t0) = stage_t0 {
             use std::sync::atomic::Ordering;
-            let total_us = t0.elapsed().as_micros() as u64;
+            ferrum_kernels::backend::timer::BackendTimer::<B>::record_end(&mut t0, &mut ctx);
+            let total_us = (ferrum_kernels::backend::timer::BackendTimer::<B>::elapsed_ms(&t0)
+                * 1000.0) as u64;
             let attn_us = ATTN_TIME_US.swap(0, Ordering::Relaxed);
             let moe_us = MOE_TIME_US.swap(0, Ordering::Relaxed);
             let route = DEC_ROUTE_US.swap(0, Ordering::Relaxed);
