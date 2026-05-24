@@ -70,7 +70,16 @@ else
 fi
 
 HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
-TOK_DIR=$(find "$HF_HOME/hub" -type d -name "models--$(echo "$HF_MODEL" | tr '/' '-')*" | head -1)
+# HF cache layout: models--<org>--<repo>/snapshots/<hash>/ — repo path
+# slashes become "--" (double-dash), so sed not tr.
+HF_DIR_NAME="models--$(echo "$HF_MODEL" | sed 's,/,--,g')"
+TOK_DIR=$(find "$HF_HOME/hub" -type d -name "$HF_DIR_NAME" 2>/dev/null | head -1)
+if [ -z "$TOK_DIR" ]; then
+    echo "ERROR: tokenizer dir not found for $HF_MODEL (expected $HF_HOME/hub/$HF_DIR_NAME)" >&2
+    echo "Available dirs:" >&2
+    ls "$HF_HOME/hub" 2>&1 | head -10 >&2
+    exit 1
+fi
 TOK_SNAP=$(find "$TOK_DIR/snapshots" -mindepth 1 -maxdepth 1 -type d | head -1)
 if [ -z "$TOK_SNAP" ] || [ ! -f "$TOK_SNAP/tokenizer.json" ]; then
     echo "ERROR: tokenizer.json not found at $TOK_SNAP" >&2
