@@ -277,6 +277,12 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
             )))
         }
     }
+
+    // PLAYBOOK § 1.5: Rust's `static` items don't run Drop on program
+    // exit, so the global TraceWriter's flush-on-drop never fires. Call
+    // it explicitly here. No-op when FERRUM_TRACE_OUT is unset.
+    ferrum_bench_core::trace::flush_global_trace();
+
     Ok(())
 }
 

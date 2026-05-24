@@ -845,6 +845,10 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
             )))
         }
     }
+
+    // PLAYBOOK § 1.5: static globals don't drop on Rust process exit.
+    ferrum_bench_core::trace::flush_global_trace();
+
     Ok(())
 }
 
