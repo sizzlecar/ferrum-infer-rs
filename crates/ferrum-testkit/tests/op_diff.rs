@@ -13,7 +13,8 @@
 //! harness still runs and produces a sensible reference output.
 
 use ferrum_testkit::op_diff::{
-    compare_backends, gemm::GemmOp, rms_norm::RmsNormOp, silu_mul::SiluMulOp, NMSE_FP16_TOL,
+    compare_backends, gemm::GemmOp, qk_norm_rope::QkNormRopeOp, rms_norm::RmsNormOp,
+    silu_mul::SiluMulOp, NMSE_FP16_TOL,
 };
 
 #[test]
@@ -82,6 +83,53 @@ fn gemm_qkv_shape() {
     // since CPU O(m*n*k) loop is cubic.
     let op = GemmOp { m: 2, n: 4096, k: 4096 };
     let report = compare_backends(&op, 31);
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
+
+#[test]
+fn qk_norm_rope_small_mode_0() {
+    // Mode 0 = plain transpose; tests that the head-major output
+    // matches across backends.
+    let op = QkNormRopeOp {
+        tokens: 4,
+        heads: 8,
+        head_dim: 64,
+        pos_offset: 0,
+        eps: 1e-5,
+        mode: 0,
+    };
+    let report = compare_backends(&op, 51);
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
+
+#[test]
+fn qk_norm_rope_small_mode_1() {
+    // Mode 1 = fused rms_norm + RoPE pairs + transpose.
+    let op = QkNormRopeOp {
+        tokens: 4,
+        heads: 8,
+        head_dim: 64,
+        pos_offset: 0,
+        eps: 1e-5,
+        mode: 1,
+    };
+    let report = compare_backends(&op, 53);
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
+
+#[test]
+fn qk_norm_rope_llama_shape_with_offset() {
+    // Llama-3 8B head_dim=128. Position offset matters for decode at
+    // non-zero generation index.
+    let op = QkNormRopeOp {
+        tokens: 2,
+        heads: 32,
+        head_dim: 128,
+        pos_offset: 64,
+        eps: 1e-5,
+        mode: 1,
+    };
+    let report = compare_backends(&op, 71);
     check_accelerator_tolerance(&report, NMSE_FP16_TOL);
 }
 

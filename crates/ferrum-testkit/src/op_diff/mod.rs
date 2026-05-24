@@ -28,6 +28,9 @@
 //! once empirical baselines are stable.
 
 pub mod gemm;
+pub mod marlin_matmul; // stub — see file docs
+pub mod paged_varlen_attn; // stub — see file docs
+pub mod qk_norm_rope;
 pub mod rms_norm;
 pub mod silu_mul;
 
