@@ -61,7 +61,13 @@ fi
 
 # ─── HF model + tokenizer locate ─────────────────────────────────────
 echo "▶ Ensuring $HF_MODEL is in HF cache"
-huggingface-cli download "$HF_MODEL" --quiet
+# huggingface-cli is deprecated in hf-hub 1.16+; use `hf download` if
+# available, fall back to old name otherwise.
+if command -v hf >/dev/null 2>&1; then
+    hf download "$HF_MODEL" >/dev/null 2>&1 || true
+else
+    huggingface-cli download "$HF_MODEL" --quiet
+fi
 
 HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 TOK_DIR=$(find "$HF_HOME/hub" -type d -name "models--$(echo "$HF_MODEL" | tr '/' '-')*" | head -1)
