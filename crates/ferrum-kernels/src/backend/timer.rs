@@ -40,6 +40,32 @@
 
 use crate::backend::Backend;
 
+/// Start a timer iff `env_var` is set in the environment — `None` is
+/// the disabled state. Pair with [`finish_probe_timer`] at the end of
+/// the scope. PLAYBOOK § 1.2 — the migration target for sites that
+/// previously did `let t0 = if env(X) { B::sync(ctx); Some(Instant::now()) }`.
+pub fn start_probe_timer<B: Backend>(env_var: &str, ctx: &mut B::Context) -> Option<B::Timer> {
+    if std::env::var(env_var).is_ok() {
+        let mut t = B::make_timer();
+        t.record_start(ctx);
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// Close a timer started by [`start_probe_timer`] and return the
+/// elapsed microseconds. `None` propagates the "disabled" state so the
+/// caller can keep the `if let Some(us) = ... { record(us) }` pattern.
+pub fn finish_probe_timer<B: Backend>(
+    timer: Option<B::Timer>,
+    ctx: &mut B::Context,
+) -> Option<u64> {
+    let mut t = timer?;
+    t.record_end(ctx);
+    Some((t.elapsed_ms() * 1000.0) as u64)
+}
+
 /// GPU-side timer scoped to a single Backend context.
 pub trait BackendTimer<B: Backend>: Send {
     /// Allocate timer state. On CUDA this creates two `cuEvent_t`
@@ -131,13 +157,13 @@ pub struct MetalTimer {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl Default for MetalTimer {
     fn default() -> Self {
-        Self::new_self()
+        Self::new()
     }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl MetalTimer {
-    fn new_self() -> Self {
+    pub fn new() -> Self {
         Self { start: None, end: None }
     }
 }
@@ -145,7 +171,7 @@ impl MetalTimer {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl BackendTimer<crate::backend::metal::MetalBackend> for MetalTimer {
     fn new() -> Self {
-        MetalTimer::new_self()
+        MetalTimer::new()
     }
 
     fn record_start(
@@ -192,7 +218,7 @@ pub struct CudaTimer {
 #[cfg(feature = "cuda")]
 impl Default for CudaTimer {
     fn default() -> Self {
-        Self::new_self()
+        Self::new()
     }
 }
 
@@ -214,7 +240,7 @@ impl Drop for CudaTimer {
 
 #[cfg(feature = "cuda")]
 impl CudaTimer {
-    fn new_self() -> Self {
+    pub fn new() -> Self {
         use cudarc::driver::sys as cu;
         let mut start: cu::CUevent = std::ptr::null_mut();
         let mut end: cu::CUevent = std::ptr::null_mut();
@@ -236,7 +262,7 @@ impl CudaTimer {
 #[cfg(feature = "cuda")]
 impl BackendTimer<crate::backend::cuda::CudaBackend> for CudaTimer {
     fn new() -> Self {
-        CudaTimer::new_self()
+        CudaTimer::new()
     }
 
     fn record_start(
