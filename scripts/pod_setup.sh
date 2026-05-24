@@ -69,6 +69,10 @@ timeout 600 huggingface-cli download Qwen/Qwen3-0.6B --quiet || true
 
 log "▶ ferrum release build (cuda)"
 cd /workspace/ferrum-infer-rs
+# CUDA 13+ toolchains don't infer the GPU's compute capability from
+# `nvidia-smi`; candle-kernels' build script needs it explicit. 4090 is
+# sm_89. Without this, the build fails at `flash_fwd_hdim*_sm80.cu`.
+export CUDA_COMPUTE_CAP=89
 # Don't pre-fetch all features — just cuda for the bench. vllm-moe-marlin
 # requires more build time and we're benching qwen3:0.6b (no MoE).
 timeout 1800 cargo build --release -p ferrum-cli --features cuda 2>&1 \
