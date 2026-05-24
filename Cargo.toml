@@ -23,6 +23,9 @@ members = [
     "crates/ferrum-server",
     "crates/ferrum-cli",
     "crates/ferrum-testkit",
+
+    # Bench schema + variance aggregation (Phase 0 of testing system)
+    "crates/ferrum-bench-core",
 ]
 resolver = "2"
 
@@ -150,6 +153,7 @@ ferrum-models = { path = "crates/ferrum-models", version = "0.7.3" }
 ferrum-server = { path = "crates/ferrum-server", version = "0.7.3" }
 ferrum-cli = { path = "crates/ferrum-cli", version = "0.7.3" }
 ferrum-testkit = { path = "crates/ferrum-testkit", version = "0.7.3" }
+ferrum-bench-core = { path = "crates/ferrum-bench-core", version = "0.7.3" }
 
 
 [profile.release]

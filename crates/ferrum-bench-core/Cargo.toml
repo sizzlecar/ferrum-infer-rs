@@ -1,0 +1,13 @@
+[package]
+name = "ferrum-bench-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Canonical bench schema + metric aggregation + variance + env_hash for ferrum's bench and bench-serve commands. Locked by docs/bench/PLAYBOOK.md § 7."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+sha2 = "0.10"

@@ -1,0 +1,104 @@
+{
+  "$schema_doc": "Reference output snapshot — byte-equal regression baseline. Each case is a frozen chat completion request + ferrum's expected reply. Any drift in `content` / `finish_reason` / `completion_tokens` fails `reference_match.rs`. v0 = self-snapshot (vLLM test_fingerprint style); v1 future = HF transformers oracle (vLLM check_outputs_equal style).",
+  "$schema_version": 1,
+  "$update_command": "FERRUM_UPDATE_FIXTURES=1 cargo test --release -p ferrum-cli --features metal --test reference_match -- --ignored --test-threads=1",
+  "cases": [
+    {
+      "id": "qwen3-0.6b-arith-2-plus-3",
+      "model": "qwen3:0.6b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2 + 3? Reply with just the number."
+        }
+      ],
+      "max_tokens": 8,
+      "temperature": 0.0,
+      "expected": {
+        "content": "2 + 3 = 5",
+        "finish_reason": "length",
+        "completion_tokens": 8
+      }
+    },
+    {
+      "id": "qwen3-0.6b-list-three-colors",
+      "model": "qwen3:0.6b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "List exactly three primary colors, comma-separated, lowercase."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0.0,
+      "expected": {
+        "content": "a, b, c",
+        "finish_reason": "stop",
+        "completion_tokens": 6
+      }
+    },
+    {
+      "id": "qwen3-0.6b-cjk-capital-china",
+      "model": "qwen3:0.6b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "用一句话回答：中国的首都是哪里？"
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0.0,
+      "expected": {
+        "content": "中国的首都是北京。",
+        "finish_reason": "stop",
+        "completion_tokens": 6
+      }
+    },
+    {
+      "id": "qwen3-0.6b-system-calculator",
+      "model": "qwen3:0.6b",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a calculator. Reply with only the number, no words."
+        },
+        {
+          "role": "user",
+          "content": "7 * 8 = ?"
+        }
+      ],
+      "max_tokens": 8,
+      "temperature": 0.0,
+      "expected": {
+        "content": "7 * 8 = 56",
+        "finish_reason": "length",
+        "completion_tokens": 8
+      }
+    },
+    {
+      "id": "qwen3-0.6b-multi-turn-recall",
+      "model": "qwen3:0.6b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "My name is Bob."
+        },
+        {
+          "role": "assistant",
+          "content": "Got it, Bob."
+        },
+        {
+          "role": "user",
+          "content": "What is my name? Reply with just the name, no punctuation."
+        }
+      ],
+      "max_tokens": 8,
+      "temperature": 0.0,
+      "expected": {
+        "content": "Bob",
+        "finish_reason": "stop",
+        "completion_tokens": 2
+      }
+    }
+  ]
+}
