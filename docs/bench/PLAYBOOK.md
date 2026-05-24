@@ -592,11 +592,11 @@ Inspect the parity-confirmed report. Three branches:
 | 0.3,0.9 | ✓ `bench` CLI consumes ferrum-bench-core |
 | 0.6 | ✓ `scripts/lock_gpu.sh` + `scripts/unlock_gpu.sh` |
 | 0.7 | ✓ `scripts/bench_vs_vllm.sh` with config-parity dump |
-| 1.1 | ⏸ **gated** — CUDA event timing trait; waits on Phase 0 decision |
-| 1.2 | ⏸ **gated** — migrate `FERRUM_*_PROF` off `Instant::now()` |
+| 1.1 | ✓ `BackendTimer` trait + CPU/Metal/CUDA impls in `crates/ferrum-kernels/src/backend/timer.rs` (CUDA via `cuEventRecord/Synchronize/ElapsedTime`; Metal via sync-wrap; CPU via `Instant`) |
+| 1.2 | ⚠ deferred — migrate ~10 `FERRUM_*_PROF` probe sites onto `BackendTimer` (mechanical; see decision doc) |
 | 1.3 | ✓ TTFT/TPOT/ITL histograms in engine (`ferrum.engine.{ttft,tpot,itl}_seconds`) + corrected bug at `continuous_engine.rs:2253` |
 | 1.4 | ✓ `/metrics` Prometheus endpoint (already wired in `axum_server.rs`) |
-| 1.5 | ⏸ **gated** — chrome trace JSON output |
+| 1.5 | ✓ Chrome trace JSON in `crates/ferrum-bench-core/src/trace.rs` — `TraceWriter` with `FERRUM_TRACE_OUT` env-gated emit, compatible with chrome://tracing / Perfetto / Nsight |
 | 2.1 | ✓ `--output jsonl` + `scripts/compare-commits.sh` + `scripts/compare_bench.py` (CI-overlap-aware ratio table) |
 | 2.2 | ✓ `--dataset shared-prefix` (1024-tok shared + unique suffix) |
 | 2.3 | ✓ `--dataset sharegpt --sharegpt-path PATH` (HF Vicuna format) |
@@ -604,9 +604,10 @@ Inspect the parity-confirmed report. Three branches:
 | 3.1 | ✓ NMSE op-diff harness in `ferrum-testkit::op_diff` — `rms_norm` + `silu_mul` covered (Metal NMSE empirically 1e-15 against CPU); extend pattern to rope/varlen_attn/marlin_matmul as follow-up PRs |
 | 3.2 | ⚠ skeleton at `crates/ferrum-cli/tests/quant_kl.rs` — body blocked on logits-capture API + paired INT4 model variant in HF cache |
 | 3.3 | ✓ `scripts/lm_eval_light.sh` against `/v1/completions` (MMLU + ARC-easy + GSM8K, rtol=0.05) |
-| 4   | ⏸ **gated** — visualizer needs Phase 1 trace JSON; raw vs-vLLM harness lives at `bench/v0.2-cuda/apples_all_drive.sh` and is superseded by `scripts/bench_vs_vllm.sh` |
+| 4   | ✓ `scripts/visualize_layerwise.py` — reads chrome trace JSON, groups by `cat`, stacked-bar PNG per layer. Smoke-tested with fixture trace. |
 
-**Outstanding gating action**: run `scripts/bench_vs_vllm.sh` on a Vast 4090 with `scripts/lock_gpu.sh` applied to produce the one credible parity-confirmed report. The outcome determines whether Phase 1.1/1.2/1.5/4 are worth building — see § 8 "Decision point". All Phase 0 / 1.3 / 1.4 / 2 / 3.1 / 3.3 deliverables are landed and locally validated on Metal.
+**Gate resolution** (see [`docs/bench/decision-2026-05-24-phase8-gate/decision.md`](decision-2026-05-24-phase8-gate/decision.md)):
+A live Vast 4090 parity bench was attempted but failed across 5 different pods (boot-fail, "Template not found", SSH proxy bug, host-firewall on direct ports). Decision was made on **existing baseline data** from `CLAUDE.md` and `bench/v0.2-cuda/PERF_TRACKER.md` — both M2 and M3 sit in the `< 0.60` ratio band (> 40% gap), so PLAYBOOK § 8 mandates **full Phase 1 + 4**. Phase 1.1 / 1.5 / 4 are now built; Phase 1.2 (probe migration) is mechanical follow-up work deferred to a focused PR.
 
 ---
 

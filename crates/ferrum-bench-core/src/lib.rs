@@ -26,6 +26,7 @@ pub mod arrivals;
 pub mod env;
 pub mod report;
 pub mod stats;
+pub mod trace;
 
 pub use env::{Env, EnvHash};
 pub use stats::{ci95_half_width, percentile, student_t_975, PercentileStats, ScalarStats};
