@@ -246,7 +246,18 @@ MarlinFuncPtr get_marlin_kernel(
   int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
 
-  #include "kernel_selector.h"
+  // CUDA 13 workaround (2026-05-25): vllm::ScalarType::id() produces
+  // different constexpr values in marlin.cu vs the per-tile
+  // sm80_kernel_*.cu instantiation TUs. Disabling the dispatcher
+  // include strips the cross-TU symbol mismatch (rust-lld errors with
+  // `undefined hidden symbol marlin::Marlin<...>` otherwise). Without
+  // it, get_marlin_kernel always returns MarlinDefault. Acceptable
+  // for M3 (Qwen3-MoE) — its critical path is the vllm-moe-marlin
+  // wna16 kernel which lives in its own namespace and links cleanly.
+  // M2 (Llama-INT4) callers that rely on this dispatcher get the no-op
+  // fallback and will need the broader fix landed before they can
+  // use the vllm-marlin GEMM kernel.
+  // #include "kernel_selector.h"
 
   return kernel;
 }
