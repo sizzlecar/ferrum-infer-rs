@@ -247,7 +247,16 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
 }
 
 fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
-    let cu_files: &[&str] = &["kernels/vllm_marlin_moe/ops.cu"];
+    // CUDA 13 hidden-default-visibility workaround: implicit Marlin<...>
+    // instantiations inside ops.cu's dispatcher are emitted with hidden
+    // ELF visibility and `ar`-bundling rejects them at the final rust-lld
+    // link. kernel_instantiations.cu explicitly instantiates the same
+    // configurations at namespace scope to force external linkage. See
+    // the file header for the upstream vLLM reference.
+    let cu_files: &[&str] = &[
+        "kernels/vllm_marlin_moe/ops.cu",
+        "kernels/vllm_marlin_moe/kernel_instantiations.cu",
+    ];
     for f in cu_files {
         println!("cargo:rerun-if-changed={f}");
     }
