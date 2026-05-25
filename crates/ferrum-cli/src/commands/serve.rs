@@ -382,6 +382,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // Clean up PID file
     std::fs::remove_file(&pid_file).ok();
 
+    // PLAYBOOK § 1.5: Rust statics don't drop on exit, so the global
+    // TraceWriter's buffered events would be lost. Force-flush on
+    // ctrl_c-driven shutdown (matches bench / bench-serve exit paths).
+    ferrum_bench_core::trace::flush_global_trace();
+
     Ok(())
 }
 
