@@ -2148,15 +2148,32 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             None
         };
         let prof = stage_t0.is_some();
-        let mark = |ctx: &mut B::Context, c: &AtomicU64, t0: std::time::Instant| {
-            if prof {
-                B::sync(ctx);
-                c.fetch_add(
-                    t0.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-        };
+        // PLAYBOOK § 1.2 — migrated. Replaces `Instant::now()` + `B::sync`
+        // with BackendTimer (CUDA event-accurate) and pushes a chrome-trace
+        // event so visualize_layerwise.py shows embed / final_norm / lm_head
+        // as separate stages within the decode_step category.
+        let stage_start =
+            |ctx: &mut B::Context| -> Option<<B as ferrum_kernels::backend::Backend>::Timer> {
+                ferrum_kernels::backend::timer::start_probe_timer::<B>(
+                    "FERRUM_DECODE_OP_PROFILE",
+                    ctx,
+                )
+            };
+        let stage_finish =
+            |t: Option<<B as ferrum_kernels::backend::Backend>::Timer>,
+             ctx: &mut B::Context,
+             name: &str,
+             c: &AtomicU64| {
+                if let Some(us) = ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
+                    t,
+                    ctx,
+                    name,
+                    "decode_step",
+                    0,
+                ) {
+                    c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+                }
+            };
         let mt0 = std::time::Instant::now();
 
         let mut residual = self
@@ -2164,9 +2181,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             .residual
             .take()
             .expect("scratch residual missing (previous call didn't restore)");
-        let t0 = std::time::Instant::now();
+        let t0 = stage_start(&mut ctx);
         B::embedding_lookup(&mut ctx, &self.embed, &[token], &mut residual, h);
-        mark(&mut ctx, &DEC_EMBED_US, t0);
+        stage_finish(t0, &mut ctx, "embed", &DEC_EMBED_US);
         let _ = mt0; // silence if unused on non-profile builds
 
         // Cross-layer rms_norm fusion: layer L's MoE tail folds the
@@ -2194,7 +2211,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 .expect("forward_layer");
         }
 
-        let t0 = std::time::Instant::now();
+        let t0 = stage_start(&mut ctx);
         B::rms_norm(
             &mut ctx,
             &residual,
@@ -2204,16 +2221,16 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             1,
             h,
         );
-        mark(&mut ctx, &DEC_FINAL_NORM_US, t0);
+        stage_finish(t0, &mut ctx, "final_norm", &DEC_FINAL_NORM_US);
 
-        let t0 = std::time::Instant::now();
+        let t0 = stage_start(&mut ctx);
         self.lm_head.forward(
             &mut ctx,
             &self.scratch.last_normed,
             &mut self.scratch.logits,
             1,
         );
-        mark(&mut ctx, &DEC_LM_HEAD_US, t0);
+        stage_finish(t0, &mut ctx, "lm_head", &DEC_LM_HEAD_US);
 
         B::sync(&mut ctx);
         self.scratch.residual = Some(residual);
