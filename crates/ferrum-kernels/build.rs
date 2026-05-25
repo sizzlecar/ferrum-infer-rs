@@ -440,6 +440,18 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
                 "--expt-extended-lambda",
                 "-Xcompiler",
                 "-fPIC",
+                // CUDA 13 default-hidden-visibility workaround. The
+                // marlin_template.h Marlin template carries a
+                // `__attribute__((visibility("default")))` to mark the
+                // kernel exportable, but nvcc 13 still emits the host
+                // stub with hidden ELF visibility unless the host
+                // compiler is told otherwise. Without this, the
+                // sm80_kernel_*.cu explicit instantiations end up as
+                // hidden symbols inside libvllm_marlin.a and rust-lld
+                // refuses them at the final link. Mirrors the same
+                // flag added to compile_vllm_moe_marlin.
+                "-Xcompiler",
+                "-fvisibility=default",
                 // vLLM kernels read CUDA_ARCH at compile time; emit it for nvcc
                 "--threads",
                 "0",
