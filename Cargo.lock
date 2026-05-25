@@ -1431,6 +1431,7 @@ dependencies = [
  "bindgen_cuda",
  "candle-core",
  "cudarc 0.19.4",
+ "ferrum-bench-core",
  "ferrum-interfaces",
  "ferrum-types",
  "half",

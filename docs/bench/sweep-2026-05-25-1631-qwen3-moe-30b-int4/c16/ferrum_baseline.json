@@ -1,0 +1,117 @@
+{
+  "backend": "cuda",
+  "completed_per_run": [
+    30
+  ],
+  "concurrency": 16,
+  "e2e_ms": {
+    "p50": {
+      "mean": 3103.1766930000003
+    },
+    "p75": {
+      "mean": 3294.6920870000004
+    },
+    "p95": {
+      "mean": 3502.1998136499997
+    },
+    "p99": {
+      "mean": 3556.39490254
+    }
+  },
+  "env": {
+    "commit_sha": "cbe04ea",
+    "cuda": "12.8",
+    "driver": "570.153.02",
+    "ferrum_env": {
+      "FERRUM_DECODE_OP_PROFILE": "1",
+      "FERRUM_GRAPH": "1",
+      "FERRUM_GRAPH_SKIP_UPLOAD": "1",
+      "FERRUM_GREEDY_ARGMAX": "1",
+      "FERRUM_KV_MAX_BLOCKS": "2048",
+      "FERRUM_MOE_DEVICE_ROUTE": "1",
+      "FERRUM_MOE_STREAMS": "4",
+      "FERRUM_PAGED_MAX_SEQS": "32",
+      "FERRUM_TRACE_OUT": "/workspace/ferrum-infer-rs/docs/bench/sweep-2026-05-25-1631-qwen3-moe-30b-int4/c16/ferrum_trace.json",
+      "FERRUM_USE_VLLM_PAGED_ATTN": "1"
+    },
+    "ferrum_features": [
+      "cuda",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2775,
+    "gpu_persistence_mode": true,
+    "gpu_power_limit_w": 450,
+    "hw_id": "rtx-4090",
+    "rust": "1.95.0"
+  },
+  "env_hash": "sha256:777d7f258c8ea94a4a0bf5b0a758e12ed71007efc0f8de8fea96110f9da9442e",
+  "errored_per_run": [
+    0
+  ],
+  "goodput_rps": {
+    "mean": 4.879356959096889
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 18.548790999999998
+    },
+    "p75": {
+      "mean": 18.919144
+    },
+    "p95": {
+      "mean": 21.099742399999993
+    },
+    "p99": {
+      "mean": 125.50105592
+    }
+  },
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "n_gen": 128,
+  "n_prompt": 256,
+  "n_repeats": 1,
+  "n_requests_per_run": 30,
+  "output_throughput_tps": {
+    "mean": 620.4915599651544
+  },
+  "request_throughput_rps": {
+    "mean": 4.879356959096889
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "total_throughput_tps": {
+    "mean": 1869.6069414939577
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 21.66704553937008
+    },
+    "p75": {
+      "mean": 22.870165903340208
+    },
+    "p95": {
+      "mean": 23.391705324603176
+    },
+    "p99": {
+      "mean": 23.50929153123642
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "mean": 277.823272
+    },
+    "p75": {
+      "mean": 484.8781822500001
+    },
+    "p95": {
+      "mean": 750.6128688999996
+    },
+    "p99": {
+      "mean": 806.98896973
+    }
+  },
+  "warmup_requests": 5
+}
