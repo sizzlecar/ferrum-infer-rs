@@ -119,7 +119,12 @@ for c in "${CELLS[@]}"; do
             --output json --out "$cell_dir/ferrum_baseline.json" 2>&1 \
             | tail -6
     fi
-    kill "$FPID" 2>/dev/null || true
+    # SIGINT (not SIGTERM) so ferrum serve's tokio ctrl_c handler fires,
+    # which is what flushes the global TraceWriter buffered events.
+    kill -INT "$FPID" 2>/dev/null || true
+    # Wait up to 10s for graceful flush
+    for _ in $(seq 1 20); do kill -0 "$FPID" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL "$FPID" 2>/dev/null || true
     wait "$FPID" 2>/dev/null || true
     sleep 2
 
