@@ -83,50 +83,51 @@ for c in "${CELLS[@]}"; do
     rm -f "$FERRUM_TRACE_OUT"
 
     FPORT=$((18000 + c))
-    "$FERRUM_BIN" serve "$HF_MODEL" --port "$FPORT" \
-        > "$cell_dir/ferrum_serve.log" 2>&1 &
-    FPID=$!
+    # nsys wraps ferrum serve (the process with GPU work) — wrapping bench-serve
+    # (HTTP client, no CUDA) was a bug: nsys-rep contained zero kernel data.
+    # Skip model-load region via --capture-range=cudaProfilerApi when ferrum
+    # supports cudaProfilerStart/Stop; until then we just trim model-load µs
+    # post-hoc with nsys stats --start-time.
+    if [ "$c" = "32" ] && command -v nsys >/dev/null 2>&1; then
+        nsys profile -o "$(pwd)/$cell_dir/ferrum_nsys" \
+            --trace=cuda,nvtx,cublas --force-overwrite=true --sample=none \
+            "$FERRUM_BIN" serve "$HF_MODEL" --port "$FPORT" \
+            > "$cell_dir/ferrum_serve.log" 2>&1 &
+        FPID=$!
+    else
+        "$FERRUM_BIN" serve "$HF_MODEL" --port "$FPORT" \
+            > "$cell_dir/ferrum_serve.log" 2>&1 &
+        FPID=$!
+    fi
     for i in $(seq 1 90); do
         curl -fsS "http://127.0.0.1:$FPORT/health" >/dev/null 2>&1 && break
         sleep 2
     done
 
-    # Wrap bench in nsys when c=32 (most representative cell — keep nsys
-    # data volume bounded; per-cell nsys for all 4 would be 200+ MB total).
-    if [ "$c" = "32" ] && command -v nsys >/dev/null 2>&1; then
-        nsys profile -o "$(pwd)/$cell_dir/ferrum_nsys" \
-            --trace=cuda,nvtx,cublas --force-overwrite=true --sample=none \
-            --duration=60 \
-            "$FERRUM_BIN" bench-serve \
-                --base-url "http://127.0.0.1:$FPORT" \
-                --model "$HF_MODEL" --tokenizer "$TOK_SNAP" \
-                --dataset random --random-input-len 256 --random-output-len 128 \
-                --num-prompts "$NUM_PROMPTS" --warmup-requests "$WARMUP" \
-                --n-repeats "$N_REPEATS" --concurrency "$c" \
-                --output json --out "$cell_dir/ferrum_baseline.json" 2>&1 \
-            | tail -8
-        # Extract kernel summary CSV
-        nsys stats "$(pwd)/$cell_dir/ferrum_nsys.nsys-rep" \
-            --report cuda_gpu_kern_sum --format csv 2>&1 \
-            | grep -E "^[0-9]" > "$cell_dir/ferrum_nsys.csv" || true
-    else
-        "$FERRUM_BIN" bench-serve \
-            --base-url "http://127.0.0.1:$FPORT" \
-            --model "$HF_MODEL" --tokenizer "$TOK_SNAP" \
-            --dataset random --random-input-len 256 --random-output-len 128 \
-            --num-prompts "$NUM_PROMPTS" --warmup-requests "$WARMUP" \
-            --n-repeats "$N_REPEATS" --concurrency "$c" \
-            --output json --out "$cell_dir/ferrum_baseline.json" 2>&1 \
-            | tail -6
-    fi
+    "$FERRUM_BIN" bench-serve \
+        --base-url "http://127.0.0.1:$FPORT" \
+        --model "$HF_MODEL" --tokenizer "$TOK_SNAP" \
+        --dataset random --random-input-len 256 --random-output-len 128 \
+        --num-prompts "$NUM_PROMPTS" --warmup-requests "$WARMUP" \
+        --n-repeats "$N_REPEATS" --concurrency "$c" \
+        --output json --out "$cell_dir/ferrum_baseline.json" 2>&1 \
+        | tail -6
     # SIGINT (not SIGTERM) so ferrum serve's tokio ctrl_c handler fires,
     # which is what flushes the global TraceWriter buffered events.
+    # When under nsys, the wrapper process is FPID — nsys forwards SIGINT.
     kill -INT "$FPID" 2>/dev/null || true
-    # Wait up to 10s for graceful flush
-    for _ in $(seq 1 20); do kill -0 "$FPID" 2>/dev/null || break; sleep 0.5; done
+    # Wait up to 30s for graceful flush (nsys post-processing takes longer)
+    for _ in $(seq 1 60); do kill -0 "$FPID" 2>/dev/null || break; sleep 0.5; done
     kill -KILL "$FPID" 2>/dev/null || true
     wait "$FPID" 2>/dev/null || true
     sleep 2
+
+    # Extract nsys kernel summary CSV (c=32 only)
+    if [ "$c" = "32" ] && [ -f "$cell_dir/ferrum_nsys.nsys-rep" ]; then
+        nsys stats "$cell_dir/ferrum_nsys.nsys-rep" \
+            --force-export=true --report cuda_gpu_kern_sum --format csv 2>&1 \
+            | grep -E "^[0-9]" > "$cell_dir/ferrum_nsys.csv" || true
+    fi
 
     # ── vLLM bench (no env vars; clean apples-to-apples) ──
     VPORT=$((19000 + c))

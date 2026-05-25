@@ -696,7 +696,10 @@ enum Cell {
 }
 
 async fn execute_cell(cmd: &BenchServeCommand, ctx: &RunContext, cell: Cell) -> Result<BenchReport> {
-    let backend = if std::env::var("CUDA_VISIBLE_DEVICES").is_ok() {
+    // Backend tag is a build-time fact, not a runtime env-var check. The earlier
+    // `CUDA_VISIBLE_DEVICES.is_ok()` heuristic silently mistagged every CUDA-built
+    // run as "cpu" when that env var was unset, polluting bench artifacts.
+    let backend = if cfg!(feature = "cuda") {
         "cuda"
     } else if cfg!(target_os = "macos") {
         "metal"
