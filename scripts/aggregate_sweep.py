@@ -170,10 +170,57 @@ def render(cells, model, root):
     return "\n".join(out)
 
 
+def render_cell_detail(cell):
+    """Per-cell bottleneck-cN.md content."""
+    c = cell["c"]
+    f, v = cell["ferrum"], cell["vllm"]
+    out = [f"# Bottleneck — c={c} (Qwen3-30B-A3B-GPTQ-Int4 / RTX 4090)\n"]
+    if f and v:
+        ft = f["output_throughput_tps"]
+        vt = v["output_throughput_tps"]
+        ratio = ft / vt
+        gap_to_80 = 0.80 - ratio
+        out.append("## Headline\n")
+        out.append(f"- **ferrum**: {ft:.1f} tok/s")
+        out.append(f"- **vLLM**:   {vt:.1f} tok/s")
+        out.append(f"- **ratio**:  {ratio:.3f}  ({'✓ above 0.80' if ratio >= 0.80 else f'gap {gap_to_80:+.3f}'})")
+        out.append(f"- **TTFT p50**: ferrum {f.get('ttft_ms_p50',0):.1f} ms vs vLLM {v.get('ttft_ms_p50',0):.1f} ms")
+        out.append(f"- **TPOT p50**: ferrum {f.get('tpot_ms_p50',0):.1f} ms vs vLLM {v.get('tpot_ms_p50',0):.1f} ms\n")
+
+    if cell["trace"]:
+        tot = sum(cell["trace"].values())
+        out.append("## ferrum chrome-trace category split\n")
+        out.append("| category | µs | % |")
+        out.append("|---|---:|---:|")
+        for k, val in sorted(cell["trace"].items(), key=lambda x: -x[1]):
+            out.append(f"| {k} | {val:,} | {val/tot*100:.1f}% |")
+        out.append("")
+    else:
+        out.append("_(chrome trace data unavailable for this cell)_\n")
+
+    if cell["nsys"]:
+        out.append("## nsys top kernels (ground truth)\n")
+        out.append("| % | kernel |")
+        out.append("|---:|---|")
+        for pct, name in cell["nsys"]:
+            out.append(f"| {pct:.1f} | `{name}` |")
+        out.append("")
+    else:
+        out.append("_(no nsys profile captured for this cell — see c=32 for kernel-level data)_\n")
+
+    return "\n".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("sweep_dir", type=Path)
     ap.add_argument("--model", default="Qwen3-30B-A3B-GPTQ-Int4")
+    ap.add_argument(
+        "--write-per-cell",
+        type=Path,
+        default=None,
+        help="If set, write bottleneck-c{N}.md into this dir for each cell.",
+    )
     args = ap.parse_args()
 
     cells = []
@@ -185,6 +232,13 @@ def main():
         sys.exit(f"no c*/ subdirs found in {args.sweep_dir}")
 
     print(render(cells, args.model, args.sweep_dir))
+
+    if args.write_per_cell:
+        args.write_per_cell.mkdir(parents=True, exist_ok=True)
+        for cell in cells:
+            outpath = args.write_per_cell / f"bottleneck-c{cell['c']}.md"
+            outpath.write_text(render_cell_detail(cell))
+            print(f"  → {outpath}", file=sys.stderr)
 
 
 if __name__ == "__main__":

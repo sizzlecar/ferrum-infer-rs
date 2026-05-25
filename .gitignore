@@ -44,3 +44,6 @@ docs/registry_pattern_explanation.md
 bench_results/
 **/*.trace/
 **/xctrace/
+.vast-current.env
+ferrum.toml
+crates/*/ferrum.toml

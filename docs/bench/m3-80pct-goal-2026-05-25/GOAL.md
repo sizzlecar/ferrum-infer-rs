@@ -1,0 +1,164 @@
+# Goal: M3(Qwen3-30B-A3B-GPTQ-Int4) → 80% of vLLM throughput across c=1/4/16/32
+
+**Status:** draft @ 2026-05-25, awaiting first sweep
+**Owner:** ferrum core (this PR opens the work; subsequent PRs ship sub-targets)
+**Validation harness:** `scripts/sweep_bottleneck.sh qwen3-moe-30b-int4` + `scripts/aggregate_sweep.py`
+
+---
+
+## Target
+
+For **Qwen/Qwen3-30B-A3B-GPTQ-Int4** on RTX 4090 (sm_89, 24 GB, CUDA 13.x, locked clock per `scripts/lock_gpu.sh`):
+
+| c | ferrum tok/s ≥ |
+|---:|---:|
+| 1 | 0.80 × vLLM_c1 |
+| 4 | 0.80 × vLLM_c4 |
+| 16 | 0.80 × vLLM_c16 |
+| 32 | 0.80 × vLLM_c32 |
+
+**Apples-to-apples**: ShareGPT-distribution prompts via `--dataset random --random-input-len 256 --random-output-len 128`, c × 30 requests, vLLM 0.20.2 with `--quantization gptq_marlin --no-enable-prefix-caching --enable-chunked-prefill --dtype float16 --gpu-memory-utilization 0.85`. ferrum env locked to the iter-3 set established in PR #206 (`FERRUM_GRAPH=1 FERRUM_MOE_DEVICE_ROUTE=1 FERRUM_MOE_STREAMS=4 FERRUM_GREEDY_ARGMAX=1 FERRUM_KV_MAX_BLOCKS=2048 FERRUM_PAGED_MAX_SEQS=32 FERRUM_USE_VLLM_PAGED_ATTN=1`).
+
+## Current baseline (2026-05-25 sweep)
+
+Sweep dir: [`docs/bench/sweep-2026-05-25-1631-qwen3-moe-30b-int4/`](../sweep-2026-05-25-1631-qwen3-moe-30b-int4/) · ferrum commit `cbe04ea`, n_repeats=1, num_prompts=30, warmup=5, random in=256 out=128.
+
+ferrum measured this session (RTX 4090, all iter-3 env knobs on):
+
+| c | ferrum tok/s | TTFT p50 | TPOT p50 |
+|---:|---:|---:|---:|
+| 1 | 86.2 | 59.0 ms | 11.2 ms |
+| 4 | 88.4 | 154.0 ms | 44.1 ms |
+| 16 | 620.5 | 277.8 ms | 21.7 ms |
+| 32 | 812.2 | 770.1 ms | 30.0 ms |
+
+vLLM 0.20.2 **did not run this session** — the rented pod's driver (570.153.02, max CUDA 12.8) is older than vLLM 0.20.2's PyTorch CUDA 13 minimum. For ratio computation we reference the apples baseline from [`bench/v0.2-cuda/REPORT_2026-05-13.md`](../../../bench/v0.2-cuda/REPORT_2026-05-13.md) (same hardware, same model, ShareGPT dataset; ferrum env knobs differed at that time):
+
+| c | this-session ferrum | historical vLLM (2026-05-13, ShareGPT) | indicative ratio |
+|---:|---:|---:|---:|
+| 1 | 86.2 | 205.4 | 0.42 |
+| 4 | 88.4 | 505.8 | 0.17 |
+| 16 | 620.5 | 1253.2 | 0.50 |
+| 32 | 812.2 | 1883.2 | 0.43 |
+
+**Caveats** — these ratios are **indicative, not authoritative**:
+1. dataset differs: this session is `random 256/128`, the 2026-05-13 baseline is ShareGPT (≤200 input avg). Random-256 is roughly 2× heavier on prefill which suppresses the throughput denominator (especially c=4).
+2. n_repeats=1 only (sweep_bottleneck.sh runs each cell once for trace+nsys); CI95 not computable.
+3. ferrum at `cbe04ea` (this session) ≠ ferrum at the 2026-05-13 baseline commit.
+
+A re-baseline against fresh apples-to-apples vLLM is required before quoting these ratios externally. Re-baseline is blocked until a Vast pod with driver ≥ 575 (CUDA 13.x) is available; track separately.
+
+**c=4 anomaly**: this session's c=4 reports 88.4 tok/s — essentially identical to c=1. Hypothesis: with `num_prompts=30 / random_in=256`, prefill cost dominates wall time at small c and the 4 concurrent prefills serialize on the iteration lock. **Re-run c=4 with `num_prompts=128` and ShareGPT data** before treating that row as load-bearing.
+
+## Bottleneck per c — measured chrome-trace breakdown
+
+Framework data (BackendTimer GPU events, NOT CPU timing — chrome trace format):
+
+| c | moe | attention | decode_step (embed/lm_head/final_norm) |
+|---:|---:|---:|---:|
+| 1 | **73.4%** | 19.1% | 7.5% |
+| 16 | **73.4%** | 19.4% | 7.1% |
+| 32 | **73.4%** | 19.5% | 7.1% |
+
+(c=4 trace omitted — bench was truncated and partial events were patched out; category split mirrors c=1.)
+
+**Headline finding**: MoE dominates at all c. The category split is essentially invariant across c=1/16/32 — the ferrum bottleneck shape is **kernel-level (MoE Marlin matmul), not scheduler-level**. Increasing c does not shift cost into the framework overhead bucket; it widens absolute moe µs proportionally.
+
+This contradicts the prior hypothesis that c=1 vs c=32 had different shaped gaps. The kernel-quality lever (vllm-moe-marlin or our own Marlin-moe v2) is the single dominant cost item at every c.
+
+| c | dominant cost | direct lever |
+|---|---|---|
+| 1 | MoE matmul (73%) + attention (19%) | vllm-moe-marlin OR ferrum Marlin tile heuristic |
+| 4 | (re-run needed, see anomaly above) | — |
+| 16 | MoE matmul (73%) + attention (19%) | vllm-moe-marlin OR ferrum Marlin tile heuristic |
+| 32 | MoE matmul (73%) + attention (19%) | vllm-moe-marlin OR ferrum Marlin tile heuristic |
+
+Per-c trace details: [bottleneck-c1.md](bottleneck-c1.md) · [bottleneck-c4.md](bottleneck-c4.md) · [bottleneck-c16.md](bottleneck-c16.md) · [bottleneck-c32.md](bottleneck-c32.md).
+
+**nsys ground truth not captured this session** — `sweep_bottleneck.sh` wraps `bench-serve` (HTTP client, no GPU work) instead of `ferrum serve` under nsys. Bug to fix in follow-up; framework-validation session's nsys data ([`framework-validation-2026-05-25/nsys_kernels.csv`](../framework-validation-2026-05-25/nsys_kernels.csv)) is the current kernel-level reference and confirms Marlin <256,1,8,8> = 49% of GPU, cublas gemv (lm_head) = 10.2%, cutlass wmma (attn) = 11.5%.
+
+## Prioritized levers
+
+Ordered by **(expected ratio gain × probability of success on CUDA 13)**:
+
+### 1. Fix `vllm-moe-marlin` build on CUDA 13 — **biggest single lever**
+
+Currently blocked: rust-lld reports `undefined hidden symbol marlin::Marlin<...>` even with `-Xcompiler -fvisibility=default` and `__attribute__((visibility("default")))` on the template definition.
+
+**Tried (PR #206 commits 1f9c3cb, 9eb46d7, b5dc156):**
+- `-Xcompiler -fvisibility=default` — no effect (likely only affects host code, not nvcc-generated device stubs)
+- `__attribute__((visibility("default")))` on template decl in `kernel.h` — no effect
+- Same attribute on template definition in `marlin_template.h` — no effect
+
+**Next things to try (decreasing order of confidence):**
+1. `-rdc=true --device-link` workflow: build ops.cu with `-rdc=true`, run `nvcc --device-link` on the .o, then link the resulting `__cudart_*` symbols into the final binary. Restructures `build.rs::compile_vllm_moe_marlin` non-trivially.
+2. Refresh vendored `crates/ferrum-kernels/kernels/vllm_marlin_moe/` from current vLLM HEAD (vendored circa v0.7-pre per Cargo.toml comments; may have been fixed upstream for CUDA 13).
+3. As a fallback: manually instantiate all referenced `Marlin<...>` template specializations in a separate `.cu` file forcing default visibility. Tedious but deterministic.
+
+**Expected gain**: ferrum_moe (49% of GPU time) → vllm_moe_marlin kernel which is empirically ~2× faster on this exact workload. **~25-30 pp ratio gain** at c=16/32, **~15 pp** at c=1/4.
+
+### 2. lm_head: swap cublas gemv → cutlass GEMM (vLLM-style)
+
+nsys shows `cublasGemvParamsEx<...,(int)6>` = **10.2% of GPU time** at c=16. vLLM uses tuned cutlass `Kernel2<...wmma_tensorop...>`. Per nsys, cutlass on the same workload runs in roughly **65% the time** of cublas gemv for vocab-sized projections.
+
+**Approach**: in `ferrum-quantization` Linear impl for the lm_head case (m ≤ 32, n = vocab ≥ 150k, k = hidden), dispatch to a cutlass-based GEMM rather than cublas. Requires the cutlass GEMM op to be exposed via `Backend::gemm_cutlass()` or as a Linear adapter.
+
+**Expected gain**: ~3 pp ratio gain across all c (the lm_head fires per emitted token regardless of batch size).
+
+### 3. MoE Marlin tile heuristic — small-m optimization
+
+Even without vLLM's marlin_moe, ferrum's own Marlin can be tuned. Per nsys at c=16, the dominant kernel is `Marlin<256,1,8,8,4,8>` (49%, `thread_m_blocks=1`). For c=32 it should pick `thread_m_blocks=2` for higher utilization but probably doesn't (autotune predicate gates).
+
+**Approach**: extend `crates/ferrum-kernels/src/backend/cuda/marlin.rs` tile selection to consider effective per-expert m (= `tokens × top_k / num_active_experts`). For Qwen3-MoE that's typically ≤8 even at c=32. The right tile is `<256,2,8,8>` for c≤16 effective-m and `<256,4,16,4>` for c≥32. Currently the heuristic picks `<256,1,8,8>` for all.
+
+**Expected gain**: ~5-8 pp at c=4/16 where small-m suboptimality bites hardest.
+
+### 4. Phase 3 chunked-prefill token budget tuning
+
+Per `memory/project_phase3_token_budget.md`: M3 c=16 +11%, c=32 +5% from setting `FERRUM_MAX_BATCHED_TOKENS=2048`. Already on in the iter-3 baseline. Could try `4096` or `8192` for larger cohort fusion, but `--max-num-batched-tokens` interacts with KV memory.
+
+**Expected gain**: small (~1-2 pp), and only at c≥16.
+
+### 5. CUDA graph capture quality at c=32
+
+`memory/project_moe_phase3_graph_bug.md`: full graph at c=32 has been net **-6%** because graph re-bind cost dominates. Currently we ship with `FERRUM_GRAPH=1` always-on. At c=32 the iter-3 number with graph ON is 970 tok/s; with graph OFF it should be ~1030 tok/s. **Try this immediately** — it might be free 6%.
+
+**Expected gain**: ~3 pp at c=32 only, may regress c=1/4 (where graph helps).
+
+## Milestone roadmap
+
+| Phase | Goal | What ships | Est. wall |
+|---|---|---|---|
+| **A. Locked baseline** | Sweep data per c, framework-validated, this PR | sweep dir + GOAL.md + per-cell bottleneck-<c>.md | 1-2h GPU |
+| **B. Easy wins** | ratio ≥ 0.60 all c (graph-c32-off + Phase 3 token-budget verify) | env tuning PR | 1d |
+| **C. lm_head cutlass** | ratio ≥ 0.65 all c | `Backend::gemm_lmhead()` or Linear adapter | 1 week |
+| **D. Marlin tile heuristic** | ratio ≥ 0.70 all c | dispatch fix in `marlin.rs` autotune | 1 week |
+| **E. vllm-moe-marlin CUDA 13 fix** | ratio ≥ 0.80 all c (final target) | -rdc=true link OR upstream refresh OR explicit template instantiation .cu | 1-2 weeks (high uncertainty) |
+
+If E proves intractable, an alternative path to 0.80 is "ferrum's own marlin_moe v2" — write a Marlin-MoE kernel from scratch tuned for sm_89. ~3-4 weeks engineering. Out of scope for this goal doc; track separately if E stalls.
+
+## Validation criteria
+
+Goal is **achieved** when:
+
+1. `scripts/sweep_bottleneck.sh qwen3-moe-30b-int4 1,4,16,32` produces a `ratio ≥ 0.80` row in `aggregate_sweep.py` output for **all four cells**, with `n_repeats ≥ 5` so CI95 doesn't overlap 0.80
+2. Sweep run is on the locked GPU (`scripts/lock_gpu.sh`) with a committed `env.commit_sha` referenceable in main
+3. The validation sweep result lives in `docs/bench/cuda-rtx4090-<date>-m3-80pct-confirmed/`
+
+Goal is **provably blocked** when:
+
+1. After E (or alternative) ships, sweep still reports `< 0.80` at any c
+2. nsys profile shows a single kernel that consumes > 30% of GPU time and is also the dominant cost in vLLM's nsys — i.e. we're already at the same kernel quality and the gap is elsewhere (scheduler, queueing, framework overhead)
+3. PR description must include the nsys evidence
+
+---
+
+## Per-cell bottleneck files
+
+(Populated by sweep + aggregate_sweep.py — links land here)
+
+- [`bottleneck-c1.md`](bottleneck-c1.md) — *pending sweep*
+- [`bottleneck-c4.md`](bottleneck-c4.md) — *pending sweep*
+- [`bottleneck-c16.md`](bottleneck-c16.md) — *pending sweep*
+- [`bottleneck-c32.md`](bottleneck-c32.md) — *pending sweep with nsys*
+- [`sweep-summary.md`](sweep-summary.md) — *full aggregate, generated by `aggregate_sweep.py`*
