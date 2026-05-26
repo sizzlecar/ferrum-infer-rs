@@ -1,0 +1,167 @@
+{
+  "backend": "cuda",
+  "completed_per_run": [
+    128,
+    128,
+    128,
+    128,
+    128
+  ],
+  "concurrency": 4,
+  "e2e_ms": {
+    "p50": {
+      "ci95_hw": 9.538903619366295,
+      "mean": 1044.8385938,
+      "stddev": 7.683586788084227
+    },
+    "p75": {
+      "ci95_hw": 7.607303931411315,
+      "mean": 1061.9061107500002,
+      "stddev": 6.127683255092616
+    },
+    "p95": {
+      "ci95_hw": 37.10360655377211,
+      "mean": 1092.26437703,
+      "stddev": 29.886954778328946
+    },
+    "p99": {
+      "ci95_hw": 46.96322850726924,
+      "mean": 1110.6467405480003,
+      "stddev": 37.82888018195606
+    }
+  },
+  "env": {
+    "commit_sha": "8836890",
+    "cuda": "13.0",
+    "driver": "580.159.04",
+    "ferrum_env": {
+      "FERRUM_DECODE_OP_PROFILE": "1",
+      "FERRUM_GRAPH": "1",
+      "FERRUM_GRAPH_SKIP_UPLOAD": "1",
+      "FERRUM_GREEDY_ARGMAX": "1",
+      "FERRUM_KV_MAX_BLOCKS": "2048",
+      "FERRUM_MOE_DEVICE_ROUTE": "1",
+      "FERRUM_MOE_STREAMS": "4",
+      "FERRUM_PAGED_MAX_SEQS": "32",
+      "FERRUM_TRACE_OUT": "/workspace/ferrum-infer-rs/docs/bench/sweep-2026-05-26-0356-qwen3-moe-30b-int4/c4/ferrum_trace.json",
+      "FERRUM_USE_VLLM_PAGED_ATTN": "1",
+      "FERRUM_VLLM_MOE": "1"
+    },
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2775,
+    "gpu_persistence_mode": true,
+    "gpu_power_limit_w": 300,
+    "hw_id": "rtx-4090",
+    "rust": "1.95.0"
+  },
+  "env_hash": "sha256:82bf5daeb8c9967f99686dd81f1e2eb2fa6b3b1f7449150eccf5a16ccf22849b",
+  "errored_per_run": [
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "goodput_rps": {
+    "ci95_hw": 0.03435968152472216,
+    "mean": 3.8240269714016897,
+    "stddev": 0.027676723189669444
+  },
+  "itl_ms": {
+    "p50": {
+      "ci95_hw": 0.04809218195307362,
+      "mean": 6.9077573,
+      "stddev": 0.03873825217340102
+    },
+    "p75": {
+      "ci95_hw": 0.03487710260090739,
+      "mean": 7.25308845,
+      "stddev": 0.028093505862342816
+    },
+    "p95": {
+      "ci95_hw": 0.042892295073916925,
+      "mean": 7.63763167,
+      "stddev": 0.03454974333438675
+    },
+    "p99": {
+      "ci95_hw": 0.13301302333414047,
+      "mean": 8.139095756,
+      "stddev": 0.10714198921754463
+    }
+  },
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4#vllm",
+  "n_gen": 128,
+  "n_prompt": 256,
+  "n_repeats": 5,
+  "n_requests_per_run": 128,
+  "output_throughput_tps": {
+    "ci95_hw": 4.793253973610227,
+    "mean": 493.16375112754656,
+    "stddev": 3.860966036892454
+  },
+  "request_throughput_rps": {
+    "ci95_hw": 0.03435968152472216,
+    "mean": 3.8240269714016897,
+    "stddev": 0.027676723189669444
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "total_throughput_tps": {
+    "ci95_hw": 13.588474625637303,
+    "mean": 1472.1146558063792,
+    "stddev": 10.945516200812687
+  },
+  "tpot_ms": {
+    "p50": {
+      "ci95_hw": 0.10317096797938596,
+      "mean": 6.727936312500001,
+      "stddev": 0.08310421387116756
+    },
+    "p75": {
+      "ci95_hw": 0.2664615787776033,
+      "mean": 6.904805206640626,
+      "stddev": 0.2146347995456183
+    },
+    "p95": {
+      "ci95_hw": 0.3453537338402471,
+      "mean": 7.066277007187499,
+      "stddev": 0.2781824298091362
+    },
+    "p99": {
+      "ci95_hw": 0.4124848925687549,
+      "mean": 7.147368943906249,
+      "stddev": 0.33225657762083355
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "ci95_hw": 6.656173735450122,
+      "mean": 186.0262893,
+      "stddev": 5.361547889955035
+    },
+    "p75": {
+      "ci95_hw": 3.9076623063656433,
+      "mean": 194.19474455,
+      "stddev": 3.147621956104895
+    },
+    "p95": {
+      "ci95_hw": 8.935290148434186,
+      "mean": 206.67019421,
+      "stddev": 7.19737614214086
+    },
+    "p99": {
+      "ci95_hw": 10.0182603620078,
+      "mean": 209.56959930399998,
+      "stddev": 8.069708640396648
+    }
+  },
+  "warmup_requests": 10
+}

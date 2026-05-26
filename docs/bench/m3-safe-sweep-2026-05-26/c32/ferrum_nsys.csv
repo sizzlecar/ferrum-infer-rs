@@ -1,0 +1,30 @@
+35.5,29175334852,392352,74360.1,67168.0,9344,217473,46045.1,"void Marlin<(int)256, (int)1, (int)8, (int)8, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+18.9,15545091979,142800,108859.2,118561.0,48320,156832,28019.1,paged_batched_decode_attn_f16
+13.8,11341788059,13440,843883.0,970277.0,368834,1358119,265341.3,paged_varlen_attn_f16
+11.7,9586508981,61728,155302.4,110752.5,19168,889284,146477.1,"void Marlin<(int)256, (int)4, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+9.5,7800651118,381860,20428.0,22112.0,11264,136833,9543.6,"void Marlin<(int)256, (int)2, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+2.5,2063010450,2572,802103.6,803012.0,757028,838884,8766.2,void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_32x2_tn_align8>(T1::Params)
+1.3,1106634450,36094,30659.8,25473.0,14944,101505,12582.0,"void Marlin<(int)256, (int)3, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+0.9,728239813,156240,4661.0,3776.0,2080,25952,4033.0,split_qkv_norm_rope_into_paged_cache_varlen_f16
+0.9,723543566,164150,4407.8,2400.0,992,50208,8290.3,embedding_lookup_f16
+0.7,552796814,160800,3437.8,3392.0,3328,4512,170.0,moe_router_topk_softmax_f16
+0.7,550617344,31547,17453.9,3008.0,2720,707876,97049.0,void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8>(T1::Params)
+0.6,496561552,160800,3088.1,2048.0,992,30432,4440.4,fused_silu_mul_interleaved_f16
+0.5,402443887,160800,2502.8,1984.0,1728,12800,1864.4,fused_add_rms_norm_inplace_f16
+0.5,389364710,164150,2372.0,1920.0,1664,11521,1605.6,rms_norm_f16
+0.5,382839958,160800,2380.8,1504.0,1312,27776,3120.8,moe_combine_f16
+0.4,336077492,116448,2886.1,2784.0,2592,7680,536.8,void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_128x2_tn_align8>(T1::Params)
+0.3,282750754,2975,95042.3,81376.0,80640,153312,26122.3,argmax_rows_f16
+0.3,258520242,160800,1607.7,1184.0,896,10497,1424.0,residual_add_inplace_f16
+0.3,243287240,156288,1556.7,1568.0,1280,2368,108.9,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, __half, __half, float, __half, (bool)0, __half, __half, __half, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
+0.1,78573645,4512,17414.4,17536.0,3456,18656,1482.2,paged_batched_flash_decode_attn_f16
+0.1,61846048,95,651011.0,650915.0,650115,652804,506.9,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<__half>, float>>(T13)"
+0.1,59308889,8976,6607.5,6688.0,4896,8320,423.6,ampere_fp16_s16816gemm_fp16_64x64_ldg8_f2f_stages_64x5_tn
+0.1,45242009,3744,12083.9,11328.5,7617,17344,3354.3,"void Marlin<(int)256, (int)1, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+0.0,10710380,4512,2373.8,2368.0,2176,2784,106.1,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<__half>, float>>(T13)"
+0.0,8556549,4560,1876.4,1856.0,1792,2720,74.1,split_qkv_norm_rope_into_paged_cache_f16
+0.0,6929065,4512,1535.7,1536.0,1504,2208,21.4,paged_batched_flash_decode_reduce_f16
+0.0,407714,48,8494.0,8512.0,7872,8672,126.1,paged_varlen_attn_split_k_phase1_f16
+0.0,95072,48,1980.7,1984.0,1824,2016,24.0,paged_varlen_split_k_reduce_f16
+0.0,67296,48,1402.0,1408.0,1280,1440,21.5,transpose_head_to_token_f16
+0.0,66146,48,1378.0,1376.0,1280,1409,20.3,transpose_token_to_head_f16

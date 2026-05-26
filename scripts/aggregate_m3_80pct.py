@@ -48,9 +48,12 @@ def load_cell(cell_dir: Path, vllm_sweep_dir: Path = None):
         out['ferrum_std'] = tps.get('std', 0.0)
         out['ferrum_n'] = f.get('n_repeats', 1)
         ttft = f.get('ttft_ms', {})
-        out['ferrum_ttft_p50'] = ttft.get('p50') or ttft.get('mean') or 0.0
+        # ttft_ms.p50 may be nested {ci95_hw, mean, stddev}
+        p50t = ttft.get('p50')
+        out['ferrum_ttft_p50'] = (p50t.get('mean') if isinstance(p50t, dict) else p50t) or ttft.get('mean') or 0.0
         tpot = f.get('tpot_ms', {})
-        out['ferrum_tpot_p50'] = tpot.get('p50') or tpot.get('mean') or 0.0
+        p50p = tpot.get('p50')
+        out['ferrum_tpot_p50'] = (p50p.get('mean') if isinstance(p50p, dict) else p50p) or tpot.get('mean') or 0.0
     # vllm baseline: prefer vllm-only-sweep dir if present, else local
     if vllm_sweep_dir is not None:
         v_alt = vllm_sweep_dir / f'c{c}' / 'vllm_bench.json'
