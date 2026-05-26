@@ -71,71 +71,76 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader ||
 
 # ──────────────────────────────────────────────────────────────────────
 # Phase 1 — PARALLEL setup: ferrum build || pip vllm || HF download
+# Each task → standalone temp script (avoids declare -f / bash-c quoting
+# hell). Each writes its own marker into orchestrator.log on completion.
 # ──────────────────────────────────────────────────────────────────────
-log "▶ Phase 1: launching 3 parallel tasks"
+log "▶ Phase 1: writing parallel task scripts"
 
-# Task A: ferrum release build (cuda + vllm-moe-marlin + vllm-paged-attn-v2)
-# Background: nohup so SSH disconnect doesn't kill it.
-build_task() {
-    cd /workspace/ferrum-infer-rs
-    source "$HOME/.cargo/env"
-    export CUDA_COMPUTE_CAP=89
-    # CUDA 13 nvcc — vllm-moe-marlin TU fix from PR #211 already merged
-    timeout 2700 cargo build --release -p ferrum-cli \
-        --features 'cuda,vllm-moe-marlin,vllm-paged-attn-v2' \
-        2>&1 | grep -E "Compiling|Finished|error|warning:" | tail -200
-    if [ -x ./target/release/ferrum ]; then
-        echo "BUILD_OK" >> "$SESSION_DIR/orchestrator.log"
-    else
-        echo "BUILD_FAIL" >> "$SESSION_DIR/orchestrator.log"
-    fi
-}
-nohup bash -c "build_task() { $(declare -f build_task); }; build_task" \
-    > "$SESSION_DIR/build.log" 2>&1 &
+cat > /tmp/task_build.sh <<EOSH
+#!/usr/bin/env bash
+set -e
+cd /workspace/ferrum-infer-rs
+source "\$HOME/.cargo/env"
+export CUDA_COMPUTE_CAP=89
+timeout 2700 cargo build --release -p ferrum-cli \\
+    --features 'cuda,vllm-moe-marlin,vllm-paged-attn-v2' \\
+    2>&1 | grep -E "Compiling|Finished|error|warning:" | tail -200
+if [ -x ./target/release/ferrum ]; then
+    echo "BUILD_OK" >> "$SESSION_DIR/orchestrator.log"
+else
+    echo "BUILD_FAIL" >> "$SESSION_DIR/orchestrator.log"
+fi
+EOSH
+
+cat > /tmp/task_vllm.sh <<EOSH
+#!/usr/bin/env bash
+set -e
+if [ ! -d "/workspace/vllm-venv" ]; then
+    python3 -m venv /workspace/vllm-venv
+fi
+source /workspace/vllm-venv/bin/activate
+timeout 60 pip install -U -q pip wheel setuptools
+# vllm 0.20.2 pulls torch transitively. cu128 wheel works on driver 580.
+timeout 1800 pip install -q \\
+    --extra-index-url https://download.pytorch.org/whl/cu128 \\
+    'vllm==0.20.2' 'huggingface_hub[cli]' || true
+if /workspace/vllm-venv/bin/vllm --version >/dev/null 2>&1; then
+    echo "VLLM_OK" >> "$SESSION_DIR/orchestrator.log"
+else
+    echo "VLLM_FAIL" >> "$SESSION_DIR/orchestrator.log"
+fi
+EOSH
+
+cat > /tmp/task_hf.sh <<EOSH
+#!/usr/bin/env bash
+set -e
+export HF_HOME="\${HF_HOME:-/workspace/hf-cache}"
+mkdir -p "\$HF_HOME"
+if ! command -v huggingface-cli >/dev/null 2>&1; then
+    pip3 install -q --user --break-system-packages 'huggingface_hub[cli]' 2>/dev/null \\
+        || pip3 install -q --user 'huggingface_hub[cli]' || true
+    export PATH="\$HOME/.local/bin:\$PATH"
+fi
+timeout 1800 huggingface-cli download Qwen/Qwen3-30B-A3B-GPTQ-Int4 --quiet || true
+if [ -d "\$HF_HOME/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4" ]; then
+    echo "MODEL_OK" >> "$SESSION_DIR/orchestrator.log"
+else
+    echo "MODEL_FAIL" >> "$SESSION_DIR/orchestrator.log"
+fi
+EOSH
+
+chmod +x /tmp/task_build.sh /tmp/task_vllm.sh /tmp/task_hf.sh
+
+log "▶ Phase 1: launching 3 parallel tasks (nohup)"
+nohup bash /tmp/task_build.sh > "$SESSION_DIR/build.log" 2>&1 &
 BUILD_PID=$!
 log "  task A (ferrum build) PID=$BUILD_PID"
 
-# Task B: pip install vllm==0.20.2 (CUDA 13 wheel via torch cu13)
-vllm_task() {
-    if [ ! -d "/workspace/vllm-venv" ]; then
-        python3 -m venv /workspace/vllm-venv
-    fi
-    source /workspace/vllm-venv/bin/activate
-    timeout 60 pip install -U -q pip wheel setuptools
-    # vllm 0.20.2 pulls torch 2.11+cu13 transitively. Set the index in case
-    # vllm doesn't pull cu13 by default (manifests as "driver too old").
-    timeout 1800 pip install -q --extra-index-url https://download.pytorch.org/whl/cu128 \
-        'vllm==0.20.2' 'huggingface_hub[cli]'
-    if /workspace/vllm-venv/bin/vllm --version >/dev/null 2>&1; then
-        echo "VLLM_OK" >> "$SESSION_DIR/orchestrator.log"
-    else
-        echo "VLLM_FAIL" >> "$SESSION_DIR/orchestrator.log"
-    fi
-}
-nohup bash -c "vllm_task() { $(declare -f vllm_task); }; vllm_task" \
-    > "$SESSION_DIR/vllm_install.log" 2>&1 &
+nohup bash /tmp/task_vllm.sh > "$SESSION_DIR/vllm_install.log" 2>&1 &
 VLLM_PID=$!
 log "  task B (vllm install) PID=$VLLM_PID"
 
-# Task C: HF model download (Qwen3-30B-A3B-GPTQ-Int4, ~16 GB)
-hf_task() {
-    export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
-    mkdir -p "$HF_HOME"
-    # huggingface-cli ships with huggingface_hub — wait for vllm venv to install it
-    # or use a separate pip install. Use a tiny pip install up front.
-    if ! command -v huggingface-cli >/dev/null 2>&1; then
-        pip3 install -q --user 'huggingface_hub[cli]' || true
-        export PATH="$HOME/.local/bin:$PATH"
-    fi
-    timeout 1800 huggingface-cli download Qwen/Qwen3-30B-A3B-GPTQ-Int4 --quiet
-    if [ -d "$HF_HOME/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4" ]; then
-        echo "MODEL_OK" >> "$SESSION_DIR/orchestrator.log"
-    else
-        echo "MODEL_FAIL" >> "$SESSION_DIR/orchestrator.log"
-    fi
-}
-nohup bash -c "hf_task() { $(declare -f hf_task); }; hf_task" \
-    > "$SESSION_DIR/hf_download.log" 2>&1 &
+nohup bash /tmp/task_hf.sh > "$SESSION_DIR/hf_download.log" 2>&1 &
 HF_PID=$!
 log "  task C (HF download) PID=$HF_PID"
 
