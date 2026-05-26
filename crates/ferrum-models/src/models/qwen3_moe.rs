@@ -1149,10 +1149,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
 
         // PLAYBOOK § 1.2 — was: `B::sync(ctx); Some(Instant::now())`.
         // Migrated onto BackendTimer (CUDA: cuEvents, async, no sync paid).
-        let attn_t0 = ferrum_kernels::backend::timer::start_probe_timer::<B>(
-            "FERRUM_DECODE_OP_PROFILE",
-            ctx,
-        );
+        let attn_t0 =
+            ferrum_kernels::backend::timer::start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx);
 
         // 1. Input RMSNorm — skipped when the previous layer's MoE tail
         //    fused this norm via `weighted_sum_residual_norm_stacked`.
@@ -1486,7 +1484,11 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         }
 
         if let Some(us) = ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
-            attn_t0, ctx, "attn", "attention", li as u32,
+            attn_t0,
+            ctx,
+            "attn",
+            "attention",
+            li as u32,
         ) {
             ATTN_TIME_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
             ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1532,10 +1534,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
 
         // ── MoE FFN block ────────────────────────────────────────────
         // PLAYBOOK § 1.2 — migrated onto BackendTimer.
-        let moe_t0 = ferrum_kernels::backend::timer::start_probe_timer::<B>(
-            "FERRUM_DECODE_OP_PROFILE",
-            ctx,
-        );
+        let moe_t0 =
+            ferrum_kernels::backend::timer::start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx);
 
         // 10. Router gemv: norm_out [tokens, hidden] → router_logits [tokens, num_experts]
         moe_layer.router.forward(
@@ -2159,21 +2159,20 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                     ctx,
                 )
             };
-        let stage_finish =
-            |t: Option<<B as ferrum_kernels::backend::Backend>::Timer>,
-             ctx: &mut B::Context,
-             name: &str,
-             c: &AtomicU64| {
-                if let Some(us) = ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
-                    t,
-                    ctx,
-                    name,
-                    "decode_step",
-                    0,
-                ) {
-                    c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
-                }
-            };
+        let stage_finish = |t: Option<<B as ferrum_kernels::backend::Backend>::Timer>,
+                            ctx: &mut B::Context,
+                            name: &str,
+                            c: &AtomicU64| {
+            if let Some(us) = ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
+                t,
+                ctx,
+                name,
+                "decode_step",
+                0,
+            ) {
+                c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
         let mt0 = std::time::Instant::now();
 
         let mut residual = self

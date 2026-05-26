@@ -67,19 +67,17 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
     // start: CUDA event record (no sync); stop: event record + sync once,
     // then read elapsed_ms. Also pushes chrome-trace events when
     // FERRUM_TRACE_OUT is set (Phase 1.5).
+    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer};
     use ferrum_kernels::backend::Backend;
-    use ferrum_kernels::backend::timer::{start_probe_timer, finish_probe_timer_traced};
     let stage_t0 = |ctx: &mut B::Context| -> Option<<B as Backend>::Timer> {
         start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx)
     };
-    let stage_end = |t: Option<<B as Backend>::Timer>,
-                     ctx: &mut B::Context,
-                     name: &str,
-                     c: &AtomicU64| {
-        if let Some(us) = finish_probe_timer_traced::<B>(t, ctx, name, "moe", 0) {
-            c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
-        }
-    };
+    let stage_end =
+        |t: Option<<B as Backend>::Timer>, ctx: &mut B::Context, name: &str, c: &AtomicU64| {
+            if let Some(us) = finish_probe_timer_traced::<B>(t, ctx, name, "moe", 0) {
+                c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
 
     let t0 = stage_t0(ctx);
     B::route_topk_softmax(
@@ -312,7 +310,13 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
             inter,
             h,
         )?;
-        stage_end(t0, ctx, "host_topk", &MOE_PREFILL_HOST_TOPK_US, &MOE_PREFILL_HOST_TOPK_CALLS);
+        stage_end(
+            t0,
+            ctx,
+            "host_topk",
+            &MOE_PREFILL_HOST_TOPK_US,
+            &MOE_PREFILL_HOST_TOPK_CALLS,
+        );
         // Worst-case ids row stride; matches `dispatch_compute_ids_tpe`.
         tokens * top_k
     } else {
@@ -326,7 +330,13 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         B::write_typed::<i32>(ctx, &mut scratch.tpe_buf, &tpe_host);
         B::write_typed::<i32>(ctx, &mut scratch.ids_2d, &ids_host);
         B::write_typed::<f32>(ctx, &mut scratch.weights_2d, &route.expert_weights);
-        stage_end(t0, ctx, "host_topk", &MOE_PREFILL_HOST_TOPK_US, &MOE_PREFILL_HOST_TOPK_CALLS);
+        stage_end(
+            t0,
+            ctx,
+            "host_topk",
+            &MOE_PREFILL_HOST_TOPK_US,
+            &MOE_PREFILL_HOST_TOPK_CALLS,
+        );
         max_per_expert
     };
 
@@ -348,7 +358,13 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         max_per_expert,
         tokens,
     )?;
-    stage_end(t0, ctx, "gate", &MOE_PREFILL_GATE_US, &MOE_PREFILL_GATE_CALLS);
+    stage_end(
+        t0,
+        ctx,
+        "gate",
+        &MOE_PREFILL_GATE_US,
+        &MOE_PREFILL_GATE_CALLS,
+    );
 
     // 2. Batched up gemm — same shape as gate.
     let t0 = stage_t0(ctx);
@@ -376,7 +392,13 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         total_pairs,
         inter,
     )?;
-    stage_end(t0, ctx, "silu", &MOE_PREFILL_SILU_US, &MOE_PREFILL_SILU_CALLS);
+    stage_end(
+        t0,
+        ctx,
+        "silu",
+        &MOE_PREFILL_SILU_US,
+        &MOE_PREFILL_SILU_CALLS,
+    );
 
     // 4. Batched down gemm — src1 is [batch, top_k, expert_inter] from
     //    silu_stacked. ne11 = top_k → each pair reads its own row.
@@ -392,7 +414,13 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         max_per_expert,
         tokens,
     )?;
-    stage_end(t0, ctx, "down", &MOE_PREFILL_DOWN_US, &MOE_PREFILL_DOWN_CALLS);
+    stage_end(
+        t0,
+        ctx,
+        "down",
+        &MOE_PREFILL_DOWN_US,
+        &MOE_PREFILL_DOWN_CALLS,
+    );
 
     // 5. Per-batch weighted sum: moe_out[b, h] = Σ_k w[b,k] · down[b,k,h]
     let t0 = stage_t0(ctx);
@@ -405,7 +433,13 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
         top_k,
         h,
     )?;
-    stage_end(t0, ctx, "wsum", &MOE_PREFILL_WSUM_US, &MOE_PREFILL_WSUM_CALLS);
+    stage_end(
+        t0,
+        ctx,
+        "wsum",
+        &MOE_PREFILL_WSUM_US,
+        &MOE_PREFILL_WSUM_CALLS,
+    );
 
     Ok(())
 }
@@ -447,14 +481,12 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
     let stage_t0 = |ctx: &mut B::Context| -> Option<<B as Backend>::Timer> {
         start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx)
     };
-    let stage_end = |t: Option<<B as Backend>::Timer>,
-                     ctx: &mut B::Context,
-                     name: &str,
-                     c: &AtomicU64| {
-        if let Some(us) = finish_probe_timer_traced::<B>(t, ctx, name, "moe_batched", 0) {
-            c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
-        }
-    };
+    let stage_end =
+        |t: Option<<B as Backend>::Timer>, ctx: &mut B::Context, name: &str, c: &AtomicU64| {
+            if let Some(us) = finish_probe_timer_traced::<B>(t, ctx, name, "moe_batched", 0) {
+                c.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
 
     let total_pairs = tokens * top_k;
 

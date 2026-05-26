@@ -1,0 +1,167 @@
+{
+  "backend": "cuda",
+  "completed_per_run": [
+    128,
+    128,
+    128,
+    128,
+    128
+  ],
+  "concurrency": 1,
+  "e2e_ms": {
+    "p50": {
+      "ci95_hw": 0.7596055712310656,
+      "mean": 681.0164679,
+      "stddev": 0.6118622814698205
+    },
+    "p75": {
+      "ci95_hw": 0.7199013765042945,
+      "mean": 682.7170563500001,
+      "stddev": 0.5798805529392193
+    },
+    "p95": {
+      "ci95_hw": 2.646855505767817,
+      "mean": 687.35349961,
+      "stddev": 2.1320420884425166
+    },
+    "p99": {
+      "ci95_hw": 2.8121234207242614,
+      "mean": 691.3862924680001,
+      "stddev": 2.2651653926003927
+    }
+  },
+  "env": {
+    "commit_sha": "8836890",
+    "cuda": "13.0",
+    "driver": "580.159.04",
+    "ferrum_env": {
+      "FERRUM_DECODE_OP_PROFILE": "1",
+      "FERRUM_GRAPH": "1",
+      "FERRUM_GRAPH_SKIP_UPLOAD": "1",
+      "FERRUM_GREEDY_ARGMAX": "1",
+      "FERRUM_KV_MAX_BLOCKS": "2048",
+      "FERRUM_MOE_DEVICE_ROUTE": "1",
+      "FERRUM_MOE_STREAMS": "4",
+      "FERRUM_PAGED_MAX_SEQS": "32",
+      "FERRUM_TRACE_OUT": "/workspace/ferrum-infer-rs/docs/bench/sweep-2026-05-26-0356-qwen3-moe-30b-int4/c1/ferrum_trace.json",
+      "FERRUM_USE_VLLM_PAGED_ATTN": "1",
+      "FERRUM_VLLM_MOE": "1"
+    },
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2790,
+    "gpu_persistence_mode": true,
+    "gpu_power_limit_w": 300,
+    "hw_id": "rtx-4090",
+    "rust": "1.95.0"
+  },
+  "env_hash": "sha256:706069ec6206176215c3b413e729faf6073ad695fb186faf52a9479775568cbc",
+  "errored_per_run": [
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "goodput_rps": {
+    "ci95_hw": 0.0007894534347685626,
+    "mean": 1.4735211208691872,
+    "stddev": 0.0006359047353073495
+  },
+  "itl_ms": {
+    "p50": {
+      "ci95_hw": 0.0005911359195032695,
+      "mean": 4.6126968,
+      "stddev": 0.0004761599783685715
+    },
+    "p75": {
+      "ci95_hw": 0.0029709851229101905,
+      "mean": 4.69900645,
+      "stddev": 0.002393128492423543
+    },
+    "p95": {
+      "ci95_hw": 0.00613275676977952,
+      "mean": 4.92216571,
+      "stddev": 0.004939935528349797
+    },
+    "p99": {
+      "ci95_hw": 0.03239484122410708,
+      "mean": 5.247472432,
+      "stddev": 0.026094044343449543
+    }
+  },
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4#vllm",
+  "n_gen": 128,
+  "n_prompt": 256,
+  "n_repeats": 5,
+  "n_requests_per_run": 128,
+  "output_throughput_tps": {
+    "ci95_hw": 0.10183949308514344,
+    "mean": 190.08422459212517,
+    "stddev": 0.08203171085464717
+  },
+  "request_throughput_rps": {
+    "ci95_hw": 0.0007894534347685626,
+    "mean": 1.4735211208691872,
+    "stddev": 0.0006359047353073495
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "total_throughput_tps": {
+    "ci95_hw": 0.3039395723859228,
+    "mean": 567.3056315346371,
+    "stddev": 0.24482332309335064
+  },
+  "tpot_ms": {
+    "p50": {
+      "ci95_hw": 0.0004543493521742798,
+      "mean": 4.572637589843749,
+      "stddev": 0.0003659783994937614
+    },
+    "p75": {
+      "ci95_hw": 0.0008983978485061566,
+      "mean": 4.5755725398437495,
+      "stddev": 0.0007236594596899584
+    },
+    "p95": {
+      "ci95_hw": 0.0009993928347742387,
+      "mean": 4.579213189296875,
+      "stddev": 0.0008050109203103076
+    },
+    "p99": {
+      "ci95_hw": 0.0008948249418311608,
+      "mean": 4.58130600834375,
+      "stddev": 0.0007207814833922085
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "ci95_hw": 0.9061613894018221,
+      "mean": 95.8890769,
+      "stddev": 0.7299129918184913
+    },
+    "p75": {
+      "ci95_hw": 0.718726742747353,
+      "mean": 97.72754755,
+      "stddev": 0.5789343854575236
+    },
+    "p95": {
+      "ci95_hw": 2.653637226340003,
+      "mean": 102.47921621,
+      "stddev": 2.137504764308445
+    },
+    "p99": {
+      "ci95_hw": 3.3745358991582823,
+      "mean": 106.300272304,
+      "stddev": 2.7181886394204957
+    }
+  },
+  "warmup_requests": 10
+}

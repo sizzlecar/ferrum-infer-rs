@@ -151,10 +151,7 @@ impl RequestRecord {
         }
         let ttft_ok = self.ttft_ms <= slo.ttft_p99_ms;
         let e2e_ok = self.e2e_ms <= slo.e2e_p99_ms;
-        let tpot_ok = self
-            .tpot_ms()
-            .map(|t| t <= slo.tpot_p99_ms)
-            .unwrap_or(true);
+        let tpot_ok = self.tpot_ms().map(|t| t <= slo.tpot_p99_ms).unwrap_or(true);
         ttft_ok && e2e_ok && tpot_ok
     }
 }
@@ -364,7 +361,10 @@ mod tests {
     }
 
     fn make_run(records: Vec<RequestRecord>, duration_s: f64) -> RunRecord {
-        RunRecord { records, duration_s }
+        RunRecord {
+            records,
+            duration_s,
+        }
     }
 
     #[test]
@@ -414,10 +414,10 @@ mod tests {
     fn goodput_excludes_slo_violators() {
         let run = make_run(
             vec![
-                req(true, 100.0, 200.0, 10, 10),   // good
-                req(true, 1000.0, 1100.0, 10, 10), // TTFT violator
+                req(true, 100.0, 200.0, 10, 10),    // good
+                req(true, 1000.0, 1100.0, 10, 10),  // TTFT violator
                 req(true, 100.0, 40_000.0, 10, 10), // E2E violator
-                req(false, 100.0, 200.0, 10, 10),  // errored
+                req(false, 100.0, 200.0, 10, 10),   // errored
             ],
             10.0,
         );
@@ -443,7 +443,10 @@ mod tests {
     #[test]
     fn json_round_trip() {
         let run = make_run(
-            vec![req(true, 100.0, 200.0, 10, 10), req(true, 120.0, 240.0, 10, 10)],
+            vec![
+                req(true, 100.0, 200.0, 10, 10),
+                req(true, 120.0, 240.0, 10, 10),
+            ],
             5.0,
         );
         let report = compute_metrics(
