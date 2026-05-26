@@ -116,12 +116,14 @@ cat > /tmp/task_hf.sh <<EOSH
 set -e
 export HF_HOME="\${HF_HOME:-/workspace/hf-cache}"
 mkdir -p "\$HF_HOME"
-if ! command -v huggingface-cli >/dev/null 2>&1; then
-    pip3 install -q --user --break-system-packages 'huggingface_hub[cli]' 2>/dev/null \\
-        || pip3 install -q --user 'huggingface_hub[cli]' || true
+# huggingface_hub >=1.x deprecates huggingface-cli in favor of \`hf\`.
+# Install + use the new CLI.
+if ! command -v hf >/dev/null 2>&1; then
+    pip3 install -q --user 'huggingface_hub' >/dev/null 2>&1 || \\
+        pip3 install -q --user --break-system-packages 'huggingface_hub' || true
     export PATH="\$HOME/.local/bin:\$PATH"
 fi
-timeout 1800 huggingface-cli download Qwen/Qwen3-30B-A3B-GPTQ-Int4 --quiet || true
+timeout 1800 hf download Qwen/Qwen3-30B-A3B-GPTQ-Int4 || true
 if [ -d "\$HF_HOME/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4" ]; then
     echo "MODEL_OK" >> "$SESSION_DIR/orchestrator.log"
 else
