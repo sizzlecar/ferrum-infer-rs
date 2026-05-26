@@ -146,7 +146,10 @@ impl TraceWriter {
     /// True if the writer is configured to emit. Probes can use this to
     /// skip the `BackendTimer` overhead entirely when tracing is off.
     pub fn is_enabled(&self) -> bool {
-        matches!(*self.inner.lock().unwrap(), TraceWriterInner::Buffering { .. })
+        matches!(
+            *self.inner.lock().unwrap(),
+            TraceWriterInner::Buffering { .. }
+        )
     }
 
     /// Record a complete event with `name`, `cat`, elapsed milliseconds.
@@ -188,7 +191,10 @@ impl TraceWriter {
     /// writers reset their event buffer).
     pub fn flush(&self) -> std::io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        if let TraceWriterInner::Buffering { out_path, events, .. } = &mut *inner {
+        if let TraceWriterInner::Buffering {
+            out_path, events, ..
+        } = &mut *inner
+        {
             let json = serde_json::to_string(&events).expect("serialize trace");
             std::fs::write(out_path, json)?;
             events.clear();

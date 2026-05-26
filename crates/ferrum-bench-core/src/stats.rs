@@ -37,17 +37,29 @@ impl ScalarStats {
     pub fn from_samples(xs: &[f64]) -> Self {
         let n = xs.len();
         if n == 0 {
-            return Self { mean: 0.0, stddev: 0.0, ci95_hw: 0.0 };
+            return Self {
+                mean: 0.0,
+                stddev: 0.0,
+                ci95_hw: 0.0,
+            };
         }
         let mean = xs.iter().sum::<f64>() / n as f64;
         if n < 3 {
             // Schema rule: CI with n < 3 is degenerate; emit mean only.
-            return Self { mean, stddev: 0.0, ci95_hw: 0.0 };
+            return Self {
+                mean,
+                stddev: 0.0,
+                ci95_hw: 0.0,
+            };
         }
         let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
         let stddev = var.sqrt();
         let ci95_hw = ci95_half_width(stddev, n);
-        Self { mean, stddev, ci95_hw }
+        Self {
+            mean,
+            stddev,
+            ci95_hw,
+        }
     }
 
     /// True if the absolute mean difference exceeds the sum of the two
@@ -180,24 +192,44 @@ mod tests {
     #[test]
     fn differs_from_overlap() {
         // Two non-overlapping CIs → differ.
-        let a = ScalarStats { mean: 100.0, stddev: 5.0, ci95_hw: 4.0 };
-        let b = ScalarStats { mean: 110.0, stddev: 5.0, ci95_hw: 4.0 };
+        let a = ScalarStats {
+            mean: 100.0,
+            stddev: 5.0,
+            ci95_hw: 4.0,
+        };
+        let b = ScalarStats {
+            mean: 110.0,
+            stddev: 5.0,
+            ci95_hw: 4.0,
+        };
         assert!(a.differs_from(&b));
         // Overlap by 1 → not significant.
-        let c = ScalarStats { mean: 107.0, stddev: 5.0, ci95_hw: 4.0 };
+        let c = ScalarStats {
+            mean: 107.0,
+            stddev: 5.0,
+            ci95_hw: 4.0,
+        };
         assert!(!a.differs_from(&c));
     }
 
     #[test]
     fn json_omits_dispersion_when_zero() {
-        let s = ScalarStats { mean: 42.0, stddev: 0.0, ci95_hw: 0.0 };
+        let s = ScalarStats {
+            mean: 42.0,
+            stddev: 0.0,
+            ci95_hw: 0.0,
+        };
         let j = serde_json::to_string(&s).unwrap();
         assert_eq!(j, r#"{"mean":42.0}"#);
     }
 
     #[test]
     fn json_includes_dispersion_when_set() {
-        let s = ScalarStats { mean: 42.0, stddev: 1.5, ci95_hw: 0.8 };
+        let s = ScalarStats {
+            mean: 42.0,
+            stddev: 1.5,
+            ci95_hw: 0.8,
+        };
         let j = serde_json::to_string(&s).unwrap();
         assert!(j.contains("\"stddev\":1.5"));
         assert!(j.contains("\"ci95_hw\":0.8"));

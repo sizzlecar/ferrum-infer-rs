@@ -127,7 +127,10 @@ impl Default for CpuTimer {
 
 impl CpuTimer {
     pub fn new() -> Self {
-        Self { start: None, end: None }
+        Self {
+            start: None,
+            end: None,
+        }
     }
 }
 
@@ -182,7 +185,10 @@ impl Default for MetalTimer {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 impl MetalTimer {
     pub fn new() -> Self {
-        Self { start: None, end: None }
+        Self {
+            start: None,
+            end: None,
+        }
     }
 }
 
@@ -201,10 +207,7 @@ impl BackendTimer<crate::backend::metal::MetalBackend> for MetalTimer {
         self.start = Some(std::time::Instant::now());
     }
 
-    fn record_end(
-        &mut self,
-        ctx: &mut <crate::backend::metal::MetalBackend as Backend>::Context,
-    ) {
+    fn record_end(&mut self, ctx: &mut <crate::backend::metal::MetalBackend as Backend>::Context) {
         // Sync so the wall-clock delta is bounded by actual GPU completion.
         crate::backend::metal::MetalBackend::sync(ctx);
         self.end = Some(std::time::Instant::now());
@@ -289,10 +292,7 @@ impl BackendTimer<crate::backend::cuda::CudaBackend> for CudaTimer {
         CudaTimer::new()
     }
 
-    fn record_start(
-        &mut self,
-        ctx: &mut <crate::backend::cuda::CudaBackend as Backend>::Context,
-    ) {
+    fn record_start(&mut self, ctx: &mut <crate::backend::cuda::CudaBackend as Backend>::Context) {
         use cudarc::driver::sys as cu;
         if let Some(evt) = self.start {
             unsafe {
@@ -302,10 +302,7 @@ impl BackendTimer<crate::backend::cuda::CudaBackend> for CudaTimer {
         }
     }
 
-    fn record_end(
-        &mut self,
-        ctx: &mut <crate::backend::cuda::CudaBackend as Backend>::Context,
-    ) {
+    fn record_end(&mut self, ctx: &mut <crate::backend::cuda::CudaBackend as Backend>::Context) {
         use cudarc::driver::sys as cu;
         if let Some(evt) = self.end {
             unsafe {

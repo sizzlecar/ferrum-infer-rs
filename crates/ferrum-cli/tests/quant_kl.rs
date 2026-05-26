@@ -216,7 +216,10 @@ async fn run_corpus(model: &str) -> Vec<String> {
 
 fn hf_cached(repo_dir_substring: &str) -> bool {
     let hf = std::env::var("HF_HOME").unwrap_or_else(|_| {
-        format!("{}/.cache/huggingface", std::env::var("HOME").unwrap_or_default())
+        format!(
+            "{}/.cache/huggingface",
+            std::env::var("HOME").unwrap_or_default()
+        )
     });
     let hub = Path::new(&hf).join("hub");
     if !hub.exists() {
@@ -275,9 +278,7 @@ async fn paired_quant_drift_qwen2p5_3b() {
     let int4 = "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4";
 
     if !hf_cached("Qwen2.5-3B-Instruct-GPTQ-Int4") {
-        eprintln!(
-            "\n⚠ skip: {int4} not in HF cache. To enable, download both variants:"
-        );
+        eprintln!("\n⚠ skip: {int4} not in HF cache. To enable, download both variants:");
         eprintln!("    huggingface-cli download {fp16}");
         eprintln!("    huggingface-cli download {int4}");
         return;

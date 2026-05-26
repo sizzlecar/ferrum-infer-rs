@@ -71,7 +71,11 @@ fn silu_mul_llama_shape() {
 #[test]
 fn gemm_small_shape() {
     // m × n × k = 4 × 128 × 128 — keep CPU reference fast.
-    let op = GemmOp { m: 4, n: 128, k: 128 };
+    let op = GemmOp {
+        m: 4,
+        n: 128,
+        k: 128,
+    };
     let report = compare_backends(&op, 17);
     assert_eq!(report.cpu.len(), op.m * op.n);
     check_accelerator_tolerance(&report, NMSE_FP16_TOL);
@@ -81,7 +85,11 @@ fn gemm_small_shape() {
 fn gemm_qkv_shape() {
     // Llama-3 8B QKV: m=tokens, n=hidden, k=hidden. Small token count
     // since CPU O(m*n*k) loop is cubic.
-    let op = GemmOp { m: 2, n: 4096, k: 4096 };
+    let op = GemmOp {
+        m: 2,
+        n: 4096,
+        k: 4096,
+    };
     let report = compare_backends(&op, 31);
     check_accelerator_tolerance(&report, NMSE_FP16_TOL);
 }
