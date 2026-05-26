@@ -57,6 +57,7 @@ template <typename scalar_t,  // compute dtype, half or nv_float16
                                      // with a separate quantization scale
           const bool is_zp_float     // is zero point of float16 type?
           >
+__attribute__((visibility("default")))
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
@@ -241,6 +242,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                                    // with a separate quantization scale
           const bool is_zp_float   // is zero point of float16 type?
           >
+__attribute__((visibility("default")))
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
