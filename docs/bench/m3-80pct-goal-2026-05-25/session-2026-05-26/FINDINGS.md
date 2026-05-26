@@ -35,6 +35,65 @@ and `docs/bench/vllm-only-sweep/c32_nsys/`.
 
 ---
 
+## ⚠️ Real root cause of `FERRUM_VLLM_MOE=1` garbled output (added late)
+
+The "ScalarType::id() TU mismatch" diagnosis in the section below was
+**wrong**. After both fixes (`b0da10d` straight-line OR-chain id() +
+`241dbc0` literal IDs) the user's CLI still produced garbled output
+with `FERRUM_VLLM_MOE=1`.
+
+A 10-minute direct nvcc microbench (`scripts/microbenches/scalar_type_id_test.cu`)
+proved that `vllm::ScalarType::id()` is consistent across TUs already
+on commit `b0da10d` (and even on the original `cbe04ea` code, in
+hindsight — the session-2026-05-25 PROGRESS.md `nm` evidence was
+showing DIFFERENT Marlin specializations because the dispatcher was
+selecting FP4/FP8 paths while only INT4 kernels were instantiated; NOT
+the same constexpr evaluating differently).
+
+The actual bug is a **weight-packing format mismatch**:
+
+```rust
+// crates/ferrum-kernels/src/backend/cuda/quant.rs:728
+let qw_packed = crate::marlin::repack_gptq_to_marlin(&qw_in, k, n_per_expert);
+```
+
+ferrum's MoE-expert stack-build uses **IST-DASLab marlin packing**
+(`crate::marlin::repack_gptq_to_marlin`), but the kernel called by
+`FERRUM_VLLM_MOE=1` is `marlin_gemm_moe_vllm → ferrum_vllm_marlin_moe_f16
+→ vllm::marlin_mm<half>` which expects **vLLM's own marlin packing**
+(a different bit layout). The kernel runs, reads the IST-packed bytes
+as if they were vLLM-packed, dequants the wrong bit slices, and returns
+garbage activations.
+
+vLLM's packing kernel is already ported into ferrum
+(`crates/ferrum-kernels/src/backend/cuda/vllm_marlin.rs:31`
+`ferrum_vllm_gptq_marlin_repack`) but is wired ONLY to the dense
+vllm-marlin path — not to the MoE expert stack at `quant.rs:728`.
+
+### Fix paths (ranked)
+
+| option | work | risk | retention of FERRUM_VLLM_MOE=1 benefits |
+|---|---|---|---|
+| A. MoE stack uses `ferrum_vllm_gptq_marlin_repack` (per-expert) | ~1 day (device-side repack per expert + scales layout verify) | medium | full |
+| B. Stay on ferrum's own `marlin_gemm_moe` (SAFE config) | 0 | 0 | none (~0.41 ratio at c=32, no batched-expert) |
+| C. Wrap vLLM's device repack into the stack flow at load | ~2 days | high | full |
+
+This session chose B (since A/C exceed remaining pod budget).
+
+### Implication for M3 80%
+
+The path to ratio ≥ 0.80 at c=32 still goes through enabling
+`FERRUM_VLLM_MOE=1` correctly (option A), which would also activate
+the device-route path (eliminating 62% DtoH overhead). Without that,
+SAFE-config ferrum stays ~0.41 at c=32. Multi-week deep work on
+graph coverage + FA2 SplitKV would also be needed.
+
+The `b0da10d` and `241dbc0` patches stay in the tree because the
+rewritten `id()` is functionally equivalent and the literal constants
+don't hurt — but neither is the bug fix. The bug is in `quant.rs:728`.
+
+---
+
 ## Correctness regression (CUDA 13)
 
 Two independent kernel paths produce wrong output when enabled on
