@@ -171,12 +171,50 @@ Lever #1 (vllm-moe-marlin) unblocked. See
 [`session-2026-05-25/RESULTS.md`](session-2026-05-25/RESULTS.md) +
 [`session-2026-05-25/PROGRESS.md`](session-2026-05-25/PROGRESS.md).
 
-| c  | OFF tput | ON tput | Δ%   | ratio_OFF → ratio_ON | gap to 0.80 |
+> ⚠️ **Data-quality caveats — read before quoting any number below**
+>
+> Per the same caveats applied to the original baseline table earlier
+> in this doc, the session-2026-05-25 numbers are **preliminary, not
+> publication-grade**:
+>
+> 1. **vLLM ratios are apples-to-oranges**. The ratio column compares
+>    this session's ferrum runs (`--dataset random --random-input-len
+>    256 --random-output-len 128`) against the historical vLLM column
+>    (2026-05-13 ShareGPT, average input ≤ 200 tokens). random-256 is
+>    roughly 2× heavier on prefill — it suppresses ferrum's throughput
+>    denominator and depresses the ratio (especially at small c where
+>    prefill dominates). The Δ% column (OFF→ON) is sound; the
+>    ratio_OFF / ratio_ON columns are **indicative only**.
+> 2. **n_repeats=1**. Single-shot per cell, no Student-t CI. PLAYBOOK
+>    § 0.4 needs n ≥ 3 before quoting outside the team.
+> 3. **c=4 marked anomaly** is inherited from the previous session's
+>    `num_prompts=30` caveat — **not re-verified** this session. Treat
+>    the +7% Δ as a lower bound; re-run with `num_prompts ≥ 128`
+>    before reading anything into it.
+> 4. **c=32 + FERRUM_GRAPH=0 = "−1.5% vs GRAPH=1"** (in `RESULTS.md`)
+>    sits inside single-shot noise. Don't read it as "graph-off doesn't
+>    help with vllm-moe-marlin" until repeated n ≥ 3.
+> 5. **No nsys / chrome-trace captured for the ON path this session**.
+>    `bottleneck-c1/c4/c16/c32.md` in this directory still describe
+>    the OFF (pre-vllm-moe-marlin) state. We don't yet know which
+>    kernel owns the remaining 23 pp gap at c=32 ON — `moe` may no
+>    longer be 73% of GPU time once vllm-moe-marlin is active.
+>
+> Re-baseline against apples-to-apples vLLM (random 256/128, vLLM
+> 0.20.2 on driver ≥ 575) **and** re-run `sweep_bottleneck.sh
+> qwen3-moe-30b-int4` with `FERRUM_VLLM_MOE=1` before any external
+> communication of this lever's outcome.
+
+| c  | OFF tput | ON tput | Δ%   | ratio_OFF → ratio_ON ⚠️ | gap to 0.80 ⚠️ |
 |---:|---------:|--------:|-----:|---:|---:|
 | 1  | 128.0    | 146.5   | +14% | 0.62 → **0.71** | 9 pp |
-| 4  | 130.1    | 138.8   | +7%  | 0.26 → 0.27 | re-test (anomaly) |
+| 4  | 130.1    | 138.8   | +7%  | 0.26 → 0.27 ⚠️ | re-test (anomaly inherited, not re-verified) |
 | 16 | 673.6    | 818.3   | +22% | 0.54 → **0.65** | 15 pp |
 | 32 | 871.1    | 1079.4  | +24% | 0.46 → **0.57** | 23 pp |
+
+⚠️ markers on a column mean "see caveat #1 — apples-to-oranges with
+the vLLM denominator". The OFF→ON Δ% column itself is internally
+consistent (same hardware, same dataset).
 
 Phase B is partially done — vllm-moe-marlin shipped, but the c=32
 graph-off A/B and Phase 3 chunked-prefill 8192 verify are still
@@ -185,3 +223,17 @@ gap on c=16/c=32. The encoding bug GOAL.md hinted at went deeper
 than visibility flags — see
 [`session-2026-05-25/PROGRESS.md#findings`](session-2026-05-25/PROGRESS.md#findings)
 for the symbol-level diagnosis.
+
+### Next-session must-do (to retire the caveats above)
+
+1. Rent pod with driver ≥ 575, install vLLM 0.20.2, run `vllm bench
+   serve --dataset random --random-input-len 256 --random-output-len
+   128 --num-prompts 256 --n-repeats 5` for c=1/4/16/32 to land the
+   apples-to-apples denominator.
+2. `FERRUM_VLLM_MOE=1 bash scripts/sweep_bottleneck.sh
+   qwen3-moe-30b-int4 1,4,16,32` (this captures chrome trace + nsys)
+   and replace `bottleneck-c*.md` with ON-state data.
+3. Re-run ferrum bench with `num_prompts=128, n_repeats=5` so the
+   throughput column lands with CI95.
+4. Replace this Update block with the publication-grade table once
+   (1)+(3) are in hand.
