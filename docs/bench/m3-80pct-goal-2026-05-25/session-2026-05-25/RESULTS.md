@@ -1,9 +1,16 @@
 # Session bench results — 2026-05-25 vllm-moe-marlin unblock
 
+> ⚠️ **PRELIMINARY** — `n_repeats=1`, `num_prompts=30`, no nsys / chrome-trace
+> captured for the ON path, vLLM ratio column uses a different dataset than
+> ferrum's runs (see `../GOAL.md` Update caveats). The OFF→ON Δ% is
+> internally consistent; the ratio_OFF / ratio_ON columns are indicative
+> only. Don't quote these numbers externally before the next-session
+> re-baseline (re-baseline checklist at the bottom of `../GOAL.md`).
+
 GPU: Vast contract 37796550, RTX 4090 (sm_89), CUDA 13.0.48, driver 580.82.09,
 locked 2520 MHz / 350 W. ferrum commit `47e8dec`. Dataset: random in=256
-out=128, num_prompts=30, warmup=5, n_repeats=1. Same iter-3 env knob set
-as GOAL.md cell-2026-05-25.
+out=128, `num_prompts=30`, warmup=5, **`n_repeats=1` (single-shot, no CI95)**.
+Same iter-3 env knob set as GOAL.md cell-2026-05-25.
 
 ## Numbers
 
@@ -62,12 +69,14 @@ heuristic) + Phase E (chunked-prefill 8192 tokens) still needed.
 Per GOAL.md lever #5 prediction of "+3pp at c=32". With vllm-moe-marlin
 on:
 
-| config | c=32 tput tok/s |
+| config | c=32 tput tok/s (n=1) |
 |---|---:|
 | GRAPH=1 (current default, ON path) | 1079.4 |
 | GRAPH=0 (this test) | 1063.2 |
 
-**GRAPH=0 is -1.5% worse**, not +3pp. The original prediction was vs
-the iter-3 (no vllm-moe-marlin) baseline; the new MoE kernel restructures
-work so graph capture overhead is amortized differently. Ship default
-remains `FERRUM_GRAPH=1` across all c.
+⚠️ **Inconclusive at n=1.** −1.5% is inside single-shot noise (we've
+seen day-to-day c=32 numbers wobble ~3-5% even with locked clocks). Do
+**not** read this as "graph-off doesn't help once vllm-moe-marlin is
+on" — that needs ≥3 repeats per cell. The most we can say from this
+data is "graph-off is not an obvious win at c=32; merits a proper A/B
+in the next session" — not a refutation of GOAL.md lever #5.
