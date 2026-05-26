@@ -1107,7 +1107,7 @@ __global__ void Marlin(
 
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
-          if constexpr (w_type_id != vllm::kFE2M1f.id()) {
+          if constexpr (w_type_id != vllm::kFE2M1fId_LITERAL) {
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
                 sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else if constexpr (group_blocks == 1 || thread_k_blocks > 4) {
@@ -1345,7 +1345,7 @@ __global__ void Marlin(
       FragB frag_b1;
       int b_quant_0, b_quant_1;
 
-      if constexpr (w_type_id == vllm::kFE2M1f.id()) {
+      if constexpr (w_type_id == vllm::kFE2M1fId_LITERAL) {
         b_quant_1 = frag_b_quant[k2][0][j];
         b_quant_0 = b_quant_1 << 8;
       } else if constexpr (w_type.size_bits() == 4) {

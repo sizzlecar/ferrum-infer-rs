@@ -36,7 +36,8 @@ namespace MARLIN_NAMESPACE_NAME {
                      THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8,         \
                      GROUP_BLOCKS, NUM_THREADS, IS_ZP_FLOAT)                   \
   template __global__ void                                                     \
-  Marlin<SCALAR_T, vllm::W_TYPE.id(), vllm::S_TYPE.id(), NUM_THREADS,          \
+  Marlin<SCALAR_T, vllm::W_TYPE##Id_LITERAL, vllm::S_TYPE##Id_LITERAL,          \
+         NUM_THREADS,                                                          \
          THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8, 4, \
          GROUP_BLOCKS, IS_ZP_FLOAT>(MARLIN_KERNEL_PARAMS);
 

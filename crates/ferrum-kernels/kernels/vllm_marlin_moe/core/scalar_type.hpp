@@ -373,4 +373,55 @@ static inline constexpr auto kFloat16 = kHalf;
 static inline constexpr auto kBFloat16 = kFE8M7;
 
 static inline constexpr auto kFloat16Id = kFloat16.id();
+
+// ─────────────────────────────────────────────────────────────────────
+// CUDA-13 nvcc cudafe++ workaround for `kFoo.id()` as template params
+// ─────────────────────────────────────────────────────────────────────
+//
+// Even with id() rewritten to a straight-line bit-pack (above), the
+// constexpr evaluation can STILL mangle inconsistently across TUs when
+// used as a template non-type parameter (the dequant.h specializations,
+// the Marlin<...,W_TYPE.id(),S_TYPE.id(),...> dispatcher in ops.cu, and
+// the explicit instantiations in kernel_instantiations.cu).
+//
+// Symptom (2026-05-26): with FERRUM_VLLM_MOE=1, ferrum returned a
+// repeated single token ("The The The...") regardless of prompt. The
+// dispatcher selected `Marlin<half, id_X, id_Y, ...>` while the
+// explicit instantiation defined `Marlin<half, id_X', id_Y', ...>` —
+// different mangled IDs for the same logical scalar type — so the
+// kernel that ran at runtime was the undefined base template (no
+// body) for dequant, producing garbage fragments.
+//
+// Hardcoded `int64_t` literals bypass the constexpr eval entirely.
+// All TUs see the same compile-time-known integer constants → matching
+// template specializations. Bit layout matches the id() output
+// (exp:8 | mant:8 | signed_:1 | bias:32 | fvo:1 | nan_repr:8).
+//
+// Values were verified against nsys-observed Marlin<...,LONG,...>
+// symbols and against a direct compile-time print.
+//
+// kFloat16  = float_IEEE754(5,10)  → exp=5  mant=10 sgn=1 bias=0   nan=1
+// kBFloat16 = float_IEEE754(8,7)   → exp=8  mant=7  sgn=1 bias=0   nan=1
+// kU4       = uint(4,0)            → exp=0  mant=4  sgn=0 bias=0   nan=1
+// kU4B8     = uint(4,8)            → exp=0  mant=4  sgn=0 bias=8   nan=1
+// kU8       = uint(8,0)            → exp=0  mant=8  sgn=0 bias=0   nan=1
+// kU8B128   = uint(8,128)          → exp=0  mant=8  sgn=0 bias=128 nan=1
+static constexpr int64_t kFloat16Id_LITERAL  = 1125899906910725LL;
+static constexpr int64_t kBFloat16Id_LITERAL = 1125899906909960LL;
+static constexpr int64_t kU4Id_LITERAL       = 1125899906843648LL;
+static constexpr int64_t kU4B8Id_LITERAL     = 1125899907892224LL;
+static constexpr int64_t kU8Id_LITERAL       = 1125899906844672LL;
+static constexpr int64_t kU8B128Id_LITERAL   = 1125899923621888LL;
+// FP8 / FP4 ids (kFE4M3fn / kFE8M0fnu / kFE2M1f). ferrum's M3 path
+// doesn't instantiate these (we don't use FP4/FP8 weights), but
+// dequant.h has template specializations referencing them — keep
+// literals so the specs match the dispatcher even if FP4/FP8 ever
+// fires.
+// kFE4M3fn  = float_(4,3,true,NAN_EXTD_RANGE_MAX_MIN=2): exp=4 mant=3 sgn=1 bias=0 fvo=1 nan=2
+// kFE8M0fnu = ScalarType(8,0,false,0,true,NAN_EXTD_RANGE_MAX_MIN=2): exp=8 mant=0 sgn=0 bias=0 fvo=1 nan=2
+// kFE2M1f   = float_(2,1,true,NAN_NONE=0): exp=2 mant=1 sgn=1 bias=0 fvo=1 nan=0
+static constexpr int64_t kFE4M3fnId_LITERAL  = 2814749767172868LL;
+static constexpr int64_t kFE8M0fnuId_LITERAL = 2814749767106568LL;
+static constexpr int64_t kFE2M1fId_LITERAL   =  562949953487106LL;
+
 };  // namespace vllm
