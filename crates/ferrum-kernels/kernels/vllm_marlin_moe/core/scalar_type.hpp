@@ -128,36 +128,19 @@ class ScalarType {
   // unique id for this scalar type that can be computed at compile time for
   //  c++17 template specialization this is not needed once we migrate to
   //  c++20 and can pass literal classes as template parameters
-  //
-  // CUDA-13 fix (2026-05-26): the original implementation used a
-  // recursive constexpr fold (`reduce_members → reduce_members_helper`)
-  // over struct members. nvcc 13.0.48's `cudafe++` frontend mis-mangles
-  // this fold *across translation units* — the same `kFloat16.id()`
-  // expression evaluated to `1125899906910725` in one TU and a
-  // different value in another, breaking template-parameter matching
-  // between the dispatcher (`ops.cu`) and the explicit instantiations
-  // (`kernel_instantiations.cu`). The wrong-id template specialization
-  // executed at runtime with the wrong dtype → garbled output.
-  //
-  // Replacement: hand-unrolled straight-line bit-pack. Identical
-  // semantics, deterministic mangling under nvcc 13. Member order
-  // matches `reduce_members` to preserve all existing IDs (and the
-  // existing `from_id` reverse).
-  //   bits 0-7  : exponent (uint8_t)
-  //   bits 8-15 : mantissa (uint8_t)
-  //   bit  16   : signed_ (bool)
-  //   bits 17-48: bias (int32_t, masked to 32 bits)
-  //   bit  49   : finite_values_only (bool)
-  //   bits 50-57: nan_repr (uint8_t)
   constexpr Id id() const {
     static_assert(id_size_bits() <= sizeof(Id) * 8,
                   "ScalarType id is too large to be stored");
-    return (int64_t(exponent) & 0xFF)
-         | ((int64_t(mantissa) & 0xFF) << 8)
-         | ((int64_t(signed_) & 0x1) << 16)
-         | ((int64_t(bias) & 0xFFFFFFFFLL) << 17)
-         | ((int64_t(finite_values_only) & 0x1) << 49)
-         | ((int64_t(nan_repr) & 0xFF) << 50);
+
+    auto or_and_advance = [](std::pair<Id, uint32_t> result,
+                             auto member) -> std::pair<Id, uint32_t> {
+      auto [id, bit_offset] = result;
+      auto constexpr bits = member_id_field_width<decltype(member)>();
+      return {id | (int64_t(member) & ((uint64_t(1) << bits) - 1))
+                       << bit_offset,
+              bit_offset + bits};
+    };
+    return reduce_members(or_and_advance, std::pair<Id, uint32_t>{}).first;
   }
 
   // create a ScalarType from an id, for c++17 template specialization,
