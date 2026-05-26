@@ -130,6 +130,18 @@ for c in "${CELLS[@]}"; do
     fi
 
     # ── vLLM bench (no env vars; clean apples-to-apples) ──
+    # Skip when SKIP_VLLM=1 (e.g. pod has no vllm install, or only ferrum
+    # numbers needed). Cell still produces ferrum_baseline.json + trace.
+    if [ "${SKIP_VLLM:-0}" = "1" ] || ! command -v vllm >/dev/null 2>&1; then
+        echo "  (vllm skipped: SKIP_VLLM=${SKIP_VLLM:-0}, command=$(command -v vllm || echo absent))"
+        python3 -c "
+import json
+f = json.load(open('$cell_dir/ferrum_baseline.json'))
+ft = f.get('output_throughput_tps', {}).get('mean', 0)
+print(f'  c=$c  ferrum={ft:.1f} tok/s  (vllm skipped)')
+"
+        continue
+    fi
     VPORT=$((19000 + c))
     VLLM_ARGS=(
         "$HF_MODEL"

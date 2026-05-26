@@ -1,0 +1,167 @@
+{
+  "backend": "cuda",
+  "completed_per_run": [
+    128,
+    128,
+    128,
+    128,
+    128
+  ],
+  "concurrency": 32,
+  "e2e_ms": {
+    "p50": {
+      "ci95_hw": 38.74787021639815,
+      "mean": 2228.7749198,
+      "stddev": 31.211409145247032
+    },
+    "p75": {
+      "ci95_hw": 23.4032245267494,
+      "mean": 2258.8627097,
+      "stddev": 18.851297166607353
+    },
+    "p95": {
+      "ci95_hw": 52.227923648837894,
+      "mean": 2334.86048716,
+      "stddev": 42.069592075817866
+    },
+    "p99": {
+      "ci95_hw": 68.17918365686178,
+      "mean": 2351.5255719240004,
+      "stddev": 54.91833188299195
+    }
+  },
+  "env": {
+    "commit_sha": "8836890",
+    "cuda": "13.0",
+    "driver": "580.159.04",
+    "ferrum_env": {
+      "FERRUM_DECODE_OP_PROFILE": "1",
+      "FERRUM_GRAPH": "1",
+      "FERRUM_GRAPH_SKIP_UPLOAD": "1",
+      "FERRUM_GREEDY_ARGMAX": "1",
+      "FERRUM_KV_MAX_BLOCKS": "2048",
+      "FERRUM_MOE_DEVICE_ROUTE": "1",
+      "FERRUM_MOE_STREAMS": "4",
+      "FERRUM_PAGED_MAX_SEQS": "32",
+      "FERRUM_TRACE_OUT": "/workspace/ferrum-infer-rs/docs/bench/sweep-2026-05-26-0356-qwen3-moe-30b-int4/c32/ferrum_trace.json",
+      "FERRUM_USE_VLLM_PAGED_ATTN": "1",
+      "FERRUM_VLLM_MOE": "1"
+    },
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2790,
+    "gpu_persistence_mode": true,
+    "gpu_power_limit_w": 300,
+    "hw_id": "rtx-4090",
+    "rust": "1.95.0"
+  },
+  "env_hash": "sha256:1b4a85f694ca91d1c95ab06eb363b43c867a34bd9e246495ce590a159ef722ae",
+  "errored_per_run": [
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "goodput_rps": {
+    "ci95_hw": 0.26438644036680786,
+    "mean": 14.349540559075885,
+    "stddev": 0.2129632755725421
+  },
+  "itl_ms": {
+    "p50": {
+      "ci95_hw": 0.20905978803549374,
+      "mean": 12.9846814,
+      "stddev": 0.16839765756810565
+    },
+    "p75": {
+      "ci95_hw": 0.08517854331381468,
+      "mean": 13.90387435,
+      "stddev": 0.06861131594888323
+    },
+    "p95": {
+      "ci95_hw": 0.883045152112771,
+      "mean": 15.827023469999995,
+      "stddev": 0.7112928628695239
+    },
+    "p99": {
+      "ci95_hw": 8.028959579034165,
+      "mean": 85.69768848199999,
+      "stddev": 6.467326875835191
+    }
+  },
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4#vllm",
+  "n_gen": 128,
+  "n_prompt": 256,
+  "n_repeats": 5,
+  "n_requests_per_run": 128,
+  "output_throughput_tps": {
+    "ci95_hw": 34.66422562390628,
+    "mean": 1850.3112632605971,
+    "stddev": 27.922033459093846
+  },
+  "request_throughput_rps": {
+    "ci95_hw": 0.26438644036680786,
+    "mean": 14.349540559075885,
+    "stddev": 0.2129632755725421
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "total_throughput_tps": {
+    "ci95_hw": 102.3375460348995,
+    "mean": 5523.793646384024,
+    "stddev": 82.43289250163883
+  },
+  "tpot_ms": {
+    "p50": {
+      "ci95_hw": 0.3758255449316745,
+      "mean": 13.7795539328125,
+      "stddev": 0.30272747339629896
+    },
+    "p75": {
+      "ci95_hw": 0.17694327048133718,
+      "mean": 14.444401166406248,
+      "stddev": 0.14252780293854536
+    },
+    "p95": {
+      "ci95_hw": 0.15108286136442758,
+      "mean": 14.939213708906248,
+      "stddev": 0.1216972436044801
+    },
+    "p99": {
+      "ci95_hw": 0.17949307201766718,
+      "mean": 15.264401133718753,
+      "stddev": 0.14458166805539235
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "ci95_hw": 70.25421077046335,
+      "mean": 450.6744292,
+      "stddev": 56.58976620617937
+    },
+    "p75": {
+      "ci95_hw": 72.8152801715019,
+      "mean": 552.3137473500001,
+      "stddev": 58.652707587957785
+    },
+    "p95": {
+      "ci95_hw": 62.87077647123648,
+      "mean": 677.29228807,
+      "stddev": 50.64240993799681
+    },
+    "p99": {
+      "ci95_hw": 53.000884044325716,
+      "mean": 700.7810106020002,
+      "stddev": 42.69221166811826
+    }
+  },
+  "warmup_requests": 10
+}

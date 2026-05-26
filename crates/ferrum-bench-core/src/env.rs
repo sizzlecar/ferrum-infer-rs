@@ -201,14 +201,12 @@ fn nvidia_smi_query(field: &str) -> Option<String> {
 /// when `nvidia-smi -lgc N,N` is applied this equals the lock value;
 /// without lock it equals whatever the GPU is currently doing.
 pub fn detect_gpu_clock_lock_mhz() -> Option<u32> {
-    nvidia_smi_query("clocks.gr")
-        .and_then(|s| s.parse::<u32>().ok())
+    nvidia_smi_query("clocks.gr").and_then(|s| s.parse::<u32>().ok())
 }
 
 /// GPU power limit in watts.
 pub fn detect_gpu_power_limit_w() -> Option<u32> {
-    nvidia_smi_query("power.limit")
-        .and_then(|s| s.split('.').next()?.parse::<u32>().ok())
+    nvidia_smi_query("power.limit").and_then(|s| s.split('.').next()?.parse::<u32>().ok())
 }
 
 /// Persistence mode (true ⇒ enabled).
@@ -287,8 +285,7 @@ mod tests {
     fn env_hash_changes_on_ferrum_env() {
         let h1 = fixture_env().hash();
         let mut e = fixture_env();
-        e.ferrum_env
-            .insert("FERRUM_VLLM_MOE".into(), "1".into());
+        e.ferrum_env.insert("FERRUM_VLLM_MOE".into(), "1".into());
         let h2 = e.hash();
         assert_ne!(h1, h2);
     }

@@ -11,7 +11,7 @@
 //!   - rows with `n_repeats < 3` show `mean` only and the table prints
 //!     a header warning that CI fields are absent
 
-use crate::{BenchReport, Scenario, ScalarStats};
+use crate::{BenchReport, ScalarStats, Scenario};
 use std::fmt::Write as _;
 
 /// Render a single bench cell into markdown.
@@ -241,9 +241,7 @@ fn fmt(stat: &ScalarStats, has_ci: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        compute_metrics, Env, RequestRecord, RunRecord, Scenario, Slo,
-    };
+    use crate::{compute_metrics, Env, RequestRecord, RunRecord, Scenario, Slo};
 
     fn make_run(records: Vec<(bool, f64, f64, u32, u32)>, duration_s: f64) -> RunRecord {
         let records = records
@@ -257,7 +255,10 @@ mod tests {
                 itl_ms: vec![],
             })
             .collect();
-        RunRecord { records, duration_s }
+        RunRecord {
+            records,
+            duration_s,
+        }
     }
 
     fn fixture_report() -> BenchReport {

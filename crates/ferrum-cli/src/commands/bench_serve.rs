@@ -161,9 +161,7 @@ pub(super) fn parse_slo(s: &str) -> std::result::Result<Slo, String> {
         let (k, v) = tok
             .split_once(':')
             .ok_or_else(|| format!("bad SLO token '{tok}', expected key:value"))?;
-        let v: f64 = v
-            .parse()
-            .map_err(|e| format!("bad SLO value '{v}': {e}"))?;
+        let v: f64 = v.parse().map_err(|e| format!("bad SLO value '{v}': {e}"))?;
         match k {
             "ttft" => ttft = Some(v),
             "tpot" => tpot = Some(v),
@@ -355,9 +353,7 @@ fn build_prompts(
         )),
         "sharegpt" => {
             let p = cmd.sharegpt_path.as_ref().ok_or_else(|| {
-                ferrum_types::FerrumError::model(
-                    "--dataset sharegpt requires --sharegpt-path PATH",
-                )
+                ferrum_types::FerrumError::model("--dataset sharegpt requires --sharegpt-path PATH")
             })?;
             load_sharegpt_prompts(p, count, rng)
         }
@@ -394,8 +390,7 @@ fn gen_shared_prefix_prompts(
         .unwrap_or_else(|_| "hello world ".repeat(prefix_len / 2));
     (0..count)
         .map(|_| {
-            let suffix_ids: Vec<u32> =
-                (0..suffix_len).map(|_| rng.random_range(lo..=hi)).collect();
+            let suffix_ids: Vec<u32> = (0..suffix_len).map(|_| rng.random_range(lo..=hi)).collect();
             let suffix = tok
                 .decode(&suffix_ids, false)
                 .unwrap_or_else(|_| "x ".repeat(suffix_len / 2));
@@ -448,7 +443,11 @@ fn load_sharegpt_prompts(
             .and_then(|arr| {
                 arr.iter()
                     .find(|t| t.get("from").and_then(|f| f.as_str()) == Some("human"))
-                    .and_then(|t| t.get("value").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                    .and_then(|t| {
+                        t.get("value")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    })
             })
             // Fallback: simple {"input": "..."} format.
             .or_else(|| {
@@ -562,7 +561,10 @@ async fn run_closed_loop(
         }
     }
     let duration_s = start.elapsed().as_secs_f64();
-    RunRecord { records, duration_s }
+    RunRecord {
+        records,
+        duration_s,
+    }
 }
 
 /// Open-loop: Poisson(rate) arrivals. The arrival schedule is fixed
@@ -625,7 +627,10 @@ async fn run_open_loop(
         }
     }
     let duration_s = start.elapsed().as_secs_f64();
-    RunRecord { records, duration_s }
+    RunRecord {
+        records,
+        duration_s,
+    }
 }
 
 impl RunContext {
@@ -695,7 +700,11 @@ enum Cell {
     Open(f64),
 }
 
-async fn execute_cell(cmd: &BenchServeCommand, ctx: &RunContext, cell: Cell) -> Result<BenchReport> {
+async fn execute_cell(
+    cmd: &BenchServeCommand,
+    ctx: &RunContext,
+    cell: Cell,
+) -> Result<BenchReport> {
     // Backend tag is a build-time fact, not a runtime env-var check. The earlier
     // `CUDA_VISIBLE_DEVICES.is_ok()` heuristic silently mistagged every CUDA-built
     // run as "cpu" when that env var was unset, polluting bench artifacts.
@@ -809,7 +818,11 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     let cells: Vec<Cell> = if let Some(rate) = cmd.request_rate {
         vec![Cell::Open(rate)]
     } else if !cmd.concurrency_sweep.is_empty() {
-        cmd.concurrency_sweep.iter().copied().map(Cell::Closed).collect()
+        cmd.concurrency_sweep
+            .iter()
+            .copied()
+            .map(Cell::Closed)
+            .collect()
     } else {
         vec![Cell::Closed(cmd.concurrency)]
     };
@@ -864,7 +877,9 @@ fn emit_jsonl(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
         .create(true)
         .append(true)
         .open(out_path)
-        .map_err(|e| ferrum_types::FerrumError::model(format!("open {}: {e}", out_path.display())))?;
+        .map_err(|e| {
+            ferrum_types::FerrumError::model(format!("open {}: {e}", out_path.display()))
+        })?;
     for r in reports {
         let line = serde_json::to_string(r).expect("serialize");
         writeln!(f, "{}", line)
@@ -886,8 +901,9 @@ fn emit_markdown(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()>
         render_sweep(reports)
     };
     if let Some(out) = cmd.out.as_ref() {
-        std::fs::write(out, &md)
-            .map_err(|e| ferrum_types::FerrumError::model(format!("write {}: {e}", out.display())))?;
+        std::fs::write(out, &md).map_err(|e| {
+            ferrum_types::FerrumError::model(format!("write {}: {e}", out.display()))
+        })?;
         eprintln!("\n→ wrote {}", out.display());
     } else {
         println!("{}", md);
@@ -950,8 +966,9 @@ fn emit_json(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
     };
     let pretty = serde_json::to_string_pretty(&value).expect("pretty");
     if let Some(out) = cmd.out.as_ref() {
-        std::fs::write(out, &pretty)
-            .map_err(|e| ferrum_types::FerrumError::model(format!("write {}: {e}", out.display())))?;
+        std::fs::write(out, &pretty).map_err(|e| {
+            ferrum_types::FerrumError::model(format!("write {}: {e}", out.display()))
+        })?;
         eprintln!("\n→ wrote {}", out.display());
     } else {
         println!("{}", pretty);

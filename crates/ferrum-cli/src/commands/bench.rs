@@ -230,7 +230,11 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
             "  {} requests · {:.1}s · {:.1} tok/s",
             run.records.len(),
             run.duration_s,
-            run.records.iter().map(|r| r.output_tokens as f64).sum::<f64>() / run.duration_s
+            run.records
+                .iter()
+                .map(|r| r.output_tokens as f64)
+                .sum::<f64>()
+                / run.duration_s
         );
         runs.push(run);
     }
@@ -303,7 +307,10 @@ async fn run_sequential_round(
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     let duration_s = start.elapsed().as_secs_f64();
-    Ok(RunRecord { records, duration_s })
+    Ok(RunRecord {
+        records,
+        duration_s,
+    })
 }
 
 async fn run_concurrent_round(
@@ -331,7 +338,10 @@ async fn run_concurrent_round(
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     let duration_s = start.elapsed().as_secs_f64();
-    Ok(RunRecord { records, duration_s })
+    Ok(RunRecord {
+        records,
+        duration_s,
+    })
 }
 
 // ── Single-stream collection ────────────────────────────────────────
@@ -517,8 +527,9 @@ fn print_human_summary(report: &BenchReport, cmd: &BenchCommand, mode_str: &str)
 fn emit_json(cmd: &BenchCommand, report: &BenchReport) -> Result<()> {
     let pretty = serde_json::to_string_pretty(report).expect("serialize");
     if let Some(out) = cmd.out.as_ref() {
-        std::fs::write(out, &pretty)
-            .map_err(|e| ferrum_types::FerrumError::model(format!("write {}: {e}", out.display())))?;
+        std::fs::write(out, &pretty).map_err(|e| {
+            ferrum_types::FerrumError::model(format!("write {}: {e}", out.display()))
+        })?;
         eprintln!("\n→ wrote {}", out.display());
     } else {
         println!("{}", pretty);

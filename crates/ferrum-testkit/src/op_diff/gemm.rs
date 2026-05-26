@@ -16,9 +16,15 @@ pub struct GemmOp {
 }
 
 impl GemmOp {
-    fn input_a_len(&self) -> usize { self.m * self.k }
-    fn input_b_len(&self) -> usize { self.n * self.k }
-    fn output_len(&self) -> usize { self.m * self.n }
+    fn input_a_len(&self) -> usize {
+        self.m * self.k
+    }
+    fn input_b_len(&self) -> usize {
+        self.n * self.k
+    }
+    fn output_len(&self) -> usize {
+        self.m * self.n
+    }
 
     fn build_input(&self, seed: u64) -> (Vec<f32>, Vec<f32>) {
         let a = random_vec(self.input_a_len(), -1.0, 1.0, seed);
@@ -28,7 +34,9 @@ impl GemmOp {
 }
 
 impl OpUnderTest for GemmOp {
-    fn name(&self) -> &str { "gemm" }
+    fn name(&self) -> &str {
+        "gemm"
+    }
 
     fn run_cpu(&self, seed: u64) -> Output {
         use ferrum_kernels::backend::cpu::CpuBackend;

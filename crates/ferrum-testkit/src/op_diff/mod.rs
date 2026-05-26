@@ -113,8 +113,7 @@ pub struct NmseReport {
 impl NmseReport {
     /// True if every available accelerator matches CPU below `tol`.
     pub fn within_tol(&self, tol: f64) -> bool {
-        self.metal_nmse.map_or(true, |n| n < tol)
-            && self.cuda_nmse.map_or(true, |n| n < tol)
+        self.metal_nmse.map_or(true, |n| n < tol) && self.cuda_nmse.map_or(true, |n| n < tol)
     }
 }
 
