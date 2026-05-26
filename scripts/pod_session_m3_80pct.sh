@@ -66,7 +66,7 @@ git pull --ff-only origin "$BRANCH"
 log "  ferrum at $(git rev-parse --short HEAD)"
 
 log "▶ Phase 0: nvidia-smi sanity"
-nvidia-smi --query-gpu=name,driver_version,cuda_version,memory.total --format=csv,noheader || {
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader || {
     log "ERROR: nvidia-smi failed — pod has no GPU"; exit 1; }
 
 # ──────────────────────────────────────────────────────────────────────
