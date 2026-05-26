@@ -284,17 +284,12 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
              m_block_size_8 == M_BLOCK_SIZE_8 &&                               \
              group_blocks == GROUP_BLOCKS && num_threads == NUM_THREADS &&     \
              is_zp_float == IS_ZP_FLOAT) {                                     \
-      /* CUDA-13 fix: use literal IDs instead of constexpr W_TYPE.id() /     \
-         S_TYPE.id() so all TUs (this dispatcher + kernel_instantiations.cu) \
-         pick the same template specialization. See core/scalar_type.hpp     \
-         "kFooId_LITERAL" block for rationale. The kFE2M1f branch is dead   \
-         in our build (ferrum doesn't instantiate fp4 weights), so we keep  \
-         a literal placeholder there but never reach it.                     */ \
-      constexpr int64_t S_TYPE_ID_LITERAL =                                    \
-          (std::is_same<scalar_t, half>::value ? vllm::kFloat16Id_LITERAL      \
-                                               : vllm::kBFloat16Id_LITERAL);   \
-      kernel = Marlin<scalar_t, W_TYPE##Id_LITERAL, S_TYPE_ID_LITERAL,         \
-                      NUM_THREADS,                                             \
+      constexpr auto S_TYPE =                                                  \
+          W_TYPE == vllm::kFE2M1f                                              \
+              ? (GROUP_BLOCKS == 1 ? vllm::kFE4M3fn : vllm::kFE8M0fnu)         \
+              : (std::is_same<scalar_t, half>::value ? vllm::kFloat16          \
+                                                     : vllm::kBFloat16);       \
+      kernel = Marlin<scalar_t, W_TYPE.id(), S_TYPE.id(), NUM_THREADS,         \
                       THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS,       \
                       M_BLOCK_SIZE_8, pipe_stages, GROUP_BLOCKS, IS_ZP_FLOAT>; \
     }
