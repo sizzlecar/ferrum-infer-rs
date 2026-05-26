@@ -323,18 +323,20 @@ impl BackendTimer<crate::backend::cuda::CudaBackend> for CudaTimer {
         let (Some(s), Some(e)) = (self.start, self.end) else {
             return 0.0;
         };
-        let mut ms: f32 = 0.0;
         unsafe {
             // cuEventSynchronize blocks until the event is observed
-            // on the stream. Required before cuEventElapsedTime.
+            // on the stream. Required before reading elapsed.
             let _ = cu::cuEventSynchronize(e);
-            // CUDA driver keeps the v1 `cuEventElapsedTime` symbol in
-            // both 12.x and 13.x (ABI-compat shim). cudarc 0.19.4 only
-            // exposes the v1 binding, so we use it directly — the
-            // earlier `_v2` reference broke the CUDA CI workflow.
-            let _ = cu::cuEventElapsedTime(&mut ms as *mut f32, s, e);
+            // Safe wrapper dispatches cuEventElapsedTime vs _v2 based on
+            // cudarc's auto-detected CUDA version (cuda-version-from-
+            // build-system feature). The two are only visible under
+            // CUDA 12.x and 13.x respectively — calling either directly
+            // is non-portable.
+            cudarc::driver::result::event::elapsed(s, e)
+                .ok()
+                .map(|ms| ms as f64)
+                .unwrap_or(0.0)
         }
-        ms as f64
     }
 }
 

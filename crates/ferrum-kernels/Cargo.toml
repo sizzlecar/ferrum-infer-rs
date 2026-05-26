@@ -16,7 +16,7 @@ candle-core = { workspace = true }
 half = { workspace = true }
 tracing = { workspace = true }
 rayon = { workspace = true }
-cudarc = { version = "0.19", default-features = false, features = ["driver", "cublas", "f16", "nvrtc"], optional = true }
+cudarc = { version = "0.19", default-features = false, features = ["driver", "cublas", "f16", "nvrtc", "cuda-version-from-build-system"], optional = true }
 metal = { version = "0.31", optional = true }
 
 [build-dependencies]
