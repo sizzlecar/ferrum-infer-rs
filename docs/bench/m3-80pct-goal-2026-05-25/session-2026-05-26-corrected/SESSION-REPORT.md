@@ -5,6 +5,14 @@
 **Budget used:** ~$1.90 / $2.10 (90% of session credit)
 **Ferrum HEAD when session started:** `6538925` (PR #215 "session(2026-05-26): M3 80% findings + CUDA 13 timer fix + microbench infra")
 
+> **Update 2026-05-27**: the fix proposed below was **verified end-to-end on
+> real Qwen3-30B-A3B weights** in the next session — see
+> [`../session-2026-05-27/SESSION-REPORT.md`](../session-2026-05-27/SESSION-REPORT.md).
+> Both `FERRUM_VLLM_MOE=1` device-route (cell B) and host-route (cell D)
+> now produce "Paris", confirmed via direct `sorted_token_ids[]` dump
+> matching the host-path values bit-for-bit. Apples-to-apples sweep
+> pending — pod preempted before completion.
+
 ---
 
 ## TL;DR
