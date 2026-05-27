@@ -237,3 +237,42 @@ for the symbol-level diagnosis.
    throughput column lands with CI95.
 4. Replace this Update block with the publication-grade table once
    (1)+(3) are in hand.
+
+---
+
+## Update — 2026-05-27 iteration 2 (perf + correctness, GPU-verified)
+
+See [`session-2026-05-27-iteration2/SESSION-REPORT.md`](session-2026-05-27-iteration2/SESSION-REPORT.md)
+for the full session writeup. Shipped (commits on `fix/moe-align-block-size-packed-row`):
+
+- **`37f5dda` fix(paged-attn)**: opt-in to extended dynamic shared
+  when `FERRUM_KV_CAPACITY > 12K`. Fixes the 3rd-chat-turn panic
+  `paged_varlen_attn: CUDA_ERROR_INVALID_VALUE` on `ferrum run`
+  (Chat-profile autosizer sets 64 KB shared > sm_89 48 KB default).
+- **`a873d63` perf(autosize)**: default-ON `FERRUM_MOE_GRAPH=1` for
+  Qwen3-MoE decode layer-loop CUDA graph capture. Memory's
+  documented "c=32 -6% regression" was on the pre-fix
+  garbage-emission path; with PR #216's moe_align fix landed, graph
+  replay produces correct sorted_token_ids and `cuGraphLaunch`
+  overhead is amortized by eliminating ~480 per-iter kernel launches.
+
+GPU-verified at c=32 (RTX 4090, random 256/128, n=1, prompts=30):
+
+| Config | tok/s | ratio vs hist vLLM 1883 |
+|---|---:|---:|
+| SAFE (`FERRUM_VLLM_MOE=0`) | 848 | 0.450 |
+| + `FERRUM_VLLM_MOE=1` (post-fix device-route) | 976 | 0.518 |
+| + autosizer `FERRUM_MOE_GRAPH=1` | **1006** | **0.534** |
+
+Still **27 pp short of 0.80**. Per nsys post-fix profile (file
+`session-2026-05-27-iteration2/api.csv`): top costs are
+`cuStreamSynchronize` 44.7% (5288 calls — ~38/iter, target ~1-2 like
+vLLM), `cuLaunchKernel` 28.8% (~400K launches), `cuMemcpyHtoDAsync`
+15.5% (50K H2D). Closing the gap requires multi-day levers
+(sync-source bisect, small-m fused MoE kernel port, full forward
+graph extension) — none fit a single bench-iteration session.
+
+Same caveat as the 2026-05-25 Update block: the vLLM denominator is
+the 2026-05-13 ShareGPT historical baseline. Re-baseline against
+apples-to-apples vLLM 0.20.2 still required to retire "indicative
+ratio" status.
