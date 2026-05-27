@@ -73,7 +73,11 @@ export FERRUM_MOE_STREAMS=4
 export FERRUM_GREEDY_ARGMAX=1
 export FERRUM_KV_MAX_BLOCKS=2048
 export FERRUM_PAGED_MAX_SEQS=32
-export FERRUM_DECODE_OP_PROFILE=1
+# DECODE_OP_PROFILE inflates cuStreamSynchronize count (~4 stage_end ×
+# 48 layers × per-iter eager work) — cost ~10% c=32 in graph-on
+# regime, ~16% in eager regime. Off by default; opt in for per-stage
+# host timer breakdown. Verified 2026-05-27 (iter-1 A/B on RTX 4090).
+[ "${FERRUM_PROFILE_STAGES:-0}" = "1" ] && export FERRUM_DECODE_OP_PROFILE=1
 
 # Per-cell sweep
 IFS=',' read -ra CELLS <<< "$SWEEP_CSV"
