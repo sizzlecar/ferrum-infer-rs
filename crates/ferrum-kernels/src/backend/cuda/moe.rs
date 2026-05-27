@@ -291,11 +291,11 @@ impl BackendMoeFused for CudaBackend {
             if !DUMPED.swap(true, Ordering::Relaxed) {
                 let _ = stream.synchronize();
                 let st = stream
-                    .memcpy_dtov(sorted_token_ids.as_i32())
+                    .clone_dtoh(sorted_token_ids.as_i32())
                     .unwrap_or_default();
-                let bi = stream.memcpy_dtov(block_ids.as_i32()).unwrap_or_default();
+                let bi = stream.clone_dtoh(block_ids.as_i32()).unwrap_or_default();
                 let tp = stream
-                    .memcpy_dtov(total_tokens_post_pad.as_i32())
+                    .clone_dtoh(total_tokens_post_pad.as_i32())
                     .unwrap_or_default();
                 let n_show = 48.min(st.len());
                 let n_bi = 16.min(bi.len());
