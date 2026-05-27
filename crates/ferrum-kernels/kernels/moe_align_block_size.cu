@@ -2,11 +2,19 @@
 // MoE kernel. Takes the per-pair expert assignments from Stage 8's
 // `route_topk_softmax` (`expert_ids[batch * top_k]`) and produces:
 //
-//   sorted_token_ids[N_padded]  — flat list of (batch * top_k) pair
-//                                  indices, sorted by their assigned
-//                                  expert and padded with `numel`
-//                                  sentinel inside each expert's
-//                                  group up to a `block_size` boundary.
+//   sorted_token_ids[N_padded]  — for each expert e's padded region,
+//                                  contains the UNPADDED packed_row
+//                                  indices that belong to e (i.e.
+//                                  unpadded_offsets[e] + 0, +1, ...).
+//                                  Remaining slots filled with sentinel
+//                                  = batch * top_k. The vLLM marlin MoE
+//                                  kernel reads `a[sorted[i] / top_k]`;
+//                                  ferrum passes pre-gathered x_packed
+//                                  with top_k=1 so the kernel reads
+//                                  x_packed[packed_row]. The value here
+//                                  MUST be the packed_row (matching
+//                                  moe_build_pairs.cu output), NOT the
+//                                  pair index — see Pass 3 comment.
 //   expert_ids_per_block[N_padded / block_size]
 //                                — which expert each block_size-row
 //                                  tile of sorted_token_ids belongs
@@ -16,15 +24,12 @@
 //   total_tokens_post_pad[1]    — actual padded token count (used by
 //                                  the fused kernel's grid_y dim).
 //
-// Layout matches vLLM's marlin_moe_wna16 kernel input expectation
-// (sorted_token_ids holds pair indices in [0, batch * top_k), the
-// fused kernel reads `a[sorted[i] / top_k]` to recover the input row).
-//
 // Algorithm: single block, ≤ 1024 threads.
 //   Pass 1: count pairs per expert (atomic into shared mem).
-//   Pass 2: ceil-div to block_size, prefix-sum → expert_offsets.
-//   Pass 3: walk pairs, atomic-claim slot in their expert's region,
-//           write sorted_token_ids[slot] = pair_idx.
+//   Pass 2: ceil-div to block_size, prefix-sum into BOTH
+//           padded `offsets` AND `unpadded_offsets`.
+//   Pass 3: walk pairs, atomic-claim padded slot in expert's region,
+//           write unpadded_offsets[e] + per_expert_pos.
 //   Pass 4: fill expert_ids_per_block[block_idx] = expert_id for
 //           each block_size-row tile.
 //   Pass 5: thread 0 writes total_tokens_post_pad.
@@ -52,6 +57,13 @@ extern "C" __global__ void moe_align_block_size_f32(
     __shared__ int counts_padded[MAX_NUM_EXPERTS];
     __shared__ int offsets[MAX_NUM_EXPERTS + 1];
     __shared__ int cursors[MAX_NUM_EXPERTS];
+    // Unpadded prefix-sum offsets — needed so the value written into
+    // sorted_token_ids matches the packed_row produced by
+    // moe_build_pairs.cu (which uses the same unpadded offsets via
+    // moe_build_pairs_by_token::expert_offsets). The vLLM marlin MoE
+    // kernel reads A[sorted_token_ids[i] / top_k], and A (= ferrum's
+    // x_packed) is gathered in unpadded-packed-row order.
+    __shared__ int unpadded_offsets[MAX_NUM_EXPERTS];
 
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
@@ -87,13 +99,16 @@ extern "C" __global__ void moe_align_block_size_f32(
     __syncthreads();
 
     if (tid == 0) {
-        int acc = 0;
+        int acc_pad = 0;
+        int acc_unpad = 0;
         for (int e = 0; e < num_experts; e++) {
-            offsets[e] = acc;
-            acc += counts_padded[e];
+            offsets[e] = acc_pad;
+            unpadded_offsets[e] = acc_unpad;
+            acc_pad += counts_padded[e];
+            acc_unpad += counts[e];
         }
-        offsets[num_experts] = acc;
-        total_tokens_post_pad[0] = acc;
+        offsets[num_experts] = acc_pad;
+        total_tokens_post_pad[0] = acc_pad;
     }
     __syncthreads();
 
@@ -103,12 +118,21 @@ extern "C" __global__ void moe_align_block_size_f32(
     }
     __syncthreads();
 
-    // Pass 3: scatter pair indices into their expert's slot.
+    // Pass 3: scatter UNPADDED packed_row into expert e's padded slot.
+    //
+    // sorted_token_ids[padded_slot] = unpadded_offsets[e] + per_expert_pos
+    //
+    // This matches the value moe_build_pairs.cu writes into pairs_by_token
+    // and the index into packed_token_idx[] that embedding_lookup_dev uses
+    // to gather x into x_packed. The vLLM marlin MoE kernel then reads
+    // A[sorted_token_ids[i] / top_k] (= x_packed[packed_row]) — correct
+    // only when the value here is the packed_row, NOT the pair_index.
     for (int p = tid; p < batch_x_topk; p += nthreads) {
         int e = expert_ids_per_pair[p];
         if (e >= 0 && e < num_experts) {
             int slot = atomicAdd(&cursors[e], 1);
-            sorted_token_ids[slot] = p;
+            int per_expert_pos = slot - offsets[e];
+            sorted_token_ids[slot] = unpadded_offsets[e] + per_expert_pos;
         }
     }
     __syncthreads();

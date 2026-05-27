@@ -260,23 +260,56 @@ impl BackendMoeFused for CudaBackend {
         // Single block — algorithm uses shared mem for counts + offsets,
         // sized to MAX_NUM_EXPERTS=256. Use 256 threads to cover the
         // ≤256-experts and ≤1024-pair Qwen3-MoE configs cleanly.
-        let mut b = stream.launch_builder(&func);
-        b.arg(expert_ids_per_pair);
-        b.arg(sorted_token_ids);
-        b.arg(block_ids);
-        b.arg(total_tokens_post_pad);
-        b.arg(&n);
-        b.arg(&ne);
-        b.arg(&bs);
-        b.arg(&smax);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
+        {
+            let mut b = stream.launch_builder(&func);
+            b.arg(&*expert_ids_per_pair);
+            b.arg(&mut *sorted_token_ids);
+            b.arg(&mut *block_ids);
+            b.arg(&mut *total_tokens_post_pad);
+            b.arg(&n);
+            b.arg(&ne);
+            b.arg(&bs);
+            b.arg(&smax);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::model(format!("moe_align_block_size launch: {e}")))?;
         }
-        .map_err(|e| FerrumError::model(format!("moe_align_block_size launch: {e}")))?;
+
+        // FERRUM_MOE_DUMP=1: dump first call's sorted_token_ids + block_ids
+        // back to host. Useful for validating that the kernel writes packed_row
+        // values (matching the host path in dispatch.rs) rather than pair
+        // indices. Cost when off: one os::var() check per call (negligible).
+        // Cost when on: one DtoH per first call (~KB), then no-op via AtomicBool.
+        if std::env::var("FERRUM_MOE_DUMP").is_ok() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static DUMPED: AtomicBool = AtomicBool::new(false);
+            if !DUMPED.swap(true, Ordering::Relaxed) {
+                let _ = stream.synchronize();
+                let st = stream
+                    .clone_dtoh(sorted_token_ids.as_i32())
+                    .unwrap_or_default();
+                let bi = stream.clone_dtoh(block_ids.as_i32()).unwrap_or_default();
+                let tp = stream
+                    .clone_dtoh(total_tokens_post_pad.as_i32())
+                    .unwrap_or_default();
+                let n_show = 48.min(st.len());
+                let n_bi = 16.min(bi.len());
+                eprintln!(
+                    "[MOE_DUMP] batch_x_topk={batch_x_topk} block_size={block_size} num_experts={num_experts} total_post_pad={:?}",
+                    tp.first().copied().unwrap_or(-1)
+                );
+                eprintln!(
+                    "[MOE_DUMP] sorted_token_ids[0..{n_show}] = {:?}",
+                    &st[..n_show]
+                );
+                eprintln!("[MOE_DUMP] block_ids[0..{n_bi}] = {:?}", &bi[..n_bi]);
+            }
+        }
         Ok(())
     }
     fn moe_combine(

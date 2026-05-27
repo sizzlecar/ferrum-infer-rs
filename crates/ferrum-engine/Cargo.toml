@@ -87,7 +87,6 @@ accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "ferrum-models/a
 cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",
-    "dep:candle-flash-attn",
     "ferrum-models/cuda",
     "ferrum-kernels/cuda",
     "ferrum-quantization/cuda",

@@ -182,10 +182,29 @@ bash scripts/lock_gpu.sh 2>&1 | tail -5 || log "  (lock failed — proceeding un
 cleanup() {
     log "▶ cleanup"
     pkill -f "target/release/ferrum serve" 2>/dev/null || true
+    pkill -f "target/release/ferrum run" 2>/dev/null || true
     pkill -f "vllm serve" 2>/dev/null || true
     bash /workspace/ferrum-infer-rs/scripts/unlock_gpu.sh 2>&1 | tail -3 || true
 }
 trap cleanup EXIT INT TERM
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 2.5 — Paris bisect (gate). If the moe_align_block_size.cu fix
+# is wrong or the device-route still emits garbage, abort BEFORE the
+# 90-min sweep so we don't collect more "garbage emission rate" numbers
+# like session-2026-05-25 did.
+# ──────────────────────────────────────────────────────────────────────
+log "▶ Phase 2.5: Paris bisect gate"
+if bash scripts/paris_bisect.sh ./target/release/ferrum "$SESSION_DIR/paris" \
+        > "$SESSION_DIR/paris.log" 2>&1; then
+    log "  ✓ all 4 cells produced 'Paris' — sweep is meaningful"
+else
+    log "  ✗ Paris bisect FAILED — see $SESSION_DIR/paris.log + $SESSION_DIR/paris/"
+    log "    aborting sweep; the fix needs more work."
+    cat "$SESSION_DIR/paris.log" | tail -40 || true
+    echo "PARIS_FAIL" >> "$SESSION_DIR/orchestrator.log"
+    exit 3
+fi
 
 # ──────────────────────────────────────────────────────────────────────
 # Phase 3 — Run ON-path sweep with FERRUM_VLLM_MOE=1, n=5 prompts=128
