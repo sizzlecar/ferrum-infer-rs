@@ -1,0 +1,32 @@
+30.5,1442766040,62976,22909.8,19936.0,11584,1025087,50408.1,"void marlin_moe_wna16::Marlin<__half, (long)1125899907892224, (long)1125899906910725, (int)128, (int)1, (int)8, (int)4, (bool)0, (int)4, (int)8, (bool)0>(const int4 *, const int4 *, int4 *, int4 *, const int4 *, const int4 *, const unsigned short *, const int4 *, const int *, const int *, const int *, const int *, const float *, int, bool, bool, int, int, int, int, int *, bool, bool, bool, int)"
+14.0,663930856,61248,10840.0,10896.0,9376,12544,1022.2,"void Marlin<(int)256, (int)1, (int)8, (int)8, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+11.0,520496971,720,722912.5,905263.0,292703,1217087,302588.3,paged_varlen_attn_f16
+10.0,473803856,30624,15471.7,15424.0,12448,18560,1392.2,paged_batched_flash_decode_attn_f16
+8.8,418298466,642,651555.2,651583.0,650527,653791,432.7,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<__half>, float>>(T13)"
+6.2,290957183,31488,9240.3,9248.0,5504,26400,1477.5,moe_align_block_size_f32
+2.5,117656899,1536,76599.5,88992.0,20128,139808,34361.6,"void Marlin<(int)256, (int)4, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+2.3,109492304,31488,3477.3,3456.0,3392,4192,51.5,moe_router_topk_softmax_f16
+1.6,73674192,30624,2405.8,2400.0,2208,2912,98.2,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<const __half>, cublasGemvTensorStridedBatched<__half>, float>>(T13)"
+1.5,68590282,31488,2178.3,2048.0,1920,11648,875.2,fused_add_rms_norm_inplace_f16
+1.4,67161923,32144,2089.4,1984.0,1856,10272,759.8,rms_norm_f16
+1.3,60761840,30816,1971.8,1920.0,1856,7616,422.7,split_qkv_norm_rope_into_paged_cache_f16
+1.2,58936344,31488,1871.7,1728.0,1695,13504,1012.3,moe_build_pairs_by_token
+1.2,56510564,31488,1794.7,1376.0,1312,40128,3229.3,moe_combine_f16
+1.1,53353342,32266,1653.5,1056.0,1024,46208,4153.9,embedding_lookup_f16
+1.0,48086025,30624,1570.2,1568.0,1535,2016,12.7,paged_batched_flash_decode_reduce_f16
+0.9,44597582,31488,1416.3,1024.0,991,32703,2878.2,fused_silu_mul_interleaved_f16
+0.9,43925411,12288,3574.7,3712.0,3072,5152,246.4,"void marlin::gptq_marlin_repack_kernel<(int)256, (int)4, (bool)0, (bool)0>(const unsigned int *, const unsigned int *, unsigned int *, int, int)"
+0.7,33344529,31488,1059.0,960.0,927,8896,746.2,residual_add_inplace_f16
+0.4,17755147,1056,16813.6,16528.0,11488,23360,4023.7,"void Marlin<(int)256, (int)2, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+0.3,14957810,144,103873.7,103711.5,102240,106336,934.6,paged_batched_decode_attn_f16
+0.2,10486876,125,83895.0,82399.0,82048,146432,9746.8,argmax_rows_f16
+0.2,9757334,672,14519.8,18207.5,3104,24256,6664.3,split_qkv_norm_rope_into_paged_cache_varlen_f16
+0.2,7826263,384,20380.9,20224.0,15360,27104,4263.3,"void Marlin<(int)256, (int)3, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+0.1,6435257,8,804407.1,800383.5,791999,821375,9718.4,void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_32x2_tn_align8>(T1::Params)
+0.1,4159707,6,693284.5,695023.5,682623,699807,6786.3,void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8>(T1::Params)
+0.1,3275005,288,11371.5,11152.0,7711,16256,3089.1,"void Marlin<(int)256, (int)1, (int)16, (int)4, (int)4, (int)8>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int)"
+0.1,2723294,432,6303.9,6176.0,5952,7616,377.7,ampere_fp16_s16816gemm_fp16_64x64_ldg8_f2f_stages_64x5_tn
+0.0,1821951,432,4217.5,4480.0,2624,7232,1213.7,void cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_128x2_tn_align8>(T1::Params)
+0.0,1483868,864,1717.4,1728.0,1504,1984,82.7,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, __half, __half, float, __half, (bool)0, __half, __half, __half, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
+0.0,978431,192,5096.0,5088.0,4768,5344,157.0,transpose_head_to_token_f16
+0.0,968862,192,5046.2,5056.0,4768,5280,145.7,transpose_token_to_head_f16

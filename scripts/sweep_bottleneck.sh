@@ -57,15 +57,22 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Standard iter-3 env knobs (best non-marlin baseline)
-export FERRUM_GRAPH=1
-export FERRUM_GRAPH_SKIP_UPLOAD=1
+# Standard iter-3 env knobs (best non-marlin baseline).
+# 2026-05-27 cleanup after explicit per-knob bisect on RTX 4090 c=32:
+#   - FERRUM_GRAPH=1: no-op placebo (only set by scripts; not read by
+#     any source file). Real graph capture is FERRUM_MOE_GRAPH=1 which
+#     the autosizer (gpu_mem_autosize.rs:282) now sets by default.
+#   - FERRUM_GRAPH_SKIP_UPLOAD=1: measured -3.8% at c=32 vs default
+#     (per-replay re-upload). graph.rs:156 comment said the re-upload
+#     is required for c=4 perf; turns out it helps c=32 too.
+#   - FERRUM_USE_VLLM_PAGED_ATTN=1: REGRESSED post-2026-05-27 build —
+#     produces garbage on the non-split-K varlen path (separate from
+#     the moe_align fix). Hold OFF until fixed; see session report.
 export FERRUM_MOE_DEVICE_ROUTE=1
 export FERRUM_MOE_STREAMS=4
 export FERRUM_GREEDY_ARGMAX=1
 export FERRUM_KV_MAX_BLOCKS=2048
 export FERRUM_PAGED_MAX_SEQS=32
-export FERRUM_USE_VLLM_PAGED_ATTN=1
 export FERRUM_DECODE_OP_PROFILE=1
 
 # Per-cell sweep

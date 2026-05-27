@@ -268,6 +268,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     };
 
     let kv_capacity_overridden = std::env::var("FERRUM_KV_CAPACITY").is_ok();
+    let moe_graph_overridden = std::env::var("FERRUM_MOE_GRAPH").is_ok();
     // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
     // sizing logic, runs even when the user overrode KV_MAX_BLOCKS + SEQS).
@@ -281,9 +282,23 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         if kv_capacity > 0 && !kv_capacity_overridden {
             std::env::set_var("FERRUM_KV_CAPACITY", kv_capacity.to_string());
         }
+        // Default-ON CUDA graph capture for Qwen3-MoE decode layer loop.
+        // Read only by `qwen3_moe.rs::decode_batch_internal`; ignored by
+        // every other model so safe to set unconditionally. Empirically
+        // measured at c=32 on RTX 4090 post-moe_align fix:
+        //   FERRUM_MOE_GRAPH=0 = 872 tok/s
+        //   FERRUM_MOE_GRAPH=1 = 1006 tok/s  (+15.5%)
+        // The "c=32 -6%" regression noted in earlier sessions was on the
+        // pre-fix garbage-emission code path; with the moe_align fix the
+        // graph replay reads correct sorted_token_ids and the cuGraphLaunch
+        // overhead is amortized by the eliminated per-kernel launch cost
+        // (which dominated the eager path's 480-launch/iter MoE block).
+        if !moe_graph_overridden {
+            std::env::set_var("FERRUM_MOE_GRAPH", "1");
+        }
     }
     eprintln!(
-        "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={}",
+        "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={} MOE_GRAPH={}",
         if kv_overridden {
             "<user>".to_string()
         } else {
@@ -300,6 +315,11 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             kv_capacity.to_string()
         } else {
             "<default>".to_string()
+        },
+        if moe_graph_overridden {
+            "<user>".to_string()
+        } else {
+            "1".to_string()
         },
     );
 }

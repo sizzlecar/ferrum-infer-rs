@@ -1,0 +1,106 @@
+{
+  "backend": "cuda",
+  "completed_per_run": [
+    30
+  ],
+  "concurrency": 32,
+  "e2e_ms": {
+    "p50": {
+      "mean": 3735.470261
+    },
+    "p75": {
+      "mean": 3807.65241375
+    },
+    "p95": {
+      "mean": 3861.2161176
+    },
+    "p99": {
+      "mean": 3867.74531459
+    }
+  },
+  "env": {
+    "commit_sha": "37f5dda",
+    "cuda": "13.0",
+    "driver": "580.126.09",
+    "ferrum_env": {},
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin"
+    ],
+    "gpu_clock_lock_mhz": 2760,
+    "gpu_persistence_mode": true,
+    "gpu_power_limit_w": 450,
+    "hw_id": "rtx-4090",
+    "rust": "unknown"
+  },
+  "env_hash": "sha256:74487f99540eff3835a1ef7e37bc74d6d7b3f2992a5faa40ce829dc7b2be7e77",
+  "errored_per_run": [
+    0
+  ],
+  "goodput_rps": {
+    "mean": 7.7546693373361855
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 19.41914
+    },
+    "p75": {
+      "mean": 20.56046175
+    },
+    "p95": {
+      "mean": 28.25741395
+    },
+    "p99": {
+      "mean": 151.95473939
+    }
+  },
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "n_gen": 128,
+  "n_prompt": 256,
+  "n_repeats": 1,
+  "n_requests_per_run": 30,
+  "output_throughput_tps": {
+    "mean": 995.6995429139662
+  },
+  "request_throughput_rps": {
+    "mean": 7.7546693373361855
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "total_throughput_tps": {
+    "mean": 2980.8948932720295
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 24.0157218203125
+    },
+    "p75": {
+      "mean": 26.32094725390625
+    },
+    "p95": {
+      "mean": 27.36238306514825
+    },
+    "p99": {
+      "mean": 27.55494265656744
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "mean": 661.3933935
+    },
+    "p75": {
+      "mean": 1063.36815625
+    },
+    "p95": {
+      "mean": 1322.6108982499995
+    },
+    "p99": {
+      "mean": 1375.82824858
+    }
+  },
+  "warmup_requests": 5
+}
