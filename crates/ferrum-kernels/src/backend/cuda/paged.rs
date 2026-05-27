@@ -267,7 +267,11 @@ fn paged_batched_flash_dispatch(
     // Bench (RTX 4090, M3, 32 q_heads):
     //   c=1  splits=8 → +22% (grid was 1/4 wave, splits saturate)
     //   c=16 splits=2 → -3.7% (grid already 4 waves)
-    //   c=32 splits=2 → +5% (grid 8 waves, kv split still helps)
+    //   c=32 splits=4 → +4.7% (grid 8 waves, kv split still helps — 2026-05-27 clean-regime
+    //                          re-test post-DECODE_OP_PROFILE removal showed splits=2
+    //                          actually -5% and splits=4 is the right answer at this wave
+    //                          count, even when kv≤768; old "splits=2 +5%" claim was
+    //                          measured under sync-instrumented bench).
     // Override via FERRUM_PAGED_FLASH_SPLITS for tuning.
     let force_splits = std::env::var("FERRUM_PAGED_FLASH_SPLITS")
         .ok()
@@ -276,13 +280,20 @@ fn paged_batched_flash_dispatch(
     const SM_TARGET: usize = 128;
     let base_grid = num_seqs * num_heads;
     let saturated = base_grid >= 2 * SM_TARGET;
+    let waves = base_grid / SM_TARGET; // c=16:4, c=32:8 on 32-q-head models
     let num_splits: usize = force_splits.unwrap_or_else(|| {
         if saturated {
-            // Only split when kv is so long that the V loop dominates.
-            match max_kv_len {
-                kv if kv <= 768 => 1,
-                kv if kv <= 2048 => 2,
-                _ => 4,
+            // Heavy concurrency (waves ≥ 8 = c≥32 on 32-q-head): even short
+            // kv benefits from splits=4 because V-loop work per (q_head,seq)
+            // is still serial inside one CTA; splitting recovers parallelism
+            // the saturated base_grid can't expose.
+            // Mid concurrency (waves 4-7 = c≈16): splits=2 hurts (-3.7%),
+            // keep splits=1 for short kv.
+            match (max_kv_len, waves) {
+                (kv, _) if kv > 2048 => 4,
+                (kv, _) if kv <= 768 && waves >= 8 => 4,
+                (kv, _) if kv <= 768 => 1,
+                _ => 2,
             }
         } else {
             // Low concurrency: aggressive splits to fill SMs.
