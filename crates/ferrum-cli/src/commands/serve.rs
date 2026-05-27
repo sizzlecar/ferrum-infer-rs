@@ -129,6 +129,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         None
     };
 
+    // Default-ON `FERRUM_MOE_GRAPH=1` — kept separate from the
+    // local-dir-gated GPU autosizer below so it lands when the user
+    // passes an HF repo name (most common) instead of a local
+    // safetensors directory.
+    crate::gpu_mem_autosize::apply_moe_graph_default();
+
     // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
     // KV pool + 4 GB scratch reserve fit in `total_gpu_mem * gpu_util`.
     // Skipped on Mac / when nvidia-smi is missing; respects user-set
