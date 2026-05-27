@@ -448,6 +448,23 @@ fn paged_batched_decode_single_pass(
     let hdi = head_dim as i32;
     let mbps = max_blocks_per_seq as i32;
     let bsi = block_size as i32;
+    // Size shared to FERRUM_KV_CAPACITY ceiling (graph-replay safe; see the
+    // comment block in `paged_varlen_attention`). Compute before the launch
+    // builder so we can opt into the extended dynamic-shared limit if the
+    // request exceeds the 48 KB default — without the opt-in cuLaunchKernel
+    // returns CUDA_ERROR_INVALID_VALUE.
+    let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+    let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+    let shared_bytes = (shared_kv as u32) * 4;
+    if shared_bytes > 48 * 1024 {
+        let _ = func.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shared_bytes as i32,
+        );
+    }
     let mut b = stream.launch_builder(&func);
     b.arg(&qv);
     b.arg(&kp);
@@ -461,12 +478,6 @@ fn paged_batched_decode_single_pass(
     b.arg(&mbps);
     b.arg(&bsi);
     b.arg(&scale);
-    let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(512);
-    let shared_kv = safe_kv_max.max(max_kv_len).max(1);
-    let shared_bytes = (shared_kv as u32) * 4;
     unsafe {
         b.launch(LaunchConfig {
             grid_dim: (num_heads as u32, num_seqs as u32, 1),
@@ -697,6 +708,34 @@ impl BackendPagedKv for CudaBackend {
         let hdi = head_dim as i32;
         let mbps = max_blocks_per_seq as i32;
         let bsi = block_size as i32;
+        // Compute shared_bytes BEFORE the launch builder so we can opt into
+        // the extended dynamic shared-memory limit if needed.
+        //
+        // CUDA graph capture freezes `shared_mem_bytes` at capture time;
+        // graph keys at the engine level are (m_total, num_seqs) — they
+        // do NOT distinguish kv_len buckets. So a graph captured at
+        // kv_len=300 (shared=300*4) replays unchanged at kv_len=600 →
+        // kernel writes scores[300..600] OOB into shared. Allocate the
+        // worst-case kv slot length so any future replay is safe.
+        let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+        let shared_bytes = (shared_kv as u32) * 4;
+        // If shared exceeds the default 48 KB per-block budget, opt into
+        // the extended limit (sm_89/Hopper/Blackwell support up to
+        // 100/228 KB). Without this opt-in, cuLaunchKernel returns
+        // CUDA_ERROR_INVALID_VALUE — exactly the panic observed on the
+        // 3rd `ferrum run` chat turn when Chat-profile autosizer sets
+        // FERRUM_KV_CAPACITY=16384 (= 64 KB shared) and the long-context
+        // prefill (q_len>64) routes through the non-split-K path.
+        if shared_bytes > 48 * 1024 {
+            let _ = func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_bytes as i32,
+            );
+        }
         let mut b = stream.launch_builder(&func);
         b.arg(&qv);
         b.arg(&kp);
@@ -712,27 +751,6 @@ impl BackendPagedKv for CudaBackend {
         b.arg(&mbps);
         b.arg(&bsi);
         b.arg(&scale);
-        // CUDA graph capture freezes `shared_mem_bytes` at capture time;
-        // graph keys at the engine level are (m_total, num_seqs) — they
-        // do NOT distinguish kv_len buckets. So a graph captured at
-        // kv_len=300 (shared=300*4) replays unchanged at kv_len=600 →
-        // kernel writes scores[300..600] OOB into shared.
-        // compute-sanitizer caught it:
-        //   "Invalid __shared__ write of size 4 bytes at paged_varlen_attn_f16
-        //    Address 0x84c is out of bounds (in captured graph replay)".
-        //
-        // Allocate the worst-case kv slot length for ANY future decode
-        // iter that may replay this graph. FERRUM_KV_CAPACITY caps it
-        // (default 512, bench sets 2048). 8 KB shared = 2048 floats
-        // — well within Ada's 96 KB/SM and Hopper's 228 KB/SM budgets.
-        // For models with longer effective contexts the cap raises with
-        // capacity at the cost of one alloc, never per-launch.
-        let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512);
-        let shared_kv = safe_kv_max.max(max_kv_len).max(1);
-        let shared_bytes = (shared_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (num_heads as u32, total_q_tokens as u32, 1),

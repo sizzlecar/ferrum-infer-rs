@@ -118,15 +118,22 @@ log "Paris bisect → $OUT_DIR"
 log "  model:   $MODEL"
 log "  binary:  $FERRUM_BIN"
 
-# Common env knobs (iter-3 baseline, sans the bisect-controlled ones)
+# Common env knobs (iter-3 baseline, sans the bisect-controlled ones).
+# 2026-05-27 cleanup:
+#   - FERRUM_GRAPH_SKIP_UPLOAD=1 dropped: measured -3.8% at c=32.
+#     graph.rs:156's "re-upload needed for c=4 perf" rationale holds
+#     at c=32 too; default-unset (= re-upload) is the right value.
+#   - FERRUM_USE_VLLM_PAGED_ATTN=1 dropped: regression in current
+#     branch produces garbage on non-split-K varlen path. Unrelated
+#     to moe_align fix; track separately.
+#   - FERRUM_GRAPH=X kept in per-cell envs as cell labels (real
+#     gating is FERRUM_MOE_GRAPH; FERRUM_GRAPH is a no-op placebo).
 COMMON=(
-    FERRUM_GRAPH_SKIP_UPLOAD=1
     FERRUM_MOE_DEVICE_ROUTE=1
     FERRUM_MOE_STREAMS=4
     FERRUM_GREEDY_ARGMAX=1
     FERRUM_KV_MAX_BLOCKS=2048
     FERRUM_PAGED_MAX_SEQS=32
-    FERRUM_USE_VLLM_PAGED_ATTN=1
 )
 
 # Track failures
@@ -135,28 +142,28 @@ fails=0
 # Cell A — SAFE baseline (no vllm-moe-marlin, no graph): must always work
 run_cell "A_safe" "pass" \
     "${COMMON[@]}" \
-    FERRUM_GRAPH=0 FERRUM_VLLM_MOE=0 \
+    FERRUM_MOE_GRAPH=0 FERRUM_VLLM_MOE=0 \
     || fails=$((fails+1))
 
 # Cell B — VLLM_MOE only (graph off): THE primary bisect cell.
 # Before the moe_align_block_size.cu fix this emits garbage.
 run_cell "B_vllm_moe" "pass" \
     "${COMMON[@]}" \
-    FERRUM_GRAPH=0 FERRUM_VLLM_MOE=1 \
+    FERRUM_MOE_GRAPH=0 FERRUM_VLLM_MOE=1 \
     || fails=$((fails+1))
 
 # Cell C — VLLM_MOE + GRAPH on: must also produce Paris (graph is innocent
 # per the corrected diagnosis — B and C should both pass or both fail)
 run_cell "C_vllm_moe_graph" "pass" \
     "${COMMON[@]}" \
-    FERRUM_GRAPH=1 FERRUM_VLLM_MOE=1 \
+    FERRUM_MOE_GRAPH=1 FERRUM_VLLM_MOE=1 \
     || fails=$((fails+1))
 
 # Cell D — VLLM_MOE + HOST_ROUTE workaround: unchanged by the kernel fix,
 # must still produce Paris (this was the only ON-path that worked pre-fix)
 run_cell "D_vllm_moe_host_route" "pass" \
     "${COMMON[@]}" \
-    FERRUM_GRAPH=0 FERRUM_VLLM_MOE=1 FERRUM_MOE_HOST_ROUTE=1 \
+    FERRUM_MOE_GRAPH=0 FERRUM_VLLM_MOE=1 FERRUM_MOE_HOST_ROUTE=1 \
     || fails=$((fails+1))
 
 log ""
