@@ -293,9 +293,7 @@ impl BackendMoeFused for CudaBackend {
                 let st = stream
                     .memcpy_dtov(sorted_token_ids.as_i32())
                     .unwrap_or_default();
-                let bi = stream
-                    .memcpy_dtov(block_ids.as_i32())
-                    .unwrap_or_default();
+                let bi = stream.memcpy_dtov(block_ids.as_i32()).unwrap_or_default();
                 let tp = stream
                     .memcpy_dtov(total_tokens_post_pad.as_i32())
                     .unwrap_or_default();
@@ -305,7 +303,10 @@ impl BackendMoeFused for CudaBackend {
                     "[MOE_DUMP] batch_x_topk={batch_x_topk} block_size={block_size} num_experts={num_experts} total_post_pad={:?}",
                     tp.first().copied().unwrap_or(-1)
                 );
-                eprintln!("[MOE_DUMP] sorted_token_ids[0..{n_show}] = {:?}", &st[..n_show]);
+                eprintln!(
+                    "[MOE_DUMP] sorted_token_ids[0..{n_show}] = {:?}",
+                    &st[..n_show]
+                );
                 eprintln!("[MOE_DUMP] block_ids[0..{n_bi}] = {:?}", &bi[..n_bi]);
             }
         }
