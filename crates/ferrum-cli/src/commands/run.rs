@@ -175,6 +175,12 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    // Default-ON `FERRUM_MOE_GRAPH=1`. Independent of the autosizer
+    // run below — autosize early-returns when the user has set
+    // KV_MAX_BLOCKS + PAGED_MAX_SEQS, skipping the MOE_GRAPH setter
+    // that used to follow.
+    crate::gpu_mem_autosize::apply_moe_graph_default();
+
     // Resolve the model through the central source resolver. Handles
     // .gguf paths, local model dirs, HF cache hits, and HF download in
     // one entry; runs the chat-profile GPU autosize + (for GGUF) sets
