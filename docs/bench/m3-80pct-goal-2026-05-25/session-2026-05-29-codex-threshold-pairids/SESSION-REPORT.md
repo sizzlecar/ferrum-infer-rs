@@ -468,6 +468,50 @@ Continuation after pod restore:
   but lost `1.03%` throughput and nearly tripled TTFT, so it failed the c32
   smoke gate and was not promoted to N=3. Do not repeat chunk64 or chunk-size
   sweeps unless a new admission/fill design can cap the TTFT cost.
+- A graph-on timeline and graph-shape prewarm check narrowed the current c32
+  tail issue. Artifact `/workspace/m3-graphon-timeline-c32-20260529_095135/`
+  passed Paris and measured Ferrum c32 N=1 `1212.4 tok/s`, `TPOT p50=23.58 ms`,
+  `ITL p50=15.19 ms`, `ITL p95=95.15 ms`, `TTFT p50=351 ms`. Same-pod vLLM
+  N=1 in the same artifact measured `1983.5 tok/s`, `ITL p95=14.01 ms`. Graph
+  replay upload/launch was only hundreds of microseconds, while large Ferrum
+  `iter-prof` spikes were mixed/full prefill batches. External prewarm of
+  c30/c31/c32 graph shapes in `/workspace/m3-graph-shape-prewarm-c32-20260529_095611/`
+  improved the single N=1 throughput to `1267.8 tok/s` but left `ITL p95=96.84 ms`,
+  so lazy shape capture is not the primary c32 tail explanation.
+- Mixed-prefill layer profiling showed a concrete attention gap. With
+  vLLM-layout paged attention enabled, `/workspace/m3-mixed-prefill-layer-prof-20260529_095945/`
+  measured mixed rows around `m≈832-876` with median layer-stage totals
+  `attn≈61.5 ms`, `moe≈36.5 ms`, `qkv≈6.7 ms`, `o_proj≈5.8 ms` under sync
+  profiling. The legacy-layout comparison
+  `/workspace/m3-mixed-prefill-legacy-varlen-prof-20260529_100212/` measured
+  `attn≈46.5 ms` and `moe≈36.3 ms` on the same style of run. This points at
+  the vLLM-layout varlen prefill attention bridge as a real tail contributor,
+  but it does not by itself prove that legacy layout should be default because
+  VPA remains useful for decode.
+- vLLM-layout varlen split-K was implemented as an opt-in kernel experiment and
+  then reverted after failing the c32 smoke gate. The candidate added
+  `FERRUM_VLLM_VARLEN_SPLIT_K=1`, a vLLM-layout split-K phase1 kernel, and
+  reused the existing varlen split-K reduce. CUDA release build took `22m17s`
+  because `ferrum-kernels/build.rs` recompiles unrelated Marlin/MoE-Marlin
+  template libraries when one attention `.cu` changes. Same-binary c32 N=1
+  artifact `/workspace/m3-vllm-varlen-splitk-ab-20260529_183142/` passed Paris
+  for both rows. `splitk` measured `1164.6 tok/s`, `TPOT p50=24.19 ms`,
+  `ITL p50=15.01 ms`, `ITL p95=104.57 ms`, `TTFT p50=419 ms`; default measured
+  `1239.8 tok/s`, `TPOT p50=22.61 ms`, `ITL p50=15.07 ms`,
+  `ITL p95=96.68 ms`, `TTFT p50=383 ms`. Split-K was `-6.06%`, so do not
+  reintroduce that two-phase path without a new kernel design. The next
+  attention attempt should be a proper tiled vLLM/FlashAttention-style varlen
+  prefill kernel or a microbench-proven equivalent, not another split-K wrapper.
+- Added `scripts/m3_vllm_varlen_splitk_ab.sh` to make this negative control
+  reproducible. It runs split-K first so a candidate Paris failure stops before
+  spending time on the default row, then runs the same-binary default baseline
+  and prints throughput/TPOT/ITL/TTFT summaries. It is a scoped experiment
+  script, not a default benchmark sweep.
+- Build-cycle efficiency is now a concrete blocker for CUDA iteration speed.
+  The observed attention-only edit rebuilt unrelated `vllm_marlin/*` and
+  `vllm_marlin_moe/*` static libraries before linking. A near-term engineering
+  fix is to add build-script stamp/artifact caching or split those static
+  libraries so attention-only PTX changes do not pay the Marlin template cost.
 
 Primary artifacts:
 
@@ -502,6 +546,11 @@ Primary artifacts:
 - `/workspace/m3-graph-prod-profile-20260529_085701/`
 - `/workspace/m3-sched-prompt-est-ab-20260529_090018/`
 - `/workspace/m3-unified-chunked-prefill-ab-20260529_094117/`
+- `/workspace/m3-graphon-timeline-c32-20260529_095135/`
+- `/workspace/m3-graph-shape-prewarm-c32-20260529_095611/`
+- `/workspace/m3-mixed-prefill-layer-prof-20260529_095945/`
+- `/workspace/m3-mixed-prefill-legacy-varlen-prof-20260529_100212/`
+- `/workspace/m3-vllm-varlen-splitk-ab-20260529_183142/`
 
 ## Current target status
 
@@ -525,7 +574,9 @@ split-K scheduler-only parity, block8-only testing, block-size-only vLLM raw-op
 probes, forcing Marlin `128x128,bps=1`, graph-pre-sync removal, Marlin
 source/body parity without new raw-op evidence,
 `FERRUM_UNIFIED_CHUNKED_PREFILL=64`, chunk-size-only prefill sweeps, or
-`FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next high-return
+`FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. Also do not repeat the
+two-phase `FERRUM_VLLM_VARLEN_SPLIT_K=1` wrapper; it passed Paris but regressed
+c32 throughput by `6.06%`. The next high-return
 loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
@@ -535,9 +586,13 @@ loop should target full-model time directly:
    overstates per-kernel bucket time;
 3. do not default prompt-token-estimate from the current evidence; it is only
    `+2.8%` and worsens TTFT;
-4. next profile should explain end-to-end occupancy/fill gaps (batch-size over
-   time, warmup/non-warmup separation, streaming backpressure) before another
-   scheduler change;
+4. before another scheduler change, the next profile should explain end-to-end
+   occupancy/fill gaps and mixed-prefill attention cost (batch-size over time,
+   warmup/non-warmup separation, streaming backpressure, and whether a proper
+   tiled varlen prefill attention kernel can remove the `~61 ms` vLLM-layout
+   attention bucket);
 5. for kernel work, skip source parity unless a new raw-op mismatch appears;
    the remaining high-upside kernel path is a genuinely fused small-M MoE design;
-6. run Paris, then c16/c32 N=3 A/B on the same pod.
+6. reduce CUDA iteration waste before another `.cu` experiment by adding
+   build-script cache/stamp logic or splitting Marlin static libraries, then run
+   Paris and c16/c32 N=3 A/B on the same pod for any positive candidate.
