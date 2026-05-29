@@ -28,6 +28,7 @@ complete**.
 | Ferrum/vLLM raw Marlin active65 op probe | synthetic op only | gate/up and down match within noise; down-source-parity ruled out |
 | graph-on production c32 profile | Paris | graph/post/scheduler not a 25% standalone gap |
 | prompt-token-estimate scheduler A/B | Paris both rows | +2.8% throughput but TTFT worse; keep opt-in |
+| split mixed prefill/decode | Paris both rows | c32 N=3 `+1.46%`; reverted as noise |
 
 ## What changed
 
@@ -538,6 +539,24 @@ Continuation after pod restore:
   real QK/V reuse problem. A future attention lever needs a full Q/K/V tiled
   FlashAttention-style varlen design or a standalone microbench showing the
   intended kernel wins before full-model testing.
+- A clean HEAD graph-on production profile after the tiled-V revert confirmed
+  the same end-to-end shape. Artifact
+  `/workspace/m3-graphon-prod-profile-8ef71ce-20260529_120645/` passed Paris
+  and measured c32 N=1 `1255.7 tok/s`, `TPOT p50=22.0 ms`,
+  `ITL p95=127.0 ms`, `TTFT p50=393 ms`. Graph replay median was
+  `total≈13.38 ms`, with upload+launch only `≈0.32 ms`; sampled full-batch
+  model calls stayed around `12–16 ms`. This reconfirms that graph
+  upload/launch, decode postprocess, and scheduler call overhead are not
+  standalone 25% gaps.
+- A split mixed-prefill/decode candidate was tested and reverted. The opt-in
+  `FERRUM_SPLIT_MIXED_PREFILL_DECODE=1` routed mixed batches through the
+  existing pure-prefill plus pure-decode graph paths instead of one Qwen
+  unified mixed forward. Paris passed. N=1 artifact
+  `/workspace/m3-split-mixed-ab-20260529_121843/` showed split `1250.8` vs
+  default `1221.5 tok/s` (`+2.4%`), but N=3 artifact
+  `/workspace/m3-split-mixed-ab-n3-20260529_122047/` measured default
+  `1256.3 ± 60.4` and split `1274.7 ± 33.9 tok/s` (`+1.46%`, overlapping
+  noise). Do not repeat split-only mixed-batch work without a new profile.
 
 Primary artifacts:
 
@@ -583,6 +602,9 @@ Primary artifacts:
 - `/workspace/m3-unified-trace-c32-20260529_114549/`
 - `/workspace/m3-varlen-tiled-v-build-20260529.log`
 - `/workspace/m3-vllm-varlen-tiled-v-ab-20260529_115504/`
+- `/workspace/m3-graphon-prod-profile-8ef71ce-20260529_120645/`
+- `/workspace/m3-split-mixed-ab-20260529_121843/`
+- `/workspace/m3-split-mixed-ab-n3-20260529_122047/`
 
 ## Current target status
 
@@ -596,8 +618,9 @@ Use the ratios below as directional only until vLLM is rerun with
   is `1299.0 / 1971.8 ≈ 0.66`. Short-v1 attention is separately validated as
   a `+2.0%` same-binary effect, but there is no clean final combined-default
   N=3 row yet. Prompt-token-estimate reached `1314.0 tok/s` in same-binary A/B
-  but is not default-worthy because TTFT regressed. On the conservative row c32
-  still needs roughly `+21%` throughput to clear 0.80× on this pod.
+  but is not default-worthy because TTFT regressed. The split mixed-batch
+  candidate only reached `1274.7 ± 33.9` and was reverted. On the conservative
+  row c32 still needs roughly `+21%` throughput to clear 0.80× on this pod.
 
 ## Next lever
 
@@ -610,7 +633,8 @@ source/body parity without new raw-op evidence,
 two-phase `FERRUM_VLLM_VARLEN_SPLIT_K=1` wrapper; it passed Paris but regressed
 c32 throughput by `6.06%`. Do not repeat simple vLLM-layout weighted-V tiling;
 `FERRUM_VLLM_VARLEN_TILED_V=1` passed Paris but regressed c32 N=1 by about
-`4.5%`. The next high-return
+`4.5%`. Do not repeat split-only mixed prefill/decode routing; it was only
+`+1.46%` at c32 N=3 and within noise. The next high-return
 loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
