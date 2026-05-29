@@ -689,8 +689,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       int parsed = std::atoi(v);
       if (parsed > 0) min_pairs = parsed;
     }
+    int max_pairs = 0;
+    if (const char* v = std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS")) {
+      int parsed = std::atoi(v);
+      if (parsed > 0) max_pairs = parsed;
+    }
     int batch_x_topk = prob_m * top_k;
-    if (log_count < log_limit && batch_x_topk >= min_pairs) {
+    bool within_max_pairs = max_pairs == 0 || batch_x_topk <= max_pairs;
+    if (log_count < log_limit && batch_x_topk >= min_pairs && within_max_pairs) {
       int sh_cache_size = get_kernel_cache_size(
           thread_tfg, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
           num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float);
