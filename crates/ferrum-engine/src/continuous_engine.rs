@@ -954,7 +954,7 @@ impl EngineInner {
             use std::sync::atomic::AtomicU64;
             static UNIFIED_PROF_N: AtomicU64 = AtomicU64::new(0);
             let n = UNIFIED_PROF_N.fetch_add(1, Ordering::Relaxed);
-            if n.is_multiple_of(32) {
+            if n < 64 || n.is_multiple_of(32) {
                 let model_us = t1.duration_since(t0).as_micros() as u64;
                 let total_us = t0.elapsed().as_micros() as u64;
                 let decode_post_us = t_decode_sample_us
