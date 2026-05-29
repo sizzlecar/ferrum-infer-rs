@@ -154,6 +154,22 @@ if "Paris" not in content:
     raise SystemExit("Paris gate failed")
 PY
 
+    cat >"$dir/multiturn_req.json" <<JSON
+{"model":"$HF_MODEL","messages":[{"role":"user","content":"What is the capital of France?"},{"role":"assistant","content":"Paris"},{"role":"user","content":"Reply with only that city name."}],"max_tokens":32,"temperature":0.0}
+JSON
+    curl -fsS -X POST "http://127.0.0.1:${port}/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        --data-binary "@$dir/multiturn_req.json" >"$dir/multiturn.json"
+    python3 - "$dir/multiturn.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+print("MULTITURN_CONTENT=", content)
+if "Paris" not in content:
+    raise SystemExit("multi-turn Paris gate failed")
+PY
+
     "$BIN" bench-serve \
         --base-url "http://127.0.0.1:${port}" \
         --model "$HF_MODEL" \
