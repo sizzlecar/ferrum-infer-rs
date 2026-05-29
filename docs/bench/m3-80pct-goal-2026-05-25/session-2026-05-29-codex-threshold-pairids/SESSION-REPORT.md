@@ -963,6 +963,23 @@ it is still not final/default: the shim is still an external runtime-loaded
 `.so`, and the CUTLASS/FA2 source integration has not yet been vendored or
 linked through `ferrum-kernels`.
 
+In-repo source-linked FA2 checkpoint: commits `2ba56af` / `dd18215` / `cb95d05`
+added the `fa2-source` feature, the static `ferrum-kernels` link path, and fixed
+stub files under `crates/ferrum-kernels/kernels/fa2_source/stubs/` instead of
+generating them in `build.rs`. Commits `3c74fbb` / `6976f41` / `59f99d0`
+updated the A/B runner and aligned `FERRUM_FA2_SOURCE` env parsing between model
+and backend layers. Remote full release build on the clean checkout took
+`28m32s`; after fast-forward to `59f99d0`, the incremental rebuild took
+`3m14s`, and the runtime-dependency grep over `ldd target/release/ferrum`
+showed no vLLM/Torch/Python/FA2 matches. Source-linked smoke artifact
+`/workspace/m3-fa2-source-linked-smoke-20260529_192213/` ran with
+`FA2_SOURCE=1 FA2_EXTRA_LD_LIBRARY_PATH=""`; both source-linked FA2 and FA-layout
+rows passed Paris and multi-turn. The c32 N=1/64 prompt row measured source FA2
+`1540.3 tok/s` versus FA-layout `1325.4 tok/s` (`+16.21%`). This removes the
+runtime shim dependency for the tested path, but it is still opt-in and not
+final/default: only c32 N=1 was run, FA2/CUTLASS is still a build-time external
+source checkout, and all-cell N>=3/N=5 confirmation remains pending.
+
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
@@ -998,10 +1015,10 @@ high-return loop should target full-model time directly:
    overstates per-kernel bucket time;
 3. do not default prompt-token-estimate from the current evidence; it is only
    `+2.8%` and worsens TTFT;
-4. replace the vLLM/Torch FA2 shim with a source-built/Ferrum-owned FA2 wrapper
-   or kernel before any default/completion claim; the source-built shim smoke
-   proves the dependency-free direction but still needs in-repo build/link
-   integration and N>=3/N=5 confirmation;
+4. continue the source-built/Ferrum-owned FA2 path before any default/completion
+   claim; the in-repo source-linked smoke removes the runtime shim dependency
+   for c32 N=1 but still needs all-cell N>=3/N=5 confirmation and source
+   dependency productization;
 5. for kernel work, skip source parity unless a new raw-op mismatch appears;
    the remaining high-upside kernel path is a genuinely fused small-M MoE design;
 6. reduce CUDA iteration waste before another `.cu` experiment by adding

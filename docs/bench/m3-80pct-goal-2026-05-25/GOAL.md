@@ -49,6 +49,19 @@ versus FA-layout `1310.8 tok/s` (`+18.53%`). This validates the dependency-free
 direction but still is not final/default because the source shim is runtime
 loaded and not yet integrated into the in-repo `ferrum-kernels` build/link path.
 
+Follow-up in-repo source-linked smoke: commits `2ba56af` / `dd18215` /
+`cb95d05` added the `fa2-source` feature, static `ferrum-kernels` link path, and
+fixed stub files; `3c74fbb` / `6976f41` / `59f99d0` updated the A/B script and
+aligned env parsing. Remote full release build took `28m32s`, the post-sync
+incremental rebuild took `3m14s`, and the runtime-dependency grep over
+`ldd target/release/ferrum` produced no vLLM/Torch/Python/FA2 matches. Smoke
+`/workspace/m3-fa2-source-linked-smoke-20260529_192213/` ran with
+`FA2_SOURCE=1 FA2_EXTRA_LD_LIBRARY_PATH=""`, passed Paris and multi-turn, and
+c32 N=1/64 prompts measured source-linked FA2 `1540.3 tok/s` versus FA-layout
+`1325.4 tok/s` (`+16.21%`). This removes the runtime shim dependency for the
+tested path, but the goal remains open until all-cell N>=3/N=5 confirmation and
+source dependency/defaulting decisions are complete.
+
 ## Current baseline (2026-05-25 sweep)
 
 Sweep dir: [`docs/bench/sweep-2026-05-25-1631-qwen3-moe-30b-int4/`](../sweep-2026-05-25-1631-qwen3-moe-30b-int4/) · ferrum commit `cbe04ea`, n_repeats=1, num_prompts=30, warmup=5, random in=256 out=128.

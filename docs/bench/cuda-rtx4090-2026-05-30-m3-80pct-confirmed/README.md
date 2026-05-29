@@ -56,3 +56,10 @@ Interpretation:
   multi-turn, and c32 N=1/64 prompts measured `1553.7 tok/s` versus FA-layout
   `1310.8 tok/s`. This validates direction only; it is still a runtime-loaded
   shim, not the final in-repo build path.
+- Follow-up in-repo source-linked smoke
+  `/workspace/m3-fa2-source-linked-smoke-20260529_192213/` built the
+  `fa2-source` feature into `ferrum-kernels`. The release binary had no
+  vLLM/Torch/Python/FA2 runtime-link matches in `ldd`, passed Paris and
+  multi-turn, and c32 N=1/64 prompts measured `1540.3 tok/s` versus FA-layout
+  `1325.4 tok/s` (`+16.21%`). This is still opt-in and not final/default:
+  all-cell N>=3/N=5 confirmation and source dependency productization remain.
