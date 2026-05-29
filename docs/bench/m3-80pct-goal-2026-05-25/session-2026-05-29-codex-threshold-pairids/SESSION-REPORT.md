@@ -30,6 +30,7 @@ complete**.
 | prompt-token-estimate scheduler A/B | Paris both rows | +2.8% throughput but TTFT worse; keep opt-in |
 | split mixed prefill/decode | Paris both rows | c32 N=3 `+1.46%`; reverted as noise |
 | unified mixed layer-loop graph | Paris | c32 N=1 `-3.82%`; reverted |
+| unified GPU greedy argmax | Paris both rows | c32 N=1 `+0.97%`; keep as cleanup, not a main lever |
 
 ## What changed
 
@@ -585,6 +586,16 @@ Continuation after pod restore:
   `ITL p95=128.86 ms`, `TTFT p50=397 ms` (`+0.41%`). Do not default it or
   spend N=3 time on this simple Q-only tiling without a new profile showing
   prefill attention dominates the current end-to-end run.
+- The unified path now uses GPU greedy argmax when `FERRUM_GREEDY_ARGMAX=1`.
+  Previously the unified decode path still read full logits back to host even
+  in greedy mode; `FERRUM_UNIFIED_GREEDY_ARGMAX=0` keeps an escape hatch for the
+  old behavior. Clean Git-flow validation from commit `b81866c` passed Paris for
+  both rows in `/workspace/m3-unified-greedy-ab-20260529_git_n1/`. c32 N=1
+  measured unified greedy `1247.6 tok/s`, `TPOT p50=22.54 ms`,
+  `ITL p95=83.67 ms`, `TTFT p50=295 ms` versus old full-logits readback
+  `1235.6 tok/s`, `TPOT p50=22.45 ms`, `ITL p95=128.86 ms`, `TTFT p50=393 ms`
+  (`+0.97%`). Keep the cleanup, but do not spend N=3 GPU time on it unless a
+  later profile shows readback dominating again.
 
 Primary artifacts:
 
@@ -635,6 +646,7 @@ Primary artifacts:
 - `/workspace/m3-split-mixed-ab-n3-20260529_122047/`
 - `/workspace/m3-unified-mixed-graph-ab-20260529_123549/`
 - `/workspace/m3-vllm-varlen-tiled-q4-ab-20260529_git_n1/`
+- `/workspace/m3-unified-greedy-ab-20260529_git_n1/`
 
 ## Current target status
 
@@ -650,8 +662,9 @@ Use the ratios below as directional only until vLLM is rerun with
   N=3 row yet. Prompt-token-estimate reached `1314.0 tok/s` in same-binary A/B
   but is not default-worthy because TTFT regressed. The split mixed-batch
   candidate only reached `1274.7 ± 33.9` and was reverted; simple Q-tiled
-  varlen attention was only `+0.41%` at c32 N=1. On the conservative row c32
-  still needs roughly `+21%` throughput to clear 0.80× on this pod.
+  varlen attention was only `+0.41%` at c32 N=1, and unified GPU argmax was
+  only `+0.97%` at c32 N=1. On the conservative row c32 still needs roughly
+  `+21%` throughput to clear 0.80× on this pod.
 
 ## Next lever
 
@@ -669,8 +682,9 @@ c32 throughput by `6.06%`. Do not repeat simple vLLM-layout weighted-V tiling;
 microbench, but full-model c32 N=1 was only `+0.41%`. Do not repeat split-only
 mixed prefill/decode routing; it was only
 `+1.46%` at c32 N=3 and within noise. Do not repeat unified mixed layer-loop
-graph capture; it regressed c32 N=1 by `3.82%`. The next high-return
-loop should target full-model time directly:
+graph capture; it regressed c32 N=1 by `3.82%`. Unified GPU argmax is already
+committed as a cleanup but only measured `+0.97%` at c32 N=1, so it is not a
+primary lever. The next high-return loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;
