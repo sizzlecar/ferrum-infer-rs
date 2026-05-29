@@ -794,7 +794,10 @@ impl BackendPagedKv for CudaBackend {
         max_blocks_per_seq: usize,
     ) -> Result<()> {
         #[cfg(feature = "fa2-source")]
-        if std::env::var("FERRUM_FA2_SOURCE").as_deref() == Ok("1") {
+        if matches!(
+            std::env::var("FERRUM_FA2_SOURCE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("on") | Ok("ON")
+        ) {
             return super::fa2_source::paged_varlen_attention_fa2_source(
                 &ctx.stream,
                 q.as_f16(),
