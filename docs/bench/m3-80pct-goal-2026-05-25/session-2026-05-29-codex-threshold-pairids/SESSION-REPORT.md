@@ -31,6 +31,7 @@ complete**.
 | split mixed prefill/decode | Paris both rows | c32 N=3 `+1.46%`; reverted as noise |
 | unified mixed layer-loop graph | Paris | c32 N=1 `-3.82%`; reverted |
 | unified GPU greedy argmax | Paris both rows | c32 N=1 `+0.97%`; keep as cleanup, not a main lever |
+| prefill-first admission | Paris both rows | c32 N=1 `+3.77%`, but TTFT worse; prompt-est combo `-0.58%`; keep opt-in |
 
 ## What changed
 
@@ -596,6 +597,21 @@ Continuation after pod restore:
   `1235.6 tok/s`, `TPOT p50=22.45 ms`, `ITL p95=128.86 ms`, `TTFT p50=393 ms`
   (`+0.97%`). Keep the cleanup, but do not spend N=3 GPU time on it unless a
   later profile shows readback dominating again.
+- A scheduler prefill-first admission experiment was added as an opt-in only
+  lever. `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE=32` skips early decode
+  scheduling while there are waiting/prefill requests and the active decode
+  cohort is below 32, trying to reduce the c32 first-wave mixed
+  prefill+decode spike. It passed local scheduler tests and remote release
+  build took `2m56s` without nvcc. Clean Git-flow c32 N=1
+  `/workspace/m3-prefill-first-ab-20260529_git_n1/` passed Paris for both rows:
+  prefill-first measured `1287.1 tok/s`, `TPOT p50=20.47 ms`,
+  `ITL p95=22.93 ms`, `TTFT p50=466 ms`; default measured `1240.4 tok/s`,
+  `TPOT p50=22.64 ms`, `ITL p95=82.92 ms`, `TTFT p50=320 ms` (`+3.77%`).
+  This hit the tail spike but missed the `+5%` continuation bar and worsened
+  TTFT. With prompt-token estimate enabled on both rows,
+  `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/` regressed
+  slightly: prefill-first `1267.0 tok/s` versus default `1274.4 tok/s`
+  (`-0.58%`). Do not default it or spend N=3 time without a stronger signal.
 
 Primary artifacts:
 
@@ -647,6 +663,8 @@ Primary artifacts:
 - `/workspace/m3-unified-mixed-graph-ab-20260529_123549/`
 - `/workspace/m3-vllm-varlen-tiled-q4-ab-20260529_git_n1/`
 - `/workspace/m3-unified-greedy-ab-20260529_git_n1/`
+- `/workspace/m3-prefill-first-ab-20260529_git_n1/`
+- `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/`
 
 ## Current target status
 
@@ -663,8 +681,10 @@ Use the ratios below as directional only until vLLM is rerun with
   but is not default-worthy because TTFT regressed. The split mixed-batch
   candidate only reached `1274.7 ± 33.9` and was reverted; simple Q-tiled
   varlen attention was only `+0.41%` at c32 N=1, and unified GPU argmax was
-  only `+0.97%` at c32 N=1. On the conservative row c32 still needs roughly
-  `+21%` throughput to clear 0.80× on this pod.
+  only `+0.97%` at c32 N=1. Prefill-first admission was only `+3.77%` at c32
+  N=1 and regressed when combined with prompt-token estimate. On the
+  conservative row c32 still needs roughly `+21%` throughput to clear 0.80× on
+  this pod.
 
 ## Next lever
 
@@ -684,7 +704,10 @@ mixed prefill/decode routing; it was only
 `+1.46%` at c32 N=3 and within noise. Do not repeat unified mixed layer-loop
 graph capture; it regressed c32 N=1 by `3.82%`. Unified GPU argmax is already
 committed as a cleanup but only measured `+0.97%` at c32 N=1, so it is not a
-primary lever. The next high-return loop should target full-model time directly:
+primary lever. Do not default or N=3 the prefill-first admission experiment:
+it reduced `ITL p95` but only measured `+3.77%` at c32 N=1, worsened TTFT, and
+regressed with prompt-token estimate. The next high-return loop should target
+full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;
