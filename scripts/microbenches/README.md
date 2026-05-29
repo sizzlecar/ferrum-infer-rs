@@ -27,6 +27,7 @@ nvcc -O3 -arch=sm_89 -std=c++17 -I<include-path> \
 | `scalar_type_id_test.cu` (+ `_other_tu.cu`) | Verifies `vllm::ScalarType::id()` constexpr produces consistent values across translation units, and that template specializations keyed on those IDs dispatch correctly. **Two-TU compile required.** |
 | `moe_marlin_active65_perf.cu` | Direct C-ABI benchmark for Ferrum's vLLM-Marlin MoE gate/up and down kernels on the real c32 active65 route. Links against existing `ferrum-kernels` build objects, avoiding a full Cargo rebuild. |
 | `vllm_flash_attn_varlen_probe.py` | Runs vLLM 0.20.2 `flash_attn_varlen_func` on Qwen3 paged-varlen prefill/mixed shapes. Use it to size the upside before porting a real FA-style varlen kernel into Ferrum. |
+| `fa2_direct_ffi_probe.cpp` | Calls the `flash::run_mha_fwd` symbol exported by vLLM's `_vllm_fa2_C.abi3.so` directly, bypassing Python and `torch.ops`, to test whether an opt-in FA2 C-ABI shim is viable. |
 
 ## Notes
 
