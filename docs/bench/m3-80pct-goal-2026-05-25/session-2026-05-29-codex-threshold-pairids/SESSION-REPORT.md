@@ -393,6 +393,15 @@ Continuation after pod restore:
   `0%`, `1 MiB / 49140 MiB`. The matching local 128x64 edits were preserved in
   stash `codex-save-local-unknown-128x64-dirty-20260529_0620` so they cannot
   contaminate this checkpoint.
+- Graph pre-sync removal was tested as a deliberately small host-barrier
+  lever and reverted. The candidate skipped the unconditional
+  `B::sync(&mut ctx)` before graph replay/eager layer-loop while still syncing
+  before graph capture. Paris passed in
+  `/workspace/m3-presync-skip-paris-20260529_074417`, but same-binary c32 N=3
+  `/workspace/m3-presync-ab-20260529_074643/` measured skip-sync
+  `1249.0 ± 27.3 tok/s` vs forced old pre-sync `1252.6 ± 81.4 tok/s`
+  (`-0.28%`). This is noise and directionally negative; do not keep or repeat
+  graph-pre-sync removal as a primary lever.
 
 Primary artifacts:
 
@@ -417,6 +426,8 @@ Primary artifacts:
 - `/workspace/m3-route-unified-layer-relaxed-clean-20260529_060400/`
 - `/workspace/m3-marlin-thread-ab-n3-20260529_060835/`
 - `/workspace/m3-admin/vllm-raw-marlin-block8-block16-20260529_0624.json`
+- `/workspace/m3-presync-skip-paris-20260529_074417`
+- `/workspace/m3-presync-ab-20260529_074643/`
 
 ## Current target status
 
@@ -435,9 +446,9 @@ Use the ratios below as directional only until vLLM is rerun with
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, block8-only
-testing, block-size-only vLLM raw-op probes, forcing Marlin `128x128,bps=1`, or
-`FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next high-return
-loop should target model time directly:
+testing, block-size-only vLLM raw-op probes, forcing Marlin `128x128,bps=1`,
+graph-pre-sync removal, or `FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone
+lever. The next high-return loop should target model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;
