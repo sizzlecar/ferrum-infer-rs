@@ -11,6 +11,12 @@ FERRUM_FA2_DIRECT_FFI_SHIM=/workspace/libferrum_fa2_shim.so
 As of the follow-up checkpoint, `FERRUM_FA2_DIRECT_FFI_SHIM` alone enables the
 direct path; `FERRUM_FA2_DIRECT_FFI=0` forces it off.
 
+Follow-up auto-shim smoke:
+`/workspace/m3-fa2-auto-shim-smoke-20260530/` intentionally left
+`FERRUM_FA2_DIRECT_FFI` unset, passed Paris, passed a two-turn chat gate, and
+completed a c32 smoke with 0 request errors. That smoke validates the automatic
+shim activation path; the N=5 table below remains the performance source.
+
 Workload: `Qwen/Qwen3-30B-A3B-GPTQ-Int4`, random `256/128`, 128 prompts,
 10 warmup requests, closed-loop `c=1/4/16/32`, RTX 4090 locked clocks.
 vLLM baseline used vLLM `0.20.2`, `--gpu-memory-utilization 0.85`,

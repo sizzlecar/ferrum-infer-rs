@@ -936,6 +936,15 @@ and allocates the extra FA-compatible K/V pool. The remaining product decision
 is accepting/defaulting that dependency and memory cost versus replacing it with
 a cleaner source-built FA2 wrapper.
 
+Follow-up `3b95ce9` reduced the deployment footgun: setting
+`FERRUM_FA2_DIRECT_FFI_SHIM=/path/libferrum_fa2_shim.so` now enables the FA2
+direct path automatically; `FERRUM_FA2_DIRECT_FFI=0` explicitly disables it.
+Remote smoke `/workspace/m3-fa2-auto-shim-smoke-20260530/` intentionally left
+`FERRUM_FA2_DIRECT_FFI` unset, passed Paris, passed a two-turn chat gate
+(`MULTITURN_CONTENT= Paris`), and completed a c32 smoke (`64/64`, 0 errors,
+`1569.2 tok/s`). Treat the smoke as path/correctness evidence only; the N=5
+confirmation table above remains the performance accounting source.
+
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
