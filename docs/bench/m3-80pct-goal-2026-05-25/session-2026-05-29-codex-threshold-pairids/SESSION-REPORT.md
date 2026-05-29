@@ -24,6 +24,7 @@ complete**.
 | partial vLLM 0.20.2 Marlin scheduling backport | Paris | no c32 gain; reverted |
 | block8 vLLM parity override | Paris/no-garbage smoke | c16/c32 regression; keep override-only |
 | broad `{128,64,128}` Marlin tile instantiation | graph-on load failed | 48GB OOM near layer 40; reverted |
+| vLLM raw Marlin block8/block16 op probe | synthetic op only | no kernel-time delta; block-size-only ruled out |
 
 ## What changed
 
@@ -367,6 +368,31 @@ Continuation after pod restore:
   measured `1235.4 ± 35.1 tok/s` (`-1.7%`). Do not turn this into a default or
   shape guard; the next MoE lever still needs source-parity/kernel work, not
   this scheduling override.
+- vLLM 0.20.2 source inspection confirmed that the single-GPU DP=1 path uses the
+  standard `MarlinExperts`, not the `BatchedMarlinExperts` DeepEP/NIXL
+  activation format. A raw-op probe then tested vLLM's block-size selector
+  directly with `/workspace/vllm-venv/bin/python` and
+  `moe_wna16_marlin_gemm` at M=32/topk=8. Artifact:
+  `/workspace/m3-admin/vllm-raw-marlin-block8-block16-20260529_0624.json`.
+  This was a synthetic random route (`unique_experts=114`, `blocks=114`), not a
+  full-model throughput row, but it is a valid block8-vs-block16 comparison on
+  the same route.
+- Raw-op result: gate/up block8 `198.949 µs` vs block16 `200.144 µs`; down
+  block8 `104.090 µs` vs block16 `104.322 µs`. Block8 halves the `npp` scratch
+  requirement but did not reduce active block count or kernel time for this
+  sparse c32-style route. This reinforces the earlier Ferrum full-model block8
+  regression: do not spend another loop on block-size-only work.
+- Process hygiene checkpoint: stale `m3build128x64d` / `ssh_tmux` 128x64 build
+  jobs were killed after they repeatedly dirtied
+  `crates/ferrum-kernels/kernels/vllm_marlin_moe/{ops.cu,kernel_instantiations.cu}`.
+  The remote diff was saved to
+  `/workspace/m3-admin/unknown-128x64-dirty-20260529_0620.diff` and stashed as
+  `codex-save-unknown-128x64-dirty-20260529_0620`. A final audit showed
+  `/workspace/ferrum-codex-clean` clean on `codex/m3-20260529-checkpoint`, no
+  matching cargo/nvcc/ferrum/vLLM/tmux processes, and RTX 4090 GPU usage
+  `0%`, `1 MiB / 49140 MiB`. The matching local 128x64 edits were preserved in
+  stash `codex-save-local-unknown-128x64-dirty-20260529_0620` so they cannot
+  contaminate this checkpoint.
 
 Primary artifacts:
 
@@ -390,6 +416,7 @@ Primary artifacts:
 - `/workspace/m3-moe-parity-lite-binary-ab-c1-20260529_044647/`
 - `/workspace/m3-route-unified-layer-relaxed-clean-20260529_060400/`
 - `/workspace/m3-marlin-thread-ab-n3-20260529_060835/`
+- `/workspace/m3-admin/vllm-raw-marlin-block8-block16-20260529_0624.json`
 
 ## Current target status
 
@@ -408,9 +435,9 @@ Use the ratios below as directional only until vLLM is rerun with
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, block8-only
-testing, forcing Marlin `128x128,bps=1`, or `FERRUM_MAX_BATCHED_TOKENS=4096`
-as a standalone lever. The next high-return loop should target model time
-directly:
+testing, block-size-only vLLM raw-op probes, forcing Marlin `128x128,bps=1`, or
+`FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next high-return
+loop should target model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;
