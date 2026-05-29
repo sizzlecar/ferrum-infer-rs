@@ -29,6 +29,7 @@ nvcc -O3 -arch=sm_89 -std=c++17 -I<include-path> \
 | `vllm_flash_attn_varlen_probe.py` | Runs vLLM 0.20.2 `flash_attn_varlen_func` on Qwen3 paged-varlen prefill/mixed shapes. Use it to size the upside before porting a real FA-style varlen kernel into Ferrum. |
 | `fa2_direct_ffi_probe.cpp` | Calls the `flash::run_mha_fwd` symbol exported by vLLM's `_vllm_fa2_C.abi3.so` directly, bypassing Python and `torch.ops`, to test whether an opt-in FA2 C-ABI shim is viable. |
 | `fa2_ferrum_shim.cpp` | Out-of-tree C ABI shim for `FERRUM_FA2_DIRECT_FFI=1`; build it with `build_fa2_ferrum_shim.sh` and point `FERRUM_FA2_DIRECT_FFI_SHIM` at the resulting `.so`. |
+| `fa2_ferrum_source_shim.cu` | Source-built FA2 C ABI shim with no vLLM/Torch runtime link. Build it with `build_fa2_ferrum_source_shim.sh`; this is the bridge toward a Ferrum-owned FA2 integration. |
 
 ## Notes
 
