@@ -304,7 +304,12 @@ where
                 .unified_block_tables
                 .as_ref()
                 .expect("unified_block_tables missing");
-            B::split_qkv_norm_rope_into_paged_cache_varlen(
+            let varlen_dispatch = if self.use_vllm_paged_attn {
+                B::split_qkv_norm_rope_into_paged_cache_varlen_vllm
+            } else {
+                B::split_qkv_norm_rope_into_paged_cache_varlen
+            };
+            varlen_dispatch(
                 ctx,
                 &self.scratch.qkv_out,
                 q_norm_w,
@@ -347,25 +352,47 @@ where
                 .unified_block_tables
                 .as_ref()
                 .expect("unified_block_tables missing");
-            B::paged_varlen_attention(
-                ctx,
-                &self.scratch.q_head_major,
-                pool_k,
-                pool_v,
-                &mut self.scratch.attn_head_major_out,
-                cu_seqlens_buf,
-                pos_offsets_buf,
-                bt_buf,
-                num_seqs,
-                m_total,
-                max_kv_len,
-                nh,
-                nkv,
-                hd,
-                block_size,
-                max_blocks_per_seq,
-            )
-            .expect("Qwen3Moe unified: paged_varlen_attention");
+            if self.use_vllm_paged_attn {
+                B::paged_varlen_attention_vllm(
+                    ctx,
+                    &self.scratch.q_head_major,
+                    pool_k,
+                    pool_v,
+                    &mut self.scratch.attn_head_major_out,
+                    cu_seqlens_buf,
+                    pos_offsets_buf,
+                    bt_buf,
+                    num_seqs,
+                    m_total,
+                    max_kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("Qwen3Moe unified: paged_varlen_attention_vllm");
+            } else {
+                B::paged_varlen_attention(
+                    ctx,
+                    &self.scratch.q_head_major,
+                    pool_k,
+                    pool_v,
+                    &mut self.scratch.attn_head_major_out,
+                    cu_seqlens_buf,
+                    pos_offsets_buf,
+                    bt_buf,
+                    num_seqs,
+                    m_total,
+                    max_kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("Qwen3Moe unified: paged_varlen_attention");
+            }
         }
 
         // 5. o_proj (m = M_total): attn_head_major_out → o_proj_out

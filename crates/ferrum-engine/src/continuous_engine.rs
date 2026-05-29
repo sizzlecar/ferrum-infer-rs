@@ -758,6 +758,12 @@ impl EngineInner {
         }
 
         // ── 3. ONE unified forward call ──
+        let unified_prof = std::env::var("FERRUM_UNIFIED_POST_PROF").is_ok();
+        let t_unified_model = if unified_prof {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let results = match self.model_executor.unified_decode(&unified).await {
             Ok(r) => r,
             Err(e) => {
@@ -774,6 +780,11 @@ impl EngineInner {
                 return self.process_batch_legacy_split(batch).await;
             }
         };
+        let t_unified_model_done = if unified_prof {
+            Some(Instant::now())
+        } else {
+            None
+        };
         if results.len() != unified.items.len() {
             return Err(FerrumError::internal(format!(
                 "unified_decode returned {} results for {} items",
@@ -785,6 +796,13 @@ impl EngineInner {
         // ── 4. Per-item post-process — split by category ──
         // Prefill items come first (in the order added), then decode items.
         let prefill_count = prefill_meta.len();
+        let decode_count = decode_meta.len();
+        let item_count = unified.items.len();
+        let mut t_decode_sample_us: u64 = 0;
+        let mut t_decode_sched_us: u64 = 0;
+        let mut t_decode_stream_us: u64 = 0;
+        let mut t_decode_stop_us: u64 = 0;
+        let mut t_decode_complete_us: u64 = 0;
         for (i, (rid, input_tokens)) in prefill_meta.into_iter().enumerate() {
             let logits_vec = match &results[i] {
                 Some(l) => l.clone(),
@@ -834,6 +852,11 @@ impl EngineInner {
         }
         for (j, rid) in decode_meta.into_iter().enumerate() {
             let i = prefill_count + j;
+            let t0_sample = if unified_prof {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let logits_vec = match &results[i] {
                 Some(l) => l.clone(),
                 None => continue,
@@ -861,6 +884,14 @@ impl EngineInner {
                 // silent no-op for production handles.
                 token
             };
+            if let Some(t0) = t0_sample {
+                t_decode_sample_us += t0.elapsed().as_micros() as u64;
+            }
+            let t0_sched = if unified_prof {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let generated_count = {
                 let sequences = self.sequences.read();
                 sequences
@@ -871,12 +902,36 @@ impl EngineInner {
             self.scheduler.update_decode_progress(&rid, generated_count);
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
+            if let Some(t0) = t0_sched {
+                t_decode_sched_us += t0.elapsed().as_micros() as u64;
+            }
+            let t0_stream = if unified_prof {
+                Some(Instant::now())
+            } else {
+                None
+            };
             self.send_stream_update(&rid, next_token).await;
+            if let Some(t0) = t0_stream {
+                t_decode_stream_us += t0.elapsed().as_micros() as u64;
+            }
+            let t0_stop = if unified_prof {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let should_stop = {
                 let sequences = self.sequences.read();
                 sequences.get(&rid).is_none_or(|s| s.should_stop())
             };
+            if let Some(t0) = t0_stop {
+                t_decode_stop_us += t0.elapsed().as_micros() as u64;
+            }
             if should_stop {
+                let t0_complete = if unified_prof {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let finish_reason = {
                     let sequences = self.sequences.read();
                     match sequences.get(&rid) {
@@ -890,6 +945,38 @@ impl EngineInner {
                     }
                 };
                 self.complete_request(&rid, finish_reason).await?;
+                if let Some(t0) = t0_complete {
+                    t_decode_complete_us += t0.elapsed().as_micros() as u64;
+                }
+            }
+        }
+        if let (Some(t0), Some(t1)) = (t_unified_model, t_unified_model_done) {
+            use std::sync::atomic::AtomicU64;
+            static UNIFIED_PROF_N: AtomicU64 = AtomicU64::new(0);
+            let n = UNIFIED_PROF_N.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(32) {
+                let model_us = t1.duration_since(t0).as_micros() as u64;
+                let total_us = t0.elapsed().as_micros() as u64;
+                let decode_post_us = t_decode_sample_us
+                    + t_decode_sched_us
+                    + t_decode_stream_us
+                    + t_decode_stop_us
+                    + t_decode_complete_us;
+                eprintln!(
+                    "[unified-prof] iter#{} items={} prefill={} decode={} total={}us model={}us decode_post={}us | sample={} sched={} stream={} stop={} complete={} (us)",
+                    n,
+                    item_count,
+                    prefill_count,
+                    decode_count,
+                    total_us,
+                    model_us,
+                    decode_post_us,
+                    t_decode_sample_us,
+                    t_decode_sched_us,
+                    t_decode_stream_us,
+                    t_decode_stop_us,
+                    t_decode_complete_us,
+                );
             }
         }
 

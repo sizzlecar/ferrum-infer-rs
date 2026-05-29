@@ -75,6 +75,147 @@ come before implementation rather than after mistakes.
 
 ---
 
+## M3 80% goal operating protocol
+
+When a task mentions M3, Qwen3-MoE, CUDA performance, vLLM ratio,
+Vast pods, or benchmark sessions, read these before acting:
+
+1. `docs/bench/m3-80pct-goal-2026-05-25/GOAL.md`
+2. `docs/bench/m3-80pct-goal-2026-05-25/session-2026-05-27-iteration3/SESSION-REPORT.md`
+3. `docs/bench/m3-80pct-goal-2026-05-25/session-2026-05-28/INCIDENT-REPORT.md`
+
+Current facts to preserve:
+
+- Goal: `Qwen/Qwen3-30B-A3B-GPTQ-Int4` must reach `>= 0.80 × vLLM`
+  throughput for `c=1/4/16/32`.
+- Best recent c=32 progress: VPA bridge on 2026-05-28 makes
+  `FERRUM_USE_VLLM_PAGED_ATTN=1` pass the Paris smoke and lifts a
+  same-pod N=3 random 256/128 sweep by about
+  `+3.1%/+2.8%/+3.4%/+6.5%` for `c=1/4/16/32`; c=32 reached
+  `1127.9 ± 101.4 tok/s` versus no-VPA `1058.9 ± 9.2 tok/s`.
+- The post-VPA c=32 active-batch profile still points at MoE, not
+  attention: m=32 decode was roughly `~69%` MoE, `~11%` attention,
+  `~14%` dense; inside MoE, vLLM-Marlin gate_up/down GEMMs dominate.
+- The easy env levers are exhausted. Do not spend another session
+  flipping `FERRUM_VLLM_MOE`, `FERRUM_MOE_GRAPH`, or
+  `FERRUM_PAGED_FLASH_SPLITS` without a new code-level hypothesis.
+- Existing Triton fused-MoE PTX was checked as a minimal small-m MoE
+  validation and is negative for this shape: gate_up only measured about
+  `453 µs/layer`, slower than the vLLM-Marlin gate_up profile at about
+  `150 µs/layer`.
+- Skipping redundant vLLM-Marlin MoE workspace zeroing is correct but
+  only a small/noisy win: Paris passed, c=32 N=3 measured
+  `1153.1 ± 152.7 tok/s` vs forced old zeroing `1130.4 ± 168.7 tok/s`.
+- 2026-05-29 Codex handoff fixed two default-path issues and one small
+  performance lever: graph capture now requires graph-clean MoE
+  (`FERRUM_VLLM_MOE=1`, no forced host route), server c=4 defaults to the
+  batched-decode path (`FERRUM_MOE_BATCH_THRESHOLD=4`), and
+  `FERRUM_VLLM_MOE_PAIR_IDS=1` defaults on with vLLM MoE. Paris passed;
+  measured full sweep before pair-id defaulting was c=1 `155.4 ± 1.0`,
+  c=4 `425.6 ± 36.6`, c=16 `965.8 ± 6.4`, c=32 `1205.6 ± 55.1`
+  tok/s. Pair-id plus the combine fast path improves c=16 to
+  `993.8 ± 26.6` and c=32 to `1264.0 ± 29.4`, still not enough to
+  declare the 0.80× goal done.
+- The pair-id combine fast path is not residual fusion. It adds
+  `weighted_sum_batched_f16` for the vLLM pair-id layout; artifact
+  `/workspace/m3-graph-loop/bench_pairids_residual_c16_c32_n3_rerun2/`
+  is valid despite the misleading name. Ignore
+  `/workspace/m3-graph-loop/bench_pairids_residual_c16_c32_n3/` because
+  the server was interrupted by process-group SIGINT.
+- Same-pod vLLM 0.20.2 c=16/c=32 N=3 baseline is now available:
+  `/workspace/m3-graph-loop/vllm0202_baseline_c16_c32_n3_retry/`
+  measured c=16 `1328.7 ± 44.4`, c=32 `1971.8 ± 7.4` tok/s. Current
+  Ferrum ratios are about c=16 `0.75×`, c=32 `0.64×`; c=32 remains the
+  main blocker and needs about `+25%`.
+- A partial vLLM 0.20.2 Marlin-MoE scheduling/tile backport was tested
+  and reverted: Paris passed, but c=16 `1000.9 ± 34.7`, c=32
+  `1250.4 ± 65.5` tok/s showed no c=32 gain. Do not repeat partial
+  thread-config/tile scheduling changes without a new profiler-backed
+  hypothesis.
+- A full-model `FERRUM_MOE_BLOCK_SIZE=8` validation was tested because
+  vLLM 0.20.2 selects block size 8 for small-M MoE. Ferrum now supports
+  the override and sizes vLLM-MoE `c_tmp` safely for block8, but the
+  same-pod result is negative: c=16 `975.1 ± 3.6`, c=32
+  `1209.5 ± 37.2` in
+  `/workspace/m3-graph-loop/block8_validation_rerun/`, below the block16
+  fast-path baseline. Do not make block8 default or repeat block8-only
+  tests; revisit only as part of a full vLLM 0.20.2 Marlin template/source
+  parity port.
+- Fresh current-default c32 profile after pair-id combine lives at
+  `/workspace/m3-graph-loop/profile_current_pairid_combine_c32/`.
+  With graph disabled for sync timers, steady m≈30/31 decode is still
+  `16–17 ms`; MoE is `~64–66%`, dominated by `gemm1≈6.2–6.6 ms` and
+  `gemm3≈3.0–3.2 ms`, while combine is only `~0.25 ms`. Do not spend a
+  primary lever on combine.
+- New debug-only tools are ready for the next GPU run:
+  `FERRUM_MOE_DUMP=1 FERRUM_MOE_DUMP_BATCH_X_TOPK=256` captures real c=32
+  decode `active_blocks/unique_experts`, and `FERRUM_UNIFIED_POST_PROF=1`
+  splits unified model time from decode post-process/sample/scheduler/stream/
+  stop/complete. Run these before making a new Marlin or engine optimization
+  claim.
+- Use `scripts/m3_route_unified_profile.sh` on the restored pod to collect the
+  route dump and `[unified-prof]`/`[iter-prof]`/`[bucket-prof]` snippets in
+  one c=32 run. It sets `FERRUM_MOE_GRAPH=0` because route dumping syncs/copies
+  GPU buffers. The script fails if route shape or unified timing is missing.
+- Vast instance `38237968` stopped during the route-dump build. Restart
+  returned `resources_unavailable`; renting a replacement 48GB RTX 4090
+  failed with `insufficient_credit`. Treat later GPU work as not run until a
+  pod is restored.
+- `FERRUM_USE_VLLM_PAGED_ATTN=1` is no longer the c=1 correctness bug
+  after the VPA bridge; keep Paris as the minimum gate for future
+  attention or MoE routing changes.
+- vLLM-ratio numbers remain indicative until an apples-to-apples vLLM
+  0.20.2 sweep is rerun with random 256/128 and `n_repeats >= 5`.
+
+### Required execution contract before GPU spend
+
+Before opening or using a paid GPU pod, write a short contract:
+
+```text
+Lever:
+Expected gain:
+Files/paths to inspect or change:
+Correctness gate:
+Benchmark gate:
+Budget cap:
+Stop condition:
+```
+
+If the task cannot be stated this concretely, do not open the pod yet.
+Ask for scope or do local analysis first.
+
+### Anti-drift rules
+
+- One session = one lever. Do not drift from a scoped kernel/graph bug
+  into broad sweeps.
+- Stop after the first failed correctness gate; do not benchmark known
+  garbage output.
+- For deltas under 10%, require same-pod `N >= 3`; single-run Vast
+  numbers are not evidence.
+- During CUDA builds, run parallel local work: source trace, microbench
+  design, or report update. Waiting is not a task.
+- If 30 minutes of GPU time produces no code change, no new profile, and
+  no falsified hypothesis, stop and report.
+
+### Recommended plan to regain goal progress
+
+1. **Lock baseline** — with explicit user budget approval, rerun
+   ferrum/vLLM apples-to-apples for `c=1/4/16/32`, random 256/128,
+   `n_repeats >= 5`, and update `GOAL.md`.
+2. **Attack MoE first** — because post-VPA profile shows MoE dominates,
+   validate full vLLM 0.20.2 Marlin-MoE source parity, a small-m fused-MoE
+   path, or a concrete vLLM-Marlin gate_up/down reduction before spending
+   time on smaller attention wins.
+3. **Fix one medium lever** — choose exactly one non-MoE lever only when
+   profiling justifies it: block-table shared-memory cache, `moe_align`
+   rewrite/port, or graph coverage beyond the layer loop. Ship only if
+   Paris and same-pod A/B pass.
+4. **Update the source of truth** — after any shipped lever, add the
+   exact artifacts and commands to the M3 goal session docs before
+   opening another GPU session.
+
+---
+
 ## What is this
 
 Ferrum Infer is a Rust-native LLM inference engine. Single binary, no Python — supports Metal (macOS), CUDA (NVIDIA), CPU backends. Targets vLLM-level performance with PagedAttention, continuous batching, custom CUDA kernels.

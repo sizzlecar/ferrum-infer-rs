@@ -1386,4 +1386,222 @@ impl BackendPagedKv for CudaBackend {
             max_seq_len,
         )
     }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention_vllm_layout(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        block_tables: &Self::Buffer,
+        context_lens: &Self::Buffer,
+        num_seqs: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_num_blocks_per_seq: usize,
+        q_len: usize,
+    ) -> Result<()> {
+        if q_len == 0 || num_seqs == 0 {
+            return Ok(());
+        }
+        if num_seqs != 1 {
+            return Err(FerrumError::model(format!(
+                "paged_varlen_attention_vllm_layout(CUDA): q_len={q_len} num_seqs={num_seqs} \
+                 not supported yet"
+            )));
+        }
+
+        let final_kv_len = {
+            let stream = ctx.stream.clone();
+            let view = context_lens.as_u32().slice(0..1);
+            let mut host = vec![0u32; 1];
+            stream
+                .memcpy_dtoh(&view, host.as_mut_slice())
+                .map_err(|e| FerrumError::model(format!("dtoh context_lens vllm: {e}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::model(format!("dtoh sync vllm: {e}")))?;
+            host[0] as usize
+        };
+        if final_kv_len < q_len {
+            return Err(FerrumError::model(format!(
+                "paged_varlen_attention_vllm_layout(CUDA): final_kv_len={final_kv_len} < q_len={q_len}"
+            )));
+        }
+        let pos_offset = (final_kv_len - q_len) as u32;
+        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 2);
+        <Self as Backend>::write_typed::<u32>(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
+        let mut pos_offsets_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
+        <Self as Backend>::write_typed::<u32>(ctx, &mut pos_offsets_buf, &[pos_offset]);
+
+        let q_n = q_len * num_heads * head_dim;
+        if ctx.paged_attn_out_tm_capacity < q_n {
+            let stream = ctx.stream.clone();
+            let n_grown = q_n.next_power_of_two().max(q_n);
+            ctx.paged_attn_out_tm = Some(crate::backend::CudaBuf::from_f16(
+                stream.alloc_zeros::<f16>(n_grown).map_err(|e| {
+                    FerrumError::model(format!("alloc paged_attn_out_tm vllm: {e}"))
+                })?,
+            ));
+            ctx.paged_attn_out_tm_capacity = n_grown;
+        }
+
+        let func = ctx.func(
+            "paged_varlen_attn_vllm",
+            ptx::PAGED_VARLEN_ATTENTION_VLLM,
+            "paged_varlen_attn_vllm_f16",
+        );
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let stream = ctx.stream.clone();
+        let shared_kv = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+            .max(final_kv_len)
+            .max(1);
+        let shared_bytes = (shared_kv as u32) * 4;
+        if shared_bytes > 48 * 1024 {
+            let _ = func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_bytes as i32,
+            );
+        }
+
+        let out_tm_ptr: *mut crate::backend::CudaBuf =
+            ctx.paged_attn_out_tm
+                .as_mut()
+                .expect("paged_attn_out_tm allocated") as *mut _;
+        unsafe {
+            let qv = q.as_f16().slice(..);
+            let kp = k_pool.as_f16().slice(..);
+            let vp = v_pool.as_f16().slice(..);
+            let csq = cu_seqlens_q_buf.as_u32().slice(..);
+            let po = pos_offsets_buf.as_u32().slice(..);
+            let bt = block_tables.as_u32().slice(..);
+            let ns = num_seqs as i32;
+            let nqi = num_heads as i32;
+            let nkvi = num_kv_heads as i32;
+            let hdi = head_dim as i32;
+            let mbps = max_num_blocks_per_seq as i32;
+            let bsi = block_size as i32;
+            let mut b = stream.launch_builder(&func);
+            b.arg(&qv);
+            b.arg(&kp);
+            b.arg(&vp);
+            b.arg(&csq);
+            b.arg(&po);
+            b.arg(&bt);
+            b.arg(&mut *out_tm_ptr);
+            b.arg(&ns);
+            b.arg(&nqi);
+            b.arg(&nkvi);
+            b.arg(&hdi);
+            b.arg(&mbps);
+            b.arg(&bsi);
+            b.arg(&scale);
+            b.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, q_len as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+            .map_err(|e| FerrumError::model(format!("paged_varlen_attn_vllm: {e}")))?;
+
+            <Self as Backend>::transpose_token_to_head(
+                ctx,
+                &*out_tm_ptr,
+                out,
+                q_len,
+                num_heads,
+                head_dim,
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention_vllm(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        cu_seqlens_q: &Self::Buffer,
+        pos_offsets: &Self::Buffer,
+        block_tables: &Self::Buffer,
+        num_seqs: usize,
+        total_q_tokens: usize,
+        max_kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if num_seqs == 0 || total_q_tokens == 0 {
+            return Ok(());
+        }
+
+        let func = ctx.func(
+            "paged_varlen_attn_vllm",
+            ptx::PAGED_VARLEN_ATTENTION_VLLM,
+            "paged_varlen_attn_vllm_f16",
+        );
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let stream = ctx.stream.clone();
+        let shared_kv = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+            .max(max_kv_len)
+            .max(1);
+        let shared_bytes = (shared_kv as u32) * 4;
+        if shared_bytes > 48 * 1024 {
+            let _ = func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_bytes as i32,
+            );
+        }
+
+        let qv = q.as_f16().slice(..);
+        let kp = k_pool.as_f16().slice(..);
+        let vp = v_pool.as_f16().slice(..);
+        let csq = cu_seqlens_q.as_u32().slice(..);
+        let po = pos_offsets.as_u32().slice(..);
+        let bt = block_tables.as_u32().slice(..);
+        let ns = num_seqs as i32;
+        let nqi = num_heads as i32;
+        let nkvi = num_kv_heads as i32;
+        let hdi = head_dim as i32;
+        let mbps = max_num_blocks_per_seq as i32;
+        let bsi = block_size as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(&csq);
+        b.arg(&po);
+        b.arg(&bt);
+        b.arg(out);
+        b.arg(&ns);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mbps);
+        b.arg(&bsi);
+        b.arg(&scale);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| FerrumError::model(format!("paged_varlen_attn_vllm: {e}")))
+    }
 }

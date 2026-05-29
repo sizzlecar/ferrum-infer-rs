@@ -55,6 +55,34 @@ extern "C" __global__ void moe_combine_f16(
     out[b * hidden + h] = __float2half(acc);
 }
 
+// Fast path when rows are already in original [batch, top_k] order.
+// Used by the vLLM pair-id MoE path: marlin_moe consumes sorted pair ids
+// but writes phase-3 output back to row `pair_id`, so no inverse
+// `pairs_by_token` lookup is needed for the final top-k reduction.
+extern "C" __global__ void weighted_sum_batched_f16(
+    const __half* __restrict__ slots,       // [batch, top_k, hidden]
+    const float* __restrict__ weights,      // [batch, top_k]
+    __half* __restrict__ out,               // [batch, hidden]
+    int batch,
+    int top_k,
+    int hidden
+) {
+    int b = blockIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch || h >= hidden) return;
+
+    float acc = 0.0f;
+    int row_base = b * top_k;
+    #pragma unroll 4
+    for (int k = 0; k < top_k; k++) {
+        int pair_row = row_base + k;
+        float w = weights[row_base + k];
+        float v = __half2float(slots[pair_row * hidden + h]);
+        acc += w * v;
+    }
+    out[b * hidden + h] = __float2half(acc);
+}
+
 // Same logic for f32 outputs (CPU parity testing convenience).
 extern "C" __global__ void moe_combine_f32(
     const float* __restrict__ packed_down,

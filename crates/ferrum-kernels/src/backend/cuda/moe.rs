@@ -10,13 +10,81 @@
 //! Marlin GEMM phase (`moe_gemm_phase_*` impl methods) lives on
 //! `BackendQuantMarlin` and is in `cuda/quant.rs`.
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaStream, LaunchConfig, PushKernelArg};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 
 use super::CudaBackend;
-use crate::backend::{Backend, BackendMoeFused};
+use crate::backend::{Backend, BackendMoeFused, CudaBuf};
 use crate::ptx;
+
+fn maybe_dump_moe_routing(
+    kind: &str,
+    stream: &CudaStream,
+    sorted_token_ids: &CudaBuf,
+    block_ids: &CudaBuf,
+    total_tokens_post_pad: &CudaBuf,
+    batch_x_topk: usize,
+    num_experts: usize,
+    block_size: usize,
+) {
+    if std::env::var("FERRUM_MOE_DUMP").is_err() {
+        return;
+    }
+    if let Ok(filter) = std::env::var("FERRUM_MOE_DUMP_BATCH_X_TOPK") {
+        if filter
+            .parse::<usize>()
+            .ok()
+            .is_some_and(|target| target != batch_x_topk)
+        {
+            return;
+        }
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    if DUMPED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let _ = stream.synchronize();
+    let st = stream
+        .clone_dtoh(sorted_token_ids.as_i32())
+        .unwrap_or_default();
+    let bi = stream.clone_dtoh(block_ids.as_i32()).unwrap_or_default();
+    let tp = stream
+        .clone_dtoh(total_tokens_post_pad.as_i32())
+        .unwrap_or_default();
+    let total_post_pad = tp.first().copied().unwrap_or(-1);
+    let total_blocks = if total_post_pad > 0 {
+        ((total_post_pad as usize) / block_size).min(bi.len())
+    } else {
+        0
+    };
+    let mut seen = vec![false; num_experts];
+    let mut unique_experts = 0usize;
+    for &expert_id in bi.iter().take(total_blocks) {
+        if expert_id >= 0 {
+            let expert_idx = expert_id as usize;
+            if expert_idx < seen.len() && !seen[expert_idx] {
+                seen[expert_idx] = true;
+                unique_experts += 1;
+            }
+        }
+    }
+    let n_show = 48.min(st.len());
+    let n_bi = 32.min(bi.len());
+    eprintln!(
+        "[MOE_DUMP:{kind}] batch_x_topk={batch_x_topk} block_size={block_size} \
+         num_experts={num_experts} total_post_pad={total_post_pad} \
+         active_blocks={total_blocks} unique_experts={unique_experts}",
+    );
+    eprintln!(
+        "[MOE_DUMP:{kind}] sorted_token_ids[0..{n_show}] = {:?}",
+        &st[..n_show]
+    );
+    eprintln!("[MOE_DUMP:{kind}] block_ids[0..{n_bi}] = {:?}", &bi[..n_bi]);
+}
 
 impl BackendMoeFused for CudaBackend {
     fn route_topk_softmax(
@@ -280,38 +348,75 @@ impl BackendMoeFused for CudaBackend {
             .map_err(|e| FerrumError::model(format!("moe_align_block_size launch: {e}")))?;
         }
 
-        // FERRUM_MOE_DUMP=1: dump first call's sorted_token_ids + block_ids
-        // back to host. Useful for validating that the kernel writes packed_row
-        // values (matching the host path in dispatch.rs) rather than pair
-        // indices. Cost when off: one os::var() check per call (negligible).
-        // Cost when on: one DtoH per first call (~KB), then no-op via AtomicBool.
-        if std::env::var("FERRUM_MOE_DUMP").is_ok() {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static DUMPED: AtomicBool = AtomicBool::new(false);
-            if !DUMPED.swap(true, Ordering::Relaxed) {
-                let _ = stream.synchronize();
-                let st = stream
-                    .clone_dtoh(sorted_token_ids.as_i32())
-                    .unwrap_or_default();
-                let bi = stream.clone_dtoh(block_ids.as_i32()).unwrap_or_default();
-                let tp = stream
-                    .clone_dtoh(total_tokens_post_pad.as_i32())
-                    .unwrap_or_default();
-                let n_show = 48.min(st.len());
-                let n_bi = 16.min(bi.len());
-                eprintln!(
-                    "[MOE_DUMP] batch_x_topk={batch_x_topk} block_size={block_size} num_experts={num_experts} total_post_pad={:?}",
-                    tp.first().copied().unwrap_or(-1)
-                );
-                eprintln!(
-                    "[MOE_DUMP] sorted_token_ids[0..{n_show}] = {:?}",
-                    &st[..n_show]
-                );
-                eprintln!("[MOE_DUMP] block_ids[0..{n_bi}] = {:?}", &bi[..n_bi]);
-            }
-        }
+        maybe_dump_moe_routing(
+            "packed",
+            &stream,
+            sorted_token_ids,
+            block_ids,
+            total_tokens_post_pad,
+            batch_x_topk,
+            num_experts,
+            block_size,
+        );
         Ok(())
     }
+
+    fn moe_align_block_size_pair_ids(
+        ctx: &mut Self::Context,
+        expert_ids_per_pair: &Self::Buffer,
+        sorted_token_ids: &mut Self::Buffer,
+        block_ids: &mut Self::Buffer,
+        total_tokens_post_pad: &mut Self::Buffer,
+        batch_x_topk: usize,
+        num_experts: usize,
+        block_size: usize,
+        sorted_max_size: usize,
+    ) -> Result<()> {
+        if num_experts > 256 {
+            return Err(FerrumError::model(format!(
+                "moe_align_block_size_pair_ids: num_experts={num_experts} exceeds compile-time MAX_NUM_EXPERTS=256"
+            )));
+        }
+        let func = ctx.func(
+            "moe_align_block_size_pair_ids",
+            ptx::MOE_ALIGN_BLOCK_SIZE_PAIR_IDS,
+            "moe_align_block_size_pair_ids_f32",
+        );
+        let n = batch_x_topk as i32;
+        let ne = num_experts as i32;
+        let bs = block_size as i32;
+        let smax = sorted_max_size as i32;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(&*expert_ids_per_pair);
+        b.arg(&mut *sorted_token_ids);
+        b.arg(&mut *block_ids);
+        b.arg(&mut *total_tokens_post_pad);
+        b.arg(&n);
+        b.arg(&ne);
+        b.arg(&bs);
+        b.arg(&smax);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("moe_align_block_size_pair_ids launch: {e}")))?;
+        maybe_dump_moe_routing(
+            "pair_ids",
+            &stream,
+            sorted_token_ids,
+            block_ids,
+            total_tokens_post_pad,
+            batch_x_topk,
+            num_experts,
+            block_size,
+        );
+        Ok(())
+    }
+
     fn moe_combine(
         ctx: &mut Self::Context,
         packed_down: &Self::Buffer,
@@ -354,6 +459,47 @@ impl BackendMoeFused for CudaBackend {
         }
         .expect("moe_combine launch");
     }
+
+    fn weighted_sum_batched(
+        ctx: &mut Self::Context,
+        slots: &Self::Buffer,
+        weights: &Self::Buffer,
+        out: &mut Self::Buffer,
+        batch: usize,
+        top_k: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        let func = ctx.func(
+            "weighted_sum_batched",
+            ptx::MOE_COMBINE,
+            "weighted_sum_batched_f16",
+        );
+        let batch_i32 = batch as i32;
+        let top_k_i32 = top_k as i32;
+        let hidden_i32 = hidden as i32;
+
+        let block = 256u32;
+        let grid_x = ((hidden as u32) + block - 1) / block;
+
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(slots);
+        b.arg(weights);
+        b.arg(out);
+        b.arg(&batch_i32);
+        b.arg(&top_k_i32);
+        b.arg(&hidden_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid_x, batch as u32, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("weighted_sum_batched launch: {e}")))?;
+        Ok(())
+    }
+
     #[cfg(feature = "vllm-moe-marlin")]
     fn upload_moe_routing(
         ctx: &mut Self::Context,

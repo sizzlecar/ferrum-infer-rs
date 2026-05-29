@@ -222,8 +222,8 @@ pub struct CudaState {
 // Process-global fp32 reduce scratch for vLLM marlin_moe_wna16.
 //
 // Sized at the upper bound vLLM uses internally:
-// `sms * 4 * moe_block_size * max_thread_n` (= 128 * 4 * 16 * 256 =
-// 2M fp32 = 8MB on a 4090).
+// `sms * 4 * moe_block_size * max_thread_n`, with the vLLM special-case
+// doubling for `moe_block_size=8`. That is 4M fp32 = 16MB on a 4090.
 //
 // MUST be process-global (not per-CudaState) for CUDA Graph capture.
 // `new_context()` builds a fresh CudaState every `decode_batch_internal`
@@ -310,7 +310,7 @@ pub fn with_vllm_moe_c_tmp<R>(
     // First-time alloc.
     let mut w = slot.write().expect("VLLM_MOE_C_TMP poisoned");
     if w.is_none() {
-        const C_TMP_SIZE_F32: usize = 2 * 1024 * 1024;
+        const C_TMP_SIZE_F32: usize = 4 * 1024 * 1024;
         let buf = stream
             .alloc_zeros::<f32>(C_TMP_SIZE_F32)
             .expect("alloc_zeros vllm_moe_c_tmp_f32 (process-global)");

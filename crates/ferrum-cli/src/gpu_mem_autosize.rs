@@ -159,8 +159,14 @@ pub enum AutoSizeProfile {
 
 /// Default-ON `FERRUM_MOE_GRAPH=1` for Qwen3-MoE. Read only by
 /// `qwen3_moe.rs::decode_batch_internal`; ignored by every other
-/// model so safe to set unconditionally. Empirically measured at c=32
-/// on RTX 4090 post-moe_align fix:
+/// model so safe to set unconditionally. When the binary is built with
+/// the vLLM MoE feature, default `FERRUM_VLLM_MOE=1` alongside it so
+/// the graph captures the device-routed, graph-clean MoE path instead
+/// of the legacy host-routed path. Also defaults the vLLM-native pair-id
+/// routing layout on for the same graph-clean path; it avoids the
+/// pre-gathered `x_packed` buffer and is a small positive win on the
+/// current Qwen3-MoE c=4/16/32 sweep. Empirically measured at c=32 on
+/// RTX 4090 post-moe_align fix:
 ///   FERRUM_MOE_GRAPH=0 = 872 tok/s
 ///   FERRUM_MOE_GRAPH=1 = 1006 tok/s  (+15.5%)
 ///
@@ -184,6 +190,39 @@ pub fn apply_moe_graph_default() {
             std::env::set_var("FERRUM_MOE_GRAPH", "1");
         }
         eprintln!("[auto-size] MOE_GRAPH=1 (default-on for Qwen3-MoE)");
+    }
+
+    let moe_graph_enabled = std::env::var("FERRUM_MOE_GRAPH").as_deref() == Ok("1");
+    if !moe_graph_enabled {
+        return;
+    }
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    {
+        let vllm_moe_overridden = std::env::var("FERRUM_VLLM_MOE").is_ok();
+        if !vllm_moe_overridden {
+            // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
+            unsafe {
+                std::env::set_var("FERRUM_VLLM_MOE", "1");
+            }
+            eprintln!("[auto-size] VLLM_MOE=1 (graph-clean MoE default)");
+        }
+
+        let pair_ids_overridden = std::env::var("FERRUM_VLLM_MOE_PAIR_IDS").is_ok();
+        if !pair_ids_overridden {
+            // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
+            unsafe {
+                std::env::set_var("FERRUM_VLLM_MOE_PAIR_IDS", "1");
+            }
+            eprintln!("[auto-size] VLLM_MOE_PAIR_IDS=1 (vLLM-native routing default)");
+        }
+    }
+
+    #[cfg(not(feature = "vllm-moe-marlin"))]
+    if std::env::var("FERRUM_VLLM_MOE").as_deref() != Ok("1") {
+        eprintln!(
+            "[auto-size] MOE_GRAPH=1 requested, but vllm-moe-marlin is not built; graph capture requires FERRUM_VLLM_MOE=1"
+        );
     }
 }
 

@@ -1545,6 +1545,62 @@ pub trait BackendPagedKv: Backend {
             "paged_decode_attention_v2 not implemented for this backend",
         ))
     }
+
+    /// q_len>1 prefill/chunk-prefill attention over vLLM-layout paged KV.
+    /// This keeps cache layout consistent when `FERRUM_USE_VLLM_PAGED_ATTN=1`
+    /// and the prompt path writes K/V in the layout consumed later by
+    /// `paged_decode_attention_v2`.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention_vllm_layout(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _context_lens: &Self::Buffer,
+        _num_seqs: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+        _q_len: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_varlen_attention_vllm_layout not implemented for this backend",
+        ))
+    }
+
+    /// Variable-length paged attention over vLLM-layout paged KV.
+    ///
+    /// Unlike [`Self::paged_varlen_attention_vllm_layout`], this accepts the
+    /// same varlen index tensors as [`Self::paged_varlen_attention`] and writes
+    /// token-major output directly. It is the unified mixed-batch companion for
+    /// `split_qkv_norm_rope_into_paged_cache_varlen_vllm`.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention_vllm(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_varlen_attention_vllm not implemented for this backend",
+        ))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1696,6 +1752,27 @@ pub trait BackendMoeFused: Backend {
             "moe_align_block_size not implemented for this backend",
         ))
     }
+
+    /// vLLM-native align variant: `sorted_token_ids` stores flattened
+    /// `(token, top_k_slot)` pair ids, not Ferrum's pre-gathered packed rows.
+    /// This lets marlin_moe read gate_up input as `A[pair_id / top_k]`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_align_block_size_pair_ids(
+        _ctx: &mut Self::Context,
+        _expert_ids_per_pair: &Self::Buffer,
+        _sorted_token_ids: &mut Self::Buffer,
+        _block_ids: &mut Self::Buffer,
+        _total_tokens_post_pad: &mut Self::Buffer,
+        _batch_x_topk: usize,
+        _num_experts: usize,
+        _block_size: usize,
+        _sorted_max_size: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "moe_align_block_size_pair_ids not implemented for this backend",
+        ))
+    }
+
     /// GPU-side bucket sort: turn `[batch, top_k]` selected expert IDs
     /// (from [`Self::route_topk_softmax`]) into `tpe[num_experts]` /
     /// `ids[num_experts * row_stride]` arrays consumed by the batched

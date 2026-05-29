@@ -25,7 +25,7 @@
 //! eager-fp32 expert stack would weigh ~110 GB.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16};
@@ -64,6 +64,7 @@ pub(crate) static DEC_WSUM_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DEC_EMBED_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DEC_FINAL_NORM_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DEC_LM_HEAD_US: AtomicU64 = AtomicU64::new(0);
+static MOE_GRAPH_UNCLEAN_WARNED: AtomicBool = AtomicBool::new(false);
 
 // MoE batched-prefill sub-stage counters (gate / up / down mul_mm_id +
 // silu + weighted_sum + host topk). Same FERRUM_DECODE_OP_PROFILE gate.
@@ -96,6 +97,26 @@ pub(crate) static BD_DENSE_US: AtomicU64 = AtomicU64::new(0); // rms_norm + qkv_
 pub(crate) static BD_ATTN_PERITEM_US: AtomicU64 = AtomicU64::new(0); // the for-i in 0..m attention loop (incl. plumbing)
 pub(crate) static BD_MOE_US: AtomicU64 = AtomicU64::new(0); // router + MoE FFN + residual add
 pub(crate) static BD_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn moe_graph_enabled_graph_clean() -> bool {
+    let graph_requested = std::env::var("FERRUM_MOE_GRAPH").as_deref() == Ok("1");
+    if !graph_requested {
+        return false;
+    }
+
+    let vllm_moe_enabled = std::env::var("FERRUM_VLLM_MOE").as_deref() == Ok("1");
+    let host_route_forced = std::env::var("FERRUM_MOE_HOST_ROUTE").as_deref() == Ok("1");
+    if vllm_moe_enabled && !host_route_forced {
+        return true;
+    }
+
+    if !MOE_GRAPH_UNCLEAN_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[moe-graph] disabled: capture requires FERRUM_VLLM_MOE=1 and FERRUM_MOE_HOST_ROUTE!=1"
+        );
+    }
+    false
+}
 
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.
 pub struct Qwen3MoeLayerState<B: QuantLlmBackend + BackendMoeFused> {
@@ -588,7 +609,7 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     //
     // True when (a) the backend reports `supports_vllm_paged_attn() == true`
     // (CUDA built with the `vllm-paged-attn-v2` feature) AND (b) the user
-    // set `FERRUM_USE_VLLM_PAGED_ATTN=1`. When set, the model writes K/V
+    // did not force `FERRUM_USE_VLLM_PAGED_ATTN=0`. When set, the model writes K/V
     // in vLLM's layout end-to-end (prefill + decode) and uses vLLM's
     // `paged_attention_v2` multi-partition kernel for decode reads.
     //
@@ -724,7 +745,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             batched_graph_failed: false,
             batched_graph_keys_seen: std::collections::HashSet::new(),
             use_vllm_paged_attn: B::supports_vllm_paged_attn()
-                && std::env::var("FERRUM_USE_VLLM_PAGED_ATTN").as_deref() == Ok("1"),
+                && std::env::var("FERRUM_USE_VLLM_PAGED_ATTN").as_deref() != Ok("0"),
         })
     }
 
@@ -910,7 +931,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             batched_graph_failed: false,
             batched_graph_keys_seen: std::collections::HashSet::new(),
             use_vllm_paged_attn: B::supports_vllm_paged_attn()
-                && std::env::var("FERRUM_USE_VLLM_PAGED_ATTN").as_deref() == Ok("1"),
+                && std::env::var("FERRUM_USE_VLLM_PAGED_ATTN").as_deref() != Ok("0"),
         })
     }
 
@@ -1412,33 +1433,46 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let pool_v = unsafe { &*pool_v_ptr };
             let final_kv_len = cache.len as u32;
             B::write_typed::<u32>(ctx, cl_buf, &[final_kv_len]);
-            if self.use_vllm_paged_attn && tokens == 1 {
-                // vLLM's paged_attention_v2 is decode-only (q_len=1). Single-
-                // seq decode here always has tokens=1; prefill (tokens>1)
-                // falls through to the existing paged_decode_attention which
-                // handles causal q_len>1. Note: when use_vllm_paged_attn is
-                // on, the prefill path reads K/V in vLLM layout, so
-                // paged_decode_attention won't actually work for prefill in
-                // that mode — single-seq prefill is not on the c=32 hot
-                // path so we accept this limitation and let the existing
-                // call fail at runtime if someone hits it.
-                B::paged_decode_attention_v2(
-                    ctx,
-                    &self.scratch.q_head_major,
-                    pool_k,
-                    pool_v,
-                    &mut self.scratch.attn_head_major_out,
-                    bt,
-                    cl_buf,
-                    1, // num_seqs
-                    nh,
-                    nkv,
-                    hd,
-                    cache.block_size,
-                    num_blocks_per_seq,
-                    cache.len, // max_seq_len = current kv_len for single-seq decode
-                )
-                .expect("paged_decode_attention_v2 (single-seq decode)");
+            if self.use_vllm_paged_attn {
+                let force_varlen_decode =
+                    std::env::var("FERRUM_VLLM_DECODE_VARLEN").as_deref() == Ok("1");
+                if tokens == 1 && !force_varlen_decode {
+                    B::paged_decode_attention_v2(
+                        ctx,
+                        &self.scratch.q_head_major,
+                        pool_k,
+                        pool_v,
+                        &mut self.scratch.attn_head_major_out,
+                        bt,
+                        cl_buf,
+                        1, // num_seqs
+                        nh,
+                        nkv,
+                        hd,
+                        cache.block_size,
+                        num_blocks_per_seq,
+                        cache.len, // max_seq_len = current kv_len for single-seq decode
+                    )
+                    .expect("paged_decode_attention_v2 (single-seq decode)");
+                } else {
+                    B::paged_varlen_attention_vllm_layout(
+                        ctx,
+                        &self.scratch.q_head_major,
+                        pool_k,
+                        pool_v,
+                        &mut self.scratch.attn_head_major_out,
+                        bt,
+                        cl_buf,
+                        1, // num_seqs
+                        nh,
+                        nkv,
+                        hd,
+                        cache.block_size,
+                        num_blocks_per_seq,
+                        tokens,
+                    )
+                    .expect("paged_varlen_attention_vllm_layout (single-seq prefill)");
+                }
             } else {
                 B::paged_decode_attention(
                     ctx,
@@ -2405,9 +2439,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // pointer writes that fail capture). Recovery: if begin_capture
         // / end_capture errors, set `batched_graph_failed=true` and
         // never retry — stays eager for the rest of this model's life.
-        let graph_enabled = std::env::var("FERRUM_MOE_GRAPH")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let graph_enabled = moe_graph_enabled_graph_clean();
         // Per-m graph cache. Key is `m` exactly, NOT `m_padded`.
         // Captured kernel launches bake the grid_dim / loop bounds for
         // the m used at capture time; replaying the same graph for a
@@ -3344,7 +3376,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // is the next PR's job. Until then the kernel sits as
         // infrastructure.
         // Two independent thresholds:
-        //   * `FERRUM_MOE_BATCH_THRESHOLD` (default 8) — m above which
+        //   * `FERRUM_MOE_BATCH_THRESHOLD` (default 4) — m above which
         //     the LEGACY non-experimental path uses the prefill GEMM.
         //     Shared with `decode_batch`'s engine-level gate, so users
         //     who set it to a small value to engage batched decode
@@ -3356,7 +3388,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let legacy_prefill_threshold: usize = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(8);
+            .unwrap_or(4);
         let new_prefill_threshold: usize = std::env::var("FERRUM_MOE_PREFILL_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -3697,33 +3729,22 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
     //     the prefill-batched MoE dispatch (one `gemm_quant_moe_id` for
     //     all tokens) amortise the ~48-dispatch lost-fusion penalty.
     //
-    // Default opted out of FERRUM_MOE_BATCHED. When opted in, the
-    // batched path engages only at M ≥ FERRUM_MOE_BATCH_THRESHOLD
-    // (default 12). Below that we still go per-item.
-    //
-    // Empirical note 2026-05-02: a follow-up PR added a batched MoE
-    // GEMV kernel (`gemv_quant_moe_id_batched`) that holds MoE
-    // dispatch count flat as concurrency scales. Wiring it through
-    // `decode_batch_internal` regressed throughput by 19% (c=4) /
-    // 36% (c=16) — `forward_layer_batched_decode`'s per-item
-    // attention plumbing (copy_slice × m × 6 dispatches) costs more
-    // than the MoE save. The batched MoE kernel is shipped as opt-in
-    // infrastructure (`FERRUM_MOE_BATCHED_DECODE=1`); flipping it on
-    // by default has to wait until the attention plumbing is fixed.
+    // Default ON in 0.7.2+. On CUDA with paged KV + vLLM MoE, the
+    // crossover is now M=4: 2026-05-28/29 Vast RTX 4090 random-256/128
+    // probes saw the old threshold=8 stay on sequential per-token decode
+    // (~89-122 tok/s), while threshold=4 measured 425.6 ± 36.6 tok/s.
+    // `FERRUM_MOE_BATCHED=0` forces the
+    // legacy loop; `FERRUM_MOE_BATCH_THRESHOLD` remains an escape hatch
+    // for future hardware/backends.
     fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
         let m = batch.len();
-        // Default ON in 0.7.2+. The threshold (default 8) keeps small-m
-        // requests on the per-token loop where it still wins on this
-        // hardware — see docs/bench/macos-2026-05-02 for the crossover
-        // measurements (c=4 batched 39 < per_token 42; c=8 batched 59 >
-        // per_token 47). `FERRUM_MOE_BATCHED=0` forces the legacy loop.
         let opted_in = std::env::var("FERRUM_MOE_BATCHED")
             .map(|v| v != "0")
             .unwrap_or(true);
         let threshold = std::env::var("FERRUM_MOE_BATCH_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8);
+            .unwrap_or(4);
         if opted_in && m >= threshold {
             self.decode_batch_internal(batch)
         } else {
@@ -3741,6 +3762,19 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        if std::env::var("FERRUM_QWEN_UNIFIED_TRACE").as_deref() == Ok("1") {
+            let lens: Vec<usize> = items.iter().map(|it| it.1.len()).collect();
+            let positions: Vec<usize> = items.iter().map(|it| it.2).collect();
+            let finals: Vec<bool> = items.iter().map(|it| it.3).collect();
+            eprintln!(
+                "[qwen-unified] items={} lens={:?} positions={:?} finals={:?} use_vllm_paged_attn={}",
+                items.len(),
+                lens,
+                positions,
+                finals,
+                self.use_vllm_paged_attn
+            );
+        }
         // Pure-decode shortcut: every item is q_len=1 + is_final_chunk.
         // For this shape, ferrum's legacy `forward_layer_batched_decode`
         // path (with FERRUM_MOE_GRAPH=1 graph capture + decode-tuned
@@ -3753,6 +3787,20 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
             return Err(FerrumError::unsupported(
                 "Qwen3MoeModel::unified_forward: pure-decode batch — \
                  routed to legacy decode_batch (faster for q_len=1)",
+            ));
+        }
+        if items.len() == 1 && items[0].1.len() > 1 {
+            return Err(FerrumError::unsupported(
+                "Qwen3MoeModel::unified_forward: single-seq prefill — \
+                 routed to specialized prefill path",
+            ));
+        }
+        if std::env::var("FERRUM_QWEN_UNIFIED_PREFILL").as_deref() == Ok("0")
+            && items.iter().any(|it| it.1.len() > 1)
+        {
+            return Err(FerrumError::unsupported(
+                "Qwen3MoeModel::unified_forward: prefill disabled by \
+                 FERRUM_QWEN_UNIFIED_PREFILL=0",
             ));
         }
         // Any prefill chunk (q_len > 1) OR non-final-chunk item:

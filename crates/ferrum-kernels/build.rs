@@ -35,6 +35,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/flash_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/paged_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/paged_varlen_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/paged_varlen_attention_vllm.cu");
     println!("cargo:rerun-if-changed=kernels/dequant_int4.cu");
     println!("cargo:rerun-if-changed=kernels/batched_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/common.cuh");
@@ -55,6 +56,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/moe_combine.cu");
     println!("cargo:rerun-if-changed=kernels/moe_router.cu");
     println!("cargo:rerun-if-changed=kernels/moe_align_block_size.cu");
+    println!("cargo:rerun-if-changed=kernels/moe_align_block_size_pair_ids.cu");
     println!("cargo:rerun-if-changed=kernels/moe_build_pairs.cu");
     println!("cargo:rerun-if-changed=kernels/int8_paged_decode_attention.cu");
     println!("cargo:rerun-if-changed=kernels/argmax_rows.cu");
@@ -79,6 +81,7 @@ fn main() {
             "kernels/flash_decode_attention.cu",
             "kernels/paged_decode_attention.cu",
             "kernels/paged_varlen_attention.cu",
+            "kernels/paged_varlen_attention_vllm.cu",
             "kernels/dequant_int4.cu",
             "kernels/batched_decode_attention.cu",
             "kernels/softmax.cu",
@@ -98,6 +101,7 @@ fn main() {
             "kernels/moe_combine.cu",
             "kernels/moe_router.cu",
             "kernels/moe_align_block_size.cu",
+            "kernels/moe_align_block_size_pair_ids.cu",
             "kernels/moe_build_pairs.cu",
             "kernels/int8_paged_decode_attention.cu",
             "kernels/argmax_rows.cu",

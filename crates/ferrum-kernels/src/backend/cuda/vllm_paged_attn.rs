@@ -1,9 +1,10 @@
-//! vLLM `paged_attention_v2` wrapper.
+//! vLLM paged-attention wrappers.
 //!
 //! Calls the extern "C" launcher in `kernels/vllm_attn/launcher.cu` which
-//! invokes vLLM's `paged_attention_v2_kernel` + reduce kernel (single
-//! HEAD_SIZE=128, BLOCK_SIZE=16, FP16 instantiation — what Qwen3-30B-A3B
-//! needs).
+//! invokes vLLM's `paged_attention_v1_kernel` for short single-partition
+//! decode, or `paged_attention_v2_kernel` + reduce kernel for longer
+//! multi-partition decode. Only the HEAD_SIZE=128, BLOCK_SIZE=16, FP16
+//! instantiation needed by Qwen3-30B-A3B is exported.
 //!
 //! Companion to the `split_qkv_norm_rope_into_paged_cache_varlen_vllm_f16`
 //! PTX kernel which writes K/V in vLLM's layout.
@@ -14,6 +15,25 @@ use half::f16;
 use std::sync::Arc;
 
 extern "C" {
+    fn ferrum_vllm_paged_attention_v1_f16_h128_b16(
+        out: *mut std::ffi::c_void,     // __half*
+        query: *const std::ffi::c_void, // const __half*
+        key_cache: *const std::ffi::c_void,
+        value_cache: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        block_tables: *const std::ffi::c_void,
+        seq_lens: *const std::ffi::c_void,
+        num_seqs: i32,
+        num_heads: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        max_seq_len: i32,
+        stream: *mut std::ffi::c_void,
+    );
+
     fn ferrum_vllm_paged_attention_v2_f16_h128_b16(
         out: *mut std::ffi::c_void,        // __half*
         exp_sums: *mut std::ffi::c_void,   // float*
@@ -58,9 +78,15 @@ struct PagedAttnCapacity {
 
 static PA_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<PagedAttnScratch>>> =
     std::sync::OnceLock::new();
+static PA_V1_SHORT_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn pa_scratch_slot() -> &'static std::sync::RwLock<Option<PagedAttnScratch>> {
     PA_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn pa_v1_short_enabled() -> bool {
+    *PA_V1_SHORT_ENABLED
+        .get_or_init(|| std::env::var("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").as_deref() != Ok("0"))
 }
 
 fn ensure_pa_scratch(
@@ -109,8 +135,8 @@ fn ensure_pa_scratch(
     });
 }
 
-/// Dispatch vLLM's `paged_attention_v2` for the FP16 / HEAD=128 / BLOCK=16
-/// shape. K/V cache must already be in vLLM layout (see
+/// Dispatch vLLM paged attention for the FP16 / HEAD=128 / BLOCK=16 shape.
+/// K/V cache must already be in vLLM layout (see
 /// `split_qkv_norm_rope_into_paged_cache_varlen_vllm_f16`).
 ///
 /// `q` is `[num_seqs, num_heads, head_dim]` (head-major within seq).
@@ -144,9 +170,6 @@ pub fn dispatch_paged_attention_v2(
             "vllm paged_attn_v2: only block_size=16 instantiated, got {block_size}"
         )));
     }
-    let max_partitions = max_seq_len.div_ceil(PARTITION_SIZE).max(1);
-    ensure_pa_scratch(stream, num_seqs, num_heads, max_partitions, head_dim);
-
     // Layout strides (in halves):
     //   K, V cache  : [num_blocks, num_kv_heads, head_dim*block_size]
     //   query       : [num_seqs, num_heads, head_dim]
@@ -154,6 +177,41 @@ pub fn dispatch_paged_attention_v2(
     let kv_block_stride = (num_kv_heads * head_dim * block_size) as i32;
     let kv_head_stride = (head_dim * block_size) as i32;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
+
+    let use_v1_short = max_seq_len <= PARTITION_SIZE && pa_v1_short_enabled();
+    if use_v1_short {
+        unsafe {
+            let (out_dp, _o_recs) = out.device_ptr_mut(stream);
+            let (q_dp, _q_recs) = q.device_ptr(stream);
+            let (k_dp, _k_recs) = k_cache.device_ptr(stream);
+            let (v_dp, _v_recs) = v_cache.device_ptr(stream);
+            let (bt_dp, _bt_recs) = block_tables.device_ptr(stream);
+            let (sl_dp, _sl_recs) = seq_lens.device_ptr(stream);
+            ferrum_vllm_paged_attention_v1_f16_h128_b16(
+                out_dp as *mut std::ffi::c_void,
+                q_dp as *const std::ffi::c_void,
+                k_dp as *const std::ffi::c_void,
+                v_dp as *const std::ffi::c_void,
+                num_kv_heads as i32,
+                scale,
+                bt_dp as *const std::ffi::c_void,
+                sl_dp as *const std::ffi::c_void,
+                num_seqs as i32,
+                num_heads as i32,
+                max_num_blocks_per_seq as i32,
+                q_stride,
+                kv_block_stride,
+                kv_head_stride,
+                max_seq_len as i32,
+                raw_stream,
+            );
+        }
+        return Ok(());
+    }
+
+    let max_partitions = max_seq_len.div_ceil(PARTITION_SIZE).max(1);
+    ensure_pa_scratch(stream, num_seqs, num_heads, max_partitions, head_dim);
 
     let slot = pa_scratch_slot();
     let mut sg = slot.write().expect("PA_SCRATCH poisoned");
@@ -176,7 +234,6 @@ pub fn dispatch_paged_attention_v2(
         // u64 is the raw device address. Cast u64 → typed pointer directly
         // (the intermediate `as *const _` form fails to infer the element
         // type when the destination is `*const c_void`).
-        let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
         ferrum_vllm_paged_attention_v2_f16_h128_b16(
             out_dp as *mut std::ffi::c_void,
             es_dp as *mut std::ffi::c_void,
