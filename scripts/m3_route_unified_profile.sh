@@ -187,10 +187,12 @@ summary = {
     "moe_dump": [],
     "unified_prof": {},
     "iter_prof": {},
+    "batched_decode_prof": {},
     "bucket_prof": {},
 }
 unified = []
 iters = []
+batched_decode = []
 buckets = []
 
 for line in text:
@@ -200,6 +202,8 @@ for line in text:
         unified.append(kvs(line))
     elif "iter-prof" in line:
         iters.append(kvs(line))
+    elif "batched-decode-prof" in line:
+        batched_decode.append(kvs(line))
     elif "bucket-prof" in line:
         buckets.append(kvs(line))
 
@@ -214,6 +218,7 @@ def med(rows, key):
 for name, rows, keys in [
     ("unified_prof", unified, ["total", "model", "decode_post", "sample", "sched", "stream", "stop", "complete"]),
     ("iter_prof", iters, ["total", "sched", "process", "batch_size"]),
+    ("batched_decode_prof", batched_decode, ["m", "layers", "total", "dense", "attn_peritem", "moe", "route", "gate", "up", "silu", "down", "wsum", "other"]),
     ("bucket_prof", buckets, ["bk_total", "sync", "d2h", "host_route", "plan", "gather", "gemm1", "silu", "gemm3", "combine"]),
 ]:
     summary[name]["samples"] = len(rows)
@@ -227,6 +232,13 @@ if unified:
     total = summary["unified_prof"].get("total_median")
     if model and total:
         summary["unified_prof"]["model_share"] = model / total
+
+if batched_decode:
+    total = summary["batched_decode_prof"].get("total_median")
+    for key in ["dense", "attn_peritem", "moe", "other"]:
+        value = summary["batched_decode_prof"].get(f"{key}_median")
+        if value is not None and total:
+            summary["batched_decode_prof"][f"{key}_share"] = value / total
 
 if buckets:
     gemm1 = summary["bucket_prof"].get("gemm1_median")
