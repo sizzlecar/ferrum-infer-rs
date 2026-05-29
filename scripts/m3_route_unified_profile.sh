@@ -98,6 +98,9 @@ env \
     FERRUM_PREFIX_CACHE=0 \
     FERRUM_MOE_DUMP=1 \
     FERRUM_MOE_DUMP_BATCH_X_TOPK="$((CONCURRENCY * TOP_K))" \
+    FERRUM_VLLM_MOE_LOG_CONFIG=1 \
+    FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS="$((CONCURRENCY * TOP_K))" \
+    FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT="${FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT:-32}" \
     FERRUM_UNIFIED_POST_PROF=1 \
     FERRUM_BATCH_DECODE_PROF=1 \
     FERRUM_NEXT_BATCH_PROF=1 \
@@ -139,7 +142,7 @@ PY
     --out "$BENCH_JSON" \
     >"$BENCH_LOG" 2>&1
 
-grep -nE "MOE_DUMP|unified-prof|iter-prof|bg-loop-gap|nb-prof|batched-decode-prof|bucket-prof" \
+grep -nE "MOE_DUMP|vllm-moe-config|unified-prof|iter-prof|bg-loop-gap|nb-prof|batched-decode-prof|bucket-prof" \
     "$SERVER_LOG" >"$OUT_ROOT/profile_snippets.log" || true
 
 if ! grep -q "MOE_DUMP" "$OUT_ROOT/profile_snippets.log"; then
@@ -150,6 +153,12 @@ fi
 
 if ! grep -q "unified-prof" "$OUT_ROOT/profile_snippets.log"; then
     echo "missing unified-prof output; increase NUM_PROMPTS or RANDOM_OUTPUT_LEN" >&2
+    tail -200 "$SERVER_LOG" >&2 || true
+    exit 1
+fi
+
+if ! grep -q "vllm-moe-config" "$OUT_ROOT/profile_snippets.log"; then
+    echo "missing vllm-moe-config output; verify the binary includes the filtered config logger" >&2
     tail -200 "$SERVER_LOG" >&2 || true
     exit 1
 fi
@@ -190,11 +199,13 @@ summary = {
     "iter_prof": {},
     "batched_decode_prof": {},
     "bucket_prof": {},
+    "vllm_moe_config": {},
 }
 unified = []
 iters = []
 batched_decode = []
 buckets = []
+configs = []
 
 for line in text:
     if "MOE_DUMP" in line and "batch_x_topk=" in line:
@@ -207,6 +218,8 @@ for line in text:
         batched_decode.append(kvs(line))
     elif "bucket-prof" in line:
         buckets.append(kvs(line))
+    elif "vllm-moe-config" in line:
+        configs.append(kvs(line))
 
 
 def med(rows, key):
@@ -221,6 +234,7 @@ for name, rows, keys in [
     ("iter_prof", iters, ["total", "sched", "process", "batch_size"]),
     ("batched_decode_prof", batched_decode, ["m", "layers", "total", "dense", "attn_peritem", "moe", "route", "gate", "up", "silu", "down", "wsum", "other"]),
     ("bucket_prof", buckets, ["bk_total", "sync", "d2h", "host_route", "plan", "gather", "gemm1", "silu", "gemm3", "combine"]),
+    ("vllm_moe_config", configs, ["batch_x_topk", "prob_m", "prob_n", "prob_k", "block", "top_k", "thread_k", "thread_n", "threads", "blocks_per_sm", "sh_cache", "max_shared"]),
 ]:
     summary[name]["samples"] = len(rows)
     for key in keys:
@@ -248,6 +262,9 @@ if buckets:
     if gemm1 is not None and gemm3 is not None and bk_total:
         # bk_total is logged in ms; phase counters are logged in us.
         summary["bucket_prof"]["gemm13_share"] = (gemm1 + gemm3) / (bk_total * 1000.0)
+
+if configs:
+    summary["vllm_moe_config"]["rows"] = configs[:16]
 
 open(out_path, "w").write(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 print("PROFILE_SUMMARY=", out_path)

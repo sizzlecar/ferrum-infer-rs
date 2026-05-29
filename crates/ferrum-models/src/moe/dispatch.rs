@@ -1114,24 +1114,37 @@ pub const MOE_BLOCK_SIZE_MAX: usize = 64;
 ///
 /// Device-routing path doesn't expose `plan` host-side; fall back to 16
 /// (no regression vs pre-PR behaviour).
+fn parse_moe_block_size_env(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|bs| matches!(*bs, 8 | 16 | 32 | 48 | 64))
+}
+
 fn pick_moe_block_size(
     plan: Option<&MoeBucketPlan>,
     num_experts: usize,
     use_device_route: bool,
+    total_pairs: usize,
 ) -> usize {
     const CANDIDATES: &[usize] = &[64, 32, 16];
     const PADDING_BUDGET: f64 = 1.30; // ≤ 30% overhead vs actual tokens
                                       // Manual override (testing / autotuning): FERRUM_MOE_BLOCK_SIZE=8/16/32/48/64.
                                       // vLLM 0.20.2 often selects 8 for small-M MoE; keep it override-only
                                       // until full-model correctness + throughput beats the 16 default.
-    if let Some(bs) = std::env::var("FERRUM_MOE_BLOCK_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|bs| matches!(*bs, 8 | 16 | 32 | 48 | 64))
-    {
+    if let Some(bs) = parse_moe_block_size_env("FERRUM_MOE_BLOCK_SIZE") {
         return bs;
     }
     if use_device_route {
+        if let Some(bs) = parse_moe_block_size_env("FERRUM_MOE_LARGE_M_BLOCK_SIZE") {
+            let min_pairs = std::env::var("FERRUM_MOE_LARGE_M_MIN_PAIRS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1024);
+            if total_pairs >= min_pairs {
+                return bs;
+            }
+        }
         // Empirical 2026-05-13: block_size=64 (`thread_m_blocks=4`,
         // matching vLLM's tile) regresses M3 c=32 by 5.7% on RTX 4090
         // because sparse routing (top_k=8 / num_experts=128 / m=32 ≈
@@ -1622,7 +1635,8 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // `Qwen3MoeScratch.route_sorted_tokens_dev` capacity is allocated
     // assuming this upper bound.
     let max_block_size: usize = 64;
-    let moe_block_size: usize = pick_moe_block_size(plan, num_experts, use_device_route);
+    let moe_block_size: usize =
+        pick_moe_block_size(plan, num_experts, use_device_route, total_pairs_active);
     debug_assert!(
         moe_block_size <= max_block_size,
         "moe_block_size {moe_block_size} exceeds scratch worst-case {max_block_size}"
@@ -2106,3 +2120,41 @@ fn candle_to_ferrum(e: candle_core::Error) -> FerrumError {
 // the lib (the candle Result alias is only used via map_err in Phase 2).
 #[allow(dead_code)]
 type _CandleResult<T> = CandleResult<T>;
+
+#[cfg(test)]
+mod tests {
+    use super::pick_moe_block_size;
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn device_route_large_m_block_size_is_thresholded() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("FERRUM_MOE_BLOCK_SIZE");
+        std::env::set_var("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64");
+        std::env::set_var("FERRUM_MOE_LARGE_M_MIN_PAIRS", "1024");
+
+        assert_eq!(pick_moe_block_size(None, 128, true, 256), 16);
+        assert_eq!(pick_moe_block_size(None, 128, true, 1024), 64);
+
+        std::env::remove_var("FERRUM_MOE_LARGE_M_BLOCK_SIZE");
+        std::env::remove_var("FERRUM_MOE_LARGE_M_MIN_PAIRS");
+    }
+
+    #[test]
+    fn global_moe_block_size_override_still_wins() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("FERRUM_MOE_BLOCK_SIZE", "32");
+        std::env::set_var("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64");
+        std::env::set_var("FERRUM_MOE_LARGE_M_MIN_PAIRS", "1024");
+
+        assert_eq!(pick_moe_block_size(None, 128, true, 2048), 32);
+
+        std::env::remove_var("FERRUM_MOE_BLOCK_SIZE");
+        std::env::remove_var("FERRUM_MOE_LARGE_M_BLOCK_SIZE");
+        std::env::remove_var("FERRUM_MOE_LARGE_M_MIN_PAIRS");
+    }
+}

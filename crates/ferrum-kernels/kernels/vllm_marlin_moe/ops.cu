@@ -679,17 +679,28 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
   if (std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG") != nullptr) {
     static int log_count = 0;
-    if (log_count < 64) {
+    int log_limit = 64;
+    if (const char* v = std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT")) {
+      int parsed = std::atoi(v);
+      if (parsed > 0) log_limit = parsed;
+    }
+    int min_pairs = 0;
+    if (const char* v = std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS")) {
+      int parsed = std::atoi(v);
+      if (parsed > 0) min_pairs = parsed;
+    }
+    int batch_x_topk = prob_m * top_k;
+    if (log_count < log_limit && batch_x_topk >= min_pairs) {
       int sh_cache_size = get_kernel_cache_size(
           thread_tfg, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
           num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float);
       std::fprintf(stderr,
-                   "[vllm-moe-config] prob_m=%d prob_n=%d prob_k=%d "
+                   "[vllm-moe-config] batch_x_topk=%d prob_m=%d prob_n=%d prob_k=%d "
                    "block=%d top_k=%d thread_k=%d thread_n=%d threads=%d "
                    "blocks_per_sm=%d sh_cache=%d max_shared=%d\n",
-                   prob_m, prob_n, prob_k, moe_block_size, top_k, thread_k,
-                   thread_n, num_threads, exec_cfg.blocks_per_sm,
-                   sh_cache_size, max_shared_mem);
+                   batch_x_topk, prob_m, prob_n, prob_k, moe_block_size, top_k,
+                   thread_k, thread_n, num_threads, exec_cfg.blocks_per_sm, sh_cache_size,
+                   max_shared_mem);
       log_count++;
     }
   }

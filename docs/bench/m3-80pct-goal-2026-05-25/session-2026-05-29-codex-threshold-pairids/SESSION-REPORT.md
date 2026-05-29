@@ -9,8 +9,9 @@
 
 This session fixed the default-path correctness issue from multi-turn chat,
 closed the c=4 batching hole, validated two small MoE routing/combine wins,
-and falsified one vLLM-source-inspired Marlin scheduling lever. The overall
-0.80× vLLM goal is **not complete**.
+validated a short-context paged-attention v1 default, and falsified multiple
+low-yield or unsafe Marlin/env levers. The overall 0.80× vLLM goal is **not
+complete**.
 
 | Change | Correctness | Result |
 |---|---|---:|
@@ -18,8 +19,11 @@ and falsified one vLLM-source-inspired Marlin scheduling lever. The overall
 | server threshold `8 → 4` | Paris 4/4 | c=4 `425.6 ± 36.6 tok/s` |
 | pair-id vLLM MoE routing | Paris + c4 smoke | c16 `986.9 ± 10.2`, c32 `1249.5 ± 69.3` |
 | pair-id combine fast path | Paris | c16 `993.8 ± 26.6`, c32 `1264.0 ± 29.4` |
+| short paged-attn v1 default | Paris on both A/B paths | c32 `1301.1 ± 25.0` vs forced-v2 `1275.2 ± 56.7` |
+| current binary vs pre-binary, forced v2 | Paris all rows | c32 `1299.0 ± 48.4` vs `1244.4 ± 53.7` |
 | partial vLLM 0.20.2 Marlin scheduling backport | Paris | no c32 gain; reverted |
 | block8 vLLM parity override | Paris/no-garbage smoke | c16/c32 regression; keep override-only |
+| broad `{128,64,128}` Marlin tile instantiation | graph-on load failed | 48GB OOM near layer 40; reverted |
 
 ## What changed
 
@@ -43,6 +47,16 @@ and falsified one vLLM-source-inspired Marlin scheduling lever. The overall
   process-global vLLM-MoE `c_tmp` scratch is sized for vLLM's block8
   requirement. This is not the default path; it exists to test vLLM block-size
   parity safely.
+- `FERRUM_VLLM_PAGED_ATTN_V1_SHORT` now defaults on; `=0` forces the old v2
+  path. This removes the v2 reduce launch for short-context decode where
+  `max_seq_len <= 512`.
+- The MoE Marlin config logger now supports
+  `FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT` and
+  `FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS`, so profiling can skip early small-M
+  calls and capture the real c32 decode config.
+- `FERRUM_MOE_LARGE_M_BLOCK_SIZE` plus `FERRUM_MOE_LARGE_M_MIN_PAIRS` is an
+  opt-in large-M device-route experiment hook. The default c32 decode block
+  size remains unchanged.
 
 ## Correctness gates
 
@@ -66,6 +80,10 @@ Results:
   first two prompts were truncated in Qwen3 `<think>` output because the gate
   used too few completion tokens. Treat this as a no-garbage smoke, not a
   publication-grade final-answer gate.
+- Short paged-attention v1 A/B produced `Paris` for both v1-short and forced-v2
+  paths.
+- Current-binary vs pre-binary A/B rows for c=1/4/16/32 all passed the Paris
+  gate before throughput was counted.
 
 ## Performance
 
@@ -107,6 +125,32 @@ Same-pod vLLM 0.20.2 c16/c32 N=3 baseline:
 |---:|---:|---:|---:|
 | 16 | `993.8 ± 26.6` | `1328.7 ± 44.4` | `0.75×` |
 | 32 | `1264.0 ± 29.4` | `1971.8 ± 7.4` | `0.64×` |
+
+Restored-pod final current-binary vs pre-binary A/B, with attention forced to
+old v2 (`FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0`) to avoid mixing in the new
+attention default:
+
+| c | current binary | pre binary | decision |
+|---:|---:|---:|---|
+| 1 | `161.9 ± 1.2` | `160.6 ± 0.8` | flat / slight positive |
+| 4 | `424.2 ± 14.1` | `428.0 ± 35.1` | flat |
+| 16 | `1001.5 ± 21.8` | `999.9 ± 32.0` | flat |
+| 32 | `1299.0 ± 48.4` | `1244.4 ± 53.7` | `+4.4%`, small but real |
+
+Artifacts:
+
+- c32: `/workspace/m3-moe-parity-lite-binary-ab-trimmed-20260529_043153/`
+- c16: `/workspace/m3-moe-parity-lite-binary-ab-c16-20260529_043419/`
+- c4: `/workspace/m3-moe-parity-lite-binary-ab-c4-20260529_043830/`
+- c1: `/workspace/m3-moe-parity-lite-binary-ab-c1-20260529_044647/`
+
+The short-attention v1 A/B is a separate same-binary effect:
+`/workspace/m3-attn-v1-ab-codex-20260529_040601/` measured c32
+`1301.1 ± 25.0` for v1-short versus `1275.2 ± 56.7` for forced-v2, a
+`+2.0%` directional attention-path win. There is still no clean final
+combined-default c32 N=3 row, so use the `1299.0 ± 48.4` forced-v2 row as the
+conservative current-binary baseline and the v1 result only as A/B evidence
+for the attention switch.
 
 Partial Marlin scheduling backport N=3:
 
@@ -182,25 +226,27 @@ Continuation notes after the pair-id combine profile:
 - Vast instance `38237968` stopped while the route-dump CUDA build was running.
   Restart returned `resources_unavailable`, and renting a replacement 48GB
   RTX 4090 failed with `insufficient_credit`. No new GPU correctness or
-  performance claims were made after this point.
+  performance claims were made during this outage window; later claims below
+  come from the restored pod and explicit artifact directories.
 - A follow-up short-context vLLM paged-attention v1 path was prepared locally:
   it calls vLLM `paged_attention_v1_kernel` when `max_seq_len <= 512`, with
   `FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0` as the old-v2 kill switch. This is
-  intended to remove the v2 reduce launch for random 256/128 decode, but it is
-  not a validated win yet. Local gates passed (`cargo fmt --all -- --check`,
-  `cargo check -p ferrum-cli`); GPU Paris/c32 A/B is pending because the Vast
-  account currently reports negative balance and replacement rentals fail with
-  `insufficient_credit`. Use `scripts/m3_attn_v1_ab.sh` when a pod is restored.
+  intended to remove the v2 reduce launch for random 256/128 decode. Local
+  gates passed (`cargo fmt --all -- --check`, `cargo check -p ferrum-cli`);
+  GPU validation was initially blocked by credit, then completed after the pod
+  was restored.
 - Added `scripts/m3_route_unified_profile.sh` so the next pod run has one
   scoped command for the real c=32 MoE route shape plus unified engine timing.
   It sets `FERRUM_MOE_DUMP_BATCH_X_TOPK=$((CONCURRENCY * TOP_K))`,
+  `FERRUM_VLLM_MOE_LOG_CONFIG=1`,
+  `FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS=$((CONCURRENCY * TOP_K))`,
   `FERRUM_UNIFIED_POST_PROF=1`, `FERRUM_BATCH_DECODE_PROF=1`,
   `FERRUM_NEXT_BATCH_PROF=1`, `FERRUM_MOE_PROFILE=1`, and
   `FERRUM_MOE_GRAPH=0` because route dumping synchronizes/copies routing
   buffers and should not run inside CUDA graph capture. The script fails fast
-  if either `[MOE_DUMP:*]` or `[unified-prof]` is missing. It also writes
-  `profile_summary.json` with medians for unified, iteration, and bucket
-  timings.
+  if `[MOE_DUMP:*]`, `[vllm-moe-config]`, or `[unified-prof]` is missing. It
+  also writes `profile_summary.json` with medians for unified, iteration,
+  bucket, and Marlin config fields.
 
 Continuation after pod restore:
 
@@ -243,6 +289,52 @@ Continuation after pod restore:
   `1304.9 tok/s`; `TPOT p50` improved to `19.0 ms`, but `TTFT p50` regressed
   to `723.7 ms`. Do not make it default or repeat max-batched-token-only
   tests without new evidence.
+- Short-context vLLM paged-attention v1 was validated as a same-binary A/B on
+  the restored dirty remote binary after fixing the default switch to match the
+  intended semantics (`default on`, `FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0` forces
+  old v2). Artifact:
+  `/workspace/m3-attn-v1-ab-codex-20260529_040601/`. Both paths passed Paris.
+  `v1_short` c32 N=3 measured `1301.1 ± 25.0 tok/s`, `TPOT p50=19.7 ms`;
+  `v2_forced` measured `1275.2 ± 56.7 tok/s`, `TPOT p50=20.6 ms`. This is a
+  small `+2.0%` directional win and supports keeping the short-v1 default, but
+  the absolute `1301 tok/s` row is not a clean current-default baseline because
+  the remote dirty binary still had prompt-token-estimate scheduling default-on.
+  Treat this artifact as attention-path A/B evidence only.
+- Added a targeted large-M MoE block-size experiment hook, not a new default:
+  `FERRUM_MOE_LARGE_M_BLOCK_SIZE=32/48/64` applies only on the device-route
+  path when `batch * top_k >= FERRUM_MOE_LARGE_M_MIN_PAIRS` (default threshold
+  `1024`). This is intended to test whether prefill/unified large-M work can use
+  the wider Marlin tile without repeating the known-bad c32 sparse-decode
+  `FERRUM_MOE_BLOCK_SIZE=64` behavior. Local tests cover thresholding and the
+  global `FERRUM_MOE_BLOCK_SIZE` override precedence; there is no GPU
+  performance claim yet.
+- Extended `FERRUM_VLLM_MOE_LOG_CONFIG=1` with
+  `FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT` and
+  `FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS` so the next clean GPU build can skip
+  early small-M Marlin calls and capture the actual c32 decode config. The
+  restored dirty-pod probe `/workspace/m3-moe-config-probe-20260529_044441/`
+  passed Paris and captured route shape `batch_x_topk=256`,
+  `total_post_pad=800`, `active_blocks=50`, `unique_experts=44`, but the old
+  fixed log cap only recorded smaller `batch_x_topk=104` calls selecting
+  `thread_k=64`, `thread_n=128`, `threads=128`, `blocks_per_sm=3`. Treat that
+  run as debug evidence only, not throughput data.
+- A broad Marlin-MoE `{thread_k=128, thread_n=64, threads=128}` tile
+  instantiation was tested and reverted. The larger CUDA module/binary loaded
+  graph-on into OOM near layer 40 on the 48GB 4090, before a valid Paris or
+  throughput result. This is a hard safety signal: do not add broad Marlin
+  template coverage without measuring binary/module/graph memory pressure.
+- Final restored-pod current-binary vs pre-binary A/B forced attention old-v2
+  (`FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0`) to isolate the non-attention code
+  state. All rows passed Paris. c32 artifact
+  `/workspace/m3-moe-parity-lite-binary-ab-trimmed-20260529_043153/` measured
+  current `1299.0 ± 48.4 tok/s` vs pre `1244.4 ± 53.7` (`+4.4%`). c16
+  `/workspace/m3-moe-parity-lite-binary-ab-c16-20260529_043419/` measured
+  `1001.5 ± 21.8` vs `999.9 ± 32.0`; c4
+  `/workspace/m3-moe-parity-lite-binary-ab-c4-20260529_043830/` measured
+  `424.2 ± 14.1` vs `428.0 ± 35.1`; c1
+  `/workspace/m3-moe-parity-lite-binary-ab-c1-20260529_044647/` measured
+  `161.9 ± 1.2` vs `160.6 ± 0.8`. Treat lower-concurrency rows as flat and
+  c32 as the only meaningful small win.
 
 Primary artifacts:
 
@@ -258,6 +350,12 @@ Primary artifacts:
 - `/workspace/m3-moe-parity-lite-profile-20260529_033812/`
 - `/workspace/m3-prefill-est-c32-stable-20260529_034726/`
 - `/workspace/m3-mbt4096-c32-n1-20260529_035206/`
+- `/workspace/m3-moe-config-probe-20260529_044441/`
+- `/workspace/m3-attn-v1-ab-codex-20260529_040601/`
+- `/workspace/m3-moe-parity-lite-binary-ab-trimmed-20260529_043153/`
+- `/workspace/m3-moe-parity-lite-binary-ab-c16-20260529_043419/`
+- `/workspace/m3-moe-parity-lite-binary-ab-c4-20260529_043830/`
+- `/workspace/m3-moe-parity-lite-binary-ab-c1-20260529_044647/`
 
 ## Current target status
 
@@ -266,11 +364,12 @@ Use the ratios below as directional only until vLLM is rerun with
 
 - c=1 and c=4 are now the healthy cells.
 - c=16 is close but not over 0.80 against same-pod vLLM 0.20.2 N=3:
-  `993.8 / 1328.7 ≈ 0.75`.
-- c=32 remains the real blocker: default fast path is `1264.0 / 1971.8 ≈
-  0.64`; the opt-in prompt-token-estimate candidate reached
-  `1288.2 / 1971.8 ≈ 0.65`, so c32 still needs roughly `+22–25%` throughput
-  to clear 0.80× on this pod.
+  the latest current-binary A/B row is `1001.5 / 1328.7 ≈ 0.75`.
+- c=32 remains the real blocker: the conservative current-binary forced-v2 row
+  is `1299.0 / 1971.8 ≈ 0.66`. Short-v1 attention is separately validated as
+  a `+2.0%` same-binary effect, but there is no clean final combined-default
+  N=3 row yet. On the conservative row c32 still needs roughly `+21%`
+  throughput to clear 0.80× on this pod.
 
 ## Next lever
 
@@ -278,14 +377,16 @@ Do not repeat env sweeps, the partial Marlin scheduling backport, block8-only
 testing, or `FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next
 high-return loop should target model time directly:
 
-1. restore a GPU pod with enough credit and 48GB-class memory if possible;
-2. first run the scoped attention A/B gate if the local v1 patch is still
-   present: `REPEATS=3 bash scripts/m3_attn_v1_ab.sh`; keep it only if Paris
-   passes and same-pod v1 beats forced-v2;
-3. add or run a scoped unified-layer profile that separates prefill and decode
+1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
+   pod before making new performance claims;
+2. add or run a scoped unified-layer profile that separates prefill and decode
    dense/attention/MoE time; the current restored profile already rules out
    scheduler/postprocess as the main gap;
+3. with a clean build, capture c32 Marlin config using
+   `FERRUM_VLLM_MOE_LOG_CONFIG=1 FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS=256`, and
+   run a scoped A/B for the opt-in large-M block hook only if prefill/unified
+   MoE remains material;
 4. if MoE remains dominant, prototype either a full vLLM 0.20.2 Marlin-MoE
    source-parity port behind the existing C ABI or one small-m gate_up/down
    fused kernel;
-6. run Paris, then c16/c32 N=3 A/B on the same pod.
+5. run Paris, then c16/c32 N=3 A/B on the same pod.

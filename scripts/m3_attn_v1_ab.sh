@@ -170,7 +170,7 @@ PY
 }
 
 run_case v1_short "$PORT_BASE" FERRUM_VLLM_PAGED_ATTN_V1_SHORT=1
-run_case v2_default "$((PORT_BASE + 1))"
+run_case v2_forced "$((PORT_BASE + 1))" FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0
 
 python3 - "$OUT_ROOT" <<'PY'
 import json, pathlib, sys

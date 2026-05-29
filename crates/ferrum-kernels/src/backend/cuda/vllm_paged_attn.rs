@@ -86,7 +86,7 @@ fn pa_scratch_slot() -> &'static std::sync::RwLock<Option<PagedAttnScratch>> {
 
 fn pa_v1_short_enabled() -> bool {
     *PA_V1_SHORT_ENABLED
-        .get_or_init(|| std::env::var("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").as_deref() == Ok("1"))
+        .get_or_init(|| std::env::var("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").as_deref() != Ok("0"))
 }
 
 fn ensure_pa_scratch(
