@@ -24,7 +24,6 @@ PORT_BASE="${PORT_BASE:-18380}"
 NUM_PROMPTS="${NUM_PROMPTS:-128}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-10}"
 CONCURRENCY="${CONCURRENCY:-32}"
-TEST_TILED_Q4="${TEST_TILED_Q4:-0}"
 
 if [[ ! -d "$MODEL_DIR" ]]; then
     echo "MODEL_DIR does not exist: $MODEL_DIR" >&2
@@ -64,7 +63,6 @@ echo "REPEATS=$REPEATS"
     echo "num_prompts=$NUM_PROMPTS"
     echo "warmup_requests=$WARMUP_REQUESTS"
     echo "concurrency=$CONCURRENCY"
-    echo "test_tiled_q4=$TEST_TILED_Q4"
 } >"$OUT_ROOT/metadata.txt"
 
 BASE_ENV=(
@@ -172,18 +170,8 @@ PY
     SERVER_PID=""
 }
 
-if [[ "$TEST_TILED_Q4" == "1" ]]; then
-    run_case fa_layout_tiled_q4 "$PORT_BASE" \
-        FERRUM_FA_LAYOUT_VARLEN=1 \
-        FERRUM_FA_LAYOUT_VARLEN_TILED_Q4=1
-    run_case fa_layout "$((PORT_BASE + 1))" \
-        FERRUM_FA_LAYOUT_VARLEN=1 \
-        FERRUM_FA_LAYOUT_VARLEN_TILED_Q4=0
-    run_case default "$((PORT_BASE + 2))" FERRUM_FA_LAYOUT_VARLEN=0
-else
-    run_case fa_layout "$PORT_BASE" FERRUM_FA_LAYOUT_VARLEN=1
-    run_case default "$((PORT_BASE + 1))" FERRUM_FA_LAYOUT_VARLEN=0
-fi
+run_case fa_layout "$PORT_BASE" FERRUM_FA_LAYOUT_VARLEN=1
+run_case default "$((PORT_BASE + 1))" FERRUM_FA_LAYOUT_VARLEN=0
 
 python3 - "$OUT_ROOT" <<'PY'
 import json, pathlib, sys
@@ -201,8 +189,4 @@ if rows.get("fa_layout", (None, None))[0] and rows.get("default", (None, None))[
     candidate = rows["fa_layout"][0]
     default = rows["default"][0]
     print(f"DELTA fa_layout vs default: {(candidate / default - 1.0) * 100.0:.2f}%")
-if rows.get("fa_layout_tiled_q4", (None, None))[0] and rows.get("fa_layout", (None, None))[0]:
-    tiled = rows["fa_layout_tiled_q4"][0]
-    fa_layout = rows["fa_layout"][0]
-    print(f"DELTA fa_layout_tiled_q4 vs fa_layout: {(tiled / fa_layout - 1.0) * 100.0:.2f}%")
 PY

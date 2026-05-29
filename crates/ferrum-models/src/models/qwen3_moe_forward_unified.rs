@@ -83,10 +83,6 @@ fn vllm_varlen_tiled_q4_enabled() -> bool {
     std::env::var("FERRUM_VLLM_VARLEN_TILED_Q4").as_deref() == Ok("1")
 }
 
-fn fa_layout_varlen_tiled_q4_enabled() -> bool {
-    std::env::var("FERRUM_FA_LAYOUT_VARLEN_TILED_Q4").as_deref() == Ok("1")
-}
-
 fn unified_greedy_argmax_enabled() -> bool {
     std::env::var("FERRUM_GREEDY_ARGMAX").as_deref() == Ok("1")
         && std::env::var("FERRUM_UNIFIED_GREEDY_ARGMAX").map_or(true, |v| v != "0")
@@ -267,12 +263,8 @@ where
 
         let use_vllm_tiled_q4 =
             self.use_vllm_paged_attn && vllm_varlen_tiled_q4_enabled() && m_total > num_seqs;
-        let use_fa_layout_tiled_q4 = self.use_vllm_paged_attn
-            && fa_layout_varlen_enabled()
-            && fa_layout_varlen_tiled_q4_enabled()
-            && m_total > num_seqs;
         let mut tile_q4_count = 0usize;
-        if use_vllm_tiled_q4 || use_fa_layout_tiled_q4 {
+        if use_vllm_tiled_q4 {
             let mut tile_seqs = Vec::with_capacity(m_total);
             let mut tile_starts = Vec::with_capacity(m_total);
             for (seq_idx, &q_len) in q_lens.iter().enumerate() {
@@ -328,7 +320,6 @@ where
                 n_exp,
                 norm_topk_prob,
                 use_vllm_tiled_q4,
-                use_fa_layout_tiled_q4,
                 tile_q4_count,
                 layer_prof.as_mut(),
             );
@@ -456,7 +447,6 @@ where
         n_exp: usize,
         norm_topk_prob: bool,
         use_vllm_tiled_q4: bool,
-        use_fa_layout_tiled_q4: bool,
         tile_q4_count: usize,
         mut prof: Option<&mut UnifiedLayerProfile>,
     ) {
@@ -621,58 +611,25 @@ where
             if self.use_vllm_paged_attn {
                 if let Some((fa_k_ptr, fa_v_ptr)) = fa_pool_ptr {
                     let (fa_pool_k, fa_pool_v) = unsafe { (&mut *fa_k_ptr, &mut *fa_v_ptr) };
-                    if use_fa_layout_tiled_q4 {
-                        let tile_seqs = self
-                            .scratch
-                            .unified_tile_q4_seqs
-                            .as_ref()
-                            .expect("unified_tile_q4_seqs missing");
-                        let tile_starts = self
-                            .scratch
-                            .unified_tile_q4_starts
-                            .as_ref()
-                            .expect("unified_tile_q4_starts missing");
-                        B::paged_varlen_attention_tiled_q4(
-                            ctx,
-                            &self.scratch.q_head_major,
-                            fa_pool_k,
-                            fa_pool_v,
-                            &mut self.scratch.attn_head_major_out,
-                            cu_seqlens_buf,
-                            pos_offsets_buf,
-                            bt_buf,
-                            tile_seqs,
-                            tile_starts,
-                            tile_q4_count,
-                            max_kv_len,
-                            nh,
-                            nkv,
-                            hd,
-                            block_size,
-                            max_blocks_per_seq,
-                        )
-                        .expect("Qwen3Moe unified: paged_varlen_attention_tiled_q4 fa-layout");
-                    } else {
-                        B::paged_varlen_attention(
-                            ctx,
-                            &self.scratch.q_head_major,
-                            fa_pool_k,
-                            fa_pool_v,
-                            &mut self.scratch.attn_head_major_out,
-                            cu_seqlens_buf,
-                            pos_offsets_buf,
-                            bt_buf,
-                            num_seqs,
-                            m_total,
-                            max_kv_len,
-                            nh,
-                            nkv,
-                            hd,
-                            block_size,
-                            max_blocks_per_seq,
-                        )
-                        .expect("Qwen3Moe unified: paged_varlen_attention fa-layout");
-                    }
+                    B::paged_varlen_attention(
+                        ctx,
+                        &self.scratch.q_head_major,
+                        fa_pool_k,
+                        fa_pool_v,
+                        &mut self.scratch.attn_head_major_out,
+                        cu_seqlens_buf,
+                        pos_offsets_buf,
+                        bt_buf,
+                        num_seqs,
+                        m_total,
+                        max_kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        block_size,
+                        max_blocks_per_seq,
+                    )
+                    .expect("Qwen3Moe unified: paged_varlen_attention fa-layout");
                 } else if use_vllm_tiled_q4 {
                     let tile_seqs = self
                         .scratch

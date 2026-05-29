@@ -1406,33 +1406,6 @@ pub trait BackendPagedKv: Backend {
             "paged_varlen_attention not implemented for this backend",
         ))
     }
-    /// Q-tiled variant of [`Self::paged_varlen_attention`] for the legacy /
-    /// FA-compatible paged K/V layout. `tile_seqs` and `tile_starts` describe
-    /// compact TILE_Q=4 query-token tiles.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_varlen_attention_tiled_q4(
-        _ctx: &mut Self::Context,
-        _q: &Self::Buffer,
-        _k_pool: &Self::Buffer,
-        _v_pool: &Self::Buffer,
-        _out: &mut Self::Buffer,
-        _cu_seqlens_q: &Self::Buffer,
-        _pos_offsets: &Self::Buffer,
-        _block_tables: &Self::Buffer,
-        _tile_seqs: &Self::Buffer,
-        _tile_starts: &Self::Buffer,
-        _num_tiles: usize,
-        _max_kv_len: usize,
-        _num_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _block_size: usize,
-        _max_num_blocks_per_seq: usize,
-    ) -> Result<()> {
-        Err(FerrumError::unsupported(
-            "paged_varlen_attention_tiled_q4 not implemented for this backend",
-        ))
-    }
     /// Batched paged decode attention — multi-seq, single token per seq.
     /// Faster path for the unified_forward layer when m_total == num_seqs
     /// (every item is a single-token decode). Skips the cu_seqlens_q
