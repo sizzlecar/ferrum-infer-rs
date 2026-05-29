@@ -32,6 +32,7 @@ complete**.
 | unified mixed layer-loop graph | Paris | c32 N=1 `-3.82%`; reverted |
 | unified GPU greedy argmax | Paris both rows | c32 N=1 `+0.97%`; keep as cleanup, not a main lever |
 | prefill-first admission | Paris both rows | c32 N=1 `+3.77%`, but TTFT worse; prompt-est combo `-0.58%`; keep opt-in |
+| unified greedy prefill token handling | Paris | correctness cleanup; current-default c32 N=1 `1299.7 tok/s` |
 
 ## What changed
 
@@ -597,6 +598,17 @@ Continuation after pod restore:
   `1235.6 tok/s`, `TPOT p50=22.45 ms`, `ITL p95=128.86 ms`, `TTFT p50=393 ms`
   (`+0.97%`). Keep the cleanup, but do not spend N=3 GPU time on it unless a
   later profile shows readback dominating again.
+- Follow-up correctness fix: the engine now treats unified greedy prefill
+  results the same way as decode results when the model returns a single f32
+  token-id sentinel, and prefix-cache stores are skipped when prefix cache is
+  disabled or the result is only that sentinel. Local gates passed
+  `cargo fmt --all -- --check`, `cargo check -q -p ferrum-engine`, and
+  `cargo test -q -p ferrum-engine --test continuous_batch_test`. Remote build
+  from Git commit `2b1e2e8` took `2m57s`. Smoke artifact
+  `/workspace/m3-greedy-prefill-fix-smoke-20260529_git_n1/` passed Paris and
+  measured current-default c32 N=1 `1299.7 tok/s`, `TPOT p50=21.78 ms`,
+  `ITL p95=85.19 ms`, `TTFT p50=325 ms`. Treat this as correctness cleanup and
+  current-default smoke only, not an N=3 performance claim.
 - A scheduler prefill-first admission experiment was added as an opt-in only
   lever. `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE=32` skips early decode
   scheduling while there are waiting/prefill requests and the active decode
@@ -665,6 +677,7 @@ Primary artifacts:
 - `/workspace/m3-unified-greedy-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/`
+- `/workspace/m3-greedy-prefill-fix-smoke-20260529_git_n1/`
 
 ## Current target status
 
