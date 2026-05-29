@@ -118,6 +118,10 @@ fn moe_graph_enabled_graph_clean() -> bool {
     false
 }
 
+pub(crate) fn fa_layout_varlen_enabled() -> bool {
+    std::env::var("FERRUM_FA_LAYOUT_VARLEN").as_deref() == Ok("1")
+}
+
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.
 pub struct Qwen3MoeLayerState<B: QuantLlmBackend + BackendMoeFused> {
     /// Router projection `[hidden] → [num_experts]` — tiny, never sparse,
@@ -589,6 +593,11 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     // `FERRUM_METAL_PAGED_KV=1`. Kv_caches entries become metadata-only
     // views (block_table + context_lens) into the shared `paged_pools`.
     pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
+    // Optional second paged K/V pool in Ferrum's legacy/FlashAttention-friendly
+    // layout `[block, slot, kv_head, head_dim]`. Used only for unified
+    // prefill/mixed varlen attention when vLLM decode keeps the primary pool
+    // in vLLM's paged-decode layout.
+    pub paged_fa_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
     pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
     // Paged-batch dispatch dimensions. Pinned at the first `ensure_kv`
     // when paged-KV is on. Stored on the model (not on scratch) so
@@ -752,6 +761,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
             paged_pools: None,
+            paged_fa_pools: None,
             paged_block_alloc: None,
             paged_dims: None,
             batched_graph_warmup: 0,
@@ -938,6 +948,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
             paged_pools: None,
+            paged_fa_pools: None,
             paged_block_alloc: None,
             paged_dims: None,
             batched_graph_warmup: 0,
@@ -1052,6 +1063,18 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             self.paged_block_alloc = Some(std::sync::Mutex::new(
                 crate::common::paged_pool::BlockAllocator::new(total_pool_blocks as u32),
             ));
+        }
+        if paged
+            && self.use_vllm_paged_attn
+            && fa_layout_varlen_enabled()
+            && self.paged_fa_pools.is_none()
+        {
+            let mut pools = Vec::with_capacity(self.cfg.base.num_layers);
+            for _ in 0..self.cfg.base.num_layers {
+                let pool_floats = total_pool_blocks * nkv * PAGED_BLOCK_SIZE * hd;
+                pools.push((B::alloc(pool_floats), B::alloc(pool_floats)));
+            }
+            self.paged_fa_pools = Some(pools);
         }
         if paged {
             self.scratch

@@ -22,7 +22,7 @@ use std::time::Instant;
 use ferrum_interfaces::kv_dtype::KvDtypeKind;
 use ferrum_kernels::backend::{Backend, BackendPagedKv, MoeLlmBackend};
 
-use super::qwen3_moe::Qwen3MoeModel;
+use super::qwen3_moe::{fa_layout_varlen_enabled, Qwen3MoeModel};
 
 #[derive(Default)]
 pub(crate) struct UnifiedLayerProfile {
@@ -493,6 +493,19 @@ where
             &mut pools[li].0 as *mut B::Buffer,
             &mut pools[li].1 as *mut B::Buffer,
         );
+        let use_fa_layout_varlen = self.use_vllm_paged_attn && fa_layout_varlen_enabled();
+        let fa_pool_ptr = if use_fa_layout_varlen {
+            let pools = self
+                .paged_fa_pools
+                .as_mut()
+                .expect("FERRUM_FA_LAYOUT_VARLEN=1 requires paged_fa_pools");
+            Some((
+                &mut pools[li].0 as *mut B::Buffer,
+                &mut pools[li].1 as *mut B::Buffer,
+            ))
+        } else {
+            None
+        };
         // SAFETY: pools allocated once, no concurrent mutation.
         let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
 
@@ -542,6 +555,36 @@ where
                 max_blocks_per_seq,
             )
             .expect("Qwen3Moe unified: split_qkv_norm_rope_into_paged_cache_varlen");
+            if let Some((fa_k_ptr, fa_v_ptr)) = fa_pool_ptr {
+                // Maintain an FA-compatible K/V view in parallel with the
+                // vLLM decode layout. The block table is shared, so release
+                // and cache lifetime rules stay unchanged.
+                let (fa_pool_k, fa_pool_v) = unsafe { (&mut *fa_k_ptr, &mut *fa_v_ptr) };
+                B::split_qkv_norm_rope_into_paged_cache_varlen(
+                    ctx,
+                    &self.scratch.qkv_out,
+                    q_norm_w,
+                    k_norm_w,
+                    &self.rope.cos,
+                    &self.rope.sin,
+                    &mut self.scratch.q_head_major,
+                    fa_pool_k,
+                    fa_pool_v,
+                    cu_seqlens_buf,
+                    pos_offsets_buf,
+                    bt_buf,
+                    num_seqs,
+                    m_total,
+                    nh,
+                    nkv,
+                    hd,
+                    eps,
+                    qk_mode,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("Qwen3Moe unified: split_qkv_norm_rope_into_paged_cache_varlen fa-layout");
+            }
             if let Some(prof) = prof.as_mut() {
                 prof.split_cache_us += unified_stage_finish::<B>(ctx, t_split_cache);
             }
@@ -566,7 +609,28 @@ where
                 .expect("unified_block_tables missing");
             let t_attn = unified_stage_start::<B>(ctx, prof_enabled);
             if self.use_vllm_paged_attn {
-                if use_vllm_tiled_q4 {
+                if let Some((fa_k_ptr, fa_v_ptr)) = fa_pool_ptr {
+                    let (fa_pool_k, fa_pool_v) = unsafe { (&mut *fa_k_ptr, &mut *fa_v_ptr) };
+                    B::paged_varlen_attention(
+                        ctx,
+                        &self.scratch.q_head_major,
+                        fa_pool_k,
+                        fa_pool_v,
+                        &mut self.scratch.attn_head_major_out,
+                        cu_seqlens_buf,
+                        pos_offsets_buf,
+                        bt_buf,
+                        num_seqs,
+                        m_total,
+                        max_kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        block_size,
+                        max_blocks_per_seq,
+                    )
+                    .expect("Qwen3Moe unified: paged_varlen_attention fa-layout");
+                } else if use_vllm_tiled_q4 {
                     let tile_seqs = self
                         .scratch
                         .unified_tile_q4_seqs
