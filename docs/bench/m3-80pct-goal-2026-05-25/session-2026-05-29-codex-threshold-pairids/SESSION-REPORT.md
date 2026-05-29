@@ -356,6 +356,17 @@ Continuation after pod restore:
   scheduler/postprocess/streaming/combine/route are not the primary c=32 gap;
   the remaining high-return lever is the vLLM-Marlin MoE GEMM body/source
   parity or a new small-M fused MoE kernel.
+- Targeted Marlin thread-config A/B tested whether the real decode shape should
+  override auto's `thread_k=64`, `thread_n=128`, `blocks_per_sm=3` selection
+  with `FERRUM_VLLM_MOE_THREAD_K=128`,
+  `FERRUM_VLLM_MOE_THREAD_N=128`, and
+  `FERRUM_VLLM_MOE_BLOCKS_PER_SM=1`. Artifact:
+  `/workspace/m3-marlin-thread-ab-n3-20260529_060835/`. Both rows passed
+  Paris. N=1 initially looked positive (`+5.7%`), but the required N=3 A/B
+  reversed it: auto measured `1257.2 ± 50.2 tok/s`; forced `128x128,bps=1`
+  measured `1235.4 ± 35.1 tok/s` (`-1.7%`). Do not turn this into a default or
+  shape guard; the next MoE lever still needs source-parity/kernel work, not
+  this scheduling override.
 
 Primary artifacts:
 
@@ -378,6 +389,7 @@ Primary artifacts:
 - `/workspace/m3-moe-parity-lite-binary-ab-c4-20260529_043830/`
 - `/workspace/m3-moe-parity-lite-binary-ab-c1-20260529_044647/`
 - `/workspace/m3-route-unified-layer-relaxed-clean-20260529_060400/`
+- `/workspace/m3-marlin-thread-ab-n3-20260529_060835/`
 
 ## Current target status
 
@@ -396,8 +408,9 @@ Use the ratios below as directional only until vLLM is rerun with
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, block8-only
-testing, or `FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next
-high-return loop should target model time directly:
+testing, forcing Marlin `128x128,bps=1`, or `FERRUM_MAX_BATCHED_TOKENS=4096`
+as a standalone lever. The next high-return loop should target model time
+directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;
