@@ -19,6 +19,25 @@ For **Qwen/Qwen3-30B-A3B-GPTQ-Int4** on RTX 4090 (sm_89, 24 GB, CUDA 13.x, locke
 
 **Apples-to-apples**: ShareGPT-distribution prompts via `--dataset random --random-input-len 256 --random-output-len 128`, c × 30 requests, vLLM 0.20.2 with `--quantization gptq_marlin --no-enable-prefix-caching --enable-chunked-prefill --dtype float16 --gpu-memory-utilization 0.85`. ferrum env locked to the iter-3 set established in PR #206 (`FERRUM_GRAPH=1 FERRUM_MOE_DEVICE_ROUTE=1 FERRUM_MOE_STREAMS=4 FERRUM_GREEDY_ARGMAX=1 FERRUM_KV_MAX_BLOCKS=2048 FERRUM_PAGED_MAX_SEQS=32 FERRUM_USE_VLLM_PAGED_ATTN=1`).
 
+## Update -- 2026-05-30 opt-in FA2 direct confirmation
+
+The opt-in `FERRUM_FA2_DIRECT_FFI=1` path clears the 0.80× throughput target on
+all four cells in a same-pod N=5 confirmation sweep. Artifact directory:
+[`../cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](../cuda-rtx4090-2026-05-30-m3-80pct-confirmed/).
+
+| c | ferrum FA2 direct tok/s | vLLM 0.20.2 tok/s | ratio |
+|---:|---:|---:|---:|
+| 1 | `160.4 ± 0.2` | `183.9 ± 0.2` | `0.872×` |
+| 4 | `446.3 ± 7.0` | `512.5 ± 2.8` | `0.871×` |
+| 16 | `1185.1 ± 12.3` | `1331.9 ± 5.7` | `0.890×` |
+| 32 | `1641.9 ± 4.8` | `1972.9 ± 18.6` | `0.832×` |
+
+This is a performance-confirmed opt-in path, not yet the default-runtime state.
+It depends on a runtime shim around the vLLM/Torch FA2 extension and uses the
+extra FA-compatible K/V pool. The remaining product decision is whether to
+accept/default that dependency and memory cost or replace it with a cleaner
+source-built FA2 wrapper.
+
 ## Current baseline (2026-05-25 sweep)
 
 Sweep dir: [`docs/bench/sweep-2026-05-25-1631-qwen3-moe-30b-int4/`](../sweep-2026-05-25-1631-qwen3-moe-30b-int4/) · ferrum commit `cbe04ea`, n_repeats=1, num_prompts=30, warmup=5, random in=256 out=128.

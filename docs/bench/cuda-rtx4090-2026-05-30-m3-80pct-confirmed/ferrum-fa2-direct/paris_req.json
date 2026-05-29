@@ -1,0 +1,1 @@
+{"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64,"temperature":0.0}

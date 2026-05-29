@@ -915,6 +915,27 @@ dominates high concurrency. It is neutral at c1, modest at c4, and clears the
 known 0.80× same-pod vLLM thresholds for c16/c32. Final goal accounting still
 needs same-pod vLLM c1/c4 and a default/dependency decision.
 
+Same-pod N=5 confirmation resolved the c1/c4 denominator and upgraded c16/c32
+from directional N=3 to final benchmark variance. Committed artifact directory:
+`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`. Remote raw roots:
+Ferrum `/workspace/m3-fa2-direct-ffi-confirm-n5-20260530/`; vLLM
+`/workspace/m3-vllm0202-baseline-full-n5-20260530/`. Both sweeps completed with
+zero request errors, and post-run process/GPU audits were clean.
+
+| c | Ferrum FA2 direct N=5 | vLLM 0.20.2 N=5 | ratio | margin over 0.80× |
+|---:|---:|---:|---:|---:|
+| 1 | `160.4 ± 0.2` | `183.9 ± 0.2` | `0.872×` | `+13.3 tok/s` |
+| 4 | `446.3 ± 7.0` | `512.5 ± 2.8` | `0.871×` | `+36.3 tok/s` |
+| 16 | `1185.1 ± 12.3` | `1331.9 ± 5.7` | `0.890×` | `+119.6 tok/s` |
+| 32 | `1641.9 ± 4.8` | `1972.9 ± 18.6` | `0.832×` | `+63.5 tok/s` |
+
+This proves the opt-in FA2 direct FFI path clears the M3 0.80× throughput target
+on all four cells for the benchmark workload. It is still not a default-runtime
+claim: the path depends on the vLLM/Torch FA2 extension through the runtime shim
+and allocates the extra FA-compatible K/V pool. The remaining product decision
+is accepting/defaulting that dependency and memory cost versus replacing it with
+a cleaner source-built FA2 wrapper.
+
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
