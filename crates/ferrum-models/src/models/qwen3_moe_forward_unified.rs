@@ -83,6 +83,11 @@ fn vllm_varlen_tiled_q4_enabled() -> bool {
     std::env::var("FERRUM_VLLM_VARLEN_TILED_Q4").as_deref() == Ok("1")
 }
 
+fn unified_greedy_argmax_enabled() -> bool {
+    std::env::var("FERRUM_GREEDY_ARGMAX").as_deref() == Ok("1")
+        && std::env::var("FERRUM_UNIFIED_GREEDY_ARGMAX").map_or(true, |v| v != "0")
+}
+
 fn unified_stage_start<B: Backend>(ctx: &mut B::Context, enabled: bool) -> Option<Instant> {
     if enabled {
         B::sync(ctx);
@@ -379,10 +384,18 @@ where
                 .unified_packed_logits
                 .as_ref()
                 .expect("unified_packed_logits missing");
-            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
-            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
-                out[orig_idx] = Some(row);
+            if unified_greedy_argmax_enabled() {
+                let tokens = B::argmax_rows_f16(&mut ctx, packed_logits, num_sampled, vocab)
+                    .expect("Qwen3Moe unified: argmax_rows_f16");
+                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                    out[orig_idx] = Some(vec![tokens[j] as f32]);
+                }
+            } else {
+                let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                    let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
+                    out[orig_idx] = Some(row);
+                }
             }
         }
         if let Some(prof) = layer_prof.as_mut() {
