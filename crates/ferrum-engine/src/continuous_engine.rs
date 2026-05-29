@@ -76,6 +76,13 @@ fn resolve_stop_conditions(
     (ids, text_seqs)
 }
 
+fn active_decode_prefill_chunk_size() -> Option<usize> {
+    std::env::var("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Sequence state
 // ────────────────────────────────────────────────────────────────────────────
@@ -93,6 +100,9 @@ pub struct SequenceState {
     pub phase: RequestPhase,
     pub rng: StdRng,
     pub prefill_complete: bool,
+    /// Number of prompt tokens already written into the model KV cache by
+    /// opt-in unified chunked prefill. Zero for the normal full-prefill path.
+    pub prefill_tokens_processed: usize,
     pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
     pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
     pub start_time: Instant,
@@ -206,6 +216,7 @@ impl SequenceState {
             phase: RequestPhase::Waiting,
             rng: StdRng::seed_from_u64(seed),
             prefill_complete: false,
+            prefill_tokens_processed: 0,
             stream_sender: None,
             response_sender: None,
             start_time: Instant::now(),
@@ -616,17 +627,36 @@ impl EngineInner {
         // see `~/.claude/projects/*/memory/project_http_server_gaps_2026_05_19.md`.
         // Opt in via `FERRUM_PREFIX_CACHE=1` once the CoW fix lands.
         let skip_prefix_cache = std::env::var("FERRUM_PREFIX_CACHE").map_or(true, |v| v != "1");
-        let mut unified_prefills: Vec<(RequestId, Vec<TokenId>, Arc<dyn KvCacheHandle>)> =
-            Vec::new();
+        struct UnifiedPrefillWork {
+            rid: RequestId,
+            input_tokens: Vec<TokenId>,
+            kv_handle: Arc<dyn KvCacheHandle>,
+            fresh_kv: bool,
+            chunk_start: usize,
+            chunk_len: usize,
+            is_final_chunk: bool,
+        }
+
+        let active_prefill_chunk_size = active_decode_prefill_chunk_size();
+        let has_decode_items = !decode_ids.is_empty();
+        let mut unified_prefills: Vec<UnifiedPrefillWork> = Vec::new();
         for rid in &prefill_ids {
-            let (input_tokens, num_tokens) = {
+            let (input_tokens, num_tokens, existing_kv, chunk_start) = {
                 let sequences = self.sequences.read();
                 let Some(seq) = sequences.get(rid) else {
                     continue;
                 };
-                (seq.input_tokens.clone(), seq.input_tokens.len())
+                (
+                    seq.input_tokens.clone(),
+                    seq.input_tokens.len(),
+                    seq.kv_cache.clone(),
+                    seq.prefill_tokens_processed,
+                )
             };
-            if !skip_prefix_cache {
+            if chunk_start >= num_tokens {
+                continue;
+            }
+            if chunk_start == 0 && !skip_prefix_cache {
                 let hit = self
                     .prefix_cache
                     .find_prefix(&input_tokens)
@@ -664,55 +694,79 @@ impl EngineInner {
                     continue;
                 }
             }
-            // Allocate KV pages (with preempt fallback) for fresh prefill.
-            let alloc_request = AllocationRequest {
-                request_id: rid.clone(),
-                initial_tokens: num_tokens,
-                max_sequence_length: model_info.max_sequence_length,
-                num_layers: model_info.num_layers,
-                num_heads: model_info.num_kv_heads,
-                head_dim: model_info.hidden_size / model_info.num_heads.max(1),
-                device: self.config.backend.device.clone(),
-                dtype: model_info.dtype,
-                priority: Priority::Normal,
-            };
-            let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
-                Ok(h) => h,
-                Err(_) => {
-                    if self.preempt_victim(rid).await {
-                        match self.kv_cache.allocate(&alloc_request).await {
-                            Ok(h) => h,
-                            Err(e) => {
-                                warn!("Unified prefill alloc failed for {}: {}", rid, e);
-                                self.complete_request(rid, FinishReason::Error).await?;
-                                continue;
+
+            let (kv_handle, fresh_kv) = if let Some(kv) = existing_kv {
+                (kv, false)
+            } else {
+                // Allocate KV pages (with preempt fallback) for fresh prefill.
+                let alloc_request = AllocationRequest {
+                    request_id: rid.clone(),
+                    initial_tokens: num_tokens,
+                    max_sequence_length: model_info.max_sequence_length,
+                    num_layers: model_info.num_layers,
+                    num_heads: model_info.num_kv_heads,
+                    head_dim: model_info.hidden_size / model_info.num_heads.max(1),
+                    device: self.config.backend.device.clone(),
+                    dtype: model_info.dtype,
+                    priority: Priority::Normal,
+                };
+                let allocated = match self.kv_cache.allocate(&alloc_request).await {
+                    Ok(h) => h,
+                    Err(_) => {
+                        if self.preempt_victim(rid).await {
+                            match self.kv_cache.allocate(&alloc_request).await {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    warn!("Unified prefill alloc failed for {}: {}", rid, e);
+                                    self.complete_request(rid, FinishReason::Error).await?;
+                                    continue;
+                                }
                             }
+                        } else {
+                            warn!("Unified prefill alloc failed for {}: no victim", rid);
+                            self.complete_request(rid, FinishReason::Error).await?;
+                            continue;
                         }
-                    } else {
-                        warn!("Unified prefill alloc failed for {}: no victim", rid);
-                        self.complete_request(rid, FinishReason::Error).await?;
-                        continue;
                     }
-                }
+                };
+                (allocated, true)
             };
-            unified_prefills.push((rid.clone(), input_tokens, kv_handle));
+            let remaining = num_tokens - chunk_start;
+            let chunk_len = match active_prefill_chunk_size {
+                Some(chunk) if has_decode_items || chunk_start > 0 => chunk.min(remaining),
+                _ => remaining,
+            };
+            let is_final_chunk = chunk_start + chunk_len >= num_tokens;
+            unified_prefills.push(UnifiedPrefillWork {
+                rid: rid.clone(),
+                input_tokens,
+                kv_handle,
+                fresh_kv,
+                chunk_start,
+                chunk_len,
+                is_final_chunk,
+            });
         }
 
         // ── 2. Build the UnifiedBatch (prefill chunks + decode tokens) ──
         let mut unified = UnifiedBatch::new();
-        let mut prefill_meta: Vec<(RequestId, Vec<TokenId>)> = Vec::new();
+        let mut prefill_meta: Vec<UnifiedPrefillWork> = Vec::new();
         let mut decode_meta: Vec<RequestId> = Vec::new();
-        for (rid, tokens, kv_handle) in &unified_prefills {
-            let q_tokens: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
-            let seq_id = kv_handle.cache_id();
+        for work in unified_prefills {
+            let chunk_end = work.chunk_start + work.chunk_len;
+            let q_tokens: Vec<u32> = work.input_tokens[work.chunk_start..chunk_end]
+                .iter()
+                .map(|t| t.get())
+                .collect();
+            let seq_id = work.kv_handle.cache_id();
             unified.items.push(UnifiedBatchItem {
                 seq_id,
                 q_tokens,
-                kv_cache: kv_handle.clone(),
-                pos_offset: 0,
-                is_final_chunk: true,
+                kv_cache: work.kv_handle.clone(),
+                pos_offset: work.chunk_start,
+                is_final_chunk: work.is_final_chunk,
             });
-            prefill_meta.push((rid.clone(), tokens.clone()));
+            prefill_meta.push(work);
         }
         {
             let sequences = self.sequences.read();
@@ -774,8 +828,10 @@ impl EngineInner {
                 // request_id, double-counting `active_caches` (only one
                 // of the two pairs ever gets deallocated by
                 // `complete_request`). Found via paged_attention_test.
-                for (rid, _, _) in &unified_prefills {
-                    let _ = self.kv_cache.deallocate(rid.clone()).await;
+                for work in &prefill_meta {
+                    if work.fresh_kv {
+                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                    }
                 }
                 return self.process_batch_legacy_split(batch).await;
             }
@@ -803,28 +859,47 @@ impl EngineInner {
         let mut t_decode_stream_us: u64 = 0;
         let mut t_decode_stop_us: u64 = 0;
         let mut t_decode_complete_us: u64 = 0;
-        for (i, (rid, input_tokens)) in prefill_meta.into_iter().enumerate() {
+        for (i, work) in prefill_meta.into_iter().enumerate() {
             let logits_vec = match &results[i] {
                 Some(l) => l.clone(),
+                None if !work.is_final_chunk => {
+                    let kv_handle = unified.items[i].kv_cache.clone();
+                    {
+                        let mut sequences = self.sequences.write();
+                        if let Some(seq) = sequences.get_mut(&work.rid) {
+                            seq.model_cache_id = Some(kv_handle.cache_id());
+                            seq.kv_cache = Some(kv_handle);
+                            seq.prefill_tokens_processed =
+                                work.chunk_start.saturating_add(work.chunk_len);
+                            seq.phase = RequestPhase::Prefilling;
+                        }
+                    }
+                    self.scheduler.mark_prefill_chunk_processed(
+                        &work.rid,
+                        work.input_tokens.len(),
+                        work.chunk_len,
+                    );
+                    continue;
+                }
                 None => {
-                    warn!("Unified prefill result missing for {}", rid);
+                    warn!("Unified prefill result missing for {}", work.rid);
                     continue;
                 }
             };
-            let num_tokens = input_tokens.len();
+            let num_tokens = work.input_tokens.len();
             let kv_handle = unified.items[i].kv_cache.clone();
             if !skip_prefix_cache && logits_vec.len() > 1 {
                 // Store in prefix cache (best-effort). Greedy-argmax results
                 // are single-token sentinels, not reusable full logits.
                 let _ = self.prefix_cache.store_prefix(
-                    &input_tokens,
+                    &work.input_tokens,
                     kv_handle.clone(),
                     logits_vec.clone(),
                 );
             }
             let first_token = {
                 let mut sequences = self.sequences.write();
-                let Some(seq) = sequences.get_mut(&rid) else {
+                let Some(seq) = sequences.get_mut(&work.rid) else {
                     continue;
                 };
                 if let Some(ref jp) = seq.json_processor {
@@ -839,22 +914,23 @@ impl EngineInner {
                 seq.generated_tokens.push(token);
                 seq.model_cache_id = Some(kv_handle.cache_id());
                 seq.kv_cache = Some(kv_handle);
+                seq.prefill_tokens_processed = num_tokens;
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
                 token
             };
-            self.scheduler.mark_prefill_complete(&rid, num_tokens);
+            self.scheduler.mark_prefill_complete(&work.rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
             counter!("ferrum.engine.prefills_total").increment(1);
-            self.send_stream_update(&rid, first_token).await;
+            self.send_stream_update(&work.rid, first_token).await;
             let should_stop = {
                 let sequences = self.sequences.read();
-                sequences.get(&rid).is_none_or(|s| s.should_stop())
+                sequences.get(&work.rid).is_none_or(|s| s.should_stop())
             };
             if should_stop {
-                self.complete_request(&rid, FinishReason::EOS).await?;
+                self.complete_request(&work.rid, FinishReason::EOS).await?;
             }
         }
         for (j, rid) in decode_meta.into_iter().enumerate() {
@@ -1045,6 +1121,7 @@ impl EngineInner {
                 seq.model_cache_id = None;
                 seq.generated_tokens.clear();
                 seq.prefill_complete = false;
+                seq.prefill_tokens_processed = 0;
                 seq.phase = RequestPhase::Waiting;
                 seq.tokens_this_iteration = 0;
                 seq.preemption_count += 1;

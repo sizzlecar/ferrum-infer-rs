@@ -32,9 +32,17 @@ use std::{
 use tracing::{debug, info, warn};
 
 const PREFILL_FIRST_UNTIL_ACTIVE_ENV: &str = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE";
+const ACTIVE_DECODE_PREFILL_CHUNK_ENV: &str = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
 
 fn prefill_first_until_active_target() -> Option<usize> {
     std::env::var(PREFILL_FIRST_UNTIL_ACTIVE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+}
+
+fn active_decode_prefill_chunk_size() -> Option<usize> {
+    std::env::var(ACTIVE_DECODE_PREFILL_CHUNK_ENV)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
@@ -342,16 +350,39 @@ impl ContinuousBatchScheduler {
             return self.cb_config.prefill_chunk_size;
         }
 
-        let estimated_tokens = req
-            .inner
+        self.prompt_token_estimate(req)
+            .unwrap_or(self.cb_config.prefill_chunk_size)
+    }
+
+    fn prompt_token_estimate(&self, req: &ContinuousBatchRequest) -> Option<usize> {
+        req.inner
             .request
             .metadata
             .get(PROMPT_TOKENS_METADATA_KEY)
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .filter(|&v| v > 0)
-            .unwrap_or(self.cb_config.prefill_chunk_size);
+    }
 
+    fn maybe_active_decode_prefill_chunk(&self, req: &ContinuousBatchRequest) -> Option<usize> {
+        let chunk = active_decode_prefill_chunk_size()?;
+        if !req.chunked_prefill && self.decoding_count() == 0 {
+            return None;
+        }
+        Some(chunk)
+    }
+
+    fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
+        let remaining = if req.prefill_tokens == 0 {
+            self.prompt_token_estimate(req)
+                .unwrap_or(self.cb_config.prefill_chunk_size)
+        } else {
+            req.prefill_tokens.saturating_sub(req.prefill_chunk_offset)
+        };
+        chunk.min(remaining).max(1)
+    }
+
+    fn initial_prefill_token_estimate_capped(&self, estimated_tokens: usize) -> usize {
         if self.cb_config.enable_chunked_prefill {
             estimated_tokens
                 .min(self.cb_config.prefill_chunk_size)
@@ -362,8 +393,13 @@ impl ContinuousBatchScheduler {
     }
 
     fn prefill_budget_tokens(&self, req: &ContinuousBatchRequest) -> usize {
+        if let Some(chunk) = self.maybe_active_decode_prefill_chunk(req) {
+            return self.chunked_prefill_budget_tokens(req, chunk);
+        }
+
         if req.prefill_tokens == 0 {
-            return self.initial_prefill_token_estimate(req);
+            let estimated = self.initial_prefill_token_estimate(req);
+            return self.initial_prefill_token_estimate_capped(estimated);
         }
 
         let remaining = req.prefill_tokens.saturating_sub(req.prefill_chunk_offset);
@@ -1129,6 +1165,45 @@ mod tests {
         );
 
         std::env::remove_var(PREFILL_FIRST_UNTIL_ACTIVE_ENV);
+    }
+
+    #[test]
+    fn active_decode_prefill_chunk_only_caps_when_decode_is_active() {
+        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
+        std::env::set_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "1");
+        std::env::set_var(ACTIVE_DECODE_PREFILL_CHUNK_ENV, "64");
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let hint = BatchHint {
+            max_batch_size: 2,
+            max_tokens: 512,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let first = create_test_request_with_prompt_tokens(Priority::Normal, 256);
+        let first_id = first.id.clone();
+        enqueue_waiting(&scheduler, first);
+        let initial_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(initial_batch.requests.len(), 1);
+        assert_eq!(initial_batch.resource_requirements.gpu_memory, 256 * 16);
+        scheduler.mark_prefill_complete(&first_id, 256);
+
+        enqueue_waiting(
+            &scheduler,
+            create_test_request_with_prompt_tokens(Priority::Normal, 256),
+        );
+        let decode_only_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(decode_only_batch.requests.len(), 1);
+        assert_eq!(decode_only_batch.resource_requirements.gpu_memory, 16);
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(mixed_batch.requests.len(), 2);
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
+
+        std::env::remove_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE");
+        std::env::remove_var(ACTIVE_DECODE_PREFILL_CHUNK_ENV);
     }
 
     #[tokio::test]
