@@ -402,6 +402,19 @@ Continuation after pod restore:
   `1249.0 ± 27.3 tok/s` vs forced old pre-sync `1252.6 ± 81.4 tok/s`
   (`-0.28%`). This is noise and directionally negative; do not keep or repeat
   graph-pre-sync removal as a primary lever.
+- vLLM 0.20.2 DP + two-tile split-K Marlin-MoE scheduler parity was tested as
+  a scoped kernel-body candidate and reverted. The patch only changed
+  `vllm_marlin_moe/marlin_template.h`, preserving Ferrum's EP handling and
+  local scale/zero-point pointer layout. Static slice accounting after the
+  patch showed limited headroom: for the clean c32 `active_blocks=65` route,
+  gate/up kept the same total slice count while down only dropped from 1324 to
+  1312 slices. The build completed in `23m51s`, Paris passed all cells in
+  `/workspace/m3-dp2sk-paris-20260529_083316`, but the single c32 smoke
+  `/workspace/m3-dp2sk-c32-smoke-20260529_083702/` measured only
+  `1262.0 tok/s`, `TPOT p50=21.84 ms`, `ITL p50=15.25 ms`,
+  `TTFT p50=379 ms`. This is below the current c32 range and not worth N=3
+  A/B. Do not repeat scheduler-only parity as a primary lever; use full
+  vLLM-Marlin source parity or a small-M fused MoE kernel instead.
 
 Primary artifacts:
 
@@ -428,6 +441,8 @@ Primary artifacts:
 - `/workspace/m3-admin/vllm-raw-marlin-block8-block16-20260529_0624.json`
 - `/workspace/m3-presync-skip-paris-20260529_074417`
 - `/workspace/m3-presync-ab-20260529_074643/`
+- `/workspace/m3-dp2sk-paris-20260529_083316`
+- `/workspace/m3-dp2sk-c32-smoke-20260529_083702/`
 
 ## Current target status
 
@@ -445,10 +460,11 @@ Use the ratios below as directional only until vLLM is rerun with
 
 ## Next lever
 
-Do not repeat env sweeps, the partial Marlin scheduling backport, block8-only
-testing, block-size-only vLLM raw-op probes, forcing Marlin `128x128,bps=1`,
-graph-pre-sync removal, or `FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone
-lever. The next high-return loop should target model time directly:
+Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
+split-K scheduler-only parity, block8-only testing, block-size-only vLLM raw-op
+probes, forcing Marlin `128x128,bps=1`, graph-pre-sync removal, or
+`FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next high-return
+loop should target model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;
@@ -461,5 +477,6 @@ lever. The next high-return loop should target model time directly:
    MoE remains material;
 4. if MoE remains dominant, prototype either a full vLLM 0.20.2 Marlin-MoE
    source-parity port behind the existing C ABI or one small-m gate_up/down
-   fused kernel;
+   fused kernel, and require a microbench/profile reason before another
+   release build;
 5. run Paris, then c16/c32 N=3 A/B on the same pod.
