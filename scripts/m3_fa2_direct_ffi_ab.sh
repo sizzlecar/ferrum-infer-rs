@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Scoped M3 A/B for the opt-in vLLM FlashAttention-2 direct FFI path.
+# Scoped M3 A/B for the opt-in FlashAttention-2 direct path.
 #
 # Compares:
-#   fa2_direct: FERRUM_FA2_DIRECT_FFI_SHIM points at the C ABI shim
+#   fa2_direct/fa2_source: FA2 C ABI path, via runtime shim or source-built link
 #   fa_layout : existing FA-compatible KV layout with Ferrum's own varlen reader
 #
 # Usage on a GPU pod from the repo root:
@@ -24,6 +24,7 @@ NUM_PROMPTS="${NUM_PROMPTS:-128}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-10}"
 CONCURRENCY="${CONCURRENCY:-32}"
 FA2_SHIM="${FA2_SHIM:-/workspace/libferrum_fa2_shim.so}"
+FA2_SOURCE="${FA2_SOURCE:-0}"
 TORCH_LIB="${TORCH_LIB:-/workspace/vllm-venv/lib/python3.12/site-packages/torch/lib}"
 FA2_DIR="${FA2_DIR:-/workspace/vllm-venv/lib/python3.12/site-packages/vllm/vllm_flash_attn}"
 if [[ -z "${FA2_EXTRA_LD_LIBRARY_PATH+x}" ]]; then
@@ -34,7 +35,7 @@ if [[ ! -d "$MODEL_DIR" ]]; then
     echo "MODEL_DIR does not exist: $MODEL_DIR" >&2
     exit 1
 fi
-if [[ ! -r "$FA2_SHIM" ]]; then
+if [[ "$FA2_SOURCE" != "1" && ! -r "$FA2_SHIM" ]]; then
     echo "FA2_SHIM is not readable: $FA2_SHIM" >&2
     echo "build it with: bash scripts/microbenches/build_fa2_ferrum_shim.sh" >&2
     exit 1
@@ -55,6 +56,7 @@ echo "OUT_ROOT=$OUT_ROOT"
 echo "MODEL_DIR=$MODEL_DIR"
 echo "REPEATS=$REPEATS"
 echo "FA2_SHIM=$FA2_SHIM"
+echo "FA2_SOURCE=$FA2_SOURCE"
 
 {
     echo "date=$(date -Is)"
@@ -74,6 +76,7 @@ echo "FA2_SHIM=$FA2_SHIM"
     echo "num_prompts=$NUM_PROMPTS"
     echo "warmup_requests=$WARMUP_REQUESTS"
     echo "concurrency=$CONCURRENCY"
+    echo "fa2_source=$FA2_SOURCE"
     echo "fa2_shim=$FA2_SHIM"
     echo "torch_lib=$TORCH_LIB"
     echo "fa2_dir=$FA2_DIR"
@@ -202,9 +205,15 @@ PY
     SERVER_PID=""
 }
 
-run_case fa2_direct "$PORT_BASE" \
-    FERRUM_FA_LAYOUT_VARLEN=1 \
-    FERRUM_FA2_DIRECT_FFI_SHIM="$FA2_SHIM"
+if [[ "$FA2_SOURCE" == "1" ]]; then
+    run_case fa2_source "$PORT_BASE" \
+        FERRUM_FA_LAYOUT_VARLEN=1 \
+        FERRUM_FA2_SOURCE=1
+else
+    run_case fa2_direct "$PORT_BASE" \
+        FERRUM_FA_LAYOUT_VARLEN=1 \
+        FERRUM_FA2_DIRECT_FFI_SHIM="$FA2_SHIM"
+fi
 run_case fa_layout "$((PORT_BASE + 1))" \
     FERRUM_FA_LAYOUT_VARLEN=1 \
     FERRUM_FA2_DIRECT_FFI=0
@@ -221,8 +230,9 @@ for path in sorted(root.glob("*_c*_n*/bench.json")):
 for name in sorted(rows):
     mean, ci95 = rows[name]
     print(f"SUMMARY {name}: throughput={mean} ci95={ci95}")
-if rows.get("fa2_direct", (None, None))[0] and rows.get("fa_layout", (None, None))[0]:
-    candidate = rows["fa2_direct"][0]
+candidate_name = "fa2_source" if "fa2_source" in rows else "fa2_direct"
+if rows.get(candidate_name, (None, None))[0] and rows.get("fa_layout", (None, None))[0]:
+    candidate = rows[candidate_name][0]
     baseline = rows["fa_layout"][0]
-    print(f"DELTA fa2_direct vs fa_layout: {(candidate / baseline - 1.0) * 100.0:.2f}%")
+    print(f"DELTA {candidate_name} vs fa_layout: {(candidate / baseline - 1.0) * 100.0:.2f}%")
 PY
