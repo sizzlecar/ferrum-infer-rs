@@ -22,7 +22,7 @@ use std::time::Instant;
 use ferrum_interfaces::kv_dtype::KvDtypeKind;
 use ferrum_kernels::backend::{Backend, BackendPagedKv, MoeLlmBackend};
 
-use super::qwen3_moe::{fa_layout_varlen_enabled, Qwen3MoeModel};
+use super::qwen3_moe::{fa2_direct_ffi_enabled, fa_layout_varlen_enabled, Qwen3MoeModel};
 
 #[derive(Default)]
 pub(crate) struct UnifiedLayerProfile {
@@ -173,6 +173,12 @@ where
         let (q_lens, cu_seqlens_q, m_total) =
             crate::common::decoder_unified::compute_cu_seqlens_q(items);
         let pos_offsets = crate::common::decoder_unified::compute_pos_offsets(items);
+        let seq_lens: Vec<u32> = pos_offsets
+            .iter()
+            .zip(q_lens.iter())
+            .map(|(&pos, &q_len)| pos + q_len as u32)
+            .collect();
+        let max_q_len = q_lens.iter().copied().max().unwrap_or(0);
         let max_kv_len = crate::common::decoder_unified::compute_max_kv_len(items);
         let num_seqs = items.len();
         let final_indices =
@@ -244,6 +250,14 @@ where
                 .expect("unified_pos_offsets missing");
             B::write_typed::<u32>(&mut ctx, po, &pos_offsets);
         }
+        {
+            let sl = self
+                .scratch
+                .unified_seq_lens
+                .as_mut()
+                .expect("unified_seq_lens missing");
+            B::write_typed::<u32>(&mut ctx, sl, &seq_lens);
+        }
         let stacked =
             crate::common::decoder_unified::stack_block_tables(items, max_blocks_per_seq, |cid| {
                 self.kv_caches
@@ -306,6 +320,7 @@ where
                 &mut residual,
                 m_total,
                 num_seqs,
+                max_q_len,
                 max_kv_len,
                 max_blocks_per_seq,
                 block_size,
@@ -433,6 +448,7 @@ where
         residual: &mut B::Buffer,
         m_total: usize,
         num_seqs: usize,
+        max_q_len: usize,
         max_kv_len: usize,
         max_blocks_per_seq: usize,
         block_size: usize,
@@ -493,7 +509,8 @@ where
             &mut pools[li].0 as *mut B::Buffer,
             &mut pools[li].1 as *mut B::Buffer,
         );
-        let use_fa_layout_varlen = self.use_vllm_paged_attn && fa_layout_varlen_enabled();
+        let use_fa_layout_varlen =
+            self.use_vllm_paged_attn && (fa_layout_varlen_enabled() || fa2_direct_ffi_enabled());
         let fa_pool_ptr = if use_fa_layout_varlen {
             let pools = self
                 .paged_fa_pools
@@ -602,6 +619,11 @@ where
                 .unified_pos_offsets
                 .as_ref()
                 .expect("unified_pos_offsets missing");
+            let seq_lens_buf = self
+                .scratch
+                .unified_seq_lens
+                .as_ref()
+                .expect("unified_seq_lens missing");
             let bt_buf = self
                 .scratch
                 .unified_block_tables
@@ -611,25 +633,54 @@ where
             if self.use_vllm_paged_attn {
                 if let Some((fa_k_ptr, fa_v_ptr)) = fa_pool_ptr {
                     let (fa_pool_k, fa_pool_v) = unsafe { (&mut *fa_k_ptr, &mut *fa_v_ptr) };
-                    B::paged_varlen_attention(
-                        ctx,
-                        &self.scratch.q_head_major,
-                        fa_pool_k,
-                        fa_pool_v,
-                        &mut self.scratch.attn_head_major_out,
-                        cu_seqlens_buf,
-                        pos_offsets_buf,
-                        bt_buf,
-                        num_seqs,
-                        m_total,
-                        max_kv_len,
-                        nh,
-                        nkv,
-                        hd,
-                        block_size,
-                        max_blocks_per_seq,
-                    )
-                    .expect("Qwen3Moe unified: paged_varlen_attention fa-layout");
+                    if fa2_direct_ffi_enabled() {
+                        let lse_buf = self
+                            .scratch
+                            .unified_attn_lse
+                            .as_mut()
+                            .expect("unified_attn_lse missing");
+                        B::paged_varlen_attention_fa2_ffi(
+                            ctx,
+                            &self.scratch.q_head_major,
+                            fa_pool_k,
+                            fa_pool_v,
+                            &mut self.scratch.attn_head_major_out,
+                            lse_buf,
+                            cu_seqlens_buf,
+                            seq_lens_buf,
+                            bt_buf,
+                            num_seqs,
+                            m_total,
+                            max_q_len,
+                            max_kv_len,
+                            nh,
+                            nkv,
+                            hd,
+                            block_size,
+                            max_blocks_per_seq,
+                        )
+                        .expect("Qwen3Moe unified: paged_varlen_attention_fa2_ffi");
+                    } else {
+                        B::paged_varlen_attention(
+                            ctx,
+                            &self.scratch.q_head_major,
+                            fa_pool_k,
+                            fa_pool_v,
+                            &mut self.scratch.attn_head_major_out,
+                            cu_seqlens_buf,
+                            pos_offsets_buf,
+                            bt_buf,
+                            num_seqs,
+                            m_total,
+                            max_kv_len,
+                            nh,
+                            nkv,
+                            hd,
+                            block_size,
+                            max_blocks_per_seq,
+                        )
+                        .expect("Qwen3Moe unified: paged_varlen_attention fa-layout");
+                    }
                 } else if use_vllm_tiled_q4 {
                     let tile_seqs = self
                         .scratch

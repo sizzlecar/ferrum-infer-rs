@@ -43,6 +43,7 @@
 // CudaBackend` (the core trait) + `CudaState` struct + global
 // stream/decode-state slots + `KvFp16` BackendKvDtype impl.
 pub mod collective;
+pub mod fa2_ffi;
 pub mod graph;
 pub mod int8_kv;
 pub mod moe;

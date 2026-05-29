@@ -122,6 +122,10 @@ pub(crate) fn fa_layout_varlen_enabled() -> bool {
     std::env::var("FERRUM_FA_LAYOUT_VARLEN").as_deref() == Ok("1")
 }
 
+pub(crate) fn fa2_direct_ffi_enabled() -> bool {
+    std::env::var("FERRUM_FA2_DIRECT_FFI").as_deref() == Ok("1")
+}
+
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.
 pub struct Qwen3MoeLayerState<B: QuantLlmBackend + BackendMoeFused> {
     /// Router projection `[hidden] → [num_experts]` — tiny, never sparse,
@@ -340,8 +344,12 @@ pub struct Qwen3MoeScratch<B: QuantLlmBackend + BackendMoeFused> {
     pub unified_cu_seqlens_q: Option<B::Buffer>,
     /// `[max_seqs]` u32 — per-item starting absolute KV position.
     pub unified_pos_offsets: Option<B::Buffer>,
+    /// `[max_seqs]` u32 — per-item final KV length after this varlen append.
+    pub unified_seq_lens: Option<B::Buffer>,
     /// `[max_seqs * max_blocks_per_seq]` u32 — stacked block tables.
     pub unified_block_tables: Option<B::Buffer>,
+    /// `[num_heads * max_tokens]` f32 — FA2 softmax LSE scratch.
+    pub unified_attn_lse: Option<B::Buffer>,
     /// Compact q4 tile list for opt-in vLLM-layout varlen attention tiling.
     pub unified_tile_q4_seqs: Option<B::Buffer>,
     pub unified_tile_q4_starts: Option<B::Buffer>,
@@ -460,7 +468,9 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
             // Unified small index buffers — allocated once by ensure.
             unified_cu_seqlens_q: None,
             unified_pos_offsets: None,
+            unified_seq_lens: None,
             unified_block_tables: None,
+            unified_attn_lse: None,
             unified_tile_q4_seqs: None,
             unified_tile_q4_starts: None,
             unified_packed_normed: None,
@@ -491,9 +501,17 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
             ferrum_kernels::backend::Dtype::U32,
             max_seqs,
         ));
+        self.unified_seq_lens = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            max_seqs,
+        ));
         self.unified_block_tables = Some(B::alloc_typed(
             ferrum_kernels::backend::Dtype::U32,
             max_seqs * max_blocks_per_seq,
+        ));
+        self.unified_attn_lse = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::F32,
+            cfg.base.num_heads * self.max_tokens,
         ));
         self.unified_tile_q4_seqs = Some(B::alloc_typed(
             ferrum_kernels::backend::Dtype::U32,
@@ -1066,7 +1084,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         }
         if paged
             && self.use_vllm_paged_attn
-            && fa_layout_varlen_enabled()
+            && (fa_layout_varlen_enabled() || fa2_direct_ffi_enabled())
             && self.paged_fa_pools.is_none()
         {
             let mut pools = Vec::with_capacity(self.cfg.base.num_layers);

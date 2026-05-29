@@ -1406,6 +1406,40 @@ pub trait BackendPagedKv: Backend {
             "paged_varlen_attention not implemented for this backend",
         ))
     }
+
+    /// Opt-in vLLM FlashAttention-2 FFI path for FA-layout paged KV.
+    ///
+    /// This is intentionally separate from [`Self::paged_varlen_attention`]:
+    /// it needs the final per-sequence KV lengths (`seq_lens`) and an explicit
+    /// LSE scratch buffer because the external FA2 runner writes softmax LSE.
+    /// Default returns Err(unsupported); CUDA overrides when a runtime shim is
+    /// provided via `FERRUM_FA2_DIRECT_FFI_SHIM`.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention_fa2_ffi(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _lse: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _seq_lens: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _max_q_len: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_varlen_attention_fa2_ffi not implemented for this backend",
+        ))
+    }
+
     /// Batched paged decode attention — multi-seq, single token per seq.
     /// Faster path for the unified_forward layer when m_total == num_seqs
     /// (every item is a single-token decode). Skips the cu_seqlens_q

@@ -772,6 +772,49 @@ impl BackendPagedKv for CudaBackend {
         .map(|_| ())
         .map_err(|e| FerrumError::model(format!("paged_varlen_attn: {e}")))
     }
+
+    fn paged_varlen_attention_fa2_ffi(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        lse: &mut Self::Buffer,
+        cu_seqlens_q: &Self::Buffer,
+        seq_lens: &Self::Buffer,
+        block_tables: &Self::Buffer,
+        num_seqs: usize,
+        total_q_tokens: usize,
+        max_q_len: usize,
+        max_kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        super::fa2_ffi::paged_varlen_attention_fa2_ffi(
+            &ctx.stream,
+            q.as_f16(),
+            k_pool.as_f16(),
+            v_pool.as_f16(),
+            out.as_f16_mut(),
+            lse.as_f32_mut(),
+            cu_seqlens_q.as_u32(),
+            seq_lens.as_u32(),
+            block_tables.as_u32(),
+            num_seqs,
+            total_q_tokens,
+            max_q_len,
+            max_kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+        )
+    }
+
     /// Paged attention dispatcher (CUDA-only, replaces missing native
     /// `paged_decode_attention`). Routes:
     ///   - q_len==1 (decode for any num_seqs): paged_batched_decode_attention.
