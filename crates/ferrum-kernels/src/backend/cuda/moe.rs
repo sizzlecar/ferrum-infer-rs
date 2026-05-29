@@ -47,14 +47,25 @@ fn maybe_dump_moe_routing(
         return;
     }
 
-    let _ = stream.synchronize();
-    let st = stream
-        .clone_dtoh(sorted_token_ids.as_i32())
-        .unwrap_or_default();
-    let bi = stream.clone_dtoh(block_ids.as_i32()).unwrap_or_default();
-    let tp = stream
-        .clone_dtoh(total_tokens_post_pad.as_i32())
-        .unwrap_or_default();
+    let read_i32 = |buf: &CudaBuf, len: usize| -> Vec<i32> {
+        let n = len.min(buf.len());
+        if n == 0 {
+            return Vec::new();
+        }
+        let view = buf.as_i32().slice(0..n);
+        let mut host = vec![0i32; n];
+        if stream.memcpy_dtoh(&view, host.as_mut_slice()).is_err() {
+            return Vec::new();
+        }
+        if stream.synchronize().is_err() {
+            return Vec::new();
+        }
+        host
+    };
+
+    let st = read_i32(sorted_token_ids, sorted_token_ids.len());
+    let bi = read_i32(block_ids, block_ids.len());
+    let tp = read_i32(total_tokens_post_pad, 1);
     let total_post_pad = tp.first().copied().unwrap_or(-1);
     let total_blocks = if total_post_pad > 0 {
         ((total_post_pad as usize) / block_size).min(bi.len())
