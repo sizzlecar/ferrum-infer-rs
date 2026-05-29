@@ -107,6 +107,7 @@ env \
     FERRUM_UNIFIED_LAYER_PROF_EVERY="${FERRUM_UNIFIED_LAYER_PROF_EVERY:-16}" \
     FERRUM_UNIFIED_LAYER_PROF_MAX_M="${FERRUM_UNIFIED_LAYER_PROF_MAX_M:-64}" \
     FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS="${FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS:-$CONCURRENCY}" \
+    FERRUM_DECODE_OP_PROFILE=1 \
     FERRUM_BATCH_DECODE_PROF=1 \
     FERRUM_NEXT_BATCH_PROF=1 \
     FERRUM_MOE_PROFILE=1 \
@@ -162,8 +163,8 @@ if ! grep -q "unified-prof" "$OUT_ROOT/profile_snippets.log"; then
     exit 1
 fi
 
-if ! grep -q "unified-layer-prof" "$OUT_ROOT/profile_snippets.log"; then
-    echo "missing unified-layer-prof output; verify the binary includes FERRUM_UNIFIED_LAYER_PROF" >&2
+if ! grep -q "unified-layer-prof\\|batched-decode-prof" "$OUT_ROOT/profile_snippets.log"; then
+    echo "missing unified-layer-prof/batched-decode-prof output; verify stage profiling is enabled" >&2
     tail -200 "$SERVER_LOG" >&2 || true
     exit 1
 fi
