@@ -42,7 +42,11 @@ if [[ "$FA2_SOURCE" != "1" && ! -r "$FA2_SHIM" ]]; then
 fi
 
 if [[ "${BUILD:-0}" == "1" ]]; then
-    cargo build --release -p ferrum-cli --features cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin
+    FEATURES="cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin"
+    if [[ "$FA2_SOURCE" == "1" ]]; then
+        FEATURES="${FEATURES},fa2-source"
+    fi
+    cargo build --release -p ferrum-cli --features "$FEATURES"
 fi
 
 if [[ ! -x "$BIN" ]]; then
