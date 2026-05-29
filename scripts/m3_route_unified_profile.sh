@@ -94,6 +94,7 @@ env \
     FERRUM_VLLM_MOE=1 \
     FERRUM_VLLM_MOE_PAIR_IDS=1 \
     FERRUM_USE_VLLM_PAGED_ATTN=1 \
+    FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0 \
     FERRUM_PREFIX_CACHE=0 \
     FERRUM_MOE_DUMP=1 \
     FERRUM_MOE_DUMP_BATCH_X_TOPK="$((CONCURRENCY * TOP_K))" \
@@ -178,7 +179,7 @@ text = open(snippets_path).read().splitlines()
 
 def kvs(line):
     out = {}
-    for key, value in re.findall(r"([A-Za-z_]+)=(-?\d+(?:\.\d+)?)", line):
+    for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=(-?\d+(?:\.\d+)?)", line):
         out[key] = float(value) if "." in value else int(value)
     return out
 
