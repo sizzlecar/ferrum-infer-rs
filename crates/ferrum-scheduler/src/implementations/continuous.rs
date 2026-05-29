@@ -31,6 +31,15 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
+const PREFILL_FIRST_UNTIL_ACTIVE_ENV: &str = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE";
+
+fn prefill_first_until_active_target() -> Option<usize> {
+    std::env::var(PREFILL_FIRST_UNTIL_ACTIVE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+}
+
 /// Request phase in continuous batching
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestPhase {
@@ -372,23 +381,38 @@ impl ContinuousBatchScheduler {
 
         let mut batch_requests = Vec::new();
         let mut total_tokens = 0;
+        let prefill_first_target = prefill_first_until_active_target()
+            .map(|target| {
+                target
+                    .min(hint.max_batch_size)
+                    .min(self.cb_config.max_decode_batch)
+            })
+            .unwrap_or(0);
+        let skip_decode_for_prefill_first = prefill_first_target > 0
+            && self.decoding_count() < prefill_first_target
+            && (self.prefilling_count() > 0 || self.waiting_count() > 0);
 
-        // First, collect decode requests (they have priority)
-        let decode_queue = self.decode_queue.read();
-        for (_, req) in decode_queue.iter() {
-            if batch_requests.len() >= hint.max_batch_size {
-                break;
-            }
+        // First, collect decode requests (they have priority). The opt-in
+        // fill-first experiment skips decodes until the active decode cohort
+        // reaches the requested target, reducing early mixed prefill+decode
+        // spikes in c=32 closed-loop runs.
+        if !skip_decode_for_prefill_first {
+            let decode_queue = self.decode_queue.read();
+            for (_, req) in decode_queue.iter() {
+                if batch_requests.len() >= hint.max_batch_size {
+                    break;
+                }
 
-            // Each decode step is 1 token per request
-            if total_tokens < hint.max_tokens {
-                let mut scheduled = req.inner.clone();
-                scheduled.tokens_processed = req.total_tokens();
-                batch_requests.push(scheduled);
-                total_tokens += 1;
+                // Each decode step is 1 token per request
+                if total_tokens < hint.max_tokens {
+                    let mut scheduled = req.inner.clone();
+                    scheduled.tokens_processed = req.total_tokens();
+                    batch_requests.push(scheduled);
+                    total_tokens += 1;
+                }
             }
+            drop(decode_queue);
         }
-        drop(decode_queue);
 
         // Then, add prefill requests up to the per-iter token budget.
         // Phase 3: `max_prefill_batch=8` no longer caps the count —
@@ -1063,6 +1087,48 @@ mod tests {
             })
             .unwrap();
         assert_eq!(batch.requests.len(), 4);
+    }
+
+    #[test]
+    fn prefill_first_until_active_skips_early_decodes() {
+        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
+        std::env::set_var(PREFILL_FIRST_UNTIL_ACTIVE_ENV, "4");
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+
+        for _ in 0..8 {
+            enqueue_waiting(&scheduler, create_test_request(Priority::Normal));
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 2);
+        let first_ids: Vec<RequestId> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for id in &first_ids {
+            scheduler.mark_prefill_complete(id, 512);
+        }
+        assert_eq!(scheduler.decoding_count(), 2);
+
+        let second_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(second_batch.requests.len(), 2);
+        assert!(
+            second_batch
+                .requests
+                .iter()
+                .all(|request| !first_ids.contains(&request.request.id)),
+            "fill-first should schedule more prefills before decoding early requests"
+        );
+
+        std::env::remove_var(PREFILL_FIRST_UNTIL_ACTIVE_ENV);
     }
 
     #[tokio::test]
