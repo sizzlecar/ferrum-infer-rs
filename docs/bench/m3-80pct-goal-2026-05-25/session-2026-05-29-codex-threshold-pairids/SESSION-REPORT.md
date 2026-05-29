@@ -718,6 +718,7 @@ Primary artifacts:
 - `/workspace/m3-fa-layout-varlen-ab-c16-20260529_git_n3/`
 - `/workspace/m3-fa-layout-varlen-ab-c4-20260529_git_n3/`
 - `/workspace/m3-fa-layout-tiled-q4-ab-c32-20260529_git_n1/`
+- `/workspace/m3-fa-flash-q8-ab-c32-20260529_git_n1/`
 - `/workspace/m3-unified-greedy-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/`
@@ -798,6 +799,25 @@ the code was reverted in `128103d`. Do not repeat Q-only tiling on this layout;
 the next attention attempt needs real FlashAttention-style online softmax /
 tiled QK/V work or a proven wrapper.
 
+Second follow-up negative control: commit `a889e65` added an online-softmax Q8
+reader on the FA-compatible layout behind
+`FERRUM_FA_LAYOUT_VARLEN_FLASH_Q8=1`, plus commit `dad0d6c` added a script row.
+The attention-only release build took `3m14s` and did not rebuild unrelated
+Marlin/MoE-Marlin CUDA templates. Artifact
+`/workspace/m3-fa-flash-q8-ab-c32-20260529_git_n1/` passed Paris for all rows,
+but c32 N=1 measured:
+
+| row | throughput | ITL p95 | TTFT p50 |
+|---|---:|---:|---:|
+| flash_q8 | `916.3` | `222.0 ms` | `730.5 ms` |
+| fa_layout | `1367.4` | `102.7 ms` | `315.7 ms` |
+| default | `1304.3` | `86.1 ms` | `358.1 ms` |
+
+`flash_q8` was `-33.0%` versus plain FA-layout, so code and script row were
+reverted in `2cce5ab` / `7e7404a`. Do not repeat one-block-per-head Q8
+online-softmax tiling; the next attempt needs a proven FA2 wrapper or a
+substantially different kernel design.
+
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
@@ -822,7 +842,8 @@ regressed with prompt-token estimate. Do not default or N=3
 `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=64` for throughput: it fixed much of the
 ITL tail but was throughput-flat and made TTFT about `3x` worse. Do not repeat
 simple Q-only tiling on the FA-compatible layout; it regressed c32 N=1 by
-`1.33%` versus plain FA-layout. The next
+`1.33%` versus plain FA-layout. Do not repeat the naive FA-layout
+online-softmax Q8 tile; it regressed by `33.0%` versus plain FA-layout. The next
 high-return loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
