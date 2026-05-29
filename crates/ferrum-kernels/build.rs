@@ -314,97 +314,6 @@ fn find_cutlass_include_dir() -> Option<PathBuf> {
     None
 }
 
-fn write_fa2_source_stubs(out_dir: &Path) -> PathBuf {
-    let stub_dir = out_dir.join("fa2_source_stubs");
-    fs::create_dir_all(stub_dir.join("ATen/cuda/detail"))
-        .unwrap_or_else(|e| panic!("[fa2-source] create ATen stubs: {e}"));
-    fs::create_dir_all(stub_dir.join("c10/cuda"))
-        .unwrap_or_else(|e| panic!("[fa2-source] create c10 stubs: {e}"));
-
-    fs::write(
-        stub_dir.join("ferrum_fa2_prelude.h"),
-        r#"#pragma once
-#include <algorithm>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <optional>
-#include <tuple>
-"#,
-    )
-    .unwrap_or_else(|e| panic!("[fa2-source] write prelude stub: {e}"));
-    fs::write(
-        stub_dir.join("ATen/cuda/CUDAGeneratorImpl.h"),
-        r#"#pragma once
-#include <cstdint>
-
-namespace at {
-
-struct PhiloxCudaState {
-    PhiloxCudaState() = default;
-
-    union Payload {
-        uint64_t val;
-        int64_t *ptr;
-    };
-
-    Payload seed_{};
-    Payload offset_{};
-    uint64_t offset_intragraph_ = 0;
-    bool captured_ = false;
-};
-
-}  // namespace at
-"#,
-    )
-    .unwrap_or_else(|e| panic!("[fa2-source] write CUDAGeneratorImpl stub: {e}"));
-    fs::write(
-        stub_dir.join("ATen/cuda/detail/UnpackRaw.cuh"),
-        r#"#pragma once
-#include <cstdint>
-#include <tuple>
-
-namespace at::cuda::philox {
-
-__host__ __device__ __forceinline__ std::tuple<uint64_t, uint64_t>
-unpack(at::PhiloxCudaState arg) {
-    if (arg.captured_) {
-        return std::make_tuple(static_cast<uint64_t>(*arg.seed_.ptr),
-                               static_cast<uint64_t>(*(arg.offset_.ptr) +
-                                                     arg.offset_intragraph_));
-    }
-    return std::make_tuple(arg.seed_.val, arg.offset_.val);
-}
-
-}  // namespace at::cuda::philox
-"#,
-    )
-    .unwrap_or_else(|e| panic!("[fa2-source] write UnpackRaw stub: {e}"));
-    fs::write(
-        stub_dir.join("c10/cuda/CUDAException.h"),
-        r#"#pragma once
-#include <cstdio>
-#include <cstdlib>
-#include <cuda_runtime.h>
-
-#define C10_CUDA_CHECK(EXPR)                                                   \
-    do {                                                                       \
-        cudaError_t ferrum_cuda_status_ = (EXPR);                              \
-        if (ferrum_cuda_status_ != cudaSuccess) {                              \
-            std::fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__,        \
-                         __LINE__, cudaGetErrorString(ferrum_cuda_status_));   \
-            std::abort();                                                      \
-        }                                                                      \
-    } while (0)
-
-#define C10_CUDA_KERNEL_LAUNCH_CHECK() C10_CUDA_CHECK(cudaPeekAtLastError())
-"#,
-    )
-    .unwrap_or_else(|e| panic!("[fa2-source] write CUDAException stub: {e}"));
-
-    stub_dir
-}
-
 fn compile_fa2_source(out_dir: &PathBuf) {
     println!("cargo:rerun-if-env-changed=FERRUM_FA2_SRC_DIR");
     println!("cargo:rerun-if-env-changed=FA_SRC_DIR");
@@ -422,6 +331,13 @@ fn compile_fa2_source(out_dir: &PathBuf) {
     let cutlass_include = find_cutlass_include_dir().unwrap_or_else(|| {
         panic!("[fa2-source] CUTLASS headers not found; set FERRUM_CUTLASS_INCLUDE_DIR")
     });
+    let stub_dir = PathBuf::from("kernels/fa2_source/stubs");
+    let stub_files = [
+        stub_dir.join("ferrum_fa2_prelude.h"),
+        stub_dir.join("ATen/cuda/CUDAGeneratorImpl.h"),
+        stub_dir.join("ATen/cuda/detail/UnpackRaw.cuh"),
+        stub_dir.join("c10/cuda/CUDAException.h"),
+    ];
 
     let local_src = "../../scripts/microbenches/fa2_ferrum_source_shim.cu";
     let external_sources = [
@@ -455,7 +371,12 @@ fn compile_fa2_source(out_dir: &PathBuf) {
     .iter()
     .map(|p| p.display().to_string())
     .collect();
-    for f in cu_files.iter().chain(header_files.iter()) {
+    let stub_files: Vec<String> = stub_files.iter().map(|p| p.display().to_string()).collect();
+    for f in cu_files
+        .iter()
+        .chain(header_files.iter())
+        .chain(stub_files.iter())
+    {
         println!("cargo:rerun-if-changed={f}");
     }
 
@@ -468,7 +389,6 @@ fn compile_fa2_source(out_dir: &PathBuf) {
         panic!("[fa2-source] nvcc not found at {nvcc:?}");
     }
 
-    let stub_dir = write_fa2_source_stubs(out_dir);
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
     let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
     let flags = vec![
@@ -485,6 +405,7 @@ fn compile_fa2_source(out_dir: &PathBuf) {
     let deps: Vec<&str> = cu_files
         .iter()
         .chain(header_files.iter())
+        .chain(stub_files.iter())
         .map(String::as_str)
         .collect();
     let signature = static_lib_signature("fa2-source", &deps, &flags);
