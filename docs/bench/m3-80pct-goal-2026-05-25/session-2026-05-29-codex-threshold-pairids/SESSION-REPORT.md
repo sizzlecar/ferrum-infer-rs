@@ -932,9 +932,10 @@ zero request errors, and post-run process/GPU audits were clean.
 This proves the opt-in FA2 direct FFI path clears the M3 0.80× throughput target
 on all four cells for the benchmark workload. It is still not a default-runtime
 claim: the path depends on the vLLM/Torch FA2 extension through the runtime shim
-and allocates the extra FA-compatible K/V pool. The remaining product decision
-is accepting/defaulting that dependency and memory cost versus replacing it with
-a cleaner source-built FA2 wrapper.
+and allocates the extra FA-compatible K/V pool. Treat it as diagnostic evidence
+only; it must not be defaulted or counted as final M3 completion until the same
+attention win is reproduced through a source-built/Ferrum-owned FA2 wrapper or
+kernel with no vLLM/Torch runtime dependency.
 
 Follow-up `3b95ce9` reduced the deployment footgun: setting
 `FERRUM_FA2_DIRECT_FFI_SHIM=/path/libferrum_fa2_shim.so` now enables the FA2
@@ -944,6 +945,23 @@ Remote smoke `/workspace/m3-fa2-auto-shim-smoke-20260530/` intentionally left
 (`MULTITURN_CONTENT= Paris`), and completed a c32 smoke (`64/64`, 0 errors,
 `1569.2 tok/s`). Treat the smoke as path/correctness evidence only; the N=5
 confirmation table above remains the performance accounting source.
+
+Source-built FA2 shim checkpoint: commits `066bd7c` / `b7defce` added
+`scripts/microbenches/fa2_ferrum_source_shim.cu` plus a build script that
+compiles the hdim128 fp16 split-K forward templates directly from a
+FlashAttention source checkout. The resulting remote library
+`/workspace/libferrum_fa2_source_shim.so` exports the same
+`ferrum_fa2_paged_varlen_fwd` ABI, and `ldd` showed only system C/C++ libs
+(no vLLM, Torch, Python, or `_vllm_fa2_C`). Commit `6f640ab` added a multi-turn
+gate to the A/B runner. Smoke artifact
+`/workspace/m3-fa2-source-shim-smoke-20260529_182244/` set
+`FA2_SHIM=/workspace/libferrum_fa2_source_shim.so` and
+`FA2_EXTRA_LD_LIBRARY_PATH=""`; both rows passed Paris and multi-turn. The
+c32 N=1/64 prompt row measured source FA2 `1553.7 tok/s` versus FA-layout
+`1310.8 tok/s` (`+18.53%`). This validates the no-vLLM-runtime direction, but
+it is still not final/default: the shim is still an external runtime-loaded
+`.so`, and the CUTLASS/FA2 source integration has not yet been vendored or
+linked through `ferrum-kernels`.
 
 ## Next lever
 
@@ -980,9 +998,10 @@ high-return loop should target full-model time directly:
    overstates per-kernel bucket time;
 3. do not default prompt-token-estimate from the current evidence; it is only
    `+2.8%` and worsens TTFT;
-4. before another scheduler change, rerun same-pod vLLM c1/c4 and decide
-   whether the FA2 direct FFI dependency/memory tradeoff is acceptable for
-   defaulting or needs a clean source-built FA2 wrapper;
+4. replace the vLLM/Torch FA2 shim with a source-built/Ferrum-owned FA2 wrapper
+   or kernel before any default/completion claim; the source-built shim smoke
+   proves the dependency-free direction but still needs in-repo build/link
+   integration and N>=3/N=5 confirmation;
 5. for kernel work, skip source parity unless a new raw-op mismatch appears;
    the remaining high-upside kernel path is a genuinely fused small-M MoE design;
 6. reduce CUDA iteration waste before another `.cu` experiment by adding

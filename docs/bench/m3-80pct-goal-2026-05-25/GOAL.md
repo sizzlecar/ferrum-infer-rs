@@ -39,6 +39,16 @@ default or final completion path. The target remains open until the same
 attention win is reproduced with a source-built/Ferrum-owned FA2 wrapper or
 kernel and no vLLM/Torch runtime dependency.
 
+Follow-up source-built smoke: commits `066bd7c` / `b7defce` added a
+FlashAttention-source-built shim that exports the same C ABI without linking
+vLLM/Torch/Python. Remote `ldd` on `/workspace/libferrum_fa2_source_shim.so`
+showed only system C/C++ libraries. Smoke
+`/workspace/m3-fa2-source-shim-smoke-20260529_182244/` passed Paris and a
+multi-turn gate, and c32 N=1/64 prompts measured source FA2 `1553.7 tok/s`
+versus FA-layout `1310.8 tok/s` (`+18.53%`). This validates the dependency-free
+direction but still is not final/default because the source shim is runtime
+loaded and not yet integrated into the in-repo `ferrum-kernels` build/link path.
+
 ## Current baseline (2026-05-25 sweep)
 
 Sweep dir: [`docs/bench/sweep-2026-05-25-1631-qwen3-moe-30b-int4/`](../sweep-2026-05-25-1631-qwen3-moe-30b-int4/) · ferrum commit `cbe04ea`, n_repeats=1, num_prompts=30, warmup=5, random in=256 out=128.

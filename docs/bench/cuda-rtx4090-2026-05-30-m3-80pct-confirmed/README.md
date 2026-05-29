@@ -50,3 +50,9 @@ Interpretation:
   pool. It is diagnostic evidence only; defaulting or claiming M3 completion
   requires a source-built/Ferrum-owned FA2 wrapper or kernel with no vLLM/Torch
   runtime dependency.
+- Follow-up source-built smoke `/workspace/m3-fa2-source-shim-smoke-20260529_182244/`
+  compiled the FA2 templates into `/workspace/libferrum_fa2_source_shim.so`;
+  `ldd` showed no vLLM/Torch/Python runtime link. It passed Paris and
+  multi-turn, and c32 N=1/64 prompts measured `1553.7 tok/s` versus FA-layout
+  `1310.8 tok/s`. This validates direction only; it is still a runtime-loaded
+  shim, not the final in-repo build path.
