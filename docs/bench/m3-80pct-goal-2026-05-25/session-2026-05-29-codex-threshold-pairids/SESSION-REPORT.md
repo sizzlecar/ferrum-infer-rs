@@ -840,6 +840,81 @@ The next attention implementation should be an opt-in C-ABI/dynamic shim around
 this proven path or a clean source-built FA2 wrapper, followed by Paris and
 same-pod c32 A/B. Do not write another approximate one-block/tiled reader first.
 
+Opt-in Ferrum FA2 direct FFI integration: commits `3e27afa` / `3d6aed0` added
+`FERRUM_FA2_DIRECT_FFI=1` behind a runtime-loaded shim and
+`scripts/m3_fa2_direct_ffi_ab.sh`. Default builds and default runtime do not
+link Python/Torch; the test path requires:
+
+```bash
+FERRUM_FA_LAYOUT_VARLEN=1 \
+FERRUM_FA2_DIRECT_FFI=1 \
+FERRUM_FA2_DIRECT_FFI_SHIM=/workspace/libferrum_fa2_shim.so
+```
+
+Remote validation used clean Git on the restored pod. Shim build artifact:
+`/workspace/m3-fa2-ferrum-shim-build-20260530.log`. Release build log:
+`/workspace/m3-fa2-ferrum-release-build-20260530.log` (`3m14s`). c32 single
+smoke `/workspace/m3-fa2-direct-ffi-ab-20260530_n1/` passed Paris and measured
+`fa2_direct 1600.6 tok/s` versus `fa_layout 1360.6 tok/s`.
+
+The required same-pod N=3 confirmation is
+`/workspace/m3-fa2-direct-ffi-ab-20260530_n3/`; both rows passed Paris:
+
+| row | throughput | TPOT p50 | ITL p95 | TTFT p50 |
+|---|---:|---:|---:|---:|
+| `fa2_direct` | `1628.3 ± 78.8 tok/s` | `17.93 ms` | `54.27 ms` | `181.7 ms` |
+| `fa_layout` | `1374.7 ± 27.4 tok/s` | `20.48 ms` | `84.71 ms` | `317.9 ms` |
+
+Delta: `+18.45%` over the FA-layout reader. Against same-pod vLLM 0.20.2 c32
+`1971.8 ± 7.4 tok/s`, this is `0.826×`, about `+51 tok/s` above the 0.80× c32
+threshold (`1577.4 tok/s`).
+
+c16 N=3 `/workspace/m3-fa2-direct-ffi-ab-c16-20260530_n3/` also passed Paris for
+both rows:
+
+| row | throughput | TPOT p50 | ITL p95 | TTFT p50 |
+|---|---:|---:|---:|---:|
+| `fa2_direct` | `1193.6 ± 68.2 tok/s` | `12.37 ms` | `18.46 ms` | `136.8 ms` |
+| `fa_layout` | `1040.2 ± 31.4 tok/s` | `13.62 ms` | `23.27 ms` | `237.8 ms` |
+
+Delta: `+14.75%` over FA-layout. Against same-pod vLLM c16 `1328.7 ± 44.4`,
+this is `0.898×`. Keep the path opt-in for now: it depends on the vLLM/Torch
+FA2 extension and uses an extra FA-compatible K/V pool.
+
+c4 N=3 `/workspace/m3-fa2-direct-ffi-ab-c4-20260530_n3/` passed Paris for both
+rows:
+
+| row | throughput | TPOT p50 | ITL p95 | TTFT p50 |
+|---|---:|---:|---:|---:|
+| `fa2_direct` | `456.5 ± 37.9 tok/s` | `8.17 ms` | `11.75 ms` | `64.5 ms` |
+| `fa_layout` | `424.2 ± 5.4 tok/s` | `8.68 ms` | `17.17 ms` | `81.1 ms` |
+
+Delta: `+7.63%`, smaller and noisier than c16/c32. The path still needs c1
+validation plus same-pod vLLM c1/c4 before final goal accounting; defaulting
+also needs a cleaner dependency/memory story.
+
+c1 N=3 `/workspace/m3-fa2-direct-ffi-ab-c1-20260530_n3_128p/` passed Paris for
+both rows and showed no material difference:
+
+| row | throughput | TPOT p50 | ITL p95 | TTFT p50 |
+|---|---:|---:|---:|---:|
+| `fa2_direct` | `160.83 ± 0.37 tok/s` | `5.85 ms` | `6.00 ms` | `48.6 ms` |
+| `fa_layout` | `160.70 ± 0.34 tok/s` | `5.85 ms` | `6.00 ms` | `49.1 ms` |
+
+Delta: `+0.08%`. Summary for FA2 direct FFI vs FA-layout, same-pod N=3:
+
+| c | FA2 direct | FA layout | delta |
+|---:|---:|---:|---:|
+| 1 | `160.83 ± 0.37` | `160.70 ± 0.34` | `+0.08%` |
+| 4 | `456.5 ± 37.9` | `424.2 ± 5.4` | `+7.63%` |
+| 16 | `1193.6 ± 68.2` | `1040.2 ± 31.4` | `+14.75%` |
+| 32 | `1628.3 ± 78.8` | `1374.7 ± 27.4` | `+18.45%` |
+
+Interpretation: the FA2 path fixes the mixed/prefill attention bottleneck that
+dominates high concurrency. It is neutral at c1, modest at c4, and clears the
+known 0.80× same-pod vLLM thresholds for c16/c32. Final goal accounting still
+needs same-pod vLLM c1/c4 and a default/dependency decision.
+
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
@@ -875,11 +950,9 @@ high-return loop should target full-model time directly:
    overstates per-kernel bucket time;
 3. do not default prompt-token-estimate from the current evidence; it is only
    `+2.8%` and worsens TTFT;
-4. before another scheduler change, the next profile should explain end-to-end
-   occupancy/fill gaps and mixed-prefill attention cost (batch-size over time,
-   warmup/non-warmup separation, streaming backpressure, and how to wire the
-   now-proven direct FA2 FFI path behind an opt-in C ABI without making the
-   default build depend on Python/Torch);
+4. before another scheduler change, rerun same-pod vLLM c1/c4 and decide
+   whether the FA2 direct FFI dependency/memory tradeoff is acceptable for
+   defaulting or needs a clean source-built FA2 wrapper;
 5. for kernel work, skip source parity unless a new raw-op mismatch appears;
    the remaining high-upside kernel path is a genuinely fused small-M MoE design;
 6. reduce CUDA iteration waste before another `.cu` experiment by adding
