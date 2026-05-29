@@ -29,6 +29,7 @@ complete**.
 | graph-on production c32 profile | Paris | graph/post/scheduler not a 25% standalone gap |
 | prompt-token-estimate scheduler A/B | Paris both rows | +2.8% throughput but TTFT worse; keep opt-in |
 | split mixed prefill/decode | Paris both rows | c32 N=3 `+1.46%`; reverted as noise |
+| unified mixed layer-loop graph | Paris | c32 N=1 `-3.82%`; reverted |
 
 ## What changed
 
@@ -557,6 +558,16 @@ Continuation after pod restore:
   `/workspace/m3-split-mixed-ab-n3-20260529_122047/` measured default
   `1256.3 ± 60.4` and split `1274.7 ± 33.9 tok/s` (`+1.46%`, overlapping
   noise). Do not repeat split-only mixed-batch work without a new profile.
+- A unified mixed/prefill CUDA graph candidate was tested and reverted. The
+  opt-in `FERRUM_UNIFIED_MIXED_GRAPH=1` captured only the Qwen unified
+  layer loop; index uploads, embedding, final norm/lm-head, and readback
+  stayed eager. Paris passed, but c32 N=1 artifact
+  `/workspace/m3-unified-mixed-graph-ab-20260529_123549/` regressed: default
+  measured `1250.4 tok/s`, `TPOT p50=22.20 ms`, `ITL p95=98.35 ms`,
+  `TTFT p50=390 ms`; candidate measured `1202.7 tok/s`, `TPOT p50=22.93 ms`,
+  `ITL p95=106.34 ms`, `TTFT p50=412 ms` (`-3.82%`). Do not repeat mixed
+  layer-loop graph capture unless a shape-stability profile first proves
+  repeated mixed shapes.
 
 Primary artifacts:
 
@@ -605,6 +616,7 @@ Primary artifacts:
 - `/workspace/m3-graphon-prod-profile-8ef71ce-20260529_120645/`
 - `/workspace/m3-split-mixed-ab-20260529_121843/`
 - `/workspace/m3-split-mixed-ab-n3-20260529_122047/`
+- `/workspace/m3-unified-mixed-graph-ab-20260529_123549/`
 
 ## Current target status
 
@@ -634,7 +646,8 @@ two-phase `FERRUM_VLLM_VARLEN_SPLIT_K=1` wrapper; it passed Paris but regressed
 c32 throughput by `6.06%`. Do not repeat simple vLLM-layout weighted-V tiling;
 `FERRUM_VLLM_VARLEN_TILED_V=1` passed Paris but regressed c32 N=1 by about
 `4.5%`. Do not repeat split-only mixed prefill/decode routing; it was only
-`+1.46%` at c32 N=3 and within noise. The next high-return
+`+1.46%` at c32 N=3 and within noise. Do not repeat unified mixed layer-loop
+graph capture; it regressed c32 N=1 by `3.82%`. The next high-return
 loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
