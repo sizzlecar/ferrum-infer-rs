@@ -588,6 +588,19 @@ Continuation after pod restore:
   `ITL p95=128.86 ms`, `TTFT p50=397 ms` (`+0.41%`). Do not default it or
   spend N=3 time on this simple Q-only tiling without a new profile showing
   prefill attention dominates the current end-to-end run.
+- Added `scripts/microbenches/vllm_flash_attn_varlen_probe.py` and ran it
+  from the clean Git checkout on the restored pod using
+  `/workspace/vllm-venv/bin/python`. Artifact:
+  `/workspace/m3-vllm-fa2-varlen-probe-20260529_git.log`. vLLM 0.20.2
+  `flash_attn_varlen_func` on the same Qwen3 paged-varlen shapes measured
+  `prefill_4x256` `40.35 us`, `mixed_3x256_4x1` `47.95 us`, and
+  `prefill_4x512` `109.47 us`. Compared with Ferrum's simple
+  vLLM-layout varlen bridge and the q4 microbench (`~422-1970 us` for the
+  same synthetic shapes), this confirms the large attention gap is kernel
+  architecture, not q-only/v-only tiling. The next attention lever should be a
+  real FlashAttention-style paged-varlen port or an FA-compatible KV path; it
+  is not a direct function swap because Ferrum's vLLM paged-decode K/V layout
+  is not the FA paged layout used by vLLM prefill.
 - The unified path now uses GPU greedy argmax when `FERRUM_GREEDY_ARGMAX=1`.
   Previously the unified decode path still read full logits back to host even
   in greedy mode; `FERRUM_UNIFIED_GREEDY_ARGMAX=0` keeps an escape hatch for the
@@ -699,6 +712,7 @@ Primary artifacts:
 - `/workspace/m3-split-mixed-ab-n3-20260529_122047/`
 - `/workspace/m3-unified-mixed-graph-ab-20260529_123549/`
 - `/workspace/m3-vllm-varlen-tiled-q4-ab-20260529_git_n1/`
+- `/workspace/m3-vllm-fa2-varlen-probe-20260529_git.log`
 - `/workspace/m3-unified-greedy-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/`
