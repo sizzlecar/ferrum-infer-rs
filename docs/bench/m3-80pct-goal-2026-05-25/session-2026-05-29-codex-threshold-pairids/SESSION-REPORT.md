@@ -25,6 +25,9 @@ complete**.
 | block8 vLLM parity override | Paris/no-garbage smoke | c16/c32 regression; keep override-only |
 | broad `{128,64,128}` Marlin tile instantiation | graph-on load failed | 48GB OOM near layer 40; reverted |
 | vLLM raw Marlin block8/block16 op probe | synthetic op only | no kernel-time delta; block-size-only ruled out |
+| Ferrum/vLLM raw Marlin active65 op probe | synthetic op only | gate/up and down match within noise; down-source-parity ruled out |
+| graph-on production c32 profile | Paris | graph/post/scheduler not a 25% standalone gap |
+| prompt-token-estimate scheduler A/B | Paris both rows | +2.8% throughput but TTFT worse; keep opt-in |
 
 ## What changed
 
@@ -416,19 +419,41 @@ Continuation after pod restore:
   A/B. Do not repeat scheduler-only parity as a primary lever; use full
   vLLM-Marlin source parity or a small-M fused MoE kernel instead.
 - A high-return raw-op localization compared vLLM 0.20.2 Marlin-MoE against
-  Ferrum's clean c32 profile on the same route class. The vLLM probe used
+  Ferrum's direct C ABI on the same active65 route class. The route was
   `batch_x_topk=256`, `block_size=16`, `total_post_pad=1040`,
   `active_blocks=65`, `unique_experts=61`, matching
-  `/workspace/m3-route-unified-layer-relaxed-clean-20260529_060400/`.
-  Artifact `/workspace/m3-admin/vllm-raw-marlin-active65-20260529_084340.json`
-  measured gate/up `107.1 µs/layer` and down `32.5 µs/layer`. Ferrum's clean
-  profile is about gate/up `5812 / 48 = 121 µs/layer` and down
-  `2883 / 48 = 60 µs/layer`. The actionable gap is therefore down GEMM body or
-  source parity, not the scheduler-only split-K change. Closing that down gap
-  would save roughly `(60 - 32.5) * 48 ≈ 1.3 ms`; also matching gate/up saves
-  another `~0.7 ms`, so full Marlin source/body parity has an estimated
-  `~2 ms` c32 decode-step ceiling (`~10-15%` throughput) before measurement
-  noise. This is the next high-return code direction.
+  `/workspace/m3-route-unified-layer-relaxed-clean-20260529_060400/`. The
+  corrected vLLM probe used `mul_topk_weights=false`, matching Ferrum's down
+  GEMM plus separate pair-id combine path.
+- Raw-op result: vLLM artifact
+  `/workspace/m3-admin/vllm-raw-marlin-active65-mulfalse-20260529_084848.json`
+  measured gate/up `107.136 µs` and down `32.108 µs`. Ferrum artifact
+  `/workspace/m3-admin/ferrum-raw-marlin-active65-20260529_085145.json`
+  measured gate/up `106.936 µs` and down `32.210 µs`. This invalidates the
+  earlier down-source-parity hypothesis: the full-model graph-off bucket profile
+  reported down around `60 µs/layer` because the profiler includes launch/sync
+  and timer overhead around the kernel body. Do not target Marlin source/body
+  parity again unless a fresh raw-op or graph-on profile shows kernel divergence.
+- Graph-on production c32 profile then checked whether graph replay, model
+  post-process, or scheduler overhead explains the end-to-end gap. Artifact:
+  `/workspace/m3-graph-prod-profile-20260529_085701/`. Paris passed; c32 N=1
+  measured `1217.6 tok/s`, `TPOT p50=22.7 ms`, `ITL p50=15.0 ms`,
+  `TTFT p50=383 ms`. Steady full-batch snippets showed `model≈12.5–14.6 ms`,
+  `decode_post≈0.15–0.8 ms`, scheduler `≈20–44 µs`, and graph replay
+  `upload≈0.10–0.13 ms`, `launch≈0.20–0.26 ms`. This rules out graph
+  upload/launch, decode post-process, and scheduler call overhead as standalone
+  25% levers.
+- Prompt-token-estimate scheduler A/B tested the concrete prefill-admission
+  mechanism exposed by that profile: without the env, new 256-token random
+  prompts are budgeted as `prefill_chunk_size=512`, so only four fit in a
+  2048-token first prefill batch. Artifact:
+  `/workspace/m3-sched-prompt-est-ab-20260529_090018/`. Both rows passed Paris.
+  c32 N=3 default measured `1278.6 tok/s`, `TPOT p50=22.0 ms`,
+  `ITL p50=15.0 ms`, `TTFT p50=374 ms`; `FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE=1`
+  measured `1314.0 tok/s` (`+2.8%`), `TPOT p50=19.4 ms`, `ITL p50=15.1 ms`,
+  `TTFT p50=603 ms`. This is below the default-worthy gain threshold and
+  worsens TTFT, so keep the feature opt-in and do not pursue scheduler env
+  sweeps without a new occupancy profile.
 
 Primary artifacts:
 
@@ -458,6 +483,10 @@ Primary artifacts:
 - `/workspace/m3-dp2sk-paris-20260529_083316`
 - `/workspace/m3-dp2sk-c32-smoke-20260529_083702/`
 - `/workspace/m3-admin/vllm-raw-marlin-active65-20260529_084340.json`
+- `/workspace/m3-admin/vllm-raw-marlin-active65-mulfalse-20260529_084848.json`
+- `/workspace/m3-admin/ferrum-raw-marlin-active65-20260529_085145.json`
+- `/workspace/m3-graph-prod-profile-20260529_085701/`
+- `/workspace/m3-sched-prompt-est-ab-20260529_090018/`
 
 ## Current target status
 
@@ -470,28 +499,29 @@ Use the ratios below as directional only until vLLM is rerun with
 - c=32 remains the real blocker: the conservative current-binary forced-v2 row
   is `1299.0 / 1971.8 ≈ 0.66`. Short-v1 attention is separately validated as
   a `+2.0%` same-binary effect, but there is no clean final combined-default
-  N=3 row yet. On the conservative row c32 still needs roughly `+21%`
-  throughput to clear 0.80× on this pod.
+  N=3 row yet. Prompt-token-estimate reached `1314.0 tok/s` in same-binary A/B
+  but is not default-worthy because TTFT regressed. On the conservative row c32
+  still needs roughly `+21%` throughput to clear 0.80× on this pod.
 
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
 split-K scheduler-only parity, block8-only testing, block-size-only vLLM raw-op
-probes, forcing Marlin `128x128,bps=1`, graph-pre-sync removal, or
-`FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next high-return
-loop should target model time directly:
+probes, forcing Marlin `128x128,bps=1`, graph-pre-sync removal, Marlin
+source/body parity without new raw-op evidence, or `FERRUM_MAX_BATCHED_TOKENS=4096`
+as a standalone lever. The next high-return loop should target full-model time
+directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;
-2. add or run a scoped unified-layer profile that separates prefill and decode
-   dense/attention/MoE time; the current restored profile already rules out
-   scheduler/postprocess as the main gap;
-3. with a clean build, capture c32 Marlin config using
-   `FERRUM_VLLM_MOE_LOG_CONFIG=1 FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS=256`, and
-   run a scoped A/B for the opt-in large-M block hook only if prefill/unified
-   MoE remains material;
-4. if MoE remains dominant, target the down GEMM first: prototype either a
-   full vLLM 0.20.2 Marlin-MoE source/body parity port behind the existing C
-   ABI or one small-m down/gate kernel, and require a microbench/profile reason
-   before another release build;
-5. run Paris, then c16/c32 N=3 A/B on the same pod.
+2. profile graph-on production c32 with `[graph-prof]`, `[iter-prof]`, and
+   `[rbd-prof]` before changing code; the graph-off route profile already
+   overstates per-kernel bucket time;
+3. do not default prompt-token-estimate from the current evidence; it is only
+   `+2.8%` and worsens TTFT;
+4. next profile should explain end-to-end occupancy/fill gaps (batch-size over
+   time, warmup/non-warmup separation, streaming backpressure) before another
+   scheduler change;
+5. for kernel work, skip source parity unless a new raw-op mismatch appears;
+   the remaining high-upside kernel path is a genuinely fused small-M MoE design;
+6. run Paris, then c16/c32 N=3 A/B on the same pod.
