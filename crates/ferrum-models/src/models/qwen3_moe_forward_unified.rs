@@ -47,6 +47,30 @@ fn unified_layer_prof_enabled() -> bool {
     std::env::var("FERRUM_UNIFIED_LAYER_PROF").map_or(false, |v| v != "0")
 }
 
+fn unified_layer_prof_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn unified_layer_prof_selected(m_total: usize, num_seqs: usize) -> bool {
+    if !unified_layer_prof_enabled() {
+        return false;
+    }
+    if let Some(max_m) = unified_layer_prof_usize("FERRUM_UNIFIED_LAYER_PROF_MAX_M") {
+        if m_total > max_m {
+            return false;
+        }
+    }
+    if let Some(min_seqs) = unified_layer_prof_usize("FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS") {
+        if num_seqs < min_seqs {
+            return false;
+        }
+    }
+    true
+}
+
 fn unified_layer_prof_every() -> u64 {
     std::env::var("FERRUM_UNIFIED_LAYER_PROF_EVERY")
         .ok()
@@ -234,7 +258,7 @@ where
         B::sync(&mut ctx);
 
         // ── 6. Layer loop ──
-        let mut layer_prof = if unified_layer_prof_enabled() {
+        let mut layer_prof = if unified_layer_prof_selected(m_total, num_seqs) {
             Some(UnifiedLayerProfile::default())
         } else {
             None
