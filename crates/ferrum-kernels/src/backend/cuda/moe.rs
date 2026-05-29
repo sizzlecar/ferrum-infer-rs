@@ -13,6 +13,7 @@
 use cudarc::driver::{CudaStream, LaunchConfig, PushKernelArg};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
+use std::sync::Arc;
 
 use super::CudaBackend;
 use crate::backend::{Backend, BackendMoeFused, CudaBuf};
@@ -20,7 +21,7 @@ use crate::ptx;
 
 fn maybe_dump_moe_routing(
     kind: &str,
-    stream: &CudaStream,
+    stream: &Arc<CudaStream>,
     sorted_token_ids: &CudaBuf,
     block_ids: &CudaBuf,
     total_tokens_post_pad: &CudaBuf,
