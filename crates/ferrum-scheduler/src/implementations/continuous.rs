@@ -329,6 +329,10 @@ impl ContinuousBatchScheduler {
     }
 
     fn initial_prefill_token_estimate(&self, req: &ContinuousBatchRequest) -> usize {
+        if std::env::var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").as_deref() != Ok("1") {
+            return self.cb_config.prefill_chunk_size;
+        }
+
         let estimated_tokens = req
             .inner
             .request
@@ -940,6 +944,23 @@ mod tests {
         )
     }
 
+    fn prompt_estimate_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn enqueue_waiting(scheduler: &ContinuousBatchScheduler, request: InferenceRequest) {
+        let request_id = request.id.clone();
+        scheduler
+            .waiting_queue
+            .write()
+            .push_back(ContinuousBatchRequest::new(request));
+        scheduler
+            .request_index
+            .write()
+            .insert(request_id, RequestPhase::Waiting);
+    }
+
     #[tokio::test]
     async fn test_scheduler_creation() {
         let config = SchedulerConfig::default();
@@ -987,18 +1008,17 @@ mod tests {
         assert!(scheduler.prefilling_count() > 0 || scheduler.decoding_count() > 0);
     }
 
-    #[tokio::test]
-    async fn prompt_token_metadata_expands_prefill_admission() {
+    #[test]
+    fn prompt_token_metadata_expands_prefill_admission() {
+        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
+        std::env::set_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "1");
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
 
         for _ in 0..16 {
-            scheduler
-                .submit(create_test_request_with_prompt_tokens(
-                    Priority::Normal,
-                    256,
-                ))
-                .await
-                .unwrap();
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
         }
 
         let hint = BatchHint {
@@ -1008,15 +1028,41 @@ mod tests {
             available_memory: None,
             resource_constraints: Default::default(),
         };
-        let first_batch = scheduler.next_batch(hint.clone()).await.unwrap();
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
         assert_eq!(first_batch.requests.len(), 8);
 
         for request in first_batch.requests {
             scheduler.mark_prefill_complete(&request.request.id, 256);
         }
 
-        let mixed_batch = scheduler.next_batch(hint).await.unwrap();
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(mixed_batch.requests.len(), 15);
+        std::env::remove_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE");
+    }
+
+    #[test]
+    fn prompt_token_metadata_is_opt_in_for_prefill_admission() {
+        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
+        std::env::remove_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE");
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+
+        for _ in 0..16 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 32,
+                max_tokens: 2048,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(batch.requests.len(), 4);
     }
 
     #[tokio::test]
