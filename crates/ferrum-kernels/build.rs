@@ -184,6 +184,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
     }
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
+    let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in cu_files {
@@ -208,7 +209,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
                 "-Xcompiler",
                 "-fPIC",
                 "--threads",
-                "0",
+                nvcc_threads.as_str(),
             ])
             .status()
             .unwrap_or_else(|e| panic!("[vllm-paged-attn-v2] nvcc spawn failed for {src}: {e}"));
@@ -285,6 +286,7 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
     }
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
+    let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in cu_files {
@@ -317,7 +319,7 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
                 "-Xcompiler",
                 "-fvisibility=default",
                 "--threads",
-                "0",
+                nvcc_threads.as_str(),
             ])
             .status()
             .unwrap_or_else(|e| panic!("[vllm-moe-marlin] nvcc spawn failed for {src}: {e}"));
@@ -419,6 +421,7 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
     }
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
+    let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
 
     // Compile each .cu to its own .o
     let mut object_files: Vec<PathBuf> = Vec::new();
@@ -458,7 +461,7 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
                 "-fvisibility=default",
                 // vLLM kernels read CUDA_ARCH at compile time; emit it for nvcc
                 "--threads",
-                "0",
+                nvcc_threads.as_str(),
             ])
             .status()
             .unwrap_or_else(|e| panic!("[vllm-marlin] nvcc spawn failed for {src}: {e}"));

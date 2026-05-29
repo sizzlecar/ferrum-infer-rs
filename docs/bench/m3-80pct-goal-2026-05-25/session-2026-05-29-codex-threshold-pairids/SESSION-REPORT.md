@@ -202,6 +202,48 @@ Continuation notes after the pair-id combine profile:
   `profile_summary.json` with medians for unified, iteration, and bucket
   timings.
 
+Continuation after pod restore:
+
+- The GPU pod was restored and tested from a dirty remote worktree intended to
+  match the pushed `codex/m3-20260529-checkpoint` contents. The remote metadata
+  still reports `git_head=a9dc705` because the checkout was dirty `main`, so
+  treat these artifacts as restored-pod dirty-binary evidence rather than a
+  clean-checkout baseline.
+- Valid restored-pod route/unified profile:
+  `/workspace/m3-moe-parity-lite-profile-20260529_033812/`.
+  Correctness gate passed (`Paris`). The captured route shape was
+  `batch_x_topk=256`, `block_size=16`, `total_post_pad=832`,
+  `active_blocks=52`, `unique_experts=48`.
+- The same profile shows postprocess is not the blocker: `unified-prof`
+  median `total≈15.1 ms`, `model≈14.6 ms`, `decode_post≈0.34 ms`, with
+  `stream≈0.23 ms` and scheduler effectively zero. The early c32 prefill waves
+  were large (`~190–288 ms` mixed-prefill iterations), so TTFT/prefill remains
+  a real part of the gap.
+- Prompt-token-estimate prefill scheduling passed local unit test
+  `cargo test -q -p ferrum-scheduler prompt_token_metadata_expands_prefill_admission`
+  and GPU Paris. In the current branch it is gated behind
+  `FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE=1`; the artifact below was produced by
+  the dirty restored-pod binary where this candidate was still default-on.
+  Stable c32 N=3 artifact:
+  `/workspace/m3-prefill-est-c32-stable-20260529_034726/`.
+  Result: `1288.2 ± 13.0 tok/s`, `TPOT p50=20.1 ms`, `ITL p50=15.1 ms`,
+  `TTFT p50=576.0 ms`. This is a small, sub-10% delta against the prior
+  `1264.0 ± 29.4` c32 row, so keep it opt-in until a same-binary direct A/B
+  confirms the effect.
+- Discard these restored-pod artifacts as contaminated by delayed old scripts,
+  process-group kills, duplicate servers, or concurrent builds:
+  `/workspace/m3-prefill-est-c32-20260529_033714/`,
+  `/workspace/m3-prefill-est-c32-clean-*`,
+  `/workspace/m3-prefill-est-c32-foreground*`,
+  `/workspace/m3-prefill-est-c32-rerun-*`, and
+  `/workspace/m3-prefill-est-c32-setsid-*`.
+- `FERRUM_MAX_BATCHED_TOKENS=4096` was tested as a targeted prefill-wave
+  hypothesis, not an env sweep. Paris passed, but N=1 artifact
+  `/workspace/m3-mbt4096-c32-n1-20260529_035206/` measured only
+  `1304.9 tok/s`; `TPOT p50` improved to `19.0 ms`, but `TTFT p50` regressed
+  to `723.7 ms`. Do not make it default or repeat max-batched-token-only
+  tests without new evidence.
+
 Primary artifacts:
 
 - `/workspace/m3-graph-loop/bench_threshold4_current_full_c1_c4_c16_c32_n3/`
@@ -213,6 +255,9 @@ Primary artifacts:
 - `/workspace/m3-graph-loop/block8_validation_rerun/`
 - `/workspace/m3-graph-loop/block8_paris128/`
 - `/workspace/m3-graph-loop/profile_current_pairid_combine_c32/`
+- `/workspace/m3-moe-parity-lite-profile-20260529_033812/`
+- `/workspace/m3-prefill-est-c32-stable-20260529_034726/`
+- `/workspace/m3-mbt4096-c32-n1-20260529_035206/`
 
 ## Current target status
 
@@ -222,25 +267,25 @@ Use the ratios below as directional only until vLLM is rerun with
 - c=1 and c=4 are now the healthy cells.
 - c=16 is close but not over 0.80 against same-pod vLLM 0.20.2 N=3:
   `993.8 / 1328.7 ≈ 0.75`.
-- c=32 remains the real blocker: `1264.0 / 1971.8 ≈ 0.64`, so it needs about
-  `+25%` Ferrum throughput to clear 0.80× on this pod.
+- c=32 remains the real blocker: default fast path is `1264.0 / 1971.8 ≈
+  0.64`; the opt-in prompt-token-estimate candidate reached
+  `1288.2 / 1971.8 ≈ 0.65`, so c32 still needs roughly `+22–25%` throughput
+  to clear 0.80× on this pod.
 
 ## Next lever
 
-Do not repeat env sweeps, the partial Marlin scheduling backport, or block8-only
-testing. The next high-return loop should target the MoE GEMM body:
+Do not repeat env sweeps, the partial Marlin scheduling backport, block8-only
+testing, or `FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next
+high-return loop should target model time directly:
 
 1. restore a GPU pod with enough credit and 48GB-class memory if possible;
 2. first run the scoped attention A/B gate if the local v1 patch is still
    present: `REPEATS=3 bash scripts/m3_attn_v1_ab.sh`; keep it only if Paris
    passes and same-pod v1 beats forced-v2;
-3. build the current branch and run
-   `bash scripts/m3_route_unified_profile.sh` to capture route shape and
-   unified/model/post timing in one pass;
-4. use the `[MOE_DUMP:*]`, `[unified-prof]`, `[iter-prof]`, and
-   `[bucket-prof]` snippets to decide whether the missing `~6 ms` is model,
-   unified post-process, scheduler loop, or HTTP/SSE;
-5. if the model dominates, prototype either a full vLLM 0.20.2
-   Marlin-MoE source-parity port behind the existing C ABI or one small-m
-   gate_up/down fused kernel;
+3. add or run a scoped unified-layer profile that separates prefill and decode
+   dense/attention/MoE time; the current restored profile already rules out
+   scheduler/postprocess as the main gap;
+4. if MoE remains dominant, prototype either a full vLLM 0.20.2 Marlin-MoE
+   source-parity port behind the existing C ABI or one small-m gate_up/down
+   fused kernel;
 6. run Paris, then c16/c32 N=3 A/B on the same pod.
