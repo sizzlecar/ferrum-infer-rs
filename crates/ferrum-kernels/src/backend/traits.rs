@@ -1630,6 +1630,34 @@ pub trait BackendPagedKv: Backend {
             "paged_varlen_attention_vllm_tiled_q4 not implemented for this backend",
         ))
     }
+
+    /// Q-tiled online-softmax varlen attention over the FA-compatible paged KV
+    /// layout `[block, slot, kv_head, head_dim]`. `tile_seqs` and
+    /// `tile_starts` describe compact 8-token Q tiles. Semantics match
+    /// [`Self::paged_varlen_attention`].
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention_fa_flash_q8(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _tile_seqs: &Self::Buffer,
+        _tile_starts: &Self::Buffer,
+        _num_tiles: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_varlen_attention_fa_flash_q8 not implemented for this backend",
+        ))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
