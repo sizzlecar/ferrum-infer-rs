@@ -568,6 +568,23 @@ Continuation after pod restore:
   `ITL p95=106.34 ms`, `TTFT p50=412 ms` (`-3.82%`). Do not repeat mixed
   layer-loop graph capture unless a shape-stability profile first proves
   repeated mixed shapes.
+- A simple Q-tiled vLLM-layout varlen attention candidate is correctness-safe
+  but not a meaningful full-model lever. Standalone CUDA microbench
+  `scripts/microbenches/varlen_vllm_tiled_q_perf.cu` showed `tiled_q4`
+  materially faster than the current one-query-per-block bridge on synthetic
+  prefill/mixed shapes: `prefill_4x256` `719.8 -> 533.7 us` (`+34.9%`),
+  `mixed_3x256_4x1` `518.7 -> 421.1 us` (`+23.2%`), and `prefill_4x512`
+  `2679.6 -> 1969.3 us` (`+36.1%`), with zero max_abs_err. The opt-in
+  production path `FERRUM_VLLM_VARLEN_TILED_Q4=1` and reproducible
+  `scripts/m3_vllm_varlen_tiled_q4_ab.sh` were committed through Git
+  (`6a40de0`, `73b1f58`) and validated on the pod from a clean checkout.
+  Release build took `3m14s` with the build-cache path. Both rows passed Paris
+  in `/workspace/m3-vllm-varlen-tiled-q4-ab-20260529_git_n1/`; c32 N=1 measured
+  tiled-Q4 `1251.1 tok/s`, `TPOT p50=22.72 ms`, `ITL p95=96.91 ms`,
+  `TTFT p50=360 ms` versus default `1246.0 tok/s`, `TPOT p50=22.33 ms`,
+  `ITL p95=128.86 ms`, `TTFT p50=397 ms` (`+0.41%`). Do not default it or
+  spend N=3 time on this simple Q-only tiling without a new profile showing
+  prefill attention dominates the current end-to-end run.
 
 Primary artifacts:
 
@@ -617,6 +634,7 @@ Primary artifacts:
 - `/workspace/m3-split-mixed-ab-20260529_121843/`
 - `/workspace/m3-split-mixed-ab-n3-20260529_122047/`
 - `/workspace/m3-unified-mixed-graph-ab-20260529_123549/`
+- `/workspace/m3-vllm-varlen-tiled-q4-ab-20260529_git_n1/`
 
 ## Current target status
 
@@ -631,8 +649,9 @@ Use the ratios below as directional only until vLLM is rerun with
   a `+2.0%` same-binary effect, but there is no clean final combined-default
   N=3 row yet. Prompt-token-estimate reached `1314.0 tok/s` in same-binary A/B
   but is not default-worthy because TTFT regressed. The split mixed-batch
-  candidate only reached `1274.7 ± 33.9` and was reverted. On the conservative
-  row c32 still needs roughly `+21%` throughput to clear 0.80× on this pod.
+  candidate only reached `1274.7 ± 33.9` and was reverted; simple Q-tiled
+  varlen attention was only `+0.41%` at c32 N=1. On the conservative row c32
+  still needs roughly `+21%` throughput to clear 0.80× on this pod.
 
 ## Next lever
 
@@ -645,7 +664,10 @@ source/body parity without new raw-op evidence,
 two-phase `FERRUM_VLLM_VARLEN_SPLIT_K=1` wrapper; it passed Paris but regressed
 c32 throughput by `6.06%`. Do not repeat simple vLLM-layout weighted-V tiling;
 `FERRUM_VLLM_VARLEN_TILED_V=1` passed Paris but regressed c32 N=1 by about
-`4.5%`. Do not repeat split-only mixed prefill/decode routing; it was only
+`4.5%`. Do not spend another loop on simple Q-only varlen tiling:
+`FERRUM_VLLM_VARLEN_TILED_Q4=1` passed Paris and had a positive standalone
+microbench, but full-model c32 N=1 was only `+0.41%`. Do not repeat split-only
+mixed prefill/decode routing; it was only
 `+1.46%` at c32 N=3 and within noise. Do not repeat unified mixed layer-loop
 graph capture; it regressed c32 N=1 by `3.82%`. The next high-return
 loop should target full-model time directly:
