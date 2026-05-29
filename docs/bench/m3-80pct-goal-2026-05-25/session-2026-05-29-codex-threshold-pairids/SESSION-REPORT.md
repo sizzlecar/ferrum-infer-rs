@@ -713,6 +713,10 @@ Primary artifacts:
 - `/workspace/m3-unified-mixed-graph-ab-20260529_123549/`
 - `/workspace/m3-vllm-varlen-tiled-q4-ab-20260529_git_n1/`
 - `/workspace/m3-vllm-fa2-varlen-probe-20260529_git.log`
+- `/workspace/m3-fa-layout-varlen-ab-20260529_git_n1/`
+- `/workspace/m3-fa-layout-varlen-ab-20260529_git_n3/`
+- `/workspace/m3-fa-layout-varlen-ab-c16-20260529_git_n3/`
+- `/workspace/m3-fa-layout-varlen-ab-c4-20260529_git_n3/`
 - `/workspace/m3-unified-greedy-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/`
@@ -727,7 +731,9 @@ Use the ratios below as directional only until vLLM is rerun with
 
 - c=1 and c=4 are now the healthy cells.
 - c=16 is close but not over 0.80 against same-pod vLLM 0.20.2 N=3:
-  the latest current-binary A/B row is `1001.5 / 1328.7 ≈ 0.75`.
+  the latest current-binary A/B row is `1001.5 / 1328.7 ≈ 0.75`. The
+  opt-in FA-compatible dual-layout KV probe reached
+  `1043.7 ± 25.5 / 1328.7 ≈ 0.785`, still just short of 0.80.
 - c=32 remains the real blocker: the conservative current-binary forced-v2 row
   is `1299.0 / 1971.8 ≈ 0.66`. Short-v1 attention is separately validated as
   a `+2.0%` same-binary effect, but there is no clean final combined-default
@@ -737,9 +743,42 @@ Use the ratios below as directional only until vLLM is rerun with
   varlen attention was only `+0.41%` at c32 N=1, and unified GPU argmax was
   only `+0.97%` at c32 N=1. Prefill-first admission was only `+3.77%` at c32
   N=1 and regressed when combined with prompt-token estimate. Active-decode
-  prefill chunking flattened throughput while worsening TTFT. On the
-  conservative row c32 still needs roughly `+21%` throughput to clear 0.80× on
-  this pod.
+  prefill chunking flattened throughput while worsening TTFT. The opt-in
+  FA-compatible dual-layout KV probe reached `1380.5 ± 34.7`, about
+  `0.70×` of same-pod vLLM and still roughly `+14%` short of 0.80×. On the
+  conservative default row c32 still needs roughly `+21%` throughput to clear
+  0.80× on this pod.
+
+## FA-Compatible Layout Probe
+
+Commit `4e4c95d` added an opt-in `FERRUM_FA_LAYOUT_VARLEN=1` path plus
+`scripts/m3_fa_layout_varlen_ab.sh`. The path keeps the primary vLLM
+paged-decode K/V layout for decode, writes a second legacy/FA-friendly paged
+K/V pool, and routes unified prefill/mixed varlen attention through the
+existing legacy-layout reader. This does not use FA2 yet; it validates that the
+KV layout itself is part of the mixed-prefill attention gap and creates the
+data layout needed for a real FA-style paged/varlen reader.
+
+Validation:
+
+- Local: `cargo fmt --all -- --check`, `cargo check -q -p ferrum-cli`,
+  `git diff --check`.
+- Remote Git-flow build: clean checkout, release build `3m11s`, no CUDA
+  static-library rebuild.
+- Paris passed for candidate and default rows at c4/c16/c32.
+
+Same-binary restored-pod A/B:
+
+| concurrency | fa-layout | default | delta |
+|---:|---:|---:|---:|
+| c4 | `432.7 ± 46.4` | `419.8 ± 32.0` | `+3.09%` |
+| c16 | `1043.7 ± 25.5` | `1010.3 ± 3.9` | `+3.30%` |
+| c32 | `1380.5 ± 34.7` | `1307.9 ± 26.6` | `+5.55%` |
+
+Keep the path opt-in for now. c1 was not run, the second K/V pool increases
+memory use, and c32 is still far below the 0.80× target. The useful next step
+is not another env sweep; it is replacing the simple legacy-layout reader with
+a proper FlashAttention-style paged/varlen kernel or wrapper.
 
 ## Next lever
 
@@ -776,8 +815,8 @@ high-return loop should target full-model time directly:
 4. before another scheduler change, the next profile should explain end-to-end
    occupancy/fill gaps and mixed-prefill attention cost (batch-size over time,
    warmup/non-warmup separation, streaming backpressure, and whether a proper
-   tiled varlen prefill attention kernel can remove the `~61 ms` vLLM-layout
-   attention bucket);
+   FA-style paged/varlen prefill attention kernel can replace the simple
+   reader now validated by `FERRUM_FA_LAYOUT_VARLEN=1`);
 5. for kernel work, skip source parity unless a new raw-op mismatch appears;
    the remaining high-upside kernel path is a genuinely fused small-M MoE design;
 6. reduce CUDA iteration waste before another `.cu` experiment by adding
