@@ -158,16 +158,14 @@ thread_config_t small_batch_thread_configs[] = {
 
     // thread_k, thread_n, num_threads
     {128, 128, 256},
-    {64, 128, 128},
-    {128, 64, 128}};
+    {64, 128, 128}};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
     {64, 256, 256},
-    {64, 128, 128},
-    {128, 64, 128}};
+    {64, 128, 128}};
 
 typedef struct {
   int blocks_per_sm;
@@ -333,10 +331,8 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define COMMON_GET_IF(W_TYPE)            \
     COMMON_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     COMMON_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-    COMMON_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     COMMON_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)  \
-    COMMON_GET_IF_M234(W_TYPE, 4, 8, 128)
+    COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)
 
   #define BIGGROUP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
     _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
@@ -355,10 +351,8 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define BIGGROUP_GET_IF(W_TYPE)            \
     BIGGROUP_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     BIGGROUP_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-    BIGGROUP_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     BIGGROUP_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)  \
-    BIGGROUP_GET_IF_M234(W_TYPE, 4, 8, 128)
+    BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)
 
   #define NVFP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
     _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 1, NUM_THREADS, false) \
@@ -372,10 +366,8 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define NVFP4_GET_IF(W_TYPE)            \
     NVFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     NVFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-    NVFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     NVFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    NVFP4_GET_IF_M234(W_TYPE, 8, 4, 128)  \
-    NVFP4_GET_IF_M234(W_TYPE, 4, 8, 128)
+    NVFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
 
   #define MXFP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
     _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false) \
@@ -389,10 +381,8 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define MXFP4_GET_IF(W_TYPE)            \
     MXFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     MXFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-    MXFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     MXFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)  \
-    MXFP4_GET_IF_M234(W_TYPE, 4, 8, 128)
+    MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
 
   // We currently have 4-bit models only with group_blocks == 4
   #define FZP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
@@ -407,10 +397,8 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define FZP_GET_IF(W_TYPE)            \
     FZP_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     FZP_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-    FZP_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     FZP_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    FZP_GET_IF_M234(W_TYPE, 8, 4, 128)  \
-    FZP_GET_IF_M234(W_TYPE, 4, 8, 128)
+    FZP_GET_IF_M234(W_TYPE, 8, 4, 128)
 
   // We currently have 4-bit models only with group_blocks == 4
   #define ACT_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)        \
@@ -425,10 +413,8 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define ACT_GET_IF(W_TYPE)            \
     ACT_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     ACT_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-    ACT_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     ACT_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    ACT_GET_IF_M234(W_TYPE, 8, 4, 128)  \
-    ACT_GET_IF_M234(W_TYPE, 4, 8, 128)
+    ACT_GET_IF_M234(W_TYPE, 8, 4, 128)
 
 template <typename scalar_t>
 MarlinFuncPtr get_marlin_kernel(const vllm::ScalarType q_type,

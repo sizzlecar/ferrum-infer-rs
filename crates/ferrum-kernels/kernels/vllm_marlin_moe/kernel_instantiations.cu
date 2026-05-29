@@ -92,10 +92,8 @@ namespace MARLIN_NAMESPACE_NAME {
 #define _COMMON_INSTANTIATE(SCALAR_T, W_TYPE, S_TYPE)                          \
   _COMMON_INSTANTIATE_M1(SCALAR_T, W_TYPE, S_TYPE, 8, 8, 256)                  \
   _COMMON_INSTANTIATE_M1(SCALAR_T, W_TYPE, S_TYPE, 8, 4, 128)                  \
-  _COMMON_INSTANTIATE_M1(SCALAR_T, W_TYPE, S_TYPE, 4, 8, 128)                  \
   _COMMON_INSTANTIATE_M234(SCALAR_T, W_TYPE, S_TYPE, 16, 4, 256)               \
-  _COMMON_INSTANTIATE_M234(SCALAR_T, W_TYPE, S_TYPE, 8, 4, 128)                \
-  _COMMON_INSTANTIATE_M234(SCALAR_T, W_TYPE, S_TYPE, 4, 8, 128)
+  _COMMON_INSTANTIATE_M234(SCALAR_T, W_TYPE, S_TYPE, 8, 4, 128)
 
 // === scalar_t=half ===
 // M3 primary: Qwen3-30B-A3B-GPTQ-Int4 (fp16 act, INT4 weight).
