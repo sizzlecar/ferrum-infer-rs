@@ -465,7 +465,7 @@ impl EngineInner {
         let r = self.process_batch(&batch).await;
         if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
             let n = self.iteration_count.load(Ordering::Relaxed);
-            if n.is_multiple_of(32) {
+            if n < 64 || n.is_multiple_of(32) {
                 let total = t0.elapsed().as_micros();
                 let sched = ts.duration_since(t0).as_micros();
                 let proc = ts.elapsed().as_micros();
