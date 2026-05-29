@@ -26,6 +26,9 @@ CONCURRENCY="${CONCURRENCY:-32}"
 FA2_SHIM="${FA2_SHIM:-/workspace/libferrum_fa2_shim.so}"
 TORCH_LIB="${TORCH_LIB:-/workspace/vllm-venv/lib/python3.12/site-packages/torch/lib}"
 FA2_DIR="${FA2_DIR:-/workspace/vllm-venv/lib/python3.12/site-packages/vllm/vllm_flash_attn}"
+if [[ -z "${FA2_EXTRA_LD_LIBRARY_PATH+x}" ]]; then
+    FA2_EXTRA_LD_LIBRARY_PATH="${TORCH_LIB}:${FA2_DIR}"
+fi
 
 if [[ ! -d "$MODEL_DIR" ]]; then
     echo "MODEL_DIR does not exist: $MODEL_DIR" >&2
@@ -74,11 +77,12 @@ echo "FA2_SHIM=$FA2_SHIM"
     echo "fa2_shim=$FA2_SHIM"
     echo "torch_lib=$TORCH_LIB"
     echo "fa2_dir=$FA2_DIR"
+    echo "fa2_extra_ld_library_path=$FA2_EXTRA_LD_LIBRARY_PATH"
 } >"$OUT_ROOT/metadata.txt"
 
 BASE_ENV=(
     HF_HOME=/workspace/hf-cache
-    LD_LIBRARY_PATH="${TORCH_LIB}:${FA2_DIR}:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+    LD_LIBRARY_PATH="${FA2_EXTRA_LD_LIBRARY_PATH:+${FA2_EXTRA_LD_LIBRARY_PATH}:}/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
     FERRUM_BACKEND=cuda
     FERRUM_MOE_DEVICE_ROUTE=1
     FERRUM_MOE_STREAMS=4

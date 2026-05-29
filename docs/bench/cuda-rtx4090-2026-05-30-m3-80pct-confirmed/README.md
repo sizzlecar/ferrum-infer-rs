@@ -47,5 +47,6 @@ Interpretation:
   concurrency cells under the same-pod `n_repeats=5` confirmation sweep.
 - This is not yet a default-runtime result. The path depends on the vLLM/Torch
   FA2 extension through a runtime shim and allocates the extra FA-compatible K/V
-  pool. Defaulting still needs a dependency and memory decision or a cleaner
-  source-built FA2 wrapper.
+  pool. It is diagnostic evidence only; defaulting or claiming M3 completion
+  requires a source-built/Ferrum-owned FA2 wrapper or kernel with no vLLM/Torch
+  runtime dependency.

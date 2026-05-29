@@ -34,9 +34,10 @@ all four cells in a same-pod N=5 confirmation sweep. Artifact directory:
 
 This is a performance-confirmed opt-in path, not yet the default-runtime state.
 It depends on a runtime shim around the vLLM/Torch FA2 extension and uses the
-extra FA-compatible K/V pool. The remaining product decision is whether to
-accept/default that dependency and memory cost or replace it with a cleaner
-source-built FA2 wrapper.
+extra FA-compatible K/V pool. Treat it as diagnostic evidence, not an acceptable
+default or final completion path. The target remains open until the same
+attention win is reproduced with a source-built/Ferrum-owned FA2 wrapper or
+kernel and no vLLM/Torch runtime dependency.
 
 ## Current baseline (2026-05-25 sweep)
 
