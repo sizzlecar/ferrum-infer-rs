@@ -240,13 +240,14 @@ Continuation notes after the pair-id combine profile:
   It sets `FERRUM_MOE_DUMP_BATCH_X_TOPK=$((CONCURRENCY * TOP_K))`,
   `FERRUM_VLLM_MOE_LOG_CONFIG=1`,
   `FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS=$((CONCURRENCY * TOP_K))`,
-  `FERRUM_UNIFIED_POST_PROF=1`, `FERRUM_BATCH_DECODE_PROF=1`,
-  `FERRUM_NEXT_BATCH_PROF=1`, `FERRUM_MOE_PROFILE=1`, and
+  `FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS=$((CONCURRENCY * TOP_K))`,
+  `FERRUM_UNIFIED_POST_PROF=1`, `FERRUM_DECODE_OP_PROFILE=1`,
+  `FERRUM_BATCH_DECODE_PROF=1`, `FERRUM_NEXT_BATCH_PROF=1`, `FERRUM_MOE_PROFILE=1`, and
   `FERRUM_MOE_GRAPH=0` because route dumping synchronizes/copies routing
   buffers and should not run inside CUDA graph capture. The script fails fast
-  if `[MOE_DUMP:*]`, `[vllm-moe-config]`, or `[unified-prof]` is missing. It
-  also writes `profile_summary.json` with medians for unified, iteration,
-  bucket, and Marlin config fields.
+  if `[MOE_DUMP:*]`, `[vllm-moe-config]`, `[unified-prof]`, or a decode-stage
+  profile is missing. It also writes `profile_summary.json` with medians for
+  unified, iteration, bucket, and Marlin config fields.
 
 Continuation after pod restore:
 
@@ -335,6 +336,26 @@ Continuation after pod restore:
   `/workspace/m3-moe-parity-lite-binary-ab-c1-20260529_044647/` measured
   `161.9 ± 1.2` vs `160.6 ± 0.8`. Treat lower-concurrency rows as flat and
   c32 as the only meaningful small win.
+- Clean-checkout c=32 profile after decode-shape filtering:
+  `/workspace/m3-route-unified-layer-relaxed-clean-20260529_060400/`
+  (`c55e9c4`, current branch clean binary). Paris passed. This is a scoped
+  profiling artifact with graph disabled and sync timers on, not a throughput
+  baseline. Route shape: `batch_x_topk=256`, `block_size=16`,
+  `total_post_pad=1040`, `active_blocks=65`, `unique_experts=61`.
+  Marlin config now correctly records only decode rows:
+  gate/up `prob_m=32 prob_n=1536 prob_k=2048 top_k=8` and down
+  `prob_m=256 prob_n=2048 prob_k=768 top_k=1`; both select `thread_k=64`,
+  `thread_n=128`, `threads=128`, `blocks_per_sm=3`.
+- Filtering the same clean profile to full `m=32` decode gives
+  `unified-prof` median `total≈15.9 ms`, `model≈15.5 ms`,
+  `decode_post≈0.35 ms`. `batched-decode-prof` median is `total≈16 ms` with
+  MoE `≈10 ms` (`~62.5%`), attention `≈2 ms`, dense `≈2 ms`, and other
+  `≈1 ms`. Paired `bucket-prof` median is `bk_total≈9 ms`, dominated by
+  `gemm1≈5.86 ms` and `gemm3≈2.89 ms` (`~97%` of the bucket), while
+  `combine≈0.25 ms`. This clean profile closes the attribution loop:
+  scheduler/postprocess/streaming/combine/route are not the primary c=32 gap;
+  the remaining high-return lever is the vLLM-Marlin MoE GEMM body/source
+  parity or a new small-M fused MoE kernel.
 
 Primary artifacts:
 
@@ -356,6 +377,7 @@ Primary artifacts:
 - `/workspace/m3-moe-parity-lite-binary-ab-c16-20260529_043419/`
 - `/workspace/m3-moe-parity-lite-binary-ab-c4-20260529_043830/`
 - `/workspace/m3-moe-parity-lite-binary-ab-c1-20260529_044647/`
+- `/workspace/m3-route-unified-layer-relaxed-clean-20260529_060400/`
 
 ## Current target status
 
