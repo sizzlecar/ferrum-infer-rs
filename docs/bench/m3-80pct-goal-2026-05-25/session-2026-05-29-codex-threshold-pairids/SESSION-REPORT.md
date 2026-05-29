@@ -415,6 +415,20 @@ Continuation after pod restore:
   `TTFT p50=379 ms`. This is below the current c32 range and not worth N=3
   A/B. Do not repeat scheduler-only parity as a primary lever; use full
   vLLM-Marlin source parity or a small-M fused MoE kernel instead.
+- A high-return raw-op localization compared vLLM 0.20.2 Marlin-MoE against
+  Ferrum's clean c32 profile on the same route class. The vLLM probe used
+  `batch_x_topk=256`, `block_size=16`, `total_post_pad=1040`,
+  `active_blocks=65`, `unique_experts=61`, matching
+  `/workspace/m3-route-unified-layer-relaxed-clean-20260529_060400/`.
+  Artifact `/workspace/m3-admin/vllm-raw-marlin-active65-20260529_084340.json`
+  measured gate/up `107.1 µs/layer` and down `32.5 µs/layer`. Ferrum's clean
+  profile is about gate/up `5812 / 48 = 121 µs/layer` and down
+  `2883 / 48 = 60 µs/layer`. The actionable gap is therefore down GEMM body or
+  source parity, not the scheduler-only split-K change. Closing that down gap
+  would save roughly `(60 - 32.5) * 48 ≈ 1.3 ms`; also matching gate/up saves
+  another `~0.7 ms`, so full Marlin source/body parity has an estimated
+  `~2 ms` c32 decode-step ceiling (`~10-15%` throughput) before measurement
+  noise. This is the next high-return code direction.
 
 Primary artifacts:
 
@@ -443,6 +457,7 @@ Primary artifacts:
 - `/workspace/m3-presync-ab-20260529_074643/`
 - `/workspace/m3-dp2sk-paris-20260529_083316`
 - `/workspace/m3-dp2sk-c32-smoke-20260529_083702/`
+- `/workspace/m3-admin/vllm-raw-marlin-active65-20260529_084340.json`
 
 ## Current target status
 
@@ -475,8 +490,8 @@ loop should target model time directly:
    `FERRUM_VLLM_MOE_LOG_CONFIG=1 FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS=256`, and
    run a scoped A/B for the opt-in large-M block hook only if prefill/unified
    MoE remains material;
-4. if MoE remains dominant, prototype either a full vLLM 0.20.2 Marlin-MoE
-   source-parity port behind the existing C ABI or one small-m gate_up/down
-   fused kernel, and require a microbench/profile reason before another
-   release build;
+4. if MoE remains dominant, target the down GEMM first: prototype either a
+   full vLLM 0.20.2 Marlin-MoE source/body parity port behind the existing C
+   ABI or one small-m down/gate kernel, and require a microbench/profile reason
+   before another release build;
 5. run Paris, then c16/c32 N=3 A/B on the same pod.
