@@ -512,6 +512,18 @@ Continuation after pod restore:
   `vllm_marlin_moe/*` static libraries before linking. A near-term engineering
   fix is to add build-script stamp/artifact caching or split those static
   libraries so attention-only PTX changes do not pay the Marlin template cost.
+- Build-cache checkpoint completed after the split-K negative control.
+  `crates/ferrum-kernels/build.rs` now writes dependency/flag signatures for
+  the Marlin, vLLM-Marlin, vLLM-MoE-Marlin, and vLLM paged-attention static
+  libraries before invoking nvcc. The first pod build paid the one-time stamp
+  generation cost (`22m21s`). After that, touching only
+  `kernels/paged_varlen_attention_vllm.cu` rebuilt the release `ferrum-cli`
+  binary in `3m13s`, and the final content-hash verbose verification log
+  `/workspace/m3-build-cache-contenthash-final-vv-20260529.log` completed in
+  `194s` with cache hits for all four static libraries. Process audit during
+  the rebuild showed no Marlin/MoE-Marlin `nvcc`/`cicc`/`ptxas` work. This is
+  not a throughput claim; it removes the worst unrelated CUDA rebuild cost
+  before the next tiled varlen prefill-attention kernel experiment.
 
 Primary artifacts:
 
@@ -551,6 +563,9 @@ Primary artifacts:
 - `/workspace/m3-mixed-prefill-layer-prof-20260529_095945/`
 - `/workspace/m3-mixed-prefill-legacy-varlen-prof-20260529_100212/`
 - `/workspace/m3-vllm-varlen-splitk-ab-20260529_183142/`
+- `/workspace/m3-build-cache-touch-attn-20260529.log`
+- `/workspace/m3-build-cache-final-vv-20260529.log`
+- `/workspace/m3-build-cache-contenthash-final-vv-20260529.log`
 
 ## Current target status
 

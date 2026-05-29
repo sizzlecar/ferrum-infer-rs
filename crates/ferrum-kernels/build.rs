@@ -1,5 +1,7 @@
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 fn cuda_root_from_env() -> Option<PathBuf> {
     for key in [
@@ -17,6 +19,126 @@ fn cuda_root_from_env() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn file_fingerprint(path: &str) -> String {
+    let meta = fs::metadata(path).unwrap_or_else(|e| panic!("metadata {path}: {e}"));
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in &bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{path}:len={}:fnv1a64={hash:016x}", meta.len())
+}
+
+fn metadata_hash_file_fingerprint(path: &str) -> String {
+    let meta = fs::metadata(path).unwrap_or_else(|e| panic!("metadata {path}: {e}"));
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in &bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "{path}:len={}:mtime={mtime}:fnv1a64={hash:016x}",
+        meta.len()
+    )
+}
+
+fn metadata_file_fingerprint(path: &str) -> String {
+    let meta = fs::metadata(path).unwrap_or_else(|e| panic!("metadata {path}: {e}"));
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{path}:len={}:mtime={mtime}", meta.len())
+}
+
+fn static_lib_signature(label: &str, deps: &[&str], flags: &[String]) -> String {
+    let mut lines = Vec::with_capacity(2 + deps.len() + flags.len());
+    lines.push(format!("label={label}"));
+    lines.extend(flags.iter().map(|f| format!("flag={f}")));
+    lines.extend(deps.iter().map(|p| file_fingerprint(p)));
+    lines.join("\n")
+}
+
+fn metadata_hash_static_lib_signature(label: &str, deps: &[&str], flags: &[String]) -> String {
+    let mut lines = Vec::with_capacity(2 + deps.len() + flags.len());
+    lines.push(format!("label={label}"));
+    lines.extend(flags.iter().map(|f| format!("flag={f}")));
+    lines.extend(deps.iter().map(|p| metadata_hash_file_fingerprint(p)));
+    lines.join("\n")
+}
+
+fn metadata_static_lib_signature(label: &str, deps: &[&str], flags: &[String]) -> String {
+    let mut lines = Vec::with_capacity(2 + deps.len() + flags.len());
+    lines.push(format!("label={label}"));
+    lines.extend(flags.iter().map(|f| format!("flag={f}")));
+    lines.extend(deps.iter().map(|p| metadata_file_fingerprint(p)));
+    lines.join("\n")
+}
+
+fn static_lib_is_fresh(
+    out_dir: &Path,
+    lib_name: &str,
+    signature: &str,
+    migration_signatures: &[&str],
+) -> bool {
+    let lib_file = out_dir.join(format!("lib{lib_name}.a"));
+    let stamp_file = out_dir.join(format!("lib{lib_name}.stamp"));
+    if !lib_file.is_file() || !stamp_file.is_file() {
+        return false;
+    }
+    match fs::read_to_string(&stamp_file) {
+        Ok(existing) if existing == signature => {
+            eprintln!("[{lib_name}] cache hit: {}", lib_file.display());
+            true
+        }
+        Ok(existing) if migration_signatures.iter().any(|s| existing == **s) => {
+            write_static_lib_stamp(out_dir, lib_name, signature);
+            eprintln!(
+                "[{lib_name}] cache hit: {} (migrated stamp)",
+                lib_file.display()
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn write_static_lib_stamp(out_dir: &Path, lib_name: &str, signature: &str) {
+    let stamp_file = out_dir.join(format!("lib{lib_name}.stamp"));
+    fs::write(&stamp_file, signature)
+        .unwrap_or_else(|e| panic!("[{lib_name}] failed to write {}: {e}", stamp_file.display()));
+}
+
+fn emit_cuda_static_link(
+    out_dir: &Path,
+    lib_name: &str,
+    cuda_root: Option<&PathBuf>,
+    link_stdcxx: bool,
+) {
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static={lib_name}");
+    if let Some(cuda_root) = cuda_root {
+        let lib64 = cuda_root.join("lib64");
+        if lib64.exists() {
+            println!("cargo:rustc-link-search=native={}", lib64.display());
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    if link_stdcxx {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
 }
 
 fn main() {
@@ -159,19 +281,21 @@ fn main() {
 
 fn compile_vllm_paged_attn(out_dir: &PathBuf) {
     let cu_files: &[&str] = &["kernels/vllm_attn/launcher.cu"];
-    for f in cu_files {
+    let header_files: &[&str] = &[
+        "kernels/vllm_attn/attention_kernels.cuh",
+        "kernels/vllm_attn/attention_dtypes.h",
+        "kernels/vllm_attn/attention_utils.cuh",
+        "kernels/vllm_attn/attention_generic.cuh",
+        "kernels/vllm_attn/dtype_float16.cuh",
+        "kernels/vllm_attn/dtype_float32.cuh",
+        "kernels/vllm_attn/dtype_bfloat16.cuh",
+        "kernels/vllm_attn/dtype_fp8.cuh",
+        "kernels/vllm_attn/ferrum_shim.h",
+        "kernels/vllm_attn/include/cuda_compat.h",
+    ];
+    for f in cu_files.iter().chain(header_files.iter()) {
         println!("cargo:rerun-if-changed={f}");
     }
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/attention_kernels.cuh");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/attention_dtypes.h");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/attention_utils.cuh");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/attention_generic.cuh");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/dtype_float16.cuh");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/dtype_float32.cuh");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/dtype_bfloat16.cuh");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/dtype_fp8.cuh");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/ferrum_shim.h");
-    println!("cargo:rerun-if-changed=kernels/vllm_attn/include/cuda_compat.h");
 
     let cuda_root = cuda_root_from_env();
     let nvcc = cuda_root
@@ -185,6 +309,33 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
     let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
+    let flags = vec![
+        format!("nvcc={}", nvcc.display()),
+        format!("arch=sm_{compute_cap}"),
+        format!("threads={nvcc_threads}"),
+        "-Ikernels/vllm_attn".to_string(),
+        "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda"
+            .to_string(),
+        "-Xcompiler -fPIC".to_string(),
+    ];
+    let deps: Vec<&str> = cu_files
+        .iter()
+        .chain(header_files.iter())
+        .copied()
+        .collect();
+    let signature = static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
+    let metadata_hash_signature =
+        metadata_hash_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
+    let metadata_signature = metadata_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
+    if static_lib_is_fresh(
+        out_dir,
+        "vllm_paged_attn",
+        &signature,
+        &[&metadata_hash_signature, &metadata_signature],
+    ) {
+        emit_cuda_static_link(out_dir, "vllm_paged_attn", cuda_root.as_ref(), true);
+        return;
+    }
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in cu_files {
@@ -235,16 +386,8 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
         panic!("[vllm-paged-attn-v2] ar failed to bundle {lib_file:?}");
     }
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=vllm_paged_attn");
-    if let Some(ref cuda_root) = cuda_root {
-        let lib64 = cuda_root.join("lib64");
-        if lib64.exists() {
-            println!("cargo:rustc-link-search=native={}", lib64.display());
-        }
-    }
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    write_static_lib_stamp(out_dir, "vllm_paged_attn", &signature);
+    emit_cuda_static_link(out_dir, "vllm_paged_attn", cuda_root.as_ref(), true);
     eprintln!(
         "[vllm-paged-attn-v2] static lib built: {}",
         lib_file.display()
@@ -262,18 +405,18 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
         "kernels/vllm_marlin_moe/ops.cu",
         "kernels/vllm_marlin_moe/kernel_instantiations.cu",
     ];
-    for f in cu_files {
+    let header_files: &[&str] = &[
+        "kernels/vllm_marlin_moe/kernel.h",
+        "kernels/vllm_marlin_moe/marlin_template.h",
+        "kernels/vllm_marlin_moe/vllm_torch_shim.h",
+        "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+    ];
+    for f in cu_files.iter().chain(header_files.iter()) {
         println!("cargo:rerun-if-changed={f}");
     }
-    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/kernel.h");
-    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/marlin_template.h");
-    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/vllm_torch_shim.h");
-    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/core/scalar_type.hpp");
-    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh");
-    println!(
-        "cargo:rerun-if-changed=kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh"
-    );
-    println!("cargo:rerun-if-changed=kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h");
 
     let cuda_root = cuda_root_from_env();
     let nvcc = cuda_root
@@ -287,6 +430,34 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
     let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
+    let flags = vec![
+        format!("nvcc={}", nvcc.display()),
+        format!("arch=sm_{compute_cap}"),
+        format!("threads={nvcc_threads}"),
+        "-Ikernels/vllm_marlin_moe".to_string(),
+        "-DMARLIN_NAMESPACE_NAME=marlin_moe_wna16".to_string(),
+        "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda"
+            .to_string(),
+        "-Xcompiler -fPIC -Xcompiler -fvisibility=default".to_string(),
+    ];
+    let deps: Vec<&str> = cu_files
+        .iter()
+        .chain(header_files.iter())
+        .copied()
+        .collect();
+    let signature = static_lib_signature("vllm-moe-marlin", &deps, &flags);
+    let metadata_hash_signature =
+        metadata_hash_static_lib_signature("vllm-moe-marlin", &deps, &flags);
+    let metadata_signature = metadata_static_lib_signature("vllm-moe-marlin", &deps, &flags);
+    if static_lib_is_fresh(
+        out_dir,
+        "vllm_moe_marlin",
+        &signature,
+        &[&metadata_hash_signature, &metadata_signature],
+    ) {
+        emit_cuda_static_link(out_dir, "vllm_moe_marlin", cuda_root.as_ref(), true);
+        return;
+    }
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in cu_files {
@@ -346,16 +517,8 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
         panic!("[vllm-moe-marlin] ar failed to bundle {lib_file:?}");
     }
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=vllm_moe_marlin");
-    if let Some(ref cuda_root) = cuda_root {
-        let lib64 = cuda_root.join("lib64");
-        if lib64.exists() {
-            println!("cargo:rustc-link-search=native={}", lib64.display());
-        }
-    }
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    write_static_lib_stamp(out_dir, "vllm_moe_marlin", &signature);
+    emit_cuda_static_link(out_dir, "vllm_moe_marlin", cuda_root.as_ref(), true);
     eprintln!("[vllm-moe-marlin] static lib built: {}", lib_file.display());
 }
 
@@ -396,19 +559,20 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
         "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_bfloat16.cu",
         "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_float16.cu",
     ];
-    for f in cu_files {
+    let header_files: &[&str] = &[
+        "vllm_marlin/marlin_template.h",
+        "vllm_marlin/marlin_mma.h",
+        "vllm_marlin/marlin_dtypes.cuh",
+        "vllm_marlin/marlin.cuh",
+        "vllm_marlin/dequant.h",
+        "vllm_marlin/kernel.h",
+        "vllm_marlin/kernel_selector.h",
+        "vllm_marlin/scalar_type.hpp",
+        "vllm_marlin/torch_stubs.h",
+    ];
+    for f in cu_files.iter().chain(header_files.iter()) {
         println!("cargo:rerun-if-changed={f}");
     }
-    // Headers (any change re-triggers build)
-    println!("cargo:rerun-if-changed=vllm_marlin/marlin_template.h");
-    println!("cargo:rerun-if-changed=vllm_marlin/marlin_mma.h");
-    println!("cargo:rerun-if-changed=vllm_marlin/marlin_dtypes.cuh");
-    println!("cargo:rerun-if-changed=vllm_marlin/marlin.cuh");
-    println!("cargo:rerun-if-changed=vllm_marlin/dequant.h");
-    println!("cargo:rerun-if-changed=vllm_marlin/kernel.h");
-    println!("cargo:rerun-if-changed=vllm_marlin/kernel_selector.h");
-    println!("cargo:rerun-if-changed=vllm_marlin/scalar_type.hpp");
-    println!("cargo:rerun-if-changed=vllm_marlin/torch_stubs.h");
 
     let cuda_root = cuda_root_from_env();
     let nvcc = cuda_root
@@ -422,6 +586,33 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
     let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
+    let flags = vec![
+        format!("nvcc={}", nvcc.display()),
+        format!("arch=sm_{compute_cap}"),
+        format!("threads={nvcc_threads}"),
+        "-Ivllm_marlin".to_string(),
+        "-DMARLIN_NAMESPACE_NAME=marlin".to_string(),
+        "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda"
+            .to_string(),
+        "-Xcompiler -fPIC -Xcompiler -fvisibility=default".to_string(),
+    ];
+    let deps: Vec<&str> = cu_files
+        .iter()
+        .chain(header_files.iter())
+        .copied()
+        .collect();
+    let signature = static_lib_signature("vllm-marlin", &deps, &flags);
+    let metadata_hash_signature = metadata_hash_static_lib_signature("vllm-marlin", &deps, &flags);
+    let metadata_signature = metadata_static_lib_signature("vllm-marlin", &deps, &flags);
+    if static_lib_is_fresh(
+        out_dir,
+        "vllm_marlin",
+        &signature,
+        &[&metadata_hash_signature, &metadata_signature],
+    ) {
+        emit_cuda_static_link(out_dir, "vllm_marlin", cuda_root.as_ref(), true);
+        return;
+    }
 
     // Compile each .cu to its own .o
     let mut object_files: Vec<PathBuf> = Vec::new();
@@ -488,16 +679,8 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
         panic!("[vllm-marlin] ar failed to bundle {lib_file:?}");
     }
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=vllm_marlin");
-    if let Some(ref cuda_root) = cuda_root {
-        let lib64 = cuda_root.join("lib64");
-        if lib64.exists() {
-            println!("cargo:rustc-link-search=native={}", lib64.display());
-        }
-    }
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    write_static_lib_stamp(out_dir, "vllm_marlin", &signature);
+    emit_cuda_static_link(out_dir, "vllm_marlin", cuda_root.as_ref(), true);
     eprintln!("[vllm-marlin] static lib built: {}", lib_file.display());
 }
 
@@ -517,6 +700,26 @@ fn compile_marlin(out_dir: &PathBuf) {
 
     // Determine compute capability: use CUDA_COMPUTE_CAP env or default to 80
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "80".to_string());
+    let flags = vec![
+        format!("nvcc={}", nvcc.display()),
+        "arch=compute_80".to_string(),
+        format!("reported_compute_cap={compute_cap}"),
+        "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr -Xcompiler -fPIC".to_string(),
+    ];
+    let signature = static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
+    let metadata_hash_signature =
+        metadata_hash_static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
+    let metadata_signature =
+        metadata_static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
+    if static_lib_is_fresh(
+        out_dir,
+        "marlin",
+        &signature,
+        &[&metadata_hash_signature, &metadata_signature],
+    ) {
+        emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
+        return;
+    }
 
     let obj_file = out_dir.join("marlin_cuda_kernel.o");
     let status = std::process::Command::new(&nvcc)
@@ -547,16 +750,8 @@ fn compile_marlin(out_dir: &PathBuf) {
                 .status();
             if let Ok(s) = ar_status {
                 if s.success() {
-                    println!("cargo:rustc-link-search=native={}", out_dir.display());
-                    println!("cargo:rustc-link-lib=static=marlin");
-                    // Link CUDA runtime
-                    if let Some(ref cuda_root) = cuda_root {
-                        let lib64 = cuda_root.join("lib64");
-                        if lib64.exists() {
-                            println!("cargo:rustc-link-search=native={}", lib64.display());
-                        }
-                    }
-                    println!("cargo:rustc-link-lib=dylib=cudart");
+                    write_static_lib_stamp(out_dir, "marlin", &signature);
+                    emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
                     eprintln!("Marlin kernel compiled successfully (sm_{compute_cap})");
                     return;
                 }
