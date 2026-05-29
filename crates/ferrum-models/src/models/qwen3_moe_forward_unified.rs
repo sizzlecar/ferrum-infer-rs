@@ -79,6 +79,10 @@ fn unified_layer_prof_every() -> u64 {
         .unwrap_or(16)
 }
 
+fn vllm_varlen_tiled_q4_enabled() -> bool {
+    std::env::var("FERRUM_VLLM_VARLEN_TILED_Q4").as_deref() == Ok("1")
+}
+
 fn unified_stage_start<B: Backend>(ctx: &mut B::Context, enabled: bool) -> Option<Instant> {
     if enabled {
         B::sync(ctx);
@@ -252,6 +256,33 @@ where
             B::write_typed::<u32>(&mut ctx, bt, &stacked);
         }
 
+        let use_vllm_tiled_q4 =
+            self.use_vllm_paged_attn && vllm_varlen_tiled_q4_enabled() && m_total > num_seqs;
+        let mut tile_q4_count = 0usize;
+        if use_vllm_tiled_q4 {
+            let mut tile_seqs = Vec::with_capacity(m_total);
+            let mut tile_starts = Vec::with_capacity(m_total);
+            for (seq_idx, &q_len) in q_lens.iter().enumerate() {
+                for start in (0..q_len).step_by(4) {
+                    tile_seqs.push(seq_idx as u32);
+                    tile_starts.push(start as u32);
+                }
+            }
+            tile_q4_count = tile_seqs.len();
+            let tile_seqs_buf = self
+                .scratch
+                .unified_tile_q4_seqs
+                .as_mut()
+                .expect("unified_tile_q4_seqs missing");
+            B::write_typed::<u32>(&mut ctx, tile_seqs_buf, &tile_seqs);
+            let tile_starts_buf = self
+                .scratch
+                .unified_tile_q4_starts
+                .as_mut()
+                .expect("unified_tile_q4_starts missing");
+            B::write_typed::<u32>(&mut ctx, tile_starts_buf, &tile_starts);
+        }
+
         // Pre-grow Marlin gather scratch for worst-case GEMM input m.
         let max_marlin_required = m_total * inter;
         B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
@@ -283,6 +314,8 @@ where
                 top_k,
                 n_exp,
                 norm_topk_prob,
+                use_vllm_tiled_q4,
+                tile_q4_count,
                 layer_prof.as_mut(),
             );
         }
@@ -400,6 +433,8 @@ where
         top_k: usize,
         n_exp: usize,
         norm_topk_prob: bool,
+        use_vllm_tiled_q4: bool,
+        tile_q4_count: usize,
         mut prof: Option<&mut UnifiedLayerProfile>,
     ) {
         let attn_layer = &self.attn_layers[li];
@@ -518,25 +553,58 @@ where
                 .expect("unified_block_tables missing");
             let t_attn = unified_stage_start::<B>(ctx, prof_enabled);
             if self.use_vllm_paged_attn {
-                B::paged_varlen_attention_vllm(
-                    ctx,
-                    &self.scratch.q_head_major,
-                    pool_k,
-                    pool_v,
-                    &mut self.scratch.attn_head_major_out,
-                    cu_seqlens_buf,
-                    pos_offsets_buf,
-                    bt_buf,
-                    num_seqs,
-                    m_total,
-                    max_kv_len,
-                    nh,
-                    nkv,
-                    hd,
-                    block_size,
-                    max_blocks_per_seq,
-                )
-                .expect("Qwen3Moe unified: paged_varlen_attention_vllm");
+                if use_vllm_tiled_q4 {
+                    let tile_seqs = self
+                        .scratch
+                        .unified_tile_q4_seqs
+                        .as_ref()
+                        .expect("unified_tile_q4_seqs missing");
+                    let tile_starts = self
+                        .scratch
+                        .unified_tile_q4_starts
+                        .as_ref()
+                        .expect("unified_tile_q4_starts missing");
+                    B::paged_varlen_attention_vllm_tiled_q4(
+                        ctx,
+                        &self.scratch.q_head_major,
+                        pool_k,
+                        pool_v,
+                        &mut self.scratch.attn_head_major_out,
+                        cu_seqlens_buf,
+                        pos_offsets_buf,
+                        bt_buf,
+                        tile_seqs,
+                        tile_starts,
+                        tile_q4_count,
+                        max_kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        block_size,
+                        max_blocks_per_seq,
+                    )
+                    .expect("Qwen3Moe unified: paged_varlen_attention_vllm_tiled_q4");
+                } else {
+                    B::paged_varlen_attention_vllm(
+                        ctx,
+                        &self.scratch.q_head_major,
+                        pool_k,
+                        pool_v,
+                        &mut self.scratch.attn_head_major_out,
+                        cu_seqlens_buf,
+                        pos_offsets_buf,
+                        bt_buf,
+                        num_seqs,
+                        m_total,
+                        max_kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        block_size,
+                        max_blocks_per_seq,
+                    )
+                    .expect("Qwen3Moe unified: paged_varlen_attention_vllm");
+                }
             } else {
                 B::paged_varlen_attention(
                     ctx,

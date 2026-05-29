@@ -338,6 +338,9 @@ pub struct Qwen3MoeScratch<B: QuantLlmBackend + BackendMoeFused> {
     pub unified_pos_offsets: Option<B::Buffer>,
     /// `[max_seqs * max_blocks_per_seq]` u32 — stacked block tables.
     pub unified_block_tables: Option<B::Buffer>,
+    /// Compact q4 tile list for opt-in vLLM-layout varlen attention tiling.
+    pub unified_tile_q4_seqs: Option<B::Buffer>,
+    pub unified_tile_q4_starts: Option<B::Buffer>,
     /// `[max_seqs, hidden]` — gather of last-token rows for lm_head.
     pub unified_packed_normed: Option<B::Buffer>,
     /// `[max_seqs, vocab]` — per-final-token logits from lm_head.
@@ -454,6 +457,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
             unified_cu_seqlens_q: None,
             unified_pos_offsets: None,
             unified_block_tables: None,
+            unified_tile_q4_seqs: None,
+            unified_tile_q4_starts: None,
             unified_packed_normed: None,
             unified_packed_logits: None,
         }
@@ -485,6 +490,14 @@ impl<B: QuantLlmBackend + BackendMoeFused> Qwen3MoeScratch<B> {
         self.unified_block_tables = Some(B::alloc_typed(
             ferrum_kernels::backend::Dtype::U32,
             max_seqs * max_blocks_per_seq,
+        ));
+        self.unified_tile_q4_seqs = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            self.max_tokens,
+        ));
+        self.unified_tile_q4_starts = Some(B::alloc_typed(
+            ferrum_kernels::backend::Dtype::U32,
+            self.max_tokens,
         ));
         self.unified_packed_normed = Some(B::alloc(max_seqs * h));
         self.unified_packed_logits = Some(B::alloc(max_seqs * v));

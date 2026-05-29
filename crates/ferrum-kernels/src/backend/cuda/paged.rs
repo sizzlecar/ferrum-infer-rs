@@ -1604,4 +1604,92 @@ impl BackendPagedKv for CudaBackend {
         .map(|_| ())
         .map_err(|e| FerrumError::model(format!("paged_varlen_attn_vllm: {e}")))
     }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention_vllm_tiled_q4(
+        ctx: &mut Self::Context,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        cu_seqlens_q: &Self::Buffer,
+        pos_offsets: &Self::Buffer,
+        block_tables: &Self::Buffer,
+        tile_seqs: &Self::Buffer,
+        tile_starts: &Self::Buffer,
+        num_tiles: usize,
+        max_kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if num_tiles == 0 {
+            return Ok(());
+        }
+
+        let func = ctx.func(
+            "paged_varlen_attn_vllm",
+            ptx::PAGED_VARLEN_ATTENTION_VLLM,
+            "paged_varlen_attn_vllm_tiled_q4_f16",
+        );
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+        let stream = ctx.stream.clone();
+        let shared_kv = std::env::var("FERRUM_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+            .max(max_kv_len)
+            .max(1);
+        let shared_bytes = (4 * shared_kv as u32) * 4;
+        if shared_bytes > 48 * 1024 {
+            let _ = func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_bytes as i32,
+            );
+        }
+
+        let qv = q.as_f16().slice(..);
+        let kp = k_pool.as_f16().slice(..);
+        let vp = v_pool.as_f16().slice(..);
+        let csq = cu_seqlens_q.as_u32().slice(..);
+        let po = pos_offsets.as_u32().slice(..);
+        let bt = block_tables.as_u32().slice(..);
+        let ts = tile_seqs.as_u32().slice(..);
+        let tst = tile_starts.as_u32().slice(..);
+        let nqi = num_heads as i32;
+        let nkvi = num_kv_heads as i32;
+        let hdi = head_dim as i32;
+        let mbps = max_num_blocks_per_seq as i32;
+        let bsi = block_size as i32;
+        let score_stride = shared_kv as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&qv);
+        b.arg(&kp);
+        b.arg(&vp);
+        b.arg(&csq);
+        b.arg(&po);
+        b.arg(&bt);
+        b.arg(&ts);
+        b.arg(&tst);
+        b.arg(out);
+        b.arg(&nqi);
+        b.arg(&nkvi);
+        b.arg(&hdi);
+        b.arg(&mbps);
+        b.arg(&bsi);
+        b.arg(&score_stride);
+        b.arg(&scale);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (num_heads as u32, num_tiles as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| FerrumError::model(format!("paged_varlen_attn_vllm_tiled_q4: {e}")))
+    }
 }

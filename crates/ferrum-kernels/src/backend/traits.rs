@@ -1601,6 +1601,35 @@ pub trait BackendPagedKv: Backend {
             "paged_varlen_attention_vllm not implemented for this backend",
         ))
     }
+
+    /// Q-tiled vLLM-layout varlen attention. `tile_seqs` and `tile_starts`
+    /// describe a compact list of q-token tiles, avoiding empty grid blocks
+    /// for mixed batches that contain both long prefill items and q_len=1
+    /// decode items. Semantics match [`Self::paged_varlen_attention_vllm`].
+    #[allow(clippy::too_many_arguments)]
+    fn paged_varlen_attention_vllm_tiled_q4(
+        _ctx: &mut Self::Context,
+        _q: &Self::Buffer,
+        _k_pool: &Self::Buffer,
+        _v_pool: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _tile_seqs: &Self::Buffer,
+        _tile_starts: &Self::Buffer,
+        _num_tiles: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _block_size: usize,
+        _max_num_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "paged_varlen_attention_vllm_tiled_q4 not implemented for this backend",
+        ))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
