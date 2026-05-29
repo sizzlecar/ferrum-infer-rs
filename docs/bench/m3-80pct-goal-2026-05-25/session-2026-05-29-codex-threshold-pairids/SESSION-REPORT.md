@@ -717,6 +717,7 @@ Primary artifacts:
 - `/workspace/m3-fa-layout-varlen-ab-20260529_git_n3/`
 - `/workspace/m3-fa-layout-varlen-ab-c16-20260529_git_n3/`
 - `/workspace/m3-fa-layout-varlen-ab-c4-20260529_git_n3/`
+- `/workspace/m3-fa-layout-tiled-q4-ab-c32-20260529_git_n1/`
 - `/workspace/m3-unified-greedy-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/`
@@ -780,6 +781,23 @@ memory use, and c32 is still far below the 0.80× target. The useful next step
 is not another env sweep; it is replacing the simple legacy-layout reader with
 a proper FlashAttention-style paged/varlen kernel or wrapper.
 
+Follow-up negative control: commit `0a1d99f` added a Q-tiled reader on the
+FA-compatible layout behind `FERRUM_FA_LAYOUT_VARLEN_TILED_Q4=1`. Remote build
+took `3m14s` with the CUDA cache path. Artifact
+`/workspace/m3-fa-layout-tiled-q4-ab-c32-20260529_git_n1/` passed Paris for all
+rows, but c32 N=1 measured:
+
+| row | throughput | ITL p95 |
+|---|---:|---:|
+| fa-layout tiled-q4 | `1346.3` | `98.7 ms` |
+| fa-layout | `1364.4` | `73.9 ms` |
+| default | `1297.0` | `86.9 ms` |
+
+The tiled reader was `-1.33%` versus plain FA-layout and worsened the tail, so
+the code was reverted in `128103d`. Do not repeat Q-only tiling on this layout;
+the next attention attempt needs real FlashAttention-style online softmax /
+tiled QK/V work or a proven wrapper.
+
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
@@ -802,7 +820,9 @@ primary lever. Do not default or N=3 the prefill-first admission experiment:
 it reduced `ITL p95` but only measured `+3.77%` at c32 N=1, worsened TTFT, and
 regressed with prompt-token estimate. Do not default or N=3
 `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=64` for throughput: it fixed much of the
-ITL tail but was throughput-flat and made TTFT about `3x` worse. The next
+ITL tail but was throughput-flat and made TTFT about `3x` worse. Do not repeat
+simple Q-only tiling on the FA-compatible layout; it regressed c32 N=1 by
+`1.33%` versus plain FA-layout. The next
 high-return loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
