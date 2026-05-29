@@ -83,10 +83,6 @@ fn vllm_varlen_tiled_q4_enabled() -> bool {
     std::env::var("FERRUM_VLLM_VARLEN_TILED_Q4").as_deref() == Ok("1")
 }
 
-fn fa_layout_varlen_flash_q8_enabled() -> bool {
-    std::env::var("FERRUM_FA_LAYOUT_VARLEN_FLASH_Q8").as_deref() == Ok("1")
-}
-
 fn unified_greedy_argmax_enabled() -> bool {
     std::env::var("FERRUM_GREEDY_ARGMAX").as_deref() == Ok("1")
         && std::env::var("FERRUM_UNIFIED_GREEDY_ARGMAX").map_or(true, |v| v != "0")
@@ -265,25 +261,19 @@ where
             B::write_typed::<u32>(&mut ctx, bt, &stacked);
         }
 
-        let use_fa_layout_varlen = self.use_vllm_paged_attn && fa_layout_varlen_enabled();
-        let use_fa_flash_q8 =
-            use_fa_layout_varlen && fa_layout_varlen_flash_q8_enabled() && m_total > num_seqs;
-        let use_vllm_tiled_q4 = self.use_vllm_paged_attn
-            && !use_fa_layout_varlen
-            && vllm_varlen_tiled_q4_enabled()
-            && m_total > num_seqs;
-        let tile_step = if use_fa_flash_q8 { 8 } else { 4 };
-        let mut tile_q_count = 0usize;
-        if use_fa_flash_q8 || use_vllm_tiled_q4 {
+        let use_vllm_tiled_q4 =
+            self.use_vllm_paged_attn && vllm_varlen_tiled_q4_enabled() && m_total > num_seqs;
+        let mut tile_q4_count = 0usize;
+        if use_vllm_tiled_q4 {
             let mut tile_seqs = Vec::with_capacity(m_total);
             let mut tile_starts = Vec::with_capacity(m_total);
             for (seq_idx, &q_len) in q_lens.iter().enumerate() {
-                for start in (0..q_len).step_by(tile_step) {
+                for start in (0..q_len).step_by(4) {
                     tile_seqs.push(seq_idx as u32);
                     tile_starts.push(start as u32);
                 }
             }
-            tile_q_count = tile_seqs.len();
+            tile_q4_count = tile_seqs.len();
             let tile_seqs_buf = self
                 .scratch
                 .unified_tile_q4_seqs
@@ -330,8 +320,7 @@ where
                 n_exp,
                 norm_topk_prob,
                 use_vllm_tiled_q4,
-                use_fa_flash_q8,
-                tile_q_count,
+                tile_q4_count,
                 layer_prof.as_mut(),
             );
         }
@@ -458,8 +447,7 @@ where
         n_exp: usize,
         norm_topk_prob: bool,
         use_vllm_tiled_q4: bool,
-        use_fa_flash_q8: bool,
-        tile_q_count: usize,
+        tile_q4_count: usize,
         mut prof: Option<&mut UnifiedLayerProfile>,
     ) {
         let attn_layer = &self.attn_layers[li];
@@ -623,57 +611,25 @@ where
             if self.use_vllm_paged_attn {
                 if let Some((fa_k_ptr, fa_v_ptr)) = fa_pool_ptr {
                     let (fa_pool_k, fa_pool_v) = unsafe { (&mut *fa_k_ptr, &mut *fa_v_ptr) };
-                    if use_fa_flash_q8 {
-                        let tile_seqs = self
-                            .scratch
-                            .unified_tile_q4_seqs
-                            .as_ref()
-                            .expect("unified_tile_q4_seqs missing");
-                        let tile_starts = self
-                            .scratch
-                            .unified_tile_q4_starts
-                            .as_ref()
-                            .expect("unified_tile_q4_starts missing");
-                        B::paged_varlen_attention_fa_flash_q8(
-                            ctx,
-                            &self.scratch.q_head_major,
-                            fa_pool_k,
-                            fa_pool_v,
-                            &mut self.scratch.attn_head_major_out,
-                            cu_seqlens_buf,
-                            pos_offsets_buf,
-                            bt_buf,
-                            tile_seqs,
-                            tile_starts,
-                            tile_q_count,
-                            nh,
-                            nkv,
-                            hd,
-                            block_size,
-                            max_blocks_per_seq,
-                        )
-                        .expect("Qwen3Moe unified: paged_varlen_attention_fa_flash_q8");
-                    } else {
-                        B::paged_varlen_attention(
-                            ctx,
-                            &self.scratch.q_head_major,
-                            fa_pool_k,
-                            fa_pool_v,
-                            &mut self.scratch.attn_head_major_out,
-                            cu_seqlens_buf,
-                            pos_offsets_buf,
-                            bt_buf,
-                            num_seqs,
-                            m_total,
-                            max_kv_len,
-                            nh,
-                            nkv,
-                            hd,
-                            block_size,
-                            max_blocks_per_seq,
-                        )
-                        .expect("Qwen3Moe unified: paged_varlen_attention fa-layout");
-                    }
+                    B::paged_varlen_attention(
+                        ctx,
+                        &self.scratch.q_head_major,
+                        fa_pool_k,
+                        fa_pool_v,
+                        &mut self.scratch.attn_head_major_out,
+                        cu_seqlens_buf,
+                        pos_offsets_buf,
+                        bt_buf,
+                        num_seqs,
+                        m_total,
+                        max_kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        block_size,
+                        max_blocks_per_seq,
+                    )
+                    .expect("Qwen3Moe unified: paged_varlen_attention fa-layout");
                 } else if use_vllm_tiled_q4 {
                     let tile_seqs = self
                         .scratch
@@ -696,7 +652,7 @@ where
                         bt_buf,
                         tile_seqs,
                         tile_starts,
-                        tile_q_count,
+                        tile_q4_count,
                         max_kv_len,
                         nh,
                         nkv,
