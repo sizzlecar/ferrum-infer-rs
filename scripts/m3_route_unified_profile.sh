@@ -102,6 +102,8 @@ env \
     FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS="$((CONCURRENCY * TOP_K))" \
     FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT="${FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT:-32}" \
     FERRUM_UNIFIED_POST_PROF=1 \
+    FERRUM_UNIFIED_LAYER_PROF=1 \
+    FERRUM_UNIFIED_LAYER_PROF_EVERY="${FERRUM_UNIFIED_LAYER_PROF_EVERY:-16}" \
     FERRUM_BATCH_DECODE_PROF=1 \
     FERRUM_NEXT_BATCH_PROF=1 \
     FERRUM_MOE_PROFILE=1 \
@@ -142,7 +144,7 @@ PY
     --out "$BENCH_JSON" \
     >"$BENCH_LOG" 2>&1
 
-grep -nE "MOE_DUMP|vllm-moe-config|unified-prof|iter-prof|bg-loop-gap|nb-prof|batched-decode-prof|bucket-prof" \
+grep -nE "MOE_DUMP|vllm-moe-config|unified-prof|unified-layer-prof|iter-prof|bg-loop-gap|nb-prof|batched-decode-prof|bucket-prof" \
     "$SERVER_LOG" >"$OUT_ROOT/profile_snippets.log" || true
 
 if ! grep -q "MOE_DUMP" "$OUT_ROOT/profile_snippets.log"; then
@@ -153,6 +155,12 @@ fi
 
 if ! grep -q "unified-prof" "$OUT_ROOT/profile_snippets.log"; then
     echo "missing unified-prof output; increase NUM_PROMPTS or RANDOM_OUTPUT_LEN" >&2
+    tail -200 "$SERVER_LOG" >&2 || true
+    exit 1
+fi
+
+if ! grep -q "unified-layer-prof" "$OUT_ROOT/profile_snippets.log"; then
+    echo "missing unified-layer-prof output; verify the binary includes FERRUM_UNIFIED_LAYER_PROF" >&2
     tail -200 "$SERVER_LOG" >&2 || true
     exit 1
 fi
@@ -196,12 +204,14 @@ def kvs(line):
 summary = {
     "moe_dump": [],
     "unified_prof": {},
+    "unified_layer_prof": {},
     "iter_prof": {},
     "batched_decode_prof": {},
     "bucket_prof": {},
     "vllm_moe_config": {},
 }
 unified = []
+unified_layer = []
 iters = []
 batched_decode = []
 buckets = []
@@ -210,6 +220,8 @@ configs = []
 for line in text:
     if "MOE_DUMP" in line and "batch_x_topk=" in line:
         summary["moe_dump"].append(kvs(line))
+    elif "unified-layer-prof" in line:
+        unified_layer.append(kvs(line))
     elif "unified-prof" in line:
         unified.append(kvs(line))
     elif "iter-prof" in line:
@@ -231,6 +243,7 @@ def med(rows, key):
 
 for name, rows, keys in [
     ("unified_prof", unified, ["total", "model", "decode_post", "sample", "sched", "stream", "stop", "complete"]),
+    ("unified_layer_prof", unified_layer, ["m", "seqs", "sampled", "layers", "layer_sum", "final_sum", "input_norm", "qkv", "split_cache", "attn", "o_proj", "post_norm", "router", "moe", "residual_add", "final_norm", "sample_gather", "lm_head", "readback"]),
     ("iter_prof", iters, ["total", "sched", "process", "batch_size"]),
     ("batched_decode_prof", batched_decode, ["m", "layers", "total", "dense", "attn_peritem", "moe", "route", "gate", "up", "silu", "down", "wsum", "other"]),
     ("bucket_prof", buckets, ["bk_total", "sync", "d2h", "host_route", "plan", "gather", "gemm1", "silu", "gemm3", "combine"]),
@@ -254,6 +267,13 @@ if batched_decode:
         value = summary["batched_decode_prof"].get(f"{key}_median")
         if value is not None and total:
             summary["batched_decode_prof"][f"{key}_share"] = value / total
+
+if unified_layer:
+    layer_sum = summary["unified_layer_prof"].get("layer_sum_median")
+    for key in ["input_norm", "qkv", "split_cache", "attn", "o_proj", "post_norm", "router", "moe", "residual_add"]:
+        value = summary["unified_layer_prof"].get(f"{key}_median")
+        if value is not None and layer_sum:
+            summary["unified_layer_prof"][f"{key}_share"] = value / layer_sum
 
 if buckets:
     gemm1 = summary["bucket_prof"].get("gemm1_median")
