@@ -454,6 +454,20 @@ Continuation after pod restore:
   `TTFT p50=603 ms`. This is below the default-worthy gain threshold and
   worsens TTFT, so keep the feature opt-in and do not pursue scheduler env
   sweeps without a new occupancy profile.
+- Unified chunked prefill was tested as a targeted vLLM-scheduler parity
+  candidate and reverted. The patch added opt-in
+  `FERRUM_UNIFIED_CHUNKED_PREFILL=64` so unified prefill requests were scheduled
+  and executed in 64-token chunks with non-final chunks skipping sampling.
+  This was meant to reduce mixed prefill/decode ITL tails, not to change Marlin
+  GEMM. The same-binary c32 N=1 artifact
+  `/workspace/m3-unified-chunked-prefill-ab-20260529_094117/` passed Paris for
+  both rows. `chunk64` measured `1219.9 tok/s`, `TPOT p50=18.27 ms`,
+  `ITL p50=15.05 ms`, `ITL p95=45.2 ms`, `TTFT p50=991 ms`; default measured
+  `1232.6 tok/s`, `TPOT p50=22.62 ms`, `ITL p50=15.24 ms`,
+  `ITL p95=98.7 ms`, `TTFT p50=391 ms`. The candidate improved tail metrics
+  but lost `1.03%` throughput and nearly tripled TTFT, so it failed the c32
+  smoke gate and was not promoted to N=3. Do not repeat chunk64 or chunk-size
+  sweeps unless a new admission/fill design can cap the TTFT cost.
 
 Primary artifacts:
 
@@ -487,6 +501,7 @@ Primary artifacts:
 - `/workspace/m3-admin/ferrum-raw-marlin-active65-20260529_085145.json`
 - `/workspace/m3-graph-prod-profile-20260529_085701/`
 - `/workspace/m3-sched-prompt-est-ab-20260529_090018/`
+- `/workspace/m3-unified-chunked-prefill-ab-20260529_094117/`
 
 ## Current target status
 
@@ -508,9 +523,10 @@ Use the ratios below as directional only until vLLM is rerun with
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
 split-K scheduler-only parity, block8-only testing, block-size-only vLLM raw-op
 probes, forcing Marlin `128x128,bps=1`, graph-pre-sync removal, Marlin
-source/body parity without new raw-op evidence, or `FERRUM_MAX_BATCHED_TOKENS=4096`
-as a standalone lever. The next high-return loop should target full-model time
-directly:
+source/body parity without new raw-op evidence,
+`FERRUM_UNIFIED_CHUNKED_PREFILL=64`, chunk-size-only prefill sweeps, or
+`FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. The next high-return
+loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;
