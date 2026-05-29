@@ -813,12 +813,15 @@ impl EngineInner {
             };
             let num_tokens = input_tokens.len();
             let kv_handle = unified.items[i].kv_cache.clone();
-            // Store in prefix cache (best-effort).
-            let _ = self.prefix_cache.store_prefix(
-                &input_tokens,
-                kv_handle.clone(),
-                logits_vec.clone(),
-            );
+            if !skip_prefix_cache && logits_vec.len() > 1 {
+                // Store in prefix cache (best-effort). Greedy-argmax results
+                // are single-token sentinels, not reusable full logits.
+                let _ = self.prefix_cache.store_prefix(
+                    &input_tokens,
+                    kv_handle.clone(),
+                    logits_vec.clone(),
+                );
+            }
             let first_token = {
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(&rid) else {
@@ -828,7 +831,11 @@ impl EngineInner {
                     jp.reset();
                 }
                 let mut logits = logits_vec;
-                let token = seq.sample_with_processors(&mut logits)?;
+                let token = if logits.len() == 1 {
+                    TokenId::new(logits[0] as u32)
+                } else {
+                    seq.sample_with_processors(&mut logits)?
+                };
                 seq.generated_tokens.push(token);
                 seq.model_cache_id = Some(kv_handle.cache_id());
                 seq.kv_cache = Some(kv_handle);
