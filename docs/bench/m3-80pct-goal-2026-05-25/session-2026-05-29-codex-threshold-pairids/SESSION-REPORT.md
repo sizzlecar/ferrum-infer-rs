@@ -624,6 +624,31 @@ Continuation after pod restore:
   `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/` regressed
   slightly: prefill-first `1267.0 tok/s` versus default `1274.4 tok/s`
   (`-0.58%`). Do not default it or spend N=3 time without a stronger signal.
+- Clean Git-flow graph-on runtime profile
+  `/workspace/m3-graph-runtime-profile-20260529_git_n1/` passed Paris and
+  measured c32 N=1 `1309.3 tok/s`, `TPOT p50=21.17 ms`, `ITL p50=15.12 ms`,
+  `ITL p95=117.9 ms`, `TTFT p50=360 ms`. Full-ish `items>=31` snippets had
+  iteration median `14.9 ms`, model median `14.0 ms`, decode-post median
+  `0.61 ms`; graph replay median was `13.16 ms` with upload+launch only
+  `~0.35 ms`. This rules out graph upload/launch, scheduler calls, and
+  postprocess as the standalone c32 20%+ throughput gap. The visible gap is
+  fill/mixed-prefill tail behavior plus remaining model work.
+- Active-decode-only prefill chunking was added as an opt-in experiment:
+  `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=64` keeps initial empty-queue prefills
+  full-size but chunks prefills admitted while decode is already active. Local
+  gates passed: `cargo fmt --all -- --check`, `git diff --check`,
+  `cargo check -q -p ferrum-engine`, `cargo test -q -p ferrum-scheduler`,
+  `cargo test -q -p ferrum-engine --test continuous_batch_test`, and
+  `cargo test -q -p ferrum-engine --test chunked_prefill_test`. Remote Rust
+  release build took `2m56s` with no nvcc. Same-binary c32 N=1
+  `/workspace/m3-active-prefill-chunk-ab-20260529_git_n1/` passed Paris for
+  both rows: active chunk measured `1305.0 tok/s`, `TPOT p50=15.87 ms`,
+  `ITL p50=14.60 ms`, `ITL p95=31.03 ms`, `TTFT p50=1065 ms`; default measured
+  `1304.3 tok/s`, `TPOT p50=21.19 ms`, `ITL p50=15.04 ms`,
+  `ITL p95=116.11 ms`, `TTFT p50=362 ms`. This is tail-latency evidence, not
+  a throughput lever: throughput was flat and TTFT worsened badly. Keep it
+  opt-in only; do not default or N=3 it for the M3 throughput goal unless a new
+  admission policy bounds TTFT and improves tok/s.
 
 Primary artifacts:
 
@@ -678,6 +703,8 @@ Primary artifacts:
 - `/workspace/m3-prefill-first-ab-20260529_git_n1/`
 - `/workspace/m3-prefill-first-prompt-est-ab-20260529_git_n1/`
 - `/workspace/m3-greedy-prefill-fix-smoke-20260529_git_n1/`
+- `/workspace/m3-graph-runtime-profile-20260529_git_n1/`
+- `/workspace/m3-active-prefill-chunk-ab-20260529_git_n1/`
 
 ## Current target status
 
@@ -695,7 +722,8 @@ Use the ratios below as directional only until vLLM is rerun with
   candidate only reached `1274.7 ± 33.9` and was reverted; simple Q-tiled
   varlen attention was only `+0.41%` at c32 N=1, and unified GPU argmax was
   only `+0.97%` at c32 N=1. Prefill-first admission was only `+3.77%` at c32
-  N=1 and regressed when combined with prompt-token estimate. On the
+  N=1 and regressed when combined with prompt-token estimate. Active-decode
+  prefill chunking flattened throughput while worsening TTFT. On the
   conservative row c32 still needs roughly `+21%` throughput to clear 0.80× on
   this pod.
 
@@ -719,8 +747,10 @@ graph capture; it regressed c32 N=1 by `3.82%`. Unified GPU argmax is already
 committed as a cleanup but only measured `+0.97%` at c32 N=1, so it is not a
 primary lever. Do not default or N=3 the prefill-first admission experiment:
 it reduced `ITL p95` but only measured `+3.77%` at c32 N=1, worsened TTFT, and
-regressed with prompt-token estimate. The next high-return loop should target
-full-model time directly:
+regressed with prompt-token estimate. Do not default or N=3
+`FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=64` for throughput: it fixed much of the
+ITL tail but was throughput-flat and made TTFT about `3x` worse. The next
+high-return loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
    pod before making new performance claims;

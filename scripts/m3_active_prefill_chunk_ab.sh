@@ -186,7 +186,7 @@ rows = {}
 for path in sorted(root.glob("*_c*_n*/bench.json")):
     data = json.load(open(path))
     throughput = data.get("output_throughput_tps") or {}
-    name = path.parent.name.split("_c", 1)[0]
+    name = path.parent.name.rsplit("_c", 1)[0]
     rows[name] = (throughput.get("mean", data.get("output_throughput")), throughput.get("ci95_hw"))
 for name in sorted(rows):
     mean, ci95 = rows[name]
