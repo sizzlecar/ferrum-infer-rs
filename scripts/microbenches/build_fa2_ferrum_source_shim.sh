@@ -61,6 +61,16 @@ fi
 STUB_DIR="$BUILD_DIR/stubs"
 mkdir -p "$STUB_DIR/ATen/cuda/detail" "$STUB_DIR/c10/cuda" "$(dirname "$OUT_SO")"
 
+cat > "$STUB_DIR/ferrum_fa2_prelude.h" <<'HDR'
+#pragma once
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
+#include <tuple>
+HDR
+
 cat > "$STUB_DIR/ATen/cuda/CUDAGeneratorImpl.h" <<'HDR'
 #pragma once
 #include <cstdint>
@@ -112,10 +122,10 @@ cat > "$STUB_DIR/c10/cuda/CUDAException.h" <<'HDR'
 
 #define C10_CUDA_CHECK(EXPR)                                                   \
     do {                                                                       \
-        cudaError_t status_ = (EXPR);                                          \
-        if (status_ != cudaSuccess) {                                          \
+        cudaError_t ferrum_cuda_status_ = (EXPR);                              \
+        if (ferrum_cuda_status_ != cudaSuccess) {                              \
             std::fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__,        \
-                         __LINE__, cudaGetErrorString(status_));              \
+                         __LINE__, cudaGetErrorString(ferrum_cuda_status_));   \
             std::abort();                                                      \
         }                                                                      \
     } while (0)
@@ -137,6 +147,7 @@ COMMON_FLAGS=(
   "-I$FA_SRC_DIR/csrc/flash_attn/src"
   "-I$CUTLASS_INCLUDE_DIR"
   "-I$CUDA_ROOT/include"
+  "-include=$STUB_DIR/ferrum_fa2_prelude.h"
 )
 
 SOURCES=(
