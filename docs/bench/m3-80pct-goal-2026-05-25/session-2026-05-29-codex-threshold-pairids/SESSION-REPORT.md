@@ -818,6 +818,28 @@ reverted in `2cce5ab` / `7e7404a`. Do not repeat one-block-per-head Q8
 online-softmax tiling; the next attempt needs a proven FA2 wrapper or a
 substantially different kernel design.
 
+Direct FA2 FFI feasibility checkpoint: commits `1c86c21` / `22226d0` added
+`scripts/microbenches/fa2_direct_ffi_probe.cpp`. The probe fills
+`Flash_fwd_params` directly and calls the `flash::run_mha_fwd` symbol exported
+by vLLM's `_vllm_fa2_C.abi3.so`, bypassing Python and `torch.ops`.
+
+Artifact: `/workspace/m3-fa2-direct-ffi-probe-20260530.log`.
+
+| shape | direct FFI avg |
+|---|---:|
+| `prefill_4x256` | `40.16 us` |
+| `mixed_3x256_4x1` | `48.02 us` |
+| `prefill_4x512` | `109.46 us` |
+
+This matches the earlier Python `flash_attn_varlen_func` probe and produced
+finite output, so the raw FA2 wrapper path is performance-feasible. It is not a
+clean Ferrum dependency yet: the existing vLLM FA2 `.so` is still a Python/Torch
+extension, so the probe links `libtorch` and `libpython`, and the link step warns
+about Torch's `libcudart.so.12` versus the FA2 extension's `libcudart.so.13`.
+The next attention implementation should be an opt-in C-ABI/dynamic shim around
+this proven path or a clean source-built FA2 wrapper, followed by Paris and
+same-pod c32 A/B. Do not write another approximate one-block/tiled reader first.
+
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
@@ -855,9 +877,9 @@ high-return loop should target full-model time directly:
    `+2.8%` and worsens TTFT;
 4. before another scheduler change, the next profile should explain end-to-end
    occupancy/fill gaps and mixed-prefill attention cost (batch-size over time,
-   warmup/non-warmup separation, streaming backpressure, and whether a proper
-   FA-style paged/varlen prefill attention kernel can replace the simple
-   reader now validated by `FERRUM_FA_LAYOUT_VARLEN=1`);
+   warmup/non-warmup separation, streaming backpressure, and how to wire the
+   now-proven direct FA2 FFI path behind an opt-in C ABI without making the
+   default build depend on Python/Torch);
 5. for kernel work, skip source parity unless a new raw-op mismatch appears;
    the remaining high-upside kernel path is a genuinely fused small-M MoE design;
 6. reduce CUDA iteration waste before another `.cu` experiment by adding
