@@ -524,6 +524,20 @@ Continuation after pod restore:
   the rebuild showed no Marlin/MoE-Marlin `nvcc`/`cicc`/`ptxas` work. This is
   not a throughput claim; it removes the worst unrelated CUDA rebuild cost
   before the next tiled varlen prefill-attention kernel experiment.
+- The first post-cache attention experiment was a negative control. A scoped
+  `FERRUM_VLLM_VARLEN_TILED_V=1` candidate changed only the weighted-V phase of
+  `paged_varlen_attn_vllm_f16`: after the existing QK/softmax work it loaded
+  vLLM-layout V as 16-slot tiles and reduced per head dimension from shared
+  memory. The candidate built in `196s` with the new build-cache path and
+  passed Paris, but same-binary c32 N=1 artifact
+  `/workspace/m3-vllm-varlen-tiled-v-ab-20260529_115504/` regressed. Tiled-V
+  measured `1165.0 tok/s`, `TPOT p50=23.88 ms`, `ITL p95=133.58 ms`,
+  `TTFT p50=458 ms`; default measured `1219.6 tok/s`, `TPOT p50=22.83 ms`,
+  `ITL p95=120.40 ms`, `TTFT p50=392 ms`. The code was reverted. Do not repeat
+  V-stage-only tiling; it adds shared-memory/barrier overhead without fixing the
+  real QK/V reuse problem. A future attention lever needs a full Q/K/V tiled
+  FlashAttention-style varlen design or a standalone microbench showing the
+  intended kernel wins before full-model testing.
 
 Primary artifacts:
 
@@ -566,6 +580,9 @@ Primary artifacts:
 - `/workspace/m3-build-cache-touch-attn-20260529.log`
 - `/workspace/m3-build-cache-final-vv-20260529.log`
 - `/workspace/m3-build-cache-contenthash-final-vv-20260529.log`
+- `/workspace/m3-unified-trace-c32-20260529_114549/`
+- `/workspace/m3-varlen-tiled-v-build-20260529.log`
+- `/workspace/m3-vllm-varlen-tiled-v-ab-20260529_115504/`
 
 ## Current target status
 
@@ -591,7 +608,9 @@ source/body parity without new raw-op evidence,
 `FERRUM_UNIFIED_CHUNKED_PREFILL=64`, chunk-size-only prefill sweeps, or
 `FERRUM_MAX_BATCHED_TOKENS=4096` as a standalone lever. Also do not repeat the
 two-phase `FERRUM_VLLM_VARLEN_SPLIT_K=1` wrapper; it passed Paris but regressed
-c32 throughput by `6.06%`. The next high-return
+c32 throughput by `6.06%`. Do not repeat simple vLLM-layout weighted-V tiling;
+`FERRUM_VLLM_VARLEN_TILED_V=1` passed Paris but regressed c32 N=1 by about
+`4.5%`. The next high-return
 loop should target full-model time directly:
 
 1. keep using the restored GPU pod if available; otherwise restore a 48GB-class
