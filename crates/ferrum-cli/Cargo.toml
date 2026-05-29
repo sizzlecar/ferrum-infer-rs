@@ -95,6 +95,7 @@ marlin = ["cuda"]  # backward compat alias
 vllm-marlin = ["cuda", "ferrum-kernels/vllm-marlin"]  # Phase 12 — vLLM gptq_marlin port (opt-in)
 vllm-moe-marlin = ["cuda", "ferrum-kernels/vllm-moe-marlin"]  # Stage 14 — vLLM marlin_moe_wna16 port (opt-in)
 vllm-paged-attn-v2 = ["cuda", "ferrum-kernels/vllm-paged-attn-v2"]  # 2026-05-12 — vLLM paged_attention_v2 port (opt-in, runtime-gated via FERRUM_USE_VLLM_PAGED_ATTN=1)
+fa2-source = ["cuda", "ferrum-kernels/fa2-source"]  # Source-built FA2 paged-varlen bridge (opt-in, runtime-gated via FERRUM_FA2_SOURCE=1)
 tensor-parallel = ["cuda"]  # backward compat alias
 # Triton-rs PTX path swap for the LLM decode kernels. Requires cuda.
 triton-kernels = ["cuda", "ferrum-engine/triton-kernels"]
