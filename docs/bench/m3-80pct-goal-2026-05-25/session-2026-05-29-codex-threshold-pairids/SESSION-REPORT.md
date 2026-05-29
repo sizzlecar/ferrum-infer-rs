@@ -980,6 +980,17 @@ runtime shim dependency for the tested path, but it is still opt-in and not
 final/default: only c32 N=1 was run, FA2/CUTLASS is still a build-time external
 source checkout, and all-cell N>=3/N=5 confirmation remains pending.
 
+Stopped all-cell source-linked FA2 validation: commit `e07051f` added
+`scripts/m3_fa2_source_allcells_ab.sh`, a thin wrapper that runs the existing
+FA2 A/B script for c=1/4/16/32 and aggregates the rows. Remote partial artifact
+`/workspace/m3-fa2-source-allcells-n3-20260529_192908/` was stopped at user
+request during the c=4 source row. Only c=1 completed: source-linked FA2
+`160.45 ± 0.28 tok/s` versus FA-layout `160.73 ± 0.63` (`-0.17%`, effectively
+flat), about `0.872×` of same-pod vLLM c1 `183.9`. Treat this as c=1
+no-regression evidence only, not an all-cell performance or completion claim.
+Remote wrapper, cell runner, server, and bench processes were stopped cleanly;
+GPU returned to idle.
+
 ## Next lever
 
 Do not repeat env sweeps, the partial Marlin scheduling backport, DP + two-tile
