@@ -24,6 +24,8 @@
 #endif
 
 #include "kernel.h"
+#include <cstdio>
+#include <cstdlib>
 // vendored for ferrum-infer-rs: original file pulled in core/registration.h
 // for the torch op binding (TORCH_LIBRARY_IMPL_EXPAND). We don't link torch.
 // #include "core/registration.h"
@@ -156,14 +158,16 @@ thread_config_t small_batch_thread_configs[] = {
 
     // thread_k, thread_n, num_threads
     {128, 128, 256},
-    {64, 128, 128}};
+    {64, 128, 128},
+    {128, 64, 128}};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
     {64, 256, 256},
-    {64, 128, 128}};
+    {64, 128, 128},
+    {128, 64, 128}};
 
 typedef struct {
   int blocks_per_sm;
@@ -214,7 +218,7 @@ int get_kernel_cache_size(thread_config_t const& th_config, bool m_block_size_8,
 
   // shm size for block_sorted_ids/rd_block_sorted_ids/block_topk_weights
   // both of them requires tb_m * 4 bytes (tb_m * int32 or tb_m * float32)
-  int sh_block_meta_size = tb_m * 4;
+  int sh_block_meta_size = tb_m * 16;
   int sh_a_size = pipe_stages * (tb_m * tb_k) * 2;
   int sh_b_size = pipe_stages * (tb_k * tb_n / pack_factor) * 4;
   int sh_red_size = tb_m * (tb_n + 8) * 2;
@@ -329,8 +333,10 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define COMMON_GET_IF(W_TYPE)            \
     COMMON_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     COMMON_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+    COMMON_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     COMMON_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)
+    COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+    COMMON_GET_IF_M234(W_TYPE, 4, 8, 128)
 
   #define BIGGROUP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
     _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
@@ -349,8 +355,10 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define BIGGROUP_GET_IF(W_TYPE)            \
     BIGGROUP_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     BIGGROUP_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+    BIGGROUP_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     BIGGROUP_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)
+    BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+    BIGGROUP_GET_IF_M234(W_TYPE, 4, 8, 128)
 
   #define NVFP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
     _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 1, NUM_THREADS, false) \
@@ -364,8 +372,10 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define NVFP4_GET_IF(W_TYPE)            \
     NVFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     NVFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+    NVFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     NVFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    NVFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
+    NVFP4_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+    NVFP4_GET_IF_M234(W_TYPE, 4, 8, 128)
 
   #define MXFP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
     _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false) \
@@ -379,8 +389,10 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define MXFP4_GET_IF(W_TYPE)            \
     MXFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     MXFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+    MXFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     MXFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
+    MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+    MXFP4_GET_IF_M234(W_TYPE, 4, 8, 128)
 
   // We currently have 4-bit models only with group_blocks == 4
   #define FZP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
@@ -395,8 +407,10 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define FZP_GET_IF(W_TYPE)            \
     FZP_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     FZP_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+    FZP_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     FZP_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    FZP_GET_IF_M234(W_TYPE, 8, 4, 128)
+    FZP_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+    FZP_GET_IF_M234(W_TYPE, 4, 8, 128)
 
   // We currently have 4-bit models only with group_blocks == 4
   #define ACT_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)        \
@@ -411,8 +425,10 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   #define ACT_GET_IF(W_TYPE)            \
     ACT_GET_IF_M1(W_TYPE, 8, 8, 256)    \
     ACT_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+    ACT_GET_IF_M1(W_TYPE, 4, 8, 128)    \
     ACT_GET_IF_M234(W_TYPE, 16, 4, 256) \
-    ACT_GET_IF_M234(W_TYPE, 8, 4, 128)
+    ACT_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+    ACT_GET_IF_M234(W_TYPE, 4, 8, 128)
 
 template <typename scalar_t>
 MarlinFuncPtr get_marlin_kernel(const vllm::ScalarType q_type,
@@ -453,11 +469,12 @@ MarlinFuncPtr get_marlin_kernel(const vllm::ScalarType q_type,
 
 template <typename scalar_t>
 exec_config_t determine_exec_config(const vllm::ScalarType& q_type, int prob_m,
-                                    int prob_n, int prob_k, int thread_m_blocks,
-                                    bool m_block_size_8, int num_bits,
-                                    int group_size, bool has_act_order,
-                                    bool is_k_full, bool has_zp,
-                                    bool is_zp_float, int max_shared_mem) {
+                                    int prob_n, int prob_k, int top_k,
+                                    int thread_m_blocks, bool m_block_size_8,
+                                    int num_bits, int group_size,
+                                    bool has_act_order, bool is_k_full,
+                                    bool has_zp, bool is_zp_float,
+                                    int max_shared_mem, int sms) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
@@ -474,7 +491,7 @@ exec_config_t determine_exec_config(const vllm::ScalarType& q_type, int prob_m,
 
     if (!is_valid_config(th_config, m_block_size_8, thread_m_blocks, prob_m,
                          prob_n, prob_k, num_bits, group_size, has_act_order,
-                         is_k_full, has_zp, is_zp_float, max_shared_mem)) {
+                         is_k_full, has_zp, is_zp_float, max_shared_mem - 512)) {
       continue;
     }
 
@@ -494,21 +511,25 @@ exec_config_t determine_exec_config(const vllm::ScalarType& q_type, int prob_m,
 
     if (kernel == MarlinDefault) continue;
 
-    if (thread_m_blocks > 1) {
-      exec_cfg = {1, th_config};
-      break;
-    } else {
-      cudaFuncAttributes attr;
-      cudaFuncGetAttributes(&attr, kernel);
-      int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
-      int allow_count = min(device_max_reg_size / reg_size,
-                            max_shared_mem / (cache_size + 1024));
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, kernel);
+    int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
+    int allow_count = min(device_max_reg_size / reg_size,
+                          max_shared_mem / (cache_size + 1536));
+    if (thread_m_blocks == 1)
       allow_count = max(min(allow_count, 4), 1);
-      if (allow_count > count) {
-        count = allow_count;
-        exec_cfg = {count, th_config};
-      };
+    else
+      allow_count = max(min(allow_count, 2), 1);
+
+    if (prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
+      allow_count =
+          max(prob_n / th_config.thread_n * prob_m * top_k * 4 / sms, 1);
     }
+
+    if (allow_count > count) {
+      count = allow_count;
+      exec_cfg = {count, th_config};
+    };
   }
 
   return exec_cfg;
@@ -524,8 +545,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                vllm::ScalarType const& q_type, bool has_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
-               int thread_n, int sms, bool use_atomic_add, bool use_fp32_reduce,
-               bool is_zp_float) {
+               int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
+               bool use_fp32_reduce, bool is_zp_float) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
 
@@ -625,8 +646,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
   if (thread_k != -1 && thread_n != -1) {
-    thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
-    exec_cfg = exec_config_t{1, thread_tfg};
+    thread_tfg =
+        thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
+    if (blocks_per_sm == -1) blocks_per_sm = 1;
+    exec_cfg = exec_config_t{blocks_per_sm, thread_tfg};
     TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                 " is not divisible by thread_n = ", thread_n);
     TORCH_CHECK(prob_k % thread_k == 0, "prob_k = ", prob_k,
@@ -634,9 +657,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   } else {
     // Auto config
     exec_cfg = determine_exec_config<scalar_t>(
-        q_type, prob_m, prob_n, prob_k, thread_m_blocks, m_block_size_8,
-        num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float,
-        max_shared_mem);
+        q_type, prob_m, prob_n, prob_k, top_k, thread_m_blocks,
+        m_block_size_8, num_bits, group_size, has_act_order, is_k_full, has_zp,
+        is_zp_float, max_shared_mem, sms);
+    if (blocks_per_sm != -1) exec_cfg.blocks_per_sm = blocks_per_sm;
     thread_tfg = exec_cfg.tb_cfg;
   }
 
@@ -666,6 +690,23 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   auto kernel = get_marlin_kernel<scalar_t>(
       q_type, thread_m_blocks, thread_n_blocks, thread_k_blocks, m_block_size_8,
       has_act_order, has_zp, group_blocks, num_threads, is_zp_float);
+
+  if (std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG") != nullptr) {
+    static int log_count = 0;
+    if (log_count < 64) {
+      int sh_cache_size = get_kernel_cache_size(
+          thread_tfg, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
+          num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float);
+      std::fprintf(stderr,
+                   "[vllm-moe-config] prob_m=%d prob_n=%d prob_k=%d "
+                   "block=%d top_k=%d thread_k=%d thread_n=%d threads=%d "
+                   "blocks_per_sm=%d sh_cache=%d max_shared=%d\n",
+                   prob_m, prob_n, prob_k, moe_block_size, top_k, thread_k,
+                   thread_n, num_threads, exec_cfg.blocks_per_sm,
+                   sh_cache_size, max_shared_mem);
+      log_count++;
+    }
+  }
 
   if (kernel == MarlinDefault) {
     TORCH_CHECK(false, "Unsupported shapes: MNK = [", prob_m, ", ", prob_n,
@@ -734,6 +775,23 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
   // that here since our extern C entry point bypasses the wrapper.
   int sms = -1;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  int force_thread_k = -1;
+  int force_thread_n = -1;
+  int force_blocks_per_sm = -1;
+  if (const char* v = std::getenv("FERRUM_VLLM_MOE_THREAD_K")) {
+    force_thread_k = std::atoi(v);
+  }
+  if (const char* v = std::getenv("FERRUM_VLLM_MOE_THREAD_N")) {
+    force_thread_n = std::atoi(v);
+  }
+  if (force_thread_k <= 0 || force_thread_n <= 0) {
+    force_thread_k = -1;
+    force_thread_n = -1;
+  }
+  if (const char* v = std::getenv("FERRUM_VLLM_MOE_BLOCKS_PER_SM")) {
+    force_blocks_per_sm = std::atoi(v);
+    if (force_blocks_per_sm <= 0) force_blocks_per_sm = -1;
+  }
   MARLIN_NAMESPACE_NAME::marlin_mm<half>(
       A, B, C, C_tmp,
       /*b_bias=*/nullptr,
@@ -756,7 +814,7 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
       /*is_k_full=*/true,
       /*has_zp=*/false,
       num_groups, group_size, dev, stream,
-      /*thread_k=*/-1, /*thread_n=*/-1, sms,
+      force_thread_k, force_thread_n, sms, force_blocks_per_sm,
       use_atomic_add != 0, use_fp32_reduce != 0,
       /*is_zp_float=*/false);
   // marlin_mm aborts on bad inputs; if we reach here the launch was issued.
