@@ -5,9 +5,11 @@ opt-in Ferrum FA2 direct FFI path:
 
 ```text
 FERRUM_FA_LAYOUT_VARLEN=1
-FERRUM_FA2_DIRECT_FFI=1
 FERRUM_FA2_DIRECT_FFI_SHIM=/workspace/libferrum_fa2_shim.so
 ```
+
+As of the follow-up checkpoint, `FERRUM_FA2_DIRECT_FFI_SHIM` alone enables the
+direct path; `FERRUM_FA2_DIRECT_FFI=0` forces it off.
 
 Workload: `Qwen/Qwen3-30B-A3B-GPTQ-Int4`, random `256/128`, 128 prompts,
 10 warmup requests, closed-loop `c=1/4/16/32`, RTX 4090 locked clocks.

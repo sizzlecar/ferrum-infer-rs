@@ -515,7 +515,7 @@ where
             let pools = self
                 .paged_fa_pools
                 .as_mut()
-                .expect("FERRUM_FA_LAYOUT_VARLEN=1 requires paged_fa_pools");
+                .expect("FA-layout varlen or FA2 direct FFI requires paged_fa_pools");
             Some((
                 &mut pools[li].0 as *mut B::Buffer,
                 &mut pools[li].1 as *mut B::Buffer,

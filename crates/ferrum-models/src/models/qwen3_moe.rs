@@ -123,7 +123,12 @@ pub(crate) fn fa_layout_varlen_enabled() -> bool {
 }
 
 pub(crate) fn fa2_direct_ffi_enabled() -> bool {
-    std::env::var("FERRUM_FA2_DIRECT_FFI").as_deref() == Ok("1")
+    match std::env::var("FERRUM_FA2_DIRECT_FFI").as_deref() {
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("off") | Ok("OFF") => false,
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("on") | Ok("ON") => true,
+        Ok(_) => true,
+        Err(_) => std::env::var_os("FERRUM_FA2_DIRECT_FFI_SHIM").is_some(),
+    }
 }
 
 /// Per-layer MoE state: router linear (small) + per-expert MLP stack.

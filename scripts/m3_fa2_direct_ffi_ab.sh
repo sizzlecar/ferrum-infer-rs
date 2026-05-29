@@ -3,7 +3,7 @@
 # Scoped M3 A/B for the opt-in vLLM FlashAttention-2 direct FFI path.
 #
 # Compares:
-#   fa2_direct: FERRUM_FA2_DIRECT_FFI=1, calling the out-of-tree C ABI shim
+#   fa2_direct: FERRUM_FA2_DIRECT_FFI_SHIM points at the C ABI shim
 #   fa_layout : existing FA-compatible KV layout with Ferrum's own varlen reader
 #
 # Usage on a GPU pod from the repo root:
@@ -184,7 +184,6 @@ PY
 
 run_case fa2_direct "$PORT_BASE" \
     FERRUM_FA_LAYOUT_VARLEN=1 \
-    FERRUM_FA2_DIRECT_FFI=1 \
     FERRUM_FA2_DIRECT_FFI_SHIM="$FA2_SHIM"
 run_case fa_layout "$((PORT_BASE + 1))" \
     FERRUM_FA_LAYOUT_VARLEN=1 \

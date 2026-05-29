@@ -2,8 +2,9 @@
 //!
 //! This is an opt-in bridge for benchmarking against the exact FA2 paged-KV
 //! runner that vLLM uses. The heavy Python/Torch extension dependencies stay
-//! outside Ferrum's normal link path: tests set `FERRUM_FA2_DIRECT_FFI_SHIM`
-//! to a small C ABI `.so`, and this module resolves it with `dlopen`.
+//! outside Ferrum's normal link path: setting `FERRUM_FA2_DIRECT_FFI_SHIM`
+//! to a small C ABI `.so` enables the path, and this module resolves it with
+//! `dlopen`.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::Arc;
@@ -69,7 +70,7 @@ fn dl_error_string() -> String {
 fn load_fa2_shim() -> Result<Fa2Shim> {
     let path = std::env::var("FERRUM_FA2_DIRECT_FFI_SHIM").map_err(|_| {
         FerrumError::unsupported(
-            "FERRUM_FA2_DIRECT_FFI=1 requires FERRUM_FA2_DIRECT_FFI_SHIM=/path/libferrum_fa2_shim.so",
+            "FA2 direct FFI requires FERRUM_FA2_DIRECT_FFI_SHIM=/path/libferrum_fa2_shim.so",
         )
     })?;
     let c_path = CString::new(path.clone()).map_err(|_| {
