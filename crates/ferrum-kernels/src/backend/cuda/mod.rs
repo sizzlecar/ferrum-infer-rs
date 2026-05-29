@@ -44,6 +44,8 @@
 // stream/decode-state slots + `KvFp16` BackendKvDtype impl.
 pub mod collective;
 pub mod fa2_ffi;
+#[cfg(feature = "fa2-source")]
+pub mod fa2_source;
 pub mod graph;
 pub mod int8_kv;
 pub mod moe;

@@ -793,6 +793,30 @@ impl BackendPagedKv for CudaBackend {
         block_size: usize,
         max_blocks_per_seq: usize,
     ) -> Result<()> {
+        #[cfg(feature = "fa2-source")]
+        if std::env::var("FERRUM_FA2_SOURCE").as_deref() == Ok("1") {
+            return super::fa2_source::paged_varlen_attention_fa2_source(
+                &ctx.stream,
+                q.as_f16(),
+                k_pool.as_f16(),
+                v_pool.as_f16(),
+                out.as_f16_mut(),
+                lse.as_f32_mut(),
+                cu_seqlens_q.as_u32(),
+                seq_lens.as_u32(),
+                block_tables.as_u32(),
+                num_seqs,
+                total_q_tokens,
+                max_q_len,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_blocks_per_seq,
+            );
+        }
+
         super::fa2_ffi::paged_varlen_attention_fa2_ffi(
             &ctx.stream,
             q.as_f16(),

@@ -13,7 +13,7 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 
-type Fa2PagedVarlenFn = unsafe extern "C" fn(
+pub(super) type Fa2PagedVarlenFn = unsafe extern "C" fn(
     q: *const c_void,
     k: *const c_void,
     v: *const c_void,
@@ -111,7 +111,8 @@ fn fa2_shim() -> Result<&'static Fa2Shim> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn paged_varlen_attention_fa2_ffi(
+pub(super) unsafe fn call_paged_varlen_fn(
+    paged_varlen: Fa2PagedVarlenFn,
     stream: &Arc<CudaStream>,
     q: &CudaSlice<f16>,
     k_pool: &CudaSlice<f16>,
@@ -152,7 +153,6 @@ pub fn paged_varlen_attention_fa2_ffi(
         )));
     }
 
-    let shim = fa2_shim()?;
     let (q_ptr, _qg) = q.device_ptr(stream);
     let (k_ptr, _kg) = k_pool.device_ptr(stream);
     let (v_ptr, _vg) = v_pool.device_ptr(stream);
@@ -163,30 +163,28 @@ pub fn paged_varlen_attention_fa2_ffi(
     let (bt_ptr, _bg) = block_tables.device_ptr(stream);
     let raw_stream = stream.cu_stream() as *mut c_void;
     let mut err_buf = vec![0i8; 512];
-    let ret = unsafe {
-        (shim.paged_varlen)(
-            q_ptr as *const c_void,
-            k_ptr as *const c_void,
-            v_ptr as *const c_void,
-            out_ptr as *mut c_void,
-            lse_ptr as *mut c_void,
-            cuq_ptr as *const c_void,
-            seq_ptr as *const c_void,
-            bt_ptr as *const c_void,
-            num_seqs as c_int,
-            total_q_tokens as c_int,
-            max_q_len as c_int,
-            max_kv_len as c_int,
-            num_heads as c_int,
-            num_kv_heads as c_int,
-            head_dim as c_int,
-            block_size as c_int,
-            max_blocks_per_seq as c_int,
-            raw_stream,
-            err_buf.as_mut_ptr(),
-            err_buf.len(),
-        )
-    };
+    let ret = paged_varlen(
+        q_ptr as *const c_void,
+        k_ptr as *const c_void,
+        v_ptr as *const c_void,
+        out_ptr as *mut c_void,
+        lse_ptr as *mut c_void,
+        cuq_ptr as *const c_void,
+        seq_ptr as *const c_void,
+        bt_ptr as *const c_void,
+        num_seqs as c_int,
+        total_q_tokens as c_int,
+        max_q_len as c_int,
+        max_kv_len as c_int,
+        num_heads as c_int,
+        num_kv_heads as c_int,
+        head_dim as c_int,
+        block_size as c_int,
+        max_blocks_per_seq as c_int,
+        raw_stream,
+        err_buf.as_mut_ptr(),
+        err_buf.len(),
+    );
     if ret != 0 {
         let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
             .to_string_lossy()
@@ -196,4 +194,51 @@ pub fn paged_varlen_attention_fa2_ffi(
         )));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_varlen_attention_fa2_ffi(
+    stream: &Arc<CudaStream>,
+    q: &CudaSlice<f16>,
+    k_pool: &CudaSlice<f16>,
+    v_pool: &CudaSlice<f16>,
+    out: &mut CudaSlice<f16>,
+    lse: &mut CudaSlice<f32>,
+    cu_seqlens_q: &CudaSlice<u32>,
+    seq_lens: &CudaSlice<u32>,
+    block_tables: &CudaSlice<u32>,
+    num_seqs: usize,
+    total_q_tokens: usize,
+    max_q_len: usize,
+    max_kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+) -> Result<()> {
+    let shim = fa2_shim()?;
+    unsafe {
+        call_paged_varlen_fn(
+            shim.paged_varlen,
+            stream,
+            q,
+            k_pool,
+            v_pool,
+            out,
+            lse,
+            cu_seqlens_q,
+            seq_lens,
+            block_tables,
+            num_seqs,
+            total_q_tokens,
+            max_q_len,
+            max_kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+        )
+    }
 }
