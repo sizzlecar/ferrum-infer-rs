@@ -29,6 +29,7 @@ PY_INFO="$("$VLLM_PYTHON" - <<'PY'
 from pathlib import Path
 import importlib.util
 import shlex
+import sysconfig
 import torch
 from torch.utils.cpp_extension import include_paths
 
@@ -41,6 +42,20 @@ print("FA2_DIR=" + shlex.quote(str(Path(spec.origin).parent)))
 print("TORCH_LIB=" + shlex.quote(str(Path(torch.__file__).parent / "lib")))
 print("TORCH_CXX11_ABI=" + str(int(torch._C._GLIBCXX_USE_CXX11_ABI)))
 print("TORCH_INCLUDE_FLAGS=" + shlex.quote(" ".join("-I" + p for p in include_paths())))
+libdir = sysconfig.get_config_var("LIBDIR") or ""
+ldlibrary = sysconfig.get_config_var("LDLIBRARY") or ""
+libs = sysconfig.get_config_var("LIBS") or ""
+syslibs = sysconfig.get_config_var("SYSLIBS") or ""
+py_flags = []
+if libdir:
+    py_flags.append("-L" + libdir)
+if ldlibrary.startswith("lib") and ldlibrary.endswith(".so"):
+    py_flags.append("-l:" + ldlibrary)
+elif ldlibrary:
+    py_flags.append("-l" + ldlibrary.removeprefix("lib").removesuffix(".so"))
+py_flags.extend(libs.split())
+py_flags.extend(syslibs.split())
+print("PY_LDFLAGS=" + shlex.quote(" ".join(py_flags)))
 PY
 )"
 eval "$PY_INFO"
@@ -58,7 +73,8 @@ echo "[microbench] compiling $SRC"
   -Wl,-rpath,"$TORCH_LIB" \
   -Wl,-rpath,"$FA2_DIR" \
   -Wl,-rpath,/usr/local/cuda/lib64 \
-  -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -lcudart -ldl -pthread
+  -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -lcudart -ldl -pthread \
+  $PY_LDFLAGS
 
 echo "[microbench] running $OUT_BIN"
 LD_LIBRARY_PATH="$TORCH_LIB:$FA2_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
