@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const PROMPT_TOKENS_METADATA_KEY: &str = "ferrum_prompt_tokens";
+
 /// Inference request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {

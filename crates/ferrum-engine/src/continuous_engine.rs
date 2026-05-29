@@ -18,7 +18,7 @@ use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
     InferenceResponse, Priority, RequestId, Result, SamplingParams, StreamChunk, TokenId,
-    TokenUsage,
+    TokenUsage, PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
@@ -2360,17 +2360,22 @@ impl ContinuousBatchEngine {
 
 #[async_trait]
 impl LlmInferenceEngine for ContinuousBatchEngine {
-    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
+    async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceResponse> {
         let request_id = request.id.clone();
         let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
         gauge!("ferrum.engine.active_requests").increment(1.0);
 
+        let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        request.metadata.insert(
+            PROMPT_TOKENS_METADATA_KEY.to_string(),
+            serde_json::Value::from(input_tokens.len() as u64),
+        );
+
         // Submit to scheduler
         self.inner.scheduler.submit(request.clone()).await?;
 
         // Create sequence state with oneshot channel
-        let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let mut seq_state = SequenceState::new_with_tokenizer(
             request,
@@ -2413,16 +2418,21 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 
     async fn infer_stream(
         &self,
-        request: InferenceRequest,
+        mut request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let (tx, rx) = mpsc::channel(100);
         let request_id = request.id.clone();
+
+        let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        request.metadata.insert(
+            PROMPT_TOKENS_METADATA_KEY.to_string(),
+            serde_json::Value::from(input_tokens.len() as u64),
+        );
 
         // Submit to scheduler
         self.inner.scheduler.submit(request.clone()).await?;
 
         // Create sequence state with stream sender
-        let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         let mut seq_state = SequenceState::new_with_tokenizer(
             request,
             input_tokens,

@@ -18,7 +18,7 @@ use ferrum_interfaces::scheduler::SchedulerMetrics;
 use ferrum_types::SchedulerConfig;
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
-    Result,
+    Result, PROMPT_TOKENS_METADATA_KEY,
 };
 use parking_lot::RwLock;
 use std::{
@@ -328,6 +328,39 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    fn initial_prefill_token_estimate(&self, req: &ContinuousBatchRequest) -> usize {
+        let estimated_tokens = req
+            .inner
+            .request
+            .metadata
+            .get(PROMPT_TOKENS_METADATA_KEY)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .filter(|&v| v > 0)
+            .unwrap_or(self.cb_config.prefill_chunk_size);
+
+        if self.cb_config.enable_chunked_prefill {
+            estimated_tokens
+                .min(self.cb_config.prefill_chunk_size)
+                .max(1)
+        } else {
+            estimated_tokens.max(1)
+        }
+    }
+
+    fn prefill_budget_tokens(&self, req: &ContinuousBatchRequest) -> usize {
+        if req.prefill_tokens == 0 {
+            return self.initial_prefill_token_estimate(req);
+        }
+
+        let remaining = req.prefill_tokens.saturating_sub(req.prefill_chunk_offset);
+        if self.cb_config.enable_chunked_prefill {
+            self.cb_config.prefill_chunk_size.min(remaining)
+        } else {
+            remaining
+        }
+    }
+
     /// Create batch plan for current iteration
     fn create_iteration_batch(&self, hint: BatchHint) -> Option<BatchPlan> {
         let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
@@ -366,19 +399,7 @@ impl ContinuousBatchScheduler {
         if prefill_remaining > 0 {
             let prefill_queue = self.prefill_queue.read();
             for req in prefill_queue.iter().take(prefill_remaining) {
-                let prefill_chunk_tokens = if self.cb_config.enable_chunked_prefill {
-                    if req.prefill_tokens == 0 {
-                        // Total unknown yet (engine hasn't reported it) —
-                        // reserve one chunk's worth so we don't over-commit.
-                        self.cb_config.prefill_chunk_size
-                    } else {
-                        self.cb_config
-                            .prefill_chunk_size
-                            .min(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
-                    }
-                } else {
-                    req.prefill_tokens
-                };
+                let prefill_chunk_tokens = self.prefill_budget_tokens(req);
                 // Skip fully-prefilled requests that are still in the queue
                 // (they'll be promoted by mark_prefill_chunk_processed on the
                 // next iteration boundary).
@@ -418,18 +439,7 @@ impl ContinuousBatchScheduler {
         if batch_requests.is_empty() {
             let prefill_queue = self.prefill_queue.read();
             for req in prefill_queue.iter().take(hint.max_batch_size) {
-                let prefill_chunk_tokens = if self.cb_config.enable_chunked_prefill {
-                    if req.prefill_tokens == 0 {
-                        self.cb_config.prefill_chunk_size
-                    } else {
-                        self.cb_config
-                            .prefill_chunk_size
-                            .min(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
-                    }
-                } else {
-                    // For new requests, prefill_tokens might be 0, use a default
-                    req.inner.request.sampling_params.max_tokens.min(512)
-                };
+                let prefill_chunk_tokens = self.prefill_budget_tokens(req);
                 if prefill_chunk_tokens == 0 {
                     continue;
                 }
@@ -920,6 +930,16 @@ mod tests {
         }
     }
 
+    fn create_test_request_with_prompt_tokens(
+        priority: Priority,
+        prompt_tokens: usize,
+    ) -> InferenceRequest {
+        create_test_request(priority).with_metadata(
+            PROMPT_TOKENS_METADATA_KEY,
+            serde_json::Value::from(prompt_tokens as u64),
+        )
+    }
+
     #[tokio::test]
     async fn test_scheduler_creation() {
         let config = SchedulerConfig::default();
@@ -965,6 +985,38 @@ mod tests {
 
         // Requests should have been promoted
         assert!(scheduler.prefilling_count() > 0 || scheduler.decoding_count() > 0);
+    }
+
+    #[tokio::test]
+    async fn prompt_token_metadata_expands_prefill_admission() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+
+        for _ in 0..16 {
+            scheduler
+                .submit(create_test_request_with_prompt_tokens(
+                    Priority::Normal,
+                    256,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 32,
+            max_tokens: 2048,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.next_batch(hint.clone()).await.unwrap();
+        assert_eq!(first_batch.requests.len(), 8);
+
+        for request in first_batch.requests {
+            scheduler.mark_prefill_complete(&request.request.id, 256);
+        }
+
+        let mixed_batch = scheduler.next_batch(hint).await.unwrap();
+        assert_eq!(mixed_batch.requests.len(), 15);
     }
 
     #[tokio::test]
