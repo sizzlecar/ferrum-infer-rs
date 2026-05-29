@@ -164,6 +164,161 @@ extern "C" __global__ void paged_varlen_attn_f16(
     }
 }
 
+extern "C" __global__ void paged_varlen_attn_tiled_q4_f16(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_block_pool,
+    const __half* __restrict__ v_block_pool,
+    const int* __restrict__ cu_seqlens_q,
+    const int* __restrict__ pos_offsets,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ tile_seqs,
+    const int* __restrict__ tile_starts,
+    __half* __restrict__ output,
+    const int num_q_heads,
+    const int num_kv_heads,
+    const int head_dim,
+    const int max_blocks_per_seq,
+    const int block_size,
+    const int score_stride,
+    const float scale
+) {
+    constexpr int TILE_Q = 4;
+    const int q_head = blockIdx.x;
+    const int tile_id = blockIdx.y;
+    const int seq_idx = tile_seqs[tile_id];
+    const int tile_start = tile_starts[tile_id];
+    const int seq_q_start = cu_seqlens_q[seq_idx];
+    const int q_len = cu_seqlens_q[seq_idx + 1] - seq_q_start;
+    const int actual_tile = min(TILE_Q, q_len - tile_start);
+    const int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const int pos0 = pos_offsets[seq_idx] + tile_start;
+    const int max_valid = pos0 + actual_tile;
+    const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+    const int kv_stride = num_kv_heads * head_dim;
+    const int block_stride_val = block_size * kv_stride;
+
+    extern __shared__ float s_scores[];
+    __shared__ float s_global_max[TILE_Q];
+    __shared__ float s_global_sum[TILE_Q];
+
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
+    const int elems_per_thread = (head_dim + WARP_SIZE - 1) / WARP_SIZE;
+    float q_reg[TILE_Q][8];
+
+#pragma unroll
+    for (int qi = 0; qi < TILE_Q; ++qi) {
+        const int token_global = seq_q_start + tile_start + qi;
+        const __half* q_ptr =
+            q + ((size_t)token_global * num_q_heads + q_head) * head_dim;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int d = lane_id + i * WARP_SIZE;
+            q_reg[qi][i] = (qi < actual_tile && i < elems_per_thread && d < head_dim)
+                               ? __half2float(q_ptr[d])
+                               : 0.0f;
+        }
+    }
+
+    for (int kv_pos = warp_id; kv_pos < max_valid; kv_pos += num_warps) {
+        const int logical_block = kv_pos / block_size;
+        const int slot = kv_pos % block_size;
+        const int physical_block = my_block_table[logical_block];
+        const __half* k_row =
+            k_block_pool + physical_block * block_stride_val
+                         + slot * kv_stride
+                         + kv_head * head_dim;
+        float k_reg[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int d = lane_id + i * WARP_SIZE;
+            k_reg[i] = (i < elems_per_thread && d < head_dim)
+                           ? __half2float(k_row[d])
+                           : 0.0f;
+        }
+
+#pragma unroll
+        for (int qi = 0; qi < TILE_Q; ++qi) {
+            const int valid = pos0 + qi + 1;
+            float dot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                dot += q_reg[qi][i] * k_reg[i];
+            }
+            const float score = warp_reduce_sum(dot) * scale;
+            if (lane_id == 0 && qi < actual_tile && kv_pos < valid) {
+                s_scores[qi * score_stride + kv_pos] = score;
+            }
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int qi = 0; qi < TILE_Q; ++qi) {
+        if (qi >= actual_tile) continue;
+        const int valid = pos0 + qi + 1;
+        float thread_max = -1e20f;
+        for (int i = threadIdx.x; i < valid; i += blockDim.x) {
+            thread_max = fmaxf(thread_max, s_scores[qi * score_stride + i]);
+        }
+        const float bmax = block_reduce_max(thread_max);
+        if (threadIdx.x == 0) s_global_max[qi] = bmax;
+        __syncthreads();
+
+        float thread_sum = 0.0f;
+        for (int i = threadIdx.x; i < valid; i += blockDim.x) {
+            const float val = expf(s_scores[qi * score_stride + i] - s_global_max[qi]);
+            s_scores[qi * score_stride + i] = val;
+            thread_sum += val;
+        }
+        __syncthreads();
+        const float bsum = block_reduce_sum(thread_sum);
+        if (threadIdx.x == 0) s_global_sum[qi] = bsum;
+        __syncthreads();
+
+        const float inv_sum = 1.0f / s_global_sum[qi];
+        for (int i = threadIdx.x; i < valid; i += blockDim.x) {
+            s_scores[qi * score_stride + i] *= inv_sum;
+        }
+        __syncthreads();
+    }
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc[TILE_Q];
+#pragma unroll
+        for (int qi = 0; qi < TILE_Q; ++qi) acc[qi] = 0.0f;
+
+        for (int kv_pos = 0; kv_pos < max_valid; ++kv_pos) {
+            const int logical_block = kv_pos / block_size;
+            const int slot = kv_pos % block_size;
+            const int physical_block = my_block_table[logical_block];
+            const __half* v_row =
+                v_block_pool + physical_block * block_stride_val
+                             + slot * kv_stride
+                             + kv_head * head_dim;
+            const float v = __half2float(v_row[d]);
+#pragma unroll
+            for (int qi = 0; qi < TILE_Q; ++qi) {
+                const int valid = pos0 + qi + 1;
+                if (qi < actual_tile && kv_pos < valid) {
+                    acc[qi] += s_scores[qi * score_stride + kv_pos] * v;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int qi = 0; qi < TILE_Q; ++qi) {
+            if (qi < actual_tile) {
+                const int token_global = seq_q_start + tile_start + qi;
+                __half* out_ptr =
+                    output + ((size_t)token_global * num_q_heads + q_head) * head_dim;
+                out_ptr[d] = __float2half(acc[qi]);
+            }
+        }
+    }
+}
+
 // ─── Split-K variant ─────────────────────────────────────────────────
 // Phase 1: each block scans 1/N of the kv_len for one (head, q_token, split).
 // Stores partial output (unnormalized) + local m + local l for online merge.
