@@ -81,6 +81,10 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   `apply_moe_graph_default()`. This keeps the compatibility values visible to
   the builder, effective-config artifact, and decision trace before they are
   materialized for older backend readers.
+- The graph-clean MoE default path is now a shared typed CLI resolver.
+  `ferrum run` consumes that resolver from a startup snapshot instead of
+  calling the old process-wide setter, so explicit overrides are preserved
+  before compatibility env values are materialized for model/backend readers.
 - `ferrum serve` now records GPU-memory autosizer-created runtime keys
   (`FERRUM_MAX_BATCHED_TOKENS`, `FERRUM_KV_MAX_BLOCKS`,
   `FERRUM_PAGED_MAX_SEQS`, `FERRUM_KV_CAPACITY`) with
@@ -126,6 +130,7 @@ cargo check -q -p ferrum-server
 cargo check -q -p ferrum-cli
 cargo test -q -p ferrum-cli config -- --nocapture
 cargo test -q -p ferrum-cli commands::serve -- --nocapture
+cargo test -q -p ferrum-cli runtime_env -- --nocapture
 cargo test -q -p ferrum-server route_health_includes_runtime_config_snapshot -- --nocapture
 python3 -m py_compile scripts/m3_ab_runner.py scripts/m3_validate_runner_artifact.py
 python3 scripts/m3_ab_runner.py --self-test
@@ -162,6 +167,9 @@ Evidence:
 - `ferrum-cli` config tests passed: `8 passed`, including config-file runtime
   source attribution, `[runtime].preset` parsing, and missing `[runtime]`
   backwards compatibility.
+- `ferrum-cli` runtime-env tests passed: `3 passed`, covering missing-default
+  insertion, `FERRUM_MOE_GRAPH=0` override preservation, and graph-enabled
+  snapshot completion.
 - `ferrum-server` health test passed and verifies `auto_config` is present
   with either a decision list or an explicit resolver error.
 - `cargo check` passed for `ferrum-types`, `ferrum-server`, and `ferrum-cli`.
@@ -176,8 +184,9 @@ Evidence:
 
 - The builder is not yet the sole owner of runtime defaults. The serve path no
   longer gets M3 or non-preset Qwen3-MoE startup defaults from the old MoE
-  graph default setter, but `ferrum run`, source resolution, autosizing, and
-  model/backend runtime configs still consume parts of the old env surface.
+  graph default setter, and `ferrum run` now uses the same typed resolver for
+  that graph-clean default. Source resolution, autosizing, and model/backend
+  runtime configs still consume parts of the old env surface.
 - CLI/config-file/script-case/memory-profile source attribution is represented
   in the builder and decision trace. `ferrum serve` now carries the named M3
   runtime preset, selected CLI runtime/profile inputs, config-file runtime

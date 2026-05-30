@@ -202,7 +202,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     non_env_runtime_entries.extend(config_runtime_entries);
     let mut non_env_runtime_entries =
         RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    let mut materialized_runtime_keys = materialize_runtime_env_defaults(&non_env_runtime_entries);
+    let mut materialized_runtime_keys =
+        crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
 
     let autosize_env_before = RuntimeConfigSnapshot::capture_current();
     // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
@@ -350,8 +351,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Default)?;
         inferred_entries.extend(non_env_runtime_entries);
         non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(inferred_entries).entries;
-        materialized_runtime_keys
-            .extend(materialize_runtime_env_defaults(&non_env_runtime_entries));
+        materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
+            &non_env_runtime_entries,
+        ));
         materialized_runtime_keys.sort();
         materialized_runtime_keys.dedup();
     }
@@ -363,11 +365,20 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     if selected_runtime_preset_name.is_none()
         && arch_for_dispatch == Some(ferrum_models::Architecture::Qwen3Moe)
     {
-        let mut legacy_entries = qwen3_moe_serve_default_entries(RuntimeConfigSource::Default);
+        let current_runtime = merge_runtime_config_sources(
+            non_env_runtime_entries.clone(),
+            RuntimeConfigSnapshot::capture_current(),
+            Vec::new(),
+        );
+        let mut legacy_entries = crate::runtime_env::moe_graph_default_entries(
+            &current_runtime,
+            RuntimeConfigSource::Default,
+        );
         legacy_entries.extend(non_env_runtime_entries);
         non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(legacy_entries).entries;
-        materialized_runtime_keys
-            .extend(materialize_runtime_env_defaults(&non_env_runtime_entries));
+        materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
+            &non_env_runtime_entries,
+        ));
         materialized_runtime_keys.sort();
         materialized_runtime_keys.dedup();
     }
@@ -739,32 +750,6 @@ fn runtime_preset_entries(
         .iter()
         .map(|(key, value)| RuntimeConfigEntry::new(*key, *value, source))
         .collect())
-}
-
-fn qwen3_moe_serve_default_entries(source: RuntimeConfigSource) -> Vec<RuntimeConfigEntry> {
-    let mut entries = Vec::new();
-    entries.push(RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", source));
-    #[cfg(feature = "vllm-moe-marlin")]
-    {
-        entries.push(RuntimeConfigEntry::new("FERRUM_VLLM_MOE", "1", source));
-        entries.push(RuntimeConfigEntry::new(
-            "FERRUM_VLLM_MOE_PAIR_IDS",
-            "1",
-            source,
-        ));
-    }
-    entries
-}
-
-fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<String> {
-    let mut materialized = Vec::new();
-    for entry in entries {
-        if std::env::var_os(&entry.key).is_none() {
-            std::env::set_var(&entry.key, &entry.effective_value);
-            materialized.push(entry.key.clone());
-        }
-    }
-    materialized
 }
 
 fn serve_cli_runtime_entries(
@@ -1508,7 +1493,10 @@ mod tests {
 
     #[test]
     fn qwen3_moe_serve_defaults_are_typed_default_entries() {
-        let entries = qwen3_moe_serve_default_entries(RuntimeConfigSource::Default);
+        let entries = crate::runtime_env::moe_graph_default_entries(
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
         let snapshot = RuntimeConfigSnapshot::from_entries(entries);
         let entry = |key: &str| {
             snapshot
@@ -1535,15 +1523,16 @@ mod tests {
 
     #[test]
     fn qwen3_moe_serve_defaults_keep_config_file_overrides() {
-        let mut entries = qwen3_moe_serve_default_entries(RuntimeConfigSource::Default);
-        entries.extend(
-            crate::config::RuntimeCliConfig {
-                moe_graph: Some(false),
-                vllm_moe: Some(false),
-                ..Default::default()
-            }
-            .runtime_config_entries(),
-        );
+        let config_entries = crate::config::RuntimeCliConfig {
+            moe_graph: Some(false),
+            vllm_moe: Some(false),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        let current = RuntimeConfigSnapshot::from_entries(config_entries.clone());
+        let mut entries =
+            crate::runtime_env::moe_graph_default_entries(&current, RuntimeConfigSource::Default);
+        entries.extend(config_entries);
         let snapshot = RuntimeConfigSnapshot::from_entries(entries);
         let entry = |key: &str| {
             snapshot

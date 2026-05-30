@@ -175,11 +175,16 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
-    // Default-ON `FERRUM_MOE_GRAPH=1`. Independent of the autosizer
-    // run below — autosize early-returns when the user has set
-    // KV_MAX_BLOCKS + PAGED_MAX_SEQS, skipping the MOE_GRAPH setter
-    // that used to follow.
-    crate::gpu_mem_autosize::apply_moe_graph_default();
+    // Resolve graph-clean Qwen3-MoE defaults as typed entries first, then
+    // materialize them only for legacy backend readers.
+    let moe_graph_defaults = crate::runtime_env::moe_graph_default_entries(
+        &ferrum_types::RuntimeConfigSnapshot::capture_current(),
+        ferrum_types::RuntimeConfigSource::Default,
+    );
+    crate::runtime_env::materialize_runtime_env_defaults(&moe_graph_defaults);
+    crate::runtime_env::warn_if_moe_graph_needs_unbuilt_vllm_moe(
+        &ferrum_types::RuntimeConfigSnapshot::capture_current(),
+    );
 
     // Resolve the model through the central source resolver. Handles
     // .gguf paths, local model dirs, HF cache hits, and HF download in

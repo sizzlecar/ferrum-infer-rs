@@ -157,75 +157,6 @@ pub enum AutoSizeProfile {
     Chat,
 }
 
-/// Default-ON `FERRUM_MOE_GRAPH=1` for Qwen3-MoE. Read only by
-/// `qwen3_moe.rs::decode_batch_internal`; ignored by every other
-/// model so safe to set unconditionally. When the binary is built with
-/// the vLLM MoE feature, default `FERRUM_VLLM_MOE=1` alongside it so
-/// the graph captures the device-routed, graph-clean MoE path instead
-/// of the legacy host-routed path. Also defaults the vLLM-native pair-id
-/// routing layout on for the same graph-clean path; it avoids the
-/// pre-gathered `x_packed` buffer and is a small positive win on the
-/// current Qwen3-MoE c=4/16/32 sweep. Empirically measured at c=32 on
-/// RTX 4090 post-moe_align fix:
-///   FERRUM_MOE_GRAPH=0 = 872 tok/s
-///   FERRUM_MOE_GRAPH=1 = 1006 tok/s  (+15.5%)
-///
-/// Standalone (not gated on autosizer running) because:
-///  1. The `apply_auto_size` early-returns when the user sets both
-///     `FERRUM_KV_MAX_BLOCKS` + `FERRUM_PAGED_MAX_SEQS` (apples bench
-///     does this — see sweep_bottleneck.sh), skipping the MOE_GRAPH
-///     setter that follows.
-///  2. `serve` only calls `apply_auto_size` when `--model` is a local
-///     directory; HF repo names (`Qwen/Qwen3-30B-A3B-GPTQ-Int4`)
-///     short-circuit before the autosizer runs.
-///
-/// Both cases left users on `FERRUM_MOE_GRAPH=0` despite the PR #217
-/// default-on intent. Extracting the setter and calling it from
-/// `serve` / `run` unconditionally restores it.
-pub fn apply_moe_graph_default() {
-    let moe_graph_overridden = std::env::var("FERRUM_MOE_GRAPH").is_ok();
-    if !moe_graph_overridden {
-        // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
-        unsafe {
-            std::env::set_var("FERRUM_MOE_GRAPH", "1");
-        }
-        eprintln!("[auto-size] MOE_GRAPH=1 (default-on for Qwen3-MoE)");
-    }
-
-    let moe_graph_enabled = std::env::var("FERRUM_MOE_GRAPH").as_deref() == Ok("1");
-    if !moe_graph_enabled {
-        return;
-    }
-
-    #[cfg(feature = "vllm-moe-marlin")]
-    {
-        let vllm_moe_overridden = std::env::var("FERRUM_VLLM_MOE").is_ok();
-        if !vllm_moe_overridden {
-            // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
-            unsafe {
-                std::env::set_var("FERRUM_VLLM_MOE", "1");
-            }
-            eprintln!("[auto-size] VLLM_MOE=1 (graph-clean MoE default)");
-        }
-
-        let pair_ids_overridden = std::env::var("FERRUM_VLLM_MOE_PAIR_IDS").is_ok();
-        if !pair_ids_overridden {
-            // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
-            unsafe {
-                std::env::set_var("FERRUM_VLLM_MOE_PAIR_IDS", "1");
-            }
-            eprintln!("[auto-size] VLLM_MOE_PAIR_IDS=1 (vLLM-native routing default)");
-        }
-    }
-
-    #[cfg(not(feature = "vllm-moe-marlin"))]
-    if std::env::var("FERRUM_VLLM_MOE").as_deref() != Ok("1") {
-        eprintln!(
-            "[auto-size] MOE_GRAPH=1 requested, but vllm-moe-marlin is not built; graph capture requires FERRUM_VLLM_MOE=1"
-        );
-    }
-}
-
 /// Apply auto-sizing: read CLI flag, query nvidia-smi, set env vars.
 /// Sets BOTH `FERRUM_KV_MAX_BLOCKS` (engine-side BlockPool) and
 /// `FERRUM_PAGED_MAX_SEQS` (model-side paged_pools — sizes the GPU
@@ -340,8 +271,8 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
     // sizing logic, runs even when the user overrode KV_MAX_BLOCKS + SEQS).
-    // FERRUM_MOE_GRAPH is set by `apply_moe_graph_default()` at the CLI
-    // entry — moved out of here so it lands even when this function
+    // FERRUM_MOE_GRAPH is resolved as a typed CLI startup default and
+    // materialized outside the autosizer so it lands even when this function
     // early-returns on full-override.
     unsafe {
         if !kv_overridden {
