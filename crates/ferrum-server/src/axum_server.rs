@@ -1978,7 +1978,9 @@ mod tests {
         http::{header, Request},
         response::Response,
     };
-    use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
+    use ferrum_interfaces::engine::{
+        EmbedEngine, InferenceEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine,
+    };
     use ferrum_types::{
         EngineConfig, EngineMetrics, EngineStatus, FinishReason,
         HealthStatus as EngineHealthStatus, InferenceRequest, InferenceResponse, MemoryUsage,
@@ -2024,6 +2026,42 @@ mod tests {
                 api_response: Some(api_response),
                 ..Self::new(text)
             }
+        }
+    }
+
+    struct StubEmbed {
+        config: EngineConfig,
+    }
+
+    impl StubEmbed {
+        fn new() -> Self {
+            let mut config = EngineConfig::default();
+            config.model.model_id = ModelId::new("stub-embed");
+            Self { config }
+        }
+    }
+
+    struct StubTranscribe {
+        config: EngineConfig,
+    }
+
+    impl StubTranscribe {
+        fn new() -> Self {
+            let mut config = EngineConfig::default();
+            config.model.model_id = ModelId::new("stub-transcribe");
+            Self { config }
+        }
+    }
+
+    struct StubTts {
+        config: EngineConfig,
+    }
+
+    impl StubTts {
+        fn new() -> Self {
+            let mut config = EngineConfig::default();
+            config.model.model_id = ModelId::new("stub-tts");
+            Self { config }
         }
     }
 
@@ -2111,6 +2149,180 @@ mod tests {
 
         async fn health_check(&self) -> EngineHealthStatus {
             EngineHealthStatus::healthy()
+        }
+    }
+
+    #[async_trait]
+    impl InferenceEngine for StubEmbed {
+        async fn status(&self) -> EngineStatus {
+            EngineStatus {
+                is_ready: true,
+                loaded_models: vec![self.config.model.model_id.clone()],
+                active_requests: 0,
+                queued_requests: 0,
+                memory_usage: MemoryUsage {
+                    total_bytes: 0,
+                    used_bytes: 0,
+                    free_bytes: 0,
+                    gpu_memory_bytes: None,
+                    cpu_memory_bytes: None,
+                    cache_memory_bytes: 0,
+                    utilization_percent: 0.0,
+                },
+                uptime_seconds: 0,
+                last_heartbeat: chrono::Utc::now(),
+                version: "test".to_string(),
+            }
+        }
+
+        async fn shutdown(&self) -> ferrum_types::Result<()> {
+            Ok(())
+        }
+
+        fn config(&self) -> &EngineConfig {
+            &self.config
+        }
+
+        fn metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        async fn health_check(&self) -> EngineHealthStatus {
+            EngineHealthStatus::healthy()
+        }
+    }
+
+    #[async_trait]
+    impl EmbedEngine for StubEmbed {
+        async fn embed_text(&self, text: &str) -> ferrum_types::Result<Vec<f32>> {
+            Ok(vec![text.len() as f32, 1.0, 0.0])
+        }
+
+        async fn embed_image(&self, image: &str) -> ferrum_types::Result<Vec<f32>> {
+            Ok(vec![image.len() as f32, 0.0, 1.0])
+        }
+
+        fn embedding_dim(&self) -> usize {
+            3
+        }
+    }
+
+    #[async_trait]
+    impl InferenceEngine for StubTranscribe {
+        async fn status(&self) -> EngineStatus {
+            EngineStatus {
+                is_ready: true,
+                loaded_models: vec![self.config.model.model_id.clone()],
+                active_requests: 0,
+                queued_requests: 0,
+                memory_usage: MemoryUsage {
+                    total_bytes: 0,
+                    used_bytes: 0,
+                    free_bytes: 0,
+                    gpu_memory_bytes: None,
+                    cpu_memory_bytes: None,
+                    cache_memory_bytes: 0,
+                    utilization_percent: 0.0,
+                },
+                uptime_seconds: 0,
+                last_heartbeat: chrono::Utc::now(),
+                version: "test".to_string(),
+            }
+        }
+
+        async fn shutdown(&self) -> ferrum_types::Result<()> {
+            Ok(())
+        }
+
+        fn config(&self) -> &EngineConfig {
+            &self.config
+        }
+
+        fn metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        async fn health_check(&self) -> EngineHealthStatus {
+            EngineHealthStatus::healthy()
+        }
+    }
+
+    #[async_trait]
+    impl TranscribeEngine for StubTranscribe {
+        async fn transcribe_file(
+            &self,
+            path: &str,
+            language: Option<&str>,
+        ) -> ferrum_types::Result<String> {
+            Ok(format!("file:{path}:{}", language.unwrap_or("auto")))
+        }
+
+        async fn transcribe_bytes(
+            &self,
+            data: &[u8],
+            language: Option<&str>,
+        ) -> ferrum_types::Result<String> {
+            Ok(format!(
+                "bytes:{}:{}",
+                data.len(),
+                language.unwrap_or("auto")
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl InferenceEngine for StubTts {
+        async fn status(&self) -> EngineStatus {
+            EngineStatus {
+                is_ready: true,
+                loaded_models: vec![self.config.model.model_id.clone()],
+                active_requests: 0,
+                queued_requests: 0,
+                memory_usage: MemoryUsage {
+                    total_bytes: 0,
+                    used_bytes: 0,
+                    free_bytes: 0,
+                    gpu_memory_bytes: None,
+                    cpu_memory_bytes: None,
+                    cache_memory_bytes: 0,
+                    utilization_percent: 0.0,
+                },
+                uptime_seconds: 0,
+                last_heartbeat: chrono::Utc::now(),
+                version: "test".to_string(),
+            }
+        }
+
+        async fn shutdown(&self) -> ferrum_types::Result<()> {
+            Ok(())
+        }
+
+        fn config(&self) -> &EngineConfig {
+            &self.config
+        }
+
+        fn metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        async fn health_check(&self) -> EngineHealthStatus {
+            EngineHealthStatus::healthy()
+        }
+    }
+
+    #[async_trait]
+    impl TtsEngine for StubTts {
+        async fn synthesize_speech(
+            &self,
+            _text: &str,
+            _language: Option<&str>,
+            _chunk_frames: usize,
+        ) -> ferrum_types::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0, 0.5, -0.5]])
+        }
+
+        fn tts_sample_rate(&self) -> u32 {
+            16_000
         }
     }
 
@@ -2339,6 +2551,18 @@ mod tests {
         (router, engine)
     }
 
+    fn router_with_stub_embed() -> Router {
+        AxumServer::from_embed(Arc::new(StubEmbed::new())).build_router()
+    }
+
+    fn router_with_stub_transcribe() -> Router {
+        AxumServer::from_transcribe(Arc::new(StubTranscribe::new())).build_router()
+    }
+
+    fn router_with_stub_tts() -> Router {
+        AxumServer::from_tts(Arc::new(StubTts::new())).build_router()
+    }
+
     async fn post_json(app: Router, path: &str, body: Value) -> Response {
         app.oneshot(
             Request::builder()
@@ -2405,6 +2629,13 @@ mod tests {
             .await
             .expect("body bytes");
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    async fn response_bytes(response: Response) -> Vec<u8> {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+            .to_vec()
     }
 
     async fn error_json(error: ServerError) -> (AxumStatusCode, Value) {
@@ -3485,6 +3716,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_embeddings_contract_uses_stub_engine() {
+        let response = post_json(
+            router_with_stub_embed(),
+            "/v1/embeddings",
+            json!({
+                "model": "stub-embed",
+                "input": ["hi", "world"]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["model"], "stub-embed");
+        assert_eq!(body["usage"]["prompt_tokens"], 7);
+        assert_eq!(body["usage"]["total_tokens"], 7);
+
+        let data = body["data"].as_array().expect("embedding data");
+        assert_eq!(data.len(), 2, "body: {body}");
+        assert_eq!(data[0]["object"], "embedding");
+        assert_eq!(data[0]["index"], 0);
+        assert_eq!(data[0]["embedding"].as_array().unwrap().len(), 3);
+        assert_eq!(data[0]["embedding"][0].as_f64().unwrap(), 2.0);
+        assert_eq!(data[1]["index"], 1);
+        assert_eq!(data[1]["embedding"][0].as_f64().unwrap(), 5.0);
+    }
+
+    #[tokio::test]
     async fn route_transcriptions_engine_unavailable_maps_to_503() {
         let boundary = "ferrum-test-boundary";
         let body = concat!(
@@ -3509,6 +3768,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_transcriptions_contract_uses_stub_engine() {
+        let boundary = "ferrum-test-boundary";
+        let body = concat!(
+            "--ferrum-test-boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+            "Content-Type: audio/wav\r\n",
+            "\r\n",
+            "RIFFtest\r\n",
+            "--ferrum-test-boundary\r\n",
+            "Content-Disposition: form-data; name=\"language\"\r\n",
+            "\r\n",
+            "en\r\n",
+            "--ferrum-test-boundary--\r\n"
+        );
+        let response = post_multipart(
+            router_with_stub_transcribe(),
+            "/v1/audio/transcriptions",
+            boundary,
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["text"], "bytes:8:en");
+    }
+
+    #[tokio::test]
     async fn route_speech_engine_unavailable_maps_to_503() {
         let response = post_json(
             router_without_llm(),
@@ -3524,6 +3810,30 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["error"]["type"], "service_unavailable_error");
         assert_eq!(body["error"]["param"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn route_speech_contract_uses_stub_engine() {
+        let response = post_json(
+            router_with_stub_tts(),
+            "/v1/audio/speech",
+            json!({
+                "model": "stub-tts",
+                "input": "hello",
+                "voice": "default",
+                "language": "english"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/wav"
+        );
+        let body = response_bytes(response).await;
+        assert!(body.len() > 44, "WAV should include header and PCM data");
+        assert_eq!(&body[0..4], b"RIFF");
+        assert_eq!(&body[8..12], b"WAVE");
     }
 
     #[tokio::test]
