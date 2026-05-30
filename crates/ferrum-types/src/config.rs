@@ -532,12 +532,9 @@ pub struct BatchConfig {
     /// vLLM-style per-iteration token budget. The scheduler emits a
     /// mixed prefill+decode batch summing to at most this many Q
     /// tokens (decode = 1 each, prefill chunk = its chunk size).
-    /// Default 4096 — large enough that the Qwen3MoE unified path
-    /// activates for typical cohort prefills (c=32 × 128 tokens ≈
-    /// 4 K) without pushing scratch past the 4 GB reserve carved by
-    /// `gpu_mem_autosize`. `FERRUM_MAX_BATCHED_TOKENS` (set by the
-    /// autosizer for `serve` / chat profile) overrides; users
-    /// should not set it by hand.
+    /// Default 2048. Runtime snapshots can override this with
+    /// `FERRUM_MAX_BATCHED_TOKENS`, usually from the GPU autosizer or a
+    /// named workload preset rather than a user hand-written env bundle.
     #[serde(default = "BatchConfig::default_max_num_batched_tokens")]
     pub max_num_batched_tokens: usize,
 }
