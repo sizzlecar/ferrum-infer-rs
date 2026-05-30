@@ -70,6 +70,12 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   before env snapshot capture and records them with CLI/config-file source
   attribution; explicit runtime config fields, env vars, and CLI flags still
   override those defaults.
+- `ferrum serve` also infers the same M3 runtime preset from Qwen3-30B-A3B
+  model metadata when no preset is explicitly configured. Those inferred
+  defaults are materialized through the typed preset entries with
+  `source=default`, so the M3 serve path no longer gets those startup
+  defaults from the legacy `apply_moe_graph_default()` env setter. The setter
+  remains as a compatibility fallback for non-preset legacy paths.
 - `scripts/m3_ab_runner.py` now passes the M3 preset through
   `--runtime-preset`, so the migrated wrappers no longer inject the common M3
   `FERRUM_*` bundle as process env. Completed runner manifests now copy the
@@ -122,12 +128,14 @@ Evidence:
   the Rust selector unless explicitly overridden.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
-- `ferrum-cli` serve tests passed: `8 passed`, covering CLI-sourced runtime
+- `ferrum-cli` serve tests passed: `11 passed`, covering CLI-sourced runtime
   entries for `--kv-dtype`, `--runtime-preset`, and profile sink arguments
   plus explicit runtime source precedence for config-file, env, and CLI
   inputs. The serve tests also verify that config-file values bridged into the
-  env snapshot keep `source=config_file` in startup artifacts.
-- `ferrum-cli` config tests passed: `7 passed`, including config-file runtime
+  env snapshot keep `source=config_file` in startup artifacts, and that
+  model-inferred M3 preset defaults keep `source=default` instead of being
+  reported as env overrides after materialization.
+- `ferrum-cli` config tests passed: `8 passed`, including config-file runtime
   source attribution, `[runtime].preset` parsing, and missing `[runtime]`
   backwards compatibility.
 - `ferrum-server` health test passed and verifies `auto_config` is present
@@ -142,9 +150,10 @@ Evidence:
 
 ## Remaining E Gaps
 
-- The builder is not yet the sole owner of runtime defaults. Existing
-  startup env setters and model/backend runtime configs still consume parts
-  of the old env surface.
+- The builder is not yet the sole owner of runtime defaults. The serve path no
+  longer gets M3 startup defaults from the old MoE graph default setter, but
+  non-preset legacy `serve`, `ferrum run`, and model/backend runtime configs
+  still consume parts of the old env surface.
 - CLI/config-file/script-case source attribution is represented in the
   builder and decision trace. `ferrum serve` now carries the named M3 runtime
   preset, selected CLI runtime/profile inputs, and config-file runtime fields

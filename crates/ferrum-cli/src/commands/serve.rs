@@ -181,7 +181,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     };
 
     let config_runtime_entries = config.runtime.runtime_config_entries();
-    let selected_runtime_preset = runtime_preset
+    let configured_runtime_preset = runtime_preset
         .as_deref()
         .map(|preset| (preset, RuntimeConfigSource::Cli))
         .or_else(|| {
@@ -192,22 +192,16 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 .map(|preset| (preset, RuntimeConfigSource::ConfigFile))
         });
     let selected_runtime_preset_name =
-        selected_runtime_preset.map(|(preset, _source)| preset.to_string());
-    let preset_runtime_entries = match selected_runtime_preset {
+        configured_runtime_preset.map(|(preset, _source)| preset.to_string());
+    let preset_runtime_entries = match configured_runtime_preset {
         Some((preset, source)) => runtime_preset_entries(preset, source)?,
         None => Vec::new(),
     };
     let mut non_env_runtime_entries = preset_runtime_entries;
     non_env_runtime_entries.extend(config_runtime_entries);
-    let non_env_runtime_entries =
+    let mut non_env_runtime_entries =
         RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    let materialized_runtime_keys = materialize_runtime_env_defaults(&non_env_runtime_entries);
-
-    // Default-ON `FERRUM_MOE_GRAPH=1` — kept separate from the
-    // local-dir-gated GPU autosizer below so it lands when the user
-    // passes an HF repo name (most common) instead of a local
-    // safetensors directory.
-    crate::gpu_mem_autosize::apply_moe_graph_default();
+    let mut materialized_runtime_keys = materialize_runtime_env_defaults(&non_env_runtime_entries);
 
     // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
     // KV pool + 4 GB scratch reserve fit in `total_gpu_mem * gpu_util`.
@@ -337,6 +331,28 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let arch_for_dispatch = model_definition
         .as_ref()
         .map(|model_def| model_def.architecture);
+    let mut selected_runtime_preset_name = selected_runtime_preset_name;
+    if selected_runtime_preset_name.is_none()
+        && is_m3_qwen3_30b_a3b(arch_for_dispatch, model_definition.as_ref())
+    {
+        selected_runtime_preset_name = Some(M3_QWEN3_30B_A3B_INT4_PRESET.to_string());
+        let mut inferred_entries =
+            runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Default)?;
+        inferred_entries.extend(non_env_runtime_entries);
+        non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(inferred_entries).entries;
+        materialized_runtime_keys
+            .extend(materialize_runtime_env_defaults(&non_env_runtime_entries));
+        materialized_runtime_keys.sort();
+        materialized_runtime_keys.dedup();
+    }
+
+    // Preserve the historical non-preset serve default for legacy/unknown
+    // Qwen3-MoE paths. M3 explicit or model-inferred presets have already
+    // materialized the same graph-clean defaults through typed entries above,
+    // so this compatibility setter becomes a no-op for those paths and does
+    // not affect their startup artifact source attribution.
+    crate::gpu_mem_autosize::apply_moe_graph_default();
+
     let startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
         profile_jsonl.as_ref(),
@@ -1103,6 +1119,103 @@ mod tests {
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_BACKEND").source, RuntimeConfigSource::Cli);
         assert_eq!(snapshot.entries.len(), 11);
+    }
+
+    #[test]
+    fn m3_runtime_preset_entries_can_be_default_sourced_for_model_inference() {
+        let entries =
+            runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Default)
+                .unwrap();
+        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_MOE_GRAPH").source,
+            RuntimeConfigSource::Default
+        );
+        assert_eq!(
+            entry("FERRUM_VLLM_MOE").source,
+            RuntimeConfigSource::Default
+        );
+    }
+
+    #[test]
+    fn model_inferred_m3_preset_keeps_config_file_overrides() {
+        let mut inferred_entries =
+            runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Default)
+                .unwrap();
+        inferred_entries.extend(
+            crate::config::RuntimeCliConfig {
+                prefix_cache: Some(true),
+                kv_max_blocks: Some(4096),
+                ..Default::default()
+            }
+            .runtime_config_entries(),
+        );
+        let snapshot = RuntimeConfigSnapshot::from_entries(inferred_entries);
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_PREFIX_CACHE").source,
+            RuntimeConfigSource::ConfigFile
+        );
+        assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
+        assert_eq!(
+            entry("FERRUM_KV_MAX_BLOCKS").source,
+            RuntimeConfigSource::ConfigFile
+        );
+        assert_eq!(
+            entry("FERRUM_MOE_GRAPH").source,
+            RuntimeConfigSource::Default
+        );
+    }
+
+    #[test]
+    fn materialized_inferred_m3_entries_keep_default_source() {
+        let inferred_entries =
+            runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Default)
+                .unwrap();
+        let materialized_keys = inferred_entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
+        let env_snapshot = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_VLLM_MOE", "1", RuntimeConfigSource::Env),
+        ]);
+        let env_snapshot = remove_materialized_config_env_entries(env_snapshot, &materialized_keys);
+        let snapshot = merge_runtime_config_sources(inferred_entries, env_snapshot, Vec::new());
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(
+            entry("FERRUM_MOE_GRAPH").source,
+            RuntimeConfigSource::Default
+        );
+        assert_eq!(
+            entry("FERRUM_VLLM_MOE").source,
+            RuntimeConfigSource::Default
+        );
     }
 
     #[test]
