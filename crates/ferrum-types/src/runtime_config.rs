@@ -127,6 +127,7 @@ pub enum RuntimeConfigSource {
     Cli,
     Env,
     ScriptCase,
+    MemoryProfile,
 }
 
 /// Impact classes used by config snapshots and artifact diffs.

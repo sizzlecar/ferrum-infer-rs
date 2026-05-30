@@ -164,6 +164,7 @@ EFFECTIVE_CONFIG_SOURCES = {
     "cli",
     "env",
     "script_case",
+    "memory_profile",
 }
 
 EFFECTIVE_CONFIG_EFFECTS = {
@@ -1033,6 +1034,12 @@ def self_test() -> None:
                 "effective_value": "2",
                 "source": "cli",
                 "affects": ["correctness", "memory"],
+            },
+            {
+                "key": "FERRUM_MAX_BATCHED_TOKENS",
+                "effective_value": "2048",
+                "source": "memory_profile",
+                "affects": ["performance", "memory"],
             },
             {
                 "key": "FERRUM_MOE_GRAPH",

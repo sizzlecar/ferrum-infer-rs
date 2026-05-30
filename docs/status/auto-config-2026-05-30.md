@@ -46,8 +46,9 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   trace. The old runner-side selector scaffold has been removed from the
   runtime harness.
 - Runtime config entry sources now propagate into selector decisions. Decision
-  traces preserve `env`, `cli`, `config_file`, and `script_case` source
-  attribution instead of marking every present key as an env override.
+  traces preserve `env`, `cli`, `config_file`, `script_case`, and
+  `memory_profile` source attribution instead of marking every present key as
+  an env override.
 - `RuntimeConfigSnapshot` now has stable explicit-entry/upsert helpers for
   non-env sources. `ferrum serve` uses them to carry CLI runtime/profile
   inputs such as `--kv-dtype` and `--profile-*` into the startup
@@ -76,6 +77,11 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   `source=default`, so the M3 serve path no longer gets those startup
   defaults from the legacy `apply_moe_graph_default()` env setter. The setter
   remains as a compatibility fallback for non-preset legacy paths.
+- `ferrum serve` now records GPU-memory autosizer-created runtime keys
+  (`FERRUM_MAX_BATCHED_TOKENS`, `FERRUM_KV_MAX_BLOCKS`,
+  `FERRUM_PAGED_MAX_SEQS`, `FERRUM_KV_CAPACITY`) with
+  `source=memory_profile` when they are introduced during startup, so startup
+  artifacts distinguish memory-profile sizing from user env overrides.
 - `scripts/m3_ab_runner.py` now passes the M3 preset through
   `--runtime-preset`, so the migrated wrappers no longer inject the common M3
   `FERRUM_*` bundle as process env. Completed runner manifests now copy the
@@ -128,13 +134,14 @@ Evidence:
   the Rust selector unless explicitly overridden.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
-- `ferrum-cli` serve tests passed: `11 passed`, covering CLI-sourced runtime
+- `ferrum-cli` serve tests passed: `13 passed`, covering CLI-sourced runtime
   entries for `--kv-dtype`, `--runtime-preset`, and profile sink arguments
   plus explicit runtime source precedence for config-file, env, and CLI
   inputs. The serve tests also verify that config-file values bridged into the
   env snapshot keep `source=config_file` in startup artifacts, and that
   model-inferred M3 preset defaults keep `source=default` instead of being
-  reported as env overrides after materialization.
+  reported as env overrides after materialization. New serve tests verify
+  autosizer-added keys are source-attributed as `memory_profile`.
 - `ferrum-cli` config tests passed: `8 passed`, including config-file runtime
   source attribution, `[runtime].preset` parsing, and missing `[runtime]`
   backwards compatibility.
@@ -154,13 +161,15 @@ Evidence:
   longer gets M3 startup defaults from the old MoE graph default setter, but
   non-preset legacy `serve`, `ferrum run`, and model/backend runtime configs
   still consume parts of the old env surface.
-- CLI/config-file/script-case source attribution is represented in the
-  builder and decision trace. `ferrum serve` now carries the named M3 runtime
-  preset, selected CLI runtime/profile inputs, and config-file runtime fields
-  into the startup snapshot. Broader non-M3 and diagnostic config-file
-  coverage still needs expansion.
+- CLI/config-file/script-case/memory-profile source attribution is represented
+  in the builder and decision trace. `ferrum serve` now carries the named M3
+  runtime preset, selected CLI runtime/profile inputs, config-file runtime
+  fields, and autosizer-created runtime keys into the startup snapshot. Broader
+  non-M3 and diagnostic config-file coverage still needs expansion.
 - Hardware capability data is currently compiled-feature/device based; it does
-  not yet include a real startup memory profile or CUDA capability probe.
+  not yet include a real CUDA capability probe. Startup autosizer outputs are
+  now source-attributed as `memory_profile`, but this is not yet a full
+  hardware-capability profile.
 - The M3 preset selector is now exposed through the Rust startup path and used
   by the migrated runner. Server-written effective-config data now owns
   completed-run runtime snapshots, and the runner no longer has a parallel

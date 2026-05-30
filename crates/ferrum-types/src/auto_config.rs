@@ -1118,6 +1118,7 @@ fn auto_config_source_from_runtime(source: RuntimeConfigSource) -> AutoConfigSou
         RuntimeConfigSource::Cli => AutoConfigSource::Cli,
         RuntimeConfigSource::Env => AutoConfigSource::Env,
         RuntimeConfigSource::ScriptCase => AutoConfigSource::ScriptCase,
+        RuntimeConfigSource::MemoryProfile => AutoConfigSource::MemoryProfile,
     }
 }
 
@@ -1483,7 +1484,7 @@ mod tests {
             assert!(entry["effective_value"].is_string());
             assert!(matches!(
                 entry["source"].as_str().unwrap(),
-                "default" | "config_file" | "cli" | "env" | "script_case"
+                "default" | "config_file" | "cli" | "env" | "script_case" | "memory_profile"
             ));
             assert!(!entry["affects"].as_array().unwrap().is_empty());
         }

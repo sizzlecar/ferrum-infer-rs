@@ -203,6 +203,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     let mut materialized_runtime_keys = materialize_runtime_env_defaults(&non_env_runtime_entries);
 
+    let autosize_env_before = RuntimeConfigSnapshot::capture_current();
     // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
     // KV pool + 4 GB scratch reserve fit in `total_gpu_mem * gpu_util`.
     // Skipped on Mac / when nvidia-smi is missing; respects user-set
@@ -210,6 +211,21 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     if let Some(p) = local_dir_path.as_ref() {
         crate::gpu_mem_autosize::apply_auto_size(p, gpu_memory_utilization);
     }
+    let autosize_runtime_entries = runtime_entries_added_by_snapshot(
+        &autosize_env_before,
+        &RuntimeConfigSnapshot::capture_current(),
+        SERVE_AUTOSIZE_RUNTIME_KEYS,
+        RuntimeConfigSource::MemoryProfile,
+    );
+    materialized_runtime_keys.extend(
+        autosize_runtime_entries
+            .iter()
+            .map(|entry| entry.key.clone()),
+    );
+    non_env_runtime_entries.extend(autosize_runtime_entries);
+    non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
+    materialized_runtime_keys.sort();
+    materialized_runtime_keys.dedup();
 
     let model_id = if let Some(p) = gguf_path.as_ref() {
         // Use the GGUF stem as the OpenAI model id — the user sees this
@@ -643,6 +659,39 @@ fn remove_materialized_config_env_entries(
         .entries
         .retain(|entry| !materialized_config_runtime_keys.contains(&entry.key));
     env_snapshot
+}
+
+const SERVE_AUTOSIZE_RUNTIME_KEYS: &[&str] = &[
+    "FERRUM_MAX_BATCHED_TOKENS",
+    "FERRUM_KV_MAX_BLOCKS",
+    "FERRUM_PAGED_MAX_SEQS",
+    "FERRUM_KV_CAPACITY",
+];
+
+fn runtime_entries_added_by_snapshot(
+    before: &RuntimeConfigSnapshot,
+    after: &RuntimeConfigSnapshot,
+    keys: &[&str],
+    source: RuntimeConfigSource,
+) -> Vec<RuntimeConfigEntry> {
+    keys.iter()
+        .filter_map(|key| {
+            let before_value = runtime_snapshot_value(before, key);
+            let after_value = runtime_snapshot_value(after, key);
+            match (before_value, after_value) {
+                (None, Some(value)) => Some(RuntimeConfigEntry::new(*key, value, source)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn runtime_snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.effective_value.as_str())
 }
 
 fn runtime_preset_entries(
@@ -1097,6 +1146,86 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "int8");
         assert_eq!(kv.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn autosize_snapshot_diff_marks_only_new_values_as_memory_profile() {
+        let before = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "2048", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
+        ]);
+        let after = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "2048", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new(
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "2048",
+                RuntimeConfigSource::Env,
+            ),
+            RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "32", RuntimeConfigSource::Env),
+        ]);
+
+        let entries = runtime_entries_added_by_snapshot(
+            &before,
+            &after,
+            SERVE_AUTOSIZE_RUNTIME_KEYS,
+            RuntimeConfigSource::MemoryProfile,
+        );
+        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(
+            entry("FERRUM_MAX_BATCHED_TOKENS").source,
+            RuntimeConfigSource::MemoryProfile
+        );
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "32");
+        assert!(snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.key != "FERRUM_KV_MAX_BLOCKS"));
+    }
+
+    #[test]
+    fn materialized_autosize_entries_keep_memory_profile_source() {
+        let autosize_entries = vec![RuntimeConfigEntry::new(
+            "FERRUM_MAX_BATCHED_TOKENS",
+            "2048",
+            RuntimeConfigSource::MemoryProfile,
+        )];
+        let materialized_keys = autosize_entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
+        let env_snapshot = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new(
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "2048",
+                RuntimeConfigSource::Env,
+            ),
+            RuntimeConfigEntry::new("FERRUM_KV_DTYPE", "fp16", RuntimeConfigSource::Env),
+        ]);
+        let env_snapshot = remove_materialized_config_env_entries(env_snapshot, &materialized_keys);
+        let snapshot = merge_runtime_config_sources(autosize_entries, env_snapshot, Vec::new());
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(
+            entry("FERRUM_MAX_BATCHED_TOKENS").source,
+            RuntimeConfigSource::MemoryProfile
+        );
+        assert_eq!(entry("FERRUM_KV_DTYPE").source, RuntimeConfigSource::Env);
     }
 
     #[test]

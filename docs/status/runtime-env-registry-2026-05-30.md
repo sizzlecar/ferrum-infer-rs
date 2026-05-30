@@ -32,6 +32,11 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   upserts. `ferrum serve` uses this for selected CLI runtime/profile inputs,
   so `--kv-dtype` and `--profile-*` appear in startup config artifacts with
   `source=cli`.
+- `RuntimeConfigSource` now includes `memory_profile`. `ferrum serve`
+  source-attributes GPU autosizer-created `FERRUM_MAX_BATCHED_TOKENS`,
+  `FERRUM_KV_MAX_BLOCKS`, `FERRUM_PAGED_MAX_SEQS`, and `FERRUM_KV_CAPACITY`
+  entries as `source=memory_profile` instead of reporting them as user env
+  overrides.
 - The CLI config schema supports a `[runtime]` surface for startup/runtime
   performance selectors: `kv_dtype`, KV/max-batch sizing, prefix cache, MoE
   graph, vLLM paged attention, vLLM-MoE, pair-id routing, greedy argmax,
