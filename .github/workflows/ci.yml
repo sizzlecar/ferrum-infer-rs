@@ -91,10 +91,11 @@ jobs:
 
       - name: M3 runner artifact checks
         run: |
-          python3 -m py_compile scripts/m3_ab_runner.py scripts/m3_validate_runner_artifact.py scripts/check_m3_runner_wrappers.py
+          python3 -m py_compile scripts/m3_ab_runner.py scripts/m3_validate_runner_artifact.py scripts/check_m3_runner_wrappers.py scripts/m3_collect_allcell_runner_artifacts.py
           python3 scripts/m3_ab_runner.py --self-test
           python3 scripts/m3_validate_runner_artifact.py --self-test
           python3 scripts/check_m3_runner_wrappers.py --self-test
+          python3 scripts/m3_collect_allcell_runner_artifacts.py --self-test
           python3 scripts/check_m3_runner_wrappers.py
           bash -n scripts/m3_fa2_direct_ffi_ab.sh
           bash -n scripts/m3_fa2_source_allcells_ab.sh

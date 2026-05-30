@@ -13,6 +13,7 @@ PORT_BASE="${PORT_BASE:-18480}"
 NUM_PROMPTS="${NUM_PROMPTS:-128}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-10}"
 CONCURRENCY="${CONCURRENCY:-32}"
+VALIDATION_CHANGE_TYPE="${VALIDATION_CHANGE_TYPE:-opt_in_experiment}"
 FA2_SHIM="${FA2_SHIM:-/workspace/libferrum_fa2_shim.so}"
 FA2_SOURCE="${FA2_SOURCE:-0}"
 TORCH_LIB="${TORCH_LIB:-/workspace/vllm-venv/lib/python3.12/site-packages/torch/lib}"
@@ -31,7 +32,7 @@ elif [[ ! -r "$FA2_SHIM" ]]; then
 fi
 
 export MODEL_DIR HF_MODEL BIN OUT_ROOT REPEATS PORT_BASE NUM_PROMPTS WARMUP_REQUESTS CONCURRENCY
-export FA2_SHIM FA2_SOURCE TORCH_LIB FA2_DIR FA2_EXTRA_LD_LIBRARY_PATH FEATURES BUILD="${BUILD:-0}"
+export VALIDATION_CHANGE_TYPE FA2_SHIM FA2_SOURCE TORCH_LIB FA2_DIR FA2_EXTRA_LD_LIBRARY_PATH FEATURES BUILD="${BUILD:-0}"
 
 mkdir -p "$OUT_ROOT"
 CONFIG="$OUT_ROOT/runner_config.json"
@@ -72,7 +73,7 @@ config = {
     "baseline_case": "fa_layout",
     "gates": {"paris": True, "multi_turn": True},
     "validation": {
-        "change_type": "opt_in_experiment",
+        "change_type": os.environ["VALIDATION_CHANGE_TYPE"],
         "touched_areas": ["model_forward", "attention_prefill_mixed_path", "fa2_runtime_path"],
         "performance_regression_required": True,
     },

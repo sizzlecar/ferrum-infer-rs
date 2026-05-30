@@ -15,6 +15,7 @@ NUM_PROMPTS="${NUM_PROMPTS:-128}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-10}"
 PORT_BASE="${PORT_BASE:-18600}"
 CONCURRENCIES="${CONCURRENCIES:-1 4 16 32}"
+VALIDATION_CHANGE_TYPE="${VALIDATION_CHANGE_TYPE:-opt_in_experiment}"
 
 mkdir -p "$OUT_ROOT"
 
@@ -23,6 +24,7 @@ echo "REPEATS=$REPEATS"
 echo "NUM_PROMPTS=$NUM_PROMPTS"
 echo "WARMUP_REQUESTS=$WARMUP_REQUESTS"
 echo "CONCURRENCIES=$CONCURRENCIES"
+echo "VALIDATION_CHANGE_TYPE=$VALIDATION_CHANGE_TYPE"
 
 {
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -36,6 +38,7 @@ echo "CONCURRENCIES=$CONCURRENCIES"
     echo "num_prompts=$NUM_PROMPTS"
     echo "warmup_requests=$WARMUP_REQUESTS"
     echo "concurrencies=$CONCURRENCIES"
+    echo "validation_change_type=$VALIDATION_CHANGE_TYPE"
 } >"$OUT_ROOT/metadata.txt"
 
 index=0
@@ -51,9 +54,17 @@ for concurrency in $CONCURRENCIES; do
         WARMUP_REQUESTS="$WARMUP_REQUESTS" \
         CONCURRENCY="$concurrency" \
         PORT_BASE="$cell_port_base" \
+        VALIDATION_CHANGE_TYPE="$VALIDATION_CHANGE_TYPE" \
         bash scripts/m3_fa2_direct_ffi_ab.sh
     index=$((index + 1))
 done
+
+if [[ "${VALIDATE_ONLY:-0}" != "1" ]]; then
+    python3 scripts/m3_collect_allcell_runner_artifacts.py "$OUT_ROOT" \
+        --baseline-case fa_layout \
+        --candidate fa2_source \
+        --change-type "$VALIDATION_CHANGE_TYPE"
+fi
 
 python3 - "$OUT_ROOT" <<'PY'
 import json
