@@ -82,6 +82,11 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   `FERRUM_PAGED_MAX_SEQS`, `FERRUM_KV_CAPACITY`) with
   `source=memory_profile` when they are introduced during startup, so startup
   artifacts distinguish memory-profile sizing from user env overrides.
+- The LLM `serve` path now passes the resolved target model path and
+  speculative decoding draft settings through typed `EngineConfig`
+  backend options instead of process-wide `FERRUM_MODEL_PATH` /
+  `FERRUM_SPEC_DRAFT` / `FERRUM_SPEC_N` writes. Those env names remain
+  available only as compatibility aliases for external engine-builder callers.
 - The CUDA `serve` startup path now performs a runtime hardware probe with
   `nvidia-smi`/`nvcc` when available. It fills `HardwareCapabilities` with
   CUDA runtime/toolkit version, compute capability, total VRAM, and SM count

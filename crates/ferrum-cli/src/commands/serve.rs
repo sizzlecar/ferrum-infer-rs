@@ -290,15 +290,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         }
     };
 
-    // Set model path for engine
-    std::env::set_var(
-        "FERRUM_MODEL_PATH",
-        source.local_path.to_string_lossy().to_string(),
-    );
+    let engine_model_path = source.local_path.to_string_lossy().to_string();
 
-    // Speculative decoding draft model: resolve + set FERRUM_SPEC_DRAFT so
-    // the engine builder picks it up. Validates that the draft model is
+    // Speculative decoding draft model: resolve the draft path and pass it
+    // through EngineConfig backend options. Validates that the draft model is
     // actually cached before the target load kicks in.
+    let mut engine_spec_draft_path = None;
     if let Some(ref draft_name) = spec_draft {
         if gguf_path.is_some() {
             return Err(ferrum_types::FerrumError::unsupported(
@@ -318,11 +315,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 );
                 ferrum_types::FerrumError::model("Draft model not found")
             })?;
-        std::env::set_var(
-            "FERRUM_SPEC_DRAFT",
-            draft_source.local_path.to_string_lossy().to_string(),
-        );
-        std::env::set_var("FERRUM_SPEC_N", spec_tokens.to_string());
+        engine_spec_draft_path = Some(draft_source.local_path.to_string_lossy().to_string());
         println!(
             "{} {} tokens / verify pass",
             "Speculative decoding:".dimmed(),
@@ -485,6 +478,20 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             engine_config.backend.device = device;
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
+            engine_config.backend.backend_options.insert(
+                "model_path".to_string(),
+                serde_json::Value::String(engine_model_path.clone()),
+            );
+            if let Some(draft_path) = engine_spec_draft_path.as_ref() {
+                engine_config.backend.backend_options.insert(
+                    "spec_draft".to_string(),
+                    serde_json::Value::String(draft_path.clone()),
+                );
+                engine_config.backend.backend_options.insert(
+                    "spec_n".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(spec_tokens)),
+                );
+            }
             super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
                 Arc::from(ferrum_engine::create_default_engine(engine_config).await?);

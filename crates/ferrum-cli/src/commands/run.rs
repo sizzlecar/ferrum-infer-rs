@@ -204,14 +204,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = source.original.clone();
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
-    // Set model path for engine
-    // NOTE: std::env::set_var is unsafe on Rust 2024; keep it minimal and explicit.
-    unsafe {
-        std::env::set_var(
-            "FERRUM_MODEL_PATH",
-            source.local_path.to_string_lossy().to_string(),
-        );
-    }
+    let engine_model_path = source.local_path.to_string_lossy().to_string();
 
     // Select device
     let device = select_device(&cmd.backend);
@@ -230,6 +223,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
     engine_config.backend.device = device;
+    engine_config.backend.backend_options.insert(
+        "model_path".to_string(),
+        serde_json::Value::String(engine_model_path),
+    );
     apply_kv_dtype_override(&mut engine_config, cmd.kv_dtype.as_deref())?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
     eprintln!(

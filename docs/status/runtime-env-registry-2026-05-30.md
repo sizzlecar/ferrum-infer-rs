@@ -60,6 +60,12 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
 - The legacy CUDA decode runner now captures diagnostic flags, paged-KV enablement, and KV block count in a typed runtime config at runner construction.
 - CUDA quant/Marlin/graph wrappers now capture Triton/vLLM-Marlin/vLLM-MoE selection, Marlin tuning switches, MoE fused/multistream dispatch, graph replay diagnostics, and vLLM paged-attn short-context selection in typed runtime configs.
 - The engine builder and component registry now snapshot model-path, speculative decoding, dtype, and tensor-parallel env knobs once. Tokenizer/executor resolution and model factory setup no longer call env APIs directly.
+- `ferrum run`, `ferrum bench`, and the LLM branch of `ferrum serve` no longer
+  write `FERRUM_MODEL_PATH` into process env before engine construction.
+  They pass `model_path` through `EngineConfig.backend_options`; `serve`
+  also passes speculative decoding `spec_draft`/`spec_n` through typed backend
+  options instead of writing `FERRUM_SPEC_DRAFT`/`FERRUM_SPEC_N`. The env names
+  remain registered as startup compatibility aliases for external callers.
 - TTS, HuggingFace download/source resolution, and LLM batch profile flags now use typed one-time env snapshots with parser tests.
 - Remaining CUDA module-level backend selectors (`FERRUM_MOE_STREAMS`, `FERRUM_CUDA_MAX_KV`, `FERRUM_CUDA_DEVICE`) and fused-attention CPU/Metal selectors now use cached runtime config.
 - The vLLM-MoE Marlin C++ bridge now reads its diagnostic logging and thread/block override env knobs through a single process-static runtime config helper instead of per-call `getenv` checks.

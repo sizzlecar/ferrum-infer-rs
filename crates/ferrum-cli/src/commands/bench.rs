@@ -133,12 +133,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
 
-    unsafe {
-        std::env::set_var(
-            "FERRUM_MODEL_PATH",
-            source.local_path.to_string_lossy().to_string(),
-        );
-    }
+    let engine_model_path = source.local_path.to_string_lossy().to_string();
 
     let device = super::run::select_device(&cmd.backend);
     let backend_str = format!("{:?}", device).to_lowercase();
@@ -171,6 +166,10 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
     engine_config.backend.device = device;
+    engine_config.backend.backend_options.insert(
+        "model_path".to_string(),
+        serde_json::Value::String(engine_model_path),
+    );
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     super::run::apply_kv_dtype_override(&mut engine_config, cmd.kv_dtype.as_deref())?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;

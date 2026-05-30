@@ -187,7 +187,7 @@ impl EngineBuilder {
         }
 
         // If model path is set, try huggingface first
-        if engine_builder_runtime_env().has_model_path() {
+        if self.has_typed_model_path() || engine_builder_runtime_env().has_model_path() {
             return "huggingface".to_string();
         }
 
@@ -240,11 +240,20 @@ impl EngineBuilder {
         }
 
         // If model path is set, try candle executor
-        if engine_builder_runtime_env().has_model_path() {
+        if self.has_typed_model_path() || engine_builder_runtime_env().has_model_path() {
             return "llm".to_string();
         }
 
         "stub".to_string()
+    }
+
+    fn has_typed_model_path(&self) -> bool {
+        self.config
+            .backend
+            .backend_options
+            .get("model_path")
+            .and_then(|value| value.as_str())
+            .is_some()
     }
 
     /// Build the inference engine
@@ -264,6 +273,7 @@ impl EngineBuilder {
         let component_config = ComponentConfig::from_engine_config(&self.config);
         let has_model_path = component_config.get_string_option("model_path").is_some()
             || engine_builder_runtime_env().has_model_path();
+        let runtime_env = engine_builder_runtime_env();
         let registry = self.registry.clone();
         let config = self.config;
 
@@ -391,15 +401,20 @@ impl EngineBuilder {
             crate::tensor_factory::candle::CandleTensorFactory::new(config.backend.device.clone()),
         );
 
-        // Opt-in speculative decoding: set FERRUM_SPEC_DRAFT=<model_path>
-        // (absolute path to a HF snapshot dir) to load a second smaller
-        // model as the draft. The draft must use the same tokenizer +
-        // vocab as the target (same family e.g. Qwen3).
-        let runtime_env = engine_builder_runtime_env();
-        let (draft_executor, spec_config) = match runtime_env.spec_draft.as_ref() {
+        // Opt-in speculative decoding: provide an absolute HF snapshot path
+        // for a second smaller model. The draft must use the same tokenizer
+        // + vocab as the target (same family e.g. Qwen3). Backend options are
+        // the typed startup path; the legacy speculative env names remain
+        // compatibility aliases.
+        let spec_draft = component_config
+            .get_string_option("spec_draft")
+            .or_else(|| runtime_env.spec_draft.clone());
+        let spec_n = component_config
+            .get_option::<usize>("spec_n")
+            .unwrap_or(runtime_env.spec_n);
+        let (draft_executor, spec_config) = match spec_draft.as_ref() {
             Some(draft_path) => {
                 info!("Speculative decoding: loading draft model from {draft_path}");
-                let n = runtime_env.spec_n;
                 let mut draft_cfg = component_config.clone();
                 draft_cfg.component_options.insert(
                     "model_path".to_string(),
@@ -409,7 +424,7 @@ impl EngineBuilder {
                     Ok(draft) => (
                         Some(draft),
                         Some(crate::speculative::SpeculativeDecodingConfig {
-                            num_speculative_tokens: n,
+                            num_speculative_tokens: spec_n,
                             temperature: 1.0,
                         }),
                     ),
@@ -475,6 +490,44 @@ mod tests {
         assert_eq!(builder.scheduler_name, Some("priority".to_string()));
         assert_eq!(builder.kv_cache_name, Some("paged".to_string()));
         assert_eq!(builder.executor_name, Some("custom_executor".to_string()));
+    }
+
+    #[test]
+    fn test_builder_typed_model_path_selects_model_components() {
+        let mut config = EngineConfig::default();
+        config.backend.backend_options.insert(
+            "model_path".to_string(),
+            serde_json::Value::String("/models/target".to_string()),
+        );
+        let builder = EngineBuilder::new(config);
+
+        assert!(builder.has_typed_model_path());
+        assert_eq!(builder.resolve_tokenizer_name(), "huggingface");
+        assert_eq!(builder.resolve_executor_name(), "llm");
+    }
+
+    #[test]
+    fn test_builder_typed_spec_options_parse_from_component_config() {
+        let mut config = EngineConfig::default();
+        config.backend.backend_options.insert(
+            "model_path".to_string(),
+            serde_json::Value::String("/models/target".to_string()),
+        );
+        config.backend.backend_options.insert(
+            "spec_draft".to_string(),
+            serde_json::Value::String("/models/draft".to_string()),
+        );
+        config.backend.backend_options.insert(
+            "spec_n".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(6)),
+        );
+        let component_config = ComponentConfig::from_engine_config(&config);
+
+        assert_eq!(
+            component_config.get_string_option("spec_draft").as_deref(),
+            Some("/models/draft")
+        );
+        assert_eq!(component_config.get_option::<usize>("spec_n"), Some(6));
     }
 
     #[test]
