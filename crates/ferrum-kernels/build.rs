@@ -224,41 +224,6 @@ fn main() {
     if env::consts::OS == "macos" {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
-    println!("cargo:rerun-if-changed=kernels/fused_add_rms_norm.cu");
-    println!("cargo:rerun-if-changed=kernels/fused_silu_mul.cu");
-    println!("cargo:rerun-if-changed=kernels/rms_norm.cu");
-    println!("cargo:rerun-if-changed=kernels/rope.cu");
-    println!("cargo:rerun-if-changed=kernels/decode_attention.cu");
-    println!("cargo:rerun-if-changed=kernels/residual_add.cu");
-    println!("cargo:rerun-if-changed=kernels/flash_decode_attention.cu");
-    println!("cargo:rerun-if-changed=kernels/paged_decode_attention.cu");
-    println!("cargo:rerun-if-changed=kernels/paged_varlen_attention.cu");
-    println!("cargo:rerun-if-changed=kernels/paged_varlen_attention_vllm.cu");
-    println!("cargo:rerun-if-changed=kernels/dequant_int4.cu");
-    println!("cargo:rerun-if-changed=kernels/batched_decode_attention.cu");
-    println!("cargo:rerun-if-changed=kernels/common.cuh");
-    println!("cargo:rerun-if-changed=kernels/softmax.cu");
-    println!("cargo:rerun-if-changed=kernels/embedding_lookup.cu");
-    println!("cargo:rerun-if-changed=kernels/flash_attn_full.cu");
-    println!("cargo:rerun-if-changed=kernels/batched_flash_decode_attention.cu");
-    println!("cargo:rerun-if-changed=kernels/qk_norm_rope.cu");
-    println!("cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_paged_cache.cu");
-    println!("cargo:rerun-if-changed=kernels/transpose.cu");
-    println!("cargo:rerun-if-changed=kernels/kv_cache_append.cu");
-    println!("cargo:rerun-if-changed=kernels/split_qkv.cu");
-    println!("cargo:rerun-if-changed=kernels/add_bias.cu");
-    println!("cargo:rerun-if-changed=kernels/layer_norm.cu");
-    println!("cargo:rerun-if-changed=kernels/gelu.cu");
-    println!("cargo:rerun-if-changed=kernels/decode_attention_hm.cu");
-    println!("cargo:rerun-if-changed=kernels/gather_columns.cu");
-    println!("cargo:rerun-if-changed=kernels/moe_combine.cu");
-    println!("cargo:rerun-if-changed=kernels/moe_router.cu");
-    println!("cargo:rerun-if-changed=kernels/moe_align_block_size.cu");
-    println!("cargo:rerun-if-changed=kernels/moe_align_block_size_pair_ids.cu");
-    println!("cargo:rerun-if-changed=kernels/moe_build_pairs.cu");
-    println!("cargo:rerun-if-changed=kernels/int8_paged_decode_attention.cu");
-    println!("cargo:rerun-if-changed=kernels/argmax_rows.cu");
-    println!("cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;

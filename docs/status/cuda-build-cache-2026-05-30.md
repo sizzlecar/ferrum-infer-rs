@@ -30,6 +30,14 @@ summary lines.
   `status=cache_hit`/`status=built` expectations. CI runs its self-test so
   future changes to the summary line format break a lightweight local gate
   before GPU timing artifacts are produced.
+- `scripts/m3_cuda_build_boundary_probe.py` runs the Milestone A release
+  touch/content-change probe for N iterations, validates the same structured
+  CUDA summary rows for every run, computes nearest-rank p50/p95 timing, and
+  writes `build_boundary_manifest.json`.
+- `ferrum-kernels/build.rs` no longer registers core CUDA `.cu` inputs before
+  the `cuda` feature check. CUDA builds still watch the same core PTX inputs in
+  `compile_core_ptx`, but non-CUDA builds are no longer dirtied by unrelated
+  core CUDA kernel touches.
 
 ## Validation
 
@@ -40,6 +48,8 @@ cargo fmt --all -- --check
 cargo check -q -p ferrum-kernels
 python3 -m py_compile scripts/validate_cuda_build_summary.py
 python3 scripts/validate_cuda_build_summary.py --self-test
+python3 -m py_compile scripts/m3_cuda_build_boundary_probe.py
+python3 scripts/m3_cuda_build_boundary_probe.py --self-test
 git diff --check
 ```
 
@@ -117,15 +127,16 @@ Remote release touch probe:
 
 ```bash
 cd /workspace/ferrum-codex-clean
-touch crates/ferrum-kernels/kernels/paged_varlen_attention_vllm.cu
-cargo build --release -p ferrum-cli \
-  --features cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source \
-  > /workspace/m3-release-touch-probe-20260530.log 2>&1
+python3 scripts/m3_cuda_build_boundary_probe.py \
+  --out /workspace/m3-release-touch-probe-20260530 \
+  --iterations 5 \
+  --fail-on-limit
 ```
 
 Evidence:
 
-- `/workspace/m3-release-touch-probe-20260530.log` completed in `3m17s`.
+- Legacy one-off `/workspace/m3-release-touch-probe-20260530.log` completed
+  in `3m17s`.
 - The ordinary cargo log showed the release chain recompiling
   `ferrum-kernels`, `ferrum-quantization`, `ferrum-models`,
   `ferrum-engine`, `ferrum-server`, and `ferrum-cli`.
@@ -192,7 +203,8 @@ Evidence:
 ## Remaining A Gaps
 
 - The 5-run release rebuild timing gate has not been run yet, so p50/p95
-  acceptance is not proven.
+  acceptance is not proven. The probe script now exists, but the GPU timing
+  artifact still needs to be produced.
 - The single release touch probe currently fails the `<= 90s` target: the
   best measured full `ferrum-cli` rebuild after an attention-kernel touch is
   `3m17s`.
