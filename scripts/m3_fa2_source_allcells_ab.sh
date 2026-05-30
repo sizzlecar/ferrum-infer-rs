@@ -64,6 +64,9 @@ if [[ "${VALIDATE_ONLY:-0}" != "1" ]]; then
         --baseline-case fa_layout \
         --candidate fa2_source \
         --change-type "$VALIDATION_CHANGE_TYPE"
+    if [[ "${VALIDATE_ARTIFACT:-1}" == "1" ]]; then
+        python3 scripts/m3_validate_runner_artifact.py "$OUT_ROOT"
+    fi
 fi
 
 python3 - "$OUT_ROOT" <<'PY'
