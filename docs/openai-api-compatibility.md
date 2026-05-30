@@ -33,10 +33,10 @@ describes the current product contract for the always-on server path.
 | `logit_bias` | Rejected | Non-empty maps return HTTP 400 with `param=logit_bias`. |
 | `logprobs` | Rejected | Returns HTTP 400 with `param=logprobs`. |
 | `top_logprobs` | Rejected | Values greater than zero return HTTP 400 with `param=top_logprobs`. |
-| `tools` | Partially supported | Function tool definitions parse and are carried through the structured request boundary; non-function tool types return HTTP 400 with `param=tools`. |
+| `tools` | Partially supported | Function tool definitions parse and are carried through the structured request boundary. Non-streaming engine output that emits matching tool-call JSON is returned as OpenAI `tool_calls`; non-function tool types return HTTP 400 with `param=tools`. |
 | `tool_choice=auto/none` | Supported | Parsed and carried through request metadata. |
-| forced `tool_choice` / `required` | Rejected | Tool-call generation is not implemented yet, so forced selection returns HTTP 400. |
-| legacy `functions` / `function_call=auto/none` | Supported | Parsed for SDK compatibility and carried through structured request data. Assistant `function_call` responses serialize in the legacy OpenAI shape. |
+| forced `tool_choice` / `required` | Rejected | Forced selection is not implemented; automatic non-streaming JSON tool-call parsing is supported only for `auto`. |
+| legacy `functions` / `function_call=auto/none` | Supported | Parsed for SDK compatibility and carried through structured request data. Assistant `function_call` responses serialize in the legacy OpenAI shape, including non-streaming engine output that emits matching function-call JSON. |
 | forced legacy `function_call` | Rejected | Returns HTTP 400 with `param=function_call`. |
 
 ## Structured Output
