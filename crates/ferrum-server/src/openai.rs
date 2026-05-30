@@ -78,8 +78,9 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<OpenAiResponseFormat>,
 
-    /// OpenAI tool definitions. These are parsed and carried through request
-    /// metadata; forced tool-call generation is rejected until implemented.
+    /// OpenAI tool definitions. Function tools are parsed, carried through
+    /// structured request data, and can shape model-emitted tool-call JSON.
+    /// Tool execution itself stays caller-owned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ChatTool>>,
 

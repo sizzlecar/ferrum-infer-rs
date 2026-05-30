@@ -34,10 +34,11 @@ describes the current product contract for the always-on server path.
 | `logprobs` | Rejected | Returns HTTP 400 with `param=logprobs`. |
 | `top_logprobs` | Rejected | Values greater than zero return HTTP 400 with `param=top_logprobs`. |
 | `tools` | Partially supported | Function tool definitions parse, are carried through the structured request boundary, and are included in the rendered chat-template prompt. Engine output that emits matching tool-call JSON is returned as OpenAI `tool_calls` for non-streaming responses and streaming deltas; non-function tool types return HTTP 400 with `param=tools`. Tool execution is caller-owned, matching OpenAI/vLLM API semantics. |
-| `tool_choice=auto/none` | Supported | Parsed and carried through request metadata. |
-| forced `tool_choice` / `required` | Rejected | Forced selection is not implemented; automatic JSON tool-call parsing is supported only for `auto`. |
+| `tool_choice=auto/none` | Supported | Parsed and carried through structured request metadata. `none` keeps generated tool-call JSON as ordinary assistant content. |
+| specific `tool_choice` | Supported | Selector objects such as `{"type":"function","function":{"name":"weather"}}` validate against declared tools, render into prompt context, and constrain generated JSON parsing to the selected tool. Undeclared tool names return HTTP 400 with `param=tool_choice`. |
+| `tool_choice=required` | Rejected | Returns HTTP 400 with `param=tool_choice` until hard tool-call forcing is implemented. |
 | legacy `functions` / `function_call=auto/none` | Supported | Parsed for SDK compatibility and carried through structured request data. Assistant `function_call` responses serialize in the legacy OpenAI shape, including non-streaming responses and streaming deltas when engine output emits matching function-call JSON. |
-| forced legacy `function_call` | Rejected | Returns HTTP 400 with `param=function_call`. |
+| specific legacy `function_call` | Supported | Named function-call selectors validate against declared legacy functions and constrain generated function-call JSON parsing to the selected function. Undeclared function names return HTTP 400 with `param=function_call`. |
 
 ## Structured Output
 

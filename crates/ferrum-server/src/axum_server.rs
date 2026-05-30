@@ -2703,6 +2703,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_streaming_chat_honors_specific_tool_choice_for_generated_tool_call_delta() {
+        let request = |generated: &'static str| {
+            post_json(
+                router_with_stub(generated),
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": "Use the selected tool."}],
+                    "stream": true,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "weather", "parameters": {"type": "object"}}
+                        },
+                        {
+                            "type": "function",
+                            "function": {"name": "calendar", "parameters": {"type": "object"}}
+                        }
+                    ],
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "weather"}
+                    }
+                }),
+            )
+        };
+
+        let response = request(r#"{"name":"weather","arguments":{"city":"Paris"}}"#).await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"tool_calls""#),
+            "selected tool should finish with tool_calls: {body}"
+        );
+        assert!(
+            body.contains(r#""function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}"#),
+            "selected tool should stream as tool_calls delta: {body}"
+        );
+
+        let response = request(r#"{"name":"calendar","arguments":{}}"#).await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains(r#""content":"{\"name\":\"calendar\",\"arguments\":{}}""#),
+            "unselected tool JSON should stream as ordinary content: {body}"
+        );
+        assert!(
+            body.contains(r#""finish_reason":"stop""#),
+            "unselected tool JSON should keep normal stop finish: {body}"
+        );
+        assert!(
+            !body.contains(r#""finish_reason":"tool_calls""#),
+            "unselected tool JSON must not become tool_calls: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn route_streaming_chat_prefers_chunk_api_response_for_tool_delta() {
         let response = post_json(
             router_with_stub_api_response(
@@ -2828,6 +2886,60 @@ mod tests {
         assert!(
             !body.contains(r#""content":"{\"function_call\""#),
             "raw function-call JSON should not be streamed as assistant content: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_honors_specific_legacy_function_call_delta() {
+        let request = |generated: &'static str| {
+            post_json(
+                router_with_stub(generated),
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": "Use the selected function."}],
+                    "stream": true,
+                    "functions": [
+                        {"name": "weather", "parameters": {"type": "object"}},
+                        {"name": "calendar", "parameters": {"type": "object"}}
+                    ],
+                    "function_call": {"name": "weather"}
+                }),
+            )
+        };
+
+        let response =
+            request(r#"{"function_call":{"name":"weather","arguments":{"city":"Paris"}}}"#).await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"function_call""#),
+            "selected function should finish with function_call: {body}"
+        );
+        assert!(
+            body.contains(
+                r#""function_call":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}"#
+            ),
+            "selected function should stream as function_call delta: {body}"
+        );
+
+        let response = request(r#"{"function_call":{"name":"calendar","arguments":{}}}"#).await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains(
+                r#""content":"{\"function_call\":{\"name\":\"calendar\",\"arguments\":{}}}""#
+            ),
+            "unselected function JSON should stream as ordinary content: {body}"
+        );
+        assert!(
+            body.contains(r#""finish_reason":"stop""#),
+            "unselected function JSON should keep normal stop finish: {body}"
+        );
+        assert!(
+            !body.contains(r#""finish_reason":"function_call""#),
+            "unselected function JSON must not become function_call: {body}"
         );
     }
 
