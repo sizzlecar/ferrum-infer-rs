@@ -135,16 +135,17 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   profile events default to the server's resolved env hash/runtime flags.
 - The runner artifact validator now schema-checks server-written
   `effective_config.json` entries, including sorted `FERRUM_*` keys,
-  non-empty `affects`, allowed source/effect values, and decision parity with
-  `decision_trace.jsonl`.
+  non-empty `affects`, allowed source/effect values, selector input objects
+  (`model_capabilities`, `hardware_capabilities`, `workload_profile`), and
+  decision parity with `decision_trace.jsonl`.
 - Decision-trace validation now rejects unknown source values, non-`FERRUM_*`
   source keys, empty candidate/effect lists, and malformed rejected-candidate
   reasons.
 - `ferrum-types` now has a locked artifact-shape unit test that parses
   `effective_config_document()` and `decision_trace_jsonl()` as real artifacts
-  and checks sorted entries, source/effect vocabulary, non-empty selector
-  fields, `FERRUM_*` source keys, and exact parity between embedded decisions
-  and JSONL trace lines.
+  and checks sorted entries, source/effect vocabulary, selector input fields,
+  non-empty selector fields, `FERRUM_*` source keys, and exact parity between
+  embedded decisions and JSONL trace lines.
 
 ## Validation
 
@@ -161,9 +162,13 @@ cargo test -q -p ferrum-cli commands::serve -- --nocapture
 cargo test -q -p ferrum-cli runtime_env -- --nocapture
 cargo test -q -p ferrum-cli source_resolver -- --nocapture
 cargo test -q -p ferrum-server route_health_includes_runtime_config_snapshot -- --nocapture
-python3 -m py_compile scripts/m3_ab_runner.py scripts/m3_validate_runner_artifact.py
+python3 -m py_compile \
+  scripts/m3_ab_runner.py \
+  scripts/m3_validate_runner_artifact.py \
+  scripts/m3_collect_allcell_runner_artifacts.py
 python3 scripts/m3_ab_runner.py --self-test
 python3 scripts/m3_validate_runner_artifact.py --self-test
+python3 scripts/m3_collect_allcell_runner_artifacts.py --self-test
 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-runner-validate-fa-layout \
   VALIDATE_ONLY=1 bash scripts/m3_fa_layout_varlen_ab.sh
 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-runner-validate-route \
@@ -177,13 +182,14 @@ Evidence:
 
 - `ferrum-types` auto-config tests passed: `17 passed`, including
   non-env source attribution for config-file, CLI, and script-case entries plus
-  locked artifact schema-shape coverage and requested max-model-len budget
-  validation. The M3 preset test also asserts prefix cache remains disabled by
-  the Rust selector unless explicitly overridden. New hardware-selector tests
-  cover non-CUDA backend fallback, forced CUDA-only override rejection, CUDA
-  compute capability parsing for FA2 eligibility, SM/VRAM-based sequence
-  budget downgrades, model-weight/KV-byte memory budget downgrades, and user
-  override precedence over hardware defaults.
+  locked artifact schema-shape coverage for runtime entries, model
+  capabilities, hardware capabilities, workload profile, and requested
+  max-model-len budget validation. The M3 preset test also asserts prefix
+  cache remains disabled by the Rust selector unless explicitly overridden.
+  New hardware-selector tests cover non-CUDA backend fallback, forced CUDA-only
+  override rejection, CUDA compute capability parsing for FA2 eligibility,
+  SM/VRAM-based sequence budget downgrades, model-weight/KV-byte memory budget
+  downgrades, and user override precedence over hardware defaults.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
 - `ferrum-cli` serve tests passed: `19 passed`, covering CLI-sourced runtime
@@ -209,12 +215,13 @@ Evidence:
 - `ferrum-server` health test passed and verifies `auto_config` is present
   with either a decision list or an explicit resolver error.
 - `cargo check` passed for `ferrum-types`, `ferrum-server`, and `ferrum-cli`.
-- Runner and artifact-validator self-tests passed after switching the runtime
-  case path to server-written config artifacts and removing the runner-side
-  selector implementation. Migrated wrapper syntax checks and
-  `VALIDATE_ONLY=1` config checks passed for the current migrated set.
+- Runner, all-cell aggregator, and artifact-validator self-tests passed after
+  requiring server-written config artifacts to include selector input objects
+  and after removing the runner-side selector implementation. Migrated wrapper
+  syntax checks and `VALIDATE_ONLY=1` config checks passed for the current
+  migrated set.
 - Env registry stayed at full coverage with no new unregistered names:
-  `147/147`, hot direct env reads `4`.
+  `146/146`, hot direct env reads `4`.
 
 ## Remaining E Gaps
 

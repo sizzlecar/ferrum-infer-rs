@@ -236,6 +236,9 @@ impl ResolvedFerrumConfig {
             "preset": self.preset,
             "env_hash": self.runtime_env_hash(),
             "entries": self.runtime_config.entries,
+            "model_capabilities": self.model_capabilities,
+            "hardware_capabilities": self.hardware_capabilities,
+            "workload_profile": self.workload_profile,
             "decisions": self.decisions,
         })
     }
@@ -1846,6 +1849,12 @@ mod tests {
             .unwrap()
             .starts_with("sha256:"));
         assert!(effective["entries"].is_array());
+        assert_eq!(effective["model_capabilities"]["architecture"], "qwen3_moe");
+        assert_eq!(effective["hardware_capabilities"]["backend"], "cuda");
+        assert_eq!(
+            effective["workload_profile"]["preset"],
+            M3_QWEN3_30B_A3B_INT4_PRESET
+        );
         assert_eq!(
             effective["decisions"].as_array().unwrap().len(),
             resolved.decisions.len()
@@ -1892,6 +1901,30 @@ mod tests {
             ));
             assert!(!entry["affects"].as_array().unwrap().is_empty());
         }
+        assert_eq!(
+            effective["model_capabilities"]["quantization"].as_str(),
+            Some("gptq_int4")
+        );
+        assert_eq!(
+            effective["model_capabilities"]["moe"]["experts_per_token"].as_u64(),
+            Some(8)
+        );
+        assert_eq!(
+            effective["hardware_capabilities"]["compute_capability"].as_str(),
+            Some("8.9")
+        );
+        assert_eq!(
+            effective["hardware_capabilities"]["compiled_features"]["vllm_moe_marlin"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            effective["workload_profile"]["target_concurrency"].as_u64(),
+            Some(32)
+        );
+        assert_eq!(
+            effective["workload_profile"]["priority"].as_str(),
+            Some("throughput")
+        );
 
         let trace = resolved.decision_trace_jsonl().unwrap();
         let trace_decisions: Vec<AutoConfigDecision> = trace

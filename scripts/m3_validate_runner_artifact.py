@@ -159,6 +159,17 @@ EFFECTIVE_CONFIG_ENTRY_REQUIRED = {
     "affects",
 }
 
+EFFECTIVE_CONFIG_REQUIRED = {
+    "schema_version",
+    "preset",
+    "env_hash",
+    "entries",
+    "model_capabilities",
+    "hardware_capabilities",
+    "workload_profile",
+    "decisions",
+}
+
 EFFECTIVE_CONFIG_SOURCES = {
     "default",
     "config_file",
@@ -173,6 +184,16 @@ EFFECTIVE_CONFIG_EFFECTS = {
     "performance",
     "memory",
     "diagnostics",
+}
+
+COMPILED_FEATURE_KEYS = {
+    "cuda",
+    "vllm_paged_attn",
+    "vllm_moe_marlin",
+    "cuda_graph",
+    "greedy_argmax",
+    "fa2_source",
+    "fa2_direct_ffi",
 }
 
 VALIDATION_CHECKLIST_REQUIRED = {
@@ -876,17 +897,175 @@ def canonicalize(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def expect_optional_positive_int(where: str, value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValidationError(f"{where} must be null or a positive integer")
+
+
+def expect_string_list(where: str, value: Any, *, allow_empty: bool = False) -> None:
+    if not isinstance(value, list):
+        raise ValidationError(f"{where} must be a list")
+    if not allow_empty and not value:
+        raise ValidationError(f"{where} must not be empty")
+    if not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValidationError(f"{where} entries must be non-empty strings")
+
+
+def validate_model_capabilities(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ValidationError("effective_config_json.model_capabilities must be an object")
+    require_keys(
+        "effective_config_json.model_capabilities",
+        value,
+        {
+            "architecture",
+            "quantization",
+            "moe",
+            "max_context_len",
+            "num_hidden_layers",
+            "head_dim",
+            "kv_heads",
+            "estimated_weight_bytes",
+            "supported_dtypes",
+            "graph_safe_moe",
+        },
+    )
+    if not isinstance(value["architecture"], str) or not value["architecture"].strip():
+        raise ValidationError("effective_config_json.model_capabilities.architecture invalid")
+    if value["quantization"] is not None and not isinstance(value["quantization"], str):
+        raise ValidationError("effective_config_json.model_capabilities.quantization invalid")
+    for key in (
+        "max_context_len",
+        "num_hidden_layers",
+        "head_dim",
+        "kv_heads",
+        "estimated_weight_bytes",
+    ):
+        expect_optional_positive_int(f"effective_config_json.model_capabilities.{key}", value[key])
+    expect_string_list(
+        "effective_config_json.model_capabilities.supported_dtypes",
+        value["supported_dtypes"],
+    )
+    if not isinstance(value["graph_safe_moe"], bool):
+        raise ValidationError("effective_config_json.model_capabilities.graph_safe_moe invalid")
+    moe = value["moe"]
+    if moe is None:
+        return
+    if not isinstance(moe, dict):
+        raise ValidationError("effective_config_json.model_capabilities.moe must be object")
+    require_keys(
+        "effective_config_json.model_capabilities.moe",
+        moe,
+        {"num_experts", "experts_per_token", "moe_intermediate_size"},
+    )
+    for key in ("num_experts", "experts_per_token"):
+        if not isinstance(moe[key], int) or isinstance(moe[key], bool) or moe[key] <= 0:
+            raise ValidationError(
+                f"effective_config_json.model_capabilities.moe.{key} must be positive integer"
+            )
+    expect_optional_positive_int(
+        "effective_config_json.model_capabilities.moe.moe_intermediate_size",
+        moe["moe_intermediate_size"],
+    )
+
+
+def validate_hardware_capabilities(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ValidationError("effective_config_json.hardware_capabilities must be an object")
+    require_keys(
+        "effective_config_json.hardware_capabilities",
+        value,
+        {
+            "backend",
+            "cuda_runtime",
+            "compute_capability",
+            "vram_bytes",
+            "sm_count",
+            "supported_dtypes",
+            "supported_kv_dtypes",
+            "graph_support",
+            "compiled_features",
+        },
+    )
+    if not isinstance(value["backend"], str) or not value["backend"].strip():
+        raise ValidationError("effective_config_json.hardware_capabilities.backend invalid")
+    for key in ("cuda_runtime", "compute_capability"):
+        if value[key] is not None and not isinstance(value[key], str):
+            raise ValidationError(f"effective_config_json.hardware_capabilities.{key} invalid")
+    expect_optional_positive_int(
+        "effective_config_json.hardware_capabilities.vram_bytes", value["vram_bytes"]
+    )
+    expect_optional_positive_int(
+        "effective_config_json.hardware_capabilities.sm_count", value["sm_count"]
+    )
+    expect_string_list(
+        "effective_config_json.hardware_capabilities.supported_dtypes",
+        value["supported_dtypes"],
+    )
+    expect_string_list(
+        "effective_config_json.hardware_capabilities.supported_kv_dtypes",
+        value["supported_kv_dtypes"],
+    )
+    if not isinstance(value["graph_support"], bool):
+        raise ValidationError("effective_config_json.hardware_capabilities.graph_support invalid")
+    features = value["compiled_features"]
+    if not isinstance(features, dict):
+        raise ValidationError(
+            "effective_config_json.hardware_capabilities.compiled_features must be object"
+        )
+    require_keys(
+        "effective_config_json.hardware_capabilities.compiled_features",
+        features,
+        COMPILED_FEATURE_KEYS,
+    )
+    for key in COMPILED_FEATURE_KEYS:
+        if not isinstance(features[key], bool):
+            raise ValidationError(
+                f"effective_config_json.hardware_capabilities.compiled_features.{key} invalid"
+            )
+
+
+def validate_workload_profile(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ValidationError("effective_config_json.workload_profile must be an object")
+    require_keys(
+        "effective_config_json.workload_profile",
+        value,
+        {
+            "preset",
+            "serving_mode",
+            "target_concurrency",
+            "prompt_length_class",
+            "output_length_class",
+            "priority",
+        },
+    )
+    if value["preset"] is not None and not isinstance(value["preset"], str):
+        raise ValidationError("effective_config_json.workload_profile.preset invalid")
+    for key in ("serving_mode", "prompt_length_class", "output_length_class"):
+        if not isinstance(value[key], str) or not value[key].strip():
+            raise ValidationError(f"effective_config_json.workload_profile.{key} invalid")
+    if (
+        not isinstance(value["target_concurrency"], int)
+        or isinstance(value["target_concurrency"], bool)
+        or value["target_concurrency"] <= 0
+    ):
+        raise ValidationError(
+            "effective_config_json.workload_profile.target_concurrency must be positive integer"
+        )
+    if value["priority"] not in {"latency", "throughput", "balanced"}:
+        raise ValidationError("effective_config_json.workload_profile.priority invalid")
+
+
 def validate_effective_config(
     path: Path, decision_events: list[dict[str, Any]]
 ) -> dict[str, Any]:
     if not path.exists():
         raise ValidationError(f"effective_config_json missing: {path}")
     data = load_json(path)
-    require_keys(
-        "effective_config_json",
-        data,
-        {"schema_version", "preset", "env_hash", "entries", "decisions"},
-    )
+    require_keys("effective_config_json", data, EFFECTIVE_CONFIG_REQUIRED)
     if data["schema_version"] != 1:
         raise ValidationError("effective_config_json.schema_version must be 1")
     if data["preset"] is not None and not isinstance(data["preset"], str):
@@ -929,6 +1108,9 @@ def validate_effective_config(
             raise ValidationError(
                 f"effective_config_json.entries[{i}].affects invalid: {invalid_effects}"
             )
+    validate_model_capabilities(data["model_capabilities"])
+    validate_hardware_capabilities(data["hardware_capabilities"])
+    validate_workload_profile(data["workload_profile"])
     decisions = data["decisions"]
     if not isinstance(decisions, list):
         raise ValidationError("effective_config_json.decisions must be a list")
@@ -1195,6 +1377,51 @@ def self_test() -> None:
             }
             for selection in sorted(REQUIRED_DECISIONS)
         ]
+        auto_config_inputs = {
+            "model_capabilities": {
+                "architecture": "qwen3_moe",
+                "quantization": "gptq_int4",
+                "moe": {
+                    "num_experts": 128,
+                    "experts_per_token": 8,
+                    "moe_intermediate_size": 768,
+                },
+                "max_context_len": 40960,
+                "num_hidden_layers": 48,
+                "head_dim": 128,
+                "kv_heads": 4,
+                "estimated_weight_bytes": 19327352832,
+                "supported_dtypes": ["fp16"],
+                "graph_safe_moe": True,
+            },
+            "hardware_capabilities": {
+                "backend": "cuda",
+                "cuda_runtime": "12.8",
+                "compute_capability": "8.9",
+                "vram_bytes": 25753026560,
+                "sm_count": 128,
+                "supported_dtypes": ["fp16", "fp32"],
+                "supported_kv_dtypes": ["fp16", "int8"],
+                "graph_support": True,
+                "compiled_features": {
+                    "cuda": True,
+                    "vllm_paged_attn": True,
+                    "vllm_moe_marlin": True,
+                    "cuda_graph": True,
+                    "greedy_argmax": True,
+                    "fa2_source": False,
+                    "fa2_direct_ffi": False,
+                },
+            },
+            "workload_profile": {
+                "preset": "m3_qwen3_30b_a3b_int4",
+                "serving_mode": "bench_serve",
+                "target_concurrency": 32,
+                "prompt_length_class": "random_256",
+                "output_length_class": "random_128",
+                "priority": "throughput",
+            },
+        }
         write_json(
             case_dir / "effective_config.json",
             {
@@ -1202,6 +1429,7 @@ def self_test() -> None:
                 "preset": snapshot["preset"],
                 "env_hash": snapshot["env_hash"],
                 "entries": effective_entries,
+                **auto_config_inputs,
                 "decisions": decisions,
             },
         )
@@ -1438,6 +1666,17 @@ def self_test() -> None:
         else:
             raise AssertionError("invalid effective_config entry unexpectedly passed")
         effective_config["entries"] = effective_entries
+        write_json(case_dir / "effective_config.json", effective_config)
+
+        effective_config["hardware_capabilities"]["compiled_features"]["cuda"] = "yes"
+        write_json(case_dir / "effective_config.json", effective_config)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False)
+        except ValidationError as exc:
+            assert "compiled_features.cuda" in str(exc)
+        else:
+            raise AssertionError("invalid effective_config hardware input unexpectedly passed")
+        effective_config["hardware_capabilities"]["compiled_features"]["cuda"] = True
         write_json(case_dir / "effective_config.json", effective_config)
 
         case_manifest = load_json(case_dir / "manifest.json")

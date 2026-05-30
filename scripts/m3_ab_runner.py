@@ -1606,6 +1606,51 @@ def self_test() -> None:
             }
             for selection in decision_selections
         ]
+        auto_config_inputs = {
+            "model_capabilities": {
+                "architecture": "qwen3_moe",
+                "quantization": "gptq_int4",
+                "moe": {
+                    "num_experts": 128,
+                    "experts_per_token": 8,
+                    "moe_intermediate_size": 768,
+                },
+                "max_context_len": 40960,
+                "num_hidden_layers": 48,
+                "head_dim": 128,
+                "kv_heads": 4,
+                "estimated_weight_bytes": 19327352832,
+                "supported_dtypes": ["fp16"],
+                "graph_safe_moe": True,
+            },
+            "hardware_capabilities": {
+                "backend": "cuda",
+                "cuda_runtime": "12.8",
+                "compute_capability": "8.9",
+                "vram_bytes": 25753026560,
+                "sm_count": 128,
+                "supported_dtypes": ["fp16", "fp32"],
+                "supported_kv_dtypes": ["fp16", "int8"],
+                "graph_support": True,
+                "compiled_features": {
+                    "cuda": True,
+                    "vllm_paged_attn": True,
+                    "vllm_moe_marlin": True,
+                    "cuda_graph": True,
+                    "greedy_argmax": True,
+                    "fa2_source": False,
+                    "fa2_direct_ffi": False,
+                },
+            },
+            "workload_profile": {
+                "preset": "m3_qwen3_30b_a3b_int4",
+                "serving_mode": "bench_serve",
+                "target_concurrency": 32,
+                "prompt_length_class": "random_256",
+                "output_length_class": "random_128",
+                "priority": "throughput",
+            },
+        }
         write_json(
             paths.effective_config_json,
             {
@@ -1621,6 +1666,7 @@ def self_test() -> None:
                     }
                     for entry in snapshot["entries"]
                 ],
+                **auto_config_inputs,
                 "decisions": decisions,
             },
         )
@@ -1630,6 +1676,9 @@ def self_test() -> None:
         server_snapshot = runner.server_runtime_config_snapshot(paths.effective_config_json)
         assert server_snapshot["env_hash"] == snapshot["env_hash"]
         assert server_snapshot["entries"][0]["effect"] == "performance"
+        effective_fixture = load_json(paths.effective_config_json)
+        assert effective_fixture["hardware_capabilities"]["backend"] == "cuda"
+        assert effective_fixture["workload_profile"]["target_concurrency"] == 32
         assert set(decision_selections) <= {decision["selection"] for decision in decisions}
         assert paths.effective_config_json.exists()
         assert paths.decision_trace_jsonl.exists()
