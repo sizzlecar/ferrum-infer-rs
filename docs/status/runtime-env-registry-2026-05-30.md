@@ -133,6 +133,10 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   `RuntimeConfigSnapshot` before CUDA device reporting and tensor-parallel
   display. It reads `FERRUM_CUDA_GRAPH` and `FERRUM_TP` from that snapshot
   instead of calling `std::env::var` directly.
+- `ferrum run`, `ferrum bench`, and `ferrum serve` now resolve
+  `FERRUM_KV_DTYPE` through captured `RuntimeConfigSnapshot` data before
+  applying the engine KV dtype override. The shared override helper now
+  validates an already-resolved value instead of owning an env fallback.
 - CUDA MoE route dump, CUDA TP/rank collectives, FA2 direct-FFI shim path,
   Metal attention dispatch policy, Metal mmap/capture/dtype policy, Metal
   quant profiling, and the Qwen3-TTS Candle fallback now resolve their env
@@ -161,7 +165,7 @@ Current local scan:
 | files scanned | 582 |
 | unique `FERRUM_*` tokens | 153 |
 | unique standalone candidates | 152 |
-| direct env read calls | 92 |
+| direct env read calls | 90 |
 | process env write calls | 42 |
 | classified process env write calls | 42 |
 | unclassified process env write calls | 0 |
@@ -178,7 +182,7 @@ Current local scan:
 | product `ferrum.toml` raw `FERRUM_*` mentions | 0 |
 | product `ferrum.toml` surface errors | 0 |
 
-The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `92` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
+The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `90` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
 
 The classified residual hot-path direct-read call sites are:
 

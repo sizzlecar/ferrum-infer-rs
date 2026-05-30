@@ -5,7 +5,10 @@ use chrono::Utc;
 use clap::{Args, ValueEnum};
 use colored::*;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
-use ferrum_types::{FinishReason, InferenceRequest, Priority, RequestId, Result, SamplingParams};
+use ferrum_types::{
+    FinishReason, InferenceRequest, Priority, RequestId, Result, RuntimeConfigSnapshot,
+    SamplingParams,
+};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -232,7 +235,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
     );
-    apply_kv_dtype_override(&mut engine_config, cmd.kv_dtype.as_deref())?;
+    let runtime_config = RuntimeConfigSnapshot::capture_current();
+    let effective_kv_dtype = cmd
+        .kv_dtype
+        .as_deref()
+        .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
+    apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
     eprintln!(
         "{}",
@@ -852,23 +860,20 @@ fn build_chat_prompt(
     }
 }
 
-/// Apply the `--kv-dtype` CLI flag (or `FERRUM_KV_DTYPE` env override)
-/// to an engine config, validating early. Default is FP16 (the
-/// production-validated path on every backend); selecting INT8 / FP8
-/// is rejected with a helpful message until model integration ships.
+/// Apply the resolved `--kv-dtype` / runtime-config override to an engine
+/// config, validating early. Default is FP16 (the production-validated path on
+/// every backend); selecting INT8 / FP8 is rejected with a helpful message
+/// until model integration ships.
 pub fn apply_kv_dtype_override(
     engine_config: &mut ferrum_types::EngineConfig,
-    cli_arg: Option<&str>,
+    raw: Option<&str>,
 ) -> ferrum_types::Result<()> {
     use ferrum_types::KvCacheDtype;
-    let raw = cli_arg
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("FERRUM_KV_DTYPE").ok());
     let Some(raw) = raw else {
         // No override → keep config default (FP16).
         return Ok(());
     };
-    let parsed = KvCacheDtype::parse(&raw).ok_or_else(|| {
+    let parsed = KvCacheDtype::parse(raw).ok_or_else(|| {
         ferrum_types::FerrumError::config(format!(
             "Unknown --kv-dtype value '{}'. Accepts: fp16, bf16, int8, fp8.",
             raw

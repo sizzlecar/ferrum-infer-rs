@@ -28,7 +28,7 @@ pub fn moe_graph_default_entries(
     source: RuntimeConfigSource,
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
-    let moe_graph_enabled = match snapshot_value(current, "FERRUM_MOE_GRAPH") {
+    let moe_graph_enabled = match runtime_snapshot_value(current, "FERRUM_MOE_GRAPH") {
         Some(value) => value == "1",
         None => {
             entries.push(RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", source));
@@ -42,10 +42,10 @@ pub fn moe_graph_default_entries(
 
     #[cfg(feature = "vllm-moe-marlin")]
     {
-        if snapshot_value(current, "FERRUM_VLLM_MOE").is_none() {
+        if runtime_snapshot_value(current, "FERRUM_VLLM_MOE").is_none() {
             entries.push(RuntimeConfigEntry::new("FERRUM_VLLM_MOE", "1", source));
         }
-        if snapshot_value(current, "FERRUM_VLLM_MOE_PAIR_IDS").is_none() {
+        if runtime_snapshot_value(current, "FERRUM_VLLM_MOE_PAIR_IDS").is_none() {
             entries.push(RuntimeConfigEntry::new(
                 "FERRUM_VLLM_MOE_PAIR_IDS",
                 "1",
@@ -59,8 +59,8 @@ pub fn moe_graph_default_entries(
 
 pub fn warn_if_moe_graph_needs_unbuilt_vllm_moe(snapshot: &RuntimeConfigSnapshot) {
     #[cfg(not(feature = "vllm-moe-marlin"))]
-    if snapshot_value(snapshot, "FERRUM_MOE_GRAPH") == Some("1")
-        && snapshot_value(snapshot, "FERRUM_VLLM_MOE") != Some("1")
+    if runtime_snapshot_value(snapshot, "FERRUM_MOE_GRAPH") == Some("1")
+        && runtime_snapshot_value(snapshot, "FERRUM_VLLM_MOE") != Some("1")
     {
         eprintln!(
             "[auto-size] MOE_GRAPH=1 requested, but vllm-moe-marlin is not built; graph capture requires FERRUM_VLLM_MOE=1"
@@ -68,7 +68,10 @@ pub fn warn_if_moe_graph_needs_unbuilt_vllm_moe(snapshot: &RuntimeConfigSnapshot
     }
 }
 
-fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
+pub fn runtime_snapshot_value<'a>(
+    snapshot: &'a RuntimeConfigSnapshot,
+    key: &str,
+) -> Option<&'a str> {
     snapshot
         .entries
         .iter()
@@ -95,14 +98,17 @@ mod tests {
             RuntimeConfigSource::Default,
         );
         let resolved = RuntimeConfigSnapshot::from_entries(entries);
-        let graph = snapshot_value(&resolved, "FERRUM_MOE_GRAPH");
+        let graph = runtime_snapshot_value(&resolved, "FERRUM_MOE_GRAPH");
 
         assert_eq!(graph, Some("1"));
         #[cfg(feature = "vllm-moe-marlin")]
         {
-            assert_eq!(snapshot_value(&resolved, "FERRUM_VLLM_MOE"), Some("1"));
             assert_eq!(
-                snapshot_value(&resolved, "FERRUM_VLLM_MOE_PAIR_IDS"),
+                runtime_snapshot_value(&resolved, "FERRUM_VLLM_MOE"),
+                Some("1")
+            );
+            assert_eq!(
+                runtime_snapshot_value(&resolved, "FERRUM_VLLM_MOE_PAIR_IDS"),
                 Some("1")
             );
         }
@@ -124,9 +130,12 @@ mod tests {
         let entries = moe_graph_default_entries(&current, RuntimeConfigSource::Default);
         let resolved = RuntimeConfigSnapshot::from_entries(entries);
 
-        assert_eq!(snapshot_value(&resolved, "FERRUM_MOE_GRAPH"), None);
+        assert_eq!(runtime_snapshot_value(&resolved, "FERRUM_MOE_GRAPH"), None);
         #[cfg(feature = "vllm-moe-marlin")]
-        assert_eq!(snapshot_value(&resolved, "FERRUM_VLLM_MOE"), Some("1"));
+        assert_eq!(
+            runtime_snapshot_value(&resolved, "FERRUM_VLLM_MOE"),
+            Some("1")
+        );
         #[cfg(not(feature = "vllm-moe-marlin"))]
         assert!(resolved.entries.is_empty());
     }

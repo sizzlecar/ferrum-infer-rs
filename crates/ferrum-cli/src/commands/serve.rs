@@ -1,6 +1,7 @@
 //! Serve command - Start the HTTP inference server
 
 use crate::config::CliConfig;
+use crate::runtime_env::runtime_snapshot_value;
 use clap::Args;
 use colored::*;
 use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
@@ -247,10 +248,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
-    let env_kv_dtype = std::env::var("FERRUM_KV_DTYPE").ok();
+    let kv_runtime_snapshot = RuntimeConfigSnapshot::capture_current();
+    let env_kv_dtype = runtime_snapshot_value(&kv_runtime_snapshot, "FERRUM_KV_DTYPE");
     let effective_kv_dtype = resolve_effective_kv_dtype(
         kv_dtype.as_deref(),
-        env_kv_dtype.as_deref(),
+        env_kv_dtype,
         config.runtime.kv_dtype.as_deref(),
     );
 
@@ -712,14 +714,6 @@ fn runtime_entries_added_by_snapshot(
             }
         })
         .collect()
-}
-
-fn runtime_snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
-    snapshot
-        .entries
-        .iter()
-        .find(|entry| entry.key == key)
-        .map(|entry| entry.effective_value.as_str())
 }
 
 fn runtime_preset_entries(
