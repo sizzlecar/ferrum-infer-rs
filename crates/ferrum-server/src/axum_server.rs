@@ -588,6 +588,16 @@ async fn handle_chat_completions_sync(
     let engine = state.llm.clone().ok_or_else(|| {
         ServerError::ServiceUnavailable("LLM engine not loaded; chat unavailable".into())
     })?;
+    let request_chat_api = inference_request
+        .api_request
+        .as_ref()
+        .and_then(|api_request| match api_request {
+            ferrum_types::ApiRequest::Chat(chat_request) => {
+                ferrum_types::chat_api_may_emit_tool_or_function_call(chat_request)
+                    .then(|| chat_request.clone())
+            }
+            _ => None,
+        });
     match engine.infer(inference_request).await {
         Ok(output) => {
             let InferenceResponse {
@@ -626,7 +636,17 @@ async fn handle_chat_completions_sync(
                 function_call: None,
             };
             let mut openai_finish_reason = finish_reason_to_string(&finish_reason);
-            if let Some(ferrum_types::ApiResponse::Chat(chat_response)) = api_response.as_ref() {
+            let structured_chat_response = match api_response.as_ref() {
+                Some(ferrum_types::ApiResponse::Chat(chat_response)) => Some(chat_response.clone()),
+                _ => match request_chat_api.as_ref() {
+                    Some(chat_request) => ferrum_types::chat_api_response_from_generated_text(
+                        chat_request,
+                        &message.content,
+                    ),
+                    _ => None,
+                },
+            };
+            if let Some(chat_response) = structured_chat_response.as_ref() {
                 message = openai_chat_message_from_api(&chat_response.message);
                 if let Some(reason) = &chat_response.finish_reason {
                     openai_finish_reason = reason.clone();
@@ -2464,6 +2484,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_serializes_generated_tool_call_json_when_engine_returns_text_only() {
+        let response = post_json(
+            router_with_stub(
+                r#"{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":{"city":"Paris"}}}]}"#,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the weather tool."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_tool_choice_none_keeps_generated_tool_json_as_content() {
+        let generated = r#"{"name":"weather","arguments":{"city":"Paris"}}"#;
+        let response = post_json(
+            router_with_stub(generated),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Do not use tools."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "none"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["choices"][0]["message"]["content"], generated);
+        assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+    }
+
+    #[tokio::test]
     async fn route_streaming_chat_serializes_generated_tool_call_delta() {
         let response = post_json(
             router_with_stub(
@@ -2636,6 +2723,42 @@ mod tests {
         assert!(
             !body.contains(r#""content":"{\"function_call\""#),
             "raw function-call JSON should not be streamed as assistant content: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_serializes_generated_legacy_function_call_when_engine_returns_text_only() {
+        let response = post_json(
+            router_with_stub(
+                r#"{"function_call":{"name":"weather","arguments":{"city":"Paris"}}}"#,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the weather function."}],
+                "functions": [{
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }],
+                "function_call": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "function_call");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            body["choices"][0]["message"]["function_call"]["name"],
+            "weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["function_call"]["arguments"],
+            "{\"city\":\"Paris\"}"
         );
     }
 
