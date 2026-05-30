@@ -958,8 +958,10 @@ fn model_capabilities_from_definition(
         quantization: quantization_from_definition(definition),
         moe,
         max_context_len: Some(definition.max_position_embeddings),
+        num_hidden_layers: Some(definition.num_hidden_layers),
         head_dim,
         kv_heads: definition.num_key_value_heads,
+        estimated_weight_bytes: estimated_weight_bytes_from_definition(definition),
         supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
         graph_safe_moe: definition.architecture == ferrum_models::Architecture::Qwen3Moe,
     }
@@ -977,6 +979,22 @@ fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> 
         Some(bits) => format!("{method}_int{bits}"),
         None => method.to_string(),
     })
+}
+
+fn estimated_weight_bytes_from_definition(
+    definition: &ferrum_models::ModelDefinition,
+) -> Option<u64> {
+    let params = definition.to_model_info("__auto_config").num_parameters;
+    if params == 0 {
+        return None;
+    }
+    let quant = definition.extra_params.get("quantization_config");
+    let bits_per_param = quant
+        .and_then(|quant| quant.get("bits"))
+        .and_then(|value| value.as_u64())
+        .filter(|bits| *bits > 0)
+        .unwrap_or(16);
+    Some(params.saturating_mul(bits_per_param).div_ceil(8))
 }
 
 fn hardware_capabilities_for_device(device: &ferrum_types::Device) -> HardwareCapabilities {

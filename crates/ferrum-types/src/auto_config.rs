@@ -13,6 +13,8 @@ use thiserror::Error;
 
 pub const M3_QWEN3_30B_A3B_INT4_PRESET: &str = "m3_qwen3_30b_a3b_int4";
 const DEFAULT_KV_BLOCK_SIZE_TOKENS: usize = 16;
+const DEFAULT_KV_BLOCKS: usize = 2048;
+const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -20,8 +22,10 @@ pub struct ModelCapabilities {
     pub quantization: Option<String>,
     pub moe: Option<MoeCapabilities>,
     pub max_context_len: Option<usize>,
+    pub num_hidden_layers: Option<usize>,
     pub head_dim: Option<usize>,
     pub kv_heads: Option<usize>,
+    pub estimated_weight_bytes: Option<u64>,
     pub supported_dtypes: Vec<String>,
     pub graph_safe_moe: bool,
 }
@@ -33,8 +37,10 @@ impl ModelCapabilities {
             quantization: None,
             moe: None,
             max_context_len: None,
+            num_hidden_layers: None,
             head_dim: None,
             kv_heads: None,
+            estimated_weight_bytes: None,
             supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
             graph_safe_moe: false,
         }
@@ -50,8 +56,14 @@ impl ModelCapabilities {
                 moe_intermediate_size: Some(768),
             }),
             max_context_len: Some(40960),
+            num_hidden_layers: Some(48),
             head_dim: Some(128),
             kv_heads: Some(4),
+            // Conservative GPTQ int4 weight footprint including quant scales
+            // and loader/runtime overhead. This keeps the RTX 4090 M3 preset
+            // at the historical 2048 KV blocks while still allowing smaller
+            // GPUs to be downgraded before startup allocation.
+            estimated_weight_bytes: Some(18 * GIB),
             supported_dtypes: vec!["fp16".to_string()],
             graph_safe_moe: true,
         }
@@ -397,18 +409,20 @@ impl FerrumConfigBuilder {
                 AutoConfigSource::Default
             },
         )?;
-        let kv_blocks = self.usize_value(
-            "FERRUM_KV_MAX_BLOCKS",
-            2048,
-            AutoConfigSource::WorkloadPreset,
-        )?;
         let default_max_sequences = self.default_max_sequences();
         let max_sequences = self.usize_value(
             "FERRUM_PAGED_MAX_SEQS",
             default_max_sequences.value,
             default_max_sequences.source,
         )?;
-        let default_max_batched_tokens = self.default_max_batched_tokens(&max_sequences);
+        let default_kv_blocks = self.default_kv_blocks(&max_sequences);
+        let kv_blocks = self.usize_value(
+            "FERRUM_KV_MAX_BLOCKS",
+            default_kv_blocks.value,
+            default_kv_blocks.source,
+        )?;
+        let default_max_batched_tokens =
+            self.default_max_batched_tokens(&max_sequences, &kv_blocks);
         let max_batched_tokens = self.usize_value(
             "FERRUM_MAX_BATCHED_TOKENS",
             default_max_batched_tokens.value,
@@ -548,17 +562,70 @@ impl FerrumConfigBuilder {
     fn default_max_batched_tokens(
         &self,
         max_sequences: &ResolvedValue<usize>,
+        kv_blocks: &ResolvedValue<usize>,
     ) -> ResolvedValue<usize> {
-        let value = max_sequences.value.max(1) * 64;
+        let kv_token_capacity = kv_blocks
+            .value
+            .saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS)
+            .max(max_sequences.value.max(1));
+        let value = max_sequences
+            .value
+            .max(1)
+            .saturating_mul(64)
+            .min(kv_token_capacity)
+            .max(max_sequences.value.max(1));
         ResolvedValue {
             value,
-            source: if max_sequences.source == AutoConfigSource::HardwareCapability {
+            source: if max_sequences.source == AutoConfigSource::HardwareCapability
+                || kv_blocks.source == AutoConfigSource::HardwareCapability
+            {
                 AutoConfigSource::HardwareCapability
             } else {
                 AutoConfigSource::WorkloadPreset
             },
             source_key: None,
         }
+    }
+
+    fn default_kv_blocks(&self, max_sequences: &ResolvedValue<usize>) -> ResolvedValue<usize> {
+        let min_blocks = ceil_div(max_sequences.value.max(1), DEFAULT_KV_BLOCK_SIZE_TOKENS);
+        let target = DEFAULT_KV_BLOCKS.max(min_blocks);
+        let selected = match (
+            self.hardware.vram_bytes,
+            self.model.estimated_weight_bytes,
+            self.kv_cache_bytes_per_token(),
+        ) {
+            (Some(vram_bytes), Some(weight_bytes), Some(kv_bytes_per_token))
+                if kv_bytes_per_token > 0 =>
+            {
+                let headroom = (vram_bytes / 10).max(2 * GIB);
+                let available = vram_bytes.saturating_sub(weight_bytes.saturating_add(headroom));
+                let kv_token_budget = (available / kv_bytes_per_token) as usize;
+                let block_budget = kv_token_budget / DEFAULT_KV_BLOCK_SIZE_TOKENS;
+                target.min(block_budget.max(min_blocks))
+            }
+            _ => target,
+        };
+        ResolvedValue {
+            value: selected.max(1),
+            source: if selected < target {
+                AutoConfigSource::HardwareCapability
+            } else {
+                AutoConfigSource::WorkloadPreset
+            },
+            source_key: None,
+        }
+    }
+
+    fn kv_cache_bytes_per_token(&self) -> Option<u64> {
+        let layers = self.model.num_hidden_layers? as u64;
+        let kv_heads = self.model.kv_heads? as u64;
+        let head_dim = self.model.head_dim? as u64;
+        layers
+            .checked_mul(2)?
+            .checked_mul(kv_heads)?
+            .checked_mul(head_dim)?
+            .checked_mul(2)
     }
 
     fn bool_value(
@@ -793,6 +860,13 @@ impl FerrumConfigBuilder {
                 "must be at least FERRUM_PAGED_MAX_SEQS",
             );
         }
+        let kv_token_capacity = kv_blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS);
+        if max_batched_tokens > kv_token_capacity {
+            return self.invalid(
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "exceeds KV cache token capacity",
+            );
+        }
         if let Some(max_model_len) = requested_max_model_len {
             if max_model_len == 0 {
                 return self.invalid("FERRUM_MAX_MODEL_LEN", "must be greater than zero");
@@ -805,7 +879,6 @@ impl FerrumConfigBuilder {
                     );
                 }
             }
-            let kv_token_capacity = kv_blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS);
             if max_model_len > kv_token_capacity {
                 return self.invalid(
                     "FERRUM_KV_MAX_BLOCKS",
@@ -1225,13 +1298,16 @@ fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
 }
 
 fn vram_default_max_sequences(vram_bytes: u64) -> usize {
-    const GIB: u64 = 1024 * 1024 * 1024;
     match vram_bytes {
         bytes if bytes >= 20 * GIB => 32,
         bytes if bytes >= 12 * GIB => 16,
         bytes if bytes >= 8 * GIB => 8,
         _ => 4,
     }
+}
+
+fn ceil_div(value: usize, divisor: usize) -> usize {
+    value.div_ceil(divisor)
 }
 
 fn auto_config_source_from_runtime(source: RuntimeConfigSource) -> AutoConfigSource {
@@ -1487,6 +1563,47 @@ mod tests {
     }
 
     #[test]
+    fn memory_budget_keeps_rtx4090_m3_kv_blocks_but_caps_constrained_vram() {
+        let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
+            .resolve()
+            .unwrap();
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap()
+        };
+        assert_eq!(decision("kv_block_count").selected, "2048");
+        assert_eq!(
+            decision("kv_block_count").source,
+            AutoConfigSource::WorkloadPreset
+        );
+
+        let mut constrained =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        constrained.vram_bytes = Some(20 * 1024 * 1024 * 1024);
+        let resolved = m3_with_hardware(&[], constrained).resolve().unwrap();
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap()
+        };
+        assert_eq!(decision("kv_block_count").selected, "2");
+        assert_eq!(
+            decision("kv_block_count").source,
+            AutoConfigSource::HardwareCapability
+        );
+        assert_eq!(decision("max_batched_tokens").selected, "32");
+        assert_eq!(
+            decision("max_batched_tokens").source,
+            AutoConfigSource::HardwareCapability
+        );
+    }
+
+    #[test]
     fn compute_capability_parser_accepts_major_minor_and_major_only() {
         assert_eq!(parse_compute_capability("8.9"), Some((8, 9)));
         assert_eq!(parse_compute_capability("9"), Some((9, 0)));
@@ -1539,6 +1656,13 @@ mod tests {
             &[
                 ("FERRUM_PAGED_MAX_SEQS", "32"),
                 ("FERRUM_MAX_BATCHED_TOKENS", "16"),
+            ],
+            "FERRUM_MAX_BATCHED_TOKENS",
+        );
+        expect_invalid_key(
+            &[
+                ("FERRUM_KV_MAX_BLOCKS", "16"),
+                ("FERRUM_MAX_BATCHED_TOKENS", "512"),
             ],
             "FERRUM_MAX_BATCHED_TOKENS",
         );
