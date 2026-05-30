@@ -402,15 +402,17 @@ impl FerrumConfigBuilder {
             2048,
             AutoConfigSource::WorkloadPreset,
         )?;
+        let default_max_sequences = self.default_max_sequences();
         let max_sequences = self.usize_value(
             "FERRUM_PAGED_MAX_SEQS",
-            self.workload.target_concurrency.max(1),
-            AutoConfigSource::WorkloadPreset,
+            default_max_sequences.value,
+            default_max_sequences.source,
         )?;
+        let default_max_batched_tokens = self.default_max_batched_tokens(&max_sequences);
         let max_batched_tokens = self.usize_value(
             "FERRUM_MAX_BATCHED_TOKENS",
-            self.workload.target_concurrency.max(1) * 64,
-            AutoConfigSource::WorkloadPreset,
+            default_max_batched_tokens.value,
+            default_max_batched_tokens.source,
         )?;
         let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
 
@@ -516,6 +518,47 @@ impl FerrumConfigBuilder {
         let (actual_major, actual_minor) =
             parse_compute_capability(self.hardware.compute_capability.as_deref()?)?;
         Some((actual_major, actual_minor) >= (major, minor))
+    }
+
+    fn default_max_sequences(&self) -> ResolvedValue<usize> {
+        let target = self.workload.target_concurrency.max(1);
+        let mut selected = target;
+        if self.workload.is_m3_preset() {
+            if let Some(sm_count) = self.hardware.sm_count {
+                // The M3 throughput preset assumes a large GPU. On smaller
+                // known GPUs, avoid auto-selecting a c32-sized admission
+                // window before memory profiling has a chance to refine KV.
+                selected = selected.min((sm_count as usize / 4).max(1));
+            }
+            if let Some(vram_bytes) = self.hardware.vram_bytes {
+                selected = selected.min(vram_default_max_sequences(vram_bytes));
+            }
+        }
+        ResolvedValue {
+            value: selected.max(1),
+            source: if selected < target {
+                AutoConfigSource::HardwareCapability
+            } else {
+                AutoConfigSource::WorkloadPreset
+            },
+            source_key: None,
+        }
+    }
+
+    fn default_max_batched_tokens(
+        &self,
+        max_sequences: &ResolvedValue<usize>,
+    ) -> ResolvedValue<usize> {
+        let value = max_sequences.value.max(1) * 64;
+        ResolvedValue {
+            value,
+            source: if max_sequences.source == AutoConfigSource::HardwareCapability {
+                AutoConfigSource::HardwareCapability
+            } else {
+                AutoConfigSource::WorkloadPreset
+            },
+            source_key: None,
+        }
     }
 
     fn bool_value(
@@ -1181,6 +1224,16 @@ fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
     Some((major.trim().parse().ok()?, minor.trim().parse().ok()?))
 }
 
+fn vram_default_max_sequences(vram_bytes: u64) -> usize {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    match vram_bytes {
+        bytes if bytes >= 20 * GIB => 32,
+        bytes if bytes >= 12 * GIB => 16,
+        bytes if bytes >= 8 * GIB => 8,
+        _ => 4,
+    }
+}
+
 fn auto_config_source_from_runtime(source: RuntimeConfigSource) -> AutoConfigSource {
     match source {
         RuntimeConfigSource::Default => AutoConfigSource::Default,
@@ -1376,10 +1429,76 @@ mod tests {
     }
 
     #[test]
+    fn hardware_capacity_sizes_default_sequence_budget_without_overriding_user_values() {
+        let mut small_gpu =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        small_gpu.sm_count = Some(16);
+        small_gpu.vram_bytes = Some(24 * 1024 * 1024 * 1024);
+
+        let resolved = m3_with_hardware(&[], small_gpu.clone()).resolve().unwrap();
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap()
+        };
+        let max_sequences = decision("max_sequences");
+        assert_eq!(max_sequences.selected, "4");
+        assert_eq!(max_sequences.source, AutoConfigSource::HardwareCapability);
+        let max_batched_tokens = decision("max_batched_tokens");
+        assert_eq!(max_batched_tokens.selected, "256");
+        assert_eq!(
+            max_batched_tokens.source,
+            AutoConfigSource::HardwareCapability
+        );
+
+        let resolved = m3_with_hardware(&[("FERRUM_PAGED_MAX_SEQS", "16")], small_gpu)
+            .resolve()
+            .unwrap();
+        let max_sequences = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "max_sequences")
+            .unwrap();
+        assert_eq!(max_sequences.selected, "16");
+        assert_eq!(max_sequences.source, AutoConfigSource::Env);
+        assert_eq!(
+            max_sequences.source_key.as_deref(),
+            Some("FERRUM_PAGED_MAX_SEQS")
+        );
+    }
+
+    #[test]
+    fn vram_capacity_caps_m3_default_sequence_budget() {
+        let mut low_vram_gpu =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        low_vram_gpu.sm_count = Some(128);
+        low_vram_gpu.vram_bytes = Some(7 * 1024 * 1024 * 1024);
+
+        let resolved = m3_with_hardware(&[], low_vram_gpu).resolve().unwrap();
+        let max_sequences = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "max_sequences")
+            .unwrap();
+        assert_eq!(max_sequences.selected, "4");
+        assert_eq!(max_sequences.source, AutoConfigSource::HardwareCapability);
+    }
+
+    #[test]
     fn compute_capability_parser_accepts_major_minor_and_major_only() {
         assert_eq!(parse_compute_capability("8.9"), Some((8, 9)));
         assert_eq!(parse_compute_capability("9"), Some((9, 0)));
         assert_eq!(parse_compute_capability("N/A"), None);
+    }
+
+    #[test]
+    fn vram_capacity_tiers_are_monotonic() {
+        assert_eq!(vram_default_max_sequences(24 * 1024 * 1024 * 1024), 32);
+        assert_eq!(vram_default_max_sequences(16 * 1024 * 1024 * 1024), 16);
+        assert_eq!(vram_default_max_sequences(8 * 1024 * 1024 * 1024), 8);
+        assert_eq!(vram_default_max_sequences(6 * 1024 * 1024 * 1024), 4);
     }
 
     #[test]

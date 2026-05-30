@@ -113,6 +113,12 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   compiled path. Forced CUDA-only overrides for vLLM paged attention,
   vLLM-MoE, GPU greedy argmax, and FA2 now fail fast on non-CUDA backends;
   source/direct FA2 also rejects known CUDA compute capabilities below `8.0`.
+- The M3 selector now consumes known `HardwareCapabilities.sm_count` and
+  `vram_bytes` when choosing default `max_sequences` and
+  `max_batched_tokens`. RTX 4090-class capability keeps the c32/2048-token
+  preset unchanged; constrained known hardware is downgraded with
+  `source=hardware_capability` in the decision trace, and explicit user/CLI/env
+  sizing overrides still win.
 - `scripts/m3_ab_runner.py` now passes the M3 preset through
   `--runtime-preset`, so the migrated wrappers no longer inject the common M3
   `FERRUM_*` bundle as process env. Completed runner manifests now copy the
@@ -160,13 +166,14 @@ python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
 
 Evidence:
 
-- `ferrum-types` auto-config tests passed: `13 passed`, including
+- `ferrum-types` auto-config tests passed: `16 passed`, including
   non-env source attribution for config-file, CLI, and script-case entries plus
   locked artifact schema-shape coverage and requested max-model-len budget
   validation. The M3 preset test also asserts prefix cache remains disabled by
   the Rust selector unless explicitly overridden. New hardware-selector tests
-  cover non-CUDA backend fallback, forced CUDA-only override rejection, and
-  CUDA compute capability parsing for FA2 eligibility.
+  cover non-CUDA backend fallback, forced CUDA-only override rejection, CUDA
+  compute capability parsing for FA2 eligibility, SM/VRAM-based sequence
+  budget downgrades, and user override precedence over hardware defaults.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
 - `ferrum-cli` serve tests passed: `19 passed`, covering CLI-sourced runtime
@@ -215,12 +222,13 @@ Evidence:
   non-M3 and diagnostic config-file coverage still needs expansion.
 - CUDA hardware capability data is no longer only compiled-feature/device
   based on the `serve` startup path. Selectors now use backend and known
-  compute capability for CUDA-only attention/MoE/sampling compatibility.
-  Remaining work is to validate the runtime probe on the GPU pod and make
-  selectors consume probed VRAM/SM data for memory and throughput policy, not
-  only backend compatibility. Startup autosizer outputs are now
-  source-attributed as `memory_profile`, but this is not yet a full
-  memory-capability selector.
+  compute capability for CUDA-only attention/MoE/sampling compatibility, and
+  known SM/VRAM data for conservative default sequence and batched-token
+  sizing. Remaining work is to validate the runtime probe on the GPU pod and
+  replace the current coarse sizing tiers with a full memory-capability
+  selector that accounts for model weights and KV bytes. Startup autosizer
+  outputs are now source-attributed as `memory_profile`, but this is not yet a
+  full memory-capability selector.
 - The M3 preset selector is now exposed through the Rust startup path and used
   by the migrated runner. Server-written effective-config data now owns
   completed-run runtime snapshots, and the runner no longer has a parallel
