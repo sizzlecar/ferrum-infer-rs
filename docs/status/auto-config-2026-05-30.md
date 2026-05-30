@@ -88,6 +88,9 @@ from a runner-only artifact toward a Rust startup control-plane surface.
 - `source_resolver` chat-profile defaults now resolve into typed entries
   before compatibility env materialization, covering dense/MoE KV capacity,
   Metal paged KV, single-user paged sizing, and MoE batching defaults.
+- GPU autosizing now uses the startup runtime snapshot for override detection
+  and emits `source=memory_profile` typed entries before compatibility
+  materialization, instead of directly reading/writing the sizing env keys.
 - `ferrum serve` now records GPU-memory autosizer-created runtime keys
   (`FERRUM_MAX_BATCHED_TOKENS`, `FERRUM_KV_MAX_BLOCKS`,
   `FERRUM_PAGED_MAX_SEQS`, `FERRUM_KV_CAPACITY`) with
@@ -193,8 +196,9 @@ Evidence:
   longer gets M3 or non-preset Qwen3-MoE startup defaults from the old MoE
   graph default setter, and `ferrum run` now uses the same typed resolver for
   that graph-clean default. Source resolver chat-profile defaults are also
-  typed before compatibility materialization. Autosizing and model/backend
-  runtime configs still consume parts of the old env surface.
+  typed before compatibility materialization, and autosizing now produces
+  typed `memory_profile` entries. Model/backend runtime configs still consume
+  parts of the old env surface.
 - CLI/config-file/script-case/memory-profile source attribution is represented
   in the builder and decision trace. `ferrum serve` now carries the named M3
   runtime preset, selected CLI runtime/profile inputs, config-file runtime

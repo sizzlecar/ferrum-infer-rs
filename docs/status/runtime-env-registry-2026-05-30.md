@@ -93,6 +93,11 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   explicit-override tests cover `FERRUM_KV_CAPACITY`,
   `FERRUM_METAL_PAGED_KV`, single-user paged KV sizing, and MoE batching
   defaults without local direct `set_var` calls.
+- GPU autosizing now detects user/config overrides from a startup
+  `RuntimeConfigSnapshot` and emits `source=memory_profile` typed entries for
+  `FERRUM_MAX_BATCHED_TOKENS`, `FERRUM_KV_MAX_BLOCKS`,
+  `FERRUM_PAGED_MAX_SEQS`, and `FERRUM_KV_CAPACITY` before compatibility
+  materialization. The autosizer no longer owns direct FERRUM env reads/writes.
 - `scripts/m3_ab_runner.py` now passes the named M3 preset to the product
   server through `--runtime-preset` instead of injecting the common M3
   `FERRUM_*` env bundle. It keeps only path-like preset env such as `HF_HOME`
@@ -147,7 +152,7 @@ Current local scan:
 | files scanned | 582 |
 | unique `FERRUM_*` tokens | 153 |
 | unique standalone candidates | 152 |
-| direct env read calls | 98 |
+| direct env read calls | 94 |
 | hot-path unique `FERRUM_*` tokens | 121 |
 | hot-path direct env read calls | 4 |
 | classified hot-path direct env read calls | 4 |
@@ -161,7 +166,7 @@ Current local scan:
 | product `ferrum.toml` raw `FERRUM_*` mentions | 0 |
 | product `ferrum.toml` surface errors | 0 |
 
-The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `98` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
+The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `94` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
 
 The classified residual hot-path direct-read call sites are:
 
@@ -202,9 +207,8 @@ Evidence:
 
 - Continue typed config coverage for the remaining low-count hot-path surfaces
   and non-hot CLI/build surfaces.
-- Move GPU autosizing compatibility defaults off legacy process-wide env
-  setters after they have equivalent typed runtime profiles or command-local
-  startup snapshots.
+- Continue shrinking the remaining non-hot compatibility materialization bridge
+  and model/backend runtime configs that still consume the old env surface.
 - Continue extending first-class config-file runtime knobs for non-M3
   surfaces and any remaining diagnostics that need source-attributed
   artifacts.
