@@ -80,6 +80,7 @@ def aggregate_checklist(
     required_gates: set[str] = set()
     local_gates: list[dict[str, Any]] = []
     skipped_gates: list[dict[str, Any]] = []
+    benchmark_impacts: list[dict[str, Any]] = []
     for manifest in child_manifests:
         checklist = manifest.get("validation_checklist") or {}
         touched_areas.update(str(item) for item in checklist.get("touched_areas", []) if item)
@@ -90,6 +91,9 @@ def aggregate_checklist(
         skipped_gates.extend(
             item for item in checklist.get("skipped_gates", []) if isinstance(item, dict)
         )
+        impact = checklist.get("benchmark_impact")
+        if isinstance(impact, dict):
+            benchmark_impacts.append(impact)
     observed_by_name: dict[str, dict[str, Any]] = {}
     for manifest in case_manifests:
         for gate in manifest.get("correctness_gates", []) or []:
@@ -110,7 +114,7 @@ def aggregate_checklist(
     completed = sum(int((manifest.get("metrics") or {}).get("completed") or 0) for manifest in case_manifests)
     errored = sum(int((manifest.get("metrics") or {}).get("errored") or 0) for manifest in case_manifests)
     bench_required = "bench_completion" in required_gates
-    return {
+    checklist = {
         "schema_version": 1,
         "change_type": change_type or str(
             (child_manifests[0].get("validation_checklist") or {}).get(
@@ -134,6 +138,17 @@ def aggregate_checklist(
         "baseline_case": baseline_case,
         "case": None,
     }
+    if benchmark_impacts:
+        exercised = any(bool(impact.get("m3_benchmark_exercised")) for impact in benchmark_impacts)
+        checklist["benchmark_impact"] = {
+            "m3_benchmark_exercised": exercised,
+            "reason": "aggregated from child runner artifacts",
+            "evidence": "; ".join(
+                str(impact.get("evidence") or impact.get("reason") or "child artifact")
+                for impact in benchmark_impacts
+            ),
+        }
+    return checklist
 
 
 def aggregate_performance_gates(
@@ -323,6 +338,11 @@ def self_test() -> None:
             "performance_regression_required": True,
             "baseline_case": "fa_layout",
             "case": None,
+            "benchmark_impact": {
+                "m3_benchmark_exercised": True,
+                "reason": "FA2 source changes are exercised by M3 all-cell benches",
+                "evidence": "self-test child artifact",
+            },
         }
         decisions = [
             {
@@ -556,6 +576,11 @@ def self_test() -> None:
         assert len(gates["cases"]["fa2_source"]["metrics"]) == 4
         manifest = load_json(root / "manifest.json")
         assert manifest["validation_checklist"]["change_type"] == "default_path"
+        assert manifest["validation_checklist"]["benchmark_impact"] == {
+            "m3_benchmark_exercised": True,
+            "reason": "aggregated from child runner artifacts",
+            "evidence": "; ".join(["self-test child artifact"] * 4),
+        }
         assert len(manifest["cases"]) == 8
         result = validate_artifact(root, require_bench=True, require_profile_events=False)
         assert result["ok"]

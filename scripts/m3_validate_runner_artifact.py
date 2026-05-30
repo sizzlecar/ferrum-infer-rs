@@ -188,6 +188,12 @@ VALIDATION_CHECKLIST_REQUIRED = {
     "baseline_case",
 }
 
+BENCHMARK_IMPACT_REQUIRED = {
+    "m3_benchmark_exercised",
+    "reason",
+    "evidence",
+}
+
 REQUIRED_DECISIONS = {
     "attention_prefill_mixed_backend",
     "attention_decode_backend",
@@ -462,6 +468,28 @@ def validate_validation_gate_list(where: str, gates: Any, *, require_ok: bool) -
             raise ValidationError(f"{where}[{i}] required gate is not ok: {gate['name']}")
 
 
+def validate_benchmark_impact(where: str, impact: Any) -> dict[str, Any] | None:
+    if impact is None:
+        return None
+    if not isinstance(impact, dict):
+        raise ValidationError(f"{where}.validation_checklist.benchmark_impact must be object")
+    require_keys(
+        f"{where}.validation_checklist.benchmark_impact",
+        impact,
+        BENCHMARK_IMPACT_REQUIRED,
+    )
+    if not isinstance(impact["m3_benchmark_exercised"], bool):
+        raise ValidationError(
+            f"{where}.validation_checklist.benchmark_impact.m3_benchmark_exercised must be boolean"
+        )
+    for key in ("reason", "evidence"):
+        if not isinstance(impact[key], str) or not impact[key].strip():
+            raise ValidationError(
+                f"{where}.validation_checklist.benchmark_impact.{key} must be non-empty string"
+            )
+    return impact
+
+
 def performance_gate_ok(summary: dict[str, Any], case_name: str, baseline_case: str | None) -> bool:
     gates = summary.get("performance_regression_gates")
     if not isinstance(gates, dict) or gates.get("enabled") is not True:
@@ -609,6 +637,19 @@ def validate_validation_checklist(
         raise ValidationError(
             f"{where}.validation_checklist.performance_regression_required must be boolean"
         )
+    benchmark_impact = validate_benchmark_impact(
+        where, checklist.get("benchmark_impact")
+    )
+    if publishable and checklist["change_type"] == "api_only" and not perf_required:
+        if benchmark_impact is None:
+            raise ValidationError(
+                f"{where}.validation_checklist api_only without performance gate requires benchmark_impact proof"
+            )
+        if benchmark_impact["m3_benchmark_exercised"]:
+            raise ValidationError(
+                f"{where}.validation_checklist api_only exercises M3 benchmark path; "
+                "set performance_regression_required=true"
+            )
     if publishable and checklist["change_type"] == "default_path" and not perf_required:
         raise ValidationError(
             f"{where}.validation_checklist default_path requires performance regression gate"
@@ -1489,6 +1530,41 @@ def self_test() -> None:
             assert "full concurrency sweep" in str(exc)
         else:
             raise AssertionError("publishable default-path artifact without full sweep passed")
+        write_json(case_dir / "manifest.json", case_manifest)
+
+        api_checklist = load_json(case_dir / "manifest.json")
+        api_checklist["validation_checklist"]["change_type"] = "api_only"
+        api_checklist["validation_checklist"]["touched_areas"] = ["openai_server_api"]
+        api_checklist["validation_checklist"]["performance_regression_required"] = False
+        write_json(case_dir / "manifest.json", api_checklist)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False)
+        except ValidationError as exc:
+            assert "benchmark_impact proof" in str(exc)
+        else:
+            raise AssertionError("api-only artifact without benchmark impact proof passed")
+
+        api_checklist["validation_checklist"]["benchmark_impact"] = {
+            "m3_benchmark_exercised": True,
+            "reason": "fixture says API path is exercised",
+            "evidence": "self-test",
+        }
+        write_json(case_dir / "manifest.json", api_checklist)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False)
+        except ValidationError as exc:
+            assert "set performance_regression_required=true" in str(exc)
+        else:
+            raise AssertionError("api-only exercised benchmark without perf gate passed")
+
+        api_checklist["validation_checklist"]["benchmark_impact"] = {
+            "m3_benchmark_exercised": False,
+            "reason": "OpenAI HTTP route is not used by M3 bench-serve hot path",
+            "evidence": "touched_areas=openai_server_api; bench uses generated endpoint flow only",
+        }
+        write_json(case_dir / "manifest.json", api_checklist)
+        result = validate_artifact(root, require_bench=True, require_profile_events=False)
+        assert result["ok"]
         write_json(case_dir / "manifest.json", case_manifest)
 
         for missing_key in sorted(PROFILE_REQUIRED):

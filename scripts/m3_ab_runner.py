@@ -251,6 +251,17 @@ class Runner:
             and not isinstance(validation["performance_regression_required"], bool)
         ):
             raise SystemExit("validation.performance_regression_required must be boolean")
+        impact = validation.get("benchmark_impact")
+        if impact is not None:
+            if not isinstance(impact, dict):
+                raise SystemExit("validation.benchmark_impact must be an object when set")
+            if not isinstance(impact.get("m3_benchmark_exercised"), bool):
+                raise SystemExit(
+                    "validation.benchmark_impact.m3_benchmark_exercised must be boolean"
+                )
+            for key in ("reason", "evidence"):
+                if not str(impact.get(key, "")).strip():
+                    raise SystemExit(f"validation.benchmark_impact.{key} must be non-empty")
         cells = validation.get("required_concurrency_cells")
         if cells is not None:
             if not isinstance(cells, list):
@@ -377,7 +388,7 @@ class Runner:
                 bench_ok = int(completed or 0) > 0 and int(errored or 0) == 0
             except (TypeError, ValueError):
                 bench_ok = False
-        return {
+        checklist = {
             "schema_version": 1,
             "change_type": self.validation_change_type(),
             "touched_areas": self.validation_touched_areas(),
@@ -395,6 +406,16 @@ class Runner:
             "baseline_case": self.config.get("baseline_case"),
             "case": None if case is None else str(case.get("name")),
         }
+        benchmark_impact = self.validation_config().get("benchmark_impact")
+        if isinstance(benchmark_impact, dict):
+            checklist["benchmark_impact"] = {
+                "m3_benchmark_exercised": bool(
+                    benchmark_impact.get("m3_benchmark_exercised")
+                ),
+                "reason": str(benchmark_impact.get("reason", "")),
+                "evidence": str(benchmark_impact.get("evidence", "")),
+            }
+        return checklist
 
     def maybe_build(self) -> None:
         if not self.config.get("build", False):
@@ -1420,6 +1441,44 @@ def self_test() -> None:
         assert [entry["key"] for entry in diff["added"]] == ["FERRUM_FA_LAYOUT_VARLEN"]
         assert diff["changed"] == []
         assert runner.runtime_effect("FERRUM_FA_LAYOUT_VARLEN") == "performance"
+
+        api_cfg = {
+            **cfg,
+            "out_root": str(root / "api-out"),
+            "validation": {
+                "change_type": "api_only",
+                "touched_areas": ["openai_server_api"],
+                "required_correctness_gates": ["api_contract_tests", "bench_completion"],
+                "performance_regression_required": False,
+                "benchmark_impact": {
+                    "m3_benchmark_exercised": False,
+                    "reason": "OpenAI route code is outside the M3 bench path",
+                    "evidence": "self-test fixture",
+                },
+            },
+        }
+        api_runner = Runner(api_cfg)
+        api_runner.validate()
+        api_checklist = api_runner.validation_checklist()
+        assert api_checklist["benchmark_impact"] == api_cfg["validation"]["benchmark_impact"]
+
+        bad_api_cfg = {
+            **api_cfg,
+            "out_root": str(root / "bad-api-out"),
+            "validation": {
+                **api_cfg["validation"],
+                "benchmark_impact": {
+                    "m3_benchmark_exercised": False,
+                    "reason": "",
+                    "evidence": "self-test fixture",
+                },
+            },
+        }
+        try:
+            Runner(bad_api_cfg).validate()
+            raise AssertionError("empty benchmark impact reason should fail validation")
+        except SystemExit as exc:
+            assert "validation.benchmark_impact.reason" in str(exc)
 
         preset_cfg = {
             "name": "preset-self-test",
