@@ -35,9 +35,14 @@ from m3_validate_runner_artifact import (
 )
 
 
-RUNTIME_PRESETS: dict[str, dict[str, str]] = {
+RUNTIME_PRESET_ENV: dict[str, dict[str, str]] = {
     "m3_qwen3_30b_a3b_int4": {
         "HF_HOME": "/workspace/hf-cache",
+    }
+}
+
+RUNTIME_PRESET_CONFIG: dict[str, dict[str, str]] = {
+    "m3_qwen3_30b_a3b_int4": {
         "FERRUM_BACKEND": "cuda",
         "FERRUM_MOE_DEVICE_ROUTE": "1",
         "FERRUM_MOE_STREAMS": "4",
@@ -172,7 +177,7 @@ class Runner:
         if not self.model_dir.is_dir():
             raise SystemExit(f"MODEL_DIR does not exist: {self.model_dir}")
         preset = self.config.get("preset")
-        if preset and preset not in RUNTIME_PRESETS:
+        if preset and preset not in RUNTIME_PRESET_ENV:
             raise SystemExit(f"unknown runtime preset: {preset}")
         profile_env_cases = self.config.get("profile", {}).get("profile_env_cases", [])
         if profile_env_cases and not isinstance(profile_env_cases, list):
@@ -447,7 +452,13 @@ class Runner:
         preset = self.config.get("preset")
         if not preset:
             return {}
-        return dict(RUNTIME_PRESETS[preset])
+        return dict(RUNTIME_PRESET_ENV[preset])
+
+    def preset_runtime_config(self) -> dict[str, str]:
+        preset = self.config.get("preset")
+        if not preset:
+            return {}
+        return dict(RUNTIME_PRESET_CONFIG[preset])
 
     def merged_env(self, case: dict[str, Any]) -> dict[str, str]:
         env = dict(os.environ)
@@ -498,16 +509,16 @@ class Runner:
     def runtime_config_snapshot(self, case: dict[str, Any]) -> dict[str, Any]:
         values: dict[str, str] = {}
         sources: dict[str, str] = {}
-        for source in (
-            self.preset_env(),
-            self.config.get("base_env", {}),
-            case.get("env", {}),
+        for source, source_name in (
+            (self.preset_runtime_config(), "cli"),
+            (self.config.get("base_env", {}), "script_case"),
+            (case.get("env", {}), "script_case"),
         ):
             for key, value in source.items():
                 if not str(key).startswith("FERRUM_"):
                     continue
                 values[str(key)] = str(value)
-                sources[str(key)] = "script_case"
+                sources[str(key)] = source_name
 
         entries = [
             {
@@ -1029,6 +1040,8 @@ class Runner:
             "--decision-trace-jsonl",
             str(paths.decision_trace_jsonl),
         ]
+        if self.config.get("preset"):
+            cmd.extend(["--runtime-preset", str(self.config["preset"])])
         cmd.extend(profile_args)
         self.server_proc = subprocess.Popen(
             cmd,
@@ -1707,6 +1720,28 @@ def self_test() -> None:
         assert [entry["key"] for entry in diff["added"]] == ["FERRUM_FA_LAYOUT_VARLEN"]
         assert diff["changed"] == []
         assert runner.runtime_effect("FERRUM_FA_LAYOUT_VARLEN") == "performance"
+
+        preset_cfg = {
+            "name": "preset-self-test",
+            "out_root": str(root / "preset-out"),
+            "model_dir": str(root / "model"),
+            "bin": sys.executable,
+            "preset": "m3_qwen3_30b_a3b_int4",
+            "cases": [{"name": "preset", "env": {"FERRUM_FA_LAYOUT_VARLEN": "1"}}],
+        }
+        preset_runner = Runner(preset_cfg)
+        preset_runner.validate()
+        preset_env = preset_runner.case_env_only(preset_cfg["cases"][0])
+        assert "FERRUM_MOE_GRAPH" not in preset_env
+        assert preset_env["HF_HOME"] == "/workspace/hf-cache"
+        preset_snapshot = preset_runner.runtime_config_snapshot(preset_cfg["cases"][0])
+        preset_entry = {
+            entry["key"]: entry for entry in preset_snapshot["entries"]
+        }
+        assert preset_entry["FERRUM_MOE_GRAPH"]["source"] == "cli"
+        assert preset_entry["FERRUM_VLLM_MOE"]["source"] == "cli"
+        assert preset_entry["FERRUM_FA_LAYOUT_VARLEN"]["source"] == "script_case"
+
         runner.config["baseline_case"] = "default"
         summary_metrics = {
             "throughput_stddev": None,

@@ -61,6 +61,16 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   config_file > default` precedence rule for both runtime behavior and startup
   artifacts. The checked-in product-facing `ferrum.toml` intentionally lists
   only the small stable/common subset as commented examples.
+- `ferrum serve --runtime-preset m3_qwen3_30b_a3b_int4` and
+  `[runtime].preset = "m3_qwen3_30b_a3b_int4"` now select the product-server
+  M3 runtime preset. The preset materializes the common M3 startup defaults
+  before env snapshot capture and records them with CLI/config-file source
+  attribution; explicit runtime config fields, env vars, and CLI flags still
+  override those defaults.
+- `scripts/m3_ab_runner.py` now passes the M3 preset through
+  `--runtime-preset`, so the migrated wrappers no longer inject the common M3
+  `FERRUM_*` bundle as process env. The runner still mirrors preset runtime
+  entries in manifests for pre-start profile metadata and config diffs.
 - The runner artifact validator now schema-checks server-written
   `effective_config.json` entries, including sorted `FERRUM_*` keys,
   non-empty `affects`, allowed source/effect values, and decision parity with
@@ -108,14 +118,14 @@ Evidence:
   the Rust selector unless explicitly overridden.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
-- `ferrum-cli` serve tests passed: `6 passed`, covering CLI-sourced runtime
-  entries for `--kv-dtype` and profile sink arguments plus explicit runtime
-  source precedence for config-file, env, and CLI inputs. The serve tests also
-  verify that config-file values bridged into the env snapshot keep
-  `source=config_file` in startup artifacts.
-- `ferrum-cli` config tests passed: `6 passed`, including config-file
-  runtime source attribution and missing `[runtime]` backwards
-  compatibility.
+- `ferrum-cli` serve tests passed: `8 passed`, covering CLI-sourced runtime
+  entries for `--kv-dtype`, `--runtime-preset`, and profile sink arguments
+  plus explicit runtime source precedence for config-file, env, and CLI
+  inputs. The serve tests also verify that config-file values bridged into the
+  env snapshot keep `source=config_file` in startup artifacts.
+- `ferrum-cli` config tests passed: `7 passed`, including config-file runtime
+  source attribution, `[runtime].preset` parsing, and missing `[runtime]`
+  backwards compatibility.
 - `ferrum-server` health test passed and verifies `auto_config` is present
   with either a decision list or an explicit resolver error.
 - `cargo check` passed for `ferrum-types`, `ferrum-server`, and `ferrum-cli`.
@@ -130,14 +140,16 @@ Evidence:
   startup env setters and model/backend runtime configs still consume parts
   of the old env surface.
 - CLI/config-file/script-case source attribution is represented in the
-  builder and decision trace. `ferrum serve` now carries selected CLI
-  runtime/profile inputs plus the primary M3 config-file runtime selector
-  fields into the startup snapshot. Broader non-M3 and diagnostic config-file
+  builder and decision trace. `ferrum serve` now carries the named M3 runtime
+  preset, selected CLI runtime/profile inputs, and config-file runtime fields
+  into the startup snapshot. Broader non-M3 and diagnostic config-file
   coverage still needs expansion.
 - Hardware capability data is currently compiled-feature/device based; it does
   not yet include a real startup memory profile or CUDA capability probe.
-- The M3 preset selector is wired for exact Qwen3-MoE 30B-A3B metadata, but
-  the old script preset and Rust startup preset still need to converge.
+- The M3 preset selector is now exposed through the Rust startup path and used
+  by the migrated runner, but the runner still mirrors the preset map for
+  pre-start artifact metadata until server-written effective-config data owns
+  that field completely.
 - No new GPU performance claim is made by this checkpoint. Default-path
   equivalence for the Rust auto-config path still needs the Milestone I
   correctness and non-regression packet.

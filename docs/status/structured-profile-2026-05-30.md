@@ -118,7 +118,7 @@ Local refresh after typed profile sink wiring:
 - `cargo check -q -p ferrum-cli`: passed.
 - `python3 scripts/m3_ab_runner.py --self-test`: passed.
 - `python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap`:
-  `146/146` registry coverage, hot direct env reads `4`.
+  `147/147` registry coverage, hot direct env reads `4`.
 - `VALIDATE_ONLY=1 MODEL_DIR=/tmp BIN=/bin/echo
   OUT_ROOT=/tmp/m3-graph-runtime-validate bash
   scripts/m3_graph_runtime_profile.sh`: passed.

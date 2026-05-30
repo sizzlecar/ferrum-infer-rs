@@ -161,6 +161,12 @@ pub struct DevConfig {
 /// Runtime knobs that can be sourced from the CLI config file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeCliConfig {
+    /// Named startup/runtime preset. Presets provide product-owned default
+    /// bundles and can still be overridden by explicit runtime keys below,
+    /// environment variables, or CLI flags.
+    #[serde(default)]
+    pub preset: Option<String>,
+
     /// KV cache dtype override, equivalent to `--kv-dtype` or
     /// `FERRUM_KV_DTYPE`.
     #[serde(default)]
@@ -504,6 +510,7 @@ mod tests {
     #[test]
     fn runtime_cli_config_emits_config_file_source_entries() {
         let runtime = RuntimeCliConfig {
+            preset: Some("m3_qwen3_30b_a3b_int4".to_string()),
             kv_dtype: Some("int8".to_string()),
             kv_max_blocks: Some(4096),
             paged_max_seqs: Some(64),
@@ -613,6 +620,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        assert!(config.runtime.preset.is_none());
         assert!(config.runtime.kv_dtype.is_none());
         assert!(config.runtime.runtime_config_entries().is_empty());
     }
