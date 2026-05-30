@@ -48,5 +48,10 @@ mock_backends = false
 test_data_dir = "./test_data"
 
 [runtime]
-# Optional runtime config-file overrides. CLI flags still take precedence.
+# Optional startup runtime overrides. Precedence is CLI > env > config file.
 # kv_dtype = "fp16"
+# kv_max_blocks = 2048
+# paged_max_seqs = 32
+# max_batched_tokens = 2048
+# prefix_cache = false
+# moe_graph = true

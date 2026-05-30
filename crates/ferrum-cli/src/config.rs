@@ -165,6 +165,28 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_KV_DTYPE`.
     #[serde(default)]
     pub kv_dtype: Option<String>,
+
+    /// KV block budget, equivalent to `FERRUM_KV_MAX_BLOCKS`.
+    #[serde(default)]
+    pub kv_max_blocks: Option<usize>,
+
+    /// Maximum paged-KV sequence count, equivalent to
+    /// `FERRUM_PAGED_MAX_SEQS`.
+    #[serde(default)]
+    pub paged_max_seqs: Option<usize>,
+
+    /// Scheduler/model max batched-token budget, equivalent to
+    /// `FERRUM_MAX_BATCHED_TOKENS`.
+    #[serde(default)]
+    pub max_batched_tokens: Option<usize>,
+
+    /// Prefix cache opt-in, equivalent to `FERRUM_PREFIX_CACHE`.
+    #[serde(default)]
+    pub prefix_cache: Option<bool>,
+
+    /// MoE CUDA graph policy override, equivalent to `FERRUM_MOE_GRAPH`.
+    #[serde(default)]
+    pub moe_graph: Option<bool>,
 }
 
 impl RuntimeCliConfig {
@@ -181,7 +203,36 @@ impl RuntimeCliConfig {
                 RuntimeConfigSource::ConfigFile,
             ));
         }
+        push_usize_entry(&mut entries, "FERRUM_KV_MAX_BLOCKS", self.kv_max_blocks);
+        push_usize_entry(&mut entries, "FERRUM_PAGED_MAX_SEQS", self.paged_max_seqs);
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_MAX_BATCHED_TOKENS",
+            self.max_batched_tokens,
+        );
+        push_bool_entry(&mut entries, "FERRUM_PREFIX_CACHE", self.prefix_cache);
+        push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
         entries
+    }
+}
+
+fn push_usize_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<usize>) {
+    if let Some(value) = value {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value.to_string(),
+            RuntimeConfigSource::ConfigFile,
+        ));
+    }
+}
+
+fn push_bool_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<bool>) {
+    if let Some(value) = value {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            if value { "1" } else { "0" },
+            RuntimeConfigSource::ConfigFile,
+        ));
     }
 }
 
@@ -367,15 +418,34 @@ mod tests {
     fn runtime_cli_config_emits_config_file_source_entries() {
         let runtime = RuntimeCliConfig {
             kv_dtype: Some("int8".to_string()),
+            kv_max_blocks: Some(4096),
+            paged_max_seqs: Some(64),
+            max_batched_tokens: Some(2048),
+            prefix_cache: Some(false),
+            moe_graph: Some(true),
+            ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, "FERRUM_KV_DTYPE");
-        assert_eq!(entries[0].effective_value, "int8");
-        assert_eq!(entries[0].source, RuntimeConfigSource::ConfigFile);
-        assert!(entries[0]
+        assert_eq!(entries.len(), 6);
+        let entry = |key: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        assert_eq!(entry("FERRUM_KV_DTYPE").effective_value, "int8");
+        assert_eq!(
+            entry("FERRUM_KV_DTYPE").source,
+            RuntimeConfigSource::ConfigFile
+        );
+        assert!(entry("FERRUM_KV_DTYPE")
             .affects
             .contains(&RuntimeConfigEffect::Correctness));
+        assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
+        assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
+        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
     }
 
     #[test]

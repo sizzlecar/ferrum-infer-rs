@@ -51,11 +51,13 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   non-env sources. `ferrum serve` uses them to carry CLI runtime/profile
   inputs such as `--kv-dtype` and `--profile-*` into the startup
   `effective_config.json` snapshot with `source=cli`.
-- `ferrum.toml` now has a narrow `[runtime]` config surface for `kv_dtype`.
-  `ferrum serve` applies it as the effective KV dtype when `--kv-dtype` and
-  `FERRUM_KV_DTYPE` are absent, records it with `source=config_file`, and uses
-  an explicit `CLI > env > config_file > default` precedence rule for both
-  runtime behavior and startup artifacts.
+- `ferrum.toml` now has a `[runtime]` config surface for `kv_dtype`,
+  `kv_max_blocks`, `paged_max_seqs`, `max_batched_tokens`, `prefix_cache`, and
+  `moe_graph`. `ferrum serve` bridges these config-file values into the
+  existing startup env snapshot only when the corresponding env var is absent,
+  records them with `source=config_file`, and uses an explicit
+  `CLI > env > config_file > default` precedence rule for both runtime
+  behavior and startup artifacts.
 - The runner artifact validator now schema-checks server-written
   `effective_config.json` entries, including sorted `FERRUM_*` keys,
   non-empty `affects`, allowed source/effect values, and decision parity with
@@ -103,11 +105,13 @@ Evidence:
   the Rust selector unless explicitly overridden.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
-- `ferrum-cli` serve tests passed: `5 passed`, covering CLI-sourced runtime
+- `ferrum-cli` serve tests passed: `6 passed`, covering CLI-sourced runtime
   entries for `--kv-dtype` and profile sink arguments plus explicit runtime
-  source precedence for config-file, env, and CLI inputs.
-- `ferrum-cli` config tests passed: `3 passed`, including config-file
-  `kv_dtype` source attribution and missing `[runtime]` backwards
+  source precedence for config-file, env, and CLI inputs. The serve tests also
+  verify that config-file values bridged into the env snapshot keep
+  `source=config_file` in startup artifacts.
+- `ferrum-cli` config tests passed: `6 passed`, including config-file
+  runtime source attribution and missing `[runtime]` backwards
   compatibility.
 - `ferrum-server` health test passed and verifies `auto_config` is present
   with either a decision list or an explicit resolver error.
@@ -124,9 +128,9 @@ Evidence:
   of the old env surface.
 - CLI/config-file/script-case source attribution is represented in the
   builder and decision trace. `ferrum serve` now carries selected CLI
-  runtime/profile inputs plus config-file `runtime.kv_dtype` into the startup
-  snapshot. Broader config-file runtime coverage still needs expansion beyond
-  this first narrow field.
+  runtime/profile inputs plus a small set of config-file runtime fields into
+  the startup snapshot. Broader config-file runtime coverage still needs
+  expansion beyond this initial startup surface.
 - Hardware capability data is currently compiled-feature/device based; it does
   not yet include a real startup memory profile or CUDA capability probe.
 - The M3 preset selector is wired for exact Qwen3-MoE 30B-A3B metadata, but

@@ -174,6 +174,10 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         None
     };
 
+    let config_runtime_entries = config.runtime.runtime_config_entries();
+    let materialized_config_runtime_keys =
+        materialize_config_runtime_env_defaults(&config_runtime_entries);
+
     // Default-ON `FERRUM_MOE_GRAPH=1` — kept separate from the
     // local-dir-gated GPU autosizer below so it lands when the user
     // passes an HF repo name (most common) instead of a local
@@ -212,7 +216,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         env_kv_dtype.as_deref(),
         config.runtime.kv_dtype.as_deref(),
     );
-    let config_runtime_entries = config.runtime.runtime_config_entries();
 
     let source: ferrum_models::source::ResolvedModelSource = if let Some(p) = gguf_path.clone() {
         println!("{} {}", "Path:".dimmed(), p.display());
@@ -323,6 +326,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         arch_for_dispatch,
         model_definition.as_ref(),
         config_runtime_entries,
+        materialized_config_runtime_keys,
         startup_cli_runtime_entries,
     )?;
     write_startup_config_artifacts(
@@ -541,13 +545,14 @@ fn startup_auto_config(
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     config_runtime_entries: Vec<RuntimeConfigEntry>,
+    materialized_config_runtime_keys: Vec<String>,
     cli_runtime_entries: Vec<RuntimeConfigEntry>,
 ) -> Result<ResolvedFerrumConfig> {
-    let runtime_config = merge_runtime_config_sources(
-        config_runtime_entries,
-        RuntimeConfigSnapshot::capture_current(),
-        cli_runtime_entries,
-    );
+    let mut env_snapshot = RuntimeConfigSnapshot::capture_current();
+    env_snapshot =
+        remove_materialized_config_env_entries(env_snapshot, &materialized_config_runtime_keys);
+    let runtime_config =
+        merge_runtime_config_sources(config_runtime_entries, env_snapshot, cli_runtime_entries);
     let model = model_definition
         .map(model_capabilities_from_definition)
         .unwrap_or_else(ModelCapabilities::unknown);
@@ -579,6 +584,27 @@ fn merge_runtime_config_sources(
         runtime_config.upsert_entry(entry);
     }
     runtime_config
+}
+
+fn remove_materialized_config_env_entries(
+    mut env_snapshot: RuntimeConfigSnapshot,
+    materialized_config_runtime_keys: &[String],
+) -> RuntimeConfigSnapshot {
+    env_snapshot
+        .entries
+        .retain(|entry| !materialized_config_runtime_keys.contains(&entry.key));
+    env_snapshot
+}
+
+fn materialize_config_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<String> {
+    let mut materialized = Vec::new();
+    for entry in entries {
+        if std::env::var_os(&entry.key).is_none() {
+            std::env::set_var(&entry.key, &entry.effective_value);
+            materialized.push(entry.key.clone());
+        }
+    }
+    materialized
 }
 
 fn serve_cli_runtime_entries(
@@ -974,6 +1000,7 @@ mod tests {
     fn serve_runtime_snapshot_prefers_cli_over_config_file() {
         let config_entries = crate::config::RuntimeCliConfig {
             kv_dtype: Some("fp16".to_string()),
+            ..Default::default()
         }
         .runtime_config_entries();
         let cli_entries =
@@ -997,6 +1024,7 @@ mod tests {
     fn serve_runtime_snapshot_prefers_env_over_config_file() {
         let config_entries = crate::config::RuntimeCliConfig {
             kv_dtype: Some("fp16".to_string()),
+            ..Default::default()
         }
         .runtime_config_entries();
         let env_snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
@@ -1013,6 +1041,33 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "int8");
         assert_eq!(kv.source, RuntimeConfigSource::Env);
+    }
+
+    #[test]
+    fn materialized_config_env_entries_keep_config_file_source() {
+        let config_entries = crate::config::RuntimeCliConfig {
+            prefix_cache: Some(true),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        let env_snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_CACHE",
+            "1",
+            RuntimeConfigSource::Env,
+        )]);
+        let env_snapshot = remove_materialized_config_env_entries(
+            env_snapshot,
+            &[String::from("FERRUM_PREFIX_CACHE")],
+        );
+
+        let snapshot = merge_runtime_config_sources(config_entries, env_snapshot, Vec::new());
+        let prefix_cache = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_PREFIX_CACHE")
+            .unwrap();
+        assert_eq!(prefix_cache.effective_value, "1");
+        assert_eq!(prefix_cache.source, RuntimeConfigSource::ConfigFile);
     }
 
     #[test]

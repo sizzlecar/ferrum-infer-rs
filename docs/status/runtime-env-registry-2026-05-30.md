@@ -28,10 +28,12 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   upserts. `ferrum serve` uses this for selected CLI runtime/profile inputs,
   so `--kv-dtype` and `--profile-*` appear in startup config artifacts with
   `source=cli`.
-- The CLI config file has an initial `[runtime] kv_dtype` knob. It is applied
-  by `ferrum serve`, recorded as `FERRUM_KV_DTYPE` with
-  `source=config_file`, and participates in the explicit startup precedence
-  order `CLI > env > config_file > default`.
+- The CLI config file has an initial `[runtime]` surface for `kv_dtype`,
+  `kv_max_blocks`, `paged_max_seqs`, `max_batched_tokens`, `prefix_cache`, and
+  `moe_graph`. `ferrum serve` records these as `source=config_file`, bridges
+  them into the existing startup env snapshot only when the corresponding env
+  var is absent, and participates in the explicit startup precedence order
+  `CLI > env > config_file > default`.
 - `ferrum-types::runtime_config` parser tests cover boolean, integer, path,
   and tri-state default/forced-off/forced-on env values.
 - `ferrum-scheduler` now parses the prompt-token-estimate, prefill-first, active-decode-prefill-chunk, and scheduler-none-prof env switches once during `ContinuousBatchScheduler` construction; batch planning reads typed fields instead of calling env APIs.
@@ -98,7 +100,7 @@ Current dirty-worktree scan:
 | files scanned | 580 |
 | unique `FERRUM_*` tokens | 153 |
 | unique standalone candidates | 152 |
-| direct env read calls | 106 |
+| direct env read calls | 107 |
 | hot-path unique `FERRUM_*` tokens | 121 |
 | hot-path direct env read calls | 4 |
 | classified hot-path direct env read calls | 4 |
@@ -109,7 +111,7 @@ Current dirty-worktree scan:
 | unregistered baseline backlog | 0 |
 | new unregistered names versus baseline | 0 |
 
-The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `106` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
+The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `107` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
 
 The classified residual hot-path direct-read call sites are:
 
@@ -151,7 +153,7 @@ Evidence:
 - Continue typed config coverage for the remaining low-count hot-path surfaces
   and non-hot CLI/build surfaces.
 - Extend first-class config-file runtime knobs and source attribution beyond
-  the initial `runtime.kv_dtype` field.
+  the initial small startup surface.
 - Replace the remaining classified C++ hot-path direct env reads with typed
   launch parameters when those legacy/diagnostic paths become product-critical.
 - Remove the backwards-compatible `FERRUM_PROFILE_*` metadata fallback after any
