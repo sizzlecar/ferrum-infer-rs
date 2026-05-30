@@ -191,6 +191,171 @@ pub struct ApiStreamOptions {
     pub include_usage: Option<bool>,
 }
 
+pub fn api_response_from_generated_text(
+    request: &InferenceRequest,
+    text: &str,
+) -> Option<ApiResponse> {
+    let ApiRequest::Chat(chat_request) = request.api_request.as_ref()? else {
+        return None;
+    };
+    chat_api_response_from_generated_text(chat_request, text).map(ApiResponse::Chat)
+}
+
+pub fn chat_api_may_emit_tool_or_function_call(chat_request: &ApiChatRequest) -> bool {
+    (!chat_request.tools.is_empty() && !api_tool_choice_is_none(chat_request))
+        || (!chat_request.legacy_functions.is_empty()
+            && !api_function_call_choice_is_none(chat_request))
+}
+
+pub fn chat_api_response_from_generated_text(
+    chat_request: &ApiChatRequest,
+    text: &str,
+) -> Option<ApiChatResponse> {
+    if !chat_request.tools.is_empty() && !api_tool_choice_is_none(chat_request) {
+        if let Some(tool_calls) = parse_tool_calls_from_generated_text(text, &chat_request.tools) {
+            return Some(ApiChatResponse {
+                message: ApiChatMessage {
+                    role: ApiMessageRole::Assistant,
+                    content: String::new(),
+                    name: None,
+                    tool_calls,
+                    tool_call_id: None,
+                    function_call: None,
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            });
+        }
+    }
+
+    if !chat_request.legacy_functions.is_empty() && !api_function_call_choice_is_none(chat_request)
+    {
+        if let Some(function_call) =
+            parse_legacy_function_call_from_generated_text(text, &chat_request.legacy_functions)
+        {
+            return Some(ApiChatResponse {
+                message: ApiChatMessage {
+                    role: ApiMessageRole::Assistant,
+                    content: String::new(),
+                    name: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    function_call: Some(function_call),
+                },
+                finish_reason: Some("function_call".to_string()),
+            });
+        }
+    }
+
+    None
+}
+
+fn api_tool_choice_is_none(chat_request: &ApiChatRequest) -> bool {
+    matches!(
+        chat_request.tool_choice.as_ref(),
+        Some(ApiToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("none")
+    )
+}
+
+fn api_function_call_choice_is_none(chat_request: &ApiChatRequest) -> bool {
+    matches!(
+        chat_request.legacy_function_call.as_ref(),
+        Some(ApiFunctionCallChoice::Mode(mode)) if mode.eq_ignore_ascii_case("none")
+    )
+}
+
+fn parse_tool_calls_from_generated_text(text: &str, tools: &[ApiTool]) -> Option<Vec<ApiToolCall>> {
+    let value = parse_json_value_from_generated_text(text)?;
+    if let Some(calls) = value.get("tool_calls").and_then(|value| value.as_array()) {
+        let parsed = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| parse_tool_call_value(value, index, tools))
+            .collect::<Vec<_>>();
+        return (!parsed.is_empty()).then_some(parsed);
+    }
+    if let Some(tool_call) = value.get("tool_call") {
+        return parse_tool_call_value(tool_call, 0, tools).map(|call| vec![call]);
+    }
+    parse_tool_call_value(&value, 0, tools).map(|call| vec![call])
+}
+
+fn parse_tool_call_value(
+    value: &serde_json::Value,
+    index: usize,
+    tools: &[ApiTool],
+) -> Option<ApiToolCall> {
+    let tool_type = value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("function");
+    if tool_type != "function" {
+        return None;
+    }
+    let function = value.get("function").unwrap_or(value);
+    let name = function.get("name").and_then(|value| value.as_str())?;
+    if !tools.iter().any(|tool| tool.function.name == name) {
+        return None;
+    }
+    let arguments = api_arguments_to_string(function.get("arguments"));
+    let id = value
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{index}"));
+
+    Some(ApiToolCall {
+        id,
+        tool_type: "function".to_string(),
+        function: ApiFunctionCall {
+            name: name.to_string(),
+            arguments,
+        },
+    })
+}
+
+fn parse_legacy_function_call_from_generated_text(
+    text: &str,
+    functions: &[ApiFunction],
+) -> Option<ApiFunctionCall> {
+    let value = parse_json_value_from_generated_text(text)?;
+    let function = value.get("function_call").unwrap_or(&value);
+    let name = function.get("name").and_then(|value| value.as_str())?;
+    if !functions.iter().any(|function| function.name == name) {
+        return None;
+    }
+    Some(ApiFunctionCall {
+        name: name.to_string(),
+        arguments: api_arguments_to_string(function.get("arguments")),
+    })
+}
+
+fn parse_json_value_from_generated_text(text: &str) -> Option<serde_json::Value> {
+    let trimmed = strip_single_json_fence(text.trim());
+    serde_json::from_str(trimmed).ok().or_else(|| {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        (start <= end)
+            .then(|| serde_json::from_str(&trimmed[start..=end]).ok())
+            .flatten()
+    })
+}
+
+fn strip_single_json_fence(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    let rest = rest.strip_prefix("json").unwrap_or(rest).trim_start();
+    rest.strip_suffix("```").map(str::trim).unwrap_or(text)
+}
+
+fn api_arguments_to_string(arguments: Option<&serde_json::Value>) -> String {
+    match arguments {
+        Some(serde_json::Value::String(raw)) => raw.clone(),
+        Some(value) => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
+        None => "{}".to_string(),
+    }
+}
+
 impl InferenceRequest {
     /// Create a new inference request
     pub fn new(prompt: impl Into<String>, model_id: impl Into<ModelId>) -> Self {

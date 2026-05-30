@@ -7,7 +7,8 @@ claim that Milestone F or G is complete.
 
 ## Covered By Non-Ignored Tests
 
-All entries below are covered by `cargo test -q -p ferrum-server`.
+Entries below are covered by `cargo test -q -p ferrum-server` unless a more
+specific test path is listed in the evidence cell.
 
 The product-facing compatibility matrix is documented in
 [`docs/openai-api-compatibility.md`](../openai-api-compatibility.md), including
@@ -30,11 +31,12 @@ explicit supported/rejected fields, usage accounting, error mapping, and the
 | `tools` request parsing | Function tools parse through `/v1/chat/completions` and are carried in structured `api_request` plus compatibility metadata | `route_tool_request_reaches_engine_structured_boundary`, `tool_requests_and_tool_messages_parse_into_structured_api_request` |
 | Non-function tools | Non-function tool types reject explicitly instead of being accepted and ignored | `route_rejects_non_function_tools_with_openai_error_param` |
 | Tool role messages | `role=tool` parses through `/v1/chat/completions`, is rendered into the chat template, and remains available in structured `api_request` | `route_tool_request_reaches_engine_structured_boundary`, `tool_requests_and_tool_messages_parse_into_structured_api_request` |
-| Engine-generated tool calls | Non-streaming `ContinuousBatchEngine` converts model-emitted JSON matching declared function tools into `ApiResponse::Chat` with `finish_reason=tool_calls`; unmatched tools and `tool_choice=none` stay on the normal text path | `generated_tool_call_json_becomes_structured_chat_response`, `tool_choice_none_keeps_generated_text_unstructured`, `unregistered_tool_name_keeps_generated_text_unstructured` in `crates/ferrum-engine/src/continuous_engine/inner/completion.rs` |
+| Engine-generated tool calls | Shared API parsing converts model-emitted JSON matching declared function tools into `ApiResponse::Chat` with `finish_reason=tool_calls`; unmatched tools and `tool_choice=none` stay on the normal text path | `generated_tool_call_json_becomes_structured_chat_response`, `tool_choice_none_keeps_generated_text_unstructured`, `unregistered_tool_name_keeps_generated_text_unstructured` in `crates/ferrum-types/tests/requests_tests.rs` |
+| Streaming generated tool calls | Chat streaming buffers tool-capable `auto` requests until final output, converts matching JSON into an OpenAI `delta.tool_calls[]` chunk with `index`, then emits a final `finish_reason=tool_calls` chunk; non-tool text falls back to normal content | `route_streaming_chat_serializes_generated_tool_call_delta`, `route_streaming_chat_tool_request_falls_back_to_content_when_no_tool_call` |
 | Legacy `functions` / `function_call=auto` | Legacy function metadata parses and reaches the structured internal request | `route_tool_request_reaches_engine_structured_boundary`, `legacy_function_role_messages_parse_into_structured_api_request` |
 | Legacy `role=function` messages | Legacy function result messages parse, render through the chat-template layer, and remain available in structured `api_request` | `legacy_function_role_messages_parse_into_structured_api_request`, `fallback_preserves_legacy_function_and_tool_roles` |
 | Assistant `tool_calls` serialization | Assistant message serializes OpenAI `tool_calls[]` shape; non-streaming chat responses can serialize structured internal tool-call responses | `assistant_tool_call_serializes_openai_shape`, `route_chat_serializes_structured_tool_call_response` |
-| Assistant `function_call` serialization | Legacy assistant `function_call` responses serialize in the OpenAI shape with `finish_reason=function_call`; non-streaming engine output can now populate this structure from model-emitted JSON matching declared legacy functions | `route_chat_serializes_legacy_function_call_response`, `generated_legacy_function_call_json_becomes_structured_chat_response` |
+| Assistant `function_call` serialization | Legacy assistant `function_call` responses serialize in the OpenAI shape with `finish_reason=function_call`; engine output can populate this structure from model-emitted JSON matching declared legacy functions in non-streaming and streaming chat | `route_chat_serializes_legacy_function_call_response`, `route_streaming_chat_serializes_generated_legacy_function_call_delta`, `generated_legacy_function_call_json_becomes_structured_chat_response` in `crates/ferrum-types/tests/requests_tests.rs` |
 | Unsupported multimodal content | Non-text content parts are rejected at the HTTP boundary with 400 instead of dropped | `route_rejects_multimodal_content_with_400` |
 | `logit_bias` | Non-empty `logit_bias` is rejected with HTTP 400 and `param=logit_bias` | `route_rejects_logit_bias_with_openai_error_param`, `chat_rejects_logit_bias_and_logprobs_explicitly` |
 | `logprobs` / `top_logprobs` | Rejected with HTTP 400 and field-specific `param` | `chat_rejects_logit_bias_and_logprobs_explicitly` |
@@ -92,10 +94,14 @@ manual GPU/Metal validation, not the always-on stub path.
 ## Known Remaining Gaps
 
 - Always-on engine tests cover tokenizer-backed mock-executor paths, including a byte-level tokenizer fixture that differs from whitespace counting. Real-model tokenizer-vs-usage fixture tests are still needed outside the mock executor path.
-- Tool-call generation is partially implemented for non-streaming engine
-  outputs that emit supported JSON matching declared function tools or legacy
-  functions. Streaming tool-call deltas and server-side execution of arbitrary
-  external tools are not implemented.
+- Tool-call generation is implemented for deterministic non-streaming and
+  streaming server paths when model output emits supported JSON matching
+  declared function tools or legacy functions. Server-side execution of
+  arbitrary external tools is intentionally out of scope for the model server;
+  callers execute returned `tool_calls` and send `role=tool` messages back.
+  Streaming tool-capable requests are buffered until final output before
+  emitting a structured tool/function delta, so token-by-token tool-call delta
+  assembly is not implemented.
 - Engines still consume `InferenceRequest.prompt` as the rendered model input;
   `api_request` now participates in final tool/function response shaping, but
   prompt rendering is not yet fully owned by an engine-side structured chat

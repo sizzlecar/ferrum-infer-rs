@@ -223,6 +223,8 @@ pub struct ChatMessage {
 /// Assistant tool call in OpenAI responses and historical conversation input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
     pub id: String,
     #[serde(rename = "type")]
     pub tool_type: String,

@@ -347,6 +347,10 @@ async fn handle_chat_completions_stream(
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
     let buffer_strict_json_schema_stream = strict_json_schema_string(&openai_request)?.is_some();
+    let stream_api_request = api_chat_request(&openai_request);
+    let buffer_structured_api_stream =
+        ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
+    let buffer_stream_output = buffer_strict_json_schema_stream || buffer_structured_api_stream;
 
     tokio::spawn(async move {
         let mut current_text = String::new();
@@ -364,7 +368,7 @@ async fn handle_chat_completions_stream(
                             if !chunk.text.is_empty() {
                                 current_text.push_str(&chunk.text);
 
-                                if !buffer_strict_json_schema_stream {
+                                if !buffer_stream_output {
                                     // Create streaming response chunk
                                     let response_chunk = ChatCompletionsResponse {
                                         id: request_id.clone(),
@@ -411,7 +415,39 @@ async fn handle_chat_completions_stream(
                                     let _ = tx.send(Ok(Event::default().data("[DONE]")));
                                     break;
                                 }
-                                if buffer_strict_json_schema_stream && !current_text.is_empty() {
+                                let structured_chat_response = if buffer_structured_api_stream {
+                                    ferrum_types::chat_api_response_from_generated_text(
+                                        &stream_api_request,
+                                        &current_text,
+                                    )
+                                } else {
+                                    None
+                                };
+
+                                if let Some(chat_response) = structured_chat_response.as_ref() {
+                                    let response_chunk = ChatCompletionsResponse {
+                                        id: request_id.clone(),
+                                        object: "chat.completion.chunk".to_string(),
+                                        created: chrono::Utc::now().timestamp() as u64,
+                                        model: openai_request.model.clone(),
+                                        choices: vec![ChatChoice {
+                                            index: 0,
+                                            message: None,
+                                            delta: Some(openai_chat_delta_from_api(
+                                                &chat_response.message,
+                                            )),
+                                            finish_reason: None,
+                                        }],
+                                        usage: None,
+                                    };
+
+                                    let sse_event = Event::default()
+                                        .json_data(&response_chunk)
+                                        .unwrap_or_else(|_| Event::default().data("error"));
+                                    if tx.send(Ok(sse_event)).is_err() {
+                                        break;
+                                    }
+                                } else if buffer_stream_output && !current_text.is_empty() {
                                     let response_chunk = ChatCompletionsResponse {
                                         id: request_id.clone(),
                                         object: "chat.completion.chunk".to_string(),
@@ -465,10 +501,15 @@ async fn handle_chat_completions_stream(
                                             tool_call_id: None,
                                             function_call: None,
                                         }),
-                                        finish_reason: chunk
-                                            .finish_reason
+                                        finish_reason: structured_chat_response
                                             .as_ref()
-                                            .map(finish_reason_to_string)
+                                            .and_then(|response| response.finish_reason.clone())
+                                            .or_else(|| {
+                                                chunk
+                                                    .finish_reason
+                                                    .as_ref()
+                                                    .map(finish_reason_to_string)
+                                            })
                                             .or(Some("length".to_string())),
                                     }],
                                     usage: None,
@@ -839,10 +880,38 @@ fn openai_message_role_from_api(role: ferrum_types::ApiMessageRole) -> MessageRo
 
 fn openai_tool_call_from_api(tool_call: &ferrum_types::ApiToolCall) -> ChatToolCall {
     ChatToolCall {
+        index: None,
         id: tool_call.id.clone(),
         tool_type: tool_call.tool_type.clone(),
         function: openai_function_call_from_api(&tool_call.function),
     }
+}
+
+fn openai_tool_call_delta_from_api(
+    index: usize,
+    tool_call: &ferrum_types::ApiToolCall,
+) -> ChatToolCall {
+    ChatToolCall {
+        index: Some(usize_to_u32_saturating(index)),
+        id: tool_call.id.clone(),
+        tool_type: tool_call.tool_type.clone(),
+        function: openai_function_call_from_api(&tool_call.function),
+    }
+}
+
+fn openai_chat_delta_from_api(message: &ferrum_types::ApiChatMessage) -> ChatMessage {
+    let mut delta = openai_chat_message_from_api(message);
+    if !message.tool_calls.is_empty() {
+        delta.tool_calls = Some(
+            message
+                .tool_calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| openai_tool_call_delta_from_api(index, call))
+                .collect(),
+        );
+    }
+    delta
 }
 
 fn openai_function_call_from_api(
@@ -2371,6 +2440,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_streaming_chat_serializes_generated_tool_call_delta() {
+        let response = post_json(
+            router_with_stub(
+                r#"{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":{"city":"Paris"}}}]}"#,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the weather tool."}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"tool_calls""#),
+            "stream should finish with tool_calls: {body}"
+        );
+        assert!(
+            body.contains(r#""tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"weather""#),
+            "stream should emit OpenAI tool_calls delta with index: {body}"
+        );
+        assert!(
+            body.contains(r#""arguments":"{\"city\":\"Paris\"}""#),
+            "tool arguments should be serialized as JSON string: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"{\"tool_calls\""#),
+            "raw tool-call JSON should not be streamed as assistant content: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_tool_request_falls_back_to_content_when_no_tool_call() {
+        let response = post_json(
+            router_with_stub("plain answer"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the weather tool if needed."}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains(r#""content":"plain answer""#),
+            "plain content should still stream when no tool call is generated: {body}"
+        );
+        assert!(
+            body.contains(r#""finish_reason":"stop""#),
+            "plain content should keep normal finish reason: {body}"
+        );
+        assert!(
+            !body.contains(r#""tool_calls""#),
+            "fallback content should not synthesize tool_calls: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_serializes_generated_legacy_function_call_delta() {
+        let response = post_json(
+            router_with_stub(
+                r#"{"function_call":{"name":"weather","arguments":{"city":"Paris"}}}"#,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the weather function."}],
+                "stream": true,
+                "functions": [{
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }],
+                "function_call": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"function_call""#),
+            "stream should finish with function_call: {body}"
+        );
+        assert!(
+            body.contains(
+                r#""function_call":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}"#
+            ),
+            "stream should emit OpenAI legacy function_call delta: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"{\"function_call\""#),
+            "raw function-call JSON should not be streamed as assistant content: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn route_chat_serializes_legacy_function_call_response() {
         let response = post_json(
             router_with_stub_api_response(
@@ -3179,6 +3370,7 @@ mod tests {
             content: String::new(),
             name: None,
             tool_calls: Some(vec![ChatToolCall {
+                index: None,
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),
                 function: ChatFunctionCall {

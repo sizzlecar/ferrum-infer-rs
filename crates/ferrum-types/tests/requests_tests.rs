@@ -143,6 +143,139 @@ fn inference_response_can_carry_structured_chat_tool_call() {
     assert_eq!(chat.message.tool_calls[0].function.name, "weather");
 }
 
+fn chat_request_with_tool(tool_choice: Option<ApiToolChoice>) -> InferenceRequest {
+    InferenceRequest::new("rendered prompt", "mock-model").with_api_request(ApiRequest::Chat(
+        ApiChatRequest {
+            messages: vec![ApiChatMessage {
+                role: ApiMessageRole::User,
+                content: "Use the weather tool".to_string(),
+                name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                function_call: None,
+            }],
+            tools: vec![ApiTool {
+                tool_type: "function".to_string(),
+                function: ApiFunction {
+                    name: "weather".to_string(),
+                    description: None,
+                    parameters: None,
+                    strict: None,
+                },
+            }],
+            tool_choice,
+            legacy_functions: Vec::new(),
+            legacy_function_call: None,
+            response_format: None,
+            stream_options: None,
+        },
+    ))
+}
+
+#[test]
+fn generated_tool_call_json_becomes_structured_chat_response() {
+    let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    let text = r#"{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":{"city":"Paris"}}}]}"#;
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+        panic!("expected structured chat tool response");
+    };
+
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(response.message.content, "");
+    assert_eq!(response.message.tool_calls.len(), 1);
+    let call = &response.message.tool_calls[0];
+    assert_eq!(call.id, "call_1");
+    assert_eq!(call.function.name, "weather");
+    assert_eq!(call.function.arguments, r#"{"city":"Paris"}"#);
+}
+
+#[test]
+fn tool_choice_none_keeps_generated_text_unstructured() {
+    let request = chat_request_with_tool(Some(ApiToolChoice::Mode("none".to_string())));
+    let text = r#"{"name":"weather","arguments":{"city":"Paris"}}"#;
+
+    assert!(api_response_from_generated_text(&request, text).is_none());
+}
+
+#[test]
+fn unregistered_tool_name_keeps_generated_text_unstructured() {
+    let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    let text = r#"{"name":"calendar","arguments":{"city":"Paris"}}"#;
+
+    assert!(api_response_from_generated_text(&request, text).is_none());
+}
+
+#[test]
+fn generated_legacy_function_call_json_becomes_structured_chat_response() {
+    let request = InferenceRequest::new("rendered prompt", "mock-model").with_api_request(
+        ApiRequest::Chat(ApiChatRequest {
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            legacy_functions: vec![ApiFunction {
+                name: "weather".to_string(),
+                description: None,
+                parameters: None,
+                strict: None,
+            }],
+            legacy_function_call: None,
+            response_format: None,
+            stream_options: None,
+        }),
+    );
+    let text = r#"```json
+{"function_call":{"name":"weather","arguments":{"city":"Paris"}}}
+```"#;
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+        panic!("expected structured legacy function response");
+    };
+
+    assert_eq!(response.finish_reason.as_deref(), Some("function_call"));
+    let function_call = response.message.function_call.unwrap();
+    assert_eq!(function_call.name, "weather");
+    assert_eq!(function_call.arguments, r#"{"city":"Paris"}"#);
+}
+
+#[test]
+fn legacy_function_call_still_parses_when_tools_are_present() {
+    let request = InferenceRequest::new("rendered prompt", "mock-model").with_api_request(
+        ApiRequest::Chat(ApiChatRequest {
+            messages: Vec::new(),
+            tools: vec![ApiTool {
+                tool_type: "function".to_string(),
+                function: ApiFunction {
+                    name: "weather".to_string(),
+                    description: None,
+                    parameters: None,
+                    strict: None,
+                },
+            }],
+            tool_choice: Some(ApiToolChoice::Mode("auto".to_string())),
+            legacy_functions: vec![ApiFunction {
+                name: "legacy_weather".to_string(),
+                description: None,
+                parameters: None,
+                strict: None,
+            }],
+            legacy_function_call: Some(ApiFunctionCallChoice::Mode("auto".to_string())),
+            response_format: None,
+            stream_options: None,
+        }),
+    );
+    let text = r#"{"function_call":{"name":"legacy_weather","arguments":{"city":"Paris"}}}"#;
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+        panic!("expected structured legacy function response");
+    };
+
+    assert_eq!(response.finish_reason.as_deref(), Some("function_call"));
+    let function_call = response.message.function_call.unwrap();
+    assert_eq!(function_call.name, "legacy_weather");
+    assert_eq!(function_call.arguments, r#"{"city":"Paris"}"#);
+}
+
 #[test]
 fn batch_request_construction() {
     let r1 = InferenceRequest::new("a", "m");
