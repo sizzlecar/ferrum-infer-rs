@@ -118,7 +118,8 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   as a backwards-compatible fallback, but `ferrum serve --profile-*` no longer
   exports them for the normal native profile path. The compatibility fallback
   now parses those fields from one env snapshot rather than six direct
-  `std::env::var` calls.
+  `std::env::var` calls, and the unused helper that wrote profile metadata
+  back into process env has been removed.
 - Runner summaries now include per-row `env_hash`,
   `runtime_config_entry_count`, and a machine-readable
   `runtime_config_diff_vs_baseline` object for A/B cases. The diff records
@@ -167,7 +168,7 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   as `auto_config` next to the runtime config snapshot.
 - The registry checker now supports threshold gates for total direct env
   reads, process env writes, non-test process env writes, and hot-path direct
-  env reads. CPU CI pins the current checkpoint limits at `75`, `31`, `8`, and
+  env reads. CPU CI pins the current checkpoint limits at `75`, `24`, `1`, and
   `4` respectively, so new call-site drift fails before it becomes another
   cleanup backlog. The non-test write budget keeps product/bench compatibility
   bridges separate from test fixture mutations.
@@ -181,8 +182,8 @@ python3 scripts/check_ferrum_env_registry.py --json
 python3 scripts/check_ferrum_env_registry.py --self-test
 python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap \
   --max-direct-env-reads 75 \
-  --max-process-env-writes 31 \
-  --max-non-test-process-env-writes 8 \
+  --max-process-env-writes 24 \
+  --max-non-test-process-env-writes 1 \
   --max-hot-direct-env-reads 4
 ```
 
@@ -194,11 +195,11 @@ Current local scan:
 | unique `FERRUM_*` tokens | 152 |
 | unique standalone candidates | 151 |
 | direct env read calls | 75 |
-| process env write calls | 31 |
+| process env write calls | 24 |
 | test process env write calls | 23 |
-| non-test process env write calls | 8 |
-| classified process env write calls | 31 |
-| classified non-test process env write calls | 8 |
+| non-test process env write calls | 1 |
+| classified process env write calls | 24 |
+| classified non-test process env write calls | 1 |
 | unclassified process env write calls | 0 |
 | unclassified non-test process env write calls | 0 |
 | hot-path unique `FERRUM_*` tokens | 120 |
@@ -214,7 +215,7 @@ Current local scan:
 | product `ferrum.toml` raw `FERRUM_*` mentions | 0 |
 | product `ferrum.toml` surface errors | 0 |
 
-The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `75` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `152` token names, `151` standalone env candidates, and `146` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot. The removed `FERRUM_VLLM_VARLEN_SPLIT_K` registry entry was tied only to an archived negative-control script, not an active product/runtime path.
+The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `75` direct reads whole-tree and `4` in hot paths. The process-write count is now `24` total and `1` non-test call after removing the unused profile metadata env writer. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `152` token names, `151` standalone env candidates, and `146` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot. The removed `FERRUM_VLLM_VARLEN_SPLIT_K` registry entry was tied only to an archived negative-control script, not an active product/runtime path.
 
 The classified residual hot-path direct-read call sites are:
 
@@ -232,10 +233,6 @@ The classified process-env write call sites are:
 
 - `23` test-only fixture setup/cleanup calls in Rust test modules or
   integration tests.
-- `7` profile sink compatibility bridge calls in
-  `crates/ferrum-bench-core/src/profile.rs`. Normal `ferrum serve`
-  structured-profile wiring uses typed `--profile-*` arguments; this bridge
-  remains for backwards-compatible `FERRUM_PROFILE_*` propagation.
 - `1` CLI runtime compatibility bridge call in
   `crates/ferrum-cli/src/runtime_env.rs`, which materializes typed
   `RuntimeConfigEntry` defaults only for backend paths that have not yet been

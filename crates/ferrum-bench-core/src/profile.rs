@@ -201,26 +201,6 @@ impl ProfileSinkConfig {
             _ => Self::disabled(),
         }
     }
-
-    pub fn apply_to_process_env(&self) {
-        let Some(path) = &self.jsonl_path else {
-            return;
-        };
-        std::env::set_var(PROFILE_JSONL_ENV, path.as_os_str());
-        match &self.metadata.commit_sha {
-            Some(commit_sha) => std::env::set_var(PROFILE_COMMIT_SHA_ENV, commit_sha),
-            None => std::env::remove_var(PROFILE_COMMIT_SHA_ENV),
-        }
-        std::env::set_var(PROFILE_ENV_HASH_ENV, &self.metadata.env_hash);
-        std::env::set_var(PROFILE_MODEL_ENV, &self.metadata.model);
-        std::env::set_var(
-            PROFILE_CONCURRENCY_ENV,
-            self.metadata.concurrency.to_string(),
-        );
-        let runtime_flags =
-            serde_json::to_string(&self.metadata.runtime_flags).unwrap_or_else(|_| "{}".into());
-        std::env::set_var(PROFILE_RUNTIME_FLAGS_JSON_ENV, runtime_flags);
-    }
 }
 
 fn env_vars_map<I, K, V>(vars: I) -> BTreeMap<String, String>

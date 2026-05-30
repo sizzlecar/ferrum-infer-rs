@@ -54,7 +54,8 @@ validators, a native JSONL sink, and the first Rust/C++ profile emitters.
   Rust writer directly and passes the same typed sink to native kernel bridges.
   The old `FERRUM_PROFILE_*` env bridge remains only as a compatibility
   fallback, and that fallback now parses from one env snapshot rather than
-  direct per-field env reads.
+  direct per-field env reads. The unused helper that wrote profile metadata
+  back into process env has been removed.
 - Native emitters now cover the primary M3 Rust-side profile families:
   `iter_prof`, `unified_prof`, `unified_layer_prof`, `batched_decode_prof`,
   `bucket_prof`, `graph_prof`, and `moe_dump`.
@@ -233,6 +234,6 @@ Evidence:
 - Profile sink overhead now has c32 N=3 same-binary evidence within noise, but
   full diagnostic producer overhead is still intentionally excluded from this
   low-intrusion bound.
-- The remaining `FERRUM_PROFILE_*` bridge is now backwards-compatibility only
-  and snapshot-parsed; normal `ferrum serve --profile-*` native profile
-  emission uses typed Rust configuration plus the vLLM-MoE C ABI sink.
+- The remaining `FERRUM_PROFILE_*` bridge is now backwards-compatibility only,
+  snapshot-parsed, and read-only; normal `ferrum serve --profile-*` native
+  profile emission uses typed Rust configuration plus the vLLM-MoE C ABI sink.
