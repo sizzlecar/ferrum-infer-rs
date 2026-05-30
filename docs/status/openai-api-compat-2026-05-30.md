@@ -25,6 +25,7 @@ explicit supported/rejected fields, usage accounting, error mapping, and the
 | Embeddings | `/v1/embeddings` returns the OpenAI list envelope, indexed embedding rows, model id, and usage for a loaded embedding engine | `route_embeddings_contract_uses_stub_engine` |
 | Audio transcription | `/v1/audio/transcriptions` accepts multipart file input plus language hint and returns an OpenAI-style `{text}` response for a loaded transcription engine | `route_transcriptions_contract_uses_stub_engine` |
 | Audio speech | `/v1/audio/speech` returns WAV bytes with `content-type: audio/wav` for a loaded TTS engine | `route_speech_contract_uses_stub_engine` |
+| Modality request parse errors | Malformed embedding JSON, malformed speech JSON, and invalid transcription multipart requests map to OpenAI error envelopes instead of Axum default rejection bodies | `route_embeddings_invalid_json_maps_to_openai_error`, `route_speech_invalid_json_maps_to_openai_error`, `route_transcriptions_invalid_multipart_maps_to_openai_error` |
 | Streaming chat | SSE returns chat chunks and `[DONE]` | `route_streaming_chat_include_usage_contract` |
 | `stream_options.include_usage` | Emits a separate final usage chunk with `choices: []` before `[DONE]` | `route_streaming_chat_include_usage_contract`, `chat_stream_options_include_usage_controls_stream_usage` |
 | `max_completion_tokens` | Chat accepts OpenAI's newer completion budget field and lets it override legacy `max_tokens` when both are present | `chat_accepts_stop_string_and_max_completion_tokens` |

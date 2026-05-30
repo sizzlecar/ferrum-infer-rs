@@ -11,7 +11,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use axum::{
-    extract::{rejection::JsonRejection, State},
+    extract::{multipart::MultipartRejection, rejection::JsonRejection, State},
     http::StatusCode as AxumStatusCode,
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
@@ -1490,8 +1490,12 @@ fn validate_completion_request(
 /// Embeddings handler — text and image embedding via OpenAI-compatible API.
 async fn embeddings_handler(
     State(state): State<AppState>,
-    Json(request): Json<EmbeddingsRequest>,
+    request: std::result::Result<Json<EmbeddingsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
+    let Json(request) = request.map_err(|e| {
+        ServerError::invalid_request(format!("invalid embeddings request: {e}"), None)
+    })?;
+
     let span = span!(Level::INFO, "embeddings", model = %request.model);
     let _enter = span.enter();
 
@@ -1563,8 +1567,12 @@ async fn embeddings_handler(
 /// Audio transcription handler (OpenAI-compatible multipart form).
 async fn transcriptions_handler(
     State(state): State<AppState>,
-    mut multipart: axum::extract::Multipart,
+    multipart: std::result::Result<axum::extract::Multipart, MultipartRejection>,
 ) -> std::result::Result<Response, ServerError> {
+    let mut multipart = multipart.map_err(|e| {
+        ServerError::invalid_request(format!("invalid transcriptions request: {e}"), None)
+    })?;
+
     let span = span!(Level::INFO, "transcription");
     let _enter = span.enter();
 
@@ -1610,8 +1618,11 @@ async fn transcriptions_handler(
 /// TTS speech synthesis handler (OpenAI-compatible /v1/audio/speech)
 async fn speech_handler(
     State(state): State<AppState>,
-    Json(request): Json<SpeechRequest>,
+    request: std::result::Result<Json<SpeechRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
+    let Json(request) = request
+        .map_err(|e| ServerError::invalid_request(format!("invalid speech request: {e}"), None))?;
+
     let span = span!(Level::INFO, "speech");
     let _guard = span.enter();
 
@@ -3744,6 +3755,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_embeddings_invalid_json_maps_to_openai_error() {
+        let response = post_raw_json(router_with_stub_embed(), "/v1/embeddings", "{").await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], Value::Null);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid embeddings request"));
+    }
+
+    #[tokio::test]
     async fn route_transcriptions_engine_unavailable_maps_to_503() {
         let boundary = "ferrum-test-boundary";
         let body = concat!(
@@ -3795,6 +3819,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_transcriptions_invalid_multipart_maps_to_openai_error() {
+        let response = post_json(
+            router_with_stub_transcribe(),
+            "/v1/audio/transcriptions",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], Value::Null);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid transcriptions request"));
+    }
+
+    #[tokio::test]
     async fn route_speech_engine_unavailable_maps_to_503() {
         let response = post_json(
             router_without_llm(),
@@ -3834,6 +3876,19 @@ mod tests {
         assert!(body.len() > 44, "WAV should include header and PCM data");
         assert_eq!(&body[0..4], b"RIFF");
         assert_eq!(&body[8..12], b"WAVE");
+    }
+
+    #[tokio::test]
+    async fn route_speech_invalid_json_maps_to_openai_error() {
+        let response = post_raw_json(router_with_stub_tts(), "/v1/audio/speech", "{").await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], Value::Null);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid speech request"));
     }
 
     #[tokio::test]
