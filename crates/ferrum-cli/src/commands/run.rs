@@ -237,7 +237,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     );
     let runtime_config = RuntimeConfigSnapshot::capture_current();
     engine_config
-        .scheduler
         .apply_runtime_config_snapshot(&runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
     let effective_kv_dtype = cmd

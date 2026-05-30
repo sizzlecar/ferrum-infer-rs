@@ -218,6 +218,9 @@ Evidence:
   consumed through typed `SchedulerConfig` fields in `ferrum run`,
   `ferrum bench`, and `ferrum serve` instead of relying on the continuous
   scheduler to read process env at construction time.
+- KV block budget and max-batched-token selections are also applied from the
+  startup/runtime snapshot into typed `EngineConfig`, so the default config
+  constructors no longer hide process-env reads for those autosized values.
 - No new GPU performance claim is made by this checkpoint. Default-path
   equivalence for the Rust auto-config path still needs the Milestone I
   correctness and non-regression packet.

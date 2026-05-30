@@ -20,6 +20,24 @@ pub struct EngineConfig {
     pub monitoring: MonitoringConfig,
 }
 
+impl EngineConfig {
+    pub fn apply_runtime_config_snapshot(
+        &mut self,
+        snapshot: &RuntimeConfigSnapshot,
+    ) -> std::result::Result<(), String> {
+        self.scheduler.apply_runtime_config_snapshot(snapshot)?;
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_KV_MAX_BLOCKS") {
+            self.kv_cache.max_blocks =
+                parse_required_positive_usize("FERRUM_KV_MAX_BLOCKS", value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_BATCHED_TOKENS") {
+            self.batching.max_num_batched_tokens =
+                parse_required_positive_usize("FERRUM_MAX_BATCHED_TOKENS", value)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineModelConfig {
     pub model_id: ModelId,
@@ -129,6 +147,15 @@ fn parse_optional_positive_usize(
     Ok((parsed > 0).then_some(parsed))
 }
 
+fn parse_required_positive_usize(key: &str, value: &str) -> std::result::Result<usize, String> {
+    let parsed = parse_usize_env_value(value).map_err(|reason| format!("{key}: {reason}"))?;
+    if parsed == 0 {
+        Err(format!("{key}: must be greater than zero"))
+    } else {
+        Ok(parsed)
+    }
+}
+
 fn parse_presence_bool(value: &str) -> std::result::Result<bool, String> {
     if value.trim().is_empty() {
         Ok(true)
@@ -187,19 +214,13 @@ impl Default for KvCacheConfig {
     fn default() -> Self {
         // 2048 blocks covers c=32 ShareGPT prompts (~32×500/16 = 1000
         // blocks). The previous 1024 floor crashed at c≥16 on real
-        // workloads with "Block pool exhausted". `FERRUM_KV_MAX_BLOCKS`
-        // is set by the GPU autosizer (`ferrum-cli::gpu_mem_autosize`)
-        // before engine construction; honour it here so the autosizer
-        // is the single source of truth for memory-budgeted runs.
-        let max_blocks = std::env::var("FERRUM_KV_MAX_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2048);
+        // workloads with "Block pool exhausted". Runtime overrides are
+        // applied through EngineConfig::apply_runtime_config_snapshot.
         Self {
             cache_type: KvCacheType::Contiguous,
             dtype: KvCacheDtype::default(),
             block_size: 16,
-            max_blocks,
+            max_blocks: 2048,
             enable_compression: false,
             compression_ratio: 0.5,
             enable_multi_level: true,
@@ -523,10 +544,7 @@ pub struct BatchConfig {
 
 impl BatchConfig {
     fn default_max_num_batched_tokens() -> usize {
-        std::env::var("FERRUM_MAX_BATCHED_TOKENS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2048)
+        2048
     }
 }
 

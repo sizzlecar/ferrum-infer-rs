@@ -5,7 +5,47 @@ fn engine_config_default_sane() {
     let cfg = EngineConfig::default();
     assert_eq!(cfg.model.model_id.as_str(), "default");
     assert!(cfg.batching.max_batch_size >= 1);
+    assert_eq!(cfg.kv_cache.max_blocks, 2048);
+    assert_eq!(cfg.batching.max_num_batched_tokens, 2048);
     assert!(cfg.monitoring.enable_metrics);
+}
+
+#[test]
+fn engine_config_applies_runtime_snapshot() {
+    let snapshot = RuntimeConfigSnapshot::from_entries([
+        RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "4096", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new(
+            "FERRUM_MAX_BATCHED_TOKENS",
+            "8192",
+            RuntimeConfigSource::Env,
+        ),
+        RuntimeConfigEntry::new(
+            "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
+            "1",
+            RuntimeConfigSource::Env,
+        ),
+    ]);
+    let mut cfg = EngineConfig::default();
+
+    cfg.apply_runtime_config_snapshot(&snapshot).unwrap();
+
+    assert_eq!(cfg.kv_cache.max_blocks, 4096);
+    assert_eq!(cfg.batching.max_num_batched_tokens, 8192);
+    assert!(cfg.scheduler.prompt_token_estimate);
+}
+
+#[test]
+fn engine_config_rejects_invalid_runtime_snapshot() {
+    let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+        "FERRUM_KV_MAX_BLOCKS",
+        "0",
+        RuntimeConfigSource::Env,
+    )]);
+    let mut cfg = EngineConfig::default();
+
+    let err = cfg.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+
+    assert!(err.contains("FERRUM_KV_MAX_BLOCKS"));
 }
 
 #[test]
