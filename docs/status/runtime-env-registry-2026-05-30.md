@@ -76,7 +76,13 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   override those defaults. When no preset is explicitly configured, `serve`
   now infers the M3 preset from Qwen3-30B-A3B model metadata and materializes
   those defaults through the same typed preset entries before the legacy MoE
-  graph compatibility setter runs.
+  graph compatibility setter would otherwise be needed.
+- Non-preset Qwen3-MoE `ferrum serve` now preserves the historical graph-clean
+  MoE defaults through typed runtime entries (`FERRUM_MOE_GRAPH`, and when
+  built, `FERRUM_VLLM_MOE` / `FERRUM_VLLM_MOE_PAIR_IDS`) before the startup
+  snapshot is resolved. Those defaults now appear as `source=default` in
+  effective config / decision artifacts instead of being introduced by a
+  hidden process-wide env setter.
 - `scripts/m3_ab_runner.py` now passes the named M3 preset to the product
   server through `--runtime-preset` instead of injecting the common M3
   `FERRUM_*` env bundle. It keeps only path-like preset env such as `HF_HOME`
@@ -186,9 +192,9 @@ Evidence:
 
 - Continue typed config coverage for the remaining low-count hot-path surfaces
   and non-hot CLI/build surfaces.
-- Move the remaining non-preset legacy `serve` paths and `ferrum run` off the
-  legacy MoE graph default setter after they have equivalent typed runtime
-  profiles.
+- Move `ferrum run`, source resolution, and GPU autosizing compatibility
+  defaults off legacy process-wide env setters after they have equivalent typed
+  runtime profiles or command-local startup snapshots.
 - Continue extending first-class config-file runtime knobs for non-M3
   surfaces and any remaining diagnostics that need source-attributed
   artifacts.

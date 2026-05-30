@@ -75,8 +75,12 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   model metadata when no preset is explicitly configured. Those inferred
   defaults are materialized through the typed preset entries with
   `source=default`, so the M3 serve path no longer gets those startup
-  defaults from the legacy `apply_moe_graph_default()` env setter. The setter
-  remains as a compatibility fallback for non-preset legacy paths.
+  defaults from the legacy `apply_moe_graph_default()` env setter.
+- Non-preset Qwen3-MoE `ferrum serve` now uses typed default entries for the
+  historical graph-clean MoE defaults instead of calling
+  `apply_moe_graph_default()`. This keeps the compatibility values visible to
+  the builder, effective-config artifact, and decision trace before they are
+  materialized for older backend readers.
 - `ferrum serve` now records GPU-memory autosizer-created runtime keys
   (`FERRUM_MAX_BATCHED_TOKENS`, `FERRUM_KV_MAX_BLOCKS`,
   `FERRUM_PAGED_MAX_SEQS`, `FERRUM_KV_CAPACITY`) with
@@ -144,15 +148,17 @@ Evidence:
   the Rust selector unless explicitly overridden.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
-- `ferrum-cli` serve tests passed: `17 passed`, covering CLI-sourced runtime
+- `ferrum-cli` serve tests passed: `19 passed`, covering CLI-sourced runtime
   entries for `--kv-dtype`, `--runtime-preset`, and profile sink arguments
   plus explicit runtime source precedence for config-file, env, and CLI
   inputs. The serve tests also verify that config-file values bridged into the
   env snapshot keep `source=config_file` in startup artifacts, and that
   model-inferred M3 preset defaults keep `source=default` instead of being
   reported as env overrides after materialization. New serve tests verify
-  autosizer-added keys are source-attributed as `memory_profile` and CUDA
-  hardware probe output is parsed into `HardwareCapabilities`.
+  autosizer-added keys are source-attributed as `memory_profile`, CUDA
+  hardware probe output is parsed into `HardwareCapabilities`, and non-preset
+  Qwen3-MoE serve defaults are represented as typed `source=default` entries
+  while preserving config-file overrides.
 - `ferrum-cli` config tests passed: `8 passed`, including config-file runtime
   source attribution, `[runtime].preset` parsing, and missing `[runtime]`
   backwards compatibility.
@@ -169,9 +175,9 @@ Evidence:
 ## Remaining E Gaps
 
 - The builder is not yet the sole owner of runtime defaults. The serve path no
-  longer gets M3 startup defaults from the old MoE graph default setter, but
-  non-preset legacy `serve`, `ferrum run`, and model/backend runtime configs
-  still consume parts of the old env surface.
+  longer gets M3 or non-preset Qwen3-MoE startup defaults from the old MoE
+  graph default setter, but `ferrum run`, source resolution, autosizing, and
+  model/backend runtime configs still consume parts of the old env surface.
 - CLI/config-file/script-case/memory-profile source attribution is represented
   in the builder and decision trace. `ferrum serve` now carries the named M3
   runtime preset, selected CLI runtime/profile inputs, config-file runtime

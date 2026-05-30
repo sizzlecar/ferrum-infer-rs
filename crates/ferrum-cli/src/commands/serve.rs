@@ -356,12 +356,21 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         materialized_runtime_keys.dedup();
     }
 
-    // Preserve the historical non-preset serve default for legacy/unknown
-    // Qwen3-MoE paths. M3 explicit or model-inferred presets have already
-    // materialized the same graph-clean defaults through typed entries above,
-    // so this compatibility setter becomes a no-op for those paths and does
-    // not affect their startup artifact source attribution.
-    crate::gpu_mem_autosize::apply_moe_graph_default();
+    // Preserve the historical non-preset serve default for Qwen3-MoE, but
+    // route it through the typed startup snapshot instead of a hidden
+    // process-wide env mutation. M3 explicit or model-inferred presets have
+    // already materialized the same graph-clean defaults above.
+    if selected_runtime_preset_name.is_none()
+        && arch_for_dispatch == Some(ferrum_models::Architecture::Qwen3Moe)
+    {
+        let mut legacy_entries = qwen3_moe_serve_default_entries(RuntimeConfigSource::Default);
+        legacy_entries.extend(non_env_runtime_entries);
+        non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(legacy_entries).entries;
+        materialized_runtime_keys
+            .extend(materialize_runtime_env_defaults(&non_env_runtime_entries));
+        materialized_runtime_keys.sort();
+        materialized_runtime_keys.dedup();
+    }
 
     let startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
@@ -730,6 +739,21 @@ fn runtime_preset_entries(
         .iter()
         .map(|(key, value)| RuntimeConfigEntry::new(*key, *value, source))
         .collect())
+}
+
+fn qwen3_moe_serve_default_entries(source: RuntimeConfigSource) -> Vec<RuntimeConfigEntry> {
+    let mut entries = Vec::new();
+    entries.push(RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", source));
+    #[cfg(feature = "vllm-moe-marlin")]
+    {
+        entries.push(RuntimeConfigEntry::new("FERRUM_VLLM_MOE", "1", source));
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_VLLM_MOE_PAIR_IDS",
+            "1",
+            source,
+        ));
+    }
+    entries
 }
 
 fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<String> {
@@ -1479,6 +1503,65 @@ mod tests {
         assert_eq!(
             entry("FERRUM_VLLM_MOE").source,
             RuntimeConfigSource::Default
+        );
+    }
+
+    #[test]
+    fn qwen3_moe_serve_defaults_are_typed_default_entries() {
+        let entries = qwen3_moe_serve_default_entries(RuntimeConfigSource::Default);
+        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_MOE_GRAPH").source,
+            RuntimeConfigSource::Default
+        );
+        #[cfg(feature = "vllm-moe-marlin")]
+        {
+            assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
+            assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
+            assert_eq!(snapshot.entries.len(), 3);
+        }
+        #[cfg(not(feature = "vllm-moe-marlin"))]
+        assert_eq!(snapshot.entries.len(), 1);
+    }
+
+    #[test]
+    fn qwen3_moe_serve_defaults_keep_config_file_overrides() {
+        let mut entries = qwen3_moe_serve_default_entries(RuntimeConfigSource::Default);
+        entries.extend(
+            crate::config::RuntimeCliConfig {
+                moe_graph: Some(false),
+                vllm_moe: Some(false),
+                ..Default::default()
+            }
+            .runtime_config_entries(),
+        );
+        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
+        assert_eq!(
+            entry("FERRUM_MOE_GRAPH").source,
+            RuntimeConfigSource::ConfigFile
+        );
+        assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "0");
+        assert_eq!(
+            entry("FERRUM_VLLM_MOE").source,
+            RuntimeConfigSource::ConfigFile
         );
     }
 
