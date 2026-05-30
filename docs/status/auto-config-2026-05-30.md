@@ -43,7 +43,8 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   effective config artifact and JSONL decision trace directly.
 - `scripts/m3_ab_runner.py` passes those paths to `ferrum serve` for every
   case and records `auto_config_decision_count` from the server-written JSONL
-  trace instead of relying only on the runner-side selector scaffold.
+  trace. The old runner-side selector scaffold has been removed from the
+  runtime harness.
 - Runtime config entry sources now propagate into selector decisions. Decision
   traces preserve `env`, `cli`, `config_file`, and `script_case` source
   attribution instead of marking every present key as an env override.
@@ -131,7 +132,9 @@ Evidence:
   with either a decision list or an explicit resolver error.
 - `cargo check` passed for `ferrum-types`, `ferrum-server`, and `ferrum-cli`.
 - Runner and artifact-validator self-tests passed after switching the runtime
-  case path to server-written config artifacts.
+  case path to server-written config artifacts and removing the runner-side
+  selector implementation. Migrated wrapper syntax checks and
+  `VALIDATE_ONLY=1` config checks passed for the current migrated set.
 - Env registry stayed at full coverage with no new unregistered names:
   `147/147`, hot direct env reads `4`.
 
@@ -149,8 +152,8 @@ Evidence:
   not yet include a real startup memory profile or CUDA capability probe.
 - The M3 preset selector is now exposed through the Rust startup path and used
   by the migrated runner. Server-written effective-config data now owns
-  completed-run runtime snapshots; the remaining runner-side selector scaffold
-  is limited to self-tests and transition helpers.
+  completed-run runtime snapshots, and the runner no longer has a parallel
+  selector implementation.
 - No new GPU performance claim is made by this checkpoint. Default-path
   equivalence for the Rust auto-config path still needs the Milestone I
   correctness and non-regression packet.

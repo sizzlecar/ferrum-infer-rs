@@ -715,277 +715,6 @@ class Runner:
             row["performance_gate_ok"] = case_result["ok"]
         return result
 
-    def runtime_entry_map(self, snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
-        return {
-            str(entry["key"]): entry
-            for entry in snapshot.get("entries", [])
-            if isinstance(entry, dict) and "key" in entry
-        }
-
-    def decision_trace(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-        entries = self.runtime_entry_map(snapshot)
-
-        def raw(key: str) -> str | None:
-            entry = entries.get(key)
-            return None if entry is None else str(entry.get("effective_value", ""))
-
-        def trueish(key: str) -> bool:
-            value = raw(key)
-            return value is not None and value.lower() not in {"0", "false", "off", "no"}
-
-        def enabled_by_default(key: str, default: bool) -> bool:
-            value = raw(key)
-            if value is None:
-                return default
-            return value.lower() not in {"0", "false", "off", "no"}
-
-        def source_for(key: str | None) -> str:
-            if key is None or key not in entries:
-                return "default"
-            return str(entries[key].get("source", "unknown"))
-
-        def event(
-            selection: str,
-            selected: str,
-            *,
-            source_key: str | None,
-            candidates: list[str],
-            rejected: list[dict[str, str]],
-            affects: list[str],
-        ) -> dict[str, Any]:
-            return {
-                "schema_version": 1,
-                "selection": selection,
-                "selected": selected,
-                "source": source_for(source_key),
-                "source_key": source_key,
-                "candidates": candidates,
-                "rejected": rejected,
-                "affects": affects,
-            }
-
-        decisions: list[dict[str, Any]] = []
-
-        if trueish("FERRUM_FA2_SOURCE"):
-            prefill = "fa2_source"
-            prefill_key = "FERRUM_FA2_SOURCE"
-            prefill_rejected = [
-                {
-                    "value": "fa_layout_varlen",
-                    "reason": "source-linked FA2 requested and has higher priority",
-                },
-                {"value": "vllm_paged_varlen", "reason": "FA2 source path selected"},
-            ]
-        elif trueish("FERRUM_FA_LAYOUT_VARLEN"):
-            prefill = "fa_layout_varlen"
-            prefill_key = "FERRUM_FA_LAYOUT_VARLEN"
-            prefill_rejected = [
-                {"value": "fa2_source", "reason": "FERRUM_FA2_SOURCE not enabled"},
-                {
-                    "value": "vllm_paged_varlen",
-                    "reason": "FA-compatible layout requested",
-                },
-            ]
-        elif enabled_by_default("FERRUM_USE_VLLM_PAGED_ATTN", False):
-            prefill = "vllm_paged_varlen"
-            prefill_key = "FERRUM_USE_VLLM_PAGED_ATTN"
-            prefill_rejected = [
-                {"value": "fa2_source", "reason": "FERRUM_FA2_SOURCE not enabled"},
-                {"value": "fa_layout_varlen", "reason": "FERRUM_FA_LAYOUT_VARLEN not enabled"},
-            ]
-        else:
-            prefill = "legacy_paged_varlen"
-            prefill_key = None
-            prefill_rejected = [
-                {"value": "fa2_source", "reason": "FERRUM_FA2_SOURCE not enabled"},
-                {"value": "fa_layout_varlen", "reason": "FERRUM_FA_LAYOUT_VARLEN not enabled"},
-                {"value": "vllm_paged_varlen", "reason": "FERRUM_USE_VLLM_PAGED_ATTN disabled"},
-            ]
-        decisions.append(
-            event(
-                "attention_prefill_mixed_backend",
-                prefill,
-                source_key=prefill_key,
-                candidates=["fa2_source", "fa_layout_varlen", "vllm_paged_varlen", "legacy_paged_varlen"],
-                rejected=prefill_rejected,
-                affects=["performance", "memory"],
-            )
-        )
-
-        if enabled_by_default("FERRUM_USE_VLLM_PAGED_ATTN", False):
-            if enabled_by_default("FERRUM_VLLM_PAGED_ATTN_V1_SHORT", True):
-                decode = "vllm_paged_attn_v1_short"
-                decode_key = "FERRUM_VLLM_PAGED_ATTN_V1_SHORT"
-            else:
-                decode = "vllm_paged_attn_v2"
-                decode_key = "FERRUM_VLLM_PAGED_ATTN_V1_SHORT"
-            decode_rejected = [{"value": "legacy_paged_decode", "reason": "vLLM paged attention enabled"}]
-        else:
-            decode = "legacy_paged_decode"
-            decode_key = "FERRUM_USE_VLLM_PAGED_ATTN"
-            decode_rejected = [
-                {"value": "vllm_paged_attn_v1_short", "reason": "FERRUM_USE_VLLM_PAGED_ATTN disabled"},
-                {"value": "vllm_paged_attn_v2", "reason": "FERRUM_USE_VLLM_PAGED_ATTN disabled"},
-            ]
-        decisions.append(
-            event(
-                "attention_decode_backend",
-                decode,
-                source_key=decode_key,
-                candidates=["vllm_paged_attn_v1_short", "vllm_paged_attn_v2", "legacy_paged_decode"],
-                rejected=decode_rejected,
-                affects=["performance"],
-            )
-        )
-
-        if enabled_by_default("FERRUM_VLLM_MOE", False):
-            moe = "vllm_marlin_moe"
-            moe_key = "FERRUM_VLLM_MOE"
-            moe_rejected = [{"value": "legacy_moe", "reason": "vLLM MoE enabled"}]
-        elif enabled_by_default("FERRUM_MOE_DEVICE_ROUTE", False):
-            moe = "device_route_moe"
-            moe_key = "FERRUM_MOE_DEVICE_ROUTE"
-            moe_rejected = [
-                {"value": "vllm_marlin_moe", "reason": "FERRUM_VLLM_MOE disabled"}
-            ]
-        else:
-            moe = "legacy_moe"
-            moe_key = None
-            moe_rejected = [
-                {"value": "vllm_marlin_moe", "reason": "FERRUM_VLLM_MOE not enabled"},
-                {"value": "device_route_moe", "reason": "FERRUM_MOE_DEVICE_ROUTE not enabled"},
-            ]
-        decisions.append(
-            event(
-                "moe_implementation",
-                moe,
-                source_key=moe_key,
-                candidates=["vllm_marlin_moe", "device_route_moe", "legacy_moe"],
-                rejected=moe_rejected,
-                affects=["performance"],
-            )
-        )
-
-        graph = "graph_clean_decode" if enabled_by_default("FERRUM_MOE_GRAPH", False) else "graph_disabled"
-        decisions.append(
-            event(
-                "moe_graph_policy",
-                graph,
-                source_key="FERRUM_MOE_GRAPH" if "FERRUM_MOE_GRAPH" in entries else None,
-                candidates=["graph_clean_decode", "graph_disabled"],
-                rejected=(
-                    [{"value": "graph_disabled", "reason": "FERRUM_MOE_GRAPH enabled"}]
-                    if graph == "graph_clean_decode"
-                    else [{"value": "graph_clean_decode", "reason": "FERRUM_MOE_GRAPH disabled"}]
-                ),
-                affects=["performance", "correctness"],
-            )
-        )
-
-        for selection, key, default, affects in [
-            ("kv_block_count", "FERRUM_KV_MAX_BLOCKS", "auto", ["memory"]),
-            ("max_sequences", "FERRUM_PAGED_MAX_SEQS", "auto", ["memory", "performance"]),
-            ("max_batched_tokens", "FERRUM_MAX_BATCHED_TOKENS", "auto", ["memory", "performance"]),
-        ]:
-            selected = raw(key) or default
-            decisions.append(
-                event(
-                    selection,
-                    selected,
-                    source_key=key if key in entries else None,
-                    candidates=[selected, default] if selected != default else [default],
-                    rejected=[],
-                    affects=affects,
-                )
-            )
-
-        prefix_cache = (
-            "prefix_cache_enabled"
-            if enabled_by_default("FERRUM_PREFIX_CACHE", False)
-            else "prefix_cache_disabled"
-        )
-        decisions.append(
-            event(
-                "prefix_cache_policy",
-                prefix_cache,
-                source_key="FERRUM_PREFIX_CACHE" if "FERRUM_PREFIX_CACHE" in entries else None,
-                candidates=["prefix_cache_enabled", "prefix_cache_disabled"],
-                rejected=(
-                    [{"value": "prefix_cache_disabled", "reason": "FERRUM_PREFIX_CACHE enabled"}]
-                    if prefix_cache == "prefix_cache_enabled"
-                    else [{"value": "prefix_cache_enabled", "reason": "FERRUM_PREFIX_CACHE disabled"}]
-                ),
-                affects=["correctness", "performance", "memory"],
-            )
-        )
-
-        if raw("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"):
-            scheduler = f"active_decode_prefill_chunk:{raw('FERRUM_ACTIVE_DECODE_PREFILL_CHUNK')}"
-            scheduler_key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"
-        elif raw("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE"):
-            scheduler = f"prefill_first_until_active:{raw('FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE')}"
-            scheduler_key = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE"
-        elif trueish("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE"):
-            scheduler = "prompt_token_estimate"
-            scheduler_key = "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE"
-        else:
-            scheduler = "continuous_default"
-            scheduler_key = None
-        decisions.append(
-            event(
-                "scheduler_admission_policy",
-                scheduler,
-                source_key=scheduler_key,
-                candidates=[
-                    "continuous_default",
-                    "prompt_token_estimate",
-                    "prefill_first_until_active",
-                    "active_decode_prefill_chunk",
-                ],
-                rejected=[],
-                affects=["performance"],
-            )
-        )
-
-        sampling = (
-            "gpu_greedy_argmax"
-            if enabled_by_default("FERRUM_GREEDY_ARGMAX", False)
-            else "logits_readback"
-        )
-        decisions.append(
-            event(
-                "sampling_readback_path",
-                sampling,
-                source_key="FERRUM_GREEDY_ARGMAX" if "FERRUM_GREEDY_ARGMAX" in entries else None,
-                candidates=["gpu_greedy_argmax", "logits_readback"],
-                rejected=(
-                    [{"value": "logits_readback", "reason": "FERRUM_GREEDY_ARGMAX enabled"}]
-                    if sampling == "gpu_greedy_argmax"
-                    else [{"value": "gpu_greedy_argmax", "reason": "FERRUM_GREEDY_ARGMAX disabled"}]
-                ),
-                affects=["performance", "correctness"],
-            )
-        )
-
-        return decisions
-
-    def write_effective_config_artifacts(
-        self, paths: RunPaths, runtime_config_snapshot: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        decisions = self.decision_trace(runtime_config_snapshot)
-        effective_config = {
-            "schema_version": 1,
-            "preset": runtime_config_snapshot.get("preset"),
-            "env_hash": runtime_config_snapshot.get("env_hash"),
-            "entries": runtime_config_snapshot.get("entries", []),
-            "decisions": decisions,
-        }
-        write_json(paths.effective_config_json, effective_config)
-        paths.decision_trace_jsonl.write_text(
-            "".join(json.dumps(item, sort_keys=True) + "\n" for item in decisions)
-        )
-        return decisions
-
     def structured_profile_enabled(self) -> bool:
         profile = self.config.get("profile", {})
         return bool(profile.get("structured"))
@@ -1813,11 +1542,7 @@ def self_test() -> None:
             profile_snippets=root / "case" / "profile_snippets.log",
             profile_jsonl=root / "case" / "profile.jsonl",
         )
-        decisions = runner.write_effective_config_artifacts(paths, snapshot)
-        server_snapshot = runner.server_runtime_config_snapshot(paths.effective_config_json)
-        assert server_snapshot["env_hash"] == snapshot["env_hash"]
-        assert server_snapshot["entries"][0]["effect"] == "performance"
-        assert {
+        decision_selections = [
             "attention_prefill_mixed_backend",
             "attention_decode_backend",
             "moe_implementation",
@@ -1828,7 +1553,45 @@ def self_test() -> None:
             "prefix_cache_policy",
             "scheduler_admission_policy",
             "sampling_readback_path",
-        } <= {decision["selection"] for decision in decisions}
+        ]
+        decisions = [
+            {
+                "schema_version": 1,
+                "selection": selection,
+                "selected": "fixture",
+                "source": "default",
+                "source_key": None,
+                "candidates": ["fixture"],
+                "rejected": [],
+                "affects": ["performance"],
+            }
+            for selection in decision_selections
+        ]
+        write_json(
+            paths.effective_config_json,
+            {
+                "schema_version": 1,
+                "preset": snapshot["preset"],
+                "env_hash": snapshot["env_hash"],
+                "entries": [
+                    {
+                        "key": entry["key"],
+                        "effective_value": entry["effective_value"],
+                        "source": entry["source"],
+                        "affects": entry["affects"],
+                    }
+                    for entry in snapshot["entries"]
+                ],
+                "decisions": decisions,
+            },
+        )
+        paths.decision_trace_jsonl.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in decisions)
+        )
+        server_snapshot = runner.server_runtime_config_snapshot(paths.effective_config_json)
+        assert server_snapshot["env_hash"] == snapshot["env_hash"]
+        assert server_snapshot["entries"][0]["effect"] == "performance"
+        assert set(decision_selections) <= {decision["selection"] for decision in decisions}
         assert paths.effective_config_json.exists()
         assert paths.decision_trace_jsonl.exists()
         ps = "\n".join(
