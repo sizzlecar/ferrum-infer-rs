@@ -62,8 +62,8 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
 - `scripts/m3_ab_runner.py` now passes the named M3 preset to the product
   server through `--runtime-preset` instead of injecting the common M3
   `FERRUM_*` env bundle. It keeps only path-like preset env such as `HF_HOME`
-  and mirrors preset runtime entries in manifests as `source=cli` for
-  pre-start profile/config metadata.
+  and uses server-written `effective_config.json` as the completed manifest
+  runtime snapshot.
 - Native structured profile emission now uses typed runner/server
   `ProfileSinkConfig` plumbing for Rust emitters and the vLLM-MoE C++ config
   emitter through a typed C ABI sink. Registered `FERRUM_PROFILE_*` names remain
@@ -75,9 +75,9 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   added/removed/changed runtime config entries with source and effect
   classification.
 - Runner-side runtime config snapshots now contain only `FERRUM_*` entries.
-  Server-preset values use `source=cli`; script-provided base/case values use
-  `source=script_case`, matching the Milestone D source vocabulary instead of
-  the earlier transitional `preset`/`case` labels.
+  Completed artifacts copy those entries from server-written
+  `effective_config.json`; the artifact validator rejects a manifest snapshot
+  whose env hash or entries differ from the server artifact.
 - Runner cleanup artifacts now include global process hygiene status for
   residual `ferrum`, `bench-serve`, `cargo`, `nvcc`, and `vllm` processes so
   publishable artifacts can prove the post-run process state was clean.

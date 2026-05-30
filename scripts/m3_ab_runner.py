@@ -41,22 +41,6 @@ RUNTIME_PRESET_ENV: dict[str, dict[str, str]] = {
     }
 }
 
-RUNTIME_PRESET_CONFIG: dict[str, dict[str, str]] = {
-    "m3_qwen3_30b_a3b_int4": {
-        "FERRUM_BACKEND": "cuda",
-        "FERRUM_MOE_DEVICE_ROUTE": "1",
-        "FERRUM_MOE_STREAMS": "4",
-        "FERRUM_GREEDY_ARGMAX": "1",
-        "FERRUM_KV_MAX_BLOCKS": "2048",
-        "FERRUM_PAGED_MAX_SEQS": "32",
-        "FERRUM_MOE_GRAPH": "1",
-        "FERRUM_VLLM_MOE": "1",
-        "FERRUM_VLLM_MOE_PAIR_IDS": "1",
-        "FERRUM_USE_VLLM_PAGED_ATTN": "1",
-        "FERRUM_PREFIX_CACHE": "0",
-    }
-}
-
 ARTIFACT_VERDICTS = {"pass", "fail", "diagnostic-only"}
 VALIDATION_CHANGE_TYPES = {
     "default_path",
@@ -454,12 +438,6 @@ class Runner:
             return {}
         return dict(RUNTIME_PRESET_ENV[preset])
 
-    def preset_runtime_config(self) -> dict[str, str]:
-        preset = self.config.get("preset")
-        if not preset:
-            return {}
-        return dict(RUNTIME_PRESET_CONFIG[preset])
-
     def merged_env(self, case: dict[str, Any]) -> dict[str, str]:
         env = dict(os.environ)
         for source in (self.preset_env(), self.config.get("base_env", {}), case.get("env", {})):
@@ -510,7 +488,6 @@ class Runner:
         values: dict[str, str] = {}
         sources: dict[str, str] = {}
         for source, source_name in (
-            (self.preset_runtime_config(), "cli"),
             (self.config.get("base_env", {}), "script_case"),
             (case.get("env", {}), "script_case"),
         ):
@@ -534,6 +511,33 @@ class Runner:
             "schema_version": 1,
             "preset": self.config.get("preset"),
             "env_hash": sha256_text(values),
+            "entries": entries,
+        }
+
+    def server_runtime_config_snapshot(self, path: Path) -> dict[str, Any]:
+        data = load_json(path)
+        entries = []
+        for entry in data.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            key = str(entry.get("key", ""))
+            affects = entry.get("affects")
+            if not isinstance(affects, list) or not affects:
+                affects = self.runtime_effects(key)
+            entries.append(
+                {
+                    "key": key,
+                    "effective_value": str(entry.get("effective_value", "")),
+                    "source": str(entry.get("source", "default")),
+                    "effect": str(affects[0]),
+                    "affects": [str(effect) for effect in affects],
+                }
+            )
+        entries.sort(key=lambda item: item["key"])
+        return {
+            "schema_version": data.get("schema_version", 1),
+            "preset": data.get("preset"),
+            "env_hash": data.get("env_hash"),
             "entries": entries,
         }
 
@@ -996,8 +1000,6 @@ class Runner:
     def profile_server_args(
         self,
         paths: RunPaths,
-        env_hash: str,
-        runtime_config_snapshot: dict[str, Any],
         case: dict[str, Any],
     ) -> list[str]:
         if not self.profile_env_enabled(case):
@@ -1006,14 +1008,10 @@ class Runner:
         args = [
             "--profile-jsonl",
             str(paths.profile_jsonl),
-            "--profile-env-hash",
-            env_hash,
             "--profile-model",
             self.hf_model,
             "--profile-concurrency",
             str(self.config.get("concurrency", 32)),
-            "--profile-runtime-flags-json",
-            canonical_json(runtime_config_snapshot),
         ]
         if git_head:
             args.extend(["--profile-commit-sha", str(git_head)])
@@ -1467,9 +1465,7 @@ class Runner:
         runtime_config_snapshot = self.runtime_config_snapshot(case)
         env = self.merged_env(case)
         profile_env_enabled = self.profile_env_enabled(case)
-        profile_args = self.profile_server_args(
-            paths, case_env_hash, runtime_config_snapshot, case
-        )
+        profile_args = self.profile_server_args(paths, case)
         artifact_verdict = self.verdict_for_case(case)
         not_publishable, not_publishable_reason = self.publishability_for_verdict(
             artifact_verdict, case
@@ -1520,6 +1516,12 @@ class Runner:
             manifest["auto_config_decision_count"] = self.count_decision_trace(
                 paths.decision_trace_jsonl
             )
+            runtime_config_snapshot = self.server_runtime_config_snapshot(
+                paths.effective_config_json
+            )
+            manifest["runtime_config_snapshot"] = runtime_config_snapshot
+            manifest["env_hash"] = runtime_config_snapshot.get("env_hash", case_env_hash)
+            write_json(paths.manifest, manifest)
             manifest["correctness_gates"] = self.run_gates(case, paths, port)
             self.run_bench(paths, port)
             manifest["metrics"] = self.extract_metrics(paths.bench_json)
@@ -1735,11 +1737,9 @@ def self_test() -> None:
         assert "FERRUM_MOE_GRAPH" not in preset_env
         assert preset_env["HF_HOME"] == "/workspace/hf-cache"
         preset_snapshot = preset_runner.runtime_config_snapshot(preset_cfg["cases"][0])
-        preset_entry = {
-            entry["key"]: entry for entry in preset_snapshot["entries"]
-        }
-        assert preset_entry["FERRUM_MOE_GRAPH"]["source"] == "cli"
-        assert preset_entry["FERRUM_VLLM_MOE"]["source"] == "cli"
+        preset_entry = {entry["key"]: entry for entry in preset_snapshot["entries"]}
+        assert "FERRUM_MOE_GRAPH" not in preset_entry
+        assert "FERRUM_VLLM_MOE" not in preset_entry
         assert preset_entry["FERRUM_FA_LAYOUT_VARLEN"]["source"] == "script_case"
 
         runner.config["baseline_case"] = "default"
@@ -1814,6 +1814,9 @@ def self_test() -> None:
             profile_jsonl=root / "case" / "profile.jsonl",
         )
         decisions = runner.write_effective_config_artifacts(paths, snapshot)
+        server_snapshot = runner.server_runtime_config_snapshot(paths.effective_config_json)
+        assert server_snapshot["env_hash"] == snapshot["env_hash"]
+        assert server_snapshot["entries"][0]["effect"] == "performance"
         assert {
             "attention_prefill_mixed_backend",
             "attention_decode_backend",
@@ -1866,30 +1869,23 @@ def self_test() -> None:
             "structured": True,
             "required_events": ["unified_prof"],
         }
-        profile_args = runner.profile_server_args(
-            paths, "sha256:test", snapshot, cfg["cases"][0]
-        )
-        assert profile_args[:6] == [
+        profile_args = runner.profile_server_args(paths, cfg["cases"][0])
+        assert profile_args[:4] == [
             "--profile-jsonl",
             str(paths.profile_jsonl),
-            "--profile-env-hash",
-            "sha256:test",
             "--profile-model",
             runner.hf_model,
         ]
-        assert "--profile-runtime-flags-json" in profile_args
+        assert "--profile-env-hash" not in profile_args
+        assert "--profile-runtime-flags-json" not in profile_args
         structured = runner.collect_profile_snippets(paths)
         assert structured["ok"]
         assert structured["mode"] == "structured_jsonl"
         assert structured["event_count"] == 1
         runner.config["profile"] = {"profile_env_cases": ["a"]}
-        case_profile_args = runner.profile_server_args(
-            paths, "sha256:test", snapshot, cfg["cases"][0]
-        )
+        case_profile_args = runner.profile_server_args(paths, cfg["cases"][0])
         assert "--profile-jsonl" in case_profile_args
-        other_profile_args = runner.profile_server_args(
-            paths, "sha256:test", snapshot, {"name": "other"}
-        )
+        other_profile_args = runner.profile_server_args(paths, {"name": "other"})
         assert other_profile_args == []
     print("m3_ab_runner self-test ok")
 

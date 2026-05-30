@@ -69,8 +69,9 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   override those defaults.
 - `scripts/m3_ab_runner.py` now passes the M3 preset through
   `--runtime-preset`, so the migrated wrappers no longer inject the common M3
-  `FERRUM_*` bundle as process env. The runner still mirrors preset runtime
-  entries in manifests for pre-start profile metadata and config diffs.
+  `FERRUM_*` bundle as process env. Completed runner manifests now copy the
+  runtime snapshot from server-written `effective_config.json`, and native
+  profile events default to the server's resolved env hash/runtime flags.
 - The runner artifact validator now schema-checks server-written
   `effective_config.json` entries, including sorted `FERRUM_*` keys,
   non-empty `affects`, allowed source/effect values, and decision parity with
@@ -147,9 +148,9 @@ Evidence:
 - Hardware capability data is currently compiled-feature/device based; it does
   not yet include a real startup memory profile or CUDA capability probe.
 - The M3 preset selector is now exposed through the Rust startup path and used
-  by the migrated runner, but the runner still mirrors the preset map for
-  pre-start artifact metadata until server-written effective-config data owns
-  that field completely.
+  by the migrated runner. Server-written effective-config data now owns
+  completed-run runtime snapshots; the remaining runner-side selector scaffold
+  is limited to self-tests and transition helpers.
 - No new GPU performance claim is made by this checkpoint. Default-path
   equivalence for the Rust auto-config path still needs the Milestone I
   correctness and non-regression packet.

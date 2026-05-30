@@ -785,7 +785,9 @@ def canonicalize(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
-def validate_effective_config(path: Path, decision_events: list[dict[str, Any]]) -> None:
+def validate_effective_config(
+    path: Path, decision_events: list[dict[str, Any]]
+) -> dict[str, Any]:
     if not path.exists():
         raise ValidationError(f"effective_config_json missing: {path}")
     data = load_json(path)
@@ -841,6 +843,7 @@ def validate_effective_config(path: Path, decision_events: list[dict[str, Any]])
         raise ValidationError("effective_config_json.decisions must be a list")
     if canonicalize(decisions) != canonicalize(decision_events):
         raise ValidationError("effective_config_json decisions do not match decision_trace_jsonl")
+    return data
 
 
 def validate_case(
@@ -868,7 +871,27 @@ def validate_case(
     decision_events = validate_decision_trace_jsonl(
         resolve(case["decision_trace_jsonl"], root)
     )
-    validate_effective_config(resolve(case["effective_config_json"], root), decision_events)
+    effective_config = validate_effective_config(
+        resolve(case["effective_config_json"], root), decision_events
+    )
+    snapshot = case["runtime_config_snapshot"]
+    if snapshot.get("env_hash") != effective_config.get("env_hash"):
+        raise ValidationError(
+            f"{case['name']}: runtime_config_snapshot.env_hash does not match effective_config_json"
+        )
+    snapshot_entries = [
+        {
+            "key": entry.get("key"),
+            "effective_value": entry.get("effective_value"),
+            "source": entry.get("source"),
+            "affects": entry.get("affects", [entry.get("effect")]),
+        }
+        for entry in snapshot.get("entries", [])
+    ]
+    if canonicalize(snapshot_entries) != canonicalize(effective_config.get("entries", [])):
+        raise ValidationError(
+            f"{case['name']}: runtime_config_snapshot.entries do not match effective_config_json"
+        )
     decision_count = case["auto_config_decision_count"]
     if (
         not isinstance(decision_count, int)
@@ -1004,20 +1027,6 @@ def write_json(path: Path, value: Any) -> None:
 def self_test() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        snapshot = {
-            "schema_version": 1,
-            "preset": "preset",
-            "env_hash": "sha256:env",
-            "entries": [
-                {
-                    "key": "FERRUM_MOE_GRAPH",
-                    "effective_value": "1",
-                    "source": "script_case",
-                    "effect": "performance",
-                    "affects": ["performance"],
-                }
-            ],
-        }
         effective_entries = [
             {
                 "key": "FERRUM_KV_DTYPE",
@@ -1032,6 +1041,18 @@ def self_test() -> None:
                 "affects": ["performance"],
             },
         ]
+        snapshot = {
+            "schema_version": 1,
+            "preset": "preset",
+            "env_hash": "sha256:env",
+            "entries": [
+                {
+                    **entry,
+                    "effect": entry["affects"][0],
+                }
+                for entry in effective_entries
+            ],
+        }
         validate_runtime_config_diff(
             {
                 "runtime_config_diff_vs_baseline": {
