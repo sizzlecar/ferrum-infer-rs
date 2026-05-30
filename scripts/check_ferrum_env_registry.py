@@ -804,6 +804,28 @@ def run_self_test() -> None:
             == "runtime_config_compatibility_bridge"
         )
 
+        threshold_report = {
+            "direct_env_reads": 3,
+            "process_env_writes": 1,
+            "hot_direct_env_reads": 0,
+        }
+        assert not threshold_errors(
+            threshold_report,
+            {
+                "direct_env_reads": 3,
+                "process_env_writes": 1,
+                "hot_direct_env_reads": 0,
+            },
+        )
+        assert threshold_errors(
+            threshold_report,
+            {
+                "direct_env_reads": 2,
+                "process_env_writes": None,
+                "hot_direct_env_reads": 0,
+            },
+        ) == ["direct_env_reads=3 exceeds limit 2"]
+
     print("check_ferrum_env_registry self-test ok")
 
 
@@ -847,6 +869,17 @@ def compare_missing_baseline(
         "new_missing_names": new_missing,
         "resolved_missing_names": resolved_missing,
     }
+
+
+def threshold_errors(report: dict[str, Any], limits: dict[str, int | None]) -> list[str]:
+    errors = []
+    for key, limit in limits.items():
+        if limit is None:
+            continue
+        actual = report[key]
+        if actual > limit:
+            errors.append(f"{key}={actual} exceeds limit {limit}")
+    return errors
 
 
 def render_human(report: dict[str, Any]) -> str:
@@ -936,6 +969,9 @@ def render_human(report: dict[str, Any]) -> str:
         )
         if product["errors"]:
             lines.extend(f"    - {error}" for error in product["errors"])
+    if report.get("threshold_errors"):
+        lines.append("  threshold_errors:")
+        lines.extend(f"    - {error}" for error in report["threshold_errors"])
     return "\n".join(lines)
 
 
@@ -982,6 +1018,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="with --missing-baseline, also fail if the baseline still lists names that are now registered or gone",
     )
+    parser.add_argument(
+        "--max-direct-env-reads",
+        type=int,
+        default=None,
+        help="fail if total direct env read calls exceed this value",
+    )
+    parser.add_argument(
+        "--max-process-env-writes",
+        type=int,
+        default=None,
+        help="fail if total process env write calls exceed this value",
+    )
+    parser.add_argument(
+        "--max-hot-direct-env-reads",
+        type=int,
+        default=None,
+        help="fail if hot-path direct env read calls exceed this value",
+    )
     return parser.parse_args()
 
 
@@ -1021,6 +1075,14 @@ def main() -> int:
 
     scan["registry"] = registry_report
     scan["product_config_surface"] = audit_product_toml_surface(REPO_ROOT / "ferrum.toml")
+    scan["threshold_errors"] = threshold_errors(
+        scan,
+        {
+            "direct_env_reads": args.max_direct_env_reads,
+            "process_env_writes": args.max_process_env_writes,
+            "hot_direct_env_reads": args.max_hot_direct_env_reads,
+        },
+    )
 
     if args.json:
         print(json.dumps(scan, indent=2, sort_keys=True))
@@ -1035,6 +1097,7 @@ def main() -> int:
         or scan["hot_direct_env_reads_unclassified"]
         or scan["process_env_writes_unclassified"]
         or scan["product_config_surface"]["errors"]
+        or scan["threshold_errors"]
     ):
         return 1
     if args.fail_on_new_missing and missing_baseline_report is not None:

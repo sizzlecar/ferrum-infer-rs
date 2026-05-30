@@ -165,6 +165,10 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   `FERRUM_MAX_MODEL_LEN` validation so requested serving length overrides are
   checked against model metadata and KV token capacity. `/health` exposes this
   as `auto_config` next to the runtime config snapshot.
+- The registry checker now supports threshold gates for total direct env
+  reads, process env writes, and hot-path direct env reads. CPU CI pins the
+  current checkpoint limits at `75`, `31`, and `4` respectively, so new
+  call-site drift fails before it becomes another cleanup backlog.
 
 ## Current Audit
 
@@ -173,7 +177,10 @@ Run:
 ```bash
 python3 scripts/check_ferrum_env_registry.py --json
 python3 scripts/check_ferrum_env_registry.py --self-test
-python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
+python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap \
+  --max-direct-env-reads 75 \
+  --max-process-env-writes 31 \
+  --max-hot-direct-env-reads 4
 ```
 
 Current local scan:

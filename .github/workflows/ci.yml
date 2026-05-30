@@ -74,7 +74,10 @@ jobs:
         run: |
           python3 -m py_compile scripts/check_ferrum_env_registry.py
           python3 scripts/check_ferrum_env_registry.py --self-test
-          python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
+          python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap \
+            --max-direct-env-reads 75 \
+            --max-process-env-writes 31 \
+            --max-hot-direct-env-reads 4
 
       - name: CUDA build summary parser check
         run: |
