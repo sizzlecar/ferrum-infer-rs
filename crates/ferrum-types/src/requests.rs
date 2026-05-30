@@ -212,7 +212,7 @@ pub fn chat_api_response_from_generated_text(
     text: &str,
 ) -> Option<ApiChatResponse> {
     if !chat_request.tools.is_empty() && !api_tool_choice_is_none(chat_request) {
-        if let Some(tool_calls) = parse_tool_calls_from_generated_text(text, &chat_request.tools) {
+        if let Some(tool_calls) = parse_tool_calls_from_generated_text(text, chat_request) {
             return Some(ApiChatResponse {
                 message: ApiChatMessage {
                     role: ApiMessageRole::Assistant,
@@ -230,7 +230,7 @@ pub fn chat_api_response_from_generated_text(
     if !chat_request.legacy_functions.is_empty() && !api_function_call_choice_is_none(chat_request)
     {
         if let Some(function_call) =
-            parse_legacy_function_call_from_generated_text(text, &chat_request.legacy_functions)
+            parse_legacy_function_call_from_generated_text(text, chat_request)
         {
             return Some(ApiChatResponse {
                 message: ApiChatMessage {
@@ -263,26 +263,29 @@ fn api_function_call_choice_is_none(chat_request: &ApiChatRequest) -> bool {
     )
 }
 
-fn parse_tool_calls_from_generated_text(text: &str, tools: &[ApiTool]) -> Option<Vec<ApiToolCall>> {
+fn parse_tool_calls_from_generated_text(
+    text: &str,
+    chat_request: &ApiChatRequest,
+) -> Option<Vec<ApiToolCall>> {
     let value = parse_json_value_from_generated_text(text)?;
     if let Some(calls) = value.get("tool_calls").and_then(|value| value.as_array()) {
         let parsed = calls
             .iter()
             .enumerate()
-            .filter_map(|(index, value)| parse_tool_call_value(value, index, tools))
+            .filter_map(|(index, value)| parse_tool_call_value(value, index, chat_request))
             .collect::<Vec<_>>();
         return (!parsed.is_empty()).then_some(parsed);
     }
     if let Some(tool_call) = value.get("tool_call") {
-        return parse_tool_call_value(tool_call, 0, tools).map(|call| vec![call]);
+        return parse_tool_call_value(tool_call, 0, chat_request).map(|call| vec![call]);
     }
-    parse_tool_call_value(&value, 0, tools).map(|call| vec![call])
+    parse_tool_call_value(&value, 0, chat_request).map(|call| vec![call])
 }
 
 fn parse_tool_call_value(
     value: &serde_json::Value,
     index: usize,
-    tools: &[ApiTool],
+    chat_request: &ApiChatRequest,
 ) -> Option<ApiToolCall> {
     let tool_type = value
         .get("type")
@@ -293,7 +296,7 @@ fn parse_tool_call_value(
     }
     let function = value.get("function").unwrap_or(value);
     let name = function.get("name").and_then(|value| value.as_str())?;
-    if !tools.iter().any(|tool| tool.function.name == name) {
+    if !api_tool_name_allowed(chat_request, name) {
         return None;
     }
     let arguments = api_arguments_to_string(function.get("arguments"));
@@ -315,18 +318,56 @@ fn parse_tool_call_value(
 
 fn parse_legacy_function_call_from_generated_text(
     text: &str,
-    functions: &[ApiFunction],
+    chat_request: &ApiChatRequest,
 ) -> Option<ApiFunctionCall> {
     let value = parse_json_value_from_generated_text(text)?;
     let function = value.get("function_call").unwrap_or(&value);
     let name = function.get("name").and_then(|value| value.as_str())?;
-    if !functions.iter().any(|function| function.name == name) {
+    if !api_function_name_allowed(chat_request, name) {
         return None;
     }
     Some(ApiFunctionCall {
         name: name.to_string(),
         arguments: api_arguments_to_string(function.get("arguments")),
     })
+}
+
+fn api_tool_name_allowed(chat_request: &ApiChatRequest, name: &str) -> bool {
+    match chat_request.tool_choice.as_ref() {
+        Some(ApiToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("none") => false,
+        Some(ApiToolChoice::Function {
+            tool_type,
+            function,
+        }) => {
+            tool_type == "function"
+                && function.name == name
+                && chat_request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.function.name == name)
+        }
+        _ => chat_request
+            .tools
+            .iter()
+            .any(|tool| tool.function.name == name),
+    }
+}
+
+fn api_function_name_allowed(chat_request: &ApiChatRequest, name: &str) -> bool {
+    match chat_request.legacy_function_call.as_ref() {
+        Some(ApiFunctionCallChoice::Mode(mode)) if mode.eq_ignore_ascii_case("none") => false,
+        Some(ApiFunctionCallChoice::Function { name: selected }) => {
+            selected == name
+                && chat_request
+                    .legacy_functions
+                    .iter()
+                    .any(|function| function.name == name)
+        }
+        _ => chat_request
+            .legacy_functions
+            .iter()
+            .any(|function| function.name == name),
+    }
 }
 
 fn parse_json_value_from_generated_text(text: &str) -> Option<serde_json::Value> {

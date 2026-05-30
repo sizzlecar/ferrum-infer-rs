@@ -244,6 +244,58 @@ fn unregistered_tool_name_keeps_generated_text_unstructured() {
 }
 
 #[test]
+fn forced_tool_choice_accepts_only_selected_tool() {
+    let request = InferenceRequest::new("rendered prompt", "mock-model").with_api_request(
+        ApiRequest::Chat(ApiChatRequest {
+            messages: Vec::new(),
+            tools: vec![
+                ApiTool {
+                    tool_type: "function".to_string(),
+                    function: ApiFunction {
+                        name: "weather".to_string(),
+                        description: None,
+                        parameters: None,
+                        strict: None,
+                    },
+                },
+                ApiTool {
+                    tool_type: "function".to_string(),
+                    function: ApiFunction {
+                        name: "calendar".to_string(),
+                        description: None,
+                        parameters: None,
+                        strict: None,
+                    },
+                },
+            ],
+            tool_choice: Some(ApiToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: ApiToolChoiceFunction {
+                    name: "weather".to_string(),
+                },
+            }),
+            legacy_functions: Vec::new(),
+            legacy_function_call: None,
+            response_format: None,
+            stream_options: None,
+        }),
+    );
+
+    assert!(
+        api_response_from_generated_text(&request, r#"{"name":"calendar","arguments":{}}"#)
+            .is_none()
+    );
+
+    let Some(ApiResponse::Chat(response)) =
+        api_response_from_generated_text(&request, r#"{"name":"weather","arguments":{}}"#)
+    else {
+        panic!("expected selected tool call");
+    };
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(response.message.tool_calls[0].function.name, "weather");
+}
+
+#[test]
 fn generated_legacy_function_call_json_becomes_structured_chat_response() {
     let request = InferenceRequest::new("rendered prompt", "mock-model").with_api_request(
         ApiRequest::Chat(ApiChatRequest {
@@ -273,6 +325,52 @@ fn generated_legacy_function_call_json_becomes_structured_chat_response() {
     let function_call = response.message.function_call.unwrap();
     assert_eq!(function_call.name, "weather");
     assert_eq!(function_call.arguments, r#"{"city":"Paris"}"#);
+}
+
+#[test]
+fn forced_legacy_function_call_accepts_only_selected_function() {
+    let request = InferenceRequest::new("rendered prompt", "mock-model").with_api_request(
+        ApiRequest::Chat(ApiChatRequest {
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            legacy_functions: vec![
+                ApiFunction {
+                    name: "weather".to_string(),
+                    description: None,
+                    parameters: None,
+                    strict: None,
+                },
+                ApiFunction {
+                    name: "calendar".to_string(),
+                    description: None,
+                    parameters: None,
+                    strict: None,
+                },
+            ],
+            legacy_function_call: Some(ApiFunctionCallChoice::Function {
+                name: "weather".to_string(),
+            }),
+            response_format: None,
+            stream_options: None,
+        }),
+    );
+
+    assert!(api_response_from_generated_text(
+        &request,
+        r#"{"function_call":{"name":"calendar","arguments":{}}}"#
+    )
+    .is_none());
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(
+        &request,
+        r#"{"function_call":{"name":"weather","arguments":{}}}"#,
+    ) else {
+        panic!("expected selected legacy function call");
+    };
+    let function_call = response.message.function_call.unwrap();
+    assert_eq!(response.finish_reason.as_deref(), Some("function_call"));
+    assert_eq!(function_call.name, "weather");
 }
 
 #[test]

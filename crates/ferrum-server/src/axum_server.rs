@@ -1040,30 +1040,69 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
 
     if let Some(choice) = &request.tool_choice {
         match choice {
-            ToolChoice::Mode(mode) if mode == "auto" || mode == "none" => {}
-            ToolChoice::Mode(mode) if mode == "required" => {
+            ToolChoice::Mode(mode)
+                if mode.eq_ignore_ascii_case("auto") || mode.eq_ignore_ascii_case("none") => {}
+            ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
                 return Err(ServerError::unsupported_feature(
                     "required tool_choice is not supported",
                     Some("tool_choice"),
                 ));
             }
-            ToolChoice::Mode(_) | ToolChoice::Function { .. } => {
+            ToolChoice::Mode(_) => {
                 return Err(ServerError::unsupported_feature(
-                    "specific tool_choice selection is not supported",
+                    "unsupported tool_choice mode",
                     Some("tool_choice"),
                 ));
+            }
+            ToolChoice::Function {
+                tool_type,
+                function,
+            } => {
+                if tool_type != "function" {
+                    return Err(ServerError::unsupported_feature(
+                        "only function tool_choice is supported",
+                        Some("tool_choice"),
+                    ));
+                }
+                let declared = request
+                    .tools
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|tool| tool.function.name == function.name);
+                if !declared {
+                    return Err(ServerError::invalid_request(
+                        "tool_choice selects a function that is not declared in tools",
+                        Some("tool_choice"),
+                    ));
+                }
             }
         }
     }
 
     if let Some(choice) = &request.function_call {
         match choice {
-            FunctionCallChoice::Mode(mode) if mode == "auto" || mode == "none" => {}
-            FunctionCallChoice::Mode(_) | FunctionCallChoice::Function { .. } => {
+            FunctionCallChoice::Mode(mode)
+                if mode.eq_ignore_ascii_case("auto") || mode.eq_ignore_ascii_case("none") => {}
+            FunctionCallChoice::Mode(_) => {
                 return Err(ServerError::unsupported_feature(
-                    "forced function_call is not supported",
+                    "unsupported function_call mode",
                     Some("function_call"),
                 ));
+            }
+            FunctionCallChoice::Function { name } => {
+                let declared = request
+                    .functions
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|function| function.name == *name);
+                if !declared {
+                    return Err(ServerError::invalid_request(
+                        "function_call selects a function that is not declared in functions",
+                        Some("function_call"),
+                    ));
+                }
             }
         }
     }
@@ -2527,6 +2566,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_honors_specific_tool_choice_for_generated_tool_call_json() {
+        let response = post_json(
+            router_with_stub(r#"{"name":"weather","arguments":{"city":"Paris"}}"#),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the selected tool."}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "weather", "parameters": {"type": "object"}}
+                    },
+                    {
+                        "type": "function",
+                        "function": {"name": "calendar", "parameters": {"type": "object"}}
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "weather"}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+
+        let response = post_json(
+            router_with_stub(r#"{"name":"calendar","arguments":{}}"#),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the selected tool."}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "weather", "parameters": {"type": "object"}}
+                    },
+                    {
+                        "type": "function",
+                        "function": {"name": "calendar", "parameters": {"type": "object"}}
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "weather"}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            r#"{"name":"calendar","arguments":{}}"#
+        );
+        assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+    }
+
+    #[tokio::test]
     async fn route_chat_tool_choice_none_keeps_generated_tool_json_as_content() {
         let generated = r#"{"name":"weather","arguments":{"city":"Paris"}}"#;
         let response = post_json(
@@ -3032,7 +3137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_rejects_forced_tool_and_function_selection() {
+    async fn route_rejects_unsupported_tool_and_function_selection() {
         for (extra, param) in [
             (
                 json!({
@@ -3046,8 +3151,21 @@ mod tests {
             ),
             (
                 json!({
+                    "tools": [{
+                        "type": "function",
+                        "function": {"name": "weather", "parameters": {"type": "object"}}
+                    }],
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "calendar"}
+                    }
+                }),
+                "tool_choice",
+            ),
+            (
+                json!({
                     "functions": [{"name": "weather", "parameters": {"type": "object"}}],
-                    "function_call": {"name": "weather"}
+                    "function_call": {"name": "calendar"}
                 }),
                 "function_call",
             ),
@@ -3518,6 +3636,67 @@ mod tests {
     }
 
     #[test]
+    fn specific_tool_choice_parses_into_structured_api_request() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "qwen3",
+            "messages": [{"role": "user", "content": "Use the selected tool."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "calendar", "parameters": {"type": "object"}}
+                }
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "weather"}
+            }
+        }))
+        .expect("specific tool_choice request parses");
+
+        validate_chat_request(&request).expect("specific tool_choice validates");
+        let internal = convert_chat_request(&request).expect("convert");
+        assert!(internal.prompt.contains("\"tool_choice\":{"));
+        assert!(internal.prompt.contains("\"name\":\"weather\""));
+        let Some(ferrum_types::ApiRequest::Chat(api)) = internal.api_request.as_ref() else {
+            panic!("expected structured chat api_request");
+        };
+        assert_eq!(
+            api.tool_choice,
+            Some(ferrum_types::ApiToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: ferrum_types::ApiToolChoiceFunction {
+                    name: "weather".to_string()
+                },
+            })
+        );
+
+        let invalid: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "qwen3",
+            "messages": [{"role": "user", "content": "Use the selected tool."}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "weather", "parameters": {"type": "object"}}
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "calendar"}
+            }
+        }))
+        .expect("invalid specific tool_choice request parses");
+        let err = validate_chat_request(&invalid).expect_err("undeclared tool should reject");
+        match err {
+            ServerError::InvalidRequest { param, .. } => {
+                assert_eq!(param.as_deref(), Some("tool_choice"));
+            }
+            other => panic!("expected invalid_request_error for tool_choice, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn legacy_function_role_messages_parse_into_structured_api_request() {
         let request: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "mystery-model",
@@ -3574,6 +3753,49 @@ mod tests {
             api.legacy_function_call,
             Some(ferrum_types::ApiFunctionCallChoice::Mode("auto".into()))
         );
+    }
+
+    #[test]
+    fn specific_legacy_function_call_parses_into_structured_api_request() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "mystery-model",
+            "messages": [{"role": "user", "content": "Use the selected function."}],
+            "functions": [
+                {"name": "weather", "parameters": {"type": "object"}},
+                {"name": "calendar", "parameters": {"type": "object"}}
+            ],
+            "function_call": {"name": "weather"}
+        }))
+        .expect("specific function_call request parses");
+
+        validate_chat_request(&request).expect("specific function_call validates");
+        let internal = convert_chat_request(&request).expect("convert");
+        assert!(internal.prompt.contains("\"function_call\":{"));
+        assert!(internal.prompt.contains("\"name\":\"weather\""));
+        let Some(ferrum_types::ApiRequest::Chat(api)) = internal.api_request.as_ref() else {
+            panic!("expected structured chat api_request");
+        };
+        assert_eq!(
+            api.legacy_function_call,
+            Some(ferrum_types::ApiFunctionCallChoice::Function {
+                name: "weather".to_string(),
+            })
+        );
+
+        let invalid: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "mystery-model",
+            "messages": [{"role": "user", "content": "Use the selected function."}],
+            "functions": [{"name": "weather", "parameters": {"type": "object"}}],
+            "function_call": {"name": "calendar"}
+        }))
+        .expect("invalid specific function_call request parses");
+        let err = validate_chat_request(&invalid).expect_err("undeclared function should reject");
+        match err {
+            ServerError::InvalidRequest { param, .. } => {
+                assert_eq!(param.as_deref(), Some("function_call"));
+            }
+            other => panic!("expected invalid_request_error for function_call, got {other:?}"),
+        }
     }
 
     #[test]
