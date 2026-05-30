@@ -138,10 +138,12 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let device = super::run::select_device(&cmd.backend);
     let backend_str = format!("{:?}", device).to_lowercase();
     eprintln!("{} {:?}", "Device:".dimmed(), device);
+    #[cfg(feature = "cuda")]
+    let runtime_config = ferrum_types::RuntimeConfigSnapshot::capture_current();
 
     #[cfg(feature = "cuda")]
     {
-        let graph_mode = std::env::var("FERRUM_CUDA_GRAPH").is_ok();
+        let graph_mode = runtime_snapshot_value(&runtime_config, "FERRUM_CUDA_GRAPH").is_some();
         if !graph_mode {
             if let Ok(d) = candle_core::Device::new_cuda(0) {
                 if let Ok(cd) = d.as_cuda_device() {
@@ -150,8 +152,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
                 }
             }
         }
-        let tp = std::env::var("FERRUM_TP")
-            .ok()
+        let tp = runtime_snapshot_value(&runtime_config, "FERRUM_TP")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| {
                 candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
@@ -287,6 +288,18 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     ferrum_bench_core::trace::flush_global_trace();
 
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn runtime_snapshot_value<'a>(
+    snapshot: &'a ferrum_types::RuntimeConfigSnapshot,
+    key: &str,
+) -> Option<&'a str> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.effective_value.as_str())
 }
 
 // ── Run loops (one round = N sequential or concurrent passes) ───────
