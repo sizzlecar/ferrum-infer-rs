@@ -116,7 +116,9 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   `ProfileSinkConfig` plumbing for Rust emitters and the vLLM-MoE C++ config
   emitter through a typed C ABI sink. Registered `FERRUM_PROFILE_*` names remain
   as a backwards-compatible fallback, but `ferrum serve --profile-*` no longer
-  exports them for the normal native profile path.
+  exports them for the normal native profile path. The compatibility fallback
+  now parses those fields from one env snapshot rather than six direct
+  `std::env::var` calls.
 - Runner summaries now include per-row `env_hash`,
   `runtime_config_entry_count`, and a machine-readable
   `runtime_config_diff_vs_baseline` object for A/B cases. The diff records
@@ -181,7 +183,7 @@ Current local scan:
 | files scanned | 581 |
 | unique `FERRUM_*` tokens | 152 |
 | unique standalone candidates | 151 |
-| direct env read calls | 81 |
+| direct env read calls | 75 |
 | process env write calls | 31 |
 | classified process env write calls | 31 |
 | unclassified process env write calls | 0 |
@@ -198,7 +200,7 @@ Current local scan:
 | product `ferrum.toml` raw `FERRUM_*` mentions | 0 |
 | product `ferrum.toml` surface errors | 0 |
 
-The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `81` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `152` token names, `151` standalone env candidates, and `146` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot. The removed `FERRUM_VLLM_VARLEN_SPLIT_K` registry entry was tied only to an archived negative-control script, not an active product/runtime path.
+The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `75` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `152` token names, `151` standalone env candidates, and `146` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot. The removed `FERRUM_VLLM_VARLEN_SPLIT_K` registry entry was tied only to an archived negative-control script, not an active product/runtime path.
 
 The classified residual hot-path direct-read call sites are:
 

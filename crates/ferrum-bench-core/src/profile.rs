@@ -112,30 +112,46 @@ impl Default for ProfileMetadata {
 
 impl ProfileMetadata {
     pub fn from_env() -> Self {
-        let commit_sha = std::env::var(PROFILE_COMMIT_SHA_ENV)
-            .ok()
+        Self::from_env_vars(std::env::vars())
+    }
+
+    pub fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let vars = env_vars_map(vars);
+        Self::from_env_map(&vars)
+    }
+
+    fn from_env_map(vars: &BTreeMap<String, String>) -> Self {
+        let commit_sha = vars
+            .get(PROFILE_COMMIT_SHA_ENV)
             .filter(|value| !value.trim().is_empty());
-        let env_hash = std::env::var(PROFILE_ENV_HASH_ENV)
-            .ok()
+        let env_hash = vars
+            .get(PROFILE_ENV_HASH_ENV)
             .filter(|value| value.starts_with("sha256:"))
+            .cloned()
             .unwrap_or_else(|| "sha256:unknown".to_string());
-        let model = std::env::var(PROFILE_MODEL_ENV)
-            .ok()
+        let model = vars
+            .get(PROFILE_MODEL_ENV)
             .filter(|value| !value.trim().is_empty())
+            .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        let concurrency = std::env::var(PROFILE_CONCURRENCY_ENV)
-            .ok()
+        let concurrency = vars
+            .get(PROFILE_CONCURRENCY_ENV)
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(1);
-        let runtime_flags = std::env::var(PROFILE_RUNTIME_FLAGS_JSON_ENV)
-            .ok()
+        let runtime_flags = vars
+            .get(PROFILE_RUNTIME_FLAGS_JSON_ENV)
             .and_then(|value| serde_json::from_str::<Value>(&value).ok())
             .filter(Value::is_object)
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
         Self {
-            commit_sha,
+            commit_sha: commit_sha.cloned(),
             env_hash,
             model,
             concurrency,
@@ -168,9 +184,19 @@ impl ProfileSinkConfig {
     }
 
     pub fn from_env() -> Self {
-        match std::env::var(PROFILE_JSONL_ENV) {
-            Ok(path) if !path.trim().is_empty() => {
-                Self::enabled(PathBuf::from(path), ProfileMetadata::from_env())
+        Self::from_env_vars(std::env::vars())
+    }
+
+    pub fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let vars = env_vars_map(vars);
+        match vars.get(PROFILE_JSONL_ENV) {
+            Some(path) if !path.trim().is_empty() => {
+                Self::enabled(PathBuf::from(path), ProfileMetadata::from_env_map(&vars))
             }
             _ => Self::disabled(),
         }
@@ -195,6 +221,17 @@ impl ProfileSinkConfig {
             serde_json::to_string(&self.metadata.runtime_flags).unwrap_or_else(|_| "{}".into());
         std::env::set_var(PROFILE_RUNTIME_FLAGS_JSON_ENV, runtime_flags);
     }
+}
+
+fn env_vars_map<I, K, V>(vars: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    vars.into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect()
 }
 
 impl ProfileEvent {
@@ -726,6 +763,42 @@ mod tests {
         assert_eq!(events[0].concurrency, 16);
         assert_eq!(events[0].runtime_flags["source"], "typed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_metadata_parses_env_snapshot() {
+        let metadata = ProfileMetadata::from_env_vars([
+            (PROFILE_COMMIT_SHA_ENV, "abc123"),
+            (PROFILE_ENV_HASH_ENV, "sha256:env"),
+            (PROFILE_MODEL_ENV, "model"),
+            (PROFILE_CONCURRENCY_ENV, "32"),
+            (PROFILE_RUNTIME_FLAGS_JSON_ENV, r#"{"fa_layout":true}"#),
+        ]);
+
+        assert_eq!(metadata.commit_sha.as_deref(), Some("abc123"));
+        assert_eq!(metadata.env_hash, "sha256:env");
+        assert_eq!(metadata.model, "model");
+        assert_eq!(metadata.concurrency, 32);
+        assert_eq!(metadata.runtime_flags["fa_layout"], true);
+    }
+
+    #[test]
+    fn profile_sink_config_parses_env_snapshot() {
+        let config = ProfileSinkConfig::from_env_vars([
+            (PROFILE_JSONL_ENV, "/tmp/profile.jsonl"),
+            (PROFILE_ENV_HASH_ENV, "sha256:env"),
+            (PROFILE_MODEL_ENV, "model"),
+        ]);
+
+        assert_eq!(
+            config.jsonl_path.as_deref(),
+            Some(std::path::Path::new("/tmp/profile.jsonl"))
+        );
+        assert_eq!(config.metadata.env_hash, "sha256:env");
+        assert_eq!(config.metadata.model, "model");
+
+        let disabled = ProfileSinkConfig::from_env_vars([(PROFILE_JSONL_ENV, "")]);
+        assert_eq!(disabled.jsonl_path, None);
     }
 
     fn tempdir() -> std::path::PathBuf {
