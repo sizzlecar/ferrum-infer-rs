@@ -66,6 +66,7 @@ VALIDATION_CHANGE_TYPES = {
     "api_only",
     "build_loop",
 }
+DEFAULT_PATH_REQUIRED_CONCURRENCY_CELLS = {1, 4, 16, 32}
 
 VALIDATION_TOUCHED_AREAS = {
     "attention_decode_path",
@@ -361,6 +362,15 @@ def validate_performance_regression_gates(summary: dict[str, Any]) -> None:
         raise ValidationError("performance_regression_gates.thresholds must be an object")
     if not isinstance(gates["cases"], dict):
         raise ValidationError("performance_regression_gates.cases must be an object")
+    for key in ("required_concurrency_cells", "observed_concurrency_cells"):
+        cells = gates.get(key, [])
+        if not isinstance(cells, list) or not all(
+            isinstance(cell, int) and not isinstance(cell, bool) and cell > 0
+            for cell in cells
+        ):
+            raise ValidationError(f"performance_regression_gates.{key} must be positive integers")
+    if "concurrency_cells_ok" in gates and not isinstance(gates["concurrency_cells_ok"], bool):
+        raise ValidationError("performance_regression_gates.concurrency_cells_ok must be boolean")
     for case_name, case_gates in gates["cases"].items():
         if not isinstance(case_gates, dict):
             raise ValidationError(f"performance_regression_gates {case_name}: must be object")
@@ -460,6 +470,22 @@ def performance_gate_ok(summary: dict[str, Any], case_name: str, baseline_case: 
         return True
     case_gates = gates.get("cases", {}).get(case_name)
     return isinstance(case_gates, dict) and case_gates.get("ok") is True
+
+
+def missing_default_path_concurrency_cells(summary: dict[str, Any] | None) -> list[int]:
+    if summary is None:
+        return sorted(DEFAULT_PATH_REQUIRED_CONCURRENCY_CELLS)
+    gates = summary.get("performance_regression_gates")
+    if not isinstance(gates, dict):
+        return sorted(DEFAULT_PATH_REQUIRED_CONCURRENCY_CELLS)
+    required = gates.get("required_concurrency_cells")
+    if isinstance(required, list) and required:
+        required_cells = {int(cell) for cell in required}
+    else:
+        required_cells = set(DEFAULT_PATH_REQUIRED_CONCURRENCY_CELLS)
+    observed = gates.get("observed_concurrency_cells")
+    observed_cells = {int(cell) for cell in observed} if isinstance(observed, list) else set()
+    return sorted(required_cells - observed_cells)
 
 
 def validate_validation_checklist(
@@ -587,6 +613,18 @@ def validate_validation_checklist(
         raise ValidationError(
             f"{where}.validation_checklist default_path requires performance regression gate"
         )
+    if publishable and checklist["change_type"] == "default_path" and perf_required:
+        missing_cells = missing_default_path_concurrency_cells(summary)
+        if missing_cells:
+            raise ValidationError(
+                f"{where}.validation_checklist default_path requires full concurrency sweep; "
+                f"missing c={missing_cells}"
+            )
+        gates = summary.get("performance_regression_gates") if summary else None
+        if not isinstance(gates, dict) or gates.get("concurrency_cells_ok") is not True:
+            raise ValidationError(
+                f"{where}.validation_checklist default_path concurrency sweep gate failed"
+            )
     baseline_case = checklist["baseline_case"]
     if baseline_case is not None and not isinstance(baseline_case, str):
         raise ValidationError(f"{where}.validation_checklist.baseline_case must be null or string")
@@ -1215,6 +1253,9 @@ def self_test() -> None:
                     "schema_version": 1,
                     "enabled": True,
                     "baseline_case": "baseline",
+                    "required_concurrency_cells": [1, 4, 16, 32],
+                    "observed_concurrency_cells": [32],
+                    "concurrency_cells_ok": False,
                     "thresholds": {
                         "enabled": True,
                         "throughput_min_delta_pct": -3.0,
@@ -1435,6 +1476,19 @@ def self_test() -> None:
             assert "default_path requires performance regression gate" in str(exc)
         else:
             raise AssertionError("publishable default-path artifact without perf gate passed")
+        write_json(case_dir / "manifest.json", case_manifest)
+
+        bad_checklist = load_json(case_dir / "manifest.json")
+        bad_checklist["validation_checklist"]["change_type"] = "default_path"
+        bad_checklist["validation_checklist"]["performance_regression_required"] = True
+        bad_checklist["validation_checklist"]["baseline_case"] = "baseline"
+        write_json(case_dir / "manifest.json", bad_checklist)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False)
+        except ValidationError as exc:
+            assert "full concurrency sweep" in str(exc)
+        else:
+            raise AssertionError("publishable default-path artifact without full sweep passed")
         write_json(case_dir / "manifest.json", case_manifest)
 
         for missing_key in sorted(PROFILE_REQUIRED):

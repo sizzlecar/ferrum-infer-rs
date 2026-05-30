@@ -49,6 +49,7 @@ VALIDATION_CHANGE_TYPES = {
     "api_only",
     "build_loop",
 }
+DEFAULT_PATH_REQUIRED_CONCURRENCY_CELLS = [1, 4, 16, 32]
 LOG_SNIPPET_PROFILE_KEYS = {
     "snippet_regex",
     "required_patterns",
@@ -250,6 +251,15 @@ class Runner:
             and not isinstance(validation["performance_regression_required"], bool)
         ):
             raise SystemExit("validation.performance_regression_required must be boolean")
+        cells = validation.get("required_concurrency_cells")
+        if cells is not None:
+            if not isinstance(cells, list):
+                raise SystemExit("validation.required_concurrency_cells must be a list")
+            for cell in cells:
+                if not isinstance(cell, int) or isinstance(cell, bool) or cell <= 0:
+                    raise SystemExit(
+                        "validation.required_concurrency_cells entries must be positive integers"
+                    )
 
     def verdict_for_case(self, case: dict[str, Any]) -> str:
         return str(case.get("artifact_verdict", self.config.get("artifact_verdict", "pass")))
@@ -314,6 +324,15 @@ class Runner:
         if "performance_regression_required" in validation:
             return bool(validation["performance_regression_required"])
         return bool(self.config.get("baseline_case"))
+
+    def validation_required_concurrency_cells(self) -> list[int]:
+        validation = self.validation_config()
+        configured = validation.get("required_concurrency_cells")
+        if configured is not None:
+            return sorted({int(cell) for cell in configured})
+        if self.validation_change_type() == "default_path" and self.validation_performance_required():
+            return list(DEFAULT_PATH_REQUIRED_CONCURRENCY_CELLS)
+        return []
 
     def normalize_validation_gates(self, key: str) -> list[dict[str, Any]]:
         gates = self.validation_config().get(key, []) or []
@@ -671,12 +690,24 @@ class Runner:
         self, rows: list[dict[str, Any]], baseline_name: str | None
     ) -> dict[str, Any]:
         thresholds = self.performance_gate_thresholds()
+        required_cells = self.validation_required_concurrency_cells()
+        observed_cells = sorted(
+            {
+                int(row["concurrency"])
+                for row in rows
+                if isinstance(row.get("concurrency"), int)
+                and not isinstance(row.get("concurrency"), bool)
+            }
+        )
         result: dict[str, Any] = {
             "schema_version": 1,
             "enabled": bool(thresholds.get("enabled", False)) and bool(baseline_name),
             "baseline_case": baseline_name,
             "thresholds": thresholds,
             "cases": {},
+            "required_concurrency_cells": required_cells,
+            "observed_concurrency_cells": observed_cells,
+            "concurrency_cells_ok": all(cell in observed_cells for cell in required_cells),
         }
         if not result["enabled"]:
             result["reason"] = thresholds.get("reason") or "no baseline_case configured"
@@ -1268,6 +1299,7 @@ class Runner:
                     "status": case.get("status"),
                     "artifact_verdict": case.get("artifact_verdict"),
                     "not_publishable": case.get("not_publishable"),
+                    "concurrency": int(self.config.get("concurrency", 32)),
                     "env_hash": case.get("env_hash"),
                     "runtime_config_entry_count": len(
                         case.get("runtime_config_snapshot", {}).get("entries", [])
@@ -1449,6 +1481,20 @@ def self_test() -> None:
         perf_gate = summary["performance_regression_gates"]["cases"]["a"]
         assert perf_gate["ok"]
         assert perf_gate["metrics"][0]["metric"] == "throughput_mean"
+        assert summary["performance_regression_gates"]["required_concurrency_cells"] == []
+        assert summary["performance_regression_gates"]["observed_concurrency_cells"] == [32]
+        assert summary["performance_regression_gates"]["concurrency_cells_ok"]
+
+        runner.config["validation"] = {
+            **runner.validation_config(),
+            "change_type": "default_path",
+        }
+        default_path_gates = runner.performance_regression_gates(
+            summary["rows"], baseline_name="default"
+        )
+        assert default_path_gates["required_concurrency_cells"] == [1, 4, 16, 32]
+        assert default_path_gates["observed_concurrency_cells"] == [32]
+        assert not default_path_gates["concurrency_cells_ok"]
         bench = root / "bench.json"
         write_json(
             bench,
