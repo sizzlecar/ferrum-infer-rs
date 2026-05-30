@@ -23,6 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from validate_cuda_build_summary import ValidationError, validate_summary
+from validate_cuda_build_boundary_manifest import validate_manifest
 
 DEFAULT_FEATURES = "cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source"
 DEFAULT_KERNEL = "crates/ferrum-kernels/kernels/paged_varlen_attention_vllm.cu"
@@ -234,6 +235,7 @@ def run_self_test() -> None:
             fail_on_limit=True,
         )
         manifest = run_probe(args)
+        validate_manifest(root / "out" / "build_boundary_manifest.json", require_limits_pass=True)
         assert manifest["iterations"] == 2
         assert manifest["timing"]["limits_pass"] is True
         assert len(manifest["runs"]) == 2

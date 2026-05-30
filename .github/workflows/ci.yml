@@ -81,8 +81,9 @@ jobs:
 
       - name: CUDA build summary parser check
         run: |
-          python3 -m py_compile scripts/validate_cuda_build_summary.py
+          python3 -m py_compile scripts/validate_cuda_build_summary.py scripts/validate_cuda_build_boundary_manifest.py
           python3 scripts/validate_cuda_build_summary.py --self-test
+          python3 scripts/validate_cuda_build_boundary_manifest.py --self-test
           python3 -m py_compile scripts/m3_cuda_build_boundary_probe.py
           python3 scripts/m3_cuda_build_boundary_probe.py --self-test
 

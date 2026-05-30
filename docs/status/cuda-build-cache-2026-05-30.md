@@ -34,11 +34,19 @@ summary lines.
   touch/content-change probe for N iterations, validates the same structured
   CUDA summary rows for every run, computes nearest-rank p50/p95 timing, and
   writes `build_boundary_manifest.json`.
+- `scripts/validate_cuda_build_boundary_manifest.py` validates the timing
+  manifest itself: schema version, mutation type, run count, per-run exit
+  status, embedded CUDA summary validation, p50/p95 values, and whether
+  `limits_pass` matches the configured timing limits. This gives the eventual
+  GPU timing artifact a machine-readable acceptance gate instead of relying on
+  the console line alone.
 - CI now runs the lightweight self-tests for both CUDA build validation tools:
-  `scripts/validate_cuda_build_summary.py --self-test` and
+  `scripts/validate_cuda_build_summary.py --self-test`,
+  `scripts/validate_cuda_build_boundary_manifest.py --self-test`, and
   `scripts/m3_cuda_build_boundary_probe.py --self-test`. This keeps the
-  parser and release-boundary probe manifest/summary validation logic checked
-  before spending GPU time on the full timing artifact.
+  parser, timing manifest validator, and release-boundary probe
+  manifest/summary validation logic checked before spending GPU time on the
+  full timing artifact.
 - `ferrum-kernels/build.rs` no longer registers core CUDA `.cu` inputs before
   the `cuda` feature check. CUDA builds still watch the same core PTX inputs in
   `compile_core_ptx`, but non-CUDA builds are no longer dirtied by unrelated
@@ -53,6 +61,8 @@ cargo fmt --all -- --check
 cargo check -q -p ferrum-kernels
 python3 -m py_compile scripts/validate_cuda_build_summary.py
 python3 scripts/validate_cuda_build_summary.py --self-test
+python3 -m py_compile scripts/validate_cuda_build_boundary_manifest.py
+python3 scripts/validate_cuda_build_boundary_manifest.py --self-test
 python3 -m py_compile scripts/m3_cuda_build_boundary_probe.py
 python3 scripts/m3_cuda_build_boundary_probe.py --self-test
 git diff --check
@@ -78,6 +88,15 @@ cargo check -p ferrum-kernels \
 
 Evidence:
 
+- `scripts/validate_cuda_build_summary.py --self-test` passed, covering
+  valid summary rows, required `cache_hit`/`built` enforcement, malformed row
+  rejection, and file loading.
+- `scripts/validate_cuda_build_boundary_manifest.py --self-test` passed,
+  covering manifest schema validation, p50/p95 `limits_pass` consistency, and
+  rejection of per-run CUDA summary validation failures.
+- `scripts/m3_cuda_build_boundary_probe.py --self-test` passed with a fake
+  cargo binary, covering manifest writing, per-run CUDA summary validation,
+  manifest validation, required cache-hit artifacts, and timing limit checks.
 - `/workspace/m3-core-ptx-cache-summary-20260530.log` contained `39`
   `[cuda-build-summary]` rows: `34` core PTX artifacts plus `5` static
   libraries.
