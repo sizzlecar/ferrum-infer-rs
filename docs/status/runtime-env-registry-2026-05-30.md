@@ -28,12 +28,16 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   upserts. `ferrum serve` uses this for selected CLI runtime/profile inputs,
   so `--kv-dtype` and `--profile-*` appear in startup config artifacts with
   `source=cli`.
-- The CLI config file has an initial `[runtime]` surface for `kv_dtype`,
-  `kv_max_blocks`, `paged_max_seqs`, `max_batched_tokens`, `prefix_cache`, and
-  `moe_graph`. `ferrum serve` records these as `source=config_file`, bridges
-  them into the existing startup env snapshot only when the corresponding env
-  var is absent, and participates in the explicit startup precedence order
-  `CLI > env > config_file > default`.
+- The CLI config schema supports a `[runtime]` surface for startup/runtime
+  performance selectors: `kv_dtype`, KV/max-batch sizing, prefix cache, MoE
+  graph, vLLM paged attention, vLLM-MoE, pair-id routing, greedy argmax,
+  FA-layout, source FA2, diagnostic FA2 direct FFI, max model length, and MoE
+  batch threshold. `ferrum serve` records these as `source=config_file`,
+  bridges them into the existing startup env snapshot only when the
+  corresponding env var is absent, and participates in the explicit startup
+  precedence order `CLI > env > config_file > default`. The checked-in
+  product-facing `ferrum.toml` intentionally lists only the small stable/common
+  subset as commented examples.
 - `ferrum-types::runtime_config` parser tests cover boolean, integer, path,
   and tri-state default/forced-off/forced-on env values.
 - `ferrum-scheduler` now parses the prompt-token-estimate, prefill-first, active-decode-prefill-chunk, and scheduler-none-prof env switches once during `ContinuousBatchScheduler` construction; batch planning reads typed fields instead of calling env APIs.
@@ -152,8 +156,9 @@ Evidence:
 
 - Continue typed config coverage for the remaining low-count hot-path surfaces
   and non-hot CLI/build surfaces.
-- Extend first-class config-file runtime knobs and source attribution beyond
-  the initial small startup surface.
+- Continue extending first-class config-file runtime knobs for non-M3
+  surfaces and any remaining diagnostics that need source-attributed
+  artifacts.
 - Replace the remaining classified C++ hot-path direct env reads with typed
   launch parameters when those legacy/diagnostic paths become product-critical.
 - Remove the backwards-compatible `FERRUM_PROFILE_*` metadata fallback after any

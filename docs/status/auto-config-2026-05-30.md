@@ -51,13 +51,16 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   non-env sources. `ferrum serve` uses them to carry CLI runtime/profile
   inputs such as `--kv-dtype` and `--profile-*` into the startup
   `effective_config.json` snapshot with `source=cli`.
-- `ferrum.toml` now has a `[runtime]` config surface for `kv_dtype`,
-  `kv_max_blocks`, `paged_max_seqs`, `max_batched_tokens`, `prefix_cache`, and
-  `moe_graph`. `ferrum serve` bridges these config-file values into the
+- The CLI config schema now has a `[runtime]` config surface for
+  M3/auto-config selectors: `kv_dtype`, KV/max-batch sizing, prefix cache, MoE
+  graph, vLLM paged attention, vLLM-MoE, pair-id routing, greedy argmax,
+  FA-layout, source FA2, diagnostic FA2 direct FFI, max model length, and MoE
+  batch threshold. `ferrum serve` bridges these config-file values into the
   existing startup env snapshot only when the corresponding env var is absent,
-  records them with `source=config_file`, and uses an explicit
-  `CLI > env > config_file > default` precedence rule for both runtime
-  behavior and startup artifacts.
+  records them with `source=config_file`, and uses an explicit `CLI > env >
+  config_file > default` precedence rule for both runtime behavior and startup
+  artifacts. The checked-in product-facing `ferrum.toml` intentionally lists
+  only the small stable/common subset as commented examples.
 - The runner artifact validator now schema-checks server-written
   `effective_config.json` entries, including sorted `FERRUM_*` keys,
   non-empty `affects`, allowed source/effect values, and decision parity with
@@ -128,9 +131,9 @@ Evidence:
   of the old env surface.
 - CLI/config-file/script-case source attribution is represented in the
   builder and decision trace. `ferrum serve` now carries selected CLI
-  runtime/profile inputs plus a small set of config-file runtime fields into
-  the startup snapshot. Broader config-file runtime coverage still needs
-  expansion beyond this initial startup surface.
+  runtime/profile inputs plus the primary M3 config-file runtime selector
+  fields into the startup snapshot. Broader non-M3 and diagnostic config-file
+  coverage still needs expansion.
 - Hardware capability data is currently compiled-feature/device based; it does
   not yet include a real startup memory profile or CUDA capability probe.
 - The M3 preset selector is wired for exact Qwen3-MoE 30B-A3B metadata, but
