@@ -61,7 +61,9 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   records them with `source=config_file`, and uses an explicit `CLI > env >
   config_file > default` precedence rule for both runtime behavior and startup
   artifacts. The checked-in product-facing `ferrum.toml` intentionally lists
-  only the small stable/common subset as commented examples.
+  only the small stable/common subset as commented examples, and the env
+  registry checker now enforces that it does not advertise advanced selector
+  keys or raw `FERRUM_*` env names.
 - `ferrum serve --runtime-preset m3_qwen3_30b_a3b_int4` and
   `[runtime].preset = "m3_qwen3_30b_a3b_int4"` now select the product-server
   M3 runtime preset. The preset materializes the common M3 startup defaults

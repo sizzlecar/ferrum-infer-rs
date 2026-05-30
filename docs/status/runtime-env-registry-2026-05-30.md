@@ -17,6 +17,10 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   condition. Its `--self-test` covers valid rows plus invalid type, invalid
   scope, and missing-sunset negative cases, and CI runs that self-test before
   the repository scan.
+- The same checker now audits the checked-in product-facing `ferrum.toml`
+  surface. It fails if `[runtime]` advertises advanced/internal selector keys
+  outside the small user-facing sample set, or if the file mentions raw
+  `FERRUM_*` env names.
 - The JSON report includes `name_paths` for every scanned token, so registry owner rows can be audited against source locations.
 - The JSON report also records hot-path direct env reads by individual call site
   with source line, parsed env name when available, and an explicit
@@ -106,7 +110,7 @@ python3 scripts/check_ferrum_env_registry.py --self-test
 python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
 ```
 
-Current dirty-worktree scan:
+Current local scan:
 
 | metric | value |
 |---|---:|
@@ -123,6 +127,9 @@ Current dirty-worktree scan:
 | registry coverage | 147 / 147 env candidates |
 | unregistered baseline backlog | 0 |
 | new unregistered names versus baseline | 0 |
+| product `ferrum.toml` runtime sample keys | `kv_dtype`, `kv_max_blocks`, `max_batched_tokens`, `moe_graph`, `paged_max_seqs`, `prefix_cache` |
+| product `ferrum.toml` raw `FERRUM_*` mentions | 0 |
+| product `ferrum.toml` surface errors | 0 |
 
 The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `107` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
 
@@ -168,6 +175,8 @@ Evidence:
 - Continue extending first-class config-file runtime knobs for non-M3
   surfaces and any remaining diagnostics that need source-attributed
   artifacts.
+- Keep advanced/experimental config-file fields available for artifacts while
+  keeping checked-in `ferrum.toml` as a small user-facing sample surface.
 - Replace the remaining classified C++ hot-path direct env reads with typed
   launch parameters when those legacy/diagnostic paths become product-critical.
 - Remove the backwards-compatible `FERRUM_PROFILE_*` metadata fallback after any

@@ -121,6 +121,22 @@ VALID_TYPES = {"bool", "enum", "float", "integer", "json", "path", "string", "tr
 SUNSET_REQUIRED_STABILITY = {"experimental", "diagnostic", "deprecated"}
 EMPTY_SENTINELS = {"", "none", "unset", "n/a", "na"}
 
+PRODUCT_TOML_RUNTIME_KEYS = {
+    # Keep the checked-in sample config product-facing. Advanced M3/FA2/debug
+    # selectors may be accepted by the schema for artifacts, but should not be
+    # advertised as normal user settings in ferrum.toml.
+    "preset",
+    "kv_dtype",
+    "kv_max_blocks",
+    "paged_max_seqs",
+    "max_batched_tokens",
+    "prefix_cache",
+    "moe_graph",
+}
+
+TOML_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+TOML_KEY_RE = re.compile(r"^\s*(#\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+
 
 def rel_path(path: Path) -> str:
     try:
@@ -449,6 +465,57 @@ def load_name_baseline(path: Path) -> dict[str, Any]:
     }
 
 
+def audit_product_toml_surface(path: Path) -> dict[str, Any]:
+    """Keep checked-in ferrum.toml from becoming an advanced selector catalog."""
+    errors: list[str] = []
+    runtime_keys: list[str] = []
+    ferrum_tokens: list[str] = []
+    if not path.exists():
+        return {
+            "path": rel_path(path),
+            "exists": False,
+            "runtime_keys": [],
+            "allowed_runtime_keys": sorted(PRODUCT_TOML_RUNTIME_KEYS),
+            "ferrum_tokens": [],
+            "errors": [f"product config not found: {rel_path(path)}"],
+        }
+
+    current_section: str | None = None
+    text = path.read_text(errors="ignore")
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for token in FERRUM_TOKEN_RE.findall(line):
+            ferrum_tokens.append(token)
+            errors.append(
+                f"{rel_path(path)}:{line_no}: checked-in product config must not mention {token}"
+            )
+
+        section_match = TOML_SECTION_RE.match(line)
+        if section_match:
+            current_section = section_match.group(1).strip()
+            continue
+        if current_section != "runtime":
+            continue
+
+        key_match = TOML_KEY_RE.match(line)
+        if not key_match:
+            continue
+        key = key_match.group(2)
+        runtime_keys.append(key)
+        if key not in PRODUCT_TOML_RUNTIME_KEYS:
+            errors.append(
+                f"{rel_path(path)}:{line_no}: [runtime].{key} is not a product-facing sample key"
+            )
+
+    return {
+        "path": rel_path(path),
+        "exists": True,
+        "runtime_keys": sorted(set(runtime_keys)),
+        "allowed_runtime_keys": sorted(PRODUCT_TOML_RUNTIME_KEYS),
+        "ferrum_tokens": sorted(set(ferrum_tokens)),
+        "errors": errors,
+    }
+
+
 def write_registry_fixture(path: Path, rows: list[dict[str, str]]) -> None:
     fields = [
         "name",
@@ -513,6 +580,37 @@ def run_self_test() -> None:
         write_registry_fixture(registry_path, [registry_fixture_row(scope="global")])
         invalid_scope = load_registry(registry_path)
         assert any("invalid scope" in error for error in invalid_scope["errors"]), invalid_scope[
+            "errors"
+        ]
+
+        product_toml = root / "ferrum.toml"
+        product_toml.write_text(
+            "\n".join(
+                [
+                    "[runtime]",
+                    '# preset = "m3_qwen3_30b_a3b_int4"',
+                    '# kv_dtype = "fp16"',
+                    "# moe_graph = true",
+                ]
+            )
+        )
+        product_ok = audit_product_toml_surface(product_toml)
+        assert not product_ok["errors"], product_ok["errors"]
+
+        product_toml.write_text(
+            "\n".join(
+                [
+                    "[runtime]",
+                    "# fa2_source = true",
+                    "# FERRUM_FA2_SOURCE=1",
+                ]
+            )
+        )
+        product_bad = audit_product_toml_surface(product_toml)
+        assert any("fa2_source" in error for error in product_bad["errors"]), product_bad[
+            "errors"
+        ]
+        assert any("FERRUM_FA2_SOURCE" in error for error in product_bad["errors"]), product_bad[
             "errors"
         ]
 
@@ -621,6 +719,18 @@ def render_human(report: dict[str, Any]) -> str:
             if missing_baseline["new_missing_names"]:
                 lines.append("  new_unregistered_name_list:")
                 lines.extend(f"    - {name}" for name in missing_baseline["new_missing_names"])
+    product = report.get("product_config_surface")
+    if product:
+        lines.extend(
+            [
+                f"  product_config: {product['path']}",
+                f"  product_runtime_keys: {', '.join(product['runtime_keys']) or 'none'}",
+                f"  product_ferrum_tokens: {', '.join(product['ferrum_tokens']) or 'none'}",
+                f"  product_config_errors: {len(product['errors'])}",
+            ]
+        )
+        if product["errors"]:
+            lines.extend(f"    - {error}" for error in product["errors"])
     return "\n".join(lines)
 
 
@@ -705,6 +815,7 @@ def main() -> int:
         registry_report["missing_baseline"] = missing_baseline_report
 
     scan["registry"] = registry_report
+    scan["product_config_surface"] = audit_product_toml_surface(REPO_ROOT / "ferrum.toml")
 
     if args.json:
         print(json.dumps(scan, indent=2, sort_keys=True))
@@ -717,6 +828,7 @@ def main() -> int:
         or comparison["missing_count"]
         or comparison["extra_count"]
         or scan["hot_direct_env_reads_unclassified"]
+        or scan["product_config_surface"]["errors"]
     ):
         return 1
     if args.fail_on_new_missing and missing_baseline_report is not None:
