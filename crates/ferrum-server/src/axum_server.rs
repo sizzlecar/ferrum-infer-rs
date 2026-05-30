@@ -1499,6 +1499,8 @@ async fn embeddings_handler(
     let span = span!(Level::INFO, "embeddings", model = %request.model);
     let _enter = span.enter();
 
+    validate_embeddings_request(&request)?;
+
     // Flatten input into individual items
     let items: Vec<EmbeddingItem> = match request.input {
         EmbeddingInput::Single(text) => vec![EmbeddingItem {
@@ -1564,6 +1566,20 @@ async fn embeddings_handler(
     Ok(Json(response).into_response())
 }
 
+fn validate_embeddings_request(
+    request: &EmbeddingsRequest,
+) -> std::result::Result<(), ServerError> {
+    if let Some(format) = request.encoding_format.as_deref() {
+        if !format.eq_ignore_ascii_case("float") {
+            return Err(ServerError::unsupported_feature(
+                "only encoding_format=float is supported for embeddings",
+                Some("encoding_format"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Audio transcription handler (OpenAI-compatible multipart form).
 async fn transcriptions_handler(
     State(state): State<AppState>,
@@ -1578,6 +1594,7 @@ async fn transcriptions_handler(
 
     let mut file_data: Option<Vec<u8>> = None;
     let mut language: Option<String> = None;
+    let mut response_format: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -1598,9 +1615,14 @@ async fn transcriptions_handler(
             "language" => {
                 language = field.text().await.ok().filter(|s| !s.is_empty());
             }
-            _ => {} // ignore model, response_format, etc. for now
+            "response_format" => {
+                response_format = field.text().await.ok().filter(|s| !s.is_empty());
+            }
+            _ => {} // ignore model and other optional multipart fields for now
         }
     }
+
+    validate_transcription_response_format(response_format.as_deref())?;
 
     let data = file_data.ok_or_else(|| ServerError::BadRequest("missing 'file' field".into()))?;
 
@@ -1615,6 +1637,20 @@ async fn transcriptions_handler(
     Ok(Json(TranscriptionResponse { text }).into_response())
 }
 
+fn validate_transcription_response_format(
+    response_format: Option<&str>,
+) -> std::result::Result<(), ServerError> {
+    if let Some(format) = response_format {
+        if !format.eq_ignore_ascii_case("json") {
+            return Err(ServerError::unsupported_feature(
+                "only response_format=json is supported for transcriptions",
+                Some("response_format"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// TTS speech synthesis handler (OpenAI-compatible /v1/audio/speech)
 async fn speech_handler(
     State(state): State<AppState>,
@@ -1622,6 +1658,8 @@ async fn speech_handler(
 ) -> std::result::Result<Response, ServerError> {
     let Json(request) = request
         .map_err(|e| ServerError::invalid_request(format!("invalid speech request: {e}"), None))?;
+
+    let response_format = speech_output_format(&request)?;
 
     let span = span!(Level::INFO, "speech");
     let _guard = span.enter();
@@ -1658,8 +1696,8 @@ async fn speech_handler(
             match rt.block_on(engine.synthesize_speech(&text, lang_opt, chunk_frames)) {
                 Ok(chunks) => {
                     for chunk in &chunks {
-                        let wav_bytes = pcm_to_wav_bytes(chunk, sample_rate);
-                        let _ = tx.send(Ok(axum::body::Bytes::from(wav_bytes)));
+                        let audio_bytes = encode_speech_audio(chunk, sample_rate, response_format);
+                        let _ = tx.send(Ok(axum::body::Bytes::from(audio_bytes)));
                     }
                 }
                 Err(e) => {
@@ -1672,7 +1710,7 @@ async fn speech_handler(
         let body = axum::body::Body::from_stream(stream);
         Ok(Response::builder()
             .status(200)
-            .header("content-type", "audio/wav")
+            .header("content-type", speech_content_type(response_format))
             .header("transfer-encoding", "chunked")
             .body(body)
             .unwrap())
@@ -1684,14 +1722,49 @@ async fn speech_handler(
             .map_err(|e| ServerError::InternalError(format!("TTS: {e}")))?;
 
         let all_samples: Vec<f32> = chunks.into_iter().flatten().collect();
-        let wav_bytes = pcm_to_wav_bytes(&all_samples, sample_rate);
+        let audio_bytes = encode_speech_audio(&all_samples, sample_rate, response_format);
 
         Ok(Response::builder()
             .status(200)
-            .header("content-type", "audio/wav")
-            .header("content-length", wav_bytes.len().to_string())
-            .body(axum::body::Body::from(wav_bytes))
+            .header("content-type", speech_content_type(response_format))
+            .header("content-length", audio_bytes.len().to_string())
+            .body(axum::body::Body::from(audio_bytes))
             .unwrap())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SpeechOutputFormat {
+    Wav,
+    Pcm,
+}
+
+fn speech_output_format(
+    request: &SpeechRequest,
+) -> std::result::Result<SpeechOutputFormat, ServerError> {
+    if request.response_format.eq_ignore_ascii_case("wav") {
+        Ok(SpeechOutputFormat::Wav)
+    } else if request.response_format.eq_ignore_ascii_case("pcm") {
+        Ok(SpeechOutputFormat::Pcm)
+    } else {
+        Err(ServerError::unsupported_feature(
+            "only response_format=wav or response_format=pcm is supported for speech",
+            Some("response_format"),
+        ))
+    }
+}
+
+fn speech_content_type(format: SpeechOutputFormat) -> &'static str {
+    match format {
+        SpeechOutputFormat::Wav => "audio/wav",
+        SpeechOutputFormat::Pcm => "audio/pcm",
+    }
+}
+
+fn encode_speech_audio(samples: &[f32], sample_rate: u32, format: SpeechOutputFormat) -> Vec<u8> {
+    match format {
+        SpeechOutputFormat::Wav => pcm_to_wav_bytes(samples, sample_rate),
+        SpeechOutputFormat::Pcm => pcm_to_s16le_bytes(samples),
     }
 }
 
@@ -1718,6 +1791,12 @@ fn pcm_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
                                                  // data chunk
     buf.extend_from_slice(b"data");
     buf.extend_from_slice(&(data_size as u32).to_le_bytes());
+    buf.extend_from_slice(&pcm_to_s16le_bytes(samples));
+    buf
+}
+
+fn pcm_to_s16le_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(samples.len() * 2);
     for &s in samples {
         let i16_val = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
         buf.extend_from_slice(&i16_val.to_le_bytes());
@@ -3733,7 +3812,8 @@ mod tests {
             "/v1/embeddings",
             json!({
                 "model": "stub-embed",
-                "input": ["hi", "world"]
+                "input": ["hi", "world"],
+                "encoding_format": "float"
             }),
         )
         .await;
@@ -3752,6 +3832,24 @@ mod tests {
         assert_eq!(data[0]["embedding"][0].as_f64().unwrap(), 2.0);
         assert_eq!(data[1]["index"], 1);
         assert_eq!(data[1]["embedding"][0].as_f64().unwrap(), 5.0);
+    }
+
+    #[tokio::test]
+    async fn route_embeddings_rejects_unsupported_encoding_format() {
+        let response = post_json(
+            router_with_stub_embed(),
+            "/v1/embeddings",
+            json!({
+                "model": "stub-embed",
+                "input": "hi",
+                "encoding_format": "base64"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "encoding_format");
     }
 
     #[tokio::test]
@@ -3804,6 +3902,10 @@ mod tests {
             "Content-Disposition: form-data; name=\"language\"\r\n",
             "\r\n",
             "en\r\n",
+            "--ferrum-test-boundary\r\n",
+            "Content-Disposition: form-data; name=\"response_format\"\r\n",
+            "\r\n",
+            "json\r\n",
             "--ferrum-test-boundary--\r\n"
         );
         let response = post_multipart(
@@ -3816,6 +3918,34 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["text"], "bytes:8:en");
+    }
+
+    #[tokio::test]
+    async fn route_transcriptions_rejects_unsupported_response_format() {
+        let boundary = "ferrum-test-boundary";
+        let body = concat!(
+            "--ferrum-test-boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+            "Content-Type: audio/wav\r\n",
+            "\r\n",
+            "RIFFtest\r\n",
+            "--ferrum-test-boundary\r\n",
+            "Content-Disposition: form-data; name=\"response_format\"\r\n",
+            "\r\n",
+            "text\r\n",
+            "--ferrum-test-boundary--\r\n"
+        );
+        let response = post_multipart(
+            router_with_stub_transcribe(),
+            "/v1/audio/transcriptions",
+            boundary,
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "response_format");
     }
 
     #[tokio::test]
@@ -3863,6 +3993,7 @@ mod tests {
                 "model": "stub-tts",
                 "input": "hello",
                 "voice": "default",
+                "response_format": "wav",
                 "language": "english"
             }),
         )
@@ -3876,6 +4007,49 @@ mod tests {
         assert!(body.len() > 44, "WAV should include header and PCM data");
         assert_eq!(&body[0..4], b"RIFF");
         assert_eq!(&body[8..12], b"WAVE");
+    }
+
+    #[tokio::test]
+    async fn route_speech_pcm_response_format_returns_raw_pcm() {
+        let response = post_json(
+            router_with_stub_tts(),
+            "/v1/audio/speech",
+            json!({
+                "model": "stub-tts",
+                "input": "hello",
+                "voice": "default",
+                "response_format": "pcm"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/pcm"
+        );
+        let body = response_bytes(response).await;
+        assert_eq!(body.len(), 6, "three f32 samples should encode as s16le");
+        assert_eq!(&body[0..2], &[0, 0]);
+        assert_ne!(&body[0..4], b"RIFF");
+    }
+
+    #[tokio::test]
+    async fn route_speech_rejects_unsupported_response_format() {
+        let response = post_json(
+            router_with_stub_tts(),
+            "/v1/audio/speech",
+            json!({
+                "model": "stub-tts",
+                "input": "hello",
+                "voice": "default",
+                "response_format": "mp3"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "response_format");
     }
 
     #[tokio::test]

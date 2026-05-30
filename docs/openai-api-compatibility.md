@@ -14,6 +14,19 @@ describes the current product contract for the always-on server path.
 | `POST /v1/audio/transcriptions` | Supported for ASR servers | Multipart form input. |
 | `POST /v1/audio/speech` | Supported for TTS servers | Speech output depends on the loaded TTS model. |
 
+## Modality Endpoint Fields
+
+| Endpoint / field | Status | Behavior |
+|---|---|---|
+| `/v1/embeddings input` | Supported | Accepts a string, array of strings, object with `text` or `image`, or array of those objects. |
+| `/v1/embeddings encoding_format=float` | Supported | Returns numeric float embeddings. |
+| `/v1/embeddings encoding_format=base64` | Rejected | Returns HTTP 400 with `param=encoding_format`; base64 embedding encoding is not implemented. |
+| `/v1/audio/transcriptions response_format=json` | Supported | Returns `{ "text": ... }`. |
+| `/v1/audio/transcriptions` other `response_format` values | Rejected | Returns HTTP 400 with `param=response_format`; text/SRT/VTT/verbose JSON transcription formats are not implemented. |
+| `/v1/audio/speech response_format=wav` | Supported | Returns 16-bit mono WAV bytes with `content-type: audio/wav`. |
+| `/v1/audio/speech response_format=pcm` | Supported | Returns raw 16-bit little-endian mono PCM bytes with `content-type: audio/pcm`. |
+| `/v1/audio/speech` other `response_format` values | Rejected | Returns HTTP 400 with `param=response_format`; compressed speech formats are not implemented. |
+
 ## Chat Fields
 
 | Field | Status | Behavior |

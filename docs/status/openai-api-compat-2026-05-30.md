@@ -24,7 +24,8 @@ explicit supported/rejected fields, usage accounting, error mapping, and the
 | Models list | `/v1/models` returns an OpenAI list envelope with loaded model objects, and an empty list when no engine is loaded | `route_models_lists_loaded_stub_model`, `route_models_without_engine_returns_empty_list` |
 | Embeddings | `/v1/embeddings` returns the OpenAI list envelope, indexed embedding rows, model id, and usage for a loaded embedding engine | `route_embeddings_contract_uses_stub_engine` |
 | Audio transcription | `/v1/audio/transcriptions` accepts multipart file input plus language hint and returns an OpenAI-style `{text}` response for a loaded transcription engine | `route_transcriptions_contract_uses_stub_engine` |
-| Audio speech | `/v1/audio/speech` returns WAV bytes with `content-type: audio/wav` for a loaded TTS engine | `route_speech_contract_uses_stub_engine` |
+| Audio speech | `/v1/audio/speech` returns WAV bytes with `content-type: audio/wav` or raw PCM bytes with `content-type: audio/pcm` for a loaded TTS engine | `route_speech_contract_uses_stub_engine`, `route_speech_pcm_response_format_returns_raw_pcm` |
+| Modality unsupported formats | Embeddings reject unsupported `encoding_format`; transcription and speech reject unsupported `response_format` values with field-specific HTTP 400 | `route_embeddings_rejects_unsupported_encoding_format`, `route_transcriptions_rejects_unsupported_response_format`, `route_speech_rejects_unsupported_response_format` |
 | Modality request parse errors | Malformed embedding JSON, malformed speech JSON, and invalid transcription multipart requests map to OpenAI error envelopes instead of Axum default rejection bodies | `route_embeddings_invalid_json_maps_to_openai_error`, `route_speech_invalid_json_maps_to_openai_error`, `route_transcriptions_invalid_multipart_maps_to_openai_error` |
 | Streaming chat | SSE returns chat chunks and `[DONE]` | `route_streaming_chat_include_usage_contract` |
 | `stream_options.include_usage` | Emits a separate final usage chunk with `choices: []` before `[DONE]` | `route_streaming_chat_include_usage_contract`, `chat_stream_options_include_usage_controls_stream_usage` |
@@ -74,6 +75,9 @@ explicit supported/rejected fields, usage accounting, error mapping, and the
 | malformed `/v1/completions` JSON | Invalid request | HTTP 400, `invalid_request_error`, `param=null` |
 | `/v1/completions` missing/non-string `prompt` | Invalid request | HTTP 400, `invalid_request_error`, `param=prompt` |
 | malformed `/v1/chat/completions` JSON | Invalid request | HTTP 400, `invalid_request_error`, `param=null` |
+| `/v1/embeddings encoding_format=base64` | Unsupported | HTTP 400, `invalid_request_error`, `param=encoding_format` |
+| `/v1/audio/transcriptions response_format!=json` | Unsupported | HTTP 400, `invalid_request_error`, `param=response_format` |
+| `/v1/audio/speech response_format` except `wav`/`pcm` | Unsupported | HTTP 400, `invalid_request_error`, `param=response_format` |
 | `stream_options` with `stream != true` | Invalid request | HTTP 400, `invalid_request_error`, `param=stream_options` |
 | non-function tools | Unsupported | HTTP 400, `invalid_request_error`, `param=tools` |
 | `tool_choice=required` | Unsupported generation behavior | HTTP 400, `invalid_request_error`, `param=tool_choice` |
