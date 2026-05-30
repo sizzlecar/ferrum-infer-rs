@@ -54,6 +54,9 @@ validators, a native JSONL sink, and the first Rust/C++ profile emitters.
 - `scripts/m3_route_unified_profile.sh` now configures the runner in
   structured profile mode and validates required event groups from
   `profile.jsonl` instead of required grep patterns.
+- `scripts/m3_graph_runtime_profile.sh` now configures the runner in
+  structured profile mode and validates graph-on runtime profile event groups
+  from `profile.jsonl` instead of grepping `server.log`.
 - `scripts/m3_ab_runner.py` can now pass structured profile sink metadata to
   `ferrum serve` via typed CLI args for selected cases only via
   `profile.profile_env_cases`, allowing same-binary overhead checks where the
@@ -76,6 +79,8 @@ python3 scripts/m3_validate_runner_artifact.py --self-test
 python3 scripts/m3_ab_runner.py --self-test
 VALIDATE_ONLY=1 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-route-validate \
   bash scripts/m3_route_unified_profile.sh
+VALIDATE_ONLY=1 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-graph-runtime-validate \
+  bash scripts/m3_graph_runtime_profile.sh
 VALIDATE_ONLY=1 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-profile-sink-validate \
   bash scripts/m3_profile_sink_overhead_ab.sh
 python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
@@ -94,6 +99,9 @@ MODEL_DIR=/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshot
   OUT_ROOT=/tmp/m3-route-validate-structured BIN=/bin/echo VALIDATE_ONLY=1 \
   bash scripts/m3_route_unified_profile.sh
 MODEL_DIR=/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441 \
+  OUT_ROOT=/tmp/m3-graph-runtime-validate-structured BIN=/bin/echo VALIDATE_ONLY=1 \
+  bash scripts/m3_graph_runtime_profile.sh
+MODEL_DIR=/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441 \
   OUT_ROOT=/tmp/m3-profile-sink-validate BIN=/bin/echo VALIDATE_ONLY=1 \
   bash scripts/m3_profile_sink_overhead_ab.sh
 cargo check -q -p ferrum-kernels --features cuda,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source
@@ -111,6 +119,9 @@ Local refresh after typed profile sink wiring:
 - `python3 scripts/m3_ab_runner.py --self-test`: passed.
 - `python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap`:
   `146/146` registry coverage, hot direct env reads `4`.
+- `VALIDATE_ONLY=1 MODEL_DIR=/tmp BIN=/bin/echo
+  OUT_ROOT=/tmp/m3-graph-runtime-validate bash
+  scripts/m3_graph_runtime_profile.sh`: passed.
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
 
 ## Real Structured Profile Artifact
@@ -204,9 +215,9 @@ Evidence:
 
 ## Remaining B Gaps
 
-- Runtime profile producers still emit text logs; the runner converts matching
-  snippets into transitional JSONL for wrappers that have not moved to
-  structured mode.
+- Some remaining runtime profile wrappers still consume text logs; the primary
+  route/unified and graph-runtime profile wrappers now require native
+  structured JSONL events.
 - Profile sink overhead now has c32 N=3 same-binary evidence within noise, but
   full diagnostic producer overhead is still intentionally excluded from this
   low-intrusion bound.

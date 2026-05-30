@@ -93,6 +93,7 @@ jobs:
           bash -n scripts/m3_fa_layout_varlen_ab.sh
           bash -n scripts/m3_attn_v1_ab.sh
           bash -n scripts/m3_route_unified_profile.sh
+          bash -n scripts/m3_graph_runtime_profile.sh
           bash -n scripts/m3_prefill_first_ab.sh
           bash -n scripts/m3_active_prefill_chunk_ab.sh
           bash -n scripts/m3_profile_sink_overhead_ab.sh
@@ -110,6 +111,8 @@ jobs:
             VALIDATE_ONLY=1 bash scripts/m3_active_prefill_chunk_ab.sh
           MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/route-profile" BIN=/bin/echo \
             VALIDATE_ONLY=1 bash scripts/m3_route_unified_profile.sh
+          MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/graph-runtime" BIN=/bin/echo \
+            VALIDATE_ONLY=1 bash scripts/m3_graph_runtime_profile.sh
           MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/profile-sink" BIN=/bin/echo \
             VALIDATE_ONLY=1 bash scripts/m3_profile_sink_overhead_ab.sh
 
