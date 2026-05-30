@@ -12,6 +12,7 @@ use ferrum_types::{
     RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
 };
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::signal;
 
@@ -968,22 +969,9 @@ fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> 
 fn hardware_capabilities_for_device(device: &ferrum_types::Device) -> HardwareCapabilities {
     let features = compiled_kernel_features();
     match device {
-        ferrum_types::Device::CUDA(_) => HardwareCapabilities {
-            backend: "cuda".to_string(),
-            cuda_runtime: None,
-            compute_capability: None,
-            vram_bytes: None,
-            sm_count: None,
-            supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
-            supported_kv_dtypes: vec![
-                "fp16".to_string(),
-                "bf16".to_string(),
-                "int8".to_string(),
-                "fp8".to_string(),
-            ],
-            graph_support: cfg!(feature = "cuda"),
-            compiled_features: features,
-        },
+        ferrum_types::Device::CUDA(id) => {
+            cuda_hardware_capabilities(features, probe_cuda_device(*id as usize))
+        }
         ferrum_types::Device::ROCm(_) => HardwareCapabilities {
             backend: "rocm".to_string(),
             supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
@@ -1006,6 +994,159 @@ fn hardware_capabilities_for_device(device: &ferrum_types::Device) -> HardwareCa
             compiled_features: features,
             ..HardwareCapabilities::unknown()
         },
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CudaDeviceProbe {
+    name: Option<String>,
+    cuda_runtime: Option<String>,
+    compute_capability: Option<String>,
+    vram_bytes: Option<u64>,
+    sm_count: Option<u32>,
+}
+
+fn cuda_hardware_capabilities(
+    features: CompiledKernelFeatures,
+    probe: CudaDeviceProbe,
+) -> HardwareCapabilities {
+    HardwareCapabilities {
+        backend: "cuda".to_string(),
+        cuda_runtime: probe.cuda_runtime,
+        compute_capability: probe.compute_capability,
+        vram_bytes: probe.vram_bytes,
+        sm_count: probe.sm_count,
+        supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
+        supported_kv_dtypes: vec![
+            "fp16".to_string(),
+            "bf16".to_string(),
+            "int8".to_string(),
+            "fp8".to_string(),
+        ],
+        graph_support: cfg!(feature = "cuda"),
+        compiled_features: features,
+    }
+}
+
+fn probe_cuda_device(device_id: usize) -> CudaDeviceProbe {
+    let mut probe = run_nvidia_smi_query(device_id, "name,compute_cap,memory.total")
+        .and_then(|output| parse_nvidia_smi_gpu_query(&output))
+        .unwrap_or_default();
+    probe.cuda_runtime = probe_cuda_runtime_version();
+    probe.sm_count = run_nvidia_smi_query(device_id, "multiprocessor_count")
+        .and_then(|output| parse_first_u32(&output))
+        .or_else(|| probe.name.as_deref().and_then(infer_sm_count_from_gpu_name));
+    probe
+}
+
+fn run_nvidia_smi_query(device_id: usize, query: &str) -> Option<String> {
+    let output = Command::new("nvidia-smi")
+        .args([
+            format!("--query-gpu={query}"),
+            "--format=csv,noheader,nounits".to_string(),
+            "-i".to_string(),
+            device_id.to_string(),
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn probe_cuda_runtime_version() -> Option<String> {
+    run_command_stdout("nvcc", &["--version"])
+        .and_then(|output| parse_nvcc_cuda_release(&output))
+        .or_else(|| {
+            run_command_stdout("nvidia-smi", &[])
+                .and_then(|output| parse_nvidia_smi_cuda_version(&output))
+        })
+}
+
+fn run_command_stdout(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_nvidia_smi_gpu_query(output: &str) -> Option<CudaDeviceProbe> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() < 3 {
+        return None;
+    }
+    let name = non_empty_probe_value(fields[0]).map(str::to_string);
+    let compute_capability = non_empty_probe_value(fields[1]).map(str::to_string);
+    let vram_bytes = parse_memory_total_bytes(fields[2]);
+    Some(CudaDeviceProbe {
+        name,
+        compute_capability,
+        vram_bytes,
+        ..CudaDeviceProbe::default()
+    })
+}
+
+fn parse_memory_total_bytes(raw: &str) -> Option<u64> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let numeric = lower
+        .trim_end_matches("mib")
+        .trim_end_matches("mb")
+        .trim_end_matches("gib")
+        .trim_end_matches("gb")
+        .trim();
+    let value = numeric.parse::<f64>().ok()?;
+    let multiplier = if lower.contains("gib") || lower.contains("gb") {
+        1024.0 * 1024.0 * 1024.0
+    } else {
+        1024.0 * 1024.0
+    };
+    Some((value * multiplier).round() as u64)
+}
+
+fn parse_first_u32(output: &str) -> Option<u32> {
+    output
+        .lines()
+        .find_map(|line| non_empty_probe_value(line)?.parse::<u32>().ok())
+}
+
+fn parse_nvcc_cuda_release(output: &str) -> Option<String> {
+    let marker = "release ";
+    let start = output.find(marker)? + marker.len();
+    parse_version_prefix(&output[start..])
+}
+
+fn parse_nvidia_smi_cuda_version(output: &str) -> Option<String> {
+    let marker = "CUDA Version:";
+    let start = output.find(marker)? + marker.len();
+    parse_version_prefix(output[start..].trim())
+}
+
+fn parse_version_prefix(raw: &str) -> Option<String> {
+    let version = raw
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<String>();
+    (!version.is_empty()).then_some(version)
+}
+
+fn non_empty_probe_value(raw: &str) -> Option<&str> {
+    let value = raw.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("n/a") {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn infer_sm_count_from_gpu_name(name: &str) -> Option<u32> {
+    let normalized = name.to_ascii_lowercase();
+    if normalized.contains("rtx 4090") {
+        Some(128)
+    } else {
+        None
     }
 }
 
@@ -1226,6 +1367,64 @@ mod tests {
             RuntimeConfigSource::MemoryProfile
         );
         assert_eq!(entry("FERRUM_KV_DTYPE").source, RuntimeConfigSource::Env);
+    }
+
+    #[test]
+    fn nvidia_smi_gpu_query_parser_extracts_cuda_hardware_fields() {
+        let probe = parse_nvidia_smi_gpu_query("NVIDIA GeForce RTX 4090, 8.9, 24564\n").unwrap();
+
+        assert_eq!(probe.name.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+        assert_eq!(probe.compute_capability.as_deref(), Some("8.9"));
+        assert_eq!(probe.vram_bytes, Some(24564 * 1024 * 1024));
+    }
+
+    #[test]
+    fn nvidia_smi_gpu_query_parser_handles_units_and_empty_values() {
+        let probe = parse_nvidia_smi_gpu_query("N/A, N/A, 24 GiB\n").unwrap();
+
+        assert_eq!(probe.name, None);
+        assert_eq!(probe.compute_capability, None);
+        assert_eq!(probe.vram_bytes, Some(24 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn cuda_runtime_version_parsers_accept_nvcc_and_nvidia_smi_output() {
+        let nvcc = "Cuda compilation tools, release 12.8, V12.8.93";
+        let smi = "| NVIDIA-SMI 570.86.15    Driver Version: 570.86.15    CUDA Version: 12.8 |";
+
+        assert_eq!(parse_nvcc_cuda_release(nvcc).as_deref(), Some("12.8"));
+        assert_eq!(parse_nvidia_smi_cuda_version(smi).as_deref(), Some("12.8"));
+        assert_eq!(parse_first_u32("128\n").unwrap(), 128);
+        assert_eq!(
+            infer_sm_count_from_gpu_name("NVIDIA GeForce RTX 4090"),
+            Some(128)
+        );
+    }
+
+    #[test]
+    fn cuda_hardware_capabilities_uses_runtime_probe_values() {
+        let hardware = cuda_hardware_capabilities(
+            CompiledKernelFeatures {
+                cuda: true,
+                cuda_graph: true,
+                ..CompiledKernelFeatures::default()
+            },
+            CudaDeviceProbe {
+                name: Some("NVIDIA GeForce RTX 4090".to_string()),
+                cuda_runtime: Some("12.8".to_string()),
+                compute_capability: Some("8.9".to_string()),
+                vram_bytes: Some(24 * 1024 * 1024 * 1024),
+                sm_count: Some(128),
+            },
+        );
+
+        assert_eq!(hardware.backend, "cuda");
+        assert_eq!(hardware.cuda_runtime.as_deref(), Some("12.8"));
+        assert_eq!(hardware.compute_capability.as_deref(), Some("8.9"));
+        assert_eq!(hardware.vram_bytes, Some(24 * 1024 * 1024 * 1024));
+        assert_eq!(hardware.sm_count, Some(128));
+        assert!(hardware.supported_kv_dtypes.contains(&"int8".to_string()));
+        assert!(hardware.compiled_features.cuda);
     }
 
     #[test]

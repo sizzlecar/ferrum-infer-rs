@@ -82,6 +82,11 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   `FERRUM_PAGED_MAX_SEQS`, `FERRUM_KV_CAPACITY`) with
   `source=memory_profile` when they are introduced during startup, so startup
   artifacts distinguish memory-profile sizing from user env overrides.
+- The CUDA `serve` startup path now performs a runtime hardware probe with
+  `nvidia-smi`/`nvcc` when available. It fills `HardwareCapabilities` with
+  CUDA runtime/toolkit version, compute capability, total VRAM, and SM count
+  (`multiprocessor_count` when reported; conservative RTX 4090 fallback
+  otherwise) instead of leaving those fields as empty compile-feature stubs.
 - `scripts/m3_ab_runner.py` now passes the M3 preset through
   `--runtime-preset`, so the migrated wrappers no longer inject the common M3
   `FERRUM_*` bundle as process env. Completed runner manifests now copy the
@@ -134,14 +139,15 @@ Evidence:
   the Rust selector unless explicitly overridden.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
-- `ferrum-cli` serve tests passed: `13 passed`, covering CLI-sourced runtime
+- `ferrum-cli` serve tests passed: `17 passed`, covering CLI-sourced runtime
   entries for `--kv-dtype`, `--runtime-preset`, and profile sink arguments
   plus explicit runtime source precedence for config-file, env, and CLI
   inputs. The serve tests also verify that config-file values bridged into the
   env snapshot keep `source=config_file` in startup artifacts, and that
   model-inferred M3 preset defaults keep `source=default` instead of being
   reported as env overrides after materialization. New serve tests verify
-  autosizer-added keys are source-attributed as `memory_profile`.
+  autosizer-added keys are source-attributed as `memory_profile` and CUDA
+  hardware probe output is parsed into `HardwareCapabilities`.
 - `ferrum-cli` config tests passed: `8 passed`, including config-file runtime
   source attribution, `[runtime].preset` parsing, and missing `[runtime]`
   backwards compatibility.
@@ -166,10 +172,12 @@ Evidence:
   runtime preset, selected CLI runtime/profile inputs, config-file runtime
   fields, and autosizer-created runtime keys into the startup snapshot. Broader
   non-M3 and diagnostic config-file coverage still needs expansion.
-- Hardware capability data is currently compiled-feature/device based; it does
-  not yet include a real CUDA capability probe. Startup autosizer outputs are
-  now source-attributed as `memory_profile`, but this is not yet a full
-  hardware-capability profile.
+- CUDA hardware capability data is no longer only compiled-feature/device
+  based on the `serve` startup path. Remaining work is to make selectors use
+  the probed fields for compatibility decisions beyond the current graph and
+  compiled-kernel gates, and to validate the probe on the GPU pod. Startup
+  autosizer outputs are now source-attributed as `memory_profile`, but this is
+  not yet a full memory-capability selector.
 - The M3 preset selector is now exposed through the Rust startup path and used
   by the migrated runner. Server-written effective-config data now owns
   completed-run runtime snapshots, and the runner no longer has a parallel
